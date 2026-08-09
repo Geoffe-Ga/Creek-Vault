@@ -223,8 +223,10 @@ _VALID_CHANNEL_TIERS: Final[frozenset[str]] = frozenset(
 # record can represent. The reasoning above stands on its own if the workflow
 # set ever changes.
 #
-# Membership (``in``), never a rank comparison: ``crawdad.loop`` owns the
-# single tier-ordering table and a second one must not exist. The values stay
+# Membership (``in``), never a rank comparison: ``crawdad.intents`` owns the
+# single tier-ordering table (``CEILING_RANK``, moved there from
+# ``crawdad.loop`` by #1152 so the capping rule sits beside the vocabulary it
+# caps) and a second one must not exist. The values stay
 # plain ``str`` rather than ``intents.PrivacyTierCeiling`` members because
 # ``channel_privacy_tiers`` is a ``dict[int, str]`` of operator-written YAML
 # and this module deliberately owns the tier vocabulary without importing

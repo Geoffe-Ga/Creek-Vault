@@ -23,8 +23,9 @@ from crawdad.config import (
     router_model_for,
 )
 from crawdad.consent import PendingBatchStore
+from crawdad.dispatcher import WorkflowRunReport
 from crawdad.history import ConversationHistory
-from crawdad.intents import ToolInfo
+from crawdad.intents import PrivacyTierCeiling, ToolInfo, cap_ceiling
 from crawdad.llm import build_async_provider
 from crawdad.loop import run_one_turn
 from crawdad.mcp_client import MCPClient, MCPUnavailableError
@@ -186,18 +187,32 @@ def _build_workflow_runner(
     mcp_client = components.mcp_client
     known_tools = components.known_tools
 
-    async def _runner(name: str, inputs: dict[str, str]) -> str:
+    async def _runner(name: str, inputs: dict[str, str]) -> WorkflowRunReport:
         """Run *name* by looking it up in the registry and composing the reply.
 
         Surface failures (constraint errors, unknown name, composer
         exceptions) as a single Discord-safe string so the slash command
         can pass them through without translating again.
+
+        The report also carries the ceiling the walk used (#1152), which
+        the dispatcher stamps onto its :class:`ToolResult`. Both failure
+        branches report ``open``: a soft-error string is CrawDad's own
+        wording, no vault content was selected, and reporting the
+        workflow's declared tier would ratchet the agent loop on the
+        strength of a failure. Only the success branch reports the
+        workflow's tier, run through :func:`cap_ceiling` so this report
+        cannot exceed the cloud-composer cap even if a future
+        construction route slips an ``intimate`` definition past the
+        walker's own pre-flight refusal.
         """
         try:
             workflow = registry.get(name)
         except Exception as exc:
             _LOGGER.warning("workflow lookup failed for %r: %s", name, exc)
-            return _truncate_for_discord(f"could not find workflow `{name}`: {exc}")
+            return WorkflowRunReport(
+                reply=_truncate_for_discord(f"could not find workflow `{name}`: {exc}"),
+                privacy_tier_ceiling=PrivacyTierCeiling.OPEN,
+            )
         try:
             reply = await run_workflow_and_compose(
                 workflow=workflow,
@@ -211,8 +226,14 @@ def _build_workflow_runner(
             )
         except Exception as exc:
             _LOGGER.warning("workflow %r failed mid-run: %s", name, exc)
-            return _truncate_for_discord(f"workflow `{name}` failed: {exc}")
-        return _truncate_for_discord(reply)
+            return WorkflowRunReport(
+                reply=_truncate_for_discord(f"workflow `{name}` failed: {exc}"),
+                privacy_tier_ceiling=PrivacyTierCeiling.OPEN,
+            )
+        return WorkflowRunReport(
+            reply=_truncate_for_discord(reply),
+            privacy_tier_ceiling=cap_ceiling(workflow.privacy_tier_ceiling),
+        )
 
     return _runner
 

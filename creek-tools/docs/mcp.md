@@ -548,11 +548,16 @@ Adepthood backend, the server also serves an **authenticated
 streamable-http** transport:
 
 ```bash
-# Generate each consumer token as high-entropy hex, once, per consumer:
-#   python -c "import secrets; print(secrets.token_hex(32))"
-export CREEK_MCP_CONSUMER_TOKENS="adepthood=<secrets.token_hex(32)>;other=<token>"
+# Generate each consumer token as a high-entropy secret, once, per consumer:
+#   python -c "import secrets; print(secrets.token_urlsafe(32))"
+export CREEK_MCP_CONSUMER_TOKENS="adepthood=<token>;other=<token>"
 creek-tools-mcp --transport network --host 127.0.0.1 --port 8000
 ```
+
+A consumer mid-rotation lists more than one currently-valid token,
+comma-separated, inside its own entry — `adepthood=<current>,<incoming>` — see
+"Rotating a consumer's secret" below. A single-token entry, as above, is the
+steady state and parses exactly as it did before #895.
 
 ### TLS is enforced for non-loopback binds (#837)
 
@@ -578,14 +583,28 @@ that happens to resolve to `127.0.0.1`, e.g. via `/etc/hosts`) is treated as
 routable by design and requires TLS.
 
 - **No anonymous access.** Network mode refuses to start unless
-  `CREEK_MCP_CONSUMER_TOKENS` is set. It holds `consumer=token` pairs,
+  `CREEK_MCP_CONSUMER_TOKENS` is set. It holds `consumer=token` entries,
   `;`-separated; tokens live in the **environment only** (never in code or
   config), mirroring the `CREEK_MCP_ELEVATED_TOKEN` precedent. Generate each
-  token as high-entropy hex — `secrets.token_hex(32)` — so a token is never
+  token high-entropy — `secrets.token_urlsafe(32)` — so a token is never
   guessable; the constant-time comparison only matters against a strong secret.
   A configured token below 32 characters is refused at startup, the same
   floor `CREEK_MCP_ELEVATED_TOKEN` now enforces (#907) — both surfaces share
   one minimum defined once in `creek_mcp/token_policy.py`.
+- **A consumer may hold more than one currently-valid token (#895).** A
+  `,`-separated list inside one consumer's entry — `adepthood=<old>,<new>` —
+  names an *ordered set* of tokens that all currently authenticate as that
+  consumer. A single token, as in the example above, is the unrotated steady
+  state and parses exactly as it did before this change. The 32-character
+  floor applies to every token in the set, not just the first, because a
+  rotation is exactly when a fresh secret gets typed in. Two configurations
+  are refused at load time rather than silently resolved: naming the same
+  consumer twice (`adepthood=a;adepthood=b` — the second entry no longer
+  silently overwrites the first) and configuring the same token value more
+  than once, whether inside one consumer's set or across two consumers —
+  every token value must be **globally unique**, because a shared value would
+  be attributed to whichever consumer the verifier happens to scan last,
+  auditing the call under the wrong identity.
 - **Per-consumer identity.** Each request must present its bearer token
   (`Authorization: Bearer <token>`). The token maps to a consumer name that
   is stamped on every audit-log entry — so remote calls are attributable the
@@ -601,8 +620,14 @@ routable by design and requires TLS.
   same configured `CREEK_MCP_CONSUMER_TOKENS` secret is re-verified and
   granted a fresh `AccessToken`/`expires_at` on each call; the TTL bounds how
   long any *individually captured* `AccessToken` (e.g. one logged or cached
-  outside the server) would remain valid, not how often the underlying
-  shared secret must be rotated.
+  outside the server) would remain valid. It does **not** bound the
+  configured secret itself and it is not a rotation mechanism — a consumer
+  that keeps presenting a value from `CREEK_MCP_CONSUMER_TOKENS` is
+  re-verified indefinitely. Dropping a token from the set and restarting is
+  what revokes it; see "Rotating a consumer's secret" below, and
+  [ADR-0009](architecture/ADR/0009-mcp-consumer-token-rotation.md) for why
+  overlapping static tokens, rather than short-lived derived credentials, is
+  the shape of that runbook.
 - **A consumer token grants remote _write_ access, by design.** A valid
   `CREEK_MCP_CONSUMER_TOKENS` entry can reach every non-purge tool at or below
   the `personal` ceiling — including the **write** tools (`creek.journal`,
@@ -646,6 +671,54 @@ routable by design and requires TLS.
   audit log from the same `CallerIdentity`, and `_effective_consumer` in
   `creek_mcp/server.py` is now MCP's thin adapter over it, unchanged in
   behaviour.
+
+### Rotating a consumer's secret (no downtime)
+
+Rotation widens a consumer's token set so the old and new secrets both work,
+lets the consumer redeploy onto the new one, then narrows the set back to
+one. Two restarts bound the window, and **the window is not closed until the
+second restart runs** — until then the retired secret still authenticates as
+that consumer, exactly like the new one.
+
+1. Generate a fresh token for the consumer being rotated:
+   ```bash
+   python -c "import secrets; print(secrets.token_urlsafe(32))"
+   ```
+2. Add it alongside the consumer's current token in
+   `CREEK_MCP_CONSUMER_TOKENS`, comma-separated, current value first:
+   ```bash
+   export CREEK_MCP_CONSUMER_TOKENS="adepthood=<current>,<new>;other=<token>"
+   ```
+3. Restart **every** process that reads this variable — `creek-tools-mcp`,
+   `creek-tools-api`, or both, if the host runs the two adapters side by side.
+   They share one registry, so a process that was not restarted is still
+   serving the pre-edit set. Startup prints a
+   rotation notice to stderr naming `adepthood` and its token count — that
+   notice is the reminder that a window is open, not a one-time line to
+   dismiss. From this restart on, both `<current>` and `<new>` authenticate
+   as `adepthood`.
+4. Redeploy the consumer onto `<new>` and confirm *at the consumer* that it
+   is presenting the new token. (The audit log at
+   `<vault>/00-Creek-Meta/audit/mcp.jsonl` attributes every call to
+   `adepthood` regardless of which token authenticated it, so it cannot tell
+   you which one is in use — check the consumer's own configuration.)
+5. Remove `<current>` from `CREEK_MCP_CONSUMER_TOKENS`, leaving only `<new>`:
+   ```bash
+   export CREEK_MCP_CONSUMER_TOKENS="adepthood=<new>;other=<token>"
+   ```
+6. Restart again — every process you restarted in step 3, not just one of
+   them. **This step is not optional.** Until it runs, `<current>` still
+   authenticates as `adepthood` on any process still holding the widened set,
+   and the rotation notice keeps firing at that process's every startup as a
+   reminder. This second restart is the only thing that actually revokes the
+   retired secret — nothing else in this system does.
+
+Skipping step 6 does not fail loudly; it leaves a permanently widened
+credential set that keeps working indefinitely. The startup notice is the
+only pressure against that, so treat it as an open task, not a status line.
+See [ADR-0009](architecture/ADR/0009-mcp-consumer-token-rotation.md) for why
+this overlapping-token runbook, rather than short-lived derived credentials,
+is the shape of rotation today.
 
 The transport is a thin wrapper around the MCP SDK's `TokenVerifier` /
 streamable-http app; the tool registry, tier-ceiling rules, and hash-chained

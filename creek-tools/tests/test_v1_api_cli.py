@@ -34,6 +34,7 @@ import pytest
 from creek_mcp import server as server_mod
 from creek_mcp.api.openapi import build_openapi
 from creek_mcp.httpapi import cli as cli_mod
+from creek_mcp.httpapi.auth import build_verifier
 from creek_mcp.httpapi.cli import DEFAULT_API_PORT, main
 from creek_mcp.remote_auth import CONSUMER_TOKENS_ENV
 from creek_mcp.server import DEFAULT_MCP_NETWORK_PORT
@@ -116,6 +117,20 @@ def _valid_tokens() -> str:
         A single ``consumer=token`` pair clearing the length floor.
     """
     return f"{CONSUMER}={STRONG_TOKEN}"
+
+
+# 44 chars each. Low-entropy test literals, not real credentials.
+_ROTATION_TOKEN_A: Final[str] = "api-test-rotation-token-" + "e" * 20
+_ROTATION_TOKEN_B: Final[str] = "api-test-rotation-token-" + "f" * 20
+
+
+def _rotation_window() -> str:
+    """Return a ``CREEK_MCP_CONSUMER_TOKENS`` value with one consumer mid-rotation.
+
+    Returns:
+        A single consumer holding two currently-valid tokens (#895).
+    """
+    return f"{CONSUMER}={_ROTATION_TOKEN_A},{_ROTATION_TOKEN_B}"
 
 
 # --------------------------------------------------------------------------- #
@@ -423,6 +438,90 @@ def test_print_openapi_writes_nothing_to_stderr(
     _stub_serve(monkeypatch)
     main(["--print-openapi"])
     assert capsys.readouterr().err == ""
+
+
+# --------------------------------------------------------------------------- #
+# Rotation-window startup notice (#895)
+#
+# A window has to be closed again, and an operator who cannot see one is open
+# will not close it. The notice goes to **stderr**: stdout on this entry point
+# carries the ``--print-openapi`` document, which consumers pipe into code
+# generators, so an operator message there breaks every one of those pipes.
+# --------------------------------------------------------------------------- #
+
+
+def test_serving_a_rotation_window_announces_it_on_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The operator is told which consumers are mid-rotation, and on which stream.
+
+    Compared against the verifier's own ``rotation_notice()`` for the same
+    configuration, so the CLI is pinned to emitting the shared message rather
+    than a second wording free to drift from it.
+
+    Args:
+        monkeypatch: Configures a rotation window and stubs the serve loop.
+        capsys: Captures both streams.
+    """
+    _configure_tokens(monkeypatch, _rotation_window())
+    recorder = _stub_serve(monkeypatch)
+    main(["--host", "127.0.0.1"])
+    captured = capsys.readouterr()
+
+    assert len(recorder.calls) == 1  # it announced and served, not instead of serving
+    expected = build_verifier(
+        {CONSUMER_TOKENS_ENV: _rotation_window()}
+    ).rotation_notice()
+    assert expected is not None
+    assert expected in captured.err
+    assert CONSUMER in captured.err  # the consumer mid-rotation is named
+    assert "2" in captured.err  # ...with its token count
+    assert _ROTATION_TOKEN_A not in captured.err  # NEVER echo a token value
+    assert _ROTATION_TOKEN_B not in captured.err
+    assert captured.out == ""  # stdout is the contract's channel
+
+
+def test_serving_without_a_rotation_window_announces_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Steady state is silent, so the notice means something when it appears.
+
+    Args:
+        monkeypatch: Configures one token per consumer and stubs the serve loop.
+        capsys: Captures both streams.
+    """
+    _configure_tokens(monkeypatch, _valid_tokens())
+    recorder = _stub_serve(monkeypatch)
+    main(["--host", "127.0.0.1"])
+    captured = capsys.readouterr()
+
+    assert len(recorder.calls) == 1
+    assert captured.err == ""
+
+
+def test_print_openapi_stdout_stays_pure_json_during_a_rotation_window(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An open window must not contaminate the machine-readable dump.
+
+    ``--print-openapi`` is what a consumer pipes into a client generator. A
+    notice printed to stdout would make the document unparseable exactly for
+    the operators who are mid-rotation — the ones least able to afford a second
+    broken thing.
+
+    Args:
+        monkeypatch: Configures a rotation window and stubs the serve loop.
+        capsys: Captures stdout.
+    """
+    _configure_tokens(monkeypatch, _rotation_window())
+    recorder = _stub_serve(monkeypatch)
+    main(["--print-openapi"])
+    out = capsys.readouterr().out
+
+    assert json.loads(out) == build_openapi()
+    assert _ROTATION_TOKEN_A not in out
+    assert _ROTATION_TOKEN_B not in out
+    assert recorder.calls == []
 
 
 # --------------------------------------------------------------------------- #

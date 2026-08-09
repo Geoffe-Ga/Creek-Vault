@@ -120,6 +120,10 @@ _MALFORMED_IDS: Final[tuple[str, ...]] = (
     "two-tokens",
 )
 
+# 45 chars. The token that replaces ``STRONG_TOKEN`` during a rotation window
+# (#895). Test literal, not a real credential.
+_ROTATION_TOKEN: Final[str] = "unit-test-rotation-token-" + "d" * 20
+
 
 @pytest.fixture
 def vault(tmp_path: Path) -> Iterator[Path]:
@@ -435,3 +439,71 @@ def test_build_verifier_enforces_the_shared_length_floor(length: int) -> None:
     assert str(MIN_TOKEN_LEN) in message
     assert "secrets.token_urlsafe(32)" in message
     assert token not in message  # NEVER echo the token value
+
+
+# --------------------------------------------------------------------------- #
+# build_verifier — the rotation window reaches /v1 through the same env (#895)
+# --------------------------------------------------------------------------- #
+
+
+def test_build_verifier_opens_a_rotation_window_for_one_consumer(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Old and new both authenticate as one consumer, straight from the env.
+
+    Driven end-to-end through the adapter rather than against ``verify_token``
+    directly, because the point of the window is what a *consumer* experiences:
+    one still holding the retired secret keeps being served while it redeploys,
+    and it is served under its own name. A window that changed the caller's
+    identity for its duration would rewrite every access line it produced, so
+    the identity handed to :func:`creek_mcp.policy.admitted_ceiling` is what is
+    asserted.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Installs the admission spy.
+    """
+    built = build_verifier(
+        {CONSUMER_TOKENS_ENV: f"{CONSUMER}={STRONG_TOKEN},{_ROTATION_TOKEN}"}
+    )
+    calls = spy_admitted_ceiling(monkeypatch)
+    with client(vault_path=vault, verifier=built) as test_client:
+        for token in (STRONG_TOKEN, _ROTATION_TOKEN):
+            response = test_client.get(HEALTH_PATH, headers=headers(token=token))
+            assert response.status_code == 200
+    assert [call[0].consumer for call in calls] == [CONSUMER, CONSUMER]
+
+
+def test_closing_the_window_revokes_the_retired_token(vault: Path) -> None:
+    """Once the operator drops the old secret, presenting it is a ``401`` again.
+
+    The half of #895 that keeps it a rotation rather than a permanent widening:
+    without this, "both tokens work" is indistinguishable from "tokens are never
+    revoked".
+
+    Args:
+        vault: A seeded vault.
+    """
+    built = build_verifier({CONSUMER_TOKENS_ENV: f"{CONSUMER}={_ROTATION_TOKEN}"})
+    with client(vault_path=vault, verifier=built) as test_client:
+        retired = test_client.get(HEALTH_PATH, headers=headers(token=STRONG_TOKEN))
+        current = test_client.get(HEALTH_PATH, headers=headers(token=_ROTATION_TOKEN))
+    assert retired.status_code == _UNAUTHENTICATED_STATUS
+    assert current.status_code == 200
+
+
+def test_build_verifier_refuses_one_token_configured_for_two_consumers() -> None:
+    """A shared secret is refused before ``/v1`` has an identity to attribute to.
+
+    The verifier scans every consumer without breaking, so a value configured
+    twice resolves to whichever consumer the scan saw last — and ``/v1`` derives
+    the audited ``consumer`` from exactly that ``client_id``. Refusing at build
+    time is the only point at which the ambiguity is still visible.
+    """
+    shared = f"{CONSUMER}={STRONG_TOKEN};{OTHER_CONSUMER}={STRONG_TOKEN}"
+    with pytest.raises(ValueError) as excinfo:
+        build_verifier({CONSUMER_TOKENS_ENV: shared})
+    message = str(excinfo.value)
+    assert CONSUMER in message
+    assert OTHER_CONSUMER in message
+    assert STRONG_TOKEN not in message  # NEVER echo the token value
