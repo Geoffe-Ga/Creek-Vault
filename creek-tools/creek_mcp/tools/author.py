@@ -10,11 +10,9 @@ verdict, per-claim provenance, and the cited ``claims`` (each with its
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from creek.author import plan_author, require_supported_medium, run_author
-from creek.author.client import AuthorLLMClient
-from creek.config import load_config
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, to_privacy_override
 
@@ -22,9 +20,33 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.author import AuthoredDraft
+    from creek.author.client import AuthorLLMClient
     from creek.models import PrivacyTier
 
 TOOL_NAME = "creek.author"
+
+
+class AuthorLLMFactory(Protocol):
+    """Tier-keyed builder for the Writing Desk's voice client.
+
+    ``factory(tier)`` returns the client the voice node speaks through for a
+    run whose evidence carries *tier* content, or ``None`` to keep the desk's
+    deterministic rendering. The production factory resolves through
+    :class:`creek.classify.llm.router.ModelRouter`, so Intimate content is
+    redirected to a local provider by the chokepoint (#658/#661); this module
+    never picks a provider itself.
+
+    The sibling of :class:`creek_mcp.tools.draft.DraftLLMFactory` and
+    :class:`creek_mcp.tools.compile.CompileLLMFactory`, and added for the same
+    reason (#1254): with no seam, ``creek.author`` answered ``status: ok``
+    carrying a deterministically-stubbed body that no hermetic test could tell
+    apart from a live one — the #460/#649/#658 signature.
+
+    Invoked lazily, inside the run, so an unconfigured provider fails only an
+    actual authoring call and never server startup.
+    """
+
+    def __call__(self, tier: PrivacyTier | None) -> AuthorLLMClient | None: ...
 
 
 def _error_response(
@@ -75,6 +97,7 @@ def author_tool(
     *,
     vault_path: Path,
     query: str,
+    llm_factory: AuthorLLMFactory | None = None,
     medium: str = "research",
     max_rounds: int | None = None,
     dry_run: bool = False,
@@ -93,6 +116,11 @@ def author_tool(
     Args:
         vault_path: The vault to author from.
         query: The user query to author about.
+        llm_factory: Tier-keyed builder for the desk's voice client (#1254).
+            ``None`` — the value a caller that never speaks to a model wants —
+            keeps the desk's deterministic rendering. The server bootstrap
+            supplies :func:`creek_mcp.server._build_author_llm`; tests pass a
+            stub, which is what makes the wire past the desk assertable.
         medium: Target medium (``research`` or ``chat``).
         max_rounds: Optional override for the voice/reflect round bound.
         dry_run: When set, return the plan + evidence summary, not a draft.
@@ -151,28 +179,16 @@ def author_tool(
                 "plan": plan["plan"],
                 "evidence": plan["evidence"],
             }
-        # #658/#661: build the router-resolved voice client per the run's content
-        # tier so live voicing of Intimate content is redirected to a local
-        # provider by the chokepoint. ``for_voice_or_none`` returns ``None``
-        # (deterministic stub) when the provider is unavailable, so the tool
-        # never hard-fails on a missing/unconsented backend.
-        config = load_config()
-        router = config.model_router
-        author_config = config.author
-
-        def _voice_client(tier: PrivacyTier | None) -> AuthorLLMClient | None:
-            return AuthorLLMClient.for_voice_or_none(
-                router,
-                author=author_config,
-                tier=tier,
-            )
-
+        # #658/#661: the injected factory is tier-keyed so live voicing of
+        # Intimate content is redirected to a local provider by the chokepoint,
+        # and may answer ``None`` (deterministic stub) for an unavailable
+        # provider — so the tool never hard-fails on a missing backend.
         draft = run_author(
             medium=medium,
             query=query,
             vault=vault_path,
             max_rounds=max_rounds,
-            voice_client_factory=_voice_client,
+            voice_client_factory=llm_factory,
             override=override,
         )
     except Exception as exc:

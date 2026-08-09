@@ -75,8 +75,10 @@ if TYPE_CHECKING:
     from mcp.server.auth.provider import AccessToken, TokenVerifier
     from mcp.types import ContentBlock
 
+    from creek.author.client import AuthorLLMClient
     from creek.compile.engine import CompileLLM
     from creek.models import PrivacyTier
+    from creek_mcp.tools.author import AuthorLLMFactory
     from creek_mcp.tools.compile import CompileLLMFactory
     from creek_mcp.tools.draft import DraftLLMFactory
     from creek_mcp.tools.reflect import _LLM, _LLMFactory
@@ -327,9 +329,48 @@ def _build_reflect_llm_factory() -> _LLMFactory:
     return _factory
 
 
+def _build_author_llm(tier: PrivacyTier | None) -> AuthorLLMClient | None:
+    """Return the Writing Desk's voice client, routed for *tier* (#658/#661).
+
+    The author-side sibling of :func:`_build_draft_llm`, extracted from
+    ``author_tool`` by #1254 so ``build_server`` can be handed a different one.
+    Same chokepoint, same laziness: the router resolves the voice role for the
+    run's content tier, so Intimate content is redirected to a local provider
+    rather than egressing, and the config is read inside the call so a server
+    with no provider configured still boots and still serves every other verb.
+
+    Unlike its draft/compile siblings it does not raise on an unavailable
+    provider: ``for_voice_or_none`` answers ``None``, which the desk reads as
+    "render deterministically". That fallback is exactly what #460/#649/#658
+    made unobservable — the honest reading is that it is a *degradation*, not a
+    failure, and the caller is told so in prose rather than by an exception.
+
+    Args:
+        tier: The run's content tier, or ``None`` when the evidence carries no
+            classification to route on.
+
+    Returns:
+        The resolved :class:`~creek.author.client.AuthorLLMClient`, or ``None``
+        when no provider is available.
+
+    Raises:
+        IntimateRoutingError: When Intimate content has no local backend to
+            fall back to. ``author_tool`` turns it into a structured error.
+    """
+    from creek.author.client import AuthorLLMClient
+
+    config = load_config()
+    return AuthorLLMClient.for_voice_or_none(
+        config.model_router,
+        author=config.author,
+        tier=tier,
+    )
+
+
 def build_server(
     *,
     vault_path: Path | None = None,
+    author_llm_factory: AuthorLLMFactory | None = None,
     draft_llm_factory: DraftLLMFactory | None = None,
     compile_llm_factory: CompileLLMFactory | None = None,
     reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
@@ -341,6 +382,12 @@ def build_server(
         vault_path: Override vault root. Defaults to
             ``load_config().vault_path`` so the MCP surface honours the
             same configuration as the CLI.
+        author_llm_factory: Optional tier-keyed factory for the Writing Desk's
+            voice client — ``factory(tier)``. Passed straight to
+            ``creek.author``, which invokes it lazily inside the run (and not
+            at all on the ``dry_run`` path), so only ``creek.author`` needs an
+            LLM provider. Added by #1254: without it the verb's stubbed and
+            live bodies were indistinguishable from outside.
         draft_llm_factory: Optional tier-keyed factory for the draft LLM —
             ``factory(tier)``. Passed straight to ``creek.draft``, which
             invokes it lazily (and only once it knows which seed it is
@@ -368,6 +415,7 @@ def build_server(
     vault = _resolve_vault(vault_path)
     consumer = _consumer_from_env()
     factory = draft_llm_factory or _build_draft_llm
+    author_factory = author_llm_factory or _build_author_llm
     compile_factory = compile_llm_factory or _build_compile_llm
     reflect_factory = reflect_llm_factory or _build_reflect_llm_factory
 
@@ -529,10 +577,11 @@ def build_server(
         dry_run: bool = False,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Author a draft for a query via the Writing Desk (stub shape)."""
+        """Author a draft for a query via the Writing Desk."""
         return author_tool(
             vault_path=vault,
             query=query,
+            llm_factory=author_factory,
             medium=medium,
             max_rounds=max_rounds,
             dry_run=dry_run,

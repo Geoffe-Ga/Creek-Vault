@@ -85,6 +85,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
+from unittest import mock
 
 import click
 import frontmatter
@@ -93,6 +94,9 @@ import typer
 from typer import rich_utils
 from typer.testing import CliRunner
 
+from creek import cli as creek_cli
+from creek.author.client import AuthorLLMClient
+from creek.classify.llm.completion import Completion
 from creek.cli import (
     _CLASSIFY_METHODS,
     _LINK_METHODS,
@@ -105,7 +109,13 @@ from creek.generate.grounding import (
 )
 from creek.ingest import INGESTOR_REGISTRY
 from creek.ingest.discord_dispatch import DiscordMode
-from creek.models import Authorship, Fragment, FragmentSource, SourcePlatform
+from creek.models import (
+    Authorship,
+    Fragment,
+    FragmentSource,
+    PrivacyTier,
+    SourcePlatform,
+)
 from creek.save import SaveTarget
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
 from creek_mcp.server import build_server
@@ -757,11 +767,17 @@ class Bench:
         for step in prepare:
             self._runner.invoke(app, [part.format(**slots) for part in step])
         before = _digest_tree(target)
-        result = self._runner.invoke(
-            app,
-            [*command.split(), *(part.format(**slots) for part in argv)],
-            input=stdin,
-        )
+        # ``creek.cli.author_llm_factory`` is the CLI twin of the factories
+        # ``build_server`` takes (#1254): the one seam that lets `creek author`
+        # be voiced hermetically. Installed for every run because a CLI
+        # invocation carries no injection channel of its own; every other
+        # command ignores it.
+        with mock.patch.object(creek_cli, "author_llm_factory", _author_llm_double):
+            result = self._runner.invoke(
+                app,
+                [*command.split(), *(part.format(**slots) for part in argv)],
+                input=stdin,
+            )
         # A surface that dies at a client boundary raises rather than printing,
         # and the exemption staleness probes need to see that reason too.
         detail = "" if result.exception is None else f"\n{result.exception!r}"
@@ -784,7 +800,8 @@ class Bench:
 
         The LLM factories ``build_server`` accepts are the production seam for
         provider injection, so a recording double proves the wire without a
-        key. ``creek.author`` has no such seam, which is why it is exempt.
+        key — including ``author_llm_factory``, added by #1254 so the wire past
+        the Writing Desk stopped being an exemption and became an assertion.
 
         Args:
             tool: Registered tool name.
@@ -803,6 +820,7 @@ class Bench:
             draft_llm_factory=lambda _tier: lambda _prompt: _LLM_CANARY,
             compile_llm_factory=lambda _tier: lambda _prompt: _LLM_CANARY,
             reflect_llm_factory=lambda: lambda _tier: lambda _prompt: _REFLECT_CANARY,
+            author_llm_factory=_author_llm_double,
         )
         args = {
             key: value.format(**slots) if isinstance(value, str) else value
@@ -822,6 +840,90 @@ _LLM_CANARY: Final = f"LLM-DOUBLE-SPOKE. {CANARY}"
 _REFLECT_CANARY: Final = json.dumps(
     {"notes": [{"quote": "I rest sometimes", "kind": "reframe", "note": "Yours."}]},
 )
+
+_AUTHOR_CANARY: Final = "AUTHOR-DOUBLE-SPOKE"
+"""Prefix the injected author voice double emits; it must reach the draft body.
+
+Proves the *injected client* was consulted rather than the desk's deterministic
+rendering — the half of #460/#649/#658 that no other gate could see.
+"""
+
+_SHOUTED_CLAIM: Final = "INGEST REWRITE"
+"""The seeded ``Ingest rewrite`` claim as the double shouts it back.
+
+The second half, and the reason :class:`_AuthorVoiceDouble` uppercases rather
+than echoing verbatim. Every corpus string the voice prompt carries — claim
+excerpts, fragment ids — the MCP envelope *also* reports in ``provenance`` and
+``claims``, whether or not a model ever ran; a verbatim needle would therefore
+be satisfied by a dead wire. Uppercased, the needle exists nowhere but on the
+far side of the client, so one assertion covers the whole path: corpus →
+evidence → prompt → injected client → body → rendered output.
+"""
+
+
+class _AuthorVoiceDouble:
+    """Provider double for the author desk's voice call.
+
+    Shouts back the prompt it was handed under :data:`_AUTHOR_CANARY`, so the
+    contract can read the corpus out of the far end of the wire instead of
+    trusting that a fixed reply means the evidence arrived.
+    """
+
+    is_cloud = False
+    """The double never leaves the process, so the cloud-consent gate is moot."""
+
+    @property
+    def model(self) -> str:
+        """Return the double's model identifier.
+
+        Returns:
+            A name no real backend answers to.
+        """
+        return "author-voice-double"
+
+    @property
+    def available(self) -> bool:
+        """Report the double as ready so the desk takes the live-voicing path.
+
+        Returns:
+            Always ``True``.
+        """
+        return True
+
+    def complete(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int | None = None,
+        system: str | None = None,
+    ) -> Completion:
+        """Return the voice prompt shouted back under the canary prefix.
+
+        Args:
+            prompt: The dynamic voice prompt carrying the assembled evidence.
+            max_tokens: Ignored; the double generates nothing to truncate.
+            system: The static prompt prefix, shouted with the rest.
+
+        Returns:
+            A :class:`Completion` whose text is the prefix plus the whole
+            prompt in upper case — see :data:`_SHOUTED_CLAIM` for why the case
+            change is load-bearing rather than decorative.
+        """
+        del max_tokens
+        spoken = f"{_AUTHOR_CANARY}\n\n{system or ''}\n\n{prompt}"
+        return Completion(text=spoken.upper())
+
+
+def _author_llm_double(_tier: PrivacyTier | None) -> AuthorLLMClient:
+    """Return the voice client both author surfaces are injected with.
+
+    Args:
+        _tier: The run's content tier, which the double does not route on.
+
+    Returns:
+        An :class:`AuthorLLMClient` wrapping :class:`_AuthorVoiceDouble`.
+    """
+    return AuthorLLMClient(_AuthorVoiceDouble())
 
 
 def _digest_tree(root: Path) -> dict[str, str]:
@@ -874,6 +976,23 @@ def elevated_token(monkeypatch: pytest.MonkeyPatch) -> str:
 # ---------------------------------------------------------------------------
 
 _BARE = "an unseeded vault has no corpus, so the corpus-derived verdict must vanish"
+
+_AUTHOR_ARGV: Final[tuple[str, ...]] = (
+    "--vault",
+    "{vault}",
+    "--query",
+    "creek and stone",
+    "--include-tier",
+    "all",
+)
+"""Arguments both ``author`` runs share; the ceiling matches the MCP twin's.
+
+``--include-tier all`` is not decoration: the seeded corpus is deliberately
+left unclassified, and under the default ``open`` ceiling the desk gathers no
+evidence at all, so the prompt would carry nothing for the double to shout
+back. The MCP entry admits the same corpus through ``_ALL``; the two surfaces
+must be asked the same question or the comparison between them is worthless.
+"""
 
 CLI_CONTRACT: Final[Mapping[str, Surface]] = {
     "init": Surface(
@@ -988,6 +1107,30 @@ CLI_CONTRACT: Final[Mapping[str, Surface]] = {
             prints=("Idea seeds",),
         ),
         contrast=Contrast(why="no vault at all means no seed table", seeded=False),
+    ),
+    "author": Surface(
+        shape=Shape.REPORTS,
+        why=(
+            "#460/#649/#658: `creek author` printed 'No LLM provider available — "
+            "rendering the deterministic stub', exited 0 and wrote nothing; "
+            "#1027 could only exempt it, because until #1254 the command built "
+            "its voice client internally and no test could reach past the desk"
+        ),
+        derived_from=(
+            "creek.cli:author_llm_factory",
+            "creek.author.voice:VoiceAgent",
+        ),
+        argv=_AUTHOR_ARGV,
+        effect=Effect(prints=(_AUTHOR_CANARY, _SHOUTED_CLAIM)),
+        contrast=Contrast(
+            why=(
+                "--dry-run plans and counts evidence without voicing, so neither "
+                "the injected client's words nor the corpus text it would have "
+                "been handed may reach a body"
+            ),
+            argv=(*_AUTHOR_ARGV, "--dry-run"),
+            seeded=True,
+        ),
     ),
     "save": Surface(
         shape=Shape.WRITES,
@@ -1401,6 +1544,28 @@ MCP_CONTRACT: Final[Mapping[str, Surface]] = {
             ),
         ),
     ),
+    "creek.author": Surface(
+        shape=Shape.REPORTS,
+        why=(
+            "#460: the verb answered `status: ok` carrying a deterministically "
+            "stubbed body, indistinguishable from a live one, until #1254 gave "
+            "`build_server` the author factory its three siblings already had"
+        ),
+        derived_from=(
+            "creek_mcp.server:build_server",
+            "creek.author.conductor:run_author",
+        ),
+        kwargs={"query": "creek and stone", **_ALL},
+        effect=Effect(prints=(_AUTHOR_CANARY, _SHOUTED_CLAIM)),
+        contrast=Contrast(
+            why=(
+                "a dry run returns the plan and evidence *counts*; a voiced body "
+                "must be absent from it"
+            ),
+            kwargs={"query": "creek and stone", "dry_run": True, **_ALL},
+            seeded=True,
+        ),
+    ),
     "creek.save": Surface(
         shape=Shape.WRITES,
         why="#580: the save target routing table is where artefacts get orphaned",
@@ -1554,16 +1719,6 @@ EXEMPTIONS: Final[Mapping[str, Exemption]] = {
         argv=("--vault", "{vault}", "--no-llm"),
         blocker="LLM provider unavailable; cannot generate draft",
     ),
-    "author": Exemption(
-        reason=(
-            "#460/#649/#658: neither `creek author` nor `creek.author` accepts an "
-            "LLM factory, so with no provider the desk renders a deterministic "
-            "stub and exits 0 — the exact signature of the bug. Proving the wire "
-            "needs an injection seam that does not exist yet."
-        ),
-        argv=("--vault", "{vault}", "--query", "creek and stone"),
-        blocker="rendering the deterministic stub",
-    ),
     "compile": Exemption(
         reason=(
             "#1024: `creek compile` builds its provider internally; with none "
@@ -1597,14 +1752,6 @@ EXEMPTIONS: Final[Mapping[str, Exemption]] = {
             "schema here would give this module a second copy to drift."
         ),
         delegate="tests/test_mcp_write_tools.py:creek.compile",
-    ),
-    "creek.author": Exemption(
-        reason=(
-            "#460: the MCP author verb constructs AuthorLLMClient internally; "
-            "`build_server` exposes draft/compile/reflect factories but no author "
-            "factory, so the wire past the desk cannot be observed hermetically."
-        ),
-        seam="creek_mcp.server:build_server:author_llm_factory",
     ),
 }
 
