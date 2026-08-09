@@ -12,5 +12,6 @@ Task-oriented how-to guides for the `creek-tools` pipeline. The top-level [`cree
 | [generation.md](generation.md) | Voice Skill Tree, idea mining, draft generation, and wavelength reports. |
 | [cleaning-and-purge.md](cleaning-and-purge.md) | Vault hygiene (orphans, duplicates, broken links) and right-to-be-forgotten purges. |
 | [configuration.md](configuration.md) | Full schema reference for `<vault>/00-Creek-Meta/creek_config.yaml`. |
+| [wiring-contract.md](wiring-contract.md) | Adding a CLI command or MCP tool: how to declare the effect it must produce, and how the contract test proves it. |
 
 Every guide is intentionally task-oriented: it answers "how do I do X" rather than "what classes does the module contain" — for the latter, read the module docstrings in [`creek/`](../creek/), which are kept above the 95% interrogate threshold.
