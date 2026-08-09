@@ -8,7 +8,11 @@ from typing import Any
 
 import pytest
 
-from crawdad.bot import handle_message, render_state_unavailable_reply
+from crawdad.bot import (
+    _SCAN_BLOCKED_REPLY,
+    handle_message,
+    render_state_unavailable_reply,
+)
 from crawdad.config import CrawDadConfig
 from crawdad.consent import PendingBatchStore
 from crawdad.mcp_client import MCPUnavailableError
@@ -1025,12 +1029,18 @@ async def test_attachment_path_replies_when_redact_tool_missing(
         known_tools=("creek.state.read",),  # no creek.redact.scan here
     )
 
-    # Two messages: body (with missing-tool soft error) + consent prompt.
+    # Two messages: body (with missing-tool soft error) + the #1054
+    # refusal. This test used to assert the *consent prompt* here — the
+    # bot told the user to scan first and then offered `ingest` in the
+    # very next message. Exact equality, plus an explicit negative,
+    # because a substring check for "ingest" is vacuous against the new
+    # copy ("I won't ingest them").
     assert len(channel.sent) == 2
-    body, consent = channel.sent
+    body, closing = channel.sent
     assert "creek.redact.scan" in body
     assert "Run `creek redact --scan" in body
-    assert "ingest" in consent.lower()
+    assert closing == _SCAN_BLOCKED_REPLY
+    assert "Reply with `ingest`" not in closing
 
 
 async def test_attachment_path_uses_soft_reply_when_mcp_dies_during_scan(
@@ -1059,11 +1069,13 @@ async def test_attachment_path_uses_soft_reply_when_mcp_dies_during_scan(
         mcp_client=_StubMCPClient(session),  # type: ignore[arg-type]
         known_tools=("creek.redact.scan",),
     )
-    # Two messages: body (with unreachable soft error) + consent prompt.
+    # Two messages: body (with unreachable soft error) + the #1054
+    # refusal, not the consent prompt — the scan never ran.
     assert len(channel.sent) == 2
-    body, consent = channel.sent
+    body, closing = channel.sent
     assert "unreachable" in body.lower()
-    assert "ingest" in consent.lower()
+    assert closing == _SCAN_BLOCKED_REPLY
+    assert "Reply with `ingest`" not in closing
 
 
 async def test_attachment_path_short_circuits_when_all_already_present(
@@ -1346,11 +1358,13 @@ async def test_run_safety_scan_swallows_unexpected_exceptions(
         known_tools=("creek.redact.scan",),
     )
 
-    # Two messages: body (soft "unreachable" error) + consent prompt.
+    # Two messages: body (soft "unreachable" error) + the #1054 refusal,
+    # not the consent prompt — the scan raised, so it never ran.
     assert len(channel.sent) == 2
-    body, consent = channel.sent
+    body, closing = channel.sent
     assert "unreachable" in body.lower()
-    assert "ingest" in consent.lower()
+    assert closing == _SCAN_BLOCKED_REPLY
+    assert "Reply with `ingest`" not in closing
 
 
 async def test_run_safety_scan_extracts_report_markdown_from_dict_response(
@@ -2383,6 +2397,7 @@ async def test_consent_dispatch_with_staged_path_outside_vault(
         accepted_files=(pf,),
         privacy_tier_ceiling="personal",
         now=store.now(),
+        scanned=True,  # this batch dispatches, so the #1054 gate must pass
     )
     store.record(batch)
 
@@ -2621,3 +2636,320 @@ async def test_already_present_batch_does_not_record_pending_state(
 
     assert store.get(999) is None
     assert any("already staged" in s.lower() for s in channel.sent)
+
+
+# ---------------------------------------------------------------------------
+# FEAT-027 — the redaction-scan gate is enforced, not advisory (#1054)
+# ---------------------------------------------------------------------------
+
+
+def _open_ceiling_config(tmp_path: Path) -> CrawDadConfig:
+    """Return a config whose channel 999 declares the narrowest tier ceiling.
+
+    ``open`` is the most restrictive :class:`TierCeiling` value, so the
+    gate tests below prove the refusal holds under the strictest channel
+    policy rather than only under the default ``personal``.
+    """
+    from crawdad.config import AttachmentConfig
+
+    return CrawDadConfig(
+        discord_bot_token="t",
+        vault_path=tmp_path,
+        allowed_user_ids=[111],
+        allowed_channel_ids=[999],
+        attachments=AttachmentConfig(channel_privacy_tiers={999: "open"}),
+    )
+
+
+async def _stage_with_client(
+    *,
+    config: CrawDadConfig,
+    session_state: SessionState,
+    channel: _FakeChannel,
+    pending_batches: PendingBatchStore,
+    mcp_client: Any,
+    known_tools: tuple[str, ...],
+    filename: str = "note.md",
+    message_id: int = 100,
+) -> None:
+    """Drive one attachment turn with an explicit MCP client / tool list.
+
+    ``_stage_attachment`` always injects a healthy scan session; the gate
+    tests need the failing sessions (and ``mcp_client=None``) instead.
+    """
+    message: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=message_id,
+        attachments=[_FakeAttachment(filename=filename, size=4, payload=b"safe")],
+    )
+    await handle_message(
+        message,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=mcp_client,
+        known_tools=known_tools,
+        pending_batches=pending_batches,
+    )
+
+
+async def _reply_and_record_ingests(
+    *,
+    config: CrawDadConfig,
+    session_state: SessionState,
+    channel: _FakeChannel,
+    pending_batches: PendingBatchStore,
+    content: str,
+) -> list[dict[str, Any]]:
+    """Send *content* as a follow-up; return every MCP tool call it made."""
+    calls: list[dict[str, Any]] = []
+
+    class _RecordingSession:
+        async def call_tool(
+            self, name: str, arguments: dict[str, Any] | None = None
+        ) -> str:
+            calls.append({"name": name, "args": arguments or {}})
+            return "ok"
+
+    followup: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content=content,
+    )
+    await handle_message(
+        followup,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_RecordingSession()),
+        known_tools=("creek.ingest",),
+        pending_batches=pending_batches,
+    )
+    return calls
+
+
+def _assert_refused(
+    *, channel: _FakeChannel, store: PendingBatchStore, calls: list[dict[str, Any]]
+) -> None:
+    """Assert the batch was refused: no dispatch, no state change, clear reply."""
+    assert calls == []
+    batch = store.get(999)
+    assert batch is not None
+    assert batch.scanned is False
+    assert batch.state != "ingested"
+    # Exact equality, not a substring: "ingest" appears inside the
+    # refusal copy, so a substring probe would pass against the old
+    # consent prompt too.
+    assert channel.sent == [_SCAN_BLOCKED_REPLY]
+    assert "Reply with `ingest`" not in channel.sent[0]
+
+
+async def test_unscanned_batch_cannot_reach_creek_ingest_under_open_ceiling(
+    session_state: SessionState, tmp_path: Path
+) -> None:
+    """#1054: `creek.redact.scan` unadvertised → an `ingest` reply dispatches nothing.
+
+    This is the issue's Signal-1 runtime proof. Before the fix the same
+    turn produced a full ``creek.ingest`` call for never-scanned content
+    at the narrowest declared ceiling.
+    """
+    config = _open_ceiling_config(tmp_path)
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_with_client(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        mcp_client=_StubMCPClient(_StubSession()),
+        known_tools=("creek.ingest",),  # creek.redact.scan UNADVERTISED
+    )
+    channel.sent.clear()
+
+    calls = await _reply_and_record_ingests(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        content="ingest",
+    )
+    _assert_refused(channel=channel, store=store, calls=calls)
+
+
+async def test_unscanned_batch_after_mcp_death_cannot_reach_creek_ingest(
+    session_state: SessionState, tmp_path: Path
+) -> None:
+    """#1054: MCP dies mid-scan → the recorded batch is refused at dispatch."""
+    config = _open_ceiling_config(tmp_path)
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    session = _StubSession(
+        errors={"creek.redact.scan": MCPUnavailableError("subprocess died")}
+    )
+    await _stage_with_client(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        mcp_client=_StubMCPClient(session),
+        known_tools=("creek.redact.scan",),
+    )
+    channel.sent.clear()
+
+    calls = await _reply_and_record_ingests(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        content="ingest",
+    )
+    _assert_refused(channel=channel, store=store, calls=calls)
+
+
+async def test_unscanned_batch_after_unexpected_error_cannot_reach_creek_ingest(
+    session_state: SessionState, tmp_path: Path
+) -> None:
+    """#1054: a non-MCP exception during the scan is also fail-closed."""
+    config = _open_ceiling_config(tmp_path)
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+
+    class _BrokenSession:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            raise TimeoutError("upstream timed out")
+
+    await _stage_with_client(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        mcp_client=_StubMCPClient(_BrokenSession()),
+        known_tools=("creek.redact.scan",),
+    )
+    channel.sent.clear()
+
+    calls = await _reply_and_record_ingests(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        content="ingest",
+    )
+    _assert_refused(channel=channel, store=store, calls=calls)
+
+
+async def test_unscanned_batch_with_no_mcp_client_cannot_reach_creek_ingest(
+    session_state: SessionState, tmp_path: Path
+) -> None:
+    """#1054: the degraded session (``mcp_client is None``) is fail-closed too."""
+    config = _open_ceiling_config(tmp_path)
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_with_client(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        mcp_client=None,
+        known_tools=("creek.redact.scan",),
+    )
+    channel.sent.clear()
+
+    calls = await _reply_and_record_ingests(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        content="ingest",
+    )
+    _assert_refused(channel=channel, store=store, calls=calls)
+
+
+async def test_unscanned_batch_cannot_ingest_via_type_disambiguation_route(
+    session_state: SessionState, tmp_path: Path
+) -> None:
+    """#1054: `ingest` → type question → type word must not launder the gate.
+
+    The issue body names only ``_apply_consent_reply``; this pins the
+    second dispatch entry point at ``_apply_disambiguation_reply``.
+    """
+    from crawdad.config import AttachmentConfig
+
+    config = CrawDadConfig(
+        discord_bot_token="t",
+        vault_path=tmp_path,
+        allowed_user_ids=[111],
+        allowed_channel_ids=[999],
+        # Empty allow list permits ``.xyz`` so ``inferred_type`` is None.
+        attachments=AttachmentConfig(
+            allowed_extensions=frozenset(), channel_privacy_tiers={999: "open"}
+        ),
+    )
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_with_client(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        mcp_client=_StubMCPClient(_StubSession()),
+        known_tools=("creek.ingest",),  # creek.redact.scan UNADVERTISED
+        filename="weird.xyz",
+    )
+    channel.sent.clear()
+
+    # Turn 1: `ingest` → the bot asks which type (no dispatch yet).
+    first = await _reply_and_record_ingests(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        content="ingest",
+    )
+    assert first == []
+    channel.sent.clear()
+
+    # Turn 2: the type word — this is the route the issue body missed.
+    second = await _reply_and_record_ingests(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        content="document",
+    )
+    _assert_refused(channel=channel, store=store, calls=second)
+
+
+async def test_scanned_batch_still_ingests_after_the_gate_lands(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """#1054 must not brick the happy path: a scanned batch still ingests."""
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_attachment(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        attachment=_FakeAttachment(filename="note.md", size=4, payload=b"safe"),
+        pending_batches=store,
+    )
+    staged = store.get(999)
+    assert staged is not None
+    assert staged.scanned is True
+    channel.sent.clear()
+
+    calls = await _reply_and_record_ingests(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        content="ingest",
+    )
+    assert [c["name"] for c in calls] == ["creek.ingest"]
+    final = store.get(999)
+    assert final is not None
+    assert final.state == "ingested"
