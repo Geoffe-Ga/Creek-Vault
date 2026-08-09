@@ -5,7 +5,6 @@ description: >-
   Gate 2 is pre-commit quality checks. Use when implementing features,
   fixing bugs, or doing any development work. Ensures code is never
   committed without passing tests and quality checks.
-  Do NOT use for bug-specific debugging (use bug-squashing-methodology).
 metadata:
   author: Geoff
   version: 1.0.0

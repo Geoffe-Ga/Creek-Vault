@@ -43,7 +43,7 @@ from starlette.datastructures import Headers
 
 from creek_mcp.api.models import ErrorCode
 from creek_mcp.api.routes import CEILING_HEADER
-from creek_mcp.httpapi.context import HTTP_SCOPE, context_of
+from creek_mcp.httpapi.context import HTTP_SCOPE, context_of, pass_through
 from creek_mcp.httpapi.errors import error_response
 from creek_mcp.policy import Admission, CallerIdentity, admitted_ceiling
 from creek_mcp.tier_ceiling import TierCeiling
@@ -78,7 +78,7 @@ class CeilingAdmissionMiddleware:
             send: The ASGI send channel.
         """
         if scope["type"] != HTTP_SCOPE:
-            await self.app(scope, receive, send)
+            await pass_through(self.app, scope, receive, send)
             return
         context = context_of(scope)
         requested = Headers(scope=scope).get(CEILING_HEADER, TierCeiling.OPEN.value)

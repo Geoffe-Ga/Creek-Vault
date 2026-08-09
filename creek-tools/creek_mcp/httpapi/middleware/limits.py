@@ -33,7 +33,7 @@ from anyio import Semaphore, WouldBlock, fail_after
 from starlette.datastructures import Headers
 
 from creek_mcp.api.models import ErrorCode
-from creek_mcp.httpapi.context import HTTP_SCOPE, context_of
+from creek_mcp.httpapi.context import HTTP_SCOPE, context_of, pass_through
 from creek_mcp.httpapi.errors import error_response
 
 if TYPE_CHECKING:
@@ -165,7 +165,7 @@ class ConcurrencyLimitMiddleware:
             send: The ASGI send channel.
         """
         if scope["type"] != HTTP_SCOPE:
-            await self.app(scope, receive, send)
+            await pass_through(self.app, scope, receive, send)
             return
         try:
             self._slots.acquire_nowait()
@@ -206,7 +206,7 @@ class RequestTimeoutMiddleware:
             send: The ASGI send channel.
         """
         if scope["type"] != HTTP_SCOPE:
-            await self.app(scope, receive, send)
+            await pass_through(self.app, scope, receive, send)
             return
         context = context_of(scope)
         try:
@@ -243,7 +243,7 @@ class BodySizeLimitMiddleware:
             send: The ASGI send channel.
         """
         if scope["type"] != HTTP_SCOPE:
-            await self.app(scope, receive, send)
+            await pass_through(self.app, scope, receive, send)
             return
         declared = _declared_length(scope)
         if declared is not None and declared > self._max_body_bytes:

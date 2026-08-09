@@ -1314,6 +1314,23 @@ The wedge is that a ${ITER_MARKER} summary matches VERDICT_RE, so the selector p
 ")")"
   check "W6 review PROSE quoting the summary marker mid-line → ready" "ready" \
     "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H COMMENTS_JSON="$w6_json" run 100)"
+
+  # W7 — A SUMMARY CARRYING A *REFUSAL* VERDICT IS STILL NOT A VERDICT (#1202).
+  # iteration-trigger.yml now writes a non-LGTM `**VERDICT**` on every NOT-cleared
+  # branch, so this shape is one the emitter really produces. pr-ready.sh's answer
+  # must not change: the summary is excluded from the selector whatever it says,
+  # so a PR whose only comment is one reads as "no verdict posted".
+  #
+  # GREEN TODAY (the summary is selected and refused for want of a marker), and
+  # it is a mutant-killer rather than a regression witness — the mutant being the
+  # tempting "accept `<!-- iteration-trigger -->` as a second provenance marker"
+  # that W4 also kills. Under it, this lane's routing would start depending on a
+  # verdict vocabulary pr-ready.sh has no reason to know, and `changes-requested`
+  # (which dispatches a fix worker) is one plausible landing.
+  ITER_ACTION_HELD='NOT cleared to merge: the do-not-auto-merge hold is set on this PR (or its labels could not be read). A human owns this one - leave it alone.'
+  w7_json="$(cj "$(iter_summary "$FRESH" '10/10 Green' 'HELD' "$ITER_ACTION_HELD")")"
+  check "W7 summary carrying a REFUSAL verdict, alone → awaiting-review" "awaiting-review" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H COMMENTS_JSON="$w7_json" run 100)"
 }
 
 # The verdict answer is now THREE fields — `<createdAt>|<isLGTM>|<markerPr>` —
@@ -2738,17 +2755,134 @@ fi
 # `**CI**:` ONLY; it never reads `**Action**:` (item 5 says in so many words: "Do
 # not infer a verdict from the `Action:` prose"). So a summary that still carries
 # `**VERDICT**: LGTM` merges no matter how emphatically `**Action**` refuses.
-# The `elif` therefore has to neutralise the VERDICT FIELD, and the value has to
-# be chosen for its BYTES: `NOT ATTESTED` contains no `LGTM` substring, so
-# neither a `*LGTM*` glob nor a `test("LGTM")` can match it.
-# (`HELD` and `BEHIND` still post `**VERDICT**: LGTM` and are defeated exactly
-# this way — pre-existing, filed as #1202, deliberately out of #1181's scope.)
+# Every NOT-cleared branch therefore has to neutralise the VERDICT FIELD, and the
+# value has to be chosen for its BYTES: it must contain no `LGTM` substring (so
+# neither a `*LGTM*` glob nor a `test("LGTM")` can match it) and it must be none
+# of the three verdicts SKILL.md's recognition rule accepts (so Step 4a falls to
+# its item 5 — surface to the user, nobody merges).
 ITER_UNATTESTED_VERDICT="VERDICT='NOT ATTESTED'"
 
 if grep -qF -- "$ITER_UNATTESTED_VERDICT" "$ITER_WORKFLOW"; then
   ok "iteration-trigger.yml also neutralises the VERDICT field, not just ACTION"
 else
   bad "iteration-trigger.yml no longer sets $ITER_UNATTESTED_VERDICT — its summary would still say '**VERDICT**: LGTM' and await-claude-review Step 4a would merge on it (#1202)"
+fi
+
+# --- EVERY not-cleared branch, not just the provenance one (#1202) -----------
+# The assertion above pins ONE branch by its literal, which is exactly how the
+# hole it guards survived on the other two: #1181 added `VERDICT='NOT ATTESTED'`
+# inside its own `elif` and said so in that file's header, while the `HELD`
+# branch (a human's `do-not-auto-merge` hold) and the `BEHIND` branch (a head not
+# current with its base) kept rewriting `ACTION` alone. Both therefore posted
+# `**VERDICT**: LGTM` + `**CI**: N/N Green` — the two fields, and the ONLY two
+# fields, Step 4a reads — so a webhook-woken session merged a PR the workflow had
+# just refused to clear, including one a human had explicitly parked. That hold
+# is the one control a human retains over an autonomous merge loop.
+#
+# THE CHECK IS STRUCTURAL, NOT A LIST OF LITERALS, because a list of literals is
+# what failed: it can only ever cover the branches whoever wrote it thought of,
+# and the NEXT `elif` added to this chain is invisible to it. This walks the
+# emitter's clearance chain instead and demands the invariant of every branch
+# that refuses — including ones that do not exist yet.
+#
+# `v` is reset at every `if`/`elif`/`else` so a value assigned on a SIBLING
+# branch can never be credited to this one; comment lines are skipped first,
+# because the chain's own prose discusses `if`, `else` and `VERDICT=` at length.
+iter_not_cleared_verdicts() {
+  awk '
+    /^[[:space:]]*#/                             { next }
+    /^[[:space:]]*(if|elif|else)([[:space:]]|$)/ { v = "" }
+    /^[[:space:]]*VERDICT=/ {
+      v = $0
+      sub(/^[[:space:]]*VERDICT=/, "", v)
+      gsub(/\047/, "", v)
+      sub(/[[:space:]]*$/, "", v)
+    }
+    /ACTION="NOT cleared to merge/ { print (v == "" ? "<UNSET>" : v) }
+  ' "$ITER_WORKFLOW"
+}
+
+# The three verdicts SKILL.md's recognition rule accepts. A refusal spelled as
+# any of them is READ as a verdict — `COMMENTS` in particular routes to Step 4a
+# item 4 ("caller decides, usually mergeable as-is"), which is not a refusal at
+# all. `CHANGES[_ ]REQUESTED` carries both spellings because this emitter writes
+# the space form and code-review.yml writes the underscore form.
+readonly ITER_RECOGNISED_VERDICT_RE='^(LGTM|CHANGES[_ ]REQUESTED|COMMENTS)$'
+
+iter_refusals="$(iter_not_cleared_verdicts)"
+iter_refusal_count="$(grep -c . <<<"$iter_refusals" || true)"
+
+# THREE is the count at the time of writing (HELD, provenance, BEHIND) and the
+# floor is what is asserted, not the exact number: adding a fourth refusal is a
+# perfectly good change and must not turn this red, while dropping to two means a
+# branch that used to refuse has stopped refusing.
+if [[ "$iter_refusal_count" -ge 3 ]]; then
+  ok "iteration-trigger.yml's clearance chain still has its $iter_refusal_count NOT-cleared branches"
+else
+  bad "iteration-trigger.yml has only $iter_refusal_count 'NOT cleared to merge' branches (expected at least 3: the do-not-auto-merge hold, the provenance marker, and a head behind its base) — a merge refusal has gone missing, or this extraction has drifted from the file"
+fi
+
+iter_refusal_n=0
+while IFS= read -r iter_verdict; do
+  [[ -n "$iter_verdict" ]] || continue
+  iter_refusal_n=$((iter_refusal_n + 1))
+  if [[ "$iter_verdict" == "<UNSET>" ]]; then
+    bad "NOT-cleared branch #$iter_refusal_n of iteration-trigger.yml rewrites ACTION only — it still posts the '**VERDICT**: LGTM' computed above the clearance chain, and await-claude-review Step 4a merges on '**VERDICT**' + '**CI**' alone (#1202)"
+  elif [[ "$iter_verdict" == *LGTM* ]]; then
+    bad "NOT-cleared branch #$iter_refusal_n sets VERDICT='$iter_verdict', which CONTAINS 'LGTM' — a '*LGTM*' glob or a test(\"LGTM\") downstream matches it and the refusal is defeated (#1202)"
+  elif [[ "$iter_verdict" =~ $ITER_RECOGNISED_VERDICT_RE ]]; then
+    bad "NOT-cleared branch #$iter_refusal_n sets VERDICT='$iter_verdict', one of the three verdicts SKILL.md Step 4a RECOGNISES — a refusal must be unrecognisable so Step 4a falls to item 5 and surfaces to a human (#1202)"
+  else
+    ok "NOT-cleared branch #$iter_refusal_n emits VERDICT='$iter_verdict', which no merge path can read as permission"
+  fi
+done <<<"$iter_refusals"
+
+# --- the PARSER side of the same contract (#1202) ----------------------------
+# Fixing the emitter alone is a prose contract between two files, and a prose
+# contract between two files is exactly what drifted here — iteration-trigger.yml
+# has committed itself to pr-ready.sh's invariants in its own header since #1181,
+# and still shipped this hole. So SKILL.md must NAME the values it refuses,
+# rather than refusing them by the accident of not recognising them.
+#
+# Read out of the emitter, never restated: rename a refusal verdict in the
+# workflow without teaching Step 4a and this goes red ON THE RENAMING PR.
+SKILL_MD="$(cd "$(dirname "$0")/../.." && pwd)/.claude/skills/await-claude-review/SKILL.md"
+if [[ ! -f "$SKILL_MD" ]]; then
+  bad "cannot find await-claude-review/SKILL.md — the consumer half of the merge contract is unverified"
+else
+  while IFS= read -r iter_verdict; do
+    [[ -n "$iter_verdict" && "$iter_verdict" != "<UNSET>" ]] || continue
+    if grep -qF -- "$iter_verdict" "$SKILL_MD"; then
+      ok "await-claude-review Step 4a names the '$iter_verdict' refusal verdict"
+    else
+      bad "await-claude-review/SKILL.md never mentions '$iter_verdict', which iteration-trigger.yml emits on a NOT-cleared branch — Step 4a would treat it as merely malformed, and the two files disagree about which fields are merge-critical (#1202)"
+    fi
+  done <<<"$iter_refusals"
+
+  # Step 4a's item 3 is the line that returns LGTM to the caller. It must require
+  # the verdict to be EXACTLY LGTM and say so; "not CHANGES_REQUESTED" is not the
+  # same test, and it is the reading under which `HELD` merges.
+  if grep -qF -- 'exactly `LGTM`' "$SKILL_MD"; then
+    ok "Step 4a requires the verdict to be EXACTLY LGTM before returning a merge"
+  else
+    bad "SKILL.md Step 4a does not state that only an EXACTLY-'LGTM' verdict clears a merge — any value it fails to recognise must refuse, and that has to be written down rather than inferred (#1202)"
+  fi
+
+  # …AND THE CONSUMER-SIDE CHECKS MUST ACTUALLY RUN, the same argument the
+  # `code-review.yml` paths: loop above makes. Without SKILL.md in
+  # ralph-recap-tests.yml's filters, a PR that narrows Step 4a back — or renames
+  # a refusal verdict on the consumer side — edits no `scripts/ralph/**` file and
+  # runs no coupling check, so the two halves of the merge contract drift with CI
+  # green. Both triggers: a `push`-only filter still lets it land through a PR,
+  # and a `pull_request`-only filter misses a direct push to `main`.
+  for trig in push pull_request; do
+    trig_block="$(recap_trigger_block "$trig")"
+    if [[ -n "$trig_block" ]] && grep -q 'await-claude-review/SKILL\.md' <<<"$trig_block"; then
+      ok "ralph-recap-tests.yml runs this suite on $trig changes to await-claude-review/SKILL.md"
+    else
+      bad "ralph-recap-tests.yml's $trig paths: omit .claude/skills/await-claude-review/SKILL.md — a consumer-only PR could narrow Step 4a, or stop naming a refusal verdict, with no coupling check run at all (#1202)"
+    fi
+  done
 fi
 
 # --- cross-file coupling: the SECOND emitter of a VERDICT_RE match (#1181) ---

@@ -25,9 +25,10 @@ this repository:
 * Fences do not **nest**. Inside an open fence every line is content, so
   a ``markdown`` block demonstrating a ``json`` block ends early at the
   inner block's bare closer, and the outer block's intended closer then
-  opens a fresh fence that is never closed. Three skill files are broken
-  exactly this way; they are listed in
-  ``tests/markdown-integrity-exceptions.txt`` under issue #1193.
+  opens a fresh fence that is never closed. Three skill files were broken
+  exactly this way; all three were deleted by the context prune, so
+  ``tests/markdown-integrity-exceptions.txt`` is now empty and the gate
+  runs unexempted.
 
 ``pyproject.toml`` sets ``python_files = ["test_*.py"]``, so this module
 is never collected as a test module -- it is a plain support module in

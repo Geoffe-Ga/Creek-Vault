@@ -4,6 +4,15 @@
 
 This page is the field-by-field reference. Every section maps to a `BaseModel` you can read in `config.py`.
 
+## Adding a config field: consumed, or declared dormant
+
+Every field of `CreekConfig` is shipped into a user's vault by `creek init`, so a field that no production code reads is a knob wired to nothing — and `ruff`, `mypy --strict`, `radon` and `interrogate` all pass on one. `tests/test_config_contract.py` is the gate that does not (issue #1042). It derives the field list from the live Pydantic model and asserts each leaf field is either:
+
+- **read** somewhere under `creek/` or `creek_mcp/` — the test resolves attribute chains through annotations, `load_config`-style helpers, aliases, `self` attributes, structural `Protocol`s and dynamic `getattr`; or
+- **listed in `DORMANT_CONFIG_FIELDS`** with a reason citing the issue that tracks wiring it in.
+
+The allowlist is a ratchet: a field that is both allowlisted *and* read fails as a stale entry, so the list can only shrink. If you add a field and the contract fails, wire it up or declare it — do not delete the assertion. Fields currently on the allowlist are documented below only as *configured*, never as effective.
+
 ## The three-pass pipeline
 
 `creek process` runs in three named passes (FEAT-005); **network egress only in Pass 3.**

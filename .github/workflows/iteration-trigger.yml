@@ -15,9 +15,20 @@ name: Iteration Trigger
 #   * the verdict carries the `<!-- creek-review pr=N -->` provenance marker for
 #     THIS PR (#1181) — the marker pr-ready.sh's MARKER_RE parses, read from the
 #     same comment the verdict came from.
-# All three fail closed on an unreadable answer. Note that only the provenance
-# branch also rewrites `VERDICT`; see the comment at that `elif` for why the
-# other two do not, and #1202 for the gap that leaves.
+# All three fail closed on an unreadable answer.
+#
+# AND EVERY ONE OF THEM REWRITES `VERDICT`, NOT JUST `ACTION` (#1202). `VERDICT`
+# is computed from the review comment ABOVE the clearance chain, so a branch that
+# refuses while leaving it alone still posts `**VERDICT**: LGTM` + `**CI**: N/N
+# Green` — and those two fields are the ONLY ones the merge path reads
+# (`.claude/skills/await-claude-review/SKILL.md` Step 4a; its item 5 says in as
+# many words "Do not infer a verdict from the `Action:` prose"). `ACTION` is
+# diagnostic; `VERDICT` is the gate. The refusal values are chosen for their
+# BYTES — `HELD`, `NOT ATTESTED`, `NOT CURRENT` — none containing an `LGTM`
+# substring and none being one of the three verdicts SKILL.md recognises, so
+# Step 4a falls to item 5 and surfaces to a human instead of merging.
+# scripts/ralph/test_pr_ready.sh walks this chain and fails on any NOT-cleared
+# branch that leaves `VERDICT` alone, including ones added after this comment.
 #
 # Required secrets:
 #   GEOFFE_GA_PAT  - personal access token for the repo owner with `pull-requests: write`.
@@ -155,13 +166,24 @@ jobs:
 
           if [ "$GREEN" = "$TOTAL" ] && [ "$VERDICT" = "LGTM" ]; then
             if [ "$HELD" != "no" ]; then
+              # THE ONE CONTROL A HUMAN RETAINS over an autonomous merge loop, so
+              # this branch is the most important place in the file to get right —
+              # and until #1202 it was the one that failed. Rewriting ACTION alone
+              # left the summary asserting `**VERDICT**: LGTM`, which is half of
+              # what Step 4a merges on, so a webhook-woken session merged the very
+              # PR a human had parked. `HELD` carries no `LGTM` substring and is
+              # not a verdict SKILL.md recognises; see the header for the full
+              # argument about why the VERDICT field, not ACTION, is the gate.
+              VERDICT='HELD'
               ACTION="NOT cleared to merge: the do-not-auto-merge hold is set on this PR (or its labels could not be read). A human owns this one - leave it alone."
             elif [ "$MARKER_PR" != "$PR" ]; then
               # Fails CLOSED: an absent or unparseable marker leaves MARKER_PR
               # empty, which never equals a PR number, so it does not clear.
               #
               # REWRITING `VERDICT` IS WHAT ACTUALLY STOPS THE MERGE; `ACTION` IS
-              # NOT LOAD-BEARING. `.claude/skills/await-claude-review/SKILL.md`
+              # NOT LOAD-BEARING — THE RULE FOR EVERY BRANCH OF THIS CHAIN, argued
+              # here once and referenced from the other two.
+              # `.claude/skills/await-claude-review/SKILL.md`
               # Step 4a parses `**VERDICT**:` and `**CI**: x/y Green` and nothing
               # else — its item 3 returns LGTM to the caller on those two fields
               # alone, and its item 5 says in as many words "Do not infer a
@@ -185,13 +207,23 @@ jobs:
               # been evaluated, and nothing reads VERDICT again before the BODY
               # printf below.
               #
-              # DELIBERATELY NOT DONE ON THE `HELD` AND `BEHIND` BRANCHES. They
-              # carry the identical pre-existing hole — a `do-not-auto-merge` hold
-              # is defeated the same way — and it is filed as #1202 (P1). The
-              # asymmetry is scoped to #1181 on purpose, not an oversight.
+              # THE `HELD` AND `BEHIND` BRANCHES NOW DO THE SAME THING (#1202).
+              # They carried the identical hole for as long as this branch did
+              # not: rewriting ACTION alone, so `**VERDICT**: LGTM` stood and a
+              # `do-not-auto-merge` hold was defeated exactly the way an
+              # unattested verdict was. The asymmetry was scoped to #1181 on
+              # purpose and is now closed; the chain has ONE rule, and
+              # test_pr_ready.sh enforces it structurally rather than by naming
+              # these three branches, so a fourth refusal inherits it.
               VERDICT='NOT ATTESTED'
               ACTION="NOT cleared to merge: the latest verdict does not attest that the reviewer read THIS PR - its provenance marker names '${MARKER_PR}', not ${PR}. Run scripts/ralph/fleet.sh sync (or push any commit) so the marker-emitting review workflow runs on this branch and the re-review is attested; re-running the old review run will not help, it replays the workflow file from the commit that run was launched from. See #1181."
             elif [ "$BEHIND" != "0" ]; then
+              # Same rule, same reason (#1202): this branch's own green proves
+              # nothing about today's base, and pr-ready.sh refuses the lane for
+              # it — so the summary must not hand the merge path an `LGTM` the
+              # sibling clearance path would reject. `NOT CURRENT` carries no
+              # `LGTM` substring and is not a verdict SKILL.md recognises.
+              VERDICT='NOT CURRENT'
               ACTION="NOT cleared to merge: this head is not current with ${BASE:-its base} (behind_by='${BEHIND}'). Run scripts/ralph/fleet.sh sync and let CI re-run first."
             else
               ACTION="You are cleared to squash merge, delete the branch, clean any worktrees, and unsubscribe from webhooks. Please proceed."
