@@ -90,6 +90,7 @@ import click
 import frontmatter
 import pytest
 import typer
+from typer import rich_utils
 from typer.testing import CliRunner
 
 from creek.cli import (
@@ -500,6 +501,76 @@ def _seed_corpus(vault: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Reading rendered output
+# ---------------------------------------------------------------------------
+
+_ANSI_RE: Final = re.compile(r"\x1b\[[0-9;]*m")
+
+# The Unicode Box Drawing block — the ``│``/``─``/``╭`` glyphs Rich frames a
+# panel with. Matched as a range so a Rich style change to a different border
+# set cannot quietly reintroduce the brittleness :func:`_flatten` removes.
+_BOX_DRAWING_RE: Final = re.compile("[─-╿]")
+
+
+def _flatten(text: str) -> str:
+    """Return *text* with ANSI codes, Rich panel borders and wrapping removed.
+
+    Every declaration in this module is a substring of what a surface renders,
+    and Rich renders differently depending on whether the process believes it
+    owns a terminal. Two consequences make a raw ``in`` test a coin flip on
+    the environment rather than a statement about the wiring:
+
+    * **Styling splits a literal.** Typer highlights option names, and Rich
+      emits one escape run per style span. ``--mode`` matches both the
+      ``option`` and the ``switch`` pattern of ``typer.rich_utils.highlighter``,
+      so the spans overlap and the rendered token is
+      ``\\x1b[1;36m-\\x1b[0m\\x1b[1;36m-mode\\x1b[0m`` — an escape sequence
+      lands *between the two hyphens*. The same thing happens to every
+      highlighted number: ``Orphans found: 5`` ships as ``Orphans found:
+      \\x1b[1;36m5\\x1b[0m``. CI is a terminal (or sets ``FORCE_COLOR``); a
+      developer's pytest run usually is not, which is how ten assertions in
+      this file passed locally and failed in CI on PR #1255.
+    * **Panels wrap and are framed.** A message inside a Rich error box is
+      hard-wrapped to the console width with ``│`` borders and padding, so a
+      phrase can break mid-sentence with a border sitting between its halves.
+      That is issue #1141, where a lengthened ``tmp_path`` moved the wrap into
+      the phrase under test.
+
+    Dropping the escapes rejoins split tokens; dropping the box-drawing block
+    and collapsing runs of whitespace rejoins wrapped sentences. What survives
+    is wording, which is what the contract actually declares. Nothing else is
+    touched: case, punctuation and word order are left exactly as rendered, so
+    a normalised comparison can never accept a *different* message.
+
+    Args:
+        text: Rendered output, as captured.
+
+    Returns:
+        The same text reduced to its wording.
+    """
+    return " ".join(_BOX_DRAWING_RE.sub(" ", _ANSI_RE.sub("", text)).split())
+
+
+def _says(haystack: str, needle: str) -> bool:
+    """Return whether *needle* appears in *haystack*, both flattened first.
+
+    The single comparison every declared ``prints`` / ``absent`` / ``contains``
+    substring and every :attr:`Refusal.reason` funnels through, so a new entry
+    naming a ``--flag`` cannot reintroduce the split-literal failure and no
+    entry needs to know Rich exists. Both sides are flattened because a
+    declaration may itself carry a newline the renderer would not.
+
+    Args:
+        haystack: Rendered output, or the text of a written artefact.
+        needle: The declared substring.
+
+    Returns:
+        ``True`` when the declaration is present in the rendered wording.
+    """
+    return _flatten(needle) in _flatten(haystack)
+
+
+# ---------------------------------------------------------------------------
 # The bench
 # ---------------------------------------------------------------------------
 
@@ -519,6 +590,29 @@ class Outcome:
     output: str
     before: Mapping[str, str]
     after: Mapping[str, str]
+
+    def says(self, needle: str) -> bool:
+        """Return whether the run rendered *needle*.
+
+        Args:
+            needle: The declared substring.
+
+        Returns:
+            ``True`` when :func:`_says` finds it in this run's output.
+        """
+        return _says(self.output, needle)
+
+    def readable(self) -> str:
+        """Return the tail of the output as the assertions compare it.
+
+        A failure message that quotes the raw capture is unreadable under
+        colour and, worse, misleading: it shows escapes the comparison never
+        saw. This shows the flattened wording instead.
+
+        Returns:
+            The last 1500 characters of :func:`_flatten` applied to the output.
+        """
+        return _flatten(self.output)[-1500:]
 
     def touched(self) -> frozenset[str]:
         """Return every relative path the run added, changed or removed.
@@ -1624,9 +1718,10 @@ def test_report_error_message_lists_exactly_the_declared_types(bench: Bench) -> 
         vault=vault,
         target=vault,
     )
+    rendered = _flatten(outcome.output)
     listed = {
         name.strip()
-        for name in outcome.output.split("Valid types:")[-1].split(".")[0].split(",")
+        for name in rendered.split("Valid types:")[-1].split(".")[0].split(",")
     }
     expected = {
         name.removeprefix("report.")
@@ -1730,7 +1825,7 @@ def _assert_writes(surface: Surface, target: Path, outcome: Outcome, name: str) 
         assert found, (
             f"{name}: declared artefact {pattern!r} was never written. The "
             f"surface exited {outcome.exit_code} regardless — which is exactly "
-            f"how #1231 shipped. Output:\n{outcome.output[-1500:]}"
+            f"how #1231 shipped. Output:\n{outcome.readable()}"
         )
         relative = {str(path.relative_to(target)) for path in found}
         assert relative & outcome.touched(), (
@@ -1744,7 +1839,7 @@ def _assert_writes(surface: Surface, target: Path, outcome: Outcome, name: str) 
             for path in found
         )
         for needle in surface.effect.contains:
-            assert needle in body, (
+            assert _says(body, needle), (
                 f"{name}: the artefact was written but carries no {needle!r}. A "
                 "file that appears without its payload is #1040's exact shape."
             )
@@ -1766,7 +1861,7 @@ def _assert_removes(surface: Surface, outcome: Outcome, name: str) -> None:
         survivors = [key for key in outcome.after if Path(key).match(pattern)]
         assert not survivors, (
             f"{name}: {sorted(survivors)} survived a purge that reported success. "
-            f"Output:\n{outcome.output[-1500:]}"
+            f"Output:\n{outcome.readable()}"
         )
 
 
@@ -1779,14 +1874,14 @@ def _assert_output(effect: Effect, outcome: Outcome, name: str) -> None:
         name: Surface name, for the failure message.
     """
     for needle in effect.prints:
-        assert needle in outcome.output, (
+        assert outcome.says(needle), (
             f"{name}: declared output {needle!r} never appeared. Output:\n"
-            f"{outcome.output[-1500:]}"
+            f"{outcome.readable()}"
         )
     for forbidden in effect.absent:
-        assert forbidden not in outcome.output, (
+        assert not outcome.says(forbidden), (
             f"{name}: output still carries {forbidden!r}, so the surface did not "
-            f"take the path the entry claims. Output:\n{outcome.output[-1500:]}"
+            f"take the path the entry claims. Output:\n{outcome.readable()}"
         )
 
 
@@ -1819,7 +1914,7 @@ def test_cli_surface_produces_its_declared_effect(
 
     assert outcome.exit_code == surface.effect.exit_code, (
         f"{name}: expected exit {surface.effect.exit_code}, got "
-        f"{outcome.exit_code}. Output:\n{outcome.output[-2000:]}"
+        f"{outcome.exit_code}. Output:\n{outcome.readable()}"
     )
     _assert_writes(surface, target, outcome, name)
     _assert_removes(surface, outcome, name)
@@ -1919,13 +2014,13 @@ def test_declared_contrast_makes_the_observable_vanish(
     outcome = _run_contrast(bench, name, surface, contrast)
 
     for needle in surface.effect.prints:
-        assert needle not in outcome.output, (
+        assert not outcome.says(needle), (
             f"{name}: {needle!r} still appears under the contrast "
             f"({contrast.why}). The declared observable is a constant, not a "
-            f"reading of the corpus. Output:\n{outcome.output[-1500:]}"
+            f"reading of the corpus. Output:\n{outcome.readable()}"
         )
     for restored in surface.effect.absent:
-        assert restored in outcome.output, (
+        assert outcome.says(restored), (
             f"{name}: the contrast was supposed to restore {restored!r} "
             f"({contrast.why}) but it never appeared."
         )
@@ -1969,12 +2064,12 @@ def test_declared_gate_refuses_and_leaves_the_vault_untouched(
         outcome = bench.run_cli(name, refusal.argv, vault=vault, target=vault)
         assert outcome.exit_code == refusal.exit_code, (
             f"{name}: refusal expected exit {refusal.exit_code}, got "
-            f"{outcome.exit_code}. Output:\n{outcome.output[-1500:]}"
+            f"{outcome.exit_code}. Output:\n{outcome.readable()}"
         )
 
-    assert refusal.reason in outcome.output, (
+    assert outcome.says(refusal.reason), (
         f"{name}: the closed gate did not give its documented reason "
-        f"{refusal.reason!r}. Output:\n{outcome.output[-1500:]}"
+        f"{refusal.reason!r}. Output:\n{outcome.readable()}"
     )
     substantive = outcome.touched() - _BOOKKEEPING_GLOBS
     assert not substantive, (
@@ -2082,11 +2177,11 @@ def test_exempt_surface_still_reports_its_blocker(
     vault = bench.seeded_vault()
     outcome = bench.run_cli(name, exemption.argv, vault=vault, target=vault)
 
-    assert exemption.blocker in outcome.output, (
+    assert outcome.says(exemption.blocker), (
         f"EXEMPTIONS[{name!r}] claims this surface still cannot be proven "
         f"hermetically because of {exemption.blocker!r} — but that no longer "
         f"appears. The surface has become provable: delete the exemption and "
-        f"add a real contract entry. Output:\n{outcome.output[-1500:]}"
+        f"add a real contract entry. Output:\n{outcome.readable()}"
     )
 
 
@@ -2347,3 +2442,69 @@ def test_harness_rejects_an_effect_made_only_of_bookkeeping() -> None:
 
     with pytest.raises(AssertionError, match="bookkeeping"):
         test_no_effect_is_satisfied_by_bookkeeping_alone("probe", probe)
+
+
+def test_declarations_survive_a_colour_terminal(
+    bench: Bench,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A declared flag must still be found when Rich is allowed to style it.
+
+    Every assertion above compares a hand-written substring against text Rich
+    rendered, and Rich only styles when it believes it owns a terminal. That
+    makes the whole contract environment-dependent unless :func:`_says`
+    normalises — which is exactly how PR #1255 shipped ten assertions that
+    were green on a developer's machine and red in CI.
+
+    The hostile input is produced by the production renderer rather than typed
+    out here: ``typer.rich_utils`` decides ``FORCE_TERMINAL`` from the
+    environment at import time, so flipping it and invoking the real CLI makes
+    Rich emit whatever Rich actually emits today. A pasted escape sequence
+    would only pin this author's guess about that.
+
+    ``discord`` is used because it has a required option; nothing about the
+    fix is specific to it.
+
+    Args:
+        bench: The bench.
+        monkeypatch: Used to let Rich colour in-process.
+    """
+    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", True)
+    reason = "Missing option '--mode'"
+    vault = bench.bare_vault()
+
+    outcome = bench.run_cli(
+        "discord", ("--vault", "{vault}"), vault=vault, target=vault
+    )
+
+    assert "\x1b[" in outcome.output, (
+        "Rich rendered no escape codes, so this guard is proving nothing. "
+        "FORCE_TERMINAL is no longer the switch that makes typer colour."
+    )
+    assert reason not in outcome.output, (
+        f"{reason!r} now survives a raw substring test, so this guard has gone "
+        "vacuous — Rich stopped splitting the flag across style spans. Find a "
+        "declaration it does still split before deleting this."
+    )
+    assert outcome.says(reason), (
+        f"_says failed to recover {reason!r} from coloured output. That is the "
+        f"CI-only failure this exists to prevent. Output:\n{outcome.readable()}"
+    )
+    assert outcome.says(f"Error {reason}"), (
+        "the panel border and its line break were not removed, so a message "
+        "that wraps mid-phrase (#1141) would still be unmatchable."
+    )
+    # Near misses, one per weakening that would make the recovery above pass
+    # for the wrong reason: a different flag, a collapsed hyphen, a lowercased
+    # comparison, stripped punctuation.
+    for near_miss in (
+        "Missing option '--modes'",
+        "Missing option '-mode'",
+        "missing option '--mode'",
+        "Missing option --mode",
+    ):
+        assert not outcome.says(near_miss), (
+            f"normalisation has become fuzzy: it accepted {near_miss!r}, which "
+            "the surface never printed. An assertion that passes on the wrong "
+            "message is worse than the failure it replaced."
+        )
