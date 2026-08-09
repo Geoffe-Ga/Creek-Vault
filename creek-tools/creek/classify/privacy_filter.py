@@ -32,6 +32,12 @@ an explicit ``unclassified`` only in the raw frontmatter — is ``INTIMATE``),
 :func:`max_source_tier` (the reduction over the tiers a call would carry,
 ``INTIMATE`` when empty).
 
+:func:`build_ancestor_index` / :class:`AncestorIndex` / :func:`ancestry_tiers`
+(#931) are the ancestry-aware sibling of :func:`source_tiers`, for the one
+caller — ``creek.compile`` — whose prompt renders a fragment's *ancestors*
+alongside the fragment itself. They exist as a separate survey rather than as a
+widening of :func:`source_tiers` on purpose; see that function's docstring.
+
 :func:`raw_privacy_tier` and :func:`within_ceiling` (#968) are the
 raw-frontmatter siblings of that pair, for generation flows that never build a
 :class:`~creek.models.Fragment` at all. They live here, and not in a new
@@ -73,7 +79,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeGuard
+from typing import TYPE_CHECKING, Any, Final, TypeGuard
 
 from creek.audit import AuditLog
 from creek.models import PrivacyTier
@@ -513,6 +519,20 @@ def source_tiers(vault_path: Path, fragment_ids: Iterable[str]) -> list[PrivacyT
     naming a thousand ids still pays one walk of the corpus rather than a
     thousand.
 
+    **This survey is deliberately ancestry-blind, and #931 kept it that
+    way.** It reports the tiers of the ids a call *names* and nothing else.
+    Its callers — ``creek.draft``, ``creek.journal``, ``creek.upload`` —
+    hand the LLM the named fragments' own content and render no
+    ``structural_path`` breadcrumb, so an ancestor's title never reaches
+    their prompts and ranking ancestry there would refuse calls that leak
+    nothing. ``creek.compile`` is the one caller whose prompt *does* render
+    ancestry, and it uses :func:`ancestry_tiers` instead. The two are two
+    functions rather than one flag because they answer two different
+    questions; ``tests/test_privacy_filter.py``'s
+    ``test_source_tiers_stays_ancestry_blind`` pins the difference so a
+    future de-duplication has to argue with a test rather than with a
+    comment.
+
     The walk deliberately goes through that shared loader — the same one
     ``creek.compile.engine._load_fragments_for_compile`` uses — so the set
     of files this survey inspects and the set the compile engine would
@@ -571,6 +591,294 @@ def source_tiers(vault_path: Path, fragment_ids: Iterable[str]) -> list[PrivacyT
         )
         if fragment.id in requested
     ]
+
+
+@dataclass(frozen=True)
+class _Chain:
+    """One node's resolved ancestry contribution, memoised during a survey.
+
+    Attributes:
+        tiers: The tiers of the node and every ancestor above it, plus any
+            fail-closed ``INTIMATE`` the walk had to add. Reduced by the
+            caller; multiplicity and order carry no meaning.
+        depth: How many strict ancestors the walk actually reached above the
+            node. Compared against the persisted breadcrumb's length by
+            :meth:`AncestorIndex._own_tiers` (rule (e)). A walk truncated by
+            a cycle or a missing parent reports ``0``, which can only
+            *add* an ``INTIMATE`` to a chain that already carries one.
+    """
+
+    tiers: tuple[PrivacyTier, ...]
+    depth: int
+
+
+_ROOT_CHAIN: Final[_Chain] = _Chain(tiers=(), depth=0)
+"""Nothing above a clean root: no tiers, no ancestors."""
+
+_CYCLE_CHAIN: Final[_Chain] = _Chain(tiers=(PrivacyTier.INTIMATE,), depth=0)
+"""A chain the walk could not finish — a cycle, or a parent that does not resolve.
+
+Rules (c) and (d) share one value because they must be indistinguishable:
+both mean "this ancestry cannot be surveyed", and a caller that could tell
+them apart would learn something about the vault's shape from a refusal.
+"""
+
+
+@dataclass(frozen=True)
+class _AncestorEntry:
+    """One node of the ancestry graph, as :class:`AncestorIndex` ranks it.
+
+    Attributes:
+        parent_id: The node's link up the hierarchy, or ``None`` at a root.
+        tier: The node's tier, read through :func:`fragment_tier` so a
+            *missing* ``privacy_tier`` key fails closed to ``INTIMATE``.
+        has_structural_path: Whether the node carries a persisted
+            ``structural_path``. Recorded because a breadcrumb is a
+            ``list[str]`` with no id binding, so its *length* is the only
+            handle on how much ancestry the prompt will render: any excess
+            over the ancestry this index can walk is ancestry it cannot
+            rank. See :meth:`AncestorIndex.chain_tiers` rule (e).
+    """
+
+    parent_id: str | None
+    tier: PrivacyTier
+    breadcrumb_len: int
+
+
+@dataclass(frozen=True)
+class AncestorIndex:
+    """Whole-corpus ``parent_id`` graph, keyed by fragment id, with tiers attached.
+
+    Built once per call by :func:`build_ancestor_index` from records the
+    caller has *already* walked, so ranking ancestry costs no extra pass
+    over ``01-Fragments``. :func:`ancestry_tiers` is the walk-it-for-me
+    entry point for callers that have no walk of their own.
+
+    Attributes:
+        entries: One :class:`_AncestorEntry` per fragment the index covers.
+            A fragment absent from this mapping is one
+            :func:`creek.vault.reader.try_load_fragment` skipped —
+            unreadable, non-``fragment``-typed, or schema-invalid — and is
+            therefore unrankable rather than open.
+    """
+
+    entries: Mapping[str, _AncestorEntry]
+
+    def chain_tiers(self, fragment_ids: Iterable[str]) -> list[PrivacyTier]:
+        """Return every tier the ancestry of *fragment_ids* would carry.
+
+        The rules, each of which is a test in
+        ``tests/test_privacy_filter.py``:
+
+        (a) A requested id that resolves contributes its own tier and the
+            tier of every strict ancestor reached by walking ``parent_id``.
+        (b) A requested id that does **not** resolve contributes nothing.
+            This is the one rule here that is not fail-closed, and it is
+            load-bearing: ``creek.compile``'s ``ValueError("Fragment(s) not
+            found in vault: ...")`` must still reach a caller with a typo'd
+            id rather than collapsing into the content-free above-ceiling
+            refusal. Nothing absent from the vault can be rendered into a
+            prompt, so admitting it costs no privacy.
+        (c) A ``parent_id`` that does not resolve contributes ``INTIMATE``.
+            Its tier is unknowable while the child's breadcrumb still names
+            it — the same posture :func:`fragment_tier` takes to a missing
+            ``privacy_tier`` key.
+        (d) A ``parent_id`` cycle is truncated by a per-leaf visited set and
+            contributes ``INTIMATE``: a chain that cannot be fully surveyed
+            fails closed.
+        (e) **Breadcrumb deeper than the ancestry we could walk contributes
+            ``INTIMATE``.** The survey ranks fragment *ids* up ``parent_id``;
+            the prompt renders *strings* out of ``structural_path``. Nothing
+            in the data binds the two, so the only sound check is the count:
+            ``creek.atomize.split._build_children`` appends at most one
+            heading per level, so ``len(structural_path)`` can never exceed
+            the number of strict ancestors. When it does — a root carrying a
+            breadcrumb, or a fragment re-parented onto a shallower parent
+            while keeping a deeper breadcrumb — the excess entries name
+            ancestors this index cannot reach, and unrankable ancestry fails
+            closed. The depth-0 case (``parent_id is None`` with a non-empty
+            breadcrumb) is the one an unmodified pipeline could plausibly
+            produce; the general rule costs nothing extra and stops the
+            invariant resting on a writer-side promise no code asserts.
+        (f) **Uniform probe cost.** Every resolved requested id is ranked
+            before the caller can read a decision: no short-circuit on the
+            first offender, no lazy per-parent vault lookup. That is what
+            keeps ``creek_mcp.tools.compile._ABOVE_CEILING_REASON`` from
+            leaking *where* the offending ancestor sits through timing, and
+            it is the same property :func:`source_tiers` documents for its
+            own loop. Making this lazy re-opens that channel.
+        (g) Chain results are memoised for the duration of the call, so a
+            wide batch sharing a deep ancestry stays cheap *and* uniform.
+        (h) A fragment id claimed by **more than one file** contributes
+            ``INTIMATE`` (applied in :func:`build_ancestor_index`). Ids are
+            content-hashed, so a collision is anomalous — but the index is a
+            mapping and a mapping is last-wins, which would let a later
+            ``privacy_tier: open`` shadow file hide an earlier ``intimate``
+            one. :func:`source_tiers` yields one tier per *file* and so had
+            no such hole; failing closed here keeps this survey at least as
+            restrictive as the one it replaces at the compile gate.
+
+        Args:
+            fragment_ids: The ids the caller named. Duplicates collapse.
+
+        Returns:
+            The tiers to reduce over, as an unordered bag. Unlike
+            :func:`source_tiers` this is **not** one entry per requested id
+            — a chain contributes as many tiers as it has surveyable nodes,
+            plus a fail-closed ``INTIMATE`` for anything it cannot survey.
+            Both callers reduce it (``max_source_tier`` /
+            ``any(not write_tier_allowed(...))``), so multiplicity and order
+            carry no meaning and neither is promised.
+        """
+        memo: dict[str, _Chain] = {}
+        tiers: list[PrivacyTier] = []
+        for fragment_id in dict.fromkeys(fragment_ids):
+            if fragment_id in self.entries:
+                tiers.extend(self._chain_from(fragment_id, memo).tiers)
+        return tiers
+
+    def _chain_from(self, leaf_id: str, memo: dict[str, _Chain]) -> _Chain:
+        """Return the chain contribution of *leaf_id*, filling *memo*.
+
+        Folds the un-memoised nodes from the root-most downwards, so each
+        node's ``depth`` (its count of successfully-walked strict ancestors)
+        is one more than its parent's and rule (e) can compare it against
+        the persisted breadcrumb's length.
+        """
+        path, tail = self._ascend(leaf_id, memo)
+        tiers, depth = tail.tiers, tail.depth
+        for node_id in reversed(path):
+            tiers = (*self._own_tiers(node_id, depth), *tiers)
+            memo[node_id] = _Chain(tiers=tiers, depth=depth)
+            depth += 1
+        return _Chain(tiers=tiers, depth=depth)
+
+    def _ascend(
+        self,
+        leaf_id: str,
+        memo: dict[str, _Chain],
+    ) -> tuple[list[str], _Chain]:
+        """Walk up from *leaf_id*, returning the un-memoised nodes and the tail.
+
+        The tail is the already-known contribution of everything above the
+        last node in the returned path: a memo hit, or the fail-closed
+        ``(INTIMATE,)`` of rule (c) / rule (d), or empty at a clean root. Its
+        ``depth`` is how many strict ancestors that last node has. A
+        truncated walk reports ``0`` — an undercount, which can only add a
+        further ``INTIMATE`` to a chain that already carries one.
+        """
+        path: list[str] = []
+        visited: set[str] = set()
+        current: str | None = leaf_id
+        while current is not None:
+            known = memo.get(current)
+            if known is not None:
+                return path, _Chain(tiers=known.tiers, depth=known.depth + 1)
+            if current in visited:
+                return path, _CYCLE_CHAIN
+            entry = self.entries.get(current)
+            if entry is None:
+                return path, _CYCLE_CHAIN
+            visited.add(current)
+            path.append(current)
+            current = entry.parent_id
+        return path, _ROOT_CHAIN
+
+    def _own_tiers(self, node_id: str, depth: int) -> tuple[PrivacyTier, ...]:
+        """Return *node_id*'s own contribution, applying rule (e) at *depth*."""
+        entry = self.entries[node_id]
+        if entry.breadcrumb_len > depth:
+            return (entry.tier, PrivacyTier.INTIMATE)
+        return (entry.tier,)
+
+
+def build_ancestor_index(
+    records: Iterable[tuple[Fragment, dict[str, object]]],
+) -> AncestorIndex:
+    """Build an :class:`AncestorIndex` from already-walked vault records.
+
+    Pure: takes the ``(fragment, raw)`` pairs a caller has in hand rather
+    than a vault path, so ``creek.compile.engine._load_fragments_for_compile``
+    — which already walks the whole of ``01-Fragments`` — pays no second
+    pass. At the 35k-fragment bar a second rglob-plus-parse of the corpus
+    doubles the pre-LLM wall clock, which is why the index is threaded out
+    of the existing walk instead of being fetched beside it;
+    ``tests/test_compile.py``'s
+    ``test_compile_to_vault_walks_the_vault_exactly_once`` pins that.
+
+    **Duplicate ids fail closed** (rule (h)). A mapping keyed on
+    ``fragment.id`` is last-wins, and :func:`source_tiers` — which this
+    replaces at the compile gate — is not: it yields one tier per *file*, so
+    two files claiming one id contributed both tiers and the more sensitive
+    one won the reduction. Preserving that is not optional, because a shadow
+    file carrying an above-ceiling ancestor's id with ``privacy_tier: open``
+    and a later sort position would otherwise downgrade the real ancestor
+    while the child's breadcrumb still rendered its heading. Ids are
+    content-hashed (``creek.ingest.base.generate_fragment_id``), so a
+    collision is anomalous by construction and ``INTIMATE`` is the honest
+    answer: nobody can say which file the chain belongs to.
+
+    Args:
+        records: ``(fragment, raw_frontmatter)`` pairs for **every** fragment
+            in the corpus, not just the ones a call names — an ancestor the
+            caller never named is precisely what this index exists to find.
+
+    Returns:
+        The index, with each entry's tier read through :func:`fragment_tier`
+        so a missing ``privacy_tier`` key fails closed to ``INTIMATE``.
+    """
+    entries: dict[str, _AncestorEntry] = {}
+    for fragment, raw in records:
+        collides = fragment.id in entries
+        entries[fragment.id] = _AncestorEntry(
+            parent_id=fragment.parent_id,
+            tier=PrivacyTier.INTIMATE if collides else fragment_tier(fragment, raw),
+            breadcrumb_len=len(fragment.structural_path),
+        )
+    return AncestorIndex(entries=entries)
+
+
+def ancestry_tiers(vault_path: Path, fragment_ids: Iterable[str]) -> list[PrivacyTier]:
+    """Return the tiers of *fragment_ids* **and their ancestors**, in one vault walk.
+
+    The ancestry-aware sibling of :func:`source_tiers` (#931), and the entry
+    point for callers that have no corpus walk of their own —
+    ``creek_mcp.tools.compile._survey_sources`` is the only one.
+
+    It exists because ``creek.compile``'s prompt renders an admitted
+    fragment's ancestry: :func:`creek.hierarchy.structural_path_context`
+    returns the persisted ``structural_path`` — ancestor headings the
+    splitter accumulated — and ``_build_prompt`` emits it after
+    ``structural_path:``. #848's gate ranks only the ids a caller *names*, so
+    an ``open`` child of an ``intimate`` parent was admitted at
+    ``ceiling=open`` and carried its parent's heading to a cloud-routed
+    provider. Ranking the ancestry closes that channel without redacting the
+    breadcrumb, which is unredactable anyway: the persisted entries are bare
+    strings with no owning-fragment id.
+
+    Uses the same shared loader as :func:`source_tiers` and
+    ``creek.compile.engine._load_fragments_for_compile``, for the same
+    reason: a file one side sees and the other does not is the bug class
+    these surveys exist to prevent. The walk is a single non-short-circuiting
+    pass and the ranking that follows it is exhaustive, so probe cost stays
+    uniform by construction — see :meth:`AncestorIndex.chain_tiers` rule (f).
+
+    Args:
+        vault_path: Vault root; fragments are read from ``01-Fragments``.
+        fragment_ids: The ids the caller named. Duplicates collapse; an id
+            that does not resolve contributes nothing, exactly as in
+            :func:`source_tiers`, so a caller's not-found path is untouched.
+
+    Returns:
+        The tiers to reduce over. See :meth:`AncestorIndex.chain_tiers` for
+        why this is a bag rather than one entry per requested id.
+    """
+    return build_ancestor_index(
+        (fragment, raw)
+        for _path, fragment, _body, raw in iter_vault_fragments(
+            vault_path / "01-Fragments",
+        )
+    ).chain_tiers(fragment_ids)
 
 
 def record_privacy_override(

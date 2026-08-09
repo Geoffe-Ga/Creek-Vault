@@ -86,9 +86,30 @@ def _write_fragment(
     body: str = "Body text.",
     privacy_tier: str = "open",
     title: str | None = None,
+    parent_id: str | None = None,
+    structural_path: list[str] | None = None,
+    child_ids: list[str] | None = None,
 ) -> None:
-    """Write a minimal fragment under ``01-Fragments/Notes`` for compile tests."""
-    metadata = {
+    """Write a minimal fragment under ``01-Fragments/Notes`` for compile tests.
+
+    The three hierarchy kwargs are emitted **only when supplied**, so every
+    pre-existing caller's frontmatter is byte-for-byte unchanged. They exist
+    for the #931 ancestry tests, which need a child whose persisted
+    ``structural_path`` carries an ancestor's heading while the ancestor
+    itself is never named in the request.
+
+    Args:
+        vault: Vault root; the file lands under ``01-Fragments/Notes``.
+        frag_id: Fragment id, also the filename stem.
+        body: Markdown body beneath the frontmatter.
+        privacy_tier: The ``privacy_tier`` frontmatter value.
+        title: Fragment title; defaults to ``"Title <frag_id>"``.
+        parent_id: Optional ``parent_id`` link up the hierarchy.
+        structural_path: Optional persisted breadcrumb, as
+            :func:`creek.atomize.split._build_children` writes it.
+        child_ids: Optional ``child_ids`` links down the hierarchy.
+    """
+    metadata: dict[str, object] = {
         "type": "fragment",
         "id": frag_id,
         "title": title or f"Title {frag_id}",
@@ -99,6 +120,12 @@ def _write_fragment(
         "privacy_tier": privacy_tier,
         "eddies": [],
     }
+    if parent_id is not None:
+        metadata["parent_id"] = parent_id
+    if structural_path is not None:
+        metadata["structural_path"] = structural_path
+    if child_ids is not None:
+        metadata["child_ids"] = child_ids
     target = vault / "01-Fragments" / "Notes" / f"{frag_id}.md"
     target.write_text(
         frontmatter.dumps(frontmatter.Post(content=body, **metadata)),
@@ -1660,6 +1687,272 @@ def test_compile_above_ceiling_wins_over_missing_id(vault: Path) -> None:
     assert result["reason"] == _ABOVE_CEILING_REASON
     assert "not found" not in result["reason"]
     assert factory.calls == 0
+
+
+# ---------------------------------------------------------------------------
+# compile — unnamed-ancestor ceiling leak (issue #931)
+# ---------------------------------------------------------------------------
+
+_ANCESTOR_HEADING = "Ritual with M."
+"""Heading of the above-ceiling ancestor, as the child's breadcrumb carries it.
+
+Deliberately the *heading* rather than a synthetic marker:
+:func:`creek.atomize.split._build_children` accumulates ancestor headings into
+each child's persisted ``structural_path``, and for an intermediate ancestor the
+heading *is* its title. That string is what
+:func:`creek.hierarchy.structural_path_context` returns and
+:func:`creek.compile.engine._build_prompt` renders after ``structural_path:``.
+"""
+
+
+def _seed_ancestry(vault: Path, *, ancestor_tier: str, child_tier: str) -> None:
+    """Write an ancestor/child pair linked both by id and by persisted breadcrumb.
+
+    The child alone is what the #931 tests name. Its ``structural_path``
+    carries :data:`_ANCESTOR_HEADING`, so the leak is reachable through the
+    *persisted* branch of :func:`creek.hierarchy.structural_path_context` —
+    the branch that needs no ancestor fragment in memory and is therefore the
+    one an MCP caller can reach.
+
+    Args:
+        vault: Vault root.
+        ancestor_tier: ``privacy_tier`` for ``frag-ancestor``.
+        child_tier: ``privacy_tier`` for ``frag-child``.
+    """
+    _write_fragment(
+        vault,
+        frag_id="frag-ancestor",
+        privacy_tier=ancestor_tier,
+        title=_ANCESTOR_HEADING,
+        child_ids=["frag-child"],
+    )
+    _write_fragment(
+        vault,
+        frag_id="frag-child",
+        privacy_tier=child_tier,
+        title="On grief",
+        parent_id="frag-ancestor",
+        structural_path=[_ANCESTOR_HEADING],
+    )
+
+
+def test_compile_refuses_an_unnamed_above_ceiling_ancestor_at_the_open_ceiling(
+    vault: Path,
+) -> None:
+    """An ``intimate`` ancestor refuses the call even though only its child is named.
+
+    Issue #931, the narrowest ceiling. #848 ranks the ids the caller
+    **names**; here the caller names one ``open`` child, so that gate admits
+    it — and the engine then renders the child's persisted
+    ``structural_path``, egressing the intimate ancestor's heading to a
+    cloud-routed provider. Ranking ancestry closes the channel.
+
+    ``factory.calls == 0`` is the load-bearing egress assertion; a
+    ``status == "refused"`` on its own would be a false green (see
+    :class:`_RecordingLLMFactory`). The refusal must also be
+    *indistinguishable* from a named-id refusal — a separate reason string
+    would be a fresh oracle telling the caller the offender is above them in
+    the tree — hence the verbatim :data:`_ABOVE_CEILING_REASON` comparison.
+    """
+    _seed_ancestry(vault, ancestor_tier="intimate", child_tier="open")
+    factory = _RecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-child"],
+        target_kind="thread",
+        target_id="thread-anc",
+        target_title="Thread Anc",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert result["reason"] == _ABOVE_CEILING_REASON
+    assert factory.calls == 0
+
+
+def test_compile_ancestor_refusal_leaves_zero_state_and_one_clean_audit_row(
+    vault: Path,
+) -> None:
+    """The ancestor refusal is audited exactly like a named-id refusal (#931).
+
+    Same path, same payload shape, same absence of on-disk state: no
+    compiled page, no hash marker, no paradox log, no target directory. The
+    stub LLM returns a payload that *would* write all three, so each missing
+    artefact is evidence the engine never ran.
+
+    The audit row must not distinguish an ancestor violation from a named-id
+    one either — no extra field, no ancestor id, no tier — so the assertions
+    mirror ``test_compile_refusal_is_audited_without_ids_or_tiers`` exactly.
+    """
+    _seed_ancestry(vault, ancestor_tier="intimate", child_tier="open")
+    payload = json.dumps(
+        {
+            "claims": [
+                {"id": "c1", "text": "A claim.", "fragment_ids": ["frag-child"]}
+            ],
+            "paradoxes": [
+                {"description": "A tension.", "fragment_ids": ["frag-child"]}
+            ],
+        },
+    )
+
+    def _leaky_factory(tier: PrivacyTier) -> object:
+        """Return a stub LLM that would emit a page body and a paradox."""
+        return lambda _prompt: payload
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-child"],
+        target_kind="eddy",
+        target_id="eddy-anc",
+        target_title="Eddy Anc",
+        llm_factory=_leaky_factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert result["reason"] == _ABOVE_CEILING_REASON
+    assert not (vault / "03-Eddies" / "eddy-anc.md").exists()
+    assert not (vault / PARADOX_LOG_RELPATH).exists()
+    assert not (vault / "00-Creek-Meta" / "audit" / "compile-eddy-anc.hash").exists()
+
+    entries = [e for e in _read_audit(vault) if e["tool"] == "creek.compile"]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["args_summary"]["fragment_ids"] == {"count": 1}
+    assert "affected_fragment_ids" not in entry
+    assert "created_path" not in entry
+    assert "created_tier" not in entry
+    assert "target_title" not in entry["args_summary"]
+
+    raw = (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8")
+    assert _ANCESTOR_HEADING not in raw
+    assert "frag-ancestor" not in raw
+    assert "intimate" not in raw
+    verify_mcp_audit_chain(vault)
+
+
+def test_compile_admits_a_within_ceiling_ancestor(vault: Path) -> None:
+    """Ancestry ranking narrows; it must not refuse everything (anti-vacuity).
+
+    Identical shape to the refusal above with the ancestor at ``open``: the
+    call is admitted, the engine runs, and the breadcrumb reaches the prompt
+    as designed. Without this row the #931 fix could be "refuse every
+    fragment that has a parent" and the refusal tests would still pass.
+    """
+    _seed_ancestry(vault, ancestor_tier="open", child_tier="open")
+    factory = _RecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-child"],
+        target_kind="thread",
+        target_id="thread-ok",
+        target_title="Thread OK",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "ok"
+    assert factory.calls == 1
+
+
+def test_compile_refuses_a_dangling_ancestry_link(vault: Path) -> None:
+    """A ``parent_id`` that resolves to nothing fails closed (#931).
+
+    A missing, unreadable, non-``fragment``-typed or schema-invalid parent is
+    invisible to :func:`creek.vault.reader.try_load_fragment`, so its tier is
+    unknowable — and the child's breadcrumb still carries whatever that
+    ancestor was called. Matching :func:`creek.classify.privacy_filter.fragment_tier`'s
+    missing-key posture, an unsurveyable chain ranks ``INTIMATE``.
+    """
+    _write_fragment(
+        vault,
+        frag_id="frag-child",
+        privacy_tier="open",
+        title="On grief",
+        parent_id="frag-vanished",
+        structural_path=[_ANCESTOR_HEADING],
+    )
+    factory = _RecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-child"],
+        target_kind="thread",
+        target_id="thread-dangle",
+        target_title="Thread Dangle",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert result["reason"] == _ABOVE_CEILING_REASON
+    assert factory.calls == 0
+
+
+def test_compile_refuses_an_orphan_breadcrumb(vault: Path) -> None:
+    """A breadcrumb with no ``parent_id`` to walk fails closed (#931).
+
+    The persisted ``structural_path`` is a ``list[str]`` with no id binding,
+    so a fragment carrying one while its ``parent_id`` is ``None`` —
+    re-parented, parent deleted, hand-edited — has ancestry that can be
+    *rendered* but not *ranked*. ``creek.atomize.split._build_children`` is
+    the only writer of the field and always sets ``parent_id`` in the same
+    ``model_copy``, so this state is anomalous by construction and ranks
+    ``INTIMATE`` rather than sailing through.
+    """
+    _write_fragment(
+        vault,
+        frag_id="frag-orphan",
+        privacy_tier="open",
+        title="On grief",
+        structural_path=[_ANCESTOR_HEADING],
+    )
+    factory = _RecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-orphan"],
+        target_kind="thread",
+        target_id="thread-orphan",
+        target_title="Thread Orphan",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert result["reason"] == _ABOVE_CEILING_REASON
+    assert factory.calls == 0
+
+
+def test_compile_ancestry_gate_still_loses_to_a_missing_id(vault: Path) -> None:
+    """Ancestry ranking must not swallow the engine's not-found refusal (#931).
+
+    The ordering #848 established is unchanged: an id that resolves to
+    nothing contributes no tier to the survey, so a request naming only
+    within-ceiling fragments plus a typo still reaches the engine and the
+    caller still learns *which* id does not resolve.
+    """
+    _seed_ancestry(vault, ancestor_tier="open", child_tier="open")
+    factory = _RecordingLLMFactory()
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-child", "frag-missing"],
+        target_kind="thread",
+        target_id="thread-x",
+        target_title="Thread X",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert "not found" in result["reason"]
+    assert "frag-missing" in result["reason"]
+    assert result["reason"] != _ABOVE_CEILING_REASON
 
 
 def test_compile_reports_unknown_target_kind_even_with_above_ceiling_sources(
