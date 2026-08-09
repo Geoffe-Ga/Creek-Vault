@@ -36,6 +36,7 @@ from creek_mcp.policy import (
 from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
     ConsumerTokenVerifier,
+    announce_rotation_window,
     load_consumer_tokens,
     remote_auth_settings,
 )
@@ -955,9 +956,15 @@ def main(argv: list[str] | None = None) -> None:
     Startup is fail-closed four times over. On *every* transport it refuses
     an elevated token below the minimum-strength floor (#907). The network
     branch additionally refuses to start without per-consumer tokens (no
-    anonymous access), refuses a configured consumer token below the same
-    floor (#838), and refuses a non-loopback bind unless TLS is configured
-    (no cleartext bearer tokens, #837).
+    anonymous access), refuses a consumer-token configuration the parser
+    cannot read unambiguously — a token below the same floor (#838), a
+    consumer named twice, a token value shared by two consumers (#895) — and
+    refuses a non-loopback bind unless TLS is configured (no cleartext bearer
+    tokens, #837).
+
+    Having started, the network branch *announces* on stderr any consumer
+    holding more than one currently-valid token, so an open rotation window
+    is visible rather than permanent (#895).
 
     Args:
         argv: Optional list of command-line arguments. When ``None``
@@ -978,8 +985,11 @@ def main(argv: list[str] | None = None) -> None:
         try:
             tokens = load_consumer_tokens()
         except ValueError as exc:
-            # A configured token is below the minimum-strength floor (#838):
-            # exit with the rotation recipe rather than serve a weak secret.
+            # An unreadable consumer-token configuration: a token below the
+            # minimum-strength floor (#838), a consumer named twice, or one
+            # token value configured for two consumers (#895). Exit naming the
+            # setting to fix rather than serve a weak or ambiguous registry;
+            # no such message ever carries a token value.
             parser.error(str(exc))
         if not tokens:
             # No anonymous access: refuse to expose the vault without per-consumer
@@ -989,7 +999,12 @@ def main(argv: list[str] | None = None) -> None:
                 "(consumer=token pairs); refusing to serve without authentication"
             )
         _require_transport_confidentiality(parser, args)
-        server = build_server(token_verifier=ConsumerTokenVerifier(tokens))
+        verifier = ConsumerTokenVerifier(tokens)
+        # A rotation window has to be closed again, and an operator who cannot
+        # see one is open will not close it (#895). On stderr: stdout on this
+        # entry point belongs to the stdio transport's JSON-RPC framing.
+        announce_rotation_window(verifier)
+        server = build_server(token_verifier=verifier)
         server.settings.host = args.host
         server.settings.port = args.port
         _serve_network(server, args)

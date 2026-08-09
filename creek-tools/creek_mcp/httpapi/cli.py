@@ -20,6 +20,14 @@ Startup is fail-closed three times over, all before a socket exists:
 * **No cleartext bearer on a routable network.** A non-loopback bind without
   TLS exits naming the flags that fix it.
 
+Having cleared those, startup **announces on stderr** any consumer holding
+more than one currently-valid token, so an open rotation window (#895) is
+visible rather than permanent. It goes to stderr because stdout here carries
+the ``--print-openapi`` document consumers pipe into client generators; the
+decision, and the notice itself, are
+:func:`creek_mcp.remote_auth.announce_rotation_window`'s, shared with the MCP
+adapter so it cannot hold on one entry point and lapse on the other.
+
 **The default port is deliberately not 8000.** That is both Adepthood's own
 backend port and :data:`creek_mcp.server.DEFAULT_MCP_NETWORK_PORT`, and the two
 Creek adapters are expected to run side by side on one host; identical defaults
@@ -46,6 +54,7 @@ from creek_mcp.api.openapi import build_openapi
 from creek_mcp.httpapi import SERVER_NAME
 from creek_mcp.httpapi.app import create_app
 from creek_mcp.httpapi.auth import build_verifier
+from creek_mcp.remote_auth import announce_rotation_window
 from creek_mcp.transport_posture import require_transport_confidentiality
 
 if TYPE_CHECKING:
@@ -162,8 +171,10 @@ def _verifier_or_exit(parser: argparse.ArgumentParser) -> ConsumerTokenVerifier:
     try:
         verifier = build_verifier()
     except ValueError as exc:
-        # Covers both "nothing configured" and "a configured token is below the
-        # shared length floor". Neither message ever carries a token value, and
+        # Covers "nothing configured", "a configured token is below the shared
+        # length floor" (#838), and the two ambiguous registries #895 refuses:
+        # a consumer named twice, and one token value configured for two
+        # consumers. No such message ever carries a token value, and
         # ``parser.error`` exits non-zero rather than returning.
         parser.error(str(exc))
     return verifier
@@ -231,7 +242,11 @@ def serve(app: Starlette, args: argparse.Namespace) -> None:  # pragma: no cover
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Parse arguments, refuse an unsafe configuration, then serve.
+    """Parse arguments, refuse an unsafe configuration, announce, then serve.
+
+    The announcement is the one non-refusal in the sequence: any open rotation
+    window (#895) is reported on stderr before the socket exists, so it is
+    visible in the same startup output as the refusals above it.
 
     Args:
         argv: Command-line arguments, or ``None`` to read :data:`sys.argv`.
@@ -245,4 +260,12 @@ def main(argv: list[str] | None = None) -> None:
     _apply_config(parser, args)
     verifier = _verifier_or_exit(parser)
     require_transport_confidentiality(parser, args)
+    # After every refusal, never before one: a process about to exit 2 has
+    # nothing to announce, and announcing above the posture gate printed a
+    # rotation notice for a server that then refused to serve — while the MCP
+    # adapter announced below its own gate. Two adapters, one moment. A window
+    # has to be closed again, and an operator who cannot see one is open will
+    # not close it (#895). On stderr: stdout on this entry point carries the
+    # ``--print-openapi`` document, which consumers pipe into code generators.
+    announce_rotation_window(verifier)
     serve(create_app(verifier=verifier), args)

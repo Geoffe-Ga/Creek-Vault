@@ -7,6 +7,7 @@ import base64
 import json
 import os
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import frontmatter
@@ -14,7 +15,11 @@ import pytest
 
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
 from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
-from creek_mcp.remote_auth import CONSUMER_TOKENS_ENV
+from creek_mcp.remote_auth import (
+    CONSUMER_TOKENS_ENV,
+    ConsumerTokenVerifier,
+    load_consumer_tokens,
+)
 from creek_mcp.server import SERVER_NAME, build_server
 
 if TYPE_CHECKING:
@@ -1216,3 +1221,114 @@ def test_main_treats_empty_elevated_token_as_unconfigured(
     server_module.main([])
 
     assert runs == ["stdio"]
+
+
+# --------------------------------------------------------------------------- #
+# Rotation-window startup notice (#895)
+#
+# A consumer may hold several currently-valid tokens so a secret can be rotated
+# without a hard cutover. That window has to be *closed* again, and an operator
+# who cannot see it is open will not close it — so network startup announces it.
+#
+# **On stderr, never stdout.** stdout on this entry point belongs to the stdio
+# transport's JSON-RPC framing, and the sibling ``creek-tools-api`` prints its
+# OpenAPI document there; an operator notice on stdout corrupts one and breaks
+# every pipe consuming the other.
+# --------------------------------------------------------------------------- #
+
+# 43 chars each. Low-entropy test literals, not real credentials.
+_ROTATION_TOKEN_A = "server-test-rotation-" + "c" * 22
+_ROTATION_TOKEN_B = "server-test-rotation-" + "d" * 22
+
+
+class _StubNetworkServer:
+    """Socket-free stand-in for the built network server.
+
+    ``main`` stamps ``settings.host``/``settings.port`` onto whatever
+    ``build_server`` returns, so the stub only has to carry those.
+    """
+
+    def __init__(self) -> None:
+        """Start with mutable settings and nothing bound."""
+        self.settings = SimpleNamespace(host=None, port=None)
+
+
+def _stub_network_startup(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Route the network branch away from sockets; return the served-server log.
+
+    Mirrors ``_stub_build_server`` in ``tests/test_mcp_remote.py``: a guard that
+    fails to fire then shows up as an unexpected entry in the log rather than as
+    a real bind that hangs the run.
+
+    Args:
+        monkeypatch: The active monkeypatch fixture.
+
+    Returns:
+        A list that records each server handed to ``_serve_network``.
+    """
+    from creek_mcp import server as server_module
+
+    served: list[object] = []
+    monkeypatch.setattr(
+        server_module, "build_server", lambda **_kwargs: _StubNetworkServer()
+    )
+    monkeypatch.setattr(
+        server_module, "_serve_network", lambda server, _args: served.append(server)
+    )
+    return served
+
+
+def test_network_startup_announces_an_open_rotation_window_on_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A consumer holding two tokens is announced — by name and count, on stderr.
+
+    The notice is compared against the verifier's own ``rotation_notice()`` for
+    the same configuration, so ``main`` is pinned to *emit the shared message*
+    rather than to a second wording that could drift from it.
+    """
+    from creek_mcp import server as server_module
+
+    raw = f"adepthood={_ROTATION_TOKEN_A},{_ROTATION_TOKEN_B}"
+    monkeypatch.delenv(ELEVATED_TOKEN_ENV, raising=False)
+    monkeypatch.setenv(CONSUMER_TOKENS_ENV, raw)
+    served = _stub_network_startup(monkeypatch)
+
+    server_module.main(["--transport", "network", "--host", "127.0.0.1"])
+
+    captured = capsys.readouterr()
+    assert len(served) == 1  # it announced and then served, not instead of serving
+    expected = ConsumerTokenVerifier(
+        load_consumer_tokens({CONSUMER_TOKENS_ENV: raw})
+    ).rotation_notice()
+    assert expected is not None
+    assert expected in captured.err
+    assert "adepthood" in captured.err  # the consumer mid-rotation is named
+    assert "2" in captured.err  # ...with its token count
+    assert _ROTATION_TOKEN_A not in captured.err  # NEVER echo a token value
+    assert _ROTATION_TOKEN_B not in captured.err
+    assert captured.out == ""  # stdout belongs to JSON-RPC, not to notices
+
+
+def test_network_startup_is_silent_when_no_rotation_window_is_open(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One token per consumer is the steady state, and the steady state says nothing.
+
+    A notice on every start is a notice operators stop reading, at which point
+    the one that matters goes unread too.
+    """
+    from creek_mcp import server as server_module
+
+    monkeypatch.delenv(ELEVATED_TOKEN_ENV, raising=False)
+    monkeypatch.setenv(CONSUMER_TOKENS_ENV, f"adepthood={_STRONG_CONSUMER_TOKEN}")
+    served = _stub_network_startup(monkeypatch)
+
+    server_module.main(["--transport", "network", "--host", "127.0.0.1"])
+
+    captured = capsys.readouterr()
+    assert len(served) == 1
+    assert captured.err == ""
+    assert captured.out == ""
