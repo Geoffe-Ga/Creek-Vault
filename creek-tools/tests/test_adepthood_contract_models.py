@@ -1349,3 +1349,34 @@ def test_models_module_reads_no_files() -> None:
         and isinstance(node.func, ast.Name | ast.Attribute)
     }
     assert called & readers == set()
+
+
+def test_every_contract_version_earns_a_change_log_row() -> None:
+    """The running version is documented in the ADR's change log (#1246).
+
+    A bump with no row is a version string a consumer cannot interpret:
+    they can see the number moved and not what moved with it. The two
+    existing ADR pins check the *header* line; this one checks that the
+    table a consumer actually reads to decide whether to care has caught
+    up too.
+    """
+    text = ADR_PATH.read_text(encoding="utf-8")
+    row = rf"^\| `{re.escape(CONTRACT_VERSION)}` \| \d{{4}}-\d{{2}}-\d{{2}} \| \S"
+    assert re.search(row, text, re.MULTILINE) is not None, (
+        f"the change log has no row for {CONTRACT_VERSION}"
+    )
+
+
+def test_the_compatibility_window_only_ever_widens() -> None:
+    """Every minor ever served is still served (#1023, #1246).
+
+    :data:`SUPPORTED_CONTRACT_MINORS` is the promise that a bump does
+    not strand existing clients, and the promise is only worth anything
+    if it is checked *per bump* rather than restated. Each entry here
+    was the current minor once; dropping one means a client that used
+    to be answered now gets ``incompatible_version``, which is a
+    deliberate breaking change and must not happen by omission when
+    somebody bumps :data:`CONTRACT_VERSION` and forgets this tuple.
+    """
+    for retired_minor in ("0.2", "0.3"):
+        assert retired_minor in SUPPORTED_CONTRACT_MINORS

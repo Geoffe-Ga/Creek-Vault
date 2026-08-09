@@ -418,6 +418,22 @@ Operational rules:
   entry to `mcp.jsonl`, so a token-less probe leaves a trail. The
   `auth_token` value never enters the audit log — only the
   refusal-or-success outcome and the structured args summary.
+- **`status` has three values, not two (#1246, contract `0.4`).**
+  `refused` means the gate said no and nothing was touched. `ok` means
+  the erasure is complete. `partial` means the operation ran to the end
+  and something it promised to erase is **still on disk** — read
+  `voice_body_undecodable` for the fragment ids, and re-run
+  `creek report --type voice` to regenerate `07-Voice/`. Treat anything
+  that is not `ok` as work still owed; a client that only knows
+  `ok`/`refused` will fall through its branches rather than read an
+  incomplete erasure as a clean one.
+- **The payload carries every `PurgeResult` field.** It is derived from
+  the model rather than hand-picked, so a counter added to the engine
+  reaches you without a second change here. That includes the ones a
+  hand-maintained list had dropped: `embeddings_removed`,
+  `provenance_scrubbed`, `intimate_stubs_removed`,
+  `journal_staged_removed`, `voice_artifacts_removed` and
+  `voice_body_undecodable`.
 
 Example `.mcp.json` for a Claude Code instance configured for
 destructive ops (replace the token with a freshly generated one — the

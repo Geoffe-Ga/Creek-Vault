@@ -21,12 +21,21 @@ The five tools mirror the CLI:
 absolute path of the target vault back via ``confirm_vault_path``,
 mirroring the CLI's interactive prompt. Both the token and the
 confirmation are required — neither alone is sufficient.
+
+**Three statuses, not two** (#1246). ``refused`` means the gate said no
+and nothing was touched. ``ok`` means the erasure is complete.
+``partial`` means the operation ran to the end and something it
+promised to erase is still on disk — read ``voice_body_undecodable``
+for the fragment ids. The engine has always recorded that distinction
+in ``purge.jsonl`` and the CLI has always printed it; this surface used
+to report every non-refusal as ``ok``, which made it the one place an
+incomplete erasure looked clean. See :data:`_ENGINE_STATUS_TO_WIRE`.
 """
 
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from creek.purge import PurgeEngine
 from creek.purge.engine import VAULT_PURGE_CONFIRMATION, PurgeResult
@@ -36,6 +45,8 @@ from creek_mcp.tier_ceiling import TierCeiling
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from creek.purge.audit import PurgeOutcomeStatus
 
 _FRAGMENT_TOOL = "creek.purge.fragment"
 _SOURCE_TOOL = "creek.purge.source"
@@ -47,6 +58,33 @@ _REFUSAL_NO_TOKEN = (
     "elevated authorization required: set CREEK_MCP_ELEVATED_TOKEN on the "
     "server and pass a matching auth_token"
 )
+
+_ENGINE_STATUS_TO_WIRE: Final[dict[PurgeOutcomeStatus, str]] = {
+    "complete": "ok",
+    "partial": "partial",
+}
+"""Wire spelling of :attr:`PurgeResult.outcome_status` (contract 0.4).
+
+Three values now reach a caller of ``creek.purge.*``: ``refused`` (the
+gate said no and nothing was touched), ``ok`` (the erasure is complete),
+and ``partial`` (the operation finished, and something it promised to
+erase is still on disk — see ``voice_body_undecodable``).
+
+The mapping is not the identity because the two halves have different
+back-compatibility obligations. ``complete`` keeps the ``ok`` spelling
+every existing client already branches on; ``partial`` is new, and a
+client that does not know it will fall through its ``ok``/``refused``
+branches rather than mistake an incomplete erasure for a clean one.
+Failing an unknown-status check is the safe direction here — silently
+reading ``partial`` as success is the defect #1246 reports.
+
+Adding the member moves the *tool surface's* semantics, so it carries a
+``CONTRACT_VERSION`` minor bump (0.3.0 → 0.4.0) with 0.3 and 0.2 still
+served (:data:`creek_mcp.api.models.SUPPORTED_CONTRACT_MINORS`). No
+``/v1`` HTTP shape changes: ``creek.purge.*`` is gated by the elevated
+token, is out of the Adepthood surface per the contract ADR, and
+appears in no route or published schema.
+"""
 
 
 def _refusal(
@@ -112,21 +150,33 @@ def _result_payload(
     tool: str,
     result: PurgeResult,
 ) -> dict[str, Any]:
-    """Render a :class:`PurgeResult` as the structured tool response."""
+    """Render a :class:`PurgeResult` as the structured tool response.
+
+    Every field of the model is forwarded, because the payload's field
+    set is *derived* from :class:`PurgeResult` rather than hand-picked.
+    The hand-picked subset this replaces had silently dropped six fields
+    by the time #1246 counted them — including
+    ``voice_body_undecodable``, a non-empty list naming the fragments
+    whose derived voice artifacts were **not** swept. A caller that
+    cannot see that field cannot know the erasure was incomplete, and
+    the field went missing precisely because a human had to remember to
+    add it. Now nobody has to: add a field to ``PurgeResult`` and it
+    reaches the caller.
+
+    ``status`` and ``tool`` are the two keys that are *not* model
+    fields — they describe the call, not the result — so they are
+    written after the dump and win any future name collision. That is
+    deliberate: a ``PurgeResult.status`` would be answering a different
+    question (engine outcome, ``complete``/``partial``) than this one
+    (call outcome, including refusals the engine never saw), and the
+    wire meaning of ``status`` must not shift under an existing client.
+
+    See :data:`_ENGINE_STATUS_TO_WIRE` for the two success spellings.
+    """
     return {
-        "status": "ok",
+        **result.model_dump(mode="json"),
+        "status": _ENGINE_STATUS_TO_WIRE[result.outcome_status],
         "tool": tool,
-        "operation": result.operation,
-        "target": result.target,
-        "criteria": dict(result.criteria),
-        "affected_fragment_ids": list(result.affected_fragment_ids),
-        "fragments_affected": result.fragments_affected,
-        "deleted_files": list(result.deleted_files),
-        "wikilinks_removed": result.wikilinks_removed,
-        "threads_updated": result.threads_updated,
-        "eddies_updated": result.eddies_updated,
-        "classifications_reset": result.classifications_reset,
-        "dry_run": result.dry_run,
     }
 
 

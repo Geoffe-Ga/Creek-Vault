@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING
 import frontmatter
 import pytest
 
+from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog
+from creek.purge.engine import PurgeResult
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tools.purge import (
     purge_classifications_tool,
@@ -515,3 +517,126 @@ def test_purge_refused_when_configured_token_is_sub_minimum(
     assert "32" not in reason  # no config oracle: never disclose the floor
     assert "chars" not in reason  # nor the observed length
     assert weak_token not in reason  # nor, obviously, the token itself
+
+
+# ---------------------------------------------------------------------------
+# The payload tells the whole truth (#1246)
+# ---------------------------------------------------------------------------
+
+
+def _make_the_voice_sweep_fall_short(vault_path: Path) -> None:
+    """Set the vault up so ``purge_fragment`` completes but erases partially.
+
+    Two ingredients. A ``07-Voice/`` directory, because the derived-
+    artifact sweep is skipped entirely when the voice root does not
+    exist. And bytes past the closing ``---`` that are not valid UTF-8,
+    so the frontmatter still parses (the fragment still matches the
+    purge criteria) while the strict body re-read the content-keyed
+    profile pass depends on raises — which is exactly the shortfall
+    :attr:`~creek.purge.engine.PurgeResult.voice_body_undecodable`
+    exists to name.
+    """
+    (vault_path / "07-Voice").mkdir(exist_ok=True)
+    frag_file = vault_path / "01-Fragments" / "Notes" / "frag-001.md"
+    frag_file.write_bytes(frag_file.read_bytes() + b"\xff\xfe")
+
+
+def _purge_frag_001(vault_path: Path) -> dict[str, object]:
+    """Purge the seeded fragment through the MCP tool with a valid token."""
+    return purge_fragment_tool(
+        vault_path=vault_path,
+        fragment_id="frag-001",
+        auth_token=ELEVATED_TOKEN,
+        consumer="claude-code",
+    )
+
+
+def _last_purge_outcome(vault_path: Path) -> PurgeAuditEntry:
+    """Return the engine's final ``outcome`` line from ``purge.jsonl``."""
+    outcomes = [e for e in PurgeAuditLog(vault_path).read() if e.phase == "outcome"]
+    assert outcomes, "the engine must have written an outcome line"
+    return outcomes[-1]
+
+
+def test_a_partial_erasure_is_not_reported_as_ok(vault: Path) -> None:
+    """An erasure that fell short must not be certified as success.
+
+    The engine finished without raising, so every count in the payload
+    is real — and a ``07-Voice/<register>-profile.md`` may still quote
+    the fragment. ``ok`` would tell the caller the opposite.
+    """
+    _make_the_voice_sweep_fall_short(vault)
+
+    payload = _purge_frag_001(vault)
+
+    assert payload["status"] == "partial"
+
+
+def test_the_mcp_status_agrees_with_the_audit_outcome_line(vault: Path) -> None:
+    """The two surfaces must not describe the same purge differently.
+
+    ``purge.jsonl`` is the compliance record and the MCP payload is what
+    the operator's client sees; the field is even spelled ``status`` on
+    both. One saying ``partial`` while the other says ``ok`` is the
+    defect, so the agreement is asserted rather than each half alone.
+    """
+    _make_the_voice_sweep_fall_short(vault)
+
+    payload = _purge_frag_001(vault)
+
+    assert _last_purge_outcome(vault).status == "partial"
+    assert payload["status"] == "partial"
+
+
+def test_the_payload_names_the_fragments_the_sweep_could_not_reach(
+    vault: Path,
+) -> None:
+    """Ids, so the caller can act — a bare ``partial`` is not actionable."""
+    _make_the_voice_sweep_fall_short(vault)
+
+    payload = _purge_frag_001(vault)
+
+    assert payload["voice_body_undecodable"] == ["frag-001"]
+
+
+def test_a_complete_erasure_still_reports_ok(vault: Path) -> None:
+    """The success spelling is unchanged, so existing callers keep working."""
+    payload = _purge_frag_001(vault)
+
+    assert payload["status"] == "ok"
+    assert payload["voice_body_undecodable"] == []
+
+
+def test_every_purge_result_field_reaches_the_caller(vault: Path) -> None:
+    """The payload's field set is derived from the model, not hand-picked.
+
+    A hand-maintained subset is the drift mechanism that lost six fields
+    between #845 and #1211. This assertion is the tripwire: add a field
+    to :class:`~creek.purge.engine.PurgeResult` and forget the payload,
+    and this test — not a caller reading a silently-truncated erasure
+    report — is what notices.
+    """
+    payload = _purge_frag_001(vault)
+
+    missing = set(PurgeResult.model_fields) - set(payload)
+    assert missing == set()
+
+
+def test_the_previously_dropped_counters_reach_the_caller(vault: Path) -> None:
+    """The six fields #1246 found missing, named one by one.
+
+    The field-set tripwire above would pass if someone re-hardcoded a
+    list that happened to be complete today; these are the specific
+    fields whose absence made an incomplete erasure unreadable.
+    """
+    payload = _purge_frag_001(vault)
+
+    for field in (
+        "embeddings_removed",
+        "provenance_scrubbed",
+        "intimate_stubs_removed",
+        "journal_staged_removed",
+        "voice_artifacts_removed",
+        "voice_body_undecodable",
+    ):
+        assert field in payload, f"{field} never reaches the MCP caller"
