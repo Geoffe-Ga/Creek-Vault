@@ -2213,8 +2213,8 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
     :func:`~creek.classify.tags_pass.has_unrecorded_tags` answers in the
     same normalised space the merge works in — comparing raw strings
     would report ``tags: [Recovery]`` beside a body reading ``#recovery``
-    as a gap and bill the operator for a paid ``--force`` run that
-    changes nothing. Computing it here rather than in its own function is
+    as a gap and send the operator off to run a backfill that changes
+    nothing. Computing it here rather than in its own function is
     what keeps it free — it rides the walk the other two already pay for,
     and must never become a second pass over 35k files.
 
@@ -2430,15 +2430,21 @@ def _hint_tags_backfill(
     config-oracle rule, #846 / #848), and the tags are the most
     disclosive of the three.
 
-    The named remedy is ``creek classify --method llm --force``, and its
-    token cost is stated. It is deliberately **not**
-    ``--method rules --force``, which would be free: on this path
+    The named remedy is a bare ``creek classify`` (#1207), and it is free:
+    the resume short-circuit preserves every ``llm``/``manual``-stamped
+    fragment — no provider call, no re-classification — while
+    :func:`creek.classify.classify_engine._write_tags_only` backfills the
+    ``tags`` key and nothing else.
+
+    Two commands it deliberately does **not** name, both of which it used
+    to. ``--method llm --force`` works but re-sends the vault to the
+    configured provider to recover data already on local disk.
+    ``--method rules --force`` is free but destructive: on that path
     :func:`creek.classify.classify_engine._classify_one` returns
     :meth:`~creek.classify.rules.RuleClassifier.classify`'s answer, which
     overwrites ``frequency`` / ``wavelength`` / ``voice`` wholesale and
-    re-stamps ``classification_method: rules``. On a vault already
-    classified by an LLM that trades every considered classification for
-    keyword output — a catastrophic price for a tag.
+    re-stamps ``classification_method: rules``, trading every considered
+    LLM classification for keyword output.
 
     Args:
         vault_path: Vault root.
@@ -2454,9 +2460,9 @@ def _hint_tags_backfill(
     console.print(
         f"[dim][fill] {backfillable} fragment(s) carry hashtags in their body "
         "that `tags` does not record (ingested before the field had a "
-        "producer). Run `creek classify --method llm --force` to backfill — "
-        "that re-sends those fragments to the configured provider and costs "
-        "tokens.[/dim]",
+        "producer). Run `creek classify` (no --force) to backfill — it is "
+        "free: already-classified fragments keep their classification and "
+        "gain only the tags.[/dim]",
     )
 
 
@@ -4573,6 +4579,7 @@ def draft(
     from creek.generate.ai_style.fingerprint import load_fingerprint
     from creek.generate.ai_style.preamble import build_style_preamble
     from creek.generate.drafts import DraftGenerator
+    from creek.generate.grounding import GroundingThresholds, default_embedding_fn
     from creek.generate.mining import IdeaMiner
 
     vault_path = _resolve_vault(vault)
@@ -4610,6 +4617,13 @@ def draft(
         privacy_override=override,
         bypass_compiled=bypass_compiled,
         ontology_twist=ontology_twist,
+        # FEAT-032 grounding guard. Both kwargs are required together — the
+        # generator skips the guard entirely if either is missing, which is
+        # exactly how it stayed dormant on this path until #1040. The model
+        # loads lazily inside the factory, so an offline host pays nothing
+        # here and the generator degrades with a warning when it does.
+        embedding_fn=default_embedding_fn(vault_config.embeddings),
+        grounding_thresholds=GroundingThresholds.from_config(vault_config.draft),
         fingerprint=fingerprint,
         ai_style_config=ai_style,
         voice_guard_no_llm=no_llm,

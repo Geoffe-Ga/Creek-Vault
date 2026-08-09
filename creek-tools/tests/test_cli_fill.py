@@ -770,6 +770,42 @@ def test_fill_hints_when_tags_can_be_backfilled(
     assert "week ahead" not in out
 
 
+def test_tags_hint_names_the_free_backfill_not_the_paid_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The remedy the hint names must be the free one (#1207).
+
+    Under #878 this line said ``creek classify --method llm --force`` and
+    stated its token cost, because the preserved short-circuit did not
+    tag. Since #1207 it does, through a narrow tags-only write, so a bare
+    ``creek classify`` backfills an ``llm``-stamped vault for nothing.
+    Naming ``--force`` now would bill the operator for a full
+    re-classification to recover data already on local disk — asserted
+    absent, alongside the paid framing, because a stale remedy in an
+    advisory line is worse than no line at all.
+    """
+    from creek.cli import _maybe_upgrade_classification
+
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", lambda *_a: None)
+    vault = tmp_path / "vault"
+    _seed_tagged_fragment(vault, "frag-gap", body=_TAGS_SIGNAL_BODY, tags="[]")
+
+    _maybe_upgrade_classification(
+        vault,
+        cli_mod._load_config_for_vault(vault),
+        upgrade=False,
+    )
+
+    # Rich soft-wraps at the console width, so collapse whitespace before
+    # matching — otherwise the assertion is really about line breaks.
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Run `creek classify` (no --force) to backfill" in out
+    assert "--method llm --force" not in out
+    assert "token" not in out.lower()
+
+
 def test_tags_hint_is_silent_when_every_hashtag_is_already_recorded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

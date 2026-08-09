@@ -76,16 +76,22 @@ runtime version string it is a prefix of. Compatibility is negotiated at minor
 granularity: a patch bump is invisible to the consumer, a minor bump is not.
 """
 
-SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (CONTRACT_MINOR, "0.2")
+SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (CONTRACT_MINOR, "0.3", "0.2")
 """Every contract minor this server can still serve.
 
-The widening this constant's shape anticipated has happened: contract 0.3
-(#1023) added the ``creek.upload`` *MCP* tool and changed no ``/v1`` wire
-shape, so ``0.2`` is retained and every client already sending
-``X-Creek-Contract-Version: 0.2`` keeps being served. It is a *list* on the
-wire because the compatibility window is expected to widen before it ever
-narrows, and the client needs to see the whole window without a second round
-trip. Drop an entry only when a ``/v1`` shape actually stops being served.
+The widening this constant's shape anticipated has happened twice, and both
+times for the same reason: the *MCP tool surface* moved while no ``/v1`` wire
+shape did. Contract 0.3 (#1023) added the ``creek.upload`` tool; contract 0.4
+(#1246) gave ``creek.purge.*`` a third status, ``partial``, so an erasure that
+fell short stops reporting unqualified ``ok``. Neither touched a route, a
+published schema, or an existing ``/v1`` response, so ``0.3`` and ``0.2`` are
+both retained and every client already sending
+``X-Creek-Contract-Version: 0.2`` keeps being served.
+
+It is a *list* on the wire because the compatibility window is expected to
+widen before it ever narrows, and the client needs to see the whole window
+without a second round trip. Drop an entry only when a ``/v1`` shape actually
+stops being served.
 """
 
 OK_STATUS: Final[Literal["ok"]] = "ok"

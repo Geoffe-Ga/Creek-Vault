@@ -646,6 +646,17 @@ class FragmentSource(BaseModel):
     channel: str | None = None
     interlocutor: str | None = None
     author: Authorship = Authorship.SELF
+    # Issue #1229: the free-text name a source document carries — a DOCX
+    # ``core_properties.author``, a PDF ``/Author``. It answers "what name is on
+    # the file", which is a *different question* from ``author`` ("whose views
+    # does this stand for?") and from ``author_slug`` (which identity folder
+    # governs it). Keeping the three apart is the whole point: writing a name
+    # into ``author`` fails enum validation, and writing one into ``author_slug``
+    # would silently relocate the fragment into ``11-Other-Authors/<name>/`` and
+    # zero its voice weight. This slot is inert — nothing routes or classifies on
+    # it — so a name can be recorded without deciding anything on the owner's
+    # behalf, and promoted to a real ``author_slug`` later if they choose.
+    author_name: str | None = None
     # FEAT-041 §7.4: the `11-Other-Authors/<slug>/` folder this fragment came
     # from, or ``None`` for a native self/owner fragment. Distinct from
     # ``author`` (the self|ai|other|collaborative axis), which is unchanged.
