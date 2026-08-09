@@ -172,6 +172,41 @@ def _pyproject() -> dict[str, Any]:
         return tomllib.load(handle)
 
 
+def _floor_default(script: Any, env_var: str) -> str:
+    """Return the ``major.minor`` default of a ``${VAR:-x.y}`` shell fallback.
+
+    Reads the value out of the script rather than pinning the literal, so a
+    reformat is fine but a silently-raised floor is not.
+
+    Args:
+        script: Path to the shell script to read.
+        env_var: Name of the environment variable whose default to extract.
+
+    Returns:
+        The default version string, e.g. ``"3.11"``.
+    """
+    pattern = re.compile(rf"\$\{{{re.escape(env_var)}:-([0-9]+\.[0-9]+)\}}")
+    match = pattern.search("\n".join(_non_comment_lines(script)))
+    assert match is not None, f"no ${{{env_var}:-x.y}} default found in {script}"
+    return match.group(1)
+
+
+def _requires_python_floor() -> str:
+    """Return the ``major.minor`` floor of pyproject's ``requires-python``.
+
+    This is the single source both the pylint and refurb version pins are
+    checked against, so raising the supported floor in one place fails the
+    gate tests until the linters are moved with it.
+
+    Returns:
+        The minimum supported version, e.g. ``"3.11"``.
+    """
+    requires = str(_pyproject()["project"]["requires-python"])
+    match = re.search(r"([0-9]+\.[0-9]+)", requires)
+    assert match is not None, f"cannot read a floor out of requires-python {requires!r}"
+    return match.group(1)
+
+
 def test_scanner_config_files_all_exist() -> None:
     """Guard the path constants so no other test can pass vacuously."""
     for path in (
@@ -215,13 +250,88 @@ def test_ci_bandit_step_scans_creek_mcp() -> None:
 
 
 def test_pylint_script_lints_creek_mcp() -> None:
-    """Both pylint invocations in scripts/pylint.sh must include creek_mcp/."""
+    """The pylint invocation in scripts/pylint.sh must include creek_mcp/."""
     script = SCRIPTS_DIR / "pylint.sh"
     lines = _command_lines(script, r"python -m pylint")
-    assert len(lines) >= 2, (
-        f"expected the gating and JSON-snapshot pylint runs, got {lines!r}"
-    )
+    assert lines, f"no `python -m pylint` invocation found in {script}"
     _assert_targets_both_packages(lines, "scripts/pylint.sh")
+
+
+def test_pylint_script_analyses_the_tree_exactly_once() -> None:
+    """scripts/pylint.sh must not re-scan the codebase for the JSON artifact.
+
+    Issue #1141: this script used to run the full analysis twice whenever
+    ``--json`` was passed — once to gate, once more to write an explicitly
+    non-gating snapshot — and CI passes ``--json``. That second pass was
+    ~167 of the CI step's 334 seconds, on the critical path, on every one
+    of the three matrix legs, and nothing consumed its output.
+
+    Pylint emits several formats from one run, so the artifact is free. This
+    test is the ratchet: the obvious "just add another call for the JSON"
+    regression reintroduces half the cost invisibly, because both spellings
+    produce the same file and the same exit code.
+    """
+    script = SCRIPTS_DIR / "pylint.sh"
+    lines = _command_lines(script, r"python -m pylint")
+    assert len(lines) == 1, (
+        "scripts/pylint.sh must analyse the tree exactly once; a second "
+        f"`python -m pylint` doubles the CI critical path: {lines!r}"
+    )
+    assert "--output-format" in lines[0], (
+        f"the single pylint run must carry --output-format: {lines[0]!r}"
+    )
+    # The multi-format spelling lives in the OUTPUT_FORMAT assignment the
+    # invocation above expands, so probe the script body rather than the
+    # command line — the point is that the artifact comes from THIS run.
+    body = "\n".join(_non_comment_lines(script))
+    assert "json:" in body, (
+        "scripts/pylint.sh must build a `json:PATH,…` multi-format so the "
+        "artifact falls out of the gating run instead of a second analysis"
+    )
+
+
+def test_pylint_gate_pins_the_supported_python_floor() -> None:
+    """Pylint's version-dependent checks must target the oldest supported Python.
+
+    ``--py-version`` defaults to the interpreter running pylint. While the
+    gate ran on every matrix leg that was merely wasteful; now that it runs
+    once (issue #1141) an unpinned run would silently check against 3.12
+    only and stop catching code that cannot run on the 3.11 floor that
+    ``requires-python`` promises.
+    """
+    script = SCRIPTS_DIR / "pylint.sh"
+    gating = _command_lines(script, r"python -m pylint")[0]
+    assert "--py-version" in gating, (
+        f"pylint gate no longer pins --py-version: {gating!r}"
+    )
+    floor = _floor_default(script, "PYLINT_PY_VERSION")
+    requires = _requires_python_floor()
+    assert floor == requires, (
+        f"pylint --py-version floor {floor!r} has drifted from "
+        f"pyproject's requires-python floor {requires!r}"
+    )
+
+
+def test_refurb_gate_pins_the_supported_python_floor() -> None:
+    """Refurb must target the oldest supported Python, not the running one.
+
+    Refurb suggests newer idioms as its target version rises, so an
+    unpinned run on 3.13 can demand a rewrite that does not parse on 3.11.
+    Pinning is also what makes the gate interpreter-independent, which is
+    the precondition for running it once instead of once per matrix leg.
+    """
+    script = SCRIPTS_DIR / "lint-refurb.sh"
+    lines = _command_lines(script, r"refurb creek")
+    assert lines, f"no `refurb creek/` invocation found in {script}"
+    assert "--python-version" in lines[0], (
+        f"refurb gate no longer pins --python-version: {lines[0]!r}"
+    )
+    floor = _floor_default(script, "REFURB_PY_VERSION")
+    requires = _requires_python_floor()
+    assert floor == requires, (
+        f"refurb --python-version floor {floor!r} has drifted from "
+        f"pyproject's requires-python floor {requires!r}"
+    )
 
 
 def test_lint_extended_script_lints_creek_mcp() -> None:
