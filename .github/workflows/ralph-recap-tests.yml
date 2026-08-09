@@ -50,6 +50,15 @@ name: Ralph Tooling Tests
 # asserts SKILL.md names every one. Emitter and consumer are two files agreeing
 # in prose, which is exactly what drifted to produce #1202, so a PR that edits
 # either one alone has to run the suite that compares them.
+#
+# .claude/skills/address-feedback/SKILL.md joins them for #1199, and it was the
+# gap the same argument had already been made about twice: the suite asserts that
+# BOTH merge-clearance skills name every login pr-ready.sh's verdict-author
+# allowlist admits (an agent told to find "the review" by author is deciding the
+# same question the gate decides, on the same thread, and its answer feeds a
+# merge) — but only await-claude-review was watched here. So that assertion could
+# have been falsified by a one-line edit to the unwatched file with CI green,
+# which is the unwired-gate failure these two `paths:` lists exist to prevent.
 on:
   push:
     paths:
@@ -59,6 +68,7 @@ on:
       - ".github/workflows/code-review.yml"
       - ".github/workflows/iteration-trigger.yml"
       - ".claude/skills/await-claude-review/SKILL.md"
+      - ".claude/skills/address-feedback/SKILL.md"
   pull_request:
     paths:
       - "scripts/ralph/**"
@@ -67,6 +77,7 @@ on:
       - ".github/workflows/code-review.yml"
       - ".github/workflows/iteration-trigger.yml"
       - ".claude/skills/await-claude-review/SKILL.md"
+      - ".claude/skills/address-feedback/SKILL.md"
 
 permissions:
   contents: read

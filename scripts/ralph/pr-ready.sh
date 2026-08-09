@@ -8,8 +8,9 @@
 #   ready            LGTM (fresh) + CI green + verified current with main → merge now
 #   ready-unreviewed CI green (with real checks that actually passed) + verified
 #                    current with main, but this PR HAS no review gate: NO
-#                    verdict-bearing comment was ever posted on it, Dependabot
-#                    authored it AND pushed its HEAD commit, and `claude-review`
+#                    verdict-bearing comment from an ACCEPTED AUTHOR was ever
+#                    posted on it (#1199), Dependabot authored it AND pushed its
+#                    HEAD commit, and `claude-review`
 #                    reported SKIPPED → the orchestrator decides (see ralph-tick.md)
 #   behind           LGTM (fresh) + CI green, but `main` has landed something
 #                    since the merge base that can invalidate this branch's
@@ -45,7 +46,10 @@
 #                    (address-feedback). This is Gate 4 FAILED — an actionable
 #                    state, distinct from waiting (issue #1097).
 #   awaiting-review  no verdict posted yet, or only a STALE one (it predates the
-#                    HEAD commit, LGTM or not) → wait for (re-)review
+#                    HEAD commit, LGTM or not) → wait for (re-)review. A
+#                    verdict-shaped comment from an account the review pipeline
+#                    cannot post as is not "posted" for this purpose: it is
+#                    skipped at selection and leaves no trace at all (#1199).
 #   optout           `do-not-auto-merge` on the PR or on the issue it closes → the
 #                    loop does not act on this PR AT ALL; a human owns it. Checked
 #                    first, and an unreadable label answer exits 2 rather than
@@ -89,13 +93,18 @@
 # Three conditions beyond "Dependabot authored it" make that safe, because the
 # token's whole justification is "green CI against current main replaces the
 # review":
-#   * NO verdict-bearing comment may exist on the PR — the `verdict_comment_seen`
-#     latch, checked first inside `review_gate_absent` and argued at its own
-#     block further down (#1181). A comment carrying a verdict LINE (whatever
-#     `VERDICT_RE` accepts) is proof that SOMETHING reviewed this PR, so the
-#     shortcut's premise — "there is no review gate to wait for" — is already
-#     false, whatever became of that verdict afterwards: refused for provenance,
-#     stale, or unreadable.
+#   * NO verdict-bearing comment FROM AN ACCEPTED AUTHOR may exist on the PR —
+#     the `verdict_comment_seen` latch, checked first inside
+#     `review_gate_absent` and argued at its own block further down (#1181).
+#     Such a comment carries a verdict LINE (whatever `VERDICT_RE` accepts) and
+#     was posted by an account only the review pipeline can authenticate as, so
+#     it is proof that SOMETHING reviewed this PR and the shortcut's premise —
+#     "there is no review gate to wait for" — is already false, whatever became
+#     of that verdict afterwards: refused for provenance, stale, or unreadable.
+#     "FROM AN ACCEPTED AUTHOR" is load-bearing and is #1199's, not #1181's: an
+#     outsider's verdict-shaped comment is skipped at SELECTION and therefore
+#     latches nothing, because a drive-by commenter must not be able to park
+#     every Dependabot bump at `awaiting-review` forever. See the latch block.
 #   * At least one NON-review check must have actually SUCCEEDED. `gh pr checks`
 #     exits 0 when every check merely skipped, and the test workflows here are
 #     `paths:`-filtered to their own sources — so a `github-actions` ecosystem
@@ -114,8 +123,12 @@
 # SELECTED comment's, so the selector's exclusion of iteration-trigger.yml's
 # summary (ITER_SUMMARY_RE) belongs to THIS guard as much as to the provenance
 # one: before that exclusion, a stale review followed by a fresh summary handed
-# this comparison the SUMMARY's stamp and read as fresh. That hole predates
-# #1181, which masked it (the summary was refused for want of a marker before
+# this comparison the SUMMARY's stamp and read as fresh. The AUTHOR filter
+# (#1199) belongs to it for the identical reason and is the sharper case: with
+# `createdAt` taken from an unfiltered `| last`, an outsider could SUPPLY THE
+# FRESHNESS for somebody else's stale LGTM just by commenting after it. Every
+# field comes off one `$v`, which is what makes that unreachable. That hole
+# predates #1181, which masked it (the summary was refused for want of a marker before
 # freshness was ever consulted) rather than closing it. It is closed and pinned
 # now.
 #
@@ -213,34 +226,35 @@
 # lands the lane back on the normal `ready` path. It is written down because an
 # unnamed behaviour change is how the next reader concludes the latch is a bug.
 #
-# WHAT THIS IS NOT: IT IS NOT AN AUTHORSHIP CONTROL, AND A FORGED VERDICT STILL
-# CLEARS THE GATE. The marker is a public, hard-coded literal, and the parser
-# below checks WHAT the comment says and never WHO said it: the verdict `--jq`
-# selects `createdAt`, the verdict test and the marker, and no author field
-# enters the decision at any point. So anybody who can comment on the
-# PR can write `<!-- creek-review pr=<N> -->` above a `## Verdict: LGTM`, the
-# selector will pick that comment (latest verdict-bearing comment wins), the
-# marker will match, and the lane will print `ready` — exactly as a hand-posted
-# verdict did before #1181. Nothing about forgery got harder here, and a reader
-# who takes the guard for an anti-forgery measure will under-protect the next
-# thing they build on it.
+# WHAT THIS IS NOT: THE MARKER IS NOT AN AUTHORSHIP CONTROL AND NEVER BECAME
+# ONE. It is a public, hard-coded literal, so it proves only what an HONEST
+# verdict attests to: that the comment was produced by a PIPELINE VERSION which
+# runs the workflow-side `reviewed_pr_number` cross-check described above — the
+# control that actually catches #1117's class — so drift, replay and legacy
+# accidents are refused where before they merged. That is a provenance claim
+# about the emitter, not an identity claim about the author, and anybody who can
+# comment can copy the literal.
 #
-# What DID change is what an HONEST verdict attests to: the marker proves the
-# comment was produced by a PIPELINE VERSION that runs the workflow-side
-# `reviewed_pr_number` cross-check described above — the control that actually
-# catches #1117's class — so drift, replay and legacy accidents are refused
-# where before they merged. That is a provenance claim about the emitter, not an
-# identity claim about the author.
+# WHAT DOES CONTROL AUTHORSHIP IS A SEPARATE, LATER GUARD (#1199), and until it
+# landed the sentence here read "a forged verdict still clears the gate" — which
+# was measured true: a forged marked LGTM from an outsider printed `ready`, and a
+# forged LGTM posted AFTER a genuine CHANGES_REQUESTED printed `ready` as well,
+# so one comment could both manufacture an approval and bury a refusal. The
+# verdict selector now admits ONLY comments whose author is in
+# `VERDICT_AUTHORS_JQ` — the two identities code-review.yml's `GH_TOKEN:` can
+# authenticate as — and it does the filtering AT SELECTION, so an outsider's
+# comment is skipped rather than refused and a genuine earlier verdict still
+# governs. The full argument, the alternatives, and the two residuals live at
+# that constant; the two guards COMPOSE (an accepted author still needs a
+# matching marker, and a matching marker still needs an accepted author).
 #
-# Authenticating the verdict's AUTHOR is tracked as #1199 and deliberately NOT
-# done here. It is not the one-liner it looks like: `--json comments` already
-# carries `.author.login` at zero extra API cost, but this repo's emitter posts
-# as `GEOFFE_GA_PAT`'s account when that secret exists and as
-# `github-actions[bot]` when it does not (see the `GH_TOKEN:` fallback in
-# `.github/workflows/code-review.yml`), so the allowlist has two legitimate
-# members whose presence depends on secret availability — and an allowlist that
-# guesses wrong unmarks every verdict in the fleet at once, which is the one
-# failure mode the polarity block below says this guard cannot afford.
+# WHAT AUTHORSHIP STILL DOES NOT COVER, so that no reader over-reads it either:
+# the repo owner can hand-post a verdict, because the emitter posts AS the owner
+# when the PAT exists — and an account with write access can EDIT an accepted
+# author's comment body. Both are named and argued at the constant. Neither is a
+# reason to treat the two guards as weaker than they are: between them they
+# refuse every verdict from an account that cannot post as this pipeline, which
+# is the entire population of "anybody who can comment".
 #
 # TWO ALTERNATIVES CONSIDERED AND REJECTED (recorded here, not as issues, for
 # the same reason the #1160 block below records its own):
@@ -503,6 +517,20 @@
 #     "only a broken EMITTER can do this, and the coupling test catches the
 #     emitter" is only as good as the enumeration of emitters behind it. Before
 #     adding a third consumer of VERDICT_RE, enumerate again.
+#
+#     THAT SELECTOR HAS SINCE GROWN AN AUTHOR DIMENSION (#1199), and the lesson
+#     transfers to it unchanged except in WHICH enumeration has to hold. What
+#     leg (2) newly rests on is the enumeration of ACCEPTED IDENTITIES, and
+#     getting it wrong is the identical correlated failure by another road: an
+#     allowlist missing a member unmarks every verdict in the fleet the day the
+#     emitter authenticates as that member. So it is coupled the same way, by the
+#     same suite — the allowlist's bytes against iteration-trigger.yml's own
+#     selector, and its CARDINALITY against code-review.yml's `GH_TOKEN:`
+#     expression, which is the only thing that makes any login legitimate at all.
+#     A third `|| secrets.OTHER_PAT` therefore goes red on the PR that adds it,
+#     while the author who knows which account that secret is, is still here.
+#     Before adding a fourth consumer of VERDICT_RE — or a third way for the
+#     pipeline to authenticate — enumerate BOTH sets again.
 #
 # Usage:  pr-ready.sh <PR_NUMBER> [--repo <owner/repo>]
 set -euo pipefail
@@ -804,6 +832,169 @@ readonly MARKER_MALFORMED='malformed'
 # instead of silently re-opening the wedge.
 readonly ITER_SUMMARY_RE='(?m)^<!-- iteration-trigger -->[[:space:]]*$'
 
+# ---------------------------------------------------------------------------
+# WHO IS ALLOWED TO SAY IT: THE VERDICT AUTHOR ALLOWLIST (#1199)
+# ---------------------------------------------------------------------------
+# Everything above asks WHAT a comment says. Until this constant existed nothing
+# asked WHO said it, and the header conceded that in writing. The consequence was
+# measured live against the code as it stood, not reasoned about: a forged marked
+# LGTM from an outsider printed `ready`, and a forged LGTM posted AFTER a genuine
+# CHANGES_REQUESTED printed `ready` too. One comment, from any account that can
+# type in the box, could both manufacture an approval and bury a refusal on the
+# script ralph-tick.md merges on.
+#
+# THE SET HAS EXACTLY TWO MEMBERS, AND NOT BY CHOICE. `.github/workflows/
+# code-review.yml`'s Post-review step runs with
+# `GH_TOKEN: ${{ secrets.GEOFFE_GA_PAT || secrets.GITHUB_TOKEN }}`, which has
+# exactly two outcomes: the comment is authored by the PAT's account when the PAT
+# secret exists and by the Actions bot when it does not. Which one appears is a
+# property of secret availability, not of the review — so an allowlist naming
+# only one of them unmarks every verdict in the fleet the day the PAT is rotated
+# out, which is precisely the correlated failure the third-polarity block above
+# says this class of guard cannot afford. test_pr_ready.sh pins the set against
+# that `GH_TOKEN:` expression itself, including its CARDINALITY, so a third
+# `|| secrets.OTHER_PAT` goes red on the PR that adds it rather than silently
+# posting verdicts nothing will ever accept.
+#
+# AND THE BOT'S LOGIN IS SPELLED `github-actions` HERE — NO `[bot]`, NO `app/`.
+# THIS IS THE ONE FACT IN THIS BLOCK THAT WAS MEASURED RATHER THAN REASONED, AND
+# IT CAME BACK THE OPPOSITE OF WHAT EVERY OTHER FILE IN THIS REPO SAYS. The same
+# bot is rendered THREE different ways across the three payloads this pipeline
+# reads, and the difference is the marshalling, not the account. Measured live
+# against PR #943 (a Dependabot lane — Dependabot comments on its own PRs, which
+# is what makes it the cheap probe for a bot-authored COMMENT):
+#
+#   gh pr view 943 --json author   → .author.login          = app/dependabot
+#   gh pr view 943 --json comments → .comments[].author.login = dependabot
+#   gh api repos/…/issues/943/comments → .[].user.login      = dependabot[bot]
+#
+# THIS PARSER READS THE MIDDLE ONE, so the bot member must be the BARE SLUG.
+# `github-actions[bot]` — the spelling `DEPENDABOT_COMMIT_AUTHOR` uses, the
+# spelling both skills use, the spelling the REST-based sibling below needs, and
+# the obvious one to write — is a string `--json comments` CANNOT PRODUCE. Had it
+# shipped, the PAT-absent half of this allowlist would have been dead on arrival:
+# fail-closed, so never a forged merge, but the day `GEOFFE_GA_PAT` lapsed every
+# verdict in the fleet would be skipped by the very member added to hedge exactly
+# that. `app/dependabot` two spellings up is the same trap from the other end and
+# is why `DEPENDABOT_AUTHOR` and `DEPENDABOT_COMMIT_AUTHOR` are two constants
+# rather than one: this file has already been bitten by assuming one login
+# spelling serves two fields. `gh` renders a GraphQL `Bot` actor differently per
+# field, and no amount of reading either API's documentation settles which — only
+# the three commands above do, which is this file's standing rule (see MARKER_RE's
+# engine note and `DEPENDABOT_AUTHOR`'s "read off a live bump").
+#
+# `github-actions` IS NOT SQUATTABLE, and that was checked too rather than
+# assumed, because a bare slug lives in the user-login namespace in a way
+# `dependabot[bot]` does not: `gh api users/github-actions` → 404, and GitHub
+# reserves the slug of a first-party App. The residual — GitHub one day freeing
+# it — would be loud, not silent: the diagnostic below names the observed login on
+# every lane at once.
+#
+# DO NOT REFORMAT THE LINE BELOW. Its bytes are asserted verbatim, with
+# `grep -qF`, against iteration-trigger.yml's own `CLAUDE=` selector — the SECOND
+# merge-clearance path, and the one that WINS when the two disagree (its summary
+# short-circuits await-claude-review's per-event classification, so an author
+# filter here alone would have moved #1199 one file over rather than closed it).
+# A jq array literal is the one form both selectors can hold character for
+# character, which is what makes the coupling checkable instead of inferred from
+# two expressions that "look equivalent". A space after the comma, a reordering,
+# or a shell-side second copy of the same set all break that.
+#
+# WHAT IS ASSERTED IS THE SAME SET, NOT THE SAME BYTES, AND THE DIFFERENCE IS THE
+# POINT. That file reads the REST endpoint, whose `.user.login` spells the bot
+# `github-actions[bot]` — so the two literals are deliberately NOT identical, and
+# a reader who "fixes" the mismatch by copying one over the other breaks whichever
+# file they copied into, silently and fleet-wide. test_pr_ready.sh therefore pins
+# each file against ITS OWN payload's spelling and pins the divergence itself, so
+# the trap fails a test instead of a fleet.
+#
+# MEMBERSHIP IS EXACT STRING EQUALITY — the whole login and nothing but the
+# login, compared as data — AND NEVER `test()`, which compares it as a PATTERN.
+# `test` is the idiom already in reach (VERDICT_RE, MARKER_RE and ITER_SUMMARY_RE
+# all use it), and it is wrong here twice over. `test` is UNANCHORED, so
+# `test("github-actions")` matches any login merely CONTAINING the slug —
+# `github-actionsb`, `my-github-actions`, `github-actions-ci` — every one of them
+# registrable for the price of a signup. And a login is not pattern-free text:
+# under the REST spelling this set carried until the measurement above,
+# `github-actions[bot]` reads as `github-actions` followed by the character class
+# `[bot]`, one character from {b,o,t}, so even an anchored `test` would have
+# admitted `github-actionsb`. The suite pins that mutant by name — "A7 near-miss
+# login 'github-actionsb'" — alongside `Geoffe-Ga2` (substring), `GEOFFE-GA-X`
+# (case-insensitive), `github-actions ` (trimming / `startswith`), and the two
+# OTHER payloads' spellings of this very bot, `github-actions[bot]` and
+# `app/github-actions`, which must be refused HERE precisely because
+# `--json comments` can never produce them: admitting a string this API cannot
+# emit widens the set for nothing and hides the marshalling trap above.
+#
+# BOTH SIDES ARE `ascii_downcase`d, AND THAT IS A DECISION IN THE DIRECTION OF
+# THE FLEET, NOT OF THE ATTACKER. It admits nothing: GitHub logins are unique
+# case-INSENSITIVELY, so an account differing from an allowlisted one only by
+# case cannot be registered, and every near miss above survives folding
+# unchanged (`geoffe-ga-x` is still not `geoffe-ga`; a trailing space is still a
+# trailing space). What it buys is the cheap hedge against the one failure this
+# guard's polarity cannot afford: if the API ever handed back a login in a
+# casing other than the one hard-coded here, exact byte equality would unmark
+# every verdict on every lane at once. That is the identical trade MARKER_RE
+# makes with its trailing `[[:space:]]*` for CRLF, and it is made the same way
+# here — a correlated fleet-wide hold is worth more than a construct saved.
+#
+# THE INPUT IS `(.author.login // "")`, AND THE `//` IS NOT DEFENSIVE PADDING.
+# GraphQL returns `author: null` for a deleted or ghost account, and a partial
+# payload can leave `{}`; without the default, `test()`/`contains()` on that null
+# would THROW, the whole `--jq` would error, `gh` would exit non-zero, and this
+# script would die mid-classification on every lane carrying such a comment. With
+# it, the login is the empty string, the empty string is in no allowlist, and the
+# comment is skipped. Fails closed, silently, per lane.
+#
+# NO `authorAssociation` CONJUNCT. It looks like free tightening and is not:
+# `github-actions[bot]`'s association is not reliably `OWNER`/`MEMBER`, and a
+# repo transfer would flip the association for EVERYONE at once — a fleet-wide
+# unmark, the failure mode named three paragraphs up. The login is already
+# unforgeable (GitHub sets it; nothing PR-controlled does), so the conjunct adds
+# correlated risk and no strength.
+#
+# NO ENVIRONMENT OVERRIDE. A knob that switches off a merge gate is the
+# anti-bypass shape this repo refuses everywhere else, and it would be reachable
+# from any process that can set a variable before invoking this script. The set
+# is hard-coded and coupled by test; changing it is a reviewed diff.
+#
+# THREE ALTERNATIVES CONSIDERED AND REJECTED, recorded here rather than as issues
+# for the same reason the #1160 and #1181 blocks record their own:
+#   * CORRELATING THE VERDICT WITH A SUCCESSFUL `claude-review` CHECK RUN on the
+#     same HEAD. Pure redundancy under selection-time filtering: the forged
+#     comment is never selected, so there is nothing left to correlate. Nor does
+#     it reach the residual below — "latest wins" would still let a hand-posted
+#     LGTM outrank a genuine CHANGES_REQUESTED, since both would correlate with
+#     the same run. It would put a second rollup correlation on the merge-critical
+#     path and owe its own fail-closed story for every way that lookup can fail.
+#   * MOVING THE EMITTER TO `gh pr review`. `--json comments` returns ISSUE
+#     comments only, so this means rewriting both parsers and the skills that read
+#     them — and the author of a PAT-submitted review is the identical datum,
+#     `Geoffe-Ga`. All of the cost, none of the structural gain.
+#   * AN HMAC / PER-RUN NONCE in the comment body. This is the only thing that
+#     would separate "Geoffe-Ga the pipeline" from "Geoffe-Ga the human", and it
+#     needs a verifier-side secret this script does not have and cannot be given
+#     (it runs on a developer's machine). A STATIC per-run token is not a
+#     substitute: it is replayable onto a forged body, exactly as the header
+#     already says of the #1181 marker.
+#
+# THE RESIDUAL, NAMED PLAINLY — this is what keeps the header's honesty:
+#   * THE REPO OWNER CAN STILL HAND-POST A VERDICT, because the PAT posts AS the
+#     owner and nothing distinguishes the two. They can also merge directly and
+#     rewrite this file, so they are not the threat model; the threat model is
+#     everybody else, and everybody else is now out.
+#   * AN ACCOUNT WITH WRITE/TRIAGE CAN EDIT AN ACCEPTED AUTHOR'S COMMENT BODY.
+#     GitHub exposes that (`includesCreatedEdit`), and refusing every edited
+#     comment was considered and rejected here: a typo fix on a real review would
+#     wedge that lane with no self-heal, which is the wrong trade for a
+#     capability that already implies write access. Filed as a follow-up (#1263)
+#     rather than solved inline, because the fix is a policy question about
+#     edited reviews and not a parser change — and the shape that would actually
+#     close it (refuse only an edit made by an account OTHER than the author, via
+#     the `userContentEdits` history) is a different API call, not a stricter
+#     predicate on the payload this `--jq` already has.
+readonly VERDICT_AUTHORS_JQ='["Geoffe-Ga","github-actions"]'
+
 # `${arr[@]+"${arr[@]}"}` expands to nothing when the array is empty instead of
 # tripping `set -u` on bash 3.2 (stock /bin/bash on macOS).
 gh_args=("$pr" ${repo_args[@]+"${repo_args[@]}"})
@@ -899,11 +1090,11 @@ merge_line="$(gh pr view "${gh_args[@]}" \
 IFS='|' read -r merge_state head_date head_author merge_rest <<<"$merge_line"
 [[ -z "$merge_rest" ]] || { merge_state=""; head_date=""; head_author=""; }
 
-# THREE fields now: "<createdAt>|<isLGTM>|<marker pr= value>". The marker is
-# captured from `$v` — the SAME comment the VERDICT_RE selector above already
-# picked — because a whole-thread question ("does this PR have a matching marker
-# anywhere?") answers yes for every PR that was ever reviewed once, and would
-# vouch for a verdict comment that carries no marker of its own (#1181).
+# FOUR fields now: "<createdAt>|<isLGTM>|<marker pr= value>|<refused author>".
+# The marker is captured from `$v` — the SAME comment the VERDICT_RE selector
+# above already picked — because a whole-thread question ("does this PR have a
+# matching marker anywhere?") answers yes for every PR that was ever reviewed
+# once, and would vouch for a verdict comment that carries no marker (#1181).
 # `[scan(...)] | flatten | first` rather than `capture`: `capture` THROWS on no
 # match, which would turn "this verdict is unattested" — the single most common
 # case while legacy verdicts are still on the fleet — into a failed `gh` call
@@ -926,24 +1117,159 @@ IFS='|' read -r merge_state head_date head_author merge_rest <<<"$merge_line"
 # provenance guard has been masking that since #1181 landed (it refused the
 # summary before freshness was ever consulted) rather than closing it. It is
 # closed now, and pinned.
+#
+# AND THE AUTHOR FILTER IS PART OF THE SAME `select(...)`, ALONGSIDE THAT
+# EXCLUSION, FOR A REASON THAT IS THE WHOLE CORRECTNESS ARGUMENT (#1199).
+# "Select the latest verdict, THEN refuse it if the author is wrong" and "select
+# the latest verdict FROM AN ACCEPTED AUTHOR" agree on every honest lane and
+# differ on exactly the one an attacker controls. Under select-then-blank, a
+# forger who posts a fake LGTM AFTER a genuine CHANGES_REQUESTED BURIES the
+# refusal: the fake is selected, the fields are blanked, and the lane reads
+# `awaiting-review` — an IN_FLIGHT token, so watch-pr.sh sleeps on it and the fix
+# worker the real verdict was owed is never dispatched. One comment, on any lane,
+# at any time, silently downgrades an actionable token to a wait. Filtering at
+# SELECTION leaves the genuine refusal selected, so it still governs and still
+# dispatches address-feedback. Same reasoning one field over for `createdAt`: an
+# implementation that filtered the author for the LGTM flag but took the stamp
+# from the unfiltered `| last` would let the attacker SUPPLY THE FRESHNESS of
+# somebody else's stale review. One `$v`, one comment, every field.
+#
+# THE FOURTH FIELD IS DIAGNOSTIC ONLY, and it is deliberately computed from the
+# UNFILTERED tail: the login of the latest verdict-bearing, non-summary comment
+# if and only if that author is NOT accepted, else empty. It feeds no token, no
+# latch and no freshness comparison — see the stderr block below for why it has
+# to exist at all. It is defined inside this same `--jq` so the allowlist lives
+# in exactly one place: a shell-side second copy of the set is a duplicate that
+# can drift from the one the coupling test greps.
+#
+# BOTH REGEX/JQ ENGINES HAVE BEEN MEASURED TO ACCEPT THESE CONSTRUCTS, because
+# this file's convention is behaviour over documentation-reading (see MARKER_RE's
+# engine note). The `select(((.author.login // "") | ascii_downcase) as $a | …)`
+# shape was run against a live PR through `gh pr view --json comments --jq` —
+# i.e. gojq/RE2, the PRODUCTION engine — and evaluated correctly, and the same
+# shape evaluates correctly under the system `jq` (Oniguruma) the suite runs.
+# HONESTLY: that measures the CONSTRUCTS, not a negative case. The suite's
+# fixtures cover the refusals under Oniguruma only, so the limitation is the
+# one-directional one MARKER_RE's note already concedes — an engine-specific
+# construct passes locally and fails live on every lane at once. `map`,
+# `ascii_downcase` and `index` are common to both by construction.
+#
+# `index` ON AN ARRAY IS ELEMENT EQUALITY, not the substring search the same
+# builtin performs on a string input — the input here is always the allowlist
+# array. It returns the POSITION, so a match on the first member answers `0`,
+# and `0` is TRUTHY in jq (only `false` and `null` are not): the one language
+# where this idiom would silently invert is not this one. It is also the idiom
+# iteration-trigger.yml already uses for its own label membership
+# (`[.labels[].name] | index("do-not-auto-merge")`), so the two clearance paths
+# read the same way as well as accepting the same set.
 verdict_line="$(gh pr view "${gh_args[@]}" \
   --json comments \
-  --jq "([.comments[] | select(.body != null
-                               and ((.body | test(\"$ITER_SUMMARY_RE\")) | not)
-                               and (.body | test(\"$VERDICT_RE\")))] | last) as \$v
+  --jq "[.comments[] | select(.body != null
+                              and ((.body | test(\"$ITER_SUMMARY_RE\")) | not)
+                              and (.body | test(\"$VERDICT_RE\")))] as \$vc
+        | ($VERDICT_AUTHORS_JQ | map(ascii_downcase)) as \$authors
+        | (\$vc | map(select(((.author.login // \"\") | ascii_downcase) as \$a
+                             | \$authors | index(\$a))) | last) as \$v
+        | ((\$vc | last | .author.login) // \"\") as \$latest_login
+        | (if ((\$latest_login | ascii_downcase) as \$a | \$authors | index(\$a))
+           then \"\" else \$latest_login end) as \$refused
         | (\$v.body // \"\") as \$b
         | ((\$b | [scan(\"$MARKER_RE\")] | flatten | first)
            // (if (\$b | test(\"$MARKER_ANY_RE\")) then \"$MARKER_MALFORMED\" else \"\" end)) as \$mk
-        | ((\$v.createdAt // \"\") + \"|\" + ((\$b | test(\"$VERDICT_LGTM_RE\")) | tostring) + \"|\" + \$mk)")"
+        | ((\$v.createdAt // \"\") + \"|\" + ((\$b | test(\"$VERDICT_LGTM_RE\")) | tostring) + \"|\" + \$mk + \"|\" + \$refused)")"
 # Split by FIELD COUNT, exactly like the mergeState answer above and the rollup
-# answer below: an RFC3339 stamp, a jq boolean and a PR number can none of them
-# contain `|`, so a fourth field means the answer is not the shape we asked for
-# and every branch below must fail closed on it. The two-expansion split this
+# answer below: an RFC3339 stamp, a jq boolean, a PR number and a login can none
+# of them contain `|`, so a FIFTH field means the answer is not the shape we asked
+# for and every branch below must fail closed on it. The two-expansion split this
 # replaces (`%%|*` / `#*|`) read `true|100` into the LGTM flag the moment the
 # answer grew its third field — the `|`-seeking class this file has already
 # proven exploitable once.
-IFS='|' read -r verdict_date verdict_lgtm verdict_pr verdict_rest <<<"$verdict_line"
-[[ -z "$verdict_rest" ]] || { verdict_date=""; verdict_lgtm=""; verdict_pr=""; }
+#
+# THE LOGIN IS THE ONE FIELD HERE THAT IS USER-CHOSEN TEXT, so it is the one
+# worth saying WHY about rather than asserting alongside the others: GitHub
+# logins are alphanumeric plus hyphen, and an App's bot login adds only the
+# `[bot]` suffix — no `|` is representable in either. That is a fact about
+# GitHub, and this parser deliberately does not rely on it: a surplus field
+# blanks the whole answer, including the new field, so an attacker who somehow
+# did smuggle a separator buys a wait rather than a shifted field.
+IFS='|' read -r verdict_date verdict_lgtm verdict_pr verdict_refused_author verdict_rest <<<"$verdict_line"
+[[ -z "$verdict_rest" ]] || { verdict_date=""; verdict_lgtm=""; verdict_pr=""; verdict_refused_author=""; }
+
+# --- the skipped-author diagnostic: stderr ONLY (#1199) ---------------------
+# WITHOUT THIS, FILTERING AT SELECTION MAKES AN UNMARKED VERDICT INVISIBLE. That
+# is the price of skipping rather than refusing: the lane behaves exactly as if
+# the comment had never been posted, and "exactly as if nothing happened" is the
+# wrong report when what happened is that the PAT was rotated to an account this
+# allowlist does not name. Every lane in the fleet would print `awaiting-review`
+# — an IN_FLIGHT token, so the watcher sleeps — with nothing anywhere saying why,
+# and the operator's reflex (re-run the review) posts one more comment from the
+# same unrecognised account. That is the correlated fleet-wide failure the
+# third-polarity block says this guard cannot afford, so the guard has to be
+# LOUD about the only symptom it produces.
+#
+# ONE SHAPE IT CANNOT NAME, SO THE CLAIM ABOVE IS BOUNDED HERE RATHER THAN LEFT
+# TO BE DISCOVERED: if the latest verdict-bearing comment's author is `null` — a
+# deleted or ghost account — `$latest_login` is `""`, which is in no allowlist, so
+# the comment is correctly SKIPPED but `$refused` stays empty and nothing is
+# printed. That is a gap in loudness, not in the gate, and it is not reachable by
+# an attacker at post time (an account cannot delete itself between posting and
+# this read). Naming the empty case in the message instead would fire the
+# diagnostic on every lane whose thread merely ends in a chat comment, which is
+# the false-alarm A13 exists to forbid — so the silence is deliberate, and the
+# bound is written down.
+#
+# IT NAMES THE OBSERVED LOGIN AND BOTH ACCEPTED IDENTITIES, because either half
+# alone leaves the operator guessing: the observed login says who spoke, and the
+# accepted pair is what turns "unrecognised" into "rotate the allowlist or the
+# secret". It fires on the CLEARED lane too — a later skipped comment behind an
+# accepted one — since a lane that prints `ready` has no held token to notice
+# instead, and a silent skip there is precisely how a rotated PAT would go
+# unobserved until the whole fleet stalled.
+#
+# STDERR ONLY, and that is not a style preference: stdout carries the one token
+# this script contracts to print, and test_pr_ready.sh's `run()` drops stderr
+# while ~14 cases assert a BARE token. A diagnostic on stdout fails all of them
+# at once and, worse, hands the orchestrator an unparseable answer for a lane
+# that is otherwise fine. One `printf` per LINE with each fact whole within its
+# line, matching the provenance guard's block below: the operator reads this in a
+# log and the suite greps it line by line.
+#
+# WHO ACTUALLY SEES IT, STATED EXACTLY, BECAUSE THE PARAGRAPH ABOVE OVERCLAIMS IF
+# LEFT ALONE. `ralph-tick.md` Step 1 runs `STATUS=$(scripts/ralph/pr-ready.sh
+# "$PR_NUM")`, which captures stdout and lets stderr through — the orchestrator
+# sees this. `watch-pr.sh` does NOT: it calls `bash "$READY" "$pr" 2>/dev/null`,
+# so on the polling path these lines are discarded, and the same is already true
+# of the provenance guard's diagnostic below. That is a real gap in the "be LOUD"
+# argument and it is named rather than papered over — but simply deleting the
+# `2>/dev/null` is the wrong fix and is deliberately NOT done here: that watcher
+# re-runs this script every 30s for up to 30 minutes, so an unconditional
+# passthrough reprints four lines ~60 times per wedged lane, on every lane at
+# once, which is how a message stops being read. Surfacing it once per token
+# CHANGE is the shape that works, it belongs in watch-pr.sh rather than here, and
+# it is filed as #1270. Until then: a rotated PAT is loud in the orchestrator's
+# log and silent in the watcher's.
+#
+# It says SKIPPED rather than refused on purpose. A refused verdict (the
+# provenance guard) blanks fields that were selected; a skipped one was never
+# selected, leaves no trace, and is inert — including in the latch below.
+#
+# THE ACCEPTED SET IS RENDERED FROM THE CONSTANT, NOT RETYPED INTO THE MESSAGE.
+# Spelling the two logins out here would put a second copy of the allowlist in
+# this file, and the copy the operator READS is the one that would drift: a
+# message naming yesterday's identities is worse than no message, because it
+# sends them to change the wrong thing. `$VERDICT_AUTHORS_JQ` prints as the jq
+# array it is, which is also the exact text to paste when the set really must
+# change.
+if [[ -n "$verdict_refused_author" ]]; then
+  {
+    printf 'pr-ready: the latest verdict-bearing comment on PR #%s was posted by `%s`, which is not an account this review pipeline can post as — it was SKIPPED, not refused (#1199).\n' \
+      "$pr" "$verdict_refused_author"
+    printf 'pr-ready:   The accepted verdict authors are %s: the PAT identity when the GEOFFE_GA_PAT secret exists, and the Actions bot when it does not — the two outcomes of code-review.yml Post-review GH_TOKEN.\n' \
+      "$VERDICT_AUTHORS_JQ"
+    printf 'pr-ready:   If that login IS the review pipeline, the PAT has been rotated to an account VERDICT_AUTHORS_JQ does not name, and every lane in the fleet will read `awaiting-review` until it does.\n'
+    printf 'pr-ready:   If it is not, nothing is wrong with this lane: a verdict-shaped comment from an outsider is inert here, and any earlier verdict from an accepted author still decides.\n'
+  } >&2
+fi
 
 # --- the verdict-EXISTED latch, recorded BEFORE the guard blanks (#1181) ----
 # The provenance guard immediately below is about to erase `verdict_date` and
@@ -956,12 +1282,12 @@ IFS='|' read -r verdict_date verdict_lgtm verdict_pr verdict_rest <<<"$verdict_l
 # THE TWO QUESTIONS ARE NOT THE SAME, AND CONFLATING THEM MOVES A LANE TOWARDS
 # MERGING. `ready-unreviewed`'s precondition is "this PR HAS NO REVIEW GATE to
 # wait for" — nobody has reviewed it and nobody ever will. An inadmissible marker
-# says the verdict is UNUSABLE; it does not say the gate is ABSENT. A comment
-# carrying a `## Verdict:` line means SOMETHING reviewed this PR and spoke: the
-# `claude-review` job posted it, or (as the authorship note in the header
-# concedes) a human did. Either way the shortcut's premise is already false, and
-# an unreadable marker is a reason to distrust WHAT was said, never evidence that
-# nothing was.
+# says the verdict is UNUSABLE; it does not say the gate is ABSENT. A SELECTED
+# comment carrying a `## Verdict:` line means SOMETHING reviewed this PR and
+# spoke: the `claude-review` job posted it, or the repo owner hand-posted it as
+# the PAT identity (the residual the allowlist block names). Either way the
+# shortcut's premise is already false, and an unreadable marker is a reason to
+# distrust WHAT was said, never evidence that nothing was said.
 #
 # Without this latch, the one lane where the difference is visible went the wrong
 # way: a Dependabot bump whose every `claude-review` rollup entry really is
@@ -999,27 +1325,55 @@ IFS='|' read -r verdict_date verdict_lgtm verdict_pr verdict_rest <<<"$verdict_l
 # (merge-adjacent) after it.
 #
 # THAT LANE CANNOT OCCUR, and the proof is in the emitter, not in this file:
-# iteration-trigger.yml EXITS EARLY ("No Claude review yet - skipping") unless
-# `[.[] | select(.body | test("(^|\\n)## Verdict:"))] | last` finds a comment. So
-# a summary exists only where a `## Verdict:` comment already does — and every
+# iteration-trigger.yml EXITS EARLY ("No Claude review yet - skipping") unless its
+# own selector finds a `## Verdict:` comment FROM AN ACCEPTED AUTHOR. So a summary
+# exists only where an ACCEPTED-AUTHOR verdict comment already does — and every
 # such comment matches VERDICT_RE (`##` takes the `#{1,6}\s+` alternative, then
 # `verdict`, then `:`), carries no `<!-- iteration-trigger -->` line of its own,
-# and therefore still latches. The latch is left feeding off the SAME corrected
-# selector as everything else; it is deliberately NOT given a looser selector of
-# its own, which would break the same-comment invariant for the sake of a lane
-# that does not exist.
+# and is admitted by the author filter here as well, so it still latches. The
+# invariant did not merely survive #1199, it TIGHTENED: the two selectors now
+# share the allowlist byte for byte (a coupling test asserts it), so the set of
+# comments that can produce a summary is a SUBSET of the set that latches here,
+# which is the direction that keeps this argument sound. The latch is left feeding
+# off the SAME corrected selector as everything else; it is deliberately NOT given
+# a looser selector of its own, which would break the same-comment invariant for
+# the sake of a lane that does not exist.
 #
 # IF THAT EARLY EXIT EVER LEAVES iteration-trigger.yml, this reasoning leaves with
 # it, and the safe move is to fail CLOSED — latch on the summary as well — never
-# to leave the latch reading a selector that can no longer see one.
+# to leave the latch reading a selector that can no longer see one. RE-CHECKED
+# under #1199 and still true: the early exit is still there, and the author filter
+# added to that selector only makes it fire MORE often, never less.
+#
+# AND THE LATCH IS FED BY THE AUTHOR-FILTERED `$verdict_date`, WITH NO CODE
+# CHANGE AT ALL (#1199) — which is a decision, not an omission. Nothing about
+# #1181 re-opens: every comment the selector can still pick is pipeline-authored,
+# so a PIPELINE verdict that the provenance guard blanks set `$verdict_date`
+# first and latches exactly as before. The one lane whose routing changes is a
+# Dependabot bump whose only comment is an OUTSIDER's verdict: previously it
+# latched and printed `awaiting-review`, now it prints `ready-unreviewed`, as if
+# that comment had never been posted. That is CORRECT, and it is not a loosening
+# — `review_gate_absent` still independently demands `app/dependabot` authorship,
+# a Dependabot HEAD commit, at least one non-review SUCCESS, and an all-`SKIPPED`
+# `claude-review` rollup, and not one of those is reachable by commenting.
+#
+# THE GOVERNING PRINCIPLE IS THAT AN UNAUTHORISED COMMENT MUST BE INERT, NOT
+# MERELY NON-CLEARING. An author-BLIND latch ("a verdict-shaped comment exists,
+# so a gate exists") reads as the conservative choice and is not: those bump lanes
+# never get a `claude-review` run — code-review.yml skips the job because Actions
+# secrets are withheld from Dependabot-triggered runs — so no verdict can ever be
+# posted to clear the latch, and no push, sync or re-review self-heals it. One
+# drive-by comment would park the bump forever, and repeating it across the fleet
+# would stop dependency maintenance outright. Handing an outsider a DIFFERENT
+# effect on routing is the same bug class as #1199 itself, one notch quieter.
 #
 # AND IT SITS AFTER THE FIELD-COUNT BLANK, one line up, not before it: a
 # surplus-field answer is not evidence that a verdict exists, it is evidence that
 # the answer is unreadable, and reading a latch out of fields we just refused to
 # trust would be the same mistake in the other direction. The residual — a
 # malformed answer letting a Dependabot lane keep the shortcut — is unreachable
-# by construction, because an RFC3339 stamp, a jq boolean and a `[0-9]+` marker
-# (or the `malformed` sentinel) can none of them contain a `|`.
+# by construction, because an RFC3339 stamp, a jq boolean, a `[0-9]+` marker (or
+# the `malformed` sentinel) and a GitHub login can none of them contain a `|`.
 verdict_comment_seen=""
 [[ -z "$verdict_date" ]] || verdict_comment_seen="yes"
 
