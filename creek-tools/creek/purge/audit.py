@@ -99,6 +99,15 @@ class PurgeAuditEntry(BaseModel):
             name because it is serialised into the append-only
             ``purge.jsonl``, where a rename would break every existing
             log.
+        voice_artifacts_removed: Number of derived ``07-Voice/`` notes
+            deleted because they carried the purged fragment's own
+            content — its ``Register-Samples`` file copy, the
+            ``<register>-profile.md`` quoting its body, and the
+            ``Lexicon`` notes quoting its sentences (#1211). Zero when
+            no voice report has ever run; dry-runs count what *would* be
+            removed. Without this field the outcome line reported a
+            successful erasure while the body survived in a derived
+            artifact.
         operator: Who performed the purge.
         dry_run: Whether the purge was a dry-run preview.
         phase: GAP-002 discriminator. ``"intent"`` is written before
@@ -134,6 +143,7 @@ class PurgeAuditEntry(BaseModel):
     provenance_scrubbed: int = 0
     intimate_stubs_removed: int = 0
     journal_staged_removed: int = 0
+    voice_artifacts_removed: int = 0
     operator: str = _DEFAULT_OPERATOR
     dry_run: bool = False
 
@@ -168,6 +178,7 @@ def _coerce_legacy_entry(raw: dict[str, Any]) -> dict[str, Any]:
     upgraded.setdefault("provenance_scrubbed", 0)
     upgraded.setdefault("intimate_stubs_removed", 0)
     upgraded.setdefault("journal_staged_removed", 0)
+    upgraded.setdefault("voice_artifacts_removed", 0)
     # GAP-002 fields take their schema defaults via Pydantic when
     # absent, so we leave them out here rather than fabricating a
     # phase / operation_id that doesn't correspond to anything on disk.
@@ -337,6 +348,7 @@ class PurgeAuditLog:
             "provenance_scrubbed": 0,
             "intimate_stubs_removed": 0,
             "journal_staged_removed": 0,
+            "voice_artifacts_removed": 0,
             "operator": "system",
             "dry_run": False,
             "migrated_entries": migrated_count,
