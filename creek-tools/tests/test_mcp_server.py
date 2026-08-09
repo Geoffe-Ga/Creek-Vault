@@ -691,9 +691,12 @@ def _patch_build_provider(monkeypatch: pytest.MonkeyPatch, spy: _ProviderSpy) ->
     (the router/reflect import) and via the ``creek.classify.llm`` re-export
     (what :func:`creek.compile.engine.default_llm` imports), so both names are
     patched and the spy records whichever path production actually takes.
+    ``creek.author.client`` binds a third copy at import time, which is the one
+    the Writing Desk's voice factory calls.
     """
     monkeypatch.setattr("creek.classify.llm.providers.build_provider", spy.build)
     monkeypatch.setattr("creek.classify.llm.build_provider", spy.build)
+    monkeypatch.setattr("creek.author.client.build_provider", spy.build)
 
 
 def _split_routing_config() -> object:
@@ -704,7 +707,7 @@ def _split_routing_config() -> object:
     proves the ``generation`` stage (not the ``default``) was consulted.
     """
     from creek.classify.llm.router import ModelRouter
-    from creek.config import LLMConfig, LLMRoutingConfig
+    from creek.config import AuthorConfig, LLMConfig, LLMRoutingConfig
 
     routing = LLMRoutingConfig(
         default=LLMConfig(provider="ollama"),
@@ -716,6 +719,10 @@ def _split_routing_config() -> object:
 
         llm = routing
         model_router = ModelRouter(routing)
+        # ``_build_author_llm`` reads the author block for the legacy
+        # ``voice_model`` fallback; the defaults leave the routing above in
+        # charge, which is what these assertions are about.
+        author = AuthorConfig()
 
     return _Config()
 
@@ -777,6 +784,78 @@ def test_build_compile_llm_routes_by_tier_then_degrades(
     with pytest.raises(RuntimeError) as excinfo:
         server_mod._build_compile_llm(PrivacyTier.OPEN)
     assert "unavailable" in str(excinfo.value).lower()
+
+
+def test_build_author_llm_routes_the_voice_role_through_the_router(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production author factory obeys the same chokepoint as its siblings.
+
+    ``_build_author_llm`` is the seam #1254 extracted out of ``author_tool`` so
+    ``build_server`` could be handed a different one. Extracting it must not
+    quietly change what production does, so the same two-arm assertion the
+    draft and compile factories carry is made here: an ``Intimate`` run is
+    redirected onto the local ``default`` model, and an ``Open`` run resolves
+    the cloud ``generation`` stage.
+
+    The third arm has no sibling. Where draft and compile raise on an
+    unavailable provider, the desk *degrades*: the factory answers ``None`` and
+    the voice node renders deterministically. That is the fallback #460/#649/
+    #658 hid behind, so it is asserted rather than assumed.
+    """
+    from creek.models import PrivacyTier
+    from creek_mcp import server as server_mod
+
+    monkeypatch.setattr(server_mod, "load_config", _split_routing_config)
+    spy = _ProviderSpy()
+    _patch_build_provider(monkeypatch, spy)
+
+    assert server_mod._build_author_llm(PrivacyTier.INTIMATE) is not None
+    assert spy.provider_names == ["ollama"]
+
+    assert server_mod._build_author_llm(PrivacyTier.OPEN) is not None
+    assert spy.provider_names == ["ollama", "anthropic"]
+
+    _patch_build_provider(monkeypatch, _ProviderSpy(available=False))
+    assert server_mod._build_author_llm(None) is None
+
+
+def test_build_server_wires_the_production_author_llm_factory(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``creek.author`` reaches the production factory with none injected (#1254).
+
+    #958's lesson applied to the seam that closes #1254: every other test of
+    this verb now injects ``author_llm_factory``, and an injected factory is
+    exactly what lets a production builder rot while the suite stays green. So
+    the injection point is deliberately left empty and the recording stand-in
+    is installed one level down, on the module attribute ``build_server``
+    resolves — proving the fallback is wired, not merely written.
+
+    The stand-in answers ``None`` (the "no provider" reply), because what is
+    under test is that the factory is *reached*; what it resolves to is the
+    subject of the router test above.
+    """
+    from creek_mcp import server as server_mod
+
+    reached: list[object] = []
+
+    def _recording(tier: object) -> None:
+        """Record the tier the desk asked for and decline to voice."""
+        reached.append(tier)
+        return None
+
+    monkeypatch.setattr(server_mod, "_build_author_llm", _recording)
+
+    server = build_server(vault_path=vault)
+    result = _structured(asyncio.run(server.call_tool("creek.author", {"query": "q"})))
+
+    assert result["status"] == "ok", result
+    assert reached, (
+        "creek.author never called the production voice factory — the verb is "
+        "wired to whatever build_server was handed and nothing else."
+    )
 
 
 def test_build_server_wires_the_production_compile_llm_factory(

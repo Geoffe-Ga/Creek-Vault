@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from creek.author.conductor import VoiceClientFactory
     from creek.classify.prompt import PromptOntology
     from creek.config import CreekConfig
     from creek.generate.ai_style.model import ScanReport, VoiceFingerprint
@@ -4832,6 +4833,26 @@ def _resolve_save_tier(
     return PrivacyTier.OPEN
 
 
+author_llm_factory: VoiceClientFactory | None = None
+"""Injection seam for the ``author`` command's voice client (#1254).
+
+The CLI twin of ``build_server(author_llm_factory=...)``, and it exists for
+the same reason: ``creek author`` otherwise builds its voice client from the
+vault's own config, so on a host with no provider it prints "rendering the
+deterministic stub", exits ``0`` and writes nothing — and *no hermetic test
+could tell that apart from a live run*, because a Typer command has no
+argument through which a Python callable can be handed in. That gap is why
+#1027's wiring contract could only record #460/#649/#658 as an exemption
+instead of asserting against it.
+
+A module attribute rather than a parameter because the seam has to survive
+``CliRunner.invoke(app, argv)``, which passes strings and nothing else;
+``tests/test_wiring_contract.py`` patches it for the length of one run.
+``None`` — the production value, never assigned anywhere in ``creek/`` — keeps
+the config-built factory, so the shipped behaviour is byte-identical.
+"""
+
+
 def _validate_author_inputs(
     medium: str, query: str | None, work: Path | None, supported: frozenset[str]
 ) -> None:
@@ -5000,12 +5021,17 @@ def author(
     # tier* so live voicing of Intimate content is redirected to a local
     # provider by the chokepoint. The factory falls back to ``None``
     # (deterministic stub) when the provider is unavailable.
-    def _voice_client(tier: PrivacyTier | None) -> AuthorLLMClient | None:
+    def _config_voice_client(tier: PrivacyTier | None) -> AuthorLLMClient | None:
         return AuthorLLMClient.for_voice_or_none(
             config.model_router,
             author=config.author,
             tier=tier,
         )
+
+    # #1254: an injected factory wins, which is the only way a test can reach
+    # past the desk. Production never assigns it, so this reads as the config
+    # factory on every real run.
+    _voice_client = author_llm_factory or _config_voice_client
 
     if _voice_client(None) is None:
         console.print(
