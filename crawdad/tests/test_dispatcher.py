@@ -811,6 +811,61 @@ async def test_dispatch_logs_a_warning_when_it_caps(
     assert "VAULT-BODY-SENTINEL" not in warnings[0]
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("intimate", PrivacyTierCeiling.PERSONAL),
+        ("all", PrivacyTierCeiling.PERSONAL),
+        ("ALL", PrivacyTierCeiling.OPEN),
+        ("", PrivacyTierCeiling.OPEN),
+        ("not-a-tier", PrivacyTierCeiling.OPEN),
+    ],
+)
+def test_capped_clamps_an_uncoerced_raw_string_ceiling_without_raising(
+    raw: str,
+    expected: PrivacyTierCeiling,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``_capped`` survives a ceiling pydantic never coerced to a member.
+
+    ``_capped`` is deliberately a function on the dispatch path rather
+    than an :class:`Intent` validator precisely because
+    ``model_construct`` / ``model_copy(update=...)`` sail past
+    validators — so the docstring's "holds for all of them" only means
+    something if the body never assumes an enum instance. It used to:
+    the WARNING interpolated ``requested.value``, which raises
+    ``AttributeError`` on a raw ``str``. That escapes ``AgentLoop.run``
+    (it catches only ``RouterParseError`` / ``UnknownIntentError`` /
+    ``MCPUnavailableError``), silencing the bot — the exact DoS the
+    clamp exists to avoid.
+
+    ``cap_ceiling``'s own raw-string tests cannot catch this: they call
+    it directly and never reach the log line.
+
+    The sentinel pins the #1090 hazard on this path too. ``args`` is
+    router-supplied and the router prompt is where raw MCP tool-result
+    bodies (vault fragments) are rendered, so anything from ``args``
+    reaching an operator log is vault content escaping its tier.
+    """
+    intent = Intent(
+        type="creek.state.read", args={"note": "VAULT-BODY-SENTINEL"}
+    ).model_copy(update={"privacy_tier_ceiling": raw})
+
+    with caplog.at_level(logging.WARNING, logger="crawdad.dispatcher"):
+        capped = dispatcher_module._capped(intent)
+
+    assert capped.privacy_tier_ceiling is expected
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "creek.state.read" in warnings[0]
+    assert expected.value in warnings[0]
+    assert "VAULT-BODY-SENTINEL" not in warnings[0]
+
+
 async def test_dispatch_does_not_log_a_warning_when_nothing_is_capped(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

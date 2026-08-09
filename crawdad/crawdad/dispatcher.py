@@ -297,7 +297,10 @@ def _capped(intent: Intent) -> Intent:
     records for the workflow cap, ``model_construct`` and
     ``model_copy(update=...)`` sail straight past validators, so a
     validator would hold only for the parsed-JSON construction route.
-    A function on the dispatch path holds for all of them.
+    A function on the dispatch path holds for all of them — which is
+    only true if this body never assumes it has an enum instance, so
+    the WARNING below formats the tiers with ``%s`` rather than reading
+    ``.value`` off them.
 
     Returns *intent* unchanged (same object) when its ceiling is already
     admitted, so the common case allocates nothing and the WARNING below
@@ -318,11 +321,20 @@ def _capped(intent: Intent) -> Intent:
     # string with no charset or length constraint. Unquoted, an
     # embedded newline would let a poisoned fragment forge log records
     # in the operator's log.
+    #
+    # ``%s`` on the tiers themselves, never ``.value``: the annotation
+    # says :class:`PrivacyTierCeiling`, but this branch exists precisely
+    # for the ceilings pydantic never coerced, and ``.value`` on a raw
+    # ``str`` raises ``AttributeError`` — an exception the agent loop
+    # does not catch, so the bot goes silent. That is the DoS the clamp
+    # is here to prevent, re-introduced one line below the clamp.
+    # ``PrivacyTierCeiling`` is a ``StrEnum``, so ``%s`` renders the
+    # bare tier for a member and a raw string alike.
     _LOGGER.warning(
         "capped privacy_tier_ceiling for intent %r: requested %s, forwarding %s",
         intent.type,
-        requested.value,
-        capped.value,
+        requested,
+        capped,
     )
     return intent.model_copy(update={"privacy_tier_ceiling": capped})
 
