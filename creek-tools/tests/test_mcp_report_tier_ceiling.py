@@ -645,7 +645,15 @@ _CASES: tuple[_ReportCase, ...] = (
         forbidden_glob="07-Voice/Rhetorical-Patterns/confessional.md",
     ),
 )
-"""Every report type ``creek.report`` exposes, in ``_VALID_TYPES`` order."""
+"""The ceiling-aware report types with a canary fixture, in dispatch order.
+
+Not the whole surface: ``creek.report`` routes all eleven of
+:data:`creek.surface_modes.REPORT_TYPES` (#1253), of which four are refused
+below ``ceiling=all`` precisely *because* their generators cannot be filtered,
+and ``decisions`` / ``mode-profiles`` / ``wavelength`` are ceiling-aware but
+have no canary vault here yet. Completeness of the surface itself is asserted
+by ``tests/test_mcp_write_tools.py``; this list is about leak evidence.
+"""
 
 _CASE_IDS = [case.report_type for case in _CASES]
 
@@ -1474,6 +1482,10 @@ _OVERRIDE_CALL_NAMES = frozenset(
         # ceiling silently dropped at this call site is a verbatim
         # above-ceiling body written to ``07-Voice/Register-Samples/``.
         "generate_register_samples",
+        # #1253: the shared body of ``report --type wavelength`` on both
+        # surfaces. It loads the corpus itself, so a ceiling dropped here is a
+        # phase-map built from above-ceiling fragments.
+        "generate_phase_map",
     },
 )
 """Callables whose new privacy parameter must never be left at its default."""

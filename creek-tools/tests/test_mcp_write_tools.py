@@ -17,10 +17,13 @@ import frontmatter
 import pytest
 
 from creek.classify.llm.router import ModelRouter
+from creek.classify.privacy_filter import PrivacyTierOverride
+from creek.cli import _REPORT_DISPATCH
 from creek.compile.engine import PARADOX_LOG_RELPATH
 from creek.config import LLMConfig, LLMRoutingConfig
 from creek.models import PrivacyTier
 from creek.save import TARGET_SUBDIRS
+from creek.surface_modes import REPORT_TYPES
 from creek_mcp.audit import (
     MCP_AUDIT_RELPATH,
     MCPAuditLog,
@@ -31,7 +34,13 @@ from creek_mcp.tools.classify import classify_tool
 from creek_mcp.tools.compile import _ABOVE_CEILING_REASON, compile_tool
 from creek_mcp.tools.ingest import ingest_tool
 from creek_mcp.tools.link import link_tool
-from creek_mcp.tools.report import report_tool
+from creek_mcp.tools.report import (
+    _MCP_REPORTS,
+    _TIER_BLIND_GENERATORS,
+    _generate_wavelength,
+    _ReportRequest,
+    report_tool,
+)
 from creek_mcp.tools.save import save_tool
 from creek_mcp.tools.skills import skills_refresh_tool
 
@@ -617,6 +626,27 @@ def test_link_refuses_unknown_method(vault: Path) -> None:
     assert "unknown method" in result["reason"]
 
 
+def test_link_reaches_the_threads_linker(vault: Path) -> None:
+    """``method="threads"`` runs the linker instead of refusing (#1252).
+
+    The thread half of #880 — the fix for one thread swallowing 94% of a
+    corpus — was unreachable over MCP because the tool carried a retyped copy
+    of the CLI's method tuple that had lost ``"threads"``. An empty vault is
+    enough to prove reachability: ``run_link`` short-circuits before touching
+    an embedding model, so what is under test is the routing, not the linker.
+
+    Args:
+        vault: Vault fixture.
+    """
+    result = link_tool(
+        vault_path=vault,
+        method="threads",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "ok", result
+    assert result["method"] == "threads"
+
+
 def test_link_runs_temporal_on_empty_vault(vault: Path) -> None:
     """An empty vault returns zero counts and writes one audit entry."""
     result = link_tool(
@@ -640,11 +670,120 @@ def test_report_refuses_unsupported_type(vault: Path) -> None:
     """An unsupported report_type returns a structured refusal."""
     result = report_tool(
         vault_path=vault,
-        report_type="wavelength",
+        report_type="definitely-not-a-report",
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
     assert result["status"] == "refused"
     assert "unsupported report_type" in result["reason"]
+
+
+def test_every_cli_report_type_has_an_mcp_branch() -> None:
+    """``_MCP_REPORTS`` covers the declared surface exactly (#1253).
+
+    The refusal path keys on :data:`creek.surface_modes.REPORT_TYPES`, so a
+    name declared there without a branch here would raise ``KeyError`` across
+    the MCP boundary, and a branch here for a name nobody declares is
+    unreachable. Both are the drift class #1253 filed, one step further along.
+    """
+    assert set(_MCP_REPORTS) == set(REPORT_TYPES), (
+        f"declared-but-unserved: {sorted(set(REPORT_TYPES) - set(_MCP_REPORTS))}; "
+        f"served-but-undeclared: {sorted(set(_MCP_REPORTS) - set(REPORT_TYPES))}"
+    )
+
+
+def test_tier_blind_types_are_a_subset_of_the_declared_surface() -> None:
+    """A tier-blind entry for a name nobody routes refuses nothing (#1253)."""
+    assert set(_TIER_BLIND_GENERATORS) <= set(REPORT_TYPES), (
+        f"not routed: {sorted(set(_TIER_BLIND_GENERATORS) - set(REPORT_TYPES))}"
+    )
+
+
+def test_wavelength_branch_writes_nothing_for_an_unresolvable_period(
+    vault: Path,
+) -> None:
+    """The generator's own period guard holds when called directly.
+
+    :func:`report_tool` refuses an unparseable period before dispatching, so
+    this branch is defensive — and an untested defence is a defence nobody can
+    rely on. Asserted here rather than through the tool for that reason.
+
+    Args:
+        vault: Vault fixture.
+    """
+    written = _generate_wavelength(
+        _ReportRequest(vault_path=vault, override=PrivacyTierOverride.ALL, period=None),
+    )
+    assert written == []
+
+
+@pytest.mark.parametrize("report_type", sorted({*_REPORT_DISPATCH, "wavelength"}))
+def test_report_serves_every_cli_type_at_the_widest_ceiling(
+    vault: Path,
+    report_type: str,
+) -> None:
+    """Every type ``creek report`` routes runs to completion over MCP (#1253).
+
+    ``ceiling=all`` is the ceiling ``creek report`` itself runs under, so this
+    is the parity claim at its strongest: an MCP caller with the operator's own
+    privileges can reach the whole report surface. Four of these types have no
+    tier-filtered generator and are refused *below* this ceiling — that is the
+    next test — but none of them may be missing from the surface entirely,
+    which is the defect #1253 filed.
+
+    Args:
+        vault: Vault fixture.
+        report_type: One CLI-routed report type.
+    """
+    (vault / "10-Liminal" / "Unnamed").mkdir(parents=True, exist_ok=True)
+    result = report_tool(
+        vault_path=vault,
+        report_type=report_type,
+        period="weekly",
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    assert result["status"] == "ok", result
+
+
+@pytest.mark.parametrize(
+    "report_type",
+    ["unnamed", "fingerprint", "paradox", "synchronicity"],
+)
+def test_report_names_tier_blind_types_rather_than_hiding_them(
+    vault: Path,
+    report_type: str,
+) -> None:
+    """A type MCP cannot filter is refused *by name*, never omitted (#1253).
+
+    These four generators take no ``PrivacyTierOverride``, so serving them
+    below the widest ceiling would distil above-ceiling content into vault
+    artifacts — the exact defect #968 closed for the other six. The refusal
+    must say that, and must not read as "no such report type": pretending the
+    type does not exist is the omission that produced #1253.
+
+    Args:
+        vault: Vault fixture.
+        report_type: One tier-blind report type.
+    """
+    result = report_tool(
+        vault_path=vault,
+        report_type=report_type,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "refused"
+    assert "unsupported report_type" not in str(result["reason"])
+    assert "no tier-filtered generator" in str(result["reason"])
+
+
+def test_report_wavelength_refuses_an_unparseable_period(vault: Path) -> None:
+    """``wavelength`` needs a period, and says so rather than guessing."""
+    result = report_tool(
+        vault_path=vault,
+        report_type="wavelength",
+        period="last-tuesday",
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    assert result["status"] == "refused"
+    assert "period" in str(result["reason"])
 
 
 def test_report_tags_writes_audit_entry(vault: Path) -> None:

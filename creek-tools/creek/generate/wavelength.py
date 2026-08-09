@@ -14,10 +14,11 @@ never suggests the human "should" do anything, and never names a phase as
 from __future__ import annotations
 
 import itertools
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import frontmatter
 import yaml
@@ -1493,12 +1494,108 @@ class ModeProfileGenerator:
         return target
 
 
+_ISO_WEEK_RE = re.compile(r"^(\d{4})-W(\d{2})$")
+_MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
+
+PERIOD_HELP: Final = "'weekly', 'monthly', an ISO week (YYYY-Www), or a month (YYYY-MM)"
+"""How to phrase the accepted ``period`` values to an operator or an agent.
+
+One string so ``creek report --type wavelength`` and ``creek.report`` describe
+the same grammar (#1253); each surface wraps it in its own sentence.
+"""
+
+
+def resolve_period(period: str | None) -> tuple[str, date] | None:
+    """Resolve a wavelength period string to a ``(mode, anchor-date)`` pair.
+
+    Accepts the relative keywords ``weekly`` / ``monthly`` (anchored on today)
+    and explicit ``YYYY-Www`` (ISO week) / ``YYYY-MM`` (calendar month)
+    periods, so a historical phase-map can be regenerated deterministically.
+
+    Args:
+        period: The raw period value, as typed by a caller.
+
+    Returns:
+        ``("weekly", anchor)`` or ``("monthly", anchor)`` where *anchor* is any
+        date inside the target window, or ``None`` when *period* is missing or
+        unparseable — the caller surfaces the error in its own vocabulary.
+    """
+    if period is None:
+        return None
+    if period in {"weekly", "monthly"}:
+        return (period, date.today())
+    week_match = _ISO_WEEK_RE.match(period)
+    if week_match:
+        year, week = int(week_match.group(1)), int(week_match.group(2))
+        try:
+            return ("weekly", date.fromisocalendar(year, week, 1))
+        except ValueError:
+            return None
+    month_match = _MONTH_RE.match(period)
+    if month_match:
+        year, month = int(month_match.group(1)), int(month_match.group(2))
+        try:
+            return ("monthly", date(year, month, 1))
+        except ValueError:
+            return None
+    return None
+
+
+def generate_phase_map(
+    vault_path: Path,
+    *,
+    mode: str,
+    anchor: date,
+    override: PrivacyTierOverride = PrivacyTierOverride.ALL,
+) -> Path | None:
+    """Write the phase-map for one resolved period, or report it has no data.
+
+    The shared body of ``creek report --type wavelength`` and the MCP
+    ``creek.report`` branch of the same name (#1253). Keeping the corpus load,
+    the emptiness check and the weekly/monthly choice in one place is what
+    stops the two surfaces from disagreeing about any of the three — the drift
+    class that made the whole report type unreachable over MCP.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+        mode: ``"weekly"`` or ``"monthly"``, as returned by
+            :func:`resolve_period`.
+        anchor: Any date inside the target window.
+        override: Tier ceiling (#968) applied to the corpus load. Stated
+            explicitly by both production callers.
+
+    Returns:
+        The written phase-map path, or ``None`` when no admitted fragment
+        carries a classified wavelength phase — the dimension is unpopulated,
+        and writing an empty map would misreport that as a real result.
+    """
+    fragments = load_fragments_from_vault(vault_path, override=override)
+    populated = any(
+        fragment.wavelength.phase != Phase.UNCLASSIFIED for fragment in fragments
+    )
+    if not populated:
+        return None
+    tracker = WavelengthTracker()
+    if mode == "weekly":
+        return tracker.generate_weekly_report(
+            vault_path,
+            week_of=anchor,
+            fragments=fragments,
+        )
+    return tracker.generate_monthly_report(
+        vault_path,
+        month=anchor,
+        fragments=fragments,
+    )
+
+
 __all__ = [
     "DEFAULT_CURRENT_PHASE_WINDOW_DAYS",
     "DEFAULT_ROLLING_WEEKS",
     "DEFAULT_TOXIC_CONSECUTIVE_WEEKS",
     "DEFAULT_TOXIC_THRESHOLD",
     "DEFAULT_WINDOW_DAYS",
+    "PERIOD_HELP",
     "PHASE_DOMAIN_MAPPINGS",
     "CurrentPhaseSummary",
     "DosageTrend",
@@ -1507,5 +1604,7 @@ __all__ = [
     "WavelengthSnapshot",
     "WavelengthTracker",
     "current_phase_summary",
+    "generate_phase_map",
     "load_fragments_from_vault",
+    "resolve_period",
 ]

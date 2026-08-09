@@ -9,7 +9,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn, cast
 
@@ -34,6 +34,7 @@ from creek.pipeline import (
     resolve_tier_b_plan,
 )
 from creek.save import SaveTarget
+from creek.surface_modes import LINK_METHODS, REPORT_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ if TYPE_CHECKING:
     from creek.ingest.base import Ingestor
     from creek.ingest.discord_dispatch import DiscordMode
     from creek.link.link_engine import LinkSummary
-    from creek.models import CompileTargetKind, Fragment, Frequency, Mode, Phase
+    from creek.models import CompileTargetKind, Frequency, Mode, Phase
     from creek.purge import PurgeEngine, PurgeResult
 
 
@@ -1488,7 +1489,6 @@ def redact(
 
 
 _CLASSIFY_METHODS = ("rules", "llm")
-_LINK_METHODS = ("embeddings", "temporal", "eddies", "threads")
 _REATOMIZE_DIRECTIONS = ("auto", "split", "aggregate")
 
 
@@ -1852,10 +1852,10 @@ def link(
     embeddings file before running ``--method embeddings`` so the
     similarity matrix is recomputed from scratch.
     """
-    if method not in _LINK_METHODS:
+    if method not in LINK_METHODS:
         console.print(
             f"[red]Unknown method {method!r}. "
-            f"Supported: {', '.join(_LINK_METHODS)}.[/red]",
+            f"Supported: {', '.join(LINK_METHODS)}.[/red]",
         )
         raise typer.Exit(code=2)
 
@@ -2051,7 +2051,10 @@ def _build_fill_steps(
         # report belongs in it — otherwise the register samples are only ever
         # written by an operator who knows to run ``report --type voice`` by hand.
         ("report/voice", lambda: _report_voice(vault_path, unfiltered)),
-        ("report/wavelength", lambda: _report_wavelength(vault_path, "weekly")),
+        (
+            "report/wavelength",
+            lambda: _report_wavelength(vault_path, "weekly", unfiltered),
+        ),
         ("index", lambda: IndexGenerator(vault_path=vault_path).generate_all()),
     ]
     if with_compost:
@@ -2915,55 +2918,11 @@ def _report_mode_profiles(vault_path: Path, override: PrivacyTierOverride) -> No
     )
 
 
-_WAVELENGTH_ISO_WEEK_RE = re.compile(r"^(\d{4})-W(\d{2})$")
-_WAVELENGTH_MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
-
-
-def _resolve_wavelength_period(period: str | None) -> tuple[str, date] | None:
-    """Resolve a ``--period`` string to a ``(mode, anchor-date)`` pair.
-
-    Accepts the relative keywords ``weekly`` / ``monthly`` (anchored on today)
-    and explicit ``YYYY-Www`` (ISO week) / ``YYYY-MM`` (calendar month) periods,
-    so an operator can regenerate a historical phase-map deterministically.
-
-    Args:
-        period: The raw ``--period`` value.
-
-    Returns:
-        ``("weekly", anchor)`` or ``("monthly", anchor)`` where *anchor* is any
-        date inside the target window, or ``None`` when *period* is missing or
-        unparseable (the caller surfaces the error).
-    """
-    if period is None:
-        return None
-    if period in {"weekly", "monthly"}:
-        return (period, date.today())
-    week_match = _WAVELENGTH_ISO_WEEK_RE.match(period)
-    if week_match:
-        year, week = int(week_match.group(1)), int(week_match.group(2))
-        try:
-            return ("weekly", date.fromisocalendar(year, week, 1))
-        except ValueError:
-            return None
-    month_match = _WAVELENGTH_MONTH_RE.match(period)
-    if month_match:
-        year, month = int(month_match.group(1)), int(month_match.group(2))
-        try:
-            return ("monthly", date(year, month, 1))
-        except ValueError:
-            return None
-    return None
-
-
-def _wavelength_dimension_populated(fragments: list[Fragment]) -> bool:
-    """Return whether any *fragments* carry a classified wavelength phase."""
-    # Local import: cli.py defers model imports to keep CLI startup fast.
-    from creek.models import Phase
-
-    return any(f.wavelength.phase != Phase.UNCLASSIFIED for f in fragments)
-
-
-def _report_wavelength(vault_path: Path, period: str | None) -> None:
+def _report_wavelength(
+    vault_path: Path,
+    period: str | None,
+    override: PrivacyTierOverride,
+) -> None:
     """Generate a descriptive wavelength phase-map to ``05-Wavelength/Phase-Maps/``.
 
     Wires the deterministic :class:`WavelengthTracker` weekly/monthly generators
@@ -2972,23 +2931,41 @@ def _report_wavelength(vault_path: Path, period: str | None) -> None:
     classified wavelength phase the dimension is unpopulated, so it prints an
     informative message instead of writing a silent empty file. Wavelength
     output is descriptive only — it never prescribes action.
+
+    Period parsing and the write itself live in
+    :mod:`creek.generate.wavelength` because ``creek.report`` serves this same
+    type over MCP (#1253) and a second parser is exactly the drift that made
+    the type unreachable there in the first place.
+
+    Args:
+        vault_path: Vault root.
+        period: The raw ``--period`` value.
+        override: Tier ceiling for the corpus load (#968). ``wavelength`` is
+            special-cased out of :data:`_REPORT_DISPATCH` because it needs
+            ``--period``, but that is a signature difference, not a licence to
+            ignore ``--include-tier``.
     """
     from creek.generate.wavelength import (
-        WavelengthTracker,
-        load_fragments_from_vault,
+        PERIOD_HELP,
+        generate_phase_map,
+        resolve_period,
     )
 
-    resolved = _resolve_wavelength_period(period)
+    resolved = resolve_period(period)
     if resolved is None:
         console.print(
-            "[red]--period must be 'weekly', 'monthly', an ISO week "
-            "(YYYY-Www), or a month (YYYY-MM) for wavelength reports.[/red]",
+            f"[red]--period must be {PERIOD_HELP} for wavelength reports.[/red]",
         )
         raise typer.Exit(code=2)
     mode, anchor = resolved
 
-    fragments = load_fragments_from_vault(vault_path)
-    if not _wavelength_dimension_populated(fragments):
+    wavelength_path = generate_phase_map(
+        vault_path,
+        mode=mode,
+        anchor=anchor,
+        override=override,
+    )
+    if wavelength_path is None:
         console.print(
             "[yellow]No wavelength phase-map written: no fragment carries a "
             "classified wavelength phase. Classify the wavelength dimension "
@@ -2996,15 +2973,6 @@ def _report_wavelength(vault_path: Path, period: str | None) -> None:
         )
         return
 
-    tracker = WavelengthTracker()
-    if mode == "weekly":
-        wavelength_path = tracker.generate_weekly_report(
-            vault_path, week_of=anchor, fragments=fragments
-        )
-    else:
-        wavelength_path = tracker.generate_monthly_report(
-            vault_path, month=anchor, fragments=fragments
-        )
     console.print(
         f"[bold green]Wrote {wavelength_path.relative_to(vault_path)} "
         "(descriptive; non-prescriptive)[/bold green]",
@@ -3424,10 +3392,13 @@ def report(
         handler(vault_path, override or PrivacyTierOverride.ALL)
         return
     if type == "wavelength":
-        _report_wavelength(vault_path, period)
+        _report_wavelength(vault_path, period, override or PrivacyTierOverride.ALL)
         return
     # Unknown/missing type: fail loudly with the valid list, not a no-op (#716).
-    valid = ", ".join([*_REPORT_DISPATCH, "wavelength"])
+    # The list comes from :data:`creek.surface_modes.REPORT_TYPES`, the one
+    # declaration ``creek.report`` reads too (#1253), rather than from
+    # ``_REPORT_DISPATCH`` plus a hand-appended ``"wavelength"``.
+    valid = ", ".join(REPORT_TYPES)
     if type is None:
         console.print(f"[red]--type is required. Valid types: {valid}.[/red]")
     else:

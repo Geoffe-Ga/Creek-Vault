@@ -635,12 +635,14 @@ def build_server(
     @server.tool(name="creek.report")
     def _report(
         report_type: str = "tags",
+        period: str | None = None,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Generate a vault-state report (``tags`` or ``voice``)."""
+        """Generate a vault-state report; `period` is for `wavelength` only."""
         return report_tool(
             vault_path=vault,
             report_type=report_type,
+            period=period,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
         )

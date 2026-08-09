@@ -58,8 +58,12 @@ Inventories are derived, never retyped
 The CLI set comes from walking the live ``click`` group that Typer builds; the
 MCP set from ``await server.list_tools()``. A retyped list is the drift defect
 epic #1024 exists to kill — and §4 of this module's own findings shows it
-biting in production: ``creek_mcp.tools.link._VALID_METHODS`` is a retyped copy
-of ``creek.cli._LINK_METHODS`` that has lost ``"threads"``.
+bit in production twice: ``creek_mcp.tools.link`` had retyped the CLI's method
+tuple and lost ``"threads"`` (#1252), and ``creek_mcp.tools.report`` had retyped
+the CLI's type tuple and lost five of eleven (#1253). Both copies are gone —
+:mod:`creek.surface_modes` is the one declaration — and the two parity tests
+below now compare what each surface *advertises to a caller*, so a
+re-introduced copy fails on behaviour rather than on inspection.
 
 Adding a surface
 ----------------
@@ -95,7 +99,6 @@ from typer.testing import CliRunner
 
 from creek.cli import (
     _CLASSIFY_METHODS,
-    _LINK_METHODS,
     _REPORT_DISPATCH,
     app,
 )
@@ -107,10 +110,12 @@ from creek.ingest import INGESTOR_REGISTRY
 from creek.ingest.discord_dispatch import DiscordMode
 from creek.models import Authorship, Fragment, FragmentSource, SourcePlatform
 from creek.save import SaveTarget
+from creek.surface_modes import LINK_METHODS
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
 from creek_mcp.server import build_server
-from creek_mcp.tools.link import _VALID_METHODS as MCP_LINK_METHODS
-from creek_mcp.tools.report import _VALID_TYPES as MCP_REPORT_TYPES
+from creek_mcp.tier_ceiling import TierCeiling
+from creek_mcp.tools.link import link_tool
+from creek_mcp.tools.report import report_tool
 from tests.helpers import write_fragment_file
 
 if TYPE_CHECKING:
@@ -183,16 +188,21 @@ def declared_cli_mode_variants() -> frozenset[str]:
 
     ``"wavelength"`` is appended by hand for one reason, pinned by
     :func:`test_report_error_message_lists_exactly_the_declared_types`: it is
-    special-cased at ``creek/cli.py:3413`` because it needs ``--period``, and
-    so is genuinely absent from :data:`creek.cli._REPORT_DISPATCH`. Enumerating
-    the dict alone silently under-covers the surface by one.
+    special-cased in ``creek report`` because it needs ``--period``, and so is
+    genuinely absent from :data:`creek.cli._REPORT_DISPATCH`. Enumerating the
+    dict alone silently under-covers the surface by one. That is also why this
+    function reads the *dispatch dict* rather than
+    :data:`creek.surface_modes.REPORT_TYPES`: the declared tuple is what both
+    frontends advertise, so comparing it against itself would prove nothing,
+    whereas comparing it against the dict plus the one special case proves the
+    declaration still describes the code.
 
     Returns:
         Strings of the form ``"<command>.<mode>"``.
     """
     return frozenset(
         {f"report.{name}" for name in (*_REPORT_DISPATCH, "wavelength")}
-        | {f"link.{name}" for name in _LINK_METHODS}
+        | {f"link.{name}" for name in LINK_METHODS}
         | {f"classify.{name}" for name in _CLASSIFY_METHODS}
         | {f"ingest.{name}" for name in INGESTOR_REGISTRY}
         | {f"save.{target.value}" for target in SaveTarget}
@@ -952,7 +962,7 @@ CLI_CONTRACT: Final[Mapping[str, Surface]] = {
     "link": Surface(
         shape=Shape.WRITES,
         why="#1024: a linker stage that computes nothing still reports success",
-        derived_from=("creek.cli:_LINK_METHODS",),
+        derived_from=("creek.surface_modes:LINK_METHODS",),
         argv=("--vault", "{vault}", "--method", "embeddings"),
         effect=Effect(writes=("00-Creek-Meta/embeddings.parquet",)),
     ),
@@ -1447,7 +1457,7 @@ MCP_CONTRACT: Final[Mapping[str, Surface]] = {
     "creek.link": Surface(
         shape=Shape.WRITES,
         why="#1024: a linker stage that computes nothing still returns counts",
-        derived_from=("creek_mcp.tools.link:_VALID_METHODS",),
+        derived_from=("creek.surface_modes:LINK_METHODS",),
         kwargs={"method": "embeddings", **_ALL},
         effect=Effect(writes=("00-Creek-Meta/embeddings.parquet",)),
         refusal=Refusal(
@@ -1458,7 +1468,7 @@ MCP_CONTRACT: Final[Mapping[str, Surface]] = {
     "creek.report": Surface(
         shape=Shape.WRITES,
         why="#580/#581/#577: report generators orphaned from any command",
-        derived_from=("creek_mcp.tools.report:_VALID_TYPES",),
+        derived_from=("creek.surface_modes:REPORT_TYPES",),
         kwargs={"report_type": "tags", **_ALL},
         effect=Effect(writes=("00-Creek-Meta/Tag-Garden.md",)),
         refusal=Refusal(
@@ -1626,12 +1636,16 @@ MODE_CONTRACT: Final[Mapping[str, str]] = {
     **{f"ingest.{name}": _VIA_INGEST for name in INGESTOR_REGISTRY},
     **{f"save.{target.value}": _VIA_SAVE for target in SaveTarget},
     "link.embeddings": "entry CLI_CONTRACT['link'] and MCP_CONTRACT['creek.link']",
-    "link.temporal": "routed by creek.cli:_LINK_METHODS; entry CLI_CONTRACT['link']",
-    "link.eddies": "routed by creek.cli:_LINK_METHODS; entry CLI_CONTRACT['link']",
+    "link.temporal": (
+        "routed by creek.surface_modes:LINK_METHODS; entry CLI_CONTRACT['link']"
+    ),
+    "link.eddies": (
+        "routed by creek.surface_modes:LINK_METHODS; entry CLI_CONTRACT['link']"
+    ),
     "link.threads": (
-        "routed by creek.cli:_LINK_METHODS; unreachable over MCP — "
-        "creek_mcp.tools.link._VALID_METHODS is a retyped copy that lost it "
-        "(#1027 finding)"
+        "routed by creek.surface_modes:LINK_METHODS; reachable over MCP since "
+        "#1252 — test_link_reaches_the_threads_linker in "
+        "tests/test_mcp_write_tools.py"
     ),
     "classify.rules": (
         "entry CLI_CONTRACT['classify'] and MCP_CONTRACT['creek.classify']"
@@ -1735,43 +1749,90 @@ def test_report_error_message_lists_exactly_the_declared_types(bench: Bench) -> 
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "#1027 finding: creek_mcp.tools.link._VALID_METHODS is a retyped copy "
-        "that lost 'threads'"
-    ),
-)
-def test_cli_and_mcp_agree_on_link_methods() -> None:
+def _listed_after(rendered: str, marker: str) -> set[str]:
+    """Return the comma-separated names a surface advertises after *marker*.
+
+    Both parity tests below read each surface's **own** rejection message
+    rather than its module constant. Reading the constant would be circular
+    once #1252/#1253 land — the two frontends import the same tuple, so
+    ``set(X) == set(X)`` would pass whatever the surfaces actually do. What a
+    caller can reach is what the caller is told, so that is what is compared.
+
+    Args:
+        rendered: The surface's message, ANSI- and panel-flattened.
+        marker: The label the list follows (``"supported:"``).
+
+    Returns:
+        The advertised names, lowercased and stripped.
+    """
+    tail = rendered.lower().split(marker.lower())[-1].split(".")[0]
+    return {name.strip() for name in tail.split(",") if name.strip()}
+
+
+def test_cli_and_mcp_agree_on_link_methods(bench: Bench) -> None:
     """The MCP linker must reach every method the CLI routes.
 
-    ``creek_mcp.tools.link._VALID_METHODS`` is a retyped copy of
-    ``creek.cli._LINK_METHODS`` and has lost ``"threads"`` — the linker with
-    the largest measured output on a real vault. This is real, filed drift and
-    the argument for deriving rather than retyping, so it stays in the suite as
-    a strict xfail: the day it is fixed, this test fails and the marker must
-    come off.
+    #1252: ``creek_mcp.tools.link`` carried a retyped copy of the CLI's method
+    tuple that had lost ``"threads"`` — the linker #880 fixed, and the one with
+    the largest measured output on a real vault. Both surfaces now read one
+    declaration, and this asserts it through what each one *tells a caller*.
+
+    Args:
+        bench: Supplies a vault to run against.
     """
-    assert set(_LINK_METHODS) == set(MCP_LINK_METHODS), (
-        f"CLI-only link methods: {sorted(set(_LINK_METHODS) - set(MCP_LINK_METHODS))}"
+    vault = bench.bare_vault()
+    outcome = bench.run_cli(
+        "link",
+        ("--vault", "{vault}", "--method", "definitely-not-a-linker"),
+        vault=vault,
+        target=vault,
+    )
+    cli_listed = _listed_after(_flatten(outcome.output), "supported:")
+    refusal = link_tool(
+        vault_path=vault,
+        method="definitely-not-a-linker",
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    mcp_listed = _listed_after(str(refusal["reason"]), "supported:")
+
+    assert cli_listed == mcp_listed, (
+        f"`creek link` advertises {sorted(cli_listed)} but `creek.link` "
+        f"advertises {sorted(mcp_listed)}; CLI-only: "
+        f"{sorted(cli_listed - mcp_listed)}"
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=("#1027 finding: creek_mcp.tools.report._VALID_TYPES exposes 6 of 11 types"),
-)
-def test_cli_and_mcp_agree_on_report_types() -> None:
+def test_cli_and_mcp_agree_on_report_types(bench: Bench) -> None:
     """The MCP report tool must reach every type the CLI routes.
 
-    ``creek_mcp.tools.report._VALID_TYPES`` exposes 6 of the 11 types
-    ``creek report`` routes: ``unnamed``, ``fingerprint``, ``paradox``,
-    ``synchronicity`` and ``wavelength`` have no route over MCP. Strict xfail,
-    for the same reason as the linker above.
+    #1253: ``creek_mcp.tools.report`` advertised 6 of the 11 types ``creek
+    report`` routes, so ``unnamed``, ``fingerprint``, ``paradox``,
+    ``synchronicity`` and ``wavelength`` were invisible over MCP. A type that
+    cannot be *served* must still be *named* — silent omission is what produced
+    the bug — so the two advertised sets must match exactly.
+
+    Args:
+        bench: Supplies a vault to run against.
     """
-    cli_types = {*_REPORT_DISPATCH, "wavelength"}
-    assert cli_types == set(MCP_REPORT_TYPES), (
-        f"CLI-only report types: {sorted(cli_types - set(MCP_REPORT_TYPES))}"
+    vault = bench.bare_vault()
+    outcome = bench.run_cli(
+        "report",
+        ("--vault", "{vault}", "--type", "definitely-not-a-report"),
+        vault=vault,
+        target=vault,
+    )
+    cli_listed = _listed_after(_flatten(outcome.output), "valid types:")
+    refusal = report_tool(
+        vault_path=vault,
+        report_type="definitely-not-a-report",
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    mcp_listed = _listed_after(str(refusal["reason"]), "valid types:")
+
+    assert cli_listed == mcp_listed, (
+        f"`creek report` advertises {sorted(cli_listed)} but `creek.report` "
+        f"advertises {sorted(mcp_listed)}; CLI-only: "
+        f"{sorted(cli_listed - mcp_listed)}"
     )
 
 
