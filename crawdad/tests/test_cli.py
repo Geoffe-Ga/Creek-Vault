@@ -8,7 +8,9 @@ from typing import Any
 import pytest
 
 from crawdad import cli
+from crawdad import dispatcher as dispatcher_module
 from crawdad.config import CrawDadConfig
+from crawdad.intents import PrivacyTierCeiling
 
 
 @pytest.fixture
@@ -469,8 +471,12 @@ async def test_loop_runner_forwards_workflow_runner_into_run_one_turn(
 
     monkeypatch.setattr(cli, "run_one_turn", _capture)
 
-    async def _workflow_runner(_name: str, _inputs: dict[str, str]) -> str:
-        return "ran"
+    async def _workflow_runner(
+        _name: str, _inputs: dict[str, str]
+    ) -> dispatcher_module.WorkflowRunReport:
+        return dispatcher_module.WorkflowRunReport(
+            reply="ran", privacy_tier_ceiling=PrivacyTierCeiling.OPEN
+        )
 
     runner = cli._build_loop_runner(
         components=components,
@@ -649,9 +655,9 @@ async def test_build_workflow_runner_returns_string_on_unknown_workflow(
     )
 
     assert runner is not None
-    reply = await runner("does-not-exist", {})
-    assert "does-not-exist" in reply
-    assert "could not find" in reply.lower()
+    report = await runner("does-not-exist", {})
+    assert "does-not-exist" in report.reply
+    assert "could not find" in report.reply.lower()
 
 
 async def test_build_workflow_runner_returns_string_on_workflow_failure(
@@ -689,9 +695,9 @@ async def test_build_workflow_runner_returns_string_on_workflow_failure(
     )
 
     assert runner is not None
-    reply = await runner("wavelength-checkin", {})
-    assert "wavelength-checkin" in reply
-    assert "failed" in reply.lower()
+    report = await runner("wavelength-checkin", {})
+    assert "wavelength-checkin" in report.reply
+    assert "failed" in report.reply.lower()
 
 
 async def test_build_workflow_runner_returns_composed_reply(
@@ -728,6 +734,109 @@ async def test_build_workflow_runner_returns_composed_reply(
     )
 
     assert runner is not None
-    reply = await runner("wavelength-checkin", {})
-    assert reply.endswith("...")
-    assert len(reply) <= cli._DISCORD_REPLY_LIMIT
+    report = await runner("wavelength-checkin", {})
+    assert report.reply.endswith("...")
+    assert len(report.reply) <= cli._DISCORD_REPLY_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# The workflow runner reports the ceiling its walk used (#1152)
+# ---------------------------------------------------------------------------
+#
+# The dispatcher stamps ``ToolResult.privacy_tier_ceiling`` from this
+# report rather than from the router's intent, so the tier that flows
+# into ``loop._max_ceiling_from`` is the one that actually selected the
+# content. A soft error selected nothing, so it reports ``open``.
+
+
+def _wired_workflow_runner(config: CrawDadConfig, tmp_path: Path) -> Any:
+    """Build a wired ``_build_workflow_runner`` closure (composer present)."""
+    from crawdad.mcp_client import ToolDetails
+    from crawdad.workflows import WorkflowRegistry
+
+    details = (
+        ToolDetails(
+            name="creek.state.read",
+            description="Read",
+            input_schema={"type": "object"},
+        ),
+    )
+    components = cli._build_agent_components(config=config, tool_details=details)
+    runner = cli._build_workflow_runner(
+        components=components,
+        session_state=None,
+        skill_registry=_empty_registry(tmp_path),
+        registry=WorkflowRegistry(vault_path=tmp_path),
+    )
+    assert runner is not None
+    return runner
+
+
+@pytest.mark.parametrize(
+    ("workflow_name", "expected"),
+    [
+        ("wavelength-checkin", PrivacyTierCeiling.OPEN),
+        ("compost-surfacing", PrivacyTierCeiling.PERSONAL),
+    ],
+    ids=["open-workflow", "personal-workflow"],
+)
+async def test_build_workflow_runner_reports_the_workflow_ceiling(
+    patched_config: CrawDadConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    workflow_name: str,
+    expected: PrivacyTierCeiling,
+) -> None:
+    """A successful run reports the workflow's own capped ceiling.
+
+    Two built-ins with different declared ceilings, so a hard-coded
+    constant fails one of the two cases whichever constant is chosen.
+    """
+
+    async def _ok(**_kwargs: Any) -> str:
+        return "composed"
+
+    monkeypatch.setattr(cli, "run_workflow_and_compose", _ok)
+    runner = _wired_workflow_runner(patched_config, tmp_path)
+
+    report = await runner(workflow_name, {})
+
+    assert report.reply == "composed"
+    assert report.privacy_tier_ceiling is expected
+
+
+async def test_build_workflow_runner_reports_open_on_lookup_failure(
+    patched_config: CrawDadConfig, tmp_path: Path
+) -> None:
+    """An unknown workflow name reports ``open`` — nothing was read."""
+    runner = _wired_workflow_runner(patched_config, tmp_path)
+
+    report = await runner("does-not-exist", {})
+
+    assert "does-not-exist" in report.reply
+    assert report.privacy_tier_ceiling is PrivacyTierCeiling.OPEN
+
+
+async def test_build_workflow_runner_reports_open_on_mid_run_failure(
+    patched_config: CrawDadConfig,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A walk that dies mid-run reports ``open``, not its declared tier.
+
+    ``compost-surfacing`` declares ``personal``; the aborted walk
+    produced no content, so reporting ``personal`` here would ratchet
+    the loop on the strength of a failure.
+    """
+
+    async def _boom(**_kwargs: Any) -> Any:
+        msg = "simulated boom"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(cli, "run_workflow_and_compose", _boom)
+    runner = _wired_workflow_runner(patched_config, tmp_path)
+
+    report = await runner("compost-surfacing", {})
+
+    assert "failed" in report.reply.lower()
+    assert report.privacy_tier_ceiling is PrivacyTierCeiling.OPEN

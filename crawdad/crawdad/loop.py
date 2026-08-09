@@ -68,7 +68,12 @@ from crawdad.dispatcher import (
     ToolResult,
     UnknownIntentError,
 )
-from crawdad.intents import Intent, PrivacyTierCeiling, RouterResponse
+from crawdad.intents import (
+    CEILING_RANK,
+    Intent,
+    PrivacyTierCeiling,
+    RouterResponse,
+)
 from crawdad.mcp_client import MCPUnavailableError
 from crawdad.router import RouterParseError
 
@@ -329,20 +334,24 @@ def _render_tool_results(results: list[ToolResult]) -> str:
 def _max_ceiling_from(results: list[ToolResult]) -> PrivacyTierCeiling:
     """Return the most permissive ceiling observed across *results*.
 
-    Ordered low→high by the underlying enum value strings: ``all`` is
-    treated as the most permissive (it's literally the "no ceiling"
-    sentinel), then ``intimate`` → ``personal`` → ``open``. Defaults
-    to OPEN when no results carry a ceiling.
+    Ordered low→high by :data:`crawdad.intents.CEILING_RANK`, which used
+    to live here as a local dict literal (#1152 moved it so the
+    dispatcher could share it — ``crawdad.dispatcher`` cannot import
+    ``crawdad.loop``). The ordering is *not* "by the underlying enum
+    value strings", as this docstring used to claim: the members are
+    ``StrEnum``, so comparing them compares spelling, which would rank
+    ``all`` — the broadest tier, the literal "no ceiling" sentinel —
+    below every other one. Hence the hand-written table, and hence
+    exactly one of it. Defaults to OPEN when no results carry a ceiling.
+
+    The comparison is one-directional by design: this only ever moves
+    upward. That is safe only because every ceiling that reaches a
+    :class:`ToolResult` was already clamped by
+    ``crawdad.dispatcher._capped``.
     """
-    rank = {
-        PrivacyTierCeiling.OPEN: 0,
-        PrivacyTierCeiling.PERSONAL: 1,
-        PrivacyTierCeiling.INTIMATE: 2,
-        PrivacyTierCeiling.ALL: 3,
-    }
     best = PrivacyTierCeiling.OPEN
     for result in results:
-        if rank[result.privacy_tier_ceiling] > rank[best]:
+        if CEILING_RANK[result.privacy_tier_ceiling] > CEILING_RANK[best]:
             best = result.privacy_tier_ceiling
     return best
 
