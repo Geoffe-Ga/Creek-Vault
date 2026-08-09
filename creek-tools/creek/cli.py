@@ -5278,6 +5278,42 @@ def clean_report(
 # ---------------------------------------------------------------------------
 
 
+def _render_voice_purge_notes(result: PurgeResult) -> None:
+    """Render the ``07-Voice`` sweep's count, follow-up, and any shortfall.
+
+    Two things an operator cannot infer from the count alone. First, the
+    swept notes are *shared* derived artifacts: deleting the profile or
+    glossary that quoted the purged fragment also drops every other
+    fragment's legitimately-retained content from it until the report is
+    regenerated, so the follow-up command is named here rather than left
+    to be discovered. Second, a fragment whose body is not valid UTF-8
+    cannot be matched against a profile at all (#1211), and an erasure
+    that fell short must say so where the operator is already looking —
+    the audit ``outcome`` line records the same shortfall as
+    ``status="partial"``.
+
+    Args:
+        result: The completed purge result.
+    """
+    if result.voice_artifacts_removed:
+        console.print(
+            f"Voice artifacts removed: {result.voice_artifacts_removed}",
+        )
+        console.print(
+            "[dim]Those derived notes are shared: re-run "
+            "`creek report --type voice` and `creek report --type lexicon` "
+            "to regenerate them for the fragments that remain.[/dim]",
+        )
+    if result.voice_body_undecodable:
+        named = ", ".join(result.voice_body_undecodable)
+        console.print(
+            f"[red]Voice sweep INCOMPLETE for: {named}[/red] — "
+            "the body is not valid UTF-8, so a "
+            "07-Voice/<register>-profile.md may still quote it. "
+            "Re-run `creek report --type voice` to regenerate 07-Voice.",
+        )
+
+
 def _render_purge_result(result: PurgeResult) -> None:
     """Render a purge result as a rich table.
 
@@ -5299,6 +5335,7 @@ def _render_purge_result(result: PurgeResult) -> None:
         console.print(
             f"Intimate stubs removed: {result.intimate_stubs_removed}",
         )
+    _render_voice_purge_notes(result)
 
     if result.deleted_files:
         table = Table(title="Deleted files")
