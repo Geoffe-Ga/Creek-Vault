@@ -105,6 +105,16 @@ creek ingest --refresh-ai-chat --vault ~/Vault
 
 It walks `01-Fragments/`, re-splits each merged Claude/ChatGPT fragment into a human (`self`) and a quarantined AI (`ai`, `voice_weight=0.0`) fragment, and removes the merged file. Running it twice is a no-op; a vault with no merged chat fragments is unchanged. Afterwards, `creek voice-authenticity` (see [generation](./generation.md#voice-fidelity-feat-040)) should report a near-zero AI-corpus leak.
 
+## Document attribution (the name on the file)
+
+A DOCX carries `core_properties.author` and a PDF carries `/Author` — Word stamps one on every save. That name answers "what name is on the file", which is **not** the question `source.author` answers ("whose views does this stand for?", on the `self|ai|other|collaborative` axis). Ingest keeps the two apart:
+
+- `source.author` gets `other` whenever a document carries a non-empty author name. Same rule the cleaning pass already applies to an explicit author name, and it fails closed: `self` is what unlocks the `intimate` privacy tier and voice/skill generation, so guessing `self` for a document that came from someone else would feed both from material that isn't yours. Guessing `other` for your own document only under-uses it, and the name below is what lets you correct it. A document with **no** author (or a blank one) keeps the `self` default — absence of a name is not evidence about anyone.
+- `source.author_name` gets the extracted name verbatim. It is inert: nothing routes, classifies, or weights voice on it. It exists so the name is queryable rather than discarded.
+- `source.author_slug` is **not** set from an extracted name. That field names an `11-Other-Authors/<slug>/` folder, and setting it would relocate the fragment out of `01-Fragments/` and zero its `voice_weight` from the folder manifest — too consequential to infer from a "Created by" field. Promote an `author_name` to a real `author_slug` deliberately, when you actually mean it.
+
+RTF and HTML never populate an author at all: `DocumentIngestor` reads embedded metadata only for `.docx` and `.pdf`, so an RTF `\author` group and an HTML `<meta name="author">` are ignored and those fragments keep the `self` default.
+
 ## Writing a new ingestor
 
 Implement the four-stage contract from `creek.ingest.base.Ingestor`:

@@ -17,6 +17,7 @@ Exports:
     _detect_scanned_pdf: Check if a PDF is likely scanned (image-only).
     _extract_docx_metadata: Extract metadata from DOCX bytes.
     _extract_pdf_metadata: Extract metadata from PDF bytes.
+    _resolve_document_author: Split extracted author metadata into axis + name.
     _infer_document_platform: Map file extension to SourcePlatform.
 """
 
@@ -40,7 +41,7 @@ from creek.ingest.base import (
     parse_authored_at,
 )
 from creek.ingest.html import extract_html_authored_at, parse_html_to_markdown
-from creek.models import SourcePlatform
+from creek.models import Authorship, SourcePlatform
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,11 @@ _SCANNED_TEXT_THRESHOLD = 100
 
 _DOCUMENT_PLATFORM_EXTENSIONS: frozenset[str] = frozenset({".docx", ".pdf", ".rtf"})
 """Extensions that map to the DOCUMENT source platform."""
+
+_AUTHORSHIP_BY_VALUE: dict[str, Authorship] = {
+    member.value: member for member in Authorship
+}
+"""Lookup from an ``Authorship`` member's wire value to the member itself."""
 
 
 # ---- Helper Functions ----
@@ -490,6 +496,53 @@ def _extract_pdf_metadata(pdf_bytes: bytes) -> dict[str, Any]:
     return _extract_pdf_metadata_from_bytes(pdf_bytes)
 
 
+def _resolve_document_author(
+    raw_author: object,
+) -> tuple[Authorship, str | None] | None:
+    """Split a document's author metadata into an authorship axis and a name.
+
+    ``FragmentSource.author`` answers "whose views does this stand for?" on the
+    ``self|ai|other|collaborative`` axis. A DOCX ``core_properties.author`` or a
+    PDF ``/Author`` answers the different question "what name is on the file".
+    Copying the second into the first was issue #1229: every document Word saves
+    carries an author, so every such document failed Pydantic validation and was
+    dropped at assembly.
+
+    Returns ``None`` when there is no usable value — absent, non-string, or
+    blank — leaving the model's ``self`` default in force. "We know nothing" is
+    not evidence about anybody.
+
+    A value that already names an ``Authorship`` member is honoured as the axis
+    and yields no name; it is a classification, not somebody's name. Any other
+    string resolves the axis to :attr:`Authorship.OTHER` and is returned as the
+    name. ``OTHER`` is both the convention this codebase already applies to an
+    explicit author name
+    (:meth:`creek.clean.authorship.AuthorshipTagger._tag_self_platform`) and the
+    fail-closed choice: ``SELF`` is what unlocks the INTIMATE privacy tier
+    (:mod:`creek.classify.privacy`) and voice/skill generation
+    (:mod:`creek.generate.skills`), so guessing ``SELF`` for a stranger's
+    document would feed both from material that is not the owner's, whereas
+    guessing ``OTHER`` for the owner's own document merely under-uses it — and
+    the returned name is what makes that recoverable.
+
+    Args:
+        raw_author: The ``author`` value an ``_extract_*`` pass put in metadata.
+
+    Returns:
+        ``(authorship, name)`` where ``name`` is ``None`` for a value that was
+        already an axis member, or ``None`` when there is nothing to record.
+    """
+    if not isinstance(raw_author, str):
+        return None
+    name = raw_author.strip()
+    if not name:
+        return None
+    axis = _AUTHORSHIP_BY_VALUE.get(name.lower())
+    if axis is not None:
+        return axis, None
+    return Authorship.OTHER, name
+
+
 def _infer_document_platform(extension: str) -> SourcePlatform:
     """Map a file extension to a SourcePlatform value.
 
@@ -794,8 +847,11 @@ class DocumentIngestor(Ingestor):
         """Generate Creek-compatible YAML frontmatter for a document fragment.
 
         Builds frontmatter with type, title, source (platform, original_file,
-        original_encoding), created timestamp, and optional author/scanned
-        fields from metadata.
+        original_encoding), created timestamp, and optional scanned flag.
+
+        An extracted document author is split by :func:`_resolve_document_author`
+        into ``source.author`` (the ``Authorship`` axis) and ``source.author_name``
+        (the free-text name), never conflated into one slot (#1229).
 
         Args:
             fragment: The parsed fragment with metadata.
@@ -814,8 +870,12 @@ class DocumentIngestor(Ingestor):
         }
 
         # Add optional metadata fields
-        if "author" in fragment.metadata:
-            source["author"] = fragment.metadata["author"]
+        resolved_author = _resolve_document_author(fragment.metadata.get("author"))
+        if resolved_author is not None:
+            authorship, author_name = resolved_author
+            source["author"] = authorship
+            if author_name is not None:
+                source["author_name"] = author_name
         if fragment.metadata.get("scanned"):
             source["scanned"] = True
 

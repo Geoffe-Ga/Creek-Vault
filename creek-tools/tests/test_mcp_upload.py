@@ -101,19 +101,22 @@ def _b64(payload: bytes) -> str:
     return base64.b64encode(payload).decode("ascii")
 
 
+_DOCX_AUTHOR = "Dana Rivers"
+"""The author name the ``.docx`` fixture carries, as every real Word save does."""
+
+
 def _docx_bytes(tmp_path: Path) -> bytes:
     """Build a genuine ``.docx`` ZIP container in-process and return its bytes.
 
-    ``core_properties.author`` is cleared because ``DocumentIngestor`` copies
-    a DOCX's author string straight onto ``Fragment.source.author``, which is
-    an enum of ``self``/``ai``/``other``/``collaborative`` — so any DOCX
-    carrying a real author name fails to assemble. That is a pre-existing
-    ingest defect, unrelated to staging, and clearing the property keeps this
-    test aimed at what it is actually pinning: byte-exact staging.
+    ``core_properties.author`` is stamped rather than cleared: Word writes one on
+    every save, so a document without it is not the document users upload. It
+    used to be cleared here to route around issue #1229 (the ingestor copied the
+    name onto the ``Authorship`` enum, so any real document failed to assemble);
+    that workaround is gone with the defect.
     """
     path = tmp_path / "source.docx"
     document = DocxDocument()
-    document.core_properties.author = ""
+    document.core_properties.author = _DOCX_AUTHOR
     document.add_heading("Quarterly notes", level=1)
     document.add_paragraph("The creek runs steady through the autumn.")
     document.save(path)
@@ -297,8 +300,13 @@ def test_a_real_docx_survives_staging_byte_identical(tmp_path: Path) -> None:
     assert staged[0].read_bytes() == raw
     fragments = _fragments(vault)
     assert len(fragments) == 1
+    # The document's author name must not relocate the fragment out of
+    # 01-Fragments/ — only an explicit author_slug does that (#1229).
     assert fragments[0].parent == vault / "01-Fragments" / "Documents"
-    assert frontmatter.load(fragments[0])["privacy_tier"] == "personal"
+    written = frontmatter.load(fragments[0])
+    assert written["privacy_tier"] == "personal"
+    assert written["source"]["author"] == "other"
+    assert written["source"]["author_name"] == _DOCX_AUTHOR
 
 
 def test_extension_routes_to_the_matching_source_type(tmp_path: Path) -> None:
