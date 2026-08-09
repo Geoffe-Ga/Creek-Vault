@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import frontmatter
+import pytest
 from typer.testing import CliRunner
 
 from creek.cli import app
@@ -19,6 +20,14 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 runner = CliRunner()
+
+SCAN_SUBCOMMANDS: tuple[str, ...] = (
+    "orphans",
+    "stale-reviews",
+    "broken-links",
+    "duplicates",
+)
+"""The ``creek clean`` subcommands that only ever read the vault."""
 
 
 # ---------------------------------------------------------------------------
@@ -148,17 +157,6 @@ def test_clean_orphans_with_age(tmp_path: Path) -> None:
     assert result.exit_code == 0
 
 
-def test_clean_orphans_with_apply(tmp_path: Path) -> None:
-    """Test that ``creek clean orphans --apply`` shows APPLY mode."""
-    vault = _make_vault(tmp_path)
-    result = runner.invoke(
-        app,
-        ["clean", "orphans", "--vault", str(vault), "--apply"],
-    )
-    assert result.exit_code == 0
-    assert "APPLY" in result.output
-
-
 def test_clean_orphans_shows_table(tmp_path: Path) -> None:
     """Test that orphan results display in a table when orphans exist."""
     vault = _make_vault(tmp_path)
@@ -179,17 +177,6 @@ def test_clean_stale_reviews_runs(tmp_path: Path) -> None:
     result = runner.invoke(app, ["clean", "stale-reviews", "--vault", str(vault)])
     assert result.exit_code == 0
     assert "Stale Review Scan" in result.output
-
-
-def test_clean_stale_reviews_with_apply(tmp_path: Path) -> None:
-    """Test that ``creek clean stale-reviews --apply`` shows APPLY mode."""
-    vault = _make_vault(tmp_path)
-    result = runner.invoke(
-        app,
-        ["clean", "stale-reviews", "--vault", str(vault), "--apply"],
-    )
-    assert result.exit_code == 0
-    assert "APPLY" in result.output
 
 
 def test_clean_broken_links_runs(tmp_path: Path) -> None:
@@ -251,3 +238,66 @@ def test_clean_report_shows_quality_distribution(tmp_path: Path) -> None:
     # Rich may wrap the title across lines, so check parts separately
     assert "Quality" in result.output
     assert "Distribution" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Honesty of the read-only scan surface (#1039)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("subcommand", SCAN_SUBCOMMANDS)
+def test_clean_scan_rejects_apply_flag(tmp_path: Path, subcommand: str) -> None:
+    """``--apply`` is gone: the scanners have no mutation path to gate.
+
+    ``creek/clean/hygiene.py`` exposes ``scan()`` and nothing else — no
+    ``apply``, ``fix``, ``remove`` or ``delete`` — so a flag advertising
+    "Apply changes (default is dry-run)" promised a mode that could not
+    exist. Passing it must now fail loudly rather than print a red banner
+    over a read-only scan.
+    """
+    vault = _make_vault(tmp_path)
+    result = runner.invoke(
+        app,
+        ["clean", subcommand, "--vault", str(vault), "--apply"],
+    )
+    assert result.exit_code != 0
+
+
+@pytest.mark.parametrize("subcommand", SCAN_SUBCOMMANDS)
+def test_clean_scan_help_does_not_offer_apply(subcommand: str) -> None:
+    """No ``creek clean`` scan advertises an ``--apply`` flag in its help."""
+    result = runner.invoke(app, ["clean", subcommand, "--help"])
+    assert result.exit_code == 0
+    assert "--apply" not in result.output
+
+
+@pytest.mark.parametrize("subcommand", SCAN_SUBCOMMANDS)
+def test_clean_scan_prints_no_mode_banner(tmp_path: Path, subcommand: str) -> None:
+    """A read-only scan claims neither APPLY nor DRY-RUN.
+
+    ``DRY-RUN`` is as misleading as ``APPLY`` here: it implies a wet run
+    exists. These commands only ever read.
+    """
+    vault = _make_vault(tmp_path)
+    result = runner.invoke(app, ["clean", subcommand, "--vault", str(vault)])
+    assert result.exit_code == 0
+    assert "APPLY" not in result.output
+    assert "DRY-RUN" not in result.output
+
+
+def test_purge_still_reports_apply_mode(tmp_path: Path) -> None:
+    """``creek purge`` keeps its APPLY banner — that one genuinely deletes.
+
+    Guards the deletion in #1039 from over-reaching: ``_render_purge_result``
+    is driven by ``PurgeResult.dry_run`` on a command that really does unlink
+    files, so its banner is honest and must survive.
+    """
+    vault = _make_vault(tmp_path)
+    old = datetime.now(tz=UTC) - timedelta(days=60)
+    _write_fragment(vault, "doomed", created=old)
+    result = runner.invoke(
+        app,
+        ["purge", "fragment", "frag-doomed", "--vault", str(vault), "--yes"],
+    )
+    assert result.exit_code == 0
+    assert "APPLY" in result.output

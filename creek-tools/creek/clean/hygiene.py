@@ -267,6 +267,14 @@ class OrphanScanner:
     no connections after a configurable age threshold (in days) are
     reported as orphans.
 
+    Wiki-links resolve through :func:`creek.vault.links.build_link_index`,
+    the same index :class:`BrokenLinkScanner` and the ``orphan-compiled``
+    lint check use, so a page is credited for links naming it by its
+    frontmatter ``title`` or any ``aliases`` entry. Comparing filename
+    stems alone — the behaviour #887 removed from the lint checks and
+    #1225 removed from here — reported alias-linked pages as orphans,
+    which is a false positive telling the operator to delete live content.
+
     Attributes:
         age_days: Minimum age in days before a fragment is considered
             an orphan candidate (default 30).
@@ -284,10 +292,10 @@ class OrphanScanner:
     def scan(self, vault_path: Path) -> OrphanResult:
         """Scan the vault for orphaned fragments.
 
-        Builds a set of all known filenames (stems), then checks each
-        fragment for outgoing wiki-links. A fragment is orphaned if it
-        has no outgoing links AND no other fragment links to it, and it
-        is older than ``age_days``.
+        Every wiki-link in the vault is resolved to the page it actually
+        names, then counted against that page alone. A fragment is orphaned
+        when nothing links to it, it links to nothing else, and it is older
+        than ``age_days``.
 
         Args:
             vault_path: Root of the Obsidian vault.
@@ -297,65 +305,68 @@ class OrphanScanner:
         """
         fragment_files = _list_fragment_files(vault_path)
         all_md_files = _list_all_md_files(vault_path)
+        link_index = build_link_index(vault_path)
 
-        all_stems = {f.stem for f in all_md_files}
-        incoming: dict[str, set[str]] = {f.stem: set() for f in fragment_files}
-        outgoing: dict[str, list[str]] = {}
-
-        self._build_link_graph(all_md_files, incoming, outgoing)
+        incoming, outgoing = self._build_link_graph(all_md_files, link_index)
 
         now = datetime.now(tz=UTC)
-        orphans = self._find_orphans(
-            fragment_files,
-            incoming,
-            outgoing,
-            all_stems,
-            now,
-        )
+        orphans = self._find_orphans(fragment_files, incoming, outgoing, now)
 
         return OrphanResult(
             orphan_paths=[str(p) for p in orphans],
             total_fragments=len(fragment_files),
         )
 
+    @staticmethod
     def _build_link_graph(
-        self,
         all_md_files: list[Path],
-        incoming: dict[str, set[str]],
-        outgoing: dict[str, list[str]],
-    ) -> None:
-        """Build incoming and outgoing link maps from all markdown files.
+        link_index: LinkIndex,
+    ) -> tuple[dict[Path, set[Path]], dict[Path, set[Path]]]:
+        """Build page-keyed incoming and outgoing link maps for the vault.
+
+        Keys and values are resolved page paths rather than filename stems,
+        so a link written in alias form credits the page that declares the
+        alias — and only that page.
 
         Args:
             all_md_files: All markdown files in the vault.
-            incoming: Mutable dict mapping fragment stems to sets of
-                source stems that link to them.
-            outgoing: Mutable dict mapping file stems to lists of
-                wiki-link targets.
+            link_index: Vault-wide name → page index.
+
+        Returns:
+            A ``(incoming, outgoing)`` pair: ``incoming`` maps a page to the
+            files linking to it, ``outgoing`` maps a file to the pages it
+            links to. Targets that resolve to nothing are dropped from both.
         """
+        incoming: dict[Path, set[Path]] = {}
+        outgoing: dict[Path, set[Path]] = {}
         for md_file in all_md_files:
             content = md_file.read_text(encoding="utf-8", errors="replace")
-            targets = _extract_wikilinks(content)
-            outgoing[md_file.stem] = targets
-            for target in targets:
-                if target in incoming:
-                    incoming[target].add(md_file.stem)
+            resolved = {
+                page
+                for target in _extract_wikilinks(content)
+                if (page := link_index.resolve(target)) is not None
+            }
+            outgoing[md_file] = resolved
+            for page in resolved:
+                incoming.setdefault(page, set()).add(md_file)
+        return incoming, outgoing
 
     def _find_orphans(
         self,
         fragment_files: list[Path],
-        incoming: dict[str, set[str]],
-        outgoing: dict[str, list[str]],
-        all_stems: set[str],
+        incoming: dict[Path, set[Path]],
+        outgoing: dict[Path, set[Path]],
         now: datetime,
     ) -> list[Path]:
         """Filter fragments to those that are orphaned and old enough.
 
+        Self-references are discounted in both directions: a note that only
+        links to itself is as unconnected as one that links to nothing.
+
         Args:
             fragment_files: Fragment markdown files.
-            incoming: Map of fragment stem to set of linking stems.
-            outgoing: Map of file stem to list of link targets.
-            all_stems: Set of all known file stems.
+            incoming: Map of page to the files linking to it.
+            outgoing: Map of file to the pages it links to.
             now: Current UTC datetime for age calculation.
 
         Returns:
@@ -363,10 +374,9 @@ class OrphanScanner:
         """
         orphans: list[Path] = []
         for frag_file in fragment_files:
-            stem = frag_file.stem
-            has_incoming = bool(incoming.get(stem))
-            out_targets = outgoing.get(stem, [])
-            has_outgoing = any(t in all_stems and t != stem for t in out_targets)
+            self_only = {frag_file}
+            has_incoming = bool(incoming.get(frag_file, set()) - self_only)
+            has_outgoing = bool(outgoing.get(frag_file, set()) - self_only)
 
             if has_incoming or has_outgoing:
                 continue

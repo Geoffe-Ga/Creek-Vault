@@ -44,7 +44,7 @@ from creek.ingest.journal_staging import ADEPTHOOD_STAGING_RELDIRS
 from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog, PurgeOutcomeStatus
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -65,6 +65,33 @@ _VAULT_CONTENT_FOLDERS: tuple[str, ...] = (
 
 VAULT_PURGE_CONFIRMATION = "I understand this is irreversible"
 """Exact phrase required to confirm a full-vault purge."""
+
+_VOICE_RELDIR: str = "07-Voice"
+"""Vault folder holding the voice subsystem's derived artifacts (#1211)."""
+
+_VOICE_SAMPLES_RELDIR: tuple[str, ...] = ("07-Voice", "Register-Samples")
+"""Where ``save_exemplars`` copies exemplar fragment files byte for byte."""
+
+_VOICE_LEXICON_RELDIR: tuple[str, ...] = ("07-Voice", "Lexicon")
+"""Where the glossary and per-domain metaphor notes quote source sentences."""
+
+_VOICE_PROFILE_GLOB: str = "*-profile.md"
+"""Top-level ``07-Voice`` notes whose ``### Sample Passages`` are exemplar bodies."""
+
+_UNNAMED_FRAGMENT = "<no-id>"
+"""Stand-in used when a partial-sweep report has no fragment id to name.
+
+A constant rather than a path or a body excerpt: the purge subsystem's
+logs and results are read by operators who are not entitled to the
+content being erased, so they name ids and constants only.
+"""
+
+_VOICE_BODY_UNDECODABLE = "UnicodeDecodeError"
+"""``failure_reason`` recorded when a body could not be decoded strictly.
+
+The exception **type name**, matching :meth:`PurgeEngine._run_audited`'s
+rule that an audit line carries the type and never the message.
+"""
 
 VAULT_MARKER_RELPATH = ("00-Creek-Meta", "creek_config.yaml")
 """Relative path to the file that proves a directory is a Creek vault (GAP-003).
@@ -164,6 +191,36 @@ def _str_list(value: object) -> list[str]:
     return []
 
 
+def _read_bytes_for_match(path: Path) -> bytes:
+    """Read *path* as raw bytes for a containment test, never for rewriting.
+
+    Bytes rather than text on purpose: the caller is deciding whether a
+    derived artifact still holds a purged fragment's content, and a
+    ``read_text`` would raise on the first undecodable byte — turning a
+    file that *might* hold the erased body into one the sweep skips
+    silently. An unreadable file yields ``b""``, which matches nothing,
+    and is logged so a skipped artifact stays distinguishable from a
+    clean one.
+
+    Args:
+        path: File to read.
+
+    Returns:
+        The file's bytes, or ``b""`` when it cannot be read.
+    """
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        # Type name only, never str(exc): an OSError message can quote a
+        # title-derived filename, and through it vault content.
+        logger.warning(
+            "Skipping unreadable derived artifact during purge: %s (%s)",
+            path,
+            type(exc).__name__,
+        )
+        return b""
+
+
 class PurgeResult(BaseModel):
     """Outcome of a single purge operation.
 
@@ -203,6 +260,24 @@ class PurgeResult(BaseModel):
             journal-era name because it is serialised into the
             append-only ``purge.jsonl``, where a rename would break
             every existing log.
+        voice_artifacts_removed: Number of derived ``07-Voice/`` notes
+            deleted because they carried the purged fragment's own
+            content (#1211) — the ``Register-Samples`` copy of its file,
+            the ``<register>-profile.md`` quoting its body, and the
+            ``Lexicon`` notes quoting its sentences. Counted-only in a
+            dry run. Deliberately **not** appended to
+            :attr:`deleted_files` and never inflates
+            :attr:`fragments_affected`: these are derived copies, not
+            fragments, and the same rule already governs
+            :attr:`journal_staged_removed`.
+        voice_body_undecodable: Ids of the purged fragments whose body
+            could not be decoded as strict UTF-8, so the content-keyed
+            ``<register>-profile.md`` pass could not run for them
+            (#1211, hazard #910). Non-empty means **the erasure is
+            incomplete**: a profile may still quote that fragment. The
+            operation's audit ``outcome`` line is downgraded to
+            ``status="partial"`` accordingly, and the CLI says so. Ids
+            only — never a path and never body text.
     """
 
     operation: str
@@ -220,6 +295,8 @@ class PurgeResult(BaseModel):
     provenance_scrubbed: int = 0
     intimate_stubs_removed: int = 0
     journal_staged_removed: int = 0
+    voice_artifacts_removed: int = 0
+    voice_body_undecodable: list[str] = Field(default_factory=list)
 
 
 class PurgeEngine:
@@ -281,6 +358,11 @@ class PurgeEngine:
             result.deleted_files.append(str(frag_file))
             result.affected_fragment_ids.append(fragment_id)
             result.fragments_affected = 1
+            # Strictly before the scrub: the lexicon's only link back to
+            # this fragment is a ``[[<id>]]`` wikilink, and the scrub
+            # rewrites it to ``[[[purged]]]``. Swept afterwards, the
+            # sweep would be blind to exactly the notes quoting the body.
+            self._purge_voice_artifacts(fragment_id, frag_file, result)
             # One vault walk applies both the wiki-link and provenance scrubs.
             wiki_count, prov_count = self._scrub_references(
                 title=title,
@@ -640,6 +722,12 @@ class PurgeEngine:
         if isinstance(frag_id, str):
             result.affected_fragment_ids.append(frag_id)
         result.fragments_affected += 1
+        # Before the scrub, for the reason spelled out in purge_fragment.
+        self._purge_voice_artifacts(
+            frag_id if isinstance(frag_id, str) else "",
+            frag_file,
+            result,
+        )
         # One vault walk applies both the wiki-link and provenance scrubs.
         wiki_count, prov_count = self._scrub_references(
             title=title,
@@ -881,6 +969,282 @@ class PurgeEngine:
         result.journal_staged_removed += 1
         if not self.dry_run:
             staged_path.unlink(missing_ok=True)
+
+    def _purge_voice_artifacts(
+        self,
+        fragment_id: str,
+        frag_file: Path,
+        result: PurgeResult,
+    ) -> None:
+        """Sweep the ``07-Voice/`` artifacts derived from a purged fragment (#1211).
+
+        The voice subsystem does not merely *reference* a fragment, it
+        **copies its body**, so scrubbing references leaves the erased
+        content on disk in three shapes:
+        ``Register-Samples/<register>/<id>.md`` is a ``shutil.copy2`` of
+        the fragment file; ``<register>-profile.md`` renders each
+        exemplar body verbatim under ``### Sample Passages``; and
+        ``Lexicon/glossary.md`` plus ``Lexicon/Metaphors/<domain>.md``
+        quote whole source sentences.
+
+        Each match is **deleted rather than edited**. A derived note is a
+        function of the corpus: excising one passage would leave the
+        purged fragment's statistical residue (its n-grams, its
+        contribution to every count in the note) behind while the note
+        went on advertising a total it no longer has. All four artifacts
+        are regenerated by ``creek report --type voice`` / ``--type
+        lexicon``, so deletion costs a re-run and buys a clean erasure.
+
+        The sweep is scoped to those declared locations, never a blanket
+        ``07-Voice`` walk. ``07-Voice/Drafts/`` in particular holds the
+        operator's own writing, which the existing provenance scrub
+        handles and which a fragment purge has no mandate to delete.
+
+        The body needed by the content-keyed pass is re-read from
+        *frag_file* under **strict** UTF-8 rather than taken from the
+        caller's already-parsed post. The callers all hold a post from
+        :meth:`_load_frontmatter_for_match`, whose contract is that a
+        match is a function of frontmatter metadata only, and which
+        therefore hands back a body with every undecodable byte replaced
+        by U+FFFD. Matching that mangled text against a profile that
+        quotes the real bytes would find nothing and report a complete
+        erasure — the exact "a derived copy survives a green purge"
+        failure this sweep exists to close. See :meth:`_voice_match_body`
+        for what happens when the strict read fails.
+
+        Args:
+            fragment_id: Id of the fragment being purged. Empty string
+                skips the id-keyed passes.
+            frag_file: The fragment file being purged, re-read strictly
+                to obtain the body the content-keyed pass matches on —
+                see :meth:`_voice_profiles_quoting` for why that pass
+                has to be content-keyed at all.
+            result: Result accumulator; ``voice_artifacts_removed`` is
+                incremented per artifact actually removed (or that would
+                be removed in a dry run), and ``voice_body_undecodable``
+                gains this fragment's id when the strict read fails.
+        """
+        voice_root = self.vault_path / _VOICE_RELDIR
+        if not voice_root.is_dir():
+            return
+        body = self._voice_match_body(frag_file, fragment_id, result)
+        contained_root = voice_root.resolve()
+        seen: set[Path] = set()
+        for candidate in self._iter_voice_artifacts(fragment_id, body):
+            target = self._contained_voice_artifact(candidate, contained_root)
+            # Checked before the counter so a dry run never previews a
+            # deletion the real run would refuse, and de-duplicated
+            # because two passes can name the same note.
+            if target is None or target in seen:
+                continue
+            seen.add(target)
+            result.voice_artifacts_removed += 1
+            if not self.dry_run:
+                target.unlink(missing_ok=True)
+
+    @staticmethod
+    def _contained_voice_artifact(
+        candidate: Path,
+        contained_root: Path,
+    ) -> Path | None:
+        """Resolve *candidate* and confirm it is a file inside the voice root.
+
+        Deletion targets the **resolved** path so a symlinked copy loses
+        its content rather than just its link — an RTBF sweep that
+        unlinked the alias would leave the body on disk. Resolving first
+        is also what makes containment meaningful: a register folder
+        symlinked out of the vault would otherwise steer the sweep at an
+        arbitrary file.
+
+        Args:
+            candidate: A path produced by one of the artifact passes.
+            contained_root: The already-resolved ``07-Voice`` directory.
+
+        Returns:
+            The resolved path to delete, or ``None`` meaning *refuse* —
+            unresolvable, outside the voice root, or not a file.
+        """
+        try:
+            resolved = candidate.resolve()
+        except (OSError, ValueError):
+            logger.warning(
+                "Ignoring voice artifact %s that cannot be resolved to a path",
+                candidate,
+            )
+            return None
+        if not resolved.is_relative_to(contained_root):
+            # The resolved victim is deliberately left out of the message:
+            # naming it would turn the log into a filesystem oracle.
+            logger.warning(
+                "Ignoring voice artifact %s that resolves outside %s",
+                candidate,
+                contained_root,
+            )
+            return None
+        if not resolved.is_file():
+            return None
+        return resolved
+
+    def _voice_match_body(
+        self,
+        frag_file: Path,
+        fragment_id: str,
+        result: PurgeResult,
+    ) -> str | None:
+        """Re-read *frag_file*'s body under strict UTF-8, or report the gap.
+
+        The content-keyed profile pass compares this text against bytes
+        a generator wrote verbatim, so a lossily-decoded body is not
+        merely imprecise — it is guaranteed not to match, which would
+        turn an incomplete erasure into a silent success. This read is
+        therefore strict, and an undecodable body is reported rather
+        than swallowed: the id goes on ``voice_body_undecodable``, which
+        downgrades the operation's audit ``outcome`` line to
+        ``status="partial"`` (see :meth:`_run_audited`) and surfaces in
+        the CLI, and a WARNING names the fragment id.
+
+        Only the id is named. The path would point an unentitled reader
+        at the file, and the body is the very content being erased; the
+        purge subsystem's logging rule is ids and constants only.
+
+        A decoding failure never stops the id-keyed passes — the
+        ``Register-Samples`` stem and the ``[[<id>]]`` lexicon wikilink
+        do not depend on the body, so those artifacts are still erased
+        for a fragment whose bytes are not valid UTF-8.
+
+        Args:
+            frag_file: The fragment file being purged.
+            fragment_id: Its id, used only to name the fragment in the
+                warning and in ``voice_body_undecodable``.
+            result: Result accumulator to record the shortfall on.
+
+        Returns:
+            The strictly-decoded body, or ``None`` when the file is not
+            valid UTF-8 and the content-keyed pass must be skipped.
+        """
+        try:
+            with frag_file.open(encoding="utf-8") as handle:
+                return frontmatter.load(handle).content
+        except UnicodeDecodeError:
+            result.voice_body_undecodable.append(fragment_id or _UNNAMED_FRAGMENT)
+            logger.warning(
+                "Body of fragment %s is not valid UTF-8, so the voice-profile "
+                "sweep cannot match it: this erasure is PARTIAL and a "
+                "07-Voice/<register>-profile.md may still quote the fragment. "
+                "Regenerate 07-Voice with `creek report --type voice`.",
+                fragment_id or _UNNAMED_FRAGMENT,
+            )
+            return None
+
+    def _iter_voice_artifacts(
+        self,
+        fragment_id: str,
+        body: str | None,
+    ) -> Iterator[Path]:
+        """Yield every ``07-Voice`` artifact attributable to one fragment.
+
+        Args:
+            fragment_id: Id of the fragment being purged.
+            body: Its strictly-decoded body text, or ``None`` when the
+                file could not be decoded — which skips the content-keyed
+                pass and only that pass, leaving both id-keyed passes to
+                erase what they can.
+
+        Yields:
+            Candidate paths, before any containment or existence check.
+        """
+        yield from self._voice_sample_copies(fragment_id)
+        yield from self._voice_lexicon_notes(fragment_id)
+        if body is not None:
+            yield from self._voice_profiles_quoting(body)
+
+    def _voice_sample_copies(self, fragment_id: str) -> Iterator[Path]:
+        """Yield the exemplar copies named after *fragment_id*.
+
+        ``VoiceExemplarCollector._persist_fragment`` writes
+        ``f"{fragment.id}.md"``, so the filename **stem** is the recorded
+        link — and it is the one link the reference scrub cannot destroy,
+        which is exactly why #879's own prune matches on it too.
+
+        Only a real fragment id names a file here, so the sibling
+        ``Register-Samples/_Summary.md`` is never a candidate: it is
+        #879's manifest, which the next prune needs in order to remove
+        stale copies. It normally carries counts and no body text — but
+        that claim is not unconditional: ``_is_safe_sample_stem`` in
+        ``creek/generate/voice.py`` documents the crash window (#879
+        territory) in which a fragment body can land in ``_Summary.md``
+        instead. Widening the sweep to cover that race is out of scope
+        here.
+
+        Args:
+            fragment_id: Id of the fragment being purged.
+
+        Yields:
+            One candidate per register folder.
+        """
+        # A separator in the id would make the join a subpath rather than
+        # a filename; the containment guard would catch an escape, but
+        # refusing here keeps the sweep from naming a file the collector
+        # could never have written.
+        if not fragment_id or {"/", "\\", "\x00"} & set(fragment_id):
+            return
+        samples_root = self.vault_path.joinpath(*_VOICE_SAMPLES_RELDIR)
+        if not samples_root.is_dir():
+            return
+        for register_dir in sorted(samples_root.iterdir()):
+            if register_dir.is_dir():
+                yield register_dir / f"{fragment_id}.md"
+
+    def _voice_lexicon_notes(self, fragment_id: str) -> Iterator[Path]:
+        """Yield lexicon notes that quote *fragment_id*'s sentences.
+
+        ``creek.generate.lexicon._render_context_line`` renders every
+        usage as ``- [[<fragment_id>]] — <sentence>``, so the wikilink is
+        a recorded, exact link from the id the caller holds to the note
+        holding its prose.
+
+        Args:
+            fragment_id: Id of the fragment being purged.
+
+        Yields:
+            Every glossary or metaphor note carrying that wikilink.
+        """
+        if not fragment_id:
+            return
+        lexicon_root = self.vault_path.joinpath(*_VOICE_LEXICON_RELDIR)
+        if not lexicon_root.is_dir():
+            return
+        needle = f"[[{fragment_id}]]".encode()
+        for note in sorted(lexicon_root.rglob("*.md")):
+            if needle in _read_bytes_for_match(note):
+                yield note
+
+    def _voice_profiles_quoting(self, body: str) -> Iterator[Path]:
+        """Yield register profiles whose sample passages contain *body*.
+
+        This pass is content-keyed because nothing else is available: a
+        profile note records the exemplar **bodies** and no fragment ids
+        at all, so there is no provenance to key on (issue #1211's
+        recorded design finding). The match is nonetheless exact rather
+        than heuristic — ``VoiceProfileGenerator._render_profile_body``
+        emits each passage verbatim, so the body appears as a contiguous
+        substring. Reaching it still starts from the id: the caller
+        resolved the id to the fragment file that supplied this body.
+
+        Args:
+            body: The purged fragment's body text.
+
+        Yields:
+            Every top-level ``<register>-profile.md`` quoting that body.
+        """
+        stripped = body.strip()
+        if not stripped:
+            return
+        voice_root = self.vault_path / _VOICE_RELDIR
+        needle = stripped.encode()
+        for profile in sorted(voice_root.glob(_VOICE_PROFILE_GLOB)):
+            if needle in _read_bytes_for_match(profile):
+                yield profile
 
     def _wipe_adepthood_staging(self, result: PurgeResult) -> None:
         """Wipe every Adepthood staging root during a vault purge (#845/#1023).
@@ -1316,6 +1680,14 @@ class PurgeEngine:
         ``failure_reason``) when *body* raises. The exception then
         propagates so callers see the failure.
 
+        A body that returns normally can still have left the erasure
+        incomplete: an undecodable fragment body skips the content-keyed
+        voice sweep (see :meth:`_voice_match_body`). That is recorded on
+        ``voice_body_undecodable`` and downgrades the outcome to
+        ``status="partial"`` too, because "the operation finished" and
+        "everything it promised to erase is gone" are different claims
+        and the audit log must not conflate them.
+
         The message is deliberately dropped: the audit log is preserved
         by every purge, including ``purge_vault``, so anything written
         there outlives the right-to-be-forgotten request that produced
@@ -1354,6 +1726,14 @@ class PurgeEngine:
                 failure_reason=failure_reason,
             )
             raise
+        if result.voice_body_undecodable:
+            self._write_outcome_audit(
+                result,
+                operation_id,
+                status="partial",
+                failure_reason=_VOICE_BODY_UNDECODABLE,
+            )
+            return result
         self._write_outcome_audit(result, operation_id, status="complete")
         return result
 
@@ -1431,6 +1811,7 @@ class PurgeEngine:
             provenance_scrubbed=result.provenance_scrubbed,
             intimate_stubs_removed=result.intimate_stubs_removed,
             journal_staged_removed=result.journal_staged_removed,
+            voice_artifacts_removed=result.voice_artifacts_removed,
             dry_run=result.dry_run,
             phase="outcome",
             operation_id=operation_id,

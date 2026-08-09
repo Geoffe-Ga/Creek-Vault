@@ -5146,7 +5146,6 @@ def _resolve_vault(vault: Path | None) -> Path:
 def clean_orphans(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     age_days: int = typer.Option(30, help="Minimum age in days for orphan detection"),
-    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
 ) -> None:
     """Identify fragments with zero incoming/outgoing links after N days."""
     from creek.clean.hygiene import OrphanScanner
@@ -5154,8 +5153,7 @@ def clean_orphans(
     vault_path = _resolve_vault(vault)
     result = OrphanScanner(age_days=age_days).scan(vault_path)
 
-    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
-    console.print(f"\n[bold]Orphan Scan[/bold] ({mode})")
+    console.print("\n[bold]Orphan Scan[/bold]")
     console.print(f"Total fragments: {result.total_fragments}")
     console.print(f"Orphans found: {len(result.orphan_paths)}")
 
@@ -5171,7 +5169,6 @@ def clean_orphans(
 def clean_stale_reviews(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     age_days: int = typer.Option(14, help="Maximum age in days for review items"),
-    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
 ) -> None:
     """Find review queue items older than N days."""
     from creek.clean.hygiene import StaleReviewScanner
@@ -5179,8 +5176,7 @@ def clean_stale_reviews(
     vault_path = _resolve_vault(vault)
     result = StaleReviewScanner(age_days=age_days).scan(vault_path)
 
-    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
-    console.print(f"\n[bold]Stale Review Scan[/bold] ({mode})")
+    console.print("\n[bold]Stale Review Scan[/bold]")
     console.print(f"Total review files: {result.total_review_files}")
     console.print(f"Stale files: {len(result.stale_paths)}")
 
@@ -5195,7 +5191,6 @@ def clean_stale_reviews(
 @clean_app.command(name="broken-links")
 def clean_broken_links(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
-    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
 ) -> None:
     """Scan fragments for wiki-links pointing to nonexistent files."""
     from creek.clean.hygiene import BrokenLinkScanner
@@ -5203,8 +5198,7 @@ def clean_broken_links(
     vault_path = _resolve_vault(vault)
     result = BrokenLinkScanner().scan(vault_path)
 
-    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
-    console.print(f"\n[bold]Broken Link Scan[/bold] ({mode})")
+    console.print("\n[bold]Broken Link Scan[/bold]")
     console.print(f"Files scanned: {result.total_files_scanned}")
     console.print(f"Broken links: {result.total_broken}")
 
@@ -5223,7 +5217,6 @@ def clean_broken_links(
 @clean_app.command(name="duplicates")
 def clean_duplicates(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
-    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
 ) -> None:
     """Execute normalized dedup sweep and output review report."""
     from creek.clean.hygiene import DuplicateScanner
@@ -5231,8 +5224,7 @@ def clean_duplicates(
     vault_path = _resolve_vault(vault)
     result = DuplicateScanner().scan(vault_path)
 
-    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
-    console.print(f"\n[bold]Duplicate Scan[/bold] ({mode})")
+    console.print("\n[bold]Duplicate Scan[/bold]")
     console.print(f"Total fragments: {result.total_fragments}")
     console.print(f"Duplicate candidates: {len(result.candidates)}")
 
@@ -5286,6 +5278,42 @@ def clean_report(
 # ---------------------------------------------------------------------------
 
 
+def _render_voice_purge_notes(result: PurgeResult) -> None:
+    """Render the ``07-Voice`` sweep's count, follow-up, and any shortfall.
+
+    Two things an operator cannot infer from the count alone. First, the
+    swept notes are *shared* derived artifacts: deleting the profile or
+    glossary that quoted the purged fragment also drops every other
+    fragment's legitimately-retained content from it until the report is
+    regenerated, so the follow-up command is named here rather than left
+    to be discovered. Second, a fragment whose body is not valid UTF-8
+    cannot be matched against a profile at all (#1211), and an erasure
+    that fell short must say so where the operator is already looking —
+    the audit ``outcome`` line records the same shortfall as
+    ``status="partial"``.
+
+    Args:
+        result: The completed purge result.
+    """
+    if result.voice_artifacts_removed:
+        console.print(
+            f"Voice artifacts removed: {result.voice_artifacts_removed}",
+        )
+        console.print(
+            "[dim]Those derived notes are shared: re-run "
+            "`creek report --type voice` and `creek report --type lexicon` "
+            "to regenerate them for the fragments that remain.[/dim]",
+        )
+    if result.voice_body_undecodable:
+        named = ", ".join(result.voice_body_undecodable)
+        console.print(
+            f"[red]Voice sweep INCOMPLETE for: {named}[/red] — "
+            "the body is not valid UTF-8, so a "
+            "07-Voice/<register>-profile.md may still quote it. "
+            "Re-run `creek report --type voice` to regenerate 07-Voice.",
+        )
+
+
 def _render_purge_result(result: PurgeResult) -> None:
     """Render a purge result as a rich table.
 
@@ -5307,6 +5335,7 @@ def _render_purge_result(result: PurgeResult) -> None:
         console.print(
             f"Intimate stubs removed: {result.intimate_stubs_removed}",
         )
+    _render_voice_purge_notes(result)
 
     if result.deleted_files:
         table = Table(title="Deleted files")
