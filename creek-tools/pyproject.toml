@@ -200,6 +200,19 @@ constraint-dependencies = [
     # so the floor lives here rather than [project].dependencies.
     # Fixed in 2.13.0 (#861).
     "torch>=2.13.0",
+    # NOT a CVE. rpds-py switched from SemVer to CalVer at 2026.5.1 —
+    # the line runs 0.29.0, 0.30.0, 2026.5.1, with no 0.31 or 1.0 in
+    # between — and raised requires-python to >=3.11, which this project
+    # already declares. Transitive-only via mcp → jsonschema (and via
+    # referencing); both consumers declare open floors (>=0.25.0 and
+    # >=0.7.0), so nothing forced the lock off 0.30.0 for eight months.
+    # Keep this a BARE FLOOR: any SemVer-shaped ceiling — <1.0, ~=0.30,
+    # or a <2026.7 written as if the month were a minor version —
+    # excludes every subsequent CalVer release permanently. Express a
+    # bound, if one is ever needed, in CalVer (#1185). Held identical to
+    # crawdad/pyproject.toml so both projects resolve the same native
+    # extension on the shared MCP path.
+    "rpds-py>=2026.6.3",
 ]
 
 [tool.setuptools.packages.find]

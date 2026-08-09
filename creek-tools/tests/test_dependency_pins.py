@@ -1,8 +1,10 @@
-"""Guard tests for security-motivated dependency pins.
+"""Guard tests for dependency pins the resolver must not undo.
 
-Each pin here answers specific CVEs; the tests guard both the declared
+Most pins here answer specific CVEs; the tests guard both the declared
 floor and the resolved lock so a future relock cannot regress onto a
-vulnerable release.
+vulnerable release. The ``rpds-py`` pin at the end of this file is the
+exception — it answers a versioning-scheme migration rather than an
+advisory — but it is guarded the same two ways for the same reason.
 
 ``mcp`` (issue #862): mcp 1.27.1 carries CVE-2026-52869 —
 cross-principal session injection on the Streamable HTTP bearer-token
@@ -50,11 +52,31 @@ edge (mcp → pyjwt[crypto]) cannot pull a lower build into the graph.
 Both surfaces are guarded independently below: dropping either one
 re-opens the regression.
 
+``rpds-py`` (issue #1185): not a CVE. rpds-py abandoned SemVer for
+CalVer at 2026.5.1 — the release line runs 0.29.0, 0.30.0, then
+2026.5.1 with no 0.31 or 1.0 in between — and raised its
+``requires-python`` from ``>=3.10`` to ``>=3.11``. Both locks sat at
+0.30.0, eight months stale, because nothing forced them off it:
+jsonschema declares ``rpds-py>=0.25.0`` and referencing declares
+``rpds-py>=0.7.0``, both open floors, so a bare ``uv lock`` is a no-op.
+rpds-py is transitive-only (mcp → jsonschema → rpds-py, and mcp →
+jsonschema → referencing → rpds-py) and nothing in this repo imports
+it, so its floor lives in ``[tool.uv].constraint-dependencies`` on the
+DEP-003 precedent.
+
+The durable hazard is the *idiom*, not the version. A ceiling written
+the way every other pin here would write one — ``rpds-py<1.0``, or a
+``~=0.30`` compatible-release clause — now excludes every release from
+2026 onward, permanently, because 2026.5.1 sorts above 1.0. So the
+constraint is a bare CalVer floor with no ceiling, and
+``test_rpds_py_constraint_admits_future_calver_releases`` fails if
+anyone adds one in the SemVer shape.
+
 Two independent guards per package:
 
 * **pyproject floor** — the declared specifier must reject the last
-  vulnerable release so a future ``uv lock`` relock cannot resolve
-  back down to it.
+  vulnerable release (for rpds-py, the last SemVer release) so a
+  future ``uv lock`` relock cannot resolve back down to it.
 * **locked version** — ``uv.lock`` is what CI installs and what
   pip-audit actually inspects, so the resolved entry must already be
   at or above the patched version.
@@ -129,6 +151,21 @@ _CRYPTOGRAPHY_PATCHED_VERSION = Version("50.0.0")
 #: lower bound would claim compatibility with releases this project has
 #: never run.
 _ANYIO_DECLARED_FLOOR = Version("4.13.0")
+
+#: The last rpds-py release on the abandoned SemVer line, and the
+#: version both locks were frozen at before issue #1185.
+_RPDS_PY_LAST_SEMVER_RELEASE = Version("0.30.0")
+
+#: The rpds-py floor: the current CalVer release. No CVE — this floor
+#: exists so a conservative relock cannot drop back onto the 0.x line,
+#: which the resolver would otherwise be free to do (jsonschema asks
+#: only for >=0.25.0).
+_RPDS_PY_CALVER_FLOOR = Version("2026.6.3")
+
+#: A plausible future CalVer release. Nothing depends on it existing;
+#: it is a probe for ceilings written in the SemVer idiom, every one of
+#: which excludes it while still admitting the floor.
+_RPDS_PY_FUTURE_CALVER_PROBE = Version("2027.1.1")
 
 #: The packages whose import-time dependencies must all be declared.
 #: Both are shipped in the wheel, so anything they import at module
@@ -863,4 +900,115 @@ def test_every_import_time_module_is_declared() -> None:
         "Declare each in [project].dependencies (or the extra that owns "
         "it) and run `uv lock`, or move the import inside the function "
         "that needs it if the package is genuinely optional"
+    )
+
+
+def _rpds_py_constraint_specifier() -> SpecifierSet:
+    """Return the ``rpds-py`` specifier from uv constraint-dependencies.
+
+    Reads ``[tool.uv].constraint-dependencies`` in ``pyproject.toml``,
+    the home for floors on transitive-only packages (DEP-003). rpds-py
+    arrives via mcp → jsonschema (and mcp → jsonschema → referencing)
+    and is never imported here, so it belongs there rather than in
+    ``[project].dependencies``.
+
+    Returns:
+        The specifier set attached to the ``rpds-py`` constraint entry.
+        Fails the calling test if the ``[tool.uv]`` table or the
+        ``rpds-py`` entry is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    constraints: list[str] = (
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in constraints:
+        requirement = Requirement(entry)
+        if requirement.name == "rpds-py":
+            return requirement.specifier
+    pytest.fail(
+        "rpds-py has no entry in [tool.uv].constraint-dependencies of pyproject.toml"
+    )
+
+
+def _locked_rpds_py_version() -> Version:
+    """Return the resolved ``rpds-py`` version pinned in ``uv.lock``.
+
+    Returns:
+        The ``rpds-py`` version resolved in the lockfile. Fails the
+        calling test if the lock has no ``rpds-py`` package entry.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == "rpds-py":
+            return Version(str(package["version"]))
+    pytest.fail("rpds-py has no [[package]] entry in uv.lock")
+
+
+def test_rpds_py_constraint_rejects_the_abandoned_semver_line() -> None:
+    """The constraint excludes 0.30.0, the last SemVer release.
+
+    Both consumers declare open floors (jsonschema ``>=0.25.0``,
+    referencing ``>=0.7.0``), so without a floor of our own a
+    conservative relock is free to sit on the 0.x line forever — which
+    is exactly how both locks went eight months stale (#1185).
+    """
+    specifier = _rpds_py_constraint_specifier()
+    assert str(_RPDS_PY_LAST_SEMVER_RELEASE) not in specifier, (
+        f"rpds-py constraint {specifier!r} admits "
+        f"{_RPDS_PY_LAST_SEMVER_RELEASE}, the abandoned SemVer line both "
+        f"locks were frozen on; the floor must be "
+        f">={_RPDS_PY_CALVER_FLOOR}"
+    )
+
+
+def test_rpds_py_constraint_accepts_the_calver_floor() -> None:
+    """The constraint accepts 2026.6.3, the release both locks pin."""
+    specifier = _rpds_py_constraint_specifier()
+    assert str(_RPDS_PY_CALVER_FLOOR) in specifier, (
+        f"rpds-py constraint {specifier!r} rejects {_RPDS_PY_CALVER_FLOOR}, "
+        "the version uv.lock resolves"
+    )
+
+
+def test_rpds_py_constraint_admits_future_calver_releases() -> None:
+    """No SemVer-shaped ceiling may be attached to rpds-py.
+
+    This is the pin's whole point. rpds-py switched from SemVer to
+    CalVer at 2026.5.1, so every ceiling written in the idiom the
+    neighbouring pins use — ``<1.0``, ``~=0.30``, ``<2026.7`` reasoned
+    about as if it were a minor version — excludes every subsequent
+    release permanently while still admitting today's floor. A probe on
+    a future CalVer version is the only assertion that catches it.
+    """
+    specifier = _rpds_py_constraint_specifier()
+    assert str(_RPDS_PY_FUTURE_CALVER_PROBE) in specifier, (
+        f"rpds-py constraint {specifier!r} rejects "
+        f"{_RPDS_PY_FUTURE_CALVER_PROBE}; rpds-py releases under CalVer "
+        "since 2026.5.1, so a SemVer-shaped ceiling (<1.0, ~=0.30) freezes "
+        "the dependency forever. Express bounds in CalVer, or use a bare "
+        "floor"
+    )
+
+
+def test_locked_rpds_py_is_on_the_calver_line() -> None:
+    """``uv.lock`` resolves rpds-py to a CalVer release.
+
+    The lockfile is what CI installs; a correct constraint with a stale
+    lock still ships the 0.x native extension on the MCP path that
+    every server start loads.
+    """
+    locked = _locked_rpds_py_version()
+    assert locked >= _RPDS_PY_CALVER_FLOOR, (
+        f"uv.lock pins rpds-py {locked}, below the CalVer floor "
+        f"{_RPDS_PY_CALVER_FLOOR}; run "
+        "`uv lock --upgrade-package rpds-py` — a bare `uv lock` is a "
+        "no-op here because 0.30.0 already satisfies jsonschema's "
+        ">=0.25.0"
+    )
+    assert locked.major >= _RPDS_PY_CALVER_FLOOR.major, (
+        f"uv.lock pins rpds-py {locked}, whose leading component "
+        f"{locked.major} is not a CalVer year; the 0.x line is abandoned"
     )
