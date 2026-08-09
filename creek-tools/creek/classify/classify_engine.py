@@ -132,15 +132,27 @@ process`` path, and a second call there would be pure duplication.
   (or the ``low-priority`` literal
   :mod:`creek.clean.context` appends). That makes the pass idempotent: a
   second run over an unchanged vault reports ``0``.
-* **NOT on the preserved short-circuit**, for the same reason as praxis
-  and more so — :func:`_write_tier_only` is not widened, and ``tags`` is
-  a field operators curate by hand. An ``llm``/``manual``-stamped vault
-  backfills it only under an explicit ``creek classify --method llm
-  --force``; ``creek fill`` surfaces the outstanding count
+* **On the preserved short-circuit too, since #1207** — the one place
+  this axis parts company with praxis. #878 originally declined the
+  exception, which left the operator's vault (35,330 fragments, every one
+  of them stamped ``classification_method: llm``) able to gain tags only
+  through a paid ``creek classify --method llm --force``, to recover data
+  already sitting in the fragment bodies on local disk. Two properties
+  make the free pass safe here where the praxis pass is not: hashtag
+  extraction is a lossless mechanical restatement of literal
+  author-written syntax rather than a judgment, so re-deriving it cannot
+  disagree with operator curation; and the merge is a union, so it cannot
+  drop a tag a hand ever wrote. The backfill goes through the **sibling**
+  narrow writer :func:`_write_tags_only` — :func:`_write_tier_only`'s
+  "changes ONLY the privacy-tier fields" promise is untouched, because a
+  writer whose field set is legible from its name survives review of a
+  path that rewrites already-curated user vaults, and one that takes its
+  scope as an argument does not. ``creek fill`` still surfaces the
+  outstanding count, now naming the free command
   (:func:`creek.cli._hint_tags_backfill`).
 
 :attr:`ClassifySummary.tags_extracted` reports how many fragments the run
-actually gained a tag on.
+actually gained a tag on, on both paths.
 
 Known residual (not fixable by ordering)
 ----------------------------------------
@@ -206,7 +218,7 @@ from creek.classify.reatomize import (
     classify_reatomize,
 )
 from creek.classify.rules import RuleClassifier
-from creek.classify.tags_pass import apply_tags
+from creek.classify.tags_pass import TAGS_KEY, apply_tags
 from creek.classify.weighted import classify_weighted
 from creek.ingest.base import IngestedFragment
 from creek.models import Fragment, Frequency, PrivacyTier
@@ -339,9 +351,13 @@ class ClassifySummary:
             genuine additions: re-deriving a hashtag the fragment already
             records is not work the operator needs reported, so the merge
             being a union makes a second run over an unchanged vault
-            report ``0``. Fragments the resume short-circuit preserved are
-            **not** counted — they are not given tags at all without
-            ``--force`` (see the module docstring).
+            report ``0``. Fragments the resume short-circuit preserved
+            **are** counted since #1207: the free backfill runs on them
+            too, through a narrow tags-only write that touches no other
+            frontmatter field (see the module docstring). Like
+            :attr:`privacy_tiers_assigned` this counts the decision, not
+            the bytes — a fragment whose write then fails is counted here
+            *and* reported on :attr:`errors`.
     """
 
     total: int
@@ -892,17 +908,18 @@ def _prepare_fragment(
     # Skip fragments whose previous run already settled the classification.
     # Tracked on distinct counters so the CLI summary can label "manual
     # preserved" and "previously LLM-classified preserved" honestly
-    # (issue #321). A tier assigned above still lands, through the narrow
-    # writer that touches nothing else.
+    # (issue #321). The free, non-destructive passes — the tier assigned
+    # above (#876) and the hashtag backfill (#1207) — still land, each
+    # through a narrow writer that touches nothing else.
     if not force and _record_if_preserved(raw, counts):
-        if owns_tier:
-            _persist_tier_only(
-                md_file=md_file,
-                fragment=fragment,
-                body=body,
-                raw=raw,
-                counts=counts,
-            )
+        _backfill_preserved(
+            md_file=md_file,
+            fragment=fragment,
+            body=body,
+            raw=raw,
+            owns_tier=owns_tier,
+            counts=counts,
+        )
         return None
     return _PreparedFragment(
         fragment=fragment,
@@ -1181,6 +1198,73 @@ def _finalise_fragment_write(
         _record_llm_progress(progress_path, new_fragment.id)
 
 
+def _backfill_preserved(
+    *,
+    md_file: Path,
+    fragment: Fragment,
+    body: str,
+    raw: dict[str, object],
+    owns_tier: bool,
+    counts: _RunCounts,
+) -> None:
+    """Apply the free, non-destructive passes to a preserved fragment.
+
+    The whole of the OPS-001 short-circuit's write surface, and the only
+    place where more than one narrow writer can fire on one file. Both
+    passes are deterministic, local and free, so neither threatens what
+    the short-circuit protects (operator curation and paid tokens):
+
+    * the #876 privacy tier, when this run owns it; then
+    * the #1207 hashtag backfill, when the body carries a tag ``tags``
+      does not already record.
+
+    **The ordering is a data dependency, not a preference.** Each writer
+    rewrites the whole file from the frontmatter it is handed, so the
+    tags write has to build on what the tier write actually left on disk.
+    Handing it the frontmatter as originally *read* would drop the tier
+    that had just been assigned and silently re-open the cloud-egress
+    hole #876 exists to close — which is why :func:`_persist_tier_only`
+    returns its result rather than ``None``.
+
+    Args:
+        md_file: The preserved fragment's file, rewritten in place.
+        fragment: The fragment as loaded, carrying any tier this run
+            assigned.
+        body: Its markdown body; retained byte-identical by both
+            writers, and the input the hashtag extractor reads.
+        raw: Its frontmatter exactly as read from disk.
+        owns_tier: Whether this run assigned the privacy tier (and so
+            has one to persist).
+        counts: Mutable per-run counters; mutated in place.
+    """
+    metadata = raw
+    if owns_tier:
+        written = _persist_tier_only(
+            md_file=md_file,
+            fragment=fragment,
+            body=body,
+            raw=metadata,
+            counts=counts,
+        )
+        if written is not None:
+            metadata = written
+
+    tagged = apply_tags(fragment, body)
+    if tagged is fragment:
+        # ``apply_tags`` returns the same object when the union adds
+        # nothing, so an already-backfilled vault is not rewritten at
+        # all — the pass is idempotent down to the file's bytes.
+        return
+    counts.tags_extracted += 1
+    _persist_tags_only(
+        md_file=md_file,
+        fragment=tagged,
+        body=body,
+        raw=metadata,
+        counts=counts,
+    )
+
+
 def _persist_tier_only(
     *,
     md_file: Path,
@@ -1188,7 +1272,7 @@ def _persist_tier_only(
     body: str,
     raw: dict[str, object],
     counts: _RunCounts,
-) -> None:
+) -> dict[str, object] | None:
     """Write a preserved fragment's new privacy tier, recording any failure.
 
     A single unwritable file must not abort a 35k-file run, so an
@@ -1204,13 +1288,24 @@ def _persist_tier_only(
         raw: The frontmatter as read from disk.
         counts: Mutable per-run counters; write failures land on
             :attr:`_RunCounts.errors`.
+
+    Returns:
+        The frontmatter now on disk, so the sibling writer that may run
+        after it (see :func:`_backfill_preserved`) composes on this
+        result instead of reverting it; ``None`` when the write failed.
     """
     try:
-        _write_tier_only(md_file=md_file, fragment=fragment, body=body, raw=raw)
+        return _write_tier_only(
+            md_file=md_file,
+            fragment=fragment,
+            body=body,
+            raw=raw,
+        )
     except OSError as exc:
         counts.errors.append(
             f"failed to update privacy tier for {fragment.id} ({md_file}): {exc}",
         )
+        return None
 
 
 def _write_tier_only(
@@ -1219,7 +1314,7 @@ def _write_tier_only(
     fragment: Fragment,
     body: str,
     raw: dict[str, object],
-) -> None:
+) -> dict[str, object]:
     """Rewrite *md_file* changing ONLY the privacy-tier fields (issue #876).
 
     Used exclusively on the preserved short-circuit path, where the whole
@@ -1235,11 +1330,24 @@ def _write_tier_only(
       would let a fragment freshly marked ``intimate`` keep advertising
       itself as voice-proxy eligible.
 
+    That promise is unchanged by #1207: the tags backfill went into the
+    **sibling** :func:`_write_tags_only` rather than widening this
+    function's scope into a parameter. A writer whose scope is its name
+    can be audited from its call site; one whose scope is an argument
+    cannot, and these run over already-classified user vaults. The
+    return value is not a widening — it is exactly the two fields above
+    on top of *raw*, handed back so a sibling writer can compose on what
+    is now on disk rather than clobber it.
+
     Args:
         md_file: Destination file, rewritten in place.
         fragment: The fragment carrying the freshly-assigned tier.
         body: Markdown body to retain unchanged.
         raw: Original frontmatter; every other key is copied verbatim.
+
+    Returns:
+        The frontmatter written, i.e. *raw* with the two tier fields
+        replaced.
 
     Raises:
         OSError: When the file cannot be written. The caller
@@ -1252,8 +1360,108 @@ def _write_tier_only(
     new_metadata[PRIVACY_TIER_KEY] = PrivacyTier(fragment.privacy_tier).value
     new_metadata[_VOICE_PROXY_ELIGIBLE_KEY] = fragment.voice_proxy_eligible
 
+    _rewrite_frontmatter(md_file=md_file, body=body, metadata=new_metadata)
+    return new_metadata
+
+
+def _persist_tags_only(
+    *,
+    md_file: Path,
+    fragment: Fragment,
+    body: str,
+    raw: dict[str, object],
+    counts: _RunCounts,
+) -> None:
+    """Write a preserved fragment's backfilled tags, recording any failure.
+
+    The exact contract :func:`_persist_tier_only` honours, one axis over:
+    an unwritable file is reported on :attr:`_RunCounts.errors` and the
+    rest of the vault still backfills.
+
+    Args:
+        md_file: Destination file, rewritten in place.
+        fragment: The fragment carrying the merged tag list.
+        body: Markdown body to retain, byte-identical, below the
+            frontmatter.
+        raw: The frontmatter to write on top of — the tier writer's
+            result when it ran, otherwise the frontmatter as read.
+        counts: Mutable per-run counters; write failures land on
+            :attr:`_RunCounts.errors`.
+    """
+    try:
+        _write_tags_only(md_file=md_file, fragment=fragment, body=body, raw=raw)
+    except OSError as exc:
+        counts.errors.append(
+            f"failed to update tags for {fragment.id} ({md_file}): {exc}",
+        )
+
+
+def _write_tags_only(
+    *,
+    md_file: Path,
+    fragment: Fragment,
+    body: str,
+    raw: dict[str, object],
+) -> None:
+    """Rewrite *md_file* changing ONLY ``tags`` (issue #1207).
+
+    The deliberate sibling of :func:`_write_tier_only` rather than a
+    widening of it. Both run over vaults that are already classified and
+    already curated, and the property that makes them reviewable is that
+    the set of fields each may touch is legible from its *name* — a
+    field-scoped writer taking its scope as an argument would push that
+    question out to every call site.
+
+    Unlike the tier, ``tags`` has no derived companion key: nothing else
+    in the frontmatter is computed from it, so this writer's field set is
+    exactly one key. ``classification_method``, ``classified_at``, the
+    provider/reasoning stamps and the body are all left byte-identical —
+    the run did not re-classify anything, and must not claim to have.
+
+    Safe on the preserved path only because
+    :func:`~creek.classify.tags_pass.merge` is a union: the value written
+    always contains every tag already on record, so a hand-written
+    Obsidian tag cannot be lost to a pass the operator did not ask for.
+
+    Args:
+        md_file: Destination file, rewritten in place.
+        fragment: The fragment carrying the merged tag list.
+        body: Markdown body to retain unchanged.
+        raw: Frontmatter to write on top of; every other key is copied
+            verbatim.
+
+    Raises:
+        OSError: When the file cannot be written. The caller
+            (:func:`_persist_tags_only`) records it and carries on.
+    """
+    new_metadata = raw.copy()
+    new_metadata[TAGS_KEY] = fragment.tags.copy()
+    _rewrite_frontmatter(md_file=md_file, body=body, metadata=new_metadata)
+
+
+def _rewrite_frontmatter(
+    *,
+    md_file: Path,
+    body: str,
+    metadata: dict[str, object],
+) -> None:
+    """Rewrite *md_file* as *metadata* over an unchanged *body*.
+
+    The shared I/O tail of the narrow writers above. It deliberately
+    decides *nothing* about which fields may change — that is each
+    writer's own, named responsibility — so that keeping the two in
+    lockstep on serialisation cannot blur their scopes.
+
+    Args:
+        md_file: Destination file, rewritten in place.
+        body: Markdown body to retain unchanged.
+        metadata: The complete frontmatter to serialise.
+
+    Raises:
+        OSError: When the file cannot be written.
+    """
     post = frontmatter.Post(content=body)
-    post.metadata.update(new_metadata)
+    post.metadata.update(metadata)
     md_file.write_text(frontmatter.dumps(post), encoding="utf-8")
 
 
