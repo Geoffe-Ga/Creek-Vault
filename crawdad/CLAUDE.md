@@ -111,8 +111,14 @@ Four gates, each must pass before the next:
   - `capture_enabled` — bot-capture toggle (#687), default `False`.
     Opt-in per deployment; see [§5.2](#52-bot-capture-boundary).
   - `capture_subpath` — vault-relative dir the capture writer appends
-    to, default `discord-capture`. Must stay inside the vault (same
-    absolute/`..` validation as `attachments.staging_subpath`).
+    to, default `discord-capture`. Must stay inside the vault — the same
+    absolute/`..` validation `attachments.staging_subpath` gets, but not
+    its canonical-root arm (#1088): nothing scans the capture dir.
+  - `attachments.staging_subpath` — vault-relative attachment staging
+    dir, default `00-Creek-Meta/Inbound`, and it must stay under that
+    root: it is the only subtree `creek.redact.scan` admits at a
+    channel's ceiling, so anywhere else the safety pass never runs
+    (#1088). See [§5.3](#53-redaction-scan-gate-feat-027-1054).
   - `attachments.channel_privacy_tiers` — per-channel declared ceiling
     (`open` / `personal` / `intimate` / `all`), validated at
     config-parse time. See [§5.2](#52-bot-capture-boundary) for how
@@ -236,11 +242,37 @@ would miss the point of the fix.
 
 Related, explicitly **not** covered here: #1087 (`scan_batch` follows
 symlinks out of the scan root — a scan that *runs* but under-reports,
-and this gate marks such a batch `scanned=True`). #1088
-(`attachments.staging_subpath` outside the scan's canonical scope) *is*
-a fifth way the scan fails to run; this design absorbs it with one more
-`_ScanOutcome(scanned=False, …)` arm, so sequence it next rather than
-touching `_run_safety_scan` twice.
+and this gate marks such a batch `scanned=True`).
+
+#1088 (`attachments.staging_subpath` outside the scan's canonical
+scope) was the fifth way the scan fails to run, and it has now landed
+in two layers. **Config gate:** `AttachmentConfig` refuses at
+config-parse time any `staging_subpath` outside
+`CANONICAL_STAGING_ROOT` (`00-Creek-Meta/Inbound`, mirrored from
+`creek_mcp/tools/redact.py`), with `validate_default=True` on the model
+so a drifted *default* is caught too. That check is lexical — the real
+confinement boundary is still creek-tools' `resolve_within_vault` plus
+its resolved `is_relative_to`. **Runtime arm:** `_run_safety_scan`
+gained the fifth `_ScanOutcome(scanned=False, …)` arm, for a response
+body that is a JSON object whose `status` is exactly `"refused"` —
+creek-tools' `refusal_response()` envelope. Every other body keeps
+`scanned=True`, deliberately: fail-open on unparseable, non-object, or
+status-less responses means the change can only ever *remove*
+admissions.
+
+This does **not** disturb the non-goal above. `ok` and `empty` both
+still clear the gate, so a scan that runs and reports secrets still
+ingests. Only `refused` — a scan that was *declined*, never a scan that
+found something — flips `scanned`, and the user-facing copy
+(`_SCAN_REFUSED_REPLY`) claims only that no scan ran.
+
+That copy is pinned by test, not just by review: `status="refused"`
+covers every refusal reason creek-tools has (out-of-scope root, but
+also `input_path not found`), so the fixed text hedges about the cause
+and `_scan_refusal_text` echoes creek-tools' own `reason` verbatim.
+`_assert_claims_no_cleanliness` asserts no delivered refusal message
+contains a cleanliness claim — if a future edit reintroduces one, a
+test goes red rather than a reviewer having to notice.
 
 **Revisit predicate:** when `creek.redact.scan` gains a failing status
 for non-empty findings, revisit whether `scanned` should become a

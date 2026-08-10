@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
 from crawdad.config import CrawDadConfig, load_config
 
@@ -138,6 +138,74 @@ def test_config_attachments_defaults_to_25_mib_and_inbound(tmp_path: Path) -> No
     assert config.attachments.staging_subpath == Path("00-Creek-Meta") / "Inbound"
     assert ".md" in config.attachments.allowed_extensions
     assert ".exe" in config.attachments.denied_extensions
+
+
+def test_canonical_staging_root_mirrors_the_mcp_scan_scope() -> None:
+    """#1088: the mirrored constant must equal creek-tools' scan scope.
+
+    ``creek-tools/creek_mcp/tools/redact.py:98`` defines
+    ``_STAGING_SUBDIR = Path("00-Creek-Meta/Inbound")`` — the single
+    subtree ``creek.redact.scan`` admits at every ceiling, and therefore
+    the only staging root a ``personal``-tier CrawDad channel can ever get
+    a real scan for. CrawDad mirrors the value rather than importing it
+    (no Python-level dependency on creek-tools beyond the MCP contract),
+    so this assertion is the guard against the mirror drifting away from
+    its source.
+    """
+    from crawdad.config import CANONICAL_STAGING_ROOT
+
+    assert Path("00-Creek-Meta") / "Inbound" == CANONICAL_STAGING_ROOT
+
+
+def test_attachment_config_validates_a_drifted_default_staging_subpath() -> None:
+    """#1088: an out-of-scope *default* is refused, not only an explicit value.
+
+    Pydantic skips field validators for defaults unless validation of
+    defaults is switched on, so without it a subclass — or a future edit
+    to the field's own default — could reintroduce an unscannable staging
+    root that no test ever passes explicitly. Bare construction of this
+    subclass must raise.
+
+    Constraint this imposes on the implementation: pydantic (2.13.4) does
+    NOT inherit a per-field ``Field(..., validate_default=True)`` into a
+    subclass that re-declares the field, but it DOES inherit
+    ``model_config = ConfigDict(..., validate_default=True)``. This test
+    therefore requires the model-level form.
+    """
+    from crawdad.config import AttachmentConfig
+
+    class _DriftedDefault(AttachmentConfig):
+        """An ``AttachmentConfig`` whose only change is an out-of-scope default."""
+
+        staging_subpath: Path = Field(default=Path("01-Fragments"))
+
+    with pytest.raises(ValidationError, match="00-Creek-Meta/Inbound"):
+        _DriftedDefault()
+
+
+def test_load_config_refuses_out_of_scope_staging_subpath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1088: the refusal reaches the operator through the YAML load path.
+
+    ``crawdad.yaml`` is where an operator actually sets
+    ``attachments.staging_subpath``, so the gate has to fire on
+    :func:`load_config`, not only on direct model construction.
+    """
+    yaml_path = tmp_path / "crawdad.yaml"
+    yaml_path.write_text(
+        "vault_path: " + str(tmp_path) + "\n"
+        "allowed_user_ids: [1]\n"
+        "allowed_channel_ids: [2]\n"
+        "attachments:\n"
+        "  staging_subpath: 01-Fragments\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "t")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+
+    with pytest.raises(ValidationError, match="00-Creek-Meta/Inbound"):
+        load_config(yaml_path)
 
 
 def test_attachment_config_rejects_unknown_privacy_tier() -> None:

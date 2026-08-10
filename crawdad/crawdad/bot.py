@@ -72,6 +72,17 @@ _DISCORD_REPLY_LIMIT = 1900
 # no Python-level dependency on creek-tools beyond the MCP contract.
 _REDACT_SCAN_TOOL = "creek.redact.scan"
 
+# #1088: the ``status`` value creek-tools returns when it *declines* to
+# scan rather than scanning. Sourced from ``refusal_response()``
+# (``creek-tools/creek_mcp/tier_ceiling.py:264-281``), which returns
+# exactly ``{"status", "tool", "tier_ceiling", "reason"}``;
+# ``creek.redact.scan`` is registered ``-> dict[str, Any]``
+# (``creek-tools/creek_mcp/server.py:637``), so FastMCP JSON-serialises
+# that dict and :meth:`crawdad.mcp_client.MCPSession.call_tool` hands the
+# bot the JSON as a plain string. Mirrored, not imported, for the same
+# reason as :data:`_REDACT_SCAN_TOOL` above.
+_SCAN_REFUSED_STATUS = "refused"
+
 _REDACT_TOOL_MISSING_REPLY = (
     "I downloaded the file(s), but the `creek.redact.scan` tool isn't advertised "
     "by creek-tools yet. Run `creek redact --scan <staging path>` from the "
@@ -112,6 +123,32 @@ _SCAN_BLOCKED_REPLY = (
     "I couldn't run the redaction scan on these files, so I won't ingest "
     "them. Run `creek redact --scan <staging path>` from the terminal to "
     "check them yourself, or reply `cancel` to drop the batch."
+)
+
+# #1088: the scan section for a turn where ``creek.redact.scan`` answered
+# with a refusal envelope instead of a report. The copy claims ONLY the
+# invariant actually established — that no scan ran — and says nothing
+# about whether the files are clean, because a scan that *does* run
+# returns a permissive status even when it finds secrets (crawdad/CLAUDE.md
+# §5.3). Swapping one false reassurance for another would miss the point
+# of the fix.
+#
+# It also does not assert *which* refusal fired. ``status="refused"`` covers
+# every refusal reason creek-tools has — the out-of-scope staging root that
+# motivated #1088, but also ``input_path not found`` (redact.py:200-205) and
+# the off-vault-symlink case. Naming the staging root as the definite cause
+# would misdirect an operator debugging a different failure, so the fixed
+# copy hedges ("most common cause") and :func:`_scan_refusal_text` appends
+# creek-tools' own ``reason`` verbatim, which is authoritative for whichever
+# refusal actually fired. Register matches _REDACT_TOOL_MISSING_REPLY; the
+# turn still closes with the shared _SCAN_BLOCKED_REPLY.
+_SCAN_REFUSED_REPLY = (
+    "creek-tools **refused** the redaction scan, so no scan ran on these "
+    "files. The most common cause is a staging root outside "
+    "`00-Creek-Meta/Inbound/` — the only subtree `creek.redact.scan` will "
+    "read at this channel's privacy ceiling — so check "
+    "`attachments.staging_subpath` in `crawdad.yaml`. To check the files "
+    "yourself, run `creek redact --scan <staging path>` from the terminal."
 )
 
 _ALREADY_STAGED_REPLY = (
@@ -353,7 +390,8 @@ class _ScanOutcome:
 
     Attributes:
         scanned: ``True`` only when ``creek.redact.scan`` actually
-            executed and returned a body. ``False`` for every failure
+            executed and returned a report rather than a refusal
+            envelope (#1088). ``False`` for every failure
             mode, and it is the value recorded on
             :attr:`crawdad.consent.PendingBatch.scanned`. Deliberately
             narrow: ``True`` says the scan *ran*, not that it came back
@@ -388,7 +426,9 @@ async def _handle_attachments(
        redundant scan or ingest.
     3. Otherwise invoke ``creek.redact.scan`` on the staging directory
        via MCP. If MCP is unreachable, the tool is not advertised, there
-       is no MCP client, or the call raises, the returned
+       is no MCP client, the call raises, or creek-tools answers with a
+       ``status="refused"`` envelope because the staging root is outside
+       its canonical scope (#1088), the returned
        :class:`_ScanOutcome` carries ``scanned=False`` and a soft error.
     4. Record the staged batch on the per-channel
        :class:`PendingBatchStore` (FEAT-034) **including** that
@@ -786,11 +826,13 @@ async def _run_safety_scan(
     state path (:func:`render_mcp_unavailable_reply`), so comparing
     against them would be a latent bug.
 
-    All four ways the scan can fail to run — no MCP client, the tool
-    unadvertised, :class:`MCPUnavailableError`, and any other unexpected
-    exception — return ``scanned=False`` with a Discord-safe soft error.
-    The bot never raises out of an attachment turn and never goes
-    silent; it just refuses to ingest afterwards (#1054).
+    All five ways the scan can fail to run — no MCP client, the tool
+    unadvertised, :class:`MCPUnavailableError`, any other unexpected
+    exception, and (#1088) a call that returns creek-tools' refusal
+    envelope instead of a report — return ``scanned=False`` with a
+    Discord-safe soft error. The bot never raises out of an attachment
+    turn and never goes silent; it just refuses to ingest afterwards
+    (#1054).
     """
     if mcp_client is None or _REDACT_SCAN_TOOL not in known_tools:
         return _ScanOutcome(scanned=False, text=_REDACT_TOOL_MISSING_REPLY)
@@ -822,26 +864,87 @@ async def _run_safety_scan(
         _LOGGER.exception("unexpected error during creek.redact.scan call")
         return _ScanOutcome(scanned=False, text=_MCP_UNAVAILABLE_REPLY)
 
-    return _ScanOutcome(scanned=True, text=_format_scan_section(body))
+    parsed = _parse_scan_body(body)
+    refusal = _scan_refusal_text(parsed)
+    if refusal is not None:
+        # A refusal is a scan that was *declined*, not one that came back
+        # clean: the tool never read a byte, so the batch is unscanned.
+        _LOGGER.warning("creek.redact.scan refused the scan target: %s", body)
+        return _ScanOutcome(scanned=False, text=refusal)
+
+    return _ScanOutcome(
+        scanned=True, text=_format_scan_section(body=body, parsed=parsed)
+    )
 
 
-def _format_scan_section(body: str) -> str:
-    """Wrap the MCP scan tool's text response into a Discord-safe section.
+def _parse_scan_body(body: str) -> dict[str, Any] | None:
+    """Parse an MCP scan response into a JSON object, or ``None``.
+
+    Both readers of the body — the ``status="refused"`` check in
+    :func:`_run_safety_scan` and the ``report_markdown`` extraction in
+    :func:`_format_scan_section` — need the same parse, so it happens
+    exactly once here instead of twice behind two ``try``/``except``
+    blocks that could drift apart.
+
+    ``None`` means "nothing structured to read": plain text, malformed
+    JSON, and a well-formed JSON *array* or scalar all land there, and
+    every caller falls back to today's behaviour for them. That
+    fail-open default is deliberate — it keeps the #1088 change able only
+    to *remove* admissions, never to newly refuse a turn that works now.
+    """
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _scan_refusal_text(parsed: dict[str, Any] | None) -> str | None:
+    """Return the reply for a scan refusal, or ``None`` if not one (#1088).
+
+    Keyed on ``status`` being exactly :data:`_SCAN_REFUSED_STATUS`. Widening
+    that to "carries a status" or "is a JSON object" would refuse every
+    attachment turn and brick the feature, so the match stays exact.
+
+    Detection and rendering live together so there is exactly one place
+    that decides a body is a refusal — a separate predicate could drift
+    out of step with the copy that explains it.
+
+    creek-tools' own ``reason`` is appended verbatim when present.
+    :data:`_SCAN_REFUSED_REPLY` can only hedge about *why* the scan was
+    declined, because ``status="refused"`` covers several reasons; the
+    echoed ``reason`` is authoritative for the one that actually fired.
+    It discloses nothing new — an out-of-scope reason is a fixed string,
+    and a "not found" reason names a staging path the download summary
+    already showed the user in the same turn.
+    """
+    if parsed is None:
+        return None
+    # Annotated ``object`` rather than the value's ``Any``: the comparison
+    # then resolves through ``object.__eq__`` and is statically a ``bool``.
+    status: object = parsed.get("status")
+    if status != _SCAN_REFUSED_STATUS:
+        return None
+    reason = parsed.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        return f"{_SCAN_REFUSED_REPLY}\n\ncreek-tools said: {reason.strip()}"
+    return _SCAN_REFUSED_REPLY
+
+
+def _format_scan_section(*, body: str, parsed: dict[str, Any] | None) -> str:
+    """Wrap the MCP scan tool's response into a Discord-safe section.
 
     The MCP transport already concatenates the tool's text content into
     a single string; ``creek.redact.scan`` puts a Markdown summary in
-    that text. If the body looks like a raw JSON dict (e.g. because a
-    future tool revision returns structured content directly), pull the
-    ``report_markdown`` field out so users do not see a JSON blob.
+    that text. When *parsed* (from :func:`_parse_scan_body`) carries a
+    ``report_markdown`` field — e.g. because a future tool revision
+    returns structured content directly — render that so users do not
+    see a JSON blob; otherwise fall back to *body* verbatim in a fence.
     """
-    stripped = body.strip()
-    if stripped.startswith("{") and stripped.endswith("}"):
-        try:
-            parsed = json.loads(stripped)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, dict) and isinstance(parsed.get("report_markdown"), str):
-            return f"**Safety scan**\n\n{parsed['report_markdown']}"
+    if parsed is not None and isinstance(parsed.get("report_markdown"), str):
+        return f"**Safety scan**\n\n{parsed['report_markdown']}"
     return f"**Safety scan**\n```\n{body}\n```"
 
 
