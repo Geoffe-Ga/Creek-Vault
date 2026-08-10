@@ -14,6 +14,7 @@ import json
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
+import frontmatter
 import pytest
 from pydantic import BaseModel
 
@@ -26,6 +27,7 @@ from creek.models import (
     Praxis,
     PraxisStatus,
     PraxisType,
+    PrivacyTier,
     SourcePlatform,
     Thread,
     ThreadStatus,
@@ -1391,6 +1393,297 @@ class TestIdIndex:
         assert writer._find_existing(sample_fragment.id, target_dir) == original
         # Unknown ID returns ``None`` via the same path.
         assert writer._find_existing("frag-unknown", target_dir) is None
+
+
+# ---- ID index verification (#1083) ----
+
+
+def _seed_victim(writer: VaultWriter) -> Path:
+    """Write one distinctive bystander fragment and return its path."""
+    victim = Fragment(
+        id="frag-victim001",
+        title="Victim",
+        source=FragmentSource(platform=SourcePlatform.CLAUDE),
+        created=datetime(2025, 1, 15, 10, 30, 0),
+        privacy_tier=PrivacyTier.INTIMATE,
+    )
+    return writer.write_fragment(victim, body="victim body")
+
+
+def _edited_fragment() -> Fragment:
+    """Return the fragment whose id a poisoned index will mis-resolve."""
+    return Fragment(
+        id="frag-edited001",
+        title="Edited",
+        source=FragmentSource(platform=SourcePlatform.CLAUDE),
+        created=datetime(2025, 1, 15, 10, 30, 0),
+    )
+
+
+def _files_declaring(target_dir: Path, model_id: str) -> list[Path]:
+    """Return the ``.md`` files in *target_dir* declaring *model_id* on disk."""
+    return sorted(
+        path
+        for path in target_dir.glob("*.md")
+        if str(frontmatter.load(str(path)).get("id")) == model_id
+    )
+
+
+class TestIdIndexVerification:
+    """The located file must itself declare the id the index claimed (#1083).
+
+    A stale or poisoned ``.id-index.jsonl`` entry names a file belonging to a
+    *different* fragment. Every locator caller — ``update_fragment``, the
+    ``_write_model`` duplicate check, ``tomb_fragment`` and
+    ``restore_fragment`` — then acts destructively on that foreign file.
+    """
+
+    def test_update_fragment_does_not_clobber_foreign_id_file(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """A stale index entry must not redirect an update onto a foreign file."""
+        seed = VaultWriter(vault_path=vault_path)
+        victim = Fragment(
+            id="frag-victim001",
+            title="Victim",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+            created=datetime(2025, 1, 15, 10, 30, 0),
+            privacy_tier=PrivacyTier.INTIMATE,
+        )
+        victim_path = seed.write_fragment(victim, body="victim body")
+        before = victim_path.read_bytes()
+
+        # Poison the on-disk index: a DIFFERENT id now names the victim's file.
+        seed._append_index_entry(
+            victim_path.parent,
+            "frag-edited001",
+            victim_path.name,
+        )
+
+        # Fresh writer, so the poisoned mapping is loaded from the JSONL
+        # rather than an in-process dict.
+        fresh = VaultWriter(vault_path=vault_path)
+        edited = Fragment(
+            id="frag-edited001",
+            title="Edited",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+            created=datetime(2025, 1, 15, 10, 30, 0),
+        )
+        result = fresh.update_fragment(edited, "therapy session notes")
+
+        assert victim_path.read_bytes() == before
+        assert "therapy session notes" not in victim_path.read_text(encoding="utf-8")
+        assert frontmatter.load(str(victim_path))["privacy_tier"] == "intimate"
+        assert result is None
+
+    def test_update_fragment_reresolves_to_the_real_file(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """A mismatch re-resolves to the file that genuinely declares the id."""
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        edited = _edited_fragment()
+        owner_path = seed.write_fragment(edited, body="owner body")
+        before = victim_path.read_bytes()
+        seed._append_index_entry(victim_path.parent, edited.id, victim_path.name)
+
+        fresh = VaultWriter(vault_path=vault_path)
+        result = fresh.update_fragment(edited, "revised owner body")
+
+        assert result == owner_path
+        assert "revised owner body" in frontmatter.load(str(owner_path)).content
+        assert victim_path.read_bytes() == before
+
+    def test_index_repair_is_persisted(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """The corrected mapping survives into a fresh writer's index load."""
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        edited = _edited_fragment()
+        owner_path = seed.write_fragment(edited, body="owner body")
+        target_dir = victim_path.parent
+        seed._append_index_entry(target_dir, edited.id, victim_path.name)
+
+        VaultWriter(vault_path=vault_path).update_fragment(edited, "revised body")
+
+        third = VaultWriter(vault_path=vault_path)
+        assert third._find_existing(edited.id, target_dir) == owner_path
+        assert _files_declaring(target_dir, edited.id) == [owner_path]
+
+    def test_write_model_does_not_return_foreign_file_as_duplicate(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """A poisoned entry must not turn a brand-new fragment into a silent no-op."""
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        before = victim_path.read_bytes()
+        newcomer = _edited_fragment()
+        seed._append_index_entry(victim_path.parent, newcomer.id, victim_path.name)
+
+        fresh = VaultWriter(vault_path=vault_path)
+        result = fresh.write_fragment(newcomer, body="newcomer body")
+
+        assert result != victim_path
+        assert result.exists()
+        assert frontmatter.load(str(result))["id"] == newcomer.id
+        assert victim_path.read_bytes() == before
+
+    def test_tomb_fragment_does_not_move_and_unlink_foreign_file(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Tombing a ghost id must not relocate and delete a bystander fragment."""
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        before = victim_path.read_bytes()
+        seed._append_index_entry(
+            victim_path.parent,
+            "frag-ghost0001",
+            victim_path.name,
+        )
+        orphan_dir = vault_path / "10-Liminal" / "Orphaned"
+
+        fresh = VaultWriter(vault_path=vault_path)
+        result = fresh.tomb_fragment("frag-ghost0001")
+
+        assert result is None
+        assert victim_path.exists()
+        assert victim_path.read_bytes() == before
+        assert list(orphan_dir.glob("*.md")) == []
+
+    def test_restore_fragment_does_not_move_and_unlink_foreign_file(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Restoring a ghost id must not drag a real tomb out of Orphaned."""
+        orphan_dir = vault_path / "10-Liminal" / "Orphaned"
+        orphan_dir.mkdir(parents=True, exist_ok=True)
+        seed = VaultWriter(vault_path=vault_path)
+        _seed_victim(seed)
+        tombed_path = seed.tomb_fragment("frag-victim001")
+        assert tombed_path is not None  # setup guard
+        before = tombed_path.read_bytes()
+        seed._append_index_entry(orphan_dir, "frag-ghost0001", tombed_path.name)
+
+        ghost = Fragment(
+            id="frag-ghost0001",
+            title="Ghost",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+            created=datetime(2025, 1, 15, 10, 30, 0),
+        )
+        fresh = VaultWriter(vault_path=vault_path)
+        result = fresh.restore_fragment(ghost)
+
+        assert result is None
+        assert tombed_path.exists()
+        assert tombed_path.read_bytes() == before
+
+    def test_unparseable_located_file_is_a_mismatch_not_a_crash(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Broken YAML in the located file resolves to no match, not an exception."""
+        edited = _edited_fragment()
+        seed = VaultWriter(vault_path=vault_path)
+        target_dir = seed._fragment_target_dir(edited)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        broken = target_dir / "broken.md"
+        broken.write_text(
+            "---\nid: [unterminated\ntitle: Broken\n---\nbroken body\n",
+            encoding="utf-8",
+        )
+        seed._append_index_entry(target_dir, edited.id, broken.name)
+
+        fresh = VaultWriter(vault_path=vault_path)
+
+        assert fresh._find_existing(edited.id, target_dir) is None
+        assert broken.exists()
+
+    def test_located_file_without_id_key_is_a_mismatch(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Valid frontmatter with no ``id`` key declares no id, so it never matches."""
+        edited = _edited_fragment()
+        seed = VaultWriter(vault_path=vault_path)
+        target_dir = seed._fragment_target_dir(edited)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        idless = target_dir / "idless.md"
+        idless.write_text(
+            "---\ntitle: No Id Here\n---\nidless body\n",
+            encoding="utf-8",
+        )
+        seed._append_index_entry(target_dir, edited.id, idless.name)
+
+        fresh = VaultWriter(vault_path=vault_path)
+
+        assert fresh._find_existing(edited.id, target_dir) is None
+
+    def test_non_str_id_in_frontmatter_is_a_mismatch(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """A YAML-int ``id`` does not satisfy the string id the caller asked for."""
+        numeric = Fragment(
+            id="12345",
+            title="Numeric",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+            created=datetime(2025, 1, 15, 10, 30, 0),
+        )
+        seed = VaultWriter(vault_path=vault_path)
+        target_dir = seed._fragment_target_dir(numeric)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        int_id_path = target_dir / "int-id.md"
+        int_id_path.write_text(
+            "---\nid: 12345\ntitle: Int Id\n---\nint id body\n",
+            encoding="utf-8",
+        )
+        before = int_id_path.read_bytes()
+        seed._append_index_entry(target_dir, numeric.id, int_id_path.name)
+
+        fresh = VaultWriter(vault_path=vault_path)
+        result = fresh.write_fragment(numeric, body="string id body")
+
+        assert result != int_id_path
+        assert frontmatter.load(str(result))["id"] == "12345"
+        assert int_id_path.read_bytes() == before
+        # ``_rebuild_index`` only indexes ids where ``isinstance(mid, str)``, so
+        # the int-typed file is invisible to re-resolution. The honest outcome
+        # is therefore two files carrying the same *logical* id — declining the
+        # foreign file cannot also deduplicate an id the index cannot see.
+        assert _files_declaring(target_dir, "12345") == sorted([int_id_path, result])
+
+    def test_vanished_file_does_not_trigger_a_rescan(
+        self,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An ordinary vanished file resolves to ``None`` without a directory scan.
+
+        Regression guard: the mismatch fix must not route the everyday
+        deleted-or-tombed case into a full ``_rebuild_index`` sweep, which
+        would undo the O(1) lookup PERF-001 bought.
+        """
+
+        def _no_rescan(target_dir: Path) -> dict[str, str]:
+            """Fail loudly instead of scanning the directory."""
+            msg = f"unexpected directory rescan of {target_dir}"
+            raise AssertionError(msg)
+
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+        victim_path.unlink()
+        monkeypatch.setattr(VaultWriter, "_rebuild_index", staticmethod(_no_rescan))
+
+        fresh = VaultWriter(vault_path=vault_path)
+
+        assert fresh._find_existing("frag-victim001", target_dir) is None
 
 
 # ---- Concurrent writes (BUG-006) ----
