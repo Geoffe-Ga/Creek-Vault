@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import discord
@@ -71,6 +72,17 @@ _DISCORD_REPLY_LIMIT = 1900
 # no Python-level dependency on creek-tools beyond the MCP contract.
 _REDACT_SCAN_TOOL = "creek.redact.scan"
 
+# #1088: the ``status`` value creek-tools returns when it *declines* to
+# scan rather than scanning. Sourced from ``refusal_response()``
+# (``creek-tools/creek_mcp/tier_ceiling.py:264-281``), which returns
+# exactly ``{"status", "tool", "tier_ceiling", "reason"}``;
+# ``creek.redact.scan`` is registered ``-> dict[str, Any]``
+# (``creek-tools/creek_mcp/server.py:637``), so FastMCP JSON-serialises
+# that dict and :meth:`crawdad.mcp_client.MCPSession.call_tool` hands the
+# bot the JSON as a plain string. Mirrored, not imported, for the same
+# reason as :data:`_REDACT_SCAN_TOOL` above.
+_SCAN_REFUSED_STATUS = "refused"
+
 _REDACT_TOOL_MISSING_REPLY = (
     "I downloaded the file(s), but the `creek.redact.scan` tool isn't advertised "
     "by creek-tools yet. Run `creek redact --scan <staging path>` from the "
@@ -83,10 +95,60 @@ _REDACT_TOOL_MISSING_REPLY = (
 # via the per-channel :class:`PendingBatchStore` threaded through this
 # module. The CLI escape hatch in the prompt below is preserved for
 # users who prefer the deterministic terminal path.
+#
+# #1054: this prompt is now sent ONLY when the redaction scan actually
+# ran. When it could not, the turn closes with _SCAN_BLOCKED_REPLY
+# instead, and ``PendingBatch.scanned=False`` makes the refusal stick
+# at the dispatch boundary — so the bot can no longer tell the user to
+# "run `creek redact --scan` before ingesting" and offer `ingest` in
+# the very next message.
 _INGEST_CONSENT_PROMPT = (
     "I did **not** ingest anything. Reply with `ingest` (or run "
     "`creek ingest --type <type> --input <staging path>`) to proceed. "
     "Reply `cancel` to drop the batch."
+)
+
+# #1054: the refusal for a batch whose redaction scan never ran. ONE
+# constant deliberately serves TWO call sites — the close of an
+# unscanned attachment turn (:func:`_handle_attachments`) and the
+# refusal at the dispatch boundary
+# (:func:`_dispatch_ingest_for_batch`) — so the two messages are
+# literally the same string and cannot drift into contradicting each
+# other the way _REDACT_TOOL_MISSING_REPLY and _INGEST_CONSENT_PROMPT
+# did. The wording claims only the invariant actually enforced ("could
+# not scan"); it must NOT be reworded to imply a successful scan blocks
+# findings, because ``creek.redact.scan`` returns a permissive status
+# even when it finds secrets. See crawdad/CLAUDE.md §5.3.
+_SCAN_BLOCKED_REPLY = (
+    "I couldn't run the redaction scan on these files, so I won't ingest "
+    "them. Run `creek redact --scan <staging path>` from the terminal to "
+    "check them yourself, or reply `cancel` to drop the batch."
+)
+
+# #1088: the scan section for a turn where ``creek.redact.scan`` answered
+# with a refusal envelope instead of a report. The copy claims ONLY the
+# invariant actually established — that no scan ran — and says nothing
+# about whether the files are clean, because a scan that *does* run
+# returns a permissive status even when it finds secrets (crawdad/CLAUDE.md
+# §5.3). Swapping one false reassurance for another would miss the point
+# of the fix.
+#
+# It also does not assert *which* refusal fired. ``status="refused"`` covers
+# every refusal reason creek-tools has — the out-of-scope staging root that
+# motivated #1088, but also ``input_path not found`` (redact.py:200-205) and
+# the off-vault-symlink case. Naming the staging root as the definite cause
+# would misdirect an operator debugging a different failure, so the fixed
+# copy hedges ("most common cause") and :func:`_scan_refusal_text` appends
+# creek-tools' own ``reason`` verbatim, which is authoritative for whichever
+# refusal actually fired. Register matches _REDACT_TOOL_MISSING_REPLY; the
+# turn still closes with the shared _SCAN_BLOCKED_REPLY.
+_SCAN_REFUSED_REPLY = (
+    "creek-tools **refused** the redaction scan, so no scan ran on these "
+    "files. The most common cause is a staging root outside "
+    "`00-Creek-Meta/Inbound/` — the only subtree `creek.redact.scan` will "
+    "read at this channel's privacy ceiling — so check "
+    "`attachments.staging_subpath` in `crawdad.yaml`. To check the files "
+    "yourself, run `creek redact --scan <staging path>` from the terminal."
 )
 
 _ALREADY_STAGED_REPLY = (
@@ -322,6 +384,26 @@ def _empty_skills() -> VoiceSkillStack:
     return VoiceSkillStack(skills=())
 
 
+@dataclass(frozen=True, slots=True)
+class _ScanOutcome:
+    """What :func:`_run_safety_scan` did, and what to tell the user (#1054).
+
+    Attributes:
+        scanned: ``True`` only when ``creek.redact.scan`` actually
+            executed and returned a report rather than a refusal
+            envelope (#1088). ``False`` for every failure
+            mode, and it is the value recorded on
+            :attr:`crawdad.consent.PendingBatch.scanned`. Deliberately
+            narrow: ``True`` says the scan *ran*, not that it came back
+            clean — the tool reports findings with a permissive status.
+        text: Discord-safe section to show the user — the formatted scan
+            report on success, a soft error otherwise.
+    """
+
+    scanned: bool
+    text: str
+
+
 async def _handle_attachments(
     *,
     message: _MessageLike,
@@ -343,15 +425,23 @@ async def _handle_attachments(
        hash already on disk), reply "already staged" and stop — no
        redundant scan or ingest.
     3. Otherwise invoke ``creek.redact.scan`` on the staging directory
-       via MCP. If MCP is unreachable or the tool is not advertised,
-       fall back to a clear soft error rather than silently ingesting.
+       via MCP. If MCP is unreachable, the tool is not advertised, there
+       is no MCP client, the call raises, or creek-tools answers with a
+       ``status="refused"`` envelope because the staging root is outside
+       its canonical scope (#1088), the returned
+       :class:`_ScanOutcome` carries ``scanned=False`` and a soft error.
     4. Record the staged batch on the per-channel
-       :class:`PendingBatchStore` (FEAT-034) so a follow-up
-       ``ingest`` / ``yes`` / ``proceed`` message in the same channel
-       dispatches ``creek.ingest`` for the batch.
-    5. Reply with the combined download summary, the scan report, and a
-       consent prompt. The bot **never** auto-ingests; the user must
-       respond explicitly.
+       :class:`PendingBatchStore` (FEAT-034) **including** that
+       ``scanned`` flag, so a follow-up ``ingest`` / ``yes`` /
+       ``proceed`` message dispatches ``creek.ingest`` only for a batch
+       that was actually scanned. An unscanned batch is still recorded —
+       it stays inspectable and cancel-able — but
+       :func:`_dispatch_ingest_for_batch` refuses it (#1054).
+    5. Reply with the combined download summary and scan section, then
+       close with the consent prompt when the scan ran or
+       :data:`_SCAN_BLOCKED_REPLY` when it did not. The bot **never**
+       auto-ingests; the user must respond explicitly, and for an
+       unscanned batch even an explicit ``ingest`` is refused.
     """
     channel_id = message.channel.id
     processed = await process_attachments(
@@ -375,7 +465,7 @@ async def _handle_attachments(
         )
         return
 
-    scan_section = await _run_safety_scan(
+    outcome = await _run_safety_scan(
         processed=processed,
         config=config,
         mcp_client=mcp_client,
@@ -394,17 +484,21 @@ async def _handle_attachments(
                 processed=processed,
                 channel_id=channel_id,
                 config=config,
+                scanned=outcome.scanned,
             )
 
     # Send the summary + scan section first (may be truncated for long
-    # scan bodies) and then the consent prompt as a separate message.
-    # The consent string is short and well under the Discord cap; sending
+    # scan bodies) and then the closing message as a separate message.
+    # The closing string is short and well under the Discord cap; sending
     # it on its own guarantees the "I did **not** ingest anything" trust
-    # signal can never be silently dropped by truncation of the scan
-    # section, even for a multi-file batch with many findings.
-    body = "\n\n".join((summary, scan_section))
+    # signal — or, for an unscanned batch, the refusal — can never be
+    # silently dropped by truncation of the scan section, even for a
+    # multi-file batch with many findings.
+    body = "\n\n".join((summary, outcome.text))
     await message.channel.send(_truncate_for_discord(body))
-    await message.channel.send(_INGEST_CONSENT_PROMPT)
+    await message.channel.send(
+        _INGEST_CONSENT_PROMPT if outcome.scanned else _SCAN_BLOCKED_REPLY
+    )
 
 
 def _record_pending_batch(
@@ -413,11 +507,21 @@ def _record_pending_batch(
     processed: ProcessedAttachments,
     channel_id: int,
     config: CrawDadConfig,
+    scanned: bool,
 ) -> None:
     """Record *processed* on the pending-batch store, superseding prior state.
 
     Skipped (no-op) when the store wasn't wired (test paths that don't
     exercise the consent flow) or when no files landed on disk.
+
+    Args:
+        pending_batches: Store to record on; ``None`` is a no-op.
+        processed: Result of the attachment download/staging pass.
+        channel_id: Discord channel the batch belongs to.
+        config: Bot config, consulted for the channel's tier ceiling.
+        scanned: :attr:`_ScanOutcome.scanned` from this turn's safety
+            pass, persisted on the batch so the dispatch boundary can
+            refuse a batch that was never scanned (#1054).
     """
     if pending_batches is None or not processed.accepted:
         return
@@ -437,6 +541,7 @@ def _record_pending_batch(
         accepted_files=files,
         privacy_tier_ceiling=_channel_tier(channel_id=channel_id, config=config),
         now=pending_batches.now(),
+        scanned=scanned,
     )
     pending_batches.record(batch)
 
@@ -522,7 +627,14 @@ async def _apply_consent_reply(
     * ``"ingested"``: re-consent is a clear no-op.
     * unresolved types: transition to ``"awaiting_type"`` and ask
       which type to apply to the unresolved subset.
-    * everything resolved: dispatch ingest immediately.
+    * everything resolved: hand off to
+      :func:`_dispatch_ingest_for_batch`, which refuses the batch
+      outright if its redaction scan never ran (#1054).
+
+    Note the ordering: an unscanned batch with an unresolved file type
+    still gets the type question on this turn and the refusal on the
+    next. One wasted turn, zero ``creek.ingest`` calls — the gate lives
+    at the shared callee so it cannot be bypassed by either route.
     """
     if batch.state == "ingested":
         await message.channel.send(_ALREADY_INGESTED_REPLY)
@@ -559,6 +671,11 @@ async def _apply_disambiguation_reply(
     type word landing while the batch is still ``"awaiting_consent"``
     or already ``"ingested"`` falls through to the regular agent loop
     so the user is never trapped inside the consent state machine.
+
+    ``with_resolved_types`` is a :func:`dataclasses.replace` copy, so
+    :attr:`PendingBatch.scanned` survives disambiguation unchanged and
+    this route cannot launder an unscanned batch past the gate in
+    :func:`_dispatch_ingest_for_batch` (#1054).
     """
     if batch.state != "awaiting_type":
         return False
@@ -584,16 +701,31 @@ async def _dispatch_ingest_for_batch(
     pending_batches: PendingBatchStore,
     config: CrawDadConfig,
 ) -> None:
-    """Invoke ``creek.ingest`` for every file in *batch* and reply.
+    """Refuse unscanned batches; otherwise invoke ``creek.ingest`` and reply.
 
-    The batch is mutated in the store to track ingested hashes (so a
-    follow-up consent in the same channel reports "already ingested")
-    and to transition state to ``"ingested"`` only once every file in
-    the batch has landed. A partial failure (mid-batch
+    **The redaction-scan gate lives here** (#1054). A batch whose
+    ``creek.redact.scan`` never ran (:attr:`PendingBatch.scanned` is
+    ``False``) is refused before any tool call. This function is the
+    single convergence point of the consent flow — both
+    :func:`_apply_consent_reply` and :func:`_apply_disambiguation_reply`
+    reach ingest through it — so guarding the callee rather than the two
+    callers closes the ``ingest`` route, the
+    ``ingest`` → type-question → type-word route, and any future third
+    caller with one branch that cannot drift out of sync. The gate
+    enforces "the scan could not run", **not** "the scan found nothing";
+    see crawdad/CLAUDE.md §5.3.
+
+    Otherwise the batch is mutated in the store to track ingested hashes
+    (so a follow-up consent in the same channel reports "already
+    ingested") and to transition state to ``"ingested"`` only once every
+    file in the batch has landed. A partial failure (mid-batch
     :class:`MCPUnavailableError`) leaves the batch in
     ``"awaiting_consent"`` so the user can retry; the already-landed
     files are then skipped on the retry via their content hashes.
     """
+    if not batch.scanned:
+        await message.channel.send(_SCAN_BLOCKED_REPLY)
+        return
     if mcp_client is None or _INGEST_TOOL not in known_tools:
         await message.channel.send(_INGEST_TOOL_MISSING_REPLY)
         return
@@ -684,17 +816,26 @@ async def _run_safety_scan(
     mcp_client: MCPClient | None,
     known_tools: tuple[str, ...],
     channel_id: int,
-) -> str:
-    """Invoke ``creek.redact.scan`` on the staging dir, return Discord-safe text.
+) -> _ScanOutcome:
+    """Invoke ``creek.redact.scan`` on the staging dir; report what happened.
 
-    Returns a soft-error message instead of raising when MCP is
-    unavailable, the tool is not advertised, or any other unexpected
-    exception occurs during the call. The user always gets the
-    download summary and a clear next step — the bot never goes silent
-    on attachment turns.
+    Returns an :class:`_ScanOutcome` rather than a bare string so the
+    caller can branch on whether the scan *ran* without string-sniffing
+    the reply text. That distinction matters: the soft-error strings are
+    shared with the ingest path (:func:`_run_ingest_dispatch`) and the
+    state path (:func:`render_mcp_unavailable_reply`), so comparing
+    against them would be a latent bug.
+
+    All five ways the scan can fail to run — no MCP client, the tool
+    unadvertised, :class:`MCPUnavailableError`, any other unexpected
+    exception, and (#1088) a call that returns creek-tools' refusal
+    envelope instead of a report — return ``scanned=False`` with a
+    Discord-safe soft error. The bot never raises out of an attachment
+    turn and never goes silent; it just refuses to ingest afterwards
+    (#1054).
     """
     if mcp_client is None or _REDACT_SCAN_TOOL not in known_tools:
-        return _REDACT_TOOL_MISSING_REPLY
+        return _ScanOutcome(scanned=False, text=_REDACT_TOOL_MISSING_REPLY)
 
     try:
         rel_staging = processed.staging_dir.relative_to(config.vault_path)
@@ -714,35 +855,96 @@ async def _run_safety_scan(
             )
     except MCPUnavailableError as exc:
         _LOGGER.warning("creek.redact.scan failed: %s", exc)
-        return _MCP_UNAVAILABLE_REPLY
+        return _ScanOutcome(scanned=False, text=_MCP_UNAVAILABLE_REPLY)
     except Exception:
         # Any other failure (timeout, protocol error, bad JSON, etc.)
         # must not bubble up — the bot would go silent on the user's
         # attachment turn. Log a full traceback for the operator and
         # surface the same soft error.
         _LOGGER.exception("unexpected error during creek.redact.scan call")
-        return _MCP_UNAVAILABLE_REPLY
+        return _ScanOutcome(scanned=False, text=_MCP_UNAVAILABLE_REPLY)
 
-    return _format_scan_section(body)
+    parsed = _parse_scan_body(body)
+    refusal = _scan_refusal_text(parsed)
+    if refusal is not None:
+        # A refusal is a scan that was *declined*, not one that came back
+        # clean: the tool never read a byte, so the batch is unscanned.
+        _LOGGER.warning("creek.redact.scan refused the scan target: %s", body)
+        return _ScanOutcome(scanned=False, text=refusal)
+
+    return _ScanOutcome(
+        scanned=True, text=_format_scan_section(body=body, parsed=parsed)
+    )
 
 
-def _format_scan_section(body: str) -> str:
-    """Wrap the MCP scan tool's text response into a Discord-safe section.
+def _parse_scan_body(body: str) -> dict[str, Any] | None:
+    """Parse an MCP scan response into a JSON object, or ``None``.
+
+    Both readers of the body — the ``status="refused"`` check in
+    :func:`_run_safety_scan` and the ``report_markdown`` extraction in
+    :func:`_format_scan_section` — need the same parse, so it happens
+    exactly once here instead of twice behind two ``try``/``except``
+    blocks that could drift apart.
+
+    ``None`` means "nothing structured to read": plain text, malformed
+    JSON, and a well-formed JSON *array* or scalar all land there, and
+    every caller falls back to today's behaviour for them. That
+    fail-open default is deliberate — it keeps the #1088 change able only
+    to *remove* admissions, never to newly refuse a turn that works now.
+    """
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _scan_refusal_text(parsed: dict[str, Any] | None) -> str | None:
+    """Return the reply for a scan refusal, or ``None`` if not one (#1088).
+
+    Keyed on ``status`` being exactly :data:`_SCAN_REFUSED_STATUS`. Widening
+    that to "carries a status" or "is a JSON object" would refuse every
+    attachment turn and brick the feature, so the match stays exact.
+
+    Detection and rendering live together so there is exactly one place
+    that decides a body is a refusal — a separate predicate could drift
+    out of step with the copy that explains it.
+
+    creek-tools' own ``reason`` is appended verbatim when present.
+    :data:`_SCAN_REFUSED_REPLY` can only hedge about *why* the scan was
+    declined, because ``status="refused"`` covers several reasons; the
+    echoed ``reason`` is authoritative for the one that actually fired.
+    It discloses nothing new — an out-of-scope reason is a fixed string,
+    and a "not found" reason names a staging path the download summary
+    already showed the user in the same turn.
+    """
+    if parsed is None:
+        return None
+    # Annotated ``object`` rather than the value's ``Any``: the comparison
+    # then resolves through ``object.__eq__`` and is statically a ``bool``.
+    status: object = parsed.get("status")
+    if status != _SCAN_REFUSED_STATUS:
+        return None
+    reason = parsed.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        return f"{_SCAN_REFUSED_REPLY}\n\ncreek-tools said: {reason.strip()}"
+    return _SCAN_REFUSED_REPLY
+
+
+def _format_scan_section(*, body: str, parsed: dict[str, Any] | None) -> str:
+    """Wrap the MCP scan tool's response into a Discord-safe section.
 
     The MCP transport already concatenates the tool's text content into
     a single string; ``creek.redact.scan`` puts a Markdown summary in
-    that text. If the body looks like a raw JSON dict (e.g. because a
-    future tool revision returns structured content directly), pull the
-    ``report_markdown`` field out so users do not see a JSON blob.
+    that text. When *parsed* (from :func:`_parse_scan_body`) carries a
+    ``report_markdown`` field — e.g. because a future tool revision
+    returns structured content directly — render that so users do not
+    see a JSON blob; otherwise fall back to *body* verbatim in a fence.
     """
-    stripped = body.strip()
-    if stripped.startswith("{") and stripped.endswith("}"):
-        try:
-            parsed = json.loads(stripped)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, dict) and isinstance(parsed.get("report_markdown"), str):
-            return f"**Safety scan**\n\n{parsed['report_markdown']}"
+    if parsed is not None and isinstance(parsed.get("report_markdown"), str):
+        return f"**Safety scan**\n\n{parsed['report_markdown']}"
     return f"**Safety scan**\n```\n{body}\n```"
 
 

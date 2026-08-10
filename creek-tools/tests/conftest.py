@@ -3,12 +3,14 @@
 Provides auto-use fixtures that:
 
 - mock the sentence-transformer model loading so tests never download
-  models or require GPU access, and
+  models or require GPU access,
 - pin the terminal width so Rich/Typer CLI output renders deterministically
   regardless of the ambient terminal or whether stdout is a TTY (GAP-013).
   The width is pinned in :func:`pytest_configure` as well as in the fixture,
   because a Rich console caches its width at construction and creek's console
-  is constructed at collection time -- see that hook's docstring (#1141).
+  is constructed at collection time -- see that hook's docstring (#1141), and
+- clear the process-global elevated-authorization failure budget so the
+  #914 purge lockout cannot leak from one test into the next.
 
 Also provides the opt-in :func:`short_write` fixture (issue #987), which
 simulates partial ``os.write`` returns so the vault/save writers can be
@@ -80,6 +82,38 @@ def _pin_terminal_width(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setenv("COLUMNS", _TEST_TERMINAL_COLUMNS)
     monkeypatch.setenv("LINES", _TEST_TERMINAL_LINES)
+
+
+@pytest.fixture(autouse=True)
+def _reset_elevated_attempt_budget() -> None:
+    """Clear the elevated-auth failed-attempt budget before every test (#914).
+
+    ``creek_mcp.auth._ELEVATED_BUDGET`` is module-level state, so failed
+    ``is_elevated`` calls accumulate across the whole process. Five of them
+    anywhere arm a lockout that every later test inherits, and *which* tests
+    those are depends on collection order: ``tests/test_mcp_auth.py`` and
+    ``tests/test_mcp_remote.py`` each spend deliberate failures, while
+    ``tests/test_wiring_contract.py`` and the purge happy paths then present a
+    correct token and expect it to work. Without this reset that combination
+    is an order-dependent flake rather than a defect in either test, and the
+    suite has to pass under ``-p no:randomly`` *and* under a shuffle.
+
+    ``tests/test_mcp_attempt_policy.py`` additionally hard-asserts that the
+    budget exists and is resettable, in
+    ``test_the_auth_module_owns_a_budget_the_conftest_hook_can_reset``, so a
+    rename cannot quietly turn this hook into a no-op from the other side.
+
+    The import is deferred into the body rather than hoisted to module scope
+    on purpose: anything imported while this file is *read* runs before
+    :func:`pytest_configure`, and that is exactly the window #1141 needs kept
+    clear of import-time Rich consoles.
+    """
+    from creek_mcp import auth
+
+    # Accessed directly, not via getattr: a missing budget must fail loudly
+    # here rather than let this fixture decay into a silent no-op and hand
+    # back the order-dependent flake it exists to prevent.
+    auth._ELEVATED_BUDGET.reset()
 
 
 def _make_mock_model(dims: int = _DIMS) -> MagicMock:

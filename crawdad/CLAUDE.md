@@ -111,8 +111,14 @@ Four gates, each must pass before the next:
   - `capture_enabled` — bot-capture toggle (#687), default `False`.
     Opt-in per deployment; see [§5.2](#52-bot-capture-boundary).
   - `capture_subpath` — vault-relative dir the capture writer appends
-    to, default `discord-capture`. Must stay inside the vault (same
-    absolute/`..` validation as `attachments.staging_subpath`).
+    to, default `discord-capture`. Must stay inside the vault — the same
+    absolute/`..` validation `attachments.staging_subpath` gets, but not
+    its canonical-root arm (#1088): nothing scans the capture dir.
+  - `attachments.staging_subpath` — vault-relative attachment staging
+    dir, default `00-Creek-Meta/Inbound`, and it must stay under that
+    root: it is the only subtree `creek.redact.scan` admits at a
+    channel's ceiling, so anywhere else the safety pass never runs
+    (#1088). See [§5.3](#53-redaction-scan-gate-feat-027-1054).
   - `attachments.channel_privacy_tiers` — per-channel declared ceiling
     (`open` / `personal` / `intimate` / `all`), validated at
     config-parse time. See [§5.2](#52-bot-capture-boundary) for how
@@ -191,6 +197,86 @@ wave through.
 tier end-to-end from the capture record through staging into fragment
 frontmatter, so an `intimate` channel can be captured faithfully
 instead of refused outright.
+
+### 5.3 Redaction-scan gate (FEAT-027, #1054)
+
+**Policy: record the batch, refuse at dispatch.** An attachment turn
+whose `creek.redact.scan` could not run still stages the files and
+still records a `PendingBatch` — so the user can see what landed and
+`cancel` it — but that batch can never be dispatched to `creek.ingest`.
+
+Rejected alternatives: *withholding the consent prompt* (relies on the
+user never typing `ingest` unprompted — prompt suppression is not
+enforcement), and *a distinct opt-in token* (a documented override is
+a fail-open path, and this is the one gate standing between unscanned
+content and the vault).
+
+**Mechanism.** `PendingBatch.scanned` is a **required field with no
+default**, placed ahead of the defaulted fields. There is deliberately
+no permissive default and no `ConsentConfig` knob: either would let a
+construction site — or an operator — silently reopen the hole.
+`_run_safety_scan` returns a `_ScanOutcome(scanned, text)` rather than
+a bare string, so the caller reads a status instead of string-matching
+the reply text against `_MCP_UNAVAILABLE_REPLY` (shared with the ingest
+and state paths). All four failure modes — no MCP client, the tool
+unadvertised, `MCPUnavailableError`, and any other exception — yield
+`scanned=False`.
+
+Enforcement is **one branch in `_dispatch_ingest_for_batch`**, the sole
+convergence point of the consent flow. Both `_apply_consent_reply` and
+`_apply_disambiguation_reply` reach ingest through it, so one guard
+closes the `ingest` route, the `ingest` → type-question → type-word
+route, and any future caller. Do not add a second guard at a caller: two
+gates drift, one cannot. `with_resolved_types` / `with_state` /
+`with_ingested` are all `dataclasses.replace` copies, so `scanned`
+survives every transition and cannot be laundered.
+
+**Explicit non-goal.** The gate enforces *"the scan could not run"* —
+**not** *"the scan found nothing"*. `creek_mcp/tools/redact.py` computes
+`status = "empty" if not scanned.matches else "ok"`, so there is no
+failing status to read: a scan that runs and reports secrets still
+clears the gate. User-facing copy must claim only what is enforced —
+`_SCAN_BLOCKED_REPLY` says "I couldn't run the redaction scan", never
+"these files are clean". Substituting a new false claim for the old one
+would miss the point of the fix.
+
+Related, explicitly **not** covered here: #1087 (`scan_batch` follows
+symlinks out of the scan root — a scan that *runs* but under-reports,
+and this gate marks such a batch `scanned=True`).
+
+#1088 (`attachments.staging_subpath` outside the scan's canonical
+scope) was the fifth way the scan fails to run, and it has now landed
+in two layers. **Config gate:** `AttachmentConfig` refuses at
+config-parse time any `staging_subpath` outside
+`CANONICAL_STAGING_ROOT` (`00-Creek-Meta/Inbound`, mirrored from
+`creek_mcp/tools/redact.py`), with `validate_default=True` on the model
+so a drifted *default* is caught too. That check is lexical — the real
+confinement boundary is still creek-tools' `resolve_within_vault` plus
+its resolved `is_relative_to`. **Runtime arm:** `_run_safety_scan`
+gained the fifth `_ScanOutcome(scanned=False, …)` arm, for a response
+body that is a JSON object whose `status` is exactly `"refused"` —
+creek-tools' `refusal_response()` envelope. Every other body keeps
+`scanned=True`, deliberately: fail-open on unparseable, non-object, or
+status-less responses means the change can only ever *remove*
+admissions.
+
+This does **not** disturb the non-goal above. `ok` and `empty` both
+still clear the gate, so a scan that runs and reports secrets still
+ingests. Only `refused` — a scan that was *declined*, never a scan that
+found something — flips `scanned`, and the user-facing copy
+(`_SCAN_REFUSED_REPLY`) claims only that no scan ran.
+
+That copy is pinned by test, not just by review: `status="refused"`
+covers every refusal reason creek-tools has (out-of-scope root, but
+also `input_path not found`), so the fixed text hedges about the cause
+and `_scan_refusal_text` echoes creek-tools' own `reason` verbatim.
+`_assert_claims_no_cleanliness` asserts no delivered refusal message
+contains a cleanliness claim — if a future edit reintroduces one, a
+test goes red rather than a reviewer having to notice.
+
+**Revisit predicate:** when `creek.redact.scan` gains a failing status
+for non-empty findings, revisit whether `scanned` should become a
+three-state outcome and whether findings should block ingest.
 
 ## 6. MCP subprocess resilience
 

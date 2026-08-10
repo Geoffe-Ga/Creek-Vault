@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -43,14 +44,23 @@ def _batch(
     created_at: float = 0.0,
     state: BatchState = "awaiting_consent",
     ingested_hashes: frozenset[str] = frozenset(),
+    scanned: bool = True,
 ) -> PendingBatch:
-    """Return a :class:`PendingBatch` with sensible test defaults."""
+    """Return a :class:`PendingBatch` with sensible test defaults.
+
+    ``scanned`` defaults to ``True`` *here only* — these unit tests
+    predate the #1054 gate and exercise unrelated behaviour, so the
+    helper preserves their original meaning (a normally-scanned batch).
+    The production dataclass has no default; see
+    ``test_pending_batch_requires_an_explicit_scanned_flag``.
+    """
     return PendingBatch(
         channel_id=channel_id,
         staging_dir=Path("/tmp/stage"),
         files=files or (_file(),),
         privacy_tier_ceiling="personal",
         created_at=created_at,
+        scanned=scanned,
         state=state,
         ingested_hashes=ingested_hashes,
     )
@@ -151,6 +161,7 @@ def test_all_ingested_false_for_empty_batch() -> None:
         files=(),
         privacy_tier_ceiling="personal",
         created_at=0.0,
+        scanned=True,
     )
 
     assert batch.all_ingested is False
@@ -396,6 +407,7 @@ def test_build_pending_batch_starts_in_awaiting_consent_state() -> None:
         accepted_files=files,
         privacy_tier_ceiling="intimate",
         now=99.0,
+        scanned=True,
     )
 
     assert batch.channel_id == 42
@@ -403,5 +415,61 @@ def test_build_pending_batch_starts_in_awaiting_consent_state() -> None:
     assert batch.files == files
     assert batch.privacy_tier_ceiling == "intimate"
     assert batch.created_at == 99.0
+    assert batch.scanned is True
     assert batch.state == "awaiting_consent"
     assert batch.ingested_hashes == frozenset()
+
+
+def test_build_pending_batch_threads_a_false_scanned_flag() -> None:
+    """#1054: the factory records a failed safety pass verbatim."""
+    batch = build_pending_batch(
+        channel_id=42,
+        staging_dir=Path("/vault/inbound/42/100"),
+        accepted_files=(_file(),),
+        privacy_tier_ceiling="open",
+        now=1.0,
+        scanned=False,
+    )
+
+    assert batch.scanned is False
+    # Still recorded and cancel-able — option (b) in crawdad/CLAUDE.md §5.3.
+    assert batch.state == "awaiting_consent"
+
+
+def test_pending_batch_requires_an_explicit_scanned_flag() -> None:
+    """#1054: ``scanned`` has no default, so nothing can inherit a permissive one.
+
+    A default of ``True`` would be a fail-open gate; a default of
+    ``False`` would silently mislabel real batches. Requiring it means
+    every construction site — present and future — has to state which
+    it is.
+    """
+    # Splatted so the omission is a *runtime* fact to assert on rather
+    # than a mypy error that would need suppressing to express.
+    without_scanned: dict[str, Any] = {
+        "channel_id": 1,
+        "staging_dir": Path("/tmp"),
+        "files": (),
+        "privacy_tier_ceiling": "personal",
+        "created_at": 0.0,
+    }
+
+    with pytest.raises(TypeError, match="scanned"):
+        PendingBatch(**without_scanned)
+
+
+def test_scanned_flag_survives_resolution_and_state_transitions() -> None:
+    """#1054: no copy helper can launder ``scanned=False`` into ``True``.
+
+    ``with_resolved_types`` is the type-disambiguation route's copy step
+    and ``with_state`` is the lifecycle's — both are
+    :func:`dataclasses.replace` calls, and this pins that they stay so.
+    """
+    batch = _batch(
+        files=(_file(filename="weird.xyz", inferred_type=None),), scanned=False
+    )
+
+    resolved = batch.with_resolved_types("document")
+    assert resolved.scanned is False
+    assert resolved.with_state("awaiting_type").scanned is False
+    assert resolved.with_ingested(frozenset({"abc"})).scanned is False

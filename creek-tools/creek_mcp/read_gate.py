@@ -318,7 +318,12 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
             "Source fragment_ids name fragments the caller did not supply; "
             "_survey_sources ranks every one of them with write_tier_allowed "
             "and compile_tool refuses the whole call on its above_ceiling flag, "
-            "before the LLM or the compiled-page write (#848)."
+            "before the LLM or the compiled-page write (#848). Their "
+            "ancestors are ranked too (#931): the prompt renders an admitted "
+            "fragment's persisted structural_path, which carries ancestor "
+            "headings the caller may never have named, so ancestry_tiers "
+            "walks parent_id and an above-ceiling ancestor refuses the whole "
+            "call with the same content-free reason."
         ),
         gate_module="creek_mcp.tools.compile",
         gate_symbol="_survey_sources",

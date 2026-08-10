@@ -6,6 +6,11 @@ elevated-authorization gate (:mod:`creek_mcp.auth`). A call without the
 a partial purge — and the ``creek.purge.vault`` tool additionally
 requires a ``confirm_vault_path`` matching the absolute path of the
 target vault, mirroring the CLI's interactive guard.
+
+The final section covers #914: the gate is also *rate limited*. Five wrong
+tokens shut it for a minute, the bound is shared across all five tools rather
+than reimplemented per tool, and the throttled refusal is byte-identical to
+an ordinary one so the lockout never becomes an oracle.
 """
 
 from __future__ import annotations
@@ -21,21 +26,27 @@ from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog
 from creek.purge.engine import PurgeResult
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tools.purge import (
+    _REFUSAL_NO_TOKEN,
     purge_classifications_tool,
     purge_daterange_tool,
     purge_fragment_tool,
     purge_source_tool,
     purge_vault_tool,
 )
+from tests.elevated_attempt_support import FakeMonotonicClock
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
 
 # 41 chars — clears the 32-char floor (#907). Low-entropy test literal,
 # not a real credential.
 ELEVATED_TOKEN = "test-elevated-secret-" + "a" * 20
+
+# 41 chars — clears the #907 floor and matches nothing. Test literal, not a
+# real credential.
+WRONG_TOKEN = "wrong-elevated-secret-" + "b" * 19
 
 
 @pytest.fixture
@@ -640,3 +651,360 @@ def test_the_previously_dropped_counters_reach_the_caller(vault: Path) -> None:
         "voice_body_undecodable",
     ):
         assert field in payload, f"{field} never reaches the MCP caller"
+
+
+# ---------------------------------------------------------------------------
+# The gate is not brute-forceable (#914)
+# ---------------------------------------------------------------------------
+
+
+def test_correct_token_is_refused_after_five_failed_attempts(vault: Path) -> None:
+    """Five wrong guesses lock the gate — the CORRECT token is then refused (#914).
+
+    The bound is proved on the *authorized* caller, which is the strongest
+    form: if a valid token is refused inside the window, an invalid one is
+    provably never evaluated.
+    """
+    for _ in range(5):  # literal, not MAX_FAILED_ATTEMPTS: at HEAD that name
+        purge_fragment_tool(  # does not exist and the test would die on an
+            vault_path=vault,  # AttributeError instead of on the assertion
+            fragment_id="frag-001",
+            auth_token=WRONG_TOKEN,
+            consumer="claude-code",
+        )
+
+    result = purge_fragment_tool(
+        vault_path=vault,
+        fragment_id="frag-001",
+        auth_token=ELEVATED_TOKEN,
+        consumer="claude-code",
+    )
+
+    assert result == {
+        "status": "refused",
+        "tool": "creek.purge.fragment",
+        "reason": _REFUSAL_NO_TOKEN,
+    }
+    assert (vault / "01-Fragments" / "Notes" / "frag-001.md").exists()
+
+
+def _fail_the_gate(vault_path: Path, times: int) -> None:
+    """Spend *times* wrong-token attempts against ``creek.purge.fragment``.
+
+    Args:
+        vault_path: The seeded vault; every attempt audits against it and
+            none of them touches a file.
+        times: How many wrong guesses to make.
+    """
+    for _ in range(times):
+        purge_fragment_tool(
+            vault_path=vault_path,
+            fragment_id="frag-001",
+            auth_token=WRONG_TOKEN,
+            consumer="claude-code",
+        )
+
+
+def test_a_throttled_refusal_is_byte_identical_to_an_ordinary_one(
+    vault: Path,
+) -> None:
+    """The lockout must leave no trace in the payload (#913, #914).
+
+    A ``retry_after`` / ``throttled`` / ``attempts_remaining`` key would be a
+    configuration oracle handed out for free: it tells a hostile caller that
+    the policy is armed, how long it lasts, and how many guesses remain — and
+    #913 closed exactly that class of leak. The key set is asserted whole, so
+    a helpful new field cannot be added without this test noticing.
+
+    Honest scope: the equality already holds at HEAD, where nothing
+    short-circuits and both payloads are the same ordinary refusal. This is a
+    ratchet on the implementation that follows, not a red test.
+    """
+    ordinary = purge_fragment_tool(
+        vault_path=vault,
+        fragment_id="frag-001",
+        auth_token=WRONG_TOKEN,
+        consumer="claude-code",
+    )
+    _fail_the_gate(vault, 4)  # ordinary + 4 == the whole budget
+
+    throttled = purge_fragment_tool(
+        vault_path=vault,
+        fragment_id="frag-001",
+        auth_token=WRONG_TOKEN,
+        consumer="claude-code",
+    )
+
+    assert throttled == ordinary
+    assert set(throttled) == {"status", "tool", "reason"}
+    assert throttled["reason"] == _REFUSAL_NO_TOKEN
+
+
+def test_a_locked_gate_cannot_be_told_apart_from_a_wrong_token(
+    vault: Path,
+) -> None:
+    """Inside the window, right and wrong tokens produce the same bytes (#914).
+
+    This is the sharper half of the byte-identity property. If a throttled
+    refusal of the *correct* token differed in any way from a refusal of a
+    wrong one, the lockout would have become an oracle that confirms a guess
+    — which is worth more to an attacker than the guesses the throttle took
+    away.
+    """
+    _fail_the_gate(vault, 5)
+
+    with_a_wrong_token = purge_fragment_tool(
+        vault_path=vault,
+        fragment_id="frag-001",
+        auth_token=WRONG_TOKEN,
+        consumer="claude-code",
+    )
+    with_the_right_token = purge_fragment_tool(
+        vault_path=vault,
+        fragment_id="frag-001",
+        auth_token=ELEVATED_TOKEN,
+        consumer="claude-code",
+    )
+
+    assert with_the_right_token == with_a_wrong_token
+    assert with_the_right_token["status"] == "refused"
+    assert (vault / "01-Fragments" / "Notes" / "frag-001.md").exists()
+
+
+def test_every_throttled_attempt_is_still_audited(vault: Path) -> None:
+    """Refusing faster must not mean refusing silently (#914).
+
+    ``mcp.jsonl`` is the only record that a brute-force attempt happened at
+    all, so the short-circuit that skips the token comparison must not also
+    skip the audit append. A throttle that hides the attack it is defending
+    against is worse than no throttle — the operator would see a quiet log
+    and a gate that mysteriously refuses them.
+
+    Honest scope: six attempts already produce six entries at HEAD, where
+    nothing short-circuits. This is what keeps that true once something does.
+    """
+    _fail_the_gate(vault, 6)
+
+    entries = _audit_entries(vault)
+    assert len(entries) == 6
+    assert [entry["tool"] for entry in entries] == ["creek.purge.fragment"] * 6
+    for entry in entries:
+        summary = entry["args_summary"]
+        assert isinstance(summary, dict)
+        assert "auth_token" not in summary
+
+
+def test_a_successful_purge_hands_the_whole_budget_back(vault: Path) -> None:
+    """Authorizing resets the counter, so honest typos never accumulate (#914).
+
+    Without the reset the budget is a lifetime allowance rather than a
+    consecutive-failure bound: four typos in this session plus four in the
+    next lock the operator out with no failed *attack* anywhere in the
+    sequence. Both successes are real — ``status == "ok"`` straight from the
+    engine — and ``dry_run`` is what leaves the fragment on disk so the
+    second round has something to purge.
+    """
+    for _ in range(2):
+        _fail_the_gate(vault, 4)
+        served = purge_fragment_tool(
+            vault_path=vault,
+            fragment_id="frag-001",
+            auth_token=ELEVATED_TOKEN,
+            consumer="claude-code",
+            dry_run=True,
+        )
+        assert served["status"] == "ok"
+        assert served["dry_run"] is True
+
+    assert (vault / "01-Fragments" / "Notes" / "frag-001.md").exists()
+
+
+def test_the_purge_gate_reopens_after_the_lockout_expires(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A locked-out operator gets their own tools back, on the clock (#914).
+
+    The failure this pins is worse than the one #914 fixes: a throttle that
+    never lifts bricks the only path the operator has to erase their own
+    data, and every individual refusal along the way looks correct. Time is
+    driven by hand through the policy module's ``_now`` seam, so the
+    assertion is exact and the test costs microseconds rather than a minute.
+
+    The import is deferred on purpose: during the RED window
+    ``creek_mcp.attempt_policy`` does not exist, and a module-level import
+    would turn every test in this file into a collection error instead of
+    letting the ones above fail on their own assertions.
+    """
+    from creek_mcp import attempt_policy
+
+    clock = FakeMonotonicClock()
+    monkeypatch.setattr(attempt_policy, "_now", clock)
+    armed_at = clock.now
+
+    _fail_the_gate(vault, attempt_policy.MAX_FAILED_ATTEMPTS)
+    locked = purge_fragment_tool(
+        vault_path=vault,
+        fragment_id="frag-001",
+        auth_token=ELEVATED_TOKEN,
+        consumer="claude-code",
+        dry_run=True,
+    )
+    assert locked["status"] == "refused"
+
+    clock.now = armed_at + attempt_policy.LOCKOUT_SECONDS
+    served = purge_fragment_tool(
+        vault_path=vault,
+        fragment_id="frag-001",
+        auth_token=ELEVATED_TOKEN,
+        consumer="claude-code",
+    )
+
+    assert served["status"] == "ok"
+    assert served["fragments_affected"] == 1
+    assert not (vault / "01-Fragments" / "Notes" / "frag-001.md").exists()
+
+
+def _attempt_fragment(vault_path: Path, token: str | None) -> dict[str, object]:
+    """Invoke ``creek.purge.fragment`` with *token*, previewing only.
+
+    Args:
+        vault_path: The seeded vault.
+        token: The ``auth_token`` to present.
+
+    Returns:
+        The tool's structured response.
+    """
+    return purge_fragment_tool(
+        vault_path=vault_path,
+        fragment_id="frag-001",
+        auth_token=token,
+        dry_run=True,
+    )
+
+
+def _attempt_source(vault_path: Path, token: str | None) -> dict[str, object]:
+    """Invoke ``creek.purge.source`` with *token*, previewing only.
+
+    Args:
+        vault_path: The seeded vault.
+        token: The ``auth_token`` to present.
+
+    Returns:
+        The tool's structured response.
+    """
+    return purge_source_tool(
+        vault_path=vault_path,
+        source_type="journal",
+        auth_token=token,
+        dry_run=True,
+    )
+
+
+def _attempt_classifications(vault_path: Path, token: str | None) -> dict[str, object]:
+    """Invoke ``creek.purge.classifications`` with *token*, previewing only.
+
+    Args:
+        vault_path: The seeded vault.
+        token: The ``auth_token`` to present.
+
+    Returns:
+        The tool's structured response.
+    """
+    return purge_classifications_tool(
+        vault_path=vault_path,
+        auth_token=token,
+        dry_run=True,
+    )
+
+
+def _attempt_daterange(vault_path: Path, token: str | None) -> dict[str, object]:
+    """Invoke ``creek.purge.daterange`` with *token*, previewing only.
+
+    Args:
+        vault_path: The seeded vault.
+        token: The ``auth_token`` to present.
+
+    Returns:
+        The tool's structured response.
+    """
+    return purge_daterange_tool(
+        vault_path=vault_path,
+        start="2026-05-01",
+        end="2026-05-02",
+        auth_token=token,
+        dry_run=True,
+    )
+
+
+def _attempt_vault(vault_path: Path, token: str | None) -> dict[str, object]:
+    """Invoke ``creek.purge.vault`` with *token* and a matching confirmation.
+
+    Args:
+        vault_path: The seeded vault, echoed back as ``confirm_vault_path``
+            so the tool's second factor is satisfied and the elevated gate
+            is the only thing left that can refuse.
+        token: The ``auth_token`` to present.
+
+    Returns:
+        The tool's structured response.
+    """
+    return purge_vault_tool(
+        vault_path=vault_path,
+        confirm_vault_path=str(vault_path),
+        auth_token=token,
+        dry_run=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool", "attempt"),
+    [
+        pytest.param("creek.purge.fragment", _attempt_fragment, id="fragment"),
+        pytest.param("creek.purge.source", _attempt_source, id="source"),
+        pytest.param(
+            "creek.purge.classifications",
+            _attempt_classifications,
+            id="classifications",
+        ),
+        pytest.param("creek.purge.daterange", _attempt_daterange, id="daterange"),
+        pytest.param("creek.purge.vault", _attempt_vault, id="vault"),
+    ],
+)
+def test_every_purge_tool_inherits_the_shared_lockout(
+    vault: Path,
+    tool: str,
+    attempt: Callable[[Path, str | None], dict[str, object]],
+) -> None:
+    """One budget guards all five tools — not five budgets of five guesses.
+
+    The window is armed entirely through ``creek.purge.classifications`` and
+    then checked on a *different* tool, so a per-tool counter fails here: five
+    tools times five guesses is a twenty-five-guess gate, and an attacker who
+    rotates tools between guesses never trips any of them. The
+    ``classifications`` parameter is the same-tool control.
+
+    Every invocation runs with ``dry_run=True``. The assertion is about the
+    gate, and a test that had to destroy the vault to learn the gate opened
+    could not then check that it stays shut.
+
+    Args:
+        vault: The seeded vault.
+        tool: The wire name the refusal must carry.
+        attempt: Invokes the tool under test with a given token.
+    """
+    for _ in range(5):  # literal: MAX_FAILED_ATTEMPTS does not exist at HEAD
+        purge_classifications_tool(
+            vault_path=vault,
+            auth_token=WRONG_TOKEN,
+            consumer="claude-code",
+            dry_run=True,
+        )
+
+    result = attempt(vault, ELEVATED_TOKEN)
+
+    assert result["status"] == "refused"
+    assert result["tool"] == tool
+    assert result["reason"] == _REFUSAL_NO_TOKEN
+    assert set(result) == {"status", "tool", "reason"}
+    assert (vault / "01-Fragments" / "Notes" / "frag-001.md").exists()
