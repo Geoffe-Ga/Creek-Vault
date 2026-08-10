@@ -67,9 +67,24 @@ from most to least likely:
 - **Redaction patterns** scrub well-known secrets (API keys, SSN-like
   strings, etc.) before fragments are read by any LLM (see
   [redaction](../redaction.md) and SEC-002 for known coverage gaps).
-- **Path-traversal guard.** `creek redact --apply` and `--review`
-  refuse to follow symlinks that escape the source/vault root
-  (SEC-003).
+- **Path-traversal guard.** Three walks encounter symlinks and they do
+  not all respond the same way. The `creek redact --apply`/`--review`
+  *directory* walk refuses outright when a child symlink escapes the
+  source/vault root (SEC-003, unchanged). The redaction *scan* walk
+  (`RedactionScanner.scan_batch`, which backs `creek redact --scan`,
+  the `creek.redact.scan` MCP tool, and the pipeline's own redaction
+  pass) instead skips an escaping child and counts it, rather than
+  refusing the whole scan. The pipeline's redaction pass escalates
+  that skip to a hard refusal before it acts on the scan result,
+  because `creek.ingest.markdown.MarkdownIngestor` would otherwise
+  read the same file again with no symlink guard of its own, turning
+  a silent skip into a silent unredacted ingest. Two gaps remain
+  open: the SEC-003 write guard is directory-only, so naming a
+  symlinked *file* directly to `--apply` bypasses it entirely
+  (#1293); and the ingestor's own directory walks still follow
+  symlinks out of the source root regardless, so the pipeline
+  refusal is a backstop that a vault with `redaction.enabled: false`
+  never reaches (#1294).
 - **Prompt-injection hardening.** Fragment title and body are
   sanitised before being templated into the LLM classifier prompt;
   responses are strictly validated to reject multi-document YAML and

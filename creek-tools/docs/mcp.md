@@ -159,15 +159,21 @@ generic out-of-scope refusal. A **remote** consumer token is capped at
 can never reach that escape — the whole-vault scan is a local-operator
 capability only.
 
-Two residuals are accepted rather than closed by this fix. **Existence
+One residual is accepted rather than closed by this fix: **existence
 probing within `Inbound/` still works** — a caller can still ask whether a
 given staged filename is there — and that is the tool's job, not a leak.
-**`RedactionScanner.scan_batch` still follows symlinked files** it walks
-into, so a symlink staged under `Inbound/` still discloses its target's PII
-types, line numbers, and whether it exists at all (it still counts toward
-`statistics.files_scanned`) — even though the fix stops the response from
-disclosing the target's *path* — tracked by #1087. `rglob` does not descend
-into symlinked *directories*, which bounds the residual to symlinked files.
+The other residual this fix used to leave open — `RedactionScanner.scan_batch`
+following a symlinked child out of the scan root and disclosing its target's
+PII types, line numbers, and existence — is closed. `scan_batch`'s one
+filesystem walk (`_scannable_candidates`) now resolves the scan root once
+and declines any symlinked child whose resolved target lands outside it,
+using the same predicate as the shipped SEC-003 write guard; a declined
+child is counted on `ScanSummary.files_skipped_symlink` and rendered into
+`report_markdown`, but that counter is not yet a typed key on this tool's
+`statistics` object — tracked by #1292, deferred so the security fix did not
+also carry a contract bump. `rglob` does not descend into symlinked
+*directories*, so a link to `01-Fragments/` staged as a directory was never
+reachable either way.
 
 One deployment knob rode on top of the fix itself: CrawDad's staging root is
 a configurable `staging_subpath` (`AttachmentConfig`, default
@@ -394,8 +400,8 @@ resolved — because `RedactionScanner.scan_batch` yields symlinked children
 unresolved, and a renderer that resolved first reported such a symlink
 under its target's name, out of a scan the scope fix alone would still
 have admitted. See "`creek.redact.scan` is scoped, not tier-filtered" under
-Read tools above for the full shape of the fix, including the two residuals
-it accepts.
+Read tools above for the full shape of the fix, including the one residual
+it still accepts and the one #1087 has since closed.
 
 ### Elevated-authorization model (FEAT-012)
 

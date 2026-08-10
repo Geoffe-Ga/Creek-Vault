@@ -540,3 +540,121 @@ def test_redact_review_refuses_symlink_escaping_vault(tmp_path: Path) -> None:
 
     assert result.exit_code != 0
     assert "symlink" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# #1087: the read path SKIPS an escaping symlink, it does not refuse
+#
+# SEC-003 above governs the *write* path: ``--apply`` and ``--review`` refuse
+# outright, because following a link there could rewrite a file outside the
+# tree the operator named. ``--scan`` writes nothing, so refusing a whole scan
+# over one bad link would be a denial of service on the safety pass itself.
+# The contract is therefore different in kind: decline the file, keep the
+# scan, and say so in the statistics.
+# ---------------------------------------------------------------------------
+
+_SYMLINK_SKIP_LABEL = "Files skipped (escaping symlink)"
+"""The statistics-table row reporting a declined symlink.
+
+Written out in full rather than probed by substring: the row sits beside
+"Files skipped (binary)" and "Files skipped (extension)", and a partial match
+would not distinguish the new counter from either of them.
+"""
+
+_ESCAPING_TARGET_PII = "SSN: 999-88-7777\n"
+"""Payload for the file parked outside the source root: exactly one ``ssn``."""
+
+_IN_ROOT_PII = "Contact: alice@example.com\n"
+"""Payload for the in-root control file: exactly one ``email``.
+
+A different pattern *type* from :data:`_ESCAPING_TARGET_PII`, so the report
+itself says which of the two files was read — the CLI prints match types, and
+never the matched text.
+"""
+
+
+def test_redact_scan_does_not_read_a_symlink_escaping_the_source_root(
+    tmp_path: Path,
+) -> None:
+    """``--scan`` declines the escaping link, finishes the scan, and reports it.
+
+    Three properties in one run, because they only mean anything together:
+
+    * ``exit_code == 0`` — the scan is skipped, not refused. A non-zero exit
+      here would make one stray link disable the operator's whole safety pass.
+    * the escaping target's pattern type never reaches the output, while the
+      in-root file's does. The second half is the non-vacuity guard: a scan
+      that read nothing would satisfy the first half perfectly.
+    * the skip is named in the statistics table. A safety tool that silently
+      declines to read a file is its own hazard — the operator reads "no
+      findings" and concludes the tree is clean.
+
+    Deliberately run without ``--verbose``: the pattern-type table is enough
+    to say which file was read, and the per-match table renders absolute
+    temporary paths whose length would make this test a formatting assertion.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "notes.md").write_text(_IN_ROOT_PII, encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text(_ESCAPING_TARGET_PII, encoding="utf-8")
+    (source / "linked.md").symlink_to(outside)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--scan", "--source", str(source)],
+    )
+
+    assert result.exit_code == 0, (
+        "--scan refused the whole tree over one escaping symlink; the read "
+        "path is supposed to skip the file and carry on.\n\n"
+        f"exit_code={result.exit_code}\n{result.output}"
+    )
+    assert "ssn" not in result.output.lower(), (
+        "the scan reported the PII type of a file outside the source root, "
+        f"so it followed the symlink and read it.\n\n{result.output}"
+    )
+    assert "email" in result.output.lower(), (
+        "the in-root control produced no finding, so every other assertion "
+        f"here would pass over a scan that read nothing.\n\n{result.output}"
+    )
+    assert _SYMLINK_SKIP_LABEL in result.output, (
+        "the summary table does not report that a file was skipped, so the "
+        f"operator reads a clean scan over a tree that was not.\n\n"
+        f"{result.output}"
+    )
+
+
+def test_redact_scan_omits_the_symlink_skip_row_when_nothing_was_skipped(
+    tmp_path: Path,
+) -> None:
+    """An ordinary scan's table gains no new row.
+
+    The over-reporting guard for the row above. Rendering it unconditionally
+    would put a permanent "escaping symlink: 0" line in front of every
+    operator whose tree has never held one, which is the fastest way to teach
+    a reader to skip that part of the table.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    source = _write_sensitive_source(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--scan", "--source", str(source)],
+    )
+
+    assert result.exit_code == 0, (
+        f"the ordinary scan failed.\n\nexit_code={result.exit_code}\n{result.output}"
+    )
+    assert "escaping symlink" not in result.output.lower(), (
+        "the escaping-symlink row is rendered for a scan that declined "
+        f"nothing.\n\n{result.output}"
+    )
+    assert "Files scanned" in result.output, (
+        f"the statistics table did not render at all.\n\n{result.output}"
+    )

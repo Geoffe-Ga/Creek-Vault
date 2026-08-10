@@ -18,6 +18,7 @@ import pytest
 from creek.config import CreekConfig
 from creek.consent import ConsentManager
 from creek.pipeline import Pipeline, PipelineResult
+from creek.redact import ScanSummary
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -232,22 +233,40 @@ class TestPipelineStages:
     """Tests for individual pipeline stages using mocks."""
 
     def test_redaction_disabled(self, vault_path, source_path):
-        """Test that redaction scan is skipped when disabled in config."""
+        """Test that redaction scan is skipped when disabled in config.
+
+        Retargeted from ``scan_directory`` to ``scan_batch`` by #1087: the
+        pipeline needs the full :class:`~creek.redact.scanner.ScanSummary` so
+        it can see ``files_skipped_symlink``, and ``scan_directory`` throws
+        the counters away. The assertion is unchanged in strength — with
+        redaction disabled the scanner must not be entered at all, and
+        ``scan_directory`` delegates to ``scan_batch``, so patching the
+        deeper call still catches a caller that went round the front door.
+        """
         config = CreekConfig()
         config.redaction.enabled = False
         pipeline = Pipeline(config=config)
-        with patch.object(pipeline.scanner, "scan_directory") as mock_scan:
+        with patch.object(pipeline.scanner, "scan_batch") as mock_scan:
             result = pipeline.run(source_path=source_path, vault_path=vault_path)
             mock_scan.assert_not_called()
             # Files are still counted even when scanning is disabled
             assert result.files_scanned == 3
 
     def test_redaction_enabled_scans_directory(self, vault_path, source_path):
-        """Test that redaction scanner is called when enabled."""
+        """Test that redaction scanner is called when enabled.
+
+        Retargeted from ``scan_directory`` to ``scan_batch`` by #1087, for the
+        reason given on ``test_redaction_disabled``. The stand-in is a real
+        ``ScanSummary`` rather than a ``MagicMock`` deliberately: the pipeline
+        now reads ``summary.files_skipped_symlink`` off the result, and a
+        ``MagicMock`` answers every attribute with a truthy object — which
+        would make the refusal fire on every mocked run and hide the check
+        rather than exercise it.
+        """
         config = CreekConfig()
         pipeline = Pipeline(config=config)
         with patch.object(
-            pipeline.scanner, "scan_directory", return_value=[]
+            pipeline.scanner, "scan_batch", return_value=ScanSummary()
         ) as mock_scan:
             pipeline.run(source_path=source_path, vault_path=vault_path)
             mock_scan.assert_called_once_with(source_path)
@@ -2005,3 +2024,165 @@ class TestPipelineAudiencePass:
         )
 
         assert str(classified[0].fragment.audience) == "private"
+
+
+# ---------------------------------------------------------------------------
+# #1087: an escaping symlink in the source tree stops the run
+#
+# The read tools skip; the pipeline must refuse. Today the escaping link's
+# target is scanned, yields matches, and RedactionRequiredError blocks the
+# ingest — so the hole is *masked* here by a different guard. Once the walk
+# skips the link the scan comes back clean, the pipeline proceeds, and
+# ``creek/ingest/markdown.py::MarkdownIngestor._read_directory`` reaches the
+# same file through its own ``rglob("*.md")`` + ``read_bytes()`` with no
+# symlink check and no ``is_file`` check of its own. Skipping in the pipeline
+# would therefore convert "blocked ingest" into "silent unredacted ingest".
+# ---------------------------------------------------------------------------
+
+_ESCAPED_CANARY = "CANARY-PIPELINE-SYMLINK-4c21"
+"""Sentinel carried only by the file parked outside the source tree.
+
+A sentinel rather than realistic prose, so "this string reached the vault"
+cannot be explained away as a phrase that could have come from anywhere.
+"""
+
+_ESCAPED_PII = "Email me at leaked@example.com"
+"""One real ``email`` match, so the out-of-tree file is worth scanning."""
+
+
+def test_pipeline_refuses_a_source_tree_holding_a_symlink_that_escapes_it(
+    vault_path: Path,
+    tmp_path: Path,
+) -> None:
+    """``creek process`` stops rather than ingesting past a declined file.
+
+    Run against the real filesystem — no ``patch.object(pipeline.scanner,
+    ...)`` — because the whole question is what the *scanner's own walk* hands
+    the pipeline, and a mocked summary can only ever hand back whatever this
+    test already believes.
+
+    The rationale for refusing rather than skipping is the comment above: the
+    redaction gate is the only thing standing between an out-of-tree file and
+    the vault, and ingestion does not repeat the containment check. A scanner
+    that quietly declines to read a file is fine for a report and fatal for a
+    gate, so the two callers must diverge here — ``--scan`` skips, ``process``
+    refuses.
+
+    ``SymlinkEscapedSourceError`` does not exist yet, so this test currently
+    fails on the import. The behavioural fact it pins, and the one that will
+    be false the moment the walk starts skipping without the pipeline
+    refusing, is the pair of vault assertions at the end: nothing carrying the
+    out-of-tree file's content may be written. They are a guard rather than
+    the discriminator — today ``RedactionRequiredError`` blocks the run and
+    they hold for the wrong reason, which is exactly why the error *type* is
+    asserted too.
+
+    Args:
+        vault_path: Vault root the run would write into.
+        tmp_path: Pytest-provided temporary directory.
+    """
+    from creek.pipeline import SymlinkEscapedSourceError
+
+    source = tmp_path / "source-with-link"
+    source.mkdir()
+    (source / "clean.md").write_text(
+        "# Ordinary notes\n\nNothing sensitive here.\n",
+        encoding="utf-8",
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.md"
+    secret.write_text(
+        f"# {_ESCAPED_CANARY}\n\n{_ESCAPED_PII}\n",
+        encoding="utf-8",
+    )
+    (source / "link.md").symlink_to(secret)
+
+    pipeline = Pipeline(config=CreekConfig())
+
+    with pytest.raises(SymlinkEscapedSourceError) as excinfo:
+        pipeline.run(source_path=source, vault_path=vault_path)
+
+    assert excinfo.value.skipped_count == 1, (
+        "the refusal does not say how many files the scan declined, so the "
+        "operator cannot tell a one-off stale link from a whole unscanned "
+        f"subtree.\n\nskipped_count: {excinfo.value.skipped_count}"
+    )
+    assert excinfo.value.source_path == source, (
+        f"the refusal names the wrong tree.\n\nsource_path: {excinfo.value.source_path}"
+    )
+    written = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in sorted(vault_path.rglob("*"))
+        if path.is_file()
+    )
+    assert _ESCAPED_CANARY not in written, (
+        "content from outside the source tree was ingested into the vault "
+        f"unredacted.\n\n{written}"
+    )
+    assert _ESCAPED_PII not in written, (
+        f"the out-of-tree file's PII reached the vault.\n\n{written}"
+    )
+
+
+def test_symlink_refusal_is_not_waived_by_redaction_dry_run(
+    vault_path: Path,
+    tmp_path: Path,
+) -> None:
+    """``redaction.dry_run`` downgrades a PII finding; it must not downgrade this.
+
+    ``dry_run`` exists so an operator can see what redaction *would* catch and
+    keep ingesting anyway — a deliberate waiver over a gate that has read the
+    content and is reporting on it. An escaping symlink is the opposite
+    situation: the scan came back clean only because it declined to look, so
+    there is no finding to waive and nothing to have judged. Letting
+    ``dry_run`` through here would hand the operator a config flag that
+    silently re-opens the traversal #1087 closed, which is why the refusal is
+    raised above the ``dry_run`` arm rather than inside it.
+
+    The ordering is asserted rather than read off the source because it is one
+    line's position in a function: a later edit that moves the check below the
+    ``dry_run`` early-return would leave every other test in this file green.
+
+    Args:
+        vault_path: Vault root the run would write into.
+        tmp_path: Pytest-provided temporary directory.
+    """
+    from creek.pipeline import SymlinkEscapedSourceError
+
+    source = tmp_path / "source-dry-run"
+    source.mkdir()
+    (source / "clean.md").write_text(
+        "# Ordinary notes\n\nNothing sensitive here.\n",
+        encoding="utf-8",
+    )
+    outside = tmp_path / "outside-dry-run"
+    outside.mkdir()
+    secret = outside / "secret.md"
+    secret.write_text(
+        f"# {_ESCAPED_CANARY}\n\n{_ESCAPED_PII}\n",
+        encoding="utf-8",
+    )
+    (source / "link.md").symlink_to(secret)
+
+    config = CreekConfig()
+    config.redaction.dry_run = True
+    pipeline = Pipeline(config=config)
+
+    with pytest.raises(SymlinkEscapedSourceError) as excinfo:
+        pipeline.run(source_path=source, vault_path=vault_path)
+
+    assert excinfo.value.skipped_count == 1, (
+        "the refusal fired but miscounted, so this test would pass even if "
+        "the guard were counting something other than the escaping link.\n\n"
+        f"skipped_count: {excinfo.value.skipped_count}"
+    )
+    written = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in sorted(vault_path.rglob("*"))
+        if path.is_file()
+    )
+    assert _ESCAPED_CANARY not in written, (
+        "redaction.dry_run waived a path-traversal refusal and the "
+        f"out-of-tree file was ingested.\n\n{written}"
+    )

@@ -979,6 +979,108 @@ def test_an_unrenderable_path_falls_back_to_a_non_disclosing_placeholder(
         )
 
 
+# ---------------------------------------------------------------------------
+# The walk does not follow an escaping symlink (#1087)
+#
+# #972 stopped the response from *naming* a symlink's target; the residual it
+# recorded was that the walk still *read* it. ``scan_batch`` selects candidates
+# with ``child.is_file()``, and ``is_file()`` follows symlinks, so the target's
+# PII types, line numbers, and existence still reached this tool's caller.
+#
+# #1087 closed it in ``_scannable_candidates``, the scanner module's one
+# filesystem walk: a child that is itself a symlink must resolve under the
+# already-resolved scan root or it is declined unopened. The test below pins
+# that from the MCP surface — the shared locator means it holds for
+# ``creek redact`` and ``creek process`` too, but each surface asserts its own
+# statistics contract, and ``files_scanned`` is this one's.
+# ---------------------------------------------------------------------------
+
+_STAGED_PII_RELPATH = f"{_STAGING_ROOT}/ch1/msg/staged.md"
+"""The one PII-bearing file :func:`scannable_vault` seeds inside the staging dir.
+
+Written down once because two assertions have to agree about it: the set of
+files a confined scan may report, and the number of files it may have opened.
+"""
+
+
+@pytest.mark.parametrize("ceiling", list(TierCeiling))
+def test_scan_does_not_read_a_symlink_escaping_the_scan_root(
+    scannable_vault: Path,
+    ceiling: TierCeiling,
+) -> None:
+    """A staged symlink's out-of-root target is not opened, reported or counted.
+
+    The scan below is one the scope gate *correctly admits*: the staging
+    subtree is admitted at every ceiling (FEAT-027), and the caller asked for
+    nothing else. What escapes is the walk. A link parked at
+    ``00-Creek-Meta/Inbound/ch1/sneaky.md`` pointing at an intimate fragment
+    is opened, its findings are attributed to the staged path, and it adds one
+    to ``files_scanned`` — which is an existence-and-readability bit about a
+    file the caller was refused, the property named in
+    ``creek_mcp/read_gate.py``.
+
+    Parametrised over every ceiling because the acceptance criterion is "at
+    any ceiling": containment at the walk is a property of *where the scan is
+    pointed*, never of what the caller declared, so an implementation that
+    only held at ``open`` would be a second ranking rule in disguise.
+
+    The **behavioural** assertion is ``files_scanned == 1``; today it is ``2``.
+    The finding-set equality is the second behavioural assertion and doubles as
+    the non-vacuity guard: the in-root control (:data:`_STAGED_PII_RELPATH`) is
+    legitimately scanned and legitimately reports PII, so "scanned nothing" and
+    "refused everything" both fail here rather than passing quietly. Neither
+    ``findings == []`` nor ``files_scanned == 0`` would be true after a correct
+    fix.
+
+    The canary assertion already passes today — #972 stopped
+    :func:`~creek_mcp.tools.redact._vault_relative` resolving the link before
+    rendering it — and is kept as a non-regression pin, so a fix that skipped
+    the file while restoring the resolving renderer could not go green.
+
+    Args:
+        scannable_vault: Used exactly as-is; this test adds only the link, so
+            the fixture's own staged file remains the positive control.
+        ceiling: The caller's declared tier ceiling.
+    """
+    staged = scannable_vault / "00-Creek-Meta" / "Inbound" / "ch1" / "sneaky.md"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.symlink_to(
+        scannable_vault / _FRAGMENTS_ROOT / "Notes" / f"my-{_FILENAME_CANARY}-note.md",
+    )
+
+    result = redact_scan_tool(
+        vault_path=scannable_vault,
+        input_path=_STAGING_ROOT,
+        privacy_tier_ceiling=ceiling,
+        consumer="crawdad",
+    )
+
+    assert result["status"] == "ok", (
+        f"the staging subtree must stay admitted at ceiling={ceiling.value!r} "
+        "(FEAT-027) or there is no scan for the rest of this test to measure."
+        f"\n\n{result}"
+    )
+    assert result["statistics"]["files_scanned"] == 1, (
+        "creek.redact.scan opened a symlinked child whose target resolves "
+        "outside the scanned root and counted it, so files_scanned carries an "
+        "existence-and-readability bit about an out-of-scope file.\n\n"
+        f"statistics: {result['statistics']}"
+    )
+    finding_paths = {str(finding["file_path"]) for finding in result["findings"]}
+    assert finding_paths == {_STAGED_PII_RELPATH}, (
+        "a scan confined to the staging subtree must report exactly the "
+        "in-root file it was pointed at: anything extra was read through the "
+        "symlink, and anything missing means the walk stopped scanning the "
+        f"subtree the tool exists for.\n\nfindings: {sorted(finding_paths)}"
+    )
+    serialised = json.dumps(result, default=str)
+    assert _FILENAME_CANARY not in serialised, (
+        "the response names the symlink target's intimate fragment — and a "
+        f"Creek filename is a slugified title — at ceiling={ceiling.value!r}."
+        f"\n\n{serialised}"
+    )
+
+
 def test_scan_accepts_a_vault_root_with_a_symlinked_component(vault: Path) -> None:
     """A vault reached through a symlink is scanned, not crashed on.
 

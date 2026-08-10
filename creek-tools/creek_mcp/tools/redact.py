@@ -70,14 +70,21 @@ because the only target ever echoed is one the scope gate admitted — a
 symlink out of the staging subtree is refused above the echo, never renamed
 by it.
 
-Residual, tracked by **#1087**: ``scan_batch`` still *follows* symlinked
-children, so such a target's PII types and line numbers are still reported
-even though its path no longer is — and it counts toward ``files_scanned``
-whether or not it yields a finding, so the residual carries an
-existence-and-readability bit about the target as well as finding detail.
-It is bounded to symlinked **files**: ``rglob`` does not descend into
-symlinked directories and ``scan_batch`` keeps only ``is_file()`` children,
-so a link to ``01-Fragments/`` staged as a directory yields nothing at all.
+**#1087 closed the scan_batch residual.** The walk it performs
+(:func:`~creek.redact.scanner._scannable_candidates`, the module's only
+filesystem enumeration) resolves the scan root once and, for a child that
+is itself a symlink, requires the resolved target to land under that root
+— the same predicate the shipped SEC-003 write guard uses
+(:func:`~creek.redact.cli_commands._assert_no_escaping_symlinks`) — before
+the child is opened. An escaping symlinked child is declined rather than
+read: its PII types, line numbers, and existence never reach this tool's
+response. The bound that used to be incidental is now a pinned property:
+``rglob`` does not descend into symlinked directories, so a link to
+``01-Fragments/`` staged as a directory was never reachable either way.
+The decline is counted on ``ScanSummary.files_skipped_symlink`` and
+rendered into ``report_markdown``, but it is not yet a typed key on this
+tool's ``statistics`` object — that wire change is deliberately deferred
+so a security fix does not also carry a contract bump (#1292).
 """
 
 from __future__ import annotations
@@ -353,9 +360,15 @@ def _vault_relative(path: Path, vault_path: Path) -> str:
 
     *path* is deliberately not resolved. ``rglob`` yields symlinked children
     unresolved, so resolving here reports a link staged under ``Inbound/``
-    beneath its target's name — the disclosure described in the module
+    beneath its target's name — the #972 disclosure recounted in the module
     docstring, arriving through a scan the scope gate correctly admitted. The
     path a finding names must be the path the scanner opened.
+
+    #1087 narrowed what can reach this renderer but did not retire the rule:
+    a symlinked child whose target escapes the scan root is now declined
+    before it is opened, yet one resolving *within* the root is still
+    admitted and still arrives here unresolved. Rendering as scanned is what
+    keeps this function's output independent of that distinction.
 
     The vault *root* is resolved, because that is what every scanned path
     descends from: they are all built from
@@ -408,7 +421,7 @@ def _relativised_summary(summary: ScanSummary, vault_path: Path) -> ScanSummary:
 
     Returns:
         A new :class:`~creek.redact.scanner.ScanSummary` carrying the same
-        matches and the same three file counters, with each ``file_path``
+        matches and the same four file counters, with each ``file_path``
         replaced by its :func:`_vault_relative` rendering.
     """
     rendered = [
