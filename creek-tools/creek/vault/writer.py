@@ -26,7 +26,7 @@ import tempfile
 import threading
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import frontmatter
 import yaml
@@ -436,6 +436,30 @@ def _file_declares_id(path: Path, model_id: str) -> bool:
         return False
     declared = post.get("id")
     return isinstance(declared, str) and declared == model_id
+
+
+class _IndexLoad(NamedTuple):
+    """The outcome of parsing one ``.id-index.jsonl`` file (#1120).
+
+    Separates *what the file said* from *whether the file was intact*,
+    so a caller can tell an index that legitimately names nothing from
+    one that was damaged and therefore names less than it should.
+
+    Attributes:
+        entries: The ``{id: filename}`` mappings that parsed cleanly.
+        torn_lines: How many lines failed ``json.loads``. A torn append
+            leaves exactly one; a crash-heavy history can leave several.
+        read_failed: ``True`` when the file could not be read at all.
+    """
+
+    entries: dict[str, str]
+    torn_lines: int
+    read_failed: bool
+
+    @property
+    def damaged(self) -> bool:
+        """Return ``True`` when *entries* may be missing a real mapping."""
+        return self.torn_lines > 0 or self.read_failed
 
 
 def _is_material_change(old_body: str, new_body: str, threshold: float) -> bool:
@@ -888,6 +912,12 @@ class VaultWriter:
             _atomic_write_text(dest, frontmatter.dumps(post))
             existing.unlink()
             index = self._load_index_locked(orphan_dir)
+            # Deliberate ordering, preserved by #1120: the in-memory
+            # mapping is set BEFORE the append, so a failed append leaves
+            # this process still resolving the tombed file (already moved
+            # above) while a fresh process re-derives it from the damage
+            # rescan in ``_load_index_locked``. Reversing this would make
+            # a torn append lose the tomb for the rest of the run.
             index[fragment_id] = dest.name
             self._append_index_entry(orphan_dir, fragment_id, dest.name)
             self._log_provenance_locked(fragment_id, "fragment", dest)
@@ -923,6 +953,10 @@ class VaultWriter:
             _atomic_write_text(dest, frontmatter.dumps(post))
             existing.unlink()
             index = self._load_index_locked(target_dir)
+            # Same deliberate ordering as ``tomb_fragment`` — see the
+            # note there; the restored file is already on disk (above),
+            # so an in-memory mapping that outlives a torn append is the
+            # conservative side of the trade (#1120).
             index[fragment.id] = dest.name
             self._append_index_entry(target_dir, fragment.id, dest.name)
             self._log_provenance_locked(fragment.id, fragment.type, dest)
@@ -1123,6 +1157,11 @@ class VaultWriter:
             # it, but a future refactor that skips the dup-check
             # branch would otherwise hit a ``KeyError`` here.
             index = self._load_index_locked(target_dir)
+            # In-memory first, on-disk second — deliberate, and preserved
+            # by #1120. ``_atomic_create`` above already put the note on
+            # disk, so a torn append leaves this process resolving the
+            # id correctly and a fresh process recovering it from the
+            # damage rescan rather than minting a duplicate.
             index[model_id] = file_path.name
             self._append_index_entry(target_dir, model_id, file_path.name)
 
@@ -1200,7 +1239,10 @@ class VaultWriter:
                 :meth:`_append_index_entry`. A lookup-shaped method can
                 therefore raise, because a mismatch persists its repair.
             OSError: If persisting a repaired entry fails to write — same
-                origin, same reason it can escape a lookup.
+                origin, same reason it can escape a lookup. Since #1120
+                the partial record such a failure leaves behind is
+                self-terminating, so a torn repair no longer damages the
+                index it was repairing.
         """
         index = self._load_index_locked(target_dir)
         filename = index.get(model_id)
@@ -1256,7 +1298,10 @@ class VaultWriter:
         Both propagate from :meth:`_append_index_entry`. The in-memory
         mapping is corrected *before* the append, so a failure to persist
         leaves this process holding ground truth and the on-disk index
-        merely stale — a cost, not a correctness loss.
+        merely stale — a cost, not a correctness loss. Across processes
+        the same holds since #1120: the torn record this path can leave
+        is self-delimiting, and the unparseable line it forms is exactly
+        the damage signal that makes the next load re-resolve by scan.
         """
         resolved = self._rebuild_index(target_dir).get(model_id)
         if resolved is None:
@@ -1292,13 +1337,46 @@ class VaultWriter:
         last successful write wins). If the JSONL file is missing the
         index is rebuilt by scanning the directory's ``.md`` files and
         the result is persisted so subsequent processes skip the scan.
+
+        When the JSONL file is *present but damaged* — an unparseable
+        line, or a file that cannot be read at all — the mappings it
+        failed to yield are re-derived by scanning the directory (#1120).
+        Without that, a mapping lost to a torn append was permanent: a
+        rescan only ever ran when the file was missing, so an id absent
+        from a present index was never re-resolved and the next write
+        minted a second file for it.
+
+        Precedence on the recovery path is **scan wins**: any id a live
+        file declares takes the on-disk truth, and the parsed JSONL
+        entries only fill gaps the scan cannot see (an id whose file
+        was tombed, or whose frontmatter the scanner declines). The
+        direction matches :meth:`_repair_index_locked`, which also
+        prefers what the directory says over what the index claimed —
+        though that method resolves *purely* by scan and drops the id
+        when the scan misses, where this one keeps the parsed entry as a
+        fallback rather than discarding a mapping it cannot disprove.
+        Letting the parsed value win instead would preserve a mapping the
+        scan just disproved, and every later lookup would pay
+        verification, a second scan and a repair append to arrive at the
+        answer this load already had.
+
+        The recovery never calls :meth:`_persist_full_index`: a
+        whole-file rewrite from this process's snapshot would destroy
+        entries another process appended. The recovered index is cached
+        in ``self._dir_indexes``, so the scan is paid at most once per
+        directory per :class:`VaultWriter` instance — not once per
+        process, since a caller that builds several writers pays it once
+        for each.
         """
         cached = self._dir_indexes.get(target_dir)
         if cached is not None:
             return cached
         index_path = target_dir / INDEX_FILENAME
         if index_path.exists():
-            index = self._load_index_file(index_path)
+            load = self._read_index_records(index_path)
+            index = load.entries
+            if load.damaged:
+                index = self._recover_damaged_index(index_path, target_dir, load)
         elif target_dir.is_dir():
             index = self._rebuild_index(target_dir)
             self._persist_full_index(target_dir, index)
@@ -1308,6 +1386,34 @@ class VaultWriter:
         return index
 
     @staticmethod
+    def _recover_damaged_index(
+        index_path: Path,
+        target_dir: Path,
+        load: _IndexLoad,
+    ) -> dict[str, str]:
+        """Re-derive a damaged index by scanning *target_dir* (#1120).
+
+        Args:
+            index_path: The damaged JSONL file, named in the warning.
+            target_dir: The directory whose ``.md`` files are the truth.
+            load: The partial parse, whose surviving entries fill any
+                gap the scan cannot see.
+
+        Returns:
+            The merged index, with the disk scan taking precedence.
+        """
+        logger.warning(
+            "index %s has %d unparseable line(s)%s; re-resolving by directory scan",
+            index_path,
+            load.torn_lines,
+            " and could not be read" if load.read_failed else "",
+        )
+        recovered = VaultWriter._rebuild_index(target_dir)
+        for model_id, filename in load.entries.items():
+            recovered.setdefault(model_id, filename)
+        return recovered
+
+    @staticmethod
     def _load_index_file(index_path: Path) -> dict[str, str]:
         """Parse a JSONL index file into ``{id: filename}``.
 
@@ -1315,19 +1421,60 @@ class VaultWriter:
         cannot poison the rest of the index. Later entries overwrite
         earlier ones — appending an entry for an existing id therefore
         rewrites the mapping in-place.
+
+        Reports only the mappings. Callers that must also know whether
+        the file was *intact* — and therefore whether the mappings are
+        complete — use :meth:`_read_index_records` instead.
+        """
+        return VaultWriter._read_index_records(index_path).entries
+
+    @staticmethod
+    def _read_index_records(index_path: Path) -> _IndexLoad:
+        """Parse a JSONL index file, reporting damage alongside the entries.
+
+        Only two outcomes count as damage, because only they mean a
+        mapping that *should* be here is missing: a failure to read or
+        decode the file at all, and a ``json.JSONDecodeError`` (a torn
+        record, per #1120). A line that parses as valid JSON but is not
+        a ``{id: str, filename: str}`` object is *not* damage — it is a
+        well-formed line the schema declines, and treating it as damage
+        would buy a directory-wide scan for a file that is perfectly
+        intact.
+
+        ``UnicodeDecodeError`` joins ``OSError`` in the read guard. Our
+        own writers can only emit ASCII (``json.dumps`` escapes
+        non-ASCII by default), so a torn append cannot split a
+        multi-byte character — but a hand-edited or externally corrupted
+        index can still be undecodable, and letting that escape would
+        take down every vault write into the directory rather than
+        costing one directory scan.
+
+        Args:
+            index_path: The ``.id-index.jsonl`` file to parse.
+
+        Returns:
+            An :class:`_IndexLoad` holding the parsed mappings, the
+            count of unparseable lines, and whether the read failed.
         """
         index: dict[str, str] = {}
         try:
             raw = index_path.read_text(encoding="utf-8")
-        except OSError:
-            return index
+        except (OSError, UnicodeDecodeError):
+            return _IndexLoad(index, 0, read_failed=True)
+        torn_lines = 0
         for line in raw.splitlines():
             stripped = line.strip()
             if not stripped:
+                # Load-bearing for the #1120 framing: every appended
+                # record opens with its own newline, so a healthy file
+                # carries a blank line before each one. Dropping this
+                # skip would make every index written after #1120 look
+                # damaged.
                 continue
             try:
                 entry = json.loads(stripped)
             except json.JSONDecodeError:
+                torn_lines += 1
                 continue
             if not isinstance(entry, dict):
                 continue
@@ -1335,7 +1482,7 @@ class VaultWriter:
             filename = entry.get("filename")
             if isinstance(mid, str) and isinstance(filename, str):
                 index[mid] = filename
-        return index
+        return _IndexLoad(index, torn_lines, read_failed=False)
 
     @staticmethod
     def _rebuild_index(target_dir: Path) -> dict[str, str]:
@@ -1384,24 +1531,39 @@ class VaultWriter:
 
         The line is drained through :func:`creek._fsio.write_all`, so an
         ordinary short ``write(2)`` no longer leaves half a JSON line at
-        the tail (#987). If the line is genuinely un-drainable the
-        ``OSError`` propagates and a partial line survives at the tail.
-        That residual is worse than a single lost entry: ``O_APPEND``
-        writes always land at EOF with no separator of their own — the
-        trailing newline is part of the payload — so a remnant left
-        *without* its trailing newline is silently concatenated onto the
-        next successful append. The merged line is not valid JSON, so
-        :meth:`_load_index_file` skips it wholesale at
-        ``json.JSONDecodeError`` and **both** the failed entry and the
-        next legitimate one drop out of the index.
+        the tail (#987).
 
-        ``ftruncate``-back is not a safe alternative: under concurrent
-        ``O_APPEND`` writers the write offset is chosen atomically inside
-        the syscall, so we never reliably learn our own start offset, and
-        another appender may already have landed a complete line past
-        ours that the truncation would destroy. Tracked as issue #1120 —
-        a real fix needs a rewrite-under-lock or a framing change, both
-        out of scope for #987.
+        Each record is framed as ``\\n{json}\\n`` — a newline on *both*
+        sides, so it is self-delimiting at its start as well as its end
+        (#1120). ``O_APPEND`` writes land at EOF with no separator the
+        filesystem supplies, so a record that ends but does not begin
+        with a newline is silently concatenated onto whatever remnant
+        precedes it; the merged line is not valid JSON and takes the
+        innocent record down with the torn one. The leading newline
+        terminates any remnant, so a tear costs at most its own entry.
+        Both newlines are kept deliberately: leading-only is a byte
+        cheaper, but a mixed-version straddle — old code appending
+        ``{b}\\n`` straight after a new-code ``\\n{a}`` — would merge the
+        two and reintroduce the defect on live vault data.
+
+        The framing needs no migration. :meth:`_read_index_records`
+        already skips blank lines, so pre-#1120 files (and the
+        :meth:`_persist_full_index` output, which renames atomically and
+        can never tear) keep parsing byte-for-byte unchanged.
+
+        This method does **not** ``fsync``, unlike
+        :meth:`creek.audit.AuditLog.append`. The index is a
+        reconstructible cache, not a ledger: losing an unsynced tail to
+        a power cut costs a directory scan, not data. That is defensible
+        only because :meth:`_load_index_locked` now supplies the paired
+        recovery — a damaged or short index re-derives its mappings by
+        scanning the directory instead of reporting them as absent.
+
+        ``ftruncate``-back remains the rejected alternative: under
+        concurrent ``O_APPEND`` writers the write offset is chosen
+        atomically inside the syscall, so we never reliably learn our own
+        start offset, and another appender may already have landed a
+        complete line past ours that the truncation would destroy.
 
         Args:
             target_dir: Directory holding the index file.
@@ -1411,14 +1573,19 @@ class VaultWriter:
         Raises:
             ValueError: If the encoded line exceeds :data:`_PIPE_BUF_BYTES`,
                 which would void the ``O_APPEND`` atomicity guarantee.
-            OSError: If the line cannot be written in full. A
-                newline-less partial line may survive at the tail, taking
-                the next appended entry down with it (#1120, above).
+                The check counts the two framing bytes, so the ceiling is
+                honoured for what actually reaches the descriptor.
+            OSError: If the line cannot be written in full. The partial
+                record left at the tail is self-terminating, so it costs
+                only itself; the id it named is re-resolved by scan on
+                the next load (#1120).
         """
         target_dir.mkdir(parents=True, exist_ok=True)
         index_path = target_dir / INDEX_FILENAME
         encoded = (
-            json.dumps({"id": model_id, "filename": filename}, sort_keys=True) + "\n"
+            "\n"
+            + json.dumps({"id": model_id, "filename": filename}, sort_keys=True)
+            + "\n"
         ).encode("utf-8")
         if len(encoded) > _PIPE_BUF_BYTES:
             msg = (
