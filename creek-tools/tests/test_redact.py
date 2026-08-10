@@ -18,6 +18,8 @@ Tests cover:
 - Batch scanning with ScanSummary (Issue #14)
 """
 
+import ast
+import inspect
 import json
 import random
 import re
@@ -3293,3 +3295,633 @@ class TestHighEntropyMaskedRunLeak:
             assert redactor.redact_content(text) == text, (
                 f"false positive: {text!r} was rewritten"
             )
+
+
+# ---------------------------------------------------------------------------
+# Symlink containment at the walk (#1087)
+#
+# ``scan_batch`` selects its candidates with ``child.is_file()``, and
+# ``is_file()`` follows symlinks — so a link inside the scanned root whose
+# target resolves *outside* it is opened, matched, reported, and counted in
+# ``files_scanned``. Three callers inherit the hole (``creek redact
+# --scan/--apply/--review`` via ``_scan_source``, ``creek.redact.scan`` over
+# MCP, and ``creek process`` via ``scan_directory``), which is why the tests
+# below sit on the chokepoint rather than on any one caller.
+#
+# The admission policy under test is the one the shipped SEC-003 *write* guard
+# already uses — ``creek/redact/cli_commands.py::_assert_no_escaping_symlinks``
+# — resolve the root once, and for a child that *is* a symlink require its
+# resolved target to be a descendant of that root. Non-symlink children are
+# never resolved, which is what keeps a root reached through a symlinked
+# component (``/tmp`` → ``/private/tmp`` on macOS) scannable.
+# ---------------------------------------------------------------------------
+
+_IN_ROOT_PII = "Contact: alice@example.com\n"
+"""Payload for the in-root control file: exactly one ``email`` match.
+
+Deliberately a different *pattern type* from :data:`_OUT_OF_ROOT_PII` rather
+than merely different text. A :class:`~creek.redact.scanner.RedactionMatch`
+carries a salted hash and never the matched string, so ``match_type`` is the
+only observable that can say *which file* a finding came out of besides the
+path — and asserting on both is what makes "nothing was read through the
+link" hard to satisfy by accident.
+"""
+
+_OUT_OF_ROOT_PII = "SSN: 999-88-7777\n"
+"""Payload for the file parked outside the scan root: exactly one ``ssn``."""
+
+_IN_ROOT_MATCH_TYPE = "email"
+"""The pattern name :data:`_IN_ROOT_PII` is expected to trigger."""
+
+_OUT_OF_ROOT_MATCH_TYPE = "ssn"
+"""The pattern name :data:`_OUT_OF_ROOT_PII` is expected to trigger."""
+
+
+def _seed_scan_root(tmp_path: Path) -> Path:
+    """Create a scan root holding one ordinary, in-root, PII-bearing file.
+
+    Args:
+        tmp_path: pytest-provided temporary directory.
+
+    Returns:
+        The scan root, containing ``real.md``. Every test below keeps this
+        file so that "the scan still works" is asserted alongside "the escape
+        was declined" — a guard that fails a fix which simply stops scanning.
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "real.md").write_text(_IN_ROOT_PII, encoding="utf-8")
+    return root
+
+
+def _seed_out_of_root_secret(tmp_path: Path) -> Path:
+    """Create a PII-bearing file in a sibling directory of the scan root.
+
+    Args:
+        tmp_path: pytest-provided temporary directory.
+
+    Returns:
+        The out-of-root file. It is a sibling of the root rather than a
+        hard-coded absolute path, so "outside the scanned tree" stays true by
+        construction if the fixture layout ever moves.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "secret.md"
+    target.write_text(_OUT_OF_ROOT_PII, encoding="utf-8")
+    return target
+
+
+def test_scan_batch_skips_a_symlink_resolving_outside_the_scan_root(
+    tmp_path: Path,
+) -> None:
+    """The chokepoint: an escaping symlink is not opened, reported, or counted.
+
+    The twin of the MCP-boundary test in ``tests/test_mcp_redact.py``, aimed
+    one layer down. It exists because the guard belongs at the *walk*: three
+    independent callers reach this method, and a containment check installed
+    in any one of them leaves the other two open.
+
+    The behavioural assertion is ``files_scanned == 1`` — today the walk opens
+    the link as well and reports ``2``. ``files_skipped_symlink`` is a new
+    field, so that assertion cannot fail behaviourally today; it is stated
+    next to the count it explains so the post-fix green means "declined one
+    file" rather than merely "read one file".
+
+    Non-vacuity is asserted in both directions: the out-of-root pattern type
+    must be absent *and* the in-root pattern type must be present, so a fix
+    that scanned nothing at all fails here.
+
+    Args:
+        tmp_path: pytest-provided temporary directory.
+    """
+    root = _seed_scan_root(tmp_path)
+    outside = _seed_out_of_root_secret(tmp_path)
+    (root / "link.md").symlink_to(outside)
+
+    summary = RedactionScanner(config=RedactionConfig()).scan_batch(root)
+
+    assert summary.files_scanned == 1, (
+        "scan_batch opened a symlinked child whose target resolves outside "
+        "the scan root, so the count reports on a file the caller never "
+        f"pointed it at.\n\nfiles_scanned: {summary.files_scanned}"
+    )
+    assert summary.files_skipped_symlink == 1, (
+        "the escaping symlink was not accounted for: a safety scanner that "
+        "silently declines to read a file has to say so.\n\n"
+        f"files_skipped_symlink: {summary.files_skipped_symlink}"
+    )
+    reported = {match.file_path for match in summary.matches}
+    assert reported == {root / "real.md"}, (
+        "scan_batch reported a finding from outside the scan root.\n\n"
+        f"reported: {sorted(str(path) for path in reported)}"
+    )
+    match_types = {match.match_type for match in summary.matches}
+    assert _OUT_OF_ROOT_MATCH_TYPE not in match_types, (
+        "the out-of-root file's PII type surfaced in the results, so its "
+        f"content was read even if its path was not named.\n\n{match_types}"
+    )
+    assert _IN_ROOT_MATCH_TYPE in match_types, (
+        "the in-root control produced no finding, so every assertion above "
+        f"would also pass over a scan that read nothing.\n\n{match_types}"
+    )
+
+
+def test_scan_batch_admits_an_in_root_symlink(tmp_path: Path) -> None:
+    """An alias staying inside the root is still scanned: the breadth guard.
+
+    Mirrors ``tests/test_cli_redact.py::test_redact_apply_allows_internal_symlink``
+    for the read path: the SEC-003 write guard permits intra-tree aliases, and
+    the walk must draw the same line, or "fix the escape" quietly becomes
+    "stop following symlinks", which is a different and unrequested change.
+
+    Green today by construction — nothing about an in-root alias changes — and
+    that is the point: it is the assertion a too-broad fix breaks. The only
+    part that cannot pass today is ``files_skipped_symlink == 0``, which pins
+    that the new counter counts *escapes* rather than symlinks.
+
+    Args:
+        tmp_path: pytest-provided temporary directory.
+    """
+    root = _seed_scan_root(tmp_path)
+    (root / "alias.md").symlink_to(root / "real.md")
+
+    summary = RedactionScanner(config=RedactionConfig()).scan_batch(root)
+
+    assert summary.files_scanned == 2, (
+        "an intra-tree alias must still be scanned; the SEC-003 write guard "
+        "permits it and the read path may not be stricter than the writer."
+        f"\n\nfiles_scanned: {summary.files_scanned}"
+    )
+    assert summary.files_skipped_symlink == 0, (
+        "an in-root alias was counted as an escape, so the counter is "
+        "counting symlinks rather than escaping symlinks.\n\n"
+        f"files_skipped_symlink: {summary.files_skipped_symlink}"
+    )
+    reported = {match.file_path for match in summary.matches}
+    assert reported == {root / "real.md", root / "alias.md"}, (
+        "both the real file and its in-root alias must report, each under "
+        f"the name the walk opened it by.\n\n"
+        f"reported: {sorted(str(path) for path in reported)}"
+    )
+
+
+def test_scan_batch_handles_a_circular_symlink(tmp_path: Path) -> None:
+    """A loop (``a → b → a``) inside the root must not crash the walk.
+
+    The discipline is copied from
+    ``tests/test_cli_redact.py::test_redact_apply_handles_circular_symlink``:
+    ``Path.resolve(strict=False)`` on a loop is interpreter- and
+    platform-dependent (it may raise ``OSError``/``RuntimeError``, or return
+    something surprising), so pinning a *disposition* here would pin an
+    accident. The guarantee is that the containment check terminates and the
+    rest of the tree is still scanned.
+
+    The call itself is the assertion for "does not raise". The finding
+    assertion that follows is the non-vacuity guard: a walk that aborted
+    silently after the loop would produce no findings at all.
+
+    Args:
+        tmp_path: pytest-provided temporary directory.
+    """
+    root = _seed_scan_root(tmp_path)
+    first = root / "a.md"
+    second = root / "b.md"
+    first.symlink_to(second)
+    second.symlink_to(first)
+
+    summary = RedactionScanner(config=RedactionConfig()).scan_batch(root)
+
+    match_types = {match.match_type for match in summary.matches}
+    assert _IN_ROOT_MATCH_TYPE in match_types, (
+        "the symlink loop swallowed the rest of the walk: the ordinary "
+        f"in-root file was never scanned.\n\n{match_types}"
+    )
+
+
+def test_scan_batch_handles_a_dangling_symlink(tmp_path: Path) -> None:
+    """A link to a path that does not exist is a non-candidate, not an escape.
+
+    The disposition is pinned explicitly, and it is decidable rather than
+    interpreter-dependent: the target named below is *inside* the root, so
+    ``resolve(strict=False)`` lands under the resolved root and the link is
+    not escaping — while ``is_file()`` is ``False`` for a broken link, so it
+    never becomes a candidate either. It is therefore neither scanned nor
+    counted as skipped, and that holds whichever order the implementation
+    applies the two checks in.
+
+    A dangling link pointing *outside* the root is deliberately not exercised
+    here: its skip count depends on that ordering, and pinning it would pin an
+    implementation detail rather than the contract.
+
+    Args:
+        tmp_path: pytest-provided temporary directory.
+    """
+    root = _seed_scan_root(tmp_path)
+    (root / "dangling.md").symlink_to(root / "never-written.md")
+
+    summary = RedactionScanner(config=RedactionConfig()).scan_batch(root)
+
+    assert summary.files_scanned == 1, (
+        "a broken link is not a readable file and must not be counted as "
+        f"one.\n\nfiles_scanned: {summary.files_scanned}"
+    )
+    assert summary.files_skipped_symlink == 0, (
+        "a dangling link whose target path is inside the root resolves inside "
+        "the root, so it is not an escape and must not inflate the escape "
+        f"count.\n\nfiles_skipped_symlink: {summary.files_skipped_symlink}"
+    )
+    reported = {match.file_path for match in summary.matches}
+    assert reported == {root / "real.md"}, (
+        "the dangling link produced a finding, which means something opened "
+        f"it.\n\nreported: {sorted(str(path) for path in reported)}"
+    )
+
+
+def test_scan_batch_does_not_descend_into_a_symlinked_directory(
+    tmp_path: Path,
+) -> None:
+    """A symlinked *directory* out of the root contributes nothing.
+
+    This pins the bound that makes a leaf-only ``is_symlink()`` check sound.
+    ``Path.rglob`` yields a symlinked directory as an entry but does not
+    descend into it, and the ``is_file()`` filter then drops the entry — so
+    the whole residual is bounded to symlinked *files*. If a future Python
+    flips the default of ``Path.glob(recurse_symlinks=...)``, the bound
+    disappears and a per-leaf check stops being sufficient; this test is the
+    canary for that day.
+
+    Green today, and expected to stay green: it is a boundary pin, not a
+    reproduction. ``files_skipped_symlink`` is deliberately *not* asserted —
+    whether a symlinked directory reaches the escape check before the
+    ``is_file()`` filter drops it is an ordering detail, not a contract.
+
+    Args:
+        tmp_path: pytest-provided temporary directory.
+    """
+    root = _seed_scan_root(tmp_path)
+    outside = _seed_out_of_root_secret(tmp_path)
+    (root / "linkdir").symlink_to(outside.parent, target_is_directory=True)
+
+    summary = RedactionScanner(config=RedactionConfig()).scan_batch(root)
+
+    assert summary.files_scanned == 1, (
+        "the walk descended into a symlinked directory pointing outside the "
+        f"scan root.\n\nfiles_scanned: {summary.files_scanned}"
+    )
+    reported = {match.file_path for match in summary.matches}
+    assert reported == {root / "real.md"}, (
+        "a file underneath a symlinked directory was reported.\n\n"
+        f"reported: {sorted(str(path) for path in reported)}"
+    )
+    match_types = {match.match_type for match in summary.matches}
+    assert _OUT_OF_ROOT_MATCH_TYPE not in match_types, (
+        "content from under the symlinked directory reached the results.\n\n"
+        f"{match_types}"
+    )
+    assert _IN_ROOT_MATCH_TYPE in match_types, (
+        "the in-root control produced no finding, so the assertions above "
+        f"would pass over an empty scan.\n\n{match_types}"
+    )
+
+
+def test_scan_batch_accepts_a_scan_root_reached_through_a_symlinked_component(
+    tmp_path: Path,
+) -> None:
+    """A root reached *through* a symlink is scanned, not treated as an escape.
+
+    The real-world case rather than an exotic one: ``/tmp`` is a symlink to
+    ``/private/tmp`` on macOS, and a vault under a synced or home-relative
+    link hits the same shape. The naive containment check — resolve each child
+    and compare it against the *unresolved* root — flags every child of such a
+    root as escaping, which would turn this fix into a total outage on one
+    platform. Resolving the root once, and only resolving children that are
+    themselves symlinks, is what avoids it.
+
+    The MCP-boundary twin of this case is ``tests/test_mcp_redact.py``'s
+    ``test_scan_accepts_a_vault_root_with_a_symlinked_component``, which must
+    keep passing unmodified.
+
+    The reported path is asserted to be the *as-scanned* spelling (through the
+    link), matching the #972 rule that a finding names the path the scanner
+    opened rather than the path it resolves to.
+
+    Args:
+        tmp_path: pytest-provided temporary directory.
+    """
+    real = _seed_scan_root(tmp_path)
+    linked = tmp_path / "linked-root"
+    linked.symlink_to(real, target_is_directory=True)
+
+    summary = RedactionScanner(config=RedactionConfig()).scan_batch(linked)
+
+    assert summary.files_scanned == 1, (
+        "a scan root reached through a symlinked component scanned nothing, "
+        "so the containment check is comparing resolved children against an "
+        f"unresolved root.\n\nfiles_scanned: {summary.files_scanned}"
+    )
+    assert summary.files_skipped_symlink == 0, (
+        "an ordinary child of a symlink-reached root was counted as an "
+        "escaping symlink; the child is not a symlink, the root is.\n\n"
+        f"files_skipped_symlink: {summary.files_skipped_symlink}"
+    )
+    reported = {match.file_path for match in summary.matches}
+    assert reported == {linked / "real.md"}, (
+        "the finding must name the path as scanned, through the link the "
+        "caller supplied.\n\n"
+        f"reported: {sorted(str(path) for path in reported)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# One walk, one gate (#1087)
+# ---------------------------------------------------------------------------
+
+_FILESYSTEM_WALK_CALLS = frozenset(
+    {"glob", "iterdir", "listdir", "rglob", "scandir", "walk"},
+)
+"""Call names that enumerate a directory's children.
+
+Both spellings are matched: the bound-method form (``dir_path.rglob``,
+``os.walk``) and the bare form a ``from os import walk`` would produce.
+"""
+
+_SCANNABLE_CANDIDATES = "_scannable_candidates"
+"""The one function in ``creek/redact/scanner.py`` allowed to walk the tree."""
+
+_MODULE_SCOPE = "<module>"
+"""Attribution for a walk call sitting at module level, outside any ``def``."""
+
+_UNGUARDED_SCANNER_SOURCE = '''\
+"""A scanner module that walks the tree behind its own helper's back."""
+
+
+def _scannable_candidates(dir_path):
+    """Admit the children that may be scanned."""
+    return sorted(dir_path.rglob("*"))
+
+
+def scan_batch(dir_path):
+    """Enumerate the tree a second time, skipping the admission policy."""
+    return [child for child in dir_path.rglob("*") if child.is_file()]
+'''
+"""Negative control for :func:`_filesystem_walk_sites`.
+
+A detector that silently stopped finding anything would leave the guard below
+green forever while the hole reopened. This source is the shape that must be
+flagged, and :func:`test_the_walk_detector_flags_a_walk_outside_the_helper`
+asserts it is.
+"""
+
+
+def _own_nodes(node: ast.AST) -> list[ast.AST]:
+    """Return the nodes belonging to *node* itself, not to a nested ``def``.
+
+    Mirrors the idiom in ``tests/test_mcp_auth.py``: ``def``/``async def``
+    bodies are not descended into, so a call inside a nested helper is
+    attributed to that helper alone and never double-counted against its
+    parent.
+
+    Args:
+        node: The subtree root to walk.
+
+    Returns:
+        Every descendant that is part of *node*'s own code.
+    """
+    own: list[ast.AST] = []
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        own.append(child)
+        own.extend(_own_nodes(child))
+    return own
+
+
+def _walk_call_name(node: ast.AST) -> str | None:
+    """Return the directory-enumeration call *node* makes, if it makes one.
+
+    Args:
+        node: Any AST node.
+
+    Returns:
+        The called name when *node* is a call to one of
+        :data:`_FILESYSTEM_WALK_CALLS`, else ``None``.
+    """
+    if not isinstance(node, ast.Call):
+        return None
+    func = node.func
+    if isinstance(func, ast.Attribute) and func.attr in _FILESYSTEM_WALK_CALLS:
+        return func.attr
+    if isinstance(func, ast.Name) and func.id in _FILESYSTEM_WALK_CALLS:
+        return func.id
+    return None
+
+
+def _filesystem_walk_sites(source: str) -> set[tuple[str, str]]:
+    """Return ``(enclosing function, call name)`` for every directory walk.
+
+    Args:
+        source: Python source text.
+
+    Returns:
+        One pair per distinct walk call site, attributed to the function whose
+        own body contains it — or to :data:`_MODULE_SCOPE` for a call at
+        module level.
+    """
+    tree = ast.parse(source)
+    sites: set[tuple[str, str]] = set()
+    for node in _own_nodes(tree):
+        called = _walk_call_name(node)
+        if called is not None:
+            sites.add((_MODULE_SCOPE, called))
+    for function in ast.walk(tree):
+        if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for node in _own_nodes(function):
+            called = _walk_call_name(node)
+            if called is not None:
+                sites.add((function.name, called))
+    return sites
+
+
+def _scanner_source() -> str:
+    """Return the on-disk source of :mod:`creek.redact.scanner`.
+
+    Returns:
+        The module's text, located through the class it defines so the test
+        cannot drift onto a stale copy of the file.
+    """
+    return Path(inspect.getfile(RedactionScanner)).read_text(encoding="utf-8")
+
+
+def test_scan_batch_is_the_only_filesystem_walk_in_the_scanner_module() -> None:
+    """Every directory walk in ``scanner.py`` goes through the admission helper.
+
+    A containment policy applied at one of two walks is not a policy. This is
+    the structural half of the fix: ``creek/redact/scanner.py`` may enumerate
+    a directory in exactly one place, :data:`_SCANNABLE_CANDIDATES`, so a
+    later "just add a quick rglob here" cannot reopen the hole while every
+    behavioural test above stays green.
+
+    Today the module's only walk is the ``rglob`` inlined in ``scan_batch``,
+    so this fails with that call site named — a structural fact about the
+    module, not a missing symbol.
+
+    Scoped to ``scanner.py`` alone, deliberately. The shipped SEC-003 write
+    guard in ``creek/redact/cli_commands.py`` runs its own ``os.walk``, and
+    widening this rule across ``creek/redact/`` would demand a rewrite of a
+    working guard that is out of scope for #1087.
+
+    The non-vacuity guard is the first assertion: a detector that found no
+    walk at all would satisfy the second one trivially, and
+    :func:`test_the_walk_detector_flags_a_walk_outside_the_helper` covers the
+    other way the detector could rot.
+    """
+    sites = _filesystem_walk_sites(_scanner_source())
+
+    assert sites, (
+        "the detector found no directory walk anywhere in scanner.py, so the "
+        "guard below asserts nothing — either the module stopped walking the "
+        "filesystem or _FILESYSTEM_WALK_CALLS no longer names how it does."
+    )
+    offenders = {site for site in sites if site[0] != _SCANNABLE_CANDIDATES}
+    assert offenders == set(), (
+        "creek/redact/scanner.py enumerates the filesystem outside "
+        f"{_SCANNABLE_CANDIDATES}(), so the escaping-symlink policy is "
+        "applied to some children and not others.\n\n"
+        f"offending call sites: {sorted(offenders)}"
+    )
+
+
+def test_the_walk_detector_flags_a_walk_outside_the_helper() -> None:
+    """The guard above is not a green no-op.
+
+    Runs the same detector over :data:`_UNGUARDED_SCANNER_SOURCE`, a module
+    shaped exactly like the failure the guard exists to catch: the admission
+    helper is present *and* a second walk bypasses it. Both call sites must be
+    seen, and the bypass must land in the offender set — otherwise the guard
+    could pass on a scanner.py with the same defect.
+    """
+    sites = _filesystem_walk_sites(_UNGUARDED_SCANNER_SOURCE)
+
+    assert (_SCANNABLE_CANDIDATES, "rglob") in sites, (
+        "the detector missed the walk inside the admission helper, so it "
+        f"cannot tell a guarded walk from an unguarded one.\n\n{sorted(sites)}"
+    )
+    offenders = {site for site in sites if site[0] != _SCANNABLE_CANDIDATES}
+    assert offenders == {("scan_batch", "rglob")}, (
+        "the detector did not flag a bare rglob sitting outside the "
+        "admission helper, so the guard it powers would stay green over "
+        f"exactly the regression it exists to catch.\n\n{sorted(offenders)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reporting the skip (#1087)
+#
+# CrawDad posts ``report_markdown`` verbatim into a Discord channel
+# (``crawdad/crawdad/bot.py::_format_scan_section``). A safety scanner that
+# quietly declines to read a file is its own hazard, so the skip has to be
+# visible in the document a human actually reads.
+# ---------------------------------------------------------------------------
+
+_EMPTY_SUMMARY_MARKDOWN = "# Redaction Scan Summary\n\nNo findings.\n"
+"""The exact bytes an ordinary empty scan renders today.
+
+Pinned so the new skip wording cannot be bought by changing what every
+existing consumer of a clean scan sees.
+"""
+
+_SYMLINK_SKIP_ROW = "- **Files skipped (escaping symlink)**: 1"
+"""The statistics line reporting one declined symlink."""
+
+
+def test_markdown_summary_names_a_symlink_skip_when_there_are_no_findings() -> None:
+    """A clean scan that declined to read a file may not report "No findings.".
+
+    The one arm where silence is most likely and most misleading: the scan
+    found nothing *because* it did not look, and the current early return says
+    only ``No findings.`` — which a reader takes as "this tree is clean".
+
+    The second assertion is the control that keeps the first from being paid
+    for out of everyone else's pocket: an ordinary empty scan, with nothing
+    skipped, must render byte-identical output to today's.
+    """
+    scanner = RedactionScanner(config=RedactionConfig())
+
+    skipped = scanner.generate_markdown_summary(
+        ScanSummary(files_skipped_symlink=1),
+    )
+
+    assert skipped != _EMPTY_SUMMARY_MARKDOWN, (
+        "a scan that declined to read a file rendered the same 'No findings.' "
+        f"document as a scan that read everything.\n\n{skipped!r}"
+    )
+    assert "skipped" in skipped.lower(), (
+        f"the summary does not say that anything was skipped.\n\n{skipped!r}"
+    )
+    assert "1" in skipped, (
+        f"the summary does not say how many files were skipped.\n\n{skipped!r}"
+    )
+    unchanged = scanner.generate_markdown_summary(ScanSummary())
+    assert unchanged == _EMPTY_SUMMARY_MARKDOWN, (
+        "an ordinary empty scan's rendering changed for every consumer that "
+        f"skipped nothing.\n\n{unchanged!r}"
+    )
+
+
+def test_markdown_summary_renders_the_symlink_skip_row_in_the_statistics_block(
+    tmp_path: Path,
+) -> None:
+    """The skip is reported alongside the other two skip counters.
+
+    ``files_skipped_binary`` and ``files_skipped_extension`` are already
+    rendered in the Statistics block; a third kind of skip that is not would
+    be the one a reviewer never learns about.
+
+    Args:
+        tmp_path: pytest-provided temporary directory.
+    """
+    (tmp_path / "data.txt").write_text(_IN_ROOT_PII, encoding="utf-8")
+    scanner = RedactionScanner(config=RedactionConfig())
+    scanned = scanner.scan_batch(tmp_path)
+
+    summary = ScanSummary(
+        matches=scanned.matches,
+        files_scanned=scanned.files_scanned,
+        files_skipped_symlink=1,
+    )
+    markdown = scanner.generate_markdown_summary(summary)
+
+    assert _SYMLINK_SKIP_ROW in markdown, (
+        "the Statistics block does not report the escaping-symlink skip "
+        f"beside the binary and extension skips.\n\n{markdown}"
+    )
+
+
+def test_markdown_summary_omits_the_symlink_skip_row_when_none_were_skipped(
+    tmp_path: Path,
+) -> None:
+    """A scan that skipped nothing says nothing about skipping.
+
+    The over-reporting guard, and green today. Without it the row could be
+    rendered unconditionally, which puts a permanent "escaping symlink" line
+    in front of every CrawDad operator whose tree has never contained one —
+    the fastest way to teach a reader to ignore it.
+
+    Args:
+        tmp_path: pytest-provided temporary directory.
+    """
+    (tmp_path / "data.txt").write_text(_IN_ROOT_PII, encoding="utf-8")
+    scanner = RedactionScanner(config=RedactionConfig())
+    summary = scanner.scan_batch(tmp_path)
+
+    markdown = scanner.generate_markdown_summary(summary)
+
+    assert "escaping symlink" not in markdown, (
+        "the escaping-symlink row is rendered for a scan that declined "
+        f"nothing.\n\n{markdown}"
+    )
+    assert "Files scanned" in markdown, (
+        f"the Statistics block did not render at all.\n\n{markdown}"
+    )

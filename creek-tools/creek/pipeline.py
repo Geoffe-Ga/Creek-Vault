@@ -170,6 +170,42 @@ class RedactionRequiredError(RuntimeError):
         )
 
 
+class SymlinkEscapedSourceError(RuntimeError):
+    """Raised when the redaction scan declined to read part of the source tree.
+
+    The read tools skip an escaping symlink; ``creek process`` refuses over
+    it, and the asymmetry is the point (#1087). The redaction scan is the
+    only containment check standing between an out-of-tree file and the
+    vault: :meth:`creek.ingest.markdown.MarkdownIngestor._read_directory`
+    walks with ``rglob("*.md")`` and ``read_bytes()`` with no symlink and no
+    ``is_file`` guard of its own (#1294). Skipping here would therefore turn
+    a blocked ingest into a silent *unredacted* ingest, with the gate that
+    used to stop it now reporting success.
+
+    Attributes:
+        skipped_count: Number of files the scan declined to read.
+        source_path: The source directory that was scanned.
+    """
+
+    def __init__(self, skipped_count: int, source_path: Path) -> None:
+        """Build a path-traversal refusal that names the offending tree.
+
+        Args:
+            skipped_count: Number of symlinked files the scan declined.
+            source_path: Source directory the scanner walked.
+        """
+        self.skipped_count = skipped_count
+        self.source_path = source_path
+        super().__init__(
+            f"Redaction scan declined to read {skipped_count} file(s) under "
+            f"{source_path}: each is a symlink whose target resolves outside "
+            "that tree, so the scanner could not check content that "
+            "ingestion would still have read. Remove or re-point the "
+            f"offending link(s) under {source_path} before re-running "
+            "`creek process`."
+        )
+
+
 class PipelineResult(BaseModel):
     """Aggregate counts from a full pipeline run.
 
@@ -414,6 +450,14 @@ class Pipeline:
         proceeds); the documented remediation is to run
         ``creek redact --apply`` first.
 
+        A source tree holding a symlink whose target escapes it is refused
+        outright via :class:`SymlinkEscapedSourceError` — before the
+        ``dry_run`` arm, because a path-traversal guard admits no waiver and
+        the scan came back clean only because it declined to look. Setting
+        ``redaction.enabled: false`` still bypasses the whole stage, symlink
+        check included; that pre-existing hole belongs to the ingestor walks
+        themselves and is tracked by #1294.
+
         Args:
             source_path: Directory to scan.
             result: Pipeline result (unused directly but kept for symmetry).
@@ -422,6 +466,8 @@ class Pipeline:
             Number of files scanned.
 
         Raises:
+            SymlinkEscapedSourceError: When the scan declined to read any
+                file because its symlink target escapes *source_path*.
             RedactionRequiredError: When matches are found and
                 ``redaction.dry_run`` is false.
         """
@@ -435,7 +481,22 @@ class Pipeline:
         if not self.config.redaction.enabled:
             return file_count
 
-        matches = self.scanner.scan_directory(source_path)
+        summary = self.scanner.scan_batch(source_path)
+
+        if summary.files_skipped_symlink:
+            logger.error(
+                "Redaction scan declined to read %d file(s) in %s whose "
+                "symlink targets escape it; refusing to ingest past an "
+                "unscanned file.",
+                summary.files_skipped_symlink,
+                source_path,
+            )
+            raise SymlinkEscapedSourceError(
+                summary.files_skipped_symlink,
+                source_path,
+            )
+
+        matches = summary.matches
         if not matches:
             return file_count
 

@@ -28,7 +28,11 @@ from creek.config import load_config, resolve_config_path
 from creek.redact.audit import RedactionAuditEntry, RedactionAuditLog
 from creek.redact.patterns import PATTERN_METADATA
 from creek.redact.redactor import Redactor
-from creek.redact.scanner import RedactionScanner, ScanSummary
+from creek.redact.scanner import (
+    SYMLINK_SKIP_LABEL,
+    RedactionScanner,
+    ScanSummary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +92,12 @@ def _style_for(severity: str) -> str:
 def _render_stats_table(summary: ScanSummary, console: Console) -> None:
     """Render the headline statistics block.
 
+    The escaping-symlink row appears only when the walk actually declined
+    something (#1087). ``--scan`` skips such a file rather than refusing the
+    tree the way the SEC-003 write guard does, so this row is the only place
+    the operator learns the scan was not exhaustive — but rendering a
+    permanent ``0`` would train them to ignore it.
+
     Args:
         summary: Scan summary to render.
         console: Rich console sink.
@@ -98,6 +108,8 @@ def _render_stats_table(summary: ScanSummary, console: Console) -> None:
     stats.add_row("Files scanned", str(summary.files_scanned))
     stats.add_row("Files skipped (binary)", str(summary.files_skipped_binary))
     stats.add_row("Files skipped (extension)", str(summary.files_skipped_extension))
+    if summary.files_skipped_symlink:
+        stats.add_row(SYMLINK_SKIP_LABEL, str(summary.files_skipped_symlink))
     stats.add_row("Total findings", str(len(summary.matches)))
     console.print(stats)
 
