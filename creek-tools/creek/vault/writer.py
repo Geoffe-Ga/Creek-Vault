@@ -884,6 +884,96 @@ class VaultWriter:
                 return found
         return None
 
+    def _relocate_fragment_locked(
+        self,
+        existing: Path,
+        dest_dir: Path,
+        post: frontmatter.Post,
+        model_id: str,
+        model_type: str,
+    ) -> Path:
+        """Move *existing* into *dest_dir*, never overwriting what is there.
+
+        Caller must hold ``self._lock``. Shared by :meth:`tomb_fragment`
+        and :meth:`restore_fragment`, which differ only in how they locate
+        *existing* and in the frontmatter marker they stamp or clear; the
+        relocation itself — create, unlink, re-index, log — is identical
+        and lives here (#1302). Both directions previously composed
+        ``<dir> / existing.name`` and wrote it with an unconditional
+        ``os.replace``, so a same-named file at the destination was
+        silently destroyed. Allocation now goes through
+        :meth:`_atomic_create`, the same ``O_CREAT | O_EXCL`` path every
+        other create in this module uses.
+
+        The stem handed to :meth:`_atomic_create` is ``existing.stem``,
+        never :meth:`_compute_base_name`: a title that drifted since the
+        original write would rename the file out from under every
+        ``[[wikilink]]`` pointing at it. Suffix stacking (``-1-1``)
+        therefore only occurs under a genuine live collision, which is
+        exactly when a distinguishing suffix is required; an uncontended
+        tomb → restore round trip is name-stable, because the tomb frees
+        the origin name before the restore asks for it back.
+
+        Three orderings below are load-bearing:
+
+        - The destination is created **before** the source is unlinked.
+          :meth:`_atomic_create` can raise — retry exhaustion, or a short
+          write that :func:`creek._fsio.create_exclusive` cleans up — and
+          create-first means both escape with the source file fully
+          intact. The worst case is a recoverable duplicate, never a
+          fragment that exists nowhere. The mirror case — a create that
+          succeeded followed by an ``unlink`` that failed — leaks an
+          unindexed copy at the destination for the same reason, which
+          is the same safe direction and is tracked in #1325.
+        - The origin's in-memory entry is dropped **after** the unlink and
+          **before** the destination entry is set. ``self._dir_indexes``
+          is keyed by :class:`~pathlib.Path`, so were origin and
+          destination ever the same directory, popping second would
+          delete the mapping just written. The on-disk origin JSONL is
+          deliberately left alone: a :meth:`_persist_full_index` rewrite
+          from this process's snapshot would destroy entries another
+          process appended (the rejection is argued in
+          :meth:`_repair_index_locked` and :meth:`_load_index_locked`),
+          and the stale line is harmless — a fresh process re-resolves it
+          through the #1083 verification path.
+        - The destination's in-memory mapping is set **before** the
+          on-disk append, preserved from #1120. The relocated file is
+          already on disk by then, so a torn append leaves this process
+          still resolving the moved file while a fresh process re-derives
+          it from the damage rescan in :meth:`_load_index_locked`.
+          Reversing this would lose the relocation for the rest of the run.
+
+        Args:
+            existing: The live file to move; unlinked once its copy at the
+                destination exists.
+            dest_dir: Directory to move into, created if absent.
+            post: The already-mutated frontmatter document to write.
+            model_id: Id to re-point at the relocated file.
+            model_type: Type string recorded in the provenance log.
+
+        Returns:
+            The path actually created, which carries a ``-N`` counter
+            suffix when the stem was already taken in *dest_dir*.
+
+        Raises:
+            RuntimeError: If a unique filename cannot be allocated within
+                :data:`_MAX_FILENAME_COLLISION_RETRIES` attempts.
+            OSError: If the destination cannot be written, or its index
+                entry cannot be appended.
+        """
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = self._atomic_create(dest_dir, existing.stem, frontmatter.dumps(post))
+        origin_dir = existing.parent
+        existing.unlink()
+        # ``pop``, not ``del``: ``_find_existing_locked`` may already have
+        # healed this entry away on its repair path (#1083).
+        self._load_index_locked(origin_dir).pop(model_id, None)
+        index = self._load_index_locked(dest_dir)
+        index[model_id] = dest.name
+        self._append_index_entry(dest_dir, model_id, dest.name)
+        self._log_provenance_locked(model_id, model_type, dest)
+        return dest
+
     def tomb_fragment(self, fragment_id: str) -> Path | None:
         """Soft-tomb a fragment: move it to ``10-Liminal/Orphaned/`` (#674).
 
@@ -893,11 +983,34 @@ class VaultWriter:
         the fragment. Returns the tombed path, or ``None`` when no live fragment
         maps to the id (already moved/removed).
 
+        ``10-Liminal/Orphaned/`` is a single flat sink fed by every
+        ``01-Fragments/<platform>/`` subfolder, while a filename stem is unique
+        only *within* one of those subfolders — so tombstones genuinely
+        collide. The move therefore runs through
+        :meth:`_relocate_fragment_locked`, which gives the arriving tombstone a
+        counter suffix instead of replacing the one already there (#1302). The
+        returned path is authoritative: it, and not ``<orphan dir>/<old
+        name>``, is what the id index now points at.
+
         Args:
             fragment_id: Id of the fragment to soft-tomb.
 
         Returns:
-            Path to the tombed file, or ``None`` if no live fragment was found.
+            Path to the tombed file, or ``None`` if no live fragment was
+            found. May carry a ``-N`` counter suffix when the name was taken.
+
+        Raises:
+            RuntimeError: If a unique filename cannot be allocated in the
+                orphan directory within
+                :data:`_MAX_FILENAME_COLLISION_RETRIES` attempts.
+            OSError: If the tombstone cannot be created, or its index entry
+                cannot be appended.
+
+        Both propagate from :meth:`_relocate_fragment_locked`.
+        :func:`creek.ingest.pipeline.tomb_missing_units` catches only
+        ``(OSError, KeyError)`` around this call, so the exhaustion
+        ``RuntimeError`` aborts the whole ingest run — deliberately loud, and
+        out of scope to widen here. Tracked in #1325.
         """
         orphan_dir = self.vault_path.joinpath(*_ORPHANED_RELPARTS)
         with self._lock:
@@ -907,21 +1020,15 @@ class VaultWriter:
             post = frontmatter.load(str(existing))
             post["lifecycle"] = "orphaned"
             post["orphaned_at"] = datetime.now(UTC).isoformat()
-            orphan_dir.mkdir(parents=True, exist_ok=True)
-            dest = orphan_dir / existing.name
-            _atomic_write_text(dest, frontmatter.dumps(post))
-            existing.unlink()
-            index = self._load_index_locked(orphan_dir)
-            # Deliberate ordering, preserved by #1120: the in-memory
-            # mapping is set BEFORE the append, so a failed append leaves
-            # this process still resolving the tombed file (already moved
-            # above) while a fresh process re-derives it from the damage
-            # rescan in ``_load_index_locked``. Reversing this would make
-            # a torn append lose the tomb for the rest of the run.
-            index[fragment_id] = dest.name
-            self._append_index_entry(orphan_dir, fragment_id, dest.name)
-            self._log_provenance_locked(fragment_id, "fragment", dest)
-        return dest
+            # Create-before-unlink and the #1120 in-memory-before-append
+            # ordering both live in the helper; see its docstring.
+            return self._relocate_fragment_locked(
+                existing,
+                orphan_dir,
+                post,
+                fragment_id,
+                "fragment",
+            )
 
     def restore_fragment(self, fragment: Fragment) -> Path | None:
         """Un-tomb a fragment: move it back from ``10-Liminal/Orphaned/`` (#674).
@@ -932,12 +1039,34 @@ class VaultWriter:
         preserved id. Returns the restored path, or ``None`` when no tombed
         file maps to the id.
 
+        The tomb freed the origin filename, so an uncontended restore lands
+        back on the original name. When a *newer* fragment has since claimed
+        that stem, :meth:`_relocate_fragment_locked` gives the returning file a
+        counter suffix rather than overwriting the newcomer (#1302), and the
+        returned path — not ``<target dir>/<tombstone name>`` — is the
+        authoritative one the id index points at.
+
         Args:
             fragment: The fragment whose id locates the tombed file and whose
                 platform/slug routes the restore destination.
 
         Returns:
-            Path to the restored file, or ``None`` if no tombed file was found.
+            Path to the restored file, or ``None`` if no tombed file was
+            found. May carry a ``-N`` counter suffix when the name was taken.
+
+        Raises:
+            RuntimeError: If a unique filename cannot be allocated in the
+                target directory within
+                :data:`_MAX_FILENAME_COLLISION_RETRIES` attempts.
+            OSError: If the restored file cannot be created, or its index
+                entry cannot be appended.
+
+        Both propagate from :meth:`_relocate_fragment_locked`.
+        :func:`creek.ingest.pipeline.restore_tombed` wraps this call in no
+        handler at all — and the sibling tomb path catches only ``(OSError,
+        KeyError)`` — so the exhaustion ``RuntimeError`` aborts the ingest
+        run. That is deliberately loud, and out of scope to widen here.
+        Tracked in #1325.
         """
         orphan_dir = self.vault_path.joinpath(*_ORPHANED_RELPARTS)
         target_dir = self._fragment_target_dir(fragment)
@@ -948,19 +1077,15 @@ class VaultWriter:
             post = frontmatter.load(str(existing))
             post.metadata.pop("lifecycle", None)
             post.metadata.pop("orphaned_at", None)
-            target_dir.mkdir(parents=True, exist_ok=True)
-            dest = target_dir / existing.name
-            _atomic_write_text(dest, frontmatter.dumps(post))
-            existing.unlink()
-            index = self._load_index_locked(target_dir)
-            # Same deliberate ordering as ``tomb_fragment`` — see the
-            # note there; the restored file is already on disk (above),
-            # so an in-memory mapping that outlives a torn append is the
-            # conservative side of the trade (#1120).
-            index[fragment.id] = dest.name
-            self._append_index_entry(target_dir, fragment.id, dest.name)
-            self._log_provenance_locked(fragment.id, fragment.type, dest)
-        return dest
+            # Same helper, same ordering guarantees as ``tomb_fragment``
+            # (create-before-unlink; #1120 in-memory-before-append).
+            return self._relocate_fragment_locked(
+                existing,
+                target_dir,
+                post,
+                fragment.id,
+                fragment.type,
+            )
 
     def write_thread(self, thread: Thread) -> Path:
         """Write a Thread to 02-Threads/{status}/.
