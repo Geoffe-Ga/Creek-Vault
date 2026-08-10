@@ -40,7 +40,26 @@
 #                    normally. Fails closed in the INVERTED direction — see the
 #                    polarity block below (#1160).
 #   pending          CI still running (or no checks registered yet) → wait for a later wake
-#   ci-failed        CI has a failing/errored check → Step 2 (ci-debugging)
+#   ci-failed        a NON-review check is failing/errored → Step 2 (ci-debugging)
+#   review-failed    EVERY failing rollup entry is the `claude-review` check, so
+#                    CI itself is fine and THE CODE NEEDS NO CHANGE. The reviewer
+#                    malfunctioned: a rate limit, a timeout, a `cancel-in-progress`
+#                    cancellation, or one of code-review.yml's two deliberate
+#                    `::error::` + `exit 1` paths — the second of which literally
+#                    prints "This is NOT a defect in this PR's code". Remedy:
+#                    RE-RUN THE FAILED REVIEW (`gh run rerun --failed <id>` on the
+#                    `claude-review` run), then re-classify. Explicitly do NOT
+#                    dispatch a fix worker; that is the whole bug this token
+#                    exists to stop (#1200). Caveat: #1201 is still open, so
+#                    code-review.yml has no `workflow_dispatch` and `gh run rerun`
+#                    replays the OLD workflow file — fine for a rate-limit retry,
+#                    not for a re-review after the workflow itself changed, where
+#                    the fallback is an empty commit.
+#                    Fails closed as a REFINEMENT of `ci-failed`, never a
+#                    replacement — see the fourth-polarity note below. This token
+#                    is a strict narrowing of `ci-failed` and must not be
+#                    "harmonised" back into it: collapsing the two restores the
+#                    misroute, and no test above the token level would notice.
 #   changes-requested CI green + a FRESH verdict (posted after HEAD) exists and is
 #                    not LGTM (CHANGES_REQUESTED / COMMENTS) → Step 2
 #                    (address-feedback). This is Gate 4 FAILED — an actionable
@@ -285,8 +304,9 @@
 # only thing making the check mean anything.
 #
 # TOKEN PRECEDENCE (deliberate, pinned by test_pr_ready.sh): `optout` is checked
-# before everything else; then CI state (`pending` / `ci-failed`), exactly as it
-# always was; the verdict is only consulted once CI is green. So
+# before everything else; then CI state (`pending` / `ci-failed` /
+# `review-failed`), exactly as it always was — #1200 subdivided that middle rung
+# without moving it; the verdict is only consulted once CI is green. So
 # `changes-requested` never outranks `pending`/`ci-failed` — a lane whose CI is
 # still running classifies `pending` even if the verdict already landed, and the
 # wake arrives when CI resolves (green → `changes-requested`, red → `ci-failed`;
@@ -442,9 +462,19 @@
 #     `behind` → sync.
 #   provenance (#1181): anything that is not a well-formed marker naming THIS PR
 #     REFUSES the verdict — main-health.sh's polarity, not review-quota.sh's.
-# THE THREE POLARITIES ARE DELIBERATELY NOT UNIFORM; the first two are argued
-# here and the third in the block that follows. Read both before making any of
-# them agree.
+#   ci tally (#1200): anything that does not POSITIVELY prove "every failing
+#     entry is the review check" stays `ci-failed` — an unreadable rollup, a
+#     non-zero probe exit, a surplus field, a non-numeric count, zero failing
+#     entries, or any entry shape the expression cannot classify. This is a
+#     REFINEMENT of an existing token, not a new claim: `ci-failed` was this
+#     branch's only answer before #1200 and remains its default, so an inverted
+#     reading can only ever cost a wasted fix worker (today's behaviour), never
+#     swallow a real CI failure. It is also the only one of the four that cannot
+#     affect mergeability in either direction — the whole branch is downstream of
+#     a non-zero `gh pr checks`, and none of its three tokens is `ready`.
+# THE FOUR POLARITIES ARE DELIBERATELY NOT UNIFORM; the first two are argued
+# here, the third in the block that follows, and the fourth at
+# `ci_failure_token`. Read them before making any of them agree.
 # The first two are fail-closed in the IDENTICAL sense — prefer the recoverable error —
 # and therefore take OPPOSITE actions, because the recoverable error differs.
 # There, merging a stale green onto a broken tree buries the culprit and waiting
@@ -645,6 +675,67 @@ readonly SUCCESS_CONCLUSION="SUCCESS"
 # stand in for a review. One is enough to prove CI ran at all, which is the whole
 # claim; all-skipped is what this rules out.
 readonly MIN_NON_REVIEW_SUCCESSES=1
+
+# --- #1200: telling a BROKEN REVIEWER apart from a RED TREE -----------------
+# `gh pr checks` collapses every non-green outcome into one non-zero exit code,
+# so a `claude-review` job that rate-limited, timed out, was cancelled, or
+# `exit 1`-ed on purpose was indistinguishable from a failing test suite. The
+# loop then dispatched a `ci-debugging` fix worker at code with nothing wrong
+# with it — while code-review.yml's own error text was already saying "This is
+# NOT a defect in this PR's code". This expression is what `ci_failure_token`
+# asks the rollup, on that branch only.
+#
+# THE ANSWER IS TWO-PART, AND THE SPLIT IS A SECURITY BOUNDARY. Line 1 is FOUR
+# COUNTS and nothing else: total failing, failing-and-named-`claude-review`,
+# non-review entries still in flight, and unclassifiable. Lines 2+ are
+# human-readable `failing: <name>` diagnostics that are NEVER field-split. A
+# check name is author-controlled (anyone who can add a workflow `name:` picks
+# it), and this file has already paid once for the `|`-shifting class the
+# surplus-field guards below call out — so the decision line carries no
+# author-controlled text at all. Proven: an entry named `a|b` yields `1|0|0|0`
+# on line 1 and `  failing: a|b` on line 2.
+#
+# NO REGEX ANYWHERE — membership is array `index`, which behaves identically in
+# the system `jq` (Oniguruma) the test suite runs and in the gojq (RE2) that
+# `gh` evaluates `--jq` with. The engine-divergence class this file pays for at
+# MARKER_RE and VERDICT_RE simply does not exist for this expression.
+#
+# `.conclusion // .state // ""` collapses the two rollup entry shapes onto one
+# axis. A CheckRun has `.name`/`.conclusion`; a legacy StatusContext has
+# `.context`/`.state` and NO `.name`, so `.name // ""` is `""` — a StatusContext
+# can never be mistaken for the review check however its context is spelled,
+# while its `ERROR`/`FAILURE` state still counts as a real failure. A CheckRun
+# with a null conclusion reads `""` → `wait` (queued/running), not `unknown`.
+# Anything this cannot classify lands in `unknown`, and the helper fails closed
+# on it: we do not get to claim "only the reviewer failed" about a state we
+# cannot read, which is also what keeps this safe when GitHub invents the next
+# conclusion enum.
+#
+# SINGLE-QUOTED SEGMENTS, DELIBERATELY. Do NOT rebuild this with the `\"$VAR\"`
+# double-quoted idiom the `review_gate_absent` --jq uses: this program declares
+# `def cls($s)` and binds `as $e` / `as $f`, and this script runs under
+# `set -euo pipefail`, so a double-quoted string would make the SHELL expand
+# `$s`/`$e`/`$f` and abort with `e: unbound variable` — pr-ready.sh would exit 1
+# printing no token at all, on every lane and every path. The only interpolation
+# is REVIEW_CHECK_NAME, and it is spliced by CLOSING the single-quoted string,
+# adding the double-quoted variable, and reopening — the exact three-token
+# sequence  '"$REVIEW_CHECK_NAME"'  as it appears verbatim twice below. Never
+# re-spell `claude-review` here; it is coupled to code-review.yml's job key, and
+# test_pr_ready.sh additionally asserts that no OTHER workflow may answer to that
+# name (a colliding job key would put a real red check in the reviewer's bucket).
+readonly ROLLUP_TALLY_JQ='def cls($s):
+  if   ["SUCCESS","SKIPPED","NEUTRAL"]|index($s) then "ok"
+  elif ["FAILURE","TIMED_OUT","CANCELLED","ACTION_REQUIRED","STARTUP_FAILURE","ERROR"]|index($s) then "fail"
+  elif ["","PENDING","EXPECTED","QUEUED","IN_PROGRESS","WAITING","REQUESTED"]|index($s) then "wait"
+  else "unknown" end;
+[ .statusCheckRollup[]?
+  | {n: (.name // ""), c: cls(.conclusion // .state // "")} ] as $e
+| [$e[] | select(.c == "fail")] as $f
+| (($f|length)|tostring)
+  + "|" + (([$f[] | select(.n == "'"$REVIEW_CHECK_NAME"'")]|length)|tostring)
+  + "|" + (([$e[] | select(.c == "wait" and .n != "'"$REVIEW_CHECK_NAME"'")]|length)|tostring)
+  + "|" + (([$e[] | select(.c == "unknown")]|length)|tostring),
+  ($f[] | "  failing: " + (if .n == "" then "<unnamed>" else .n end))'
 
 die() { echo "pr-ready: $1" >&2; exit 2; }
 
@@ -1044,6 +1135,88 @@ if [[ -n "$issue_n" ]]; then
   fi
 fi
 
+# Which flavour of "not green" this is (#1200) → `review-failed` | `pending` |
+# `ci-failed`. Called ONLY from the non-zero/non-no-checks branch below, so no
+# lane that has already decided pays for the extra API call.
+#
+# DEFINED HERE, NOT BESIDE `review_gate_absent`. Bash resolves a function name at
+# CALL time, and the call site is a dozen lines below this point; a definition
+# further down the file would make the call a `command not found`, the `if` read
+# false, and the whole fix silently inert while every fail-closed test went on
+# passing. That is the failure mode the POSITIVE laziness sentinel in
+# test_pr_ready.sh exists to catch, and this placement is the other half of it.
+#
+# IT EMITS THE TOKEN ITSELF and always returns 0. The three-way decision lives in
+# exactly one place, so there is no way to add a guard here and forget the arm
+# that consumes it — a predicate-plus-caller split had precisely that bug, with
+# an unreachable clause that made its own pending case answer `review-failed`.
+#
+# EVERY GUARD FUNNELS TO `ci-failed`. That is the fail-closed polarity made
+# structural rather than promised: `ci-failed` is what this branch printed before
+# #1200 and it stays the answer for every shape we cannot positively prove is a
+# lone reviewer malfunction. The inverse mistake — reading a genuinely red tree
+# as a broken reviewer — would leave a real failure un-debugged, which is far
+# worse than today's wasted fix worker. Note also that this helper's whole
+# codomain is {review-failed, pending, ci-failed}: it can never make a PR MORE
+# mergeable, because `ready` is not in it and this branch is only reached when
+# `gh pr checks` already exited non-zero.
+#
+# WHY A TOKEN AND NOT JUST A DIAGNOSTIC: #1270 — watch-pr.sh discards this
+# script's stderr. On the local polling path the message below is invisible, so a
+# stderr-only fix would change nothing the loop can act on. The stderr lines are
+# for the human reading a log; the TOKEN is for the orchestrator.
+ci_failure_token() {
+  local answer counts names ft fr po un rest n
+  # Declared and assigned separately: `local x="$(…)"` masks the command
+  # substitution's exit status (SC2155), which here would swallow a failed probe.
+  answer=""
+  answer="$(gh pr view "${gh_args[@]}" --json statusCheckRollup \
+    --jq "$ROLLUP_TALLY_JQ" 2>/dev/null)" || { echo "ci-failed"; return 0; }
+  counts="${answer%%$'\n'*}"
+  names="${answer#"$counts"}"; names="${names#$'\n'}"
+  # `if … fi`, NEVER `[[ -n "$names" ]] && printf …`: under `set -euo pipefail` an
+  # AND-list whose overall status is 1 IS an errexit trigger (the exemption covers
+  # non-final commands inside the list, not the list itself), and this function
+  # runs inside command substitution, where errexit is NOT suspended.
+  if [[ -n "$names" ]]; then
+    printf 'pr-ready: PR #%s failing checks:\n%s\n' "$pr" "$names" >&2
+  fi
+  # Split by FIELD COUNT with a surplus-field guard, the same discipline as the
+  # mergeStateStatus and rollup answers: a count cannot contain a `|`, so a
+  # surplus field means the answer is malformed.
+  IFS='|' read -r ft fr po un rest <<<"$counts"
+  printf 'pr-ready: PR #%s check tally fail=%s review=%s pending=%s unknown=%s\n' \
+    "$pr" "$ft" "$fr" "$po" "$un" >&2
+  [[ -z "$rest" ]] || { echo "ci-failed"; return 0; }        # surplus field
+  for n in "$ft" "$fr" "$po" "$un"; do
+    [[ "$n" =~ ^[0-9]+$ ]] || { echo "ci-failed"; return 0; }  # empty / malformed
+  done
+  [[ "$un" -eq 0 ]]     || { echo "ci-failed"; return 0; }   # an entry we cannot read
+  # DISAGREEMENT: `gh pr checks` de-duplicates check runs by name (newest wins)
+  # while the rollup carries one entry per triggering event, so the rollup can
+  # only ever hold MORE failing entries than gh saw, never fewer. Zero failures
+  # here while gh exited non-zero therefore is not "the reviewer broke" — it is a
+  # transport error, an auth failure, or a view we cannot reconcile.
+  [[ "$ft" -ge 1 ]]     || { echo "ci-failed"; return 0; }
+  [[ "$fr" -eq "$ft" ]] || { echo "ci-failed"; return 0; }   # a NON-review check is red
+  # D2 (#1200): a non-review check still in flight beside a failed review. gh
+  # reports failure in preference to pending, so this branch is reachable while
+  # CI is unfinished — and this is the DOMINANT real timing, because
+  # `claude-review` dies inside ~2 min on a rate limit while the 3-python matrix
+  # runs ~14 min. `ci-failed` here would dispatch a fix worker at a tree that is
+  # still building (issue #1200's complaint verbatim); `review-failed` would
+  # claim a tree is proven when it is not. `pending` claims neither, is in
+  # watch-pr.sh's IN_FLIGHT_TOKENS so the lane keeps polling, and self-resolves on
+  # the next poll either way — sibling red → `ci-failed`, green → `review-failed`.
+  # It cannot hide a real failure: any non-review FAILING entry was already caught
+  # one line above. Accepted cost: a lane whose sibling check is genuinely stuck
+  # waits out watch-pr.sh's timeout. Entries named `claude-review` are excluded
+  # from this count upstream in ROLLUP_TALLY_JQ — the review's own re-run already
+  # being in flight is the remedy, not a reason to wait.
+  [[ "$po" -eq 0 ]]     || { echo "pending"; return 0; }
+  echo "review-failed"
+}
+
 # --- CI state from the exit code, not the text table -----------------------
 ci_ec=0
 # `2>&1 >/dev/null`: route stderr into the capture, then drop stdout — so ci_err
@@ -1063,7 +1236,10 @@ elif [[ "$ci_ec" -ne 0 ]]; then
   if grep -qi "$NO_CHECKS_SIG" <<<"$ci_err"; then
     echo "pending"
   else
-    echo "ci-failed"
+    # Something is genuinely not green. Ask the rollup WHICH check, so a broken
+    # `claude-review` is not mistaken for a red tree (#1200). Still `ci-failed`
+    # unless the rollup positively proves otherwise.
+    ci_failure_token
   fi
   exit 0
 fi

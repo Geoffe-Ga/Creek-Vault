@@ -15,8 +15,8 @@
 # classifier — never a rollup grep) every INTERVAL seconds and exits the moment
 # the token leaves the IN-FLIGHT set {pending, awaiting-review, main-not-green,
 # review-quota-exhausted}; every other token (ready, ready-unreviewed, behind,
-# ci-failed, changes-requested, optout) is a state the orchestrator acts on, so
-# it is worth a wake. Output is exactly one line:
+# ci-failed, review-failed, changes-requested, optout) is a state the
+# orchestrator acts on, so it is worth a wake. Output is exactly one line:
 #
 #   WATCH <PR> already-watching     another live watcher owns this PR (pidfile)
 #   WATCH <PR> <token>              the lane settled; <token> is pr-ready.sh's
@@ -67,6 +67,20 @@ readonly DEFAULT_TIMEOUT=1800
 # seven days with three still to run. The fleet would spin at wake speed burning
 # the API budget for days, precisely when nobody can merge anything and that
 # budget is the scarce thing.
+#
+# `review-failed` (issue #1200) IS DELIBERATELY *NOT* A FIFTH. It is the exact
+# INVERSE of the two arguments above: those tokens are in this set because
+# nothing the orchestrator can do will change them, whereas `review-failed` means
+# a `claude-review` run broke (rate limit, timeout, `cancel-in-progress`, or one
+# of code-review.yml's deliberate `exit 1` paths) and the remedy — re-run that
+# run — is an action, available now, that only the orchestrator can take. Adding
+# it here would sleep the lane for the FULL ~30-minute TIMEOUT on a state
+# genuinely nothing will ever change on its own, and then wake with
+# `timeout review-failed` having achieved nothing: the mirror image of #1159's
+# busy-wake, wasting wall-clock instead of API budget. Note that this is
+# precisely why pr-ready.sh emits `pending` rather than `review-failed` when a
+# non-review check is still RUNNING beside the failed review (its D2 note): that
+# case genuinely IS a wait, and it routes to the in-flight token that says so.
 readonly -a IN_FLIGHT_TOKENS=(pending awaiting-review main-not-green review-quota-exhausted)
 
 # `gh pr view --json state` values that mean the PR no longer exists to watch.

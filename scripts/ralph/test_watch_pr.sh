@@ -167,6 +167,17 @@ check "changes-requested wakes promptly (outside the in-flight set)" \
   "WATCH 114 changes-requested" "$out"
 check "changes-requested case polled exactly twice" "2" "$(polls 114)"
 
+# `review-failed` (issue #1200) — the `claude-review` job itself broke while
+# every other check is green, so the code needs no change and the tree is fine.
+# It is ACTIONABLE (re-run that review run), which is the exact inverse of the
+# #1159/#1160 argument for the four tokens that ARE in-flight: nothing resolves
+# this on its own, so a watcher that slept on it would burn the full ~30-minute
+# timeout and then wake having achieved nothing.
+out="$(TOKENS="awaiting-review,review-failed" run_watch 120)"
+check "review-failed wakes promptly (outside the in-flight set)" \
+  "WATCH 120 review-failed" "$out"
+check "review-failed case polled exactly twice" "2" "$(polls 120)"
+
 # --- THE BUSY-WAKE REGRESSION TEST (issue #1159) ----------------------------
 # `main-not-green` means "this lane is held until `main`'s CI goes green again",
 # which is a WAIT — the orchestrator has nothing to do about it, and `main` CI

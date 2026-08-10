@@ -265,6 +265,38 @@ mkdir -p "$BIN"
 #                   stub runs the REAL jq with pr-ready.sh's own `--jq`, so a
 #                   rollup expression that miscounts SKIPPED/null conclusions is
 #                   caught here (a scalar stub would mask it).
+#   TALLY_JSON    — raw `--json statusCheckRollup` payload for the CI-FAILURE
+#                   tally probe (issue #1200), the SEPARATE `gh pr view` call
+#                   `ci_failure_token` makes to tell a broken `claude-review`
+#                   apart from a genuinely red tree. When set, the stub runs the
+#                   REAL jq with pr-ready.sh's own ROLLUP_TALLY_JQ — same
+#                   argument as ROLLUP_JSON: a scalar stub would let a
+#                   miscounting expression pass. `jq -r`, NOT `-rc`: that answer
+#                   is deliberately MULTI-LINE (counts on line 1, `failing:`
+#                   diagnostics on lines 2+), and `-c` would fold it.
+#                   Same Oniguruma-vs-gojq caveat as COMMENTS_JSON below: this
+#                   harness evaluates the expression with the system `jq` while
+#                   production evaluates it inside `gh` with gojq. ROLLUP_TALLY_JQ
+#                   is deliberately REGEX-FREE (membership via array `index`), so
+#                   for this one expression the two engines cannot diverge.
+#   TALLY_RAW     — bypass the jq entirely and print this as the probe's whole
+#                   answer, for the malformed shapes no fixture can produce
+#                   (surplus field, non-numeric counts, empty). Honoured with
+#                   `+set` rather than `:-` so `TALLY_RAW=''` reproduces an EMPTY
+#                   answer, which must fail closed to `ci-failed`.
+#   TALLY_EC      — exit code of the tally probe; 1 plays a failed lookup, which
+#                   must fail closed to `ci-failed`, never to the new token.
+#   TALLY_SENTINEL — file the tally arm touches when it is called. Same laziness
+#                   argument as COMPARE_SENTINEL, plus a POSITIVE assertion the
+#                   other probes lack: the `ci-failed` lane MUST probe. A `--jq`
+#                   that throws, or a helper defined below its call site, makes
+#                   the probe silently inert and every token reverts to today's
+#                   `ci-failed` — which looks exactly like an unfixed bug. Only a
+#                   `probed … "yes"` case catches that independently of a token.
+#   UNSET DEFAULT — with none of the above set the arm prints NOTHING, which
+#                   parses non-numeric and fails closed to `ci-failed`. That is
+#                   what keeps every pre-existing `CHECKS_EC=1` assertion in this
+#                   file byte-identical.
 #   VERDICT       — the "<createdAt>|<isLGTM>" scalar the verdict jq resolves to
 #   VERDICT_PR    — the THIRD field of that scalar (issue #1181): the PR number
 #                   the selected comment's `<!-- creek-review pr=N -->` marker
@@ -462,6 +494,30 @@ case "$args" in
       printf '%s|%s|%s\n' "${PR_AUTHOR:-}" "${REVIEW_CONCLUSIONS:-}" "${NON_REVIEW_SUCCESSES-1}"
     fi
     exit "${REVIEW_EC:-0}" ;;
+  *"pr view"*"--json statusCheckRollup"*)
+    # The CI-FAILURE tally probe (issue #1200). PLACEMENT IS LOAD-BEARING IN BOTH
+    # DIRECTIONS, and both were checked against every arm above:
+    #   * it must sit AFTER the `--json author` arm, because that arm serves
+    #     `review_gate_absent`'s `--json author,statusCheckRollup` call — which
+    #     contains `--json author` and so is claimed there, as it always was;
+    #   * this arm cannot hijack that call in return, because
+    #     `--json author,statusCheckRollup` does NOT contain the substring
+    #     `--json statusCheckRollup`;
+    #   * and it must sit BEFORE the `*)` catch-all, or the probe silently
+    #     receives an empty answer on every case and the tally is never tested.
+    # DO NOT re-spell the probe with `author,` in its selector: that would match
+    # the arm above, trip REVIEW_SENTINEL, and redden the "lazy review-gate:
+    # ci-failed does not probe" assertion — a real coupling, not a hypothetical.
+    [[ -n "${TALLY_SENTINEL:-}" ]] && : > "$TALLY_SENTINEL"
+    if [[ -n "${TALLY_RAW+set}" ]]; then
+      printf '%s\n' "$TALLY_RAW"
+    elif [[ -n "${TALLY_JSON:-}" ]]; then
+      expr="" prev=""
+      for a in "$@"; do [[ "$prev" == "--jq" ]] && expr="$a"; prev="$a"; done
+      # `-r`, never `-rc`: the answer is multi-line by design.
+      printf '%s' "$TALLY_JSON" | jq -r "$expr"
+    fi
+    exit "${TALLY_EC:-0}" ;;
   *"--json mergeStateStatus"*)
     printf '%s|%s|%s\n' "${MERGE_STATE:-CLEAN}" "${HEAD_DATE:-}" "${HEAD_AUTHOR-dependabot[bot]}" ;;
   *"--json comments"*)
@@ -515,6 +571,14 @@ run_err() { { PATH="$BIN:$PATH" "$READY" "$@" >/dev/null; } 2>&1; }
 # of this file.
 cj() { printf '{"comments":[%s]}' "$1" \
        | jq -c '.comments |= map(if has("author") then . else .author = {"login":"Geoffe-Ga"} end)'; }
+
+# Wrap rollup entr(ies) as a `--json statusCheckRollup` payload for TALLY_JSON
+# (issue #1200). Deliberately does NOT normalise or default anything: the whole
+# point of the tally cases is to feed the REAL expression the raw entry shapes
+# GitHub emits — a CheckRun with a null `conclusion`, a StatusContext with no
+# `.name` at all, a conclusion enum nobody has invented yet. A helper that
+# repaired those would test the helper instead of the gate.
+rt() { printf '{"statusCheckRollup":[%s]}' "$1"; }
 
 # The default `gh run view --log` payload for the review run (issue #1160): the
 # verbatim rate-limit rejection from PR #1158's re-review (run 30685776913,
@@ -2881,6 +2945,214 @@ tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$NO_VERDICT" BEHIND_B
 check "lazy review-gate: no-verdict lane token" "ready-unreviewed" "$tok"
 probed "lazy review-gate: no-verdict lane DOES probe" "yes" "$R_NOVERDICT"
 
+# === issue #1200: a BROKEN REVIEWER is not a RED TREE ========================
+# `gh pr checks` collapses every non-green outcome into one non-zero exit, so
+# until now a `claude-review` job that rate-limited, timed out, was CANCELLED by
+# its own `cancel-in-progress`, or `exit 1`-ed on purpose (code-review.yml's two
+# `::error::` paths — one of which literally prints "This is NOT a defect in this
+# PR's code") read identically to a failing test suite. The orchestrator then
+# dispatched a `ci-debugging` fix worker at code with nothing wrong with it.
+#
+# `ci_failure_token` now reads the status rollup ON THAT BRANCH ONLY and splits
+# it three ways. THE POLARITY IS THE WHOLE POINT: `ci-failed` remains the default
+# answer, and every unproven shape funnels back to it. The cases below are
+# deliberately weighted toward that fence — a dozen of them assert that TODAY's
+# answer is unchanged, and they were green before the fix as well as after.
+#
+# NOTHING HERE CAN EVER PRODUCE `ready`. This branch is reached only when
+# `gh pr checks` exited non-zero, and the helper's entire codomain is
+# {review-failed, pending, ci-failed}. The change is merge-safety one-way by
+# construction, not by assertion.
+CR_FAIL='{"name":"claude-review","conclusion":"FAILURE"}'
+CQ_OK='{"name":"Some Other Job","conclusion":"SUCCESS"}'
+
+# (a) THE HEADLINE CASE. Reviewer red, everything else green → the tree is fine.
+check "tally: only claude-review failing → review-failed" "review-failed" \
+  "$(CHECKS_EC=1 TALLY_JSON="$(rt "$CR_FAIL,$CQ_OK")" run 100)"
+
+# (b)(c) Any NON-review failing entry keeps today's answer, byte for byte.
+check "tally: review + another check failing → ci-failed" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_JSON="$(rt "$CR_FAIL"',{"name":"ci","conclusion":"FAILURE"}')" run 100)"
+check "tally: only a non-review check failing → ci-failed" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_JSON="$(rt '{"name":"ci","conclusion":"FAILURE"}')" run 100)"
+
+# (d)-(g) THE FAIL-CLOSED FENCE: every unreadable answer is `ci-failed`. A probe
+# that cannot be trusted must never be the reason a lane stops being debugged.
+check "tally: probe exits non-zero → ci-failed" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_EC=1 TALLY_JSON="$(rt "$CR_FAIL,$CQ_OK")" run 100)"
+check "tally: surplus field → ci-failed" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_RAW='1|1|0|0|x' run 100)"
+check "tally: empty answer → ci-failed" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_RAW='' run 100)"
+check "tally: non-numeric counts → ci-failed" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_RAW='a|b|c|d' run 100)"
+check "tally: too FEW fields → ci-failed" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_RAW='1|1' run 100)"
+# A count that is WELL-FORMED IN SHAPE but non-numeric in ONE field, chosen so
+# every other guard would wave it through (rest empty, four fields, ft/fr/po all
+# sane). This is the case that makes the numeric-shape loop load-bearing, and the
+# loop earns its place by ORDER as much as by existence: `[[ "zzz" -eq 0 ]]` does
+# not merely compare false, it ABORTS under `set -u` with `zzz: unbound
+# variable`, because bash arithmetic contexts evaluate a bare word as a variable
+# name. Reaching any `-eq` guard with an unvalidated field would therefore exit 1
+# printing NO TOKEN AT ALL — which pr-ready.sh's contract reserves for tooling
+# errors and the orchestrator cannot act on. So this asserts the TOKEN, not just
+# the absence of `review-failed`.
+check "tally: non-numeric in one field → ci-failed, not a crash" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_RAW='1|1|0|zzz' run 100)"
+t_rc=0
+CHECKS_EC=1 TALLY_RAW='1|1|0|zzz' run 100 >/dev/null || t_rc=$?
+check "tally: non-numeric count still exits 0 (never a bare `set -u` abort)" "0" "$t_rc"
+
+# (h) DISAGREEMENT. `gh pr checks` de-duplicates check runs by name; the rollup
+# carries one entry per triggering event, so it can only ever hold MORE failing
+# entries, never fewer. A rollup with ZERO failures while gh exited non-zero is
+# therefore not "the reviewer broke" — it is a transport error, an auth failure,
+# or a view of the world we cannot reconcile. Fail closed.
+check "tally: zero failing entries but gh exited 1 → ci-failed" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_JSON="$(rt "$CQ_OK"',{"name":"ci","conclusion":"SUCCESS"}')" run 100)"
+
+# (i) D1 — ANY-FAILURE-COUNTS, per entry, never de-duped by name. A re-run HEAD
+# shows both the stale FAILURE and the fresh SUCCESS under one name. With nothing
+# else red this is still "only the reviewer failed", and the remedy (re-run the
+# review) is idempotent, so `review-failed` is right and safe.
+check "tally: two claude-review entries FAILURE+SUCCESS → review-failed" "review-failed" \
+  "$(CHECKS_EC=1 TALLY_JSON="$(rt "$CR_FAIL"',{"name":"claude-review","conclusion":"SUCCESS"}')" run 100)"
+
+# (j) EVERY conclusion gh buckets as failing is a reviewer malfunction, not just
+# FAILURE. CANCELLED is first-class: code-review.yml sets `cancel-in-progress`
+# on this very job, so a superseded push cancels the review as a matter of course.
+for concl in FAILURE TIMED_OUT CANCELLED ACTION_REQUIRED STARTUP_FAILURE; do
+  check "tally: claude-review $concl alone → review-failed" "review-failed" \
+    "$(CHECKS_EC=1 TALLY_JSON="$(rt '{"name":"claude-review","conclusion":"'"$concl"'"},'"$CQ_OK")" run 100)"
+done
+
+# (k) …and SUCCESS/SKIPPED/NEUTRAL are NOT failures, so they cannot absorb a real
+# one. A skipped review beside a red test suite is a red tree.
+for concl in SKIPPED NEUTRAL; do
+  check "tally: claude-review $concl + ci FAILURE → ci-failed" "ci-failed" \
+    "$(CHECKS_EC=1 TALLY_JSON="$(rt '{"name":"claude-review","conclusion":"'"$concl"'"},{"name":"ci","conclusion":"FAILURE"}')" run 100)"
+done
+
+# (l) A StatusContext (a legacy commit status: no `.name`, no `.conclusion`, it
+# carries `.context`/`.state`) is classified through `.state` and can NEVER be
+# mistaken for the review check — `.name // ""` is `""`, which does not equal
+# `claude-review` however the context happens to be spelled. Both directions:
+check "tally: review FAILURE + failing StatusContext → ci-failed" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_JSON="$(rt "$CR_FAIL"',{"__typename":"StatusContext","context":"legacy","state":"ERROR"}')" run 100)"
+check "tally: StatusContext named claude-review is not the review check" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_JSON="$(rt '{"__typename":"StatusContext","context":"claude-review","state":"FAILURE"}')" run 100)"
+
+# (m) An enum GitHub has not invented yet is UNCLASSIFIABLE, and unclassifiable
+# fails closed — we cannot claim "only the reviewer failed" about a state we
+# cannot read. This is the guard that keeps the fix safe against GitHub's API
+# growing a new conclusion after this PR merges.
+check "tally: unknown conclusion enum → ci-failed" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_JSON="$(rt '{"name":"ci","conclusion":"WEIRD_NEW_ENUM"}')" run 100)"
+# …and the case that actually makes the `unknown` guard load-bearing, rather
+# than leaving it shadowed by the zero-failures floor above: an unreadable entry
+# sitting BESIDE a genuinely failed review, where every other guard is satisfied
+# (one failure, and it is the review). We must not report "only the reviewer
+# failed" while holding an entry we could not classify — it may be the red test
+# suite. Tally 1|1|0|1.
+check "tally: failed review + an UNCLASSIFIABLE entry → ci-failed" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_JSON="$(rt "$CR_FAIL"',{"name":"ci","conclusion":"WEIRD_NEW_ENUM"}')" run 100)"
+
+# (n) D2 — A STILL-RUNNING NON-REVIEW CHECK BESIDE A FAILED REVIEW IS `pending`.
+# THIS IS A DELIBERATE BEHAVIOUR CHANGE and the one sub-case where HEAD's answer
+# (`ci-failed`) is replaced by something other than the new token. gh reports
+# failure in preference to pending, so this branch IS reachable with CI
+# unfinished — and it is the DOMINANT real timing: `claude-review` dies inside
+# ~2 min on a rate limit while the 3-python matrix runs ~14 min. Emitting
+# `ci-failed` there would dispatch a fix worker at a tree that is still building,
+# which is issue #1200's complaint verbatim; emitting `review-failed` would claim
+# the tree is proven when it is not. `pending` claims neither, is already in
+# watch-pr.sh's in-flight set so the lane keeps polling, and self-resolves on the
+# very next poll in BOTH directions: the sibling goes red → `ci-failed`, green →
+# `review-failed`. It can never hide a real failure — any non-review FAILING
+# entry gives ft > fr and yields `ci-failed` on the same poll, as (b) asserts.
+check "tally: failed review + null-conclusion sibling → pending (D2)" "pending" \
+  "$(CHECKS_EC=1 TALLY_JSON="$(rt "$CR_FAIL"',{"name":"ci","conclusion":null}')" run 100)"
+check "tally: failed review + QUEUED sibling → pending (D2)" "pending" \
+  "$(CHECKS_EC=1 TALLY_JSON="$(rt "$CR_FAIL"',{"name":"ci","conclusion":"QUEUED"}')" run 100)"
+# …but the REVIEW's OWN in-flight re-run does not count as an unfinished tree.
+# The pending tally excludes entries named `claude-review` on purpose: a second
+# review attempt already running IS the remedy for a failed one, so waiting on it
+# would be waiting for the thing the token is telling the loop to go do.
+check "tally: failed review + its own re-run in flight → review-failed" "review-failed" \
+  "$(CHECKS_EC=1 TALLY_JSON="$(rt "$CR_FAIL"',{"name":"claude-review","conclusion":null},'"$CQ_OK")" run 100)"
+
+# (o)(p) The two pre-existing `pending` classifications are untouched.
+check "tally: 'no checks reported' still → pending" "pending" \
+  "$(CHECKS_NO_CHECKS=1 TALLY_JSON="$(rt "$CR_FAIL,$CQ_OK")" run 100)"
+check "tally: exit 8 still → pending" "pending" \
+  "$(CHECKS_EC=8 TALLY_JSON="$(rt "$CR_FAIL,$CQ_OK")" run 100)"
+
+# (q) Exit-code contract: a token the orchestrator can act on, on stdout, exit 0
+# — never a `die`. A lane that gets exit 2 and no token is a wedged lane.
+t_rc=0
+t_out="$(CHECKS_EC=1 TALLY_JSON="$(rt "$CR_FAIL,$CQ_OK")" run 100)" || t_rc=$?
+check "tally: review-failed lane exits 0" "0" "$t_rc"
+check "tally: review-failed lane prints exactly one line" "1" "$(printf '%s\n' "$t_out" | wc -l | tr -d ' ')"
+
+# (r) THE DIAGNOSTIC, asserted through run_err/says because `run` swallows
+# stderr. It must name the culprit on BOTH outcomes — a lane that stays
+# `ci-failed` still deserves to know which check was red. (#1270 means watch-pr.sh
+# currently discards this stderr, which is exactly why the fix had to be a TOKEN
+# and not a stderr-only diagnostic; the message is for the human reading a log.)
+err="$(CHECKS_EC=1 TALLY_JSON="$(rt "$CR_FAIL,$CQ_OK")" run_err 100)"
+says "tally diagnostic: review-failed lane names claude-review" 'failing: claude-review' "$err"
+says "tally diagnostic: review-failed lane prints the counts" 'fail=1 review=1 pending=0 unknown=0' "$err"
+err="$(CHECKS_EC=1 TALLY_JSON="$(rt "$CR_FAIL"',{"name":"ci","conclusion":"FAILURE"}')" run_err 100)"
+says "tally diagnostic: ci-failed lane names claude-review too" 'failing: claude-review' "$err"
+says "tally diagnostic: ci-failed lane names the OTHER culprit" 'failing: ci$' "$err"
+
+# (s) INJECTION. A check name is author-controlled — anyone who can add a
+# workflow `name:` chooses it — and this file has already proven the `|`-shifting
+# class exploitable once. The answer is split so that line 1 is PURE COUNTS and
+# lines 2+ are diagnostics that are never field-split, so a `|` in a name cannot
+# reach the decision. Asserted both ways: the token is unaffected AND the name
+# still reaches the log intact.
+err="$(CHECKS_EC=1 TALLY_JSON="$(rt '{"name":"a|b","conclusion":"FAILURE"}')" run_err 100)"
+check "tally: pipe in a check name cannot shift the decision fields" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_JSON="$(rt '{"name":"a|b","conclusion":"FAILURE"}')" run 100)"
+says "tally: pipe-bearing name still reaches the diagnostic intact" 'failing: a\|b' "$err"
+
+# --- the tally probe is LAZY, and — uniquely — PROVABLY NOT INERT ------------
+# Four negative sentinels for the usual rate-limit reason, and one POSITIVE one
+# that the other probes in this file do not have. It is the load-bearing case:
+# a `--jq` that throws, or a helper defined below its call site, makes the probe
+# silently never run, every token reverts to `ci-failed`, and all twelve
+# fail-closed cases above go on passing while the fix does nothing at all. Only
+# `probed … "yes"` can tell "correctly conservative" from "completely inert".
+T_GREEN="$WORK/tally-green"
+tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
+       TALLY_SENTINEL="$T_GREEN" run 100)" || tok="exit-$?"
+check "lazy tally: green lane token" "ready" "$tok"
+probed "lazy tally: green lane does not probe" "no" "$T_GREEN"
+
+T_PENDING="$WORK/tally-pending"
+tok="$(CHECKS_EC=8 TALLY_SENTINEL="$T_PENDING" run 100)" || tok="exit-$?"
+check "lazy tally: exit-8 lane token" "pending" "$tok"
+probed "lazy tally: exit-8 lane does not probe" "no" "$T_PENDING"
+
+T_NOCHECKS="$WORK/tally-nochecks"
+tok="$(CHECKS_NO_CHECKS=1 TALLY_SENTINEL="$T_NOCHECKS" run 100)" || tok="exit-$?"
+check "lazy tally: no-checks lane token" "pending" "$tok"
+probed "lazy tally: no-checks lane does not probe" "no" "$T_NOCHECKS"
+
+# Opt-out is checked BEFORE CI state, so a parked PR never pays for this probe
+# — and, more importantly, never gets re-classified by it.
+T_OPTOUT="$WORK/tally-optout"
+tok="$(CHECKS_EC=1 PR_LABELS="$OPTOUT" TALLY_SENTINEL="$T_OPTOUT" run 100)" || tok="exit-$?"
+check "lazy tally: opt-out lane token" "optout" "$tok"
+probed "lazy tally: opt-out lane does not probe" "no" "$T_OPTOUT"
+
+T_CIFAIL="$WORK/tally-cifail"
+tok="$(CHECKS_EC=1 TALLY_SENTINEL="$T_CIFAIL" TALLY_JSON="$(rt "$CR_FAIL,$CQ_OK")" run 100)" || tok="exit-$?"
+check "lazy tally: ci-failure lane token" "review-failed" "$tok"
+probed "lazy tally: ci-failure lane DOES probe the rollup" "yes" "$T_CIFAIL"
+
 # --- cross-file coupling: the review job's check NAME ----------------------
 # pr-ready.sh identifies the review check by the literal string `claude-review`,
 # which is the workflow's JOB KEY. Two edits to code-review.yml would silently
@@ -2888,6 +3160,11 @@ probed "lazy review-gate: no-verdict lane DOES probe" "yes" "$R_NOVERDICT"
 # else: renaming the job key, or adding a `name:` override (GitHub then reports
 # the check under the display name, and the literal match stops matching).
 REVIEW_WORKFLOW="$(cd "$(dirname "$0")/../.." && pwd)/.github/workflows/code-review.yml"
+WF_DIR="$(dirname "$REVIEW_WORKFLOW")"
+# The same literal pr-ready.sh holds in REVIEW_CHECK_NAME and code-review.yml
+# holds as its job key. Named here so the #1200 collision sweep below and the
+# two assertions above cannot drift apart from each other.
+REVIEW_JOB_KEY="claude-review"
 
 if grep -qx "  claude-review:" "$REVIEW_WORKFLOW"; then
   ok "code-review.yml still defines the 'claude-review' job key"
@@ -2910,6 +3187,49 @@ else
   ok "claude-review declares no name: override (check name stays 'claude-review')"
 fi
 
+# THE COUNTERPART, AND IT GUARDS A DIFFERENT PROPERTY (issue #1200). The two
+# assertions above ask "does the review job still ANSWER to this name?" — they
+# protect the review gate from going silently unenforced. This one asks the
+# inverse: "is anything ELSE allowed to answer to it?"
+#
+# It matters because `ci_failure_token` decides `review-failed` — "the only
+# failing check is the reviewer, so the tree is fine and needs no change" —
+# purely by matching a rollup entry's `.name` against `claude-review`. A check
+# NAME is not unique across workflow files: GitHub reports one Check Run per
+# job, keyed on the job's `name:` or, absent that, its job id, and nothing stops
+# a second workflow from using either. So a job id collision in ANY workflow —
+# an accidental copy-paste, or a deliberate one — would put a genuinely red,
+# entirely unrelated check into the review bucket. If it were the only failure,
+# `fr == ft` would hold and a real CI failure would be reported as a broken
+# reviewer and never debugged. That is the ONE outcome #1200's fail-closed
+# design otherwise makes unreachable, and it is the only way in.
+#
+# It cannot be defended at runtime: two Check Runs with the same name are
+# indistinguishable in the rollup, which is precisely the problem. So it is
+# defended HERE, at the point where it would be introduced — the PR that adds
+# the colliding workflow goes red, naming the file.
+for wf in "$WF_DIR"/*.yml; do
+  [[ "$wf" == "$REVIEW_WORKFLOW" ]] && continue
+  if grep -qx "  $REVIEW_JOB_KEY:" "$wf"; then
+    bad "$(basename "$wf") also defines a '$REVIEW_JOB_KEY' job — its failures would be read as a broken reviewer (#1200)"
+  fi
+done
+ok "no workflow other than code-review.yml defines a '$REVIEW_JOB_KEY' job key"
+
+# The same collision via the other spelling: an explicit `name:` override makes
+# GitHub report the check under THAT string regardless of the job id, so a
+# `name: claude-review` anywhere is the identical hazard by another route.
+                        # `${VAR}` braces, not bare `$VAR`: the `[` of the next
+                        # bracket expression would otherwise read as an array
+                        # subscript (shellcheck SC1087).
+name_collisions="$(grep -rlE "^[[:space:]]+name:[[:space:]]*['\"]?${REVIEW_JOB_KEY}['\"]?[[:space:]]*$" \
+                   "$WF_DIR" 2>/dev/null || true)"
+if [[ -n "$name_collisions" ]]; then
+  bad "a workflow declares 'name: $REVIEW_JOB_KEY', colliding with the review check (#1200): $name_collisions"
+else
+  ok "no workflow declares a 'name: $REVIEW_JOB_KEY' override that would collide"
+fi
+
 # --- cross-file coupling: the provenance marker (issue #1181) ---------------
 # code-review.yml is the EMITTER of the marker and pr-ready.sh is the PARSER.
 # Nothing else connects them: they are different languages in different
@@ -2917,7 +3237,6 @@ fi
 # Drift here does not wedge one lane, it wedges every lane at once — an emitter
 # that stops emitting turns the whole fleet to `awaiting-review` with no verdict
 # anyone can post to clear it.
-WF_DIR="$(dirname "$REVIEW_WORKFLOW")"
 RECAP_WORKFLOW="$WF_DIR/ralph-recap-tests.yml"
 ITER_WORKFLOW="$WF_DIR/iteration-trigger.yml"
 
