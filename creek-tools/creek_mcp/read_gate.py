@@ -121,6 +121,70 @@ fails if an entry lies: the manifest must match ``server.list_tools()``
 exactly, a ``GATED`` claim is checked against a real call site in the named
 module, a gap must name a positive issue that the tool's own source mentions,
 and a tool recorded as a gap must not already call a primitive below.
+
+**The three egress channels, and which one each layer watches.** #1036 added
+a seventh layer, (g): every ``GATED`` tool that can hand corpus text to a
+model is driven all the way *to* the provider with a recording factory, and no
+sentinel from an above-ceiling fragment may appear in any prompt it sent. It
+exists because every layer before it terminates at the response envelope, and
+a prompt has already crossed to the provider by the time an envelope exists.
+The follow-up on #1036 asked for the probes to be read per *egress channel*
+rather than per tool. Named on that axis, the surface is:
+
+1. **JSON response** — layer (f), driven off ``_RUNTIME_PROBES`` /
+   ``_PROBE_EXEMPT``. Forced: a newly ``GATED`` tool must grow a probe or
+   record a justified exemption.
+2. **Model prompt** — layer (g), driven off ``_PROMPT_PROBES`` /
+   ``_PROMPT_PROBE_EXEMPT``, over a set derived from the tools' own
+   signatures. Forced the same way, plus a non-emptiness assertion on the
+   derivation, since a derived set can silently empty itself.
+3. **Disk artifacts** — covered per tool, and **not forced**.
+   ``test_report_probe_leaves_no_canary_in_the_artifact_it_writes``,
+   ``test_state_render_probe_leaves_no_canary_in_the_artifact_it_writes``,
+   ``test_journal_probe_refuses_and_leaves_the_fragment_bytes_untouched`` and
+   ``test_upload_probe_refuses_and_leaves_the_staged_document_untouched`` are
+   four good ideas, and nothing obliges the fifth artifact-writing tool to
+   grow a fifth. That gap is deliberately **out of scope here** and split to
+   **#1273** rather than left implied: #968 and #969 were both found on this
+   channel, so it is simultaneously the channel with the worst track record
+   and the only one with no forcing function.
+
+**Scope item 4 of #1036 — a second gate pair on :class:`ToolPosture` — is
+decided NO.** ``creek.reflect``'s rationale names two gates while the
+dataclass records one, so the obvious repair is a second
+``(gate_module, gate_symbol)`` pair. It was not taken. A second pair is only
+ever checkable at the strength layers (c)/(e) can offer — the symbol exists in
+the named module and is called there — and for reflect's grounding gate that
+check is green *by construction*: ``creek/author/agents.py`` imports
+``tier_within_override`` at line 28 and calls it in ``_load_corpus`` at line
+115 for every Writing Desk consumer. It would stay green if
+``creek_mcp.tools.reflect._default_retrieve`` stopped passing ``override``,
+stopped being called, or reflect dropped grounding altogether — three ways to
+lose the gate entirely without disturbing the evidence for it. Layer (g)
+checks that gate's *effect* instead, which is strictly stronger, and the
+injection drill at the top of ``tests/test_mcp_read_gate.py`` is the evidence:
+the two independent mutations that neutralise the grounding cutoff turn (g)
+red and leave every structural layer and all ten response probes green.
+Revisit predicate: **a tool whose second gate's effect no runtime probe can
+observe.** For that tool the structural check is the only one available, and a
+weak check is better than none.
+
+**``creek.classify`` is a known prompt-channel egress outside both probe
+manifests.** Its posture is ``METADATA_ONLY`` on a rationale about its
+*response* — "Returns counts only … the ceiling is audited for the trail, not
+enforced" — and ``creek_mcp/tools/classify.py`` says the same in its own
+words: the ceiling "is recorded for the audit trail; it does not gate
+execution". Both are true of the envelope and beside the point on this
+channel. With ``method="llm"`` the whole corpus, every tier of it, goes
+through a provider, defended only by
+:class:`creek.classify.llm.router.ModelRouter`'s Intimate-never-cloud gate —
+which ``creek/classify/classify_engine.py`` reaches by resolving a second,
+intimate-only classifier config, and which says nothing about ``personal``.
+Layer (g) structurally cannot enrol it: the derivation looks for a
+function taking both ``llm_factory`` and ``privacy_tier_ceiling``, and
+``classify_tool`` takes no factory — so the reason this tool is absent from
+the prompt manifest is a fact about its signature, not a finding about its
+safety. Tracked in **#1274**.
 """
 
 from __future__ import annotations
