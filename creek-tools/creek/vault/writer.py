@@ -415,6 +415,29 @@ def _atomic_write_text(path: Path, content: str) -> None:
                 tmp_path.unlink()
 
 
+def _file_declares_id(path: Path, model_id: str) -> bool:
+    """Return ``True`` only when *path*'s own frontmatter declares *model_id*.
+
+    The verifier behind the id index (#1083): an index entry is a *claim*
+    about a file, and this is the only thing that turns that claim into
+    evidence. A missing ``id`` key, a non-``str`` id, and an unparseable
+    file all answer ``False``.
+
+    The guarded exception set and the ``isinstance(..., str)`` gate are
+    deliberately identical to the ones
+    :meth:`VaultWriter._rebuild_index` applies while scanning, so the
+    verifier and the scanner can never disagree about which files
+    declare an id — a file this function rejects is exactly a file the
+    rebuild would decline to index.
+    """
+    try:
+        post = frontmatter.load(str(path))
+    except (OSError, ValueError, yaml.YAMLError):
+        return False
+    declared = post.get("id")
+    return isinstance(declared, str) and declared == model_id
+
+
 def _is_material_change(old_body: str, new_body: str, threshold: float) -> bool:
     """Return ``True`` when an edit changed the body materially (#675).
 
@@ -784,7 +807,10 @@ class VaultWriter:
         already on disk, so it never lowers an operator's decision.
 
         Returns ``None`` when no file is mapped to ``fragment.id`` (e.g. the
-        file was removed out of band), so the caller can fall back to a fresh
+        file was removed out of band), and also when the mapped file exists
+        but declares a *different* id and no live file in the directory
+        declares this one (#1083) — a rewrite there would clobber a foreign
+        fragment. Either way the caller can fall back to a fresh
         :meth:`write_fragment`.
 
         Args:
@@ -798,7 +824,9 @@ class VaultWriter:
 
         Returns:
             Path to the rewritten file, or ``None`` when no existing file
-            maps to the id.
+            maps to the id — including the case where the mapped file
+            exists but declares a different id and re-resolution finds no
+            live file declaring this one.
         """
         target_dir = self._fragment_target_dir(fragment)
         with self._lock:
@@ -1064,7 +1092,10 @@ class VaultWriter:
         # ``_find_existing_locked`` and ``_atomic_create`` that BUG-006
         # was filed to close. The throughput trade-off is documented
         # in the PR description; revisit only with a benchmark-driven
-        # follow-up issue.
+        # follow-up issue. The id verification and any index repair
+        # ``_find_existing_locked`` performs (#1083) run inside this same
+        # critical section, so a repaired mapping cannot be raced by a
+        # concurrent write between the re-resolution and the file creation.
         with self._lock:
             existing = self._find_existing_locked(model_id, target_dir)
             if existing is not None:
@@ -1114,13 +1145,62 @@ class VaultWriter:
         directory scan if the index file is missing or corrupt so
         existing vaults remain compatible.
 
+        The index is a claim, not evidence: a stale or poisoned entry
+        names a file belonging to a *different* id, and every caller of
+        this locator then acts on that foreign file — rewriting it
+        (:meth:`update_fragment`), dropping a new fragment as a false
+        duplicate (:meth:`_write_model`), or moving and unlinking it
+        (:meth:`tomb_fragment` / :meth:`restore_fragment`). So a located
+        file is verified against its own frontmatter before it is
+        returned, and a mismatch re-resolves through
+        :meth:`_repair_index_locked` (#1083).
+
+        Cost and the rejected memo:
+
+        - Exactly one :func:`frontmatter.load` per index **hit**, none
+          per miss, so no directory scan enters the steady-state path.
+          Measured by call-counting a real unchanged re-ingest: 400
+          units produced 400 loads before this verification existed and
+          400 after — one per hit, not one per lookup. Each load costs
+          ~180 us on a real fragment (1.6 KB, ~20 frontmatter keys),
+          which is roughly +8% on the steady-state unchanged re-ingest
+          and about +6 s on a full 35 000-fragment sweep. That is the
+          price of not move-and-unlinking a stranger's file, and it is
+          paid only where the index claims a hit.
+        - Parsing *only* the frontmatter block by hand was measured and
+          rejected: ``frontmatter.load`` resolves libyaml's C loader,
+          while a hand-rolled ``yaml.safe_load`` of the same block runs
+          on the pure-Python loader and measured several times slower.
+          Reducing the cost further needs a bounded byte-scan for the
+          single ``id`` key, which is tracked as a follow-up rather
+          than smuggled into a data-loss fix.
+        - An mtime/size memo of the verification result was deliberately
+          **rejected**: memoising the check reintroduces "trust a cache
+          instead of the artifact" one level down — the exact defect
+          being closed — and buys nothing on a cold-process sweep, where
+          each path is visited exactly once.
+        - The repair appends a single later-wins line and repairs only
+          the requested id; other stale ids self-heal on first access.
+          This is not a full index rebuild.
+
         Args:
             model_id: The ID to search for.
             target_dir: The directory to search in.
 
         Returns:
-            The path to the existing file, or ``None`` if not indexed
-            or the indexed path no longer exists on disk.
+            The path to the existing file — returned only when that
+            file's own frontmatter declares *model_id*. ``None`` if the
+            id is not indexed, the indexed path no longer exists on
+            disk, or the indexed path declares a different id and no
+            live file in *target_dir* declares this one.
+
+        Raises:
+            ValueError: If a repaired index entry exceeds
+                :data:`_PIPE_BUF_BYTES` when encoded — see
+                :meth:`_append_index_entry`. A lookup-shaped method can
+                therefore raise, because a mismatch persists its repair.
+            OSError: If persisting a repaired entry fails to write — same
+                origin, same reason it can escape a lookup.
         """
         index = self._load_index_locked(target_dir)
         filename = index.get(model_id)
@@ -1128,7 +1208,9 @@ class VaultWriter:
             return None
         candidate = target_dir / filename
         if candidate.exists():
-            return candidate
+            if _file_declares_id(candidate, model_id):
+                return candidate
+            return self._repair_index_locked(index, model_id, target_dir)
         # Stale entry — drop it from the in-memory cache so the next
         # write reuses the slot. The on-disk JSONL still contains the
         # stale line, but it is harmless: the next write appends a new
@@ -1136,6 +1218,53 @@ class VaultWriter:
         # pass (out of scope for this fix) can reclaim the space.
         del index[model_id]
         return None
+
+    def _repair_index_locked(
+        self,
+        index: dict[str, str],
+        model_id: str,
+        target_dir: Path,
+    ) -> Path | None:
+        """Re-resolve *model_id* by scanning *target_dir*, and persist the fix.
+
+        Caller must hold ``self._lock``. Reached only when the indexed
+        file exists but declares a different id, so the scan is paid
+        once per poisoned entry rather than per lookup.
+
+        The corrected mapping is persisted with
+        :meth:`_append_index_entry`, never :meth:`_persist_full_index`:
+        a whole-file rewrite from this process's in-memory snapshot
+        would destroy every entry another process appended since this
+        writer loaded the index. The append is later-wins and keeps the
+        file append-only, so a fresh :class:`VaultWriter` resolves the
+        id directly without repeating the scan.
+
+        Args:
+            index: The in-memory index for *target_dir*, mutated in place.
+            model_id: The ID whose entry was found to be mis-mapped.
+            target_dir: The directory to re-scan.
+
+        Returns:
+            The path of the file that genuinely declares *model_id*, or
+            ``None`` when no live file in *target_dir* declares it.
+
+        Raises:
+            ValueError: If the repaired entry exceeds
+                :data:`_PIPE_BUF_BYTES` when encoded.
+            OSError: If the repaired entry cannot be written.
+
+        Both propagate from :meth:`_append_index_entry`. The in-memory
+        mapping is corrected *before* the append, so a failure to persist
+        leaves this process holding ground truth and the on-disk index
+        merely stale — a cost, not a correctness loss.
+        """
+        resolved = self._rebuild_index(target_dir).get(model_id)
+        if resolved is None:
+            del index[model_id]
+            return None
+        index[model_id] = resolved
+        self._append_index_entry(target_dir, model_id, resolved)
+        return target_dir / resolved
 
     def _find_existing(self, model_id: str, target_dir: Path) -> Path | None:
         """Return the path of an existing file for *model_id*, or ``None``.

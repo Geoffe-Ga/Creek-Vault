@@ -268,7 +268,28 @@ Every registered tool's relationship to the caller's ceiling is now a
 machine-checked audit record: `creek_mcp/read_gate.py`'s `TOOL_POSTURES`
 names one of six postures per tool, verified against the live server
 surface and, for `GATED` entries, against a real call site in the
-named module, and for the rest against a runtime canary probe.
+named module. Those claims are then checked by *running* the tools —
+not with one canary probe, but with **one probe set per egress
+channel**, because a tool has more than one way to put content in front
+of you and closing one channel says nothing about the others:
+
+| Egress channel | What is checked | Which tools | Forced? |
+|----------------|-----------------|-------------|---------|
+| **JSON response** | The tool is called at `ceiling=open` against a vault holding an `intimate` fragment whose title, body and tags each carry a unique sentinel; that sentinel must appear nowhere in the serialised response. | Ten of the twelve `GATED` tools. `creek.draft` and `creek.author` carry recorded exemptions instead — a bare fixture does not drive either far enough for its envelope to mean anything. | Yes. A newly `GATED` tool must grow a probe or record a justified exemption; it cannot inherit silence. |
+| **Model prompt** | The tool is driven all the way *to* the provider with a recording client, and neither the `intimate` sentinel nor the above-ceiling **`personal`** one may appear in any prompt it sent — nor in the response of that same call ([#1036](https://github.com/Geoffe-Ga/Creek-Vault/issues/1036)). | `creek.reflect`, `creek.compile` and `creek.author`. `creek.draft` is exempt, and its stated reason is executed rather than trusted. | Yes. The set is *derived* from the tools' own signatures — a `GATED` tool taking both an LLM factory and a ceiling — so a tool cannot become model-backed without being asked for a prompt probe. |
+| **Disk artifacts** | The bytes the call writes into the vault carry no sentinel, and a refused call leaves the bytes it would have overwritten untouched. | `creek.report`, `creek.state.render`, `creek.journal`, `creek.upload`. | **No.** Four per-tool tests and no forcing function: nothing obliges the fifth artifact-writing tool to grow a fifth test. Tracked in [#1273](https://github.com/Geoffe-Ga/Creek-Vault/issues/1273). |
+
+The prompt channel is the one you cannot check from the outside. A
+response you can inspect; a prompt has already crossed to the provider
+by the time the response exists, so a tool could hand you a perfectly
+clean envelope having shipped an above-ceiling fragment to a cloud
+endpoint on the way to building it. Note which of that row's two
+sentinels does the work, too: the `personal` one. Every path in this
+codebase drops `intimate`, but the privacy filter *summarises* a
+personal fragment to
+`[Personal-tier summary: <title>]` — so on that path an above-ceiling
+**title** reaches the model by design, and it is exactly what a weaker
+"no intimate content in the prompt" check would never see.
 
 Most of what the sweep found is **write-side**: a tool *acts on* content
 above the caller's ceiling (#970) rather than handing it
