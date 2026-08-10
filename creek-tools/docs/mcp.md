@@ -400,8 +400,8 @@ resolved — because `RedactionScanner.scan_batch` yields symlinked children
 unresolved, and a renderer that resolved first reported such a symlink
 under its target's name, out of a scan the scope fix alone would still
 have admitted. See "`creek.redact.scan` is scoped, not tier-filtered" under
-Read tools above for the full shape of the fix, including the two residuals
-it accepts.
+Read tools above for the full shape of the fix, including the one residual
+it still accepts and the one #1087 has since closed.
 
 ### Elevated-authorization model (FEAT-012)
 

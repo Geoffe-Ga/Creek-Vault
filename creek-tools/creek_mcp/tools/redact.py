@@ -360,9 +360,15 @@ def _vault_relative(path: Path, vault_path: Path) -> str:
 
     *path* is deliberately not resolved. ``rglob`` yields symlinked children
     unresolved, so resolving here reports a link staged under ``Inbound/``
-    beneath its target's name — the disclosure described in the module
+    beneath its target's name — the #972 disclosure recounted in the module
     docstring, arriving through a scan the scope gate correctly admitted. The
     path a finding names must be the path the scanner opened.
+
+    #1087 narrowed what can reach this renderer but did not retire the rule:
+    a symlinked child whose target escapes the scan root is now declined
+    before it is opened, yet one resolving *within* the root is still
+    admitted and still arrives here unresolved. Rendering as scanned is what
+    keeps this function's output independent of that distinction.
 
     The vault *root* is resolved, because that is what every scanned path
     descends from: they are all built from

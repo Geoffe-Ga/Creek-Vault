@@ -980,15 +980,19 @@ def test_an_unrenderable_path_falls_back_to_a_non_disclosing_placeholder(
 
 
 # ---------------------------------------------------------------------------
-# The walk still follows an escaping symlink (#1087)
+# The walk does not follow an escaping symlink (#1087)
 #
-# #972 stopped the response from *naming* a symlink's target. The residual it
-# recorded — in ``creek_mcp/tools/redact.py``'s own module docstring, under
-# "Residual, tracked by #1087" — is that the walk still *reads* it:
-# ``scan_batch`` selects candidates with ``child.is_file()``, and ``is_file()``
-# follows symlinks. So the target's PII types and line numbers are still
-# reported, and the file is still counted in ``files_scanned`` whether or not
-# it yields a finding.
+# #972 stopped the response from *naming* a symlink's target; the residual it
+# recorded was that the walk still *read* it. ``scan_batch`` selects candidates
+# with ``child.is_file()``, and ``is_file()`` follows symlinks, so the target's
+# PII types, line numbers, and existence still reached this tool's caller.
+#
+# #1087 closed it in ``_scannable_candidates``, the scanner module's one
+# filesystem walk: a child that is itself a symlink must resolve under the
+# already-resolved scan root or it is declined unopened. The test below pins
+# that from the MCP surface — the shared locator means it holds for
+# ``creek redact`` and ``creek process`` too, but each surface asserts its own
+# statistics contract, and ``files_scanned`` is this one's.
 # ---------------------------------------------------------------------------
 
 _STAGED_PII_RELPATH = f"{_STAGING_ROOT}/ch1/msg/staged.md"
