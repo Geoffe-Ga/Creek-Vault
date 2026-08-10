@@ -16,6 +16,14 @@ from typing import TYPE_CHECKING
 
 from crawdad.bot import CrawDadClient
 from crawdad.capture import MessageCapture
+from crawdad.capture_audit import (
+    apply_purge,
+    audit_capture_tree,
+    format_audit_report,
+    format_purge_report,
+    list_skipped_entries,
+    plan_purge,
+)
 from crawdad.composer import SonnetComposer
 from crawdad.config import (
     composer_model_for,
@@ -58,26 +66,100 @@ def _truncate_for_discord(text: str) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """Parse *argv*, resolve config, and start the runtime."""
+    """Parse *argv*, resolve config, and dispatch to the selected subcommand."""
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.subcommand == "run":
-        config = load_config(args.config)
-        run_bot(config)
+        run_bot(load_config(args.config))
+    else:
+        run_capture_command(args)
+
+
+def _add_config_flag(parser: argparse.ArgumentParser) -> None:
+    """Attach the shared ``--config`` flag to *parser*."""
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Path to crawdad.yaml (defaults to ./crawdad.yaml).",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
     """Return the top-level argument parser."""
     parser = argparse.ArgumentParser(prog="crawdad")
     sub = parser.add_subparsers(dest="subcommand", required=True)
-    run = sub.add_parser("run", help="Start the Discord bot.")
-    run.add_argument(
-        "--config",
-        type=Path,
-        default=None,
-        help="Path to crawdad.yaml (defaults to ./crawdad.yaml).",
-    )
+    _add_config_flag(sub.add_parser("run", help="Start the Discord bot."))
+    _add_capture_parser(sub)
     return parser
+
+
+def _add_capture_parser(
+    sub: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    """Attach ``crawdad capture audit|purge`` — the #1264 remediation helper.
+
+    ``audit`` is the default-shaped, read-only mode. ``purge`` is a dry run
+    unless ``--apply`` is passed, because deletion is irreversible and the
+    operator must see the target list before it is acted on.
+    """
+    capture = sub.add_parser(
+        "capture",
+        help="Inspect or clean up an existing bot-capture tree (#1264).",
+    )
+    modes = capture.add_subparsers(dest="capture_mode", required=True)
+    _add_config_flag(
+        modes.add_parser(
+            "audit",
+            help="Report what each captured channel dir holds. Read-only.",
+        )
+    )
+    purge = modes.add_parser(
+        "purge",
+        help="Delete capture dirs the current gate would refuse. Dry run by default.",
+    )
+    _add_config_flag(purge)
+    purge.add_argument(
+        "--channel",
+        action="append",
+        default=[],
+        metavar="LABEL",
+        help=(
+            "Also purge this channel directory, for a name-labelled dir the "
+            "audit could not resolve to a channel id. Repeatable. A directory "
+            "the current gate admits is refused even when named."
+        ),
+    )
+    purge.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually delete. Without it, purge only reports what it would do.",
+    )
+
+
+def run_capture_command(args: argparse.Namespace) -> None:
+    """Run ``crawdad capture audit|purge`` and print the report to stdout.
+
+    Loads the live config so the audit judges the tree against the *current*
+    allowlist and tier table — the same two inputs :func:`crawdad.bot._capture_allowed`
+    reads — rather than a second, driftable copy of the gate.
+    """
+    config = load_config(args.config)
+    capture_dir = config.vault_path / config.capture_subpath
+    audits = audit_capture_tree(capture_dir=capture_dir, config=config)
+    if args.capture_mode == "audit":
+        print(
+            format_audit_report(
+                capture_dir=capture_dir,
+                audits=audits,
+                skipped=list_skipped_entries(capture_dir),
+            )
+        )
+        return
+    plan = plan_purge(audits=audits, requested_labels=tuple(args.channel))
+    if args.apply:
+        apply_purge(capture_dir=capture_dir, plan=plan)
+    print(format_purge_report(capture_dir=capture_dir, plan=plan, applied=args.apply))
 
 
 def run_bot(config: CrawDadConfig) -> None:

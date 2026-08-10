@@ -91,14 +91,70 @@ vault, because a captured message currently can't carry its channel's
 privacy tier with it. #1262 tracks carrying that tier end-to-end so
 `intimate` channels can be captured faithfully instead of refused.
 
-**Upgrading from a pre-#1052 build.** If you ran with
-`capture_enabled: true` before this fix, `<vault>/discord-capture/`
-may already hold records from non-allowlisted users, other bots, or
-an `intimate` channel — the old capture path bypassed all three
-gates. These records are still ingestible today. #1264 tracks the
-fix; until then the manual mitigation is deleting the offending
-channel subdirectories under `discord-capture/` before running
-`creek sync`.
+#### Upgrading from a pre-#1052 build — audit your capture tree
+
+#1052 stopped future bad writes; it did nothing about what an older build
+already wrote. If you ever ran with `capture_enabled: true` before that fix,
+`<vault>/discord-capture/` may hold records from non-allowlisted users, other
+bots, or a channel you declared `intimate` — the old capture path bypassed all
+three gates, and those records are **still ingestible**, landing as
+`unclassified`, which ranks with `personal`. Run the audit before your next
+`creek sync`:
+
+```bash
+crawdad capture audit                       # read-only; changes nothing
+```
+
+It reports, for every channel directory under the capture root: the verdict the
+*current* gate would give it, the declared privacy tier, the record count, the
+date range, and the distinct author names. Then:
+
+```bash
+crawdad capture purge                       # DRY RUN — shows what would go
+crawdad capture purge --apply               # actually delete (irreversible)
+```
+
+Both read the same `crawdad.yaml` the bot does, so they judge the tree against
+your live allowlist and tier table.
+
+**What purge deletes, and what it deliberately does not.**
+
+| Verdict | Meaning | Purged? |
+|---|---|---|
+| `admitted` | An allowlisted channel at an admitted tier — the gate would write it today. | **Never**, even if you name it. Delete it by hand if you want it gone. |
+| `refused` | A numeric-labelled dir whose id is not in `allowed_channel_ids`, or is declared `intimate`/`all`. | Yes, by default. |
+| `unresolved` | The dir is named after the channel (`general`), not its id, so it cannot be matched against `allowed_channel_ids`. | Only when you name it: `crawdad capture purge --channel general --apply`. |
+
+Most directories will be `unresolved`: CrawDad names each capture directory
+after the channel's *name*, and a name cannot be mapped back to a channel id
+offline. Guessing is the one way this tool could destroy legitimate data, so it
+does not — it shows you the contents and waits for you to name the directory.
+
+A directory is only read as a channel **id** when its name could plausibly be
+one: all digits, no leading zero, and at least 15 of them (Discord ids are
+`(ms since the 2015 epoch) << 22`, so real ones run 15-19 digits). This matters
+because channel *names* made only of digits are ordinary — `2024`, `420`, `911`.
+Without the length floor, `2024` would be read as channel id 2024, miss your
+allowlist, and be auto-purged even though the channel itself is allowlisted. If
+you have a genuinely id-labelled directory from very early 2015 it will show as
+`unresolved` instead; that costs you one `--channel` flag, not your data.
+
+Anything under the capture root that is not a real channel directory — a loose
+file, or a symlink — is skipped and listed at the end of the audit, so the
+report never quietly under-states what is on disk. Purge never follows a
+symlink.
+
+**Purge removes whole channel directories, never individual records.** A capture
+record stores the author's display name but no user id and no channel id, so
+`allowed_user_ids` cannot be re-evaluated from disk. An `admitted` directory may
+therefore still contain messages from users who were never allowlisted; the
+audit's authors column is how you spot them, and removing them means removing
+the whole directory. Filtering on a display name instead would match on a
+spoofable, mutable key — it would either destroy legitimate messages or leave
+the leak while reporting it fixed.
+
+#1262 tracks carrying the tier end-to-end so `intimate` channels can be captured
+faithfully instead of refused outright.
 
 ### LLM provider selection
 

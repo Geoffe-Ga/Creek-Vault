@@ -71,6 +71,26 @@ _INCLUDE_TIER_HELP = (
     "<vault>/00-Creek-Meta/audit/privacy.jsonl."
 )
 
+_SKILLS_DEFAULT_CEILING_HINT = (
+    "[yellow]Personal and unclassified fragments contribute no exemplars at "
+    "the default ceiling; pass --include-tier personal to include them."
+    "[/yellow]"
+)
+"""Static remedy printed after an exemplar-bearing ``creek skills generate``
+at the default ceiling.
+
+Static rather than conditional on a survey of what was actually withheld: the
+CLI needs no such survey otherwise, and "you would have been told" only
+reassures when the line is unconditional. On an unclassified vault every
+fragment ranks with ``personal`` (#876), so the default ceiling yields 34 files
+of "no qualifying exemplars" placeholders — indistinguishable, without this
+line, from a broken command.
+
+The one condition it *is* gated on is ``--signature-only``, where the remedy
+would be false rather than merely redundant: that mode emits no exemplars at
+any ceiling, so widening the ceiling changes nothing (PR #1286 review).
+"""
+
 # ``report`` needs its own wording because the flag runs the other way here
 # (#968). Everywhere else ``--include-tier`` *widens* an already-restrictive
 # default; on ``report`` an absent flag means **unfiltered**, and the flag
@@ -3793,11 +3813,19 @@ def skills_generate(
     content. The two variants can coexist in the same output directory.
     """
     override = _parse_include_tier(include_tier)
-    # Skill tree generation already excludes intimate exemplars; the
-    # override is recorded as an explicit operator decision rather
-    # than mutating downstream behaviour. _audit_privacy_override_if_
-    # needed already short-circuits for None / OPEN via override_elev-
-    # ates, so there is no extra guard to write at this call site.
+    # The override now *gates the corpus* (#971): it is threaded into
+    # SkillTreeGenerator below as a hard rank cutoff, so a personal or
+    # unclassified fragment contributes no exemplar until the operator
+    # widens the ceiling. ``allow_intimate`` is deliberately NOT derived from
+    # this flag: ``creek/templates/skills/privacy-tier.SKILL.md`` rule 1
+    # promises that "even with --include-tier intimate, intimate fragments
+    # contribute to the voice-skill tree only when the human has explicitly
+    # opted in (SkillTreeGenerator(allow_intimate=True) and consent on file).
+    # The tier flag alone is not enough." Wiring consent to the flag would be
+    # a strict loosening of a shipped promise, so consent stays a
+    # Python-API-only opt-in. _audit_privacy_override_if_needed already
+    # short-circuits for None / OPEN via override_elevates, so there is no
+    # extra guard to write at this call site.
     _audit_privacy_override_if_needed(
         vault_path=_resolve_vault(vault),
         command="skills",
@@ -3817,12 +3845,25 @@ def skills_generate(
     output_dir = output if output is not None else vault_path / "creek-skills"
     written = SkillTreeGenerator(
         signature_only=signature_only,
+        override=override,
     ).generate_all_skills(vault_path, output_dir)
     variant_label = "signature-only" if signature_only else "exemplar-bearing"
     console.print(
         f"[bold green]Voice Skill Tree generated ({len(written)} "
         f"{variant_label} files) at {output_dir}[/bold green]",
     )
+    # ``override_elevates`` is False for exactly None and OPEN — the two
+    # spellings of the default ceiling — so the hint reaches the operator who
+    # has not yet widened it and stays out of the way of the one who has.
+    # ``signature_only`` suppresses it outright rather than qualifying it: that
+    # mode drops every exemplar in ``_maybe_pick_exemplars`` before any tier is
+    # consulted, so the ceiling is inert and the advertised remedy would
+    # produce a byte-identical tree (PR #1286 review). There is no true
+    # rewording to fall back on, and the confusion the hint exists to prevent
+    # cannot arise here: the operator asked for zero exemplars and the success
+    # line above says "signature-only" back to them.
+    if not signature_only and not override_elevates(override):
+        console.print(_SKILLS_DEFAULT_CEILING_HINT)
 
 
 @skills_app.command("sync")

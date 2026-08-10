@@ -198,6 +198,39 @@ tier end-to-end from the capture record through staging into fragment
 frontmatter, so an `intimate` channel can be captured faithfully
 instead of refused outright.
 
+**Remediating a pre-#1052 tree (#1264).** The gate above is
+write-time-only; it never re-examines what an older build already
+wrote, and the creek-tools read side
+(`stage_capture_as_data_package`) applies no allowlist or tier filter
+of its own. `crawdad/crawdad/capture_audit.py` plus
+`crawdad capture audit|purge` is the offline remediation helper —
+audit read-only by default, purge dry-run unless `--apply`. It
+re-derives the gate's verdict from `crawdad.yaml`, so it must never
+grow a second copy of the gate's rules: `_verdict_for` reads
+`allowed_channel_ids` and `CAPTURE_ADMITTED_TIERS` directly, in the
+same order `_capture_allowed` does.
+
+Two limits are structural, not provisional. **Only channel-level
+conditions are re-derivable**: `_record_for` writes no user id and no
+channel id, so `allowed_user_ids` cannot be re-evaluated from disk and
+purge therefore operates on whole channel directories, never on
+individual records. **Only id-labelled directories get a verdict**:
+`_channel_label` prefers the channel *name*, and a name cannot be
+mapped back to an id offline, so name-labelled dirs are reported
+`UNRESOLVED` and left alone until the operator names one with
+`--channel`. Note the trap `_resolve_channel_id` exists to avoid:
+digit-only channel *names* are ordinary (`2024`, `420`, `911`), so
+"all digits" alone must never mean "is an id" — a short numeric name
+read as an id misses the allowlist, becomes `REFUSED`, and is deleted
+by a default `--apply` with no confirmation. Hence the
+`_MIN_SNOWFLAKE_DIGITS` floor. Do not relax it; the failure it
+prevents is silent, irreversible data loss, while its cost when it
+over-triggers is one `--channel` flag. A gate-`ADMITTED` directory is refused even when named
+explicitly — that refusal is what makes "never deletes what the gate
+would admit" a property of the tool rather than of how carefully it
+was invoked. Both limits are stated in the tool's own output; do not
+remove them from the report to tidy it up.
+
 ### 5.3 Redaction-scan gate (FEAT-027, #1054)
 
 **Policy: record the batch, refuse at dispatch.** An attachment turn

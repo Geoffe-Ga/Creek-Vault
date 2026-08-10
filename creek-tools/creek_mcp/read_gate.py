@@ -84,7 +84,8 @@ a voice profile's ``### Sample Passages`` leaks the title and poisons the
 corpus — and it reads the tier through the validated
 :class:`~creek.models.Fragment`, so it fails open on a *missing*
 ``privacy_tier`` key. ``creek.report`` therefore joins ``wheel``, ``mine``,
-``draft`` and ``author``, all ``GATED`` on
+``draft``, ``author`` and — since #971 closed the voice-skill-tree gap on
+exactly this argument — ``skills.refresh``, all ``GATED`` on
 :func:`creek_mcp.tier_ceiling.to_privacy_override` without adopting either
 primitive. What the manifest checks is that the named gate exists and decides
 something, not which of two shapes it takes.
@@ -121,6 +122,70 @@ fails if an entry lies: the manifest must match ``server.list_tools()``
 exactly, a ``GATED`` claim is checked against a real call site in the named
 module, a gap must name a positive issue that the tool's own source mentions,
 and a tool recorded as a gap must not already call a primitive below.
+
+**The three egress channels, and which one each layer watches.** #1036 added
+a seventh layer, (g): every ``GATED`` tool that can hand corpus text to a
+model is driven all the way *to* the provider with a recording factory, and no
+sentinel from an above-ceiling fragment may appear in any prompt it sent. It
+exists because every layer before it terminates at the response envelope, and
+a prompt has already crossed to the provider by the time an envelope exists.
+The follow-up on #1036 asked for the probes to be read per *egress channel*
+rather than per tool. Named on that axis, the surface is:
+
+1. **JSON response** — layer (f), driven off ``_RUNTIME_PROBES`` /
+   ``_PROBE_EXEMPT``. Forced: a newly ``GATED`` tool must grow a probe or
+   record a justified exemption.
+2. **Model prompt** — layer (g), driven off ``_PROMPT_PROBES`` /
+   ``_PROMPT_PROBE_EXEMPT``, over a set derived from the tools' own
+   signatures. Forced the same way, plus a non-emptiness assertion on the
+   derivation, since a derived set can silently empty itself.
+3. **Disk artifacts** — covered per tool, and **not forced**.
+   ``test_report_probe_leaves_no_canary_in_the_artifact_it_writes``,
+   ``test_state_render_probe_leaves_no_canary_in_the_artifact_it_writes``,
+   ``test_journal_probe_refuses_and_leaves_the_fragment_bytes_untouched`` and
+   ``test_upload_probe_refuses_and_leaves_the_staged_document_untouched`` are
+   four good ideas, and nothing obliges the fifth artifact-writing tool to
+   grow a fifth. That gap is deliberately **out of scope here** and split to
+   **#1273** rather than left implied: #968 and #969 were both found on this
+   channel, so it is simultaneously the channel with the worst track record
+   and the only one with no forcing function.
+
+**Scope item 4 of #1036 — a second gate pair on :class:`ToolPosture` — is
+decided NO.** ``creek.reflect``'s rationale names two gates while the
+dataclass records one, so the obvious repair is a second
+``(gate_module, gate_symbol)`` pair. It was not taken. A second pair is only
+ever checkable at the strength layers (c)/(e) can offer — the symbol exists in
+the named module and is called there — and for reflect's grounding gate that
+check is green *by construction*: ``creek/author/agents.py`` imports
+``tier_within_override`` at line 28 and calls it in ``_load_corpus`` at line
+115 for every Writing Desk consumer. It would stay green if
+``creek_mcp.tools.reflect._default_retrieve`` stopped passing ``override``,
+stopped being called, or reflect dropped grounding altogether — three ways to
+lose the gate entirely without disturbing the evidence for it. Layer (g)
+checks that gate's *effect* instead, which is strictly stronger, and the
+injection drill at the top of ``tests/test_mcp_read_gate.py`` is the evidence:
+the two independent mutations that neutralise the grounding cutoff turn (g)
+red and leave every structural layer and all ten response probes green.
+Revisit predicate: **a tool whose second gate's effect no runtime probe can
+observe.** For that tool the structural check is the only one available, and a
+weak check is better than none.
+
+**``creek.classify`` is a known prompt-channel egress outside both probe
+manifests.** Its posture is ``METADATA_ONLY`` on a rationale about its
+*response* — "Returns counts only … the ceiling is audited for the trail, not
+enforced" — and ``creek_mcp/tools/classify.py`` says the same in its own
+words: the ceiling "is recorded for the audit trail; it does not gate
+execution". Both are true of the envelope and beside the point on this
+channel. With ``method="llm"`` the whole corpus, every tier of it, goes
+through a provider, defended only by
+:class:`creek.classify.llm.router.ModelRouter`'s Intimate-never-cloud gate —
+which ``creek/classify/classify_engine.py`` reaches by resolving a second,
+intimate-only classifier config, and which says nothing about ``personal``.
+Layer (g) structurally cannot enrol it: the derivation looks for a
+function taking both ``llm_factory`` and ``privacy_tier_ceiling``, and
+``classify_tool`` takes no factory — so the reason this tool is absent from
+the prompt manifest is a fact about its signature, not a finding about its
+safety. Tracked in **#1274**.
 """
 
 from __future__ import annotations
@@ -375,14 +440,52 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
         gate_symbol="to_privacy_override",
     ),
     "creek.skills.refresh": ToolPosture(
-        posture=ReadPosture.UNGATED_KNOWN_GAP,
+        posture=ReadPosture.GATED,
         rationale=(
-            "SkillTreeGenerator hardcodes an intimate exclusion but the "
-            "ceiling is never threaded, so personal bodies pass unsummarised "
-            "at ceiling=open — looser than every sibling generation tool "
-            "(#971)."
+            "Converts the ceiling with to_privacy_override and threads it "
+            "into SkillTreeGenerator, whose corpus walk admits a fragment "
+            "only when tier_within_override clears the hard rank cutoff — so "
+            "no above-ceiling *fragment* body, title or id reaches the "
+            "untiered <vault>/creek-skills tree. Read 'fragment' strictly: "
+            "only _collect_fragments took the override, so thread and eddy "
+            "skills are NOT gated. Thread and Eddy carry no privacy_tier "
+            "field for _collect_typed to rank them by — the same shape that "
+            "makes creek.report's tag garden fragment-derived only — while "
+            "their titles, ids, descriptions and fragment counts are all "
+            "derived from their member fragments. An eddy title derived from "
+            "an above-ceiling member therefore still reaches "
+            "creek-skills/eddies/ and, slugified, IS the filename, so it "
+            "also reaches the skill_paths this tool returns; skill_count "
+            "moves with how many threads and eddies clear their member "
+            "thresholds. That is the leak class #969 closed for "
+            "creek.state.render, and gating the typed walk would change "
+            "which files the tree emits at ceiling=open — a product call, so "
+            "it is tracked as #1284 rather than folded into #971. Excludes "
+            "rather than refuses: the tool names no target, it is a corpus "
+            "walk like report/wheel/mine, and refusing would make the tree "
+            "unreachable — #968's explicit anti-goal. The cutoff is hard "
+            "rather than summarising for #968's reason one step further in: "
+            "a skill file IS a voice-exemplar corpus, so "
+            "filter_fragments_by_tier's '[Personal-tier summary: <title>]' "
+            "stub would be written into ## Exemplar Passages beside the "
+            "fragment id in bold — leaking the title it claims to protect "
+            "and teaching the model a sentence nobody wrote. The intimate "
+            "exclusion remains a SEPARATE consent gate ANDed with this one "
+            "(_is_snapshot_fragment's allow_intimate), and the MCP surface "
+            "never opens it, so intimate exemplars are unreachable here at "
+            "every ceiling, ceiling=all included. The #971 gap was "
+            "write-side, which is why a response-level sweep missed it: for "
+            "the four fragment-derived categories the response carries only "
+            "a count and fixed skill names (F1, rising, express-do…), so the "
+            "evidence was always the tree's bytes. Consequence to know: "
+            "unclassified ranks with personal (#876), so a vault that has "
+            "never been through creek classify yields a complete tree whose "
+            "## Exemplar Passages sections all carry the 'no qualifying "
+            "exemplars' placeholder at ceiling=open — the gate working, not "
+            "an empty vault; a broader ceiling recovers them."
         ),
-        gap_issue=971,
+        gate_module="creek_mcp.tools.skills",
+        gate_symbol="to_privacy_override",
     ),
     "creek.journal": ToolPosture(
         posture=ReadPosture.GATED,

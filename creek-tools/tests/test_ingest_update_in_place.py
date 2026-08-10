@@ -226,3 +226,60 @@ class TestEditedJournalUpdatesInPlace:
         rec = ledger.get("personal/journal/2026-06-26.md")
         assert rec is not None
         assert rec.fragment_id == original_id
+
+    def test_stale_index_edit_is_not_lost(self, tmp_path: Path) -> None:
+        """A poisoned id index must not swallow the edit into a foreign fragment.
+
+        The ledger still maps the source unit to its fragment id, but the
+        directory's ``.id-index.jsonl`` now maps that id onto a *bystander*
+        file. ``update_fragment`` must decline the foreign file, so the changed
+        branch falls through to its ``updated is None`` fallback and re-creates
+        the fragment under the preserved id — the edit survives, and the
+        bystander is untouched (#1083).
+        """
+        vault = _make_vault(tmp_path)
+        entry = vault / "personal" / "journal" / "2026-06-26.md"
+        entry.write_text(
+            "---\ndate: 2026-06-26\n---\nFirst draft.\n",
+            encoding="utf-8",
+        )
+        _, errors, _ = _ingest(vault, entry)
+        assert errors == []
+        original = _journal_files(vault)[0]
+        original_id = str(frontmatter.load(str(original))["id"])
+
+        # The real fragment vanishes out of band, a bystander is written into
+        # the same directory, and the index is poisoned to name it.
+        original.unlink()
+        seed = VaultWriter(vault_path=vault)
+        bystander = Fragment(
+            id="frag-bystander1",
+            title="Bystander",
+            source=FragmentSource(platform=SourcePlatform.JOURNAL),
+        )
+        bystander_path = seed.write_fragment(bystander, body="bystander body")
+        # Setup guard: the poison only bites if both share one directory index.
+        assert bystander_path.parent == original.parent
+        before = bystander_path.read_bytes()
+        seed._append_index_entry(
+            bystander_path.parent,
+            original_id,
+            bystander_path.name,
+        )
+
+        entry.write_text(
+            "---\ndate: 2026-06-26\n---\nRewritten after the index went stale.\n",
+            encoding="utf-8",
+        )
+        _, errors, _ = _ingest(vault, entry)
+        assert errors == []
+
+        recreated = [
+            path
+            for path in _journal_files(vault)
+            if frontmatter.load(str(path))["id"] == original_id
+        ]
+        assert len(recreated) == 1
+        post = frontmatter.load(str(recreated[0]))
+        assert "Rewritten after the index went stale" in post.content
+        assert bystander_path.read_bytes() == before
