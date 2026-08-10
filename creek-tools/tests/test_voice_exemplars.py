@@ -20,10 +20,12 @@ from creek.generate.voice import (
     DEFAULT_MIN_PER_REGISTER,
     VOICE_REGISTERS,
     VoiceExemplarCollector,
+    _eligible_register,
     _is_other_authors_path,
     _is_safe_sample_stem,
 )
 from creek.models import (
+    Authorship,
     Confidence,
     Fragment,
     FragmentSource,
@@ -72,9 +74,17 @@ def _build_fragment(
     confidence: Confidence | None,
     privacy: PrivacyTier = PrivacyTier.PERSONAL,
     fully_classified: bool = True,
-    voice_weight: float = 1.0,
+    voice_weight: float | None = None,
+    author: Authorship = Authorship.SELF,
 ) -> Fragment:
-    """Build a Fragment with the desired voice / privacy / classification state."""
+    """Build a Fragment with the desired voice / privacy / classification state.
+
+    ``voice_weight`` is omitted from the constructor call when ``None`` so a
+    test can exercise the *model default* (``1.0``, ``creek/models.py``)
+    rather than a value the helper supplied — the distinction #1213 turns on,
+    since a non-self fragment with no explicit weight is exactly what
+    ``DocumentIngestor`` produces.
+    """
     if fully_classified:
         frequency = FrequencyClassification(primary=Frequency.F5)
         wavelength = WavelengthClassification(
@@ -84,17 +94,18 @@ def _build_fragment(
     else:
         frequency = FrequencyClassification()
         wavelength = WavelengthClassification()
+    weight_kwargs = {} if voice_weight is None else {"voice_weight": voice_weight}
     return Fragment(
         id=frag_id,
         title=title,
-        source=FragmentSource(platform=SourcePlatform.JOURNAL),
+        source=FragmentSource(platform=SourcePlatform.JOURNAL, author=author),
         created=datetime(2026, 1, 15, 12, 0, 0),
         ingested=datetime(2026, 1, 15, 12, 0, 0),
         frequency=frequency,
         wavelength=wavelength,
         voice=VoiceClassification(voice_register=register, confidence=confidence),
         privacy_tier=privacy,
-        voice_weight=voice_weight,
+        **weight_kwargs,
     )
 
 
@@ -315,12 +326,15 @@ class TestCollectExemplars:
 class TestVoiceCorpusExcludesBorrowedContent:
     """Issue #466: borrowed / AI-authored text must never reach the voice corpus.
 
-    Two additive gates protect voice fidelity, mirroring the privacy
+    Three additive gates protect voice fidelity, mirroring the privacy
     fail-closed rule:
 
-    1. ``voice_weight > 0`` — a fragment with ``voice_weight <= 0`` (the
+    1. ``source.author == self`` — the frontmatter axis that
+       :attr:`~creek.models.Fragment.voice_proxy_eligible` is derived from.
+       This is the primary gate (#1213); the two below are backstops to it.
+    2. ``voice_weight > 0`` — a fragment with ``voice_weight <= 0`` (the
        ``ai-as-user`` analogue with ``voice_weight=0.0``) is ineligible.
-    2. ``11-Other-Authors/`` path exclusion — any fragment whose source
+    3. ``11-Other-Authors/`` path exclusion — any fragment whose source
        path contains that segment is skipped regardless of weight.
     """
 
@@ -407,6 +421,244 @@ class TestVoiceCorpusExcludesBorrowedContent:
         native = tmp_path / "01-Fragments" / "Journal" / "f.md"
         assert _is_other_authors_path(other) is True
         assert _is_other_authors_path(native) is False
+
+    @pytest.mark.parametrize(
+        "author",
+        [Authorship.AI, Authorship.OTHER, Authorship.COLLABORATIVE],
+    )
+    def test_excludes_non_self_authors_at_default_voice_weight(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+        author: Authorship,
+    ) -> None:
+        """Non-self prose is refused on authorship alone, with no weight help.
+
+        Issue #1213. Neither backstop applies here: the fragment sits in
+        ``01-Fragments/Journal/`` (so the ``11-Other-Authors`` path gate
+        never sees it) and carries no explicit ``voice_weight``, so the
+        model default of ``1.0`` applies. ``other`` is the live case —
+        ``DocumentIngestor`` resolves a DOCX ``core_properties.author`` /
+        PDF ``/Author`` to :attr:`~creek.models.Authorship.OTHER` and sets
+        no weight, so a stranger's document reaches this walk today.
+
+        The fragment round-trips through ``frontmatter`` and
+        ``Fragment.model_validate``, so the gate is exercised against the
+        plain ``str`` that ``FragmentSource``'s ``use_enum_values=True``
+        yields at runtime — not against an enum member.
+        """
+        borrowed = _build_fragment(
+            frag_id=f"frag-authored-{author.value}",
+            title=f"Written by {author.value}",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+            author=author,
+        )
+        assert borrowed.voice_weight == 1.0
+        _write_fragment(vault, borrowed, body_words=400)
+
+        exemplars = collector.collect_exemplars(vault)
+
+        assert [f.id for f in exemplars["confessional"]] == []
+
+    @pytest.mark.parametrize("author", list(Authorship))
+    @pytest.mark.parametrize(
+        "tier",
+        [PrivacyTier.OPEN, PrivacyTier.PERSONAL, PrivacyTier.INTIMATE],
+    )
+    def test_gate_matches_the_canonical_property_and_the_intimate_override(
+        self,
+        author: Authorship,
+        tier: PrivacyTier,
+    ) -> None:
+        """The gate is equivalent to the canonical predicate, override aside.
+
+        Two arms, and both are load-bearing (#1213):
+
+        * At ``allow_intimate=False`` admission must equal
+          :attr:`~creek.models.Fragment.voice_proxy_eligible` exactly.
+        * At ``allow_intimate=True`` admission must equal *self-authorship
+          alone* — the opt-in overrides the INTIMATE exclusion the property
+          bakes in, and nothing else. This arm is what fails if anyone
+          "simplifies" ``_eligible_register`` to
+          ``return fragment.voice_proxy_eligible``: that would silently
+          revoke the operator's opt-in to their own intimate writing.
+
+        ``list(Authorship)`` is deliberate: a fifth member added later is
+        excluded by the property and must be excluded here too, without
+        anyone remembering to extend a hand-written list.
+
+        The tier axis is deliberately **not** ``list(PrivacyTier)``.
+        ``PrivacyTier.UNCLASSIFIED`` is omitted because #1212 will make
+        ``_eligible_register`` stop admitting a self-authored *untiered*
+        fragment, at which point the first arm stops holding for that cell
+        while the property (which only excludes INTIMATE) still reports
+        ``True``. Widening this parametrization is green today and a
+        landmine tomorrow.
+        """
+        fragment = _build_fragment(
+            frag_id="frag-equivalence",
+            title="Equivalence probe",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+            privacy=tier,
+            author=author,
+        )
+
+        admitted_default = _eligible_register(fragment, allow_intimate=False)
+        admitted_opted_in = _eligible_register(fragment, allow_intimate=True)
+
+        assert (admitted_default is not None) == fragment.voice_proxy_eligible
+        assert (admitted_opted_in is not None) == (
+            str(fragment.source.author) == Authorship.SELF.value
+        )
+
+    def test_self_authored_intimate_admitted_when_allow_intimate(
+        self,
+        vault: Path,
+    ) -> None:
+        """The operator's own intimate writing survives the authorship gate.
+
+        The regression the issue body's suggested fix would have caused
+        (#1213): delegating to ``voice_proxy_eligible`` bakes in the
+        INTIMATE exclusion and silently drops this fragment even though the
+        operator opted the voice proxy in.
+        """
+        mine = _build_fragment(
+            frag_id="frag-self-intimate",
+            title="My own intimate writing",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+            privacy=PrivacyTier.INTIMATE,
+        )
+        _write_fragment(vault, mine, body_words=400)
+
+        exemplars = VoiceExemplarCollector(allow_intimate=True).collect_exemplars(vault)
+
+        assert [f.id for f in exemplars["confessional"]] == ["frag-self-intimate"]
+
+    def test_self_author_with_positive_weight_is_still_admitted(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """The admit direction is pinned independently of the weight gate (#1213)."""
+        mine = _build_fragment(
+            frag_id="frag-self-default",
+            title="My own writing",
+            register=VoiceRegister.PROPHETIC,
+            confidence=Confidence.CONVICTION,
+        )
+        _write_fragment(vault, mine, body_words=400)
+
+        exemplars = collector.collect_exemplars(vault)
+
+        assert [f.id for f in exemplars["prophetic"]] == ["frag-self-default"]
+
+    @pytest.mark.parametrize(
+        "author",
+        [Authorship.AI, Authorship.OTHER, Authorship.COLLABORATIVE],
+    )
+    def test_collect_all_exemplars_excludes_non_self_authors(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+        author: Authorship,
+    ) -> None:
+        """The flat lexicon-facing walk shares the authorship gate (#1213).
+
+        ``collect_all_exemplars`` is a second, independent walk; asserting
+        the gate on ``collect_exemplars`` alone would not cover it.
+        """
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id=f"frag-flat-{author.value}",
+                title="Borrowed",
+                register=VoiceRegister.ANALYTICAL,
+                confidence=Confidence.SETTLED,
+                author=author,
+            ),
+            body_words=400,
+        )
+
+        assert collector.collect_all_exemplars(vault) == []
+
+    def test_register_samples_are_not_written_for_non_self_authors(
+        self,
+        vault: Path,
+    ) -> None:
+        """No verbatim copy of borrowed prose lands in ``Register-Samples`` (#1213).
+
+        ``generate_register_samples`` ``shutil.copy2``-s the source file into
+        the vault byte for byte, so this surface turns an excerpt into a
+        durable copy of someone else's writing.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-samples-other",
+                title="Stranger's document",
+                register=VoiceRegister.INSTRUCTIONAL,
+                confidence=Confidence.CONVICTION,
+                author=Authorship.OTHER,
+            ),
+            body_words=400,
+        )
+
+        assert generate_register_samples(vault) == {}
+        register_dir = vault / "07-Voice" / "Register-Samples" / "instructional"
+        assert not register_dir.exists()
+
+    def test_previously_written_non_self_samples_are_pruned(
+        self,
+        vault: Path,
+    ) -> None:
+        """A sample written before the fix is deleted on the next run (#1213/#879).
+
+        Two runs through the public entry point. The first writes the copy
+        while the fragment is still self-authored; the frontmatter is then
+        rewritten on disk to ``author: other`` — the state a pre-fix vault is
+        already in — and the second run must remove the copy it recorded
+        writing and rewrite the summary to an honest zero. ``_save_register``
+        prunes above its empty-bucket branch precisely so an emptied register
+        is cleared rather than left describing a cohort that has gone.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        source = _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-prune-other",
+                title="Later reattributed",
+                register=VoiceRegister.RAW,
+                confidence=Confidence.CONVICTION,
+            ),
+            body_words=400,
+        )
+        register_dir = vault / "07-Voice" / "Register-Samples" / "raw"
+        copy = register_dir / "frag-prune-other.md"
+        summary = register_dir / "_Summary.md"
+
+        first_pruned: list[Path] = []
+        generate_register_samples(vault, on_prune=first_pruned.append)
+        assert copy.is_file()
+        assert summary.is_file()
+        assert first_pruned == []
+
+        post = frontmatter.load(str(source))
+        post["source"] = {**post["source"], "author": Authorship.OTHER.value}
+        source.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+        second_pruned: list[Path] = []
+        result = generate_register_samples(vault, on_prune=second_pruned.append)
+
+        assert second_pruned == [copy]
+        assert not copy.exists()
+        assert "raw" not in result
+        assert "frag-prune-other" not in summary.read_text(encoding="utf-8")
 
     def test_path_helper_no_substring_false_positive(self, tmp_path: Path) -> None:
         """A folder merely containing the text is not excluded (segment match only)."""

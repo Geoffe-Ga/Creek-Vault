@@ -365,7 +365,11 @@ class ClaudeIngestor(Ingestor):
         if is_ai:
             # The AI turn is AI-authored, so it can never feed the voice proxy
             # (``source.author=ai`` makes ``voice_proxy_eligible`` False); zero
-            # weight is belt-and-braces against future selectors.
+            # weight is belt-and-braces against future selectors. The voice
+            # corpus enforces the authorship half in
+            # ``creek.generate.voice._eligible_register`` (#1213); before that
+            # it read only the weight, and this comment described a mechanism
+            # nothing consulted.
             source["author"] = _ROLE_AI
 
         suffix = ", AI" if is_ai else ""

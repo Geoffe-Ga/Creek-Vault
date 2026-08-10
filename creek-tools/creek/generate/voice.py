@@ -13,6 +13,16 @@ body texts to extract sentence structure, paragraph structure, transition
 patterns, metaphor families, rhetorical moves, vocabulary fingerprint, and
 punctuation habits.
 
+**Voice fidelity** is guarded separately from privacy, by three additive
+gates in :func:`_eligible_register` and the walks around it. The primary
+one is authorship (#1213): a fragment whose ``source.author`` is not
+``self`` is refused outright, which is what enforces the guarantee
+:attr:`~creek.models.Fragment.voice_proxy_eligible` documents. Behind it
+sit two backstops from #466 — ``voice_weight > 0``, stamped to ``0.0`` on
+AI turns at ingest, and the ``11-Other-Authors`` path exclusion
+(:data:`_OTHER_AUTHORS_SEGMENT`). Both are retained deliberately: they
+catch a fragment whose authorship axis is missing or mis-set.
+
 The collector is deliberately conservative about privacy, and two
 independent gates say so. ``allow_intimate`` is a **consent** gate: the
 voice proxy is opt-in even at ``--include-tier intimate``
@@ -52,6 +62,7 @@ from pydantic import ValidationError
 from creek.classify.privacy_filter import PrivacyTierOverride, within_ceiling
 from creek.config import VoiceAudienceWeightingConfig
 from creek.models import (
+    Authorship,
     Confidence,
     Fragment,
     Frequency,
@@ -84,6 +95,15 @@ _OTHER_AUTHORS_SEGMENT: str = "11-Other-Authors"
 Any fragment whose source path contains this segment is excluded from the
 voice corpus regardless of its ``voice_weight``, as a defensive backstop
 against voice drift.
+
+Since #1213 this is a backstop to a real frontmatter gate rather than a
+front-line defence, and it is **retained deliberately** — it still catches
+a fragment whose ``source.author`` axis is absent or mis-set. It was never
+load-bearing on its own: the walks only rglob :data:`_FRAGMENTS_SUBDIR`,
+while :meth:`creek.vault.writer.VaultWriter._fragment_target_dir` routes
+borrowed fragments to a vault-root ``11-Other-Authors/<slug>/`` that is
+outside the scan root entirely. What this segment check actually catches
+is a nested or symlinked occurrence *inside* ``01-Fragments/``.
 """
 
 _SAMPLES_SUBPATH: tuple[str, str] = ("07-Voice", "Register-Samples")
@@ -302,14 +322,36 @@ def _eligible_register(
             fragments are rejected.
 
     Returns:
-        The canonical register string when the fragment has qualifying
-        confidence, a positive ``voice_weight``, allowed privacy tier,
-        and a canonical register; otherwise ``None``.
+        The canonical register string when the fragment is self-authored
+        and has qualifying confidence, a positive ``voice_weight``, allowed
+        privacy tier, and a canonical register; otherwise ``None``.
     """
-    # Voice-fidelity fail-closed gate (Issue #466): borrowed / AI-authored
-    # text (notably ``ai-as-user`` content with ``voice_weight=0.0``) must
-    # never train the voice proxy. ``voice_weight`` is already coerced to a
-    # float in ``[0, 1]`` by the model, so a plain comparison is safe.
+    # Authorship gate (Issue #1213), first because it is the primary one:
+    # this is what enforces the guarantee
+    # :attr:`~creek.models.Fragment.voice_proxy_eligible` documents — that
+    # AI-, collaborator- and other-authored prose can never train the voice
+    # proxy. Before this clause the corpus consulted no authorship axis at
+    # all, and the two gates below were the whole defence.
+    #
+    # Re-derived rather than delegated to the property, exactly as
+    # :func:`creek.generate.skills._is_snapshot_fragment` is and for the
+    # same documented reason: the property bakes in the INTIMATE exclusion,
+    # while ``allow_intimate=True`` deliberately overrides it, so
+    # ``return fragment.voice_proxy_eligible`` would silently revoke the
+    # operator's opt-in to their *own* intimate writing.
+    #
+    # Compared by value, not identity: ``FragmentSource`` sets
+    # ``use_enum_values=True``, so ``author`` is a plain ``str`` at runtime
+    # — the same idiom as the privacy-tier comparison below. Deliberately
+    # not ``Authorship(...) is Authorship.SELF``, which raises on a
+    # hand-corrupted frontmatter value instead of failing closed.
+    if str(fragment.source.author) != Authorship.SELF.value:
+        return None
+    # Voice-fidelity backstop (Issue #466): ``ai-as-user`` content is
+    # stamped ``voice_weight=0.0`` at ingest, which refuses it a second
+    # time even if its authorship axis is ever mis-set. ``voice_weight`` is
+    # already coerced to a float in ``[0, 1]`` by the model, so a plain
+    # comparison is safe.
     if fragment.voice_weight <= 0:
         return None
     if _confidence_value(fragment) not in _QUALIFYING_CONFIDENCE:
@@ -578,9 +620,10 @@ class VoiceExemplarCollector:
     def collect_exemplars(self, vault_path: Path) -> dict[str, list[Fragment]]:
         """Scan ``01-Fragments/`` and group qualifying exemplars by register.
 
-        Fragments are kept when their ``voice.confidence`` is ``settled``
-        or ``conviction`` and their ``voice.register`` is set. Intimate
-        privacy tier fragments are filtered out unless
+        Fragments are kept when they are **self-authored** (#1213), their
+        ``voice.confidence`` is ``settled`` or ``conviction``, their
+        ``voice_weight`` is positive, and their ``voice.register`` is set.
+        Intimate privacy tier fragments are filtered out unless
         :attr:`allow_intimate` is ``True``, and every fragment must
         additionally sit within :attr:`override` (#968). Each register key
         in the returned dict is always present; empty registers map to
@@ -631,8 +674,9 @@ class VoiceExemplarCollector:
     def collect_all_exemplars(self, vault_path: Path) -> list[Exemplar]:
         """Collect every qualifying exemplar across all registers, with bodies.
 
-        Shares the eligibility gate with :meth:`collect_exemplars` (``settled``
-        or ``conviction`` confidence, a set register, intimate filtered unless
+        Shares the eligibility gate with :meth:`collect_exemplars`
+        (self-authored, ``settled`` or ``conviction`` confidence, positive
+        ``voice_weight``, a set register, intimate filtered unless
         :attr:`allow_intimate`, within :attr:`override`, ``11-Other-Authors``
         excluded) but returns a flat :class:`Exemplar` list — fragment paired
         with its on-disk body — rather than per-register ``Fragment`` buckets.
@@ -670,7 +714,8 @@ class VoiceExemplarCollector:
         """Return the fragment's register if it qualifies, else ``None``.
 
         This answers the *consent* question only (``allow_intimate``, plus
-        confidence / voice-weight / register eligibility). The *ceiling*
+        authorship / confidence / voice-weight / register eligibility).
+        The *ceiling*
         question is asked separately by
         :func:`~creek.classify.privacy_filter.within_ceiling` at each walk,
         because it needs the raw frontmatter this method never sees. Do not

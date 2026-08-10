@@ -93,7 +93,7 @@ The caveat: a source keyed on mtime treats *any* filesystem touch as a change, n
 
 ## AI-chat attribution (per turn)
 
-Ingesting a Claude or ChatGPT conversation emits **two attributed fragments per turn**: the human turn is the owner's voice (`source.author = self`, full `voice_weight`) and the AI turn is AI-authored (`source.author = ai`, `voice_weight = 0.0`). Because `Fragment.voice_proxy_eligible` excludes non-`self` authors, the assistant's prose can never train the voice proxy, while threading/linking survives — both turns share the conversation id, turn index, and timestamp.
+Ingesting a Claude or ChatGPT conversation emits **two attributed fragments per turn**: the human turn is the owner's voice (`source.author = self`, full `voice_weight`) and the AI turn is AI-authored (`source.author = ai`, `voice_weight = 0.0`). Because `Fragment.voice_proxy_eligible` excludes non-`self` authors, the assistant's prose can never train the voice proxy, while threading/linking survives — both turns share the conversation id, turn index, and timestamp. That guarantee is *enforced* rather than aspirational as of [#1213](https://github.com/Geoffe-Ga/Creek-Vault/issues/1213): the voice corpus refuses any fragment whose `source.author` is not `self` in `creek.generate.voice._eligible_register`, so it holds for `other`- and `collaborative`-authored content too — including a document whose file metadata named someone else — not only for the AI turns that also carry `voice_weight = 0.0`.
 
 ### Migrating an existing vault
 

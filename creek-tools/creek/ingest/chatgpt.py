@@ -167,7 +167,9 @@ class ChatGPTIngestor(Ingestor):
             source["conversation_id"] = conv_id
         if is_ai:
             # AI turns are AI-authored, excluded from the voice proxy via
-            # ``voice_proxy_eligible``; zero weight is belt-and-braces.
+            # ``voice_proxy_eligible``; zero weight is belt-and-braces. The
+            # authorship half is enforced by
+            # ``creek.generate.voice._eligible_register`` (#1213).
             source["author"] = _ROLE_AI
         frontmatter_dict: dict[str, Any] = {
             "title": fragment.metadata.get("title", "Untitled Conversation"),
