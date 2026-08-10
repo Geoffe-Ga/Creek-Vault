@@ -169,12 +169,17 @@ types, line numbers, and whether it exists at all (it still counts toward
 disclosing the target's *path* — tracked by #1087. `rglob` does not descend
 into symlinked *directories*, which bounds the residual to symlinked files.
 
-One deployment knob is worth flagging on top of the fix itself: CrawDad's
-staging root is a configurable `staging_subpath`
-(`AttachmentConfig`, default `00-Creek-Meta/Inbound`), not a hardcoded
-constant, so an operator who points it elsewhere gets a subtree the scan's
-hardcoded scope does not recognise as admitted-at-every-ceiling — a real
-deployment gap, tracked by #1088.
+One deployment knob rode on top of the fix itself: CrawDad's staging root is
+a configurable `staging_subpath` (`AttachmentConfig`, default
+`00-Creek-Meta/Inbound`), not a hardcoded constant, so an operator who
+pointed it elsewhere got a subtree this scan's hardcoded scope does not
+recognise as admitted-at-every-ceiling. #1088 closed that gap from the
+CrawDad side: a `staging_subpath` outside `00-Creek-Meta/Inbound/` is now
+refused at config-parse time, and a `status="refused"` response is treated
+as *un-scanned*, so the batch can never be dispatched to `creek.ingest`.
+That CrawDad-side check is lexical — it resolves nothing — so this tool's
+`resolve_within_vault` plus its resolved `is_relative_to` remains the
+confinement boundary.
 
 ### Author tools (FEAT-041)
 

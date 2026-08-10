@@ -433,6 +433,120 @@ def test_config_refuses_parent_traversal_in_staging_subpath() -> None:
         AttachmentConfig(staging_subpath=Path("../../tmp"))
 
 
+# ---------------------------------------------------------------------------
+# #1088 — staging_subpath must stay inside the one subtree creek.redact.scan
+# will actually scan. Outside it, the scan is refused at every ceiling a
+# CrawDad channel ever declares, so the safety pass silently never runs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(Path("00-Creek-Meta/Inbound"), id="the-canonical-root-itself"),
+        pytest.param(Path("00-Creek-Meta/Inbound/discord"), id="one-level-below"),
+        pytest.param(Path("00-Creek-Meta/Inbound/a/b"), id="two-levels-below"),
+        pytest.param(Path("00-Creek-Meta/./Inbound"), id="dot-segment-normalised"),
+        pytest.param(Path("00-Creek-Meta/Inbound/"), id="trailing-slash-normalised"),
+        pytest.param("00-Creek-Meta/Inbound", id="plain-str-coerced-by-pydantic"),
+    ],
+)
+def test_config_accepts_staging_subpath_inside_canonical_root(
+    value: Path | str,
+) -> None:
+    """#1088: the canonical scan scope, and anything under it, are accepted.
+
+    ``creek.redact.scan`` is hard-scoped to ``00-Creek-Meta/Inbound/``
+    (``creek-tools/creek_mcp/tools/redact.py:98``) and admits that subtree
+    at *every* ceiling, so every value here can actually be scanned and
+    must keep parsing.
+
+    ``dot-segment-normalised`` and ``trailing-slash-normalised`` pin that
+    ``pathlib`` collapses ``.`` and a trailing separator before the
+    validator ever sees the value, so the scope check does not have to
+    re-implement normalisation. ``plain-str-coerced-by-pydantic`` pins
+    that a YAML string flows through the same validator as a ``Path``.
+    """
+    config = AttachmentConfig(staging_subpath=value)
+    assert config.staging_subpath.parts[:2] == ("00-Creek-Meta", "Inbound")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(Path("01-Fragments"), id="unrelated-vault-folder"),
+        pytest.param(Path("00-Creek-Meta/Inbound-other"), id="sibling-prefix"),
+        pytest.param(Path("00-Creek-Meta/Outbound"), id="sibling-folder"),
+        pytest.param(Path("00-Creek-Meta"), id="the-parent-is-not-inside"),
+        pytest.param(Path("00-creek-meta/inbound"), id="case-differs"),
+        pytest.param(Path(""), id="empty-normalises-to-dot"),
+    ],
+)
+def test_config_refuses_staging_subpath_outside_canonical_root(value: Path) -> None:
+    """#1088: a staging root the scan cannot reach is refused at parse time.
+
+    Outside ``00-Creek-Meta/Inbound/`` the scan ranks the target as
+    intimate content, so a ``personal``/``open`` CrawDad channel gets
+    ``status="refused"`` on every call and the safety pass never runs.
+    Refusing at config-parse time turns that silent runtime hole into a
+    startup error naming the fix.
+
+    ``sibling-prefix`` (``00-Creek-Meta/Inbound-other``) is the case that
+    forces ``Path.is_relative_to`` over ``str.startswith``: it shares the
+    canonical root's string prefix but is a different directory, and a
+    ``startswith`` check would wave it through.
+
+    ``case-differs`` (``00-creek-meta/inbound``) must be refused on every
+    platform, including case-insensitive filesystems. Case folding is
+    deliberately NOT performed: ``creek_mcp/tools/redact.py:340`` compares
+    the target against ``00-Creek-Meta/Inbound`` literally, so folding
+    here would admit a config the server then refuses — reopening the
+    exact never-scanned hole this issue closes.
+    """
+    with pytest.raises(ValueError, match="00-Creek-Meta/Inbound") as excinfo:
+        AttachmentConfig(staging_subpath=value)
+    # The message must restate the scope rule, not just name the folder —
+    # the operator needs to know *why* their path cannot be scanned.
+    assert "ranked as intimate content" in str(excinfo.value)
+
+
+def test_config_refuses_out_of_scope_staging_subpath_at_every_ceiling() -> None:
+    """#1088: the config gate does not merely shadow the downstream tier rule.
+
+    A channel declaring ``intimate`` *would* be admitted by
+    ``creek.redact.scan`` for an out-of-scope path, so a gate that only
+    fired for narrow ceilings would be a restatement of the server's rule
+    rather than an independent one. The refusal must turn on the path
+    alone, whatever ``channel_privacy_tiers`` says.
+    """
+    with pytest.raises(ValueError, match="00-Creek-Meta/Inbound"):
+        AttachmentConfig(
+            staging_subpath=Path("01-Fragments"),
+            channel_privacy_tiers={1: "intimate"},
+        )
+
+
+def test_config_refuses_traversal_out_of_canonical_root_via_the_dotdot_arm() -> None:
+    """#1088: ``..`` inside the canonical root is caught by the ``..`` arm.
+
+    ``00-Creek-Meta/Inbound/../../01-Fragments`` is *lexically*
+    ``is_relative_to`` the canonical root — ``Path.is_relative_to`` is a
+    pure prefix comparison and does not resolve ``..`` — so the new scope
+    arm alone would wave it through. Only the pre-existing ``..`` arm
+    catches it, which means the arms must stay in order: absolute, then
+    ``..``, then scope.
+
+    The negative assertion is the real discriminator: both arms
+    interpolate ``value!r``, so the path's own dots satisfy ``match``
+    either way, but only the scope arm restates the tier rule.
+    """
+    with pytest.raises(ValueError, match=r"\.\.") as excinfo:
+        AttachmentConfig(
+            staging_subpath=Path("00-Creek-Meta/Inbound/../../01-Fragments")
+        )
+    assert "ranked as intimate content" not in str(excinfo.value)
+
+
 async def test_empty_allowed_extensions_passes_anything_not_denied(
     tmp_path: Path,
 ) -> None:

@@ -68,7 +68,7 @@ allowed_channel_ids:
 | `mcp_server_command` | no | `[creek-tools-mcp]` | argv for the MCP subprocess. |
 | `allowed_user_ids` | yes | — | Discord user ids permitted to message the bot. |
 | `allowed_channel_ids` | yes | — | Channels the bot will respond in. |
-| `attachments` | no | see source | Per-attachment limits, allow/deny lists, channel privacy tiers (FEAT-027/035). |
+| `attachments` | no | see source | Per-attachment limits, allow/deny lists, channel privacy tiers (FEAT-027/035). `staging_subpath` must stay under `00-Creek-Meta/Inbound/`: `creek.redact.scan` is scoped to that subtree (#972), so anywhere else is ranked as intimate content and the safety pass never runs. A non-conforming value is refused at config-parse time (#1088). |
 | `consent` | no | see source | Conversational consent tokens + TTL (FEAT-034). |
 | `max_loop_rounds` | no | `5` | FEAT-036 agent-loop round cap, bounded `[1, 50]`. Raise when a single user turn legitimately needs more router/dispatcher passes (multi-source ingest, large re-classification asks, long workflow chains); the upper bound prevents pathological runaway loops. |
 | `capture_enabled` | no | `False` | Bot-capture toggle (#687) — see [Bot capture](#bot-capture) below. |
