@@ -632,12 +632,13 @@ class _AncestorEntry:
         parent_id: The node's link up the hierarchy, or ``None`` at a root.
         tier: The node's tier, read through :func:`fragment_tier` so a
             *missing* ``privacy_tier`` key fails closed to ``INTIMATE``.
-        has_structural_path: Whether the node carries a persisted
-            ``structural_path``. Recorded because a breadcrumb is a
-            ``list[str]`` with no id binding, so its *length* is the only
-            handle on how much ancestry the prompt will render: any excess
-            over the ancestry this index can walk is ancestry it cannot
-            rank. See :meth:`AncestorIndex.chain_tiers` rule (e).
+        breadcrumb_len: How many entries the node's persisted
+            ``structural_path`` carries. Recorded as a *length*, not a
+            presence flag, because a breadcrumb is a ``list[str]`` with no id
+            binding: the count is the only handle on how much ancestry the
+            prompt will render, and any excess over the ancestry this index
+            can walk is ancestry it cannot rank. See
+            :meth:`AncestorIndex.chain_tiers` rule (e).
     """
 
     parent_id: str | None
