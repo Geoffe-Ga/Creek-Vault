@@ -75,7 +75,8 @@ _SKILLS_DEFAULT_CEILING_HINT = (
     "the default ceiling; pass --include-tier personal to include them."
     "[/yellow]"
 )
-"""Static remedy printed after a ``creek skills generate`` at the default ceiling.
+"""Static remedy printed after an exemplar-bearing ``creek skills generate``
+at the default ceiling.
 
 Static rather than conditional on a survey of what was actually withheld: the
 CLI needs no such survey otherwise, and "you would have been told" only
@@ -83,6 +84,10 @@ reassures when the line is unconditional. On an unclassified vault every
 fragment ranks with ``personal`` (#876), so the default ceiling yields 34 files
 of "no qualifying exemplars" placeholders — indistinguishable, without this
 line, from a broken command.
+
+The one condition it *is* gated on is ``--signature-only``, where the remedy
+would be false rather than merely redundant: that mode emits no exemplars at
+any ceiling, so widening the ceiling changes nothing (PR #1286 review).
 """
 
 # ``report`` needs its own wording because the flag runs the other way here
@@ -3846,7 +3851,14 @@ def skills_generate(
     # ``override_elevates`` is False for exactly None and OPEN — the two
     # spellings of the default ceiling — so the hint reaches the operator who
     # has not yet widened it and stays out of the way of the one who has.
-    if not override_elevates(override):
+    # ``signature_only`` suppresses it outright rather than qualifying it: that
+    # mode drops every exemplar in ``_maybe_pick_exemplars`` before any tier is
+    # consulted, so the ceiling is inert and the advertised remedy would
+    # produce a byte-identical tree (PR #1286 review). There is no true
+    # rewording to fall back on, and the confusion the hint exists to prevent
+    # cannot arise here: the operator asked for zero exemplars and the success
+    # line above says "signature-only" back to them.
+    if not signature_only and not override_elevates(override):
         console.print(_SKILLS_DEFAULT_CEILING_HINT)
 
 

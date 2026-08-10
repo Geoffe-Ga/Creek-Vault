@@ -1147,3 +1147,132 @@ def test_cli_hints_at_the_default_ceiling(tmp_path: Path) -> None:
         "creek skills generate --include-tier personal still claims personal "
         f"fragments contribute no exemplars.\n\n{widened_run.output}"
     )
+
+
+def _generate_signature_only(vault: Path, output: Path, ceiling: str | None) -> str:
+    """Run ``skills generate --signature-only`` and return its squashed output.
+
+    Args:
+        vault: Vault root to read from.
+        output: Destination for the skill tree, so two ceilings can be
+            generated side by side and compared.
+        ceiling: Value for ``--include-tier``, or ``None`` to leave the flag
+            off and take the default ceiling.
+
+    Returns:
+        The CLI's console output, ANSI-stripped and whitespace-collapsed.
+    """
+    argv = [
+        "skills",
+        "generate",
+        "--generate",
+        "--signature-only",
+        "--vault",
+        str(vault),
+        "--output",
+        str(output),
+    ]
+    if ceiling is not None:
+        argv += ["--include-tier", ceiling]
+    result = runner.invoke(app, argv)
+    assert result.exit_code == 0, result.output
+    return _squash(result.output)
+
+
+_GENERATED_DATE_RE = re.compile(r"^generated_date:.*$", re.MULTILINE)
+"""The one frontmatter field that differs between two runs of the same input.
+
+Dropped before comparing two trees so ``_tree_contents`` measures what the
+ceiling did, not how many microseconds apart the two invocations landed.
+"""
+
+
+def _tree_contents(root: Path) -> dict[str, str]:
+    """Return every generated file under *root*, keyed by tree-relative path.
+
+    The wall-clock ``generated_date`` stamp is blanked so two trees generated
+    from identical inputs compare equal.
+
+    Args:
+        root: Root of a generated skill tree.
+
+    Returns:
+        Relative path to file text, for every ``.md`` file beneath *root*.
+    """
+    return {
+        str(path.relative_to(root)): _GENERATED_DATE_RE.sub(
+            "generated_date: <stamp>",
+            path.read_text(encoding="utf-8"),
+        )
+        for path in sorted(root.rglob("*.md"))
+    }
+
+
+def test_cli_does_not_offer_the_ceiling_remedy_in_signature_only_mode(
+    tmp_path: Path,
+) -> None:
+    """``--signature-only`` must not be told that widening the ceiling helps.
+
+    PR #1286 review. The hint asserted by
+    :func:`test_cli_hints_at_the_default_ceiling` fires on ``not
+    override_elevates(override)`` alone, so ``creek skills generate
+    --signature-only`` at the default ceiling also printed "pass
+    --include-tier personal to include them". That remedy does not work in
+    that mode: :meth:`SkillTreeGenerator._maybe_pick_exemplars` returns an
+    empty list and ``_maybe_render_exemplar_section`` omits the section
+    outright whenever ``signature_only`` is set — before either one consults a
+    tier. No exemplar appears at *any* ceiling, so the operator who follows the
+    advice re-runs the command and sees the identical tree.
+
+    Nothing leaks; the cost is a false remedy, which is the specific thing the
+    house rule against unactionable operator messages forbids.
+
+    The fix suppresses the hint rather than qualifying it, and the first
+    assertion below is why that is safe: in signature-only mode the ceiling is
+    *inert*, changing not one byte of the output tree. There is no true remedy
+    to reword the message into, and the confusion the hint exists to prevent —
+    an exemplar-free tree reading as a broken command — cannot arise for an
+    operator who explicitly asked for zero exemplars and is told so by the
+    ``(N signature-only files)`` success line.
+
+    That first assertion is also the tripwire: should the ceiling ever gain a
+    real effect on signature-only output, it goes red and says to restore a
+    hint here rather than leaving the operator uninformed.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    _seed_four_tiers(tmp_path)
+    default_dir = tmp_path / "out-default"
+    widened_dir = tmp_path / "out-personal"
+
+    default_output = _generate_signature_only(tmp_path, default_dir, None)
+    _generate_signature_only(tmp_path, widened_dir, "personal")
+
+    assert _tree_contents(default_dir) == _tree_contents(widened_dir), (
+        "--include-tier changed the signature-only tree. The hint is "
+        "suppressed in this mode on the premise that the ceiling is inert "
+        "here; that premise no longer holds, so restore a hint describing "
+        "whatever the ceiling now does."
+    )
+    assert _WITHHELD_HINT not in default_output, (
+        "creek skills generate --signature-only advises passing "
+        f"{_WITHHELD_HINT!r}, but signature-only output carries no exemplars "
+        "at any ceiling — the operator who follows the advice gets a "
+        f"byte-identical tree.\n\n{default_output}"
+    )
+    assert _HINT_NO_EXEMPLARS not in default_output, (
+        "creek skills generate --signature-only blames the default ceiling "
+        f"for the absence of exemplars ({_HINT_NO_EXEMPLARS!r}). The mode, "
+        f"not the ceiling, is why there are none.\n\n{default_output}"
+    )
+
+    exemplar_bearing = runner.invoke(
+        app,
+        ["skills", "generate", "--generate", "--vault", str(tmp_path)],
+    )
+    assert exemplar_bearing.exit_code == 0, exemplar_bearing.output
+    assert _WITHHELD_HINT in _squash(exemplar_bearing.output), (
+        "Suppressing the signature-only hint also silenced the "
+        "exemplar-bearing one, where the remedy is true and load-bearing."
+    )

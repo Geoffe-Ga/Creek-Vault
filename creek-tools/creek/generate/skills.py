@@ -183,9 +183,11 @@ the record is dropped by the unconfigured root logger: **no operator sees this
 line**. Wiring a handler here would not be a fix, it would be a repo-wide
 logging policy, and on the MCP stdio transport a stdout handler would corrupt
 the protocol stream. The operator-facing remedy is the static
-``_SKILLS_DEFAULT_CEILING_HINT`` in ``creek/cli.py``, printed unconditionally
-at the default ceiling — that is what keeps an exemplar-free tree from reading
-as a broken command.
+``_SKILLS_DEFAULT_CEILING_HINT`` in ``creek/cli.py``, printed at the default
+ceiling on every exemplar-bearing run — that is what keeps an exemplar-free
+tree from reading as a broken command. It is withheld under
+``--signature-only``, where no ceiling admits an exemplar and the remedy would
+therefore be untrue (PR #1286 review).
 
 The line still earns its place: an embedder that has configured logging (and a
 future ``--verbose``) gets the count, the ceiling that applied and the remedy
