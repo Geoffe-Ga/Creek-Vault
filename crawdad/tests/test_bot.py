@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,9 @@ from typing import Any
 import pytest
 
 from crawdad.bot import (
+    _INGEST_CONSENT_PROMPT,
     _SCAN_BLOCKED_REPLY,
+    _SCAN_REFUSED_REPLY,
     handle_message,
     render_state_unavailable_reply,
 )
@@ -2953,3 +2956,362 @@ async def test_scanned_batch_still_ingests_after_the_gate_lands(
     final = store.get(999)
     assert final is not None
     assert final.state == "ingested"
+
+
+# ---------------------------------------------------------------------------
+# FEAT-027 — a *refused* scan response is not a scan (#1088)
+# ---------------------------------------------------------------------------
+
+# The out-of-scope refusal reason creek-tools returns when
+# ``creek.redact.scan`` is pointed at a path outside its canonical scope.
+# MIRRORED, not imported: CrawDad has no Python-level dependency on
+# creek-tools beyond the MCP contract (same rationale as the
+# ``_REDACT_SCAN_TOOL`` mirror in ``crawdad/bot.py``).
+#
+# Source of the text:  creek-tools/creek_mcp/tools/redact.py:101-106
+#                      (``_OUT_OF_SCOPE_REASON``).
+_OUT_OF_SCOPE_REASON = (
+    "creek.redact.scan is scoped to the 00-Creek-Meta/Inbound/ staging "
+    "subtree, which every ceiling admits; the scan reads no per-file privacy "
+    "tier, so any other vault path is ranked as intimate content and needs a "
+    "ceiling of intimate or all."
+)
+
+# The exact four-key refusal envelope CrawDad sees on the wire.
+#
+# Source of the shape:  creek-tools/creek_mcp/tier_ceiling.py:264-281 —
+#   ``refusal_response()`` returns exactly
+#   ``{"status", "tool", "tier_ceiling", "reason"}``.
+# Source of the serialisation:  creek-tools/creek_mcp/server.py:637-653
+#   registers ``creek.redact.scan`` as ``-> dict[str, Any]``, so FastMCP
+#   JSON-serialises the dict and ``MCPSession.call_tool``
+#   (crawdad/mcp_client.py:157-178) hands CrawDad that JSON as a plain
+#   string — which is why these tests reply with a ``str``, not a dict.
+#
+# ``tier_ceiling`` is ``"open"`` because :func:`_open_ceiling_config`
+# declares channel 999 as ``open``: the refusal is asserted under the
+# NARROWEST ceiling, where the hole is least excusable.
+_REFUSED_SCAN_BODY = json.dumps(
+    {
+        "status": "refused",
+        "tool": "creek.redact.scan",
+        "tier_ceiling": "open",
+        "reason": _OUT_OF_SCOPE_REASON,
+    }
+)
+
+_OK_SCAN_REPORT = "# Redaction Scan Summary\n\nNo findings.\n"
+_OK_SCAN_BODY = json.dumps(
+    {"status": "ok", "report_markdown": _OK_SCAN_REPORT, "findings": []}
+)
+
+
+def _refusing_scan_client(body: str = _REFUSED_SCAN_BODY) -> _StubMCPClient:
+    """Return an MCP client whose ``creek.redact.scan`` returns the refusal."""
+    return _StubMCPClient(_StubSession(replies={"creek.redact.scan": body}))
+
+
+# Words that would turn a "the scan did not run" message into a safety
+# assurance. crawdad/CLAUDE.md §5.3 records this as a hard constraint:
+# ``creek.redact.scan`` returns a permissive ``ok``/``empty`` even when it
+# finds secrets, so no reply may imply the files were checked and passed.
+_CLEANLINESS_CLAIMS = ("clean", "no findings", "no secrets", "safe to", "nothing found")
+
+
+def _assert_claims_no_cleanliness(text: str) -> None:
+    """Fail if *text* could be read as "these files are fine"."""
+    lowered = text.lower()
+    for claim in _CLEANLINESS_CLAIMS:
+        assert claim not in lowered, f"refusal copy implies cleanliness: {claim!r}"
+
+
+async def test_refused_scan_response_cannot_reach_creek_ingest(
+    session_state: SessionState, tmp_path: Path
+) -> None:
+    """#1088: a ``status="refused"`` payload must count as *not scanned*.
+
+    ``creek.redact.scan`` refuses any target outside
+    ``00-Creek-Meta/Inbound/`` unless the caller's ceiling is
+    ``intimate``/``all`` — which is exactly what an operator-configured,
+    non-canonical ``attachments.staging_subpath`` produces on a
+    ``personal`` (or, here, ``open``) channel.
+
+    Today ``_run_safety_scan`` returns ``scanned=True`` the moment
+    ``session.call_tool`` returns (bot.py:825), so the refusal envelope is
+    rendered to the user as a "Safety scan" section, the batch is recorded
+    ``scanned=True``, and the #1054 dispatch gate waves it through: a live
+    ``creek.ingest`` call for content that was never scanned, at the
+    narrowest declared ceiling. That dispatch is the defect.
+    """
+    config = _open_ceiling_config(tmp_path)
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_with_client(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        mcp_client=_refusing_scan_client(),
+        known_tools=("creek.redact.scan", "creek.ingest"),
+    )
+    # Pin the staging turn's own copy BEFORE clearing: this is the only
+    # place _SCAN_REFUSED_REPLY reaches the user, so without this the
+    # string would be executed-but-unasserted and could silently drift
+    # into a cleanliness claim.
+    _assert_claims_no_cleanliness(channel.sent[0])
+    assert _SCAN_REFUSED_REPLY in channel.sent[0]
+    assert _OUT_OF_SCOPE_REASON in channel.sent[0]
+    assert channel.sent[-1] == _SCAN_BLOCKED_REPLY
+    channel.sent.clear()
+
+    calls = await _reply_and_record_ingests(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        content="ingest",
+    )
+    _assert_refused(channel=channel, store=store, calls=calls)
+
+
+async def test_refused_scan_cannot_ingest_via_type_disambiguation_route(
+    session_state: SessionState, tmp_path: Path
+) -> None:
+    """#1088: the refusal also holds on the type-disambiguation route.
+
+    Mirrors ``test_unscanned_batch_cannot_ingest_via_type_disambiguation_route``
+    with the refusal body instead of an unadvertised tool, pinning the
+    second dispatch entry point (``_apply_disambiguation_reply``) so the
+    ``ingest`` → type-question → type-word path cannot launder a refused
+    scan into the vault.
+    """
+    from crawdad.config import AttachmentConfig
+
+    config = CrawDadConfig(
+        discord_bot_token="t",
+        vault_path=tmp_path,
+        allowed_user_ids=[111],
+        allowed_channel_ids=[999],
+        # Empty allow list permits ``.xyz`` so ``inferred_type`` is None.
+        attachments=AttachmentConfig(
+            allowed_extensions=frozenset(), channel_privacy_tiers={999: "open"}
+        ),
+    )
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_with_client(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        mcp_client=_refusing_scan_client(),
+        known_tools=("creek.redact.scan", "creek.ingest"),
+        filename="weird.xyz",
+    )
+    channel.sent.clear()
+
+    # Turn 1: `ingest` → the bot asks which type (no dispatch yet).
+    first = await _reply_and_record_ingests(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        content="ingest",
+    )
+    assert first == []
+    channel.sent.clear()
+
+    # Turn 2: the type word — the second route into the dispatch gate.
+    second = await _reply_and_record_ingests(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        content="document",
+    )
+    _assert_refused(channel=channel, store=store, calls=second)
+
+
+async def test_refusal_for_another_reason_echoes_that_reason_not_a_guess(
+    session_state: SessionState, tmp_path: Path
+) -> None:
+    """#1088: the copy must not assert the staging root as the definite cause.
+
+    ``status="refused"`` covers every refusal creek-tools has, not only the
+    out-of-scope staging root — ``redact.py:200-205`` also refuses with
+    ``input_path not found`` (e.g. the staged file was removed before the
+    scan ran). The batch must still be refused, but the operator must be
+    shown the reason that actually fired rather than being sent to inspect
+    a correctly-configured `staging_subpath`.
+    """
+    reason = "input_path not found: 00-Creek-Meta/Inbound/999/100"
+    body = json.dumps(
+        {
+            "status": "refused",
+            "tool": "creek.redact.scan",
+            "tier_ceiling": "open",
+            "reason": reason,
+        }
+    )
+    config = _open_ceiling_config(tmp_path)
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_with_client(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        mcp_client=_refusing_scan_client(body),
+        known_tools=("creek.redact.scan", "creek.ingest"),
+    )
+
+    batch = store.get(999)
+    assert batch is not None
+    assert batch.scanned is False
+    # The real reason is surfaced verbatim...
+    assert reason in channel.sent[0]
+    # ...and the fixed copy hedges rather than asserting the cause.
+    assert "most common cause" in channel.sent[0]
+    _assert_claims_no_cleanliness(channel.sent[0])
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        pytest.param({"status": "refused"}, id="no-reason-key"),
+        pytest.param({"status": "refused", "reason": "   "}, id="blank-reason"),
+        pytest.param({"status": "refused", "reason": 17}, id="non-string-reason"),
+    ],
+)
+async def test_refusal_without_a_usable_reason_still_refuses(
+    session_state: SessionState, tmp_path: Path, envelope: dict[str, Any]
+) -> None:
+    """#1088: a refusal with no echoable reason still blocks the batch.
+
+    The ``reason`` echo is a courtesy, not the gate. A malformed or
+    reason-less refusal envelope must not fall through to ``scanned=True``
+    — the batch is refused on ``status`` alone, and the user still gets the
+    fixed copy without a dangling "creek-tools said:" fragment.
+    """
+    config = _open_ceiling_config(tmp_path)
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_with_client(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        mcp_client=_refusing_scan_client(json.dumps(envelope)),
+        known_tools=("creek.redact.scan", "creek.ingest"),
+    )
+
+    batch = store.get(999)
+    assert batch is not None
+    assert batch.scanned is False
+    assert _SCAN_REFUSED_REPLY in channel.sent[0]
+    assert "creek-tools said:" not in channel.sent[0]
+    _assert_claims_no_cleanliness(channel.sent[0])
+
+
+async def test_successful_scan_response_still_ingests(
+    session_state: SessionState, tmp_path: Path
+) -> None:
+    """#1088 over-refusal guard: a non-refusal JSON payload still ingests.
+
+    The new status parse must key on ``status == "refused"`` exactly. If it
+    ever widens to "the body is a JSON object" or "the body carries a
+    status", every attachment turn would be refused and the feature would
+    be bricked — this test goes red first if that happens. It also pins
+    that the ``report_markdown`` extraction (``_format_scan_section``)
+    still runs, so the user sees rendered markdown rather than a code
+    fence full of JSON.
+    """
+    config = _open_ceiling_config(tmp_path)
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_with_client(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        mcp_client=_StubMCPClient(
+            _StubSession(replies={"creek.redact.scan": _OK_SCAN_BODY})
+        ),
+        known_tools=("creek.redact.scan", "creek.ingest"),
+    )
+    staged = store.get(999)
+    assert staged is not None
+    assert staged.scanned is True
+
+    # Body + consent prompt, with the markdown rendered as markdown.
+    assert len(channel.sent) == 2
+    body, closing = channel.sent
+    assert "Redaction Scan Summary" in body
+    assert "```" not in body
+    assert '"findings"' not in body
+    assert closing == _INGEST_CONSENT_PROMPT
+    channel.sent.clear()
+
+    calls = await _reply_and_record_ingests(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        content="ingest",
+    )
+    assert [c["name"] for c in calls] == ["creek.ingest"]
+    final = store.get(999)
+    assert final is not None
+    assert final.state == "ingested"
+
+
+@pytest.mark.parametrize(
+    "scan_body",
+    [
+        pytest.param("Scan summary: no findings", id="plain-text-not-json"),
+        pytest.param("{not really json}", id="brace-wrapped-but-unparseable"),
+        pytest.param(
+            json.dumps({"report_markdown": "# Report\n\nnone.\n"}),
+            id="json-object-without-a-status-key",
+        ),
+        pytest.param(
+            json.dumps({"status": "ok", "report_markdown": "# Report\n"}),
+            id="status-ok",
+        ),
+        pytest.param(
+            json.dumps({"status": "empty", "report_markdown": "# Report\n"}),
+            id="status-empty",
+        ),
+        pytest.param(json.dumps(["not", "an", "object"]), id="json-array"),
+    ],
+)
+async def test_non_refusal_scan_bodies_stay_scanned(
+    session_state: SessionState, tmp_path: Path, scan_body: str
+) -> None:
+    """#1088: only ``status="refused"`` flips ``scanned``; everything else stays.
+
+    Fail-open on an unparseable or unfamiliar body is deliberate — it is
+    the status quo, so the #1088 change only ever *removes* admissions and
+    can never newly refuse a turn that works today. These cases pin that
+    property: widening the parse (e.g. "any body without an explicit ok is
+    unscanned") would turn a bug fix into a behaviour change nobody
+    reviewed.
+    """
+    config = _open_ceiling_config(tmp_path)
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    await _stage_with_client(
+        config=config,
+        session_state=session_state,
+        channel=channel,
+        pending_batches=store,
+        mcp_client=_StubMCPClient(
+            _StubSession(replies={"creek.redact.scan": scan_body})
+        ),
+        known_tools=("creek.redact.scan", "creek.ingest"),
+    )
+
+    batch = store.get(999)
+    assert batch is not None
+    assert batch.scanned is True
+    assert channel.sent[-1] == _INGEST_CONSENT_PROMPT
