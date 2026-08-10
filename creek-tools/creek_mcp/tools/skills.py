@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from creek.generate.skills import SkillTreeGenerator
 from creek_mcp.audit import MCPAuditLog
-from creek_mcp.tier_ceiling import TierCeiling
+from creek_mcp.tier_ceiling import TierCeiling, to_privacy_override
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -31,22 +31,43 @@ def skills_refresh_tool(
 ) -> dict[str, Any]:
     """Regenerate the voice-skill tree and return the written paths.
 
-    ``intimate`` exemplars are excluded — but by a hardcode in the
-    generator, not by the caller's ceiling: ``_is_snapshot_fragment`` in
-    ``creek/generate/skills.py`` defaults ``allow_intimate=False``, and
-    this tool never passes ``allow_intimate=True``. The ceiling itself is
-    never threaded (``to_privacy_override`` is never called here), so a
-    ``personal`` fragment contributes its *full body* at ``ceiling=open``
-    — looser than every sibling generation tool: ``creek.mine``,
-    ``creek.draft``, and ``creek.author`` all route through
-    ``filter_fragments_by_tier``, where a personal fragment at ``open``
-    contributes a title-only summary instead. Output lands in the
-    untiered ``<vault>/creek-skills`` directory; the MCP surface does not
-    expose an override (the CLI flag is the right tool for that).
-    Tracked by #971.
+    The caller's ceiling is converted with ``to_privacy_override`` and
+    threaded into ``SkillTreeGenerator``, which applies it as a **hard rank
+    cutoff**: an above-ceiling fragment is omitted from exemplar harvesting
+    outright rather than summarised, so no above-ceiling *fragment* body,
+    title or id reaches the untiered ``<vault>/creek-skills`` tree. Omission
+    is the point — a ``"[Personal-tier summary: <title>]"`` stub written into
+    ``## Exemplar Passages`` would be a fabricated voice exemplar carrying
+    the very title it claims to protect.
+
+    That claim covers fragments and stops there. **Thread and eddy skills are
+    not gated.** ``Thread`` and ``Eddy`` carry no ``privacy_tier`` field, so
+    the generator's ``_collect_typed`` walk has nothing to rank them by and
+    takes no override, while their titles, ids, descriptions and fragment
+    counts are all derived from their member fragments. An eddy whose members
+    sit above the ceiling still reaches ``creek-skills/eddies/`` under a title
+    built from their vocabulary — and because that title, slugified, is the
+    filename, it also reaches the ``skill_paths`` this function returns, with
+    ``skill_count`` moving as threads and eddies clear their member
+    thresholds. Closing that is a product decision about which files the tree
+    emits at all, tracked separately in #1284.
+
+    ``intimate`` needs more than a ceiling. It additionally requires the
+    Python-API ``allow_intimate`` consent opt-in, which this tool **never**
+    passes, so intimate exemplars are unreachable through MCP at every
+    ceiling — ``all`` included.
+
+    Consequence to know: because an untiered fragment ranks with
+    ``personal`` (#876), a vault that has never been through
+    ``creek classify`` produces, at the default ``ceiling=open``, a complete
+    tree whose ``## Exemplar Passages`` sections all carry the "no
+    qualifying exemplars" placeholder. That is the gate working, not an
+    empty vault; a broader ceiling recovers them.
     """
     output = vault_path / _SKILLS_RELDIR
-    written = SkillTreeGenerator().generate_all_skills(vault_path, output)
+    written = SkillTreeGenerator(
+        override=to_privacy_override(privacy_tier_ceiling),
+    ).generate_all_skills(vault_path, output)
     relative = [str(p.relative_to(vault_path)) for p in written]
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,

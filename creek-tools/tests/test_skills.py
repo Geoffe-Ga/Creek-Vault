@@ -3,6 +3,19 @@
 Covers the ``SkillTreeGenerator`` class implementing Section 11.4 of
 the Creek Ontology: a tree of ``SKILL.md`` files for frequencies,
 phases, modes, registers, threads, eddies, and meta-skills.
+
+**Every generator in this file states its ceiling out loud (#971).**
+``_build_fragment`` defaults to ``privacy=PrivacyTier.PERSONAL``, and once the
+generator honours the caller's tier ceiling a default ceiling of ``open``
+excludes personal fragments from exemplar harvesting entirely — which would
+silently gut roughly two dozen exemplar assertions below into vacuity. The
+default was *not* flipped to ``OPEN`` to paper over that: the tier dimension is
+load-bearing here (``TestPrivacy`` needs it, and ``proxy_eligible=False`` is
+derived from it and rejects non-PERSONAL/INTIMATE tiers outright). Instead each
+construction passes ``override=PrivacyTierOverride.PERSONAL``, so a reader can
+see that these tests are about grouping and rendering, not about admission.
+Admission is asserted in ``TestPrivacy`` below and, end to end across both
+production surfaces, in ``tests/test_skills_tier_ceiling.py``.
 """
 
 from __future__ import annotations
@@ -13,6 +26,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 import pytest
 
+from creek.classify.privacy_filter import PrivacyTierOverride
 from creek.generate.skills import (
     DEFAULT_MAX_EXEMPLARS,
     DEFAULT_MIN_EDDY_FRAGMENTS,
@@ -83,8 +97,15 @@ def output_dir(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def generator() -> SkillTreeGenerator:
-    """Create a default SkillTreeGenerator."""
-    return SkillTreeGenerator()
+    """Create a SkillTreeGenerator whose ceiling admits personal fragments.
+
+    Not ``SkillTreeGenerator()``: the default ceiling is ``open`` (#971) and
+    ``_build_fragment`` writes ``personal`` fragments, so a default generator
+    would harvest no exemplars at all and every "the title appears in the body"
+    assertion in this file would pass or fail for reasons having nothing to do
+    with what it is testing. See the module docstring.
+    """
+    return SkillTreeGenerator(override=PrivacyTierOverride.PERSONAL)
 
 
 def _build_fragment(
@@ -747,7 +768,11 @@ class TestOptionalSnapshot:
         generator: SkillTreeGenerator,
     ) -> None:
         """Passing a snapshot should skip the vault scan and still render."""
-        snapshot = _load_vault_snapshot(vault, allow_intimate=False)
+        snapshot = _load_vault_snapshot(
+            vault,
+            allow_intimate=False,
+            override=PrivacyTierOverride.PERSONAL,
+        )
         paths = generator.generate_frequency_skills(
             vault,
             output_dir,
@@ -762,7 +787,11 @@ class TestOptionalSnapshot:
         generator: SkillTreeGenerator,
     ) -> None:
         """Phase skills accept a pre-loaded snapshot."""
-        snapshot = _load_vault_snapshot(vault, allow_intimate=False)
+        snapshot = _load_vault_snapshot(
+            vault,
+            allow_intimate=False,
+            override=PrivacyTierOverride.PERSONAL,
+        )
         paths = generator.generate_phase_skills(
             vault,
             output_dir,
@@ -777,7 +806,11 @@ class TestOptionalSnapshot:
         generator: SkillTreeGenerator,
     ) -> None:
         """Mode skills accept a pre-loaded snapshot."""
-        snapshot = _load_vault_snapshot(vault, allow_intimate=False)
+        snapshot = _load_vault_snapshot(
+            vault,
+            allow_intimate=False,
+            override=PrivacyTierOverride.PERSONAL,
+        )
         paths = generator.generate_mode_skills(
             vault,
             output_dir,
@@ -792,7 +825,11 @@ class TestOptionalSnapshot:
         generator: SkillTreeGenerator,
     ) -> None:
         """Register skills accept a pre-loaded snapshot."""
-        snapshot = _load_vault_snapshot(vault, allow_intimate=False)
+        snapshot = _load_vault_snapshot(
+            vault,
+            allow_intimate=False,
+            override=PrivacyTierOverride.PERSONAL,
+        )
         paths = generator.generate_register_skills(
             vault,
             output_dir,
@@ -817,7 +854,11 @@ class TestOptionalSnapshot:
                 description="Many fragments.",
             ),
         )
-        snapshot = _load_vault_snapshot(vault, allow_intimate=False)
+        snapshot = _load_vault_snapshot(
+            vault,
+            allow_intimate=False,
+            override=PrivacyTierOverride.PERSONAL,
+        )
         paths = generator.generate_thread_skills(
             vault,
             output_dir,
@@ -842,7 +883,11 @@ class TestOptionalSnapshot:
                 description="Many fragments.",
             ),
         )
-        snapshot = _load_vault_snapshot(vault, allow_intimate=False)
+        snapshot = _load_vault_snapshot(
+            vault,
+            allow_intimate=False,
+            override=PrivacyTierOverride.PERSONAL,
+        )
         paths = generator.generate_eddy_skills(
             vault,
             output_dir,
@@ -900,8 +945,19 @@ class TestPrivacy:
         vault: Path,
         output_dir: Path,
     ) -> None:
-        """Explicit opt-in allows intimate fragments in exemplars."""
-        generator = SkillTreeGenerator(allow_intimate=True)
+        """Explicit opt-in allows intimate fragments in exemplars.
+
+        Both switches are stated because admission is the AND of two
+        independent gates (#971): ``allow_intimate`` is the consent opt-in and
+        ``override`` is the rank cutoff. The assertion below is unchanged from
+        before the ceiling existed; what changed is that consent alone is no
+        longer sufficient, which the three tests after this one pin from the
+        other direction.
+        """
+        generator = SkillTreeGenerator(
+            allow_intimate=True,
+            override=PrivacyTierOverride.INTIMATE,
+        )
         fragment = _build_fragment(
             frag_id="frag-intimate2",
             title="Intimate yet shared",
@@ -911,6 +967,93 @@ class TestPrivacy:
         generator.generate_frequency_skills(vault, output_dir)
         body = (output_dir / "frequencies" / "F3.SKILL.md").read_text()
         assert "Intimate yet shared" in body
+
+    def test_personal_excluded_at_the_default_ceiling(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """A bare ``SkillTreeGenerator()`` harvests no personal exemplars (#971).
+
+        The unit-level statement of the bug, and the reason every other
+        generator in this file now names its ceiling. ``SkillTreeGenerator()``
+        with no ``override`` defaults to ``PrivacyTierOverride.OPEN``, which is
+        the same posture ``creek.mine``, ``creek.draft`` and ``creek.author``
+        have always taken toward a personal fragment — except that here the
+        fragment is *omitted* rather than summarised, because a summary stub
+        written into ``## Exemplar Passages`` would be a fabricated voice
+        exemplar carrying the title it was built from.
+
+        The title is what is asserted, not the body: it is what a summarising
+        filter would leave behind, so pinning it distinguishes "excluded" from
+        "redacted".
+        """
+        fragment = _build_fragment(
+            frag_id="frag-personal-default",
+            title="Something I only tell my journal",
+            privacy=PrivacyTier.PERSONAL,
+        )
+        _write_fragment(vault, fragment, _make_passage(3))
+        SkillTreeGenerator().generate_frequency_skills(vault, output_dir)
+        body = (output_dir / "frequencies" / "F3.SKILL.md").read_text()
+        assert "Something I only tell my journal" not in body
+        assert "frag-personal-default" not in body
+        assert "[Personal-tier summary:" not in body
+        assert "No qualifying exemplars" in body
+
+    def test_intimate_excluded_at_the_open_ceiling_even_with_consent(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """Consent alone does not admit intimate content past an ``open`` ceiling.
+
+        Half of the AND. ``allow_intimate=True`` is the operator's standing
+        consent for this vault; the ceiling is a statement about *this call*.
+        An implementation that read the consent flag and skipped the rank cutoff
+        would pass ``test_intimate_fragments_included_when_opted_in`` and fail
+        here.
+        """
+        fragment = _build_fragment(
+            frag_id="frag-intimate-open-ceiling",
+            title="Consented but above the ceiling",
+            privacy=PrivacyTier.INTIMATE,
+        )
+        _write_fragment(vault, fragment, _make_passage(3))
+        SkillTreeGenerator(allow_intimate=True).generate_frequency_skills(
+            vault,
+            output_dir,
+        )
+        body = (output_dir / "frequencies" / "F3.SKILL.md").read_text()
+        assert "Consented but above the ceiling" not in body
+
+    def test_intimate_excluded_without_consent_even_at_the_all_override(
+        self,
+        vault: Path,
+        output_dir: Path,
+    ) -> None:
+        """A ceiling of ``all`` does not manufacture consent for intimate content.
+
+        The other half of the AND, and the one that protects a shipped promise:
+        ``creek/templates/skills/privacy-tier.SKILL.md`` rule 1 says intimate
+        content never enters the voice-skill tree, and
+        ``creek.skills.refresh`` relies on never passing ``allow_intimate`` at
+        all. ``PrivacyTierOverride.ALL`` admits every tier through the rank
+        cutoff, so if the cutoff were the *only* gate, an MCP caller at
+        ``ceiling=all`` would get intimate exemplars.
+        """
+        fragment = _build_fragment(
+            frag_id="frag-intimate-all-override",
+            title="Above the ceiling with no consent",
+            privacy=PrivacyTier.INTIMATE,
+        )
+        _write_fragment(vault, fragment, _make_passage(3))
+        SkillTreeGenerator(
+            allow_intimate=False,
+            override=PrivacyTierOverride.ALL,
+        ).generate_frequency_skills(vault, output_dir)
+        body = (output_dir / "frequencies" / "F3.SKILL.md").read_text()
+        assert "Above the ceiling with no consent" not in body
 
     def test_ineligible_fragments_excluded(
         self,
@@ -942,7 +1085,10 @@ class TestExemplarSelection:
         output_dir: Path,
     ) -> None:
         """max_exemplars limits how many passages appear in one skill file."""
-        generator = SkillTreeGenerator(max_exemplars=2)
+        generator = SkillTreeGenerator(
+            max_exemplars=2,
+            override=PrivacyTierOverride.PERSONAL,
+        )
         for i in range(5):
             frag = _build_fragment(
                 frag_id=f"frag-cap{i}",
@@ -1052,7 +1198,11 @@ class TestLoaders:
             description="an eddy",
         )
         _write_eddy(vault, eddy)
-        snapshot = _load_vault_snapshot(vault, allow_intimate=False)
+        snapshot = _load_vault_snapshot(
+            vault,
+            allow_intimate=False,
+            override=PrivacyTierOverride.PERSONAL,
+        )
         assert len(snapshot.fragments) == 1
         assert len(snapshot.threads) == 1
         assert len(snapshot.eddies) == 1
@@ -1723,7 +1873,9 @@ class TestSignatureAndSkillCoexist:
     ) -> None:
         """The SKILL variant still quotes the user's prose."""
         _populated_vault_for_signature_tests(vault)
-        SkillTreeGenerator().generate_frequency_skills(vault, output_dir)
+        SkillTreeGenerator(
+            override=PrivacyTierOverride.PERSONAL,
+        ).generate_frequency_skills(vault, output_dir)
         skill_body = (output_dir / "frequencies" / "F3.SKILL.md").read_text()
         assert SIGNATURE_PASSAGE_MARKER in skill_body
         assert "## Exemplar Passages" in skill_body
@@ -1735,7 +1887,9 @@ class TestSignatureAndSkillCoexist:
     ) -> None:
         """The SIGNATURE variant must stay quote-free even when SKILL ran first."""
         _populated_vault_for_signature_tests(vault)
-        SkillTreeGenerator().generate_frequency_skills(vault, output_dir)
+        SkillTreeGenerator(
+            override=PrivacyTierOverride.PERSONAL,
+        ).generate_frequency_skills(vault, output_dir)
         SkillTreeGenerator(signature_only=True).generate_frequency_skills(
             vault,
             output_dir,

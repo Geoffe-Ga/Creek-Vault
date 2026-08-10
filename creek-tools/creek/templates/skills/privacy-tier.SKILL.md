@@ -40,7 +40,7 @@ The four generation verbs — `creek mine`, `creek draft`, `creek report`, `cree
 | `creek mine` (blog-idea seeds) | full body | title + summary | full body | excluded | full body, audit logged |
 | `creek draft` (essay generation) | full body | title + summary | full body | excluded | full body, audit logged |
 | `creek report` (wavelength / voice / threads reports) | full body in report | title + summary in report | full body in report | counted in metrics only; never quoted | full body, audit logged |
-| `creek skills` (voice-skill tree exemplars) | exemplar passages allowed | exemplar passages allowed (title + extracted passage) | full body for exemplar selection | **never used as exemplars**; do not contribute even with `--include-tier intimate` *unless* `allow_intimate=True` plus consent | exemplar passages allowed, audit logged |
+| `creek skills` (voice-skill tree exemplars) | exemplar passages allowed | **excluded** — no exemplar contribution at the default ceiling (omitted, not summarised: a title-only stub in `## Exemplar Passages` would be a fabricated exemplar leaking the title) | full body for exemplar selection | **never used as exemplars**; do not contribute even with `--include-tier intimate` *unless* `allow_intimate=True` plus consent | exemplar passages allowed, audit logged |
 
 Two flow-level rules that override the table:
 

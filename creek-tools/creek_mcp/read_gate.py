@@ -84,7 +84,8 @@ a voice profile's ``### Sample Passages`` leaks the title and poisons the
 corpus — and it reads the tier through the validated
 :class:`~creek.models.Fragment`, so it fails open on a *missing*
 ``privacy_tier`` key. ``creek.report`` therefore joins ``wheel``, ``mine``,
-``draft`` and ``author``, all ``GATED`` on
+``draft``, ``author`` and — since #971 closed the voice-skill-tree gap on
+exactly this argument — ``skills.refresh``, all ``GATED`` on
 :func:`creek_mcp.tier_ceiling.to_privacy_override` without adopting either
 primitive. What the manifest checks is that the named gate exists and decides
 something, not which of two shapes it takes.
@@ -439,14 +440,52 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
         gate_symbol="to_privacy_override",
     ),
     "creek.skills.refresh": ToolPosture(
-        posture=ReadPosture.UNGATED_KNOWN_GAP,
+        posture=ReadPosture.GATED,
         rationale=(
-            "SkillTreeGenerator hardcodes an intimate exclusion but the "
-            "ceiling is never threaded, so personal bodies pass unsummarised "
-            "at ceiling=open — looser than every sibling generation tool "
-            "(#971)."
+            "Converts the ceiling with to_privacy_override and threads it "
+            "into SkillTreeGenerator, whose corpus walk admits a fragment "
+            "only when tier_within_override clears the hard rank cutoff — so "
+            "no above-ceiling *fragment* body, title or id reaches the "
+            "untiered <vault>/creek-skills tree. Read 'fragment' strictly: "
+            "only _collect_fragments took the override, so thread and eddy "
+            "skills are NOT gated. Thread and Eddy carry no privacy_tier "
+            "field for _collect_typed to rank them by — the same shape that "
+            "makes creek.report's tag garden fragment-derived only — while "
+            "their titles, ids, descriptions and fragment counts are all "
+            "derived from their member fragments. An eddy title derived from "
+            "an above-ceiling member therefore still reaches "
+            "creek-skills/eddies/ and, slugified, IS the filename, so it "
+            "also reaches the skill_paths this tool returns; skill_count "
+            "moves with how many threads and eddies clear their member "
+            "thresholds. That is the leak class #969 closed for "
+            "creek.state.render, and gating the typed walk would change "
+            "which files the tree emits at ceiling=open — a product call, so "
+            "it is tracked as #1284 rather than folded into #971. Excludes "
+            "rather than refuses: the tool names no target, it is a corpus "
+            "walk like report/wheel/mine, and refusing would make the tree "
+            "unreachable — #968's explicit anti-goal. The cutoff is hard "
+            "rather than summarising for #968's reason one step further in: "
+            "a skill file IS a voice-exemplar corpus, so "
+            "filter_fragments_by_tier's '[Personal-tier summary: <title>]' "
+            "stub would be written into ## Exemplar Passages beside the "
+            "fragment id in bold — leaking the title it claims to protect "
+            "and teaching the model a sentence nobody wrote. The intimate "
+            "exclusion remains a SEPARATE consent gate ANDed with this one "
+            "(_is_snapshot_fragment's allow_intimate), and the MCP surface "
+            "never opens it, so intimate exemplars are unreachable here at "
+            "every ceiling, ceiling=all included. The #971 gap was "
+            "write-side, which is why a response-level sweep missed it: for "
+            "the four fragment-derived categories the response carries only "
+            "a count and fixed skill names (F1, rising, express-do…), so the "
+            "evidence was always the tree's bytes. Consequence to know: "
+            "unclassified ranks with personal (#876), so a vault that has "
+            "never been through creek classify yields a complete tree whose "
+            "## Exemplar Passages sections all carry the 'no qualifying "
+            "exemplars' placeholder at ceiling=open — the gate working, not "
+            "an empty vault; a broader ceiling recovers them."
         ),
-        gap_issue=971,
+        gate_module="creek_mcp.tools.skills",
+        gate_symbol="to_privacy_override",
     ),
     "creek.journal": ToolPosture(
         posture=ReadPosture.GATED,

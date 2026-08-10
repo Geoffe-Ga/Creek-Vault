@@ -134,8 +134,14 @@ Injection drill (each step is expected to turn exactly one layer red):
 
 Deliberately absent: any runtime probe asserting that a known gap *still
 leaks*. Such a test passes because the bug exists and breaks when it is fixed.
-The gap issues (#968/#969/#970/#971) each carry their own runtime-probe
-acceptance criterion.
+Each gap issue (#968/#969/#970/#971, and #972 before them) carried its own
+runtime-probe acceptance criterion instead, discharged in this file as the gap
+closed. With #971 the last of them is closed and the manifest records **no**
+ungated gaps at all — a state layers (d) and (e) now describe rather than
+enforce, which is why
+:func:`test_the_manifest_records_no_ungated_gaps` exists to say so out loud and
+why the four gap-driven tests below are written as loops over an empty
+collection rather than as parametrisations of one. The next gap re-arms them.
 """
 
 from __future__ import annotations
@@ -176,6 +182,7 @@ from creek_mcp.tools.mine import mine_tool
 from creek_mcp.tools.redact import _OUT_OF_SCOPE_REASON, redact_scan_tool
 from creek_mcp.tools.reflect import reflect_tool
 from creek_mcp.tools.report import report_tool
+from creek_mcp.tools.skills import skills_refresh_tool
 from creek_mcp.tools.state import state_render_tool
 from creek_mcp.tools.state_read import state_read_tool
 from creek_mcp.tools.upload import upload_tool
@@ -282,11 +289,45 @@ _PINNED_GATE_ROWS = [
     # nothing about the one thing they can act on, which is where they pointed
     # the scan. Same call #968 made for creek.report, one step further out.
     ("creek.redact.scan", "creek_mcp.tools.redact", "_refuse_outside_scan_scope"),
+    # #971 closed the skills gap, and this row is a re-point of exactly the
+    # kind #968/#969/#970 made: the entry moves from a gap claim to a gate
+    # claim layers (c) and (f) can check, rather than being deleted.
+    #
+    # ``creek.skills.refresh`` is the third tool to reach for the HARD CUTOFF
+    # (``creek.classify.privacy_filter.tier_within_override``) inside the
+    # generator rather than adopting either canonical primitive, and for
+    # ``creek.report``'s reason one step further in: a skill file is a
+    # voice-exemplar corpus, so ``filter_fragments_by_tier``'s
+    # ``"[Personal-tier summary: <title>]"`` stub would be written into
+    # ``## Exemplar Passages`` as a quoted passage — leaking the title it was
+    # built from, beside the fragment id in bold, and teaching the model a
+    # sentence nobody wrote. A skill tree must omit, not summarise.
+    #
+    # What layers (c)/(e) can therefore see is the *ceiling conversion*, not
+    # the cutoff: ``to_privacy_override`` is what turns the caller's
+    # ``TierCeiling`` into the ``PrivacyTierOverride`` the generator is
+    # constructed with, and it is the one symbol whose absence from this module
+    # would mean the ceiling never left the tool wrapper — which is precisely
+    # what #971 was. The cutoff itself lives one layer down in
+    # ``creek/generate/skills.py`` and is pinned behaviourally by
+    # ``tests/test_skills_tier_ceiling.py``.
+    ("creek.skills.refresh", "creek_mcp.tools.skills", "to_privacy_override"),
 ]
 
-_PINNED_GAPS = {
-    "creek.skills.refresh": 971,
-}
+_PINNED_GAPS: dict[str, int] = {}
+"""Tools pinned as ``UNGATED_KNOWN_GAP``, with the issue tracking each.
+
+**Empty on purpose, and empty for the first time.** Every gap this table has
+ever held has closed — #968 (report), #969 (both state tools), #970 (journal),
+#972 (redact.scan) and finally #971 (skills.refresh) — and each was *re-pointed*
+into :data:`_PINNED_GATE_ROWS` at the gate that closed it rather than deleted,
+so the claim stays checkable by layers (c) and (e) instead of disappearing.
+
+The table stays here rather than being removed with its last row: the next tool
+triaged as a known gap re-arms this pin and the three tests that read
+:data:`_UNGATED_GAP_TOOLS` / :data:`_GAP_ISSUE_TOOLS`, and a deleted table is
+one a future author has to reinvent (and might not).
+"""
 
 _PINNED_AUTH_TOKEN_TOOLS = [
     "creek.purge.fragment",
@@ -346,7 +387,14 @@ _OPEN_BODY = "CANARY-OPEN-BODY-5c04"
 _PERSONAL_BODY = "CANARY-PERSONAL-BODY-2b71"
 _INTIMATE_BODY = "CANARY-INTIMATE-BODY-9f3a"
 _PERSONAL_TITLE = "Personal note"
-_PERSONAL_SUMMARY = f"[Personal-tier summary: {_PERSONAL_TITLE}]"
+_PERSONAL_SUMMARY_PREFIX = "[Personal-tier summary:"
+"""The opening of ``_summarize_personal``'s stub, title-independent.
+
+Named separately from :data:`_PERSONAL_SUMMARY` because #971 needs to assert
+the stub's *absence* from an artifact whose title it cannot predict: the whole
+claim is that no such summary was written, for any fragment.
+"""
+_PERSONAL_SUMMARY = f"{_PERSONAL_SUMMARY_PREFIX} {_PERSONAL_TITLE}]"
 
 # Used only by the #961 agreement test below. The title is deliberately shared
 # between an ``unclassified`` and a ``personal`` fragment there: the personal
@@ -681,8 +729,7 @@ def test_pinned_gate_claims_are_not_downgraded(
     assert (entry.gate_module, entry.gate_symbol) == (module, symbol)
 
 
-@pytest.mark.parametrize(("tool", "issue"), sorted(_PINNED_GAPS.items()))
-def test_pinned_gaps_keep_their_posture_and_issue(tool: str, issue: int) -> None:
+def test_pinned_gaps_keep_their_posture_and_issue() -> None:
     """The known-ungated tools stay labelled as gaps against their own issues.
 
     These read vault content without honouring the caller's ceiling. The
@@ -690,19 +737,32 @@ def test_pinned_gaps_keep_their_posture_and_issue(tool: str, issue: int) -> None
     that someone is on the hook for it. Relabelling either one — without the
     code changing — converts a tracked gap into an invisible one.
 
-    The table shrinks as gaps close: #968 took ``creek.report`` out of it and
-    #969 took the two ``creek.state.*`` entries, each *re-pointed* at the gate
-    that closed it in :data:`_PINNED_GATE_ROWS` rather than merely deleted, so
-    the claim stays checkable by layers (c) and (e) instead of disappearing.
+    The table shrinks as gaps close: #968 took ``creek.report`` out of it, #969
+    the two ``creek.state.*`` entries, #970 ``creek.journal`` and #971
+    ``creek.skills.refresh`` — each *re-pointed* at the gate that closed it in
+    :data:`_PINNED_GATE_ROWS` rather than merely deleted, so the claim stays
+    checkable by layers (c) and (e) instead of disappearing.
+
+    **Written as a loop rather than a parametrisation, and that is not style.**
+    :data:`_PINNED_GAPS` is now empty, and ``pyproject.toml`` sets no
+    ``empty_parameter_set_mark``, so pytest's default of ``skip`` would have
+    turned this test into a silent skip behind a green gate — the assertion
+    still in the file, still read as protection, and never executed again. A
+    bare loop over an empty collection is a *pass*, which is honest: there is
+    nothing to check today, and the moment a gap is recorded the loop has
+    something to check with no edit required.
+    :func:`test_the_manifest_records_no_ungated_gaps` is what keeps the empty
+    state itself asserted rather than merely tolerated.
     """
-    entry = TOOL_POSTURES[tool]
-    assert entry.posture is ReadPosture.UNGATED_KNOWN_GAP, (
-        f"{tool} was recorded as {entry.posture.value!r}, but it reads vault "
-        f"content without honouring the ceiling — a gap tracked by #{issue}. "
-        "If the gap is genuinely closed, point the entry at the gate that "
-        "closed it (GATED) rather than relabelling the posture."
-    )
-    assert entry.gap_issue == issue
+    for tool, issue in sorted(_PINNED_GAPS.items()):
+        entry = TOOL_POSTURES[tool]
+        assert entry.posture is ReadPosture.UNGATED_KNOWN_GAP, (
+            f"{tool} was recorded as {entry.posture.value!r}, but it reads vault "
+            f"content without honouring the ceiling — a gap tracked by #{issue}. "
+            "If the gap is genuinely closed, point the entry at the gate that "
+            "closed it (GATED) rather than relabelling the posture."
+        )
+        assert entry.gap_issue == issue
 
 
 def test_journal_carries_no_residual_gap_issue() -> None:
@@ -887,37 +947,49 @@ def test_every_ungated_gap_declares_a_tracking_issue() -> None:
         )
 
 
-@pytest.mark.parametrize("tool", _GAP_ISSUE_TOOLS)
-def test_gap_issue_numbers_are_positive_integers(tool: str) -> None:
+def test_gap_issue_numbers_are_positive_integers() -> None:
     """A tracking issue is a positive integer, not a placeholder.
 
     Guards the obvious escape hatches — ``0``, ``-1``, or a bool sneaking
     through ``int`` — that would satisfy a bare "is not None" check while
     pointing at no issue anyone can open.
+
+    A loop rather than a parametrisation over :data:`_GAP_ISSUE_TOOLS`, which
+    #971 emptied. ``pyproject.toml`` sets no ``empty_parameter_set_mark``, so
+    pytest's default of ``skip`` would have deleted this check from the suite
+    silently the moment the last gap closed; a loop over an empty list passes
+    instead, and re-arms itself the moment a gap is recorded.
     """
-    issue = TOOL_POSTURES[tool].gap_issue
-    assert isinstance(issue, int)
-    assert not isinstance(issue, bool)
-    assert issue > 0
+    for tool in _GAP_ISSUE_TOOLS:
+        issue = TOOL_POSTURES[tool].gap_issue
+        assert isinstance(issue, int)
+        assert not isinstance(issue, bool)
+        assert issue > 0
 
 
-@pytest.mark.parametrize("tool", _GAP_ISSUE_TOOLS)
-def test_gap_issues_are_named_in_their_own_tool_module(tool: str) -> None:
+def test_gap_issues_are_named_in_their_own_tool_module() -> None:
     """The tool's own source names the issue tracking its gap.
 
     The manifest is a file most readers of ``creek_mcp/tools/report.py`` will
     never open. Requiring the literal ``#<issue>`` in the module itself means
     the person editing the tool learns about the gap where they already are,
     and cannot extend the tool believing its reads are ceiling-filtered.
+
+    A loop rather than a parametrisation, for the reason recorded on
+    :func:`test_gap_issue_numbers_are_positive_integers`: an empty argument set
+    is a silent skip under pytest's default ``empty_parameter_set_mark``, and a
+    guardrail that skips itself out of existence when its subject list empties
+    is worse than no guardrail, because the file still reads as protection.
     """
-    issue = TOOL_POSTURES[tool].gap_issue
-    assert issue is not None
-    source = inspect.getsource(_import_tool_module(tool))
-    assert f"#{issue}" in source, (
-        f"{_module_path_for(tool)} does not mention #{issue}. Add a posture "
-        "note to the module docstring naming the gap and its issue, so a "
-        "reader of the tool learns the ceiling is not enforced there."
-    )
+    for tool in _GAP_ISSUE_TOOLS:
+        issue = TOOL_POSTURES[tool].gap_issue
+        assert issue is not None
+        source = inspect.getsource(_import_tool_module(tool))
+        assert f"#{issue}" in source, (
+            f"{_module_path_for(tool)} does not mention #{issue}. Add a posture "
+            "note to the module docstring naming the gap and its issue, so a "
+            "reader of the tool learns the ceiling is not enforced there."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -925,8 +997,7 @@ def test_gap_issues_are_named_in_their_own_tool_module(tool: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("tool", _UNGATED_GAP_TOOLS)
-def test_ungated_gap_tools_do_not_call_a_canonical_gate_primitive(tool: str) -> None:
+def test_ungated_gap_tools_do_not_call_a_canonical_gate_primitive() -> None:
     """A tool recorded as an ungated gap must not already use a canonical gate.
 
     This is the anti-rot direction. When someone closes one of these gaps by
@@ -942,16 +1013,55 @@ def test_ungated_gap_tools_do_not_call_a_canonical_gate_primitive(tool: str) -> 
     calls ``write_tier_allowed`` for its write-side gate while still carrying a
     read-side gap, so keying off the older helpers would make this test
     unsatisfiable for an honest entry.
+
+    Looped over :data:`_UNGATED_GAP_TOOLS` rather than parametrised over it,
+    now that #971 emptied the list. Under pytest's default
+    ``empty_parameter_set_mark`` an empty argument set is a *skip*, so the
+    anti-rot layer would have quietly stopped running at exactly the moment its
+    subject list emptied — and the next gap recorded would have inherited a
+    skipped guardrail that looks, in the file, like a live one.
     """
-    module = _import_tool_module(tool)
-    for primitive in sorted(CANONICAL_GATE_PRIMITIVES):
-        assert not _calls_symbol(module, primitive), (
-            f"{tool} is recorded as an ungated known gap "
-            f"(#{TOOL_POSTURES[tool].gap_issue}) but {_module_path_for(tool)} "
-            f"already calls {primitive}. If the gap is closed, change the "
-            "posture to GATED and name the gate; if it is not, this call is "
-            "misleading."
-        )
+    for tool in _UNGATED_GAP_TOOLS:
+        module = _import_tool_module(tool)
+        for primitive in sorted(CANONICAL_GATE_PRIMITIVES):
+            assert not _calls_symbol(module, primitive), (
+                f"{tool} is recorded as an ungated known gap "
+                f"(#{TOOL_POSTURES[tool].gap_issue}) but "
+                f"{_module_path_for(tool)} already calls {primitive}. If the "
+                "gap is closed, change the posture to GATED and name the gate; "
+                "if it is not, this call is misleading."
+            )
+
+
+def test_the_manifest_records_no_ungated_gaps() -> None:
+    """Every tracked read-side gap on the MCP surface is closed (#971).
+
+    The three tests above are now loops over empty collections, which is the
+    honest shape for "there is nothing to check" — but an empty loop passes just
+    as happily when the collection is empty *by accident*, e.g. because someone
+    renamed ``ReadPosture.UNGATED_KNOWN_GAP`` or broke the comprehension that
+    derives these lists. This test states the empty set as a claim, so the
+    layer keeps teeth: reaching zero ungated gaps was the point of #968, #969,
+    #970, #972 and #971, and staying there is a property worth failing on.
+
+    When a new gap is genuinely triaged, this is the test that says so out loud
+    — and its failure is the prompt to add the tool to :data:`_PINNED_GAPS`,
+    which re-arms the three loops above.
+    """
+    assert _UNGATED_GAP_TOOLS == [], (
+        "the manifest records ungated known gap(s) again: "
+        f"{_UNGATED_GAP_TOOLS}. That is allowed — a tracked gap is better than "
+        "an untracked one — but it must be deliberate: add each tool to "
+        "_PINNED_GAPS with its issue number so the loops above start checking "
+        "it, and update this assertion."
+    )
+    assert _GAP_ISSUE_TOOLS == [], (
+        "a TOOL_POSTURES entry carries a gap_issue again: "
+        f"{_GAP_ISSUE_TOOLS}. A gap_issue on a GATED entry advertises a hole "
+        "that is not there and sends an auditor hunting a closed issue — see "
+        "test_journal_carries_no_residual_gap_issue for the same argument one "
+        "tool at a time."
+    )
 
 
 def test_canonical_gate_primitives_name_the_exported_callables() -> None:
@@ -1904,6 +2014,150 @@ def _probe_redact_scan(vault: Path) -> dict[str, Any]:
     )
 
 
+_SKILLS_PERSONAL_CANARY = "CANARY-RUNTIME-SKILLS-PERSONAL-2f19"
+"""The sentinel #971 actually reproduced: a *personal* body in a SKILL file.
+
+Its own value rather than a reuse of :data:`_PERSONAL_BODY`, for the reason
+recorded above :data:`_RUNTIME_OPEN_CANARY`: a sentinel shared between two
+fixtures makes a failure ambiguous about which one leaked.
+"""
+
+_SKILLS_EXEMPLAR_WORDS_MIN = 30
+"""Mirrors ``creek.generate.skills._EXEMPLAR_WORDS_MIN``.
+
+Repeated rather than imported so the helper below asserts against the floor a
+*reader* of this file can see, and so a change to the private constant surfaces
+here as a failed assertion rather than as a silently-vacuous probe.
+"""
+
+
+def _skills_exemplar_body(sentinel: str) -> str:
+    """Return a body long enough for the skill generator to actually quote.
+
+    ``_extract_passage`` accumulates whole sentences until it clears
+    ``_EXEMPLAR_WORDS_MIN`` (30) and yields nothing at all below it. Every body
+    in ``canary_vault`` is four words long, so a skills probe run over the bare
+    fixture would produce an exemplar-free tree — canary-free whether or not any
+    ceiling was enforced, which is a green layer (f) that proves nothing. This
+    is the same vacuity trap :func:`_seed_state_carriers` and
+    :func:`_seed_redact_canaries` document, arriving by a third route.
+
+    The sentinel opens the first sentence so it lands *inside* the extracted
+    passage rather than past whatever boundary the extractor stops at.
+
+    Args:
+        sentinel: The canary this body carries.
+
+    Returns:
+        A body whose first four sentences total 34 words.
+    """
+    body = (
+        f"{sentinel} opens this note and names it. "
+        "I sat down at the table and wrote until the light changed. "
+        "The house was quiet then. "
+        "Nobody asked me what I meant by any of it. "
+        "I kept the page and read it back the next morning."
+    )
+    assert len(body.split()) > _SKILLS_EXEMPLAR_WORDS_MIN, (
+        "the skills carrier body no longer clears _EXEMPLAR_WORDS_MIN, so the "
+        "generator would quote nothing and the probe would be vacuous"
+    )
+    return body
+
+
+def _seed_skills_canaries(vault: Path) -> None:
+    """Give the skills probe carriers the generator will really quote.
+
+    Two independent reasons the shared ``canary_vault`` cannot serve here, and
+    either alone would make the probe vacuous:
+
+    * Its bodies are four words long, under ``_EXEMPLAR_WORDS_MIN`` (30), so no
+      exemplar is built from them and no title, id or body is ever rendered.
+    * It holds no ``personal`` fragment at all, and ``personal`` is the tier
+      #971 leaked. ``intimate`` was already excluded by
+      ``_is_snapshot_fragment``'s ``allow_intimate=False`` hardcode, so an
+      intimate-only fixture would come back clean against the *unfixed* tool.
+
+    The fixture is deliberately **not** extended to fix this. Ten other probes
+    assert exact sets and exact counts against ``canary_vault`` —
+    ``test_wheel_probe_still_counts_the_fragment_it_is_admitted_to`` pins
+    ``total_classified == 1`` — so a third fragment there would break tools that
+    have nothing to do with skills.
+
+    Three carriers are seeded instead: ``open`` (the positive control, asserted
+    *present* so a gate broken in the drop-everything direction cannot pass by
+    writing an empty tree), ``personal`` (the leak), and ``intimate`` (which
+    must stay out even though a different gate already keeps it out — so a fix
+    that *replaced* the consent gate rather than ANDing with it is caught).
+
+    Args:
+        vault: The seeded canary vault, mutated in place.
+    """
+    for frag_id, tier, canary in (
+        ("frag-skills-open", "open", _RUNTIME_OPEN_CANARY),
+        ("frag-skills-personal", "personal", _SKILLS_PERSONAL_CANARY),
+        ("frag-skills-intimate", "intimate", _RUNTIME_INTIMATE_CANARY),
+    ):
+        _write_fragment(
+            vault,
+            frag_id=frag_id,
+            title=f"Skills carrier {frag_id}",
+            body=_skills_exemplar_body(canary),
+            privacy_tier=tier,
+        )
+
+
+def _probe_skills_refresh(vault: Path) -> dict[str, Any]:
+    """Call ``creek.skills.refresh`` at the open ceiling over the canary vault.
+
+    **The shared layer-(f) assertion is near-vacuous for this tool, and saying
+    so is the point.** ``skills_refresh_tool`` returns ``skill_count`` and a
+    list of vault-relative *paths* — never a title, a tag or a body — so its
+    envelope was canary-free for the whole life of #971 and would stay
+    canary-free under a completely ungated generator. The envelope sweep still
+    earns its place as a tripwire against a future response shape that does
+    carry content, exactly as it does for ``creek.report`` and
+    ``creek.journal``, but it is not evidence about this gap.
+
+    The real weight is carried two places: file-level here by
+    :func:`test_skills_refresh_probe_leaves_no_canary_in_the_tree_it_writes`,
+    and end-to-end across both production surfaces (MCP *and*
+    ``creek skills generate``) by ``tests/test_skills_tier_ceiling.py``.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    _seed_skills_canaries(vault)
+    return skills_refresh_tool(
+        vault_path=vault,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="read-gate-probe",
+    )
+
+
+def _skills_tree_blob(vault: Path) -> str:
+    """Return the text of every file in the generated skill tree.
+
+    A whole-tree sweep rather than one named file: a single fragment reaches
+    the frequency, phase, mode and register categories, so a leak into any of
+    them is the same leak. Naming one file would pin the shape of the tree that
+    exists today.
+
+    Args:
+        vault: Vault root; the tree is read from ``<vault>/creek-skills``.
+
+    Returns:
+        One string covering every ``*.md`` under the tree.
+    """
+    return "".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((vault / "creek-skills").rglob("*.md"))
+    )
+
+
 def _fragment_bytes(vault: Path) -> dict[Path, bytes]:
     """Return every fragment file under ``01-Fragments`` mapped to its bytes.
 
@@ -1932,6 +2186,7 @@ _RUNTIME_PROBES: dict[str, Callable[[Path], dict[str, Any]]] = {
     "creek.journal": _probe_journal,
     "creek.upload": _probe_upload,
     "creek.redact.scan": _probe_redact_scan,
+    "creek.skills.refresh": _probe_skills_refresh,
 }
 """``GATED`` tool → a callable that invokes it at ``ceiling=open``.
 
@@ -2151,6 +2406,76 @@ def test_report_probe_leaves_no_canary_in_the_artifact_it_writes(
     assert _RUNTIME_OPEN_CANARY in garden, (
         "creek.report wrote a tag garden with no admitted tag in it, so the "
         f"exclusion assertions above are vacuous.\n\n{garden}"
+    )
+
+
+def test_skills_refresh_probe_leaves_no_canary_in_the_tree_it_writes(
+    canary_vault: Path,
+) -> None:
+    """``creek.skills.refresh``'s leak is the tree it writes, not the dict it returns.
+
+    Read this as ``creek.report``'s test one tool over, and for the same reason.
+    The shared assertion in
+    ``test_gated_tools_leak_no_above_ceiling_content_at_the_open_ceiling`` is
+    **near-vacuous for this tool**: ``skills_refresh_tool`` returns a count and
+    a list of vault-relative paths, never a title, a tag or a body, so its
+    envelope was canary-free for the whole life of #971 and would be canary-free
+    under a completely ungated generator too.
+
+    The evidence that means anything lives in the bytes under
+    ``<vault>/creek-skills``, where an admitted fragment is rendered as a quoted
+    passage beneath ``> **<title>** (`<id>`)`` — body, title and id, three leaks
+    from one admission.
+
+    Both above-ceiling tiers are asserted, and they fail for different reasons:
+
+    * ``personal`` is the tier #971 reproduced. Nothing but the new ceiling gate
+      keeps it out.
+    * ``intimate`` was *already* excluded, by ``_is_snapshot_fragment``'s
+      ``allow_intimate=False`` hardcode. Its absence is therefore not evidence
+      that the ceiling is enforced — it is a check that the ceiling gate was
+      **ANDed with** the consent gate rather than substituted for it.
+
+    ``_PERSONAL_SUMMARY_PREFIX`` is asserted absent because the other candidate
+    fix — routing the corpus through ``filter_fragments_by_tier`` — would write
+    ``"[Personal-tier summary: <title>]"`` into ``## Exemplar Passages`` as a
+    voice exemplar, leaking the title and teaching the model a sentence nobody
+    wrote. A skill tree must omit, not summarise; same call #968 made for
+    ``creek.report``.
+
+    The ``open`` canary is asserted *present* as the positive control, so a gate
+    broken in the drop-everything direction cannot pass by writing an
+    exemplar-free tree: leak-free, and useless.
+    """
+    response = _probe_skills_refresh(canary_vault)
+    assert response["status"] == "ok"
+
+    blob = _skills_tree_blob(canary_vault)
+    assert blob, (
+        "creek.skills.refresh wrote no skill tree at all, so every assertion "
+        f"below is vacuous: {response}"
+    )
+    assert _RUNTIME_OPEN_CANARY in blob, (
+        "creek.skills.refresh wrote a skill tree with no admitted exemplar in "
+        "it, so the exclusion assertions below hold over an empty corpus."
+    )
+    assert _SKILLS_PERSONAL_CANARY not in blob, (
+        "creek.skills.refresh copied a personal fragment's full body into "
+        "<vault>/creek-skills at privacy_tier_ceiling=open. The response "
+        "envelope carries only paths — it was clean before this gate existed "
+        f"too — so nothing above this line could have caught it.\n\n{blob}"
+    )
+    assert _RUNTIME_INTIMATE_CANARY not in blob, (
+        "an intimate fragment's body reached the skill tree. This was already "
+        "excluded by _is_snapshot_fragment(allow_intimate=False) before #971, "
+        "so seeing it here means the ceiling gate replaced the consent gate "
+        f"instead of being ANDed with it.\n\n{blob}"
+    )
+    assert _PERSONAL_SUMMARY_PREFIX not in blob, (
+        "the skill tree carries a filter_fragments_by_tier summary stub. The "
+        "gate here must be the hard cutoff (tier_within_override): a summary "
+        "written into ## Exemplar Passages is a fabricated voice exemplar "
+        f"carrying the title it was built from.\n\n{blob}"
     )
 
 
