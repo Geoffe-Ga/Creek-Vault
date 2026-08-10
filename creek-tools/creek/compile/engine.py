@@ -31,7 +31,12 @@ import frontmatter
 
 from creek.audit import AuditLog
 from creek.care.guardrail import CARE_POLICY
-from creek.classify.privacy_filter import fragment_tier, max_source_tier
+from creek.classify.privacy_filter import (
+    AncestorIndex,
+    build_ancestor_index,
+    fragment_tier,
+    max_source_tier,
+)
 from creek.compile.provenance import ProvenanceEntry, merge_provenance
 from creek.hierarchy import (
     LevelPolicy,
@@ -268,6 +273,7 @@ def _payload_to_paradox_entries(
 
 def _routing_tier_for(
     loaded: list[tuple[Fragment, str, dict[str, object]]],
+    ancestry: list[PrivacyTier],
 ) -> PrivacyTier:
     """Return the tier this compile's LLM call must be keyed with.
 
@@ -280,10 +286,40 @@ def _routing_tier_for(
     ``by_id`` lookup spanning *all* pairs to
     :func:`creek.hierarchy.structural_path_context`, which walks
     ``parent_id`` and emits the dropped parents' **titles** as the
-    surviving child's ``structural_path:`` breadcrumb
-    (``creek/hierarchy.py:115-124``). Reducing over the policy-selected
-    subset would therefore under-route: an intimate parent's title would
-    egress on a call keyed by its open child.
+    surviving child's ``structural_path:`` breadcrumb. Reducing over the
+    policy-selected subset would therefore under-route: an intimate
+    parent's title would egress on a call keyed by its open child.
+
+    **The *ancestry* term closes the other half of the same channel
+    (#931).** The walk above only reaches ancestors the caller *named*, so
+    it never saw the branch that fires when they did not:
+    ``structural_path_context`` prefers the leaf's own **persisted**
+    ``structural_path``, a list of ancestor headings the splitter baked in
+    at ingest, and that branch needs no ancestor fragment in memory at all.
+    Name one ``open`` child of an ``intimate`` document and pre-#931 the
+    call routed ``OPEN`` — a cloud client built with ``structural_path:
+    <the intimate document's heading>`` sitting in the prompt. Folding
+    :meth:`creek.classify.privacy_filter.AncestorIndex.chain_tiers` into the
+    reduction escalates the routing tier instead of redacting the
+    breadcrumb: the ``creek compile`` operator owns the vault, so the
+    orienting value of the ancestry is theirs to keep — it just may not
+    leave the machine. (The MCP wrapper makes the opposite and equally
+    correct choice for *its* caller, refusing the whole call; see
+    ``creek_mcp.tools.compile``.)
+
+    **Two accepted costs of ranking by walking ``parent_id``.** First it
+    *over-covers*: it ranks the root document, whose title the persisted
+    breadcrumb never carries (the splitter appends only headings). An
+    intimate root therefore forces its descendants' compiles local even
+    though the prompt shows only section headings — accepted, because the
+    fallback branch of ``structural_path_context`` *does* render the root's
+    title, and the two branches must be gated the same way. Second, an
+    ancestry link that cannot be surveyed — dangling (``creek
+    ingest``'s resplit unlinks a merged parent), cyclic, or a breadcrumb
+    deeper than the walk can reach — ranks ``INTIMATE``, so a whole subtree
+    becomes uncompilable at cloud tiers and the operator sees only
+    ``IntimateRoutingError``. That is the right privacy answer and a poor
+    diagnostic; ``creek lint`` surfacing those states is #1277.
 
     Sensitivity is read fragment-by-fragment through
     :func:`creek.classify.privacy_filter.fragment_tier`, which is why the
@@ -296,15 +332,22 @@ def _routing_tier_for(
     Args:
         loaded: Every ``(fragment, body, raw)`` triple the compile loaded,
             pre-policy and in requested order.
+        ancestry: The tiers of the requested fragments' ancestors, from
+            :meth:`creek.classify.privacy_filter.AncestorIndex.chain_tiers`.
+            Empty when nothing requested resolved — which cannot narrow the
+            result, because the reduction below then has nothing to reduce
+            and fails closed anyway.
 
     Returns:
-        The most sensitive tier among *loaded*, or
-        :attr:`~creek.models.PrivacyTier.INTIMATE` when *loaded* is empty
+        The most sensitive tier among *loaded* and *ancestry*, or
+        :attr:`~creek.models.PrivacyTier.INTIMATE` when both are empty
         — an empty compile carries no evidence about what it would send,
         and :func:`creek.classify.privacy_filter.max_source_tier` owns
         that fail-closed default so every caller of it agrees.
     """
-    return max_source_tier(fragment_tier(f, raw) for f, _body, raw in loaded)
+    return max_source_tier(
+        [*(fragment_tier(f, raw) for f, _body, raw in loaded), *ancestry],
+    )
 
 
 def compile_to_vault(
@@ -365,8 +408,8 @@ def compile_to_vault(
             credential — propagates untouched for the same reason: the
             engine takes no view on how a client is built.
     """
-    pairs_with_raw = _load_fragments_for_compile(vault_path, fragment_ids)
-    tier = _routing_tier_for(pairs_with_raw)
+    pairs_with_raw, ancestors = _load_fragments_for_compile(vault_path, fragment_ids)
+    tier = _routing_tier_for(pairs_with_raw, ancestors.chain_tiers(fragment_ids))
     llm = llm_factory(tier)
     target_path = _resolve_target_path(vault_path, target_kind, target_id)
     existing = _load_existing_provenance(target_path)
@@ -567,7 +610,7 @@ def _render_body(title: str, claims: list[dict[str, object]]) -> str:
 def _load_fragments_for_compile(
     vault_path: Path,
     fragment_ids: list[str],
-) -> list[tuple[Fragment, str, dict[str, object]]]:
+) -> tuple[list[tuple[Fragment, str, dict[str, object]]], AncestorIndex]:
     """Load the requested fragments from the vault and preserve order.
 
     Keeps the ``raw`` frontmatter :func:`creek.vault.reader.iter_vault_fragments`
@@ -582,29 +625,44 @@ def _load_fragments_for_compile(
     that duplication is pre-existing and unresolved (#847). The two must
     keep agreeing; nothing but review currently makes them.
 
+    It also returns the whole-corpus
+    :class:`~creek.classify.privacy_filter.AncestorIndex` (#931), built from
+    the records of *this* walk rather than fetched by a second one. The
+    ancestors the prompt's ``structural_path:`` breadcrumb renders are
+    usually not among the requested ids, so ranking them needs the corpus —
+    but at the 35k-fragment bar a second ``rglob``-plus-parse pass doubles
+    the pre-LLM wall clock, and a privacy fix has no business shipping that
+    regression. ``tests/test_compile.py``'s
+    ``test_compile_to_vault_walks_the_vault_exactly_once`` pins the single
+    walk so a future lane cannot quietly reintroduce the second one.
+
     Args:
         vault_path: Vault root; fragments are read from ``01-Fragments``.
         fragment_ids: The ids to load, in the order the caller wants them.
 
     Returns:
-        One ``(fragment, body, raw)`` triple per requested id, in
-        requested order.
+        A ``(triples, ancestor_index)`` pair: one ``(fragment, body, raw)``
+        triple per requested id in requested order, and the ancestry index
+        spanning every fragment in the corpus.
 
     Raises:
         ValueError: If any requested id has no matching fragment.
     """
     requested = fragment_ids.copy()
-    by_id: dict[str, tuple[Fragment, str, dict[str, object]]] = {}
-    for _path, fragment, body, raw in iter_vault_fragments(
-        vault_path / "01-Fragments",
-    ):
-        if fragment.id in requested:
-            by_id[fragment.id] = (fragment, body, raw)
+    records = iter_vault_fragments(vault_path / "01-Fragments")
+    by_id: dict[str, tuple[Fragment, str, dict[str, object]]] = {
+        fragment.id: (fragment, body, raw)
+        for _path, fragment, body, raw in records
+        if fragment.id in requested
+    }
+    ancestors = build_ancestor_index(
+        (fragment, raw) for _path, fragment, _body, raw in records
+    )
     missing = [fid for fid in requested if fid not in by_id]
     if missing:
         msg = f"Fragment(s) not found in vault: {', '.join(missing)}"
         raise ValueError(msg)
-    return [by_id[fid] for fid in requested]
+    return [by_id[fid] for fid in requested], ancestors
 
 
 def _resolve_target_path(

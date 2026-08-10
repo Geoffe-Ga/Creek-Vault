@@ -9,9 +9,16 @@ of them was asserted in this docstring and implemented nowhere):
   any state-affecting step.** Compile's variant of the FEAT-011 write-side
   rule gates the classified tiers of the fragments being rolled up
   rather than the tier of the page being created: a caller cannot
-  compile a page out of fragments they *named* and could not read.
-  (Only the named ids are checked — an admitted fragment's own
-  ``structural_path`` ancestry is not, which is a tracked follow-up.)
+  compile a page out of fragments they could not read — nor out of a
+  fragment whose *ancestry* they could not read. Since #931 the survey
+  ranks the named ids **and** every ancestor reached by walking
+  ``parent_id``, because the prompt renders an admitted fragment's
+  persisted ``structural_path`` (ancestor headings the splitter baked in
+  at ingest) whether or not the caller named the ancestor. An
+  above-ceiling ancestor refuses the whole call, with the same
+  content-free :data:`_ABOVE_CEILING_REASON` and the same audit row as a
+  named-id violation — a distinguishable refusal would be a fresh oracle
+  saying "the offender is above you in the tree".
   The check runs
   ahead of any LLM client being built, any page being written, and any
   paradox being logged — the three places the source ids would
@@ -59,7 +66,7 @@ from __future__ import annotations
 import hashlib
 from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol, cast
 
-from creek.classify.privacy_filter import source_tiers
+from creek.classify.privacy_filter import ancestry_tiers
 from creek.compile.engine import TARGET_KINDS, compile_to_vault
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import (
@@ -84,6 +91,21 @@ TOOL_NAME = "creek.compile"
 # group testing *exact*, so a caller could binary-search a batch knowing
 # precisely how many above-ceiling ids each half holds.
 #
+# SINCE #931 THE BOOL ANSWERS A WIDER PROPOSITION: not "a named id is above
+# your ceiling" but "a named id *or any of its transitive ancestors* is above
+# your ceiling". Re-analysed and accepted as no worse than the residual below,
+# and in one respect better:
+#
+# - It is one bit per ancestry chain, and it does not localise the offender.
+#   Ids are derivable *downward* only (``generate_child_fragment_id`` hashes
+#   ``f"{parent_id}:{level}:{index}"``), so a caller cannot enumerate upward
+#   from an admitted child to name the ancestor the bit refers to.
+# - It is strictly less than what the bug leaked, which was the ancestor's
+#   literal heading text into a compiled page the caller then reads.
+# - It *degrades* the group-testing oracle below: subset resubmission can no
+#   longer isolate a named id's own tier, because an above-ceiling ancestor
+#   contaminates every subset containing any of its descendants.
+#
 # ACCEPTED RESIDUAL RISK: a bare boolean is still a group-testing oracle — a
 # caller who resubmits subsets of a batch identifies every above-ceiling id in
 # O(k log n) calls. Two things that argument must NOT lean on:
@@ -102,7 +124,12 @@ TOOL_NAME = "creek.compile"
 #   uniform *by construction* rather than resting on an accident of iteration
 #   order. The reasoning moved rather than being dropped because the property
 #   is now shared: switching that one function to a lazy loader would re-open
-#   the timing channel here and in ``creek.draft`` at the same time.
+#   the timing channel here and in ``creek.draft`` at the same time. Compile
+#   now calls the ancestry-aware ``ancestry_tiers`` (#931), which preserves
+#   the property in both halves: one non-short-circuiting walk, then an
+#   exhaustive ranking of every resolved id's whole chain before any
+#   decision is read (``AncestorIndex.chain_tiers`` rule (f)). A lazy
+#   per-parent lookup would re-open the channel this constant guards.
 #
 # Accepted because the real control is the audit trail, not id entropy: every
 # True probe appends a ``creek.compile`` entry distinguishable from a success
@@ -217,9 +244,21 @@ def _survey_sources(
             call argument and no longer depends on the operator's model config.
         ceiling: The caller's declared ceiling.
 
+    Since #931 the survey is :func:`creek.classify.privacy_filter.ancestry_tiers`
+    rather than its ancestry-blind sibling ``source_tiers``, so "requested
+    fragment" below means the named ids **and** their ancestors. Compile is
+    the only tool that needs the wider survey: its prompt renders an
+    admitted fragment's persisted ``structural_path``, which is a list of
+    ancestor headings, so #848's named-ids-only gate admitted an ``open``
+    child of an ``intimate`` parent and shipped the parent's heading to the
+    provider. ``draft`` / ``journal`` / ``upload`` render no breadcrumb and
+    keep the narrower survey deliberately.
+
     Returns:
         A :class:`_SourceGate` whose ``above_ceiling`` is ``True`` when at
-        least one requested fragment is above *ceiling*.
+        least one requested fragment — or one of its ancestors — is above
+        *ceiling*. The two are deliberately indistinguishable in the result
+        and everywhere downstream of it.
 
         The refusal decision is deliberately a bare bool: the offending ids
         never leave this function; see :data:`_ABOVE_CEILING_REASON` for why.
@@ -234,8 +273,10 @@ def _survey_sources(
         reaches this wrapper at all, so there is nothing here to leak.
     """
     # One shared survey (#958) so ``creek.compile`` and ``creek.draft`` can
-    # never read the same file's tier two different ways.
-    tiers = source_tiers(vault_path, fragment_ids)
+    # never read the same file's tier two different ways. Compile takes the
+    # ancestry-aware variant (#931) because compile — alone among the survey's
+    # callers — renders an admitted fragment's ancestors into its prompt.
+    tiers = ancestry_tiers(vault_path, fragment_ids)
     return _SourceGate(
         above_ceiling=any(not write_tier_allowed(tier, ceiling) for tier in tiers),
     )

@@ -17,6 +17,7 @@ deciding which structural levels they operate on. The helpers must:
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -198,6 +199,58 @@ class TestStructuralPathContext:
     def test_no_parent_returns_empty(self) -> None:
         """A root fragment has no breadcrumb."""
         assert structural_path_context(_frag("a"), {}) == []
+
+    def test_parent_id_cycle_terminates_without_repeating_an_ancestor(self) -> None:
+        """A mutual-parent cycle returns instead of looping forever (#931).
+
+        The walk terminated at HEAD only because ``by_id`` is finite *and*
+        every step moved to a strictly new key — a mutual-parent pair breaks
+        that accident and spins. Its sibling walk in
+        :func:`creek.classify.privacy_filter.AncestorIndex.chain_tiers` is
+        vault-backed and has no such accident to rely on, and shipping two
+        ancestry walks with different cycle semantics is exactly the
+        two-readers-can-disagree drift the privacy-filter module docstring
+        exists to prevent.
+        """
+        a = _frag("a", parent_id="b", title="A")
+        b = _frag("b", parent_id="a", title="B")
+        by_id = {"a": a, "b": b}
+
+        path = structural_path_context(a, by_id)
+
+        assert len(path) == len(set(path))
+        assert set(path) <= {"A", "B"}
+
+    def test_self_parent_terminates(self) -> None:
+        """The degenerate cycle — a fragment that is its own parent — terminates.
+
+        The breadcrumb is empty rather than ``["S"]``: a fragment is never
+        its own ancestor, so the visited set is seeded with the leaf.
+        """
+        s = _frag("s", parent_id="s", title="S")
+        assert structural_path_context(s, {"s": s}) == []
+
+
+def test_structural_path_context_has_exactly_one_production_caller() -> None:
+    """Only :mod:`creek.compile.engine` may render the breadcrumb (#931).
+
+    The ancestry channel is closed by *ranking* ancestors in
+    :func:`creek.classify.privacy_filter.ancestry_tiers`, which
+    ``creek.compile``'s two entry points consult. A second renderer
+    elsewhere in ``creek`` / ``creek_mcp`` would re-open the leak silently,
+    with no test failing — so the caller count is pinned rather than merely
+    noted. Adding a renderer means adding its tier gate first, then this
+    list.
+    """
+    project_root = Path(__file__).resolve().parents[1]
+    callers = {
+        path.relative_to(project_root).as_posix()
+        for pkg in ("creek", "creek_mcp")
+        for path in (project_root / pkg).rglob("*.py")
+        if "structural_path_context(" in path.read_text(encoding="utf-8")
+        and path.name != "hierarchy.py"
+    }
+    assert callers == {"creek/compile/engine.py"}
 
 
 class TestLevelPolicyType:
