@@ -109,6 +109,16 @@ class PendingBatch:
             MCP server can enforce the policy at its boundary.
         created_at: Monotonic timestamp the batch was recorded at;
             consumed by :meth:`is_expired`.
+        scanned: Whether ``creek.redact.scan`` actually ran for this
+            batch (FEAT-027, #1054). ``False`` means the scan could not
+            run — MCP unreachable, the tool unadvertised, no MCP client
+            at all, or an unexpected error — and the batch must never be
+            dispatched to ``creek.ingest``. Enforced by the single guard
+            in :func:`crawdad.bot._dispatch_ingest_for_batch`. Required
+            with **no default** so no construction site can silently
+            inherit a permissive value. Note the narrow claim: ``True``
+            means the scan ran, *not* that it came back clean — see
+            crawdad/CLAUDE.md §5.3.
         state: Lifecycle stage (``"awaiting_consent"`` →
             ``"awaiting_type"`` → ``"ingested"``). Abandonment removes
             the batch entirely instead of transitioning the state.
@@ -122,6 +132,11 @@ class PendingBatch:
     files: tuple[PendingFile, ...]
     privacy_tier_ceiling: str
     created_at: float
+    # Placement is load-bearing: ``scanned`` has no default, so it must
+    # precede every defaulted field or the class raises
+    # ``TypeError: non-default argument follows default argument`` at
+    # import time.
+    scanned: bool
     state: BatchState = "awaiting_consent"
     ingested_hashes: frozenset[str] = field(default_factory=frozenset)
 
@@ -352,12 +367,24 @@ def build_pending_batch(
     accepted_files: tuple[PendingFile, ...],
     privacy_tier_ceiling: str,
     now: float,
+    scanned: bool,
 ) -> PendingBatch:
     """Construct a fresh :class:`PendingBatch` in the ``awaiting_consent`` state.
 
     Thin factory so the bot handler doesn't have to remember the
     initial state — the only valid starting point for a freshly staged
     batch is ``awaiting_consent``.
+
+    Args:
+        channel_id: Discord channel the batch belongs to.
+        staging_dir: Per-message staging directory under the vault.
+        accepted_files: Staged attachments awaiting consent.
+        privacy_tier_ceiling: Channel ceiling forwarded to every
+            ``creek.ingest`` call.
+        now: Timestamp to stamp the batch with.
+        scanned: Whether ``creek.redact.scan`` actually ran. Required —
+            see :attr:`PendingBatch.scanned`; a caller that cannot say
+            must pass ``False``.
     """
     return PendingBatch(
         channel_id=channel_id,
@@ -365,4 +392,5 @@ def build_pending_batch(
         files=accepted_files,
         privacy_tier_ceiling=privacy_tier_ceiling,
         created_at=now,
+        scanned=scanned,
     )

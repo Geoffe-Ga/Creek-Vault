@@ -192,6 +192,60 @@ tier end-to-end from the capture record through staging into fragment
 frontmatter, so an `intimate` channel can be captured faithfully
 instead of refused outright.
 
+### 5.3 Redaction-scan gate (FEAT-027, #1054)
+
+**Policy: record the batch, refuse at dispatch.** An attachment turn
+whose `creek.redact.scan` could not run still stages the files and
+still records a `PendingBatch` — so the user can see what landed and
+`cancel` it — but that batch can never be dispatched to `creek.ingest`.
+
+Rejected alternatives: *withholding the consent prompt* (relies on the
+user never typing `ingest` unprompted — prompt suppression is not
+enforcement), and *a distinct opt-in token* (a documented override is
+a fail-open path, and this is the one gate standing between unscanned
+content and the vault).
+
+**Mechanism.** `PendingBatch.scanned` is a **required field with no
+default**, placed ahead of the defaulted fields. There is deliberately
+no permissive default and no `ConsentConfig` knob: either would let a
+construction site — or an operator — silently reopen the hole.
+`_run_safety_scan` returns a `_ScanOutcome(scanned, text)` rather than
+a bare string, so the caller reads a status instead of string-matching
+the reply text against `_MCP_UNAVAILABLE_REPLY` (shared with the ingest
+and state paths). All four failure modes — no MCP client, the tool
+unadvertised, `MCPUnavailableError`, and any other exception — yield
+`scanned=False`.
+
+Enforcement is **one branch in `_dispatch_ingest_for_batch`**, the sole
+convergence point of the consent flow. Both `_apply_consent_reply` and
+`_apply_disambiguation_reply` reach ingest through it, so one guard
+closes the `ingest` route, the `ingest` → type-question → type-word
+route, and any future caller. Do not add a second guard at a caller: two
+gates drift, one cannot. `with_resolved_types` / `with_state` /
+`with_ingested` are all `dataclasses.replace` copies, so `scanned`
+survives every transition and cannot be laundered.
+
+**Explicit non-goal.** The gate enforces *"the scan could not run"* —
+**not** *"the scan found nothing"*. `creek_mcp/tools/redact.py` computes
+`status = "empty" if not scanned.matches else "ok"`, so there is no
+failing status to read: a scan that runs and reports secrets still
+clears the gate. User-facing copy must claim only what is enforced —
+`_SCAN_BLOCKED_REPLY` says "I couldn't run the redaction scan", never
+"these files are clean". Substituting a new false claim for the old one
+would miss the point of the fix.
+
+Related, explicitly **not** covered here: #1087 (`scan_batch` follows
+symlinks out of the scan root — a scan that *runs* but under-reports,
+and this gate marks such a batch `scanned=True`). #1088
+(`attachments.staging_subpath` outside the scan's canonical scope) *is*
+a fifth way the scan fails to run; this design absorbs it with one more
+`_ScanOutcome(scanned=False, …)` arm, so sequence it next rather than
+touching `_run_safety_scan` twice.
+
+**Revisit predicate:** when `creek.redact.scan` gains a failing status
+for non-empty findings, revisit whether `scanned` should become a
+three-state outcome and whether findings should block ingest.
+
 ## 6. MCP subprocess resilience
 
 The bot does **not** exit on MCP subprocess failure. The pattern is:

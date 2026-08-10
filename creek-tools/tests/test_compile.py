@@ -46,6 +46,7 @@ from creek.models import (
     PrivacyTier,
     SourcePlatform,
 )
+from creek.vault.reader import iter_vault_fragments
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -1750,7 +1751,19 @@ def test_compile_to_vault_routes_on_a_parent_the_level_policy_dropped(
     :func:`creek.hierarchy.structural_path_context`, which walks
     ``parent_id`` through the pre-policy lookup whenever the persisted
     ``structural_path`` is empty. The intimate parent's title therefore
-    egresses on a call whose only surviving source is ``open``.
+    reaches the prompt on a call whose only surviving source is ``open``.
+
+    **#931 did not change this row, and assertion (ii) deliberately still
+    asserts the title is present.** This test names *both* fragments, so
+    #848's named-id gate already covers it on the MCP side and assertion (i)
+    already covers it on the CLI side: the breadcrumb is safe here because
+    the call is keyed ``INTIMATE`` and therefore never reaches a cloud
+    provider — not because the breadcrumb was stripped. Retaining it is the
+    ``creek compile`` operator's due; they own the vault. What #931 fixed is
+    the case this test cannot see, where the caller names only the child and
+    the breadcrumb comes from the *persisted* field with no ancestor loaded
+    at all:
+    ``test_compile_to_vault_routes_intimate_on_a_persisted_ancestor_not_named``.
     """
     parent = Fragment(
         id="frag-parent",
@@ -1795,6 +1808,199 @@ def test_compile_to_vault_routes_on_a_parent_the_level_policy_dropped(
     assert "the open child body" in prompt
     # (ii) and yet its title egressed anyway, as the child's breadcrumb.
     assert f"structural_path: {_INTIMATE_TITLE}" in prompt
+
+
+def _write_ancestry_pair(
+    vault: Path,
+    *,
+    ancestor_tier: PrivacyTier,
+    child_tier: PrivacyTier = PrivacyTier.PERSONAL,
+) -> None:
+    """Write an ancestor/child pair whose link is a *persisted* breadcrumb (#931).
+
+    The child carries ``structural_path=[_INTIMATE_TITLE]``, so
+    :func:`creek.hierarchy.structural_path_context` returns the ancestor's
+    heading from its persisted-field branch — the branch that fires even
+    when the ancestor is absent from the prompt builder's ``by_id`` lookup,
+    which is exactly the case when the caller names only the child.
+
+    Args:
+        vault: Vault root.
+        ancestor_tier: Tier of ``frag-ancestor``.
+        child_tier: Tier of ``frag-child``.
+    """
+    ancestor = Fragment(
+        id="frag-ancestor",
+        title=_INTIMATE_TITLE,
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        created=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        ingested=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        level="document",
+        child_ids=["frag-child"],
+        privacy_tier=ancestor_tier,
+    )
+    child = Fragment(
+        id="frag-child",
+        title="On grief",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        created=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        ingested=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        level="paragraph",
+        parent_id="frag-ancestor",
+        structural_path=[_INTIMATE_TITLE],
+        privacy_tier=child_tier,
+    )
+    # The breadcrumb must come from the PERSISTED field, not the by_id walk:
+    # the caller never names the ancestor, so it is never in ``by_id``.
+    assert child.structural_path == [_INTIMATE_TITLE]
+    _write_fragment_to_vault(vault, ancestor, _INTIMATE_BODY)
+    _write_fragment_to_vault(vault, child, "the personal child body")
+
+
+def test_compile_to_vault_routes_intimate_on_a_persisted_ancestor_not_named(
+    vault: Path,
+) -> None:
+    """An unnamed intimate ancestor sets the CLI's routing tier (#931).
+
+    The ceiling-less ``creek compile`` CLI deliberately **keeps** the
+    breadcrumb — its operator is the vault owner, and the orienting value of
+    the ancestry is real — and escalates the *routing* tier instead, so the
+    ancestor's heading only ever reaches a model through
+    :class:`~creek.classify.llm.router.ModelRouter`'s ``Intimate``-never-cloud
+    chokepoint (#647/#962). The MCP wrapper makes the opposite (and equally
+    correct) choice for its caller: it refuses the whole call.
+
+    Distinct from
+    ``test_compile_to_vault_routes_on_a_parent_the_level_policy_dropped``,
+    which names *both* fragments and so is already covered by the pre-#931
+    reduction over loaded fragments. Here only the child is named, so the
+    ancestor is never loaded, never in ``by_id``, and contributed nothing to
+    the routing tier before this fix — while its heading egressed anyway.
+    """
+    _write_ancestry_pair(vault, ancestor_tier=PrivacyTier.INTIMATE)
+    factory = _TierRecordingFactory()
+
+    compile_to_vault(
+        fragment_ids=["frag-child"],
+        vault_path=vault,
+        target_kind="thread",
+        target_id="thread-anc",
+        target_title="Anc",
+        llm_factory=factory,
+    )
+
+    # (i) the unnamed ancestor set the routing tier.
+    assert factory.tiers == [PrivacyTier.INTIMATE]
+    # (ii) and the breadcrumb is deliberately retained, not redacted — which
+    # is precisely why (i) has to hold.
+    assert f"structural_path: {_INTIMATE_TITLE}" in factory.prompts[0]
+
+
+def test_compile_to_vault_keeps_open_routing_for_a_within_tier_ancestor(
+    vault: Path,
+) -> None:
+    """Ancestry ranking escalates only when the ancestry warrants it.
+
+    Anti-vacuity for #931: with the ancestor at ``open`` and the child at
+    ``open`` the call still routes ``OPEN``. Without this row the fix could
+    be "route every fragment with a parent as INTIMATE" and the escalation
+    test above would still pass.
+    """
+    _write_ancestry_pair(
+        vault,
+        ancestor_tier=PrivacyTier.OPEN,
+        child_tier=PrivacyTier.OPEN,
+    )
+    factory = _TierRecordingFactory()
+
+    compile_to_vault(
+        fragment_ids=["frag-child"],
+        vault_path=vault,
+        target_kind="thread",
+        target_id="thread-anc-open",
+        target_title="Anc Open",
+        llm_factory=factory,
+    )
+
+    assert factory.tiers == [PrivacyTier.OPEN]
+
+
+def test_compile_to_vault_refuses_an_unnamed_intimate_ancestor_with_no_local_backend(
+    vault: Path,
+) -> None:
+    """All-cloud config + an unnamed intimate ancestor raises instead of egressing.
+
+    The #931 sibling of
+    ``test_compile_to_vault_propagates_the_intimate_routing_refusal``: with
+    ``default`` also cloud there is nowhere local to redirect to, so the
+    escalated routing tier becomes a loud
+    :class:`~creek.classify.llm.router.IntimateRoutingError` rather than a
+    silent cloud call carrying the ancestor's heading.
+
+    **Anti-vacuity.** The assertion before the ``raises`` block pins that the
+    tier-less resolution on this same config is perfectly happy and hands
+    back the cloud provider, so the raise can only come from the tier the
+    engine derived. The trailing assertion pins that a refused compile leaves
+    no page behind — ``_resolve_target_path`` ``mkdir``s unconditionally, so
+    the gate has to win before it.
+    """
+    _write_ancestry_pair(vault, ancestor_tier=PrivacyTier.INTIMATE)
+    router = ModelRouter(
+        LLMRoutingConfig(
+            default=LLMConfig(provider="anthropic"),
+            generation=LLMConfig(provider="anthropic"),
+        ),
+    )
+    # ANTI-VACUITY: with no tier this config resolves happily, to the CLOUD.
+    assert router.resolve("generation").provider == "anthropic"
+
+    with pytest.raises(IntimateRoutingError, match="cannot route to cloud provider"):
+        compile_to_vault(
+            fragment_ids=["frag-child"],
+            vault_path=vault,
+            target_kind="thread",
+            target_id="thread-anc-refused",
+            target_title="Refused",
+            llm_factory=lambda tier: default_llm(router.resolve("generation", tier)),
+        )
+
+    assert not (vault / "02-Threads" / "Active" / "thread-anc-refused.md").exists()
+
+
+def test_compile_to_vault_walks_the_vault_exactly_once(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ranking ancestry must not cost a second corpus walk (#931).
+
+    ``iter_vault_fragments`` rglobs and parses every file under
+    ``01-Fragments`` into a list before returning; at the 35k-fragment bar a
+    second pass doubles the pre-LLM wall clock. The ancestor index is
+    therefore built from the records ``_load_fragments_for_compile`` already
+    walked, and this counter is what stops a future lane reintroducing the
+    convenient-but-quadratic ``ancestry_tiers(vault_path, ...)`` call here.
+    """
+    _write_ancestry_pair(vault, ancestor_tier=PrivacyTier.INTIMATE)
+    real = iter_vault_fragments
+    calls: list[Path] = []
+
+    def _counting(root: Path) -> list[tuple[Path, Fragment, str, dict[str, object]]]:
+        """Record the walked root and delegate to the real loader."""
+        calls.append(root)
+        return real(root)
+
+    monkeypatch.setattr("creek.compile.engine.iter_vault_fragments", _counting)
+
+    compile_to_vault(
+        fragment_ids=["frag-child"],
+        vault_path=vault,
+        target_kind="thread",
+        target_id="thread-walks",
+        target_title="Walks",
+        llm_factory=_TierRecordingFactory(),
+    )
+
+    assert calls == [vault / "01-Fragments"]
 
 
 def test_compile_to_vault_propagates_the_intimate_routing_refusal(

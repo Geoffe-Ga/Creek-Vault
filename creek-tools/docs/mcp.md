@@ -386,7 +386,11 @@ Operational rules:
   (FEAT-013+) is launched without `CREEK_MCP_ELEVATED_TOKEN`, and its
   MCP requests omit `auth_token`. Every purge call from CrawDad
   therefore returns `status="refused"` — there is no Discord command
-  surface that could accidentally destroy vault content.
+  surface that could accidentally destroy vault content. CrawDad is
+  also the canonical transport-authorised, elevated-denied consumer,
+  which makes it exactly the party the attempt-rate bound below
+  (#914) is aimed at: its refusals spend from the same process-global
+  budget as everyone else's.
 - **The developer's Claude Code can be configured with the token.**
   Generate one with high entropy — this is the same recipe the startup
   check prints if the configured token is too weak:
@@ -418,6 +422,52 @@ Operational rules:
   entry to `mcp.jsonl`, so a token-less probe leaves a trail. The
   `auth_token` value never enters the audit log — only the
   refusal-or-success outcome and the structured args summary.
+- **Failed attempts are rate-bounded (#914).** Constant-time
+  comparison stops an attacker learning the token byte-by-byte; it
+  does nothing to stop them guessing it whole, at machine speed.
+  After 5 consecutive denials (`MAX_FAILED_ATTEMPTS`) the gate stops
+  evaluating tokens at all for 60 seconds (`LOCKOUT_SECONDS`) —
+  during the window even a correct token is refused, and the
+  comparison is never performed. Every denial mode counts toward the
+  5, identically: unset token, empty token, a sub-32-char server
+  token (the #907 floor above), a missing client token, and a wrong
+  client token. Counting only mismatches would make "purge
+  disabled/misconfigured" behave differently from "wrong token" and
+  hand back the configuration oracle #907/#913 closed. The refusal
+  itself is deliberately indistinguishable whether or not it was
+  throttled — same `status`, same `tool`, same `reason`; there is no
+  `throttled` flag, no `retry_after`, no `attempts_remaining` — so
+  detect a lockout by the *rate* of refusals in `mcp.jsonl` (see
+  above), not by any field on one. The budget is process-global, not
+  per-consumer or per-tool: a per-identity budget would multiply an
+  attacker's guesses by the number of identities they hold, and a
+  per-tool budget would turn the five purge tools into a 25-guess
+  gate. Attempts made inside the window do not extend it, so an
+  individual lockout always ends 60 seconds after it was armed, and a
+  single successful call resets the counter to zero. The lockout
+  self-heals — the full allowance returns after 60 seconds with no
+  restart, env var, or file to touch, and there is deliberately no
+  way to clear a live lockout in production. Three residuals, stated
+  honestly. (1) The counter lives in the process, so restarting the
+  server also restores the allowance — this *bounds* the brute force
+  rather than closing it, and an attacker able to cycle the process
+  already has more than guessing power. (2) Five wrong tokens —
+  fat-fingered, or sent by one hostile transport-authorised consumer
+  such as CrawDad above — lock `creek.purge.*` process-wide for 60
+  seconds. (3) **A *sustained* attacker keeps re-arming the lockout,
+  and that is the honest cost of a process-global budget.** One guess
+  per second for an hour yields the attacker 285 evaluated guesses
+  (4.75/min, against a previously unbounded rate) but leaves the gate
+  shut to *everyone* for roughly 92% of that hour: each time the
+  window expires the attacker spends the fresh allowance in about
+  four seconds and arms the next one. So MCP purge is not merely
+  delayed for 60 seconds while an attack is running — it is largely
+  unavailable for the duration. That is accepted deliberately: the
+  alternative, keying the budget per consumer, multiplies the
+  attacker's guess rate by the number of identities they hold, and
+  rate-limiting the *secret* is the point. The operator's recovery
+  path is not to wait it out but to use `creek purge` on the CLI,
+  which calls `PurgeEngine` directly and never reaches this gate.
 - **`status` has three values, not two (#1246, contract `0.4`).**
   `refused` means the gate said no and nothing was touched. `ok` means
   the erasure is complete. `partial` means the operation ran to the end
