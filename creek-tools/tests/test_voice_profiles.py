@@ -28,6 +28,7 @@ from creek.generate.voice import (
     VoiceProfileGenerator,
 )
 from creek.models import (
+    Authorship,
     Confidence,
     Fragment,
     FragmentSource,
@@ -54,12 +55,18 @@ def _make_fragment(
     title: str,
     register: VoiceRegister = VoiceRegister.CONFESSIONAL,
     confidence: Confidence = Confidence.CONVICTION,
+    author: Authorship = Authorship.SELF,
 ) -> Fragment:
-    """Build a fully classified fragment for exemplar use."""
+    """Build a fully classified fragment for exemplar use.
+
+    No ``voice_weight`` is passed, so the model default of ``1.0`` applies —
+    the shape ``DocumentIngestor`` produces for a DOCX/PDF carrying an
+    ``author`` in its file metadata (#1213).
+    """
     return Fragment(
         id=frag_id,
         title=title,
-        source=FragmentSource(platform=SourcePlatform.JOURNAL),
+        source=FragmentSource(platform=SourcePlatform.JOURNAL, author=author),
         created=datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC),
         ingested=datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC),
         frequency=FrequencyClassification(primary=Frequency.F5),
@@ -261,6 +268,79 @@ def test_generate_rhetorical_patterns_empty_vault_writes_nothing(vault: Path) ->
 
     assert written == []
     assert not (vault / "07-Voice" / "Rhetorical-Patterns").exists()
+
+
+# ---- Authorship gate on the streaming walk (Issue #1213) ----
+
+
+@pytest.mark.parametrize(
+    "author",
+    [Authorship.AI, Authorship.OTHER, Authorship.COLLABORATIVE],
+)
+def test_generate_all_profiles_excludes_non_self_authors(
+    vault: Path,
+    generator: VoiceProfileGenerator,
+    author: Authorship,
+) -> None:
+    """Borrowed prose never reaches a written voice profile (#1213).
+
+    ``_stream_into`` is the third walk over ``01-Fragments/``, independent
+    of both collector walks, and it is the one that feeds
+    ``report --type voice`` profiles and ``report --type rhetorical-patterns``.
+    The self-authored fragment is present so the register note is written at
+    all — the assertion is about what is *missing* from a note that exists.
+    """
+    _write_fragment_file(
+        vault,
+        _make_fragment("prof-mine", "Mine"),
+        "The tide turns and I turn with it. I said what I meant to say.",
+    )
+    _write_fragment_file(
+        vault,
+        _make_fragment("prof-borrowed", "Borrowed", author=author),
+        "Zarquon vitrifies the perambulating quotidian. Zarquon persists.",
+    )
+
+    paths = generator.generate_all_profiles(vault)
+
+    note = vault / "07-Voice" / "confessional-profile.md"
+    assert note in paths
+    text = note.read_text(encoding="utf-8")
+    assert "tide turns" in text
+    assert "Zarquon" not in text
+    assert "perambulating" not in text
+
+
+def test_generate_rhetorical_patterns_excludes_non_self_authors(
+    vault: Path,
+) -> None:
+    """Borrowed rhetorical moves never reach the patterns note (#1213).
+
+    Same ``_stream_into`` walk as the profiles, but a separately-written
+    surface, so it is asserted separately. This note reports *counts*, not
+    quoted text, so the assertion is that the counts are the self-authored
+    body's alone: the borrowed body carries every hedge and every paradox
+    in the vault, and the self-authored one carries none.
+    """
+    _write_fragment_file(
+        vault,
+        _make_fragment("rhet-mine", "Mine"),
+        "The truth is we rise. We rise, and the rising is the whole of it.",
+    )
+    _write_fragment_file(
+        vault,
+        _make_fragment("rhet-borrowed", "Borrowed", author=Authorship.OTHER),
+        "I'm probably wrong. And yet it holds. As I mentioned, it holds.",
+    )
+
+    written = VoiceProfileGenerator().generate_rhetorical_patterns(vault)
+
+    note = vault / "07-Voice" / "Rhetorical-Patterns" / "confessional.md"
+    assert note in written
+    text = note.read_text(encoding="utf-8")
+    assert "- Self-deprecation before insight: 0." in text
+    assert "- Paradox constructions: 0." in text
+    assert "- Callbacks to earlier points: 0." in text
 
 
 # ---- Module surface ----
