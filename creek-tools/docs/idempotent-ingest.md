@@ -87,11 +87,21 @@ The migration **pins**; it does not re-mint. Existing ids never move.
 
 It is idempotent (a second run pins nothing) and `--dry-run` writes nothing.
 
-An un-migrated vault is detected on the next ingest — the empty ledger is the
-marker — and the advisory naming the remedy is printed **before that run's
-write pass begins**, so an operator watching it can still abort with nothing
-yet duplicated. This covers every ingest driven through the CLI, `creek sync`
-included.
+An un-migrated vault is detected on the next ingest — an empty **markdown**
+ledger over a vault that already holds fragments is the marker — and the
+advisory naming the remedy is printed **before that run's write pass begins**,
+so an operator watching it can still abort with nothing yet duplicated. This
+covers every ingest driven through the CLI, `creek sync` included.
+
+The ledger it weighs is always the markdown one, never whichever ledger the
+current run resolved. A run may borrow another ledger for identity
+(`run_ingest(ledger_source=…)`, as the `creek.upload` MCP tool always does),
+and judging that borrowed ledger's emptiness would both warn about vaults
+already migrated and — the worse half — go permanently quiet about vaults that
+are not, as soon as the borrowed ledger gained its first record. The advisory
+is scoped by the run's `source_type` instead: `#1329` moved *markdown* id
+derivation only, so a document or image run is never warned, and no
+`ledger_source` override can change what a run's `source_type` is.
 
 It is an advisory, not a gate: the run continues and the exit code is
 unchanged. A warning describes vault state that will cause trouble, not a

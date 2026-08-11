@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from creek.ingest.base import assemble_ingested_fragment
 
@@ -78,7 +78,19 @@ def derive_source_key(source_path: str, vault_path: Path) -> str:
         return candidate.name
 
 
-TOMBING_SOURCES: frozenset[str] = frozenset({"markdown"})
+LEDGERED_SOURCE_TYPE: Final[str] = "markdown"
+"""The one source type whose identity is ledger-backed by default (#672).
+
+Three places have to agree on this name: :func:`ledger_for_source`, which
+loads that ledger; :func:`unpinned_vault_warning`, whose whole subject is
+that ledger; and the ``creek.ingest.pin_ids`` migration, which back-fills
+it. They agree by importing this constant rather than by each spelling
+``"markdown"`` and a comment promising to stay in step — a promise is not
+an enforcement, and the review that produced this constant found the
+advisory already consulting a different ledger than the migration wrote.
+"""
+
+TOMBING_SOURCES: frozenset[str] = frozenset({LEDGERED_SOURCE_TYPE})
 """Source types whose directory ingest may soft-tomb units it no longer sees.
 
 Deliberately *narrower* than "has a ledger", and separate from it (#1329).
@@ -98,7 +110,7 @@ def ledger_for_source(source_type: str, vault_path: Path) -> SourceLedger | None
     Only the markdown (journal) source is ledger-wired; append-only event
     sources keep their content-hashed ids untouched.
     """
-    if source_type != "markdown":
+    if source_type != LEDGERED_SOURCE_TYPE:
         return None
     from creek.ingest.ledger import SourceLedger
 
@@ -381,29 +393,49 @@ _UNPINNED_VAULT_WARNING = (
 
 
 def unpinned_vault_warning(
-    ledger: SourceLedger | None,
+    source_type: str,
     vault_path: Path,
 ) -> str | None:
     """Return the un-pinned-vault advisory, or ``None`` when it does not apply.
 
-    A vault that already holds markdown fragments but whose ledger is empty
-    predates the pin migration. The next ingest of those same sources will
-    derive ids under the corrected rule, fail to match anything, and write
-    duplicates — so the operator is told once, before that happens.
+    A vault that already holds markdown fragments but whose **markdown**
+    ledger is empty predates the pin migration. The next ingest of those same
+    sources will derive ids under the corrected rule, fail to match anything,
+    and write duplicates — so the operator is told once, before that happens.
 
-    The ledger's own emptiness *is* the marker; deriving the signal from it
+    That ledger's own emptiness *is* the marker; deriving the signal from it
     rather than from a version stamp in ``00-Creek-Meta/State/`` keeps this to
     one piece of state. A second marker is a second thing that can be wrong.
 
+    **This deliberately does not accept a ledger.** It used to take whichever
+    ledger the run had resolved, and a run with a ``ledger_source`` override —
+    which the ``creek.upload`` MCP tool always passes, including for an
+    uploaded ``.md`` — therefore weighed an unrelated ledger's emptiness. That
+    produced a spurious warning on an already-migrated vault, and, worse, went
+    permanently silent on a genuinely un-pinned one as soon as the borrowed
+    ledger gained any record. The subject of this advisory is fixed by what
+    the advisory *says*, so it is looked up here from :data:`LEDGERED_SOURCE_TYPE`
+    and cannot be substituted by anything a caller overrides.
+
+    The run's *source_type* still gates it, because #1329 moved markdown id
+    derivation only: a document or image run has nothing to be warned about,
+    and a warning delivered on a run it does not apply to is trained-away
+    noise. Unlike the resolved ledger, ``source_type`` names the identity
+    scheme this run writes under and no override can move it.
+
     Args:
-        ledger: The ledger resolved for this run, or ``None`` when unledgered.
+        source_type: Registry key of the ingestor being run, verbatim.
         vault_path: Vault root.
 
     Returns:
-        The advisory text, or ``None`` when the vault is fresh, already
-        pinned, or this run is unledgered.
+        The advisory text, or ``None`` when this run writes under some other
+        source type's identity, or the vault is fresh or already pinned.
     """
-    if ledger is None or len(ledger) > 0:
+    if source_type != LEDGERED_SOURCE_TYPE:
+        return None
+    from creek.ingest.ledger import SourceLedger
+
+    if len(SourceLedger.load(vault_path, source=LEDGERED_SOURCE_TYPE)) > 0:
         return None
     fragments_root = vault_path / "01-Fragments"
     if not fragments_root.is_dir():
@@ -490,7 +522,7 @@ def run_ingest(
     # Checked BEFORE the write loop: once the loop has recorded its first
     # ledger entry the vault no longer looks un-pinned, and the advisory would
     # never fire for the very run it needed to warn about.
-    unpinned = unpinned_vault_warning(ledger, vault_path)
+    unpinned = unpinned_vault_warning(source_type, vault_path)
     if unpinned is not None:
         warn(unpinned)
 

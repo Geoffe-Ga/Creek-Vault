@@ -62,7 +62,7 @@ import frontmatter
 
 from creek.ingest.base import generate_fragment_id
 from creek.ingest.ledger import SourceLedger
-from creek.ingest.pipeline import derive_source_key
+from creek.ingest.pipeline import LEDGERED_SOURCE_TYPE, derive_source_key
 from creek.vault.authors import OTHER_AUTHORS_DIR
 from creek.vault.reader import iter_vault_fragments
 
@@ -82,12 +82,14 @@ from creek.vault.writer import (
 
 logger = logging.getLogger(__name__)
 
-_LEDGER_SOURCE: str = "markdown"
+_LEDGER_SOURCE: str = LEDGERED_SOURCE_TYPE
 """Ledger name to back-fill.
 
-Must match the source type :func:`creek.ingest.pipeline.ledger_for_source`
-ledgers, or the records written here would land in a file no ingest ever
-reads.
+Imported rather than retyped: this has to be the same ledger
+:func:`creek.ingest.pipeline.ledger_for_source` loads and
+:func:`creek.ingest.pipeline.unpinned_vault_warning` judges, or the records
+written here land in a file no ingest ever reads and the advisory that sends
+operators to this migration never notices it ran.
 """
 
 _MARKDOWN_SUFFIX: str = ".md"

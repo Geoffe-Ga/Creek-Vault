@@ -30,6 +30,7 @@ from typer.testing import CliRunner
 from creek.cli import app
 from creek.ingest import pin_ids
 from creek.ingest.base import generate_fragment_id
+from creek.ingest.journal_staging import UPLOAD_LEDGER_SOURCE
 from creek.ingest.ledger import SourceLedger
 from creek.ingest.markdown import MarkdownIngestor
 from creek.ingest.pin_ids import pin_source_ids
@@ -219,9 +220,8 @@ def test_an_unpinned_vault_advisory_is_recorded_in_the_run_result(
 def test_a_fresh_vault_is_not_warned_about(tmp_path: Path) -> None:
     """An empty vault has nothing to strand, so the advisory stays quiet."""
     vault = _make_vault(tmp_path)
-    ledger = SourceLedger.load(vault, source="markdown")
 
-    assert unpinned_vault_warning(ledger, vault) is None
+    assert unpinned_vault_warning("markdown", vault) is None
 
 
 def test_a_pinned_vault_is_not_warned_about(tmp_path: Path) -> None:
@@ -231,8 +231,112 @@ def test_a_pinned_vault_is_not_warned_about(tmp_path: Path) -> None:
     _seed_pre_fix_fragment(vault, source)
     pin_source_ids(vault)
 
-    ledger = SourceLedger.load(vault, source="markdown")
-    assert unpinned_vault_warning(ledger, vault) is None
+    assert unpinned_vault_warning("markdown", vault) is None
+
+
+# ---- (a2) the advisory's subject is the markdown ledger, always ----
+
+
+def _upload_style_ingest(vault: Path, staged: Path) -> list[str]:
+    """Ingest one markdown file the way ``creek.upload`` does, and collect its
+    advisories from the emission channel operators actually see.
+
+    ``creek_mcp.tools.upload`` always passes
+    ``ledger_source=UPLOAD_LEDGER_SOURCE``, including for an uploaded ``.md``
+    (``route_to_ingestor`` maps ``.md`` to the *markdown* ingestor), so this is
+    the exact shape of a real upload: markdown identity written under a
+    borrowed ledger. A single file is passed, not a directory, because that is
+    what the upload tool passes — and because a directory pass under a borrowed
+    ledger is the separate tombing hazard :data:`TOMBING_SOURCES` guards.
+
+    Advisories are read off the ``on_warning`` callback rather than
+    :attr:`IngestRunResult.warnings`: the callback is the channel a surface
+    prints from, so asserting on it tests the advisory as *emitted* rather than
+    as an internal tally.
+
+    Args:
+        vault: Vault root.
+        staged: The single markdown file standing in for a staged upload.
+
+    Returns:
+        Every advisory emitted during the run, in emission order.
+    """
+    emitted: list[str] = []
+    run_ingest(
+        ingestor_cls=MarkdownIngestor,
+        source_type="markdown",
+        input_path=staged,
+        vault_path=vault,
+        ledger_source=UPLOAD_LEDGER_SOURCE,
+        on_warning=emitted.append,
+    )
+    return emitted
+
+
+def test_a_pinned_vault_is_not_warned_about_through_a_borrowed_ledger(
+    tmp_path: Path,
+) -> None:
+    """An already-pinned vault stays quiet even when the run borrows a ledger.
+
+    The false-positive half of the ``ledger_source`` defect. This vault *is*
+    migrated — its markdown ledger holds the pinned record — but the first
+    upload finds the ``upload`` ledger empty, and an advisory that reads
+    whichever ledger the run happened to resolve would tell the operator to
+    re-run a migration they have already run. An advisory that fires on a vault
+    in good order is how operators learn to ignore advisories.
+    """
+    vault = _make_vault(tmp_path)
+    source = _make_source(tmp_path)
+    _seed_pre_fix_fragment(vault, source)
+    pin_source_ids(vault)
+
+    emitted = _upload_style_ingest(vault, source)
+
+    assert [msg for msg in emitted if "--pin-source-ids" in msg] == []
+
+
+def test_an_unpinned_vault_is_warned_about_through_a_borrowed_ledger(
+    tmp_path: Path,
+) -> None:
+    """An un-pinned vault is still warned about once an unrelated ledger fills.
+
+    The false-negative half, and the serious one: the markdown ledger is empty
+    — the vault genuinely will duplicate on its next markdown re-ingest — but a
+    previous upload has put a record in the ``upload`` ledger. Reading the
+    resolved ledger's emptiness silences the advisory through this path
+    permanently, on exactly the vault that needs it. The advisory's subject is
+    the markdown ledger; nothing a run overrides may substitute another.
+    """
+    vault = _make_vault(tmp_path)
+    source = _make_source(tmp_path)
+    _seed_pre_fix_fragment(vault, source)
+    SourceLedger.load(vault, source=UPLOAD_LEDGER_SOURCE).record(
+        "00-Creek-Meta/Staging/uploads/earlier.pdf",
+        "frag-unrelated-upload",
+        SourceLedger.content_hash("earlier"),
+    )
+
+    emitted = _upload_style_ingest(vault, source)
+
+    assert [msg for msg in emitted if "--pin-source-ids" in msg] != []
+
+
+def test_a_non_markdown_source_type_is_never_warned_about(tmp_path: Path) -> None:
+    """The advisory is scoped to the source type whose ids the fix moved.
+
+    Companion invariant to the two above, and the boundary that keeps the
+    subject-fix from over-correcting into noise: #1329 changed *markdown* id
+    derivation, so a document or image run — even on an un-pinned vault, even
+    under a borrowed ledger — has nothing this advisory can warn it about. The
+    gate is the run's own ``source_type``, which no ``ledger_source`` override
+    can move.
+    """
+    vault = _make_vault(tmp_path)
+    source = _make_source(tmp_path)
+    _seed_pre_fix_fragment(vault, source)
+
+    assert unpinned_vault_warning("document", vault) is None
+    assert unpinned_vault_warning("discord", vault) is None
 
 
 # ---- (b) + (c) the migration's core promise ----
