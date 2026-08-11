@@ -78,13 +78,70 @@ from most to least likely:
   that skip to a hard refusal before it acts on the scan result,
   because `creek.ingest.markdown.MarkdownIngestor` would otherwise
   read the same file again with no symlink guard of its own, turning
-  a silent skip into a silent unredacted ingest. Two gaps remain
-  open: the SEC-003 write guard is directory-only, so naming a
-  symlinked *file* directly to `--apply` bypasses it entirely
-  (#1293); and the ingestor's own directory walks still follow
-  symlinks out of the source root regardless, so the pipeline
-  refusal is a backstop that a vault with `redaction.enabled: false`
-  never reaches (#1294).
+  a silent skip into a silent unredacted ingest. #1293 is now closed
+  for the CLI's named-path surface: `--apply`/`--review` refuse
+  (exit 1) before reading anything through a named symlink —
+  including before loading `<vault>/00-Creek-Meta/creek_config.yaml`,
+  which was previously read through a symlinked vault. Both paths
+  the operator names are contained, not just the scanned one:
+  `--apply` also takes a `--vault`, and that one is *written* to —
+  the audit record lands in
+  `<vault>/00-Creek-Meta/audit/redact.jsonl`, creating the `audit/`
+  directory if absent. An escaping `--vault` was therefore a second
+  out-of-root write, reachable with an entirely innocent `--source`,
+  and it put the record of what was touched wherever the link
+  pointed. `--scan`
+  still skips the named path and counts it under "Files skipped
+  (escaping symlink)" rather than refusing the whole pass, keeping
+  its distinct skip-and-count contract: `--scan` writes nothing, so
+  refusing a whole scan over one bad link would be a denial of
+  service on the safety pass itself. The mechanism that was actually
+  closed is not what the original report claimed: `--apply
+  <symlinked-file>` never "writes through the link" —
+  `_atomic_write` ends in `os.replace`, which replaces the *link*,
+  not its target. The real defect for a named symlinked file was
+  out-of-root read, exfiltration into the tree, and destruction of
+  the operator's link — the target's secrets were enumerated and
+  printed, and the link was replaced by a regular in-tree file
+  holding a redacted copy of out-of-tree content. A named symlinked
+  *directory* was a separate, worse failure — a genuine in-place
+  out-of-root rewrite, because `is_dir()` follows the link and the
+  walk guard then resolved the root to the target, laundering every
+  child as "inside." `run_scan` had no symlink guard of any kind.
+  The fix for a named symlinked directory is leaf-only, not a
+  blanket refusal: it is refused when its target escapes the link's
+  own parent, and admitted — with the resolved target used as the
+  root everywhere thereafter — when the target stays under that
+  parent, so `~/vault -> ~/Dropbox/vault` is still admitted and
+  still redacts under `~/Dropbox/vault`. Three residuals remain.
+  First, a named path reached through an escaping *ancestor*
+  component (e.g. `<root>/linkdir/a.md`, where the leaf is a real
+  file but `linkdir` is the escaping link) is still admitted and
+  rewritten in place — the same resolve-the-root/lstat-the-leaf
+  asymmetry the scanner already documents and relies on to keep a
+  `/tmp` -> `/private/tmp` root scannable. Second,
+  `Pipeline._run_redaction` (`creek/pipeline.py:478`
+  `source_path.rglob("*")` and `:484` `scan_batch`) still traverses
+  a directly-named symlinked directory; it is read-only there and
+  escalates to a hard refusal via the skip counter rather than
+  writing. Third, `--scan`'s own `--vault` is not contained. It is
+  used only to locate `creek_config.yaml`, and `--scan` writes
+  nothing, so this is a read-escape rather than a write: an
+  out-of-tree `creek_config.yaml` is opened, parsed, and used to
+  configure the pass (confirmed by pointing it at malformed YAML,
+  which surfaces as a parse error from outside the named tree). It
+  is deliberately not refused here, because a refusing `--scan` is
+  the denial of service the skip-and-count contract exists to
+  avoid; tracked separately in #1359. One gap remains open: the
+  ingestor's own directory walks
+  still follow symlinks out of the source root regardless, so the
+  pipeline refusal is a backstop that a vault with `redaction.enabled:
+  false` never reaches (#1294). User-visible effect: aliasing an
+  external export tree into the vault (`ln -s /Volumes/Export
+  ~/vault/inbox`) and naming that alias to `--apply`/`--review` is
+  now refused; the workaround is to name the resolved path directly.
+  `--scan` on such an alias now reports 0 files scanned with a skip
+  row instead of scanning the target.
 - **Prompt-injection hardening.** Fragment title and body are
   sanitised before being templated into the LLM classifier prompt;
   responses are strictly validated to reject multi-document YAML and
@@ -167,7 +224,10 @@ The codebase annotates design-trace work with short IDs: `SEC-*`, `INC-*`, `OPS-
 Notable threat-model-adjacent IDs that have shipped or are in flight:
 
 - **SEC-002** — Redaction pattern coverage gaps
-- **SEC-003** — Symlink refusal in redaction (resolved)
+- **SEC-003** — Symlink refusal in redaction: covers both the walked
+  tree and a directly-named path (`--apply`/`--review` refuse before
+  reading; `--scan` skips and counts); the escaping-ancestor-component
+  residual is leaf-only and documented above (resolved)
 - **SEC-004** — Prompt injection hardening (resolved)
 - **SEC-005** — Audit log tamper-evidence
 - **SEC-006** — Privacy-tier enforcement in mine/draft
