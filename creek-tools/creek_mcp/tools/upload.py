@@ -277,39 +277,6 @@ def _ledgered_names_for_id(vault_path: Path, external_id: str) -> dict[str, list
     return grouped
 
 
-def _staged_for_id(vault_path: Path, external_id: str) -> list[Path]:
-    """Return every staged upload bound to *external_id*, whatever its extension.
-
-    The staged filename is ``<stem><suffix>``, so the ledger — which keys on
-    that path — actually keys identity on ``(external_id, extension)`` rather
-    than on ``external_id`` alone. This function recovers the id-only view the
-    tool's contract promises, and is what stops a re-send under a changed
-    extension from silently forking into a second, unrelated fragment while
-    orphaning the first one's staged bytes (a hole in the RTBF coverage this
-    tool exists to provide).
-
-    Matching is on the full name, not :attr:`Path.stem`: ``safe_stem`` permits
-    ``.`` in its slug, so ``Path("a.b-<digest>.pdf").stem`` is ``a.b-<digest>``
-    and a stem comparison would mis-group unrelated ids.
-
-    Args:
-        vault_path: Vault root.
-        external_id: The caller's idempotency key.
-
-    Returns:
-        Sorted staged paths, or ``[]`` when the staging dir does not exist.
-    """
-    stem = safe_stem(external_id)
-    staging = vault_path / UPLOAD_STAGING_RELDIR
-    if not staging.is_dir():
-        return []
-    return sorted(
-        path
-        for path in staging.iterdir()
-        if path.is_file() and (path.name == stem or path.name.startswith(f"{stem}."))
-    )
-
-
 def _refuse_unadmitted_overwrite(
     vault_path: Path, external_id: str, filename: str, ceiling: TierCeiling
 ) -> dict[str, Any] | None:
