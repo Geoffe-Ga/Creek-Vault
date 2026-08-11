@@ -132,11 +132,35 @@ from most to least likely:
   which surfaces as a parse error from outside the named tree). It
   is deliberately not refused here, because a refusing `--scan` is
   the denial of service the skip-and-count contract exists to
-  avoid; tracked separately in #1359. One gap remains open: the
-  ingestor's own directory walks
-  still follow symlinks out of the source root regardless, so the
-  pipeline refusal is a backstop that a vault with `redaction.enabled:
-  false` never reaches (#1294). User-visible effect: aliasing an
+  avoid; tracked separately in #1359. #1294 closed the last of the
+  gaps: the ingestor walks had no containment check of any kind, so
+  the pipeline refusal was a backstop that a vault with
+  `redaction.enabled: false` never reached — and that a caller
+  running an ingestor directly (`creek ingest`, the `creek.ingest`
+  MCP tool) never reached at all. All eleven registered ingestors
+  now pass through one gate,
+  `creek._containment.assert_source_contained`, called from
+  `Ingestor.ingest` before any discovery walk. Ingest **refuses**
+  rather than skipping: it is a write path, so it takes the same
+  side of #1293's split as `--apply`/`--review`, and skipping would
+  have left the posture depending on whether `redaction.enabled` was
+  set. The measured defect was not theoretical — at HEAD a source
+  tree containing `nested/link.md -> <outside>/secret.md` produced a
+  vault fragment holding the out-of-tree file's text, and
+  `CodeIngestor` was worse than the rest: it recurses with
+  `iterdir()` + `is_dir()`, which follows symlinks, so it walked an
+  entire out-of-tree *subtree* rather than just the named link. The
+  gate uses `os.walk(followlinks=False)` and inspects `dirnames` as
+  well as `filenames`, which is what closes that. One consequence
+  worth recording because it was nearly the opposite of a fix:
+  ingestion's refusal must propagate out of `Ingestor.ingest` rather
+  than being collected by `_discover_safe`, because an empty
+  discovery leaves `run_ingest`'s `seen_keys` empty and
+  `tomb_missing_units` then soft-tombs every live ledger key — one
+  stray link would have orphaned every fragment previously ingested
+  from that source. Residual, unchanged: the escaping-*ancestor*
+  component case, which is the leaf-only policy applied
+  consistently on all three surfaces. User-visible effect: aliasing an
   external export tree into the vault (`ln -s /Volumes/Export
   ~/vault/inbox`) and naming that alias to `--apply`/`--review` is
   now refused; the workaround is to name the resolved path directly.
@@ -224,10 +248,13 @@ The codebase annotates design-trace work with short IDs: `SEC-*`, `INC-*`, `OPS-
 Notable threat-model-adjacent IDs that have shipped or are in flight:
 
 - **SEC-002** — Redaction pattern coverage gaps
-- **SEC-003** — Symlink refusal in redaction: covers both the walked
-  tree and a directly-named path (`--apply`/`--review` refuse before
-  reading; `--scan` skips and counts); the escaping-ancestor-component
-  residual is leaf-only and documented above (resolved)
+- **SEC-003** — Symlink refusal: covers the walked tree, a
+  directly-named path (`--apply`/`--review` refuse before reading;
+  `--scan` skips and counts), and — since #1294 — every ingestor
+  discovery walk, which refuses. One predicate,
+  `creek._containment.resolves_within`, serves all three surfaces; the
+  escaping-ancestor-component residual is leaf-only and documented
+  above (resolved)
 - **SEC-004** — Prompt injection hardening (resolved)
 - **SEC-005** — Audit log tamper-evidence
 - **SEC-006** — Privacy-tier enforcement in mine/draft

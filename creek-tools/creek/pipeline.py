@@ -174,13 +174,19 @@ class SymlinkEscapedSourceError(RuntimeError):
     """Raised when the redaction scan declined to read part of the source tree.
 
     The read tools skip an escaping symlink; ``creek process`` refuses over
-    it, and the asymmetry is the point (#1087). The redaction scan is the
-    only containment check standing between an out-of-tree file and the
-    vault: :meth:`creek.ingest.markdown.MarkdownIngestor._read_directory`
-    walks with ``rglob("*.md")`` and ``read_bytes()`` with no symlink and no
-    ``is_file`` guard of its own (#1294). Skipping here would therefore turn
-    a blocked ingest into a silent *unredacted* ingest, with the gate that
-    used to stop it now reporting success.
+    it, and the asymmetry is the point (#1087).
+
+    This was once the *only* containment check standing between an
+    out-of-tree file and the vault, because the ingestor walks had none of
+    their own. Since #1294 they do:
+    :func:`creek._containment.assert_source_contained` gates
+    ``Ingestor.ingest`` for every registered ingestor. This refusal is kept
+    all the same, and is not redundant. It fires earlier — before any
+    ingestor runs — and it carries the count of files the *scan* declined,
+    which is the number an operator needs to distinguish one stale link
+    from a whole unscanned subtree. Skipping here would still turn a
+    blocked ingest into a silent partial one, with the gate that used to
+    stop it reporting success.
 
     Attributes:
         skipped_count: Number of files the scan declined to read.
@@ -454,9 +460,11 @@ class Pipeline:
         outright via :class:`SymlinkEscapedSourceError` — before the
         ``dry_run`` arm, because a path-traversal guard admits no waiver and
         the scan came back clean only because it declined to look. Setting
-        ``redaction.enabled: false`` still bypasses the whole stage, symlink
-        check included; that pre-existing hole belongs to the ingestor walks
-        themselves and is tracked by #1294.
+        ``redaction.enabled: false`` still bypasses this whole stage, symlink
+        check included — but no longer bypasses containment: since #1294 the
+        ingestors refuse such a tree themselves, so the posture no longer
+        depends on a config toggle. What ``redaction.enabled: false`` now
+        costs is the PII scan, not the path-traversal guard.
 
         Args:
             source_path: Directory to scan.

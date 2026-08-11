@@ -11,7 +11,6 @@ command registration and keeps :mod:`creek.cli` focused on routing.
 
 from __future__ import annotations
 
-import itertools
 import logging
 import os
 import tempfile
@@ -25,6 +24,7 @@ from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 
+from creek._containment import find_escaping_symlink, named_path_escapes
 from creek.config import load_config, resolve_config_path
 from creek.redact.audit import RedactionAuditEntry, RedactionAuditLog
 from creek.redact.patterns import PATTERN_METADATA
@@ -33,10 +33,16 @@ from creek.redact.scanner import (
     SYMLINK_SKIP_LABEL,
     RedactionScanner,
     ScanSummary,
-    resolves_within,
 )
 
 logger = logging.getLogger(__name__)
+
+# The named-leaf predicate moved to :mod:`creek._containment` in #1294, when
+# the ingest gate became its third consumer; the name stays bound here so
+# this module's call sites and the #1293 tests keep reading the same way.
+# Dangling and looping links do not reach it from the CLI anyway —
+# ``_require_existing`` reports them as "not found" first.
+_named_path_escapes = named_path_escapes
 
 if TYPE_CHECKING:
     from rich.console import Console
@@ -291,49 +297,6 @@ def _error_exit(console: Console, message: str, *, code: int = 2) -> NoReturn:
     raise typer.Exit(code=code)
 
 
-def _named_path_escapes(path: Path) -> bool:
-    """Report whether *path* is itself a symlink leaving its own parent.
-
-    The containment question for a path the operator names on the command
-    line, as opposed to one the scanner discovers while walking a tree. It
-    delegates to :func:`creek.redact.scanner.resolves_within` rather than
-    restating the predicate, so the named-leaf surface and the walked-child
-    surface cannot drift into two definitions of "inside".
-
-    Three properties carry the correctness argument:
-
-    * ``is_symlink()`` is an ``lstat`` on the leaf, so a path that is not
-      itself a link is never resolved and never compared. That is what makes
-      this guard behave identically on darwin and on Linux CI: a root reached
-      *through* a symlinked component (``/tmp`` → ``/private/tmp`` on macOS)
-      is not flagged. Same reasoning as the scanner's own walk policy.
-    * When the leaf *is* a link, BOTH sides are resolved — the target inside
-      ``resolves_within``, the parent here — so ``/tmp`` → ``/private/tmp``
-      cannot manufacture a spurious refusal for a link that never left its
-      own directory.
-    * The predicate is LEAF-ONLY, and deliberately so: a named path whose
-      escaping link is an ANCESTOR component (``<root>/linkdir/a.md``, where
-      ``linkdir`` is the link) is admitted. That is a known, accepted
-      residual — not full coverage of path traversal.
-
-    ``strict=False`` matches the shipped guard: a target that does not exist
-    still resolves to a candidate location worth comparing. Dangling and
-    looping links do not reach here in the CLI anyway — ``_require_existing``
-    reports them as "not found" first.
-
-    Args:
-        path: The source or vault path exactly as the operator supplied it.
-
-    Returns:
-        ``True`` when *path* is a symlink whose target is not a descendant of
-        its own resolved parent directory.
-    """
-    return path.is_symlink() and not resolves_within(
-        path,
-        path.parent.resolve(strict=False),
-    )
-
-
 def _assert_named_path_contained(
     path: Path,
     *,
@@ -419,27 +382,25 @@ def _assert_no_escaping_symlinks(
         typer.Exit: When any descendant symlink resolves outside
             *root* or forms a loop.
     """
-    resolved_root = root.resolve(strict=False)
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        for entry in itertools.chain(dirnames, filenames):
-            candidate = Path(dirpath) / entry
-            if not candidate.is_symlink():
-                continue
-            try:
-                resolved = candidate.resolve(strict=False)
-                resolved.relative_to(resolved_root)
-            except (OSError, RuntimeError, ValueError):
-                logger.exception(
-                    "Refusing to follow symlink that escapes the %s root: %s",
-                    label,
-                    candidate,
-                )
-                _error_exit(
-                    console,
-                    f"Refusing to follow symlink that escapes the {label} "
-                    f"root: {candidate}",
-                    code=1,
-                )
+    # The walk itself lives in :func:`creek._containment.find_escaping_symlink`
+    # (#1294), which the ingest gate also calls. Returning the offender rather
+    # than raising is what lets two callers with different refusal mechanics —
+    # ``typer.Exit`` here, ``EscapingSymlinkError`` there — share one walk.
+    # ``logger.warning`` rather than ``logger.exception``: no exception is in
+    # flight at this point any more, and ``logger.exception`` outside an
+    # ``except`` block appends a bogus ``NoneType: None`` traceback.
+    candidate = find_escaping_symlink(root)
+    if candidate is not None:
+        logger.warning(
+            "Refusing to follow symlink that escapes the %s root: %s",
+            label,
+            candidate,
+        )
+        _error_exit(
+            console,
+            f"Refusing to follow symlink that escapes the {label} root: {candidate}",
+            code=1,
+        )
 
 
 def _require_existing(console: Console, path: Path, label: str) -> None:

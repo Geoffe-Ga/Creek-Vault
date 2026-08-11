@@ -18,6 +18,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+from creek._containment import EscapingSymlinkError, assert_source_contained
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     override_elevates,
@@ -430,6 +431,9 @@ def _run_ingest(
     except FileNotFoundError as exc:
         console.print(f"[red]Vault unavailable: {exc}[/red]")
         raise typer.Exit(code=1) from exc
+    except EscapingSymlinkError as exc:
+        console.print(f"[red]Symlink containment: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
 
     if print_summary:
         console.print(
@@ -438,6 +442,27 @@ def _run_ingest(
             f"{result.skipped} skipped[/dim]",
         )
     return result.written, result.errors, result.discovered
+
+
+def _assert_ingest_source_contained(source_path: Path) -> None:
+    """Refuse an ingest source that links out of itself, before reading it.
+
+    Translates :class:`creek._containment.EscapingSymlinkError` into the
+    CLI's refusal idiom so the handler can call the gate early — above
+    ``_gate_consent`` — without letting a traceback reach the operator.
+
+    Args:
+        source_path: The ``--input`` path exactly as the operator gave it.
+
+    Raises:
+        typer.Exit: With code ``1`` when *source_path* is, or contains, a
+            symlink whose target resolves outside it.
+    """
+    try:
+        assert_source_contained(source_path)
+    except EscapingSymlinkError as exc:
+        console.print(f"[red]Symlink containment: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
 
 
 def _warn_if_discovered_but_empty(
@@ -1203,6 +1228,13 @@ def process(
     except SymlinkEscapedSourceError as exc:
         console.print(f"[red]Symlink containment: {exc}[/red]")
         raise typer.Exit(code=1) from exc
+    except EscapingSymlinkError as exc:
+        # Reachable only with ``redaction.enabled: false``, which returns
+        # early from ``_run_redaction`` before the #1087 check. The ingestor
+        # gate is then what stops the run, and its refusal must read like a
+        # refusal rather than a traceback (#1294).
+        console.print(f"[red]Symlink containment: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
 
     console.print(f"[bold]Files scanned:[/bold] {result.files_scanned}")
     console.print(f"[bold]Fragments created:[/bold] {result.fragments_created}")
@@ -1310,6 +1342,15 @@ def ingest(
     if not input.exists():
         console.print(f"[red]Input path not found: {input}[/red]")
         raise typer.Exit(code=2)
+
+    # Before ``_gate_consent``, and NOT redundant with the gate inside
+    # ``Ingestor.ingest``. The consent prompt calls
+    # ``creek/consent.py::_build_source_summary``, which walks ``rglob("*")``
+    # and ``stat()``s every entry — following an escaping link and folding
+    # out-of-tree file counts and byte totals into the very summary the
+    # operator is asked to approve. A guard that sits only downstream blocks
+    # the write and still performs that out-of-root read first (#1294).
+    _assert_ingest_source_contained(input)
 
     _gate_consent(
         source_path=input,

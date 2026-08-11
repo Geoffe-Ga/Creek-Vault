@@ -197,9 +197,16 @@ re-running `creek process`.
 
 The scan itself did not fail here — it *skipped* the escaping link and
 carried on, which is why the pipeline has to refuse on its behalf. A clean
-result reached by declining to look reads exactly like a clean tree, and
-ingestion has no symlink guard of its own: it would read that file anyway
-(#1294). Remediation:
+result reached by declining to look reads exactly like a clean tree.
+
+Since #1294 ingestion no longer depends on that refusal. Every ingestor
+passes through one containment gate before it discovers anything, so
+`creek ingest`, the `creek.ingest` MCP tool and `creek process` all refuse
+a source tree containing an escaping symlink — including when
+`redaction.enabled: false` skips the scan entirely. The pipeline refusal
+above is kept as the earlier, better-informed of the two: it fires before
+any ingestor runs and reports how many files the scan declined.
+Remediation:
 
 1. **Find the offending links.** Each skip is logged as it happens —
    `Skipping symlink that escapes the scan root: <path>` — naming the link
@@ -214,8 +221,9 @@ ingestion has no symlink guard of its own: it would read that file anyway
 Neither override above applies. `redaction.dry_run: true` does not suppress
 this refusal — that setting means "log the matches you found", not "proceed
 past a file nobody read". `redaction.enabled: false` does skip the whole
-redaction stage, symlink check included, which is precisely the unredacted
-ingest this refusal exists to prevent.
+redaction stage, symlink check included; what it no longer skips is
+containment, because the ingestors enforce that themselves (#1294). Turning
+redaction off costs you the PII scan, not the path-traversal guard.
 
 The check is deliberately narrow. A symlink whose target stays *inside* the
 source tree is still admitted, and is still scanned **unresolved** — under

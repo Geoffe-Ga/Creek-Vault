@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 import chardet
 from pydantic import BaseModel, ConfigDict, Field
 
+from creek._containment import assert_source_contained
 from creek.classify.tags_pass import apply_tags
 from creek.models import Fragment, FragmentLevel
 
@@ -564,7 +565,29 @@ class Ingestor(abc.ABC):
 
         Returns:
             An ``IngestResult`` containing fragments, provenance, and errors.
+
+        Raises:
+            EscapingSymlinkError: When *source_path* is, or contains, a
+                symlink whose target resolves outside the tree the caller
+                named (#1294).
         """
+        # The single containment gate for all eleven registered ingestors,
+        # placed here rather than inside each ``discover()`` for two reasons.
+        # It runs BEFORE any walk, so no ingestor reads through the link on
+        # its way to refusing; and a future twelfth ingestor inherits the
+        # guard by construction instead of by someone remembering. A
+        # module-level function rather than a method, so a subclass cannot
+        # weaken it by overriding.
+        #
+        # It must stay OUTSIDE ``_discover_safe``, whose ``except Exception``
+        # collects failures into ``result.errors`` and returns ``[]``. An
+        # empty discovery leaves ``run_ingest``'s ``seen_keys`` empty, and
+        # ``creek/ingest/pipeline.py::tomb_missing_units`` then soft-tombs
+        # every ``ledger.live_keys()`` the pass did not see — so a refusal
+        # swallowed there would orphan every fragment previously ingested
+        # from this source. A containment guard must never become a deletion
+        # primitive (#1294).
+        assert_source_contained(source_path)
         result = IngestResult()
         ingestor_name = type(self).__name__
         now = datetime.now(tz=LA_TZ)
