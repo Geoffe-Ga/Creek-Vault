@@ -865,6 +865,91 @@ def test_redact_apply_refuses_a_named_symlinked_directory_whose_target_escapes(
     )
 
 
+def test_redact_apply_refuses_a_named_symlinked_directory_before_walking_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal must land *before* the tree is walked, not merely before a write.
+
+    ``run_apply`` guards ``--source`` in the handler and again at the
+    ``_scan_source`` chokepoint. The chokepoint alone already prevents the
+    out-of-root *write*, so a test that only asserts ``exit_code == 1`` and
+    unchanged victim bytes passes with the handler guard deleted — the two
+    layers are indistinguishable by outcome. Mutation testing found exactly
+    that survivor.
+
+    What the handler guard uniquely buys is ordering, and it is the reason
+    the call sits above ``if source.is_dir():`` with a comment saying so:
+    ``is_dir()`` follows the link, so without the early refusal
+    :func:`_assert_no_escaping_symlinks` runs ``os.walk`` over the *target's*
+    tree. That enumerates directory names outside the tree the operator
+    named — a structure disclosure of the victim directory, and the same
+    class of oracle #1087 closes — before anything refuses. Measured on the
+    unmutated tree the count is zero directories; with the handler guard
+    removed it is the link plus every subdirectory beneath it.
+
+    Spying on ``os.walk`` rather than ``os.scandir`` keeps this stable across
+    3.11-3.13: the guard calls the module-level ``os.walk`` directly, whereas
+    ``scandir`` is a pathlib implementation detail that has moved between
+    versions and could make this test vacuously green.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        monkeypatch: Pytest monkeypatch fixture, used to install the
+            ``os.walk`` spy.
+    """
+    secrets_dir = tmp_path / "outside" / "secrets"
+    (secrets_dir / "nested").mkdir(parents=True)
+    (secrets_dir / "a.md").write_text(
+        "API_KEY=sk-abcdefghijklmnopqrstuvwx\n",
+        encoding="utf-8",
+    )
+    source = tmp_path / "src"
+    source.mkdir()
+    link = source / "linkdir"
+    link.symlink_to(secrets_dir)
+
+    walked: list[str] = []
+    real_walk = real_os.walk
+
+    def spy_walk(top: object, *args: object, **kwargs: object) -> object:
+        """Record each walk root, then delegate to the real ``os.walk``."""
+        walked.append(str(top))
+        return real_walk(top, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(real_os, "walk", spy_walk)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--apply", "--source", str(link), "--yes"],
+    )
+
+    assert result.exit_code == 1, (
+        "--apply accepted a named escaping symlinked directory.\n\n"
+        f"exit_code={result.exit_code}\n{result.output}"
+    )
+
+    # ``realpath`` on plain strings, not ``Path``: this module imports
+    # ``pathlib.Path`` only under ``TYPE_CHECKING``, so naming it here would
+    # raise ``NameError`` at runtime and turn a genuine regression into a
+    # red-for-the-wrong-reason. Resolving both sides also collapses the
+    # macOS ``/tmp`` -> ``/private/tmp`` alias.
+    secrets_real = real_os.path.realpath(secrets_dir)
+    escaping_walks = [
+        root
+        for root in walked
+        if real_os.path.realpath(root) == secrets_real
+        or real_os.path.realpath(root).startswith(secrets_real + real_os.sep)
+    ]
+    assert not escaping_walks, (
+        "the run walked out of the tree the operator named before refusing. "
+        "The write was still blocked downstream, but the victim directory's "
+        "structure was enumerated on the way there; the guard exists to "
+        "refuse before is_dir() follows the link.\n\n"
+        f"out-of-root walk roots={escaping_walks}\nall walk roots={walked}"
+    )
+
+
 def test_redact_review_refuses_a_named_symlink_whose_target_escapes_its_parent(
     tmp_path: Path,
 ) -> None:
