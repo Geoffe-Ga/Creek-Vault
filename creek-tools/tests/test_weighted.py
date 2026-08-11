@@ -124,6 +124,7 @@ class TestPublicSurface:
         """``weighted.py``'s ``__all__`` names the public-API symbols."""
         assert set(weighted_module.__all__) == {
             "WEIGHTED_CLASSIFICATION_TEMPLATE",
+            "WeightedClassificationResult",
             "WeightedDimension",
             "WeightedFragmentClassification",
             "build_weighted_classification_prompt",
@@ -825,7 +826,9 @@ class TestClassifyWeighted:
     def test_empty_body_short_circuits(self, llm_config: LLMConfig) -> None:
         """A whitespace-only body returns an empty WFC without invoking the LLM."""
         result = classify_weighted(_make_ingested("   \n   "), llm_config)
-        assert result == WeightedFragmentClassification()
+        assert result.classification == WeightedFragmentClassification()
+        # No LLM ran, so the caller must not be told one did (#1330).
+        assert result.succeeded is False
 
     def test_representative_classification(
         self,
@@ -838,11 +841,15 @@ class TestClassifyWeighted:
             _make_ingested("Paranoia is a Red Frequency phenomenon..."),
             llm_config,
         )
-        assert result.frequencies == (
+        assert result.succeeded is True
+        classification = result.classification
+        assert classification.frequencies == (
             WeightedDimension(value=Frequency.F3, weight=0.8),
         )
-        assert result.phases == (WeightedDimension(value=Phase.RISING, weight=0.7),)
-        assert result.overall_confidence == 0.7
+        assert classification.phases == (
+            WeightedDimension(value=Phase.RISING, weight=0.7),
+        )
+        assert classification.overall_confidence == 0.7
 
     @pytest.mark.parametrize(
         ("body", "freqs_yaml", "expected_top_freq"),
@@ -885,7 +892,8 @@ class TestClassifyWeighted:
         """Five representative bodies classify with their canned LLM responses."""
         fake_invoke[0] = _weighted_yaml_payload(frequencies=freqs_yaml)
         result = classify_weighted(_make_ingested(body), llm_config)
-        assert result.frequencies[0].value == expected_top_freq
+        assert result.succeeded is True
+        assert result.classification.frequencies[0].value == expected_top_freq
 
     def test_provider_unavailable_returns_empty(
         self,
@@ -897,7 +905,9 @@ class TestClassifyWeighted:
             return_value=False,
         ):
             result = classify_weighted(_make_ingested("body"), llm_config)
-        assert result == WeightedFragmentClassification()
+        assert result.classification == WeightedFragmentClassification()
+        # An unreachable provider is a failure, not an empty verdict (#1330).
+        assert result.succeeded is False
 
     def test_malformed_yaml_returns_empty(
         self,
@@ -907,7 +917,9 @@ class TestClassifyWeighted:
         """A parse failure collapses to an empty WFC without re-raising."""
         fake_invoke[0] = "```yaml\nnot: a: valid: yaml: ::\n```"
         result = classify_weighted(_make_ingested("body"), llm_config)
-        assert result == WeightedFragmentClassification()
+        assert result.classification == WeightedFragmentClassification()
+        # A parse failure is a failure, not an empty verdict (#1330).
+        assert result.succeeded is False
 
     def test_unknown_top_level_key_returns_empty(
         self,
@@ -919,7 +931,9 @@ class TestClassifyWeighted:
             "reasoning\n\n```yaml\nfrequencies: []\nbogus_top_level_key: 1\n```"
         )
         result = classify_weighted(_make_ingested("body"), llm_config)
-        assert result == WeightedFragmentClassification()
+        assert result.classification == WeightedFragmentClassification()
+        # A schema violation is a failure, not an empty verdict (#1330).
+        assert result.succeeded is False
 
     def test_transport_failure_returns_empty(
         self,
@@ -943,7 +957,9 @@ class TestClassifyWeighted:
             ),
         ):
             result = classify_weighted(_make_ingested("body"), llm_config)
-        assert result == WeightedFragmentClassification()
+        assert result.classification == WeightedFragmentClassification()
+        # A transport error is a failure, not an empty verdict (#1330).
+        assert result.succeeded is False
 
 
 # ---- classify_engine wiring (#366 integration) -----------------------------

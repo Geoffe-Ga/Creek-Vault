@@ -1544,10 +1544,12 @@ def _classify_one_weighted(
     :meth:`WeightedFragmentClassification.to_legacy` so existing
     consumers (lint, compile, voice-skill generation) stay
     synchronised. When the underlying call fails soft to an empty
-    profile (provider unavailable, transport error, malformed YAML)
-    the legacy fields collapse to ``UNCLASSIFIED`` — the operator
-    sees the same "no signal" verdict the single-pick path produces
-    on failure.
+    profile (whitespace-only body, provider unavailable, transport
+    error, malformed YAML) nothing is derived from it: the input
+    fragment is handed back untouched — rule verdict intact,
+    :attr:`Fragment.weighted` still ``None`` — and reported as a
+    skip, exactly as the single-pick path reports its own failures
+    (#744, #1330).
 
     Args:
         fragment: Fragment carrying any rule-classifier output that
@@ -1558,14 +1560,27 @@ def _classify_one_weighted(
             Anthropic selection the legacy LLM path uses.
 
     Returns:
+        ``(fragment, skipped, reasoning)``. On success,
         ``(updated_fragment, False, reasoning)``: the weighted profile
-        plus its derived legacy fields land on the returned Fragment;
-        ``False`` reflects "the LLM was actually invoked"; the
+        plus its derived legacy fields land on the returned Fragment,
+        ``False`` reflects "the LLM was actually invoked", and the
         reasoning trace mirrors the model's preamble for FEAT-017
-        observability.
+        observability. On failure, ``(fragment, True, "")``: the input
+        fragment unchanged, and ``True`` so the caller treats it like
+        the rules-sufficed skip.
     """
     ingested = IngestedFragment(fragment=fragment, body=body)
-    weighted = classify_weighted(ingested, llm_config)
+    result = classify_weighted(ingested, llm_config)
+    if not result.succeeded:
+        # The weighted call produced nothing (whitespace-only body, provider
+        # unavailable, transport error, malformed YAML) and there is no profile
+        # to derive from. Treat it like the rules-sufficed skip so the write
+        # path stamps ``rules`` (the result that actually stands), NOT a lying
+        # ``classification_method: llm`` — and the fragment stays eligible for
+        # a later re-classify rather than being skipped by
+        # ``_record_if_preserved`` forever (#744, #1330).
+        return fragment, True, ""
+    weighted = result.classification
     freq, wave, voice = weighted.to_legacy()
     updated = fragment.model_copy(
         update={
