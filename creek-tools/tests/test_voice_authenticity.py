@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from creek.cli import app
@@ -33,6 +34,39 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 def _strip_ansi(text: str) -> str:
     """Return *text* with ANSI escape sequences removed."""
     return _ANSI_ESCAPE_RE.sub("", text)
+
+
+_WEIGHTING_CASES = [True, False]
+assert len(_WEIGHTING_CASES) == 2, (
+    "Both halves are required: a lone True case passes whether or not the "
+    "probe reads the vault's config, which is how #1313 hid for so long."
+)
+
+
+def _set_vault_weighting(vault: Path, *, enabled: bool) -> None:
+    """Write ``<vault>/00-Creek-Meta/creek_config.yaml`` with the knob set.
+
+    Before #1313 ``_probe_audience_mix`` constructed its own
+    ``VoiceAudienceWeightingConfig()`` and reported that default, so a probe on
+    a config-less tmp vault answered ``True`` whether or not it read anything.
+    Seeding a real config — and asserting both values — is what makes the
+    ``weighting_active`` assertions below able to fail.
+
+    Args:
+        vault: Vault root.
+        enabled: Value for ``voice_audience_weighting.enabled``.
+    """
+    from creek.config import CreekConfig
+
+    data = CreekConfig().model_dump(mode="json")
+    data["vault_path"] = str(vault)
+    data["voice_audience_weighting"]["enabled"] = enabled
+    meta = vault / "00-Creek-Meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    (meta / "creek_config.yaml").write_text(
+        yaml.dump(data, sort_keys=False),
+        encoding="utf-8",
+    )
 
 
 def _write_fragment(
@@ -131,10 +165,37 @@ def test_report_shape_reconciles_to_eligible_corpus(tmp_path: Path) -> None:
     assert 0.0 <= report.ai_corpus_leak.fraction <= 1.0
 
 
-def test_audience_mix_buckets_eligible_by_tier(tmp_path: Path) -> None:
-    """Eligible fragments bucket by tier; INTIMATE stays zero (excluded)."""
+@pytest.mark.parametrize("enabled", _WEIGHTING_CASES)
+def test_audience_mix_buckets_eligible_by_tier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    enabled: bool,
+) -> None:
+    """Eligible fragments bucket by tier; INTIMATE stays zero (excluded).
+
+    Parametrized over the weighting knob because ``weighting_active`` must
+    track the **vault's** setting rather than a fabricated default (#1313).
+    The tier buckets are invariant to it — the weighting ranks, it does not
+    gate — so asserting them under both values also pins that.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Used to unset ``CREEK_CONFIG``, which outranks the
+            vault's own file in ``resolve_config_path`` — with it set in the
+            environment the seeded config would never be read and the
+            ``False`` row would report ``True`` for the wrong reason.
+        enabled: The vault's configured weighting value.
+    """
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+    # And run from a directory holding no creek_config.yaml. Without this the
+    # False row discriminates against a bare-load_config() regression only
+    # because the ambient cwd happens to have no config in it — true today,
+    # enforced by nothing.
+    monkeypatch.chdir(tmp_path)
     vault = tmp_path / "vault"
     _scaffold_mixed_vault(vault)
+    _set_vault_weighting(vault, enabled=enabled)
 
     mix = build_voice_authenticity_report(vault, draft_path=None).audience_mix
 
@@ -142,8 +203,8 @@ def test_audience_mix_buckets_eligible_by_tier(tmp_path: Path) -> None:
     assert mix.by_tier["personal"] == 2
     assert mix.by_tier["unclassified"] == 1
     assert mix.by_tier["intimate"] == 0
-    # Graduated audience-authority weighting is active in the voice pipeline.
-    assert mix.weighting_active is True
+    # Reports the vault's own setting, not the probe's built-in default.
+    assert mix.weighting_active is enabled
 
 
 def test_ai_corpus_leak_counts_chat_platforms(tmp_path: Path) -> None:
@@ -222,16 +283,39 @@ def test_deslop_unattested_when_no_voice_distance(tmp_path: Path) -> None:
     assert deslop.status
 
 
-def test_to_json_is_stable_and_parseable(tmp_path: Path) -> None:
-    """``to_json`` emits a documented, parseable schema with all sub-scores."""
+@pytest.mark.parametrize("enabled", _WEIGHTING_CASES)
+def test_to_json_is_stable_and_parseable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    enabled: bool,
+) -> None:
+    """``to_json`` emits a documented, parseable schema with all sub-scores.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Used to unset ``CREEK_CONFIG`` — see
+            :func:`test_audience_mix_buckets_eligible_by_tier` for why the
+            ``False`` row is otherwise satisfiable for the wrong reason.
+        enabled: The vault's configured weighting value, which the JSON
+            payload must carry through faithfully rather than defaulting
+            (#1313).
+    """
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+    # And run from a directory holding no creek_config.yaml. Without this the
+    # False row discriminates against a bare-load_config() regression only
+    # because the ambient cwd happens to have no config in it — true today,
+    # enforced by nothing.
+    monkeypatch.chdir(tmp_path)
     vault = tmp_path / "vault"
     _scaffold_mixed_vault(vault)
+    _set_vault_weighting(vault, enabled=enabled)
 
     report = build_voice_authenticity_report(vault, draft_path=None)
     payload = json.loads(report.to_json())
 
     assert payload["eligible_total"] == 5
-    assert payload["audience_mix"]["weighting_active"] is True
+    assert payload["audience_mix"]["weighting_active"] is enabled
     assert payload["audience_mix"]["by_tier"]["open"] == 2
     assert payload["audience_mix"]["total"] == 5
     assert payload["ai_corpus_leak"]["leaked"] == 2

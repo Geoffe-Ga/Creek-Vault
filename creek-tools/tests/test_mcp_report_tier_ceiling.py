@@ -1519,10 +1519,10 @@ def _call_name(node: ast.Call) -> str | None:
     return None
 
 
-def _states_override(node: ast.Call) -> bool:
-    """Return whether *node* names an ``override`` at its own or its receiver's call.
+def _states_keyword(node: ast.Call, keyword_name: str) -> bool:
+    """Return whether *node* names *keyword_name* at its own or its receiver's call.
 
-    Two shapes carry the override, and both are legitimate:
+    Two shapes carry such a keyword, and both are legitimate:
 
     * ``generate_decisions(vault, override=override)`` — the parameter is on the
       function itself;
@@ -1531,29 +1531,40 @@ def _states_override(node: ast.Call) -> bool:
       corpus takes none. Requiring ``override=`` on ``generate_all_profiles``
       itself would force an API the design does not have.
 
+    The receiver walk is what makes the constructor shape count, and it is
+    reused verbatim by the ``audience_weighting`` guard added for #1313.
+
     Args:
         node: The call node to inspect.
+        keyword_name: The keyword that must be stated.
 
     Returns:
-        ``True`` when an ``override`` keyword is stated at this call or at the
+        ``True`` when *keyword_name* is stated at this call or at the
         constructor call the method is invoked on.
     """
-    if any(keyword.arg == "override" for keyword in node.keywords):
+    if any(keyword.arg == keyword_name for keyword in node.keywords):
         return True
     func = node.func
     if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Call):
-        return _states_override(func.value)
+        return _states_keyword(func.value, keyword_name)
     return False
 
 
-def _guarded_calls(module: ModuleType) -> list[tuple[str, int, bool]]:
-    """Return ``(name, lineno, states_override)`` for every guarded call site.
+def _guarded_calls(
+    module: ModuleType,
+    names: frozenset[str] = _OVERRIDE_CALL_NAMES,
+    keyword_name: str = "override",
+) -> list[tuple[str, int, bool]]:
+    """Return ``(name, lineno, states_keyword)`` for every guarded call site.
 
     Args:
         module: The imported production module to scan.
+        names: The callee names to look for. Defaults to the privacy-ceiling
+            set; #1313's audience-weighting guard passes its own.
+        keyword_name: The keyword each matched call must state.
 
     Returns:
-        One tuple per call to a name in :data:`_OVERRIDE_CALL_NAMES`.
+        One tuple per call to a name in *names*.
     """
     tree = ast.parse(inspect.getsource(module))
     found: list[tuple[str, int, bool]] = []
@@ -1561,9 +1572,9 @@ def _guarded_calls(module: ModuleType) -> list[tuple[str, int, bool]]:
         if not isinstance(node, ast.Call):
             continue
         name = _call_name(node)
-        if name in _OVERRIDE_CALL_NAMES:
+        if name in names:
             assert name is not None
-            found.append((name, node.lineno, _states_override(node)))
+            found.append((name, node.lineno, _states_keyword(node, keyword_name)))
     return found
 
 
@@ -1620,5 +1631,132 @@ def test_every_guarded_symbol_is_actually_called_somewhere() -> None:
     assert not missing, (
         f"_OVERRIDE_CALL_NAMES lists {sorted(missing)}, which neither "
         f"{' nor '.join(_OVERRIDE_CALLER_MODULES)} calls. An entry no call site "
+        "matches is an assertion about nothing."
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1313 — the production call sites must state the vault's audience weighting
+# ---------------------------------------------------------------------------
+
+
+_AUDIENCE_WEIGHTING_CALL_NAMES = frozenset(
+    {
+        "VoiceProfileGenerator",
+        # Constructed only inside ``creek.generate.voice`` — at
+        # ``VoiceProfileGenerator.__init__``'s default collector and inside
+        # ``generate_register_samples``. Neither outer surface names it, which
+        # is exactly why ``creek.generate.voice`` is in the module list below.
+        "VoiceExemplarCollector",
+        # The half of the voice report that copies fragment bodies into the
+        # vault. Which fragments survive the top-N cut decides whose prose is
+        # persisted verbatim, so a weighting dropped here is a privacy-visible
+        # change, not merely a ranking one.
+        "generate_register_samples",
+    },
+)
+"""Callables whose ``audience_weighting`` must never be left at its default.
+
+Deliberately a *separate* set from :data:`_OVERRIDE_CALL_NAMES` rather than a
+reuse of it. That set contains ``generate_lexicon``, and requiring
+``audience_weighting=`` there would demand a keyword the function does not
+have and should not gain: the lexicon path is provably invariant to the
+weighting (``collect_all_exemplars`` does no ranking, ``extract_patterns`` is
+called with no ``weights=``, and ``build_lexicon`` reads ``patterns`` only for
+metaphor families), so the kwarg would be an untestable no-op. See the ``Note:``
+on :func:`creek.generate.lexicon.generate_lexicon`. What guards that path
+instead is the behavioural invariance tripwire
+``test_lexicon_output_is_invariant_to_the_audience_weighting`` in
+``tests/test_voice_audience_weighting_wiring.py``, which — unlike a guard
+exclusion — goes red the day the lexicon starts consuming a weighted metric.
+"""
+
+_AUDIENCE_WEIGHTING_CALLER_MODULES = [
+    "creek_mcp.tools.report",
+    "creek.cli",
+    # Required, not decorative. ``VoiceExemplarCollector`` is constructed only
+    # here, so without this entry a deleted ``audience_weighting=`` forward
+    # inside ``generate_register_samples`` leaves the guard green while the
+    # config stops reaching the ranking.
+    "creek.generate.voice",
+]
+"""Every module that constructs an audience-weighted voice generator."""
+
+
+@pytest.mark.parametrize("dotted", _AUDIENCE_WEIGHTING_CALLER_MODULES)
+def test_production_voice_callers_always_state_an_audience_weighting(
+    dotted: str,
+) -> None:
+    """No production caller may fall back to the fabricated default weighting.
+
+    ``audience_weighting`` defaults to ``None``, which
+    :class:`VoiceExemplarCollector` turns into a fresh
+    :class:`~creek.config.VoiceAudienceWeightingConfig` — an *enabled* one. That
+    default is what made the vault's ``voice_audience_weighting`` section inert
+    for the whole exemplar path: every construction quietly substituted the
+    built-in values, so ``enabled: false`` on disk changed nothing and
+    ``creek voice-authenticity`` reported ``ON`` regardless (#1313).
+
+    Keeping the default is right — it keeps the library usable — but it is safe
+    only while every production caller states the vault's config out loud, and
+    this is the test that makes that structural rather than hoped-for. The
+    original defect was exactly the shape this catches: five call sites wired
+    and a sixth forgotten reads, at the call site, as ordinary working code.
+
+    Structural on purpose: it cannot tell whether the value passed came from the
+    *vault's* config rather than a bare ``load_config()`` — the behavioural
+    tests in ``tests/test_voice_audience_weighting_wiring.py`` do that, by
+    running from a config-less cwd — but it is the only thing that catches a new
+    call site added months from now that simply omits the keyword.
+
+    Args:
+        dotted: The production module to parse.
+    """
+    module = importlib.import_module(dotted)
+    calls = _guarded_calls(
+        module,
+        _AUDIENCE_WEIGHTING_CALL_NAMES,
+        "audience_weighting",
+    )
+    assert calls, (
+        f"{dotted} contains no call to any of "
+        f"{sorted(_AUDIENCE_WEIGHTING_CALL_NAMES)}, so this guardrail is "
+        "scanning for symbols nothing invokes. Either the voice fan-out moved, "
+        "or the names in _AUDIENCE_WEIGHTING_CALL_NAMES are stale."
+    )
+    silent = [(name, lineno) for name, lineno, stated in calls if not stated]
+    assert not silent, (
+        f"{dotted} constructs a voice generator without stating an "
+        f"audience_weighting: {silent}. The parameter defaults to the built-in "
+        "config, so an omitted keyword is not a neutral omission — it is the "
+        "vault's own voice_audience_weighting setting being silently discarded "
+        "at that call site (#1313)."
+    )
+
+
+def test_every_audience_weighted_symbol_is_actually_called_somewhere() -> None:
+    """The audience-weighting name list describes real call sites, not aspirations.
+
+    Same hole as :func:`test_every_guarded_symbol_is_actually_called_somewhere`
+    closes for the ceiling guard: a typo or a rename would leave an entry that
+    can never fail, and the per-module assertions would still pass on the
+    strength of the others. Asserting the union across all three surfaces covers
+    every name closes it.
+    """
+    called: set[str] = set()
+    for dotted in _AUDIENCE_WEIGHTING_CALLER_MODULES:
+        module = importlib.import_module(dotted)
+        called.update(
+            name
+            for name, _lineno, _stated in _guarded_calls(
+                module,
+                _AUDIENCE_WEIGHTING_CALL_NAMES,
+                "audience_weighting",
+            )
+        )
+    missing = _AUDIENCE_WEIGHTING_CALL_NAMES - called
+    assert not missing, (
+        f"_AUDIENCE_WEIGHTING_CALL_NAMES lists {sorted(missing)}, which none of "
+        f"{_AUDIENCE_WEIGHTING_CALLER_MODULES} calls. An entry no call site "
         "matches is an assertion about nothing."
     )

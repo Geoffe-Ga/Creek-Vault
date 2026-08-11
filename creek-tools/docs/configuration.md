@@ -360,15 +360,51 @@ voice_audience_weighting:
     open: 1.5          # public-facing work carries the most authority
     personal: 1.0      # baseline
     unclassified: 0.75
-    intimate: 0.0      # also excluded from the corpus entirely
+    intimate: 0.0      # also excluded from the corpus entirely, upstream
   representativeness_authority:
     self: 1.0
     endorsed: 0.9
     aspirational: 0.6
     reference: 0.3     # borrowed material keeps near-zero influence
+  platform_authority:
+    essay: 2.0          # audience-facing platforms outrank private ones
+    substack: 2.0
+    journal: 0.1
+    messages: 0.4
+    discord: 0.4
+    chatgpt: 0.3
+    claude: 0.3
+  audience_authority:
+    audience-facing: 2.0   # the #634 classifier's primary signal
+    private: 0.1
+    mixed: 1.0              # the unclassified default; falls back to platform_authority
 ```
 
-Each voice exemplar's ranking score is multiplied by `privacy_tier_authority[tier] × representativeness_authority[value]`, so an `OPEN` essay outweighs a `PERSONAL` chat turn and dominates the patterns that shape drafts. Setting `enabled: false` makes every authority `1.0` (the pre-weighting ranking). Missing keys default to `1.0`.
+`platform_authority` and `audience_authority` are seeded into every vault by `creek init` alongside the two maps above, but **not every report reads all four** — this is the part of the section that trips people up:
+
+| Path | Formula | Reads |
+|------|---------|-------|
+| **Exemplar ranking** — `creek report --type voice`, `--type rhetorical-patterns`, and the register samples `creek fill` writes to `07-Voice/Register-Samples/` | `privacy_tier_authority[tier] × representativeness_authority[value]` | Only these two maps. `platform_authority` and `audience_authority` have no effect here. |
+| **Fingerprint** — `creek report --type fingerprint` | `audience_authority[audience] × privacy_tier_authority[tier] × representativeness_authority[value] × platform_authority[platform]` | All four maps. |
+
+So an `OPEN` essay outweighs a `PERSONAL` chat turn on both paths, but scoping the fingerprint to audience-facing platforms via `platform_authority` or `audience_authority` does nothing to which exemplars get ranked or persisted as register samples. Setting `enabled: false` makes every authority `1.0` on both paths (the pre-weighting, uniform ranking). Missing keys default to `1.0` on every map, so a new privacy tier, representativeness value, platform, or audience classification never silently zeroes a fragment out.
+
+**A `0.0` authority means two different things depending on the path.** On the fingerprint path it is a membership gate: `_eligible_texts` drops a fragment from the corpus outright when its combined weight is not greater than zero, so `intimate: 0.0` (the default) keeps intimate fragments out of the fingerprint. Note when that actually bites: `_eligible_texts` already skips intimate fragments outright unless its caller passes `include_intimate=True`, so on a default run the zero authority is a redundant second gate. It becomes the operative one precisely when an operator opts intimate content in — at which point the shipped `0.0` quietly overrides that opt-in. If you deliberately want intimate writing in your fingerprint, you must raise `privacy_tier_authority.intimate` above zero as well. On the exemplar path a `0.0` only de-ranks: `rank_exemplars` always returns the top `max_per_register` fragments by score, whatever those scores are, so a zero-weighted fragment can still be selected if the register has room. **Do not set `intimate: 0.0` (or any authority to zero) expecting it to exclude fragments from the exemplar corpus, register samples, or lexicon — it will not.** Exclusion there is the job of the privacy-tier ceiling and the self-authorship/consent gates, described next.
+
+**This is not a privacy control.** Setting `enabled: false`, or editing any of the four maps, never widens who is eligible for the voice corpus. Membership is decided upstream and independently of this section — by the privacy-tier ceiling (`--include-tier`, #968) and the self-authorship/consent gates in `VoiceExemplarCollector._eligible_register` — before any authority multiplier is ever applied. No value of `voice_audience_weighting`, not even `intimate: 10.0`, can admit an intimate or above-ceiling fragment into the corpus.
+
+What it *does* change is which fragments survive the top-`max_per_register` cut on the exemplar path, and that matters because the cut decides which fragment bodies get duplicated into the vault verbatim. There are **two** such surfaces, not one:
+
+- a persisted register sample is the source fragment's file **copied byte for byte** into `07-Voice/Register-Samples/<register>/`;
+- a rendered profile embeds up to `max_exemplars` (10) **full exemplar bodies** under `### Sample Passages` in `07-Voice/<register>-profile.md`. This is the surface the MCP `report_type="voice"` tool writes — it deliberately does not write register samples — so an MCP-only operator is still exposed to this even though the first bullet does not apply to them.
+
+Both then seed generated drafts.
+
+Concretely, with the shipped defaults: the only live factor on the exemplar path is `privacy_tier_authority` (`open 1.5` / `personal 1.0` / `unclassified 0.75`), so when candidates exceed the cap, `enabled: false` flattens every authority to `1.0` and lets a `personal` body displace an `open` one out of the cohort — and get copied verbatim in its place. The starker version needs an edited corpus rather than an edited knob: give a fragment `representativeness: reference` in its own frontmatter and it scores `0.3`, so `enabled: true` keeps one `self`-authored fragment ahead of borrowed material that `enabled: false` would let crowd it out entirely. (Fragments Creek itself files under `11-Other-Authors/` are excluded from the voice corpus outright and are not the case at issue here.)
+
+Turning the weighting off can therefore *increase* how much borrowed — or, with a permissive tier ceiling, private — prose is duplicated into the vault and fed to drafts. An operator-directed and permissible choice, but one worth knowing you are making.
+
+**Upgrade note.** The values `creek init` writes above are byte-identical to the code defaults the exemplar path was already using before this section was wired to the vault's file (issue #1313 — the vault's `enabled: false` or edited maps were previously ignored on that path). Activating the fix changes exemplar-ranking output only for operators who had deliberately edited this block, which is exactly the behaviour those edits asked for; everyone still running the shipped defaults sees no change.
 
 ## `ai_style` — voice fidelity / de-slop
 

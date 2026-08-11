@@ -589,7 +589,14 @@ class VoiceExemplarCollector:
                 applied during ranking. Defaults to the standard weighting,
                 which keeps a uniform-audience vault's relative ranking
                 unchanged while letting public-facing work dominate a
-                mixed-audience one.
+                mixed-audience one. On **this** path a ``0.0`` authority
+                only de-ranks: :meth:`rank_exemplars` returns
+                ``scored[:max_per_register]`` whatever the scores are, so the
+                weighting can never admit or exclude a fragment — membership
+                belongs to :func:`within_ceiling` and :meth:`_eligible_register`
+                alone. (The fingerprint path differs: ``if weight > 0.0`` at
+                ``creek/generate/ai_style/fingerprint.py`` makes a zero
+                authority a genuine membership gate there. See #1313.)
 
         Raises:
             ValueError: If ``max_per_register`` or ``min_per_register``
@@ -612,7 +619,7 @@ class VoiceExemplarCollector:
         self.min_per_register = min_per_register
         self.allow_intimate = allow_intimate
         self.override = override
-        self._audience_weighting = audience_weighting or VoiceAudienceWeightingConfig()
+        self.audience_weighting = audience_weighting or VoiceAudienceWeightingConfig()
         self._records: dict[str, _ExemplarRecord] = {}
 
     # ---- Collection ----
@@ -789,7 +796,7 @@ class VoiceExemplarCollector:
             score += _LENGTH_BONUS
         if _is_fully_classified(fragment):
             score += _CLASSIFICATION_BONUS
-        return score * audience_authority(fragment, self._audience_weighting)
+        return score * audience_authority(fragment, self.audience_weighting)
 
     # ---- Persistence ----
 
@@ -2145,7 +2152,29 @@ class VoiceProfileGenerator:
                 ``self._collector`` so there is exactly one storage location
                 and an injected collector cannot be contradicted.
             audience_weighting: Graduated audience-authority multipliers
-                applied during ranking.
+                applied during ranking, forwarded into the *default*
+                collector only (see *collector*), on the same terms as
+                *override*: the value is **not** stored on the generator.
+                :meth:`_rank_exemplars` and :meth:`_stream_into` read it back
+                off ``self._collector`` so there is exactly one storage
+                location and an injected collector cannot be contradicted.
+                ``None`` means "the standard weighting" —
+                :class:`~creek.config.VoiceAudienceWeightingConfig`'s defaults,
+                which is *enabled*. That is the opposite of
+                :func:`~creek.generate.ai_style.fingerprint.build_fingerprint`,
+                whose ``None`` means off; see that function's docstring for
+                why the two differ and why neither default moved (#1313).
+                No production caller *on this path* relies on the default:
+                ``tests/test_mcp_report_tier_ceiling.py``'s
+                ``test_production_voice_callers_always_state_an_audience_weighting``
+                requires every construction of this class,
+                :class:`VoiceExemplarCollector` and
+                :func:`generate_register_samples` to pass the vault's config
+                explicitly. That guard covers those three symbols only — it
+                says nothing about
+                :func:`~creek.generate.ai_style.fingerprint.build_fingerprint`,
+                which has a production caller still taking its default
+                (see #1410).
 
         Raises:
             ValueError: If either bound is less than 1, or if
@@ -2162,12 +2191,11 @@ class VoiceProfileGenerator:
             raise ValueError(msg)
         self.max_exemplars = max_exemplars
         self.min_exemplars = min_exemplars
-        self._audience_weighting = audience_weighting or VoiceAudienceWeightingConfig()
         self._collector = collector or VoiceExemplarCollector(
             max_per_register=max_exemplars,
             min_per_register=min_exemplars,
             override=override,
-            audience_weighting=self._audience_weighting,
+            audience_weighting=audience_weighting,
         )
         self._extractor = extractor or VoicePatternExtractor()
 
@@ -2342,7 +2370,7 @@ class VoiceProfileGenerator:
                 ranked = self._rank_exemplars(register_exemplars)
                 bodies = [e.body for e in ranked]
                 weights = [
-                    audience_authority(e.fragment, self._audience_weighting)
+                    audience_authority(e.fragment, self._collector.audience_weighting)
                     for e in ranked
                 ]
                 patterns = self._extractor.extract_patterns(bodies, weights=weights)
@@ -2480,7 +2508,7 @@ class VoiceProfileGenerator:
         scored = sorted(
             exemplars,
             key=lambda e: (
-                -_exemplar_score(e, self._audience_weighting),
+                -_exemplar_score(e, self._collector.audience_weighting),
                 e.fragment.id,
             ),
         )
@@ -2523,6 +2551,7 @@ def generate_register_samples(
     vault_path: Path,
     *,
     override: PrivacyTierOverride = PrivacyTierOverride.ALL,
+    audience_weighting: VoiceAudienceWeightingConfig | None = None,
     on_prune: Callable[[Path], None] | None = None,
 ) -> dict[str, Path]:
     """Collect the voice corpus and persist its register samples (#879).
@@ -2553,6 +2582,21 @@ def generate_register_samples(
             stays off here. The ceiling matters more on this path than on a
             rendered report: a persisted sample is a source fragment's file
             copied into the vault byte for byte.
+        audience_weighting: Graduated audience-authority multipliers for the
+            ranking, forwarded to the collector (#1313). ``None`` selects
+            :class:`~creek.config.VoiceAudienceWeightingConfig`'s defaults, and
+            the default exists only for library callers: every production
+            caller must state the vault's own config, which
+            ``tests/test_mcp_report_tier_ceiling.py``'s
+            ``test_production_voice_callers_always_state_an_audience_weighting``
+            enforces structurally. This knob cannot change *who* is eligible —
+            :meth:`VoiceExemplarCollector.rank_exemplars` returns
+            ``scored[:max_per_register]`` regardless of score, so unlike
+            ``fingerprint.py``'s ``if weight > 0.0`` a zero authority here only
+            de-ranks. It can still change *which* fragments survive the top-N
+            cut, and because that cut decides whose file is copied verbatim,
+            disabling the weighting can replace a self-authored sample with a
+            borrowed one. That trade is documented in ``docs/configuration.md``.
         on_prune: Invoked once per deleted stale copy, with its path. This
             call both writes and *deletes* vault content, and the returned
             mapping describes only the writing, so a caller that reports
@@ -2562,7 +2606,10 @@ def generate_register_samples(
         Mapping of register → path of the written ``_Summary.md``, one entry
         per register that had exemplars. Empty when the corpus is.
     """
-    collector = VoiceExemplarCollector(override=override)
+    collector = VoiceExemplarCollector(
+        override=override,
+        audience_weighting=audience_weighting,
+    )
     buckets = collector.collect_exemplars(vault_path)
     return collector.save_exemplars(buckets, vault_path, on_prune=on_prune)
 

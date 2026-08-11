@@ -171,6 +171,13 @@ def _eligible_texts(
         include_intimate: When ``True``, intimate-tier fragments are kept.
         audience_weighting: When supplied and enabled, scope the fingerprint to
             audience-facing documents; ``None`` keeps the flat-average path.
+            Note the semantics below: ``if weight > 0.0`` makes a zero
+            authority a **membership gate** on this path — a fragment weighted
+            to zero is dropped from the corpus outright. On the exemplar path
+            (:meth:`creek.generate.voice.VoiceExemplarCollector.rank_exemplars`)
+            the same zero only de-ranks, because that method returns
+            ``scored[:max]`` whatever the scores are. That difference is
+            semantic, not a defaulting accident (#1313).
 
     Returns:
         One ``(weight, text)`` pair per eligible fragment.
@@ -225,7 +232,31 @@ def build_fingerprint(
         config: AI-style configuration.
         include_intimate: When ``True``, include intimate-tier fragments.
         audience_weighting: When supplied and enabled, scope the fingerprint to
-            audience-facing documents; ``None`` keeps the flat-average path.
+            audience-facing documents; ``None`` keeps the flat-average path —
+            that is, ``None`` means **off** here, the opposite of
+            :class:`~creek.generate.voice.VoiceExemplarCollector`, whose
+            ``None`` selects the enabled default. Neither default moved in
+            #1313: flipping the collector's would silently disable the shipped
+            #632/#633/#634 epic, and flipping this one is a behaviour change
+            for library callers with no issue behind it.
+
+            Be careful what you conclude from that. On the *exemplar* side the
+            default is unreachable in production, because
+            ``test_production_voice_callers_always_state_an_audience_weighting``
+            requires every construction there to state the value. **No such
+            guard covers this function.** ``build_fingerprint`` is deliberately
+            absent from ``_AUDIENCE_WEIGHTING_CALL_NAMES``, and one production
+            caller does still rely on the ``None`` default:
+            ``creek/cli.py``'s ``_resolve_voice_fingerprint``, the fallback
+            ``creek voice-check`` takes when a vault has no persisted
+            ``voice-fingerprint.json``. So that command can score against an
+            unweighted fingerprint while ``report --type fingerprint``
+            persists a weighted one. Tracked in #1410; not fixed here because
+            it is pre-existing and outside #1313's inventory.
+
+            The load-bearing difference between the two paths is not the
+            default but the semantics — see :func:`_eligible_texts` on why a
+            ``0.0`` authority excludes here and merely de-ranks there.
 
     Returns:
         A fingerprint whose ``fragment_count`` is the number of eligible

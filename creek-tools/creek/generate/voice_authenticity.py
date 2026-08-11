@@ -11,8 +11,12 @@ The three sub-scores:
 ``audience_mix``
     Distribution of the *voice-eligible* corpus (self-authored, non-INTIMATE
     fragments — see :attr:`creek.models.Fragment.voice_proxy_eligible`) by
-    ``privacy_tier``. ``weighting_active`` is a stub ``False`` until the
-    graduated audience-authority model lands.
+    ``privacy_tier``. ``weighting_active`` reports the **vault's own**
+    ``voice_audience_weighting.enabled`` setting, read from
+    ``<vault>/00-Creek-Meta/creek_config.yaml``. It was previously a fabricated
+    default — the probe constructed a fresh config object and reported its
+    value back as an observation, so it printed ``ON`` even for a vault that
+    had switched the feature off (#1313).
 
 ``ai_corpus_leak``
     Count and fraction of voice-eligible fragments whose
@@ -37,7 +41,11 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
-from creek.config import VoiceAudienceWeightingConfig
+from creek.config import (
+    VoiceAudienceWeightingConfig,
+    load_config,
+    resolve_config_path,
+)
 from creek.generate.ai_style.guard import (
     VOICE_DISTANCE_KEY,
     VOICE_FINDINGS_KEY,
@@ -205,11 +213,20 @@ class VoiceAuthenticityReport:
         return json.dumps(self.to_json_dict(), indent=2)
 
 
-def _probe_audience_mix(eligible: list[Fragment]) -> AudienceMix:
+def _probe_audience_mix(
+    eligible: list[Fragment],
+    weighting: VoiceAudienceWeightingConfig,
+) -> AudienceMix:
     """Bucket the eligible corpus by ``privacy_tier``.
 
     Args:
         eligible: The voice-eligible fragments.
+        weighting: The **vault's** audience-weighting config. Previously this
+            probe constructed a fresh :class:`VoiceAudienceWeightingConfig`
+            and reported its default, so ``weighting_active`` printed ``ON``
+            for every vault including ones that had disabled the feature — a
+            diagnostic reporting its own default back as an observation
+            (#1313).
 
     Returns:
         The audience-mix sub-score. ``weighting_active`` reflects whether the
@@ -219,10 +236,7 @@ def _probe_audience_mix(eligible: list[Fragment]) -> AudienceMix:
     for fragment in eligible:
         tier = str(fragment.privacy_tier)
         by_tier[tier] = by_tier.get(tier, 0) + 1
-    return AudienceMix(
-        by_tier=by_tier,
-        weighting_active=VoiceAudienceWeightingConfig().enabled,
-    )
+    return AudienceMix(by_tier=by_tier, weighting_active=weighting.enabled)
 
 
 def _conversation_key(fragment: Fragment) -> tuple[str, str | None, str | None] | None:
@@ -324,6 +338,14 @@ def build_voice_authenticity_report(
     voice-eligible corpus, and runs the three skeleton probes. When
     *draft_path* is given its frontmatter is read for the de-slop sub-score.
 
+    The audience-weighting config is resolved here, from the *vault_path* this
+    function already owns, rather than accepted as a keyword. That is
+    deliberate: a ``None``-defaulting kwarg would fall straight back to the
+    fabricated default this fix removes, giving every future caller one more
+    thing to forget, and no structural guard covers this function. Resolving
+    internally leaves no call site to get wrong and keeps every existing
+    invocation working unchanged (#1313).
+
     Args:
         vault_path: Vault root.
         draft_path: Optional drafted essay to probe for de-slop attestation.
@@ -335,8 +357,15 @@ def build_voice_authenticity_report(
     fragments = [fragment for _path, fragment, _body, _raw in records]
     eligible = [fragment for fragment in fragments if fragment.voice_proxy_eligible]
     deslop = _probe_deslop(draft_path) if draft_path is not None else None
+    # Vault-scoped, not the bare process-wide ``load_config()``: that resolves
+    # ``creek_config.yaml`` against the cwd and never reads the vault's own
+    # file. Same precedent as ``creek_mcp/tools/draft.py`` (#1313).
+    config = load_config(resolve_config_path(vault_path, None), warn_on_missing=False)
     return VoiceAuthenticityReport(
-        audience_mix=_probe_audience_mix(eligible),
+        audience_mix=_probe_audience_mix(
+            eligible,
+            config.voice_audience_weighting,
+        ),
         ai_corpus_leak=_probe_ai_corpus_leak(eligible, fragments),
         deslop=deslop,
     )
