@@ -398,7 +398,16 @@ def tomb_missing_units(
 
     A tomb that fails on I/O is collected into *errors* and the unit is left
     live in the ledger so the next full-source pass retries it, rather than
-    crashing the whole run. Returns the number of units actually tombed.
+    crashing the whole run. A tomb that finds nothing to move is treated the
+    same way (#1332) — see :func:`_tomb_one_unit`.
+
+    Returns:
+        The number of fragments this call actually relocated into
+        ``10-Liminal/Orphaned/``. Not the number of units considered, and
+        not the number of ledger records written: a unit whose fragment was
+        already tombed has its record reconciled but moved nothing, so it
+        does not count. The figure is printed to the operator verbatim, so
+        it may only ever name work that happened.
     """
     if ledger is None or not input_path.is_dir():
         return 0
@@ -409,22 +418,80 @@ def tomb_missing_units(
         record = ledger.get(source_key)
         if record is None:
             continue
-        try:
-            writer.tomb_fragment(record.fragment_id)
-        except (OSError, KeyError) as exc:
-            errors.append(
-                f"[{source_type}] failed to tomb {record.fragment_id}: {exc}",
-            )
-            continue
-        ledger.record(
-            source_key,
-            record.fragment_id,
-            record.content_hash,
-            last_seen=record.last_seen,
-            tombed=True,
-        )
-        tombed += 1
+        tombed += _tomb_one_unit(ledger, writer, record, errors, source_type)
     return tombed
+
+
+def _tomb_one_unit(
+    ledger: SourceLedger,
+    writer: VaultWriter,
+    record: LedgerRecord,
+    errors: list[str],
+    source_type: str,
+) -> int:
+    """Soft-tomb one vanished unit; return 1 only if this call moved it.
+
+    The three outcomes are kept distinct because conflating them is the
+    #1332 defect. Before it, the caller discarded
+    :meth:`~creek.vault.writer.VaultWriter.tomb_fragment`'s return value and
+    recorded ``tombed=True`` unconditionally, so a lookup that found nothing
+    wrote a permanent lie into the ledger — ``live_keys`` never revisits a
+    tombed record — and reported a tomb the operator could disprove by
+    opening the vault.
+
+    - **Relocated.** The fragment moved. Record it and count it.
+    - **Already tombed.** ``tomb_fragment`` returns ``None`` both when it
+      found nothing and when the fragment is already in the orphan
+      directory, so the two are separated by asking
+      :meth:`~creek.vault.writer.VaultWriter.find_tombed_fragment`. This is
+      the state a crash between the file move and the ledger append leaves
+      behind — the tomb-then-record ordering is deliberate, because the
+      reverse leaves ``tombed=True`` on a live fragment, which
+      ``live_keys`` guarantees is permanent. Recording it here is not a
+      guess: the vault is showing the tombstone. Nothing moved, so nothing
+      is counted.
+    - **Not found.** No live fragment and no tombstone. The record stays
+      live so the next full-source pass retries, and the miss is reported.
+      Recording success here is the behaviour this function exists to
+      remove; recording a third ledger state instead would need every
+      reader of ``tombed`` to learn a new case to answer the same question.
+
+    Args:
+        ledger: The ledger to reconcile; written only on a proven tomb.
+        writer: Vault writer performing the relocation and the lookups.
+        record: The ledgered unit that this pass no longer saw.
+        errors: Collector for ``[<source_type>] …`` operator messages.
+        source_type: Registry key, used to prefix those messages.
+
+    Returns:
+        ``1`` when this call relocated the fragment, else ``0``.
+    """
+    try:
+        moved = writer.tomb_fragment(record.fragment_id)
+        # ``or`` short-circuits, so the orphan directory is consulted only
+        # when nothing was relocated. A ``Path`` is always truthy, so this
+        # falls back exactly when *moved* is ``None``.
+        tombstone = moved or writer.find_tombed_fragment(record.fragment_id)
+    except (OSError, KeyError) as exc:
+        errors.append(
+            f"[{source_type}] failed to tomb {record.fragment_id}: {exc}",
+        )
+        return 0
+    if tombstone is None:
+        errors.append(
+            f"[{source_type}] no fragment found to tomb for "
+            f"{record.fragment_id} (source {record.source_key}); left live "
+            f"in the ledger for the next full-source pass",
+        )
+        return 0
+    ledger.record(
+        record.source_key,
+        record.fragment_id,
+        record.content_hash,
+        last_seen=record.last_seen,
+        tombed=True,
+    )
+    return 1 if moved is not None else 0
 
 
 def should_skip_unit(
