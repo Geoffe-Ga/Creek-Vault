@@ -34,6 +34,7 @@ from pathlib import Path  # noqa: TC003 — Pydantic needs Path at runtime
 from pydantic import BaseModel
 from tqdm import tqdm
 
+from creek._containment import resolves_within
 from creek.config import RedactionConfig  # noqa: TC001 — used at runtime
 from creek.redact.patterns import (
     HIGH_ENTROPY_MIN_RUN,
@@ -787,42 +788,19 @@ def _statistics_lines(summary: ScanSummary) -> list[str]:
     return lines
 
 
-def resolves_within(child: Path, resolved_root: Path) -> bool:
-    """Report whether *child*'s symlink target stays under *resolved_root*.
-
-    Public because it is now also the named-leaf containment predicate for
-    :mod:`creek.redact.cli_commands` (#1293), so the walked-child surface and
-    the named-path surface cannot drift into two subtly different definitions
-    of "inside".
-
-    The failure arm is a deliberate classification, not a swallowed error:
-    a loop (``RuntimeError``), an unreadable link (``OSError``), and a
-    target outside the root (``ValueError`` from ``relative_to``) are all
-    cases where the scanner cannot prove containment — and an unprovable
-    containment is an escape. The caller logs and counts every rejection.
-
-    Dangling links never reach here in either direction:
-    :func:`_scannable_candidates` gates on ``is_file()`` first, which is
-    ``False`` for a link whose target does not exist, so a dangling link is
-    dropped as a non-file before containment is ever asked about.
-
-    The exception object itself is deliberately dropped rather than logged:
-    ``relative_to``'s message quotes the *resolved* target, which is exactly
-    the out-of-root path this guard exists to keep out of the record.
-
-    Args:
-        child: A symlinked child of the scan root, as scanned.
-        resolved_root: The scan root, already resolved exactly once by
-            :func:`_scannable_candidates`.
-
-    Returns:
-        ``True`` when the link's target is a descendant of *resolved_root*.
-    """
-    try:
-        child.resolve(strict=False).relative_to(resolved_root)
-    except (OSError, RuntimeError, ValueError):
-        return False
-    return True
+# ``resolves_within`` is re-exported, not defined here. It began as this
+# module's private ``_resolves_within``, was made public by #1293 when the
+# redaction CLI needed the same predicate for a directly-named path, and
+# moved to :mod:`creek._containment` in #1294 when the ingestor discovery
+# gate became its third consumer. Three copies of a containment predicate
+# are three predicates that drift; one definition cannot. The name stays
+# bound here because :mod:`creek.redact.cli_commands` imports it from this
+# module and ``_scannable_candidates`` below calls it.
+#
+# The dependency direction is deliberate: ``creek._containment`` is
+# stdlib-only and must not import this module back, because
+# :mod:`creek.ingest.base` depends on it and compiling this module's regex
+# battery on every ingest would be the cost of that cycle.
 
 
 def _scannable_candidates(dir_path: Path) -> tuple[list[Path], int]:
@@ -858,9 +836,12 @@ def _scannable_candidates(dir_path: Path) -> tuple[list[Path], int]:
       link — is still admitted here. That is not an oversight: it is the
       resolve-the-root / ``lstat``-the-leaf policy documented above, applied
       consistently on both surfaces.
-    * #1294 — the ingestor walks (e.g.
-      ``creek.ingest.markdown.MarkdownIngestor._read_directory``) still follow
-      symlinks out of the source root.
+    Closed since this docstring was written: #1294 — the ingestor walks no
+    longer follow symlinks out of the source root.
+    :func:`creek._containment.assert_source_contained` gates
+    ``Ingestor.ingest`` for every registered ingestor, so the pipeline
+    refusal built on this counter is now a second line of defence rather
+    than the only one.
 
     Args:
         dir_path: The scan root, exactly as the caller supplied it.

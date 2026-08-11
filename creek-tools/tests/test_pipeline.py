@@ -2037,6 +2037,16 @@ class TestPipelineAudiencePass:
 # same file through its own ``rglob("*.md")`` + ``read_bytes()`` with no
 # symlink check and no ``is_file`` check of its own. Skipping in the pipeline
 # would therefore convert "blocked ingest" into "silent unredacted ingest".
+#
+# #1294 closed that second walk: ``Ingestor.ingest`` now refuses an escaping
+# link before ``discover()`` runs. The two tests below are UNCHANGED by it and
+# must stay that way. ``Pipeline.run`` orders the stages redaction (Stage 1,
+# ``creek/pipeline.py:350``) then ingestion (Stage 2, ``:364``), so with the
+# default ``redaction.enabled: true`` the scan still declines the file first
+# and ``SymlinkEscapedSourceError`` still wins the race to raise. The new
+# ingest guard only becomes observable through ``creek process`` when
+# redaction is switched off — which is the config-toggle hole #1294 names,
+# and which the last test in this file now pins.
 # ---------------------------------------------------------------------------
 
 _ESCAPED_CANARY = "CANARY-PIPELINE-SYMLINK-4c21"
@@ -2185,4 +2195,78 @@ def test_symlink_refusal_is_not_waived_by_redaction_dry_run(
     assert _ESCAPED_CANARY not in written, (
         "redaction.dry_run waived a path-traversal refusal and the "
         f"out-of-tree file was ingested.\n\n{written}"
+    )
+
+
+def test_process_refuses_an_escaping_symlink_with_redaction_disabled(
+    vault_path: Path,
+    tmp_path: Path,
+) -> None:
+    """RED for #1294: the config toggle no longer decides containment.
+
+    ``_run_redaction`` returns early on ``redaction.enabled: false``
+    (``creek/pipeline.py:481``), taking the #1087 symlink check with it —
+    the stage docstring says so in as many words and points at this issue.
+    So at HEAD the *same tree* that ``creek process`` refuses outright with
+    the default config is ingested, unredacted, the moment an operator sets
+    one boolean. A containment guarantee that a config key can switch off is
+    not a guarantee; it is a default.
+
+    The refusal now comes from the ingest chokepoint instead, so the error
+    type is :class:`creek._containment.EscapingSymlinkError` rather than
+    :class:`~creek.pipeline.SymlinkEscapedSourceError`. That is deliberate
+    and not an oversight to be "tidied" later: ``SymlinkEscapedSourceError``
+    carries a ``skipped_count`` describing how many files *the scan* declined
+    to read, and here no scan ran at all — there is no honest number to put
+    in it.
+
+    Args:
+        vault_path: Vault root the run would write into.
+        tmp_path: Pytest-provided temporary directory.
+    """
+    from creek._containment import EscapingSymlinkError
+
+    source = tmp_path / "source-redaction-off"
+    source.mkdir()
+    (source / "clean.md").write_text(
+        "# Ordinary notes\n\nNothing sensitive here.\n",
+        encoding="utf-8",
+    )
+    outside = tmp_path / "outside-redaction-off"
+    outside.mkdir()
+    secret = outside / "secret.md"
+    secret.write_text(
+        f"# {_ESCAPED_CANARY}\n\n{_ESCAPED_PII}\n",
+        encoding="utf-8",
+    )
+    (source / "link.md").symlink_to(secret)
+
+    config = CreekConfig()
+    config.redaction.enabled = False
+    pipeline = Pipeline(config=config, no_llm=True)
+
+    with pytest.raises(EscapingSymlinkError) as excinfo:
+        pipeline.run(source_path=source, vault_path=vault_path)
+
+    assert excinfo.value.root == source, (
+        "the refusal names the wrong source tree, so an operator cannot "
+        f"tell which input stopped.\n\nroot: {excinfo.value.root}"
+    )
+    assert excinfo.value.path == source / "link.md", (
+        "the refusal names the wrong entry; it must name the link exactly "
+        f"as walked.\n\npath: {excinfo.value.path}"
+    )
+    written = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in sorted(vault_path.rglob("*"))
+        if path.is_file()
+    )
+    assert _ESCAPED_CANARY not in written, (
+        "with redaction disabled, the ingestor walks followed the symlink "
+        "out of the source tree and wrote the target into the vault. This "
+        "is #1294: the same tree behaves differently depending on a config "
+        f"toggle.\n\n{written}"
+    )
+    assert _ESCAPED_PII not in written, (
+        f"the out-of-tree file's PII reached the vault.\n\n{written}"
     )

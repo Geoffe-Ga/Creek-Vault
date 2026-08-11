@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from creek._containment import EscapingSymlinkError
 from creek.ingest import INGESTOR_REGISTRY, assemble_ingested_fragment
 from creek.models import PrivacyTier
 from creek.vault.writer import VaultWriter
@@ -97,7 +98,19 @@ def ingest_tool(
         )
 
     writer = VaultWriter(vault_path=vault_path)
-    ingest_result = ingestor_cls().ingest(resolved)
+    try:
+        ingest_result = ingestor_cls().ingest(resolved)
+    except EscapingSymlinkError as exc:
+        # ``resolve_within_vault`` above confines the path the caller NAMED;
+        # it says nothing about a link *underneath* a legitimately in-vault
+        # source. Refusals on this surface are structured responses, so the
+        # containment error must not surface as a transport crash (#1294).
+        # ``exc.path`` names the link as walked, never its resolved target.
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason=(f"source tree contains a symlink that escapes it: {exc.path}"),
+        )
     written_ids: list[str] = []
     errors: list[str] = list(ingest_result.errors)
     for parsed in ingest_result.fragments:

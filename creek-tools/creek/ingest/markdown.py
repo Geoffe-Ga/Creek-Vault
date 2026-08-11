@@ -328,6 +328,14 @@ class MarkdownIngestor(Ingestor):
         """
         docs: list[RawDocument] = []
         for md_file in sorted(dir_path.rglob("*.md")):
+            # Alone among the ingestors this walk had no ``is_file()`` filter,
+            # so a directory or a dangling link named ``*.md`` reached
+            # ``read_bytes()`` and raised. ``_discover_safe`` would collect
+            # that and return ``[]``, which arms ``tomb_missing_units`` — one
+            # unreadable entry would orphan the whole source. Robustness fix
+            # alongside #1294's containment gate, not the containment fix.
+            if not md_file.is_file():
+                continue
             raw_bytes = md_file.read_bytes()
             _text, encoding = normalize_encoding(raw_bytes)
             docs.append(

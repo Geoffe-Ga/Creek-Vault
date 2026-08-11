@@ -23,6 +23,41 @@ If `--type` is omitted, `creek process` picks ingestors by file extension.
 
 `gdrive` is **not** a `--type` (ARCH-001) — it is a downloader. Run `creek gdrive --download --staging <dir>` to mirror Drive files locally, then run `creek ingest --type document --input <dir>` (or `--type spreadsheet`, etc.) against the staged directory. See [Google Drive](#google-drive) below.
 
+## Symlinks in a source tree
+
+Ingestion refuses a source tree that links out of itself. If any entry under
+`--input` is a symlink whose target resolves outside that tree — or if
+`--input` is itself such a link — the run stops with exit 1 and writes
+nothing:
+
+```
+Symlink containment: Refusing to ingest /Users/me/exports: /Users/me/exports/notes/link.md
+is a symlink whose target resolves outside that tree, so ingestion would write content
+from outside the source into the vault. Remove or re-point the link, or ingest the
+target's own directory directly.
+```
+
+This applies to every `--type`, to `creek process`, and to the
+`creek.ingest` MCP tool, and it holds regardless of `redaction.enabled` —
+containment is not part of the PII scan. There is no override flag; the fix
+is to remove the link, re-point it inside the tree, or name the target's own
+directory as `--input`.
+
+On both `creek ingest` and `creek process` the refusal lands *before* the
+first-time consent prompt, not after it. That ordering is the point: the
+prompt's `Found: N file(s), X MB` / `Sample: ...` summary is built by walking
+the source tree and `stat()`ing every entry, which follows an escaping link.
+Refusing first means no out-of-tree filename is ever printed, and — under
+`--yes`, which records consent immediately — no file count measured through
+a link is ever written into
+`00-Creek-Meta/Processing-Log/consent-log.json`, where it would persist and
+suppress the prompt on every later run.
+
+Symlinks that stay **inside** the source tree are fine and keep working, so
+an ordinary alias (`latest -> 2026-08-01`, or `alias.md -> real.md`) needs no
+change. A tree reached *through* a symlink is also fine — only links that
+leave the named root are refused.
+
 ## Common patterns
 
 ```bash
