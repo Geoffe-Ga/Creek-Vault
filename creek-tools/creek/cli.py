@@ -455,29 +455,38 @@ def _parse_since_arg(text: str) -> datetime:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
-def _print_ingest_warning(message: str) -> None:
-    """Show one ingest advisory to the operator, as it is detected (#1329).
+def _print_advisory(message: str) -> None:
+    """Show one operator advisory on the console, as it is detected (#1329).
 
-    Warnings go to the same stdout console as every other ``creek ingest``
-    advisory (``_warn_if_discovered_but_empty``, ``_print_pin_findings``)
-    rather than to stderr: this command's output is human prose, not data on a
-    pipe, and an advisory routed to a stream none of its neighbours use is one
-    an operator can lose.
+    Advisories go to the same stdout console as every other advisory the
+    surrounding command prints, rather than to stderr: these commands' output
+    is human prose, not data on a pipe, and an advisory routed to a stream
+    none of its neighbours use is one an operator can lose.
 
-    The exit code is deliberately left alone. A warning reports vault state
+    The exit code is deliberately left alone. An advisory reports vault state
     that will cause trouble later, not a failure of this run — and
-    ``creek sync`` shares this path, so escalating would turn every scheduled
-    pass over an un-migrated vault into a hard failure.
+    ``creek sync`` shares the ingest path, so escalating would turn every
+    scheduled pass over an un-migrated vault into a hard failure.
 
     ``escape`` and ``soft_wrap=True`` are load-bearing for the same reasons as
-    in :func:`_print_pin_findings`: the text carries a shell command the
-    operator is meant to copy, and rich would otherwise be free to wrap it
-    across lines (or read a bracketed path as markup).
+    in :func:`_print_pin_findings`: the text carries paths and commands the
+    operator is meant to read or copy, and rich would otherwise be free to
+    wrap them across lines (or read a bracketed path as markup — a paradox
+    advisory names ``[[wikilink]]`` literally).
+
+    Args:
+        message: The advisory text from the pipeline that detected it.
+    """
+    console.print(f"[yellow]{escape(message)}[/yellow]", soft_wrap=True)
+
+
+def _print_ingest_warning(message: str) -> None:
+    """Show one ingest advisory to the operator, as it is detected (#1329).
 
     Args:
         message: The advisory text from the ingest pipeline.
     """
-    console.print(f"[yellow]{escape(message)}[/yellow]", soft_wrap=True)
+    _print_advisory(message)
 
 
 def _run_ingest(
@@ -3882,7 +3891,13 @@ def _report_paradox(vault_path: Path, override: PrivacyTierOverride) -> None:
 
     Wires the implemented ``ParadoxDetector`` to a runnable command: scans the
     vault for contradictory pairs and writes one neutral note per paradox into
-    ``10-Liminal/Paradoxes/``. Idempotent; deterministic (no LLM).
+    ``10-Liminal/Paradoxes/``. Deterministic (no LLM), and idempotent because
+    the generator skips pairs an existing note already records (#1320) — so a
+    re-run on a later day writes nothing rather than a second copy.
+
+    Any pre-#1320 duplicate copies already in the vault are reported through
+    ``on_warning`` as they are detected, before the empty/success line, and are
+    never deleted.
 
     Args:
         vault_path: Vault root.
@@ -3898,11 +3913,20 @@ def _report_paradox(vault_path: Path, override: PrivacyTierOverride) -> None:
     from creek.generate.paradox import generate_paradoxes
 
     config = _load_config_for_vault(vault_path)
-    written = generate_paradoxes(vault_path, config.embeddings)
+    written = generate_paradoxes(
+        vault_path,
+        config.embeddings,
+        on_warning=_print_advisory,
+    )
     if not written:
+        # Deliberately covers both empty cases: no contradictory pair exists,
+        # and every pair that exists is already recorded. `generate_paradoxes`
+        # returns `[]` for both and the difference does not change what the
+        # operator should do — the notes they want are in the folder either way.
         console.print(
-            "[yellow]No paradox notes generated: "
-            "no contradictory fragment pairs found.[/yellow]",
+            "[yellow]No paradox notes generated: no contradictory fragment "
+            "pairs beyond those already recorded in "
+            "10-Liminal/Paradoxes/.[/yellow]",
         )
         return
     console.print(

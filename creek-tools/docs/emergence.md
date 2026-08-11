@@ -46,6 +46,8 @@ Four detection rules; a fragment pair matching any one becomes a paradox:
 
 Output: a note in `10-Liminal/Paradoxes/` linking both fragments, a neutral description of the tension, and the `#paradox` tag plus relevant frequency tags. CLI: `creek report --type paradox`.
 
+Re-running is idempotent (#1320) — a fragment pair already captured by an existing note is skipped, never rewritten, so a note you have annotated survives every later run. The key is the note's `fragments:` frontmatter, not its filename: the filename embeds the detection date, so before #1320 a weekly run left one copy of every paradox per calendar day. Vaults that already hold those copies are told so, by count and by path, on the next run — and nothing is deleted for you, because which copy carries your reflection is not a judgement the generator gets to make.
+
 ---
 
 ## §10.3 — Synchronicity Detection
