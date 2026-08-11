@@ -246,10 +246,6 @@ def _ledgered_names_for_id(vault_path: Path, external_id: str) -> dict[str, list
     A ledger record survives the file it points at, so this survey does not
     go blind at exactly the moment it matters.
 
-    Args:
-        vault_path: Vault root.
-        external_id: The caller's idempotency key.
-
     Tombed records are counted too (:meth:`~creek.ingest.ledger.SourceLedger.all_keys`,
     not ``live_keys``): a soft-tombed fragment still exists, under
     ``10-Liminal/Orphaned/``, and for a gate whose failure mode is

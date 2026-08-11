@@ -154,6 +154,35 @@ def _sheet_unit_keys(sheets: Sequence[SheetData]) -> list[str | None]:
     return units
 
 
+def _sheet_label(fragment: ParsedFragment) -> str:
+    """Return the operator-visible name of *fragment*'s sheet (#1305).
+
+    The **de-duplicated** ``source_unit``, never the raw
+    ``metadata["sheet"]``. Excel forbids duplicate sheet titles but a
+    hand-built workbook does not, and two sheets both named ``Data`` carry
+    the identical raw name. :func:`_sheet_unit_keys` already resolved that
+    collision into ``Data`` and ``Data~2``; deriving the title and the body
+    heading from the raw name instead hands the operator two fragments with
+    distinct ids, distinct files and identical text — disambiguated in the
+    index, indistinguishable everywhere they actually read it.
+
+    Consuming the unit also makes the visible label and the ``…#<unit>``
+    source key the same string, so a fragment can be matched by eye to the
+    ledger and purge records that name it.
+
+    Args:
+        fragment: A parsed spreadsheet fragment.
+
+    Returns:
+        The fragment's ``source_unit`` when it has one, else the raw sheet
+        name. That fallback is reached only by a source carrying no unit at
+        all — a CSV, a one-sheet XLSX — which has no sibling to be confused
+        with, and whose pre-#1305 rendering is preserved verbatim so no
+        fragment already in a vault is re-titled.
+    """
+    return fragment.source_unit or str(fragment.metadata.get("sheet", "Sheet"))
+
+
 @dataclass(frozen=True)
 class WorkbookData:
     """A workbook (XLSX or CSV) decomposed into sheets.
@@ -542,13 +571,17 @@ class SpreadsheetIngestor(Ingestor):
         return fragments
 
     def convert_to_markdown(self, fragment: ParsedFragment) -> str:
-        """Render the sheet as a GFM table with optional summary truncation."""
+        """Render the sheet as a GFM table with optional summary truncation.
+
+        #1305: the heading names the sheet by its **de-duplicated unit**
+        via :func:`_sheet_label`, not by the raw sheet name. See that
+        function for why the distinction is the whole point.
+        """
         headers, rows = _extract_headers_and_rows(fragment)
-        sheet_name = str(fragment.metadata.get("sheet", "Sheet"))
         original = Path(
             str(fragment.metadata.get("original_file", fragment.source_path))
         )
-        lines = [f"# {original.name} — {sheet_name}", ""]
+        lines = [f"# {original.name} — {_sheet_label(fragment)}", ""]
         if not headers and not rows:
             lines.append("_(empty sheet)_")
             return "\n".join(lines) + "\n"
@@ -563,8 +596,9 @@ class SpreadsheetIngestor(Ingestor):
         present; absent for CSV and for XLSX files whose core
         properties carry no creation date.
 
-        #1305: ``title`` is now always emitted, and names the sheet when
-        the fragment carries a sheet unit. Two reasons it cannot be left
+        #1305: ``title`` is now always emitted, and names the sheet — by
+        its de-duplicated unit, see :func:`_sheet_label` — when the
+        fragment carries one. Two reasons it cannot be left
         to the ``setdefault`` fallback in
         :func:`~creek.ingest.base.assemble_ingested_fragment`. First, that
         fallback is ``Path(source_path).stem``, which is the *workbook*
@@ -589,12 +623,7 @@ class SpreadsheetIngestor(Ingestor):
             fragment.metadata.get("original_file", fragment.source_path)
         )
         stem = Path(original_file).stem
-        sheet_name = str(fragment.metadata.get("sheet", "")).strip()
-        # A blank sheet name falls back to its unit key rather than to the
-        # empty string, which would render as ``"book — "`` and sanitise to
-        # a bare ``book`` — indistinguishable from the no-unit case.
-        label = sheet_name or fragment.source_unit
-        title = f"{stem} — {label}" if fragment.source_unit else stem
+        title = f"{stem} — {_sheet_label(fragment)}" if fragment.source_unit else stem
         frontmatter_dict: dict[str, Any] = {
             "type": "fragment",
             "title": title,

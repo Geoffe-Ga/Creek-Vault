@@ -1501,6 +1501,64 @@ class TestMultiSheetWorkbookIdentity:
         assert len({item.fragment.id for item in assembled}) == 3
         assert len(_fragment_files(vault)) == 3
 
+    def test_duplicate_sheet_names_get_distinct_titles_and_headings(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Two sheets named ``Data`` must be tellable apart *on disk*.
+
+        The sibling test above proves the two sheets get distinct ids and
+        two files. That is disambiguation in the index — an operator never
+        reads an index. Both user-visible strings, the ``title`` in
+        frontmatter and the ``# `` heading in the body, were derived from
+        the RAW ``metadata["sheet"]`` name, which is ``Data`` for both
+        sheets. So the fix produced two fragments the operator opens and
+        cannot distinguish: same title, same heading, same rendered table
+        shape, differing only in a ``frag-<12hex>`` id and a ``-1``
+        de-collision suffix the writer had to invent because the computed
+        filenames collided too.
+
+        The deduplicated ``source_unit`` (``Data`` / ``Data~2``) is the
+        string that already resolved this, and is what both surfaces must
+        consume. Asserted against file bytes rather than the assembled
+        model, because the frontmatter round-trip is where the sibling
+        keys ``sheet`` / ``rows`` / ``columns`` are silently dropped
+        (#1392) — an in-memory assertion would not have noticed that the
+        title is the only per-sheet marker left.
+        """
+        source = tmp_path / "book.xlsx"
+        _write_xlsx_placeholder(source)
+        vault = _scaffold_vault(tmp_path)
+        backend = StubSpreadsheetBackend(
+            workbooks={"book.xlsx": _stub_workbook(["Data", "Data"])},
+        )
+
+        assembled = _assemble_all(SpreadsheetIngestor(backend=backend), source)
+        _write_all(vault, assembled)
+
+        files = _fragment_files(vault)
+        assert len(files) == 2
+        loaded = [frontmatter.load(path) for path in files]
+
+        titles = sorted(str(post.metadata["title"]) for post in loaded)
+        assert titles == ["book — Data", "book — Data~2"]
+
+        headings = sorted(
+            line
+            for post in loaded
+            for line in post.content.splitlines()
+            if line.startswith("# ")
+        )
+        assert headings == ["# book.xlsx — Data", "# book.xlsx — Data~2"]
+
+        # Distinct titles mean distinct computed filenames, so the writer
+        # has no name clash to de-collide. A ``-1`` tail is the on-disk
+        # signature of two fragments that both wanted the same name.
+        assert sorted(_title_part(path) for path in files) == [
+            "book--Data",
+            "book--Data2",
+        ]
+
     def test_inserting_a_first_sheet_does_not_re_mint_existing_ids(
         self,
         tmp_path: Path,
