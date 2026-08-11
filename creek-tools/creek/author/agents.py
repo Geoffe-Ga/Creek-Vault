@@ -45,7 +45,7 @@ from creek.models import (
     PrivacyTier,
     VoiceRegister,
 )
-from creek.vault.reader import iter_vault_fragments
+from creek.vault.reader import CORPUS_SUBDIRS, iter_vault_fragments
 
 if TYPE_CHECKING:
     from enum import StrEnum
@@ -56,9 +56,6 @@ if TYPE_CHECKING:
     from creek.models import Fragment
 
 _DimT = TypeVar("_DimT", bound="StrEnum")
-
-#: Vault subtrees the specialists draw evidence from.
-_CORPUS_SUBDIRS: tuple[str, ...] = ("01-Fragments", "09-Reference", "11-Other-Authors")
 
 #: Obsidian wikilink target, ignoring any ``|alias`` or ``#heading`` suffix.
 _WIKILINK = re.compile(r"\[\[([^\]|#]+)")
@@ -110,7 +107,7 @@ def _load_corpus(
     ``override`` of ``None`` defaults to ``OPEN`` (the most restrictive).
     """
     records: list[tuple[Fragment, str]] = []
-    for sub in _CORPUS_SUBDIRS:
+    for sub in CORPUS_SUBDIRS:
         for _path, fragment, body, _meta in iter_vault_fragments(vault / sub):
             if tier_within_override(fragment.privacy_tier, override):
                 records.append((fragment, body))
@@ -126,6 +123,20 @@ def fragment_tier_map(
     Built from the same override-filtered corpus the specialists gather from, so
     the desk can derive a run's *content tier* (the most-sensitive tier actually
     in the evidence) and route the voice call accordingly.
+
+    This is the **admitted** view of the corpus, and it diverges from the leak
+    gate's on purpose. Here an id seen twice resolves last-wins in
+    :data:`~creek.vault.reader.CORPUS_SUBDIRS` order over records that already
+    passed ``tier_within_override``, because the question is "what is in the
+    evidence this run may use". The HARD gate at
+    :func:`creek.author.checks._resolve_cited_tiers` reads the *unfiltered*
+    corpus and resolves most-restrictive-wins, because its question is "what is
+    the true tier of the text this draft reproduces" — a gate that only saw the
+    admitted view would be blind to exactly the content it exists to catch.
+    The divergence is deliberate, and pinned by
+    ``test_leak_gate_reads_the_true_tier_while_the_router_reads_the_admitted_one``
+    in ``tests/test_reflection.py``, so a future "make these agree" cleanup has
+    to argue with a named assertion rather than a silent assumption.
 
     Args:
         vault: Vault root.

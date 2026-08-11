@@ -4,10 +4,15 @@ from creek.vault.authors import (
     load_author_manifest,
     load_author_manifest_or_default,
 )
-from creek.vault.reader import iter_vault_fragments, try_load_fragment
+from creek.vault.reader import (
+    CORPUS_SUBDIRS,
+    iter_vault_fragments,
+    try_load_fragment,
+)
 from creek.vault.writer import VaultWriter
 
 __all__ = [
+    "CORPUS_SUBDIRS",
     "VaultWriter",
     "iter_vault_fragments",
     "load_author_manifest",

@@ -90,6 +90,15 @@ The reflection node scores a draft across six rubric dimensions:
 - `paradox_preservation`
 - `attribution_correctness`
 
+`privacy_compliance` is a HARD gate, and it polices **every** subtree the
+specialists draw evidence from — `01-Fragments`, `09-Reference` and
+`11-Other-Authors`. Both sides read one definition of that list
+(`creek.vault.reader.CORPUS_SUBDIRS`), so the gate cannot fall behind the
+specialists it polices. A cited fragment id present in more than one subtree
+resolves to its **most restrictive** tier, and every body stored under that id
+is checked against the draft — the lower-tier twins' bodies included, because
+the tier is a property of the id rather than of the file that happened to win.
+
 A clean draft returns `PASS`. One or more findings return `REVISE`, which the
 conductor retries within the round budget. A draft that cannot be authored at
 all — or that never clears `REVISE` before the budget is exhausted — returns

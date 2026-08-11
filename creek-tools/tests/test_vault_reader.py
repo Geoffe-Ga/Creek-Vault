@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import ast
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from creek import author as author_pkg
+from creek.author import agents as author_agents
+from creek.author import checks as author_checks
 from creek.models import Fragment, FragmentSource, SourcePlatform
+from creek.vault import authors as vault_authors
+from creek.vault import reader as vault_reader
 from creek.vault.reader import iter_vault_fragments, try_load_fragment
 from tests.helpers import write_fragment_file
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def test_try_load_fragment_returns_triple(tmp_path: Path) -> None:
@@ -213,3 +216,123 @@ def test_try_load_fragment_round_trips_hierarchy_fields(tmp_path: Path) -> None:
     assert raw["child_ids"] == ["frag-hier-kidaa", "frag-hier-kidbb"]
     assert raw["level"] == "section"
     assert raw["structural_path"] == ["Essay", "Part 2"]
+
+
+# ---------------------------------------------------------------------------
+# #1341 — one definition of "the corpus", or the leak gate goes blind again
+#
+# ``creek/author/agents.py`` listed the three subtrees the desk reads;
+# ``creek/author/checks.py`` hardcoded ``01-Fragments`` and read one. The two
+# lists disagreeing is the whole defect, so the fix is not "add two strings to
+# the gate" — it is "there is only one list, and it lives under ``creek.vault``
+# with the rest of the vault-layout knowledge."
+# ---------------------------------------------------------------------------
+
+_CORPUS_ROOTS = ("01-Fragments", "09-Reference", "11-Other-Authors")
+"""The three vault subtrees the Writing Desk draws evidence from.
+
+Spelled out here rather than imported so the AST sweep below fails on what it
+is meant to find — a hardcoded root in a desk module — instead of on an import
+error. Drift between this literal and the shipped constant is what
+:func:`test_the_leak_gate_and_the_specialists_read_one_corpus_definition`
+catches.
+"""
+
+
+def _author_package_root() -> Path:
+    """Return the on-disk directory holding the ``creek.author`` package.
+
+    Derived from the imported package rather than a repository-relative path so
+    the sweep follows the installed package wherever the test runs from.
+
+    Returns:
+        The directory containing ``creek/author/__init__.py``.
+    """
+    origin = author_pkg.__file__
+    assert origin is not None  # a regular package always has a file origin
+    return Path(origin).parent
+
+
+def _non_docstring_strings(tree: ast.Module) -> list[str]:
+    """Return every string constant in *tree* that is not in a docstring position.
+
+    A docstring — module, class, function, or the PEP-257-style *attribute*
+    docstring this repo writes after an assignment — is a bare expression
+    statement whose value is a string constant. That is a superset of what
+    :func:`ast.get_docstring` reports (which covers only ``Module`` /
+    ``ClassDef`` / ``FunctionDef`` / ``AsyncFunctionDef``), so skipping bare
+    ``Expr(Constant(str))`` statements excludes every kind at once. Prose is
+    allowed to name a vault folder; *code* is not.
+
+    Args:
+        tree: A parsed module.
+
+    Returns:
+        The remaining string constants, in walk order.
+    """
+    docstring_positions = {
+        id(node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+    }
+    return [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstring_positions
+    ]
+
+
+def test_the_leak_gate_and_the_specialists_read_one_corpus_definition() -> None:
+    """The gate and the specialists must share one corpus-subtree object (#1341).
+
+    Asserted by **identity**, not equality: two hardcoded lists that happen to
+    match today would satisfy ``==`` and then drift apart on the next edit —
+    which is precisely how ``check_privacy_compliance`` came to police one
+    subtree while ``_load_corpus`` gathered from three. ``is`` can only be
+    satisfied by both modules reading the same object.
+
+    The definition belongs beside the rest of the vault-layout knowledge in
+    :mod:`creek.vault.reader`, and its ``11-Other-Authors`` entry must be the
+    already-canonical :data:`creek.vault.authors.OTHER_AUTHORS_DIR` rather than
+    a fourth copy of that string.
+
+    Today this fails with ``AttributeError`` — the constant does not exist yet.
+    """
+    assert tuple(vault_reader.CORPUS_SUBDIRS) == _CORPUS_ROOTS
+    assert author_checks.CORPUS_SUBDIRS is vault_reader.CORPUS_SUBDIRS
+    assert author_agents.CORPUS_SUBDIRS is vault_reader.CORPUS_SUBDIRS
+    assert vault_reader.CORPUS_SUBDIRS[2] == vault_authors.OTHER_AUTHORS_DIR
+
+
+def test_no_desk_module_hardcodes_a_corpus_root() -> None:
+    """No module under ``creek/author/`` may spell a corpus root in code (#1341).
+
+    The forcing function for the constant above: an AST sweep of every desk
+    module for a string constant — outside any docstring — containing one of
+    the three corpus roots. A second literal is a second source of truth, and
+    the first one that fell out of step is what made the HARD privacy gate
+    blind to ``09-Reference`` and ``11-Other-Authors``.
+
+    Only the three exact root strings are matched. A shape-based rule such as
+    ``^\\d{2}-[A-Za-z]`` would reject ``creek/author/contracts.py``'s
+    legitimate ``("00-Creek-Meta", "Skills", "mediums")`` tuple, which names a
+    *different* part of the vault and is not the constant under discussion.
+
+    Today this fails naming two offenders: ``agents.py``'s ``_CORPUS_SUBDIRS``
+    tuple and ``checks.py``'s ``vault / "01-Fragments"``.
+    """
+    offenders: list[str] = []
+    for module_path in sorted(_author_package_root().rglob("*.py")):
+        tree = ast.parse(module_path.read_text(encoding="utf-8"))
+        offenders.extend(
+            f"{module_path.name}: {text!r}"
+            for text in _non_docstring_strings(tree)
+            if any(root in text for root in _CORPUS_ROOTS)
+        )
+
+    assert offenders == [], (
+        "Desk modules must import the corpus subtrees from creek.vault.reader "
+        f"instead of spelling them: {offenders}"
+    )
