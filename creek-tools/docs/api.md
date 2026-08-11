@@ -183,12 +183,49 @@ not encryption at rest, not attestation, and not key custody, and it does not
 satisfy an intimate-transit contract. That is entirely
 [#757](https://github.com/Geoffe-Ga/Creek-Vault/issues/757)'s.
 
+## Caching
+
+Every response `creek-tools-api` builds carries both of these, on every status:
+
+```
+Vary: X-Creek-Tier-Ceiling, Authorization
+Cache-Control: no-store
+```
+
+Every `/v1` body is computed from two things a cache cannot see in the URL: the
+**declared tier ceiling** and the **authenticated consumer**. An entry keyed on
+neither — or on only one of them — may be handed to a caller the server would
+have answered differently. `Cache-Control: no-store` says do not keep it;
+`Vary` says that if you keep it anyway, these are the headers that decide
+whether it matches. The two answer different failure modes and neither replaces
+the other: drop the directive and a compliant cache is free to store, drop the
+tokens and a non-compliant one is free to mismatch.
+
+**These are unconditional, not "on authenticated responses".** Bearer
+authentication sits above the router, so all five routes are authenticated
+anyway; and refusals need the treatment as much as successes. A stored `404`
+is the concrete case — it is the one status this surface returns that both is
+reachable on any unrouted path and is *heuristically cacheable* under RFC 9110
+§15.1, so a conforming shared cache may store and reuse it with no freshness
+information at all.
+
+**Scope.** This is a promise about responses the application builds. Two paths
+answer a client without passing through that builder: a trailing slash is
+answered by the router's own `307`
+([#1369](https://github.com/Geoffe-Ga/Creek-Vault/issues/1369)), and a fault in
+the outermost middleware escapes as a bare `text/plain` `500`
+([#1370](https://github.com/Geoffe-Ga/Creek-Vault/issues/1370)). Neither
+carries these headers.
+
+**If you front this server with a reverse proxy, do not enable caching on
+`/v1`.** The [access-log scope note](#request-logging) applies here too: a proxy
+that ignores `no-store` is outside this process and nothing here can stop it.
+
 ## Privacy tiers
 
 The ceiling arrives on `X-Creek-Tier-Ceiling` and defaults to `open` when absent
-— fail closed. Every response carries `Vary: X-Creek-Tier-Ceiling`, so an
-intermediary cache cannot serve one caller's ceiling-filtered response to
-another.
+— fail closed. See [Caching](#caching) for the two response headers that stop an
+intermediary serving one caller's ceiling-filtered response to another.
 
 **`intimate` and `all` are refused at the edge, before any handler runs and
 before any vault read is attempted.** `/v1` is remote by construction, so every
