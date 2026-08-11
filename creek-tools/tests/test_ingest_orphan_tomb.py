@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import frontmatter
 import pytest
@@ -19,11 +19,10 @@ import pytest
 from creek.cli import _run_ingest
 from creek.ingest import INGESTOR_REGISTRY
 from creek.ingest.ledger import SourceLedger
+from creek.ingest.markdown import _infer_platform
+from creek.ingest.pipeline import TOMBING_SOURCES, tomb_missing_units
 from creek.models import Fragment, FragmentSource, SourcePlatform
-from creek.vault.writer import VaultWriter
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from creek.vault.writer import _PLATFORM_SUBFOLDER, VaultWriter
 
 
 def _make_vault(tmp_path: Path) -> Path:
@@ -596,3 +595,408 @@ class TestOrphanLifecycle:
         rec = ledger.get("personal/journal/2026-06-26.md")
         assert rec is not None
         assert rec.tombed is False
+
+
+# ---- Nested platform subfolders (#1332) --------------------------------
+
+
+def _fragment_for(platform: str) -> Fragment:
+    """Build a fragment for *platform* with an id unique to that platform."""
+    return Fragment(
+        id=f"frag-{platform}-01",
+        title="Piece",
+        source=FragmentSource(platform=SourcePlatform(platform)),
+    )
+
+
+def _ledger_lines(vault: Path, source: str = "markdown") -> list[dict[str, object]]:
+    """Parse the ledger JSONL off disk, by hand, with no reload machinery.
+
+    ``SourceLedger.load`` collapses the append-only log to one record per
+    key, so it cannot answer "was a ``tombed: true`` line ever written?".
+    Reading the raw bytes can, which is the assertion #1332 needs: the bug
+    was a *record* that lied, not a lookup that returned the wrong thing.
+    """
+    path = SourceLedger.path_for(vault, source)
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+class TestNestedPlatformTombLookup:
+    """Every platform in the routing map must be tombable (#1332).
+
+    ``_PLATFORM_SUBFOLDER`` holds exactly one two-level value
+    (``substack -> "Writing/Substack"``), and the tomb lookup used to
+    enumerate only the immediate children of ``01-Fragments`` — so it
+    probed the empty ``Writing`` index and never descended into
+    ``Substack``. ``restore_fragment`` routes through
+    ``_fragment_target_dir`` and resolved the nested path correctly, so
+    the two halves of #674 disagreed with each other.
+    """
+
+    def test_the_routing_map_is_total_and_holds_a_nested_value(self) -> None:
+        """The parametrised sweep below is known to cover the nested case.
+
+        Guards two ways the sweep could go vacuous: a map that stopped
+        covering every ``SourcePlatform``, and a map with no multi-level
+        value left in it (which would make the whole nesting question
+        untested while every test still passed).
+        """
+        assert set(_PLATFORM_SUBFOLDER) == {str(p) for p in SourcePlatform}
+        assert len(_PLATFORM_SUBFOLDER) == 14
+        nested = {k: v for k, v in _PLATFORM_SUBFOLDER.items() if "/" in v}
+        assert nested, "no multi-level subfolder left; the nesting sweep is vacuous"
+
+    @pytest.mark.parametrize("platform", sorted(_PLATFORM_SUBFOLDER))
+    def test_every_platform_round_trips_through_a_tomb(
+        self, tmp_path: Path, platform: str
+    ) -> None:
+        """A written fragment is found and relocated for every platform."""
+        assert _PLATFORM_SUBFOLDER, "empty routing map would skip every case"
+        vault = _make_vault(tmp_path)
+        writer = VaultWriter(vault_path=vault)
+        fragment = _fragment_for(platform)
+        written = writer.write_fragment(fragment, body="body")
+        assert written.parent == vault / "01-Fragments" / _PLATFORM_SUBFOLDER[platform]
+
+        tombed = writer.tomb_fragment(fragment.id)
+
+        assert tombed is not None, f"tomb_fragment returned None for {platform}"
+        assert tombed.parent == vault / "10-Liminal" / "Orphaned"
+        assert not written.exists(), f"{platform} fragment still live at {written}"
+        post = frontmatter.load(str(tombed))
+        assert post["id"] == fragment.id
+        assert post["lifecycle"] == "orphaned"
+
+    def test_find_fragment_resolves_a_nested_subfolder_before_any_tomb(
+        self, tmp_path: Path
+    ) -> None:
+        """The public read-only lookup descends into ``Writing/Substack`` too."""
+        vault = _make_vault(tmp_path)
+        writer = VaultWriter(vault_path=vault)
+        fragment = _fragment_for(str(SourcePlatform.SUBSTACK))
+        written = writer.write_fragment(fragment, body="body")
+
+        assert written.parent == vault / "01-Fragments" / "Writing" / "Substack"
+        assert writer.find_fragment(fragment.id) == written
+
+    def test_a_three_level_subfolder_resolves_without_a_code_change(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Adding a deeper routing value must not need the scan updated.
+
+        The acceptance criterion for #1332: the search set is derived from
+        the routing map, so a hypothetical third level is covered the day
+        someone adds it rather than the day someone remembers to.
+        """
+        monkeypatch.setitem(
+            _PLATFORM_SUBFOLDER, str(SourcePlatform.OTHER), "Writing/Substack/Deep"
+        )
+        vault = _make_vault(tmp_path)
+        writer = VaultWriter(vault_path=vault)
+        fragment = _fragment_for(str(SourcePlatform.OTHER))
+        written = writer.write_fragment(fragment, body="body")
+
+        assert written.parent == vault / "01-Fragments/Writing/Substack/Deep"
+        assert writer.find_fragment(fragment.id) == written
+
+    def test_a_directory_the_map_does_not_name_is_still_searched(
+        self, tmp_path: Path
+    ) -> None:
+        """Back-compat: a hand-made ``01-Fragments`` subfolder still resolves.
+
+        The scan is the union of the map's values and what is actually on
+        disk. Narrowing it to the declared set alone would stop finding
+        fragments in any directory an older release, or the operator,
+        created — a silent regression this test refuses.
+        """
+        vault = _make_vault(tmp_path)
+        legacy = vault / "01-Fragments" / "LegacyCustom"
+        legacy.mkdir(parents=True)
+        (legacy / "note.md").write_text(
+            "---\nid: frag-legacy01\ntitle: Legacy\n---\nBody.\n", encoding="utf-8"
+        )
+
+        found = VaultWriter(vault_path=vault).find_fragment("frag-legacy01")
+
+        assert found == legacy / "note.md"
+
+    def test_substack_tomb_and_restore_agree_on_the_nested_path(
+        self, tmp_path: Path
+    ) -> None:
+        """The tomb/restore asymmetry #1332 names is closed in both directions.
+
+        ``restore_fragment`` routes through ``_fragment_target_dir`` and
+        always resolved ``Writing/Substack``; the tomb side did not. An
+        uncontended round trip must land back on the original filename.
+        """
+        vault = _make_vault(tmp_path)
+        writer = VaultWriter(vault_path=vault)
+        fragment = _fragment_for(str(SourcePlatform.SUBSTACK))
+        written = writer.write_fragment(fragment, body="body")
+
+        assert writer.tomb_fragment(fragment.id) is not None
+        assert not written.exists()
+
+        restored = writer.restore_fragment(fragment)
+
+        assert restored == written
+        assert _orphan_files(vault) == []
+        assert "lifecycle" not in frontmatter.load(str(restored)).metadata
+
+
+class TestLookupChangesNothing:
+    """Asking where a fragment is must not write to the vault (#1332).
+
+    ``find_fragment``'s docstring promised that "asking cannot change
+    anything". It could: a lookup over a directory holding nothing to
+    index persisted a zero-byte ``.id-index.jsonl`` there, and #1332
+    widens the set of directories a lookup visits — so the claim has to
+    become executable before the reach grows.
+    """
+
+    def test_a_missing_id_leaves_the_vault_byte_identical(self, tmp_path: Path) -> None:
+        """A lookup that finds nothing creates, removes and edits nothing."""
+        vault = _make_vault(tmp_path)
+        writer = VaultWriter(vault_path=vault)
+        writer.write_fragment(_journal_fragment(), body="body")
+        before = {
+            p.relative_to(vault): (p.read_bytes() if p.is_file() else None)
+            for p in vault.rglob("*")
+        }
+
+        assert writer.find_fragment("frag-absent") is None
+
+        after = {
+            p.relative_to(vault): (p.read_bytes() if p.is_file() else None)
+            for p in vault.rglob("*")
+        }
+        assert after == before
+
+    def test_a_miss_leaves_no_empty_index_behind(self, tmp_path: Path) -> None:
+        """Scanning an empty subfolder must not persist a zero-byte index.
+
+        The narrow companion to the snapshot above, naming the exact
+        artefact the issue reported: the failed Substack scan wrote
+        ``01-Fragments/Writing/.id-index.jsonl`` at zero bytes.
+        """
+        vault = _make_vault(tmp_path)
+        (vault / "01-Fragments" / "Writing").mkdir(parents=True, exist_ok=True)
+
+        assert VaultWriter(vault_path=vault).find_fragment("frag-absent") is None
+
+        stray = vault / "01-Fragments" / "Writing" / ".id-index.jsonl"
+        assert not stray.exists(), f"zero-byte index left at {stray}"
+
+    def test_find_tombed_fragment_reports_the_orphan_dir(self, tmp_path: Path) -> None:
+        """The new orphan-dir lookup answers what the tomb sweep asks it.
+
+        Mirrors ``test_public_find_existing_uses_lock``: the public shim
+        resolves a known id through the lock and reports ``None`` for an
+        unknown one. This is the evidence the sweep uses to tell "already
+        tombed" apart from "not found", so it may not guess either way.
+        """
+        vault = _make_vault(tmp_path)
+        writer = VaultWriter(vault_path=vault)
+        fragment = _journal_fragment()
+        live = writer.write_fragment(fragment, body="body")
+
+        assert writer.find_tombed_fragment(fragment.id) is None  # live, not tombed
+
+        tombed = writer.tomb_fragment(fragment.id)
+
+        assert not live.exists()
+        assert writer.find_tombed_fragment(fragment.id) == tombed
+        assert writer.find_tombed_fragment("frag-absent") is None
+
+
+# ---- The tomb record must not outrun the tomb (#1332) ------------------
+
+
+class TestTombOutcomeIsRecordedHonestly:
+    """``tomb_missing_units`` may only record what actually happened.
+
+    It used to discard ``tomb_fragment``'s return value and record
+    ``tombed=True`` unconditionally, so a lookup miss wrote a permanent
+    lie into the ledger and reported a tomb to the operator while the
+    fragment stayed live with no ``lifecycle`` marker.
+
+    These call ``tomb_missing_units`` directly rather than through
+    ``_ingest``: markdown ingest can only mint journal/essay/code/markdown
+    platforms, so the failure has to be staged at the unit boundary.
+    """
+
+    @staticmethod
+    def _stage(tmp_path: Path) -> tuple[Path, VaultWriter, SourceLedger]:
+        """Return a scaffolded vault with a writer and an empty ledger."""
+        vault = _make_vault(tmp_path)
+        return (
+            vault,
+            VaultWriter(vault_path=vault),
+            SourceLedger.load(vault, source="markdown"),
+        )
+
+    @staticmethod
+    def _sweep(
+        vault: Path, writer: VaultWriter, ledger: SourceLedger
+    ) -> tuple[int, list[str]]:
+        """Run a full-source tomb sweep that sees no live source units."""
+        errors: list[str] = []
+        count = tomb_missing_units(
+            ledger, writer, vault / "01-Fragments", set(), errors, "markdown"
+        )
+        return count, errors
+
+    def test_a_tomb_that_found_nothing_is_not_recorded_tombed(
+        self, tmp_path: Path
+    ) -> None:
+        """A miss reports an error and leaves the ledger record live."""
+        vault, writer, ledger = self._stage(tmp_path)
+        fragment = _journal_fragment()
+        written = writer.write_fragment(fragment, body="body")
+        moved = vault / "09-Reference" / written.name
+        moved.parent.mkdir(parents=True, exist_ok=True)
+        written.rename(moved)  # out of 01-Fragments: the lookup genuinely misses
+        ledger.record("personal/journal/gone.md", fragment.id, "hash-1")
+
+        count, errors = self._sweep(vault, writer, ledger)
+
+        assert count == 0
+        assert any("no fragment found to tomb" in e for e in errors)
+        assert moved.exists()
+        assert "lifecycle" not in frontmatter.load(str(moved)).metadata
+        assert _orphan_files(vault) == []
+        assert not any(
+            line["source_key"] == "personal/journal/gone.md" and line["tombed"]
+            for line in _ledger_lines(vault)
+        ), "a tombed=True line was written for a tomb that did not happen"
+        reloaded = SourceLedger.load(vault, source="markdown")
+        assert "personal/journal/gone.md" in reloaded.live_keys()
+
+    def test_an_already_tombed_fragment_converges_without_inflating_the_count(
+        self, tmp_path: Path
+    ) -> None:
+        """The ledger catches up to a tomb the vault can prove already happened.
+
+        A crash between ``tomb_fragment`` moving the file and
+        ``ledger.record`` appending the line leaves exactly this state.
+        Treating it as a hard failure would make it recur on every future
+        pass and never converge.
+        """
+        vault, writer, ledger = self._stage(tmp_path)
+        fragment = _journal_fragment()
+        writer.write_fragment(fragment, body="body")
+        already = writer.tomb_fragment(fragment.id)
+        assert already is not None
+        ledger.record("personal/journal/gone.md", fragment.id, "hash-1")
+
+        count, errors = self._sweep(vault, writer, ledger)
+
+        assert count == 0, "nothing was relocated by this call"
+        assert errors == []
+        assert _orphan_files(vault) == [already]
+        assert frontmatter.load(str(already))["lifecycle"] == "orphaned"
+        rec = SourceLedger.load(vault, source="markdown").get(
+            "personal/journal/gone.md"
+        )
+        assert rec is not None
+        assert rec.tombed is True
+
+    def test_a_successful_tomb_still_counts_and_records(self, tmp_path: Path) -> None:
+        """The guard must not be satisfiable by refusing to tomb anything."""
+        vault, writer, ledger = self._stage(tmp_path)
+        fragment = _journal_fragment()
+        written = writer.write_fragment(fragment, body="body")
+        ledger.record("personal/journal/gone.md", fragment.id, "hash-1")
+
+        count, errors = self._sweep(vault, writer, ledger)
+
+        assert count == 1
+        assert errors == []
+        assert not written.exists()
+        orphans = _orphan_files(vault)
+        assert len(orphans) == 1
+        assert frontmatter.load(str(orphans[0]))["lifecycle"] == "orphaned"
+        rec = SourceLedger.load(vault, source="markdown").get(
+            "personal/journal/gone.md"
+        )
+        assert rec is not None
+        assert rec.tombed is True
+
+    def test_the_reported_count_equals_the_number_relocated(
+        self, tmp_path: Path
+    ) -> None:
+        """A mixed batch reports the tombs it performed, not the units it saw."""
+        vault, writer, ledger = self._stage(tmp_path)
+        source = FragmentSource(platform=SourcePlatform.JOURNAL)
+        tombable = Fragment(id="frag-live001", title="Live", source=source)
+        writer.write_fragment(tombable, body="body")
+        ledger.record("personal/journal/a.md", tombable.id, "hash-a")
+
+        lost = Fragment(id="frag-lost001", title="Lost", source=source)
+        lost_path = writer.write_fragment(lost, body="body")
+        moved = vault / "09-Reference" / lost_path.name
+        moved.parent.mkdir(parents=True, exist_ok=True)
+        lost_path.rename(moved)
+        ledger.record("personal/journal/b.md", lost.id, "hash-b")
+
+        prior = Fragment(id="frag-prior01", title="Prior", source=source)
+        writer.write_fragment(prior, body="body")
+        writer.tomb_fragment(prior.id)
+        ledger.record("personal/journal/c.md", prior.id, "hash-c")
+        before = len(_orphan_files(vault))
+
+        count, errors = self._sweep(vault, writer, ledger)
+
+        assert count == 1
+        assert len(_orphan_files(vault)) == before + 1
+        assert len(errors) == 1
+        assert "frag-lost001" in errors[0]
+
+
+# ---- Why no shipped vault needs migrating (#1332) ----------------------
+
+
+class TestLedgeredTombingCannotMintANestedPlatform:
+    """The lookup half of #1332 is latent, so there is nothing to migrate.
+
+    A vault could only hold a ``tombed=True`` record for a fragment still
+    live under ``01-Fragments`` if the ledgered tomb sweep had missed a
+    *nested* fragment — and it cannot reach one. Tombing arms only for
+    the source types in ``TOMBING_SOURCES``, and the markdown ingestor,
+    the sole member, cannot mint a platform whose routing value has a
+    second level.
+
+    This is asserted rather than argued because it is the whole basis for
+    shipping no migration. The day someone arms tombing for a source type
+    that *can* mint ``substack``, this goes red and the migration
+    question becomes real again.
+    """
+
+    def test_only_markdown_tombs_and_markdown_routes_one_level_deep(self) -> None:
+        """No platform the tombing ingestor can produce is nested."""
+        assert frozenset({"markdown"}) == TOMBING_SOURCES
+        # `_detect_document_type` is documented and implemented to return
+        # exactly these four, so crossing them with the path heuristics
+        # enumerates every platform a markdown ingest can reach.
+        document_types = ("journal", "essay", "technical", "notes")
+        paths = (
+            Path("personal/journal/2026-01-01.md"),
+            Path("writing/essays/piece.md"),
+            Path("inbox/loose-note.md"),
+        )
+        reachable = {
+            _infer_platform(doc_type, path)
+            for doc_type in document_types
+            for path in paths
+        }
+
+        assert reachable, "empty reachable set would make this vacuous"
+        assert SourcePlatform.SUBSTACK not in reachable
+        nested = {p for p in reachable if "/" in _PLATFORM_SUBFOLDER[str(p)]}
+        assert nested == set(), f"a tombing ingest can now mint {nested}"

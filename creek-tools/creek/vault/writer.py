@@ -868,17 +868,78 @@ class VaultWriter:
             self._log_provenance_locked(fragment.id, fragment.type, existing)
         return existing
 
+    @staticmethod
+    def _fragment_search_dirs(fragments_root: Path) -> list[Path]:
+        """Return every directory under *fragments_root* a fragment may sit in.
+
+        The union of two sets, and both halves earn their place:
+
+        - **Declared** — every distinct value of :data:`_PLATFORM_SUBFOLDER`,
+          joined a segment at a time. This is what makes a *nested* value
+          reachable. ``substack -> "Writing/Substack"`` is the only two-level
+          entry today, and enumerating immediate children alone probed the
+          empty ``Writing`` index and never descended (#1332). Deriving the
+          set from the routing map means a future third level is covered the
+          day it is added rather than the day someone remembers the scan.
+        - **On disk** — the immediate child directories, which is what this
+          method used to return outright. Kept, because narrowing to the
+          declared set would newly *lose* fragments in any directory the map
+          no longer names — a hand-made folder, or one an older release
+          routed to. Shipping that inside a fix for "the lookup misses
+          things" would be the same defect wearing a tidier map.
+
+        Derived per call rather than memoised at import: the routing map is
+        monkeypatched by tests and read at call time by
+        :meth:`_fragment_target_dir`, so a frozen copy would answer for a map
+        that is no longer in force. The cost is a dozen path joins against an
+        ``iterdir`` syscall this method already pays.
+
+        Args:
+            fragments_root: The ``01-Fragments`` directory, which must exist.
+
+        Returns:
+            Deduplicated, sorted directories. Declared entries that do not
+            exist on disk are included and create nothing: the index load
+            returns an empty mapping for a non-directory. It does *cache*
+            that emptiness against the path, which is new — before #1332
+            only directories that already existed were ever visited — and
+            within one :class:`VaultWriter` it is harmless, because
+            :meth:`_write_model` mutates the same cached dict in place. It
+            does widen, by the width of one lookup, the cross-process index
+            staleness already declared out of scope for BUG-006 in the
+            ``self._lock`` docstring: another process could create and
+            populate a declared directory between this process caching it
+            empty and a later write in the same run.
+        """
+        declared = (
+            fragments_root.joinpath(*subfolder.split("/"))
+            for subfolder in dict.fromkeys(_PLATFORM_SUBFOLDER.values())
+        )
+        on_disk = (p for p in fragments_root.iterdir() if p.is_dir())
+        # Deduplicate on the resolved Path, not the string: ``Writing`` is
+        # both a declared value (ESSAY) and an on-disk child, and visiting it
+        # twice would let one lookup fire ``_repair_index_locked``'s append
+        # twice.
+        return sorted({*declared, *on_disk})
+
     def _find_in_fragments_locked(self, fragment_id: str) -> Path | None:
         """Return the live fragment file for *fragment_id* under 01-Fragments.
 
         Caller must hold ``self._lock``. Scans each platform subfolder's id
         index so a tomb does not need to know which subfolder a fragment
-        landed in.
+        landed in — including the nested ones, which is what
+        :meth:`_fragment_search_dirs` is for.
+
+        This searches ``01-Fragments`` only. A *borrowed* fragment lives
+        under ``11-Other-Authors/<slug>/`` (see :meth:`_fragment_target_dir`)
+        and is deliberately out of reach here; that gap is tracked in #1424,
+        and since #1332 a caller that cannot find a fragment is told so
+        rather than assuming the fragment was dealt with.
         """
         fragments_root = self.vault_path / _FRAGMENTS_RELPART
         if not fragments_root.is_dir():
             return None
-        for subdir in sorted(p for p in fragments_root.iterdir() if p.is_dir()):
+        for subdir in self._fragment_search_dirs(fragments_root):
             found = self._find_existing_locked(fragment_id, subdir)
             if found is not None:
                 return found
@@ -893,18 +954,54 @@ class VaultWriter:
         answer "does this vault still hold the id the old derivation would
         have minted?" without walking and parsing every fragment file.
 
-        Read-only and index-backed, so asking is cheap and asking cannot
-        change anything.
+        Read-only and index-backed, so asking is cheap. Asking also no
+        longer *writes*: until #1332 a lookup over a directory with nothing
+        to index persisted a zero-byte ``.id-index.jsonl`` into the
+        operator's vault, which made this paragraph's promise false in
+        exactly the directories the nested-subfolder fix now visits. See
+        :meth:`_load_index_locked`.
 
         Args:
             fragment_id: The id to look for.
 
         Returns:
-            The fragment's path, or ``None`` when the vault does not hold
-            it (including when ``01-Fragments/`` does not exist).
+            The fragment's path, or ``None`` when ``01-Fragments/`` does not
+            hold it (including when that directory does not exist). Scoped
+            deliberately: a *borrowed* fragment lives under
+            ``11-Other-Authors/<slug>/`` and is never reported here, so
+            ``None`` means "not live under ``01-Fragments``", not "absent
+            from the vault". That gap is tracked in #1424 — its fix needs a
+            search set bounded by something other than the author count,
+            which is a different shape from #1332's.
         """
         with self._lock:
             return self._find_in_fragments_locked(fragment_id)
+
+    def find_tombed_fragment(self, fragment_id: str) -> Path | None:
+        """Return the *tombed* file for *fragment_id*, or ``None`` (#1332).
+
+        The orphan-directory counterpart to :meth:`find_fragment`, wrapping
+        the same lookup :meth:`restore_fragment` already trusts to locate a
+        tombstone.
+
+        It exists so a caller can tell a tomb that *failed* apart from one
+        that had already happened. :meth:`tomb_fragment` returns ``None`` for
+        both, and
+        :func:`creek.ingest.pipeline.tomb_missing_units` must not treat them
+        alike: the first is a miss that has to be reported and retried, while
+        the second is the state a crash between the file move and the ledger
+        append leaves behind, and it converges only if it can be recognised.
+
+        Args:
+            fragment_id: The id to look for in ``10-Liminal/Orphaned/``.
+
+        Returns:
+            The tombstone's path, or ``None`` when no tombed file declares
+            this id.
+        """
+        orphan_dir = self.vault_path.joinpath(*_ORPHANED_RELPARTS)
+        with self._lock:
+            return self._find_existing_locked(fragment_id, orphan_dir)
 
     def _relocate_fragment_locked(
         self,
@@ -1483,7 +1580,17 @@ class VaultWriter:
         the JSONL file (later entries overwrite earlier ones, so the
         last successful write wins). If the JSONL file is missing the
         index is rebuilt by scanning the directory's ``.md`` files and
-        the result is persisted so subsequent processes skip the scan.
+        the result is persisted so subsequent processes skip the scan —
+        **unless the rebuild found nothing**, in which case nothing is
+        written (#1332). A memo of "no ids here" saves a glob over an
+        empty directory and costs a file created in the operator's vault
+        by a *lookup*; the sole caller that reached this path with an
+        empty directory was the tomb scan, which left a trail of zero-byte
+        ``.id-index.jsonl`` files behind every miss. Re-globbing an empty
+        directory once per :class:`VaultWriter` is the cheaper side of that
+        trade, and it keeps :meth:`find_fragment` genuinely read-only.
+        Pre-existing zero-byte index files stay valid: they parse to the
+        same empty mapping a rescan produces.
 
         When the JSONL file is *present but damaged* — an unparseable
         line, or a file that cannot be read at all — the mappings it
@@ -1526,7 +1633,8 @@ class VaultWriter:
                 index = self._recover_damaged_index(index_path, target_dir, load)
         elif target_dir.is_dir():
             index = self._rebuild_index(target_dir)
-            self._persist_full_index(target_dir, index)
+            if index:
+                self._persist_full_index(target_dir, index)
         else:
             index = {}
         self._dir_indexes[target_dir] = index
@@ -1655,7 +1763,9 @@ class VaultWriter:
         """Atomically write a fresh JSONL index file from *index*.
 
         Used only on first-time index construction (scanning a vault
-        that predates the index file). Steady-state updates use
+        that predates the index file), and only when that scan found at
+        least one id — see :meth:`_load_index_locked` for why an empty
+        rebuild must not be memoised (#1332). Steady-state updates use
         :meth:`_append_index_entry`, which is O(1) per write.
         """
         target_dir.mkdir(parents=True, exist_ok=True)
