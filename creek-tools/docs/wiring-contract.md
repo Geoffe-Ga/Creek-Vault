@@ -80,6 +80,15 @@ Field by field:
   documented reason appears *and* the vault is byte-identical. The entry's
   primary invocation supplies the open-gate half. One half alone is passed by a
   surface that refuses everything.
+- **`refusal.mutate`** — vault-relative path → content, written before the
+  refusal run. Some gates trigger on *pre-existing local state* rather than on
+  a flag or a missing token: `skills sync` refuses on **drift**, which by
+  definition cannot exist in a vault straight from `creek init`. Without
+  `mutate` such a gate is undeclarable, and an undeclarable gate is an
+  unwatched one — that is precisely how #1306 (the drift guard covering
+  `*.SKILL.md` but not `mediums/*.MEDIUM.md`) survived here unseen. The write
+  lands before the harness snapshots its baseline digest, so the mutated bytes
+  become the "untouched" reference and a refusal that reverts them fails.
 - **`strip`** — vault-relative globs the fixture deletes before the run, for a
   surface whose artefacts `creek init` already deploys (`skills sync`).
 - **`prepare`** — CLI invocations to run first, for chained preconditions

@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from creek.author.conductor import VoiceClientFactory
     from creek.author.models import AuthoredDraft
@@ -569,21 +569,95 @@ def _guard_vault_path(vault: Path, allow_in_repo: bool) -> None:
     )
 
 
+def _print_skill_drift_refusal(
+    labels: Sequence[str],
+    *,
+    verb: str,
+    remedy: str,
+    whole_deployment: bool,
+) -> None:
+    """Explain a refused canonical-skill deployment and the way past it.
+
+    ``creek skills sync`` and ``creek init`` reach the same destructive
+    primitive, so they owe the operator the same explanation (issue
+    #1306). Each label gets its own line: Rich hard-wraps at the console
+    width, and a path folded across a wrap is both unreadable and
+    unsearchable. The labels are vault-relative on purpose — the bare
+    filename this used to print could not tell
+    ``mediums/essay.MEDIUM.md`` apart from a top-level skill.
+
+    Both the verb and the suggested command are supplied by the caller
+    rather than derived here. Printing a fixed menu of escapes is how a
+    refusal ends up advising ``--refresh`` to someone who never typed
+    it — which for a plain ``creek init`` would also skip seeding
+    ``creek_config.yaml``, so the "fix" would quietly do less than the
+    command it replaced.
+
+    Args:
+        labels: Vault-relative paths of the drifted files, as
+            ``creek.scaffold.DriftedSkillsError.labels`` renders them.
+            Plain strings so this module needs no import of the
+            exception type (``creek.scaffold`` is imported lazily inside
+            the commands that use it).
+        verb: What this invocation was trying to do, for the first line.
+        remedy: The exact command to re-run, already ``--force``-bearing
+            and matching the flags the operator actually passed.
+        whole_deployment: Whether the refusal aborted more than the skill
+            tree. An explicit flag, not a test on *verb*: what the
+            operator is told must not depend on how a word was spelled.
+    """
+    console.print(
+        f"[red]Refusing to {verb}: local changes detected in "
+        f"{len(labels)} skill file(s):[/red]",
+        highlight=False,
+    )
+    for label in labels:
+        console.print(f"[red]  - {escape(label)}[/red]", highlight=False)
+    if whole_deployment:
+        # A drifted skill aborts the *whole* canonical deployment, not
+        # just the skill tree. Say so, or the operator is left guessing
+        # whether the ontology spec and AGENTS.md landed.
+        console.print(
+            "[red]Nothing at all was deployed: no folders, no ontology "
+            "spec, no AGENTS.md.[/red]",
+            highlight=False,
+        )
+    console.print(
+        "[yellow]Revert the edit, or re-run to overwrite it:\n"
+        f"  {escape(remedy)}[/yellow]",
+        highlight=False,
+    )
+    console.print(
+        "[dim]--force keeps your version alongside the canonical file as "
+        "<name>.bak, replacing anything already at that path; a later "
+        "--force overwrites it again.[/dim]",
+        highlight=False,
+    )
+
+
 @app.command()
 def init(
     vault: Path = typer.Option(..., "--vault", help="Vault root to initialise"),
     force: bool = typer.Option(
         False,
         "--force",
-        help="Overwrite an existing creek_config.yaml.",
+        help=(
+            "Overwrite an existing creek_config.yaml, and overwrite "
+            "locally-modified canonical skill files (your version is kept "
+            "alongside as <name>.bak; a later --force overwrites that "
+            "backup)."
+        ),
     ),
     refresh: bool = typer.Option(
         False,
         "--refresh",
         help=(
-            "Re-copy canonical templates (ontology, AGENTS.md, schema "
-            "skills, scaffold) into an existing vault. User data and "
-            "creek_config.yaml are preserved."
+            "Re-copy canonical material (folder scaffold, ontology spec, "
+            "AGENTS.md, schema skills, medium contracts) into an existing "
+            "vault without seeding a fresh creek_config.yaml. AGENTS.md is "
+            "always overwritten; a locally-edited skill or medium contract "
+            "makes the command refuse unless --force. User content "
+            "elsewhere in the vault is untouched."
         ),
     ),
     allow_in_repo: bool = typer.Option(
@@ -609,11 +683,19 @@ def init(
     By default ``creek init`` refuses to scaffold inside a git repo;
     pass ``--allow-in-repo`` to override.
 
-    ``--refresh`` re-copies canonical material into an existing vault
-    without touching user-edited content or ``creek_config.yaml``.
+    Every run — with or without ``--refresh`` — restores the canonical
+    material: the folder scaffold, the ontology spec, ``AGENTS.md``, the
+    schema skills and the medium contracts. ``AGENTS.md`` is *always*
+    overwritten; it is the machine-facing agent contract, not
+    operator-authored content. A locally-edited skill or medium contract
+    makes the command refuse outright — deploying nothing — unless
+    ``--force`` is passed, which keeps the operator's bytes alongside as
+    ``<name>.bak``. ``--refresh`` differs from a plain run only in that
+    it leaves ``creek_config.yaml`` alone instead of seeding a fresh
+    one. User content elsewhere in the vault is never touched.
     """
     from creek.config import generate_default_config
-    from creek.scaffold import deploy_canonical
+    from creek.scaffold import DriftedSkillsError, deploy_canonical
 
     _guard_vault_path(vault, allow_in_repo)
 
@@ -627,7 +709,21 @@ def init(
         )
         raise typer.Exit(code=1)
 
-    result = deploy_canonical(vault)
+    try:
+        result = deploy_canonical(vault, force=force)
+    except DriftedSkillsError as exc:
+        # Name the invocation the operator actually made. A plain ``creek
+        # init`` can reach here too (existing skills, deleted config), and
+        # telling that operator to re-run with ``--refresh`` would skip the
+        # ``generate_default_config`` step they were owed.
+        refresh_flag = " --refresh" if refresh else ""
+        _print_skill_drift_refusal(
+            exc.labels,
+            verb="refresh" if refresh else "initialise",
+            remedy=f"creek init --vault {vault}{refresh_flag} --force",
+            whole_deployment=True,
+        )
+        raise typer.Exit(code=1) from exc
 
     if not refresh:
         generate_default_config(config_path)
@@ -4235,33 +4331,40 @@ def skills_sync(
     force: bool = typer.Option(
         False,
         "--force",
-        help="Overwrite locally-modified skill files.",
+        help=(
+            "Overwrite locally-modified skill files, keeping your version "
+            "alongside as <name>.bak. A later --force overwrites that "
+            "backup."
+        ),
     ),
 ) -> None:
     """Re-deploy the canonical schema-skill tree into ``<vault>/00-Creek-Meta/Skills/``.
 
-    Pulls upstream changes from
-    ``creek-tools/creek/templates/skills/*.SKILL.md`` after upgrading
-    ``creek-tools``. Local edits to deployed skill files block the
-    overwrite unless ``--force`` is passed.
+    Pulls upstream changes to both classes of canonical skill file after
+    upgrading ``creek-tools``: the flat schema skills
+    (``creek/templates/skills/*.SKILL.md``) and the medium contracts
+    (``creek/templates/skills/mediums/*.MEDIUM.md``). Local edits to
+    either class block the overwrite unless ``--force`` is passed.
     """
-    from creek.scaffold import deploy_skills, detect_drifted_skills
+    from creek.scaffold import DriftedSkillsError, deploy_skills
 
-    drifted = detect_drifted_skills(vault)
-    if drifted and not force:
-        names = ", ".join(p.name for p in drifted)
-        console.print(
-            f"[red]Refusing to sync: local changes detected in "
-            f"{len(drifted)} skill file(s): {names}. "
-            "Pass --force to overwrite.[/red]",
+    try:
+        deployment = deploy_skills(vault, force=force)
+    except DriftedSkillsError as exc:
+        _print_skill_drift_refusal(
+            exc.labels,
+            verb="sync",
+            remedy=f"creek skills sync --vault {vault} --force",
+            whole_deployment=False,
         )
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from exc
 
-    synced = deploy_skills(vault)
     console.print(
-        f"[bold green]Synced {synced} skill file(s) to "
+        f"[bold green]Synced {deployment.written} skill file(s) to "
         f"{vault / '00-Creek-Meta' / 'Skills'}.[/bold green]",
     )
+    for backup in deployment.preserved:
+        console.print(f"[yellow]Kept your previous version at {backup}.[/yellow]")
 
 
 def _warn_bypass_compiled(verb: str) -> None:

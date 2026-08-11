@@ -304,12 +304,20 @@ class Refusal:
         reason: Substring of the documented refusal message.
         argv: CLI arguments that leave the gate closed.
         kwargs: MCP arguments that leave the gate closed.
+        mutate: Vault-relative path -> content, written *before* the run so a
+            gate whose trigger is pre-existing local state can be declared at
+            all. ``skills sync`` refuses on *drift*, which cannot exist in a
+            vault straight from ``creek init``; without this the drift gate
+            would be undeclarable and #1306 would have stayed invisible here.
+            The write lands before the harness takes its baseline digest, so
+            the mutated bytes become the "untouched" reference.
         exit_code: Expected CLI exit status.
     """
 
     reason: str
     argv: tuple[str, ...] = ()
     kwargs: Mapping[str, Any] = field(default_factory=dict)
+    mutate: Mapping[str, str] = field(default_factory=dict)
     exit_code: int = 1
 
 
@@ -1374,10 +1382,29 @@ CLI_CONTRACT: Final[Mapping[str, Surface]] = {
             "#460: the canonical skills shipped in the package but never "
             "reached a vault"
         ),
-        derived_from=("creek.scaffold:VAULT_TEMPLATE_DIR",),
+        derived_from=(
+            "creek.scaffold:SKILLS_TEMPLATE_DIR",
+            "creek.scaffold:deploy_skills",
+        ),
         argv=("--vault", "{vault}", "--force"),
         strip=("00-Creek-Meta/Skills/**/*.md",),
-        effect=Effect(writes=("00-Creek-Meta/Skills/*.SKILL.md",)),
+        effect=Effect(
+            writes=(
+                "00-Creek-Meta/Skills/*.SKILL.md",
+                # #1306: the medium contracts are the *other* half of what
+                # this command deploys. Declaring only the flat schema skills
+                # is what let the drift guard cover one class for a whole
+                # release without a single test noticing.
+                "00-Creek-Meta/Skills/mediums/*.MEDIUM.md",
+            )
+        ),
+        refusal=Refusal(
+            reason="local changes",
+            argv=("--vault", "{vault}"),
+            mutate={
+                "00-Creek-Meta/Skills/mediums/essay.MEDIUM.md": "# my house style\n",
+            },
+        ),
     ),
     "purge fragment": Surface(
         shape=Shape.REMOVES,
@@ -2274,6 +2301,10 @@ def test_declared_gate_refuses_and_leaves_the_vault_untouched(
     refusal = surface.refusal
     assert refusal is not None
     vault = bench.seeded_vault()
+    for relative, content in refusal.mutate.items():
+        seeded = vault / relative
+        seeded.parent.mkdir(parents=True, exist_ok=True)
+        seeded.write_text(content, encoding="utf-8")
 
     if name in MCP_CONTRACT:
         outcome = bench.run_mcp(name, refusal.kwargs, vault=vault)
