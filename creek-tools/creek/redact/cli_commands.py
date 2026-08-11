@@ -16,6 +16,7 @@ import logging
 import os
 import tempfile
 from collections import Counter
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -32,6 +33,7 @@ from creek.redact.scanner import (
     SYMLINK_SKIP_LABEL,
     RedactionScanner,
     ScanSummary,
+    resolves_within,
 )
 
 logger = logging.getLogger(__name__)
@@ -197,21 +199,75 @@ def render_matches(summary: ScanSummary, console: Console) -> None:
 # ---------------------------------------------------------------------------
 
 
+class SymlinkPolicy(Enum):
+    """What a redaction mode does with a directly-named escaping symlink.
+
+    The read and write contracts differ in kind, and the fix for #1293 has to
+    keep them distinct rather than collapsing both into one refusal:
+
+    * ``REFUSE`` — ``--apply`` and ``--review``. Both may write, so following
+      a link named on the command line risks rewriting a file outside the
+      tree the operator named. They abort with exit ``1`` before anything is
+      read through the link.
+    * ``SKIP`` — ``--scan``. It writes nothing, so refusing a whole scan over
+      one bad link would be a denial of service on the safety pass itself —
+      the operator's only way of learning what is exposed. The path is
+      declined, counted under ``files_skipped_symlink``, and the scan still
+      exits ``0``.
+
+    The distinction is pinned by ``tests/test_cli_redact.py:545-553``.
+
+    Attributes:
+        REFUSE: Abort the run — the write path (``--apply``, ``--review``).
+        SKIP: Decline the path and carry on — the read path (``--scan``).
+    """
+
+    REFUSE = "refuse"
+    SKIP = "skip"
+
+
 def _scan_source(
     source: Path,
     config: CreekConfig,
+    *,
+    console: Console,
+    label: str,
+    policy: SymlinkPolicy,
 ) -> tuple[RedactionScanner, ScanSummary]:
     """Scan *source* (file or directory) and return the scanner + summary.
 
+    The single chokepoint through which every redaction mode reaches the
+    filesystem, and therefore the right place to decide what happens when the
+    operator names an escaping symlink outright (#1293). *policy* has no
+    default on purpose: mypy strict then makes it a build error to add a
+    fourth mode without stating a symlink policy, which is precisely the
+    omission that left ``run_scan`` unguarded in the first place.
+
     Args:
-        source: File or directory to scan.
+        source: File or directory to scan, exactly as the operator named it.
         config: Loaded Creek configuration.
+        console: Rich console sink for the refusal banner.
+        label: Human-readable label for the root in the refusal message
+            (e.g. ``"source"`` or ``"vault"``).
+        policy: What to do when *source* itself escapes its own parent —
+            see :class:`SymlinkPolicy`.
 
     Returns:
         Tuple of ``(scanner, summary)``. The scanner is returned so that
-        the caller can reuse its session salt for redaction or review.
+        the caller can reuse its session salt for redaction or review. Under
+        :attr:`SymlinkPolicy.SKIP` an escaping *source* yields an empty
+        summary carrying a single ``files_skipped_symlink``.
+
+    Raises:
+        typer.Exit: With code ``1`` under :attr:`SymlinkPolicy.REFUSE` when
+            *source* is a symlink resolving outside its own parent.
     """
     scanner = RedactionScanner(config=config.redaction)
+    if _named_path_escapes(source):
+        if policy is SymlinkPolicy.REFUSE:
+            _assert_named_path_contained(source, console=console, label=label)
+        logger.warning("Skipping symlink that escapes the scan root: %s", source)
+        return scanner, ScanSummary(files_skipped_symlink=1)
     if source.is_file():
         matches = scanner.scan_file(source)
         summary = ScanSummary(matches=matches, files_scanned=1)
@@ -233,6 +289,96 @@ def _error_exit(console: Console, message: str, *, code: int = 2) -> NoReturn:
     """
     console.print(f"[red]{message}[/red]")
     raise typer.Exit(code=code)
+
+
+def _named_path_escapes(path: Path) -> bool:
+    """Report whether *path* is itself a symlink leaving its own parent.
+
+    The containment question for a path the operator names on the command
+    line, as opposed to one the scanner discovers while walking a tree. It
+    delegates to :func:`creek.redact.scanner.resolves_within` rather than
+    restating the predicate, so the named-leaf surface and the walked-child
+    surface cannot drift into two definitions of "inside".
+
+    Three properties carry the correctness argument:
+
+    * ``is_symlink()`` is an ``lstat`` on the leaf, so a path that is not
+      itself a link is never resolved and never compared. That is what makes
+      this guard behave identically on darwin and on Linux CI: a root reached
+      *through* a symlinked component (``/tmp`` → ``/private/tmp`` on macOS)
+      is not flagged. Same reasoning as the scanner's own walk policy.
+    * When the leaf *is* a link, BOTH sides are resolved — the target inside
+      ``resolves_within``, the parent here — so ``/tmp`` → ``/private/tmp``
+      cannot manufacture a spurious refusal for a link that never left its
+      own directory.
+    * The predicate is LEAF-ONLY, and deliberately so: a named path whose
+      escaping link is an ANCESTOR component (``<root>/linkdir/a.md``, where
+      ``linkdir`` is the link) is admitted. That is a known, accepted
+      residual — not full coverage of path traversal.
+
+    ``strict=False`` matches the shipped guard: a target that does not exist
+    still resolves to a candidate location worth comparing. Dangling and
+    looping links do not reach here in the CLI anyway — ``_require_existing``
+    reports them as "not found" first.
+
+    Args:
+        path: The source or vault path exactly as the operator supplied it.
+
+    Returns:
+        ``True`` when *path* is a symlink whose target is not a descendant of
+        its own resolved parent directory.
+    """
+    return path.is_symlink() and not resolves_within(
+        path,
+        path.parent.resolve(strict=False),
+    )
+
+
+def _assert_named_path_contained(
+    path: Path,
+    *,
+    console: Console,
+    label: str,
+) -> None:
+    """Refuse a directly-named symlink that escapes its own parent (#1293).
+
+    The write-path half of the contract: ``--apply`` and ``--review`` stop
+    here, before the named path is opened, walked, or used to locate
+    ``<vault>/00-Creek-Meta/creek_config.yaml``. The companion read path
+    (``--scan``) skips instead — see :class:`SymlinkPolicy`.
+
+    The refusal is outright. There is no ``--force``, no environment
+    variable, and no config key, per SEC-003's no-waiver precedent: the
+    security direction here is one-way, and this guard may only ever cause
+    the tool to read and write *less*.
+
+    Only the as-supplied path is named — in the banner and in the log. The
+    resolved target is never disclosed: doing so is the very oracle #1087
+    closes. The log is a ``warning`` rather than an ``exception`` because no
+    exception is being handled at this point; ``logger.exception`` here would
+    append a bogus ``NoneType: None`` traceback to the record.
+
+    Args:
+        path: The source or vault path exactly as the operator supplied it.
+        console: Rich console sink for the error banner.
+        label: Human-readable label for the root in the error message
+            (e.g. ``"source"`` or ``"vault"``).
+
+    Raises:
+        typer.Exit: With code ``1`` when *path* is an escaping symlink.
+    """
+    if not _named_path_escapes(path):
+        return
+    logger.warning(
+        "Refusing to follow symlink that escapes the %s root: %s",
+        label,
+        path,
+    )
+    _error_exit(
+        console,
+        f"Refusing to follow symlink that escapes the {label} root: {path}",
+        code=1,
+    )
 
 
 def _assert_no_escaping_symlinks(
@@ -354,6 +500,11 @@ def run_scan(
 ) -> ScanSummary:
     """Scan *source* for sensitive data and render a report.
 
+    The read path never refuses over containment: a *source* that is itself
+    an escaping symlink is declined and counted in the statistics table
+    (:attr:`SymlinkPolicy.SKIP`), so one bad link cannot disable the whole
+    safety pass.
+
     Args:
         source: File or directory to scan.
         report: When ``True``, render the detailed markdown report.
@@ -368,7 +519,13 @@ def run_scan(
     """
     _require_existing(console, source, "Source path")
     config = load_config(resolve_config_path(vault, None))
-    scanner, summary = _scan_source(source, config)
+    scanner, summary = _scan_source(
+        source,
+        config,
+        console=console,
+        label="source",
+        policy=SymlinkPolicy.SKIP,
+    )
     render_summary(summary, console)
     if verbose:
         render_matches(summary, console)
@@ -409,6 +566,16 @@ def _atomic_write(file_path: Path, content: str) -> None:
     place with :func:`os.replace`. The swap is atomic on POSIX and best
     effort on Windows. If any step fails the temp file is unlinked so
     the original on-disk file is left untouched.
+
+    When *file_path* is a symlink, :func:`os.replace` MATERIALISES it: the
+    link is replaced by a regular file rather than written through. That
+    side effect is deliberate, not incidental. Writing *through* a link is
+    the operation SEC-003 forbids; by the time execution reaches here both
+    ends of any surviving alias are inside the tree the operator named
+    (:func:`_named_path_escapes` for the named leaf,
+    :func:`_assert_no_escaping_symlinks` for descendants), and
+    ``scan_batch`` surfaces the alias's target as a file in its own right,
+    so the target is redacted on its own pass.
 
     Args:
         file_path: Destination path to rewrite.
@@ -469,7 +636,29 @@ def _write_redaction_audit(
     vault_path: Path,
     dry_run: bool,
 ) -> None:
-    """Append one audit entry per touched file under *vault_path*."""
+    """Append one audit entry per touched file under *vault_path*.
+
+    Each entry records ``source_path`` exactly as the pipeline saw it, never
+    resolved. That is truthful without being exhaustive, and the difference
+    matters to anyone reading the trail:
+
+    * for a directly-named path, because no admitted named path resolves
+      outside its own parent (:func:`_named_path_escapes`);
+    * for a descendant, because the walk guard and the scanner's own
+      candidate filter both decline children that escape the root.
+    * Residual: a path reached through a symlinked ANCESTOR component is
+      admitted by that leaf-only policy, and the audit then records the
+      as-supplied path rather than where the write landed.
+
+    Resolving audit paths would not close that residual — it would only
+    start disclosing real intra-tree paths behind ordinary aliases.
+
+    Args:
+        summary: Scan summary whose matches describe what was found.
+        files: Files touched by this run, in report order.
+        vault_path: Vault root owning ``00-Creek-Meta/audit/redact.jsonl``.
+        dry_run: Whether this run previewed rather than committed changes.
+    """
     audit_log = RedactionAuditLog(vault_path)
     grouped = _matches_by_file(summary)
     for file_path in files:
@@ -567,14 +756,37 @@ def run_apply(
         assume_yes: Skip the interactive confirmation prompt.
         console: Rich console sink.
         vault: Vault root for the audit log. Defaults to
-            ``load_config().vault_path``.
+            ``load_config().vault_path``. Contained like *source*: it is
+            both read from and *written to*, so an escaping link here is an
+            out-of-root write even when *source* is innocent.
+
+    Raises:
+        typer.Exit: With code ``1`` when *source* or *vault* is, or
+            contains, a symlink that escapes the tree the operator named.
     """
     _require_existing(console, source, "Source path")
+    # Before ``is_dir()``, which follows the link, and before ``load_config``,
+    # which would otherwise read the config *through* it (#1293).
+    _assert_named_path_contained(source, console=console, label="source")
+    # ``--vault`` is the second path the operator names, and the only one this
+    # mode WRITES to: the audit record lands in
+    # ``<vault>/00-Creek-Meta/audit/redact.jsonl``, creating that directory if
+    # needed. Guarding only ``--source`` would leave the audit trail — the
+    # record of what was touched — landing wherever a link points, with an
+    # entirely innocent source (#1293).
+    if vault is not None:
+        _assert_named_path_contained(vault, console=console, label="vault")
     if source.is_dir():
         _assert_no_escaping_symlinks(source, console=console, label="source")
     config = load_config(resolve_config_path(vault, None))
     vault_path = vault if vault is not None else config.vault_path
-    scanner, summary = _scan_source(source, config)
+    scanner, summary = _scan_source(
+        source,
+        config,
+        console=console,
+        label="source",
+        policy=SymlinkPolicy.REFUSE,
+    )
     render_summary(summary, console)
     if verbose:
         render_matches(summary, console)
@@ -625,12 +837,25 @@ def run_review(
         vault: Vault root (or any directory) to re-scan.
         verbose: When ``True``, also list every individual match.
         console: Rich console sink.
+
+    Raises:
+        typer.Exit: With code ``1`` when *vault* is, or contains, a symlink
+            that escapes the tree the operator named.
     """
     _require_existing(console, vault, "Vault path")
+    # Before ``is_dir()``, which follows the link, and before ``load_config``,
+    # which would otherwise read the config *through* it (#1293).
+    _assert_named_path_contained(vault, console=console, label="vault")
     if vault.is_dir():
         _assert_no_escaping_symlinks(vault, console=console, label="vault")
     config = load_config(resolve_config_path(vault, None))
-    scanner, summary = _scan_source(vault, config)
+    scanner, summary = _scan_source(
+        vault,
+        config,
+        console=console,
+        label="vault",
+        policy=SymlinkPolicy.REFUSE,
+    )
     render_summary(summary, console)
     if verbose:
         render_matches(summary, console)

@@ -787,8 +787,13 @@ def _statistics_lines(summary: ScanSummary) -> list[str]:
     return lines
 
 
-def _resolves_within(child: Path, resolved_root: Path) -> bool:
+def resolves_within(child: Path, resolved_root: Path) -> bool:
     """Report whether *child*'s symlink target stays under *resolved_root*.
+
+    Public because it is now also the named-leaf containment predicate for
+    :mod:`creek.redact.cli_commands` (#1293), so the walked-child surface and
+    the named-path surface cannot drift into two subtly different definitions
+    of "inside".
 
     The failure arm is a deliberate classification, not a swallowed error:
     a loop (``RuntimeError``), an unreadable link (``OSError``), and a
@@ -846,8 +851,13 @@ def _scannable_candidates(dir_path: Path) -> tuple[list[Path], int]:
 
     Known gaps, deliberately out of scope here:
 
-    * #1293 — the SEC-003 write guard is directory-only, so
-      ``creek redact --apply <symlinked-file>`` still writes through the link.
+    * Escaping ANCESTOR components. The directly-named path is now tested
+      for containment by :mod:`creek.redact.cli_commands` before any mode
+      reads through it (#1293), but a path reached *through* a link one
+      level up — ``<root>/linkdir/a.md``, where ``linkdir`` is the escaping
+      link — is still admitted here. That is not an oversight: it is the
+      resolve-the-root / ``lstat``-the-leaf policy documented above, applied
+      consistently on both surfaces.
     * #1294 — the ingestor walks (e.g.
       ``creek.ingest.markdown.MarkdownIngestor._read_directory``) still follow
       symlinks out of the source root.
@@ -866,7 +876,7 @@ def _scannable_candidates(dir_path: Path) -> tuple[list[Path], int]:
     for child in dir_path.rglob("*"):
         if not child.is_file():
             continue
-        if child.is_symlink() and not _resolves_within(child, resolved_root):
+        if child.is_symlink() and not resolves_within(child, resolved_root):
             logger.warning("Skipping symlink that escapes the scan root: %s", child)
             escaped += 1
             continue

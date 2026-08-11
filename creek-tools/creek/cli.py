@@ -1431,7 +1431,10 @@ def _dispatch_redact(
         apply: ``--apply`` flag.
         review: ``--review`` flag.
         source: ``--source`` path (scan/apply).
-        vault: ``--vault`` path (review).
+        vault: ``--vault`` path. Required by ``--review`` as the tree to
+            re-scan; optional for ``--scan``/``--apply``, where it locates
+            ``creek_config.yaml`` and, for ``--apply``, receives the audit
+            record.
         report: ``--report`` flag (scan).
         dry_run: ``--dry-run`` flag (apply).
         verbose: ``--verbose`` flag.
@@ -1480,7 +1483,11 @@ def redact(
     source: Path | None = typer.Option(
         None, "--source", help="Source path (scan/apply)"
     ),
-    vault: Path | None = typer.Option(None, "--vault", help="Vault path (review)"),
+    vault: Path | None = typer.Option(
+        None,
+        "--vault",
+        help="Vault path (review; also config/audit root for scan/apply)",
+    ),
     report: bool = typer.Option(
         False, "--report", help="Include the detailed markdown report (scan)"
     ),
