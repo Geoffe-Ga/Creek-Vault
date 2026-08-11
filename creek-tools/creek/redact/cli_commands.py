@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import uuid
 from collections import Counter
 from enum import Enum
 from pathlib import Path
@@ -26,7 +27,13 @@ from rich.text import Text
 
 from creek._containment import find_escaping_symlink, named_path_escapes
 from creek.config import load_config, resolve_config_path
-from creek.redact.audit import RedactionAuditEntry, RedactionAuditLog
+from creek.purge.audit import LEGACY_PURGE_LOG_RELPATH
+from creek.redact.audit import (
+    REDACT_AUDIT_RELPATH,
+    RedactionAuditEntry,
+    RedactionAuditLog,
+    RedactionOutcomeStatus,
+)
 from creek.redact.patterns import PATTERN_METADATA
 from creek.redact.redactor import Redactor
 from creek.redact.scanner import (
@@ -577,12 +584,15 @@ def _audit_entry_for_file(
     file_matches: list[RedactionMatch],
     *,
     dry_run: bool,
+    operation_id: str,
 ) -> RedactionAuditEntry:
-    """Build a :class:`RedactionAuditEntry` for one touched file."""
+    """Build a ``phase="file"`` entry for one touched file."""
     counts: dict[str, int] = {}
     for match in file_matches:
         counts[match.match_type] = counts.get(match.match_type, 0) + 1
     return RedactionAuditEntry(
+        phase="file",
+        operation_id=operation_id,
         source_path=str(file_path),
         pattern_names=sorted(counts.keys()),
         match_counts=counts,
@@ -590,18 +600,68 @@ def _audit_entry_for_file(
     )
 
 
-def _write_redaction_audit(
-    summary: ScanSummary,
-    files: list[Path],
-    *,
-    vault_path: Path,
-    dry_run: bool,
-) -> None:
-    """Append one audit entry per touched file under *vault_path*.
+class _AuditWriteError(Exception):
+    """The audit log could not record a file that was already rewritten.
 
-    Each entry records ``source_path`` exactly as the pipeline saw it, never
-    resolved. That is truthful without being exhaustive, and the difference
-    matters to anyone reading the trail:
+    Distinct from the bare :class:`OSError` a *file* rewrite raises,
+    because the two demand opposite messages: an ``OSError`` from
+    :func:`_atomic_write` means the named file was NOT modified, while
+    this means it WAS and the record of it is missing. Reporting the
+    second with the first's "I/O error after redacting K of N file(s)"
+    wording would misdescribe a successful rewrite as a failed one.
+
+    The originating error is carried on ``__cause__``.
+    """
+
+
+class _ApplyAudit:
+    """The single writer of ``<vault>/00-Creek-Meta/audit/redact.jsonl``.
+
+    Emits the three-phase grammar #1308 introduced: one ``intent`` entry
+    naming every candidate file *before* the first byte is rewritten,
+    one ``file`` entry appended immediately after each file's own
+    :func:`_atomic_write`, and one ``outcome`` entry closing the run.
+    All three carry one :attr:`operation_id`.
+
+    **Ordering is the whole point.** Previously every entry was batched
+    after the rewrite loop returned, so an abort mid-batch destroyed
+    bytes and recorded nothing at all. Interleaving the per-file append
+    costs the same N appends and buys a compliance reader a real bound:
+    every file with a ``file`` entry was rewritten, at most one further
+    file may have been rewritten without its record, and nothing outside
+    the intent entry's ``files`` list was touched.
+
+    **Three-tier write policy**, because an audit append can fail for
+    the same reason the rewrite did (ENOSPC on the shared volume) and
+    the right response differs by phase:
+
+    * :meth:`record_intent` fails **closed** — nothing has been
+      destroyed yet, so refusing costs nothing and turns "destroy, then
+      discover the log is unwritable" into "fail before touching
+      anything".
+    * :meth:`record_file` fails **fast** — the bytes are already gone;
+      continuing would destroy more files that also could not be
+      recorded, so the loop stops with the damage bounded to the
+      entries already written.
+    * :meth:`record_outcome` is **best effort** — it runs from inside
+      exception handlers and must never displace the original failure.
+
+    **Durability scope**, stated rather than claimed:
+    :meth:`creek.audit.AuditLog.append` calls ``os.fsync`` inside the
+    flock window, so the intent line's bytes are durable before the
+    first rewrite and no extra fsync is needed here. NOT claimed: that a
+    freshly created log's parent directory entry is directory-fsynced,
+    nor that :func:`_atomic_write`'s ``os.replace`` is. Both residuals
+    fail safe — intent present, rewrite lost.
+
+    **Disclosure note.** The intent entry records candidate file PATHS,
+    so an aborted run that modifies nothing now leaves those paths in
+    the log where previously it left nothing. That is the same property
+    ``source_path`` has always had, but it is new for aborted runs.
+
+    Each entry records paths exactly as the pipeline saw them, never
+    resolved. That is truthful without being exhaustive, and the
+    difference matters to anyone reading the trail:
 
     * for a directly-named path, because no admitted named path resolves
       outside its own parent (:func:`_named_path_escapes`);
@@ -616,58 +676,383 @@ def _write_redaction_audit(
 
     Args:
         summary: Scan summary whose matches describe what was found.
-        files: Files touched by this run, in report order.
+        files: Files this run may touch, in report order.
         vault_path: Vault root owning ``00-Creek-Meta/audit/redact.jsonl``.
-        dry_run: Whether this run previewed rather than committed changes.
+        dry_run: Whether this run previews rather than commits changes.
     """
-    audit_log = RedactionAuditLog(vault_path)
-    grouped = _matches_by_file(summary)
-    for file_path in files:
-        file_matches = grouped.get(file_path, [])
-        if not file_matches:
-            continue
-        audit_log.append(
-            _audit_entry_for_file(file_path, file_matches, dry_run=dry_run),
+
+    def __init__(
+        self,
+        summary: ScanSummary,
+        files: list[Path],
+        *,
+        vault_path: Path,
+        dry_run: bool,
+    ) -> None:
+        """Mint an ``operation_id`` and bind one log instance to the run."""
+        self.files = files
+        self.dry_run = dry_run
+        self.operation_id = uuid.uuid4().hex
+        self._grouped = _matches_by_file(summary)
+        # One instance for the whole run: ``AuditLog`` caches the chain
+        # head per instance, so a fresh log per append would rescan the
+        # whole file N times.
+        self._log = RedactionAuditLog(vault_path)
+
+    @property
+    def log_path(self) -> Path:
+        """Absolute path of the JSONL log this run writes to."""
+        return self._log.log_path
+
+    def record_intent(self, *, console: Console) -> None:
+        """Declare the candidate set before anything is rewritten.
+
+        Args:
+            console: Rich console sink for the refusal message.
+
+        Raises:
+            typer.Exit: With code ``1`` when the log cannot be written.
+                Nothing has been destroyed at this point, so refusing is
+                strictly cheaper than proceeding blind.
+        """
+        entry = RedactionAuditEntry(
+            phase="intent",
+            operation_id=self.operation_id,
+            files=[str(path) for path in self.files],
+            dry_run=self.dry_run,
         )
+        try:
+            self._log.append(entry)
+        except OSError as exc:
+            console.print(
+                f"[red]Cannot write the redaction audit log at "
+                f"{self.log_path}: {type(exc).__name__}. "
+                f"No files were modified.[/red]"
+            )
+            raise typer.Exit(code=1) from exc
+
+    def record_file(self, file_path: Path) -> None:
+        """Record one rewritten file, immediately after its own write.
+
+        Args:
+            file_path: The file just rewritten by :func:`_atomic_write`.
+
+        Raises:
+            _AuditWriteError: When the append fails. The caller must
+                stop the batch: the bytes are gone and cannot be
+                certified.
+        """
+        entry = _audit_entry_for_file(
+            file_path,
+            self._grouped.get(file_path, []),
+            dry_run=self.dry_run,
+            operation_id=self.operation_id,
+        )
+        try:
+            self._log.append(entry)
+        except OSError as exc:
+            raise _AuditWriteError(str(file_path)) from exc
+
+    def record_outcome(
+        self,
+        *,
+        status: RedactionOutcomeStatus,
+        console: Console,
+        failure_reason: str | None = None,
+    ) -> None:
+        """Close the run. Best effort — never raises.
+
+        Args:
+            status: ``"complete"`` when the batch finished,
+                ``"partial"`` when it aborted.
+            console: Rich console sink for the degraded-logging warning.
+            failure_reason: Exception **type name only**. Never
+                ``str(exc)``: an ``OSError`` message embeds the
+                offending path and filenames here carry secrets.
+        """
+        entry = RedactionAuditEntry(
+            phase="outcome",
+            operation_id=self.operation_id,
+            status=status,
+            failure_reason=failure_reason,
+            dry_run=self.dry_run,
+        )
+        try:
+            self._log.append(entry)
+        except OSError as exc:
+            logger.warning(
+                "Could not append the redaction outcome entry: %s",
+                type(exc).__name__,
+            )
+            console.print(
+                f"[yellow]Warning: could not record the redaction outcome "
+                f"in the audit log: {type(exc).__name__}.[/yellow]"
+            )
+
+    def record_preview(self, *, console: Console) -> None:
+        """Write the full three-phase grammar for a ``--dry-run``.
+
+        Kept separate from the rewrite loop so a read-only mode gains no
+        new failure surface from the destructive path.
+
+        Args:
+            console: Rich console sink.
+
+        Raises:
+            typer.Exit: With code ``1`` when the log cannot be written.
+        """
+        self.record_intent(console=console)
+        try:
+            for file_path in self.files:
+                self.record_file(file_path)
+        except _AuditWriteError as exc:
+            console.print(
+                f"[red]Cannot write the redaction audit log at "
+                f"{self.log_path}: {type(exc.__cause__).__name__}. "
+                f"No files were modified.[/red]"
+            )
+            raise typer.Exit(code=1) from exc
+        self.record_outcome(status="complete", console=console)
+
+
+PROTECTED_AUDIT_RELPATHS: tuple[Path, ...] = (
+    REDACT_AUDIT_RELPATH.parent,
+    LEGACY_PURGE_LOG_RELPATH,
+)
+"""Vault-relative compliance artifacts ``--apply`` must never rewrite.
+
+The first entry is the whole ``00-Creek-Meta/audit/`` directory, not
+just ``redact.jsonl``: ``purge.jsonl``, ``privacy.jsonl`` and
+``mcp.jsonl`` are the same hash-chained shape and ``.json`` *is* in the
+default ``supported_extensions``, so they were being rewritten already.
+
+The second is the pre-Batch-C purge log, which lives outside that
+directory and is worse than plain data loss:
+:meth:`creek.purge.audit.PurgeAuditLog._migrate_legacy_if_needed`
+replays it into the chained ``purge.jsonl`` on next use, so redacting it
+would get the mutated records chain-*signed* into the purge trail.
+
+Both are derived from their owning module's constant rather than
+restated here, so a future relocation cannot silently unprotect them.
+"""
+
+
+def _exclude_audit_artifacts(
+    files: list[Path],
+    vault_path: Path,
+    *,
+    console: Console,
+) -> list[Path]:
+    """Drop candidates that are the vault's own compliance artifacts.
+
+    The audit trail sits *inside* the tree ``--apply`` walks:
+    ``exclude_patterns`` defaults to ``['.git', 'node_modules']`` and
+    says nothing about ``00-Creek-Meta``. ``redact.jsonl`` escaped only
+    because ``.jsonl`` happens to be absent from the *user-editable*
+    ``supported_extensions`` list. A run that redacts its own history
+    mutates lines the hash chain then re-anchors onto, and
+    :meth:`RedactionAuditLog.verify` still passes: silent, undetectable
+    tampering with a tamper-evidence log.
+
+    So the exclusion is unconditional — independent of both
+    ``supported_extensions`` and ``exclude_patterns`` — and covers every
+    path in :data:`PROTECTED_AUDIT_RELPATHS`.
+
+    Applied to the APPLY file list only, never to ``scan_batch``:
+    detection must stay exactly as wide as it is today for ``--scan``,
+    ``--review``, the MCP scan tool and ``creek process``. Only in-place
+    destruction narrows.
+
+    Args:
+        files: Candidate files the apply would rewrite.
+        vault_path: Vault root owning the compliance artifacts.
+        console: Rich console sink for the one-line notice.
+
+    Returns:
+        *files* minus every protected compliance artifact.
+    """
+    protected = tuple(
+        (vault_path / relpath).resolve() for relpath in PROTECTED_AUDIT_RELPATHS
+    )
+    kept: list[Path] = []
+    dropped = 0
+    for file_path in files:
+        if _is_protected(file_path, protected):
+            dropped += 1
+        else:
+            kept.append(file_path)
+    if dropped:
+        console.print(
+            f"[yellow]Skipped {dropped} compliance artifact(s) under "
+            f"{vault_path / '00-Creek-Meta'}: the audit trail is never "
+            f"rewritten in place.[/yellow]"
+        )
+    return kept
+
+
+def _is_protected(file_path: Path, protected: tuple[Path, ...]) -> bool:
+    """Return ``True`` when *file_path* is, or sits under, a protected path.
+
+    Fails **closed**: a path that cannot be resolved is treated as
+    protected, so an unresolvable candidate is skipped rather than
+    rewritten. Refusing to redact a file is recoverable; corrupting the
+    audit log is not.
+
+    That inversion is why this does not reuse
+    :func:`creek._containment.resolves_within`, the repo's usual
+    containment predicate. That helper returns ``False`` — "outside" —
+    when resolution fails, which is the right default when the question
+    is "may I touch this?" and the wrong one when the question is "must
+    I leave this alone?". Reusing it here would keep an unresolvable
+    candidate in the rewrite set and destroy it.
+
+    Args:
+        file_path: Candidate path to test.
+        protected: Already-resolved paths to test against.
+
+    Returns:
+        Whether *file_path* must be left alone.
+    """
+    try:
+        resolved = file_path.resolve()
+    except OSError:
+        return True
+    return any(resolved == root or root in resolved.parents for root in protected)
+
+
+def _nothing_to_redact_message(summary: ScanSummary) -> str:
+    """Return the message for an apply that has no file to rewrite.
+
+    Two ways to get here: the scan found nothing, or everything it found
+    was inside the audit directory, which is never rewritten. The
+    message must not contradict the summary table already printed.
+
+    Args:
+        summary: The scan summary just rendered.
+
+    Returns:
+        A Rich-markup string containing the substring
+        ``"nothing to redact"``.
+    """
+    if summary.matches:
+        return (
+            "[green]Nothing to redact — every match is in the audit "
+            "trail, which is never rewritten in place.[/green]"
+        )
+    return "[green]No findings — nothing to redact.[/green]"
+
+
+def _rewrite_and_record(
+    redactor: Redactor,
+    file_path: Path,
+    audit: _ApplyAudit,
+) -> None:
+    """Rewrite one file and record it — the pair is indivisible.
+
+    The ONLY call site of :func:`_atomic_write`, deliberately. #1308 was
+    an ordering defect: the appends were batched after the rewrite loop,
+    so an abort left destroyed bytes with no record. Binding the two
+    into one function makes reintroducing that ordering a structural
+    change rather than a subtle one, and
+    ``test_atomic_write_has_exactly_one_call_site_and_it_records``
+    fails if anyone tries.
+
+    Args:
+        redactor: Configured :class:`Redactor`.
+        file_path: File to rewrite in place.
+        audit: The run's audit writer.
+
+    Raises:
+        OSError: From the read or the atomic write; the file is then
+            untouched.
+        _AuditWriteError: From the append; the file IS rewritten.
+    """
+    text = file_path.read_text(encoding="utf-8", errors="replace")
+    redacted = redactor.redact_content(text)
+    _atomic_write(file_path, redacted)
+    audit.record_file(file_path)
 
 
 def _apply_redactions(
     redactor: Redactor,
     files: list[Path],
+    audit: _ApplyAudit,
     console: Console,
 ) -> None:
-    """Rewrite each file in place with sensitive data replaced.
+    """Rewrite each file in place, recording each one as it lands.
 
     Each file is rewritten atomically via :func:`_atomic_write`, so a
-    mid-loop failure cannot leave any single file half-written. If an
-    :class:`OSError` interrupts the batch, already-redacted files keep
-    their redactions and the remaining files remain untouched — the
-    partial progress is reported and the error is surfaced as a
-    non-zero exit code.
+    mid-loop failure cannot leave any single file half-written, and
+    :meth:`_ApplyAudit.record_file` runs immediately after each write
+    (inside :func:`_rewrite_and_record`) so an abort cannot leave a
+    destroyed file unrecorded. If the batch is interrupted,
+    already-redacted files keep their redactions, the remaining files
+    remain untouched, the partial progress is reported, and the error
+    surfaces as a non-zero exit code.
+
+    The outcome entry is written from inside each handler rather than
+    from an outer wrapper, and that is not incidental: ``typer.Exit``
+    subclasses ``click.exceptions.Exit`` → ``RuntimeError``, so a
+    wrapper placed outside this function would catch the *converted*
+    exception and record ``failure_reason="Exit"`` — the literal string
+    — instead of the real cause. The handler order is likewise
+    load-bearing: most specific first.
+
+    The ``except BaseException ... raise`` clause mirrors
+    :meth:`creek.purge.engine.PurgeEngine._run_audited`, so a Ctrl-C
+    mid-batch is recorded rather than silently losing the run.
 
     Args:
         redactor: Configured :class:`Redactor`.
         files: Files to rewrite.
+        audit: The run's audit writer, already carrying its intent line.
         console: Rich console sink for progress and error messages.
 
     Raises:
         typer.Exit: With code ``1`` when the batch is interrupted by an
-            I/O failure after reporting how many files were completed.
+            I/O failure or by an audit-write failure, after reporting
+            how many files were completed.
     """
     completed = 0
     try:
         for file_path in files:
-            text = file_path.read_text(encoding="utf-8", errors="replace")
-            redacted = redactor.redact_content(text)
-            _atomic_write(file_path, redacted)
+            _rewrite_and_record(redactor, file_path, audit)
             completed += 1
+    except _AuditWriteError as exc:
+        reason = type(exc.__cause__).__name__
+        console.print(
+            f"[red]Redaction audit write failed after {completed} of "
+            f"{len(files)} file(s): {reason}. Stopping — the file just "
+            f"rewritten has no audit record, and continuing would "
+            f"destroy more files that could not be recorded either."
+            f"[/red]"
+        )
+        audit.record_outcome(
+            status="partial",
+            failure_reason=reason,
+            console=console,
+        )
+        raise typer.Exit(code=1) from exc
     except OSError as exc:
         console.print(
             f"[red]I/O error after redacting {completed} of "
             f"{len(files)} file(s): {exc}[/red]"
         )
+        audit.record_outcome(
+            status="partial",
+            failure_reason=type(exc).__name__,
+            console=console,
+        )
         raise typer.Exit(code=1) from exc
+    except BaseException as exc:
+        audit.record_outcome(
+            status="partial",
+            failure_reason=type(exc).__name__,
+            console=console,
+        )
+        raise
     console.print(f"[green]Applied redactions to {completed} file(s).[/green]")
+    audit.record_outcome(status="complete", console=console)
 
 
 def _confirm_apply(
@@ -705,10 +1090,30 @@ def run_apply(
 ) -> None:
     """Scan *source*, obtain consent, and redact files in place.
 
-    Both dry-run and apply runs append per-file entries to
-    ``<vault>/00-Creek-Meta/audit/redact.jsonl`` so the audit trail
-    captures every preview operators reviewed in addition to the
-    committed rewrites.
+    Both dry-run and apply runs write the three-phase record described
+    on :class:`_ApplyAudit` to ``<vault>/00-Creek-Meta/audit/
+    redact.jsonl``, so the audit trail captures every preview operators
+    reviewed in addition to the committed rewrites. The ``intent`` entry
+    is written after consent and before the first rewrite; per-file
+    entries are interleaved with the rewrites themselves; the
+    ``outcome`` entry closes the run.
+
+    What a reader of that log may conclude, and no more (#1308): every
+    file carrying a ``file`` entry WAS rewritten; at most one further
+    file may have been rewritten without its record (the one in flight
+    when the run died); and nothing outside the ``intent`` entry's
+    ``files`` list was touched. An ``intent`` with no ``outcome`` means
+    the run did not finish — it does not mean nothing happened.
+
+    Durability scope: :meth:`creek.audit.AuditLog.append` fsyncs inside
+    its flock window, so the intent line is durable before the first
+    rewrite. Not claimed: directory-level fsync of a freshly created
+    log, or of :func:`_atomic_write`'s ``os.replace``. Both residuals
+    fail safe — intent present, rewrite lost.
+
+    The vault's own ``00-Creek-Meta/audit/`` directory is excluded from
+    the rewrite set unconditionally (:func:`_exclude_audit_artifacts`),
+    so a run can never redact its own history.
 
     Args:
         source: File or directory to scan and redact.
@@ -752,33 +1157,31 @@ def run_apply(
     if verbose:
         render_matches(summary, console)
 
-    if not summary.matches:
-        console.print("[green]No findings — nothing to redact.[/green]")
+    files = _exclude_audit_artifacts(
+        _files_from_summary(summary),
+        vault_path,
+        console=console,
+    )
+    if not files:
+        console.print(_nothing_to_redact_message(summary))
         return
 
-    files = _files_from_summary(summary)
+    audit = _ApplyAudit(summary, files, vault_path=vault_path, dry_run=dry_run)
 
     if dry_run:
-        _write_redaction_audit(
-            summary,
-            files,
-            vault_path=vault_path,
-            dry_run=True,
-        )
+        audit.record_preview(console=console)
         console.print("[yellow]Dry run: no files modified.[/yellow]")
         return
 
     if not _confirm_apply(files, assume_yes=assume_yes, console=console):
         return
 
+    # After consent, before the first byte: an operator who declined has
+    # authorised nothing, and an unwritable log must abort while there is
+    # still nothing to be sorry about.
+    audit.record_intent(console=console)
     redactor = Redactor(config=config.redaction, salt=scanner.salt)
-    _apply_redactions(redactor, files, console)
-    _write_redaction_audit(
-        summary,
-        files,
-        vault_path=vault_path,
-        dry_run=False,
-    )
+    _apply_redactions(redactor, files, audit, console)
 
 
 # ---------------------------------------------------------------------------
