@@ -14,13 +14,17 @@ content. It is a ``personal`` fragment's **full body, its title and its id**
 copied verbatim into ``<vault>/creek-skills/**.SKILL.md`` for a caller who
 declared ``ceiling=open``.
 
-The response is *not* content-free in general, and this module does not claim
-otherwise: a ``threads/`` or ``eddies/`` skill takes its filename from a title
-derived from its member fragments, so those ``skill_paths`` can carry
-above-ceiling vocabulary. That surface is ungated — ``Thread`` and ``Eddy``
-have no ``privacy_tier`` field and ``_collect_typed`` takes no override — and
-deliberately out of scope here: no test below seeds ``02-Threads`` or
-``03-Eddies``, and the gap is tracked by #1284.
+The response is *not* content-free in general, and section T10 is where that
+is tested. A ``threads/`` or ``eddies/`` skill takes its filename from a title
+derived from its member fragments, so those ``skill_paths`` entries carry
+content rather than ontology constants. ``Thread`` and ``Eddy`` have no
+``privacy_tier`` field to rank, so #1284 gates them on a **derived** tier
+instead: a thread or eddy skill is emitted only when every fragment naming it
+clears the ceiling, and one no fragment names is emitted only at
+``ceiling=intimate``/``all``. Those tests assert on the response list as well
+as on the tree's bytes, which is the one place this module departs from
+property (1) below — and it departs for a reason rather than by drift, since
+for that category the filename really is the disclosure.
 
 The fragment leak is looser than every sibling generation tool: ``creek.mine``,
 ``creek.draft`` and ``creek.author`` all route their corpus through
@@ -67,7 +71,11 @@ from typer.testing import CliRunner
 
 from creek.classify.privacy_filter import PrivacyTierOverride
 from creek.cli import app
-from creek.generate.skills import SkillTreeGenerator
+from creek.generate.skills import (
+    DEFAULT_MIN_EDDY_FRAGMENTS,
+    DEFAULT_MIN_THREAD_FRAGMENTS,
+    SkillTreeGenerator,
+)
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.skills import skills_refresh_tool
 
@@ -147,6 +155,66 @@ asserting a heading that never existed.
 
 _SKILLS_LOGGER_NAME = "creek.generate.skills"
 
+# ---------------------------------------------------------------------------
+# #1284 — thread and eddy canaries
+#
+# These live in the note's *title*, not in a body, because a thread or eddy
+# SKILL file has no exemplar section at all: the title is the whole disclosure,
+# and the generator slugifies it into the filename, which is what
+# ``skills_refresh_tool`` hands back in ``skill_paths``. A canary in a title is
+# therefore the only one that can prove both the write-side and the read-side
+# halves of this leak at once.
+# ---------------------------------------------------------------------------
+
+_THREAD_COUNT_OVER_MINIMUM = DEFAULT_MIN_THREAD_FRAGMENTS + 1
+"""Stamped ``fragment_count`` that clears the thread skill's strict-``>`` gate."""
+
+_EDDY_COUNT_OVER_MINIMUM = DEFAULT_MIN_EDDY_FRAGMENTS + 1
+"""Stamped ``fragment_count`` that clears the eddy skill's strict-``>`` gate."""
+
+_OPEN_THREAD_TOKEN = "canaryopenthread1284"
+"""Token in the title of a thread every member of which is ``open``.
+
+Each canary below is one lowercase alphanumeric word, and that shape is
+load-bearing rather than ugly-on-purpose: ``_slugify`` lowercases and
+hyphenates, so a multi-word canary survives into the *filename* in a different
+spelling than into the *body*. A token that slugifies to itself lets one
+``in`` / ``not in`` cover the rendered bytes and the returned ``skill_paths``
+without this module re-implementing the slug rules it is trying to test.
+"""
+
+_PERSONAL_THREAD_TOKEN = "canarypersonalthread1284"
+"""Token in the title of a thread named by a ``personal`` fragment."""
+
+_MIXED_EDDY_TOKEN = "canarymixededdy1284"
+"""Token in the title of an eddy with one ``open`` and one ``personal`` member.
+
+The single most important row in this section. A fix that reduced over the
+*already-admitted* fragments would resolve this eddy to ``open`` and emit it —
+which is leak (3) of the three #969 reproduced for ``creek state``, arriving in
+a second generator. Reducing over the **unfiltered** corpus is the difference.
+"""
+
+_OPEN_EDDY_TOKEN = "canaryopeneddy1284"
+"""Token in the title of an eddy every member of which is ``open``."""
+
+_ORPHAN_THREAD_TOKEN = "canaryorphanthread1284"
+"""Token in the title of a thread no fragment names, so nothing vouches for it."""
+
+_KEYLESS_THREAD_TOKEN = "canarykeylessthread1284"
+"""Token in the title of a thread whose only member has no ``privacy_tier`` key.
+
+Pins the one place this gate diverges from ``creek state``'s — see
+:func:`test_a_thread_whose_members_are_keyless_is_admitted_at_the_personal_ceiling`.
+"""
+
+_OPEN_THREAD_TITLE = f"Thread {_OPEN_THREAD_TOKEN}"
+_PERSONAL_THREAD_TITLE = f"Thread {_PERSONAL_THREAD_TOKEN}"
+_MIXED_EDDY_TITLE = f"Eddy {_MIXED_EDDY_TOKEN}"
+_OPEN_EDDY_TITLE = f"Eddy {_OPEN_EDDY_TOKEN}"
+_ORPHAN_THREAD_TITLE = f"Thread {_ORPHAN_THREAD_TOKEN}"
+_KEYLESS_THREAD_TITLE = f"Thread {_KEYLESS_THREAD_TOKEN}"
+
 _WITHHELD_HINT = "--include-tier personal"
 """The remedy the operator-feedback log line and the CLI hint must both name.
 
@@ -209,6 +277,8 @@ def _write_fragment(
     title: str,
     body: str,
     privacy_tier: str | None,
+    threads: tuple[str, ...] = (),
+    eddies: tuple[str, ...] = (),
 ) -> Path:
     """Write one classified fragment under ``01-Fragments/Notes``.
 
@@ -230,6 +300,13 @@ def _write_fragment(
             ``None`` is not the same as ``"unclassified"``: the model defaults a
             missing key to ``unclassified``, and only the raw front matter can
             still tell the two apart.
+        threads: Thread titles this fragment belongs to, written as
+            ``[[...]]`` wikilinks. Membership lives on the *fragment* side —
+            :class:`~creek.models.Thread` records only a ``fragment_count`` —
+            so this is the only evidence a thread's derived tier can be built
+            from (#1284).
+        eddies: Eddy titles this fragment belongs to, same shape and same
+            reason as *threads*.
 
     Returns:
         The path the fragment was written to.
@@ -244,7 +321,8 @@ def _write_fragment(
         "frequency": {"primary": "F3", "secondary": []},
         "wavelength": {"phase": "rising", "mode": "express", "orientation": "do"},
         "voice": {"voice_register": "confessional", "confidence": "settled"},
-        "eddies": [],
+        "threads": [f"[[{name}]]" for name in threads],
+        "eddies": [f"[[{name}]]" for name in eddies],
     }
     if privacy_tier is not None:
         metadata["privacy_tier"] = privacy_tier
@@ -296,6 +374,103 @@ def _seed_four_tiers(vault: Path) -> None:
         body=_exemplar_body(_INTIMATE_CANARY),
         privacy_tier="intimate",
     )
+
+
+def _write_thread(
+    vault: Path,
+    *,
+    thread_id: str,
+    title: str,
+    fragment_count: int = _THREAD_COUNT_OVER_MINIMUM,
+) -> Path:
+    """Write one thread note under ``02-Threads/Active``.
+
+    ``fragment_count`` defaults above :data:`DEFAULT_MIN_THREAD_FRAGMENTS`
+    because :meth:`SkillTreeGenerator._generate_thread_skills` filters on
+    ``fragment_count > self.min_thread_fragments`` *before* rendering. A thread
+    seeded at the default zero would be dropped by the threshold, and every
+    exclusion assertion about the ceiling would hold for the wrong reason.
+
+    The count is deliberately a bare integer unrelated to how many fragments
+    the test actually seeds: it is what the linking pipeline stamped on the
+    note, not evidence about tier, and #969 already ruled that a stored count
+    is a number rather than evidence.
+
+    Args:
+        vault: Vault root.
+        thread_id: Thread id, and the file stem.
+        title: Thread title — member-derived in production, and what the
+            generator slugifies into the SKILL filename.
+        fragment_count: The stamped member count.
+
+    Returns:
+        The path the thread note was written to.
+    """
+    metadata: dict[str, Any] = {
+        "type": "thread",
+        "id": thread_id,
+        "title": title,
+        "status": "active",
+        "first_seen": "2026-05-01",
+        "last_seen": "2026-05-02",
+        "frequency_affinity": ["F3"],
+        "fragment_count": fragment_count,
+        "description": "",
+        "tags": [],
+    }
+    target = vault / "02-Threads" / "Active" / f"{thread_id}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        frontmatter.dumps(frontmatter.Post(content="", **metadata)),
+        encoding="utf-8",
+    )
+    return target
+
+
+def _write_eddy(
+    vault: Path,
+    *,
+    eddy_id: str,
+    title: str,
+    threads: tuple[str, ...] = (),
+    fragment_count: int = _EDDY_COUNT_OVER_MINIMUM,
+) -> Path:
+    """Write one eddy note under ``03-Eddies``.
+
+    Args:
+        vault: Vault root.
+        eddy_id: Eddy id, and the file stem.
+        title: Eddy title — member-derived in production.
+        threads: Titles of the threads that flow through this eddy, written as
+            ``[[...]]`` wikilinks exactly as
+            :meth:`creek.link.eddies.EddyDetector._flowing_threads` stores
+            them. :meth:`SkillTreeGenerator._render_eddy_body` renders this
+            list verbatim, which is a second-order channel: an *admitted* eddy
+            can still print a *withheld* thread's title.
+        fragment_count: The stamped member count, defaulted above
+            :data:`DEFAULT_MIN_EDDY_FRAGMENTS` for the reason given in
+            :func:`_write_thread`.
+
+    Returns:
+        The path the eddy note was written to.
+    """
+    metadata: dict[str, Any] = {
+        "type": "eddy",
+        "id": eddy_id,
+        "title": title,
+        "formed": "2026-05-01",
+        "fragment_count": fragment_count,
+        "threads": [f"[[{name}]]" for name in threads],
+        "description": "",
+        "tags": [],
+    }
+    target = vault / "03-Eddies" / f"{eddy_id}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        frontmatter.dumps(frontmatter.Post(content="", **metadata)),
+        encoding="utf-8",
+    )
+    return target
 
 
 def _skills_blob(vault: Path) -> str:
@@ -1275,4 +1450,434 @@ def test_cli_does_not_offer_the_ceiling_remedy_in_signature_only_mode(
     assert _WITHHELD_HINT in _squash(exemplar_bearing.output), (
         "Suppressing the signature-only hint also silenced the "
         "exemplar-bearing one, where the remedy is true and load-bearing."
+    )
+
+
+# ---------------------------------------------------------------------------
+# T10 — thread and eddy skills are gated on a *derived* tier (#1284)
+#
+# Everything above concerns fragments, whose tier is written on the note. A
+# Thread and an Eddy carry no ``privacy_tier`` field at all, so the tests below
+# exercise a different rule: a thread or eddy is admitted only when every
+# fragment naming it clears this call's ceiling, and one named by nothing is
+# admitted only at ``intimate``/``all``.
+# ---------------------------------------------------------------------------
+
+
+def _seed_linked_vault(vault: Path) -> None:
+    """Seed the shared thread/eddy corpus the #1284 tests reason over.
+
+    Five threads and two eddies covering every branch of the derived-tier rule
+    in one vault, so a single refresh call can assert an exclusion and its
+    positive control against the same tree — an exclusion proved on a vault
+    that emitted nothing proves nothing.
+
+    * ``frag-1284-open`` is ``open`` and names the open thread, the open eddy,
+      the mixed eddy and the personal thread. Naming the *personal* thread
+      matters: it makes that thread's evidence a genuine mix rather than a
+      single above-ceiling row, so a fix that admitted on "some member
+      resolved" is caught.
+    * ``frag-1284-personal`` is ``personal`` and names the personal thread and
+      the mixed eddy.
+    * ``frag-1284-keyless`` carries no ``privacy_tier`` key and names only the
+      keyless thread.
+    * The orphan thread is named by nobody.
+
+    The open eddy lists the *personal* thread among its member threads. That
+    is not decoration: ``_render_eddy_body`` joins ``eddy.threads`` verbatim,
+    so an admitted eddy is a second, independent route by which a withheld
+    thread's title can reach the tree.
+
+    Args:
+        vault: Vault root, mutated in place.
+    """
+    _write_fragment(
+        vault,
+        frag_id="frag-1284-open",
+        title=_OPEN_TITLE,
+        body=_exemplar_body(_OPEN_CANARY),
+        privacy_tier="open",
+        threads=(_OPEN_THREAD_TITLE, _PERSONAL_THREAD_TITLE),
+        eddies=(_OPEN_EDDY_TITLE, _MIXED_EDDY_TITLE),
+    )
+    _write_fragment(
+        vault,
+        frag_id="frag-1284-personal",
+        title=_PERSONAL_TITLE,
+        body=_exemplar_body(_PERSONAL_CANARY),
+        privacy_tier="personal",
+        threads=(_PERSONAL_THREAD_TITLE,),
+        eddies=(_MIXED_EDDY_TITLE,),
+    )
+    _write_fragment(
+        vault,
+        frag_id="frag-1284-keyless",
+        title=_UNCLASSIFIED_TITLE,
+        body=_exemplar_body(_UNCLASSIFIED_CANARY),
+        privacy_tier=None,
+        threads=(_KEYLESS_THREAD_TITLE,),
+    )
+    _write_thread(vault, thread_id="thr-1284-open", title=_OPEN_THREAD_TITLE)
+    _write_thread(vault, thread_id="thr-1284-personal", title=_PERSONAL_THREAD_TITLE)
+    _write_thread(vault, thread_id="thr-1284-keyless", title=_KEYLESS_THREAD_TITLE)
+    _write_thread(vault, thread_id="thr-1284-orphan", title=_ORPHAN_THREAD_TITLE)
+    _write_eddy(
+        vault,
+        eddy_id="edd-1284-open",
+        title=_OPEN_EDDY_TITLE,
+        threads=(_OPEN_THREAD_TITLE, _PERSONAL_THREAD_TITLE),
+    )
+    _write_eddy(vault, eddy_id="edd-1284-mixed", title=_MIXED_EDDY_TITLE)
+
+
+def _paths_blob(response: dict[str, Any]) -> str:
+    """Return ``skill_paths`` joined into one searchable string.
+
+    The read-side half of this leak. For ``threads/`` and ``eddies/`` the
+    filename *is* the slugified title, so the response envelope carries derived
+    content even though #971's four categories only ever carried ontology
+    constants — which is why this module's docstring could once say the
+    response was content-free and no longer can.
+
+    Args:
+        response: A ``skills_refresh_tool`` return value.
+
+    Returns:
+        Every path in ``skill_paths``, newline-joined.
+    """
+    paths = response["skill_paths"]
+    assert isinstance(paths, list)
+    return "\n".join(str(entry) for entry in paths)
+
+
+def test_a_thread_derived_from_a_personal_member_is_withheld_at_the_open_ceiling(
+    tmp_path: Path,
+) -> None:
+    """A thread ranks at the tier of the most sensitive fragment that names it.
+
+    The write-side and read-side halves are asserted together because for a
+    thread skill they are the same string: the title goes into the body, and
+    ``_slugify``'d into the filename that ``skill_paths`` returns.
+
+    The open thread is the anti-vacuity control. Without it, an implementation
+    that simply stopped emitting thread skills altogether would pass — and that
+    outage is the likelier failure here than the leak, because the cheapest
+    gate (fail closed on the note, #968's shape) empties both categories at
+    every ceiling below ``intimate``.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    _seed_linked_vault(tmp_path)
+    response = skills_refresh_tool(
+        vault_path=tmp_path,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="probe",
+    )
+    blob = _skills_blob(tmp_path)
+    paths = _paths_blob(response)
+
+    assert _OPEN_THREAD_TOKEN in blob, (
+        "no thread skill was written at all, so every exclusion below is "
+        f"vacuous — the ceiling must gate threads, not delete them.\n\n{paths}"
+    )
+    assert _OPEN_THREAD_TOKEN in paths, (
+        "the open thread's skill file exists but its path is missing from "
+        "skill_paths; the positive control has to hold on both surfaces."
+    )
+    assert _PERSONAL_THREAD_TOKEN not in blob, (
+        "a thread named by a personal fragment reached <vault>/creek-skills "
+        "at ceiling=open. Its title is derived from its members' vocabulary, "
+        f"so it is exactly as sensitive as they are.\n\n{blob}"
+    )
+    assert _PERSONAL_THREAD_TOKEN not in paths, (
+        "the personal-derived thread's slugified title came back in "
+        f"skill_paths — the read-side half of #1284.\n\n{paths}"
+    )
+
+
+def test_an_eddy_with_one_above_ceiling_member_is_withheld_at_the_open_ceiling(
+    tmp_path: Path,
+) -> None:
+    """The reduction runs over the unfiltered corpus, not the admitted one.
+
+    ``_MIXED_EDDY_TITLE`` has one ``open`` member and one ``personal`` member.
+    An implementation that derived the eddy's tier from the fragments the
+    ceiling already admitted would see only the ``open`` one, resolve the eddy
+    to ``open``, and emit it. This is the assertion that tells the two
+    implementations apart, and it is the same ordering trap
+    ``creek.generate.state._load_fragments_admitted`` documents for #969.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    _seed_linked_vault(tmp_path)
+    response = skills_refresh_tool(
+        vault_path=tmp_path,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="probe",
+    )
+    blob = _skills_blob(tmp_path)
+    paths = _paths_blob(response)
+
+    assert _OPEN_EDDY_TOKEN in blob, (
+        "no eddy skill was written at all, so the exclusion below is vacuous."
+    )
+    assert _MIXED_EDDY_TOKEN not in blob, (
+        "an eddy with one open and one personal member was emitted at "
+        "ceiling=open. Deriving over the already-admitted fragments hides the "
+        f"personal one; derive over the whole corpus.\n\n{blob}"
+    )
+    assert _MIXED_EDDY_TOKEN not in paths, (
+        f"the mixed eddy's slugified title came back in skill_paths.\n\n{paths}"
+    )
+
+
+def test_an_admitted_eddy_does_not_render_a_withheld_member_thread(
+    tmp_path: Path,
+) -> None:
+    """Gating the walk is not enough; the eddy body lists its member threads.
+
+    ``_render_eddy_body`` renders ``", ".join(eddy.threads)`` under
+    **Member threads**, and those entries are wikilinks to *thread titles*
+    stored by ``EddyDetector._flowing_threads``. The open eddy here is admitted
+    on its own members, but it lists the personal-derived thread — so a fix
+    that gated only ``_collect_typed`` would close the front door and leave
+    this one open.
+
+    The eddy's own skill file is asserted present first, so the absence below
+    cannot be satisfied by the eddy having been withheld for its own reasons.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    _seed_linked_vault(tmp_path)
+    skills_refresh_tool(
+        vault_path=tmp_path,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="probe",
+    )
+    blob = _skills_blob(tmp_path)
+
+    assert _OPEN_EDDY_TOKEN in blob, (
+        "the open eddy was not emitted, so this test proves nothing about "
+        "what an admitted eddy renders."
+    )
+    assert _OPEN_THREAD_TOKEN in blob, (
+        "the open thread is the member this eddy is still allowed to name; "
+        "if it is absent the assertion below passes for the wrong reason."
+    )
+    assert _PERSONAL_THREAD_TOKEN not in blob, (
+        "an admitted eddy printed a withheld thread's title in its "
+        "'Member threads' line. The eddy cleared the ceiling on its own "
+        f"members; the thread it names did not.\n\n{blob}"
+    )
+
+
+def test_a_thread_no_fragment_names_is_withheld_below_the_intimate_ceiling(
+    tmp_path: Path,
+) -> None:
+    """No evidence is not the same as no sensitivity.
+
+    ``max_source_tier`` reduces the empty set to ``INTIMATE`` and that is the
+    right answer here for #969's reason: nobody has vouched for a thread no
+    fragment names, and its stored ``fragment_count`` is a number rather than
+    evidence. The cost is real and is stated in the docs — an orphaned thread
+    needs ``--include-tier intimate`` to come back — so it is pinned rather
+    than left to be discovered.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    _seed_linked_vault(tmp_path)
+    for ceiling in (TierCeiling.OPEN, TierCeiling.PERSONAL):
+        skills_refresh_tool(
+            vault_path=tmp_path,
+            privacy_tier_ceiling=ceiling,
+            consumer="probe",
+        )
+        assert _ORPHAN_THREAD_TOKEN not in _skills_blob(tmp_path), (
+            f"a thread no fragment names was emitted at ceiling={ceiling.value}. "
+            "It has no tier evidence at all, so nothing vouches for its title."
+        )
+
+    skills_refresh_tool(
+        vault_path=tmp_path,
+        privacy_tier_ceiling=TierCeiling.ALL,
+        consumer="probe",
+    )
+    assert _ORPHAN_THREAD_TOKEN in _skills_blob(tmp_path), (
+        "the orphaned thread never comes back, at any ceiling. Exclusion has "
+        "to be recoverable or it is deletion."
+    )
+
+
+def test_a_thread_whose_members_are_keyless_is_admitted_at_the_personal_ceiling(
+    tmp_path: Path,
+) -> None:
+    """A deliberate divergence from ``creek state``'s derived-tier gate.
+
+    ``creek.generate.state`` reads member tiers with ``raw_privacy_tier``,
+    where a *missing* ``privacy_tier`` key fails all the way closed to
+    ``INTIMATE``. This generator reads them with ``tier_of`` instead, so a
+    keyless member ranks ``UNCLASSIFIED`` — which ranks with ``PERSONAL``
+    (#876) — for the reason ``_collect_fragments`` already argues at length
+    about its own gate: on a freshly ingested vault every fragment is keyless,
+    and the raw reader would withhold a thread every one of whose members this
+    same call admits. That is loss with no privacy gain.
+
+    Both directions are asserted. Withheld at ``open`` is the privacy half;
+    admitted at ``personal`` is the half that makes ``--include-tier personal``
+    mean something on the corpus that needs it most.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    _seed_linked_vault(tmp_path)
+    skills_refresh_tool(
+        vault_path=tmp_path,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="probe",
+    )
+    assert _KEYLESS_THREAD_TOKEN not in _skills_blob(tmp_path), (
+        "a thread whose only member is untiered was emitted at ceiling=open. "
+        "An untiered fragment ranks with personal (#876), so its thread does "
+        "too."
+    )
+
+    skills_refresh_tool(
+        vault_path=tmp_path,
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+        consumer="probe",
+    )
+    assert _KEYLESS_THREAD_TOKEN in _skills_blob(tmp_path), (
+        "--include-tier personal admits the keyless member fragment itself but "
+        "not the thread it names. Reading the member tier raw rather than "
+        "through the model is what does that, and it makes the flag useless on "
+        "a vault that has never been through creek classify."
+    )
+
+
+def test_thread_and_eddy_skills_return_in_full_at_the_all_ceiling(
+    tmp_path: Path,
+) -> None:
+    """Recoverability: a broad enough ceiling brings every category back.
+
+    Asserted over the withheld titles *and* over the member-thread line the
+    admitted eddy renders, because those are two separate suppressions and a
+    fix could restore one without the other.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    _seed_linked_vault(tmp_path)
+    skills_refresh_tool(
+        vault_path=tmp_path,
+        privacy_tier_ceiling=TierCeiling.ALL,
+        consumer="probe",
+    )
+    blob = _skills_blob(tmp_path)
+
+    for token in (
+        _OPEN_THREAD_TOKEN,
+        _PERSONAL_THREAD_TOKEN,
+        _KEYLESS_THREAD_TOKEN,
+        _ORPHAN_THREAD_TOKEN,
+        _OPEN_EDDY_TOKEN,
+        _MIXED_EDDY_TOKEN,
+    ):
+        assert token in blob, (
+            f"{token} is still missing at ceiling=all. Every exclusion this "
+            "gate makes must be recoverable by widening the ceiling."
+        )
+
+
+def test_skill_count_does_not_move_with_above_ceiling_thread_cardinality(
+    tmp_path: Path,
+) -> None:
+    """``skill_count`` must not be an oracle for how much is above the ceiling.
+
+    Two vaults identical below the ceiling and differing only in how many
+    above-ceiling threads they hold must return the same ``skill_count``. This
+    is the criterion that a per-thread "emit a redacted placeholder" fix would
+    fail while still passing every title assertion above.
+
+    ``skill_count == len(files)`` is re-asserted on both vaults so the equality
+    cannot be satisfied by a count that has stopped describing the tree.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    counts: list[int] = []
+    for extra_threads, vault_name in ((0, "lean"), (4, "loaded")):
+        vault = tmp_path / vault_name
+        vault.mkdir()
+        _write_fragment(
+            vault,
+            frag_id="frag-1284-open",
+            title=_OPEN_TITLE,
+            body=_exemplar_body(_OPEN_CANARY),
+            privacy_tier="open",
+            threads=(_OPEN_THREAD_TITLE,),
+        )
+        _write_thread(vault, thread_id="thr-1284-open", title=_OPEN_THREAD_TITLE)
+        for index in range(extra_threads):
+            title = f"Thread canaryextra{index}1284"
+            _write_fragment(
+                vault,
+                frag_id=f"frag-1284-personal-{index}",
+                title=_PERSONAL_TITLE,
+                body=_exemplar_body(_PERSONAL_CANARY),
+                privacy_tier="personal",
+                threads=(title,),
+            )
+            _write_thread(vault, thread_id=f"thr-1284-extra-{index}", title=title)
+        response = skills_refresh_tool(
+            vault_path=vault,
+            privacy_tier_ceiling=TierCeiling.OPEN,
+            consumer="probe",
+        )
+        files = sorted((vault / _SKILLS_RELDIR).rglob("*.md"))
+        assert response["skill_count"] == len(files)
+        counts.append(len(files))
+
+    assert counts[0] == counts[1], (
+        "skill_count moved with the number of above-ceiling threads "
+        f"({counts[0]} vs {counts[1]}). A caller can subtract the two and read "
+        "back how much of the vault sits above their ceiling."
+    )
+
+
+def test_cli_withholds_a_personal_derived_thread_at_the_default_ceiling(
+    tmp_path: Path,
+) -> None:
+    """The CLI is the second production surface for this gate too.
+
+    ``creek skills generate`` builds its own ``SkillTreeGenerator``, so a fix
+    threaded only through ``skills_refresh_tool`` would leave the vault's own
+    operator with an ungated typed walk. The default (no ``--include-tier``)
+    is what is exercised, for the reason
+    :func:`test_cli_leaks_no_personal_body_at_the_default_ceiling` gives.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    _seed_linked_vault(tmp_path)
+    result = runner.invoke(
+        app,
+        ["skills", "generate", "--generate", "--vault", str(tmp_path)],
+    )
+    assert result.exit_code == 0, result.output
+    blob = _skills_blob(tmp_path)
+
+    assert _OPEN_THREAD_TOKEN in blob, (
+        f"the CLI emitted no thread skills at all.\n\n{result.output}"
+    )
+    assert _PERSONAL_THREAD_TOKEN not in blob, (
+        "creek skills generate emitted a personal-derived thread title with no "
+        f"--include-tier flag.\n\n{blob}"
+    )
+    assert _MIXED_EDDY_TOKEN not in blob, (
+        "creek skills generate emitted a mixed-tier eddy title with no "
+        f"--include-tier flag.\n\n{blob}"
     )
