@@ -912,10 +912,20 @@ def test_redact_apply_refuses_a_named_symlinked_directory_before_walking_it(
     walked: list[str] = []
     real_walk = real_os.walk
 
-    def spy_walk(top: object, *args: object, **kwargs: object) -> object:
+    # ``Any`` rather than ``object``: this spy is a transparent passthrough to
+    # ``os.walk``, which typeshed declares as an overload set (str vs bytes
+    # paths). Typing the parameters as ``object`` makes the delegation
+    # untypeable under mypy strict and invites a type suppression, which the
+    # house rules forbid without a tracking issue and which would paper over
+    # the symptom rather than the cause. ``Any`` splats into the overload
+    # cleanly and needs nothing suppressed. Imported here, not at module
+    # scope, to leave the pre-existing import block untouched.
+    from typing import Any
+
+    def spy_walk(top: Any, *args: Any, **kwargs: Any) -> Any:
         """Record each walk root, then delegate to the real ``os.walk``."""
         walked.append(str(top))
-        return real_walk(top, *args, **kwargs)  # type: ignore[arg-type]
+        return real_walk(top, *args, **kwargs)
 
     monkeypatch.setattr(real_os, "walk", spy_walk)
 
