@@ -694,7 +694,12 @@ class ClassificationConfig(BaseModel):
     Rule-confident fragments are NOT re-classified —
     :attr:`Fragment.weighted` stays ``None`` for those even with this
     flag on. This preserves the FEAT-017 cost gate that already keeps
-    the LLM from re-running over high-confidence rule picks.
+    the LLM from re-running over high-confidence rule picks. A fragment
+    whose weighted call reaches the LLM but *fails* (provider
+    unavailable, transport error, unparseable payload) likewise keeps
+    :attr:`Fragment.weighted` as ``None``, along with its honest
+    ``rules`` provenance, rather than persisting a fabricated all-zero
+    profile (#1330).
     """
 
 
