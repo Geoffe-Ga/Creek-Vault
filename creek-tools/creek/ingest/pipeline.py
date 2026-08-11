@@ -15,10 +15,13 @@ any surface can drive it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from creek.ingest.base import assemble_ingested_fragment
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -42,6 +45,9 @@ class IngestRunResult:
         tombed: Ledgered units soft-tombed because a full-source pass no longer
             saw them.
         skipped: Units skipped by incremental/``since`` filtering.
+        warnings: Non-fatal operator advisories. Unlike *errors*, these do not
+            mean anything failed — they mean the run detected a vault state
+            that will cause trouble if left alone (#1329).
     """
 
     written: int
@@ -52,6 +58,7 @@ class IngestRunResult:
     unchanged: int
     tombed: int
     skipped: int
+    warnings: list[str] = field(default_factory=list)
 
 
 def derive_source_key(source_path: str, vault_path: Path) -> str:
@@ -68,6 +75,20 @@ def derive_source_key(source_path: str, vault_path: Path) -> str:
         return candidate.resolve().relative_to(vault_path.resolve()).as_posix()
     except ValueError:
         return candidate.name
+
+
+TOMBING_SOURCES: frozenset[str] = frozenset({"markdown"})
+"""Source types whose directory ingest may soft-tomb units it no longer sees.
+
+Deliberately *narrower* than "has a ledger", and separate from it (#1329).
+:func:`resolve_ledger` lets a caller opt a non-markdown source type into
+ledger-backed *identity* via ``ledger_source``, and until this split that same
+opt-in silently armed :func:`tomb_missing_units` as well — so a directory
+ingest under a borrowed ledger would tomb every previously-recorded unit it
+did not happen to see. Identity and tombing are different questions; only a
+source whose directory listing is genuinely the full, authoritative set of
+live units belongs here.
+"""
 
 
 def ledger_for_source(source_type: str, vault_path: Path) -> SourceLedger | None:
@@ -226,12 +247,22 @@ def write_fragment_idempotent(
 ) -> str:
     """Write or update the fragment; return ``"created"``/``"updated"``/``"unchanged"``.
 
-    When the ledger already maps this source unit to a fragment and the
-    content has *changed*, reuse that fragment id and rewrite it in place
-    (preserving classifications/links, flagging re-classification on a material
-    change per *reclassify_threshold*). Unchanged content falls through to the
-    normal write, where the deterministic id makes it an idempotent no-op. A
-    new unit (no prior ledger record) is written fresh and reported as created.
+    When the ledger already maps this source unit to a fragment, **the
+    ledger's recorded id wins on every branch** — changed, unchanged, or
+    tombed. That assignment is hoisted above the branches deliberately
+    (#1329): it used to happen only on the changed and tombed paths, leaving
+    the unchanged path to write whatever id the ingestor had just *derived*.
+    Any drift in id derivation — a timezone bug, a new hash input, a
+    refactor — therefore turned every unchanged ledgered unit into a silent
+    duplicate, because the writer's dedup keys on the id alone. Identity for
+    a mutable file source is ledger-backed by design (#672 SPEC R1); the
+    derivation is only how a *new* unit gets its first id.
+
+    Beyond identity: changed content is rewritten in place (preserving
+    classifications/links, flagging re-classification on a material change
+    per *reclassify_threshold*); unchanged content falls through to a write
+    the id makes a no-op; a new unit with no prior record is written fresh
+    and reported as created.
     """
     record = ledger_record(ledger, fragment)
     # `record is not None` guarantees `ledger is not None` (ledger_record
@@ -239,6 +270,9 @@ def write_fragment_idempotent(
     if record is None or ledger is None:
         writer.write_fragment(fragment, body=body)
         return "created"
+    # The ledger is the authority on this unit's identity, on every branch
+    # below. Do not push this back down into the branches (#1329).
+    fragment.id = record.fragment_id
     new_hash = ledger.content_hash(parsed.content)
     if record.tombed:
         restored = restore_tombed(
@@ -249,7 +283,6 @@ def write_fragment_idempotent(
             writer.write_fragment(fragment, body=body)
         return "updated"
     if record.content_hash != new_hash:
-        fragment.id = record.fragment_id
         updated = writer.update_fragment(
             fragment, body, reclassify_threshold=reclassify_threshold
         )
@@ -257,9 +290,11 @@ def write_fragment_idempotent(
             # File gone out of band: recreate under the preserved id.
             writer.write_fragment(fragment, body=body)
         return "updated"
-    # Known unit, content unchanged: idempotent no-op (the deterministic id
-    # dedups the write). Reported as unchanged so it never inflates the
-    # updated counter in the ingest summary.
+    # Known unit, content unchanged: idempotent no-op. The write resolves to
+    # the existing file because `fragment.id` is now the *ledgered* id and the
+    # writer's per-directory id index matches on it — the guarantee comes from
+    # the ledger, not from trusting the derivation to reproduce (#1329).
+    # Reported as unchanged so it never inflates the updated counter.
     writer.write_fragment(fragment, body=body)
     return "unchanged"
 
@@ -278,11 +313,19 @@ def tomb_missing_units(
     input never tombs — that guards the incremental epic from tombing every
     other unit when re-ingesting one file.
 
+    Tombing is additionally gated on *source_type* being in
+    :data:`TOMBING_SOURCES` (#1329). Holding a ledger is not sufficient: a
+    caller can borrow one via ``ledger_source`` purely to pin identity, and
+    that must not arm the tomb sweep for a source type whose directory
+    listing is not the authoritative set of live units.
+
     A tomb that fails on I/O is collected into *errors* and the unit is left
     live in the ledger so the next full-source pass retries it, rather than
     crashing the whole run. Returns the number of units actually tombed.
     """
     if ledger is None or not input_path.is_dir():
+        return 0
+    if source_type not in TOMBING_SOURCES:
         return 0
     tombed = 0
     for source_key in sorted(ledger.live_keys() - seen_keys):
@@ -324,6 +367,49 @@ def should_skip_unit(
     record = ledger_record(ledger, fragment)
     content_hash = ledger.content_hash(parsed.content) if ledger is not None else ""
     return not unit_is_changed(parsed.timestamp, content_hash, record, since)
+
+
+_UNPINNED_VAULT_WARNING = (
+    "This vault has markdown fragments but an empty ingest ledger, so it has "
+    "not been migrated for the #1329 id-derivation fix. Re-ingesting these "
+    "sources will mint new ids and leave the existing fragments behind as "
+    "duplicates. Run `creek ingest --pin-source-ids --vault <vault>` once "
+    "first (use --dry-run to preview)."
+)
+"""Advisory shown when a populated vault has no ledger records yet (#1329)."""
+
+
+def unpinned_vault_warning(
+    ledger: SourceLedger | None,
+    vault_path: Path,
+) -> str | None:
+    """Return the un-pinned-vault advisory, or ``None`` when it does not apply.
+
+    A vault that already holds markdown fragments but whose ledger is empty
+    predates the pin migration. The next ingest of those same sources will
+    derive ids under the corrected rule, fail to match anything, and write
+    duplicates — so the operator is told once, before that happens.
+
+    The ledger's own emptiness *is* the marker; deriving the signal from it
+    rather than from a version stamp in ``00-Creek-Meta/State/`` keeps this to
+    one piece of state. A second marker is a second thing that can be wrong.
+
+    Args:
+        ledger: The ledger resolved for this run, or ``None`` when unledgered.
+        vault_path: Vault root.
+
+    Returns:
+        The advisory text, or ``None`` when the vault is fresh, already
+        pinned, or this run is unledgered.
+    """
+    if ledger is None or len(ledger) > 0:
+        return None
+    fragments_root = vault_path / "01-Fragments"
+    if not fragments_root.is_dir():
+        return None
+    if not any(fragments_root.rglob("*.md")):
+        return None
+    return _UNPINNED_VAULT_WARNING
 
 
 def run_ingest(
@@ -376,6 +462,15 @@ def run_ingest(
     ingest_result = ingestor_cls().ingest(input_path)
     ledger = resolve_ledger(source_type, vault_path, ledger_source)
     filtering = since is not None or incremental
+
+    warnings: list[str] = []
+    # Checked BEFORE the write loop: once the loop has recorded its first
+    # ledger entry the vault no longer looks un-pinned, and the advisory would
+    # never fire for the very run it needed to warn about.
+    unpinned = unpinned_vault_warning(ledger, vault_path)
+    if unpinned is not None:
+        warnings.append(unpinned)
+        logger.warning("%s", unpinned)
 
     errors: list[str] = [f"[{source_type}] {err}" for err in ingest_result.errors]
     written = 0
@@ -437,4 +532,5 @@ def run_ingest(
         unchanged=counts.get("unchanged", 0),
         tombed=tombed,
         skipped=skipped,
+        warnings=warnings,
     )

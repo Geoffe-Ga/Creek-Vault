@@ -26,6 +26,85 @@ tracked in a per-source **ledger**:
 Today the markdown (journal) source is ledger-wired; append-only event sources
 keep their content-hash ids untouched.
 
+**The ledger is the authority on a known unit's identity.** Once a
+`source_key` has a record, every branch below reuses `record.fragment_id` —
+including the *unchanged* branch, which until #1329 wrote whatever id the
+ingestor had just derived. That distinction matters more than it sounds: it
+means a change to *how* ids are derived can never silently duplicate a
+fragment the ledger already knows about. Derivation is only how a **new** unit
+gets its first id.
+
+## One-time migration: `creek ingest --pin-source-ids`
+
+**If you have a vault created before this release, run this once:**
+
+```bash
+creek ingest --pin-source-ids --vault <vault>          # add --dry-run to preview
+```
+
+### Why
+
+`generate_fragment_id` hashes the fragment's timestamp, and for a file with no
+embedded date that timestamp came from the filesystem. Two host-dependent
+inputs leaked into it (#1329):
+
+- `datetime.fromtimestamp(mtime)` with no `tz=` rendered the epoch in the
+  *host's local zone*, so one file minted a different id in every timezone —
+  move a laptop, or run CI in UTC while working in Los Angeles, and the next
+  ingest saw a "new" fragment.
+- `st_birthtime` exists on macOS/BSD and not on Linux, so the same file minted
+  a different id on a developer's Mac than in Linux CI.
+
+Both are fixed: markdown, documents and images now derive that fallback
+through `creek.ingest.base.file_modified_time`, a pure function of the file's
+epoch mtime in UTC. But fixing the derivation **changes** it, so without the
+migration the next `creek ingest` over an existing vault would fail to
+recognise its own fragments and write duplicates.
+
+### What it does — and what it refuses to do
+
+The migration **pins**; it does not re-mint. Existing ids never move.
+
+- **Ledger** — one record per markdown-sourced fragment, carrying the id read
+  off disk. Never a recomputed one. That is what makes the whole re-mapping
+  problem (renaming files, rewriting the id index, children, resonance edges,
+  the embedding cache, thread membership, provenance) *vacuous* rather than
+  merely skipped: none of those references move, so none of them need
+  rewriting.
+- **Frontmatter** — exactly one key is added, `source.origin_key`. `id`,
+  `created`, the body and the filename are byte-identical afterwards. The
+  stamp is mandatory rather than cosmetic: the RTBF purge sweep resolves its
+  target by reading that field off disk and skips fragments without it, and
+  `update_fragment` preserves on-disk frontmatter rather than merging fresh
+  `source` fields — so a fragment lacking the key at migration time would
+  never gain one on any later ingest. Writes are atomic.
+- **Already-duplicated vaults** — a `source_key` claimed by more than one live
+  fragment is pinned for *neither*, and both paths are printed. Blessing one
+  would orphan the other forever. Resolve with `creek clean duplicates`, then
+  re-run.
+- **Unresolvable sources** — a fragment whose source has been deleted, or that
+  records no source file, is listed and skipped rather than guessed at.
+
+It is idempotent (a second run pins nothing) and `--dry-run` writes nothing.
+An un-migrated vault is detected on the next `creek ingest` and warned about
+before it is duplicated.
+
+### Two behaviour changes worth knowing about
+
+1. **On macOS, a markdown fragment's `created` now reports modification time,
+   not birth time.** That is the price of an id that does not depend on which
+   operating system ingested the file, and the trade is deliberate. Because
+   the writer builds a fragment's filename from `created`, a **newly ingested**
+   fragment's date prefix may differ from what the old code would have chosen.
+   No existing file is renamed — the migration never touches `created`.
+   Authorship remains `authored_at`'s job (FEAT-031), which has its own
+   frontmatter fields and its own backfill (`creek ingest --refresh-dates`).
+2. **Documents remain unledgered.** The derivation fix alone stops their
+   *timezone*-driven duplication, but a document whose mtime moves still
+   re-derives its id with no ledger record to pin it. Widening the ledger to
+   documents is blocked on a real defect in `derive_source_key` and is tracked
+   separately (#1363).
+
 ## What happens on ingest
 
 For each source unit, the ledger drives an **unchanged / changed / gone**
@@ -33,7 +112,7 @@ decision:
 
 | Case | Detection | Behaviour |
 |------|-----------|-----------|
-| **unchanged** | content hash matches the ledger | idempotent no-op (deterministic id dedups the write) |
+| **unchanged** | content hash matches the ledger | idempotent no-op (the write resolves to the existing fragment under the **ledgered** id) |
 | **changed** | same `source_key`, new content hash | **update in place** — the existing fragment is rewritten under its preserved id, keeping classifications and resonance links |
 | **gone** | a ledgered `source_key` is absent from a full-source pass | **soft-tomb** — the fragment moves to `10-Liminal/Orphaned/` and is marked `lifecycle: orphaned` (never hard-deleted) |
 | **re-added** | a tombed `source_key` reappears | **restore** — the tombed fragment is moved back and un-marked under its preserved id |

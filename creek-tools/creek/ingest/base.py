@@ -454,8 +454,43 @@ def assemble_ingested_fragment(parsed: ParsedFragment) -> IngestedFragment:
 def file_modified_time(path: Path) -> datetime:
     """Return *path*'s modification time as a timezone-aware UTC datetime.
 
-    Centralised so file-based ingestors share a single conversion
-    rule and do not drift apart over time.
+    This is the **identity anchor** for every file-based ingestor that has
+    no embedded date to fall back on. :func:`generate_fragment_id` hashes
+    the timestamp it returns, so the conversion must be a *pure function of
+    the epoch float*: invariant under the host's ``TZ`` environment
+    variable, its installed tzdata, its DST state, and its operating
+    system. ``datetime.fromtimestamp(st_mtime, tz=UTC)`` is exactly that.
+
+    Two ways of getting it wrong were live until #1329, and both are worth
+    naming because both look like simplifications:
+
+    * ``datetime.fromtimestamp(st_mtime)`` with no ``tz=`` renders the epoch
+      in the *host's* local zone. One file then mints a different
+      ``frag-<sha>`` in every timezone it is ingested from.
+    * ``getattr(stat, "st_birthtime", stat.st_mtime)`` reads a field that
+      exists on macOS/BSD and not on Linux. One file then mints a different
+      id on a developer's laptop than in CI. Birth time is *not* available
+      here for that reason; mtime is the only field every supported
+      platform agrees on.
+
+    Rendering in a fixed non-UTC zone (say LA) would also be
+    host-independent, but it bakes a ``-07:00``/``-08:00`` offset that
+    flips with DST into the hashed input. UTC is the rule for markdown,
+    documents, generic, substack, spreadsheets, presentations and images.
+    :mod:`creek.ingest.code` renders LA instead — a deliberate, equally
+    host-independent divergence left alone by #1329 because re-minting it
+    would orphan every code fragment, and code sources change too
+    continuously for any reproduction-based migration to recover them. That
+    last divergence is tracked by #1364.
+
+    Note that this value answers "which file is this?", not "when was this
+    written?". Authorship is ``authored_at``'s job (FEAT-031).
+
+    Args:
+        path: The file to stat.
+
+    Returns:
+        The file's mtime as a timezone-aware UTC datetime.
     """
     return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
 

@@ -16,9 +16,8 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import frontmatter
 
@@ -26,11 +25,15 @@ from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
     RawDocument,
+    file_modified_time,
     normalize_encoding,
     normalize_timestamp,
     parse_authored_at,
 )
 from creek.models import SourcePlatform
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -261,25 +264,6 @@ def _extract_authored_at_from_frontmatter(fm_data: dict[str, Any]) -> datetime |
     return None
 
 
-def _get_file_creation_timestamp(path: Path) -> datetime:
-    """Get the file creation timestamp from filesystem metadata.
-
-    Falls back to modification time if creation time is not available.
-    Returns a timezone-aware datetime in America/Los_Angeles.
-
-    Args:
-        path: The file path to inspect.
-
-    Returns:
-        A timezone-aware datetime from the file's metadata.
-    """
-    stat = path.stat()
-    # Use birth time on macOS, fall back to mtime
-    ctime = getattr(stat, "st_birthtime", stat.st_mtime)
-    ts_string = datetime.fromtimestamp(ctime).isoformat()
-    return normalize_timestamp(ts_string, None)
-
-
 # ---- MarkdownIngestor ----
 
 
@@ -420,14 +404,28 @@ class MarkdownIngestor(Ingestor):
         """Resolve a timestamp from frontmatter or filesystem metadata.
 
         Checks frontmatter fields first (date, created, created_at),
-        then falls back to the file's creation/modification time.
+        then falls back to the file's modification time.
+
+        **This value is an identity anchor, not an authorship claim.**
+        :func:`creek.ingest.base.generate_fragment_id` hashes it, so the
+        fallback must be a pure function of the file's epoch mtime —
+        invariant under the host's ``TZ`` env var, its tzdata, its DST
+        state, and its operating system (#1329). That is exactly what
+        :func:`~creek.ingest.base.file_modified_time` guarantees, and it is
+        why this must never be "simplified" back to a bare
+        ``datetime.fromtimestamp(mtime)`` (host-local, so one file mints one
+        id per timezone) or to ``st_birthtime`` (present on macOS/BSD,
+        absent on Linux, so one file mints one id per operating system).
+
+        Authorship is ``authored_at``'s job (FEAT-031), which has its own
+        frontmatter fields and its own backfill.
 
         Args:
             fm_data: Parsed frontmatter dictionary.
             file_path: Path to the source file.
 
         Returns:
-            A timezone-aware datetime.
+            A timezone-aware datetime; UTC when it comes from the filesystem.
         """
         fm_ts = _extract_timestamp_from_frontmatter(fm_data)
         if fm_ts is not None:
@@ -436,7 +434,7 @@ class MarkdownIngestor(Ingestor):
             except ValueError:
                 logger.warning("Invalid frontmatter timestamp: %s", fm_ts)
 
-        return _get_file_creation_timestamp(file_path)
+        return file_modified_time(file_path)
 
     def convert_to_markdown(self, fragment: ParsedFragment) -> str:
         """Return the fragment content as-is (already markdown).

@@ -36,6 +36,7 @@ from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
     RawDocument,
+    file_modified_time,
     normalize_encoding,
     normalize_timestamp,
     parse_authored_at,
@@ -810,12 +811,31 @@ class DocumentIngestor(Ingestor):
         Checks metadata for created_date first, then falls back to
         the file's modification time.
 
+        **This value is an identity anchor, not an authorship claim.**
+        :func:`creek.ingest.base.generate_fragment_id` hashes it, so the
+        fallback must be a pure function of the file's epoch mtime —
+        invariant under the host's ``TZ`` env var, its tzdata, its DST
+        state, and its operating system (#1329). That is exactly what
+        :func:`~creek.ingest.base.file_modified_time` guarantees, and it is
+        why this must never be "simplified" back to a bare
+        ``datetime.fromtimestamp(mtime)``, which renders the epoch in the
+        host's local zone and so mints one id per timezone.
+
+        Documents are more exposed to this than markdown, not less:
+        :func:`creek.ingest.pipeline.ledger_for_source` leaves them
+        unledgered, so there is no recorded id to fall back on and a
+        drifting derivation is an unconditional second write rather than a
+        merely possible one. Widening the ledger to documents is blocked on
+        a bare-filename collision in ``derive_source_key`` and is tracked by
+        #1363; this fix removes the timezone-driven churn, not the
+        mtime-driven churn.
+
         Args:
             metadata: Fragment metadata dict.
             file_path: Path to the source file.
 
         Returns:
-            A timezone-aware datetime.
+            A timezone-aware datetime; UTC when it comes from the filesystem.
         """
         created = metadata.get("created_date")
         if created is not None:
@@ -824,10 +844,7 @@ class DocumentIngestor(Ingestor):
             except ValueError:
                 logger.warning("Invalid metadata timestamp: %s", created)
 
-        # Fall back to file modification time
-        mtime = file_path.stat().st_mtime
-        ts_string = datetime.fromtimestamp(mtime).isoformat()
-        return normalize_timestamp(ts_string, None)
+        return file_modified_time(file_path)
 
     def convert_to_markdown(self, fragment: ParsedFragment) -> str:
         """Return the fragment content as markdown.
