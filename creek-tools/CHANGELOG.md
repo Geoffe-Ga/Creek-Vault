@@ -69,3 +69,17 @@ to locate the originating commit for any reference below.
   `01-Fragments/` … `10-Liminal/` or `00-Creek-Meta/`. User vault
   content lives outside this repository (default suggested location:
   `~/Obsidian/Creek-Vault/`, scaffolded by `creek init`).
+
+### Fixed
+
+- **The drift guard that refuses to overwrite a hand-edited skill file
+  now covers medium contracts too, not just schema skills, and it now
+  lives inside the shared deployment primitive itself** (#1306).
+  `<vault>/00-Creek-Meta/Skills/mediums/*.MEDIUM.md` is refused on
+  divergence exactly like `*.SKILL.md`; because the guard moved into
+  the deploy primitive, `creek init --refresh` is covered by the same
+  check, and a refusal there is atomic — nothing at all is deployed,
+  not just the skill tree. `--force` no longer silently discards the
+  operator's edits: it now preserves the local version alongside as
+  `<name>.bak` (e.g. `mediums/essay.MEDIUM.md.bak`) before
+  overwriting.

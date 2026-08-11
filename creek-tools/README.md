@@ -118,7 +118,7 @@ Every command is also documented under [`docs/`](docs/) with end-to-end examples
 | Command | Purpose | Doc |
 |---------|---------|-----|
 | `creek skills generate` | Generate the **Voice Skill Tree** under `<vault>/creek-skills/` (one `SKILL.md` per frequency, phase, mode, register, plus thread/eddy/meta skills). Previously `creek skills`; see [`CHANGELOG.md`](CHANGELOG.md) for the FEAT-019 rename. | [generation](docs/generation.md#voice-skill-tree) |
-| `creek skills sync` | Re-deploy the canonical schema-skill tree from `creek-tools/creek/templates/skills/` into `<vault>/00-Creek-Meta/Skills/`. Refuses to overwrite locally-modified skill files unless `--force` is passed. | [generation](docs/generation.md#voice-skill-tree) |
+| `creek skills sync` | Re-deploy the canonical schema-skill tree and medium contracts from `creek-tools/creek/templates/skills/` into `<vault>/00-Creek-Meta/Skills/` (including `mediums/*.MEDIUM.md`). Refuses to overwrite a locally-modified *canonical* file of either class unless `--force` is passed, in which case the local version is preserved alongside as `<name>.bak`. Files you authored yourself are never deployed over or reported as drift. | [generation](docs/generation.md#voice-skill-tree) |
 | `creek mine`     | Mine blog/essay seed ideas from the vault using four discovery strategies (liminal cross-eddy, thread terminus, resonance chain, wavelength-phase window). | [generation](docs/generation.md#mining) |
 | `creek draft`    | Draft an essay from a mined idea using the activated skill stack. Saves to `07-Voice/Drafts/` with full provenance. | [generation](docs/generation.md#drafting) |
 

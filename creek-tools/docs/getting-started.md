@@ -33,7 +33,7 @@ The scaffold materialises the canonical folder topology, copies the ontology spe
 └── AGENTS.md
 ```
 
-After upgrading `creek-tools`, re-deploy upstream schema-skill changes with `creek skills sync --vault <path>` (add `--force` to overwrite local edits). To re-copy templates without touching user content, run `creek init --vault <path> --refresh`.
+After upgrading `creek-tools`, re-deploy upstream schema-skill and medium-contract changes with `creek skills sync --vault <path>`. `creek init --vault <path> --refresh` does the same for the whole scaffold — folder topology, ontology spec, schema-skill tree, and medium contracts — and always overwrites `AGENTS.md` with the canonical copy (it's the machine-facing agent contract, not operator-authored content, so it isn't protected). If a deployed skill or medium file has been hand-edited since the last deploy, both commands refuse rather than clobber it — for `--refresh` that refusal is atomic, so nothing at all is deployed, not just the skill tree. Pass `--force` to overwrite anyway; the operator's version is preserved alongside as `<name>.bak` (e.g. `mediums/essay.MEDIUM.md.bak`) before being replaced.
 
 A minimal starter `creek_config.yaml` (already written by `creek init`):
 
