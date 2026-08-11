@@ -72,6 +72,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "WEIGHTED_CLASSIFICATION_TEMPLATE",
+    "WeightedClassificationResult",
     "WeightedDimension",
     "WeightedFragmentClassification",
     "build_weighted_classification_prompt",
@@ -794,10 +795,30 @@ def parse_weighted_yaml(response: str) -> WeightedFragmentClassification:
     )
 
 
+@dataclass(frozen=True)
+class WeightedClassificationResult:
+    """Outcome of a single weighted-profile classification call.
+
+    Attributes:
+        classification: The detected weighted ontology profile. When
+            the call short-circuits (whitespace-only body, provider
+            unavailable, transport error, unparseable payload), this is
+            the empty :class:`WeightedFragmentClassification` default.
+        succeeded: ``True`` when the LLM actually produced a weighted
+            profile; ``False`` when the call short-circuited or failed
+            and ``classification`` is the empty default. Lets the engine
+            avoid stamping ``classification_method: llm`` on a failed
+            call (#1330).
+    """
+
+    classification: WeightedFragmentClassification
+    succeeded: bool = True
+
+
 def classify_weighted(
     fragment: IngestedFragment,
     config: LLMConfig,
-) -> WeightedFragmentClassification:
+) -> WeightedClassificationResult:
     """Classify a fragment, returning a weighted ontology profile.
 
     Fragment-level twin of
@@ -808,10 +829,14 @@ def classify_weighted(
     descending, the model's reasoning preamble, and the model's
     self-reported overall confidence.
 
-    Short-circuits to an empty :class:`WeightedFragmentClassification`
-    when the fragment body is whitespace-only, when the provider is
-    unavailable, or when the call raises — the caller can then decide
-    whether to abort or to proceed without weighted guidance.
+    That profile is wrapped in a :class:`WeightedClassificationResult`
+    rather than handed back bare because an empty profile is
+    indistinguishable from a genuine all-unclassified verdict: a caller
+    that cannot tell the two apart stamps a provenance the run did not
+    earn (#1330). So the wrapper reports ``succeeded=False`` when the
+    provider is unavailable and when the call raises — and equally for
+    a whitespace-only body, which short-circuits before a classifier is
+    even built: no LLM ran there either.
 
     Args:
         fragment: The fragment (paired with its body via
@@ -819,11 +844,16 @@ def classify_weighted(
         config: LLM provider configuration (provider, model, threshold).
 
     Returns:
-        The detected :class:`WeightedFragmentClassification`; empty
-        (all-zeros) when classification could not run.
+        The detected :class:`WeightedFragmentClassification` paired with
+        whether an LLM actually produced it. When classification could
+        not run the classification is empty (all-zeros) and
+        ``succeeded`` is ``False``.
     """
     if not fragment.body.strip():
-        return WeightedFragmentClassification()
+        return WeightedClassificationResult(
+            classification=WeightedFragmentClassification(),
+            succeeded=False,
+        )
 
     # Import inside the function to avoid pulling the heavy classify
     # package into module-load time — :mod:`creek.classify.weighted`
@@ -839,7 +869,10 @@ def classify_weighted(
             "LLM provider %r unavailable; returning empty weighted classification",
             config.provider,
         )
-        return WeightedFragmentClassification()
+        return WeightedClassificationResult(
+            classification=WeightedFragmentClassification(),
+            succeeded=False,
+        )
 
     prompt = build_weighted_classification_prompt(
         body=fragment.body,
@@ -853,11 +886,15 @@ def classify_weighted(
     except (RuntimeError, OSError, ValueError) as exc:
         # ValueError covers malformed YAML and schema violations from
         # the parser; RuntimeError/OSError cover provider transport
-        # failures. Both collapse to "no signal" so the caller can
-        # decide whether to proceed without weighted guidance.
+        # failures. Both report ``succeeded=False`` so the caller can
+        # tell a failed call from a genuine all-unclassified verdict
+        # and decide whether to proceed without weighted guidance.
         logger.warning(
             "Weighted fragment classification failed (%s); returning empty result",
             exc,
         )
-        return WeightedFragmentClassification()
-    return parsed
+        return WeightedClassificationResult(
+            classification=WeightedFragmentClassification(),
+            succeeded=False,
+        )
+    return WeightedClassificationResult(classification=parsed)

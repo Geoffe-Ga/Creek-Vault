@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from creek.author.conductor import VoiceClientFactory
+    from creek.author.models import AuthoredDraft
     from creek.classify.prompt import PromptOntology
     from creek.config import CreekConfig
     from creek.generate.ai_style.model import ScanReport, VoiceFingerprint
@@ -4957,6 +4958,109 @@ def _compose_author_query(query: str | None, work: Path | None) -> str:
     return query
 
 
+_PRIVACY_DIMENSION = "privacy_compliance"
+"""The reflection dimension whose findings make ``creek author`` withhold a body.
+
+Named once because it is asserted on twice — to select the findings and to name
+the gate in the refusal — and because the refusal is only intelligible if the
+word the operator reads is the same one the reflection node emitted (#1310).
+"""
+
+
+def _preflight_medium_contract(medium: str, vault_path: Path) -> None:
+    """Refuse to author when *medium*'s contract cannot be loaded (#1310).
+
+    The contract carries the ``default_privacy_tier`` that the HARD privacy gate
+    measures a draft against, and a vault may shadow a shipped contract with a
+    malformed one at ``00-Creek-Meta/Skills/mediums/<medium>.MEDIUM.md``. An
+    unusable contract therefore means *no ceiling*, which is the whole defect
+    #1310 closes — so it fails closed here, before anything is drafted or
+    printed, rather than degrading to a contract-less run.
+
+    The contract is loaded a second time inside
+    :func:`creek.author.conductor.run_author`; re-reading one small skill file
+    is cheaper than widening that function's signature to accept a pre-loaded
+    contract, and it keeps a single loader as the source of truth.
+
+    Args:
+        medium: The requested output medium (already validated as supported).
+        vault_path: The resolved vault root to load the contract from.
+
+    Raises:
+        typer.Exit: With code 1 when the contract cannot be read, parsed, or
+            validated.
+    """
+    # Function-local, matching this module's style for heavyweight/optional
+    # imports. ``ValidationError`` is not a ``ValueError`` in Pydantic v2 and
+    # ``yaml.YAMLError`` is not one either, so both are named explicitly
+    # alongside ``OSError`` (unreadable file) and ``ValueError``
+    # (``ContractConformanceError`` and friends).
+    import yaml
+    from pydantic import ValidationError
+
+    from creek.author.contracts import load_medium_contract
+
+    try:
+        load_medium_contract(medium, vault_path)
+    except (OSError, ValueError, ValidationError, yaml.YAMLError) as exc:
+        # The exception *class* only: a pydantic/YAML message embeds the
+        # offending input, and Rich would try to read its square brackets as
+        # markup. The path below is what the operator actually needs to fix.
+        console.print(
+            f"[red]Refusing to author: the {medium!r} medium contract could not "
+            f"be loaded ({type(exc).__name__}). That contract declares the "
+            "privacy ceiling the draft is judged against, so authoring without "
+            "it is refused. Fix or remove "
+            f"00-Creek-Meta/Skills/mediums/{medium}.MEDIUM.md.[/red]",
+        )
+        raise typer.Exit(code=1) from exc
+
+
+def _emit_author_result(draft: AuthoredDraft) -> None:
+    """Print the run summary, then either the draft body or a privacy refusal.
+
+    The summary line is unconditional — an operator is told the verdict either
+    way — but the body is withheld whenever the reflection node raised a
+    :data:`_PRIVACY_DIMENSION` finding, because that finding *means* the body
+    reproduces text above the medium's privacy ceiling (#1310).
+
+    The trigger is that one dimension, never ``ESCALATE`` as such: escalation is
+    routine on this surface (an empty vault escalates, and any unresolved soft
+    finding escalates once the round budget runs out), so refusing on it would
+    withhold ordinary drafts. Each finding's message is echoed because it names
+    the offending fragment id and tier — and only those, never the protected
+    text itself.
+
+    Args:
+        draft: The finished draft returned by
+            :func:`creek.author.conductor.run_author`.
+
+    Raises:
+        typer.Exit: With code 1 when the draft carries any privacy finding.
+    """
+    console.print(
+        f"medium={draft.medium} verdict={draft.verdict} "
+        f"rounds={draft.rounds} provenance={len(draft.provenance)}",
+    )
+    leaks = [hit for hit in draft.findings if hit.dimension == _PRIVACY_DIMENSION]
+    if not leaks:
+        console.print(draft.body)
+        return
+    # ``escape`` because each message interpolates a fragment id read straight
+    # from the vault: an id carrying square brackets is otherwise parsed as Rich
+    # markup, which either silently renders the WRONG id (``frag[bold]x`` prints
+    # as ``fragx``) or raises ``MarkupError`` and replaces the refusal with a
+    # traceback. A HARD gate's refusal has to survive its own input (#1310).
+    detail = escape(" ".join(hit.message for hit in leaks))
+    console.print(
+        f"[red]Draft withheld: the {_PRIVACY_DIMENSION} gate raised "
+        f"{len(leaks)} finding(s), so the body is not printed. {detail} "
+        "Narrow --include-tier, or redact the cited fragments, then "
+        "re-run.[/red]",
+    )
+    raise typer.Exit(code=1)
+
+
 @app.command()
 def author(
     query: str | None = typer.Option(None, "--query", help="What to author about."),
@@ -5015,8 +5119,14 @@ def author(
     real evidence only (no voicing or reflection). ``book-report`` takes
     ``--work`` (the 11-Other-Authors path) instead of ``--query``; every other
     medium requires ``--query``.
+
+    The run is judged against the medium's contract. If that contract cannot be
+    loaded, or if the finished draft reproduces text above the contract's
+    privacy tier, the command prints the verdict, refuses, and exits non-zero
+    **without printing the body**. A ``chat`` draft is truncated to the medium's
+    character ceiling.
     """
-    from creek.author import SUPPORTED_MEDIUMS, build_default_conductor
+    from creek.author import SUPPORTED_MEDIUMS, build_default_conductor, run_author
     from creek.author.client import AuthorLLMClient
 
     _validate_author_inputs(medium, query, work, SUPPORTED_MEDIUMS)
@@ -5030,6 +5140,12 @@ def author(
 
     if dry_run:
         # The dry run only plans + gathers evidence; no voicing, so no client.
+        # Deliberately still the contract-less ``build_default_conductor``
+        # rather than ``plan_author`` (#1310): this branch renders no body, so
+        # there is nothing for the privacy gate to gate, and ``plan_author``
+        # returns counts only — switching to it would silently drop the
+        # ``_audit_privacy_override_if_needed`` call below, losing the record
+        # that the operator accessed elevated content, for zero privacy gain.
         conductor = build_default_conductor(max_rounds=rounds)
         evidence = conductor.gather_evidence(
             effective_query,
@@ -5051,6 +5167,10 @@ def author(
             f"{len(evidence.all_source_fragments())} source_fragments",
         )
         return
+
+    # #1310: fail closed on an unusable contract *before* anything is printed —
+    # a run with no ceiling is exactly the leak this command must not ship.
+    _preflight_medium_contract(medium, vault_path)
 
     # #658/#661: build the router-resolved voice client *per the run's content
     # tier* so live voicing of Intimate content is redirected to a local
@@ -5074,17 +5194,24 @@ def author(
             "stub. Configure llm.generation (and consent for a cloud provider) "
             "for live voicing.[/dim]",
         )
-    draft_result = build_default_conductor(
-        max_rounds=rounds,
-        voice_client_factory=_voice_client,
-    ).run(
+    # #1310: route through ``run_author`` rather than driving a conductor
+    # directly, so the run carries the medium contract (the privacy ceiling the
+    # HARD gate needs) and the chat character ceiling, both of which
+    # ``Conductor.run`` alone does not apply. ``max_rounds`` stays explicit:
+    # ``rounds`` came from this vault's ``author.max_author_rounds``, which must
+    # keep winning over ``run_author``'s bare ``AuthorConfig()`` fallback.
+    draft_result = run_author(
         medium=medium,
         query=effective_query,
         vault=vault_path,
+        max_rounds=rounds,
+        voice_client_factory=_voice_client,
         override=override,
     )
     # #660: audit the elevated access using the fragments actually cited in the
-    # draft's provenance (no-op for None/OPEN).
+    # draft's provenance (no-op for None/OPEN). Before any refusal on purpose —
+    # the operator did read elevated content, and withholding the draft does not
+    # un-read it, so the audit trail must record the access either way (#1310).
     _audit_privacy_override_if_needed(
         vault_path=vault_path,
         command="author",
@@ -5093,11 +5220,7 @@ def author(
             fid for entry in draft_result.provenance for fid in entry.fragment_ids
         ],
     )
-    console.print(
-        f"medium={draft_result.medium} verdict={draft_result.verdict} "
-        f"rounds={draft_result.rounds} provenance={len(draft_result.provenance)}",
-    )
-    console.print(draft_result.body)
+    _emit_author_result(draft_result)
 
 
 @app.command(name="save")
