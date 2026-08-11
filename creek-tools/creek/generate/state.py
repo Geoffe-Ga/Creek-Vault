@@ -49,7 +49,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
@@ -78,9 +77,11 @@ from creek.generate.mining import (
     phase_filtered_seeds,
 )
 from creek.generate.state_tiers import (
+    admit_by_derived_tier,
     derived_link_tiers,
     max_admitted_tier,
     stamp_report,
+    wikilink_targets,
 )
 from creek.generate.wavelength import (
     DEFAULT_CURRENT_PHASE_WINDOW_DAYS,
@@ -177,9 +178,6 @@ _FREQUENCY_ORDER: dict[str, int] = {
     member.value: index for index, member in enumerate(Frequency)
 }
 """Canonical sort position per :class:`Frequency` value (F1..F10 then UNCLASSIFIED)."""
-
-_WIKILINK_PATTERN: re.Pattern[str] = re.compile(r"\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]")
-"""Match an Obsidian wikilink like ``[[Target]]`` or ``[[Target|Alias]]``."""
 
 _STALE_FRAGMENT_AGE_DAYS: int = 90
 """Age threshold (days) before an unreferenced fragment is reported as stale."""
@@ -318,9 +316,6 @@ the previous union return forced an ``isinstance`` narrow at every caller that
 mypy could not do for itself.
 """
 
-_LinkedT = TypeVar("_LinkedT", Thread, Eddy)
-"""Models whose tier is *derived* from the fragments naming their ``title``."""
-
 
 def _safe_post(md_file: Path) -> frontmatter.Post | None:
     """Load a frontmatter post, returning ``None`` on parse errors."""
@@ -433,11 +428,11 @@ def _load_fragments_admitted(
     """
     loaded = _read_fragment_files(root)
     eddy_tiers = derived_link_tiers(
-        (raw_privacy_tier(raw), _wikilink_targets(fragment.eddies))
+        (raw_privacy_tier(raw), wikilink_targets(fragment.eddies))
         for _path, fragment, raw in loaded
     )
     thread_tiers = derived_link_tiers(
-        (raw_privacy_tier(raw), _wikilink_targets(fragment.threads))
+        (raw_privacy_tier(raw), wikilink_targets(fragment.threads))
         for _path, fragment, raw in loaded
     )
     admitted = [entry for entry in loaded if within_ceiling(entry[2], override)]
@@ -448,41 +443,6 @@ def _load_fragments_admitted(
         eddy_tiers=eddy_tiers,
         thread_tiers=thread_tiers,
     )
-
-
-def _admit_by_derived_tier(
-    models: list[_LinkedT],
-    link_tiers: dict[str, list[PrivacyTier]],
-    override: PrivacyTierOverride,
-) -> tuple[list[_LinkedT], list[PrivacyTier]]:
-    """Admit eddies / threads on the tier of the fragments that name them.
-
-    Neither model carries a ``privacy_tier`` field, so the cutoff runs against
-    a *derived* tier: the maximum over the tiers of every fragment whose
-    ``eddies`` / ``threads`` wikilinks name this title.
-    :func:`~creek.classify.privacy_filter.max_source_tier` supplies the empty
-    case, ``INTIMATE`` — an eddy no fragment names has no tier evidence at all,
-    and that includes the ``fragment_count`` fallback path in
-    :meth:`StateReportGenerator._eddy_count`, whose stored count is a number
-    rather than evidence.
-
-    Args:
-        models: Every eddy or thread loaded from disk.
-        link_tiers: ``{title: [member tier, ...]}`` from
-            :func:`_load_fragments_admitted`.
-        override: The admission ceiling.
-
-    Returns:
-        ``(admitted models, their derived tiers)``, positionally parallel.
-    """
-    admitted: list[_LinkedT] = []
-    tiers: list[PrivacyTier] = []
-    for model in models:
-        tier = max_source_tier(link_tiers.get(model.title, []))
-        if tier_within_override(tier, override):
-            admitted.append(model)
-            tiers.append(tier)
-    return admitted, tiers
 
 
 def _admit_praxis(
@@ -498,8 +458,10 @@ def _admit_praxis(
 
     An **empty** ``derived_from`` is excluded rather than admitted. It names no
     evidence, so there is nothing whose tier could vouch for the title — the
-    same reasoning as :func:`_admit_by_derived_tier`'s empty case, reached one
-    step earlier because ``ALL`` would otherwise admit the fail-closed
+    same reasoning as
+    :func:`~creek.generate.state_tiers.admit_by_derived_tier`'s empty case,
+    reached one step earlier because ``ALL`` would otherwise admit the
+    fail-closed
     ``INTIMATE`` that reduction produces.
 
     Args:
@@ -680,7 +642,7 @@ def _load_vault_state(
         The admitted :class:`_VaultState`.
     """
     frags = _load_fragments_admitted(vault_path / _FRAGMENTS_SUBDIR, override)
-    threads, thread_tiers = _admit_by_derived_tier(
+    threads, thread_tiers = admit_by_derived_tier(
         _load_typed_models(
             vault_path / _THREADS_SUBDIR,
             type_tag="thread",
@@ -689,7 +651,7 @@ def _load_vault_state(
         frags.thread_tiers,
         override,
     )
-    eddies, eddy_tiers = _admit_by_derived_tier(
+    eddies, eddy_tiers = admit_by_derived_tier(
         _load_typed_models(
             vault_path / _EDDIES_SUBDIR,
             type_tag="eddy",
@@ -758,19 +720,6 @@ def _frequency_label(freq_value: Frequency | str) -> str:
             return freq_value
     name = FREQUENCY_NAMES.get(freq)
     return f"{freq.value} ({name})" if name else freq.value
-
-
-def _wikilink_targets(wikilinks: list[str]) -> list[str]:
-    """Return the inner targets of ``[[...]]`` wikilink strings.
-
-    Plain strings (no brackets) are returned unchanged so eddy fields
-    stored without ``[[...]]`` syntax still match.
-    """
-    targets: list[str] = []
-    for raw in wikilinks:
-        match = _WIKILINK_PATTERN.search(raw)
-        targets.append(match.group(1).strip() if match else raw.strip())
-    return targets
 
 
 def _section(header: str, body_lines: list[str]) -> str:
@@ -1242,8 +1191,9 @@ class StateReportGenerator:
         the placeholder behaviour of FEAT-006 is preserved.
 
         #969: ``self._state.eddies`` is already the admitted slice —
-        :func:`_admit_by_derived_tier` cut it off against the maximum tier of
-        the fragments naming each title, because :class:`~creek.models.Eddy`
+        :func:`~creek.generate.state_tiers.admit_by_derived_tier` cut it off
+        against the maximum tier of the fragments naming each title, because
+        :class:`~creek.models.Eddy`
         carries no ``privacy_tier`` of its own. Note that the
         ``has_leaves=False`` fallback above is reachable only for eddies that
         cleared that cutoff, and an eddy with no member fragments has no tier
@@ -1348,7 +1298,7 @@ class StateReportGenerator:
         """
         counts: Counter[str] = Counter()
         for frag in self._leaves():
-            for target in _wikilink_targets(getattr(frag, attr)):
+            for target in wikilink_targets(getattr(frag, attr)):
                 counts[target] += 1
         return dict(counts)
 
@@ -1709,7 +1659,7 @@ class StateReportGenerator:
         admitted_titles = {eddy.title for eddy in self._state.eddies}
         mapping: dict[str, set[str]] = {}
         for fragment in self._state.fragments:
-            targets = set(_wikilink_targets(fragment.eddies)) & admitted_titles
+            targets = set(wikilink_targets(fragment.eddies)) & admitted_titles
             if targets:
                 mapping[fragment.id] = targets
         return mapping

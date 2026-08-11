@@ -18,6 +18,7 @@ from creek.author.checks import (
     check_voice_fidelity,
 )
 from creek.author.conductor import Conductor
+from creek.author.contracts import load_medium_contract
 from creek.author.models import (
     EvidenceBundle,
     EvidenceClaim,
@@ -800,3 +801,96 @@ def test_privacy_punctuated_leak_finding_is_high_and_names_the_fragment(
     assert finding.severity == "HIGH"
     assert "frag-a" in finding.message
     assert "intimate" in finding.message
+
+
+def test_privacy_missing_contract_gates_at_the_strictest_ceiling(
+    tmp_path: Path,
+) -> None:
+    """A ``None`` contract must gate at OPEN, not disable the HARD gate (#1310).
+
+    ``check_privacy_compliance`` used to return ``[]`` whenever *either* the
+    vault or the contract was ``None``. Every contract-less caller therefore
+    got a silently disabled privacy gate — which is how ``creek author`` shipped
+    an intimate fragment's protected text to stdout with ``verdict=PASS``.
+
+    A missing contract is now the *strictest* ceiling (``PrivacyTier.OPEN``),
+    so an above-OPEN cited fragment reproduced verbatim in the body is one
+    ``HIGH`` finding. Every shipped medium template already declares
+    ``default_privacy_tier: open``, so this is a no-op for contract-bearing
+    callers and closes the hole for everyone else.
+
+    Today this returns zero findings.
+    """
+    secret = "the intimate confession nobody should publish"
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+
+    body = f"Here is the leak: {secret}"
+
+    findings = check_privacy_compliance(body, evidence, tmp_path, None)
+
+    assert [(f.dimension, f.severity) for f in findings] == [
+        ("privacy_compliance", "HIGH")
+    ]
+    assert "frag-a" in findings[0].message
+    assert "intimate" in findings[0].message
+
+
+def test_privacy_without_a_vault_still_skips(tmp_path: Path) -> None:
+    """``vault=None`` remains the one branch that skips the check (#1310).
+
+    The surviving half of the old two-part skip. Without a vault there is no
+    fragment file to resolve a tier or a protected body from, so there is
+    nothing to gate on — asserted against the same corpus and body that
+    :func:`test_privacy_missing_contract_gates_at_the_strictest_ceiling` flags,
+    so the two tests differ in exactly one argument.
+    """
+    secret = "the intimate confession nobody should publish"
+    _seed_fragment(tmp_path, "frag-a", secret, tier=PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+
+    body = f"Here is the leak: {secret}"
+
+    assert check_privacy_compliance(body, evidence, None, None) == []
+
+
+def test_rubric_cannot_soften_a_verdict(tmp_path: Path) -> None:
+    """No rubric can turn a finding into a ``PASS`` (#1310).
+
+    ``ReflectionNode.review`` opens with ``del rubric``
+    (``creek/author/reflection.py:102``): the deterministic checks gate on hard
+    rules, and the per-dimension weights are accepted for interface stability
+    only. That is a *security* property — a medium contract is authored inside
+    the vault, so if weights were scored, a contract that weighted
+    ``privacy_compliance`` at ``0.0`` could buy itself a clean verdict on a
+    leaking draft.
+
+    Pinned three ways against one body that trips ``ontological_accuracy``: no
+    rubric, the shipped ``research`` contract's real weights, and an
+    adversarial rubric that zeroes the offending dimension. All three must
+    return the identical decision *and* the identical findings.
+    """
+    body = "The piece traces the origins of the wave."
+    evidence = _grounded()
+    contract_weights = load_medium_contract("research", tmp_path).reflection_rubric
+    silencing = {
+        "ontological_accuracy": 0.0,
+        "citation_completeness": 0.0,
+        "voice_fidelity": 0.0,
+    }
+    node = ReflectionNode()
+
+    baseline = node.review(body, evidence, None)
+    weighted = node.review(body, evidence, contract_weights)
+    zeroed = node.review(body, evidence, silencing)
+
+    assert baseline.decision == "REVISE"
+    assert any(f.dimension == "ontological_accuracy" for f in baseline.findings)
+    assert weighted.decision == baseline.decision
+    assert weighted.findings == baseline.findings
+    assert zeroed.decision == baseline.decision
+    assert zeroed.findings == baseline.findings

@@ -81,7 +81,9 @@ class ReflectionNode:
                 deterministic checks gate on hard rules rather than weights, so
                 this is accepted for interface stability but not scored.
             contract: The medium contract; its ``default_privacy_tier`` is the
-                privacy ceiling. ``None`` skips the privacy check.
+                privacy ceiling. ``None`` does **not** skip the privacy check —
+                it gates at the strictest ceiling instead (#1310); see
+                :func:`~creek.author.checks.check_privacy_compliance`.
             vault: The vault root used to resolve cited fragments' privacy
                 tiers. ``None`` skips the privacy check.
             fingerprint: The owner's voice fingerprint. ``None`` skips voice

@@ -1,4 +1,4 @@
-"""Tier admission and self-description for the ``creek state`` artifact (#969).
+"""Derived-tier admission, and the ``creek state`` artifact's self-stamp (#969).
 
 ``creek state`` writes a document, and until #969 that document said nothing
 about how sensitive its own contents were. ``creek.state.read`` therefore had
@@ -8,6 +8,19 @@ the two halves of the fix that are *pure* — the artifact stamp and the
 reductions the per-section gates in :mod:`creek.generate.state` need — so that
 module keeps its per-function complexity and per-file coverage budget while the
 admission decisions stay next to the sections that make them.
+
+**The derived-tier half is no longer state-only (#1284).**
+:func:`derived_link_tiers`, :func:`wikilink_targets` and
+:func:`admit_by_derived_tier` answer a question that belongs to
+:class:`~creek.models.Thread` and :class:`~creek.models.Eddy` rather than to
+any one generator — "how sensitive is a title nobody wrote a tier on?" — and
+:mod:`creek.generate.skills` now asks it too. They live here rather than being
+re-derived there because two tools that disagree about the same file is the bug
+class :mod:`creek.classify.privacy_filter`'s module docstring exists to
+prevent: an eddy the state report withholds at ``ceiling=open`` and the voice
+skill tree emits is not a difference of opinion, it is a leak. What each caller
+*is* free to choose is the per-fragment tier reader it feeds in — see
+:func:`derived_link_tiers` — and the two deliberately differ.
 
 **The stamp key is ``privacy_tier``, deliberately.** A bespoke key would have
 forced a bespoke reader, and a second tier reader is exactly the divergence
@@ -31,13 +44,19 @@ section parsing as well.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+import re
+from typing import TYPE_CHECKING, TypeVar
 
 import frontmatter
 import yaml
 
-from creek.classify.privacy_filter import raw_privacy_tier, tier_sensitivity
-from creek.models import PrivacyTier
+from creek.classify.privacy_filter import (
+    max_source_tier,
+    raw_privacy_tier,
+    tier_sensitivity,
+    tier_within_override,
+)
+from creek.models import Eddy, PrivacyTier, Thread
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -45,6 +64,12 @@ if TYPE_CHECKING:
     from creek.classify.privacy_filter import PrivacyTierOverride
 
 logger = logging.getLogger(__name__)
+
+_LinkedT = TypeVar("_LinkedT", Thread, Eddy)
+"""The two vault note types whose tier can only ever be derived."""
+
+WIKILINK_PATTERN: re.Pattern[str] = re.compile(r"\[\[([^\]|]+?)(?:\|[^\]]+?)?\]\]")
+"""Matches ``[[Target]]`` and ``[[Target|alias]]``, capturing the target."""
 
 
 STATE_REPORT_TYPE: str = "state-report"
@@ -95,6 +120,21 @@ def derived_link_tiers(
     (``INTIMATE``) is the right answer for a target no fragment names: nobody
     has vouched for it.
 
+    **The caller supplies the source tiers, and the two callers disagree on
+    purpose.** :mod:`creek.generate.state` reads them with
+    :func:`~creek.classify.privacy_filter.raw_privacy_tier`, where a *missing*
+    ``privacy_tier`` key fails closed to ``INTIMATE``.
+    :mod:`creek.generate.skills` reads them with
+    :func:`~creek.classify.privacy_filter.tier_of`, where a missing key is the
+    model's ``UNCLASSIFIED`` default and so ranks with ``PERSONAL`` (#876).
+    Neither is this function's business: it groups whatever evidence it is
+    handed, and each generator owns the same reader for a thread's members that
+    it already owns for the thread's fragments — a generator that ranked a
+    fragment one way and the eddy that fragment names another way would be
+    incoherent with *itself*, which is worse than differing from its sibling.
+    The grouping and the cutoff, which are the parts a leak turns on, are
+    shared.
+
     Args:
         entries: ``(source tier, wikilink targets)`` pairs, one per fragment.
 
@@ -108,6 +148,69 @@ def derived_link_tiers(
         for target in targets:
             grouped.setdefault(target, []).append(tier)
     return grouped
+
+
+def wikilink_targets(wikilinks: Iterable[str]) -> list[str]:
+    """Return the inner targets of ``[[...]]`` wikilink strings.
+
+    Plain strings (no brackets) are returned unchanged so eddy and thread
+    fields stored without ``[[...]]`` syntax still match. The result is the
+    join key :func:`derived_link_tiers` and :func:`admit_by_derived_tier` both
+    use — a thread or eddy **title** — so every producer of that key has to
+    normalise the same way or the two sides silently stop meeting.
+
+    Args:
+        wikilinks: Raw ``threads`` / ``eddies`` frontmatter values.
+
+    Returns:
+        The link targets, stripped of brackets, aliases and surrounding space.
+    """
+    targets: list[str] = []
+    for raw in wikilinks:
+        match = WIKILINK_PATTERN.search(raw)
+        targets.append(match.group(1).strip() if match else raw.strip())
+    return targets
+
+
+def admit_by_derived_tier(
+    models: Iterable[_LinkedT],
+    link_tiers: dict[str, list[PrivacyTier]],
+    override: PrivacyTierOverride,
+) -> tuple[list[_LinkedT], list[PrivacyTier]]:
+    """Admit eddies / threads on the tier of the fragments that name them.
+
+    Neither model carries a ``privacy_tier`` field, so the cutoff runs against
+    a *derived* tier: the maximum over the tiers of every fragment whose
+    ``eddies`` / ``threads`` wikilinks name this title.
+    :func:`~creek.classify.privacy_filter.max_source_tier` supplies the empty
+    case, ``INTIMATE`` — an eddy no fragment names has no tier evidence at all,
+    and that includes the ``fragment_count`` fallback path in
+    ``StateReportGenerator._eddy_count``, whose stored count is a number rather
+    than evidence.
+
+    Because both the reduction and the cutoff rank by
+    :func:`~creek.classify.privacy_filter.tier_sensitivity`, "the max clears
+    the ceiling" and "every member clears the ceiling" are the same statement.
+    That equivalence is the invariant callers should quote: **a thread or eddy
+    is emitted only when every fragment naming it would itself be admitted.**
+
+    Args:
+        models: Every eddy or thread loaded from disk.
+        link_tiers: ``{title: [member tier, ...]}`` from
+            :func:`derived_link_tiers`.
+        override: The admission ceiling.
+
+    Returns:
+        ``(admitted models, their derived tiers)``, positionally parallel.
+    """
+    admitted: list[_LinkedT] = []
+    tiers: list[PrivacyTier] = []
+    for model in models:
+        tier = max_source_tier(link_tiers.get(model.title, []))
+        if tier_within_override(tier, override):
+            admitted.append(model)
+            tiers.append(tier)
+    return admitted, tiers
 
 
 def max_admitted_tier(tiers: Iterable[PrivacyTier]) -> PrivacyTier:
