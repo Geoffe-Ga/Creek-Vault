@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path  # runtime use: resolving recorded source paths
 from typing import TYPE_CHECKING, Final
 
 from creek.ingest.base import assemble_ingested_fragment
@@ -26,7 +27,6 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from collections.abc import Callable
     from datetime import datetime
-    from pathlib import Path
 
     from creek.ingest.base import Ingestor, ParsedFragment
     from creek.ingest.ledger import LedgerRecord, SourceLedger
@@ -62,16 +62,64 @@ class IngestRunResult:
     warnings: list[str] = field(default_factory=list)
 
 
+def resolve_recorded_source(source_path: str, vault_path: Path) -> Path:
+    """Interpret a recorded ``source.original_file`` string as a path on disk.
+
+    ``source.original_file`` is stored **verbatim** as whatever path the ingest
+    run was handed — ``MarkdownIngestor.parse`` records ``str(raw.path)`` and
+    the CLI does not resolve ``--source`` — so a vault ingested with ``creek
+    ingest --source 00-Inbox`` from the vault root holds *relative* recorded
+    paths. A bare :class:`Path` of such a string is anchored to the current
+    working directory, which makes every later reader of that record answer a
+    different question depending on where it was invoked from.
+
+    Anchoring to the vault is the recovery: the vault root is a stable anchor
+    the reader already holds as an argument, and it is the directory a
+    vault-relative record was almost certainly written against.
+
+    The current directory still wins when it resolves, so a run made from the
+    original ingest's directory behaves exactly as before; the vault is
+    consulted only for a relative path that names nothing where it stands.
+    When neither locates a file the string is returned unchanged, so a caller
+    asking whether the source still exists gets the same honest ``no`` — this
+    widens what *resolves*, never what is assumed to exist.
+
+    Args:
+        source_path: The recorded ``source.original_file``, verbatim.
+        vault_path: Vault root, used to anchor a relative record.
+
+    Returns:
+        The best on-disk interpretation of *source_path*.
+    """
+    candidate = Path(source_path)
+    # The ``is_absolute`` arm states intent and saves a stat; it is not a
+    # behavioural branch. ``vault_path / <absolute>`` is that absolute path
+    # again, so an absolute record takes the same value either way — dropping
+    # this clause is an equivalent mutation, and no test can kill it.
+    if candidate.is_absolute() or candidate.exists():
+        return candidate
+    vault_anchored = vault_path / candidate
+    if vault_anchored.exists():
+        return vault_anchored
+    return candidate
+
+
 def derive_source_key(source_path: str, vault_path: Path) -> str:
     """Return a stable vault-relative ``source_key`` for a source file (#672).
 
     Prefers the path relative to the vault root (the stable identity a
     re-ingested edit is matched on); falls back to the bare filename when the
     source lives outside the vault.
-    """
-    from pathlib import Path as _Path
 
-    candidate = _Path(source_path)
+    The recorded string is interpreted by :func:`resolve_recorded_source`
+    rather than being anchored to the current directory, so a relative record
+    keys the same way whichever directory the caller runs from. Sharing that
+    one resolution with the ``pin_ids`` migration is deliberate: two functions
+    disagreeing about where the same recorded path points is how the migration
+    came to call a live in-vault source deleted while this function happily
+    derived a key for it.
+    """
+    candidate = resolve_recorded_source(source_path, vault_path)
     try:
         return candidate.resolve().relative_to(vault_path.resolve()).as_posix()
     except ValueError:

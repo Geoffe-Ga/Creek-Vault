@@ -56,13 +56,17 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path  # runtime use: suffix/existence checks on source paths
+from typing import TYPE_CHECKING
 
 import frontmatter
 
 from creek.ingest.base import generate_fragment_id
 from creek.ingest.ledger import SourceLedger
-from creek.ingest.pipeline import LEDGERED_SOURCE_TYPE, derive_source_key
+from creek.ingest.pipeline import (
+    LEDGERED_SOURCE_TYPE,
+    derive_source_key,
+    resolve_recorded_source,
+)
 from creek.vault.authors import OTHER_AUTHORS_DIR
 from creek.vault.reader import iter_vault_fragments
 
@@ -79,6 +83,9 @@ from creek.vault.writer import (
     _ORPHANED_RELPARTS,
     _atomic_write_text,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +216,7 @@ def _raw_created(metadata: dict[str, object]) -> datetime | None:
     return None
 
 
-def _unpinnable_reason(source_path_str: str) -> str | None:
+def _unpinnable_reason(source_path_str: str, vault_path: Path) -> str | None:
     """Return why *source_path_str* cannot be pinned, or ``None`` if it can.
 
     Three dispositions are refused, each for its own reason:
@@ -221,15 +228,26 @@ def _unpinnable_reason(source_path_str: str) -> str | None:
       it would only add a record no future run will ever match — and, worse,
       could shadow a *different* file that later takes that path.
 
+    The existence question is asked of :func:`~creek.ingest.pipeline.
+    resolve_recorded_source`, the same resolution
+    :func:`~creek.ingest.pipeline.derive_source_key` keys on, so this predicate
+    and the key written for whatever it admits can never disagree about where a
+    recorded path points. Asking it of a bare ``Path`` instead anchored a
+    relative record to the *current directory*, so running this one-shot
+    migration from anywhere but the original ingest's directory reported live
+    in-vault sources as deleted and silently skipped exactly the fragments the
+    migration exists to protect.
+
     Args:
         source_path_str: The fragment's ``source.original_file``, verbatim.
+        vault_path: Vault root, used to anchor a relative record.
 
     Returns:
         A human-readable reason, or ``None`` when the source is pinnable.
     """
     if not source_path_str:
         return "fragment records no source.original_file"
-    source_path = Path(source_path_str)
+    source_path = resolve_recorded_source(source_path_str, vault_path)
     if source_path.suffix.lower() != _MARKDOWN_SUFFIX:
         return f"source {source_path_str!r} is not a {_MARKDOWN_SUFFIX} file"
     if not source_path.exists():
@@ -255,7 +273,7 @@ def _collect_candidates(vault_path: Path) -> tuple[list[_Candidate], list[str]]:
             vault_path.joinpath(*relparts),
         ):
             source_path_str = fragment.source.original_file or ""
-            reason = _unpinnable_reason(source_path_str)
+            reason = _unpinnable_reason(source_path_str, vault_path)
             if reason is not None:
                 unpinnable.append(f"{md_file}: {reason}")
                 continue

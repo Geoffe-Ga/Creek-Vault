@@ -723,6 +723,179 @@ def test_a_non_markdown_source_is_left_to_its_own_ingestor(tmp_path: Path) -> No
     assert ".md" in result.unpinnable[0]
 
 
+# ---- (j) a relatively-pathed source, migrated from a different directory ----
+#
+# ``source.original_file`` is stored verbatim as whatever path the ingest run
+# was handed (``MarkdownIngestor.parse`` records ``str(raw.path)`` and the CLI
+# does not resolve ``--source``), so an operator who ran ``creek ingest
+# --source 00-Inbox`` from the vault root has a vault full of *relative*
+# recorded paths. The one-time migration is a separate invocation and there is
+# nothing to make an operator run it from the same directory.
+
+
+def _make_in_vault_source(vault: Path, relpath: str = "00-Inbox/note.md") -> Path:
+    """Write a pinned-mtime markdown source *inside* the vault.
+
+    The in-vault case is what a relatively-pathed record is normally about:
+    journals kept in the vault and ingested from the vault root.
+
+    Args:
+        vault: Vault root.
+        relpath: Vault-relative location for the source file.
+
+    Returns:
+        The absolute path to the created source file.
+    """
+    src = vault / relpath
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text(_BODY, encoding="utf-8")
+    os.utime(src, (PINNED_MTIME, PINNED_MTIME))
+    return src
+
+
+def test_a_relatively_pathed_source_is_pinned_from_any_working_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live fragment is protected even when the migration runs from elsewhere.
+
+    Resolving the recorded path against the *current* directory rather than
+    against the vault it was recorded relative to made this fragment look
+    deleted, so the migration skipped it — leaving the one population the
+    migration exists to protect exposed to the re-minting duplication. The
+    report line said so, but an operator who runs a one-shot migration, sees a
+    few sources called unpinnable and moves on has not been protected.
+
+    Args:
+        tmp_path: Pytest temp directory.
+        monkeypatch: Used to run the migration from an unrelated directory.
+    """
+    vault = _make_vault(tmp_path)
+    source = _make_in_vault_source(vault)
+    md_file = _seed_pre_fix_fragment(vault, source.relative_to(vault))
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    result = pin_source_ids(vault)
+
+    assert result.unpinnable == []
+    assert result.pinned == 1
+    assert _origin_key(md_file) == "00-Inbox/note.md"
+
+    # The outcome that matters: the pin actually holds against the re-ingest.
+    reingested = _reingest(vault, source.parent)
+
+    assert reingested.unchanged == 1
+    assert reingested.created == 0
+    files = _fragment_files(vault)
+    assert len(files) == 1
+    assert str(frontmatter.load(str(files[0]))["id"]) == _PRE_FIX_ID
+
+
+def test_a_relatively_pathed_source_pins_the_same_key_from_either_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The recorded ``source_key`` does not depend on where the migration ran.
+
+    Two identical vaults, two different working directories, one key. A key
+    that varied with the operator's shell would file the pin under a name the
+    next ingest does not look up, which re-mints just as surely as skipping the
+    fragment does.
+
+    Args:
+        tmp_path: Pytest temp directory.
+        monkeypatch: Used to switch working directory between the two runs.
+    """
+    keys: list[str | None] = []
+    for index, cwd_name in enumerate(("inside", "elsewhere")):
+        vault = _make_vault(tmp_path / f"case{index}")
+        source = _make_in_vault_source(vault)
+        md_file = _seed_pre_fix_fragment(vault, source.relative_to(vault))
+        cwd = vault if cwd_name == "inside" else tmp_path / f"case{index}-cwd"
+        cwd.mkdir(parents=True, exist_ok=True)
+        monkeypatch.chdir(cwd)
+
+        assert pin_source_ids(vault).pinned == 1
+        keys.append(_origin_key(md_file))
+
+    assert keys == ["00-Inbox/note.md", "00-Inbox/note.md"]
+
+
+def test_a_relative_source_resolving_where_it_stands_still_wins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The vault is the fallback anchor, not the preferred one.
+
+    A migration run from the original ingest's own directory must key exactly
+    as it did before this anchoring existed, or the fix would quietly re-point
+    already-correct records at a same-named file that happens to sit in the
+    vault. Here the recorded path resolves *both* ways: the real source is
+    outside the vault under the working directory, and a decoy of the same
+    vault-relative name sits inside. The working directory wins, so the key is
+    the outside-the-vault bare-name form.
+
+    Args:
+        tmp_path: Pytest temp directory.
+        monkeypatch: Used to run the migration from the ingest's directory.
+    """
+    vault = _make_vault(tmp_path)
+    _make_in_vault_source(vault)  # the decoy, same vault-relative name
+    work = tmp_path / "work"
+    real = work / "00-Inbox" / "note.md"
+    real.parent.mkdir(parents=True, exist_ok=True)
+    real.write_text(_BODY, encoding="utf-8")
+    md_file = _seed_pre_fix_fragment(vault, real.relative_to(work))
+    monkeypatch.chdir(work)
+
+    result = pin_source_ids(vault)
+
+    assert result.pinned == 1
+    assert _origin_key(md_file) == "note.md"
+
+
+def test_a_relative_source_that_exists_nowhere_is_still_unpinnable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Anchoring to the vault widens what resolves — it does not pin blindly.
+
+    The refusal in :func:`~creek.ingest.pin_ids._unpinnable_reason` is a real
+    safety property: a record filed against a path holding no file can shadow a
+    different file that later takes that path. A relative path that names
+    nothing under the vault *or* the working directory is still a vanished
+    source.
+
+    Args:
+        tmp_path: Pytest temp directory.
+        monkeypatch: Used to run the migration from an unrelated directory.
+    """
+    vault = _make_vault(tmp_path)
+    fragment = Fragment(
+        id="frag-deadbeef0000",
+        title="ghost",
+        created=datetime(2024, 3, 14, 19, 0, tzinfo=UTC),
+        source=FragmentSource(
+            platform=SourcePlatform.MARKDOWN,
+            original_file="00-Inbox/never-existed.md",
+        ),
+    )
+    md_file = VaultWriter(vault_path=vault).write_fragment(fragment, body=_BODY)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    result = pin_source_ids(vault)
+
+    assert result.pinned == 0
+    assert len(result.unpinnable) == 1
+    assert str(md_file) in result.unpinnable[0]
+    assert len(SourceLedger.load(vault, source="markdown")) == 0
+    assert _origin_key(md_file) is None
+
+
 # ---- CLI surface ----
 
 

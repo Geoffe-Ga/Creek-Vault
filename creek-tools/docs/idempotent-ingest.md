@@ -87,6 +87,13 @@ The migration **pins**; it does not re-mint. Existing ids never move.
 
 It is idempotent (a second run pins nothing) and `--dry-run` writes nothing.
 
+Run it from wherever you like. `source.original_file` is recorded verbatim, so
+a vault ingested with a relative `--source` holds relative paths; a relative
+record that names nothing in the current directory is resolved against the
+vault root before it is called missing. Without that, running this one-shot
+migration from a different directory than the original ingest reported live
+sources as deleted and skipped exactly the fragments it exists to protect.
+
 An un-migrated vault is detected on the next ingest — an empty **markdown**
 ledger over a vault that already holds fragments is the marker — and the
 advisory naming the remedy is printed **before that run's write pass begins**,
