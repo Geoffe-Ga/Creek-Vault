@@ -195,10 +195,55 @@ confinement boundary.
 
 Mirrors the `creek author` CLI args and returns an `AuthoredDraft` shape:
 `medium`, `query`, `body`, `provenance` (a list of provenance entries),
-`verdict` (one of `PASS` / `REVISE` / `ESCALATE`), and `rounds`. The response
-is a typed **stub** today (the skeleton from #456); issue #460 wires it to the
-real desk. Only the `research` medium is wired — any other `medium` returns
-`status: error`.
+`claims` (each with its `source_fragments`), `verdict` (one of `PASS` /
+`REVISE` / `ESCALATE`), and `rounds`. The response was a typed stub in the
+#456 skeleton; #460 wired it to the real desk, so it is a live draft today.
+All six mediums in `creek.author.SUPPORTED_MEDIUMS` (`research`,
+`research-piece`, `essay`, `chat`, `how-to`, `book-report`) are wired — any
+other `medium` returns `status: error` naming the wired set.
+
+**A condemned draft is refused, not returned ([#1353](https://github.com/Geoffe-Ga/Creek-Vault/issues/1353)).**
+When the Writing Desk's HARD privacy check raises a `privacy_compliance`
+finding — the drafted prose reproduces a cited fragment's protected text
+verbatim, above the medium contract's `default_privacy_tier` — the verb
+answers `status: "refused"` and **omits `body`, `claims` and `provenance`
+entirely**. It still carries `medium`, `query`, `verdict`, `rounds`, a fixed
+`reason`, and `privacy_findings`: the offending findings' `dimension`,
+`severity` and `message`, where each message names the fragment id and both
+tiers involved — the fragment's own tier and the contract default it exceeded
+— and no corpus text. The keys are *absent*, never `""` or `null` — a
+falsy-but-present `body` is exactly the shape that lets a caller print nothing
+and believe it published a draft, whereas a missing key raises at the moment
+of the refusal. Until #1353 this envelope answered `status: ok` with the
+verdict, the finding **and** the protected text still in `body`. The CLI half
+of the same leak was [#1310](https://github.com/Geoffe-Ga/Creek-Vault/issues/1310),
+closed separately by #1352, so `creek author` and `creek.author` now withhold
+a condemned draft on the same trigger.
+
+Three details that are easy to misread:
+
+- **Only the `privacy_compliance` findings are echoed**, which is why the key
+  is `privacy_findings` and not `findings`. Two sibling checks interpolate
+  corpus text into their own messages — `biographical_grounding` embeds a
+  sentence lifted from the drafted body, `attribution_correctness` embeds a
+  fragment title — so echoing the whole finding list would undo the scrub.
+- **The trigger is the finding dimension, never `verdict == "ESCALATE"`.**
+  Escalation is routine on this surface (an empty vault escalates, and any
+  unresolved soft finding escalates once the round budget runs out), so
+  refusing on the verdict would withhold ordinary drafts.
+- **`tier_ceiling_enforced` stays `true`.** It is a claim about the #660
+  retrieval filter, which ran and did its job; the breach is against a
+  *different* gate, the medium contract's `default_privacy_tier` (`open` in
+  all six shipped templates). At `ceiling=all` the caller *is* admitted to
+  intimate content, which is precisely why this leak survived every
+  `ceiling=open` probe.
+
+Returning the text under a second key (`withheld_body` and similar) was
+considered and **rejected**: the whole envelope is serialized to the client —
+CrawDad feeds it verbatim into an LLM composer — so renaming the key changes
+no bytes on the wire and only makes the leak harder to see. A caller that
+legitimately needs the text in order to revise should re-run at a ceiling that
+excludes the offending fragment, or re-tier the fragment.
 
 ### Write tools (FEAT-011)
 
