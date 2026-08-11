@@ -1,4 +1,4 @@
-"""Short-write-safe primitives for raw file-descriptor I/O (#987).
+"""Torn-write-safe file primitives: short writes (#987), atomic replace (#1307).
 
 ``os.write`` is allowed to write *fewer* bytes than it was handed: the
 POSIX ``write(2)`` contract only promises some forward progress, so a
@@ -9,10 +9,26 @@ Both :mod:`creek.vault.writer` and :mod:`creek.save.writer` create notes
 by writing straight to the *final* path (``O_CREAT | O_EXCL``, with no
 tempfile + ``os.replace`` staging step), so a short write there does not
 merely spoil a scratch file — it files a half-written note under the
-real name, with no exception raised for anyone to notice. These two
-helpers live here instead of being triplicated across those call sites,
-so the drain loop and the partial-file cleanup have exactly one
-implementation to audit.
+real name, with no exception raised for anyone to notice.
+:func:`write_all` and :func:`create_exclusive` live here instead of being
+triplicated across those call sites, so the drain loop and the
+partial-file cleanup have exactly one implementation to audit.
+
+:func:`atomic_write_text` covers the *overwrite* case the two creation
+helpers deliberately do not: ``Path.write_text`` truncates the target
+before it writes, so an interrupted rewrite leaves a half-file under the
+real name and the previous contents gone. Staging into a tempfile and
+committing with ``os.replace`` means a reader sees either the whole old
+file or the whole new one, never a splice of the two — the same
+hardening merged for the vault index in #1307.
+
+Near-identical private implementations already exist at
+``creek/vault/writer.py:392`` (``_atomic_write_text``) and
+``creek/redact/cli_commands.py:531`` (``_atomic_write``). Converging
+them onto this helper is deliberate follow-up work, not part of #1312:
+each carries call-site-specific behaviour (a ``mkdir`` in the former, a
+symlink-materialisation contract in the latter) that has to be unpicked
+against its own tests.
 
 Stdlib-only by design: this module sits underneath the writers and must
 not drag any of the package in behind it.
@@ -23,10 +39,8 @@ from __future__ import annotations
 import contextlib
 import errno
 import os
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from pathlib import Path
+import tempfile
+from pathlib import Path
 
 _EXCLUSIVE_CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL
 """Create-or-fail open flags: never truncates or clobbers an existing file."""
@@ -122,3 +136,70 @@ def create_exclusive(path: Path, data: bytes) -> None:
         with contextlib.suppress(OSError):
             path.unlink()
         raise
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    """Replace *path*'s contents with *content* in a single atomic step.
+
+    *content* is staged in a uniquely named tempfile inside *path*'s own
+    directory and committed with ``os.replace``, so a concurrent reader
+    sees either the whole previous file or the whole new one and never a
+    splice of the two. If the write or the rename fails, the original
+    file is left byte-intact and the stage file is removed — unlike
+    ``Path.write_text``, which truncates the target *before* it writes
+    and so turns any interruption into permanent data loss.
+
+    Two consequences of ``mkstemp`` + ``os.replace`` that callers must
+    know about, both measured rather than assumed:
+
+    - The resulting file mode is **0o600**, inherited from
+      :func:`tempfile.mkstemp` and deliberately tighter than this
+      module's ``_NEW_FILE_MODE`` (0o644). The first consumer is an
+      operator-private audit record naming source paths and operator
+      identity, so owner-only is the right default; ``write_text``
+      would have produced 0o644.
+    - ``os.replace`` does *not* preserve the target's existing mode, so
+      a file that was 0o644 tightens to 0o600 on its next write through
+      this helper. The change is a one-way narrowing — it can never
+      widen a file that was already private.
+
+    Deliberately does not ``mkdir``: as with :func:`create_exclusive`,
+    the parent directory must already exist. The stage file has to live
+    beside the target anyway (a cross-filesystem ``os.replace`` raises
+    ``EXDEV``), and conjuring a directory tree here would silently
+    absorb a caller's wrong path.
+
+    Args:
+        path: File to overwrite. Its parent directory must already
+            exist and be writable, because the stage file is created
+            there.
+        content: The full text to write, encoded as UTF-8.
+
+    Raises:
+        OSError: Propagated untouched from the staging create, the
+            write, or the rename — an unwritable directory
+            (``EACCES``), a full disk (``ENOSPC``), and so on. Any
+            stage file left behind is unlinked first, and a failure to
+            unlink it is suppressed so the caller still sees the
+            original error rather than the cleanup's.
+    """
+    # ``mkstemp`` runs outside the ``try`` on purpose: if it raises there
+    # is no descriptor and no stage file to clean up, and ``tmp_name``
+    # would be unbound in the ``finally``.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        # ``fdopen`` takes ownership of ``fd``, so the ``with`` closes it
+        # exactly once on every path — including the write failing.
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_name, path)
+    finally:
+        # After a successful ``os.replace`` the stage name is gone, so
+        # the existence check is what makes this cleanup a no-op on the
+        # happy path rather than a spurious ``FileNotFoundError``.
+        tmp_path = Path(tmp_name)
+        if tmp_path.exists():
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()

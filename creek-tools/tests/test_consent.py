@@ -8,6 +8,8 @@ JSON format.
 from __future__ import annotations
 
 import json
+import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -16,6 +18,7 @@ import pytest
 
 from creek.consent import (
     ConsentLog,
+    ConsentLogUnavailableError,
     ConsentManager,
     ConsentRecord,
     SourceSummary,
@@ -24,6 +27,12 @@ from creek.consent import (
 )
 
 LA_TZ = ZoneInfo("America/Los_Angeles")
+
+requires_mode_bits = pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0,
+    reason="root and Windows ignore mode bits, so an unreadable path stays readable",
+)
+"""Skip marker for tests whose provocation is a chmod that root would ignore."""
 
 
 # ---- Fixtures ----
@@ -358,3 +367,334 @@ class TestConsentManagerGetSourceSummary:
         full = manager.get_source_summary(source_dir, exclusions=[])
         filtered = manager.get_source_summary(source_dir, exclusions=["*.log"])
         assert filtered.file_count < full.file_count
+
+
+# ---- Consent log corruption / unavailability tests ----
+
+
+def _corrupt_siblings(consent_dir: Path) -> list[Path]:
+    """Return every quarantined consent log in *consent_dir*.
+
+    Args:
+        consent_dir: The Processing-Log directory holding the consent log.
+
+    Returns:
+        Sorted list of ``consent-log.json.corrupt-*`` paths.
+    """
+    return sorted(consent_dir.glob("consent-log.json.corrupt-*"))
+
+
+def _tmp_residue(consent_dir: Path) -> list[str]:
+    """Return the names of any leftover ``.tmp`` files in *consent_dir*.
+
+    Args:
+        consent_dir: The Processing-Log directory holding the consent log.
+
+    Returns:
+        Sorted names of every entry whose name ends in ``.tmp``.
+    """
+    return sorted(p.name for p in consent_dir.iterdir() if p.name.endswith(".tmp"))
+
+
+class TestConsentLogRecovery:
+    """The consent log is append-only: no failure may destroy prior grants.
+
+    Every case here pins one way the old ``_load_log``/``_save_log`` pair
+    could lose or misreport recorded consent — swallowing a torn file and
+    overwriting it, reporting an unreadable log as "no consent recorded",
+    or leaving a half-written file behind.
+    """
+
+    def test_truncated_log_is_quarantined_before_a_fresh_log_is_written(
+        self, manager: ConsentManager, consent_dir: Path
+    ) -> None:
+        """A torn log is preserved on disk; the fresh log never buries it.
+
+        This is the whole defect in one test: recording a new grant over
+        an unparsable log used to silently overwrite it, taking every
+        previously recorded source path with it.
+        """
+        manager.record_consent(
+            source_type="claude",
+            source_path="/data/claude",
+            file_count=10,
+            exclusions=[],
+            operator="user",
+        )
+        log_path = consent_dir / "consent-log.json"
+        torn = log_path.read_bytes()[:-5]
+        log_path.write_bytes(torn)
+
+        manager.record_consent(
+            source_type="chatgpt",
+            source_path="/data/chatgpt",
+            file_count=5,
+            exclusions=[],
+            operator="user",
+        )
+
+        quarantined = _corrupt_siblings(consent_dir)
+        assert len(quarantined) == 1
+        assert quarantined[0].read_bytes() == torn
+        assert b"/data/claude" in quarantined[0].read_bytes()
+
+        data = json.loads(log_path.read_text(encoding="utf-8"))
+        assert [r["source_type"] for r in data["records"]] == ["chatgpt"]
+
+    def test_directory_at_log_path_raises_rather_than_reporting_no_consent(
+        self, manager: ConsentManager, consent_dir: Path
+    ) -> None:
+        """An I/O failure surfaces as an error, not as a False consent answer.
+
+        A directory sitting where the log file belongs raises
+        ``IsADirectoryError`` from ``read_text``; the old code swallowed
+        it and answered "no consent recorded".
+        """
+        log_path = consent_dir / "consent-log.json"
+        log_path.mkdir()
+
+        with pytest.raises(ConsentLogUnavailableError) as excinfo:
+            manager.check_consent("claude", "/data/claude")
+
+        assert excinfo.value.path == log_path
+        assert str(log_path) in str(excinfo.value)
+
+    @requires_mode_bits
+    def test_unreadable_log_raises_instead_of_reporting_no_consent(
+        self, manager: ConsentManager, consent_dir: Path
+    ) -> None:
+        """A log that exists but cannot be read must not read as "no consent".
+
+        Answering ``False`` here re-prompts (or, under ``--yes``,
+        re-records) for a source the operator already consented to,
+        and the rewrite then destroys the unreadable record.
+        """
+        manager.record_consent(
+            source_type="claude",
+            source_path="/data/claude",
+            file_count=10,
+            exclusions=[],
+            operator="user",
+        )
+        log_path = consent_dir / "consent-log.json"
+        log_path.chmod(0o000)
+        try:
+            with pytest.raises(ConsentLogUnavailableError):
+                manager.check_consent("claude", "/data/claude")
+        finally:
+            log_path.chmod(0o600)
+
+    @requires_mode_bits
+    def test_unreadable_parent_directory_raises_through_the_same_contract(
+        self, manager: ConsentManager, consent_dir: Path
+    ) -> None:
+        """An unsearchable parent is an I/O failure, not a bare traceback.
+
+        The old ``exists()`` guard sat outside the ``try`` and let
+        ``PermissionError`` escape ``check_consent`` untyped.
+        """
+        manager.record_consent(
+            source_type="claude",
+            source_path="/data/claude",
+            file_count=10,
+            exclusions=[],
+            operator="user",
+        )
+        consent_dir.chmod(0o600)
+        try:
+            with pytest.raises(ConsentLogUnavailableError):
+                manager.check_consent("claude", "/data/claude")
+        finally:
+            consent_dir.chmod(0o700)
+
+    def test_non_utf8_bytes_are_quarantined_as_corruption_not_propagated(
+        self, manager: ConsentManager, consent_dir: Path
+    ) -> None:
+        """Undecodable bytes are corruption: quarantine and carry on."""
+        log_path = consent_dir / "consent-log.json"
+        payload = b"\xff\xfe\x00bad"
+        log_path.write_bytes(payload)
+
+        assert manager.check_consent("claude", "/data/claude") is False
+
+        quarantined = _corrupt_siblings(consent_dir)
+        assert len(quarantined) == 1
+        assert quarantined[0].read_bytes() == payload
+
+    def test_empty_log_file_is_quarantined_under_the_same_rule(
+        self, manager: ConsentManager, consent_dir: Path
+    ) -> None:
+        """A zero-byte log is a torn write, not an empty consent history."""
+        log_path = consent_dir / "consent-log.json"
+        log_path.write_bytes(b"")
+
+        assert manager.check_consent("claude", "/data/claude") is False
+
+        quarantined = _corrupt_siblings(consent_dir)
+        assert len(quarantined) == 1
+        assert quarantined[0].read_bytes() == b""
+
+    def test_two_quarantines_in_the_same_second_do_not_collide(
+        self, manager: ConsentManager, consent_dir: Path
+    ) -> None:
+        """Back-to-back quarantines keep both payloads and touch no older one.
+
+        A second-resolution timestamp alone would collide; the reserved
+        random suffix is what keeps each corrupt file recoverable.
+        """
+        log_path = consent_dir / "consent-log.json"
+        preexisting = consent_dir / "consent-log.json.corrupt-19700101T000000-aaaa"
+        preexisting_bytes = b'{"records": [ truncated long ago'
+        preexisting.write_bytes(preexisting_bytes)
+
+        first_payload = b'{"records": 1'
+        log_path.write_bytes(first_payload)
+        assert manager.check_consent("claude", "/data/claude") is False
+
+        second_payload = b"not json at all"
+        log_path.write_bytes(second_payload)
+        assert manager.check_consent("claude", "/data/claude") is False
+
+        quarantined = _corrupt_siblings(consent_dir)
+        assert len(quarantined) == 3
+
+        fresh = [p for p in quarantined if p != preexisting]
+        assert len({p.name for p in fresh}) == 2
+        assert sorted(p.read_bytes() for p in fresh) == sorted(
+            [first_payload, second_payload],
+        )
+        assert preexisting.read_bytes() == preexisting_bytes
+
+    def test_failed_quarantine_never_lets_a_fresh_log_clobber_the_corrupt_bytes(
+        self,
+        manager: ConsentManager,
+        consent_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If the corrupt log cannot be moved aside, refuse rather than overwrite.
+
+        Quarantine is the only thing standing between a torn log and a
+        fresh one written over it, so a failed rename has to abort the
+        write — and clean up its own reserved placeholder.
+        """
+        log_path = consent_dir / "consent-log.json"
+        payload = b'{"records": 1'
+        log_path.write_bytes(payload)
+
+        def _refuse(*_args: object, **_kwargs: object) -> None:
+            """Stand in for ``os.replace`` on a filesystem that refuses it."""
+            raise OSError("rename refused")
+
+        monkeypatch.setattr("creek.consent.os.replace", _refuse)
+
+        with pytest.raises(ConsentLogUnavailableError):
+            manager.record_consent(
+                source_type="chatgpt",
+                source_path="/data/chatgpt",
+                file_count=5,
+                exclusions=[],
+                operator="user",
+            )
+
+        assert log_path.read_bytes() == payload
+        assert _corrupt_siblings(consent_dir) == []
+
+    @requires_mode_bits
+    def test_quarantine_failure_on_a_read_only_directory_preserves_the_corrupt_bytes(
+        self, manager: ConsentManager, consent_dir: Path
+    ) -> None:
+        """A read-only log directory blocks quarantine, so nothing is rewritten.
+
+        Mode ``0o500`` still permits the read that discovers the
+        corruption, which is exactly the window where an overwrite
+        would be silent.
+        """
+        log_path = consent_dir / "consent-log.json"
+        payload = b'{"records": 1'
+        log_path.write_bytes(payload)
+
+        consent_dir.chmod(0o500)
+        try:
+            with pytest.raises(ConsentLogUnavailableError):
+                manager.check_consent("claude", "/data/claude")
+        finally:
+            consent_dir.chmod(0o700)
+
+        assert log_path.read_bytes() == payload
+
+    def test_missing_log_is_a_first_run_not_a_corruption(
+        self, manager: ConsentManager, consent_dir: Path
+    ) -> None:
+        """No log at all is the first run: answer False and quarantine nothing."""
+        assert not (consent_dir / "consent-log.json").exists()
+
+        assert manager.check_consent("claude", "/data/claude") is False
+
+        assert _corrupt_siblings(consent_dir) == []
+
+    def test_save_log_failure_leaves_the_previous_log_intact(
+        self,
+        manager: ConsentManager,
+        consent_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A write that dies mid-flight must not truncate the recorded grants.
+
+        Asserts the specific ``ConsentLogUnavailableError`` rather than
+        its ``OSError`` ancestor: a failed *save* must reach the caller
+        under the same typed contract as a failed *load*, so the CLI's
+        single handler covers both. Matching on the base class would
+        still pass if ``_save_log`` stopped wrapping and let the raw
+        ``OSError`` through.
+        """
+        manager.record_consent(
+            source_type="claude",
+            source_path="/data/claude",
+            file_count=10,
+            exclusions=[],
+            operator="user",
+        )
+
+        def _refuse(*_args: object, **_kwargs: object) -> None:
+            """Stand in for ``os.replace`` failing after the temp write."""
+            raise OSError("rename refused")
+
+        monkeypatch.setattr("creek._fsio.os.replace", _refuse)
+
+        with pytest.raises(ConsentLogUnavailableError, match="rename refused"):
+            manager.record_consent(
+                source_type="chatgpt",
+                source_path="/data/chatgpt",
+                file_count=5,
+                exclusions=[],
+                operator="user",
+            )
+
+        log_path = consent_dir / "consent-log.json"
+        log = ConsentLog.model_validate_json(log_path.read_text(encoding="utf-8"))
+        assert [r.source_type for r in log.records] == ["claude"]
+        assert _tmp_residue(consent_dir) == []
+
+    def test_valid_log_is_never_quarantined(
+        self, manager: ConsentManager, consent_dir: Path
+    ) -> None:
+        """The happy path keeps appending: no quarantine, both records kept."""
+        manager.record_consent(
+            source_type="claude",
+            source_path="/data/claude",
+            file_count=10,
+            exclusions=[],
+            operator="user",
+        )
+        manager.record_consent(
+            source_type="chatgpt",
+            source_path="/data/chatgpt",
+            file_count=5,
+            exclusions=[],
+            operator="user",
+        )
+
+        assert _corrupt_siblings(consent_dir) == []
+        log_path = consent_dir / "consent-log.json"
+        log = ConsentLog.model_validate_json(log_path.read_text(encoding="utf-8"))
+        assert [r.source_type for r in log.records] == ["claude", "chatgpt"]

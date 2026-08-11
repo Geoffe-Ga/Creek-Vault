@@ -552,11 +552,37 @@ class Pipeline:
 
         If no consent_manager is configured, consent is assumed.
 
+        The returned bool no longer carries every outcome, and that is
+        the point. An I/O failure reading the consent log raises rather
+        than returning ``False``, so fail-closed behaviour is now
+        enforced *by the type*: a destroyed or unreadable record can no
+        longer reach :meth:`run`'s ``if not has_consent:`` branch (skip
+        ingestion, still index) and masquerade there as a deliberate
+        operator refusal. The run aborts instead.
+
+        One residual ambiguity is honest and remains: a *corrupt*
+        (unparsable) log is quarantined rather than raised on, so it
+        legitimately still yields ``False`` and still takes that
+        branch. What distinguishes "the record was destroyed" from
+        "consent was never granted" in that single case is out-of-band
+        — the WARNING the quarantine emits, which names both the
+        original and the quarantine path, plus the
+        ``consent-log.json.corrupt-<timestamp>-<rand>`` artifact left
+        on disk for inspection.
+
         Args:
             source_path: The source directory to check consent for.
 
         Returns:
-            ``True`` if consent exists or no consent_manager is set.
+            ``True`` if consent exists or no consent_manager is set;
+            ``False`` when consent was never recorded, or when the log
+            was corrupt and has been quarantined.
+
+        Raises:
+            ConsentLogUnavailableError: When the consent log cannot be
+                read — an unreadable file, an unreadable parent
+                directory, or a directory sitting at the log path. This
+                aborts the run instead of being downgraded to a bool.
         """
         if self.consent_manager is None:
             return True

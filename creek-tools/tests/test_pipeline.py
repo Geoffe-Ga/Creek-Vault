@@ -9,6 +9,7 @@ confirm the full pipeline runs without errors against real temp files.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
@@ -16,7 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from creek.config import CreekConfig
-from creek.consent import ConsentManager
+from creek.consent import ConsentLogUnavailableError, ConsentManager
 from creek.link.link_engine import LinkSummary
 from creek.models import Fragment, FragmentSource, SourcePlatform
 from creek.pipeline import Pipeline, PipelineResult
@@ -1052,6 +1053,28 @@ class TestPipelineConsent:
         pipeline = Pipeline(config=config, consent_manager=cm)
         result = pipeline.run(source_path=source_path, vault_path=vault_path)
         assert result.indexes_generated >= 4
+
+    def test_unreadable_consent_log_aborts_instead_of_skipping_ingestion(
+        self, config, vault_path, source_path, tmp_path, caplog
+    ):
+        """An unreadable consent log is an error, not a silent refusal.
+
+        The "skip ingestion, still index" branch is reserved for a
+        deliberate absence of consent. Routing an I/O failure through it
+        would report a successful, empty run and log a warning that
+        blames the operator for something the filesystem did.
+        """
+        log_dir = tmp_path / "00-Creek-Meta" / "Processing-Log"
+        log_dir.mkdir(parents=True)
+        (log_dir / "consent-log.json").mkdir()
+        cm = ConsentManager(log_dir=log_dir)
+        pipeline = Pipeline(config=config, consent_manager=cm)
+
+        caplog.set_level(logging.WARNING, logger="creek.pipeline")
+        with pytest.raises(ConsentLogUnavailableError):
+            pipeline.run(source_path=source_path, vault_path=vault_path)
+
+        assert "Consent not granted" not in caplog.text
 
     def test_consent_manager_stored_on_pipeline(self, config, tmp_path):
         """Pipeline should store the consent_manager attribute."""

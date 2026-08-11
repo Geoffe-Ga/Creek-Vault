@@ -26,7 +26,7 @@ from creek.classify.privacy_filter import (
     record_privacy_override,
 )
 from creek.config import AIStyleConfig, load_config, resolve_config_path
-from creek.consent import ConsentManager
+from creek.consent import ConsentLogUnavailableError, ConsentManager
 from creek.models import PraxisPotential, PrivacyTier
 from creek.pipeline import (
     Pipeline,
@@ -228,7 +228,7 @@ def _format_summary(file_count: int, size_bytes: int) -> str:
     return f"{file_count} file(s), {mb:.1f} MB"
 
 
-def _gate_consent(
+def _gate_consent_unguarded(
     *,
     source_path: Path,
     vault_path: Path,
@@ -256,7 +256,15 @@ def _gate_consent(
     Raises:
         typer.Exit: With code ``1`` when the operator declines, or
             when consent has not been recorded and the caller is
-            non-interactive without ``--yes``.
+            non-interactive without ``--yes``. With code ``2`` when
+            *source_path* does not exist.
+        ConsentLogUnavailableError: Propagated from the consent-log
+            read (``check_consent``) or write (``record_consent``)
+            when the log cannot be read or safely set aside. This
+            function deliberately does not handle it; the
+            :func:`_gate_consent` wrapper turns it into a legible
+            refusal so an unreadable log can never be mistaken for a
+            source the operator simply never approved.
     """
     log_dir = _consent_log_dir(vault_path)
     manager = ConsentManager(log_dir=log_dir)
@@ -310,6 +318,64 @@ def _gate_consent(
     )
     console.print("[green]Consent recorded.[/green]")
     return manager
+
+
+def _gate_consent(
+    *,
+    source_path: Path,
+    vault_path: Path,
+    source_type: str,
+    assume_yes: bool,
+) -> ConsentManager:
+    """Run the consent gate, refusing outright if the log is unreadable.
+
+    Thin guard around :func:`_gate_consent_unguarded`. A single handler
+    here covers every consent-log touch in that function — the
+    ``check_consent`` read and both ``record_consent`` writes — so the
+    gate's own branching stays within the complexity budget. It is
+    narrow on purpose: only :class:`ConsentLogUnavailableError` is
+    caught, leaving an unrelated ``OSError`` (e.g. from the source
+    summary's directory walk) free to propagate.
+
+    An unreadable consent log is not the same fact as an ungranted
+    source, and must not be reported as one. Exit code ``1`` marks the
+    refusal; code ``2`` stays reserved for usage errors such as a
+    missing source path.
+
+    Args:
+        source_path: Source directory the operator wants to ingest.
+        vault_path: Vault path used to locate the consent log.
+        source_type: Source identifier for the consent record (e.g.
+            ``"pipeline"``, ``"markdown"``).
+        assume_yes: When ``True``, skip the interactive prompt.
+
+    Returns:
+        A :class:`ConsentManager` rooted at the vault's processing log.
+
+    Raises:
+        typer.Exit: With code ``1`` when the consent log cannot be read
+            or written, and (passed through from the wrapped gate) when
+            the operator declines or the caller is non-interactive
+            without ``--yes``; with code ``2`` when *source_path* does
+            not exist.
+    """
+    try:
+        manager = _gate_consent_unguarded(
+            source_path=source_path,
+            vault_path=vault_path,
+            source_type=source_type,
+            assume_yes=assume_yes,
+        )
+    except ConsentLogUnavailableError as exc:
+        console.print(f"[red]Consent log unavailable: {exc}[/red]")
+        console.print(
+            "[red]Refusing to proceed: the consent record could not be read, "
+            "so this run cannot tell an ungranted source from a destroyed "
+            "record.[/red]"
+        )
+        raise typer.Exit(code=1) from exc
+    else:
+        return manager
 
 
 def _is_interactive() -> bool:
@@ -1315,6 +1381,68 @@ def discord(
     _dispatch_discord(selected, config, vault_path, dry_run=dry_run, package=package)
 
 
+def _run_pipeline_or_exit(
+    pipeline: Pipeline, *, source_path: Path, vault_path: Path
+) -> PipelineResult:
+    """Run *pipeline*, turning every refusal into a message and exit 1.
+
+    Each exception below is a deliberate refusal rather than a crash, so
+    each is reported in the operator's own terms instead of as a
+    traceback. They are handled here, out of line, so that ``process``
+    itself stays under the complexity gate as refusals are added.
+
+    Note the absence of a bare ``except OSError``: it would swallow the
+    unrelated filesystem errors ``Pipeline.run`` raises from its yield
+    summary and index writes, turning a genuine crash into a polite
+    refusal. Only the named types are caught.
+
+    Args:
+        pipeline: The configured pipeline to run.
+        source_path: Directory of source files to process.
+        vault_path: Obsidian vault root to write results into.
+
+    Returns:
+        The completed :class:`~creek.pipeline.PipelineResult`.
+
+    Raises:
+        typer.Exit: With code ``1`` when the pipeline refuses to run.
+    """
+    # Deferred, like every other heavy import in this module: nothing may
+    # be imported at CLI import time that builds a Rich console (#1141).
+    from creek.link import EmbeddingModelUnavailableError
+
+    try:
+        return pipeline.run(source_path=source_path, vault_path=vault_path)
+    except RedactionRequiredError as exc:
+        console.print(f"[red]Redaction gate: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    except (SymlinkEscapedSourceError, EscapingSymlinkError) as exc:
+        # ``EscapingSymlinkError`` is reachable only with
+        # ``redaction.enabled: false``, which returns early from
+        # ``_run_redaction`` before the #1087 check. The ingestor gate is
+        # then what stops the run, and its refusal must read like a
+        # refusal rather than a traceback (#1294). Both say the same
+        # thing to the operator, so they share one arm.
+        console.print(f"[red]Symlink containment: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    except EmbeddingModelUnavailableError as exc:
+        # The deleted ``LinkingPipeline`` already loaded the model, so
+        # this failure was always *reachable* from ``creek process`` — it
+        # was simply never handled, and surfaced as a traceback. #1303
+        # gives it the same treatment ``creek link`` has always had: the
+        # exception message names the model and spells out the
+        # remediation, so print it verbatim and exit non-zero.
+        console.print(f"[red]Embedding linker aborted: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    except ConsentLogUnavailableError as exc:
+        # The gate before the run passed, so the log was readable then;
+        # this is a log that became unreadable mid-run (Stage 0 re-reads
+        # it). Name it, rather than letting it surface as a traceback
+        # that looks like a crash instead of a refusal (#1312).
+        console.print(f"[red]Consent log unavailable: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+
 @app.command()
 def process(
     source: Path | None = typer.Option(None, help="Source directory to process"),
@@ -1377,34 +1505,9 @@ def process(
         no_llm=no_llm,
     )
 
-    # Deferred, like every other heavy import in this module: nothing may
-    # be imported at CLI import time that builds a Rich console (#1141).
-    from creek.link import EmbeddingModelUnavailableError
-
-    try:
-        result = pipeline.run(source_path=source_path, vault_path=vault_path)
-    except RedactionRequiredError as exc:
-        console.print(f"[red]Redaction gate: {exc}[/red]")
-        raise typer.Exit(code=1) from exc
-    except SymlinkEscapedSourceError as exc:
-        console.print(f"[red]Symlink containment: {exc}[/red]")
-        raise typer.Exit(code=1) from exc
-    except EscapingSymlinkError as exc:
-        # Reachable only with ``redaction.enabled: false``, which returns
-        # early from ``_run_redaction`` before the #1087 check. The ingestor
-        # gate is then what stops the run, and its refusal must read like a
-        # refusal rather than a traceback (#1294).
-        console.print(f"[red]Symlink containment: {exc}[/red]")
-        raise typer.Exit(code=1) from exc
-    except EmbeddingModelUnavailableError as exc:
-        # The deleted ``LinkingPipeline`` already loaded the model, so
-        # this failure was always *reachable* from ``creek process`` — it
-        # was simply never handled, and surfaced as a traceback. #1303
-        # gives it the same treatment ``creek link`` has always had: the
-        # exception message names the model and spells out the
-        # remediation, so print it verbatim and exit non-zero.
-        console.print(f"[red]Embedding linker aborted: {exc}[/red]")
-        raise typer.Exit(code=1) from exc
+    result = _run_pipeline_or_exit(
+        pipeline, source_path=source_path, vault_path=vault_path
+    )
 
     console.print(f"[bold]Files scanned:[/bold] {result.files_scanned}")
     console.print(f"[bold]Fragments created:[/bold] {result.fragments_created}")

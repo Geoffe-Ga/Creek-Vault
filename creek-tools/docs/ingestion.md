@@ -149,6 +149,32 @@ an ordinary alias (`latest -> 2026-08-01`, or `alias.md -> real.md`) needs no
 change. A tree reached *through* a symlink is also fine — only links that
 leave the named root are refused.
 
+### Quarantined consent logs — do not delete these blind
+
+If `00-Creek-Meta/Processing-Log/consent-log.json` is ever unparsable — a
+torn write from a crash or a full disk, or bad bytes on disk — Creek moves
+it aside to a sibling named
+
+```
+00-Creek-Meta/Processing-Log/consent-log.json.corrupt-<timestamp>-<random>
+```
+
+and starts a fresh log, emitting a `WARNING` that names both paths. **That
+quarantined file may be the only surviving record of what you consented
+to**, so it is preserved byte for byte and is never overwritten or removed
+by Creek. Two quarantines in the same second get distinct names, and an
+existing `.corrupt-*` file is never clobbered.
+
+Treat one appearing as a signal, not as litter: open it, recover the grants
+you recognise, and re-confirm them. Only delete it once you have. A vault
+tidy-up script that sweeps unknown files out of `Processing-Log/` will
+destroy audit history — exclude this pattern.
+
+An unreadable log — bad permissions, or a directory sitting at the path —
+is a different case and is *not* quarantined: the command refuses with a
+non-zero exit rather than guessing. Creek will never report "no consent
+recorded" because it failed to read the record.
+
 ## Common patterns
 
 ```bash

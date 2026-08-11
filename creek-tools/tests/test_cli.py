@@ -2789,6 +2789,145 @@ def test_process_consent_is_per_source(tmp_path: Path) -> None:
     assert "consent" in blocked.output.lower() or "Non-interactive" in blocked.output
 
 
+def test_process_exits_cleanly_when_the_consent_log_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """``creek process`` refuses, rather than tracebacking, on a broken log.
+
+    A directory where ``consent-log.json`` belongs makes every read of
+    the log fail. The gate must translate that into the CLI's refusal
+    idiom — exit 1, a message naming the log — and must NOT report the
+    source as newly consented, which would overwrite the log.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text("Body\n")
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / d).mkdir(parents=True)
+    (vault / "00-Creek-Meta" / "Processing-Log" / "consent-log.json").mkdir(
+        parents=True
+    )
+
+    result = runner.invoke(
+        app,
+        ["process", "--source", str(src), "--vault", str(vault), "--yes"],
+    )
+
+    assert result.exit_code == 1
+    # A clean ``typer.Exit`` reaches CliRunner as SystemExit; an unhandled
+    # IsADirectoryError would land here instead and also exit 1.
+    assert isinstance(result.exception, SystemExit)
+    output = _strip_ansi(result.output)
+    # Rich may soft-wrap the long log path, so rejoin lines before matching.
+    assert "consent-log.json" in output.replace("\n", "")
+    assert "Consent auto-granted" not in " ".join(output.split())
+
+
+def test_ingest_exits_cleanly_when_the_consent_log_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """``creek ingest`` shares the gate, so it shares the refusal.
+
+    ``ingest`` never constructs a ``Pipeline``, so a handler wrapped
+    around ``pipeline.run`` cannot cover this call site — only one
+    inside ``_gate_consent`` does.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text("# Hello\n\nFirst note about systems.\n")
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / d).mkdir(parents=True)
+    (vault / "00-Creek-Meta" / "Processing-Log" / "consent-log.json").mkdir(
+        parents=True
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "--type",
+            "markdown",
+            "--input",
+            str(src),
+            "--vault",
+            str(vault),
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    output = _strip_ansi(result.output)
+    assert "consent-log.json" in output.replace("\n", "")
+    assert "Consent auto-granted" not in " ".join(output.split())
+
+
+def test_process_reports_a_consent_log_that_breaks_mid_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A log readable at the gate but not at Stage 0 is still a refusal.
+
+    ``creek process`` reads the consent log twice: once in the gate, and
+    again in the pipeline's Stage 0 consent check. A log that goes away
+    between the two — a disk unmounting, a permissions change — surfaces
+    from inside ``pipeline.run`` rather than from the gate, so a
+    different handler has to catch it. Without one it exits as a raw
+    traceback, which reads like a crash rather than a refusal.
+    """
+    from creek.consent import ConsentLogUnavailableError, ConsentManager
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text("# Hello\n\nFirst note about systems.\n")
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / d).mkdir(parents=True)
+
+    calls = {"n": 0}
+    real_check = ConsentManager.check_consent
+
+    def _breaks_after_the_gate(
+        self: ConsentManager, source_type: str, source_path: str
+    ) -> bool:
+        """Answer the gate honestly, then fail every later read.
+
+        Args:
+            self: The consent manager under test.
+            source_type: Source identifier passed through to the real call.
+            source_path: Source path passed through to the real call.
+
+        Returns:
+            The real answer, on the first call only.
+
+        Raises:
+            ConsentLogUnavailableError: On every call after the first.
+        """
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise ConsentLogUnavailableError(
+                vault / "00-Creek-Meta" / "Processing-Log" / "consent-log.json",
+                OSError("disk went away"),
+            )
+        return real_check(self, source_type, source_path)
+
+    monkeypatch.setattr(ConsentManager, "check_consent", _breaks_after_the_gate)
+
+    result = runner.invoke(
+        app,
+        ["process", "--source", str(src), "--vault", str(vault), "--yes"],
+    )
+
+    assert calls["n"] > 1, "the pipeline never re-read the consent log"
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    output = _strip_ansi(result.output).replace("\n", "")
+    assert "Consent log unavailable" in output
+    assert "disk went away" in output
+
+
 def test_process_aborts_on_unresolved_redactions(tmp_path: Path) -> None:
     """``creek process`` exits 1 with a remediation hint when secrets exist."""
     src = tmp_path / "src"
