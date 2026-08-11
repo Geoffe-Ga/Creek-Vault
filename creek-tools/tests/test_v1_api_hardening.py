@@ -61,12 +61,14 @@ from starlette.responses import JSONResponse
 
 from creek.audit import log as audit_log_module
 from creek_mcp.api.models import ERROR_MESSAGES, ERROR_STATUS, ErrorCode
+from creek_mcp.api.routes import AUTHORIZATION_HEADER
 from creek_mcp.audit import MCP_AUDIT_RELPATH, verify_mcp_audit_chain
 from creek_mcp.httpapi import capabilities as capabilities_module
 from creek_mcp.httpapi import handlers as handlers_module
 from creek_mcp.httpapi import vault as vault_module
 from creek_mcp.httpapi.auth import BearerAuthMiddleware
 from creek_mcp.httpapi.context import LIFESPAN_SCOPE, UnsupportedScopeError
+from creek_mcp.httpapi.errors import NO_STORE
 from creek_mcp.httpapi.logging import ACCESS_LOGGER_NAME, ERROR_LOGGER_NAME
 from creek_mcp.httpapi.middleware.access_log import AccessLogMiddleware
 from creek_mcp.httpapi.middleware.boundary import ErrorBoundaryMiddleware
@@ -130,6 +132,15 @@ Spelled the same way ``tests/test_v1_api_not_implemented.py`` spells it, and
 derived in both places rather than imported from one into the other: no test
 module here imports from another, because a shared fixture that two suites
 disagreed about would make their refusal tests measure different things.
+"""
+
+_STANDING_VARY: Final[str] = f"{CEILING_HEADER}, {AUTHORIZATION_HEADER}"
+"""The whole ``Vary`` value a response with no caller ``Vary`` must render.
+
+Two tokens since #1129: an intermediary must key on the declared ceiling *and*
+on the credential, because every ``/v1`` body is a function of both. Composed
+here rather than restated as a literal so a third standing token is a one-line
+change; ``tests/test_v1_api_admission.py`` owns the policy tests behind it.
 """
 
 _SMALL_LIMIT: Final[int] = 64
@@ -1438,10 +1449,13 @@ def test_a_non_routing_http_exception_echoes_no_detail(
 
     ``content-type`` is asserted because it is what fails loudly if anyone
     "fixes" this by falling back to Starlette's default handler: that answers
-    ``text/plain`` with the detail *as* the body. ``Vary`` is asserted because
-    it is only unconditional while every response — this one included — is
-    built by the single response builder in
-    :mod:`creek_mcp.httpapi.errors`.
+    ``text/plain`` with the detail *as* the body. ``Vary`` and ``Cache-Control``
+    are asserted because they are only unconditional while every response —
+    this one included — is built by the single response builder in
+    :mod:`creek_mcp.httpapi.errors`. The ``500`` is the status class no other
+    sweep drives, and a stored fault is the worst entry of the lot: it outlives
+    the transient that caused it and is replayed to callers whose requests
+    would have succeeded.
 
     Args:
         vault: A seeded vault.
@@ -1460,7 +1474,8 @@ def test_a_non_routing_http_exception_echoes_no_detail(
     assert "HTTPException" not in response.text
     assert not contains_a_path(response.text)
     assert response.headers["content-type"].startswith("application/json")
-    assert response.headers["vary"] == CEILING_HEADER
+    assert response.headers["vary"] == _STANDING_VARY
+    assert response.headers.get_list("cache-control") == [NO_STORE]
 
 
 def test_a_non_routing_http_exception_is_logged_exactly_once(

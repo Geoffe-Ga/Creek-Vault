@@ -52,8 +52,28 @@ without it, and those two must name the same header.
 CEILING_HEADER: Final[str] = "X-Creek-Tier-Ceiling"
 """Header carrying the caller's declared tier ceiling.
 
-Also the value of every response's ``Vary``, so an intermediary cache can never
-serve one caller's ceiling-filtered response to another.
+Also one of the two standing ``Vary`` tokens, so an intermediary cache can never
+serve one caller's ceiling-filtered response to another. The other is
+:data:`AUTHORIZATION_HEADER`.
+"""
+
+AUTHORIZATION_HEADER: Final[str] = "Authorization"
+"""The header a consumer presents its bearer token in.
+
+Declared in this framework-free module, rather than beside the middleware that
+reads it, because two modules now have to agree on the string and one of them
+cannot import the other. :mod:`creek_mcp.httpapi.auth` *reads* this header to
+authenticate; :mod:`creek_mcp.httpapi.errors` *names* it in every response's
+``Vary`` so a cache keys on the credential (#1129). Those two must be the same
+header or the ``Vary`` declares a dependency on something no request carries —
+and ``auth`` already imports ``errors``, so the constant cannot live there
+without a cycle.
+
+Unlike its two neighbours it is **not** published in the OpenAPI document: that
+document declares no ``securitySchemes`` and no bearer requirement at all,
+despite every route sitting behind the gate. That gap is tracked separately; it
+is a reason this constant will gain a third reader, not a reason to file it
+somewhere else.
 """
 
 OP_CAPABILITIES: Final[str] = "getCapabilities"

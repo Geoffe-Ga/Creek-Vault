@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Final
 from starlette.datastructures import Headers
 
 from creek_mcp.api.models import ErrorCode
+from creek_mcp.api.routes import AUTHORIZATION_HEADER
 from creek_mcp.httpapi.context import HTTP_SCOPE, context_of, pass_through
 from creek_mcp.httpapi.errors import error_response
 from creek_mcp.remote_auth import (
@@ -49,9 +50,6 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from starlette.types import ASGIApp, Receive, Scope, Send
-
-AUTHORIZATION_HEADER: Final[str] = "Authorization"
-"""The header a consumer presents its bearer token in."""
 
 BEARER_SCHEME: Final[str] = "Bearer"
 """The one accepted scheme spelling. Compared exactly, never case-folded."""

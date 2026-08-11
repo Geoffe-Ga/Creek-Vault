@@ -42,11 +42,14 @@ import pytest
 
 from creek_mcp import policy
 from creek_mcp.api.models import ERROR_MESSAGES, ErrorCode
+from creek_mcp.api.routes import AUTHORIZATION_HEADER
 from creek_mcp.httpapi import capabilities as capabilities_module
 from creek_mcp.httpapi import handlers as handlers_module
 from creek_mcp.httpapi.errors import (
     BEARER_CHALLENGE,
+    CACHE_CONTROL_HEADER,
     HTTP_OK,
+    NO_STORE,
     VARY_HEADER,
     WWW_AUTHENTICATE_HEADER,
     json_response,
@@ -172,6 +175,104 @@ hands back the perfectly legal token ``Accept``, repairing precisely the input
 the builder refuses to repair. ``Cookie`` is well-formed and must survive
 either way, which is what keeps the assertion about the repair and not about
 the drop.
+"""
+
+_STANDING_VARY: Final[str] = f"{CEILING_HEADER}, {AUTHORIZATION_HEADER}"
+"""The whole ``Vary`` value a response with no caller ``Vary`` must render.
+
+Two tokens since #1129, in this order, and written once here so that a third
+standing token is a one-line change rather than a sweep through a dozen
+byte-exact assertions — the sweep is how one of them would be missed, and a
+missed one is a ``Vary`` that under-declares what the response turns on.
+
+The order is part of the value, not an artefact of it: every assertion below
+that compares whole rendered lines would go red on a reordering, and that is
+deliberate. A header whose bytes depended on set iteration would differ between
+two worker processes answering the same request.
+"""
+
+_LOWERCASE_CACHE_CONTROL: Final[str] = "cache-control"
+"""``Cache-Control`` as the wire spells it, and as ``raw_headers`` renders it."""
+
+_MAX_AGE_DIRECTIVE: Final[str] = "max-age=600"
+"""A caller directive that is *strictly more cacheable* than ``no-store``.
+
+The one to search a rendered header block for. ``no-store, max-age=600`` is the
+plausible-looking union a merge would produce, and it is the outcome the
+replacement policy exists to rule out: RFC 9111 reads the pair as
+self-contradictory, so which half an intermediary honours is its choice rather
+than the server's.
+"""
+
+_PUBLIC_CACHE_DIRECTIVE: Final[str] = "public, max-age=600"
+"""What a well-meaning handler writes when it thinks its answer is public."""
+
+_WEAKENING_DIRECTIVES: Final[tuple[str, ...]] = (
+    _MAX_AGE_DIRECTIVE,
+    "public, max-age=31536000",
+    NO_STORE,
+)
+"""Caller ``Cache-Control`` values the builder must overwrite, not negotiate.
+
+Three rather than one because they fail differently. The first is the ordinary
+freshness lifetime; the second adds ``public``, which invites a *shared* cache
+to store a response computed under one caller's ceiling and credential; the
+third is the caller agreeing with the policy, which must still render as one
+line rather than two — a builder that appended when the values matched would
+emit ``no-store, no-store`` and pass any assertion written as a substring test.
+"""
+
+_WEAKENING_DIRECTIVE_IDS: Final[tuple[str, ...]] = (
+    "max-age",
+    "public-max-age",
+    "echoed-no-store",
+)
+"""Stable parametrize ids for :data:`_WEAKENING_DIRECTIVES`, in that order."""
+
+_CACHE_CONTROL_SPELLINGS: Final[tuple[str, ...]] = (
+    CACHE_CONTROL_HEADER,
+    CACHE_CONTROL_HEADER.lower(),
+    CACHE_CONTROL_HEADER.upper(),
+)
+"""The three ways a call site might spell the cache header at us.
+
+Parametrised rather than represented by the lower-case case alone because
+#1365's mutation battery had a mutant survive exactly that economy: a guard
+that compares the header name without folding it lets the second spelling
+through as a separate dict key, and Starlette renders a second key as a second
+header line rather than merging it.
+"""
+
+_CACHE_CONTROL_SPELLING_IDS: Final[tuple[str, ...]] = ("canonical", "lower", "upper")
+"""Stable parametrize ids for :data:`_CACHE_CONTROL_SPELLINGS`, in that order.
+
+Spelled out for the same reason :data:`_ECHOED_CEILING_SPELLING_IDS` is: the
+three values fold to one string, so ids derived from the values would collide.
+"""
+
+_ECHOED_AUTHORIZATION_SPELLINGS: Final[tuple[str, ...]] = (
+    AUTHORIZATION_HEADER,
+    AUTHORIZATION_HEADER.lower(),
+    AUTHORIZATION_HEADER.upper(),
+)
+"""The three ways a call site might name the credential header in its ``Vary``."""
+
+_ECHOED_AUTHORIZATION_SPELLING_IDS: Final[tuple[str, ...]] = (
+    "canonical",
+    "lower",
+    "upper",
+)
+"""Stable parametrize ids for :data:`_ECHOED_AUTHORIZATION_SPELLINGS`."""
+
+_ABOVE_CEILING_JOURNAL_BODY: Final[dict[str, str]] = {
+    "content": "vary probe",
+    "tier": "personal",
+}
+"""The ``PUT`` body that earns the ``403`` in :func:`_vary_cases`.
+
+A ``personal`` write under an ``open`` ceiling: admitted at the edge, refused
+once the object's own tier is known. Named here because three separate sweeps
+now drive that case and an inline copy in each is three chances to drift.
 """
 
 
@@ -567,6 +668,28 @@ def _vary_cases() -> tuple[tuple[str, dict[str, str], str, int], ...]:
     )
 
 
+def _drive_status_case(
+    vault: Path, path: str, request_headers: dict[str, str], method: str
+) -> httpx.Response:
+    """Drive one :func:`_vary_cases` row through the whole stack.
+
+    ``PUT`` is the one case needing a body; the others take none, and a body on
+    a ``GET`` would be refused before the headers under test are set.
+
+    Args:
+        vault: A seeded vault.
+        path: Request path.
+        request_headers: Headers to send.
+        method: HTTP method.
+
+    Returns:
+        The response, read after every middleware has run.
+    """
+    body = _ABOVE_CEILING_JOURNAL_BODY if method == "PUT" else None
+    with client(vault_path=vault) as test_client:
+        return test_client.request(method, path, headers=request_headers, json=body)
+
+
 @pytest.mark.parametrize(
     ("path", "request_headers", "method", "expected"),
     _vary_cases(),
@@ -594,11 +717,7 @@ def test_vary_is_set_on_every_response(
         method: HTTP method.
         expected: The status this case must produce.
     """
-    # ``PUT`` is the one case needing a body; the others take none, and a
-    # body on a ``GET`` would be refused before the header under test is set.
-    body = {"content": "vary probe", "tier": "personal"} if method == "PUT" else None
-    with client(vault_path=vault) as test_client:
-        response = test_client.request(method, path, headers=request_headers, json=body)
+    response = _drive_status_case(vault, path, request_headers, method)
     assert response.status_code == expected
     assert CEILING_HEADER.lower() in response.headers.get("vary", "").lower()
 
@@ -700,6 +819,7 @@ def test_a_caller_added_vary_token_is_not_discarded() -> None:
     assert len(lines) == 1
     assert _vary_token_set(lines[0]) == {
         CEILING_HEADER.lower(),
+        AUTHORIZATION_HEADER.lower(),
         _CALLER_VARY_TOKEN.lower(),
     }
 
@@ -715,13 +835,19 @@ def test_the_standing_vary_token_is_written_first() -> None:
     :func:`test_a_caller_echoing_the_standing_token_does_not_double_it` would
     become the flake that reports it.
 
-    Standing-token-first is also the honest reading order: the token the server
+    Standing-token-first is also the honest reading order: the tokens the server
     insists on, then whatever the call site asked to add.
+
+    The prefix is the *whole* standing value rather than the ceiling token alone
+    (#1129). Both standing tokens lead, in a fixed order, and a check that only
+    looked at the first of them would go green against a merge that appended
+    ``Authorization`` after the caller's tokens — an ordering nobody wrote, and
+    one that changes the rendered bytes without changing the token set.
     """
     response = json_response({}, HTTP_OK, headers={VARY_HEADER: _CALLER_VARY_TOKEN})
     lines = _rendered_vary(response)
     assert len(lines) == 1
-    assert lines[0].startswith(CEILING_HEADER)
+    assert lines[0].startswith(_STANDING_VARY)
 
 
 def test_a_lowercase_vary_cannot_smuggle_a_second_header_line() -> None:
@@ -737,7 +863,11 @@ def test_a_lowercase_vary_cannot_smuggle_a_second_header_line() -> None:
     response = json_response({}, HTTP_OK, headers={_LOWERCASE_VARY: "Cookie"})
     lines = _rendered_vary(response)
     assert len(lines) == 1
-    assert _vary_token_set(lines[0]) == {CEILING_HEADER.lower(), "cookie"}
+    assert _vary_token_set(lines[0]) == {
+        CEILING_HEADER.lower(),
+        AUTHORIZATION_HEADER.lower(),
+        "cookie",
+    }
 
 
 def test_both_spellings_of_vary_are_collected_into_the_one_value() -> None:
@@ -748,7 +878,7 @@ def test_both_spellings_of_vary_are_collected_into_the_one_value() -> None:
     rather than the first or the last one found, and a merge that took either
     end would pass every other test in this section. It is asserted byte-exact
     because it pins three properties at once — both values survive, the standing
-    token still leads, and the whole thing still renders as one header line.
+    tokens still lead, and the whole thing still renders as one header line.
     """
     response = json_response(
         {},
@@ -756,7 +886,7 @@ def test_both_spellings_of_vary_are_collected_into_the_one_value() -> None:
         headers={VARY_HEADER: _CALLER_VARY_TOKEN, _LOWERCASE_VARY: "Cookie"},
     )
     assert _rendered_vary(response) == [
-        f"{CEILING_HEADER}, {_CALLER_VARY_TOKEN}, Cookie"
+        f"{_STANDING_VARY}, {_CALLER_VARY_TOKEN}, Cookie"
     ]
 
 
@@ -789,7 +919,7 @@ def test_a_caller_echoing_the_standing_token_does_not_double_it(
         HTTP_OK,
         headers={VARY_HEADER: f"{spelling}, Cookie"},
     )
-    assert _rendered_vary(response) == [f"{CEILING_HEADER}, Cookie"]
+    assert _rendered_vary(response) == [f"{_STANDING_VARY}, Cookie"]
 
 
 def test_an_empty_vary_token_leaves_no_trailing_separator() -> None:
@@ -802,7 +932,7 @@ def test_an_empty_vary_token_leaves_no_trailing_separator() -> None:
     somewhere else fail for a reason nobody can find.
     """
     response = json_response({}, HTTP_OK, headers={VARY_HEADER: "Cookie,,"})
-    assert _rendered_vary(response) == [f"{CEILING_HEADER}, Cookie"]
+    assert _rendered_vary(response) == [f"{_STANDING_VARY}, Cookie"]
 
 
 def test_the_uncacheable_wildcard_token_survives_the_filter() -> None:
@@ -816,7 +946,7 @@ def test_the_uncacheable_wildcard_token_survives_the_filter() -> None:
     this module exists to close, arrived at from the opposite side.
     """
     response = json_response({}, HTTP_OK, headers={VARY_HEADER: "*"})
-    assert _rendered_vary(response) == [f"{CEILING_HEADER}, *"]
+    assert _rendered_vary(response) == [f"{_STANDING_VARY}, *"]
 
 
 @pytest.mark.parametrize(
@@ -842,7 +972,7 @@ def test_a_malformed_vary_token_never_reaches_the_header_value(
         why: What is wrong with it; supplies the parametrize id.
     """
     response = json_response({}, HTTP_OK, headers={VARY_HEADER: malformed})
-    assert _rendered_vary(response) == [CEILING_HEADER], why
+    assert _rendered_vary(response) == [_STANDING_VARY], why
 
 
 def test_a_malformed_token_is_not_whitespace_stripped_into_a_legal_one() -> None:
@@ -856,7 +986,7 @@ def test_a_malformed_token_is_not_whitespace_stripped_into_a_legal_one() -> None
     test about repair rather than about rejection.
     """
     response = json_response({}, HTTP_OK, headers={VARY_HEADER: _STRIPPABLE_VARY})
-    assert _rendered_vary(response) == [f"{CEILING_HEADER}, Cookie"]
+    assert _rendered_vary(response) == [f"{_STANDING_VARY}, Cookie"]
 
 
 def test_a_hostile_vary_cannot_forge_a_second_header() -> None:
@@ -880,7 +1010,7 @@ def test_a_hostile_vary_cannot_forge_a_second_header() -> None:
     assert b"x-creek-injected" not in block
     assert b"\r" not in block.replace(b"\r\n", b"")
     assert b"\n" not in block.replace(b"\r\n", b"")
-    assert _rendered_vary(response) == [CEILING_HEADER]
+    assert _rendered_vary(response) == [_STANDING_VARY]
 
 
 def test_a_non_colliding_caller_header_still_rides() -> None:
@@ -901,7 +1031,7 @@ def test_a_non_colliding_caller_header_still_rides() -> None:
         BEARER_CHALLENGE.encode("latin-1"),
     )
     assert challenge in response.raw_headers
-    assert _rendered_vary(response) == [CEILING_HEADER]
+    assert _rendered_vary(response) == [_STANDING_VARY]
 
 
 async def _vary_overriding_health(_request: Request) -> Response:
@@ -945,7 +1075,396 @@ def test_a_handler_cannot_override_the_standing_vary_through_the_stack(
     with client(vault_path=vault) as test_client:
         response = test_client.get(HEALTH_PATH, headers=headers())
     assert response.status_code == 200
-    assert response.headers.get_list("vary") == [f"{CEILING_HEADER}, Cookie"]
+    assert response.headers.get_list("vary") == [f"{_STANDING_VARY}, Cookie"]
+
+
+# --------------------------------------------------------------------------- #
+# no-store, and the credential the answer turns on (#1129)
+# --------------------------------------------------------------------------- #
+#
+# ``Vary`` tells an intermediary *what to key on*; it never tells it not to
+# store. Every ``/v1`` answer is computed from a bearer identity and an admitted
+# ceiling, so storing one at all is a bet that the next caller presenting a
+# different credential will be told apart by the key — and the key is whatever
+# the intermediary chose to honour. ``no-store`` declines the bet, and naming
+# ``Authorization`` in ``Vary`` is the belt to its braces: the two answer
+# different failure modes, and a cache that ignores one may still honour the
+# other.
+#
+# The directive is unconditional because every response is either one of the
+# five authenticated routes — ``BearerAuthMiddleware`` sits above the router, so
+# authentication is not a property a route can opt out of — or a refusal, and a
+# stored refusal is a denial of service served to a caller who would have been
+# admitted.
+
+
+def _rendered_cache_control(response: Response) -> list[str]:
+    """Return every ``cache-control`` header line *response* has rendered.
+
+    Read off ``raw_headers`` for the reason :func:`_rendered_vary` documents:
+    Starlette's mapping answers with the first match, so two lines and one line
+    are indistinguishable through it — and "one line, and it says ``no-store``"
+    is precisely the claim here, since a builder that *appended* the standing
+    directive to a caller's would render two.
+
+    Args:
+        response: The built response, before anything sends it.
+
+    Returns:
+        One decoded entry per rendered ``cache-control`` line, in render order.
+    """
+    return [
+        value.decode("latin-1")
+        for name, value in response.raw_headers
+        if name.decode("latin-1").lower() == _LOWERCASE_CACHE_CONTROL
+    ]
+
+
+def test_the_standing_header_names_are_the_published_wire_literals() -> None:
+    """The three new constants say what the contract says, and name a real header.
+
+    Every assertion in this section is written against the constants rather
+    than against literals, which buys legibility and costs rename-detection: a
+    mutant that renamed ``no-store`` to ``max-age=0`` would satisfy all of them
+    at once. This is where that is bought back — the same reason
+    ``tests/v1_api_support.py`` spells the wire vocabulary out rather than
+    importing it.
+
+    The last two assertions are the ones that matter most. ``Authorization`` is
+    a standing ``Vary`` token only because it is the header the caller's
+    credential actually arrives in; a constant that named some near-miss
+    spelling would produce a ``Vary`` that varies on nothing, and every other
+    assertion in this file would still be green.
+    """
+    assert AUTHORIZATION_HEADER == "Authorization"
+    assert CACHE_CONTROL_HEADER == "Cache-Control"
+    assert NO_STORE == "no-store"
+    assert AUTHORIZATION_HEADER in headers()
+    assert AUTHORIZATION_HEADER not in headers(token=None)
+
+
+@pytest.mark.parametrize(("method", "path"), MOUNTED, ids=MOUNTED_IDS)
+def test_no_store_rides_on_every_mounted_route(
+    vault: Path, method: str, path: str
+) -> None:
+    """All five published routes answer uncacheably, whatever they answer.
+
+    Every one of them sits below ``BearerAuthMiddleware`` — item 5 of the seven
+    layers, above the router — so there is no such thing as an unauthenticated
+    ``/v1`` route whose body a shared cache could safely hold. Health is the
+    tempting exception and is not one: it is still reached with a credential,
+    and a stored ``200`` for it is a stored ``200`` for a path an operator's
+    monitoring depends on being live rather than remembered.
+
+    The status is deliberately not pinned. ``POST /v1/reflections`` has no LLM
+    provider in a hermetic test environment and answers a refusal rather than a
+    ``200``; pinning the status here would make this test about provider wiring
+    instead of about caching, and the ``200`` case is pinned by the status-class
+    sweep below. What *is* pinned is that the probe reached a mounted route at
+    all — a ``404`` would also carry ``no-store``, so a sweep whose paths had
+    all gone stale would pass while probing nothing.
+
+    ``get_list`` rather than ``headers["cache-control"]``: httpx joins duplicate
+    lines with ``", "``, so a response carrying ``no-store`` twice, or carrying
+    ``no-store, max-age=600`` across two lines, reads as a single innocuous
+    string through the mapping.
+
+    Args:
+        vault: A seeded vault.
+        method: HTTP method under test.
+        path: Request path under test.
+    """
+    with client(vault_path=vault) as test_client:
+        response = _call(test_client, method, path, headers=headers())
+    assert response.status_code != _NOT_FOUND_STATUS
+    assert response.headers.get_list("cache-control") == [NO_STORE]
+
+
+@pytest.mark.parametrize(
+    ("path", "request_headers", "method", "expected"),
+    _vary_cases(),
+    ids=["401", "404", "422", "403", "200"],
+)
+def test_no_store_is_set_on_every_response(
+    vault: Path,
+    path: str,
+    request_headers: dict[str, str],
+    method: str,
+    expected: int,
+) -> None:
+    """Refusals are as uncacheable as successes, and for symmetric reasons.
+
+    A cached refusal is a denial of service: the ``422`` a caller earned by
+    declaring ``intimate`` would be replayed to the same caller declaring
+    ``personal``, and the ``401`` earned by omitting a credential would be
+    replayed to a request that carried one. A cached success is the disclosure
+    pointed the other way — one caller's ceiling-filtered wheel handed to
+    somebody who never presented a credential at all.
+
+    The same five rows as the ``Vary`` sweep, because the two headers protect
+    the same set of responses and a row present in one list and absent from the
+    other is how they would drift.
+
+    Args:
+        vault: A seeded vault.
+        path: Request path.
+        request_headers: Headers to send.
+        method: HTTP method.
+        expected: The status this case must produce.
+    """
+    response = _drive_status_case(vault, path, request_headers, method)
+    assert response.status_code == expected
+    assert response.headers.get_list("cache-control") == [NO_STORE]
+
+
+@pytest.mark.parametrize(
+    ("path", "request_headers", "method", "expected"),
+    _vary_cases(),
+    ids=["401", "404", "422", "403", "200"],
+)
+def test_vary_names_authorization_on_every_response(
+    vault: Path,
+    path: str,
+    request_headers: dict[str, str],
+    method: str,
+    expected: int,
+) -> None:
+    """The credential is part of the cache key, on every status class.
+
+    ``no-store`` is the instruction; this is the key an intermediary that
+    ignores the instruction — or a private cache that is entitled to store
+    anyway — must use. Every ``/v1`` body is a function of the authenticated
+    consumer as well as of the ceiling: two consumers presenting two valid
+    tokens can be told apart by the server and must be told apart by the store.
+
+    Asserted as the whole rendered line, not merely as membership. None of these
+    five responses carries a caller ``Vary``, so the standing value is the whole
+    value, and an equality is what notices a second ``vary`` line or a reordered
+    one — neither of which a membership test can see.
+
+    Args:
+        vault: A seeded vault.
+        path: Request path.
+        request_headers: Headers to send.
+        method: HTTP method.
+        expected: The status this case must produce.
+    """
+    response = _drive_status_case(vault, path, request_headers, method)
+    assert response.status_code == expected
+    assert AUTHORIZATION_HEADER.lower() in _vary_token_set(
+        response.headers.get("vary", "")
+    )
+    assert response.headers.get_list("vary") == [_STANDING_VARY]
+
+
+def test_the_unauthenticated_refusal_carries_both_standing_tokens_and_no_store(
+    vault: Path,
+) -> None:
+    """Yes, ``Vary: Authorization`` belongs on a response nobody authenticated.
+
+    The pinned answer to the question the two-token seed raises, because it
+    reads backwards: the caller sent no credential, so what could the answer
+    possibly vary on? Both directions of reuse, is the answer. A stored ``401``
+    that does not name ``Authorization`` may be served to a caller who *did*
+    present a valid token — a denial of service wearing the costume of a
+    credential failure, and one the caller cannot debug because their token was
+    never looked at. A stored ``200`` from that same cache may be served to a
+    caller who presented nothing, which is the disclosure. Naming the header on
+    the ``401`` closes the first; naming it on the ``200`` closes the second;
+    only doing both makes the entries mutually unmatchable.
+
+    ``no-store`` on the ``401`` is the same argument without the cache's
+    cooperation, which is why it is asserted here rather than left to the sweep.
+
+    Args:
+        vault: A seeded vault.
+    """
+    with client(vault_path=vault) as test_client:
+        response = test_client.get(HEALTH_PATH, headers=headers(token=None))
+    assert response.status_code == _UNAUTHENTICATED_STATUS
+    assert _vary_token_set(response.headers.get("vary", "")) == {
+        CEILING_HEADER.lower(),
+        AUTHORIZATION_HEADER.lower(),
+    }
+    assert response.headers.get_list("vary") == [_STANDING_VARY]
+    assert response.headers.get_list("cache-control") == [NO_STORE]
+
+
+async def _cache_control_overriding_health(_request: Request) -> Response:
+    """Answer health with a colliding, lowercased caller ``Cache-Control``.
+
+    The value is the plausible mistake rather than a hostile one: a handler
+    author who has decided their endpoint is public and cheap, and is right
+    about neither on this surface.
+
+    Args:
+        _request: Ignored, exactly as the real health handler ignores it.
+
+    Returns:
+        The health body, plus the directive the builder must overwrite.
+    """
+    return json_response(
+        HEALTH_BODY,
+        HTTP_OK,
+        headers={_LOWERCASE_CACHE_CONTROL: _PUBLIC_CACHE_DIRECTIVE},
+    )
+
+
+def test_a_handler_cannot_override_the_standing_cache_control_through_the_stack(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The directive survives a real handler and all seven middleware layers.
+
+    The twin of the ``Vary`` override test above, and health is the right probe
+    for the same reason: it is exempt from the contract-version gate and its
+    real handler is a bare ``json_response(HEALTH_BODY, HTTP_OK)``, so the
+    substitution changes exactly one thing.
+
+    It is worth driving through the stack rather than trusting the builder unit
+    tests because the claim is about what a cache would be handed, and a
+    middleware that re-wrapped or re-headed the response on the way out would
+    falsify it without touching :mod:`creek_mcp.httpapi.errors` at all.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Substitutes the health handler for one that collides.
+    """
+    monkeypatch.setitem(
+        handlers_module.HANDLERS, OP_HEALTH, _cache_control_overriding_health
+    )
+    with client(vault_path=vault) as test_client:
+        response = test_client.get(HEALTH_PATH, headers=headers())
+    assert response.status_code == 200
+    assert response.headers.get_list("cache-control") == [NO_STORE]
+
+
+def test_the_standing_headers_are_stamped_without_any_caller_header() -> None:
+    """The bare builder call — what every real handler makes — carries both.
+
+    Every other test in this section hands the builder something to react to,
+    and a policy implemented only on the collision path would satisfy all of
+    them while leaving the ordinary ``json_response(payload, status)`` — the
+    call five handlers and one error renderer actually make — bare. This is the
+    default path, asserted byte-exactly: two standing ``Vary`` tokens in a fixed
+    order on one line, and one ``no-store``.
+    """
+    response = json_response({}, HTTP_OK)
+    assert _rendered_vary(response) == [_STANDING_VARY]
+    assert _rendered_cache_control(response) == [NO_STORE]
+
+
+@pytest.mark.parametrize(
+    "directive", _WEAKENING_DIRECTIVES, ids=_WEAKENING_DIRECTIVE_IDS
+)
+@pytest.mark.parametrize(
+    "spelling", _CACHE_CONTROL_SPELLINGS, ids=_CACHE_CONTROL_SPELLING_IDS
+)
+def test_a_caller_cache_control_cannot_weaken_the_directive(
+    spelling: str, directive: str
+) -> None:
+    """Nine cells: three spellings times three directives, one rendered answer.
+
+    The spelling axis is not thoroughness for its own sake. ``Cache-Control``
+    and ``cache-control`` are one header on the wire and two keys in a dict, and
+    a guard that compares the name unfolded lets the second one through as a
+    passthrough header — Starlette then writes both, and which directive keys
+    the store becomes the intermediary's choice. #1365's mutation battery had a
+    mutant survive precisely this economy, on a test that used only lower-case
+    spellings.
+
+    The directive axis covers the three shapes a weakening arrives in: a bare
+    freshness lifetime, a ``public`` one that invites a *shared* store, and the
+    caller agreeing with the policy — which must still render once.
+
+    Args:
+        spelling: How the caller happens to capitalise the header name.
+        directive: The value the caller supplied.
+    """
+    response = json_response({}, HTTP_OK, headers={spelling: directive})
+    assert _rendered_cache_control(response) == [NO_STORE]
+
+
+def test_both_spellings_of_cache_control_collapse_to_one_line() -> None:
+    """Two colliding keys at once — the pathological dict, cache-side.
+
+    The same shape ``test_both_spellings_of_vary_are_collected_into_the_one_value``
+    covers, and it needs its own case for the same reason: collapsing it
+    correctly means finding *every* colliding key rather than the first or the
+    last one, and a builder that dropped either end would pass every
+    single-spelling case above.
+
+    The outcomes differ, and that is the point of having both tests. ``Vary``
+    unions, because more tokens is monotone toward safety; ``Cache-Control``
+    replaces, because ``no-store, max-age=600`` is self-contradictory and
+    ``public`` alone is strictly more cacheable than what the server insists on.
+    """
+    response = json_response(
+        {},
+        HTTP_OK,
+        headers={
+            CACHE_CONTROL_HEADER: _MAX_AGE_DIRECTIVE,
+            _LOWERCASE_CACHE_CONTROL: "public",
+        },
+    )
+    assert _rendered_cache_control(response) == [NO_STORE]
+
+
+def test_the_caller_cache_directive_is_dropped_rather_than_unioned() -> None:
+    """The caller's text is *absent*, not merely outranked.
+
+    Union is the right policy for ``Vary`` and the wrong one here, so the
+    absence has to be asserted rather than inferred from the presence of
+    ``no-store``. ``no-store, max-age=600`` contains ``no-store`` and would
+    satisfy a substring test, a token-membership test, and any assertion that
+    only counted header lines — while telling an intermediary two incompatible
+    things and leaving it to pick. RFC 9111 does not say which it must pick.
+
+    Asserted over the serialised header block rather than over the
+    ``cache-control`` value alone, so a directive relocated into some other
+    header on the way out is caught by the same line. Two nets, not one: the
+    caller's exact text, and then the bare directive *name*, which still catches
+    a survival that was rewritten on the way through — ``max-age=0`` is a
+    different string and the same mistake.
+    """
+    response = json_response(
+        {}, HTTP_OK, headers={CACHE_CONTROL_HEADER: _MAX_AGE_DIRECTIVE}
+    )
+    block = _serialised_header_block(response)
+    assert _MAX_AGE_DIRECTIVE.encode("latin-1") not in block
+    assert b"max-age" not in block
+    assert _rendered_cache_control(response) == [NO_STORE]
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    _ECHOED_AUTHORIZATION_SPELLINGS,
+    ids=_ECHOED_AUTHORIZATION_SPELLING_IDS,
+)
+def test_a_caller_echoing_the_authorization_token_does_not_double_it(
+    spelling: str,
+) -> None:
+    """The second standing token deduplicates exactly as the first one does.
+
+    A call site that has read the contract and names the credential header in
+    its own ``Vary`` is the likeliest collision there is now that there are two
+    standing tokens, and it will spell the field name however it spells it. The
+    dedupe is case-folded, so all three spellings fold onto the server's — and a
+    half-folded dedupe that seeds its ``seen`` set folded but then tests the raw
+    token passes the lower-case echo by coincidence and doubles the upper-case
+    one.
+
+    The whole rendered value is asserted rather than the token set, because a
+    set cannot see a repetition at all.
+
+    Args:
+        spelling: How the caller happens to capitalise the credential header.
+    """
+    response = json_response(
+        {},
+        HTTP_OK,
+        headers={VARY_HEADER: f"{spelling}, Cookie"},
+    )
+    assert _rendered_vary(response) == [f"{_STANDING_VARY}, Cookie"]
 
 
 # --------------------------------------------------------------------------- #

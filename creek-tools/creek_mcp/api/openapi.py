@@ -39,6 +39,7 @@ from creek_mcp.api.models import (
     ErrorCode,
 )
 from creek_mcp.api.routes import (
+    AUTHORIZATION_HEADER,
     CEILING_HEADER,
     CONTRACT_VERSION_HEADER,
     IMPLEMENTED_CAPABILITIES,
@@ -67,11 +68,25 @@ DOCUMENT_TITLE: Final[str] = "Creek Adepthood /v1 application API"
 
 DOCUMENT_DESCRIPTION: Final[str] = (
     "Authenticated HTTP/JSON access to Creek's Adepthood-facing capabilities. "
-    f"Every response carries Vary: {CEILING_HEADER}, every error is the "
-    "ErrorEnvelope, and retryability is the static retry-policy.json table "
-    "keyed on the error code alone."
+    f"Every response this application builds carries Vary: {CEILING_HEADER}, "
+    f"{AUTHORIZATION_HEADER} and Cache-Control: no-store — do not enable "
+    "caching for /v1 on an intermediary. Every error is the ErrorEnvelope, and "
+    "retryability is the static retry-policy.json table keyed on the error "
+    "code alone."
 )
-"""``info.description``. Prose only; it states no fact about any vault."""
+"""``info.description``. Prose only; it states no fact about any vault.
+
+Interpolated from the header constants rather than spelled out, so the sentence
+a consumer reads and the header the server stamps cannot drift — the same
+reason :func:`_parameters` publishes the parameter names from constants.
+
+The caching half of it changed with #1129 and is a *description* change only:
+no operation, parameter, schema or status moved, so the byte-pinned component
+schemas under ``docs/contracts/adepthood-v1/schemas/`` are untouched and the
+contract minor does not advance. It documents a response header, which OpenAPI
+3.1 has no required place for on a document-wide basis, so prose is where it
+goes until the per-response ``headers`` objects are worth generating.
+"""
 
 _DEFS_KEY: Final[str] = "$defs"
 """The key Pydantic hoists nested definitions under, and OpenAPI does not."""
