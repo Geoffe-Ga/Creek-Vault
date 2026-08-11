@@ -7,6 +7,7 @@ utilities. All behaviour maps to the acceptance criteria on Issue #40.
 
 from __future__ import annotations
 
+import inspect
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
@@ -15,12 +16,13 @@ import frontmatter
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
 from creek.generate.compost import (
     CompostCandidate,
     CompostTracker,
+    _AdmittedFragments,
 )
 from creek.generate.compost_verifier import (
     CompostVerdict,
@@ -1160,3 +1162,303 @@ class TestTimezoneAwareClock:
             f"{before.isoformat()}-{_TZ_PROJECT_TAG}.md",
             f"{after.isoformat()}-{_TZ_PROJECT_TAG}.md",
         }
+
+
+# ---- Issue #1311: the screened-fragment boundary ---------------------------
+#
+# ``skip_intimate`` / ``skip_paradox`` used to be enforced inside a single
+# detector, so the thread and project detectors copied withheld fragments'
+# titles and IDs into vault notes — and, on the project path, the withheld
+# fragment's *tag* became the note's identity: its title, its
+# ``original_project``, its filename, and a line in ``_Compost-Report.md``.
+# Filtering the emitted lists cannot reach that, because the candidate *is*
+# the tag. The screen therefore runs once, on the fragment sequence, before
+# any detector sees it.
+
+
+_GRIEF_THREAD_TITLE = "Grief Work"
+"""Thread title shared by the residual-channel test's fixtures."""
+
+
+class _RecordingTracker(CompostTracker):
+    """Tracker that records the fragment IDs each private detector was handed.
+
+    The inheritance property under test is structural: a future fourth
+    detector added to ``detect_compost_candidates`` is guarded by
+    construction only if the screen happens at the boundary rather than
+    inside each detector.
+    """
+
+    def __init__(self, *, now: datetime) -> None:
+        """Initialise the tracker and the per-detector recording map."""
+        super().__init__(now=now, similarity_fn=_high_similarity)
+        self.seen: dict[str, tuple[str, ...]] = {}
+
+    def _detect_threads(
+        self,
+        threads: list[Thread],
+        admitted: _AdmittedFragments,
+    ) -> list[CompostCandidate]:
+        """Record the admitted IDs, then delegate."""
+        self.seen["threads"] = tuple(frag.id for frag in admitted.fragments)
+        return super()._detect_threads(threads, admitted)
+
+    def _detect_abandonment_fragments(
+        self,
+        admitted: _AdmittedFragments,
+        bodies: Mapping[str, str],
+    ) -> list[CompostCandidate]:
+        """Record the admitted IDs, then delegate."""
+        self.seen["fragments"] = tuple(frag.id for frag in admitted.fragments)
+        return super()._detect_abandonment_fragments(admitted, bodies)
+
+    def _detect_disappeared_projects(
+        self,
+        admitted: _AdmittedFragments,
+    ) -> list[CompostCandidate]:
+        """Record the admitted IDs, then delegate."""
+        self.seen["projects"] = tuple(frag.id for frag in admitted.fragments)
+        return super()._detect_disappeared_projects(admitted)
+
+
+def _fingerprint(candidate: CompostCandidate) -> tuple[object, ...]:
+    """Return every field of *candidate* that a compost note renders."""
+    return (
+        candidate.source_type,
+        candidate.source_id,
+        candidate.title,
+        candidate.reason,
+        tuple(candidate.fragment_ids),
+        tuple(candidate.energy_fragment_ids),
+        tuple(candidate.energy_excerpts),
+    )
+
+
+def _dormant(thread_id: str, title: str, last_seen: date) -> Thread:
+    """Build a dormant thread with a caller-chosen ``last_seen``."""
+    return Thread(
+        id=thread_id,
+        title=title,
+        status=ThreadStatus.DORMANT,
+        first_seen=date(2023, 1, 1),
+        last_seen=last_seen,
+        fragment_count=3,
+        frequency_affinity=[Frequency.F5],
+        description="Ran hot for a season and then went quiet.",
+    )
+
+
+class TestScreenedFragmentBoundary:
+    """The single screen at the top of ``detect_compost_candidates``."""
+
+    def test_every_detector_receives_only_admitted_fragments(
+        self,
+        reference_now: datetime,
+    ) -> None:
+        """All three detectors are handed the same screened tuple."""
+        corpus = [
+            _fragment(
+                frag_id="f-open",
+                title="Kept going",
+                created=datetime(2024, 5, 1, 9, 0, 0),
+            ),
+            _fragment(
+                frag_id="f-intimate",
+                title="Therapy: the affair and the shame",
+                created=datetime(2024, 5, 2, 9, 0, 0),
+                privacy_tier=PrivacyTier.INTIMATE,
+            ),
+            _fragment(
+                frag_id="f-paradox",
+                title="Both true at once",
+                created=datetime(2024, 5, 3, 9, 0, 0),
+                tags=["paradox"],
+            ),
+        ]
+        tracker = _RecordingTracker(now=reference_now)
+
+        tracker.detect_compost_candidates([], corpus)
+
+        assert tracker.seen == {
+            "threads": ("f-open",),
+            "fragments": ("f-open",),
+            "projects": ("f-open",),
+        }
+
+    def test_every_detector_declares_the_screened_fragment_type(self) -> None:
+        """A fourth detector taking a raw ``list[Fragment]`` must not compile.
+
+        MyPy already rejects *passing* an unscreened list to a screened
+        detector, but it cannot object to a new detector that declares
+        ``list[Fragment]`` and is called with the raw sequence — which is
+        exactly how this defect was introduced. Annotations are compared as
+        strings: ``compost.py`` uses ``from __future__ import annotations``
+        and imports ``Mapping`` only under ``TYPE_CHECKING``, so
+        ``typing.get_type_hints`` raises ``NameError`` on
+        ``_detect_abandonment_fragments`` — the one method this most needs
+        to police.
+        """
+        detectors = {
+            name: fn
+            for name, fn in inspect.getmembers(CompostTracker, inspect.isfunction)
+            if name.startswith("_detect_")
+        }
+
+        assert set(detectors) == {
+            "_detect_threads",
+            "_detect_abandonment_fragments",
+            "_detect_disappeared_projects",
+        }
+        for name, fn in detectors.items():
+            annotations = [
+                param.annotation for param in inspect.signature(fn).parameters.values()
+            ]
+            assert "_AdmittedFragments" in annotations, name
+
+    def test_screening_equals_removing_the_withheld_fragments_up_front(
+        self,
+        reference_now: datetime,
+    ) -> None:
+        """FORBIDDEN DIRECTION: nothing admitted at HEAD stops being emitted.
+
+        Screening is proved to be exactly subtraction — every candidate the
+        unguarded tracker derives from the admitted fragments alone is still
+        produced, field for field. Because the withheld fragment is the
+        *most recent* member of the ``zine`` group, equality of ``reason``
+        also pins that counts and dates come from the admitted set only.
+        """
+        thread = _dormant("thr-deep", "Deep Work", date(2025, 1, 1))
+        admitted = [
+            _fragment(
+                frag_id="f-open-a",
+                title="Kept going",
+                created=datetime(2024, 5, 1, 9, 0, 0),
+                tags=["zine"],
+                threads=["[[Deep Work]]"],
+            ),
+            _fragment(
+                frag_id="f-open-b",
+                title="Also kept",
+                created=datetime(2024, 5, 2, 9, 0, 0),
+                tags=["zine"],
+            ),
+        ]
+        withheld = _fragment(
+            frag_id="f-hidden",
+            title="Therapy: the affair and the shame",
+            created=datetime(2024, 5, 3, 9, 0, 0),
+            tags=["zine"],
+            threads=["[[Deep Work]]"],
+            privacy_tier=PrivacyTier.INTIMATE,
+        )
+
+        screened = CompostTracker(now=reference_now).detect_compost_candidates(
+            [thread],
+            [*admitted, withheld],
+        )
+        baseline = CompostTracker(
+            now=reference_now,
+            skip_intimate=False,
+            skip_paradox=False,
+        ).detect_compost_candidates([thread], admitted)
+
+        assert [_fingerprint(c) for c in screened] == [
+            _fingerprint(c) for c in baseline
+        ]
+        assert screened
+        assert all("f-hidden" not in c.fragment_ids for c in screened)
+
+    def test_a_project_alive_only_in_withheld_fragments_becomes_silent(
+        self,
+        reference_now: datetime,
+    ) -> None:
+        """ACCEPTED BEHAVIOUR CHANGE — decided here, not discovered in review.
+
+        Screening the fragment sequence changes the *silence* arithmetic: a
+        project whose only recent activity is withheld now looks dormant and
+        gets a compost note it would not have got before. The semantics are
+        deliberate — "a project alive only in intimate content is silent in
+        the non-intimate view" — and the direction is the safe one: no
+        withheld fragment becomes admitted, and the new note is derived
+        entirely from admitted fragments, disclosing nothing about the
+        protected content. Operators will see new files appear.
+        """
+        corpus = [
+            _fragment(
+                frag_id="f-zine-1",
+                title="Laying out the zine",
+                created=datetime(2024, 5, 1, 9, 0, 0),
+                tags=["zine"],
+            ),
+            _fragment(
+                frag_id="f-zine-2",
+                title="Zine paper stock",
+                created=datetime(2024, 5, 1, 9, 0, 0),
+                tags=["zine"],
+            ),
+            _fragment(
+                frag_id="f-zine-private",
+                title="Therapy: the affair and the shame",
+                created=datetime(2026, 3, 25, 9, 0, 0),
+                tags=["zine"],
+                privacy_tier=PrivacyTier.INTIMATE,
+            ),
+        ]
+
+        unguarded = CompostTracker(
+            now=reference_now,
+            skip_intimate=False,
+        ).detect_compost_candidates([], corpus)
+        guarded = CompostTracker(now=reference_now).detect_compost_candidates(
+            [],
+            corpus,
+        )
+
+        assert [c for c in unguarded if c.source_type == "project"] == []
+        projects = [c for c in guarded if c.source_type == "project"]
+        assert len(projects) == 1
+        assert projects[0].source_id == "zine"
+        assert projects[0].fragment_ids == ["f-zine-1", "f-zine-2"]
+        assert projects[0].reason == "Project silent for 700 days"
+
+    def test_a_thread_reason_is_thread_derived_not_fragment_derived(
+        self,
+        reference_now: datetime,
+    ) -> None:
+        """ACCEPTED RESIDUAL CHANNEL — pinned rather than recomputed.
+
+        ``_thread_reason`` reads ``Thread.last_seen`` off the thread's own
+        frontmatter, so screening the fragment sequence cannot change it: a
+        thread whose ``last_seen`` was stamped by a withheld fragment still
+        reports the dormancy measured from that date. This is accepted, not
+        overlooked. ``02-Threads/<id>.md`` is an ordinary vault note any
+        reader already sees, so the compost note discloses nothing new — and
+        recomputing the reason from fragments would break the guarantee that
+        a thread with no ingested fragments still composts at all.
+        """
+        thread = _dormant("thr-grief", _GRIEF_THREAD_TITLE, date(2025, 1, 1))
+        corpus = [
+            _fragment(
+                frag_id="f-open",
+                title="A note anyone may read",
+                created=datetime(2023, 6, 1, 9, 0, 0),
+                threads=[f"[[{_GRIEF_THREAD_TITLE}]]"],
+            ),
+            _fragment(
+                frag_id="f-hidden",
+                title="Therapy: the affair and the shame",
+                created=datetime(2025, 1, 1, 9, 0, 0),
+                threads=[f"[[{_GRIEF_THREAD_TITLE}]]"],
+                privacy_tier=PrivacyTier.INTIMATE,
+            ),
+        ]
+
+        candidates = CompostTracker(now=reference_now).detect_compost_candidates(
+            [thread],
+            corpus,
+        )
+
+        threads = [c for c in candidates if c.source_type == "thread"]
+        assert len(threads) == 1
+        assert threads[0].fragment_ids == ["f-open"]
+        assert threads[0].reason == "Dormant for 455 days"

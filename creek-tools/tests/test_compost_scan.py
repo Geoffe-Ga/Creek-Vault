@@ -27,6 +27,7 @@ import frontmatter
 import pytest
 
 from creek.config import CompostConfig
+from creek.generate.compost import CompostTracker
 from creek.generate.compost_scan import (
     load_composted_source_ids,
     run_compost_scan,
@@ -37,6 +38,7 @@ from creek.models import (
     FragmentSource,
     Frequency,
     FrequencyClassification,
+    PraxisPotential,
     PrivacyTier,
     SourcePlatform,
     Thread,
@@ -104,6 +106,20 @@ def vault(tmp_path: Path) -> Path:
     return tmp_path
 
 
+_RECENT = datetime(2026, 3, 1, 9, 0, 0)
+"""Default fragment authoring date — 31 days before :data:`_NOW`."""
+
+_BACK_DATED = datetime(2024, 5, 1, 9, 0, 0)
+"""Authoring date old enough to trip the 180-day project-silence gap.
+
+Load-bearing for every project-path test in this module. With the
+:data:`_RECENT` default the silence detector never fires, so a test that
+asserts "no note names this tag" passes on a vault where no note was
+written for any reason at all — vacuously green, which is precisely the
+failure mode the privacy tests below exist to rule out.
+"""
+
+
 def _write_fragment(
     vault_path: Path,
     *,
@@ -112,27 +128,63 @@ def _write_fragment(
     body: str = "I have let this one go.",
     tags: list[str] | None = None,
     privacy_tier: PrivacyTier = PrivacyTier.UNCLASSIFIED,
+    created: datetime = _RECENT,
+    threads: list[str] | None = None,
+    praxis_potential: PraxisPotential = PraxisPotential.NONE,
+    drop_privacy_tier: bool = False,
 ) -> Fragment:
     """Write a fragment note into ``01-Fragments`` and return the model.
 
-    ``created``/``ingested`` are pinned near :data:`_NOW` so the FEAT-031
-    project-silence detector never fires incidentally — these tests are
-    about the fragment path, and a stray project candidate would make the
-    plan counts ambiguous.
+    ``created``/``ingested`` default to :data:`_RECENT` so the FEAT-031
+    project-silence detector never fires incidentally — most tests here
+    are about the fragment path, and a stray project candidate would make
+    the plan counts ambiguous. Pass ``created=_BACK_DATED`` to exercise
+    the project path deliberately.
+
+    Args:
+        vault_path: Root of the vault to write into.
+        frag_id: Fragment ID, also the filename stem.
+        title: Fragment title.
+        body: Note body text.
+        tags: Tags carried by the fragment; each one is a project identity
+            to :meth:`CompostTracker._group_fragments_by_tag`.
+        privacy_tier: Declared tier written into the frontmatter.
+        created: Authoring timestamp, mirrored into ``ingested``.
+        threads: ``[[Wikilink]]`` thread references.
+        praxis_potential: ``EXPLICIT`` marks the fragment as carrying
+            surviving energy, which is what puts its **title** into a
+            candidate's ``energy_excerpts`` — the only path by which a
+            fragment title, rather than its ID, reaches a compost note.
+        drop_privacy_tier: When ``True`` the ``privacy_tier`` key is
+            removed from the written frontmatter entirely, modelling a
+            hand-written or legacy note. Distinct from an explicit
+            ``unclassified``: the model default silently supplies
+            ``unclassified`` for a *missing* key, which is why
+            :func:`creek.classify.privacy_filter.raw_privacy_tier` reads
+            the raw mapping instead.
+
+    Returns:
+        The :class:`~creek.models.Fragment` as written (before any
+        fail-closed tier narrowing the loader applies).
     """
     fragment = Fragment(
         id=frag_id,
         title=title,
         source=FragmentSource(platform=SourcePlatform.JOURNAL),
-        created=datetime(2026, 3, 1, 9, 0, 0),
-        ingested=datetime(2026, 3, 1, 9, 0, 0),
+        created=created,
+        ingested=created,
         frequency=FrequencyClassification(primary=Frequency.F5),
         voice=VoiceClassification(),
+        praxis_potential=praxis_potential,
+        threads=threads or [],
         tags=tags or [],
         privacy_tier=privacy_tier,
     )
+    metadata = fragment.model_dump(mode="json")
+    if drop_privacy_tier:
+        metadata.pop("privacy_tier")
     post = frontmatter.Post(content=body)
-    post.metadata.update(fragment.model_dump(mode="json"))
+    post.metadata.update(metadata)
     path = vault_path / "01-Fragments" / f"{frag_id}.md"
     path.write_text(frontmatter.dumps(post), encoding="utf-8")
     return fragment
@@ -163,6 +215,32 @@ def _notes_in(vault_path: Path, relpath: str) -> list[Path]:
     if not folder.exists():
         return []
     return [p for p in sorted(folder.glob("*.md")) if not p.name.startswith("_")]
+
+
+def _compost_tree(vault_path: Path) -> list[Path]:
+    """Return every markdown file under the whole ``10-Liminal/Compost`` subtree.
+
+    ``rglob``, not ``glob``: :data:`CompostConfig.review_queue_relpath`
+    defaults to ``10-Liminal/Compost/Review``, and :func:`_notes_in` — like
+    :meth:`CompostTracker._load_existing_compost_notes` — only walks the top
+    level. A privacy assertion that misses the review subtree misses half
+    the surface.
+    """
+    folder = vault_path / _CANONICAL_RELDIR
+    if not folder.exists():
+        return []
+    return sorted(folder.rglob("*.md"))
+
+
+def _compost_tree_text(vault_path: Path) -> str:
+    """Return the concatenated bytes of every note in the compost subtree.
+
+    Assertions run against written vault content rather than against
+    :class:`CompostCandidate` models, because the leak this guards is in
+    what lands on disk — including in filenames, which no model-level
+    assertion can see.
+    """
+    return "\n".join(p.read_text(encoding="utf-8") for p in _compost_tree(vault_path))
 
 
 # ---- Routing: confirmed / ambiguous / rejected ----
@@ -373,6 +451,353 @@ def test_paradox_fragment_is_skipped_when_configured(vault: Path) -> None:
 
     assert verifier.calls == []
     assert result.composted == []
+
+
+# ---- Privacy: withheld fragments reach no note, no filename, no report ----
+#
+# Issue #1311. ``skip_intimate`` used to guard only the *fragment* detection
+# path, so a withheld fragment's title and ``[[id]]`` still landed in thread
+# and project notes — and, for projects, the intimate-derived *tag* became the
+# note's ``title``, its ``original_project``, its FILENAME, and a line in
+# ``_Compost-Report.md``. Filtering the emitted ``fragment_ids`` /
+# ``energy_excerpts`` lists — the fix the issue body proposed — does not close
+# that last channel, because the project candidate's identity *is* the tag.
+# These tests therefore assert on written vault bytes and on note names.
+
+
+_WITHHELD_KINDS: tuple[str, ...] = ("intimate", "paradox")
+"""The two skip policies that must behave identically at the boundary.
+
+Every leak test below is parametrised over this tuple. An emptied
+parametrize list makes privacy tests vanish behind a green gate, so
+:func:`test_the_withheld_kind_matrix_covers_both_skip_policies` pins its
+contents and the suite is run with ``-rs`` to confirm nothing is skipped.
+"""
+
+
+def _never_similar(_text: str) -> float:
+    """Similarity stub below every floor — isolates the thread/project paths."""
+    return 0.0
+
+
+def _write_withheld(
+    vault_path: Path,
+    *,
+    kind: str,
+    frag_id: str,
+    title: str,
+    tags: list[str] | None = None,
+    threads: list[str] | None = None,
+    created: datetime = _RECENT,
+    praxis_potential: PraxisPotential = PraxisPotential.NONE,
+) -> Fragment:
+    """Write a fragment that compost detection must withhold.
+
+    Args:
+        vault_path: Root of the vault to write into.
+        kind: ``"intimate"`` (declares ``privacy_tier: intimate``) or
+            ``"paradox"`` (adds the ``paradox`` tag).
+        frag_id: Fragment ID, also the filename stem.
+        title: Fragment title — the string that must not escape.
+        tags: Additional tags; each is a project identity to the detector.
+        threads: ``[[Wikilink]]`` thread references.
+        created: Authoring timestamp, mirrored into ``ingested``.
+        praxis_potential: ``EXPLICIT`` routes the title into
+            ``energy_excerpts``, putting it on the leak surface.
+
+    Returns:
+        The written :class:`~creek.models.Fragment`.
+    """
+    extra_tags = list(tags or [])
+    privacy_tier = PrivacyTier.UNCLASSIFIED
+    if kind == "intimate":
+        privacy_tier = PrivacyTier.INTIMATE
+    else:
+        extra_tags.append("paradox")
+    return _write_fragment(
+        vault_path,
+        frag_id=frag_id,
+        title=title,
+        tags=extra_tags,
+        privacy_tier=privacy_tier,
+        created=created,
+        threads=threads,
+        praxis_potential=praxis_potential,
+    )
+
+
+def test_the_withheld_kind_matrix_covers_both_skip_policies() -> None:
+    """Guard the parametrize list itself against silently emptying out."""
+    assert set(_WITHHELD_KINDS) == {"intimate", "paradox"}
+
+
+@pytest.mark.parametrize("kind", _WITHHELD_KINDS)
+def test_a_tag_carried_only_by_withheld_fragments_produces_no_compost_note(
+    vault: Path,
+    kind: str,
+) -> None:
+    """The criterion the issue body omits: the *tag itself* is the leak.
+
+    A project candidate's ``source_id`` and ``title`` are the tag, so a tag
+    carried only by withheld fragments must yield no candidate at all —
+    otherwise the tag reaches the filename, the frontmatter, the body, and
+    the rollup report even after every fragment ID has been filtered out.
+    """
+    for idx in (1, 2):
+        _write_withheld(
+            vault,
+            kind=kind,
+            frag_id=f"f-hidden-{idx}",
+            title=f"Therapy: the affair and the shame ({idx})",
+            tags=["affair-recovery"],
+            created=_BACK_DATED,
+        )
+    config = CompostConfig()
+
+    result = run_compost_scan(
+        vault,
+        similarity_fn=_never_similar,
+        verifier=None,
+        config=config,
+        now=_NOW,
+    )
+    CompostTracker(now=_NOW).generate_compost_report(vault)
+
+    assert result.composted == []
+    assert result.review_queued == []
+    assert _notes_in(vault, _CANONICAL_RELDIR) == []
+    assert not any("affair-recovery" in p.name for p in _compost_tree(vault))
+    text = _compost_tree_text(vault)
+    for secret in ("affair-recovery", "f-hidden-1", "f-hidden-2", "the affair"):
+        assert secret not in text
+    assert (
+        load_composted_source_ids(
+            vault,
+            review_queue_relpath=config.review_queue_relpath,
+        )
+        == set()
+    )
+
+
+@pytest.mark.parametrize("kind", _WITHHELD_KINDS)
+def test_a_withheld_fragment_never_reaches_a_thread_compost_note(
+    vault: Path,
+    kind: str,
+) -> None:
+    """A dormant thread's note names its open fragments and only those.
+
+    Both fragments are marked ``EXPLICIT`` so both titles are on the
+    ``energy_excerpts`` surface: the assertion is that the guard subtracts
+    the withheld one rather than that titles never appear.
+    """
+    _write_thread(vault, thread_id="thr-deep", title="Deep Work")
+    _write_withheld(
+        vault,
+        kind=kind,
+        frag_id="f-hidden-1",
+        title="Therapy: the affair and the shame",
+        threads=["[[Deep Work]]"],
+        praxis_potential=PraxisPotential.EXPLICIT,
+    )
+    _write_fragment(
+        vault,
+        frag_id="f-open-1",
+        title="Timeboxing experiment",
+        threads=["[[Deep Work]]"],
+        praxis_potential=PraxisPotential.EXPLICIT,
+    )
+
+    result = run_compost_scan(
+        vault,
+        similarity_fn=_never_similar,
+        verifier=None,
+        config=CompostConfig(),
+        now=_NOW,
+    )
+    CompostTracker(now=_NOW).generate_compost_report(vault)
+
+    assert len(result.composted) == 1
+    text = _compost_tree_text(vault)
+    # Negative branch: withholding must subtract, not suppress wholesale.
+    assert "f-open-1" in text
+    assert "Timeboxing experiment" in text
+    assert "f-hidden-1" not in text
+    assert "the affair" not in text
+    assert not any("affair" in p.name for p in _compost_tree(vault))
+
+
+@pytest.mark.parametrize("kind", _WITHHELD_KINDS)
+def test_a_dormant_thread_whose_only_fragments_are_withheld_writes_no_note(
+    vault: Path,
+    kind: str,
+) -> None:
+    """SILENT OMISSION is the contract — an empty note is itself a disclosure.
+
+    Writing the note with ``_No related fragments were recorded._`` in place
+    of the fragment list announces "this thread's only fragments are
+    protected", which is the fact being protected. The candidate is dropped.
+    """
+    _write_thread(vault, thread_id="thr-deep", title="Deep Work")
+    _write_withheld(
+        vault,
+        kind=kind,
+        frag_id="f-hidden-1",
+        title="Therapy: the affair and the shame",
+        threads=["[[Deep Work]]"],
+    )
+
+    result = run_compost_scan(
+        vault,
+        similarity_fn=_never_similar,
+        verifier=None,
+        config=CompostConfig(),
+        now=_NOW,
+    )
+    CompostTracker(now=_NOW).generate_compost_report(vault)
+
+    assert result.composted == []
+    assert _notes_in(vault, _CANONICAL_RELDIR) == []
+    text = _compost_tree_text(vault)
+    assert "_No related fragments were recorded._" not in text
+    assert "Deep Work" not in text
+    assert "f-hidden-1" not in text
+
+
+def test_a_dormant_thread_with_no_fragments_at_all_still_composts(
+    vault: Path,
+) -> None:
+    """REGRESSION FENCE, not a mutation test — expected green before and after.
+
+    Suppression is conditioned on *withheld-ness*, never on emptiness.
+    ``tests/test_compost.py::TestDetectCompostCandidates::
+    test_dormant_thread_detected`` passes ``fragments=[]`` and requires a
+    candidate, so simplifying the branch to ``if not related: continue``
+    would silently stop composting every thread whose fragments have not
+    been ingested yet. This test exists to make that simplification fail.
+    """
+    _write_thread(vault, thread_id="thr-lonely", title="Sourdough experiments")
+
+    result = run_compost_scan(
+        vault,
+        similarity_fn=_never_similar,
+        verifier=None,
+        config=CompostConfig(),
+        now=_NOW,
+    )
+
+    assert len(result.composted) == 1
+    assert frontmatter.load(str(result.composted[0])).get("original_thread") == (
+        "[[thr-lonely]]"
+    )
+
+
+# ---- Privacy: failing closed on tiers the model would default open ----
+
+
+def test_a_fragment_with_no_privacy_tier_key_is_withheld(vault: Path) -> None:
+    """A missing ``privacy_tier`` key must read INTIMATE, not ``unclassified``.
+
+    ``Fragment.privacy_tier`` defaults to ``unclassified`` when the key is
+    absent, so reading the tier off the validated model admits a note that
+    never declared a tier at all.
+    :func:`creek.classify.privacy_filter.raw_privacy_tier` — the house
+    fail-closed reader, mirrored onto liminal fragments by
+    ``creek.generate.mining`` — resolves the same file to ``intimate``. Two
+    readers must not disagree about one file, so the scan's loader
+    materialises the raw-derived tier before the tracker ever sees it.
+    """
+    for idx in (1, 2):
+        _write_fragment(
+            vault,
+            frag_id=f"f-untiered-{idx}",
+            title=f"Notes from the untiered project ({idx})",
+            tags=["untiered-project"],
+            created=_BACK_DATED,
+            drop_privacy_tier=True,
+        )
+
+    result = run_compost_scan(
+        vault,
+        similarity_fn=_never_similar,
+        verifier=None,
+        config=CompostConfig(),
+        now=_NOW,
+    )
+    CompostTracker(now=_NOW).generate_compost_report(vault)
+
+    assert result.composted == []
+    assert _notes_in(vault, _CANONICAL_RELDIR) == []
+    assert not any("untiered-project" in p.name for p in _compost_tree(vault))
+    assert "untiered-project" not in _compost_tree_text(vault)
+
+
+def test_an_explicitly_unclassified_fragment_is_still_admitted(vault: Path) -> None:
+    """The narrowing is scoped to the *missing* key, not to every open note.
+
+    An explicit ``unclassified`` ranks with ``personal`` (#876/#961) and is
+    admitted; only the absent key fails closed. Without this negative branch
+    "withhold everything" would satisfy every other privacy test here.
+    """
+    for idx in (1, 2):
+        _write_fragment(
+            vault,
+            frag_id=f"f-open-{idx}",
+            title=f"Notes from the open project ({idx})",
+            tags=["open-project"],
+            created=_BACK_DATED,
+            privacy_tier=PrivacyTier.UNCLASSIFIED,
+        )
+
+    result = run_compost_scan(
+        vault,
+        similarity_fn=_never_similar,
+        verifier=None,
+        config=CompostConfig(),
+        now=_NOW,
+    )
+
+    assert len(result.composted) == 1
+    assert any("open-project" in p.name for p in _compost_tree(vault))
+
+
+def test_a_fragment_with_an_unrecognised_privacy_tier_never_contributes(
+    vault: Path,
+) -> None:
+    """PIN, not a mutation-tested assertion — this is already green today.
+
+    An unrecognised tier string fails ``Fragment.model_validate``, so
+    ``creek.vault.reader.try_load_fragment`` drops the note before the
+    tracker sees it. That is fail-closed *by accident*: a future
+    ``mode="before"`` coercer on ``Fragment.privacy_tier``, of the kind
+    ``AuthorProfile.default_privacy_tier`` already carries, would make the
+    note load with a defaulted tier and silently admit it. This test is what
+    turns that accident into a contract.
+    """
+    for idx in (1, 2):
+        _write_fragment(
+            vault,
+            frag_id=f"f-bad-{idx}",
+            title=f"Notes from the secret project ({idx})",
+            tags=["secret-project"],
+            created=_BACK_DATED,
+        )
+        path = vault / "01-Fragments" / f"f-bad-{idx}.md"
+        post = frontmatter.load(str(path))
+        post.metadata["privacy_tier"] = "super-secret"
+        path.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    result = run_compost_scan(
+        vault,
+        similarity_fn=_never_similar,
+        verifier=None,
+        config=CompostConfig(),
+        now=_NOW,
+    )
+    CompostTracker(now=_NOW).generate_compost_report(vault)
+
+    assert result.composted == []
+    assert not any("secret-project" in p.name for p in _compost_tree(vault))
+    assert "secret-project" not in _compost_tree_text(vault)
 
 
 # ---- Idempotency ----

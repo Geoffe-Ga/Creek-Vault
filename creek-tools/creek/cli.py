@@ -6675,8 +6675,11 @@ def _build_scan_verifier(config: CreekConfig) -> SupportsVerifyCompost:
     ``skip_intimate=True`` — not read from config, so no config edit or flag can
     turn it off — which means an ``Intimate`` fragment is dropped before the
     embedding gate, let alone the verifier. ``Personal`` is therefore the most
-    sensitive tier that can physically reach this provider. Should that forced
-    flag ever become configurable, this resolve call must be re-derived
+    sensitive tier that can physically reach this provider. Issue #1311 moved
+    that drop from inside the fragment detector to the detection *boundary*
+    and made an undeclared ``privacy_tier`` fail closed to ``Intimate``, so
+    the derivation is strictly stronger than when it was written. Should that
+    forced flag ever become configurable, this resolve call must be re-derived
     per-fragment instead of hoisted here.
 
     Unlike :func:`_build_compost_verifier`, an unavailable provider is fatal —
