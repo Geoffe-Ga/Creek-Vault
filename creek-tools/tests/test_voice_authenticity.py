@@ -188,6 +188,11 @@ def test_audience_mix_buckets_eligible_by_tier(
         enabled: The vault's configured weighting value.
     """
     monkeypatch.delenv("CREEK_CONFIG", raising=False)
+    # And run from a directory holding no creek_config.yaml. Without this the
+    # False row discriminates against a bare-load_config() regression only
+    # because the ambient cwd happens to have no config in it — true today,
+    # enforced by nothing.
+    monkeypatch.chdir(tmp_path)
     vault = tmp_path / "vault"
     _scaffold_mixed_vault(vault)
     _set_vault_weighting(vault, enabled=enabled)
@@ -297,6 +302,11 @@ def test_to_json_is_stable_and_parseable(
             (#1313).
     """
     monkeypatch.delenv("CREEK_CONFIG", raising=False)
+    # And run from a directory holding no creek_config.yaml. Without this the
+    # False row discriminates against a bare-load_config() regression only
+    # because the ambient cwd happens to have no config in it — true today,
+    # enforced by nothing.
+    monkeypatch.chdir(tmp_path)
     vault = tmp_path / "vault"
     _scaffold_mixed_vault(vault)
     _set_vault_weighting(vault, enabled=enabled)

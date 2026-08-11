@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 import yaml
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from creek.cli import app
@@ -47,11 +48,12 @@ _SAMPLES_SUBPATH = ("07-Voice", "Register-Samples")
 
 
 def _voice_body(marker: str) -> str:
-    """Return a body of ~300 whitespace tokens, inside the length-bonus band.
+    """Return a body of 232 whitespace tokens, inside the length-bonus band.
 
     ``VoiceExemplarCollector.rank_exemplars`` awards its length bonus for a
     word count in ``[200, 800]``, so every fixture fragment must land there
-    for the two candidates to share an identical quality base.
+    for the two candidates to share an identical quality base. 232 = the
+    marker plus 33 repetitions of a seven-word clause.
     """
     return f"{marker} " + ("the creek of thought flows gently downstream " * 33)
 
@@ -115,6 +117,7 @@ def _write_vault_config(
     *,
     enabled: bool,
     privacy_tier_authority: dict[str, float] | None = None,
+    fingerprint_path: str | None = None,
 ) -> Path:
     """Seed ``<vault>/00-Creek-Meta/creek_config.yaml`` the way ``creek init`` does.
 
@@ -129,6 +132,10 @@ def _write_vault_config(
         enabled: Value for ``voice_audience_weighting.enabled``.
         privacy_tier_authority: Optional replacement authority map, for the
             custom-multiplier cases.
+        fingerprint_path: Optional non-default ``ai_style.fingerprint_path``.
+            The fingerprint fix moved ``ai_style`` onto the vault's config in
+            the same line as the weighting, so this is what lets a test pin
+            that half independently.
 
     Returns:
         Path of the written config file.
@@ -139,6 +146,8 @@ def _write_vault_config(
     weighting["enabled"] = enabled
     if privacy_tier_authority is not None:
         weighting["privacy_tier_authority"] = privacy_tier_authority
+    if fingerprint_path is not None:
+        data["ai_style"]["fingerprint_path"] = fingerprint_path
     meta = vault / "00-Creek-Meta"
     meta.mkdir(parents=True, exist_ok=True)
     target = meta / "creek_config.yaml"
@@ -511,6 +520,15 @@ def test_weighting_can_never_widen_corpus_membership(
     gate excludes intimate content at every ceiling, while ``--include-tier
     open`` additionally excludes PERSONAL.
 
+    Note what this test is and is not. It would have passed against the
+    pre-#1313 code too — back then the config was ignored outright, so
+    ``intimate: 10.0`` was never applied to anything. It is therefore a
+    forward-looking invariant guard, **not** evidence that the fix works;
+    the ordering and membership tests above are that. What it protects is
+    the property the fix makes newly reachable: now that operator-set
+    authorities really do reach the ranking, this pins that they still
+    cannot reach the gates.
+
     Args:
         tmp_path: Pytest temporary directory.
         monkeypatch: Pytest monkeypatch fixture.
@@ -535,6 +553,11 @@ def test_weighting_can_never_widen_corpus_membership(
 
     persisted = _persisted_stems(vault)
     links = " ".join(_summary_links(vault))
+    # Positive control FIRST. Every assertion below is a non-membership claim,
+    # and ``_persisted_stems`` returns an empty set for a missing directory —
+    # so without proof that something WAS persisted, an outage would satisfy
+    # the whole test.
+    assert "a-open.md" in persisted, persisted
     assert "c-intimate.md" not in persisted, (
         "A 10.0 intimate authority pulled an INTIMATE fragment into the "
         "verbatim-copied register samples. The weighting must never override "
@@ -641,8 +664,25 @@ def test_lexicon_output_is_invariant_to_the_audience_weighting(
     _isolate(monkeypatch, tmp_path)
     on_vault = _weighted_vault(tmp_path, enabled=True, name="on")
     off_vault = _weighted_vault(tmp_path, enabled=False, name="off")
-    _seed_cut_corpus(on_vault)
-    _seed_cut_corpus(off_vault)
+    for vault in (on_vault, off_vault):
+        _seed_cut_corpus(vault)
+        # Give the one OPEN fragment — the exact fragment the weighting moves
+        # across the top-N cut on every other path — a borrowed term. This is
+        # what gives the tripwire teeth: `_build_borrowed_terms` copies the
+        # whole surrounding sentence into `glossary.md` with no occurrence
+        # threshold, so if `collect_all_exemplars` ever gained ranking or a
+        # cap, `z-open` would leave one side's corpus and this sentence would
+        # vanish from one glossary only. Without it, both corpora differ by
+        # two near-identical bodies and the assertion might not notice.
+        _write_voice_fragment(
+            vault,
+            "z-open",
+            tier="open",
+            body=(
+                "The sangha is not the point and the dharma is not the point. "
+                + _voice_body("z-open")
+            ),
+        )
 
     _run_report(on_vault, "lexicon")
     _run_report(off_vault, "lexicon")
@@ -659,8 +699,17 @@ def test_lexicon_output_is_invariant_to_the_audience_weighting(
             if p.is_file()
         }
 
-    assert _lexicon_tree(on_vault), "The lexicon report wrote nothing to assert on."
-    assert _lexicon_tree(on_vault) == _lexicon_tree(off_vault)
+    on_tree = _lexicon_tree(on_vault)
+    assert on_tree, "The lexicon report wrote nothing to assert on."
+    # Pin the lever, so the invariance below is a real observation rather than
+    # a comparison of two outputs that happen to contain nothing distinctive.
+    # ``z-open``'s borrowed terms must actually be reaching the glossary; if a
+    # refactor stops them, this fails loudly instead of leaving the tripwire
+    # silently toothless.
+    glossary = "\n".join(on_tree["glossary.md"])
+    assert "sangha" in glossary and "dharma" in glossary, glossary[:400]
+
+    assert on_tree == _lexicon_tree(off_vault)
 
 
 _PARADOX_SENTENCE = " The current holds, and yet the bank runs dry."
@@ -901,6 +950,45 @@ def test_cli_fingerprint_reads_the_vault_config_not_the_cwd(
     assert _fingerprint(off_vault)["fragment_count"] == 2
 
 
+_CUSTOM_FINGERPRINT_PATH = "00-Creek-Meta/custom-fingerprint.json"
+"""A non-default ``ai_style.fingerprint_path``, to pin the other half."""
+
+
+def test_fingerprint_reads_ai_style_from_the_vault_too(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fingerprint fix moved ``ai_style`` onto the vault's config as well.
+
+    ``_report_fingerprint`` derived BOTH ``ai_style`` and
+    ``voice_audience_weighting`` from one bare ``load_config()``, so replacing
+    it with the vault-scoped resolution corrected two config sections in a
+    single line. The weighting half is covered by the ranking tests; without
+    this one a mutant that reverted only the ``ai_style`` half would survive
+    every other assertion in the module.
+
+    ``fingerprint_path`` is the observable because it decides where the
+    artifact is written — a claim no ranking assertion can make.
+    """
+    _isolate(monkeypatch, tmp_path)
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments" / "Journal").mkdir(parents=True)
+    _write_vault_config(
+        vault,
+        enabled=True,
+        fingerprint_path=_CUSTOM_FINGERPRINT_PATH,
+    )
+    _seed_fingerprint_corpus(vault)
+
+    _run_report(vault, "fingerprint")
+
+    assert (vault / _CUSTOM_FINGERPRINT_PATH).is_file(), (
+        "The fingerprint did not land at the vault config's fingerprint_path, "
+        "so ai_style is still being read from the cwd rather than the vault."
+    )
+    assert not (vault / "00-Creek-Meta" / "voice-fingerprint.json").exists()
+
+
 def _mcp_report(vault: Path, report_type: str, ceiling: TierCeiling) -> None:
     """Drive the MCP ``report`` tool directly and assert it did not refuse."""
     result = report_tool(
@@ -1012,6 +1100,45 @@ def test_voice_authenticity_reports_the_vaults_weighting_state(
     assert as_json.exit_code == 0, as_json.output
     payload = json.loads(as_json.output)
     assert payload["audience_mix"]["weighting_active"] is enabled
+
+
+def test_mcp_config_resolution_stays_lazy_for_config_less_report_types(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale vault config must not break the report types that never read one.
+
+    ``_vault_config`` is called inside the three voice generators rather than
+    at ``report_tool``'s fan-out, and this is the test that keeps it there.
+    That fan-out serves all eleven report types, eight of which read no config
+    at all. ``CreekConfig`` forbids extra keys, so resolving eagerly would turn
+    a stale-but-harmless ``<vault>/00-Creek-Meta/creek_config.yaml`` — one an
+    older creek wrote, or an operator typo'd — into an unhandled
+    ``ValidationError`` on ``report_type="tags"``, a type that worked fine
+    before #1313.
+
+    Written as a guard against a plausible future "simplification" (hoisting
+    the resolution to the one obvious place) rather than against today's code.
+    """
+    _isolate(monkeypatch, tmp_path)
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments" / "Journal").mkdir(parents=True)
+    meta = vault / "00-Creek-Meta"
+    meta.mkdir(parents=True)
+    data: dict[str, Any] = CreekConfig().model_dump(mode="json")
+    data["vault_path"] = str(vault)
+    data["a_key_no_creek_version_ever_had"] = True
+    (meta / "creek_config.yaml").write_text(
+        yaml.dump(data, sort_keys=False),
+        encoding="utf-8",
+    )
+    _write_voice_fragment(vault, "a-personal", tier="personal")
+
+    # Sanity: that config really is unloadable, so the test is not vacuous.
+    with pytest.raises(ValidationError):
+        CreekConfig.model_validate(data)
+
+    _mcp_report(vault, "tags", TierCeiling.ALL)
 
 
 def test_fill_voice_step_honours_the_vault_audience_weighting(

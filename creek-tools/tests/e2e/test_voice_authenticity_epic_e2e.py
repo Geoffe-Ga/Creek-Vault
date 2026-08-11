@@ -167,6 +167,11 @@ def test_voice_authenticity_epic_end_to_end(
             (#1313); the other three points are invariant to it.
     """
     monkeypatch.delenv("CREEK_CONFIG", raising=False)
+    # And run from a directory holding no creek_config.yaml. Without this the
+    # False row discriminates against a bare-load_config() regression only
+    # because the ambient cwd happens to have no config in it — true today,
+    # enforced by nothing.
+    monkeypatch.chdir(tmp_path)
     vault = tmp_path / "vault"
     (vault / "00-Creek-Meta").mkdir(parents=True)
     _ingest_claude_chat(vault)

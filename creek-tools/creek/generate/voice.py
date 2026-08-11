@@ -2164,11 +2164,17 @@ class VoiceProfileGenerator:
                 :func:`~creek.generate.ai_style.fingerprint.build_fingerprint`,
                 whose ``None`` means off; see that function's docstring for
                 why the two differ and why neither default moved (#1313).
-                Production callers never rely on either default —
+                No production caller *on this path* relies on the default:
                 ``tests/test_mcp_report_tier_ceiling.py``'s
                 ``test_production_voice_callers_always_state_an_audience_weighting``
-                requires every one of them to pass the vault's config
-                explicitly.
+                requires every construction of this class,
+                :class:`VoiceExemplarCollector` and
+                :func:`generate_register_samples` to pass the vault's config
+                explicitly. That guard covers those three symbols only — it
+                says nothing about
+                :func:`~creek.generate.ai_style.fingerprint.build_fingerprint`,
+                which has a production caller still taking its default
+                (see #1410).
 
         Raises:
             ValueError: If either bound is less than 1, or if

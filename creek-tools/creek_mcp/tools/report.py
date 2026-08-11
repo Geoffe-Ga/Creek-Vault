@@ -119,7 +119,17 @@ class _ReportRequest:
 
 
 def _vault_config(request: _ReportRequest) -> CreekConfig:
-    """Load the config belonging to *request*'s vault, quietly.
+    """Load *request*'s vault config — or ``CREEK_CONFIG``, if that is set.
+
+    The name is a slight overstatement and the precedence is worth knowing:
+    :func:`resolve_config_path` consults ``CREEK_CONFIG`` *before* the vault's
+    own file, so a server process that inherited that variable will rank one
+    vault's exemplars under another vault's weighting. That is the established
+    repo-wide behaviour — ``creek_mcp/tools/draft.py`` and
+    ``creek/cli.py``'s ``_load_config_for_vault`` resolve identically — and
+    #1313 deliberately did not change it. The blast radius is bounded because
+    this knob is ranking-only: it cannot widen corpus membership whichever
+    file it comes from.
 
     The precedent is ``creek_mcp/tools/draft.py``, whose comment names the
     hazard: this is deliberately **not** the bare process-wide

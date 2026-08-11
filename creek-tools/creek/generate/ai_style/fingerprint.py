@@ -238,10 +238,22 @@ def build_fingerprint(
             ``None`` selects the enabled default. Neither default moved in
             #1313: flipping the collector's would silently disable the shipped
             #632/#633/#634 epic, and flipping this one is a behaviour change
-            for library callers with no issue behind it. The asymmetry is a
-            library-only wart, because every production caller now states the
-            vault's config explicitly under the structural guard
-            ``test_production_voice_callers_always_state_an_audience_weighting``.
+            for library callers with no issue behind it.
+
+            Be careful what you conclude from that. On the *exemplar* side the
+            default is unreachable in production, because
+            ``test_production_voice_callers_always_state_an_audience_weighting``
+            requires every construction there to state the value. **No such
+            guard covers this function.** ``build_fingerprint`` is deliberately
+            absent from ``_AUDIENCE_WEIGHTING_CALL_NAMES``, and one production
+            caller does still rely on the ``None`` default:
+            ``creek/cli.py``'s ``_resolve_voice_fingerprint``, the fallback
+            ``creek voice-check`` takes when a vault has no persisted
+            ``voice-fingerprint.json``. So that command can score against an
+            unweighted fingerprint while ``report --type fingerprint``
+            persists a weighted one. Tracked in #1410; not fixed here because
+            it is pre-existing and outside #1313's inventory.
+
             The load-bearing difference between the two paths is not the
             default but the semantics — see :func:`_eligible_texts` on why a
             ``0.0`` authority excludes here and merely de-ranks there.
