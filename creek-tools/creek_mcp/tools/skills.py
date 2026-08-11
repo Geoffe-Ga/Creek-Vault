@@ -34,23 +34,28 @@ def skills_refresh_tool(
     The caller's ceiling is converted with ``to_privacy_override`` and
     threaded into ``SkillTreeGenerator``, which applies it as a **hard rank
     cutoff**: an above-ceiling fragment is omitted from exemplar harvesting
-    outright rather than summarised, so no above-ceiling *fragment* body,
-    title or id reaches the untiered ``<vault>/creek-skills`` tree. Omission
-    is the point — a ``"[Personal-tier summary: <title>]"`` stub written into
+    outright rather than summarised, so no above-ceiling body, title or id
+    reaches the untiered ``<vault>/creek-skills`` tree. Omission is the point
+    — a ``"[Personal-tier summary: <title>]"`` stub written into
     ``## Exemplar Passages`` would be a fabricated voice exemplar carrying
     the very title it claims to protect.
 
-    That claim covers fragments and stops there. **Thread and eddy skills are
-    not gated.** ``Thread`` and ``Eddy`` carry no ``privacy_tier`` field, so
-    the generator's ``_collect_typed`` walk has nothing to rank them by and
-    takes no override, while their titles, ids, descriptions and fragment
-    counts are all derived from their member fragments. An eddy whose members
-    sit above the ceiling still reaches ``creek-skills/eddies/`` under a title
-    built from their vocabulary — and because that title, slugified, is the
-    filename, it also reaches the ``skill_paths`` this function returns, with
-    ``skill_count`` moving as threads and eddies clear their member
-    thresholds. Closing that is a product decision about which files the tree
-    emits at all, tracked separately in #1284.
+    **Thread and eddy skills are gated too, on a derived tier (#1284).**
+    ``Thread`` and ``Eddy`` carry no ``privacy_tier`` field, but their titles,
+    descriptions and member lists are computed from their member fragments,
+    and the title slugified is the filename — so those entries of the returned
+    ``skill_paths`` really do carry content, unlike the four fragment-derived
+    categories whose keys are ontology constants. The rule is therefore: a
+    thread or eddy skill is written only when **every fragment naming it**
+    clears the caller's ceiling, and one no fragment names is written only at
+    ``ceiling=intimate``/``all``. ``skill_count`` no longer moves with
+    above-ceiling thread or eddy cardinality, and an admitted eddy's
+    "Member threads" line lists only the threads that were themselves
+    admitted.
+
+    Consequence to know: an orphaned thread or eddy — one left unlinked by a
+    partial ``creek link`` run — has no tier evidence, so it is unreachable
+    over MCP below ``ceiling=intimate``.
 
     ``intimate`` needs more than a ceiling. It additionally requires the
     Python-API ``allow_intimate`` consent opt-in, which this tool **never**

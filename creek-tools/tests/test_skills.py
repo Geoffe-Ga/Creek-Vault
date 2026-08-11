@@ -169,23 +169,103 @@ def _write_fragment(vault_path: Path, fragment: Fragment, body: str) -> Path:
     return target
 
 
-def _write_thread(vault_path: Path, thread: Thread) -> Path:
-    """Persist *thread* under ``02-Threads/Active/``."""
+def _write_member(
+    vault_path: Path,
+    *,
+    frag_id: str,
+    threads: tuple[str, ...] = (),
+    eddies: tuple[str, ...] = (),
+) -> Path:
+    """Persist a minimal ``open`` fragment that names *threads* / *eddies*.
+
+    Tier evidence, not content. Since #1284 a thread or eddy is admitted on the
+    tier of the fragments naming it, and one that nothing names has no evidence
+    at all and is admitted only at ``ceiling=intimate``. A thread written into
+    an otherwise empty vault is therefore invisible at every ceiling these
+    tests use, so the fixtures below give each thread and eddy one member — the
+    shape a vault that has actually been through ``creek link`` has.
+
+    The body is empty on purpose: ``_extract_passage`` needs 30 words, so this
+    fragment supplies a tier and nothing else, and cannot perturb any exemplar
+    assertion. It is ``open`` so the evidence never becomes the reason a test
+    fails.
+
+    Args:
+        vault_path: Vault root.
+        frag_id: Fragment id, and the file stem.
+        threads: Thread titles to link, written as ``[[...]]`` wikilinks.
+        eddies: Eddy titles to link, same shape.
+
+    Returns:
+        The path the fragment was written to.
+    """
+    fragment = _build_fragment(
+        frag_id=frag_id,
+        title=f"Member {frag_id}",
+        privacy=PrivacyTier.OPEN,
+    )
+    data = fragment.model_dump(mode="json")
+    data["threads"] = [f"[[{name}]]" for name in threads]
+    data["eddies"] = [f"[[{name}]]" for name in eddies]
+    target = vault_path / "01-Fragments" / "Journal" / f"{frag_id}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        frontmatter.dumps(frontmatter.Post(content="", **data)),
+        encoding="utf-8",
+    )
+    return target
+
+
+def _write_thread(vault_path: Path, thread: Thread, *, member: bool = True) -> Path:
+    """Persist *thread* under ``02-Threads/Active/``.
+
+    Args:
+        vault_path: Vault root.
+        thread: The thread to persist.
+        member: Write a companion ``open`` member fragment naming this thread,
+            so it has the tier evidence #1284 admits it on. Pass ``False`` only
+            when a test is *about* the orphan case.
+
+    Returns:
+        The path the thread note was written to.
+    """
     data = thread.model_dump(mode="json")
     post = frontmatter.Post(content=thread.description, **data)
     target = vault_path / "02-Threads" / "Active" / f"{thread.id}.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    if member:
+        _write_member(
+            vault_path,
+            frag_id=f"member-of-{thread.id}",
+            threads=(thread.title,),
+        )
     return target
 
 
-def _write_eddy(vault_path: Path, eddy: Eddy) -> Path:
-    """Persist *eddy* under ``03-Eddies/``."""
+def _write_eddy(vault_path: Path, eddy: Eddy, *, member: bool = True) -> Path:
+    """Persist *eddy* under ``03-Eddies/``.
+
+    Args:
+        vault_path: Vault root.
+        eddy: The eddy to persist.
+        member: Write a companion ``open`` member fragment naming this eddy —
+            see :func:`_write_thread`.
+
+    Returns:
+        The path the eddy note was written to.
+    """
     data = eddy.model_dump(mode="json")
     post = frontmatter.Post(content=eddy.description, **data)
     target = vault_path / "03-Eddies" / f"{eddy.id}.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    if member:
+        _write_member(
+            vault_path,
+            frag_id=f"member-of-{eddy.id}",
+            eddies=(eddy.title,),
+        )
     return target
 
 
@@ -600,12 +680,30 @@ class TestEddySkills:
         output_dir: Path,
         generator: SkillTreeGenerator,
     ) -> None:
-        """Eddies with more than the threshold fragments earn a skill."""
+        """Eddies with more than the threshold fragments earn a skill.
+
+        The member thread is a real thread — a title, backed by a note and a
+        member fragment — rather than the bare ``"thread-abc"`` id this used to
+        pass. Since #1284 ``_render_eddy_body`` renders only the threads the
+        same snapshot admitted, because an eddy admitted on *its* members can
+        otherwise still print the title of a thread withheld on *its* members.
+        A dangling link names a thread this snapshot never ranked, so it is
+        dropped; asserting on it would have pinned that leak in place.
+        """
+        _write_thread(
+            vault,
+            Thread(
+                id="thread-abc",
+                title="Kitchen Table Talks",
+                status=ThreadStatus.ACTIVE,
+                fragment_count=20,
+            ),
+        )
         eddy = Eddy(
             id="eddy-major",
             title="Family Of Origin",
             fragment_count=42,
-            threads=["thread-abc"],
+            threads=["[[Kitchen Table Talks]]"],
             description="The gravitational centre of the vault.",
         )
         _write_eddy(vault, eddy)
@@ -613,7 +711,7 @@ class TestEddySkills:
         assert len(paths) == 1
         body = paths[0].read_text()
         assert "Family Of Origin" in body
-        assert "thread-abc" in body
+        assert "Kitchen Table Talks" in body
 
     def test_eddies_below_threshold_are_skipped(
         self,
@@ -1181,7 +1279,14 @@ class TestLoaders:
         self,
         vault: Path,
     ) -> None:
-        """The snapshot helper composes fragments, threads, and eddies."""
+        """The snapshot helper composes fragments, threads, and eddies.
+
+        Three fragments, not one: ``_write_thread`` and ``_write_eddy`` each
+        write a companion ``open`` member so their note has the tier evidence
+        #1284 admits it on. The count is asserted rather than left loose
+        because it is the visible proof that the derived-tier walk reads the
+        *whole* fragment corpus, member fragments included.
+        """
         frag = _build_fragment(frag_id="frag-snap1", title="Snap")
         _write_fragment(vault, frag, _make_passage(3))
         thread = Thread(
@@ -1203,7 +1308,7 @@ class TestLoaders:
             allow_intimate=False,
             override=PrivacyTierOverride.PERSONAL,
         )
-        assert len(snapshot.fragments) == 1
+        assert len(snapshot.fragments) == 3
         assert len(snapshot.threads) == 1
         assert len(snapshot.eddies) == 1
 
