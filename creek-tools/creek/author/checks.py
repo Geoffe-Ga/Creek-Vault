@@ -80,6 +80,18 @@ An unrecognised contract ``default_privacy_tier`` gates as strictly as
 possible (the lowest ceiling), so more cited tiers count as over-tier rather
 than fewer — the conservative direction for a HARD gate."""
 
+_NO_CONTRACT_CEILING: PrivacyTier = PrivacyTier.OPEN
+"""Fail-closed ceiling for a caller that supplied no contract at all (#1310).
+
+A *different* condition from the one :data:`_LEAST_RESTRICTIVE_RANK` covers:
+there the contract exists and its ``default_privacy_tier`` is merely unranked;
+here there is no contract to read a ceiling from. Both fail closed in the same
+direction — gate at the strictest tier — so a contract-less caller gets the
+HARD gate rather than no gate. Every shipped medium template declares
+``default_privacy_tier: open``, so this is a no-op for contract-bearing
+callers. Skipping instead is how ``creek author`` shipped an intimate
+fragment's protected text to stdout with ``verdict=PASS``."""
+
 #: Legacy alias keys whose presence in a body signals non-canonical taxonomy
 #: (INC-019). Maps each deprecated alias to its canonical replacement.
 _LEGACY_ALIASES: dict[str, str] = (
@@ -284,27 +296,34 @@ def check_privacy_compliance(
     For each cited fragment whose resolved tier is *more restrictive* than the
     contract's ``default_privacy_tier``, the draft breaches privacy iff the body
     still contains that fragment's protected text. The check is deterministic;
-    when *vault* or *contract* is ``None`` there is nothing to resolve against,
-    so no finding is raised. A cited fragment id with no matching file in the
-    vault is unresolvable (its tier cannot be known) and is skipped rather than
-    guessed — the hard citation gate still requires every claim to carry an id.
+    only *vault* being ``None`` skips it, because without a vault there is no
+    file to resolve a tier or a protected body from. A missing *contract* does
+    **not** skip: it gates at :data:`_NO_CONTRACT_CEILING` (#1310). A cited
+    fragment id with no matching file in the vault is unresolvable (its tier
+    cannot be known) and is skipped rather than guessed — the hard citation gate
+    still requires every claim to carry an id.
 
     Args:
         body: The drafted prose under review.
         evidence: The evidence the draft was rendered from.
         vault: The vault root, or ``None`` to skip the check.
         contract: The medium contract whose ``default_privacy_tier`` is the
-            ceiling, or ``None`` to skip.
+            ceiling, or ``None`` to gate at :data:`_NO_CONTRACT_CEILING`.
 
     Returns:
         One ``HIGH`` finding per leaked over-tier fragment, dimension
         ``"privacy_compliance"``.
     """
-    if vault is None or contract is None:
+    if vault is None:
         return []
     # Pydantic stores tiers as the underlying str; coerce back to the enum so
-    # the ordering lookup and display are well-defined.
-    ceiling_tier = PrivacyTier(contract.default_privacy_tier)
+    # the ordering lookup and display are well-defined. With no contract there
+    # is no declared ceiling to coerce, so fail closed at the strictest one.
+    ceiling_tier = (
+        _NO_CONTRACT_CEILING
+        if contract is None
+        else PrivacyTier(contract.default_privacy_tier)
+    )
     ceiling = _TIER_RANK.get(ceiling_tier, _LEAST_RESTRICTIVE_RANK)
     findings: list[ReflectionFinding] = []
     for frag_id, (raw_tier, frag_body) in _resolve_cited_tiers(evidence, vault).items():
