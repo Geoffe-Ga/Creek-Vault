@@ -5,25 +5,62 @@ delegates to ``creek.author.run_author`` (or ``plan_author`` for a dry run) —
 no desk logic lives in the MCP layer (SPEC §4.3: both the CLI and MCP surfaces
 call the same desk). The response carries the draft body, the reflection
 verdict, per-claim provenance, and the cited ``claims`` (each with its
-``source_fragments``). Existing MCP verbs are untouched.
+``source_fragments``) — **unless** the desk's HARD privacy check condemned the
+draft, in which case the verb answers ``status: "refused"`` and withholds all
+three content keys (#1353). Returning a ``privacy_compliance`` finding
+*alongside* the protected text it just caught hands the caller the very breach
+the gate detected; the finding travels, the corpus does not. Existing MCP verbs
+are untouched.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from creek.author import plan_author, require_supported_medium, run_author
 from creek_mcp.audit import MCPAuditLog
-from creek_mcp.tier_ceiling import TierCeiling, to_privacy_override
+from creek_mcp.tier_ceiling import TierCeiling, refusal_response, to_privacy_override
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from creek.author import AuthoredDraft
+    from creek.author import AuthoredDraft, ReflectionFinding
     from creek.author.client import AuthorLLMClient
+    from creek.author.models import FindingDimension
     from creek.models import PrivacyTier
 
 TOOL_NAME = "creek.author"
+
+
+# The one reflection dimension whose presence turns a finished draft into a
+# refusal (#1353). Annotated with :data:`~creek.author.models.FindingDimension`
+# — the ``Literal`` that already contains this exact string — so strict mypy
+# rejects a typo here instead of leaving a filter that silently matches nothing
+# forever, which would restore the leak without failing anything.
+#
+# The literal is deliberately re-stated rather than imported from whatever
+# module happens to construct the finding (today, the body of
+# :func:`creek.author.checks.check_privacy_compliance`): an MCP tool reaching
+# into another surface's internals is a worse coupling than one duplicated
+# string that ``FindingDimension`` already type-checks. Promoting a shared
+# public constant next to the check itself is the right eventual cleanup and is
+# deliberately out of scope here.
+_PRIVACY_DIMENSION: Final[FindingDimension] = "privacy_compliance"
+
+
+# The refusal's ``reason``: fixed prose plus a count, and nothing else. No
+# fragment id, no draft text, no finding message is interpolated — a refusal
+# that quotes the corpus to explain itself has not refused anything. The
+# offending ids and tiers ride in ``privacy_findings`` instead, whose messages
+# are corpus-free by construction (``creek/author/checks.py:323-327``: fragment
+# id and tier only).
+_PRIVACY_REFUSAL_REASON: Final[str] = (
+    "The Writing Desk's privacy gate condemned this draft "
+    "({count} privacy_compliance finding(s)): it reproduces protected text "
+    "from a cited fragment held above the medium contract's default privacy "
+    "tier. The body, claims and provenance are withheld; see "
+    "privacy_findings for the offending fragments and their tiers."
+)
 
 
 class AuthorLLMFactory(Protocol):
@@ -66,12 +103,119 @@ def _error_response(
     }
 
 
+def _privacy_refusal_response(
+    draft: AuthoredDraft,
+    leaks: list[ReflectionFinding],
+    *,
+    tier_ceiling: TierCeiling,
+) -> dict[str, Any]:
+    """Render the refusal envelope for a draft the privacy gate condemned.
+
+    Built on :func:`creek_mcp.tier_ceiling.refusal_response` so this is the same
+    ``status: "refused"`` shape ``creek.link``, ``creek.report``,
+    ``creek.state.read``, ``creek.journal`` and ``creek.upload`` already emit,
+    rather than a sixth hand-rolled refusal: every consumer's ``status != "ok"``
+    branch then handles it for free. Not ``status: "error"`` — nothing
+    malfunctioned. :func:`_error_response` owns the malformed/blew-up path, and
+    collapsing a successful refusal into it would make a provider outage
+    indistinguishable from a privacy stop.
+
+    ``body``, ``claims`` and ``provenance`` are *absent*, not emptied. A
+    falsy-but-present ``body`` is exactly the shape that lets a caller print
+    nothing and believe it published a draft; with the key gone,
+    ``response["body"]`` raises at the moment of the refusal instead.
+
+    Every value is copied field by field on purpose. Never reach for
+    ``draft.model_dump()`` here: :class:`~creek.author.models.AuthoredDraft`
+    carries a ``rendered_text`` ``@computed_field`` that aliases ``body`` and
+    *is* included in dumps, so any dump smuggles the condemned prose back onto
+    the wire under a second name.
+
+    Args:
+        draft: The condemned draft. Only its non-content metadata is echoed.
+        leaks: Its findings, already filtered to :data:`_PRIVACY_DIMENSION` by
+            :func:`_draft_response` — see there for why the filter must happen
+            before anything is serialised.
+        tier_ceiling: The caller's ceiling, echoed back unchanged.
+
+    Returns:
+        The canonical refusal keys plus this verb's own non-content metadata and
+        the privacy findings.
+    """
+    return {
+        **refusal_response(
+            tool=TOOL_NAME,
+            ceiling=tier_ceiling,
+            reason=_PRIVACY_REFUSAL_REASON.format(count=len(leaks)),
+        ),
+        # "refused" with "enforced: True" is not a contradiction. This flag is a
+        # claim about the #660 retrieval filter, which ran and did its job: at
+        # ceiling=all the caller *is* admitted to intimate content, so no
+        # ceiling was violated. The breach is against a different gate — the
+        # medium contract's `default_privacy_tier` (`open` in all six shipped
+        # templates) — which is exactly why the leak survives at `all` and why
+        # every ceiling=open probe missed it.
+        "tier_ceiling_enforced": True,
+        "dry_run": False,
+        "medium": draft.medium,
+        "query": draft.query,
+        "verdict": draft.verdict,
+        "rounds": draft.rounds,
+        "privacy_findings": [
+            {
+                "dimension": finding.dimension,
+                "severity": finding.severity,
+                "message": finding.message,
+            }
+            for finding in leaks
+        ],
+    }
+
+
 def _draft_response(
     draft: AuthoredDraft,
     *,
     tier_ceiling: TierCeiling,
 ) -> dict[str, Any]:
-    """Render an :class:`AuthoredDraft` into the MCP success envelope."""
+    """Render an :class:`AuthoredDraft` into the MCP success envelope.
+
+    A draft carrying any :data:`_PRIVACY_DIMENSION` finding is refused instead
+    (#1353). The desk's HARD privacy check fires when the drafted prose
+    reproduces a cited fragment's protected text verbatim, and the success
+    envelope would then carry that text three times over — in ``body``, in
+    ``claims[*].claim`` and in ``provenance[*].claim_excerpt`` — under
+    ``status: "ok"``.
+
+    The trigger is the finding *dimension*, never ``verdict == "ESCALATE"``:
+    escalation is routine here (an empty vault escalates, and any unresolved
+    soft finding escalates once the round budget runs out —
+    ``creek/author/conductor.py:430-436``), so gating on the verdict would
+    withhold ordinary drafts. It is not conditioned on severity either:
+    ``check_privacy_compliance`` only emits ``HIGH`` today, and a
+    dimension-only trigger stays correct if a future ``MID`` privacy finding
+    appears.
+
+    The findings are filtered to that one dimension *here*, before anything
+    reaches an envelope. Echoing all of ``draft.findings`` would undo the
+    scrub, because two sibling checks interpolate corpus text into their own
+    messages: ``biographical_grounding`` embeds a sentence lifted from the
+    drafted body (``creek/author/checks.py:164``) and
+    ``attribution_correctness`` embeds a fragment title (``checks.py:517``).
+    Hence the refusal key is ``privacy_findings`` and not ``findings`` — a name
+    nobody can "complete" by widening the filter without also having to rename
+    it.
+
+    Args:
+        draft: The desk's finished draft.
+        tier_ceiling: The caller's ceiling, echoed back unchanged.
+
+    Returns:
+        The success envelope, or — when the draft carries a privacy finding —
+        the refusal envelope from :func:`_privacy_refusal_response`.
+    """
+    leaks = [leak for leak in draft.findings if leak.dimension == _PRIVACY_DIMENSION]
+    if leaks:
+        return _privacy_refusal_response(draft, leaks, tier_ceiling=tier_ceiling)
     return {
         "status": "ok",
         "tool": TOOL_NAME,
@@ -129,8 +273,11 @@ def author_tool(
 
     Returns:
         On success, the draft envelope (body, verdict, provenance, cited
-        ``claims``) or — for ``dry_run`` — the plan + evidence summary. An
-        unsupported medium yields ``status: error`` with a ``reason``.
+        ``claims``) or — for ``dry_run`` — the plan + evidence summary. A draft
+        the desk's privacy check condemned yields ``status: refused`` instead,
+        carrying the ``privacy_findings`` but none of the three content keys
+        (#1353); see :func:`_draft_response`. An unsupported medium, or any
+        desk failure, yields ``status: error`` with a ``reason``.
     """
     # #660: the ceiling is enforced — converted to a PrivacyTierOverride below
     # and threaded into the specialists, which exclude above-ceiling fragments
