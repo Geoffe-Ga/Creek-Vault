@@ -29,6 +29,7 @@ import logging
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Final
 
 from pydantic import BaseModel, Field
 
@@ -51,12 +52,41 @@ from creek.generate.indexes import IndexGenerator
 from creek.ingest import INGESTOR_REGISTRY
 from creek.ingest.base import IngestedFragment, assemble_ingested_fragment
 from creek.ingest.ledger import LedgerRecord
-from creek.link.linker import LinkingPipeline
+from creek.link.link_engine import LinkSummary, run_link
 from creek.models import Fragment, Frequency
 from creek.redact.scanner import RedactionScanner
 from creek.vault.writer import VaultWriter
 
 logger = logging.getLogger(__name__)
+
+_PROCESS_LINK_METHODS: Final[tuple[str, ...]] = ("eddies", "threads")
+"""Linker stages ``creek process`` runs, in order — and why only these two.
+
+**Why not all four.** ``creek link``'s four methods do not all persist
+anything. ``temporal`` computes proximity links and returns a count with
+no write of any kind; ``embeddings`` persists only the *vector* parquet —
+the resonance edges it counts are discarded, there is no ``Resonance``
+writer anywhere in the codebase, and :class:`~creek.models.Fragment` has
+no ``resonances`` field. Running them here would reproduce the very
+overclaim #1303 is about, and ``find_resonances`` is additionally the
+O(n^2) hotspot (#857/#858) that issue declares out of scope. The vector
+cache they would have warmed is written by the eddies pass anyway.
+
+**Why two calls and not one shared load.** The tuple is ordered and each
+entry is a *separate* :func:`~creek.link.link_engine.run_link` call
+precisely because ``run_link`` re-reads fragments from disk every time.
+``_persist_fragment_link_updates`` rewrites frontmatter from the
+in-memory model's full dump, so it overwrites *every* Fragment-owned key
+— including the link list the other stage owns. A design that loaded the
+corpus once and fed both detectors would have the second stage write
+``eddies: []`` over the wiki-links the first stage had just persisted,
+and it would still pass a page-existence assertion. The per-call reload
+is the correctness boundary, guarded by the both-lists assertion in
+``tests/e2e/test_full_pipeline_linking.py``.
+
+Deliberately *not* ``creek.surface_modes.LINK_METHODS``: that tuple is
+the ``creek link`` surface and must keep all four.
+"""
 
 
 # Map a ``creek sync`` source name -> the ingestor type it routes to.
@@ -219,14 +249,32 @@ class PipelineResult(BaseModel):
         files_scanned: Number of source files scanned for sensitive data.
         fragments_created: Number of fragments produced by ingestion.
         classifications_made: Number of fragments classified.
-        links_found: Total link count across all linking stages.
+        links_found: Link artefacts this run **persisted to the vault**:
+            eddy pages written under ``03-Eddies/`` plus thread pages
+            written under ``02-Threads/{Active,Dormant,Resolved}/``.
+            Sourced from ``eddies_written``/``threads_written``, never
+            from ``*_detected``, so a cluster the writer failed on is not
+            reported as a success. It deliberately excludes resonance and
+            temporal edges: ``creek process`` does not compute them, and
+            nothing in this codebase can persist them (#1303). Before
+            #1303 this field summed four in-memory counts and the whole
+            graph was then discarded, so a large number meant nothing.
+        link_summaries: Per-stage :class:`LinkSummary` objects, one per
+            entry in :data:`_PROCESS_LINK_METHODS`, in execution order.
+            Empty when the run had no fragments to link.
         indexes_generated: Number of index notes generated.
         deterministic_classified: Fragments confidently resolved by Pass 1
             (rules + ``human_review_sources`` short-circuit). Reported on
             every run so the audit report (FEAT-006) can graph the
             deterministic-pass yield over time.
-        local_model_processed: Fragments that traversed Pass 2 (embeddings
-            / OCR). Equals the count handed to the linking pipeline; the
+        local_model_processed: Pass-2 local-model work done by this run —
+            in practice the embedding vectors the sentence-transformer
+            actually computed. Fragments served from the embeddings
+            parquet cache are *not* counted, so a re-run over an
+            unchanged corpus honestly reports near-zero local-model work
+            rather than re-billing the whole vault (#1303). Nothing adds
+            an OCR count here today, despite Pass 2 nominally covering
+            OCR; the field's older docstring claimed otherwise. The
             ``--no-llm`` flag does not change this number.
         residue: Fragments the rule classifier left uncertain — i.e.
             would have been routed to the LLM if Pass 3 were enabled.
@@ -241,6 +289,7 @@ class PipelineResult(BaseModel):
     fragments_created: int = 0
     classifications_made: int = 0
     links_found: int = 0
+    link_summaries: list[LinkSummary] = Field(default_factory=list)
     indexes_generated: int = 0
     deterministic_classified: int = 0
     local_model_processed: int = 0
@@ -272,7 +321,6 @@ class Pipeline:
         tier_classifiers: Per-tier LLM classifiers (#666/#706) — the fragment's
             privacy tier selects the provider so Intimate stays local.
         review_generator: Review queue generator for uncertain fragments.
-        linking_pipeline: Orchestrator for all four linking stages.
         consent_manager: Optional consent manager for gating processing.
     """
 
@@ -319,10 +367,6 @@ class Pipeline:
         # construction), so a rules-only or all-cloud ``process`` run is fine.
         self.tier_classifiers = build_tier_classifiers(config)
         self.review_generator = ReviewQueueGenerator(config=config.classification)
-        self.linking_pipeline = LinkingPipeline(
-            config=config.embeddings,
-            linking_config=config.linking,
-        )
 
     def run(self, source_path: Path, vault_path: Path) -> PipelineResult:
         """Execute the full pipeline from source to vault.
@@ -337,7 +381,7 @@ class Pipeline:
             2. Ingestion (discover ingestors for source type)
             3. Classification (rule -> LLM -> review queue)
             4. Vault write (persist classified fragments + bodies)
-            5. Linking (embeddings, temporal, threads, eddies)
+            5. Linking (eddies then threads, each persisted to the vault)
             6. Index generation
 
         Args:
@@ -379,8 +423,13 @@ class Pipeline:
 
         # Stage 5: Linking
         fragments_only = [item.fragment for item in classified]
-        link_total = self._run_linking(fragments_only, vault_path, result)
-        result.links_found = link_total
+        summaries = self._run_linking(fragments_only, vault_path, result)
+        result.link_summaries = summaries
+        # ``*_written``, never ``*_detected``: a cluster the writer could
+        # not materialise must not be reported as a persisted artefact.
+        result.links_found = sum(
+            summary.eddies_written + summary.threads_written for summary in summaries
+        )
 
         # Stage 6: Indexing
         index_count = self._run_indexing(vault_path, result)
@@ -836,37 +885,57 @@ class Pipeline:
         fragments: list[Fragment],
         vault_path: Path,
         result: PipelineResult,
-    ) -> int:
-        """Run the linking pipeline on classified fragments.
+    ) -> list[LinkSummary]:
+        """Run — and persist — the link stage over the vault.
 
-        Treated as Pass 2 work for yield-summary purposes: every fragment
-        handed to the linker exercises local-model inference (sentence
-        transformers for embeddings, plus the deterministic temporal /
-        thread / eddy detectors that operate on those embeddings).
-        :attr:`PipelineResult.local_model_processed` is bumped here so
-        the audit report can attribute Pass-2 work back to the run.
+        Delegates to :func:`~creek.link.link_engine.run_link`, the same
+        entry point ``creek link`` uses, once per entry in
+        :data:`_PROCESS_LINK_METHODS`. Before #1303 this stage ran a
+        second, count-only orchestrator that wrote nothing at all.
+
+        **Scope is the whole vault, not just this run's fragments.**
+        ``run_link`` re-reads ``01-Fragments/`` itself, so a freshly
+        ingested note can join an eddy of notes ingested months ago —
+        which is the only way membership-derived cluster ids stay
+        coherent. The *fragments* argument is therefore a trigger, not an
+        input set: an empty list short-circuits so a run that ingested
+        nothing never re-clusters the corpus. The accepted cost is one
+        DBSCAN pass plus one union-find pass per ``creek process``,
+        i.e. exactly ``creek link --method eddies`` followed by
+        ``--method threads``, with no ``find_resonances``.
+
+        Pass-2 accounting is now honest: ``local_model_processed`` is
+        bumped by the vectors the model actually computed, not by the
+        fragment count. The second ``run_link`` call reads the parquet
+        the first one wrote, so it contributes ``0`` and there is no
+        double count.
 
         Args:
-            fragments: Classified fragments to link.
-            vault_path: Vault path for linking output.
+            fragments: Classified fragments from this run. Used only to
+                decide whether there is anything to link.
+            vault_path: Vault root to link over and write into.
             result: Pipeline result; mutated to record
                 ``local_model_processed``.
 
         Returns:
-            Total link count across all linking stages.
+            One :class:`LinkSummary` per method, in execution order, or
+            an empty list when there was nothing to link.
         """
         if not fragments:
             logger.info("No fragments to link.")
-            return 0
+            return []
 
-        result.local_model_processed += len(fragments)
-        link_result = self.linking_pipeline.run(fragments, vault_path)
-        return (
-            link_result.resonance_count
-            + link_result.temporal_count
-            + link_result.thread_count
-            + link_result.eddy_count
-        )
+        summaries: list[LinkSummary] = []
+        for method in _PROCESS_LINK_METHODS:
+            summary = run_link(
+                vault_path=vault_path,
+                config=self.config,
+                method=method,
+                rebuild=False,
+            )
+            result.local_model_processed += summary.fragments_embedded
+            summaries.append(summary)
+        return summaries
 
     def _run_indexing(self, vault_path: Path, result: PipelineResult) -> int:
         """Generate Dataview index notes in the vault.

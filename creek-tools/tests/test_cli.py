@@ -85,6 +85,124 @@ def test_process_command(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
 
 
+def _process_argv(source: Path, vault: Path) -> list[str]:
+    """Return the ``creek process`` argv the #1303 tests share.
+
+    Args:
+        source: Source directory to ingest.
+        vault: Vault root to write into.
+
+    Returns:
+        Argv for ``CliRunner.invoke``.
+    """
+    return [
+        "process",
+        "--source",
+        str(source),
+        "--vault",
+        str(vault),
+        "--yes",
+        "--no-llm",
+    ]
+
+
+def test_process_summary_reports_persistence_not_a_bare_link_count(
+    tmp_path: Path,
+) -> None:
+    """``creek process`` must not print an undifferentiated ``Links found``.
+
+    That line was the operator-facing face of #1303: it summed four
+    in-memory counts over a link graph the pipeline then discarded, two
+    of which (resonance and temporal edges) nothing in this codebase can
+    persist. It is replaced by the same per-stage phrasing ``creek link``
+    uses, plus a total that counts pages written to disk.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "note.md").write_text("# A note\n\nBody.\n", encoding="utf-8")
+    vault = tmp_path / "vault"
+    for name in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / name).mkdir(parents=True, exist_ok=True)
+
+    result = runner.invoke(
+        app,
+        _process_argv(source, vault),
+    )
+    assert result.exit_code == 0, result.output
+    normalized = " ".join(_strip_ansi(result.output).split())
+    assert "Links found:" not in normalized
+    assert "Eddies linker:" in normalized
+    assert "Threads linker:" in normalized
+    assert "Link artefacts persisted: 0" in normalized, (
+        "a corpus too small to cluster must report zero persisted artefacts, "
+        "not a non-zero in-memory count"
+    )
+
+
+def test_process_into_unscaffolded_vault_reports_honest_zero(
+    tmp_path: Path,
+) -> None:
+    """A half-set-up vault must degrade to zero, not crash (#1303).
+
+    Stage 5 now writes to the vault, so it inherits ``VaultWriter``'s
+    scaffold requirement and a new way to fail. Verified by execution
+    rather than assumed: on a bare vault the fragment write earlier in
+    the run lands nothing under ``01-Fragments/``, so ``_load_fragments``
+    returns empty and ``run_link`` short-circuits before it ever reaches
+    ``_materialise_link_models`` (whose own ``FileNotFoundError`` swallow
+    is covered directly in ``tests/test_link_engine.py``). What this test
+    pins is the end-to-end guarantee: exit 0, and an honest zero rather
+    than a traceback or an invented count.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "note.md").write_text("# A note\n\nBody.\n", encoding="utf-8")
+    vault = tmp_path / "bare-vault"
+    vault.mkdir()
+
+    result = runner.invoke(
+        app,
+        _process_argv(source, vault),
+    )
+    assert result.exit_code == 0, result.output
+    normalized = " ".join(_strip_ansi(result.output).split())
+    assert "Link artefacts persisted: 0" in normalized
+
+
+def test_process_embedding_model_unavailable_exits_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model-load failure aborts ``creek process`` with the remediation.
+
+    ``creek link`` has always handled this; ``creek process`` did not need
+    to, because its link stage never loaded the model for real work. Since
+    #1303 it does, so the same typed error is reachable here — and must
+    print the remediation rather than a traceback.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "note.md").write_text("# A note\n\nBody.\n", encoding="utf-8")
+    vault = tmp_path / "vault"
+    for name in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / name).mkdir(parents=True, exist_ok=True)
+
+    def _raise(_model_name: str, _cache_folder: str | None) -> object:
+        msg = "boom"
+        raise OSError(msg)
+
+    monkeypatch.setattr("creek.link.embeddings._load_sentence_transformer", _raise)
+
+    result = runner.invoke(
+        app,
+        _process_argv(source, vault),
+    )
+    assert result.exit_code != 0
+    normalized = " ".join(_strip_ansi(result.output).split())
+    assert "Embedding linker aborted" in normalized
+    assert "network access" in normalized
+
+
 def test_ingest_help() -> None:
     """Test that ingest --help shows subcommand help."""
     result = runner.invoke(app, ["ingest", "--help"])
@@ -1185,10 +1303,15 @@ def test_link_embeddings_output_phrases_similarity_edges(tmp_path: Path) -> None
     """Embeddings CLI output explicitly says "similarity edges", not "links".
 
     Issue #338 Problem B: the pre-fix output used "link(s)" for pairwise
-    similarity edges stored only in the parquet cache. That implied a
-    user-visible side effect in fragment frontmatter that did not exist.
-    The fix is to phrase the count accurately as similarity edges
-    cached in the parquet so operators know what they're being shown.
+    similarity edges that never reached fragment frontmatter. That
+    implied a user-visible side effect that did not exist.
+
+    Issue #1303 finished the job: the #338 wording said the *edges* were
+    cached in the parquet, when in fact only the *vectors* are — the
+    edges are computed and dropped, because no resonance writer exists.
+    The output must therefore name both halves. The two assertions below
+    are unchanged from #338 on purpose: the accurate vocabulary has to
+    survive the rewording, not be replaced by it.
     """
     vault = tmp_path / "vault"
     (vault / "01-Fragments").mkdir(parents=True)
@@ -1201,6 +1324,8 @@ def test_link_embeddings_output_phrases_similarity_edges(tmp_path: Path) -> None
     # New phrasing — accurate to what the embeddings method does.
     assert "similarity edge" in result.output.lower()
     assert "embeddings.parquet" in result.output
+    # #1303: and it must not claim the edges themselves were persisted.
+    assert "not persisted" in result.output.lower()
 
 
 def test_link_embeddings_model_unavailable_exits_nonzero(

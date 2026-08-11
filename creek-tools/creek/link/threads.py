@@ -273,9 +273,12 @@ class ThreadDetector:
     ) -> ThreadDetector:
         """Build a detector wired to the vault's linking configuration.
 
-        The single construction path for both orchestrators
-        (:mod:`creek.link.link_engine` and :mod:`creek.link.linker`), so the
-        same vault cannot cluster differently depending on which one ran.
+        The single construction path into the detector, so a vault cannot
+        cluster differently depending on the caller. ADR-0008 introduced
+        this to reconcile two orchestrators; #1303 deleted the second one
+        (``creek.link.linker``), leaving :mod:`creek.link.link_engine` as
+        the only production caller — but the constraint still binds every
+        future entry point.
 
         Args:
             embeddings: Optional mapping of fragment ID to embedding vector.

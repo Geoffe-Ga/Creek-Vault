@@ -1231,6 +1231,15 @@ CLI_CONTRACT: Final[Mapping[str, Surface]] = {
             writes=(
                 "01-Fragments/Notes/*Canary-note.md",
                 "00-Creek-Meta/Source-Index.md",
+                # #1303: Stage 5 used to compute the whole link graph and
+                # persist none of it. The parquet is the one link artefact
+                # a single-fragment canary vault can produce (one fragment
+                # cannot reach ``eddy_min_fragments``), and it is absent at
+                # the broken revision — so it is a real tripwire, not a
+                # tautology. Deliberately NOT ``03-Eddies/*.md``: the
+                # IndexGenerator's ``Eddy-Map.md`` would match that on
+                # every run, orphaned stage or not.
+                "00-Creek-Meta/embeddings.parquet",
             ),
             contains=(CANARY,),
         ),
