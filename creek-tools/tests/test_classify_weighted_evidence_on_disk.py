@@ -11,16 +11,23 @@ Why the written file and not the returned ``Fragment``: the write path is
 ``exclude_none``, so a nulled confidence really does land on disk as
 ``confidence: null``. An in-memory assertion cannot see that.
 
-A deliberate limitation is encoded in every test here, and it is the reason
-for the ``_RULE_INERT_BODY`` constant and the explicit precondition
-assertions. ``RuleClassifier._build_updates`` rebuilds ``VoiceClassification``
-from scratch under an ``OR`` guard, so for any body its voice matcher fires
-on, a persisted ``confidence`` is destroyed *before* the weighted classifier
-is ever called and no downstream merge can recover it. That is a separate
-defect at the rules layer, filed as issue #1400 and out of scope here. These
-tests therefore prove the weighted path closes completely **for the fragments
-the rule pass leaves alone**, and they assert that precondition rather than
-quietly depending on it.
+``_RULE_INERT_BODY`` and the explicit precondition assertions were written
+here as the visible boundary of a defect that is now closed. When #1309
+landed, ``RuleClassifier._build_updates`` still rebuilt ``VoiceClassification``
+from scratch under an ``OR`` guard, so for any body its voice matcher fired
+on, a persisted ``confidence`` was destroyed *before* the weighted classifier
+was ever called and no downstream merge could recover it — which meant these
+tests could only prove the weighted path closed **for the fragments the rule
+pass left alone**. Issue #1331 fixed that rules-layer twin, so the rule pass
+now merges its verdict like this one does and the caveat is retired.
+
+The inert fixture stays, and so do the assertions, for a different and better
+reason: these tests are about the *weighted* merge, and a body that fires the
+rule matchers would let the rules layer explain a passing result. Keeping the
+fixture inert keeps the subject of the measurement unambiguous, and
+:func:`_assert_rule_pass_preserves_evidence` now pins a guarantee rather than
+hedging a known gap. The general proof that the rules layer preserves evidence
+for *any* body lives in ``tests/test_rules_preserves_evidence.py``.
 """
 
 from __future__ import annotations
@@ -81,11 +88,13 @@ _RULE_INERT_TITLE: Final[str] = "A quiet note"
 
 The rule matchers read the title as well as the body, and that bites. An
 earlier draft titled this fragment "Evidence bearing fragment"; the word
-"evidence" trips ``_match_voice_register`` into an ``analytical`` verdict,
-which fires the ``OR`` guard at ``rules.py:791`` and destroys the persisted
-``confidence`` before the weighted classifier is reached (#1400) — turning
-these tests red for a reason that has nothing to do with what they measure.
-The precondition assertions caught it.
+"evidence" trips ``_match_voice_register`` into an ``analytical`` verdict.
+Before #1331 that fired the ``OR`` guard at ``rules.py:791`` and destroyed the
+persisted ``confidence`` before the weighted classifier was reached, turning
+these tests red for a reason that had nothing to do with what they measure;
+the precondition assertions caught it. The destruction is fixed, but the inert
+title is kept so a rule-matcher verdict can never be the thing that explains a
+pass here — see the module docstring.
 """
 
 _CONFESSIONAL_CONVICTION_RESPONSE: Final[str] = """\
@@ -192,9 +201,13 @@ def _seed_with_evidence(vault: Path) -> Path:
 def _assert_rule_pass_preserves_evidence(fragment: Fragment) -> None:
     """Assert the rules layer leaves this fragment's evidence intact.
 
-    The visible boundary of this PR. If this ever fails, the rules-layer
-    twin (#1400) has started firing on the test body and the assertions
-    downstream would be measuring the wrong defect.
+    Since #1331 this is a *guarantee* the rule pass makes for any body — it
+    merges its verdict instead of rebuilding the sub-models — rather than the
+    fixture-dependent precondition it was when #1309 wrote it. It is kept
+    because these tests measure the weighted merge specifically: if it ever
+    fails, the rules layer has started moving the very axes the assertions
+    downstream attribute to ``merge_onto``, and those assertions would be
+    measuring the wrong component.
 
     Args:
         fragment: The seeded fragment, before classification.

@@ -284,7 +284,11 @@ class LLMClassifier:
             updates,
             unclassified_threshold=self.config.unclassified_threshold,
         )
-        _apply_voice(data, updates)
+        # Issue #1331: the voice block merges axis-by-axis, so it needs the
+        # one the fragment already carries — a response that names only
+        # ``voice_register`` must not null a persisted ``confidence``, which
+        # is half the INTIMATE privacy trigger.
+        _apply_voice(data, updates, fragment.voice)
         # Issue #877: ``praxis_potential`` is monotone, so the merge needs
         # the verdict the fragment already carries — a model answering
         # ``latent`` for an ``explicit`` fragment must lose. ``_apply_praxis``

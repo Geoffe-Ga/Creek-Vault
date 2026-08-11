@@ -36,6 +36,8 @@ from typing import TYPE_CHECKING, Generic, TypeVar
 import yaml
 from pydantic import BaseModel, ConfigDict
 
+from creek.classify.evidence import layer_determined_over
+
 # Import :func:`_strip_code_fences` from its defining submodule rather
 # than the :mod:`creek.classify.llm` package surface. The package's
 # ``__init__.py`` re-exports happen *after* every submodule loads, but
@@ -495,6 +497,11 @@ class WeightedFragmentClassification(BaseModel):
         here", never "the call died", so deferring to the fragment's
         prior evidence is always the right reading.
 
+        The rule itself is no longer local to this method:
+        :func:`~creek.classify.evidence.layer_determined_over` holds the
+        single implementation, now shared with the rule classifier's own
+        layering step (#1331), so the two paths cannot drift apart.
+
         Args:
             fragment: The fragment being classified, carrying whatever
                 classification a previous run or the rule classifier
@@ -505,21 +512,19 @@ class WeightedFragmentClassification(BaseModel):
             profile and its legacy classification merged, not replaced.
         """
         freq, wave, voice = self.to_legacy()
-        # THE ``exclude_defaults`` INVARIANT that makes this a merge:
-        # every legacy classification field's default *is* its "not
-        # determined" sentinel (``UNCLASSIFIED`` / ``""`` / ``None``).
-        # So dumping the collapse with ``exclude_defaults=True`` yields
-        # exactly the subset of fields the model actually spoke to, and
-        # anything it was silent about is simply absent from the update
-        # — leaving the fragment's prior evidence standing.
+        # What makes this a merge rather than a replacement is THE
+        # ``exclude_defaults`` INVARIANT, documented in full on
+        # :func:`~creek.classify.evidence.layer_determined_over` — which
+        # is now the one implementation this path and the rules path
+        # (#1331) both call. Read it there before "simplifying" either
+        # call site back into the defect.
         update: dict[str, object] = {
             "weighted": self,
-            "wavelength": fragment.wavelength.model_copy(
-                update=wave.model_dump(exclude_defaults=True),
+            "wavelength": layer_determined_over(
+                prior=fragment.wavelength,
+                determined=wave,
             ),
-            "voice": fragment.voice.model_copy(
-                update=voice.model_dump(exclude_defaults=True),
-            ),
+            "voice": layer_determined_over(prior=fragment.voice, determined=voice),
         }
         # THE FREQUENCY ASYMMETRY: frequency is replaced wholesale when
         # the profile has any frequencies (so stale secondaries from an
