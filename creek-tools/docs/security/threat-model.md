@@ -158,7 +158,30 @@ from most to least likely:
   discovery leaves `run_ingest`'s `seen_keys` empty and
   `tomb_missing_units` then soft-tombs every live ledger key — one
   stray link would have orphaned every fragment previously ingested
-  from that source. Residual, unchanged: the escaping-*ancestor*
+  from that source. One further defect surfaced only on Python 3.13
+  and is recorded because the mechanism generalises: the predicate
+  resolved with `Path.resolve(strict=False)`, whose behaviour on a
+  symlink **cycle** pathlib never specified. On 3.11/3.12 it raises
+  `RuntimeError`, which the predicate classified as unprovable and so
+  refused; on 3.13 `Path.resolve` delegates to `os.path.realpath`,
+  which for `strict=False` stops unwinding at the cycle and returns a
+  *partially resolved* path. For a cycle that closes back on its own
+  starting point that answer erases the hops in between:
+  `<root>/a.md -> <outside>/o.md -> <root>/a.md` resolved to
+  `<root>/a.md`, an in-root answer for a link whose first hop leaves
+  the root, and the tree was admitted. No out-of-root content reached
+  the vault, because `open` also fails `ELOOP` — but that is the
+  kernel refusing rather than Creek, and it stops holding as soon as
+  the cycle is broken at the far end, outside the tree the operator
+  named. Resolution now goes through
+  `creek._containment._resolved_target`, which uses
+  `os.path.realpath(..., strict=True)` — a cycle is `OSError(ELOOP)`
+  on every supported version — and treats only `FileNotFoundError` as
+  non-fatal, so a dangling link is still judged on its candidate
+  location. The verdict is now identical on 3.11, 3.12 and 3.13, and
+  the general lesson is that a containment predicate must not take
+  its "cannot prove this" signal from an unspecified stdlib
+  exception. Residual, unchanged: the escaping-*ancestor*
   component case, which is the leaf-only policy applied
   consistently on all three surfaces. User-visible effect: aliasing an
   external export tree into the vault (`ln -s /Volumes/Export

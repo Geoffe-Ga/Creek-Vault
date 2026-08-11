@@ -29,6 +29,9 @@ The policy, unchanged from the shipped SEC-003 guard:
   would flag every child of a root reached *through* a symlinked component
   — ``/tmp`` -> ``/private/tmp`` on macOS — as escaping.
 * Unprovable containment IS an escape.
+* The resolution primitive is ``os.path.realpath``, NOT
+  :meth:`~pathlib.Path.resolve` — see :func:`_resolved_target` for why the
+  difference is load-bearing rather than stylistic.
 
 That policy is deliberately LEAF-ONLY, so a path reached through an
 escaping *ancestor* component (``<root>/linkdir/a.md``, where ``linkdir``
@@ -93,6 +96,53 @@ class EscapingSymlinkError(RuntimeError):
         )
 
 
+def _resolved_target(child: Path) -> Path | None:
+    """Resolve *child* to the location containment must be judged against.
+
+    The one place symlinks are followed, and deliberately NOT via
+    :meth:`pathlib.Path.resolve`. ``Path.resolve``'s behaviour on a symlink
+    **cycle** is not part of pathlib's contract and it changed under us:
+
+    * On 3.11/3.12, ``Path.resolve(strict=False)`` raises
+      ``RuntimeError("Symlink loop from ...")``.
+    * On 3.13 it delegates to ``os.path.realpath``, which for
+      ``strict=False`` treats a cycle as "stop unwinding here" and returns
+      a PARTIAL path with the looping component left unresolved.
+
+    That partial answer is worse than an error, because for a cycle that
+    closes back on its own starting point it erases the hops in between.
+    ``<root>/a.md -> <outside>/o.md -> <root>/a.md`` resolves, on 3.13, to
+    ``<root>/a.md`` — an in-root answer for a link whose very first hop
+    leaves the root. Judging containment on that answer admits the link.
+
+    ``os.path.realpath(..., strict=True)`` reports a cycle as
+    ``OSError(ELOOP)`` on every supported version, so it is the primitive
+    with the stable contract. Two arms, and the split is the whole policy:
+
+    * ``FileNotFoundError`` is NOT a containment failure. A dangling link
+      still names a candidate location worth comparing, so it falls back to
+      ``strict=False`` and is judged on where its target *would* sit —
+      which is what refuses a broken link pointing out of the root while
+      admitting a stale in-tree alias.
+    * Every other ``OSError`` — a cycle, an unreadable component — is a
+      containment that cannot be proven, and by this module's policy an
+      unprovable containment is an escape.
+
+    Args:
+        child: A path being tested for containment, as walked.
+
+    Returns:
+        The location to compare against the root, or ``None`` when
+        resolution failed in a way that leaves containment unproven.
+    """
+    try:
+        return Path(os.path.realpath(child, strict=True))
+    except FileNotFoundError:
+        return Path(os.path.realpath(child, strict=False))
+    except OSError:
+        return None
+
+
 def resolves_within(child: Path, resolved_root: Path) -> bool:
     """Report whether *child*'s symlink target stays under *resolved_root*.
 
@@ -102,15 +152,21 @@ def resolves_within(child: Path, resolved_root: Path) -> bool:
     drift into subtly different definitions of "inside".
 
     The failure arm is a deliberate classification, not a swallowed error:
-    a loop (``RuntimeError``), an unreadable link (``OSError``), and a
-    target outside the root (``ValueError`` from ``relative_to``) are all
-    cases where containment cannot be proven — and an unprovable
-    containment is an escape. Every caller logs and counts its rejections.
+    an unresolvable link (``None`` from :func:`_resolved_target` — a cycle,
+    an unreadable component) and a target outside the root (``ValueError``
+    from ``relative_to``) are both cases where containment cannot be
+    proven, and an unprovable containment is an escape. Every caller logs
+    and counts its rejections.
 
-    ``strict=False`` is deliberate: a dangling link still resolves to a
-    candidate location worth comparing, so a broken link pointing *outside*
-    is still refused rather than waved through on the technicality that its
-    target does not exist yet.
+    Resolution goes through :func:`_resolved_target` rather than
+    :meth:`~pathlib.Path.resolve` so that this classification is a decision
+    this module makes, not one inherited from whichever exception the
+    stdlib happens to raise that release. It was the latter until 3.13
+    changed the answer underneath it; see that function.
+
+    A dangling link is still judged on its candidate location, so a broken
+    link pointing *outside* is refused rather than waved through on the
+    technicality that its target does not exist yet.
 
     The exception object itself is deliberately dropped rather than logged:
     ``relative_to``'s message quotes the *resolved* target, which is exactly
@@ -125,7 +181,10 @@ def resolves_within(child: Path, resolved_root: Path) -> bool:
         ``True`` when the link's target is a descendant of *resolved_root*.
     """
     try:
-        child.resolve(strict=False).relative_to(resolved_root)
+        target = _resolved_target(child)
+        if target is None:
+            return False
+        target.relative_to(resolved_root)
     except (OSError, RuntimeError, ValueError):
         return False
     return True

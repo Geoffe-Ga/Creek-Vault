@@ -1250,13 +1250,25 @@ def test_a_dangling_link_pointing_inside_the_root_is_admitted(
 def test_a_symlink_loop_under_the_root_is_refused(tmp_path: Path) -> None:
     """RED. An unprovable containment is an escape.
 
-    ``a -> b -> a`` raises ``RuntimeError`` (or ``OSError(ELOOP)``,
-    depending on platform and Python version) from ``resolve``.
-    ``resolves_within`` classifies both as not-contained, deliberately: the
-    guard cannot prove the target is inside, and a safety check that
-    admits what it cannot verify is not a safety check. Pinned here so the
-    classification is a decision on the record rather than an accident of
-    which exception ``resolve`` happens to raise.
+    ``a -> b -> a`` cannot be resolved, so the guard cannot prove the
+    target is inside, and a safety check that admits what it cannot verify
+    is not a safety check.
+
+    This assertion was originally carried by ``Path.resolve`` raising, and
+    that turned out to be exactly the "accident of which exception
+    ``resolve`` happens to raise" it claimed to be pinning against: on
+    3.11/3.12 ``resolve(strict=False)`` raises ``RuntimeError('Symlink loop
+    from ...')``, while on 3.13 it delegates to ``os.path.realpath``, which
+    returns a PARTIAL path with the cycle left unresolved — an in-root
+    answer — and the tree was admitted. The classification now belongs to
+    ``creek._containment._resolved_target``, which asks
+    ``os.path.realpath(..., strict=True)``; that reports a cycle as
+    ``OSError(ELOOP)`` on every supported version.
+
+    The consequence of admitting this *particular* tree is mild — nothing
+    out-of-root is read, because ``open`` also fails ``ELOOP`` — so the
+    security-relevant half of the same divergence is pinned separately by
+    :func:`test_a_symlink_loop_that_leaves_the_root_is_refused`.
 
     Either link may be reported — ``os.walk`` does not promise an order
     within a directory — so the assertion accepts both.
@@ -1281,6 +1293,120 @@ def test_a_symlink_loop_under_the_root_is_refused(tmp_path: Path) -> None:
         "the operator has nothing to delete.\n\n"
         f"path={excinfo.value.path}"
     )
+
+
+def test_a_symlink_loop_that_leaves_the_root_is_refused(tmp_path: Path) -> None:
+    """RED on 3.13 before the fix. A cycle must not launder an escape.
+
+    ``<root>/a.md -> <outside>/o.md -> <root>/a.md``. Every question you
+    can ask about the FIRST hop says escape: the link's own target is a
+    path outside the root, and the ``o.md`` it names is a file the operator
+    never offered. The only reason it is hard is that the chain happens to
+    close back on where it started.
+
+    That is what made ``Path.resolve(strict=False)`` an unsafe primitive to
+    judge containment with on 3.13. Its answer for this tree is the
+    partially-resolved ``<root>/a.md`` — in-root — because on hitting the
+    cycle it stops unwinding and hands back the component it started from,
+    erasing the out-of-root hop in between. The guard compared that answer
+    to the root, found it inside, and admitted the tree; on 3.11/3.12 the
+    same tree was refused. A containment predicate whose verdict depends on
+    the interpreter is not one predicate.
+
+    No fragment carrying the sentinel would reach the vault today even if
+    the tree were admitted, because ``open`` fails ``ELOOP`` too — but that
+    is the kernel refusing, not Creek, and it stops holding the moment
+    anyone breaks the cycle at the far end, which is a change outside the
+    tree the operator named and outside anything Creek can see.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    from creek._containment import EscapingSymlinkError, assert_source_contained
+
+    src = tmp_path / "src"
+    src.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (src / "innocent.md").write_text(f"{_IN_ROOT_MARKER}\n", encoding="utf-8")
+    inside_link = src / "a.md"
+    outside_link = outside / "o.md"
+    inside_link.symlink_to(outside_link)
+    outside_link.symlink_to(inside_link)
+
+    with pytest.raises(EscapingSymlinkError) as excinfo:
+        assert_source_contained(src)
+
+    assert excinfo.value.path == inside_link, (
+        "the refusal names the wrong entry. Only the in-root link is the "
+        "operator's to delete; naming the out-of-root end would also "
+        "disclose the target this guard refused to read.\n\n"
+        f"path={excinfo.value.path}\nexpected={inside_link}"
+    )
+    assert str(outside_link) not in str(excinfo.value), (
+        "the refusal message quotes the out-of-tree link it resolved "
+        "through, which is the #1087 disclosure oracle.\n\n"
+        f"message={excinfo.value}"
+    )
+
+
+def test_containment_does_not_depend_on_path_resolve_raising(
+    tmp_path: Path,
+) -> None:
+    """RED on 3.13 before the fix. Pin the primitive, not the side effect.
+
+    The unit-level statement of the two tests above, aimed at the exact
+    line that regressed. ``resolves_within`` must classify an unresolvable
+    cycle as not-contained on its own authority — because
+    ``os.path.realpath(..., strict=True)`` reports ``ELOOP`` on every
+    supported version — and not as a side effect of ``Path.resolve``
+    raising, which is a behaviour pathlib never promised and changed in
+    3.13.
+
+    The ``Path.resolve`` call here is the evidence, not the subject: on
+    3.11/3.12 it raises and on 3.13 it returns an in-root path, and the
+    verdict below is the same either way. Asserting on the verdict while
+    the primitive underneath it diverges is what makes this a
+    version-independent test rather than a version-skipped one.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    from creek._containment import resolves_within
+
+    src = tmp_path / "src"
+    src.mkdir()
+    a = src / "a.md"
+    b = src / "b.md"
+    a.symlink_to(b)
+    b.symlink_to(a)
+
+    assert resolves_within(a, src.resolve(strict=False)) is False, (
+        "a symlink cycle was reported as contained. The guard cannot "
+        "prove where this link points — on this interpreter "
+        "Path.resolve(strict=False) answers "
+        f"{_describe_resolve(a)} — and by this module's policy an "
+        "unprovable containment is an escape."
+    )
+
+
+def _describe_resolve(path: Path) -> str:
+    """Report what ``Path.resolve`` does with *path*, for a failure message.
+
+    Kept out of the assertion body so the message can name the actual
+    interpreter-specific behaviour that produced a failure instead of
+    asserting one of the two possibilities.
+
+    Args:
+        path: The path to resolve.
+
+    Returns:
+        Either the resolved path or the exception type it raised.
+    """
+    try:
+        return str(path.resolve(strict=False))
+    except (OSError, RuntimeError, ValueError) as exc:  # pragma: no cover
+        return f"{type(exc).__name__}"
 
 
 # ---------------------------------------------------------------------------
