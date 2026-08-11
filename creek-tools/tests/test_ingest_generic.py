@@ -13,11 +13,11 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import BinaryIO
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from creek.ingest import generic as generic_module
 from creek.ingest.base import IngestResult, ParsedFragment, RawDocument
 from creek.ingest.generic import (
     _BINARY_CHECK_SIZE,
@@ -604,30 +604,6 @@ class TestGenericIngestorAuthoredAt:
 # ---- Discover-time binary skip (issue #1304) ----
 
 
-class _CountingHandle:
-    """A binary file handle that records how many bytes were read through it."""
-
-    def __init__(self, handle: BinaryIO, tally: list[int]) -> None:
-        """Wrap *handle*, appending each read size to *tally*."""
-        self._handle = handle
-        self._tally = tally
-
-    def read(self, size: int = -1) -> bytes:
-        """Read from the wrapped handle and record the byte count."""
-        chunk = self._handle.read(size)
-        self._tally.append(len(chunk))
-        return chunk
-
-    def __enter__(self) -> _CountingHandle:
-        """Enter the wrapped handle's context."""
-        self._handle.__enter__()
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        """Close the wrapped handle."""
-        self._handle.close()
-
-
 class TestDiscoverSkipsBinariesUnread:
     """``discover`` must not slurp files ``parse`` was always going to drop.
 
@@ -665,25 +641,54 @@ class TestDiscoverSkipsBinariesUnread:
         assert ingestor.parse(pre_change_doc) == []
         assert ingestor.ingest(tmp_path).fragments == []
 
-    def test_only_a_bounded_prefix_of_a_binary_file_is_read(
+    def test_the_binary_verdict_is_reached_on_a_bounded_prefix(
         self,
         ingestor: GenericIngestor,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A 4 MB binary costs one small read, not four megabytes of them."""
+        """A 4 MB binary is judged on 8 KiB, not on four megabytes.
+
+        Spies on the predicate rather than on the file handle: if
+        ``discover`` ever goes back to slurping the file and testing the
+        whole thing, the recorded length changes and this fails.
+        """
         (tmp_path / "big.bin").write_bytes(b"\x00\xff" * (2 * 1024 * 1024))
-        tally: list[int] = []
-        real_open = Path.open
+        judged: list[int] = []
+        real_predicate = generic_module._is_binary_content
 
-        def counting_open(self: Path, *args: object, **kwargs: object) -> object:
-            handle = real_open(self, *args, **kwargs)  # type: ignore[arg-type]
-            return _CountingHandle(handle, tally)  # type: ignore[arg-type]
+        def spy(raw_bytes: bytes) -> bool:
+            judged.append(len(raw_bytes))
+            return real_predicate(raw_bytes)
 
-        monkeypatch.setattr(Path, "open", counting_open)
+        monkeypatch.setattr(generic_module, "_is_binary_content", spy)
 
         assert ingestor.discover(tmp_path) == []
-        assert sum(tally) <= _BINARY_CHECK_SIZE, tally
+        assert judged == [_BINARY_CHECK_SIZE]
+
+    def test_a_null_byte_past_the_prefix_is_left_to_parse(
+        self,
+        ingestor: GenericIngestor,
+        tmp_path: Path,
+    ) -> None:
+        """The prefix check must not claim to see bytes it never read.
+
+        The edge the output-neutrality argument turns on: a file whose
+        first 8 KiB are clean text but which turns binary later. The
+        prefix cannot know that, so ``discover`` has to hand the file on
+        and let ``parse`` — which does see the whole thing — drop it.
+        Ending up with a *fragment* here would be new output; skipping at
+        discover would be the prefix overreaching.
+        """
+        path = tmp_path / "late.txt"
+        path.write_bytes(b"a" * (_BINARY_CHECK_SIZE + 16) + b"\x00tail")
+
+        discovered = ingestor.discover(tmp_path)
+
+        assert [doc.path.name for doc in discovered] == ["late.txt"]
+        assert discovered[0].content == path.read_bytes()
+        assert ingestor.parse(discovered[0]) == []
+        assert ingestor.ingest(tmp_path).fragments == []
 
     def test_utf16_text_survives_the_skip(
         self, ingestor: GenericIngestor, tmp_path: Path

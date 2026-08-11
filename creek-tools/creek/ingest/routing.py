@@ -74,7 +74,10 @@ Each contested extension and the reason its winner wins:
   ``document`` on ``.html``, and letting the declared fallback outrank a
   specialist anywhere makes the order incoherent.
 * ``.csv``/``.xlsx`` -> **spreadsheet**, ``.pptx`` -> **presentation**,
-  images -> **image**, each over **generic**, for the same reason.
+  images -> **image**, ``.rtf``/``.docx``/``.pdf``/``.htm`` -> **document**,
+  each over **generic**, for the same reason. That completes
+  ``DocumentIngestor``'s extension set; ``generic`` claims everything
+  outside ``{.md, .json}``, so every one of them is contested.
 
 The winner is load-bearing beyond the body text: a fragment's id hashes
 ``source_path + timestamp + content`` (``creek.ingest.base``), and the
