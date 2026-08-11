@@ -1573,6 +1573,85 @@ def test_report_paradox_writes_notes(tmp_path: Path) -> None:
     assert sorted((vault / "10-Liminal" / "Paradoxes").glob("*.md"))
 
 
+def _seed_paradox_pair(vault: Path) -> None:
+    """Write two fragments whose opposite confidence on one thread is a paradox."""
+    from creek.models import (
+        Confidence,
+        Fragment,
+        FragmentSource,
+        SourcePlatform,
+        VoiceClassification,
+    )
+    from tests.helpers import write_fragment_file
+
+    for fid, conf in (
+        ("frag-cli-dupe-aa", Confidence.MUSING),
+        ("frag-cli-dupe-bb", Confidence.SETTLED),
+    ):
+        write_fragment_file(
+            vault=vault,
+            fragment=Fragment(
+                id=fid,
+                title="career ambitions",
+                source=FragmentSource(platform=SourcePlatform.JOURNAL),
+                voice=VoiceClassification(confidence=conf),
+                threads=["thread-career"],
+            ),
+            body="a contradiction worth holding",
+        )
+
+
+def test_report_paradox_rerun_writes_no_second_copy(tmp_path: Path) -> None:
+    """A second `report --type paradox` run records nothing new (#1320).
+
+    The CLI-level pin on the fix: the empty-result line must not claim no
+    contradictory pair was found when one was found and already recorded.
+    """
+    vault = _report_vault(tmp_path)
+    _seed_paradox_pair(vault)
+    runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+
+    result = runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert "already recorded" in result.output
+    assert len(list((vault / "10-Liminal" / "Paradoxes").glob("*.md"))) == 1
+
+
+def test_report_paradox_reports_pre_existing_duplicates(tmp_path: Path) -> None:
+    """Pre-#1320 duplicate copies are named on the console and left on disk."""
+    import frontmatter
+
+    vault = _report_vault(tmp_path)
+    _seed_paradox_pair(vault)
+    runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+    (original,) = (vault / "10-Liminal" / "Paradoxes").glob("*.md")
+    stray = original.with_name("2020-01-01-frag-cli-dupe-aa-frag-cli-dupe-bb.md")
+    post = frontmatter.loads(original.read_text(encoding="utf-8"))
+    post["detected_date"] = "2020-01-01"
+    stray.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    result = runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert "#1320" in result.output
+    assert "Nothing is deleted automatically" in result.output
+    assert stray.exists()
+    assert original.exists()
+
+
+def test_report_paradox_is_quiet_when_no_duplicates(tmp_path: Path) -> None:
+    """An operator must not be accused of duplicates on every clean run."""
+    vault = _report_vault(tmp_path)
+    _seed_paradox_pair(vault)
+    runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+
+    result = runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert "#1320" not in result.output
+
+
 def test_report_synchronicity_writes_notes(tmp_path: Path) -> None:
     """`report --type synchronicity` writes notes + reports success (#711, #726).
 

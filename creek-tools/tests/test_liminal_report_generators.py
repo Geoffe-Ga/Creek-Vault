@@ -81,7 +81,13 @@ class TestGenerateParadoxes:
         assert len(_paradox_notes(vault)) == 1
 
     def test_idempotent(self, tmp_path: Path) -> None:
-        """Re-running writes the same note in place (no duplicate)."""
+        """Re-running records nothing new (#1320).
+
+        This assertion used to read "writes the same note in place", which was
+        only ever true within a single calendar day — the note path embeds
+        ``detected_date``. The cross-day case, and the read-back scan that now
+        supplies the identity, live in ``tests/test_paradox_idempotency.py``.
+        """
         vault = _vault(tmp_path)
         for fid, conf in (
             ("frag-parax-cccc", Confidence.MUSING),
@@ -98,9 +104,11 @@ class TestGenerateParadoxes:
                 ),
                 body="body",
             )
-        generate_paradoxes(vault, EmbeddingsConfig())
-        generate_paradoxes(vault, EmbeddingsConfig())
-        assert len(_paradox_notes(vault)) == 1  # stable path → overwrite
+        first = generate_paradoxes(vault, EmbeddingsConfig())
+        second = generate_paradoxes(vault, EmbeddingsConfig())
+        assert len(first) == 1
+        assert second == []  # the pair is already recorded → skipped, not rewritten
+        assert len(_paradox_notes(vault)) == 1
 
     def test_empty_vault_no_notes(self, tmp_path: Path) -> None:
         """A vault with fewer than two fragments yields no paradoxes."""
