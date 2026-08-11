@@ -11,7 +11,7 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NoReturn, cast
+from typing import TYPE_CHECKING, Final, Literal, NoReturn, cast
 
 import typer
 from rich.console import Console
@@ -159,6 +159,14 @@ app.add_typer(purge_app, name="purge")
 app.add_typer(skills_app, name="skills")
 app.add_typer(compost_app, name="compost")
 console = Console()
+
+_SOURCE_COVERAGE_SAMPLE: Final[int] = 10
+"""How many contested/unclaimed source paths ``creek process`` lists.
+
+The full lists live on :class:`~creek.pipeline.PipelineResult`; the
+summary only samples them so a large source tree cannot bury the rest of
+the report.
+"""
 
 
 def _consent_log_dir(vault_path: Path) -> Path:
@@ -1313,11 +1321,58 @@ def process(
         f"[bold]Residue:[/bold] {result.residue} "
         "(would go to LLM if Pass-3 enabled)"
     )
+    _print_source_coverage(result)
     error_count = len(result.errors)
     error_style = "red" if error_count else "dim"
     console.print(f"[bold {error_style}]Errors:[/bold {error_style}] {error_count}")
     for err in result.errors:
         console.print(f"  [dim]{err}[/dim]")
+
+
+def _print_source_coverage(result: PipelineResult) -> None:
+    """Report source files that were contested or that nobody ingested.
+
+    Silent when there is nothing to say, so a clean run's summary keeps
+    its current shape.
+
+    *Contested* is the migration notice for issue #1304. Before that
+    change several ingestors could each write a fragment for the same
+    file; now one wins. The loser's fragments in an existing vault are
+    left exactly where they are — deleting a fragment is not something a
+    processing run gets to decide — so this names the affected files and
+    the read-only command that finds the strays.
+
+    *Unclaimed* names files that produced nothing at all, which was
+    previously silent.
+
+    Args:
+        result: The finished pipeline result.
+    """
+    if result.contested_sources:
+        console.print(
+            f"[bold yellow]Contested sources:[/bold yellow] "
+            f"{len(result.contested_sources)} "
+            "(more than one ingestor claimed these; one won)"
+        )
+        console.print(
+            "  [dim]A vault ingested before this release may still hold the "
+            "losing ingestor's fragments. Nothing is deleted automatically; "
+            "inspect with[/dim]"
+        )
+        console.print(
+            "  [dim]creek purge source --source-path <path> --match exact "
+            "--dry-run[/dim]"
+        )
+        for path in result.contested_sources[:_SOURCE_COVERAGE_SAMPLE]:
+            console.print(f"  [dim]{path}[/dim]")
+    if result.unclaimed_sources:
+        console.print(
+            f"[bold yellow]Unclaimed sources:[/bold yellow] "
+            f"{len(result.unclaimed_sources)} "
+            "(no ingestor produced a fragment for these)"
+        )
+        for path in result.unclaimed_sources[:_SOURCE_COVERAGE_SAMPLE]:
+            console.print(f"  [dim]{path}[/dim]")
 
 
 @app.command()

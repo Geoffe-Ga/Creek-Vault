@@ -50,14 +50,27 @@ from creek.config import CreekConfig
 from creek.consent import ConsentManager
 from creek.generate.indexes import IndexGenerator
 from creek.ingest import INGESTOR_REGISTRY
-from creek.ingest.base import IngestedFragment, assemble_ingested_fragment
+from creek.ingest.base import (
+    IngestedFragment,
+    ParsedFragment,
+    assemble_ingested_fragment,
+)
 from creek.ingest.ledger import LedgerRecord
+from creek.ingest.routing import SKIPPED_DIRECTORY_NAMES, Arbitration, arbitrate
 from creek.link.link_engine import LinkSummary, run_link
 from creek.models import Fragment, Frequency
 from creek.redact.scanner import RedactionScanner
 from creek.vault.writer import VaultWriter
 
 logger = logging.getLogger(__name__)
+
+_UNCLAIMED_LOG_SAMPLE: Final[int] = 10
+"""How many unclaimed source paths to name in the warning log line.
+
+The full list is always on :attr:`PipelineResult.unclaimed_sources`; the
+log only samples it, so a source tree with thousands of unreadable files
+cannot flood the console.
+"""
 
 _PROCESS_LINK_METHODS: Final[tuple[str, ...]] = ("eddies", "threads")
 """Linker stages ``creek process`` runs, in order — and why only these two.
@@ -242,6 +255,53 @@ class SymlinkEscapedSourceError(RuntimeError):
         )
 
 
+def _is_authored_content(path: Path, source_path: Path) -> bool:
+    """Decide whether *path* is a file a user meant to have ingested.
+
+    The exclusion contract behind
+    :attr:`PipelineResult.unclaimed_sources`, kept deliberately narrow
+    so the report stays trustworthy: directories are not files, and
+    anything beneath a directory named in
+    :data:`~creek.ingest.routing.SKIPPED_DIRECTORY_NAMES` or beneath a
+    dot-directory is machinery. The test is on the *parent* directories
+    only — a dotfile the user put in the source root is still their
+    file, and gets reported.
+
+    Args:
+        path: Candidate path, anywhere under *source_path*.
+        source_path: Root of the scanned source tree.
+
+    Returns:
+        ``True`` when *path* is a file worth reporting on.
+    """
+    if not path.is_file():
+        return False
+    return not any(
+        part in SKIPPED_DIRECTORY_NAMES or part.startswith(".")
+        for part in path.relative_to(source_path).parts[:-1]
+    )
+
+
+def _unclaimed_files(source_path: Path, seen: set[str]) -> list[str]:
+    """List source files that no ingestor produced a fragment from.
+
+    Args:
+        source_path: Root of the scanned source tree.
+        seen: Source paths every ingestor produced output for, taken
+            before arbitration so a losing claimant still counts as
+            having seen the file.
+
+    Returns:
+        Sorted absolute paths, excluding machinery per
+        :func:`_is_authored_content`.
+    """
+    return [
+        str(path)
+        for path in sorted(source_path.rglob("*"))
+        if str(path) not in seen and _is_authored_content(path, source_path)
+    ]
+
+
 class PipelineResult(BaseModel):
     """Aggregate counts from a full pipeline run.
 
@@ -283,6 +343,16 @@ class PipelineResult(BaseModel):
         errors: Human-readable error messages collected from each stage.
             Each entry is prefixed with its source ingestor name so the
             user can trace the failure back to the offending file.
+        contested_sources: Absolute paths of source files that more than
+            one ingestor produced fragments for. One ingestor's output
+            was kept (see :mod:`creek.ingest.routing`); the rest was
+            discarded before it reached the vault. Reported because a
+            vault ingested before #1304 already holds the discarded
+            ingestor's fragments and nothing removes them.
+        unclaimed_sources: Absolute paths of source files that produced
+            no fragments at all, under the exclusion contract in
+            :meth:`Pipeline._record_source_coverage`. Surfaces a
+            pre-existing silent drop rather than a new one.
     """
 
     files_scanned: int = 0
@@ -295,6 +365,8 @@ class PipelineResult(BaseModel):
     local_model_processed: int = 0
     residue: int = 0
     errors: list[str] = Field(default_factory=list)
+    contested_sources: list[str] = Field(default_factory=list)
+    unclaimed_sources: list[str] = Field(default_factory=list)
 
 
 class Pipeline:
@@ -576,26 +648,54 @@ class Pipeline:
     def _run_ingestion(
         self, source_path: Path, result: PipelineResult
     ) -> list[IngestedFragment]:
-        """Discover and run ingestors, returning structured fragment+body bundles.
+        """Run every ingestor, then keep one ingestor's output per source file.
 
-        For each ingestor in :data:`INGESTOR_REGISTRY`, this method:
+        Each entry in :data:`INGESTOR_REGISTRY` still sees the whole
+        source tree, because several ingestors identify their input by
+        sniffing its structure or content rather than by its extension —
+        a Discord export is a directory shape, a ChatGPT export is a
+        particular JSON envelope — and no dispatch table can express
+        that. What changed in issue #1304 is what happens next: the
+        collected fragments are arbitrated by
+        :func:`creek.ingest.routing.arbitrate`, so a file claimed by two
+        ingestors is written to the vault once, by the higher-priority
+        one, instead of twice.
 
-        1. Calls ``ingest()`` to produce parsed fragments and any errors.
-        2. Forwards each error onto :attr:`PipelineResult.errors`,
-           prefixed with the ingestor's registry key for traceability.
-        3. Assembles each parsed fragment into an :class:`IngestedFragment`
-           carrying a deterministic ``frag-`` ID and the converted body.
-        4. Treats per-fragment assembly failures as recoverable: the
+        Arbitration is on **written output**, not on parsing: contested
+        text files are still parsed by every claimant, and the losers'
+        fragments are discarded before assembly. That ordering is
+        deliberate — an ingestor that discovered a file but failed to
+        parse it forfeits, so a malformed spreadsheet still reaches the
+        vault as text instead of vanishing. See
+        :mod:`creek.ingest.routing` for the priority order and the
+        reasoning behind each contested extension.
+
+        The steps:
+
+        1. Call ``ingest()`` on every registered ingestor.
+        2. Forward **every** ingestor's errors onto
+           :attr:`PipelineResult.errors`, prefixed with its registry key
+           — including the losers', so arbitration never suppresses a
+           failure report.
+        3. Arbitrate, recording the contested paths on
+           :attr:`PipelineResult.contested_sources` and any file no
+           ingestor claimed on :attr:`PipelineResult.unclaimed_sources`.
+        4. Assemble each surviving fragment into an
+           :class:`IngestedFragment` carrying a deterministic ``frag-``
+           ID and the converted body.
+        5. Treat per-fragment assembly failures as recoverable: the
            failure is recorded on ``result.errors`` and skipped, rather
            than aborting the whole pipeline.
 
         Args:
             source_path: Directory containing source files.
-            result: Pipeline result; mutated to collect error messages.
+            result: Pipeline result; mutated to collect error messages,
+                contested paths and unclaimed paths.
 
         Returns:
             List of :class:`IngestedFragment` ready for classification
-            and vault writing.
+            and vault writing, with duplicates already removed — so
+            ``len()`` of it is an honest fragment count.
         """
         if not INGESTOR_REGISTRY:
             logger.warning(
@@ -604,14 +704,20 @@ class Pipeline:
             )
             return []
 
-        ingested: list[IngestedFragment] = []
+        claims: dict[str, list[ParsedFragment]] = {}
         for name, ingestor_cls in INGESTOR_REGISTRY.items():
             logger.info("Running ingestor: %s", name)
-            ingestor = ingestor_cls()
-            ingest_result = ingestor.ingest(source_path)
+            ingest_result = ingestor_cls().ingest(source_path)
             for err in ingest_result.errors:
                 result.errors.append(f"[{name}] {err}")
-            for parsed in ingest_result.fragments:
+            claims[name] = ingest_result.fragments.copy()
+
+        arbitration = arbitrate(claims)
+        self._record_source_coverage(source_path, claims, arbitration, result)
+
+        ingested: list[IngestedFragment] = []
+        for name, fragments in arbitration.winners.items():
+            for parsed in fragments:
                 try:
                     ingested.append(assemble_ingested_fragment(parsed))
                 except (KeyError, ValueError) as exc:
@@ -627,6 +733,72 @@ class Pipeline:
                     )
 
         return ingested
+
+    @staticmethod
+    def _record_source_coverage(
+        source_path: Path,
+        claims: dict[str, list[ParsedFragment]],
+        arbitration: Arbitration,
+        result: PipelineResult,
+    ) -> None:
+        """Record which source files were contested and which went unclaimed.
+
+        Both lists are diagnostics, not control flow — nothing is
+        skipped, deleted or retried on the strength of them.
+
+        *Contested* paths are the migration story for issue #1304. A
+        vault ingested before that change already holds the losing
+        ingestor's fragment, and nothing here removes it or ever
+        re-derives it: fragment ids hash source path, timestamp and
+        content, and the two ingestors disagree on the latter two, so
+        the survivor resolves to its own pre-existing id and the loser's
+        file is simply left behind. Naming the contested paths is what
+        makes those strays findable
+        (``creek purge source --source-path <path> --dry-run``).
+
+        *Unclaimed* paths are files no ingestor produced anything from.
+        The exclusion contract, deliberately narrow: directories are not
+        files; anything under a directory named in
+        :data:`~creek.ingest.routing.SKIPPED_DIRECTORY_NAMES` or under a
+        dot-directory is machinery rather than authored content. Note
+        this reports a pre-existing gap rather than a new one — a plain
+        ``.json`` that is not a chat export has always yielded nothing,
+        because the sniffers reject it and ``GenericIngestor`` excludes
+        the extension.
+
+        Args:
+            source_path: Root of the scanned source tree.
+            claims: Every ingestor's fragments *before* arbitration — a
+                loser still proves the file was seen.
+            arbitration: The resolved claims.
+            result: Pipeline result; mutated in place.
+        """
+        result.contested_sources = list(arbitration.contested)
+        if arbitration.contested:
+            logger.warning(
+                "%d source file(s) were claimed by more than one ingestor; "
+                "one ingestor's output was kept for each. A vault ingested "
+                "before issue #1304 may still hold the other's fragments as "
+                "strays -- they are not removed automatically.",
+                len(arbitration.contested),
+            )
+
+        if not source_path.is_dir():
+            return
+        seen = {
+            fragment.source_path
+            for fragments in claims.values()
+            for fragment in fragments
+        }
+        unclaimed = _unclaimed_files(source_path, seen)
+        result.unclaimed_sources = unclaimed
+        if unclaimed:
+            logger.warning(
+                "%d source file(s) produced no fragments -- no ingestor "
+                "claimed them: %s",
+                len(unclaimed),
+                ", ".join(unclaimed[:_UNCLAIMED_LOG_SAMPLE]),
+            )
 
     def _run_classification(
         self,

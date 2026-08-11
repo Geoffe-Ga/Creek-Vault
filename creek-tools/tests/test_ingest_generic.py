@@ -17,8 +17,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from creek.ingest import generic as generic_module
 from creek.ingest.base import IngestResult, ParsedFragment, RawDocument
 from creek.ingest.generic import (
+    _BINARY_CHECK_SIZE,
     GenericIngestor,
     _is_binary_content,
     _try_decode,
@@ -597,3 +599,143 @@ class TestGenericIngestorAuthoredAt:
         )
         fm = ingestor.generate_frontmatter(fragment)
         assert "authored_at" not in fm
+
+
+# ---- Discover-time binary skip (issue #1304) ----
+
+
+class TestDiscoverSkipsBinariesUnread:
+    """``discover`` must not slurp files ``parse`` was always going to drop.
+
+    Output-neutral: every case here produced zero fragments before issue
+    #1304 too, because ``parse`` discarded the content after reading it.
+    What changes is that the bytes are no longer read.
+    """
+
+    def test_binary_file_is_not_discovered(
+        self, ingestor: GenericIngestor, tmp_path: Path
+    ) -> None:
+        """A binary file yields no raw document at all."""
+        (tmp_path / "shot.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+
+        assert ingestor.discover(tmp_path) == []
+
+    def test_binary_file_produced_no_fragment_before_either(
+        self, ingestor: GenericIngestor, tmp_path: Path
+    ) -> None:
+        """The skip is output-neutral: parsing it would have yielded nothing.
+
+        Feeds ``parse`` the document ``discover`` used to build, proving
+        the fragment count is unchanged rather than merely asserting the
+        new behaviour.
+        """
+        path = tmp_path / "shot.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+        pre_change_doc = RawDocument(
+            path=path,
+            content=path.read_bytes(),
+            metadata={"source_type": "generic"},
+            detected_encoding="utf-8",
+        )
+
+        assert ingestor.parse(pre_change_doc) == []
+        assert ingestor.ingest(tmp_path).fragments == []
+
+    def test_the_binary_verdict_is_reached_on_a_bounded_prefix(
+        self,
+        ingestor: GenericIngestor,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A 4 MB binary is judged on 8 KiB, not on four megabytes.
+
+        Spies on the predicate rather than on the file handle: if
+        ``discover`` ever goes back to slurping the file and testing the
+        whole thing, the recorded length changes and this fails.
+        """
+        (tmp_path / "big.bin").write_bytes(b"\x00\xff" * (2 * 1024 * 1024))
+        judged: list[int] = []
+        real_predicate = generic_module._is_binary_content
+
+        def spy(raw_bytes: bytes) -> bool:
+            judged.append(len(raw_bytes))
+            return real_predicate(raw_bytes)
+
+        monkeypatch.setattr(generic_module, "_is_binary_content", spy)
+
+        assert ingestor.discover(tmp_path) == []
+        assert judged == [_BINARY_CHECK_SIZE]
+
+    def test_a_null_byte_past_the_prefix_is_left_to_parse(
+        self,
+        ingestor: GenericIngestor,
+        tmp_path: Path,
+    ) -> None:
+        """The prefix check must not claim to see bytes it never read.
+
+        The edge the output-neutrality argument turns on: a file whose
+        first 8 KiB are clean text but which turns binary later. The
+        prefix cannot know that, so ``discover`` has to hand the file on
+        and let ``parse`` — which does see the whole thing — drop it.
+        Ending up with a *fragment* here would be new output; skipping at
+        discover would be the prefix overreaching.
+        """
+        path = tmp_path / "late.txt"
+        path.write_bytes(b"a" * (_BINARY_CHECK_SIZE + 16) + b"\x00tail")
+
+        discovered = ingestor.discover(tmp_path)
+
+        assert [doc.path.name for doc in discovered] == ["late.txt"]
+        assert discovered[0].content == path.read_bytes()
+        assert ingestor.parse(discovered[0]) == []
+        assert ingestor.ingest(tmp_path).fragments == []
+
+    def test_utf16_text_survives_the_skip(
+        self, ingestor: GenericIngestor, tmp_path: Path
+    ) -> None:
+        """UTF-16 is null-heavy but is text, and must still be ingested.
+
+        The BOM carve-out exists in ``_try_decode`` for exactly this
+        reason; the discover-time check has to honour it or the change
+        would silently drop real content.
+        """
+        (tmp_path / "wide.txt").write_bytes("Hello from UTF-16.".encode("utf-16"))
+
+        fragments = ingestor.ingest(tmp_path).fragments
+
+        assert [f.content.strip() for f in fragments] == ["Hello from UTF-16."]
+
+    def test_a_single_binary_file_path_is_not_discovered(
+        self, ingestor: GenericIngestor, tmp_path: Path
+    ) -> None:
+        """The single-file discovery arm skips binaries too."""
+        path = tmp_path / "shot.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+
+        assert ingestor.discover(path) == []
+
+    def test_an_empty_file_is_still_discovered(
+        self, ingestor: GenericIngestor, tmp_path: Path
+    ) -> None:
+        """Empty is not binary; the prior behaviour of discovering it holds."""
+        (tmp_path / "empty.txt").write_bytes(b"")
+
+        assert [doc.path.name for doc in ingestor.discover(tmp_path)] == ["empty.txt"]
+
+    def test_a_text_file_larger_than_the_prefix_is_read_in_full(
+        self, ingestor: GenericIngestor, tmp_path: Path
+    ) -> None:
+        """Reading a bounded prefix must not truncate the document.
+
+        The prefix is only a binary *test*; everything past it still has
+        to reach the fragment, or the change would quietly amputate every
+        source file over 8 KiB.
+        """
+        body = "line of text\n" * ((_BINARY_CHECK_SIZE // 13) + 500)
+        (tmp_path / "long.txt").write_text(body, encoding="utf-8")
+
+        fragments = ingestor.ingest(tmp_path).fragments
+
+        assert len(fragments) == 1
+        assert fragments[0].content == body
+        assert len(fragments[0].content) > _BINARY_CHECK_SIZE

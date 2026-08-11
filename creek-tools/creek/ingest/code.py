@@ -30,29 +30,20 @@ from creek.ingest.base import (
     normalize_encoding,
     parse_authored_at,
 )
+from creek.ingest.routing import SKIPPED_DIRECTORY_NAMES
 from creek.models import SourcePlatform
 
 logger = logging.getLogger(__name__)
 
 # ---- Constants ----
 
-_SKIP_DIRS: frozenset[str] = frozenset(
-    {
-        "node_modules",
-        "vendor",
-        ".git",
-        "__pycache__",
-        ".tox",
-        ".venv",
-        ".mypy_cache",
-        ".ruff_cache",
-        ".pytest_cache",
-        "dist",
-        "build",
-        ".eggs",
-    }
-)
-"""Directory names to skip during discovery."""
+_SKIP_DIRS: frozenset[str] = SKIPPED_DIRECTORY_NAMES
+"""Directory names to skip during discovery.
+
+Shared with the pipeline's unclaimed-source report (issue #1304) via
+:data:`creek.ingest.routing.SKIPPED_DIRECTORY_NAMES` — a file this walk
+declines to visit must not then be reported as an ingestor's oversight.
+"""
 
 _README_PATTERNS: tuple[str, ...] = (
     "README.md",
