@@ -40,8 +40,6 @@ from creek.models import MediumContract, PrivacyTier
 if TYPE_CHECKING:
     from pathlib import Path
 
-    import pytest
-
 
 def _grounded() -> EvidenceBundle:
     """Return a single grounded, attributed-free, paradox-free evidence bundle."""
@@ -54,14 +52,38 @@ def _seed_fragment(
     vault: Path,
     frag_id: str,
     body: str,
-    tier: PrivacyTier = PrivacyTier.OPEN,
+    tier: PrivacyTier | None = PrivacyTier.OPEN,
+    *,
+    subtree: str = "01-Fragments",
+    title: str = "t",
 ) -> None:
-    """Write a minimal fragment file with *body* and *tier* into the vault."""
-    folder = vault / "01-Fragments" / "Notes"
+    """Write a minimal fragment file with *body* and *tier* into the vault.
+
+    The defaults reproduce the pre-#1341 shape exactly — an ``open`` fragment
+    under ``01-Fragments/Notes`` — so every existing caller is untouched.
+
+    Args:
+        vault: Vault root to seed under.
+        frag_id: Fragment id; also the file stem. Two records sharing an id
+            must therefore be seeded into two different ``subtree`` values.
+        body: Markdown body written below the frontmatter.
+        tier: Tier to stamp, or ``None`` to omit the ``privacy_tier`` key
+            entirely — the legacy / hand-edited shape, which
+            :class:`~creek.models.Fragment` loads as
+            :attr:`~creek.models.PrivacyTier.UNCLASSIFIED` (``creek/models.py``
+            field default).
+        subtree: Top-level vault folder to seed under. The desk's specialists
+            gather from ``01-Fragments``, ``09-Reference`` and
+            ``11-Other-Authors``; the ``Notes`` leaf is kept under whichever
+            one is named.
+        title: Fragment title.
+    """
+    folder = vault / subtree / "Notes"
     folder.mkdir(parents=True, exist_ok=True)
+    tier_line = "" if tier is None else f"privacy_tier: {tier.value}\n"
     (folder / f"{frag_id}.md").write_text(
-        f'---\ntype: fragment\nid: {frag_id}\ntitle: "t"\n'
-        f"privacy_tier: {tier.value}\n"
+        f'---\ntype: fragment\nid: {frag_id}\ntitle: "{title}"\n'
+        f"{tier_line}"
         f"source:\n  platform: journal\n  author: self\n---\n{body}\n",
         encoding="utf-8",
     )
@@ -836,6 +858,369 @@ def test_privacy_missing_contract_gates_at_the_strictest_ceiling(
     ]
     assert "frag-a" in findings[0].message
     assert "intimate" in findings[0].message
+
+
+# ---------------------------------------------------------------------------
+# #1341 — the HARD leak gate must police every corpus subtree
+#
+# ``_resolve_cited_tiers`` walks ``<vault>/01-Fragments`` alone, while the desk
+# specialists gather evidence from ``01-Fragments``, ``09-Reference`` **and**
+# ``11-Other-Authors`` (``creek/author/agents.py``'s ``_CORPUS_SUBDIRS``, used
+# by ``_load_corpus``). A cited fragment living in either of the other two
+# subtrees resolves to nothing, so the gate never learns its tier and the draft
+# ships its protected text with ``verdict=PASS``.
+# ---------------------------------------------------------------------------
+
+_LEAK_SECRET = "the confession I never wanted written down"
+"""A seven-word protected snippet — comfortably over ``_MIN_PROTECTED_LEAK_WORDS``.
+
+Anything under five words cannot trip the gate at all, so a shorter snippet
+would make every test below pass vacuously. Deliberately plain English: no
+legacy taxonomy alias (``origins``, ``solo``, ``pitch``, …) and no bespoke
+ontology term, so ``privacy_compliance`` is the only dimension it can raise.
+"""
+
+_DECOY_BODY = "a plainly publishable paragraph about tide charts"
+"""The twin body a duplicate-id record carries, never reproduced in a draft.
+
+Its job is to be the record the resolver *prefers* — by tier, by walk order, or
+by both — so that preferring it is observable as a missing finding.
+"""
+
+
+def _draft_reproducing(secret: str) -> str:
+    """Return a longer reviewed body that reproduces *secret* verbatim.
+
+    Args:
+        secret: The protected snippet to embed word for word.
+
+    Returns:
+        Innocuous prose with *secret* inside it — the realistic hazard shape,
+        where nothing but the protected text itself gives the leak away.
+    """
+    return (
+        "The piece opens on an ordinary morning and then reproduces its "
+        f"source word for word: {secret} — and it keeps going after that."
+    )
+
+
+_SUBTREE_TIER_CASES = [
+    pytest.param(subtree, tier, expected, id=f"{subtree}-{label}")
+    for subtree in ("09-Reference", "11-Other-Authors")
+    for tier, expected, label in (
+        (PrivacyTier.INTIMATE, "intimate", "intimate"),
+        (PrivacyTier.PERSONAL, "personal", "personal"),
+        (None, "unclassified", "absent-privacy-tier-key"),
+    )
+]
+"""The cross product of the two unwalked corpus subtrees and three over-tier shapes.
+
+``PERSONAL`` is included because it is *also* above an ``open`` ceiling — the
+gate is not an intimate-only gate — and the key-absent shape because a legacy
+or hand-edited fragment is exactly the content nobody has vouched for.
+"""
+
+
+@pytest.mark.parametrize(("subtree", "tier", "expected_tier"), _SUBTREE_TIER_CASES)
+def test_privacy_gate_sees_over_tier_fragment_in_every_corpus_subtree(
+    tmp_path: Path,
+    subtree: str,
+    tier: PrivacyTier | None,
+    expected_tier: str,
+) -> None:
+    """An over-tier fragment leaks identically from any corpus subtree (#1341).
+
+    One cited fragment, seeded outside ``01-Fragments``, whose protected body is
+    reproduced verbatim in the draft under an ``open`` medium contract. The
+    fragment's location in the vault is not a privacy property, so the finding
+    must be the same one ``01-Fragments`` already produces: a single ``HIGH``
+    ``privacy_compliance`` finding naming the fragment and its tier.
+
+    The key-absent case asserts ``'unclassified'`` because
+    :class:`~creek.models.Fragment` defaults ``privacy_tier`` to
+    :attr:`~creek.models.PrivacyTier.UNCLASSIFIED` (verified in
+    ``creek/models.py``), and the leak gate's ``_TIER_RANK`` puts
+    ``UNCLASSIFIED`` at the *top* of the restrictiveness order — an untiered
+    fragment is over every ceiling.
+
+    Measured today: the resolver returns ``{}`` for both subtrees, so this
+    reviews as ``PASS`` with zero findings.
+
+    Args:
+        tmp_path: Vault root for this case.
+        subtree: The corpus subtree the fragment is seeded into.
+        tier: The stamped tier, or ``None`` to omit the key entirely.
+        expected_tier: The tier string the finding's message must name.
+    """
+    _seed_fragment(tmp_path, "frag-b", _LEAK_SECRET, tier, subtree=subtree)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-b"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+
+    result = ReflectionNode().review(
+        _draft_reproducing(_LEAK_SECRET),
+        evidence,
+        contract=contract,
+        vault=tmp_path,
+    )
+
+    assert result.decision == "REVISE", result.findings
+    leaks = [f for f in result.findings if f.dimension == "privacy_compliance"]
+    assert len(leaks) == 1, result.findings
+    assert leaks[0].severity == "HIGH"
+    assert "'frag-b'" in leaks[0].message
+    assert f"'{expected_tier}'" in leaks[0].message
+
+
+@pytest.mark.parametrize(
+    ("strict_subtree", "lax_subtree"),
+    [
+        pytest.param("09-Reference", "01-Fragments", id="strict-last"),
+        pytest.param("01-Fragments", "09-Reference", id="strict-first"),
+    ],
+)
+def test_duplicate_cited_id_resolves_to_the_most_restrictive_tier(
+    tmp_path: Path,
+    strict_subtree: str,
+    lax_subtree: str,
+) -> None:
+    """Two vault records share an id — the gate must read the stricter tier (#1341).
+
+    Fragment ids are not unique across a real vault: the same id can land in
+    ``01-Fragments`` and in ``09-Reference`` (an import, a copy, a re-export).
+    Once the resolver walks more than one subtree it will see both records, and
+    "last write wins" would let the ``open`` twin overwrite the ``intimate``
+    one and silently disarm the HARD gate. Resolution must fail closed to the
+    most restrictive tier found for that id.
+
+    Both walk orders are exercised, and the second one is the whole point.
+    The walk runs in ``CORPUS_SUBDIRS`` order, so with the strict record in
+    ``09-Reference`` it is simply seen *last* — and last-wins happens to give
+    the right answer, for the wrong reason. Only ``strict-first`` — the
+    ``intimate`` record in ``01-Fragments``, its ``open`` twin behind it —
+    separates a real rank-max from that coincidence. Measured against a
+    last-wins merge: ``strict-last`` still reports the leak while
+    ``strict-first`` reports **nothing at all**, with the protected body
+    sitting verbatim in the draft.
+
+    Only the intimate body is reproduced in the draft, so a correct gate has
+    both halves of the evidence it needs: the strict tier and the leaked text.
+
+    Args:
+        tmp_path: Vault root for this case.
+        strict_subtree: Where the ``intimate`` record carrying the secret goes.
+        lax_subtree: Where its harmless ``open`` twin goes.
+    """
+    _seed_fragment(
+        tmp_path, "frag-d", _DECOY_BODY, PrivacyTier.OPEN, subtree=lax_subtree
+    )
+    _seed_fragment(
+        tmp_path,
+        "frag-d",
+        _LEAK_SECRET,
+        PrivacyTier.INTIMATE,
+        subtree=strict_subtree,
+    )
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-d"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+
+    result = ReflectionNode().review(
+        _draft_reproducing(_LEAK_SECRET),
+        evidence,
+        contract=contract,
+        vault=tmp_path,
+    )
+
+    leaks = [f for f in result.findings if f.dimension == "privacy_compliance"]
+    assert len(leaks) == 1, result.findings
+    assert leaks[0].severity == "HIGH"
+    assert "'frag-d'" in leaks[0].message
+    assert "'intimate'" in leaks[0].message
+
+
+@pytest.mark.parametrize(
+    ("decoy_subtree", "leaker_subtree"),
+    [
+        pytest.param("01-Fragments", "11-Other-Authors", id="decoy-first"),
+        pytest.param("11-Other-Authors", "01-Fragments", id="decoy-second"),
+    ],
+)
+def test_duplicate_cited_id_at_equal_tier_cannot_mask_the_leaking_body(
+    tmp_path: Path,
+    decoy_subtree: str,
+    leaker_subtree: str,
+) -> None:
+    """Same id, same tier, two bodies — walk order must not decide the verdict (#1341).
+
+    Tier alone cannot break this tie: both records are ``intimate``, so a
+    resolver that keeps one ``(tier, body)`` pair per id keeps whichever body it
+    happened to see last. Sorting the walk makes that deterministic but not
+    *correct* — it just fixes which of the two draws. The subtree name decides
+    the sort (``01-Fragments`` < ``09-Reference`` < ``11-Other-Authors``), so
+    the two cases here put the harmless twin on either side of the leaker and
+    demand the same finding from both. Keeping **every** body stored under a
+    cited id is the only implementation that satisfies both cases at once.
+
+    Args:
+        tmp_path: Vault root for this case.
+        decoy_subtree: Where the harmless twin is seeded.
+        leaker_subtree: Where the twin carrying the protected text is seeded.
+    """
+    _seed_fragment(
+        tmp_path, "frag-e", _DECOY_BODY, PrivacyTier.INTIMATE, subtree=decoy_subtree
+    )
+    _seed_fragment(
+        tmp_path, "frag-e", _LEAK_SECRET, PrivacyTier.INTIMATE, subtree=leaker_subtree
+    )
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-e"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+
+    result = ReflectionNode().review(
+        _draft_reproducing(_LEAK_SECRET),
+        evidence,
+        contract=contract,
+        vault=tmp_path,
+    )
+
+    leaks = [f for f in result.findings if f.dimension == "privacy_compliance"]
+    assert len(leaks) == 1, result.findings
+    assert "'frag-e'" in leaks[0].message
+    assert "'intimate'" in leaks[0].message
+
+
+def test_duplicate_cited_id_below_the_winner_is_still_body_checked(
+    tmp_path: Path,
+) -> None:
+    """The loser record's body is protected too, because the *id* resolved intimate.
+
+    An implementation that fails closed on the tier but keeps only the winning
+    record's body still leaks: here the draft reproduces the ``open`` twin's
+    body while the id resolves to ``intimate``, and the gate must flag it. The
+    tier is a property of the cited id, and every body stored under that id is
+    text the draft may not reproduce — pinning keep-ALL-bodies against a
+    keep-only-the-winner's-body shortcut (#1341).
+    """
+    _seed_fragment(
+        tmp_path,
+        "frag-f",
+        _LEAK_SECRET,
+        PrivacyTier.INTIMATE,
+        subtree="09-Reference",
+    )
+    second_body = "the quieter half of the same note, filed openly"
+    _seed_fragment(tmp_path, "frag-f", second_body, PrivacyTier.OPEN)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-f"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+
+    result = ReflectionNode().review(
+        _draft_reproducing(second_body),
+        evidence,
+        contract=contract,
+        vault=tmp_path,
+    )
+
+    leaks = [f for f in result.findings if f.dimension == "privacy_compliance"]
+    assert len(leaks) == 1, result.findings
+    assert "'frag-f'" in leaks[0].message
+    assert "'intimate'" in leaks[0].message
+
+
+def test_privacy_gate_polices_a_vault_with_no_01_fragments_dir(
+    tmp_path: Path,
+) -> None:
+    """A vault with no ``01-Fragments`` folder is still policed (#1341).
+
+    The resolver bails on the whole walk when ``<vault>/01-Fragments`` is not a
+    directory, so a corpus held entirely under ``09-Reference`` — a
+    reference-only vault, or one mid-migration — gets no privacy gate at all,
+    not even a degraded one. The absence of one subtree must never disable the
+    others.
+
+    Measured today: zero findings, ``PASS``.
+    """
+    _seed_fragment(
+        tmp_path,
+        "frag-g",
+        _LEAK_SECRET,
+        PrivacyTier.INTIMATE,
+        subtree="09-Reference",
+    )
+    assert not (tmp_path / "01-Fragments").exists()  # the precondition under test
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-g"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, contract
+    )
+
+    assert [(f.dimension, f.severity) for f in findings] == [
+        ("privacy_compliance", "HIGH")
+    ]
+    assert "'frag-g'" in findings[0].message
+    assert "'intimate'" in findings[0].message
+
+
+def test_leak_gate_reads_the_true_tier_while_the_router_reads_the_admitted_one(
+    tmp_path: Path,
+) -> None:
+    """The gate and the router see the same id at two different tiers — on purpose.
+
+    Two records share ``frag-d``: an ``open`` one in ``01-Fragments`` and an
+    ``intimate`` one in ``09-Reference``.
+
+    * The **router** (``creek.author.agents.fragment_tier_map``) reads the
+      *admitted* view. ``_load_corpus`` filters with ``tier_within_override``,
+      so at an ``open`` ceiling the intimate copy never enters the evidence and
+      the map reports ``open``. That half passes today; it is a pin, not a fix.
+    * The **leak gate** reads the *true* tier, unfiltered and fail-closed. It
+      exists to answer "is protected text in this draft?", and a gate that only
+      looked at what the ceiling admitted would be blind to exactly the content
+      it is there to catch. It must report ``intimate``.
+
+    The divergence is therefore deliberate, and this test states it so a future
+    "make these agree" cleanup has to argue with a named assertion rather than a
+    silent assumption. The gate half is asserted through the public
+    :func:`~creek.author.checks.check_privacy_compliance` message rather than
+    the private resolver, whose return shape #1341 changes.
+    """
+    from creek.author.agents import fragment_tier_map
+    from creek.classify.privacy_filter import PrivacyTierOverride
+
+    _seed_fragment(tmp_path, "frag-d", _DECOY_BODY, PrivacyTier.OPEN)
+    _seed_fragment(
+        tmp_path,
+        "frag-d",
+        _LEAK_SECRET,
+        PrivacyTier.INTIMATE,
+        subtree="09-Reference",
+    )
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-d"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, contract
+    )
+
+    # Gate half — the true tier, above the ceiling, so the leak is caught.
+    assert [(f.dimension, f.severity) for f in findings] == [
+        ("privacy_compliance", "HIGH")
+    ]
+    assert "'intimate'" in findings[0].message
+    # Router half — the admitted view at the same ceiling, unchanged.
+    assert fragment_tier_map(tmp_path, PrivacyTierOverride.OPEN) == {
+        "frag-d": PrivacyTier.OPEN
+    }
 
 
 def test_privacy_without_a_vault_still_skips(tmp_path: Path) -> None:

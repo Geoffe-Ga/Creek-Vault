@@ -496,6 +496,78 @@ def test_author_withholds_intimate_text_leaked_by_the_deterministic_render(
     assert result.exit_code != 0, plain
 
 
+@pytest.mark.parametrize(
+    "subdir",
+    [
+        pytest.param("09-Reference/External-Sources", id="09-Reference"),
+        pytest.param("11-Other-Authors/quoted-friend", id="11-Other-Authors"),
+    ],
+)
+def test_author_withholds_intimate_text_leaked_from_a_non_fragments_subtree(
+    tmp_path: Path,
+    subdir: str,
+) -> None:
+    """The same refusal must hold for the other two corpus subtrees (#1341).
+
+    The twin of
+    :func:`test_author_withholds_intimate_text_leaked_by_the_deterministic_render`
+    with one thing changed: where the fragment lives. The desk's specialists
+    gather from ``01-Fragments``, ``09-Reference`` and ``11-Other-Authors``
+    alike (``creek/author/agents.py``), so all three can put protected text in
+    a draft — but ``check_privacy_compliance`` resolves cited tiers out of
+    ``01-Fragments`` only, and an unresolvable id is skipped rather than
+    guessed. The result is a leak the HARD gate cannot see.
+
+    ``title == body`` for the same reason as the original: the deterministic
+    renderer emits fragment *titles* as claims while ``_is_verbatim_leak``
+    matches *bodies*, so a differing title renders nothing leakable and the
+    test would pass vacuously.
+
+    The fragment stays self-authored with no ``author_slug`` in both cases —
+    including under ``11-Other-Authors`` — so ``privacy_compliance`` remains
+    the only dimension this corpus can raise. Adding a slug would add an
+    ``attribution_correctness`` finding and muddy which gate produced the
+    refusal, and the loader keys on the folder, not on the slug.
+
+    Measured today: stdout carries the protected sentence verbatim under
+    ``verdict=PASS`` with exit code ``0``.
+
+    Args:
+        tmp_path: Root for the synthetic vault.
+        subdir: The corpus subtree (and leaf) the fragment is seeded into.
+    """
+    vault = _vault(tmp_path)
+    write_raw_fragment_file(
+        vault,
+        subdir,
+        "frag-int",
+        _INTIMATE_SENTENCE,
+        body=_INTIMATE_SENTENCE,
+        privacy_tier="intimate",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "author",
+            "--medium",
+            "research",
+            "--query",
+            "father",
+            "--vault",
+            str(vault),
+            "--include-tier",
+            "intimate",
+        ],
+    )
+
+    plain = _collapse(result.output)
+    assert _collapse(_INTIMATE_SENTENCE) not in plain, plain
+    assert "verdict=ESCALATE" in plain, plain
+    assert "privacy_compliance" in plain, plain
+    assert result.exit_code != 0, plain
+
+
 def test_author_withholds_intimate_text_leaked_by_the_live_voice_client(
     tmp_path: Path,
 ) -> None:
