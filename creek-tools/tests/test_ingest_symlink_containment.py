@@ -197,6 +197,87 @@ def _vault_orphans(vault: Path) -> list[Path]:
     return sorted((vault / "10-Liminal" / "Orphaned").rglob("*.md"))
 
 
+def _consent_log_path(vault: Path) -> Path:
+    """Return the path ``ConsentManager`` persists its log to.
+
+    Mirrors ``creek/cli.py::_consent_log_dir`` plus
+    ``creek/consent.py::ConsentManager.__init__``'s ``consent-log.json``.
+    Spelled out here rather than imported so the test pins the on-disk
+    location an operator would inspect, not whatever the code currently
+    computes.
+
+    Args:
+        vault: Vault root to read.
+
+    Returns:
+        Path to ``<vault>/00-Creek-Meta/Processing-Log/consent-log.json``.
+    """
+    return vault / "00-Creek-Meta" / "Processing-Log" / "consent-log.json"
+
+
+def _consent_log_text(vault: Path) -> str:
+    """Return the raw consent-log JSON, or ``""`` when none was written.
+
+    Read as text rather than parsed so an assertion can search the whole
+    persisted record — paths, operator, every field — for a name that has
+    no business being there.
+
+    Args:
+        vault: Vault root to read.
+
+    Returns:
+        The consent log's file contents, or the empty string.
+    """
+    path = _consent_log_path(vault)
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def _consent_records(vault: Path) -> list[dict[str, Any]]:
+    """Return the consent records persisted under *vault*.
+
+    Args:
+        vault: Vault root to read.
+
+    Returns:
+        The ``records`` list from the consent log, empty when absent.
+    """
+    text = _consent_log_text(vault)
+    if not text:
+        return []
+    payload = json.loads(text)
+    records = payload.get("records", [])
+    return list(records)
+
+
+def _spy_on_source_summary(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Install a RECORDING wrapper around the consent summariser.
+
+    Recording, never a raising sentinel: ``CliRunner`` catches a raised
+    sentinel and reports exit 1, which would manufacture a pass for the
+    exit-code assertions at HEAD.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture, used to install the spy.
+
+    Returns:
+        A live list that gains one entry per summariser call.
+    """
+    from creek import consent as consent_module
+
+    real_summary = consent_module._build_source_summary
+    calls: list[Path] = []
+
+    def _recording_summary(source_path: Path, exclusions: list[str]) -> Any:
+        """Record the call, then delegate to the real summariser."""
+        calls.append(source_path)
+        return real_summary(source_path, exclusions)
+
+    monkeypatch.setattr(consent_module, "_build_source_summary", _recording_summary)
+    return calls
+
+
 # ---------------------------------------------------------------------------
 # Per-ingestor fixture builders
 #
@@ -949,10 +1030,10 @@ def test_cli_ingest_refuses_before_the_consent_gate_reads_the_source_tree(
     and still leaks the shape of the victim directory into the consent
     prompt.
 
-    The spy is a RECORDING wrapper that delegates to the real summariser,
-    never a raising sentinel: ``CliRunner`` catches a raised sentinel and
-    reports exit 1, which would manufacture a pass for the exit-code
-    assertion at HEAD.
+    The spy (:func:`_spy_on_source_summary`) is a RECORDING wrapper that
+    delegates to the real summariser, never a raising sentinel:
+    ``CliRunner`` catches a raised sentinel and reports exit 1, which would
+    manufacture a pass for the exit-code assertion at HEAD.
 
     ``--yes`` is passed deliberately. Without it the non-interactive branch
     exits 1 on its own, and the exit-code assertion would hold at HEAD for
@@ -962,24 +1043,9 @@ def test_cli_ingest_refuses_before_the_consent_gate_reads_the_source_tree(
         tmp_path: Pytest-provided temporary directory.
         monkeypatch: Pytest monkeypatch fixture, used to install the spy.
     """
-    from creek import consent as consent_module
-
     vault = _make_vault(tmp_path)
     source, _link = _build_markdown(tmp_path / "lane", escaping=True)
-
-    real_summary = consent_module._build_source_summary
-    calls: list[object] = []
-
-    def _recording_summary(source_path, exclusions):
-        """Record the call, then delegate to the real summariser."""
-        calls.append(source_path)
-        return real_summary(source_path, exclusions)
-
-    monkeypatch.setattr(
-        consent_module,
-        "_build_source_summary",
-        _recording_summary,
-    )
+    calls = _spy_on_source_summary(monkeypatch)
 
     result = runner.invoke(
         app,
@@ -1017,6 +1083,189 @@ def test_cli_ingest_refuses_before_the_consent_gate_reads_the_source_tree(
     )
     assert _SENTINEL not in _written_vault_text(vault), (
         f"the CLI ingested the out-of-tree file.\n\n{result.output}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7b. The same ordering pin on the OTHER CLI entry point: ``creek process``
+#
+# ``ingest`` and ``process`` are the only two ``_gate_consent`` callers in
+# the tree (``grep -n _gate_consent creek/ creek_mcp/``). Section 7 closed
+# ``ingest`` and left ``process`` open, and it was an ordering test existing
+# for one surface and not the other that let that happen. These are that
+# test for ``process``.
+#
+# The durable half is the consent log. Console output scrolls away; a
+# ``file_count`` derived from a tree the operator was never entitled to read
+# is written into ``00-Creek-Meta/Processing-Log/consent-log.json`` and stays
+# there, and every later run reads that record back and skips the prompt.
+# ---------------------------------------------------------------------------
+
+
+def test_cli_process_refuses_before_the_consent_gate_reads_the_source_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED. ``process`` must refuse above ``_gate_consent``, as ``ingest`` does.
+
+    ``creek/cli.py``'s ``process`` handler calls ``_gate_consent`` at
+    line 1211 with no containment check anywhere above it. For a first-time
+    (unconsented) source that runs ``ConsentManager.get_source_summary`` ->
+    ``creek/consent.py:118 _build_source_summary``, whose ``rglob("*")`` /
+    ``stat()`` pass counts the escaping link as a file and folds the
+    out-of-tree target's byte total into the summary — the identical
+    read-before-refuse this file already closed for ``ingest`` in section 7.
+
+    Under ``--yes`` that inflated ``file_count`` is then written into the
+    consent log *before* the pipeline gets far enough to refuse, so the
+    leak outlives the process: the record is durable, and a later run reads
+    it back and skips the prompt entirely.
+
+    ``--yes`` is passed deliberately. Without it the non-interactive branch
+    exits 1 on its own and the exit-code assertion would hold at HEAD for
+    the wrong reason.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        monkeypatch: Pytest monkeypatch fixture, used to install the spy.
+    """
+    vault = _make_vault(tmp_path)
+    source, _link = _build_markdown(tmp_path / "lane", escaping=True)
+    contained_files = sorted(
+        p for p in source.rglob("*") if p.is_file() and not p.is_symlink()
+    )
+    calls = _spy_on_source_summary(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "process",
+            "--source",
+            str(source),
+            "--vault",
+            str(vault),
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 1, (
+        "creek process accepted a source tree containing a symlink that "
+        f"leaves it.\n\nexit_code={result.exit_code}\n{result.output}"
+    )
+    assert "symlink" in result.output.lower(), (
+        "the refusal does not say why it refused; an operator cannot act "
+        f"on an unexplained exit 1.\n\n{result.output}"
+    )
+    assert not calls, (
+        "the consent summary ran before the refusal, so creek process "
+        "walked the source tree with rglob and stat()'d straight through "
+        "the escaping link before anything checked containment. This is "
+        "the exact hazard section 7 closed for creek ingest, left open on "
+        f"the other entry point.\n\ncalls={calls}\n{result.output}"
+    )
+    records = _consent_records(vault)
+    assert records == [], (
+        "a consent record was persisted by a run that refused its source. "
+        "Console output scrolls away; this file does not — and the "
+        "file_count in it was measured through the escaping link, so the "
+        "operator's audit trail now certifies approval of a count derived "
+        "from a directory they never named. Worse, check_consent() matches "
+        "on (source_type, source_path), so the next run skips the prompt "
+        f"on the strength of it.\n\n{_consent_log_text(vault)}"
+    )
+    assert len(contained_files) == 1, (
+        "the fixture no longer holds exactly one genuinely-in-root file, so "
+        "the inflated-count check below cannot tell an honest count from a "
+        f"leaked one.\n\n{contained_files}"
+    )
+    inflated = [r for r in records if r["file_count"] > len(contained_files)]
+    assert not inflated, (
+        "the recorded file_count exceeds the number of files actually "
+        "inside the source root, so the escaping link was counted as a file "
+        "and its out-of-tree target was stat()'d. At HEAD this reads "
+        f"file_count=2 against {len(contained_files)} contained "
+        f"file(s).\n\n{inflated}"
+    )
+    assert _SENTINEL not in _written_vault_text(vault), (
+        f"creek process ingested the out-of-tree file.\n\n{result.output}"
+    )
+
+
+def test_cli_process_leaks_no_out_of_tree_filename_to_console_or_consent_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED. Naming a symlinked directory must not enumerate its target.
+
+    The section-5 shape (#1360), on the ``process`` surface. When
+    ``--source`` is *itself* a link to a directory outside its own parent,
+    ``_build_source_summary``'s ``rglob("*")`` runs over the target's tree
+    directly — no descent into a link is needed, so this leak is
+    interpreter-version-independent, unlike the descendant-link case pinned
+    by ``test_rglob_does_not_descend_into_a_symlinked_directory``.
+
+    The consequence is concrete: real out-of-tree *filenames* land in
+    ``summary.sample_filenames`` and get printed as ``Sample: ...``, and the
+    count of the victim directory's files is recorded in the consent log.
+    The victim filename here is a sentinel so "this leaked" cannot be
+    explained away as a name that could have come from anywhere.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        monkeypatch: Pytest monkeypatch fixture, used to install the spy.
+    """
+    victim_name = f"{_SENTINEL}-filename.md"
+    base = tmp_path / "lane"
+    vault = _make_vault(tmp_path)
+    outside = base / "outside"
+    outside.mkdir(parents=True)
+    (outside / victim_name).write_text(f"# Secret\n\n{_SENTINEL}\n", encoding="utf-8")
+    # The link must sit somewhere that does NOT contain the target, or it
+    # does not escape its own parent and there is nothing to refuse.
+    holder = base / "holder"
+    holder.mkdir()
+    link = holder / "linkdir"
+    link.symlink_to(outside)
+    calls = _spy_on_source_summary(monkeypatch)
+
+    result = runner.invoke(
+        app,
+        [
+            "process",
+            "--source",
+            str(link),
+            "--vault",
+            str(vault),
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 1, (
+        "creek process accepted a --source that is itself a symlink out of "
+        f"its own parent.\n\nexit_code={result.exit_code}\n{result.output}"
+    )
+    assert not calls, (
+        "the consent summary enumerated the link's target before anything "
+        f"refused.\n\ncalls={calls}\n{result.output}"
+    )
+    assert victim_name not in result.output, (
+        "a filename from the out-of-tree directory was printed to the "
+        "console in the consent prompt's Sample line. The operator was "
+        "shown the contents of a directory they did not name, by a run "
+        f"that then refused to process it.\n\n{result.output}"
+    )
+    assert victim_name not in _consent_log_text(vault), (
+        "an out-of-tree filename was written into the persisted consent "
+        f"log.\n\n{_consent_log_text(vault)}"
+    )
+    assert _consent_records(vault) == [], (
+        "a run that refused its source still recorded consent, and the "
+        "file_count in that record is the victim directory's file count — "
+        f"durable state derived from an unentitled read.\n\n"
+        f"{_consent_log_text(vault)}"
+    )
+    assert _SENTINEL not in _written_vault_text(vault), (
+        f"creek process ingested the out-of-tree file.\n\n{result.output}"
     )
 
 
@@ -1526,6 +1775,62 @@ def test_the_containment_predicate_has_exactly_one_definition() -> None:
         "predicate. Either drop the name or alias the canonical one; a "
         "second body is the drift this test exists to prevent.\n\n"
         f"{legacy!r}"
+    )
+
+
+def test_every_consent_gate_caller_checks_containment_first() -> None:
+    """RED for ``process``. The rule, not the two call sites of it.
+
+    Both CLI entry points had the read-before-refuse bug and only one was
+    fixed in the first pass, because an ordering test existed for ``ingest``
+    and not for ``process``. Two behavioural tests per surface do not stop a
+    *third* ``_gate_consent`` caller from landing with no guard above it —
+    and by construction nothing would fail when it did. This is the
+    structural half: it reads ``creek/cli.py``'s AST and enforces the rule
+    on whatever call sites exist, including ones not written yet.
+
+    "Before" is judged by line number within the enclosing function, which
+    is exactly as strong as the hazard requires: the read happens inside
+    ``_gate_consent``, so any refusal textually above it in the same body
+    runs first. A guard smuggled into a conditional branch would satisfy
+    this check while skipping at runtime; that is a real limit, and the
+    behavioural tests in sections 7 and 7b are what close it for the call
+    sites that exist today.
+    """
+    import ast
+    import inspect
+
+    from creek import cli as cli_module
+
+    tree = ast.parse(inspect.getsource(cli_module))
+    offenders: list[str] = []
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef):
+            continue
+        called: list[tuple[str, int]] = [
+            (node.func.id, node.lineno)
+            for node in ast.walk(func)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        gates = [line for name, line in called if name == "_gate_consent"]
+        guards = [
+            line for name, line in called if name == "_assert_ingest_source_contained"
+        ]
+        offenders += [
+            f"{func.name}: _gate_consent at line {gate} has no "
+            f"_assert_ingest_source_contained above it (guards at {guards})"
+            for gate in gates
+            if not any(guard < gate for guard in guards)
+        ]
+
+    assert offenders == [], (
+        "a creek/cli.py handler calls _gate_consent without checking "
+        "containment first. The consent prompt walks the source tree with "
+        "rglob and stat()s every entry, so it reads through an escaping "
+        "link — printing out-of-tree filenames and, under --yes, recording "
+        "a file count measured outside the named root into the consent "
+        "log — all before any downstream guard refuses (#1294).\n\n"
+        + "\n".join(offenders)
     )
 
 

@@ -445,14 +445,28 @@ def _run_ingest(
 
 
 def _assert_ingest_source_contained(source_path: Path) -> None:
-    """Refuse an ingest source that links out of itself, before reading it.
+    """Refuse a source that links out of itself, before anything reads it.
 
     Translates :class:`creek._containment.EscapingSymlinkError` into the
-    CLI's refusal idiom so the handler can call the gate early — above
+    CLI's refusal idiom so a handler can call the gate early — above
     ``_gate_consent`` — without letting a traceback reach the operator.
 
+    **Every** ``_gate_consent`` caller must call this first, and it is not
+    redundant with the gate inside ``Ingestor.ingest``. The consent prompt
+    runs ``creek/consent.py::_build_source_summary``, which walks
+    ``rglob("*")`` and ``stat()``s every entry — following an escaping link
+    and folding out-of-tree file counts and byte totals into the very
+    summary the operator is asked to approve. When ``--source`` is itself a
+    link to an outside directory, that walk enumerates the target directly
+    and prints real out-of-tree *filenames* in the ``Sample:`` line. Under
+    ``--yes`` the inflated ``file_count`` is then written into the consent
+    log, so the leak outlives the process and a later run reads the record
+    back and skips the prompt. A guard that sits only downstream blocks the
+    write and still performs that out-of-root read first (#1294).
+
     Args:
-        source_path: The ``--input`` path exactly as the operator gave it.
+        source_path: The ``--input`` / ``--source`` path exactly as the
+            operator gave it.
 
     Raises:
         typer.Exit: With code ``1`` when *source_path* is, or contains, a
@@ -1208,6 +1222,10 @@ def process(
         f"{' (no-LLM)' if no_llm else ''}[/bold green]"
     )
 
+    # Above ``_gate_consent``, never below it — see the helper's docstring
+    # for why the consent summary is itself an out-of-root read (#1294).
+    _assert_ingest_source_contained(source_path)
+
     consent_manager = _gate_consent(
         source_path=source_path,
         vault_path=vault_path,
@@ -1343,13 +1361,8 @@ def ingest(
         console.print(f"[red]Input path not found: {input}[/red]")
         raise typer.Exit(code=2)
 
-    # Before ``_gate_consent``, and NOT redundant with the gate inside
-    # ``Ingestor.ingest``. The consent prompt calls
-    # ``creek/consent.py::_build_source_summary``, which walks ``rglob("*")``
-    # and ``stat()``s every entry — following an escaping link and folding
-    # out-of-tree file counts and byte totals into the very summary the
-    # operator is asked to approve. A guard that sits only downstream blocks
-    # the write and still performs that out-of-root read first (#1294).
+    # Above ``_gate_consent``, never below it — see the helper's docstring
+    # for why the consent summary is itself an out-of-root read (#1294).
     _assert_ingest_source_contained(input)
 
     _gate_consent(

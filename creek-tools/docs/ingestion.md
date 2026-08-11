@@ -43,6 +43,16 @@ containment is not part of the PII scan. There is no override flag; the fix
 is to remove the link, re-point it inside the tree, or name the target's own
 directory as `--input`.
 
+On both `creek ingest` and `creek process` the refusal lands *before* the
+first-time consent prompt, not after it. That ordering is the point: the
+prompt's `Found: N file(s), X MB` / `Sample: ...` summary is built by walking
+the source tree and `stat()`ing every entry, which follows an escaping link.
+Refusing first means no out-of-tree filename is ever printed, and — under
+`--yes`, which records consent immediately — no file count measured through
+a link is ever written into
+`00-Creek-Meta/Processing-Log/consent-log.json`, where it would persist and
+suppress the prompt on every later run.
+
 Symlinks that stay **inside** the source tree are fine and keep working, so
 an ordinary alias (`latest -> 2026-08-01`, or `alias.md -> real.md`) needs no
 change. A tree reached *through* a symlink is also fine — only links that
