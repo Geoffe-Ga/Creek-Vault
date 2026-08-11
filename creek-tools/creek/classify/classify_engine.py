@@ -1506,6 +1506,10 @@ def _classify_one(
             the rules path or on ``--method llm`` runs where the rule
             classifier already cleared the confidence floor; for those
             fragments :attr:`Fragment.weighted` stays ``None``.
+            The *merge* itself is no longer particular to this flag:
+            since #1331 the rule pass and the single-pick LLM parse
+            layer their verdicts the same way, through the one shared
+            rule in :mod:`creek.classify.evidence`.
 
     Returns:
         ``(updated_fragment, skipped, reasoning)``. ``skipped`` is
@@ -1557,7 +1561,11 @@ def _classify_one_weighted(
     classification rather than replacing it wholesale — a dimension
     the profile is silent about leaves the prior value standing. The
     merge rule, and why the wholesale form was a privacy defect, live
-    on :meth:`WeightedFragmentClassification.merge_onto` (#1309).
+    on :func:`creek.classify.evidence.layer_determined_over`, which
+    :meth:`WeightedFragmentClassification.merge_onto` calls (#1309) and
+    which the rule pass upstream of it now calls too (#1331) — so by
+    the time a fragment reaches here its rule-derived evidence is
+    intact rather than already half destroyed.
 
     When the underlying call fails soft to an empty
     profile (whitespace-only body, provider unavailable, transport

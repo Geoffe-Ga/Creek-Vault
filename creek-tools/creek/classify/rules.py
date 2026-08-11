@@ -16,6 +16,7 @@ import re
 from enum import Enum
 from typing import TypeVar
 
+from creek.classify.evidence import layer_determined_over
 from creek.models import (
     Confidence,
     Fragment,
@@ -518,6 +519,22 @@ class RuleClassifier:
         with each frequency, phase, mode, voice register, and confidence
         level.  Uses scoring with positional weighting.
 
+        The verdict is **merged, not assigned**: a dimension the
+        matchers said nothing about keeps whatever the fragment already
+        carried, because keyword silence is an absence of evidence and
+        not evidence of absence. See :meth:`_layer_over_fragment` for
+        the rule, including why frequency alone is replaced wholesale.
+
+        This matters beyond bookkeeping. The ``voice.confidence`` the
+        old wholesale assignment destroyed is half of the
+        ``confessional + conviction`` INTIMATE trigger that
+        :class:`~creek.classify.privacy.PrivacyClassifier` reads in
+        ``_is_high_confidence_confessional``
+        (``creek/classify/privacy.py:205-214``), so on a confessional
+        body this pass used to supply one half of the trigger and erase
+        the other in the same breath — a missed escalation (fail-open),
+        not merely a lossy one (#1331).
+
         Args:
             fragment: The fragment to classify.
             content: The markdown body text to scan for keywords.
@@ -571,7 +588,9 @@ class RuleClassifier:
         )
 
         if updates:
-            return fragment.model_copy(update=updates)
+            return fragment.model_copy(
+                update=self._layer_over_fragment(fragment, updates),
+            )
 
         return fragment.model_copy()
 
@@ -757,10 +776,30 @@ class RuleClassifier:
         voice_register: VoiceRegister | None,
         confidence: Confidence | None,
     ) -> dict[str, object]:
-        """Build a dict of model fields to update on the fragment.
+        """Build the sparse verdict for what the matchers determined.
 
-        Only includes fields whose classification produced a result
-        above the configured thresholds.
+        A **pure function of the match results**: it never sees the
+        fragment, and it only names blocks whose classification produced
+        a result above the configured thresholds. Within a named block,
+        every axis the matchers were silent about is left at that
+        field's "not determined" default sentinel — the wavelength block
+        carries no orientation, dosage, colour or descriptor, and the
+        voice block carries ``None`` for whichever of its two axes did
+        not match.
+
+        That makes the result **unsafe to assign wholesale**. Passing it
+        straight to ``fragment.model_copy(update=...)`` replaces each
+        whole block, so those untouched axes overwrite the fragment's
+        prior evidence with sentinels — including the
+        ``voice.confidence`` the INTIMATE privacy escalation reads
+        (#1331). Callers must route it through
+        :meth:`_layer_over_fragment` first.
+
+        The split mirrors the weighted path, where
+        :meth:`~creek.classify.weighted.WeightedFragmentClassification.to_legacy`
+        is a documented pure collapse and
+        :meth:`~creek.classify.weighted.WeightedFragmentClassification.merge_onto`
+        is the separate layering step (#1309).
 
         Args:
             primary: Primary frequency.
@@ -771,8 +810,8 @@ class RuleClassifier:
             confidence: Matched confidence level (or None).
 
         Returns:
-            Dictionary of field names to new values, suitable for
-            ``fragment.model_copy(update=...)``.
+            Dictionary of field names to the values the matchers
+            determined, ready for :meth:`_layer_over_fragment`.
         """
         updates: dict[str, object] = {}
 
@@ -795,6 +834,61 @@ class RuleClassifier:
             )
 
         return updates
+
+    @staticmethod
+    def _layer_over_fragment(
+        fragment: Fragment,
+        updates: dict[str, object],
+    ) -> dict[str, object]:
+        """Layer a sparse verdict over the evidence *fragment* already holds.
+
+        Turns the unsafe-to-assign output of :meth:`_build_updates` into
+        an update dict that is safe to hand to
+        ``fragment.model_copy(update=...)``: the ``wavelength`` and
+        ``voice`` entries are replaced by the fragment's own blocks with
+        only the determined axes overlaid, via
+        :func:`~creek.classify.evidence.layer_determined_over`. An axis
+        the matchers said nothing about keeps whatever was on record.
+
+        THE FREQUENCY ASYMMETRY: ``frequency`` is deliberately **not**
+        layered. :attr:`~creek.models.FrequencyClassification.secondary`
+        is a list, and a list cannot be merged field-wise the way the
+        scalar wavelength and voice axes can — so a freshly picked
+        primary replaces the block wholesale, clearing stale secondaries
+        from an earlier verdict rather than accumulating them. When no
+        primary clears the threshold the block is absent from *updates*
+        entirely and is left completely alone. This matches
+        :meth:`~creek.classify.weighted.WeightedFragmentClassification.merge_onto`
+        on purpose: two divergent merge semantics for one problem is how
+        this defect came to be filed twice (#1331 and #1400).
+
+        Args:
+            fragment: The fragment being classified, carrying whatever
+                evidence a previous run or the operator established.
+            updates: The sparse verdict from :meth:`_build_updates`. Not
+                mutated.
+
+        Returns:
+            A copy of *updates* whose classification blocks are merged
+            onto the fragment's rather than replacing them.
+        """
+        layered = updates.copy()
+
+        wavelength = layered.get("wavelength")
+        if isinstance(wavelength, WavelengthClassification):
+            layered["wavelength"] = layer_determined_over(
+                prior=fragment.wavelength,
+                determined=wavelength,
+            )
+
+        voice = layered.get("voice")
+        if isinstance(voice, VoiceClassification):
+            layered["voice"] = layer_determined_over(
+                prior=fragment.voice,
+                determined=voice,
+            )
+
+        return layered
 
     def _match_voice_register(
         self,

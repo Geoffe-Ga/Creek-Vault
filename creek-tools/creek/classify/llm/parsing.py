@@ -18,6 +18,7 @@ from typing import TypeVar
 
 import yaml
 
+from creek.classify.evidence import layer_determined_over
 from creek.classify.praxis_pass import PRAXIS_POTENTIAL_KEY, escalate
 from creek.models import (
     Confidence,
@@ -597,23 +598,53 @@ def _apply_texture(
 def _apply_voice(
     data: dict[str, object],
     updates: dict[str, object],
+    current: VoiceClassification,
 ) -> None:
-    """Extract voice classification from parsed data.
+    """Layer the response's voice verdict over the recorded one (#1331).
+
+    Takes the fragment's prior value for the same reason
+    :func:`_apply_praxis` (#877) and :func:`_apply_texture` (#878) do.
+    Rebuilding the whole block from the response nulls whichever axis
+    the model was silent about: a response carrying ``voice:
+    {voice_register: confessional}`` and no ``confidence`` used to erase
+    a persisted ``conviction`` — half of the INTIMATE trigger read by
+    :meth:`~creek.classify.privacy.PrivacyClassifier._is_high_confidence_confessional`
+    — so the escalation that evidence should unlock never fired. That is
+    a fail-open, and it is the single-pick LLM path's copy of the defect
+    fixed one layer earlier in
+    :meth:`~creek.classify.rules.RuleClassifier.classify`.
+
+    Unlike the wavelength axes there is no FEAT-017 gating question
+    here: ``voice_register`` and ``confidence`` are not in
+    :data:`~creek.classify.llm.calibration._BIASED_DIMENSIONS`, so no
+    self-reported confidence score is entitled to downgrade them to a
+    sentinel. A model silent about an axis has said nothing, and silence
+    must not erase evidence.
+
+    A response with no ``voice`` block at all stays a **no-op** — no key
+    is written, rather than a wholly-default verdict being merged — so
+    :meth:`~creek.classify.llm.orchestrator.LLMClassifier._apply_classification`
+    can still recognise a run that marked nothing.
 
     Args:
         data: Parsed LLM response.
-        updates: Dict to populate with voice updates.
+        updates: Dict to populate with the merged voice block.
+        current: The voice classification already on the fragment. Only
+            the axes this response actually decided are overlaid on it.
     """
     voice_data = data.get("voice")
     if not isinstance(voice_data, dict):
         return
-    updates["voice"] = VoiceClassification(
-        voice_register=_parse_optional_enum(
-            voice_data.get("voice_register"),
-            VoiceRegister,
-        ),
-        confidence=_parse_optional_enum(
-            voice_data.get("confidence"),
-            Confidence,
+    updates["voice"] = layer_determined_over(
+        prior=current,
+        determined=VoiceClassification(
+            voice_register=_parse_optional_enum(
+                voice_data.get("voice_register"),
+                VoiceRegister,
+            ),
+            confidence=_parse_optional_enum(
+                voice_data.get("confidence"),
+                Confidence,
+            ),
         ),
     )

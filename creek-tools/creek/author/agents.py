@@ -527,6 +527,12 @@ class _FragmentSignal:
         and confidence from ``title + body`` keyword signal; the rule
         classifier does not detect dosage, so dosage is read from the
         fragment's existing frontmatter (``wavelength.dosage``) instead.
+        Reading the *original* fragment for that used to be load-bearing:
+        the rule pass rebuilt the whole wavelength block and blanked the
+        dosage on its way past, so ``classified.wavelength.dosage`` was a
+        sentinel. Since #1331 the pass merges instead, and the two agree —
+        the explicit read is kept because it still states the intent, not
+        because it is the only thing that works.
         ``voice_register`` and ``confidence`` are ``None`` when no keyword
         fired (neither enum has an ``UNCLASSIFIED`` member).
 
