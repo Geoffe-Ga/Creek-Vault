@@ -19,9 +19,100 @@ Every ingestor is registered in `creek.ingest.INGESTOR_REGISTRY`. The table maps
 | `image`         | `.png` / `.jpg` / `.tiff` / `.pdf-page-as-image` via OCR.             | `pytesseract`, `pdf2image`, system `tesseract`, `poppler` |
 | `generic`       | Plain-text fallback for unknown extensions.                           | none                          |
 
-If `--type` is omitted, `creek process` picks ingestors by file extension.
+If `--type` is omitted, `creek process` resolves an owner per file — see
+[How `creek process` picks an ingestor](#how-creek-process-picks-an-ingestor).
 
 `gdrive` is **not** a `--type` (ARCH-001) — it is a downloader. Run `creek gdrive --download --staging <dir>` to mirror Drive files locally, then run `creek ingest --type document --input <dir>` (or `--type spreadsheet`, etc.) against the staged directory. See [Google Drive](#google-drive) below.
+
+## How `creek process` picks an ingestor
+
+`creek process` runs **every** registered ingestor over the source tree,
+because several of them recognise their input by its structure or content
+rather than its extension: a Discord export is a `messages/<channel>/`
+directory shape, a ChatGPT export is a particular JSON envelope, a
+Substack post is a `<postid>.<slug>.html` filename. No dispatch table can
+express those.
+
+It then **arbitrates**. Fragments are grouped by the source file they came
+from, and only the highest-priority ingestor that actually produced output
+for that file is kept. The order lives in
+`creek.ingest.routing.CLAIM_PRIORITY`, which reads specific to general:
+
+```
+discord · chatgpt · claude · substack     ← recognise the file's internals
+markdown · code · spreadsheet · presentation · image · document
+generic                                    ← "nothing better claimed it"
+```
+
+Two consequences worth knowing:
+
+* **One *ingestor* per file, not one *fragment* per file.** An ingestor
+  that wins a file keeps everything it produced for it — one fragment per
+  sheet of a workbook, one per module and function of a `.py` file, one
+  per turn pair of a conversation.
+* **The winner's rendering is the fragment.** A fragment's id hashes its
+  source path, timestamp and content, so the arbitration decides the body
+  text, the id, and the `YYYY-MM-DD-` prefix on the vault filename.
+
+Before this behaviour existed (issue #1304) every claimant's output was
+written, so a `.txt`, `.html`, `.csv`, `.py` or README-shaped `.md` file
+produced two or three fragments per run.
+
+### Upgrading a vault ingested before this change
+
+Nothing is migrated automatically, and nothing is deleted. Here is exactly
+what happens and what you may want to do.
+
+Re-running `creek process` over the same source produces the winning
+ingestor's fragment, which resolves to the id it already had, so it
+de-duplicates against itself as usual. The **losing** ingestor's fragments
+from earlier runs stay in the vault as strays: they have different ids
+(the two ingestors disagree on both body and timestamp), so nothing
+matches them, and now that the loser never runs against those files again
+nothing will ever revisit them. They are ordinary fragment notes — indexed,
+linkable, and indistinguishable from real ones apart from being a second
+copy of a file you only have one of.
+
+`creek process` now names the affected files for you:
+
+```
+Contested sources: 3 (more than one ingestor claimed these; one won)
+  A vault ingested before this release may still hold the losing
+  ingestor's fragments. Nothing is deleted automatically; inspect with
+  creek purge source --source-path <path> --match exact --dry-run
+  /home/me/notes/log.txt
+  ...
+```
+
+The recommended sequence, per file, is to look before you touch anything:
+
+```bash
+# 1. See every fragment in the vault that came from this source file.
+creek purge source --source-path /home/me/notes/log.txt --match exact --dry-run
+```
+
+If there is more than one, you have a stray. Two ways forward:
+
+* **Leave it.** It is a duplicate note, not corruption. This is the right
+  answer if you have hand-edited or hand-linked either copy — see the
+  caveat below.
+* **Purge and re-process.** `creek purge source --source-path <path>
+  --match exact --yes` deletes *every* fragment from that source (the
+  stray *and* the current one), then `creek process` recreates the
+  current one. Note the caveat: purging scrubs references, replacing
+  `[[wikilinks]]` to the deleted notes with `[purged]` across the vault,
+  and re-processing does **not** restore them.
+
+Two smaller changes ride along:
+
+* `.txt` and `.html` files now get `DocumentIngestor`'s rendering rather
+  than the generic fallback's, so their body — and therefore their id and
+  filename — differs from what a pre-#1304 run wrote. `GenericIngestor`
+  also stamped an `authored_at` in frontmatter that `DocumentIngestor`
+  leaves unset.
+* README, `CLAUDE.md` and ADR `.md` files go to `MarkdownIngestor` rather
+  than `CodeIngestor`, which keeps their YAML frontmatter out of the body
+  but drops the `artifact_type` label.
 
 ## Symlinks in a source tree
 

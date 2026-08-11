@@ -47,6 +47,10 @@ _BINARY_CHECK_SIZE = 8192
 # If more than 10% of bytes are non-text control chars, treat as binary
 _BINARY_CONTROL_THRESHOLD = 0.10
 
+# UTF-16 byte-order marks. UTF-16 text is full of null bytes, so it trips
+# every binary heuristic here and has to be recognised before they run.
+_UTF16_BOMS: tuple[bytes, bytes] = (b"\xff\xfe", b"\xfe\xff")
+
 
 def _safe_file_mtime(path: Path) -> datetime | None:
     """Return *path*'s mtime as a tz-aware datetime, or ``None`` defensively.
@@ -113,7 +117,7 @@ def _try_decode(raw_bytes: bytes) -> str | None:
         return ""
 
     # Try UTF-16 first if BOM is present (contains null bytes so check before binary)
-    if raw_bytes[:2] in (b"\xff\xfe", b"\xfe\xff"):
+    if raw_bytes[:2] in _UTF16_BOMS:
         with suppress(UnicodeDecodeError, ValueError):
             return raw_bytes.decode("utf-16")
 
@@ -132,6 +136,39 @@ def _try_decode(raw_bytes: bytes) -> str | None:
 
     # Latin-1 as final fallback (can decode any byte sequence)
     return raw_bytes.decode("latin-1")
+
+
+def _read_unless_binary(file_path: Path) -> bytes | None:
+    """Read *file_path* whole, or return ``None`` once a prefix proves it binary.
+
+    ``parse`` has always discarded binary content (``_try_decode``
+    returns ``None`` for it), but ``discover`` used to slurp the entire
+    file into memory first — so a source tree of photos, videos or Office
+    documents was read cover to cover on every ``creek process`` run and
+    thrown away. This reads a bounded prefix, decides on that, and only
+    continues reading when the content might survive parsing.
+
+    Output-neutral by construction rather than by an extension list.
+    :func:`_is_binary_content` looks for a null byte anywhere and
+    otherwise scores only the first ``_BINARY_CHECK_SIZE`` bytes, so if
+    the prefix tests binary the whole file necessarily does too, and
+    ``parse`` would have dropped it. The UTF-16 BOM exemption is applied
+    here for the same reason ``_try_decode`` applies it: UTF-16 text is
+    riddled with nulls and is not binary.
+
+    Args:
+        file_path: File to read.
+
+    Returns:
+        The file's bytes, or ``None`` when it is binary and ``parse``
+        would have discarded it anyway.
+    """
+    with file_path.open("rb") as handle:
+        prefix = handle.read(_BINARY_CHECK_SIZE)
+        if prefix[:2] not in _UTF16_BOMS and _is_binary_content(prefix):
+            logger.debug("Skipping binary file without reading it: %s", file_path)
+            return None
+        return prefix + handle.read()
 
 
 class GenericIngestor(Ingestor):
@@ -170,12 +207,15 @@ class GenericIngestor(Ingestor):
             file_path: Path to the file.
 
         Returns:
-            A single-element list if the file is unclaimed, else empty.
+            A single-element list if the file is unclaimed and not
+            binary, else empty.
         """
         if file_path.suffix.lower() in _CLAIMED_EXTENSIONS:
             return []
 
-        raw_bytes = file_path.read_bytes()
+        raw_bytes = _read_unless_binary(file_path)
+        if raw_bytes is None:
+            return []
         _text, encoding = normalize_encoding(raw_bytes)
         return [
             RawDocument(
@@ -193,7 +233,8 @@ class GenericIngestor(Ingestor):
             dir_path: Directory path to search.
 
         Returns:
-            A list of ``RawDocument`` objects for unclaimed files.
+            A list of ``RawDocument`` objects for unclaimed, non-binary
+            files.
         """
         docs: list[RawDocument] = []
         for file_path in sorted(dir_path.rglob("*")):
@@ -202,7 +243,9 @@ class GenericIngestor(Ingestor):
             if file_path.suffix.lower() in _CLAIMED_EXTENSIONS:
                 continue
 
-            raw_bytes = file_path.read_bytes()
+            raw_bytes = _read_unless_binary(file_path)
+            if raw_bytes is None:
+                continue
             _text, encoding = normalize_encoding(raw_bytes)
             docs.append(
                 RawDocument(

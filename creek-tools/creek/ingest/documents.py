@@ -581,10 +581,15 @@ class DocumentIngestor(Ingestor):
 
         Substack export directories (``posts.csv`` + per-post
         ``<id>.<slug>.html``) are claimed by ``SubstackIngestor``;
-        ``DocumentIngestor`` defers to it rather than double-emitting
-        every post as an opaque HTML document, so the auto-detect path
-        of ``creek process`` (which fans every registered ingestor at
-        the source) produces one fragment per essay, not two.
+        ``DocumentIngestor`` defers to it rather than emitting every
+        post a second time as an opaque HTML document. Since issue #1304
+        the pipeline would arbitrate that contest anyway — ``substack``
+        outranks ``document`` in
+        :data:`creek.ingest.routing.CLAIM_PRIORITY` — but narrowing the
+        claim here is still worth doing: it saves parsing a whole export
+        directory whose output is guaranteed to be discarded, and it
+        keeps ``creek ingest --type document`` honest, which the
+        arbiter never sees.
 
         Args:
             source_path: A file or directory path to search.

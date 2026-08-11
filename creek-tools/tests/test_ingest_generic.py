@@ -13,12 +13,14 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import BinaryIO
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from creek.ingest.base import IngestResult, ParsedFragment, RawDocument
 from creek.ingest.generic import (
+    _BINARY_CHECK_SIZE,
     GenericIngestor,
     _is_binary_content,
     _try_decode,
@@ -597,3 +599,138 @@ class TestGenericIngestorAuthoredAt:
         )
         fm = ingestor.generate_frontmatter(fragment)
         assert "authored_at" not in fm
+
+
+# ---- Discover-time binary skip (issue #1304) ----
+
+
+class _CountingHandle:
+    """A binary file handle that records how many bytes were read through it."""
+
+    def __init__(self, handle: BinaryIO, tally: list[int]) -> None:
+        """Wrap *handle*, appending each read size to *tally*."""
+        self._handle = handle
+        self._tally = tally
+
+    def read(self, size: int = -1) -> bytes:
+        """Read from the wrapped handle and record the byte count."""
+        chunk = self._handle.read(size)
+        self._tally.append(len(chunk))
+        return chunk
+
+    def __enter__(self) -> _CountingHandle:
+        """Enter the wrapped handle's context."""
+        self._handle.__enter__()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        """Close the wrapped handle."""
+        self._handle.close()
+
+
+class TestDiscoverSkipsBinariesUnread:
+    """``discover`` must not slurp files ``parse`` was always going to drop.
+
+    Output-neutral: every case here produced zero fragments before issue
+    #1304 too, because ``parse`` discarded the content after reading it.
+    What changes is that the bytes are no longer read.
+    """
+
+    def test_binary_file_is_not_discovered(
+        self, ingestor: GenericIngestor, tmp_path: Path
+    ) -> None:
+        """A binary file yields no raw document at all."""
+        (tmp_path / "shot.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+
+        assert ingestor.discover(tmp_path) == []
+
+    def test_binary_file_produced_no_fragment_before_either(
+        self, ingestor: GenericIngestor, tmp_path: Path
+    ) -> None:
+        """The skip is output-neutral: parsing it would have yielded nothing.
+
+        Feeds ``parse`` the document ``discover`` used to build, proving
+        the fragment count is unchanged rather than merely asserting the
+        new behaviour.
+        """
+        path = tmp_path / "shot.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+        pre_change_doc = RawDocument(
+            path=path,
+            content=path.read_bytes(),
+            metadata={"source_type": "generic"},
+            detected_encoding="utf-8",
+        )
+
+        assert ingestor.parse(pre_change_doc) == []
+        assert ingestor.ingest(tmp_path).fragments == []
+
+    def test_only_a_bounded_prefix_of_a_binary_file_is_read(
+        self,
+        ingestor: GenericIngestor,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A 4 MB binary costs one small read, not four megabytes of them."""
+        (tmp_path / "big.bin").write_bytes(b"\x00\xff" * (2 * 1024 * 1024))
+        tally: list[int] = []
+        real_open = Path.open
+
+        def counting_open(self: Path, *args: object, **kwargs: object) -> object:
+            handle = real_open(self, *args, **kwargs)  # type: ignore[arg-type]
+            return _CountingHandle(handle, tally)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "open", counting_open)
+
+        assert ingestor.discover(tmp_path) == []
+        assert sum(tally) <= _BINARY_CHECK_SIZE, tally
+
+    def test_utf16_text_survives_the_skip(
+        self, ingestor: GenericIngestor, tmp_path: Path
+    ) -> None:
+        """UTF-16 is null-heavy but is text, and must still be ingested.
+
+        The BOM carve-out exists in ``_try_decode`` for exactly this
+        reason; the discover-time check has to honour it or the change
+        would silently drop real content.
+        """
+        (tmp_path / "wide.txt").write_bytes("Hello from UTF-16.".encode("utf-16"))
+
+        fragments = ingestor.ingest(tmp_path).fragments
+
+        assert [f.content.strip() for f in fragments] == ["Hello from UTF-16."]
+
+    def test_a_single_binary_file_path_is_not_discovered(
+        self, ingestor: GenericIngestor, tmp_path: Path
+    ) -> None:
+        """The single-file discovery arm skips binaries too."""
+        path = tmp_path / "shot.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+
+        assert ingestor.discover(path) == []
+
+    def test_an_empty_file_is_still_discovered(
+        self, ingestor: GenericIngestor, tmp_path: Path
+    ) -> None:
+        """Empty is not binary; the prior behaviour of discovering it holds."""
+        (tmp_path / "empty.txt").write_bytes(b"")
+
+        assert [doc.path.name for doc in ingestor.discover(tmp_path)] == ["empty.txt"]
+
+    def test_a_text_file_larger_than_the_prefix_is_read_in_full(
+        self, ingestor: GenericIngestor, tmp_path: Path
+    ) -> None:
+        """Reading a bounded prefix must not truncate the document.
+
+        The prefix is only a binary *test*; everything past it still has
+        to reach the fragment, or the change would quietly amputate every
+        source file over 8 KiB.
+        """
+        body = "line of text\n" * ((_BINARY_CHECK_SIZE // 13) + 500)
+        (tmp_path / "long.txt").write_text(body, encoding="utf-8")
+
+        fragments = ingestor.ingest(tmp_path).fragments
+
+        assert len(fragments) == 1
+        assert fragments[0].content == body
+        assert len(fragments[0].content) > _BINARY_CHECK_SIZE
