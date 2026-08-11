@@ -25,7 +25,8 @@ Three concerns get exercised here:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import re
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -33,7 +34,11 @@ from pydantic import ValidationError
 
 from creek.classify import prompt as prompt_module
 from creek.classify import weighted as weighted_module
+from creek.classify.privacy import PrivacyClassifier
+from creek.classify.privacy_pass import reassess
+from creek.classify.rules import RuleClassifier
 from creek.classify.weighted import (
+    _ALLOWED_TOP_LEVEL_KEYS,
     _FREQUENCY_TO_COLOR,
     _LEGACY_SECONDARY_WEIGHT,
     _LEGACY_SINGLE_WEIGHT,
@@ -51,6 +56,7 @@ from creek.classify.weighted import (
 from creek.config import LLMConfig
 from creek.ingest.base import IngestedFragment
 from creek.models import (
+    Authorship,
     Color,
     Confidence,
     Dosage,
@@ -62,6 +68,7 @@ from creek.models import (
     Mode,
     Orientation,
     Phase,
+    PrivacyTier,
     SourcePlatform,
     VoiceClassification,
     VoiceRegister,
@@ -70,6 +77,8 @@ from creek.models import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from creek.classify.llm.orchestrator import LLMClassifier
 
 # ---- Fixtures --------------------------------------------------------------
 
@@ -201,10 +210,63 @@ class TestLoadYamlDict:
             "orientations: []\n"
             "dosages: []\n"
             "voice_registers: []\n"
+            "confidences: []\n"
             "overall_confidence: 0.5\n"
         )
         parsed = _load_yaml_dict(text)
         assert parsed["overall_confidence"] == 0.5
+
+    def test_allow_list_is_exactly_these_eight_keys(self) -> None:
+        """SEC-004: the allow-list is pinned exactly, as a forcing function.
+
+        ``_ALLOWED_TOP_LEVEL_KEYS`` is the boundary that stops a model (or a
+        prompt injection carried in fragment text) from writing arbitrary
+        Fragment fields — ``privacy_tier`` above all — straight out of an LLM
+        response. An equality assertion rather than a membership one means
+        widening the schema is always a deliberate, reviewed act: #1309 added
+        exactly one key and this test is where that has to be admitted.
+        """
+        assert (
+            frozenset(
+                {
+                    "frequencies",
+                    "phases",
+                    "modes",
+                    "orientations",
+                    "dosages",
+                    "voice_registers",
+                    "confidences",
+                    "overall_confidence",
+                },
+            )
+            == _ALLOWED_TOP_LEVEL_KEYS
+        )
+
+    def test_singular_confidence_key_still_rejected(self) -> None:
+        """The Fragment field spelling ``confidence:`` is not the new axis.
+
+        The weighted axis is the PLURAL ``confidences``. The singular is the
+        name of the Fragment's own field, and accepting it would let a
+        response address Fragment state directly.
+        """
+        with pytest.raises(ValueError, match="unexpected top-level keys"):
+            _load_yaml_dict("frequencies: []\nconfidence: conviction")
+
+    def test_privacy_tier_rejected_alongside_a_legal_confidences_section(
+        self,
+    ) -> None:
+        """A legal new key does not smuggle an illegal one past the validator.
+
+        The realistic injection shape after #1309: a payload that looks
+        well-formed because it carries the newly-legal ``confidences:``
+        section, with ``privacy_tier`` riding along. Downgrading a tier from
+        an LLM response is exactly what SEC-004 exists to prevent.
+        """
+        with pytest.raises(ValueError, match="unexpected top-level keys"):
+            _load_yaml_dict(
+                "confidences:\n  - value: conviction\n    weight: 0.9\n"
+                "privacy_tier: open\n",
+            )
 
     def test_non_dict_entry_dropped(self) -> None:
         """``_parse_dimension`` skips non-dict entries silently."""
@@ -222,9 +284,26 @@ class TestLoadYamlDict:
         # Bypass Pydantic's enum coercion by going through ``model_validate``
         # with a typo — Pydantic would raise; we hand-roll the legacy
         # widening helper directly to exercise the defensive branch.
-        from creek.classify.weighted import _widen_voice_register
+        from creek.classify.weighted import _widen_optional
 
-        assert _widen_voice_register("not-a-register") == ()
+        assert _widen_optional("not-a-register", VoiceRegister) == ()
+
+    def test_widen_optional_is_enum_generic(self) -> None:
+        """``_widen_optional`` handles ``Confidence`` as well as ``VoiceRegister``.
+
+        ``Confidence`` has no ``unclassified`` member (``Confidence(
+        "unclassified")`` raises), which is why the optional-aware helper
+        rather than ``_widen_single`` is the right widener for it.
+        """
+        from creek.classify.weighted import _widen_optional
+
+        assert _widen_optional(None, Confidence) == ()
+        assert _widen_optional("garbage", Confidence) == ()
+        assert _widen_optional(Confidence.CONVICTION, Confidence) == (
+            WeightedDimension(
+                value=Confidence.CONVICTION, weight=_LEGACY_SINGLE_WEIGHT
+            ),
+        )
 
 
 class TestCoerceEnumEdgeCases:
@@ -555,8 +634,19 @@ class TestRoundTrip:
         assert wave_out.color == Color.RED  # recomputed from primary, matches original
         assert voice_out.voice_register == VoiceRegister.ANALYTICAL
 
-    def test_widen_drops_voice_confidence(self) -> None:
-        """``VoiceClassification.confidence`` does not round-trip (documented)."""
+    def test_widen_round_trips_voice_confidence(self) -> None:
+        """``VoiceClassification.confidence`` now round-trips (#1309).
+
+        DELIBERATELY INVERTED, not deleted. This test was previously named
+        ``test_widen_drops_voice_confidence`` and asserted
+        ``voice_out.confidence is None`` — it pinned the defect in place. The
+        dropped confidence is the third INTIMATE trigger in
+        ``PrivacyClassifier.classify_tier`` (``confessional`` +
+        ``conviction``), so "confidence does not round-trip" was not a benign
+        documented limitation; it was a fail-open privacy hole with a test
+        holding it open. Confidence is now a real weighted axis, so the
+        round-trip is lossless and the assertion is reversed.
+        """
         original = _make_fragment(
             voice=VoiceClassification(
                 voice_register=VoiceRegister.PROPHETIC,
@@ -565,9 +655,8 @@ class TestRoundTrip:
         )
         widened = WeightedFragmentClassification.from_single_pick(original)
         _freq, _wave, voice_out = widened.to_legacy()
-        # voice_register survives; confidence is dropped to None.
         assert voice_out.voice_register == VoiceRegister.PROPHETIC
-        assert voice_out.confidence is None
+        assert voice_out.confidence == Confidence.SETTLED
 
     def test_widen_drops_descriptor(self) -> None:
         """``WavelengthClassification.descriptor`` does not round-trip."""
@@ -708,10 +797,16 @@ def _weighted_yaml_payload(
     orientations: str = "  - value: do_feel\n    weight: 0.5",
     dosages: str = "  - value: medicine\n    weight: 0.6",
     voice_registers: str = "  - value: analytical\n    weight: 0.5",
+    confidences: str = "",
     overall_confidence: float = 0.7,
     reasoning: str = "The fragment lands at F3 / Red, rising into expression.",
 ) -> str:
-    """Render a canned LLM response with controllable per-section content."""
+    """Render a canned LLM response with controllable per-section content.
+
+    ``confidences`` defaults to empty rather than to a canned entry (unlike
+    every sibling section) so the pre-#1309 payloads every other test in this
+    module renders stay byte-identical — the new axis is opt-in per test.
+    """
     sections: list[str] = [reasoning, "", "```yaml"]
     if frequencies:
         sections.extend(("frequencies:", frequencies))
@@ -725,6 +820,8 @@ def _weighted_yaml_payload(
         sections.extend(("dosages:", dosages))
     if voice_registers:
         sections.extend(("voice_registers:", voice_registers))
+    if confidences:
+        sections.extend(("confidences:", confidences))
     sections.extend((f"overall_confidence: {overall_confidence}", "```"))
     return "\n".join(sections)
 
@@ -741,6 +838,96 @@ class TestBuildWeightedClassificationPrompt:
         assert "{level}" in WEIGHTED_CLASSIFICATION_TEMPLATE
         assert "{title}" in WEIGHTED_CLASSIFICATION_TEMPLATE
         assert "{content}" in WEIGHTED_CLASSIFICATION_TEMPLATE
+
+    def test_every_key_the_prompt_requests_is_on_the_allow_list(self) -> None:
+        """The prompt skeleton and the schema validator cannot drift (#1309).
+
+        This is a structural guard, not a hand-maintained list, and it exists
+        because PR #1358 changed the *consequence* of drift from loud to
+        silent. The two halves of a schema widening are the YAML skeleton in
+        ``WEIGHTED_CLASSIFICATION_TEMPLATE`` and
+        ``_ALLOWED_TOP_LEVEL_KEYS``. Add a key to the prompt but not the
+        allow-list and:
+
+        * before #1358, ``_load_yaml_dict`` raised, the profile failed soft to
+          empty, and every legacy field on every fragment was blanked to
+          ``unclassified`` on disk — catastrophic, but obvious at a glance;
+        * after #1358, the same raise is caught, ``succeeded`` is ``False``,
+          and the engine hands the fragment back untouched with an honest
+          ``classification_method: rules``. The run reports zero errors and a
+          full classified count. **The weighted feature is dead on every
+          fragment and nothing anywhere says so** except one log warning that
+          no gate asserts on.
+
+        A hand-written key list (``test_known_keys_pass``) cannot catch this,
+        because the person adding the key updates the list they can see.
+        """
+        prompt = build_weighted_classification_prompt(
+            body="A body",
+            title="A title",
+            unclassified_threshold=0.6,
+        )
+        # Pull the fenced YAML skeleton out of the built prompt and read its
+        # top-level keys — column-zero ``key:`` lines only, so nested list
+        # entries and prose are ignored.
+        fences = re.findall(r"```yaml\n(.*?)```", prompt, re.DOTALL)
+        assert fences, "the prompt must contain a fenced YAML skeleton"
+        requested = {
+            match.group(1)
+            for fence in fences
+            for match in re.finditer(r"^([a-z_]+):", fence, re.MULTILINE)
+        }
+        assert requested, "no top-level keys found in the YAML skeleton"
+        assert requested <= _ALLOWED_TOP_LEVEL_KEYS, (
+            "the prompt asks the model for keys the validator will reject, "
+            "which silently kills the whole weighted path: "
+            f"{sorted(requested - _ALLOWED_TOP_LEVEL_KEYS)}"
+        )
+        # And specifically: the new axis really is being requested, so this
+        # test cannot pass vacuously by the prompt asking for nothing.
+        assert "confidences" in requested
+
+    def test_a_response_shaped_like_the_prompt_skeleton_is_accepted(
+        self,
+    ) -> None:
+        """End-to-end: an obedient model's response actually parses (#1309).
+
+        The mirror of the drift guard above, from the other side — a payload
+        carrying every section the prompt requests must survive
+        ``_load_yaml_dict`` rather than being rejected and failed soft.
+        """
+        payload = _weighted_yaml_payload(
+            confidences="  - value: conviction\n    weight: 0.9",
+        )
+        parsed = parse_weighted_yaml(payload)
+        assert parsed.confidences == (
+            WeightedDimension(value=Confidence.CONVICTION, weight=0.9),
+        )
+
+    def test_prompt_distinguishes_author_stance_from_model_certainty(
+        self,
+    ) -> None:
+        """The prompt must not let the model conflate the two confidences.
+
+        ``overall_confidence`` is the model's self-rating of its own work;
+        ``confidences`` is ontology axis 9, the author's stance toward their
+        own claim. Conflating them would manufacture INTIMATE escalations at
+        scale, and under the escalate-only ratchet those are permanent. The
+        disambiguation is therefore a privacy control and is asserted, not
+        left to the prompt author's memory.
+        """
+        prompt = build_weighted_classification_prompt(
+            body="A body",
+            unclassified_threshold=0.6,
+        )
+        lowered = prompt.lower()
+        assert "confidences" in lowered
+        assert "overall_confidence" in lowered
+        # The axis is glossed as the AUTHOR's stance...
+        assert "author" in lowered
+        # ...and the five ontology stance values are offered verbatim.
+        for stance in Confidence:
+            assert stance.value in lowered
 
     def test_body_and_title_appear(self) -> None:
         """The fragment body and title are substituted into the template."""
@@ -1123,3 +1310,646 @@ class TestClassifyEngineWiring:
         assert reasoning == ""
         # And the weighted LLM stub was never called.
         assert stub_llm.dispatched is False
+
+
+# ---- #1309: the weighted path must not void the INTIMATE escalation --------
+#
+# Framing, because it decides what these tests may assert. This is NOT a
+# ratchet violation in the "a stored tier gets lowered" sense: every writer
+# of ``privacy_tier`` is escalate-only (``privacy_pass.escalate``,
+# ``apply_tier``, ``reassess``, and ``vault/writer.py``'s re-ingest merge all
+# take the max). The defect is a MISSED escalation — fail-open — plus the
+# destruction of the on-disk evidence that escalation reads.
+#
+# Consequence: an assertion of the form "the tier did not go down" PASSES at
+# HEAD and proves nothing. Every test below asserts the tier goes UP, at
+# parity with the single-pick path.
+
+# A body the rule classifier has no opinion about: no recovery keyword, no
+# voice-register trigger, no frequency keyword. Verified at HEAD —
+# ``RuleClassifier.classify`` returns the fragment with voice and wavelength
+# untouched and ``frequency.primary == UNCLASSIFIED``, so ``_classify_one``
+# cannot short-circuit on rule confidence and is forced down the LLM path.
+#
+# This body is load-bearing, not incidental. ``RuleClassifier._build_updates``
+# rebuilds ``VoiceClassification`` from scratch under an OR guard, so a body
+# the voice matcher DOES fire on (e.g. "I confess ...") arrives at the
+# weighted classifier with ``confidence`` already destroyed — before any code
+# under test here runs. That is a separate, out-of-scope defect (see the
+# follow-up issue referenced in the PR body); each test below pins the
+# precondition explicitly so the boundary is visible rather than implied.
+_RULE_INERT_BODY = "A plain paragraph about gardening tools and afternoon light."
+
+# The single-pick wire format: top-level ``frequency:``/``wavelength:``/
+# ``voice:`` blocks parsed by ``creek.classify.llm.parsing``. Same model
+# verdict as the weighted payloads below, down the legacy path.
+_SINGLE_PICK_CONFESSIONAL_RESPONSE = """\
+frequency:
+  primary: F6
+wavelength:
+  phase: rising
+  mode: express
+voice:
+  voice_register: confessional
+  confidence: conviction
+"""
+
+
+class _WeightedOnlyLLM:
+    """LLMClassifier stand-in exposing only what the weighted path needs.
+
+    ``_classify_one_weighted`` reads ``.config`` and nothing else. The
+    ``classify_with_reasoning`` override raises so a test that accidentally
+    routes down the single-pick path fails loudly instead of silently
+    asserting the wrong code path.
+    """
+
+    def __init__(self, config: LLMConfig) -> None:
+        """Capture the config the weighted classifier will be handed."""
+        self.config = config
+
+    def classify_with_reasoning(
+        self,
+        fragment: Fragment,
+        content: str = "",
+    ) -> object:
+        """Raise: the weighted path must never fall back to single-pick."""
+        del fragment, content
+        msg = "legacy classify_with_reasoning should not be invoked"
+        raise AssertionError(msg)
+
+
+def _essay_fragment(**overrides: Any) -> Fragment:
+    """Build a self-authored ESSAY-platform fragment.
+
+    ESSAY (not JOURNAL) and ``author="self"`` is the combination that makes
+    the confessional+conviction trigger the *only* route to INTIMATE:
+    ``PrivacyClassifier.classify_tier`` checks a recovery keyword first, then
+    ``platform == JOURNAL``, and only then the high-confidence-confessional
+    rule. A journal fragment would reach INTIMATE regardless and the test
+    would prove nothing about voice evidence.
+
+    Args:
+        **overrides: Field values spliced onto the default fragment.
+
+    Returns:
+        A constructed :class:`Fragment` on the ESSAY platform.
+    """
+    return _make_fragment(
+        id=overrides.pop("id", "frag-1309000001"),
+        source=FragmentSource(platform=SourcePlatform.ESSAY, author=Authorship.SELF),
+        **overrides,
+    )
+
+
+def _run_weighted(
+    fragment: Fragment,
+    config: LLMConfig,
+    body: str = _RULE_INERT_BODY,
+) -> Fragment:
+    """Drive ``_classify_one`` down the weighted path and return the result.
+
+    Args:
+        fragment: The fragment to classify.
+        config: LLM config handed to the weighted classifier.
+        body: Fragment body; defaults to the rule-inert body.
+
+    Returns:
+        The updated :class:`Fragment`.
+    """
+    from creek.classify.classify_engine import _classify_one
+
+    updated, _skipped, _reasoning = _classify_one(
+        fragment=fragment,
+        body=body,
+        method="llm",
+        rules=RuleClassifier(),
+        llm=cast("LLMClassifier", _WeightedOnlyLLM(config)),
+        confidence_threshold=1.0,
+        weighted_classification=True,
+    )
+    return updated
+
+
+class TestWeightedPreservesEvidence:
+    """A weighted run merges over prior classification instead of erasing it."""
+
+    def test_weighted_run_does_not_erase_persisted_voice_and_wavelength(
+        self,
+        llm_config: LLMConfig,
+        fake_invoke: list[str],
+    ) -> None:
+        """Persisted voice confidence and wavelength descriptor survive (#1309).
+
+        The isolating red for the merge half: the stubbed response carries
+        ONLY keys the pre-fix schema already accepts, so nothing here depends
+        on the new ``confidences`` axis. At HEAD ``_classify_one_weighted``
+        replaces ``voice`` and ``wavelength`` wholesale from ``to_legacy()``,
+        which yields ``confidence=None``, ``descriptor=""`` and
+        ``mode=UNCLASSIFIED`` for a profile that said nothing about them.
+        """
+        fragment = _essay_fragment(
+            voice=VoiceClassification(
+                voice_register=VoiceRegister.ANALYTICAL,
+                confidence=Confidence.CONVICTION,
+            ),
+            wavelength=WavelengthClassification(
+                phase=Phase.RISING,
+                mode=Mode.EXPRESS,
+                color=Color.GREEN,
+                descriptor="Social Anxiety",
+            ),
+        )
+
+        # PRECONDITION, asserted rather than assumed: the rule classifier
+        # leaves all three values intact for this body, so a failure below is
+        # attributable to the weighted merge and not to rules.py destroying
+        # the evidence first.
+        pre = RuleClassifier().classify(fragment, content=_RULE_INERT_BODY)
+        assert pre.voice.confidence == Confidence.CONVICTION
+        assert pre.wavelength.descriptor == "Social Anxiety"
+        assert pre.wavelength.mode == Mode.EXPRESS
+
+        fake_invoke[0] = _weighted_yaml_payload(
+            frequencies="  - value: F6\n    weight: 0.8",
+            phases="",
+            modes="",
+            orientations="",
+            dosages="",
+            voice_registers="  - value: analytical\n    weight: 0.5",
+        )
+        updated = _run_weighted(fragment, llm_config)
+
+        # The model did say something about frequency and voice register, so
+        # those are the model's now.
+        assert updated.frequency.primary == Frequency.F6
+        assert updated.voice.voice_register == VoiceRegister.ANALYTICAL
+        # It said nothing about confidence, descriptor or mode — so the
+        # fragment's own evidence stands. At HEAD: None, "", "unclassified".
+        assert updated.voice.confidence == Confidence.CONVICTION
+        assert updated.wavelength.descriptor == "Social Anxiety"
+        assert updated.wavelength.mode == Mode.EXPRESS
+
+
+class TestWeightedPrivacyParity:
+    """One model verdict reaches one privacy tier on both classifier paths."""
+
+    def test_weighted_verdict_reaches_intimate_like_single_pick(
+        self,
+        llm_config: LLMConfig,
+        fake_invoke: list[str],
+    ) -> None:
+        """confessional+conviction reaches INTIMATE on both paths (#1309).
+
+        The primary red. Same model verdict, two code paths, one tier. At
+        HEAD the weighted arm yields OPEN for two independent reasons: the
+        schema validator rejects ``confidences:`` outright (so the call fails
+        soft and, post-#1358, hands the fragment back untouched), and even a
+        profile that carried it would be flattened by ``to_legacy``'s
+        hard-coded ``confidence=None``.
+        """
+        from creek.classify.llm.orchestrator import LLMClassifier
+
+        fragment = _essay_fragment()
+
+        # The test proves its own baseline: an essay fragment with no voice
+        # evidence is OPEN, so any INTIMATE below is a genuine escalation and
+        # not a pre-existing tier the run merely failed to lower.
+        baseline = PrivacyClassifier().classify_tier(
+            fragment,
+            content=_RULE_INERT_BODY,
+        )
+        assert baseline == PrivacyTier.OPEN
+
+        # Precondition: the rule pass contributes no voice evidence here, so
+        # both arms start from the same empty state.
+        pre = RuleClassifier().classify(fragment, content=_RULE_INERT_BODY)
+        assert pre.voice.confidence is None
+        assert pre.voice.voice_register is None
+
+        # --- weighted arm -------------------------------------------------
+        fake_invoke[0] = _weighted_yaml_payload(
+            frequencies="  - value: F6\n    weight: 0.8",
+            phases="",
+            modes="",
+            orientations="",
+            dosages="",
+            voice_registers="  - value: confessional\n    weight: 0.9",
+            confidences="  - value: conviction\n    weight: 0.9",
+        )
+        weighted_out = _run_weighted(fragment, llm_config)
+        weighted_tier = reassess(
+            weighted_out,
+            _RULE_INERT_BODY,
+            baseline=baseline,
+            classifier=PrivacyClassifier(),
+        ).privacy_tier
+
+        # --- single-pick arm, identical verdict ---------------------------
+        # The legacy path dispatches through ``_invoke_llm``, not the
+        # ``invoke_prompt`` seam the weighted path (and the ``fake_invoke``
+        # fixture) uses, so it needs its own stub.
+        from creek.classify.classify_engine import _classify_one
+
+        with patch(
+            "creek.classify.llm.LLMClassifier._invoke_llm",
+            new=lambda self, prompt: _SINGLE_PICK_CONFESSIONAL_RESPONSE,
+        ):
+            single_out, _skipped, _reasoning = _classify_one(
+                fragment=fragment,
+                body=_RULE_INERT_BODY,
+                method="llm",
+                rules=RuleClassifier(),
+                llm=LLMClassifier(config=llm_config),
+                confidence_threshold=1.0,
+                weighted_classification=False,
+            )
+        single_tier = reassess(
+            single_out,
+            _RULE_INERT_BODY,
+            baseline=baseline,
+            classifier=PrivacyClassifier(),
+        ).privacy_tier
+
+        # The escalation actually happened — asserted UP from OPEN, not
+        # merely "not lowered" (which passes at HEAD and proves nothing).
+        assert single_tier == PrivacyTier.INTIMATE
+        assert weighted_tier == PrivacyTier.INTIMATE
+        assert weighted_tier == single_tier
+        assert weighted_out.voice.confidence == Confidence.CONVICTION
+
+    @pytest.mark.parametrize(
+        "stance",
+        [Confidence.MUSING, Confidence.EXPLORING],
+    )
+    def test_tentative_confessional_does_not_reach_intimate(
+        self,
+        llm_config: LLMConfig,
+        fake_invoke: list[str],
+        stance: Confidence,
+    ) -> None:
+        """A tentative confessional stance must NOT be buried (#1309).
+
+        The escalate-only ratchet makes over-burying as much a defect as
+        under-burying: nothing ever lowers a stored tier, so a manufactured
+        INTIMATE is permanent. Only ``conviction`` is the trigger.
+        """
+        fragment = _essay_fragment()
+        fake_invoke[0] = _weighted_yaml_payload(
+            frequencies="  - value: F6\n    weight: 0.8",
+            phases="",
+            modes="",
+            orientations="",
+            dosages="",
+            voice_registers="  - value: confessional\n    weight: 0.9",
+            confidences=f"  - value: {stance.value}\n    weight: 0.9",
+        )
+        updated = _run_weighted(fragment, llm_config)
+
+        # The stance round-trips (so this is not vacuously passing because
+        # the axis was dropped)...
+        assert updated.voice.confidence == stance
+        # ...and it does not trigger the burial.
+        assert (
+            PrivacyClassifier().classify_tier(updated, content=_RULE_INERT_BODY)
+            == PrivacyTier.OPEN
+        )
+
+    def test_overall_confidence_is_not_a_confidence_axis(
+        self,
+        llm_config: LLMConfig,
+        fake_invoke: list[str],
+    ) -> None:
+        """``overall_confidence`` is never coerced into a ``Confidence`` (#1309).
+
+        They are different quantities: ``overall_confidence`` is the model's
+        self-rating of the whole classification; ``Confidence`` is ontology
+        axis 9, the *author's* stance. Conflating them would manufacture
+        intimate escalations at scale, and under the one-way ratchet that is
+        permanent burial.
+        """
+        fragment = _essay_fragment(
+            voice=VoiceClassification(
+                voice_register=VoiceRegister.CONFESSIONAL,
+                confidence=Confidence.MUSING,
+            ),
+        )
+        fake_invoke[0] = _weighted_yaml_payload(
+            frequencies="  - value: F6\n    weight: 0.8",
+            phases="",
+            modes="",
+            orientations="",
+            dosages="",
+            voice_registers="  - value: confessional\n    weight: 0.9",
+            confidences="",
+            overall_confidence=0.99,
+        )
+        updated = _run_weighted(fragment, llm_config)
+
+        # A 0.99 self-rating with no ``confidences:`` section leaves the
+        # author's stance exactly as it was — it never becomes CONVICTION.
+        assert updated.voice.confidence == Confidence.MUSING
+        assert (
+            PrivacyClassifier().classify_tier(updated, content=_RULE_INERT_BODY)
+            == PrivacyTier.OPEN
+        )
+
+    def test_rerun_is_idempotent_over_an_intimate_fragment(
+        self,
+        llm_config: LLMConfig,
+        fake_invoke: list[str],
+    ) -> None:
+        """A second weighted run preserves both the tier and its evidence.
+
+        ``classify_engine``'s stated invariant is that the escalation
+        "prevents every *future* egress" for a fragment. On the weighted path
+        at HEAD it prevents none of them: every re-run nulls the confidence
+        again, so the fragment routes to the cloud on every run rather than
+        once.
+        """
+        payload = _weighted_yaml_payload(
+            frequencies="  - value: F6\n    weight: 0.8",
+            phases="",
+            modes="",
+            orientations="",
+            dosages="",
+            voice_registers="  - value: confessional\n    weight: 0.9",
+            confidences="  - value: conviction\n    weight: 0.9",
+        )
+        fake_invoke[0] = payload
+        first = _run_weighted(_essay_fragment(), llm_config)
+        first = reassess(
+            first,
+            _RULE_INERT_BODY,
+            baseline=PrivacyTier.OPEN,
+            classifier=PrivacyClassifier(),
+        )
+        assert first.privacy_tier == PrivacyTier.INTIMATE
+
+        fake_invoke[0] = payload
+        second = _run_weighted(first, llm_config)
+        second = reassess(
+            second,
+            _RULE_INERT_BODY,
+            baseline=first.privacy_tier,
+            classifier=PrivacyClassifier(),
+        )
+
+        # Tier holds AND the evidence that justifies it is still on the
+        # fragment — a tier with its evidence erased is one re-ingest away
+        # from being unexplainable.
+        assert second.privacy_tier == PrivacyTier.INTIMATE
+        assert second.voice.confidence == Confidence.CONVICTION
+        assert second.voice.voice_register == VoiceRegister.CONFESSIONAL
+
+
+class TestMergeOnto:
+    """``merge_onto`` overlays only what the profile actually determined."""
+
+    def test_exclude_defaults_delta_is_exactly_the_determined_subset(self) -> None:
+        """Pin the delta dict that makes the whole merge correct (#1309).
+
+        ``merge_onto`` rests on one invariant: every legacy classification
+        field's default IS its "not determined" sentinel (``UNCLASSIFIED`` /
+        ``""`` / ``None``), so ``model_dump(exclude_defaults=True)`` yields
+        exactly the fields the model spoke to. If a future field lands with a
+        non-sentinel default, that invariant breaks silently and the merge
+        starts overwriting prior evidence again — so the delta is asserted
+        here explicitly rather than trusted.
+        """
+        partial = WeightedFragmentClassification(
+            phases=(WeightedDimension(value=Phase.PEAKING, weight=0.9),),
+            frequencies=(WeightedDimension(value=Frequency.F3, weight=0.9),),
+        )
+        _freq, wave, voice = partial.to_legacy()
+        assert wave.model_dump(exclude_defaults=True) == {
+            "phase": "peaking",
+            "color": "red",
+        }
+        assert voice.model_dump(exclude_defaults=True) == {}
+
+    def test_empty_profile_is_a_no_op(self) -> None:
+        """A signal-free profile overwrites nothing but ``weighted`` itself."""
+        fragment = _make_fragment(
+            frequency=FrequencyClassification(primary=Frequency.F3),
+            wavelength=WavelengthClassification(
+                phase=Phase.RISING,
+                mode=Mode.EXPRESS,
+                descriptor="Social Anxiety",
+            ),
+            voice=VoiceClassification(
+                voice_register=VoiceRegister.ANALYTICAL,
+                confidence=Confidence.CONVICTION,
+            ),
+        )
+        merged = WeightedFragmentClassification().merge_onto(fragment)
+        assert merged.frequency.primary == Frequency.F3
+        assert merged.wavelength.phase == Phase.RISING
+        assert merged.wavelength.mode == Mode.EXPRESS
+        assert merged.wavelength.descriptor == "Social Anxiety"
+        assert merged.voice.voice_register == VoiceRegister.ANALYTICAL
+        assert merged.voice.confidence == Confidence.CONVICTION
+
+    def test_determined_dimensions_win_over_prior(self) -> None:
+        """What the model DID determine replaces the prior value."""
+        fragment = _make_fragment(
+            wavelength=WavelengthClassification(phase=Phase.RISING),
+            voice=VoiceClassification(voice_register=VoiceRegister.ANALYTICAL),
+        )
+        merged = WeightedFragmentClassification(
+            phases=(WeightedDimension(value=Phase.PEAKING, weight=0.9),),
+            voice_registers=(
+                WeightedDimension(value=VoiceRegister.CONFESSIONAL, weight=0.9),
+            ),
+        ).merge_onto(fragment)
+        assert merged.wavelength.phase == Phase.PEAKING
+        assert merged.voice.voice_register == VoiceRegister.CONFESSIONAL
+
+    def test_frequencies_replace_wholesale_so_stale_secondaries_clear(self) -> None:
+        """Frequency is replaced, not merged — secondaries are a list."""
+        fragment = _make_fragment(
+            frequency=FrequencyClassification(
+                primary=Frequency.F3,
+                secondary=[Frequency.F5, Frequency.F7],
+            ),
+        )
+        merged = WeightedFragmentClassification(
+            frequencies=(WeightedDimension(value=Frequency.F6, weight=0.9),),
+        ).merge_onto(fragment)
+        assert merged.frequency.primary == Frequency.F6
+        assert merged.frequency.secondary == []
+
+
+class TestSucceededButEmptyProfile:
+    """The one destruction path #1358 did not close, and its honest stamp."""
+
+    def test_a_signal_free_verdict_preserves_the_rule_classification(
+        self,
+        llm_config: LLMConfig,
+        fake_invoke: list[str],
+    ) -> None:
+        """A model that ran and detected nothing must not erase prior work.
+
+        This case is distinct from every failure mode PR #1358 handled, and
+        it is easy to believe it was covered: ``_load_yaml_dict`` accepts a
+        payload whose keys are all allow-listed but whose sections are all
+        empty, so ``classify_weighted`` returns ``succeeded=True`` with an
+        all-default profile and sails straight past #1358's guard. Before
+        this fix that wiped every legacy field; now it is a no-op.
+
+        The ``llm`` stamp stays correct here and that is deliberate — the
+        provider really did run and really did return a parseable verdict,
+        so claiming ``rules`` would be a different lie.
+        """
+        fragment = _essay_fragment(
+            frequency=FrequencyClassification(primary=Frequency.F3),
+            wavelength=WavelengthClassification(
+                phase=Phase.RISING,
+                mode=Mode.EXPRESS,
+                descriptor="Social Anxiety",
+            ),
+            voice=VoiceClassification(
+                voice_register=VoiceRegister.ANALYTICAL,
+                confidence=Confidence.CONVICTION,
+            ),
+        )
+        fake_invoke[0] = _weighted_yaml_payload(
+            frequencies="",
+            phases="",
+            modes="",
+            orientations="",
+            dosages="",
+            voice_registers="",
+            confidences="",
+        )
+
+        from creek.classify.classify_engine import _classify_one
+
+        updated, was_skipped, _reasoning = _classify_one(
+            fragment=fragment,
+            body=_RULE_INERT_BODY,
+            method="llm",
+            rules=RuleClassifier(),
+            llm=cast("LLMClassifier", _WeightedOnlyLLM(llm_config)),
+            confidence_threshold=1.0,
+            weighted_classification=True,
+        )
+
+        # Every prior field stands.
+        assert updated.frequency.primary == Frequency.F3
+        assert updated.wavelength.phase == Phase.RISING
+        assert updated.wavelength.mode == Mode.EXPRESS
+        assert updated.wavelength.descriptor == "Social Anxiety"
+        assert updated.voice.voice_register == VoiceRegister.ANALYTICAL
+        assert updated.voice.confidence == Confidence.CONVICTION
+        # The empty-but-real verdict is still recorded, and the run is NOT a
+        # skip: the LLM was genuinely invoked.
+        assert updated.weighted == WeightedFragmentClassification(
+            overall_confidence=0.7,
+            reasoning="The fragment lands at F3 / Red, rising into expression.",
+        )
+        assert was_skipped is False
+
+
+class TestWeightedBackwardCompatibility:
+    """Fragments written by the pre-#1309 pipeline still load."""
+
+    def test_pre_fix_weighted_block_validates_with_empty_confidences(self) -> None:
+        """An on-disk ``weighted:`` block with no ``confidences`` key loads."""
+        pre_fix: dict[str, object] = {
+            "frequencies": [{"value": "F3", "weight": 0.8}],
+            "phases": [{"value": "rising", "weight": 0.7}],
+            "modes": [{"value": "express", "weight": 0.6}],
+            "orientations": [],
+            "dosages": [],
+            "voice_registers": [{"value": "analytical", "weight": 0.5}],
+            "overall_confidence": 0.7,
+            "reasoning": "written before the confidences axis existed",
+        }
+        loaded = WeightedFragmentClassification.model_validate(pre_fix)
+        assert loaded.confidences == ()
+        assert loaded.frequencies == (
+            WeightedDimension(value=Frequency.F3, weight=0.8),
+        )
+
+    def test_pre_fix_fragment_frontmatter_round_trips(self) -> None:
+        """A whole Fragment carrying a pre-fix ``weighted`` block round-trips."""
+        fragment = _make_fragment(
+            weighted=WeightedFragmentClassification(
+                frequencies=(WeightedDimension(value=Frequency.F3, weight=0.8),),
+            ),
+        )
+        dumped = fragment.model_dump(mode="json")
+        assert "confidences" in dumped["weighted"]
+        reloaded = Fragment.model_validate(dumped)
+        assert reloaded.weighted is not None
+        assert reloaded.weighted.confidences == ()
+
+    def test_response_without_confidences_parses_to_empty(self) -> None:
+        """A model that omits the new section collapses to ``()``, not an error."""
+        parsed = parse_weighted_yaml(
+            "frequencies:\n  - value: F3\n    weight: 0.8\noverall_confidence: 0.7",
+        )
+        assert parsed.confidences == ()
+
+    def test_malformed_confidences_collapse_to_empty(self) -> None:
+        """A bogus stance value is dropped rather than raising."""
+        parsed = parse_weighted_yaml(
+            "confidences:\n  - value: not-a-stance\n    weight: 0.9\n"
+            "overall_confidence: 0.7",
+        )
+        assert parsed.confidences == ()
+
+
+class TestWeightedDownstreamConsumers:
+    """Restoring confidence unbreaks the readers the nulling silently broke."""
+
+    def test_fully_classified_weighted_fragment_is_not_flagged_for_review(
+        self,
+        llm_config: LLMConfig,
+        fake_invoke: list[str],
+    ) -> None:
+        """``ReviewQueueGenerator.needs_review`` stops flagging every fragment.
+
+        At HEAD every weighted-classified fragment tripped the
+        ``voice.confidence is None`` branch, so the review queue filled with
+        fragments whose only defect was the classifier erasing its own
+        evidence. ``conviction`` is used deliberately: ``musing`` and
+        ``exploring`` are in ``_LOW_CONFIDENCE_LEVELS`` and legitimately
+        still flag.
+        """
+        from creek.classify.review import ReviewQueueGenerator
+
+        fake_invoke[0] = _weighted_yaml_payload(
+            frequencies="  - value: F6\n    weight: 0.8",
+            voice_registers="  - value: analytical\n    weight: 0.9",
+            confidences="  - value: conviction\n    weight: 0.9",
+        )
+        updated = _run_weighted(_essay_fragment(), llm_config)
+        assert updated.voice.confidence == Confidence.CONVICTION
+        assert ReviewQueueGenerator().needs_review(updated) is False
+
+    def test_weighted_fragment_counts_as_fully_classified_for_voice_corpus(
+        self,
+        llm_config: LLMConfig,
+        fake_invoke: list[str],
+    ) -> None:
+        """``generate.voice._is_fully_classified`` returns True (#1309).
+
+        This test passes only because the merge fixed the WAVELENGTH half as
+        well as the voice half: ``_is_fully_classified`` also requires
+        ``wavelength.mode != UNCLASSIFIED``. Silently returning False here is
+        how a fully-classified fragment was dropped from the voice-exemplar
+        corpus without any error surfacing.
+        """
+        from creek.generate.voice import _is_fully_classified
+
+        fake_invoke[0] = _weighted_yaml_payload(
+            frequencies="  - value: F6\n    weight: 0.8",
+            phases="  - value: rising\n    weight: 0.7",
+            modes="  - value: express\n    weight: 0.6",
+            voice_registers="  - value: analytical\n    weight: 0.9",
+            confidences="  - value: conviction\n    weight: 0.9",
+        )
+        updated = _run_weighted(_essay_fragment(), llm_config)
+        assert _is_fully_classified(updated) is True

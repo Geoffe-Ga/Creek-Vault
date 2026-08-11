@@ -686,10 +686,19 @@ class ClassificationConfig(BaseModel):
     actually reaches the LLM also gets a
     :class:`~creek.classify.weighted.WeightedFragmentClassification`
     persisted to :attr:`Fragment.weighted`; the legacy single-pick
-    fields are derived from the top weighted entries via
-    :meth:`WeightedFragmentClassification.to_legacy` so downstream
-    consumers (lint, compile, voice-skill generation) keep working
-    unchanged.
+    fields are derived from the top weighted entries so downstream
+    consumers (lint, compile, voice-skill generation) keep reading a
+    canonical pick.
+
+    Those derived fields are **merged** over the fragment via
+    :meth:`WeightedFragmentClassification.merge_onto`, not written over
+    it: a dimension the model said nothing about keeps whatever value
+    the fragment already carried. That, plus the author-stance
+    (``confidences``) axis added alongside it, is what makes the
+    weighted path reach the **same privacy tier as the single-pick
+    path for the same model verdict** — before #1309 a
+    confessional+conviction verdict escalated to INTIMATE on the
+    single-pick path and stayed OPEN here.
 
     Rule-confident fragments are NOT re-classified —
     :attr:`Fragment.weighted` stays ``None`` for those even with this

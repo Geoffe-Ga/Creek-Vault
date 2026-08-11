@@ -244,6 +244,47 @@ class TestBuildPromptOntologyPrompt:
 # ---- Response parser ----
 
 
+class TestConfidencesIsDeliberatelyNotDetected:
+    """The prompt-level twin drops the author-stance axis on purpose (#1309)."""
+
+    def test_template_does_not_request_confidences(self) -> None:
+        """The operator-seed prompt must not ask for an author stance.
+
+        Issue #1309 added a ``confidences`` axis to the *fragment* classifier,
+        whose YAML schema this module shares. It was deliberately NOT added
+        here: ``Confidence`` is ontology axis 9, the stance an author takes
+        toward their own claim, and an operator-supplied essay seed has no
+        author whose stance could be detected.
+
+        This half of the test is what stops the pair being vacuous. The field
+        copy in ``parse_prompt_ontology_response`` is hand-written, so the
+        dropping below is structural and cannot regress on its own — but
+        nothing structural stops a future edit adding ``confidences:`` to this
+        template and quietly asking the model for a value nobody consumes.
+        """
+        assert "confidences" not in PROMPT_ONTOLOGY_TEMPLATE
+
+    def test_a_confidences_section_is_dropped_not_rejected(self) -> None:
+        """A response carrying the shared key parses cleanly and ignores it.
+
+        The two modules share ``_ALLOWED_TOP_LEVEL_KEYS``, so widening it for
+        the fragment classifier necessarily makes ``confidences:`` legal here
+        too. That must be tolerated rather than fatal: a model that volunteers
+        the section should not take the whole detection down with it.
+        """
+        payload = _yaml_payload().replace(
+            "overall_confidence:",
+            "confidences:\n  - value: conviction\n    weight: 0.9\noverall_confidence:",
+        )
+        ontology = parse_prompt_ontology_response(payload, prompt="seed")
+        # Parsed, not rejected — the other dimensions still land.
+        assert ontology.frequencies == (
+            WeightedDimension(value=Frequency.F3, weight=0.8),
+        )
+        # And the volunteered axis is simply not carried onto PromptOntology.
+        assert not hasattr(ontology, "confidences")
+
+
 class TestParsePromptOntologyResponse:
     """Tests for parsing the LLM's YAML response into :class:`PromptOntology`."""
 
