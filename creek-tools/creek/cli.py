@@ -30,6 +30,7 @@ from creek.consent import ConsentManager
 from creek.models import PraxisPotential, PrivacyTier
 from creek.pipeline import (
     Pipeline,
+    PipelineResult,
     RedactionRequiredError,
     SymlinkEscapedSourceError,
     resolve_tier_a_plan,
@@ -1271,6 +1272,11 @@ def process(
         consent_manager=consent_manager,
         no_llm=no_llm,
     )
+
+    # Deferred, like every other heavy import in this module: nothing may
+    # be imported at CLI import time that builds a Rich console (#1141).
+    from creek.link import EmbeddingModelUnavailableError
+
     try:
         result = pipeline.run(source_path=source_path, vault_path=vault_path)
     except RedactionRequiredError as exc:
@@ -1286,11 +1292,20 @@ def process(
         # refusal rather than a traceback (#1294).
         console.print(f"[red]Symlink containment: {exc}[/red]")
         raise typer.Exit(code=1) from exc
+    except EmbeddingModelUnavailableError as exc:
+        # The deleted ``LinkingPipeline`` already loaded the model, so
+        # this failure was always *reachable* from ``creek process`` — it
+        # was simply never handled, and surfaced as a traceback. #1303
+        # gives it the same treatment ``creek link`` has always had: the
+        # exception message names the model and spells out the
+        # remediation, so print it verbatim and exit non-zero.
+        console.print(f"[red]Embedding linker aborted: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
 
     console.print(f"[bold]Files scanned:[/bold] {result.files_scanned}")
     console.print(f"[bold]Fragments created:[/bold] {result.fragments_created}")
     console.print(f"[bold]Classifications made:[/bold] {result.classifications_made}")
-    console.print(f"[bold]Links found:[/bold] {result.links_found}")
+    _print_link_summaries(result)
     console.print(f"[bold]Indexes generated:[/bold] {result.indexes_generated}")
     console.print(
         f"[bold]Deterministic:[/bold] {result.deterministic_classified} classified | "
@@ -2166,6 +2181,28 @@ def link(
     console.print(_format_link_summary(summary))
 
 
+def _print_link_summaries(result: PipelineResult) -> None:
+    """Print what ``creek process`` actually persisted at its link stage.
+
+    Replaces the single ``Links found: N`` line, which was the operator-
+    facing face of #1303: it summed four in-memory counts — two of which
+    (resonance and temporal edges) nothing in this codebase can persist —
+    over a graph the pipeline then discarded. The per-stage phrasing is
+    :func:`_format_link_summary`, shared verbatim with ``creek link``, so
+    the two entry points describe the same work the same way. The trailing
+    total is ``PipelineResult.links_found``, which counts pages written.
+
+    Extracted rather than inlined: ``process`` is already long and
+    xenon's ``--max-modules B`` bites on this module's aggregate.
+
+    Args:
+        result: The completed pipeline result.
+    """
+    for summary in result.link_summaries:
+        console.print(_format_link_summary(summary))
+    console.print(f"[bold]Link artefacts persisted:[/bold] {result.links_found}")
+
+
 def _format_link_summary(summary: LinkSummary) -> str:
     """Render a method-specific summary message for the ``creek link`` CLI.
 
@@ -2187,9 +2224,14 @@ def _format_link_summary(summary: LinkSummary) -> str:
     """
     fragments = summary.fragment_count
     if summary.method == "embeddings":
+        # #1303: the previous wording claimed the *edges* were cached in
+        # the parquet. Only the vectors are — the similarity edges are
+        # computed in memory and dropped, because there is no Resonance
+        # writer and Fragment has no ``resonances`` field.
         body = (
             f"Embeddings linker: {fragments} fragment(s) embedded, "
-            f"{summary.similarity_edges} similarity edge(s) cached in "
+            f"{summary.similarity_edges} similarity edge(s) computed in memory "
+            f"(not persisted — no resonance writer exists); vectors cached in "
             f"00-Creek-Meta/embeddings.parquet."
         )
     elif summary.method == "eddies":
@@ -2202,8 +2244,11 @@ def _format_link_summary(summary: LinkSummary) -> str:
             f"{_format_cluster_stats(summary)}."
         )
     elif summary.method == "temporal":
+        # #1303: same honesty fix. The temporal linker writes nothing at
+        # all — no page, no frontmatter, not even a cache.
         body = (
-            f"Temporal linker: {fragments} fragment(s), {summary.link_count} link(s)."
+            f"Temporal linker: {fragments} fragment(s), {summary.link_count} "
+            f"link(s) computed in memory, not persisted."
         )
     elif summary.method == "threads":
         body = (

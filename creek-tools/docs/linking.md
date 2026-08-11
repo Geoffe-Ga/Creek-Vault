@@ -22,16 +22,9 @@ creek link --vault ~/Obsidian/Creek-Vault --method eddies
 
 ## Resonances (embeddings)
 
-`creek.link.embeddings.EmbeddingLinker` encodes each fragment's body with a sentence-transformer model and emits a resonance edge whenever the cosine similarity exceeds `EmbeddingsConfig.similarity_threshold`. Resonance edges live in the fragment's frontmatter:
+`creek.link.embeddings.EmbeddingLinker` encodes each fragment's title with a sentence-transformer model and emits a resonance edge whenever the cosine similarity exceeds `EmbeddingsConfig.similarity_threshold`.
 
-```yaml
-links:
-  resonances:
-    - fragment_id: frag-9c1f3a2b8e02
-      score: 0.87
-      method: embeddings
-      generated_at: 2026-04-28T17:35:00Z
-```
+> **Resonance edges are not persisted.** They are computed in memory, counted, and dropped. There is no resonance writer anywhere in the codebase and `Fragment` has no `resonances` field — only `threads` and `eddies`. The only thing `--method embeddings` writes is the vector cache at `00-Creek-Meta/embeddings.parquet`, which the `threads` and `eddies` linkers then reuse. Earlier revisions of this page documented a `links: resonances:` frontmatter block; no version of Creek has ever written one. Persisting resonances is unbuilt work, not a regression.
 
 ### Tuning
 
@@ -155,6 +148,25 @@ Re-clustering and discards are only mentioned when they happened:
 … largest cluster: 480 fragment(s), 2 oversized cluster(s) re-clustered,
 61 fragment(s) discarded as unsplittable.
 ```
+
+## What `creek process` runs
+
+`creek process`'s link stage is not a fifth linker — it calls the same `run_link` entry point this page documents, twice, in this order:
+
+```
+creek link --method eddies      # then
+creek link --method threads
+```
+
+Three consequences worth knowing:
+
+- **`embeddings` and `temporal` are not run.** Neither persists anything a subsequent stage needs: `temporal` writes nothing at all, and the vector cache `embeddings` would warm is written by the `eddies` pass anyway. Running them would only add the O(n²) `find_resonances` pass for a result nothing can store. Run `creek link --method embeddings` explicitly if you want the resonance count reported.
+- **The scope is the whole vault, not the files you just ingested.** `run_link` reloads every fragment under `01-Fragments/`, which is the only way a new note can join an eddy of older notes and the only way membership-derived cluster ids stay coherent. The cost is one DBSCAN pass plus one union-find pass per `creek process`.
+- **The two calls stay two calls deliberately.** Frontmatter is rewritten from the whole in-memory fragment model, so a stage that ran off a shared, once-loaded fragment list would overwrite the other stage's wiki-links with an empty list. Each call re-reads what the previous one wrote.
+
+### Stale pages on a growing corpus
+
+Eddy and thread ids are derived from their sorted member fragment ids. That is what makes re-running idempotent on an *unchanged* corpus — the same membership re-mints the same id and the same filename. But when membership changes (you ingest one more note into a cluster) the id changes too, so a **new** page is written and the previous one is left behind, orphaned, with no fragment linking to it. On the `creek link` path that is an occasional manual annoyance; with `creek process` on a schedule it accumulates. `creek lint`'s broken-links check is the current detector; there is no reaper yet.
 
 ## Cost / cadence
 

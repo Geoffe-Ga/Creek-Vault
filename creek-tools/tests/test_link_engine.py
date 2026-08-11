@@ -859,3 +859,81 @@ def test_run_link_honours_configured_stream_platforms(tmp_path: Path) -> None:
     )
     assert unsegmented.eddies_detected == 1
     assert unsegmented.largest_cluster_fragments == len(fragments)
+
+
+def test_embedding_pass_splits_computed_from_reused(tmp_path: Path) -> None:
+    """``EmbeddingPass`` must distinguish fresh vectors from cache hits.
+
+    The distinction is what ``creek process`` bills ``local_model_processed``
+    against (#1303). Before it existed, the only number available to a
+    caller was ``len(fragments)``, which counted every cache hit as
+    local-model work the run never actually did.
+    """
+    from creek.link.link_engine import _load_or_compute_embeddings
+
+    vault = tmp_path / "vault"
+    first = Fragment(
+        id="frag-embedpass01",
+        title="First embedded fragment",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(vault=vault, fragment=first, body="body")
+    cache_path = embeddings_cache_path(vault)
+
+    cold = _load_or_compute_embeddings(
+        fragments=[first],
+        config=CreekConfig(),
+        cache_path=cache_path,
+    )
+    assert cold.computed == 1
+    assert cold.reused == 0
+    assert set(cold.vectors) == {first.id}
+
+    second = Fragment(
+        id="frag-embedpass02",
+        title="Second embedded fragment",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    warm = _load_or_compute_embeddings(
+        fragments=[first, second],
+        config=CreekConfig(),
+        cache_path=cache_path,
+    )
+    assert warm.computed == 1, "only the new fragment should have been embedded"
+    assert warm.reused == 1
+    assert set(warm.vectors) == {first.id, second.id}
+
+
+def test_run_link_reports_fragments_embedded_per_method(tmp_path: Path) -> None:
+    """Every method's summary reports the vectors that pass actually computed.
+
+    ``eddies`` and ``threads`` both load embeddings, so the first of the
+    two to run pays for them and the second reports zero. ``creek process``
+    relies on exactly that to avoid double-counting Pass-2 work (#1303).
+    """
+    vault = tmp_path / "vault"
+    for index in range(3):
+        _write_fragment(
+            vault=vault,
+            fragment=Fragment(
+                id=f"frag-embedcount{index}",
+                title=f"Counted fragment {index}",
+                source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+            ),
+            body="body",
+        )
+
+    first = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="eddies",
+        rebuild=False,
+    )
+    second = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="threads",
+        rebuild=False,
+    )
+    assert first.fragments_embedded == 3
+    assert second.fragments_embedded == 0

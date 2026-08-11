@@ -56,7 +56,7 @@ def _frequency_only_detection(
     monkeypatch.setattr(
         link_engine,
         "_load_or_compute_embeddings",
-        lambda **_kwargs: {},
+        lambda **_kwargs: link_engine.EmbeddingPass(vectors={}, computed=0, reused=0),
     )
     yield
 

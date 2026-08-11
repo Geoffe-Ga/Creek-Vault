@@ -17,6 +17,8 @@ import pytest
 
 from creek.config import CreekConfig
 from creek.consent import ConsentManager
+from creek.link.link_engine import LinkSummary
+from creek.models import Fragment, FragmentSource, SourcePlatform
 from creek.pipeline import Pipeline, PipelineResult
 from creek.redact import ScanSummary
 
@@ -127,6 +129,30 @@ class TestPipelineResult:
         assert data["files_scanned"] == 2
         assert data["indexes_generated"] == 4
 
+    def test_link_summaries_default_and_round_trip(self):
+        """``link_summaries`` defaults empty and survives ``model_dump``.
+
+        ``LinkSummary`` is a frozen stdlib dataclass, not a pydantic model,
+        so this pins that pydantic can carry and dump it — the field is
+        what lets the CLI print per-stage persistence facts instead of one
+        undifferentiated ``Links found: N`` (#1303).
+        """
+        assert PipelineResult().link_summaries == []
+        result = PipelineResult(
+            link_summaries=[
+                LinkSummary(
+                    method="eddies",
+                    fragment_count=4,
+                    link_count=1,
+                    eddies_detected=1,
+                    eddies_written=1,
+                ),
+            ],
+        )
+        dumped = result.model_dump()["link_summaries"]
+        assert dumped[0]["method"] == "eddies"
+        assert dumped[0]["eddies_written"] == 1
+
     def test_is_pydantic_model(self):
         """Test that PipelineResult is a Pydantic BaseModel, not a dataclass."""
         from pydantic import BaseModel
@@ -162,10 +188,19 @@ class TestPipelineInit:
         pipeline = Pipeline(config=config)
         assert pipeline.review_generator is not None
 
-    def test_creates_linking_pipeline(self, config):
-        """Test that Pipeline initialises a LinkingPipeline."""
+    def test_holds_no_second_linking_orchestrator(self, config):
+        """Pipeline must not own a private, non-persisting linker (#1303).
+
+        Replaces ``test_creates_linking_pipeline``, which asserted the
+        opposite: that ``Pipeline`` builds its own ``LinkingPipeline``.
+        That object was the defect — it computed the whole link graph and
+        wrote nothing. Stage 5 now delegates to
+        :func:`creek.link.link_engine.run_link`, the same entry point
+        ``creek link`` uses, so an attribute reappearing here would mean
+        the second code path had come back.
+        """
         pipeline = Pipeline(config=config)
-        assert pipeline.linking_pipeline is not None
+        assert not hasattr(pipeline, "linking_pipeline")
 
     def test_stores_config(self, config):
         """Test that Pipeline stores the provided config."""
@@ -423,8 +458,51 @@ class TestPipelineWithFragments:
         pipeline = Pipeline(config=config)
         with patch("creek.pipeline.INGESTOR_REGISTRY", registry):
             result = pipeline.run(source_path=source_path, vault_path=vault_path)
-        # Linking returns counts (may be 0 with stubs, but it ran)
-        assert result.links_found >= 0
+        # Linking ran both persisting stages, and the headline number is
+        # exactly what they wrote (#1303) — never a detected-only count.
+        assert [s.method for s in result.link_summaries] == ["eddies", "threads"]
+        assert result.links_found == sum(
+            s.eddies_written + s.threads_written for s in result.link_summaries
+        )
+
+    def test_links_found_counts_written_not_detected(
+        self, config, vault_path, source_path
+    ):
+        """A cluster the writer failed on must not be reported as persisted.
+
+        The two counts coincide on every happy path, so an identity
+        assertion against ``*_written`` cannot tell the two apart. This
+        forces them apart: three clusters detected, one written. The
+        honesty ratchet of #1303 only holds if the headline follows the
+        smaller number.
+        """
+        registry = self._make_mock_ingestor_registry(source_path)
+        pipeline = Pipeline(config=config)
+        partial = [
+            LinkSummary(
+                method="eddies",
+                fragment_count=9,
+                link_count=2,
+                eddies_detected=2,
+                eddies_written=1,
+            ),
+            LinkSummary(
+                method="threads",
+                fragment_count=9,
+                link_count=1,
+                threads_detected=1,
+                threads_written=0,
+            ),
+        ]
+        with (
+            patch("creek.pipeline.INGESTOR_REGISTRY", registry),
+            patch.object(Pipeline, "_run_linking", return_value=partial),
+        ):
+            result = pipeline.run(source_path=source_path, vault_path=vault_path)
+        assert result.links_found == 1, (
+            "links_found must count pages that reached disk (1), not clusters "
+            "the detector found (3)"
+        )
 
     def test_review_queue_generated(self, config, vault_path, source_path):
         """Test that review queue markdown is generated for fragments."""
@@ -631,11 +709,68 @@ class TestPipelinePrivateMethods:
         assert classified == []
 
     def test_run_linking_no_fragments(self, config, vault_path):
-        """Test _run_linking returns 0 for no fragments."""
+        """_run_linking must short-circuit — and not touch the vault — on []."""
         pipeline = Pipeline(config=config)
         result = PipelineResult()
-        count = pipeline._run_linking([], vault_path, result)
-        assert count == 0
+        with patch("creek.pipeline.run_link") as mock_run_link:
+            summaries = pipeline._run_linking([], vault_path, result)
+        assert summaries == []
+        # An ingest that produced nothing must not re-cluster the whole
+        # corpus: run_link reloads every fragment under 01-Fragments/.
+        mock_run_link.assert_not_called()
+        assert result.local_model_processed == 0
+
+    def test_run_linking_runs_eddies_then_threads(self, config, vault_path):
+        """Stage 5 runs exactly two methods, in an order that is load-bearing.
+
+        The order is not cosmetic. ``run_link`` reloads fragments from disk
+        on every call, and ``_persist_fragment_link_updates`` rewrites all
+        Fragment-owned frontmatter keys from the in-memory model — so the
+        two calls must stay two calls, each re-reading what the previous
+        one wrote. Collapsing them into one shared load would make the
+        second stage erase the first stage's wiki-links (#1303).
+        """
+        pipeline = Pipeline(config=config)
+        result = PipelineResult()
+        fragment = Fragment(
+            id="frag-abcdef123456",
+            title="Anything",
+            source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        )
+        summaries = pipeline._run_linking([fragment], vault_path, result)
+        assert [s.method for s in summaries] == ["eddies", "threads"]
+
+    def test_run_linking_counts_only_computed_vectors(self, config, vault_path):
+        """``local_model_processed`` counts vectors, not fragments (#1303).
+
+        It used to be ``+= len(fragments)``, which billed the run for every
+        fragment handed to the linker whether or not the model ran. With a
+        warm parquet cache almost none of them are re-embedded.
+        """
+        pipeline = Pipeline(config=config)
+        result = PipelineResult()
+        fragment = Fragment(
+            id="frag-abcdef123456",
+            title="Anything",
+            source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        )
+        summaries = [
+            LinkSummary(
+                method="eddies",
+                fragment_count=99,
+                link_count=0,
+                fragments_embedded=7,
+            ),
+            LinkSummary(
+                method="threads",
+                fragment_count=99,
+                link_count=0,
+                fragments_embedded=0,
+            ),
+        ]
+        with patch("creek.pipeline.run_link", side_effect=summaries):
+            pipeline._run_linking([fragment], vault_path, result)
+        assert result.local_model_processed == 7
 
     def test_run_indexing_creates_files(self, config, vault_path):
         """Test _run_indexing returns count of generated files."""
@@ -730,20 +865,27 @@ class TestPipelineIntegration:
         # Markdown ingestor finds .md files
         assert result.fragments_created >= 3
         assert result.classifications_made >= 3
-        # Linking now runs against real fragment metadata. The mock
-        # SentenceTransformer in conftest.py is deterministic within a
-        # single pytest process (seeded by hash() of each fragment's
-        # content), so the count is stable across re-runs but its
-        # absolute value depends on PYTHONHASHSEED. We bound it to a
-        # sane envelope rather than pin an exact number: the lower
-        # bound catches "linker silently skipped"; the upper bound
-        # catches "linker exploded into N^2 spam links".
+        # #1303: the old bound here was ``links_found <=
+        # fragments_created ** 2``, which assumed the link stage only ever
+        # saw this run's fragments and counted pairwise edges. Stage 5 now
+        # delegates to ``run_link``, which reloads the whole vault and
+        # reports *persisted pages*. The identity below is the honest
+        # replacement: the headline number is exactly the sum of what the
+        # per-stage summaries say reached disk, so an inflated headline
+        # can no longer hide behind a loose envelope.
         assert isinstance(result.links_found, int)
-        assert 0 <= result.links_found <= result.fragments_created**2
+        assert result.links_found == sum(
+            s.eddies_written + s.threads_written for s in result.link_summaries
+        )
+        assert [s.method for s in result.link_summaries] == ["eddies", "threads"]
         # Indexes should be generated
         assert result.indexes_generated >= 4
 
-        # Verify vault structure populated
+        # Verify vault structure populated. NOTE: these two are
+        # IndexGenerator artefacts (Stage 6), NOT link-stage evidence —
+        # they were green throughout #1303, when Stage 5 persisted
+        # nothing at all. Real link pages are asserted in
+        # tests/e2e/test_full_pipeline_linking.py.
         assert (vault_path / "02-Threads" / "Thread-Index.md").exists()
         assert (vault_path / "03-Eddies" / "Eddy-Map.md").exists()
         assert (vault_path / "00-Creek-Meta" / "Temporal-Index.md").exists()

@@ -70,7 +70,9 @@ Run the full pipeline:
 creek process --source /tmp/creek-smoke --vault ~/Obsidian/Creek-Vault
 ```
 
-`creek process` chains `ingest → redact → classify → link → index`. When it completes you should see:
+`creek process` chains `ingest → redact → classify → link → index`. Its link stage persists eddy pages under `03-Eddies/`, thread pages under `02-Threads/{Active,Dormant,Resolved}/`, the matching `eddies:`/`threads:` wiki-links on each member fragment, and the embedding vector cache at `00-Creek-Meta/embeddings.parquet`. It does **not** produce resonance or temporal edges — those are computed only by `creek link --method embeddings|temporal`, and neither is written to the vault (see [linking.md](linking.md)). The link stage runs over the **whole vault**, not just the files this run ingested, so a new note can join an existing eddy.
+
+When it completes you should see:
 
 - A new fragment under `01-Fragments/` with deterministic frontmatter (`fragment_id`, `source.platform`, `ingested`, classification stubs).
 - An entry in the review queue (printed by `creek review`) if the classifier wasn't confident.
