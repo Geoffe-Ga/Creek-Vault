@@ -338,6 +338,15 @@ class TagGardenGenerator:
         and suggestion generation, then writes the output to
         ``00-Creek-Meta/Tag-Garden.md`` and persists history.
 
+        ``00-Creek-Meta/`` is created on demand (#1318). This was the one
+        report write site that assumed its folder already existed, so on a
+        vault that had never been scaffolded ``creek report --type tags``
+        died with a raw ``FileNotFoundError`` while every sibling generator
+        succeeded — the #1231 convention, "every write target is created on
+        demand", had never been applied here. The folder name is a literal,
+        not operator input, so nothing beyond one known subdirectory of the
+        already-resolved vault is ever conjured.
+
         Returns:
             Path to the generated Tag-Garden.md file.
         """
@@ -359,6 +368,7 @@ class TagGardenGenerator:
         }
 
         output_path = self.vault_path / "00-Creek-Meta" / "Tag-Garden.md"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(_build_note(front, body), encoding="utf-8")
 
         self._save_history(scan)
