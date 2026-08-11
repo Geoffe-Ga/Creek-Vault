@@ -20,9 +20,25 @@ accepts both spellings is a parser two implementations will disagree about.
 published status set ``{200, 401, 403, 404, 409, 422, 500, 501, 503}``, and a
 conforming client maps an out-of-set status to "unreachable" — losing the vault
 entirely over a wrong verb. It would also publish which verbs a path serves,
-which is a small enumeration primitive. So Starlette's ``HTTPException`` is
-handled here and both the unmatched path and the method mismatch become ``404
-not_found``.
+which is a small enumeration primitive. So the dispatch to :func:`_routing_miss`
+is keyed on the two *statuses* that mean "no such route", ``404`` and ``405``,
+and both the unmatched path and the method mismatch become ``404 not_found``.
+
+**Keyed on the status, not on the exception class (#1127).** Registered against
+:class:`starlette.exceptions.HTTPException` itself, *every* one of them became
+``404 not_found``, which did two kinds of harm. It made a published promise
+false — ``not_found`` is documented as a *routing* code, never emitted for a
+vault object — and, less visibly, it **swallowed the fault**: masked at the
+handler, the exception never reached
+:class:`~creek_mcp.httpapi.middleware.boundary.ErrorBoundaryMiddleware`, so it
+was logged nowhere. That is the un-diagnosable ``500`` #1122 was filed to end,
+wearing a ``404``. The corollary is the whole design: **in this contract
+refusals are returned, never raised** — every published refusal is a ``return
+error_response(...)`` — so the only legitimate raiser of ``HTTPException`` is
+Starlette's own router, at ``404`` or ``405``. Anything else is by construction
+a bug in this server, and a bug is a ``500``. :func:`_not_a_routing_miss`
+therefore holds the class key and does nothing but re-raise, sending the fault
+up to the error boundary to be logged and enveloped there.
 
 This module is therefore the **only** one in :mod:`creek_mcp.httpapi` that names
 :attr:`~creek_mcp.api.models.ErrorCode.NOT_FOUND`, and an AST guard pins that.
@@ -37,14 +53,14 @@ version of that guard — an allowlist over every construction site in
 from __future__ import annotations
 
 from functools import update_wrapper
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final, NoReturn
 
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.routing import Route
 
-from creek_mcp.api.models import SUPPORTED_CONTRACT_MINORS, ErrorCode
+from creek_mcp.api.models import ERROR_STATUS, SUPPORTED_CONTRACT_MINORS, ErrorCode
 from creek_mcp.api.routes import CONTRACT_VERSION_HEADER, ROUTES
 from creek_mcp.httpapi import handlers
 from creek_mcp.httpapi.auth import BearerAuthMiddleware, build_verifier
@@ -73,6 +89,22 @@ if TYPE_CHECKING:
     from creek_mcp.httpapi.handlers import Handler
     from creek_mcp.remote_auth import ConsumerTokenVerifier
     from creek_mcp.tools.reflect import _LLMFactory
+
+METHOD_NOT_ALLOWED: Final[int] = 405
+"""The status Starlette's router raises on a verb mismatch.
+
+Spelled as a literal precisely because the contract has **no**
+:class:`~creek_mcp.api.models.ErrorCode` for it. ``405`` is outside the
+published status set ``{200, 401, 403, 404, 409, 422, 500, 501, 503}`` *on
+purpose* — see the module docstring for why a method miss must be
+indistinguishable from a path miss — so there is no table to derive it from,
+and inventing a code to derive it from would put it back in the set.
+
+Its sibling key is written ``ERROR_STATUS[ErrorCode.NOT_FOUND]`` rather than a
+bare ``404`` for the mirror-image reason: that status *does* have a table, and
+the key dispatch matches on must not be able to drift from the code
+:func:`_routing_miss` renders.
+"""
 
 
 def _speaks_a_served_minor(request: Request) -> bool:
@@ -149,17 +181,71 @@ def _route_for(spec: RouteSpec) -> Route:
 async def _routing_miss(request: Request, _exc: Exception) -> Response:
     """Render an unmatched path or a mismatched method as ``404 not_found``.
 
+    Registered against the two routing statuses rather than against
+    :class:`~starlette.exceptions.HTTPException`, so this handler can only ever
+    be entered at ``404`` or ``405``. The "status deliberately unread" claim
+    below used to rest on the author's restraint; status-keyed dispatch makes it
+    structural, because there is no longer any other status that can arrive.
+
     Args:
         request: The request in flight.
-        _exc: The ``HTTPException`` Starlette's router raised. Deliberately
-            unread: its status code (``404`` or ``405``) and its ``Allow``
-            header are exactly the two facts that must not reach the caller.
+        _exc: The ``HTTPException`` that carried one of the two routing
+            statuses here. Deliberately unread: its status code (``404`` or
+            ``405``) and its ``Allow`` header are exactly the two facts that
+            must not reach the caller, and reading the status could now only
+            re-derive the key dispatch already matched on.
 
     Returns:
         The published routing refusal, carrying the standing ``Vary`` like
         every other response.
     """
     return error_response(ErrorCode.NOT_FOUND, context_of(request.scope))
+
+
+async def _not_a_routing_miss(_request: Request, exc: Exception) -> NoReturn:
+    """Re-raise an ``HTTPException`` that is not a routing miss, untouched.
+
+    This handler exists to *displace* Starlette's own class-keyed default, not
+    to answer anything. Leaving that default in place — the "just let it take
+    its own path" reading — was probed against the real stack and answers a
+    raised ``403`` as ``403``, ``content-type: text/plain``, no ``Vary``, and
+    the exception's ``detail`` verbatim as the body. Four contract violations at
+    once: the wrong envelope, the standing ``Vary`` that
+    :mod:`creek_mcp.httpapi.errors` exists to make unconditional now absent, an
+    author-written string on the wire where the contract guarantees only
+    constants from :data:`~creek_mcp.api.models.ERROR_MESSAGES`, and a status
+    outside the published set. So that repair is refused.
+
+    Re-raising is what is left, and it is also what is wanted. The fault escapes
+    Starlette's ``ExceptionMiddleware``,
+    :class:`~creek_mcp.httpapi.middleware.boundary.ErrorBoundaryMiddleware`
+    catches it, logs the traceback on ``creek_mcp.httpapi.error``, and renders
+    ``500 internal_error`` through the single ``error_response`` builder: no
+    second envelope construction site, no duplicated logging, and an operator
+    who gets the traceback for what is, by the module docstring's argument,
+    always a bug in this server.
+
+    The body must stay a bare re-raise. Starlette wraps exception handling
+    twice — once per route in :func:`starlette.routing.request_response` and
+    again at ``ExceptionMiddleware`` — so this is entered **twice** per fault.
+    Purity is what makes that observationally invisible; a log line, a metric or
+    a counter here would each fire twice, and a test pins the fault-log record
+    count at exactly one.
+
+    Args:
+        _request: The request in flight. Unread — dispatch has already made the
+            whole decision by selecting this handler over
+            :func:`_routing_miss`, so there is no branch here to inform, and
+            none anywhere: keying the two handlers on status is what replaces
+            the ``if status_code in {404, 405}`` test a single handler would
+            have needed.
+        exc: The fault Starlette's exception handling caught.
+
+    Raises:
+        Exception: *exc* itself, unchanged and with its traceback intact, for
+            the error boundary above to log and envelope.
+    """
+    raise exc
 
 
 def _middleware(
@@ -242,7 +328,11 @@ def create_app(
             timeout_seconds,
             max_concurrency,
         ),
-        exception_handlers={HTTPException: _routing_miss},
+        exception_handlers={
+            ERROR_STATUS[ErrorCode.NOT_FOUND]: _routing_miss,
+            METHOD_NOT_ALLOWED: _routing_miss,
+            HTTPException: _not_a_routing_miss,
+        },
     )
     app.state.vault_path = vault_path
     app.state.reflect_llm_factory = reflect_llm_factory

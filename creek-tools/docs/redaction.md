@@ -181,3 +181,43 @@ Two ways to override the gate:
 
 This trades a small ergonomic cost (an extra command) for the guarantee
 that `creek process` cannot silently leak secrets into the vault.
+
+A second, narrower refusal fires *before* that gate and takes no waiver. If
+any file under the source tree is a symlink whose target resolves outside
+that tree, `creek process` raises `SymlinkEscapedSourceError` and exits
+non-zero without ingesting anything:
+
+```
+Symlink containment: Redaction scan declined to read 1 file(s) under
+/tmp/exports: each is a symlink whose target resolves outside that tree,
+so the scanner could not check content that ingestion would still have
+read. Remove or re-point the offending link(s) under /tmp/exports before
+re-running `creek process`.
+```
+
+The scan itself did not fail here — it *skipped* the escaping link and
+carried on, which is why the pipeline has to refuse on its behalf. A clean
+result reached by declining to look reads exactly like a clean tree, and
+ingestion has no symlink guard of its own: it would read that file anyway
+(#1294). Remediation:
+
+1. **Find the offending links.** Each skip is logged as it happens —
+   `Skipping symlink that escapes the scan root: <path>` — naming the link
+   as scanned, deliberately never its target. Running
+   `creek redact --scan --source <path>` over the same tree reports the
+   count as a **Files skipped (escaping symlink)** row in its statistics
+   (the row is omitted entirely when nothing was declined).
+2. **Remove or re-point each one** so it lands inside the source tree, or
+   copy the target's content in so the scanner reads the bytes it is being
+   asked to vouch for. Then re-run `creek process`.
+
+Neither override above applies. `redaction.dry_run: true` does not suppress
+this refusal — that setting means "log the matches you found", not "proceed
+past a file nobody read". `redaction.enabled: false` does skip the whole
+redaction stage, symlink check included, which is precisely the unredacted
+ingest this refusal exists to prevent.
+
+The check is deliberately narrow. A symlink whose target stays *inside* the
+source tree is still admitted, and is still scanned **unresolved** — under
+the path it was reached by rather than its target's — so findings keep
+being reported at the path the operator actually has.

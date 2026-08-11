@@ -9,9 +9,12 @@ single-file ``--input`` run never tombs (guards the incremental epic).
 
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import frontmatter
+import pytest
 
 from creek.cli import _run_ingest
 from creek.ingest import INGESTOR_REGISTRY
@@ -21,8 +24,6 @@ from creek.vault.writer import VaultWriter
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 
 def _make_vault(tmp_path: Path) -> Path:
@@ -64,6 +65,57 @@ def _journal_fragment(platform: SourcePlatform = SourcePlatform.JOURNAL) -> Frag
     return Fragment(
         id="frag-fixed01", title="Day", source=FragmentSource(platform=platform)
     )
+
+
+# A fragment's filename stem is ``{date}-{sanitised title}`` (``_compute_base_name``),
+# which is unique only *within* one ``01-Fragments/<platform>/`` subfolder. Fixing the
+# date and the title makes two fragments in different subfolders land on the same
+# stem, which is what collides in the flat ``10-Liminal/Orphaned/`` sink (#1302).
+_COLLIDING_CREATED = datetime(2026, 8, 9, tzinfo=UTC)
+_COLLIDING_STEM = "2026-08-09-Notes.md"
+_MARKER_A = "IRREPLACEABLE-MARKER-ALPHA-7f21"
+_MARKER_B = "IRREPLACEABLE-MARKER-BRAVO-3c94"
+
+
+def _colliding_fragment(frag_id: str, platform: SourcePlatform) -> Fragment:
+    """Build a fragment pinned to the shared ``_COLLIDING_STEM`` filename."""
+    return Fragment(
+        id=frag_id,
+        title="Notes",
+        source=FragmentSource(platform=platform),
+        created=_COLLIDING_CREATED,
+    )
+
+
+def _raw_id_index(target_dir: Path) -> dict[str, str]:
+    """Parse ``.id-index.jsonl`` by hand, later-wins, with no repair pass.
+
+    Deliberately bypasses ``VaultWriter._load_index_locked`` and
+    ``_find_existing``: both re-resolve a mis-mapped entry by directory scan
+    and persist the correction (#1083), which is exactly the healing this
+    reader must not perform. Records are self-delimiting since #1120, so the
+    file carries blank separator lines; they are skipped.
+    """
+    index_path = target_dir / ".id-index.jsonl"
+    mapping: dict[str, str] = {}
+    for line in index_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        mapping[str(record["id"])] = str(record["filename"])
+    return mapping
+
+
+def _provenance_paths(vault: Path) -> dict[str, str]:
+    """Return each id's most recent recorded provenance ``path``."""
+    log_path = vault / "00-Creek-Meta" / "Processing-Log" / "provenance.jsonl"
+    latest: dict[str, str] = {}
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        latest[str(record["id"])] = str(record["path"])
+    return latest
 
 
 # ---- Ledger tombed flag -------------------------------------------------
@@ -135,6 +187,267 @@ class TestTombAndRestore:
         assert (
             VaultWriter(vault_path=vault).restore_fragment(_journal_fragment()) is None
         )
+
+
+# ---- Writer tomb / restore: filename collisions (#1302) ----------------
+
+
+class TestTombRestoreFilenameCollisions:
+    """Neither tomb nor restore may destroy a same-named bystander file.
+
+    Both directions used to compose their destination as
+    ``<dir> / existing.name`` and write it with ``_atomic_write_text`` — an
+    ``os.replace`` that overwrites unconditionally. Because a filename stem is
+    unique only within one ``01-Fragments/<platform>/`` subfolder, while
+    ``10-Liminal/Orphaned/`` is a single flat sink for all of them, a second
+    tomb of a same-stemmed fragment silently replaced the first tombstone, and
+    a restore lost the same way to a newer fragment holding the freed stem.
+    Allocation now runs through ``_atomic_create`` (``O_CREAT | O_EXCL`` plus a
+    counter suffix), and these tests keep it that way (#1302).
+    """
+
+    def test_tomb_preserves_a_same_named_bystander(self, tmp_path: Path) -> None:
+        """A second tomb sharing a filename stem must not clobber the first."""
+        vault = _make_vault(tmp_path)
+        writer = VaultWriter(vault_path=vault)
+        # Journal -> 01-Fragments/Journal, Discord -> 01-Fragments/Messages.
+        # ``_write_model`` mkdirs the Messages folder that ``_make_vault`` omits.
+        frag_a = _colliding_fragment("frag-coll-a", SourcePlatform.JOURNAL)
+        frag_b = _colliding_fragment("frag-coll-b", SourcePlatform.DISCORD)
+        path_a = writer.write_fragment(frag_a, body=_MARKER_A)
+        path_b = writer.write_fragment(frag_b, body=_MARKER_B)
+        assert path_a != path_b
+        assert path_a.name == _COLLIDING_STEM
+        assert path_b.name == _COLLIDING_STEM
+
+        tombed_a = writer.tomb_fragment("frag-coll-a")
+        tombed_b = writer.tomb_fragment("frag-coll-b")
+
+        assert tombed_a is not None
+        assert tombed_b is not None
+        bodies = [p.read_text(encoding="utf-8") for p in _orphan_files(vault)]
+        # A's body has no other copy in the vault: the live file was unlinked by
+        # its own tomb, so if B's tomb replaced the tombstone A is simply gone.
+        assert any(_MARKER_A in text for text in bodies)
+        assert any(_MARKER_B in text for text in bodies)
+        assert len(_orphan_files(vault)) == 2
+        assert tombed_a != tombed_b
+        assert tombed_a.exists()
+        assert tombed_b.exists()
+        assert frontmatter.load(str(tombed_a))["id"] == "frag-coll-a"
+        assert frontmatter.load(str(tombed_b))["id"] == "frag-coll-b"
+
+    def test_restore_preserves_a_same_named_bystander(self, tmp_path: Path) -> None:
+        """A restore must not clobber a newer fragment holding the freed stem."""
+        vault = _make_vault(tmp_path)
+        writer = VaultWriter(vault_path=vault)
+        frag_c = _colliding_fragment("frag-coll-c", SourcePlatform.JOURNAL)
+        writer.write_fragment(frag_c, body=_MARKER_A)
+        assert writer.tomb_fragment("frag-coll-c") is not None
+
+        # D takes the stem C freed inside 01-Fragments/Journal.
+        frag_d = _colliding_fragment("frag-coll-d", SourcePlatform.JOURNAL)
+        path_d = writer.write_fragment(frag_d, body=_MARKER_B)
+        assert path_d.name == _COLLIDING_STEM
+        bytes_d = path_d.read_text(encoding="utf-8")
+        assert _MARKER_B in bytes_d
+
+        restored = writer.restore_fragment(frag_c)
+
+        assert restored is not None
+        # D was never tombed and never rewritten: its bytes must be untouched.
+        assert path_d.read_text(encoding="utf-8") == bytes_d
+        assert restored != path_d
+        assert restored.exists()
+        assert path_d.exists()
+        assert frontmatter.load(str(path_d))["id"] == "frag-coll-d"
+        assert frontmatter.load(str(restored))["id"] == "frag-coll-c"
+
+    def test_colliding_tombs_index_to_distinct_filenames(self, tmp_path: Path) -> None:
+        """Each tombed id resolves, from disk, to its own tombstone file."""
+        vault = _make_vault(tmp_path)
+        writer = VaultWriter(vault_path=vault)
+        writer.write_fragment(
+            _colliding_fragment("frag-coll-a", SourcePlatform.JOURNAL),
+            body=_MARKER_A,
+        )
+        writer.write_fragment(
+            _colliding_fragment("frag-coll-b", SourcePlatform.DISCORD),
+            body=_MARKER_B,
+        )
+        writer.tomb_fragment("frag-coll-a")
+        writer.tomb_fragment("frag-coll-b")
+
+        # A fresh writer reloads ``.id-index.jsonl`` from disk instead of reading
+        # the first writer's in-process dict, so this pins what the tomb actually
+        # *recorded* — the path the create returned, not a locally composed name.
+        fresh = VaultWriter(vault_path=vault)
+        orphan_dir = vault / "10-Liminal" / "Orphaned"
+        found_a = fresh._find_existing("frag-coll-a", orphan_dir)
+        found_b = fresh._find_existing("frag-coll-b", orphan_dir)
+
+        assert found_a is not None
+        assert found_b is not None
+        assert found_a != found_b
+        assert frontmatter.load(str(found_a))["id"] == "frag-coll-a"
+        assert frontmatter.load(str(found_b))["id"] == "frag-coll-b"
+
+    def test_colliding_tombs_record_the_created_path_not_the_old_name(
+        self, tmp_path: Path
+    ) -> None:
+        """The index and provenance name the file the create actually made.
+
+        Getting the destination right but recording the pre-move filename
+        would trade a silent overwrite for a silent orphan: the bystander
+        survives, but the id points at a stranger's file.
+        """
+        vault = _make_vault(tmp_path)
+        writer = VaultWriter(vault_path=vault)
+        writer.write_fragment(
+            _colliding_fragment("frag-coll-a", SourcePlatform.JOURNAL),
+            body=_MARKER_A,
+        )
+        writer.write_fragment(
+            _colliding_fragment("frag-coll-b", SourcePlatform.DISCORD),
+            body=_MARKER_B,
+        )
+
+        tombed_a = writer.tomb_fragment("frag-coll-a")
+        tombed_b = writer.tomb_fragment("frag-coll-b")
+
+        assert tombed_a is not None
+        assert tombed_b is not None
+        # Read the raw artifacts, not ``_find_existing``: a mis-mapped entry
+        # is re-resolved by scan and silently repaired on first lookup
+        # (#1083), so a lookup-based assertion cannot tell "recorded
+        # correctly" apart from "recorded wrong and healed on the way out".
+        recorded = _raw_id_index(vault / "10-Liminal" / "Orphaned")
+        assert recorded["frag-coll-a"] == tombed_a.name
+        assert recorded["frag-coll-b"] == tombed_b.name
+        assert recorded["frag-coll-a"] != recorded["frag-coll-b"]
+
+        provenance = _provenance_paths(vault)
+        assert provenance["frag-coll-a"] == str(tombed_a)
+        assert provenance["frag-coll-b"] == str(tombed_b)
+
+    def test_tomb_drops_the_origin_index_entry(self, tmp_path: Path) -> None:
+        """Tombing removes the id from the origin directory's id index."""
+        vault = _make_vault(tmp_path)
+        writer = VaultWriter(vault_path=vault)
+        writer.write_fragment(
+            _colliding_fragment("frag-coll-a", SourcePlatform.JOURNAL),
+            body=_MARKER_A,
+        )
+        origin_dir = vault / "01-Fragments" / "Journal"
+        # Deliberately white-box. A tomb leaves the origin index pointing at a
+        # filename it just unlinked; ``_find_existing_locked`` self-heals that
+        # lazily on the next lookup, so an eager drop is indistinguishable from
+        # the status quo through the public surface. Reading the index directly
+        # is the only assertion that tells them apart, and the writer already
+        # documents ``_find_existing`` as retained "for tests and tooling".
+        assert "frag-coll-a" in writer._dir_indexes[origin_dir]
+
+        writer.tomb_fragment("frag-coll-a")
+
+        assert "frag-coll-a" not in writer._dir_indexes[origin_dir]
+
+    def test_a_failed_destination_create_leaves_the_source_intact(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A tomb that cannot allocate a destination must not unlink the source.
+
+        Pins the create-before-unlink ordering. ``_atomic_create`` gained two
+        ways to raise that ``_atomic_write_text`` never had — ``RuntimeError``
+        at counter-suffix exhaustion and ``OSError`` from a short write that
+        ``create_exclusive`` cleans up. Unlink-first would turn either into a
+        window where the fragment exists nowhere; create-first makes the worst
+        case a recoverable duplicate.
+        """
+        vault = _make_vault(tmp_path)
+        writer = VaultWriter(vault_path=vault)
+        frag = _colliding_fragment("frag-coll-doomed", SourcePlatform.JOURNAL)
+        live = writer.write_fragment(frag, body=_MARKER_A)
+        before = live.read_bytes()
+
+        def _exhausted(_target_dir: Path, _base_name: str, _content: str) -> Path:
+            """Stand in for a destination allocator that cannot succeed."""
+            msg = "Could not allocate a unique filename"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(VaultWriter, "_atomic_create", staticmethod(_exhausted))
+
+        with pytest.raises(RuntimeError):
+            writer.tomb_fragment("frag-coll-doomed")
+
+        # The source survives untouched: loud failure, no data loss.
+        assert live.exists()
+        assert live.read_bytes() == before
+        assert _orphan_files(vault) == []
+
+    def test_a_failed_restore_create_leaves_the_tombstone_intact(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The restore direction keeps its source on a failed allocation too.
+
+        Both directions share ``_relocate_fragment_locked``, so this is the
+        symmetric half of the ordering guarantee asserted above — held
+        explicitly rather than by inference from the tomb path.
+        """
+        vault = _make_vault(tmp_path)
+        writer = VaultWriter(vault_path=vault)
+        frag = _colliding_fragment("frag-coll-doomed", SourcePlatform.JOURNAL)
+        writer.write_fragment(frag, body=_MARKER_A)
+        tombed = writer.tomb_fragment("frag-coll-doomed")
+        assert tombed is not None  # setup guard
+        before = tombed.read_bytes()
+
+        def _exhausted(_target_dir: Path, _base_name: str, _content: str) -> Path:
+            """Stand in for a destination allocator that cannot succeed."""
+            msg = "Could not allocate a unique filename"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(VaultWriter, "_atomic_create", staticmethod(_exhausted))
+
+        with pytest.raises(RuntimeError):
+            writer.restore_fragment(frag)
+
+        assert tombed.exists()
+        assert tombed.read_bytes() == before
+        assert _journal_files(vault) == []
+
+    def test_round_trip_without_collision_keeps_the_original_filename(
+        self, tmp_path: Path
+    ) -> None:
+        """A tomb+restore with no competitor preserves the existing filename.
+
+        Expected to PASS at HEAD — this is a lock, not a RED. It pins the
+        surviving half of the contract so a collision fix that recomputes the
+        stem from the fragment (``_compute_base_name``) instead of preserving
+        ``existing.name`` is caught: the title is drifted between the tomb and
+        the restore, so a recomputed name would differ and silently rename the
+        file out from under every ``[[wikilink]]`` pointing at it.
+        """
+        vault = _make_vault(tmp_path)
+        writer = VaultWriter(vault_path=vault)
+        frag = _colliding_fragment("frag-coll-solo", SourcePlatform.JOURNAL)
+        original_name = writer.write_fragment(frag, body=_MARKER_A).name
+        assert original_name == _COLLIDING_STEM
+
+        tombed = writer.tomb_fragment("frag-coll-solo")
+        assert tombed is not None
+        assert tombed.name == original_name
+
+        frag.title = "Notes Retitled Much Later"
+        restored = writer.restore_fragment(frag)
+
+        assert restored is not None
+        assert restored.name == original_name
+        assert restored.parent == vault / "01-Fragments" / "Journal"
+        assert _MARKER_A in restored.read_text(encoding="utf-8")
 
 
 # ---- End-to-end: delete -> tomb -> restore -----------------------------

@@ -308,6 +308,17 @@ vault-object non-answer collapses to `403 privacy_refused` with one fixed
 reason. A method mismatch (`PUT /v1/wheel`) also renders `404`, because `405` is
 not in the contract's published status set.
 
+**`404` is keyed on the routing statuses, not on the exception class.** The two
+answers the router can reach — `404` for a path it does not serve and `405` for
+a verb it does not serve on a path it does — are the only ones that become
+`not_found`. Any *other* internal `HTTPException` is a bug in this server rather
+than a routing outcome, because every published refusal is returned through the
+error table and none is ever raised; it therefore takes the error boundary's
+path and renders `500 internal_error`, with the traceback going to the operator
+log and nothing but the constant envelope going to the caller. Folding those
+into `404` instead would have made the promise directly above this paragraph
+false, and would have hidden the fault from the operator as well as the client.
+
 ## Hardening
 
 | Limit | Default | Behaviour when exceeded |

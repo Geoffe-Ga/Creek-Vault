@@ -196,7 +196,8 @@ posted **after** the PR's HEAD commit (stale-verdict guard):
 ```bash
 STATUS=$(scripts/ralph/pr-ready.sh "$PR_NUM") && RC=0 || RC=$?
 # ready | ready-unreviewed | behind | main-not-green | review-quota-exhausted |
-# pending | ci-failed | changes-requested | awaiting-review | optout
+# pending | ci-failed | review-failed | changes-requested | awaiting-review |
+# optout
 ```
 The exit code is captured explicitly (`RC`) — the helper now exits non-zero
 when it cannot classify a lane at all, and an unchecked `$STATUS` would just
@@ -353,7 +354,23 @@ Then act on `$STATUS`:
   re-kicking (`gh run rerun`, empty commits) will produce a review. Resolve the
   conflict (`fleet.sh sync` → conflict-fix worker → push); the post-resolution
   push triggers the PR's real CI + review.
-- **`ci-failed`** — a check failed. Advance it via Step 2 (`ci-debugging`).
+- **`ci-failed`** — a **non-review** check failed. Advance it via Step 2
+  (`ci-debugging`).
+- **`review-failed`** — every failing check is `claude-review` itself, so CI is
+  fine and **the code needs no change** (issue #1200). The reviewer
+  malfunctioned: a rate limit, a timeout, a `cancel-in-progress` cancellation,
+  or one of `code-review.yml`'s deliberate `::error::` + `exit 1` paths — one of
+  which literally prints "This is NOT a defect in this PR's code".
+  **Do NOT dispatch `ci-debugging`**; sending a fix worker at a healthy tree is
+  the exact bug this token exists to stop. Instead re-run the failed review —
+  `gh run list --workflow code-review.yml --branch <branch>` to find the run,
+  then `gh run rerun --failed <id>` — and re-classify on the next poll.
+  Caveat (#1201 is still open): `code-review.yml` has no `workflow_dispatch`, so
+  `gh run rerun` replays the **old** workflow file. That is fine for a
+  rate-limit retry, but not for a re-review after the workflow itself changed —
+  there the fallback is an empty commit. If the same run fails repeatedly for a
+  non-transient reason, treat it as a reviewer/infra defect and file an issue
+  rather than editing this PR.
 - **`changes-requested`** — CI is green and a **fresh** verdict (posted after
   the PR's HEAD commit) exists and is not `LGTM` — i.e. `CHANGES_REQUESTED` or
   `COMMENTS`. This is **Gate 4 failed**, an actionable state, not a wait:

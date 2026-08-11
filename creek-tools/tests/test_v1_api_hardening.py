@@ -56,10 +56,11 @@ from anyio import Event, create_task_group, sleep_forever
 from anyio import run as run_async
 from anyio import sleep as async_sleep
 from anyio.to_thread import run_sync
+from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 
 from creek.audit import log as audit_log_module
-from creek_mcp.api.models import ERROR_MESSAGES, ErrorCode
+from creek_mcp.api.models import ERROR_MESSAGES, ERROR_STATUS, ErrorCode
 from creek_mcp.audit import MCP_AUDIT_RELPATH, verify_mcp_audit_chain
 from creek_mcp.httpapi import capabilities as capabilities_module
 from creek_mcp.httpapi import handlers as handlers_module
@@ -78,6 +79,7 @@ from creek_mcp.httpapi.middleware.limits import (
 from tests.v1_api_support import (
     ANONYMOUS_CONSUMER,
     CAPABILITIES_PATH,
+    CEILING_HEADER,
     CONSUMER,
     HEALTH_PATH,
     JOURNAL_PATH,
@@ -98,7 +100,7 @@ from tests.v1_api_support import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Awaitable, Callable, Iterator
     from pathlib import Path
 
     from starlette.applications import Starlette
@@ -113,6 +115,22 @@ _UNAVAILABLE_STATUS: Final[int] = 503
 _INTERNAL_ERROR_STATUS: Final[int] = 500
 _UNSUPPORTED_STATUS: Final[int] = 501
 _UNAUTHENTICATED_STATUS: Final[int] = 401
+_NOT_FOUND_STATUS: Final[int] = 404
+_METHOD_NOT_ALLOWED_STATUS: Final[int] = 405
+_BAD_REQUEST_STATUS: Final[int] = 400
+_FORBIDDEN_STATUS: Final[int] = 403
+_BAD_GATEWAY_STATUS: Final[int] = 502
+
+ALLOWED_HTTP_STATUSES: Final[frozenset[int]] = frozenset(
+    set(ERROR_STATUS.values()) | {_OK_STATUS}
+)
+"""The closed status set the contract publishes, derived not restated.
+
+Spelled the same way ``tests/test_v1_api_not_implemented.py`` spells it, and
+derived in both places rather than imported from one into the other: no test
+module here imports from another, because a shared fixture that two suites
+disagreed about would make their refusal tests measure different things.
+"""
 
 _SMALL_LIMIT: Final[int] = 64
 """A tiny body cap, so the size tests stay in-memory and instant."""
@@ -1296,6 +1314,256 @@ def test_the_fault_does_not_reach_the_access_logger(
     assert access[0].exc_info is None
     assert _SENTINEL_BODY not in str(access[0].__dict__)
     assert len(_error_records(caplog)) == 1
+
+
+_NON_ROUTING_STATUSES: Final[tuple[int, ...]] = (
+    _BAD_REQUEST_STATUS,
+    _FORBIDDEN_STATUS,
+    _BAD_GATEWAY_STATUS,
+)
+"""Three ``HTTPException`` statuses that are not routing outcomes (#1127).
+
+``403`` is :attr:`~creek_mcp.api.models.ErrorCode.PRIVACY_REFUSED`'s status, so
+a blanket class-keyed routing handler *mislabels* the most contract-loaded code
+in the vocabulary: the single answer this surface gives for every vault-object
+non-answer would reach the caller as ``not_found``, which is precisely the
+existence oracle #846 / #970 / #972 / #1090 spent five issues collapsing.
+
+``400`` and ``502`` sit outside the published status set altogether, and that
+is what disqualifies the tempting alternative of simply letting Starlette's own
+default handler render a non-routing ``HTTPException``: it would emit a literal
+``400``, as ``text/plain``, echoing the detail, with no ``Vary`` — four
+contract violations for the price of one line.
+"""
+
+_NON_ROUTING_IDS: Final[tuple[str, ...]] = (
+    "400-bad-request",
+    "403-forbidden",
+    "502-bad-gateway",
+)
+"""Stable parametrize ids for :data:`_NON_ROUTING_STATUSES`, in that order."""
+
+_ROUTING_STATUSES: Final[tuple[int, ...]] = (
+    _NOT_FOUND_STATUS,
+    _METHOD_NOT_ALLOWED_STATUS,
+)
+"""The two statuses that *are* routing outcomes, whoever raised them."""
+
+_ROUTING_IDS: Final[tuple[str, ...]] = ("404-not-found", "405-method-not-allowed")
+"""Stable parametrize ids for :data:`_ROUTING_STATUSES`, in that order."""
+
+
+def _raise_http_exception(status: int) -> Callable[[Request], Awaitable[Response]]:
+    """Return a handler that always raises ``HTTPException(status)``.
+
+    The detail deliberately carries :data:`_SENTINEL_BODY`. A raiser whose
+    message nobody could mind seeing would make "the detail is not echoed" true
+    by construction rather than by the server's doing — and real details do
+    carry vault material, since the shape an author reaches for is
+    ``fragment 'abc' is above your ceiling``.
+
+    Args:
+        status: The status the raised
+            :class:`~starlette.exceptions.HTTPException` declares.
+
+    Returns:
+        An async handler with the mounted-endpoint signature that never
+        returns.
+    """
+
+    async def _raiser(_request: Request) -> Response:
+        """Raise the configured ``HTTPException``.
+
+        Args:
+            _request: Ignored.
+
+        Returns:
+            Never.
+
+        Raises:
+            HTTPException: Always, at the configured status, detailed with the
+                sentinel the envelope must not echo.
+        """
+        raise HTTPException(status, detail=f"refused {_SENTINEL_BODY}")
+
+    return _raiser
+
+
+@pytest.mark.parametrize("status", _NON_ROUTING_STATUSES, ids=_NON_ROUTING_IDS)
+def test_a_non_routing_http_exception_is_the_published_500(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """A non-routing ``HTTPException`` is ``500 internal_error`` (#1127).
+
+    The routing miss belongs to the *statuses* that mean "no such route", not
+    to the exception class. Keyed on the class, every ``HTTPException`` the
+    surface can raise — a ``403``, a ``502``, anything — renders as ``404
+    not_found`` instead, and the fault never reaches the error boundary, so it
+    is never logged either.
+
+    The negative assertion is the whole issue, so it is stated out loud rather
+    than left implied by the positive one: ``not_found`` is documented as a
+    *routing* code that is never emitted for a vault object, and a masked fault
+    wearing it makes that published promise false.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Swaps the health handler for one raising at *status*.
+        status: The non-routing status the handler raises; see
+            :data:`_NON_ROUTING_STATUSES` for why these three.
+    """
+    monkeypatch.setitem(
+        handlers_module.HANDLERS, OP_HEALTH, _raise_http_exception(status)
+    )
+    with client(vault_path=vault) as test_client:
+        response = test_client.get(HEALTH_PATH, headers=headers())
+
+    body = envelope(response)
+    assert response.status_code == _INTERNAL_ERROR_STATUS
+    assert body["code"] == ErrorCode.INTERNAL_ERROR.value
+    assert body["code"] != ErrorCode.NOT_FOUND.value
+    assert body["message"] == ERROR_MESSAGES[ErrorCode.INTERNAL_ERROR]
+    assert set(body) == {"code", "message", "request_id"}
+
+
+@pytest.mark.parametrize("status", _NON_ROUTING_STATUSES, ids=_NON_ROUTING_IDS)
+def test_a_non_routing_http_exception_echoes_no_detail(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """The detail is discarded, and the envelope's shape and headers hold.
+
+    An ``HTTPException``'s detail is author-written and routinely names the
+    thing that was refused, so echoing it hands back the identifier the ceiling
+    gate exists to leave unconfirmed.
+
+    ``content-type`` is asserted because it is what fails loudly if anyone
+    "fixes" this by falling back to Starlette's default handler: that answers
+    ``text/plain`` with the detail *as* the body. ``Vary`` is asserted because
+    it is only unconditional while every response — this one included — is
+    built by the single response builder in
+    :mod:`creek_mcp.httpapi.errors`.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Swaps the health handler for one raising at *status*.
+        status: The non-routing status the handler raises; see
+            :data:`_NON_ROUTING_STATUSES` for why these three.
+    """
+    monkeypatch.setitem(
+        handlers_module.HANDLERS, OP_HEALTH, _raise_http_exception(status)
+    )
+    with client(vault_path=vault) as test_client:
+        response = test_client.get(HEALTH_PATH, headers=headers())
+
+    assert _SENTINEL_BODY not in response.text
+    assert "Traceback" not in response.text
+    assert "HTTPException" not in response.text
+    assert not contains_a_path(response.text)
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.headers["vary"] == CEILING_HEADER
+
+
+def test_a_non_routing_http_exception_is_logged_exactly_once(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One record, with the traceback; the caller still gets the bare envelope.
+
+    Starlette wraps exception handling twice — once per route in
+    ``routing.request_response`` and again at ``ExceptionMiddleware`` — so the
+    class-keyed handler that lets a non-routing fault through is entered twice
+    per fault. It is a pure re-raise, which makes that observationally
+    invisible, and ``== 1`` is what keeps it so: the count turns red the moment
+    anyone adds a log line, a metric or a counter to that handler, and a fault
+    reported twice is a fault an operator triages twice.
+
+    ``403`` alone is enough. The count is a property of the dispatch, not of
+    the status. The contrast — sentinel present in the log, absent from the
+    body — is asserted here in one place for the same reason
+    :func:`test_a_handler_fault_is_logged_with_its_traceback` asserts it in
+    one place: it is their conjunction that is the invariant.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Swaps the health handler for one raising ``403``.
+        caplog: Captures the fault log.
+    """
+    monkeypatch.setitem(
+        handlers_module.HANDLERS, OP_HEALTH, _raise_http_exception(_FORBIDDEN_STATUS)
+    )
+    caplog.set_level(logging.ERROR, logger=ERROR_LOGGER_NAME)
+    with client(vault_path=vault) as test_client:
+        response = test_client.get(HEALTH_PATH, headers=headers())
+
+    records = _error_records(caplog)
+    assert len(records) == 1
+    record = records[0]
+    assert record.exc_info is not None
+    assert record.exc_info[0] is HTTPException
+    assert "Traceback (most recent call last)" in caplog.text
+    assert _SENTINEL_BODY in caplog.text
+    assert _field(record, "request_id") == envelope(response)["request_id"]
+
+    assert _SENTINEL_BODY not in response.text
+
+
+@pytest.mark.parametrize("status", _ROUTING_STATUSES, ids=_ROUTING_IDS)
+def test_a_handler_raised_routing_status_is_still_the_routing_miss(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """``404`` and ``405`` render as ``404 not_found`` whoever raised them.
+
+    The discriminator is the **status**, not the raiser. This server cannot
+    tell a ``404`` raised inside a handler from one raised by the router — the
+    exception carries no provenance — and it deliberately does not try: a
+    handler that concluded "no such route" has said what the router says, and
+    answering the two differently would publish which of them concluded it. So
+    both keep the published routing refusal, and the ``405``'s ``Allow``
+    header — a verb-enumeration primitive attached to a status outside the
+    contract's set — never reaches the caller.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Swaps the health handler for one raising at *status*.
+        status: The routing status the handler raises.
+    """
+    monkeypatch.setitem(
+        handlers_module.HANDLERS, OP_HEALTH, _raise_http_exception(status)
+    )
+    with client(vault_path=vault) as test_client:
+        response = test_client.get(HEALTH_PATH, headers=headers())
+
+    body = envelope(response)
+    assert response.status_code == _NOT_FOUND_STATUS
+    assert body["code"] == ErrorCode.NOT_FOUND.value
+    assert body["message"] == ERROR_MESSAGES[ErrorCode.NOT_FOUND]
+    assert _SENTINEL_BODY not in response.text
+    assert "allow" not in {name.lower() for name in response.headers}
+
+
+@pytest.mark.parametrize("status", _NON_ROUTING_STATUSES, ids=_NON_ROUTING_IDS)
+def test_a_non_routing_http_exception_stays_in_the_published_set(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    """Whatever a handler raises, the wire status is one the contract publishes.
+
+    ``400`` and ``502`` are not in the closed set, and a conforming client maps
+    an out-of-set status to "unreachable" — losing the vault over a fault it
+    could have retried. This is the assertion that refuses the "just let
+    Starlette render it" repair, which would put the raised status on the wire
+    verbatim.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Swaps the health handler for one raising at *status*.
+        status: The non-routing status the handler raises.
+    """
+    monkeypatch.setitem(
+        handlers_module.HANDLERS, OP_HEALTH, _raise_http_exception(status)
+    )
+    with client(vault_path=vault) as test_client:
+        response = test_client.get(HEALTH_PATH, headers=headers())
+
+    assert response.status_code in ALLOWED_HTTP_STATUSES
 
 
 # --------------------------------------------------------------------------- #

@@ -30,6 +30,7 @@ from creek.models import PraxisPotential, PrivacyTier
 from creek.pipeline import (
     Pipeline,
     RedactionRequiredError,
+    SymlinkEscapedSourceError,
     resolve_tier_a_plan,
     resolve_tier_b_plan,
 )
@@ -1198,6 +1199,9 @@ def process(
         result = pipeline.run(source_path=source_path, vault_path=vault_path)
     except RedactionRequiredError as exc:
         console.print(f"[red]Redaction gate: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    except SymlinkEscapedSourceError as exc:
+        console.print(f"[red]Symlink containment: {exc}[/red]")
         raise typer.Exit(code=1) from exc
 
     console.print(f"[bold]Files scanned:[/bold] {result.files_scanned}")

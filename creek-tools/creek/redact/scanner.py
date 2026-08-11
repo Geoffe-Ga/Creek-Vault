@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -39,6 +40,35 @@ from creek.redact.patterns import (
     PATTERN_METADATA,
     REDACTION_PATTERNS,
 )
+
+logger = logging.getLogger(__name__)
+
+SYMLINK_SKIP_LABEL = "Files skipped (escaping symlink)"
+"""Statistics label for files declined because they escape the scan root.
+
+Exported rather than spelled twice: the markdown summary this module
+renders and the Rich statistics table in
+:func:`creek.redact.cli_commands._render_stats_table` describe the same
+counter, and two literals are how the two surfaces drift apart.
+"""
+
+_EMPTY_SUMMARY_MARKDOWN = "# Redaction Scan Summary\n\nNo findings.\n"
+"""Rendering for a scan that found nothing *and* declined nothing.
+
+Held as a constant because it is a contract with every existing consumer of
+a clean scan — notably CrawDad, which posts the markdown verbatim into a
+Discord channel — and must stay byte-identical when nothing was skipped.
+"""
+
+_UNREAD_FILES_CAVEAT = (
+    "No findings — but the scan declined to read one or more files, so this "
+    "tree has not been fully checked. See the statistics above."
+)
+"""Replacement for a bare "No findings." when the walk skipped something.
+
+A clean result reached by *not looking* reads identically to a clean tree,
+which is the one place a silent skip in a safety scanner does real harm.
+"""
 
 HIGH_ENTROPY_PATTERN_NAME = "high_entropy_string"
 """Pattern key used by the generic high-entropy detector."""
@@ -133,12 +163,17 @@ class ScanSummary:
         files_scanned: Number of files that were scanned.
         files_skipped_binary: Number of files skipped as binary.
         files_skipped_extension: Number of files skipped due to extension.
+        files_skipped_symlink: Number of symlinked children declined because
+            their target resolves outside the scan root (#1087). Declared
+            last so that any positional construction of the three original
+            counters keeps its meaning.
     """
 
     matches: list[RedactionMatch] = field(default_factory=list)
     files_scanned: int = 0
     files_skipped_binary: int = 0
     files_skipped_extension: int = 0
+    files_skipped_symlink: int = 0
 
 
 class RedactionScanner:
@@ -375,7 +410,16 @@ class RedactionScanner:
         """Recursively scan a directory and return a full scan summary.
 
         Returns a :class:`ScanSummary` with match details and statistics
-        about files scanned, skipped (binary), and skipped (extension).
+        about files scanned, skipped (binary), skipped (extension), and
+        skipped as symlinks escaping *dir_path*.
+
+        This is the single chokepoint every read-path caller reaches —
+        ``creek redact --scan/--apply/--review`` via
+        :func:`creek.redact.cli_commands._scan_source`, ``creek.redact.scan``
+        over MCP, and ``creek process`` via
+        :meth:`Pipeline._run_redaction <creek.pipeline.Pipeline>` — so the
+        containment policy lives here in :func:`_scannable_candidates` and
+        not in any one of them (#1087).
 
         Args:
             dir_path: Path to the directory to scan.
@@ -391,7 +435,7 @@ class RedactionScanner:
             msg = f"Directory not found: {dir_path}"
             raise FileNotFoundError(msg)
 
-        candidates = sorted(child for child in dir_path.rglob("*") if child.is_file())
+        candidates, files_skipped_symlink = _scannable_candidates(dir_path)
 
         matches: list[RedactionMatch] = []
         files_scanned = 0
@@ -428,6 +472,7 @@ class RedactionScanner:
             files_scanned=files_scanned,
             files_skipped_binary=files_skipped_binary,
             files_skipped_extension=files_skipped_extension,
+            files_skipped_symlink=files_skipped_symlink,
         )
 
     def generate_report(self, matches: list[RedactionMatch]) -> str:
@@ -552,6 +597,9 @@ class RedactionScanner:
         Results are grouped by file and sorted by severity within
         each file section.
 
+        The findings-free arm is delegated to :func:`_no_findings_markdown`,
+        which distinguishes "nothing to report" from "nothing was read".
+
         Args:
             summary: The scan summary to format.
 
@@ -559,17 +607,14 @@ class RedactionScanner:
             Markdown-formatted string.
         """
         if not summary.matches:
-            return "# Redaction Scan Summary\n\nNo findings.\n"
+            return _no_findings_markdown(summary)
 
         lines: list[str] = [
             "# Redaction Scan Summary",
             "",
             "## Statistics",
             "",
-            f"- **Files scanned**: {summary.files_scanned}",
-            f"- **Files skipped (binary)**: {summary.files_skipped_binary}",
-            f"- **Files skipped (extension)**: {summary.files_skipped_extension}",
-            f"- **Total findings**: {len(summary.matches)}",
+            *_statistics_lines(summary),
             "",
         ]
 
@@ -678,6 +723,156 @@ class RedactionScanner:
                 )
 
         return "\n".join(lines)
+
+
+def _no_findings_markdown(summary: ScanSummary) -> str:
+    """Render the markdown for a scan that produced no matches.
+
+    Two different documents, because "we read everything and found nothing"
+    and "we found nothing in what we agreed to read" are two different
+    facts, and only the first one licenses the reader's conclusion that the
+    tree is clean. A scan that declined a file therefore gets the full
+    statistics block — which names the skip — plus
+    :data:`_UNREAD_FILES_CAVEAT` in place of a bare "No findings.".
+
+    A scan that declined nothing renders :data:`_EMPTY_SUMMARY_MARKDOWN`
+    byte-for-byte, so the new wording is not paid for out of the pocket of
+    every existing consumer of a clean scan.
+
+    Args:
+        summary: A scan summary whose ``matches`` list is empty.
+
+    Returns:
+        Markdown-formatted string.
+    """
+    if not summary.files_skipped_symlink:
+        return _EMPTY_SUMMARY_MARKDOWN
+
+    return "\n".join(
+        (
+            "# Redaction Scan Summary",
+            "",
+            "## Statistics",
+            "",
+            *_statistics_lines(summary),
+            "",
+            _UNREAD_FILES_CAVEAT,
+            "",
+        )
+    )
+
+
+def _statistics_lines(summary: ScanSummary) -> list[str]:
+    """Render the bullet list of the Statistics block.
+
+    The escaping-symlink row is emitted only when the counter is non-zero.
+    A permanent "escaping symlink: 0" line in front of every operator whose
+    tree has never held one is the fastest way to teach a reader to skip
+    that part of the report.
+
+    Args:
+        summary: The scan summary to describe.
+
+    Returns:
+        One markdown bullet per reported counter, in display order.
+    """
+    lines = [
+        f"- **Files scanned**: {summary.files_scanned}",
+        f"- **Files skipped (binary)**: {summary.files_skipped_binary}",
+        f"- **Files skipped (extension)**: {summary.files_skipped_extension}",
+    ]
+    if summary.files_skipped_symlink:
+        lines.append(f"- **{SYMLINK_SKIP_LABEL}**: {summary.files_skipped_symlink}")
+    lines.append(f"- **Total findings**: {len(summary.matches)}")
+    return lines
+
+
+def _resolves_within(child: Path, resolved_root: Path) -> bool:
+    """Report whether *child*'s symlink target stays under *resolved_root*.
+
+    The failure arm is a deliberate classification, not a swallowed error:
+    a loop (``RuntimeError``), an unreadable link (``OSError``), and a
+    target outside the root (``ValueError`` from ``relative_to``) are all
+    cases where the scanner cannot prove containment — and an unprovable
+    containment is an escape. The caller logs and counts every rejection.
+
+    Dangling links never reach here in either direction:
+    :func:`_scannable_candidates` gates on ``is_file()`` first, which is
+    ``False`` for a link whose target does not exist, so a dangling link is
+    dropped as a non-file before containment is ever asked about.
+
+    The exception object itself is deliberately dropped rather than logged:
+    ``relative_to``'s message quotes the *resolved* target, which is exactly
+    the out-of-root path this guard exists to keep out of the record.
+
+    Args:
+        child: A symlinked child of the scan root, as scanned.
+        resolved_root: The scan root, already resolved exactly once by
+            :func:`_scannable_candidates`.
+
+    Returns:
+        ``True`` when the link's target is a descendant of *resolved_root*.
+    """
+    try:
+        child.resolve(strict=False).relative_to(resolved_root)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
+def _scannable_candidates(dir_path: Path) -> tuple[list[Path], int]:
+    """Return the files under *dir_path* the scanner may read, plus escapes.
+
+    The only place :mod:`creek.redact.scanner` enumerates the filesystem, so
+    the containment policy cannot be applied to some children and not others.
+    That "one walk, one gate" property is itself pinned, by
+    ``test_scan_batch_is_the_only_filesystem_walk_in_the_scanner_module``.
+
+    The admission policy is the one the shipped SEC-003 *write* guard already
+    uses — :func:`creek.redact.cli_commands._assert_no_escaping_symlinks` —
+    rather than a second, subtly different predicate: resolve the root
+    once, and for a child that is *itself* a symlink require its resolved
+    target to be a descendant of that root. Non-symlink children are never
+    resolved, which is what keeps a root reached *through* a symlinked
+    component scannable (``/tmp`` → ``/private/tmp`` on macOS); resolving
+    them too would flag every child of such a root as escaping. Resolving
+    the root and ``lstat``-checking only the leaf is what makes a per-leaf
+    check sound: ``Path.rglob`` surfaces a symlinked *directory* as an entry
+    but does not descend into it, and ``is_file()`` then drops it, so the
+    residual is bounded to symlinked files.
+
+    Skips are logged naming only the as-scanned path. The resolved target is
+    never named: disclosing it is the very oracle #1087 closes.
+
+    Known gaps, deliberately out of scope here:
+
+    * #1293 — the SEC-003 write guard is directory-only, so
+      ``creek redact --apply <symlinked-file>`` still writes through the link.
+    * #1294 — the ingestor walks (e.g.
+      ``creek.ingest.markdown.MarkdownIngestor._read_directory``) still follow
+      symlinks out of the source root.
+
+    Args:
+        dir_path: The scan root, exactly as the caller supplied it.
+
+    Returns:
+        ``(candidates, escaped)`` — the admitted files, sorted, and the
+        number of symlinked children declined for resolving outside the root.
+    """
+    resolved_root = dir_path.resolve(strict=False)
+    candidates: list[Path] = []
+    escaped = 0
+
+    for child in dir_path.rglob("*"):
+        if not child.is_file():
+            continue
+        if child.is_symlink() and not _resolves_within(child, resolved_root):
+            logger.warning("Skipping symlink that escapes the scan root: %s", child)
+            escaped += 1
+            continue
+        candidates.append(child)
+
+    return sorted(candidates), escaped
 
 
 def _entropy_from_counts(counts: dict[str, int], length: int) -> float:
