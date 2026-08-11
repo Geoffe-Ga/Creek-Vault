@@ -613,7 +613,12 @@ def test_untouched_default_config_produces_unchanged_voice_output(
     _run_report(seeded, "voice")
     _run_report(bare, "voice")
 
-    assert _voice_tree(seeded) == _voice_tree(bare)
+    seeded_tree = _voice_tree(seeded)
+    # Non-emptiness first: two empty trees compare equal, so without this the
+    # assertion below would pass just as happily if the report wrote nothing
+    # at all — proving no-op-ness by producing no output either way.
+    assert len(seeded_tree) > 1, seeded_tree
+    assert seeded_tree == _voice_tree(bare)
 
 
 def test_lexicon_output_is_invariant_to_the_audience_weighting(
