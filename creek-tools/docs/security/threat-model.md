@@ -87,7 +87,11 @@ from most to least likely:
   `--apply` also takes a `--vault`, and that one is *written* to —
   the audit record lands in
   `<vault>/00-Creek-Meta/audit/redact.jsonl`, creating the `audit/`
-  directory if absent. An escaping `--vault` was therefore a second
+  directory if absent — and since #1308 that write happens *before*
+  the first file is rewritten, so the out-of-root write it was
+  guarding against now precedes the destruction rather than
+  following it, which makes the containment check load-bearing
+  earlier, not later. An escaping `--vault` was therefore a second
   out-of-root write, reachable with an entirely innocent `--source`,
   and it put the record of what was touched wherever the link
   pointed. `--scan`
@@ -205,6 +209,32 @@ from most to least likely:
   structured entry to `<vault>/00-Creek-Meta/audit/`. The integrity
   story (hash chaining, tamper-evidence) is the subject of SEC-005;
   treat the current log as a journal, not a trust anchor.
+- **The audit trail is not a redaction target.** `creek redact
+  --apply` excludes the whole of `<vault>/00-Creek-Meta/audit/` and
+  the legacy `Processing-Log/purge-log.json` from its rewrite set
+  **unconditionally** — independent of `redaction.supported_extensions`
+  and `redaction.exclude_patterns`, both of which are operator-editable
+  and neither of which mentioned `00-Creek-Meta`. Before #1308 the log
+  survived only because `.jsonl` happened to be absent from the default
+  extension list; adding it made a vault-wide run rewrite its own first
+  entry, after which `verify()` still passed because the entries
+  appended on top re-anchored the chain onto the mutated line. That is
+  undetectable tampering with a tamper-evidence log, reachable by
+  editing a config field, and the accidental protection is now a
+  deliberate one. The legacy purge log is included because
+  `PurgeAuditLog._migrate_legacy_if_needed` replays it into the chained
+  `purge.jsonl`, which would have chain-*signed* redacted records as
+  authentic. Detection is deliberately unchanged: `--scan` and
+  `--review` still report matches inside `00-Creek-Meta/audit/`; only
+  in-place destruction narrows.
+- **A destructive redaction cannot outrun its own record.** The
+  per-file audit entry is appended immediately after that file's
+  atomic write, and the `intent` entry naming every candidate is
+  written before the first one. An unwritable audit destination is
+  therefore discovered *before* anything is destroyed rather than
+  after, and an abort mid-batch leaves at most one rewritten file
+  unrecorded. See [redaction.md → The audit
+  trail](../redaction.md#the-audit-trail) for the exact bound.
 
 ## What is NOT protected
 

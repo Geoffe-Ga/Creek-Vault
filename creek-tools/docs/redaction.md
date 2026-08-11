@@ -155,7 +155,86 @@ Redaction sanitises *content*; it doesn't delete the fragment. If you need a fra
 
 - **Always** scan before `creek ingest` on any new export.
 - **Re-scan** the vault after every classification pass, especially if you've turned on the LLM path — it can occasionally surface PII the rules missed.
-- **Audit** the report monthly. Every `creek redact --apply` invocation appends one JSONL entry per touched file to `<vault>/00-Creek-Meta/audit/redact.jsonl` — including dry-runs, marked with `dry_run: true`. The log shares the same hash-chain integrity as the purge audit log; see [cleaning-and-purge.md → Audit trail](cleaning-and-purge.md#audit-trail) for the full schema.
+- **Audit** the report monthly. See [the audit trail](#the-audit-trail) below for what `<vault>/00-Creek-Meta/audit/redact.jsonl` records and, just as importantly, what it does not.
+
+## The audit trail
+
+Every `creek redact --apply` invocation — including `--dry-run`, whose entries
+are all marked `dry_run: true` — writes a three-phase record to
+`<vault>/00-Creek-Meta/audit/redact.jsonl`. The log shares the same hash-chain
+integrity as the purge audit log.
+
+| `phase`   | Written when | Carries |
+|-----------|--------------|---------|
+| `intent`  | After you confirm, **before the first file is rewritten** | `files`: every candidate path the run is about to touch |
+| `file`    | Immediately after **that file's own** atomic write | `source_path`, `pattern_names`, `match_counts` |
+| `outcome` | Last | `status`: `complete` or `partial`, plus `failure_reason` on a partial |
+
+All three share one `operation_id`, which is how you group the lines of a single
+run — and the only way to tell one three-file preview from three separate
+one-file previews.
+
+### What you may conclude from it, and no more
+
+The per-file entry is appended next to the write it records, not batched after
+the run, so a run that dies partway still names what it destroyed. Concretely:
+
+- every file carrying a `file` entry **was** rewritten;
+- **at most one** further file may have been rewritten without its record — the
+  one in flight when the run died;
+- nothing outside the `intent` entry's `files` list was touched.
+
+That one-file window is the honest bound. Do not read the absence of a `file`
+entry as proof a file was untouched unless the run also has an `outcome` entry.
+
+An `intent` line with no `outcome` line means the run did not finish — **or**
+that the outcome write itself failed. The outcome append is deliberately
+best-effort so it can never displace the error it is reporting; when it fails,
+the CLI prints a warning naming the audit log. A successful run whose outcome
+line was lost is therefore indistinguishable in the log from an aborted one, and
+the console warning is the only thing that separates them.
+
+`failure_reason` is the exception **type name only** (`OSError`,
+`KeyboardInterrupt`), never the message. An `OSError` message embeds the
+offending path, and in a redaction workflow filenames routinely carry the very
+secrets being redacted. The type is the forensic value; the message is the leak.
+
+`match_counts` is **what the scan found in this file** — not a count of
+substitutions actually performed. Scan/apply parity is a separate open gap
+(#900, #946).
+
+### Durability
+
+`AuditLog.append` fsyncs inside its flock window, so the `intent` line's bytes
+are durable before the first rewrite. Not claimed: that a freshly created log's
+parent directory entry is fsynced, or that the atomic write's `os.replace` is.
+Both residuals fail safe — intent present, rewrite lost.
+
+### What `--apply` will not rewrite
+
+The audit trail lives inside the tree `--apply` walks, and `exclude_patterns`
+says nothing about `00-Creek-Meta`. Left alone, a vault-wide run rewrote its own
+history — and `verify()` still passed, because the entries appended afterwards
+re-anchored the chain onto the mutated line. So the whole of
+`00-Creek-Meta/audit/` and the legacy
+`00-Creek-Meta/Processing-Log/purge-log.json` are excluded from the rewrite set
+**unconditionally** — independent of `supported_extensions` and
+`exclude_patterns`. Detection is unaffected: `--scan` and `--review` still
+report matches there.
+
+Two known residuals:
+
+- A secret that leaked into a *filename* is recorded in `source_path` and can no
+  longer be remediated by `creek redact --apply`, because the file holding it is
+  now protected. Rewriting a hash-chained log needs a chain-aware operation —
+  that is purge-shaped work, tracked in #1397.
+- `<vault>/00-Creek-Meta/creek_config.yaml` **is** still rewritten by a
+  vault-wide apply, which can redact your own `false_positive_allowlist`
+  entries. Tracked in #1398.
+
+There is also a second, unrelated redaction log: `Redactor.log_redactions`
+writes an unchained file with `write_text`. It has no production caller and is
+not the audit trail; do not confuse the two.
 
 ## How `creek process` interacts with redaction
 
