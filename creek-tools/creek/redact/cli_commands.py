@@ -11,6 +11,7 @@ command registration and keeps :mod:`creek.cli` focused on routing.
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import tempfile
@@ -600,6 +601,34 @@ def _audit_entry_for_file(
     )
 
 
+def _safe_error_detail(exc: BaseException | None) -> str:
+    """Describe a failure for an operator without echoing its message.
+
+    ``str(OSError)`` renders as ``[Errno 28] No space left on device:
+    '/vault/ssn-123-45-6789.md'`` — the ``filename`` argument rides
+    along. In a redaction workflow filenames routinely carry the very
+    secrets being redacted, and the console is not a private channel:
+    it reaches CI logs, terminal scrollback and shared screens, all of
+    which outlive the run. The audit log applies this rule already; the
+    operator-facing messages on the destructive path must too.
+
+    The errno *symbol* is kept because it is the actionable part and is
+    OS-derived, never path-derived: an operator who sees ``ENOSPC``
+    knows to free space, where a bare ``OSError`` tells them nothing.
+
+    Args:
+        exc: The failure to describe, or ``None``.
+
+    Returns:
+        A short, path-free description such as ``"OSError (ENOSPC)"``.
+    """
+    if exc is None:
+        return "unknown cause"
+    name = type(exc).__name__
+    code = errno.errorcode.get(exc.errno or 0) if isinstance(exc, OSError) else None
+    return f"{name} ({code})" if code else name
+
+
 class _AuditWriteError(Exception):
     """The audit log could not record a file that was already rewritten.
 
@@ -871,9 +900,23 @@ def _exclude_audit_artifacts(
     Returns:
         *files* minus every protected compliance artifact.
     """
-    protected = tuple(
-        (vault_path / relpath).resolve() for relpath in PROTECTED_AUDIT_RELPATHS
-    )
+    try:
+        protected = tuple(
+            (vault_path / relpath).resolve() for relpath in PROTECTED_AUDIT_RELPATHS
+        )
+    except (OSError, RuntimeError) as exc:
+        # The candidate side of the comparison fails closed (see
+        # :func:`_is_protected`); the protected-root side must too, or the
+        # invariant only holds for half of it. A symlink loop at
+        # ``00-Creek-Meta/audit`` would otherwise crash with a raw
+        # traceback. Nothing has been rewritten at this point.
+        console.print(
+            f"[red]Cannot resolve the vault's compliance artifacts under "
+            f"{vault_path / '00-Creek-Meta'}: {_safe_error_detail(exc)}. "
+            f"Refusing to redact anything, because the audit trail cannot "
+            f"be reliably excluded. No files were modified.[/red]"
+        )
+        raise typer.Exit(code=1) from exc
     kept: list[Path] = []
     dropped = 0
     for file_path in files:
@@ -1019,24 +1062,29 @@ def _apply_redactions(
             _rewrite_and_record(redactor, file_path, audit)
             completed += 1
     except _AuditWriteError as exc:
-        reason = type(exc.__cause__).__name__
+        # ``record_file`` always raises ``from`` the OSError it caught, so
+        # ``__cause__`` is set; ``_safe_error_detail`` degrades to a loud
+        # "unknown cause" rather than a silent "NoneType" if that ever
+        # stops being true.
         console.print(
             f"[red]Redaction audit write failed after {completed} of "
-            f"{len(files)} file(s): {reason}. Stopping — the file just "
-            f"rewritten has no audit record, and continuing would "
-            f"destroy more files that could not be recorded either."
-            f"[/red]"
+            f"{len(files)} file(s): {_safe_error_detail(exc.__cause__)}. "
+            f"Stopping — the file just rewritten has no audit record, and "
+            f"continuing would destroy more files that could not be "
+            f"recorded either.[/red]"
         )
         audit.record_outcome(
             status="partial",
-            failure_reason=reason,
+            failure_reason=type(exc.__cause__).__name__,
             console=console,
         )
         raise typer.Exit(code=1) from exc
     except OSError as exc:
+        # Never ``{exc}``: str(OSError) embeds the filename it failed on,
+        # and those filenames carry secrets. Same rule as failure_reason.
         console.print(
             f"[red]I/O error after redacting {completed} of "
-            f"{len(files)} file(s): {exc}[/red]"
+            f"{len(files)} file(s): {_safe_error_detail(exc)}[/red]"
         )
         audit.record_outcome(
             status="partial",

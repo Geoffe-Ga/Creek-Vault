@@ -447,7 +447,7 @@ def test_failure_reason_records_the_type_and_never_the_message(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``failure_reason`` carries the exception TYPE NAME only.
+    """No secret-bearing path reaches the audit log **or** the console.
 
     ``str(OSError)`` embeds the offending path, and filenames in a
     redaction workflow demonstrably carry the very secrets being
@@ -456,7 +456,12 @@ def test_failure_reason_records_the_type_and_never_the_message(
     message is the leak".
 
     Asserted on the RAW JSONL BYTES rather than on the parsed model, so
-    a leak through any other field is caught too.
+    a leak through any other field is caught too — **and** on
+    ``result.output``, because the console is not a private channel
+    either: it reaches CI logs, terminal scrollback and shared screens,
+    all of which outlive the run. An earlier revision of this fix
+    hardened the log and left the ``except OSError`` handler printing
+    ``{exc}`` verbatim, and a log-only assertion did not notice.
     """
     import creek.redact.cli_commands as cli_commands
 
@@ -495,6 +500,16 @@ def test_failure_reason_records_the_type_and_never_the_message(
     assert leaky_path.encode("utf-8") not in raw
     assert f"ssn-{SECRET_SSN}".encode() not in raw
     assert b"No space left on device" not in raw
+
+    flattened = " ".join(result.output.split())
+    assert leaky_path not in flattened, (
+        "the operator-facing error echoed the secret-bearing path"
+    )
+    assert f"ssn-{SECRET_SSN}" not in flattened
+    # The actionable part survives: errno is OS-derived, never
+    # path-derived, so an operator still learns the disk is full.
+    assert "I/O error" in flattened
+    assert "ENOSPC" in flattened
 
     outcome = log.read()[-1]
     assert outcome.phase == "outcome"
@@ -892,6 +907,50 @@ def test_an_unresolvable_candidate_is_treated_as_protected(
         console=Console(),
     )
     assert kept == [tmp_path / "fine.md"]
+
+
+def test_an_unresolvable_audit_root_refuses_the_whole_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail-closed applies to the protected-root side of the test too.
+
+    ``_is_protected`` fails closed on the candidate path, but that
+    invariant only holds for half the comparison if resolving the
+    protected roots themselves can raise. A symlink loop at
+    ``00-Creek-Meta/audit`` makes ``Path.resolve`` raise ``RuntimeError``
+    — which would escape as a raw traceback and, worse, would do so
+    without the audit trail having been excluded from anything.
+    """
+    from pathlib import Path as RealPath
+
+    from rich.console import Console
+
+    import creek.redact.cli_commands as cli_commands
+
+    vault = tmp_path / "vault"
+    real_resolve = RealPath.resolve
+
+    def looping_resolve(self: RealPath, strict: bool = False) -> RealPath:
+        if "00-Creek-Meta" in str(self):
+            msg = "Symlink loop"
+            raise RuntimeError(msg)
+        return real_resolve(self, strict=strict)
+
+    monkeypatch.setattr(RealPath, "resolve", looping_resolve)
+
+    # ``typer.Exit`` is ``click.exceptions.Exit``; only click's
+    # ``main()`` standalone mode turns it into ``SystemExit``, and this
+    # calls the helper directly.
+    import typer
+
+    with pytest.raises(typer.Exit) as excinfo:
+        cli_commands._exclude_audit_artifacts(
+            [tmp_path / "fine.md"],
+            vault,
+            console=Console(),
+        )
+    assert excinfo.value.exit_code == 1
 
 
 def test_atomic_write_has_exactly_one_call_site_and_it_records() -> None:
