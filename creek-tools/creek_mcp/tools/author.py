@@ -40,11 +40,12 @@ TOOL_NAME = "creek.author"
 #
 # The literal is deliberately re-stated rather than imported from whatever
 # module happens to construct the finding (today, the body of
-# :func:`creek.author.checks.check_privacy_compliance`): an MCP tool reaching
-# into another surface's internals is a worse coupling than one duplicated
-# string that ``FindingDimension`` already type-checks. Promoting a shared
-# public constant next to the check itself is the right eventual cleanup and is
-# deliberately out of scope here.
+# :func:`creek.author.checks.check_privacy_compliance`) or from the CLI's own
+# module-local twin (``creek/cli.py:4954``, landed by #1352): an MCP tool
+# reaching into another surface's private internals is a worse coupling than
+# one duplicated string that ``FindingDimension`` already type-checks.
+# Promoting a single shared public constant next to the check itself is the
+# right eventual cleanup and is tracked as issue #1362, not done here.
 _PRIVACY_DIMENSION: Final[FindingDimension] = "privacy_compliance"
 
 
@@ -52,7 +53,7 @@ _PRIVACY_DIMENSION: Final[FindingDimension] = "privacy_compliance"
 # fragment id, no draft text, no finding message is interpolated — a refusal
 # that quotes the corpus to explain itself has not refused anything. The
 # offending ids and tiers ride in ``privacy_findings`` instead, whose messages
-# are corpus-free by construction (``creek/author/checks.py:323-327``: fragment
+# are corpus-free by construction (``creek/author/checks.py:342-346``: fragment
 # id and tier only).
 _PRIVACY_REFUSAL_REASON: Final[str] = (
     "The Writing Desk's privacy gate condemned this draft "
@@ -199,8 +200,9 @@ def _draft_response(
     reaches an envelope. Echoing all of ``draft.findings`` would undo the
     scrub, because two sibling checks interpolate corpus text into their own
     messages: ``biographical_grounding`` embeds a sentence lifted from the
-    drafted body (``creek/author/checks.py:164``) and
-    ``attribution_correctness`` embeds a fragment title (``checks.py:517``).
+    drafted body (``creek/author/checks.py:176``) and
+    ``attribution_correctness`` embeds the borrowed claim's text — the cited
+    fragment's title, on the deterministic path (``checks.py:536``).
     Hence the refusal key is ``privacy_findings`` and not ``findings`` — a name
     nobody can "complete" by widening the filter without also having to rename
     it.

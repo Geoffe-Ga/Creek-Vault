@@ -215,8 +215,10 @@ tiers involved — the fragment's own tier and the contract default it exceeded
 falsy-but-present `body` is exactly the shape that lets a caller print nothing
 and believe it published a draft, whereas a missing key raises at the moment
 of the refusal. Until #1353 this envelope answered `status: ok` with the
-verdict, the finding **and** the protected text still in `body`; the CLI half
-of the same leak is [#1310](https://github.com/Geoffe-Ga/Creek-Vault/issues/1310).
+verdict, the finding **and** the protected text still in `body`. The CLI half
+of the same leak was [#1310](https://github.com/Geoffe-Ga/Creek-Vault/issues/1310),
+closed separately by #1352, so `creek author` and `creek.author` now withhold
+a condemned draft on the same trigger.
 
 Three details that are easy to misread:
 

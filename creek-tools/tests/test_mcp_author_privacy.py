@@ -1,12 +1,12 @@
 """``creek.author`` must refuse, not publish, a draft the privacy gate condemned.
 
-``creek_mcp.tools.author._draft_response`` builds its success envelope with
-``"body": draft.body`` unconditionally (``creek_mcp/tools/author.py:69``). So
-when the Writing Desk's HARD privacy check fires, the verb still answers
-``status: "ok"`` — carrying a ``privacy_compliance``/``HIGH`` finding *and* the
-protected text itself, on the wire three times over: in ``body``, in
-``claims[*].claim``, and in ``provenance[*].claim_excerpt``. The gate detects
-the breach and then hands the caller the breach.
+``creek_mcp.tools.author._draft_response`` used to build its success envelope
+with ``"body": draft.body`` unconditionally. So when the Writing Desk's HARD
+privacy check fired, the verb still answered ``status: "ok"`` — carrying a
+``privacy_compliance``/``HIGH`` finding *and* the protected text itself, on the
+wire three times over: in ``body``, in ``claims[*].claim``, and in
+``provenance[*].claim_excerpt``. The gate detected the breach and then handed
+the caller the breach.
 
 Every pre-existing ``creek.author`` test probes at ``ceiling=open``, where the
 #660 retrieval filter drops the intimate fragment before it can reach a draft
@@ -43,14 +43,18 @@ Its length is load-bearing in *both* directions, so do not lengthen it and do
 not shorten it. 54 characters, 12 words:
 
 * **Under 80 characters.** ``creek/author/conductor.py:177`` truncates every
-  provenance entry to ``claim_excerpt=claim.claim[:80]``. A 137-character
-  sentence was tried first and the whole-envelope sweep in
-  :func:`test_privacy_leak_is_absent_from_the_whole_serialized_response` came
-  back green purely because of that truncation — on a tree that was still
-  putting 80 characters of intimate text on the wire. A short secret is what
-  makes the sweep honest about ``claims`` and ``provenance``.
+  provenance entry to ``claim_excerpt=claim.claim[:_EXCERPT_LEN]``, and
+  ``_EXCERPT_LEN`` is 80. ``body`` is never truncated, so a long secret is
+  caught there — but it is *not* caught in ``claims`` or ``provenance``, which
+  is exactly the half-fixed tree ("scrub the key I remembered") that the
+  whole-envelope sweep in
+  :func:`test_privacy_leak_is_absent_from_the_whole_serialized_response` exists
+  to catch. MEASURED against a body-scrubbed envelope: at 54 characters the
+  sweep fails on ``claims``/``provenance``; at 141 characters it passes while
+  the first **80 characters** of the intimate sentence still ship. A short
+  secret is what makes the sweep honest about the two keys nobody remembers.
 * **At least four words.** ``_MIN_PROTECTED_LEAK_WORDS``
-  (``creek/author/checks.py:216``) is 4: a shorter snippet is treated as
+  (``creek/author/checks.py:228``) is 4: a shorter snippet is treated as
   coincidental overlap and never trips the HARD gate, so the fixture would
   quietly stop reproducing the defect at all.
 """
@@ -259,10 +263,11 @@ def test_refusal_carries_only_privacy_dimension_findings(tmp_path: Path) -> None
     ``draft.findings`` into the refusal would undo the scrub, because two
     sibling checks interpolate corpus text into their own messages:
     ``biographical_grounding`` embeds ``finding.sentence!r``, a sentence lifted
-    straight out of the drafted body (``creek/author/checks.py:164``), and
-    ``attribution_correctness`` embeds ``claim.claim!r``, a fragment title
-    (``checks.py:517``). The ``privacy_compliance`` message is corpus-free by
-    construction (``checks.py:323-327``): fragment id and tier, nothing else.
+    straight out of the drafted body (``creek/author/checks.py:176``), and
+    ``attribution_correctness`` embeds ``claim.claim!r`` — the cited fragment's
+    title, on the deterministic path (``checks.py:536``). The
+    ``privacy_compliance`` message is corpus-free by construction
+    (``checks.py:342-346``): fragment id and tier, nothing else.
     Hence the key is ``privacy_findings``, filtered to the one dimension, and
     not ``findings``.
 
