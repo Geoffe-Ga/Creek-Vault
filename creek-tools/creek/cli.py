@@ -3328,7 +3328,23 @@ def _report_voice(vault_path: Path, override: PrivacyTierOverride) -> None:
     """
     from creek.generate.voice import VoiceProfileGenerator, generate_register_samples
 
-    profile_paths = VoiceProfileGenerator(override=override).generate_all_profiles(
+    # Re-resolved from the *resolved* vault_path, deliberately. The command
+    # body already loaded a config from the raw ``--vault`` argument, and with
+    # ``--vault`` omitted those two can be different files: the command may
+    # find its vault via a cwd config while the vault carries its own. For
+    # vault-scoped behaviour the vault's file is the intended winner, matching
+    # ``_report_unnamed`` above. Bare ``load_config()`` would be wrong twice
+    # over — it reads ``creek_config.yaml`` from the *current directory* and
+    # never looks inside the vault at all, which is precisely how this knob
+    # stayed inert (#1313).
+    weighting = _load_config_for_vault(
+        vault_path,
+        warn_on_missing=False,
+    ).voice_audience_weighting
+    profile_paths = VoiceProfileGenerator(
+        override=override,
+        audience_weighting=weighting,
+    ).generate_all_profiles(
         vault_path,
     )
     # Deliberately above the no-profiles early return: an emptied corpus has
@@ -3353,6 +3369,7 @@ def _report_voice(vault_path: Path, override: PrivacyTierOverride) -> None:
     summaries = generate_register_samples(
         vault_path,
         override=override,
+        audience_weighting=weighting,
         on_prune=pruned.append,
     )
     # Announced before the early return, because the emptied corpus that
@@ -3458,8 +3475,14 @@ def _report_rhetorical_patterns(
     """
     from creek.generate.voice import VoiceProfileGenerator
 
+    # Vault-scoped, not cwd-scoped — see the comment in ``_report_voice`` (#1313).
+    weighting = _load_config_for_vault(
+        vault_path,
+        warn_on_missing=False,
+    ).voice_audience_weighting
     written_paths = VoiceProfileGenerator(
         override=override,
+        audience_weighting=weighting,
     ).generate_rhetorical_patterns(vault_path)
     if not written_paths:
         console.print(
@@ -3579,13 +3602,17 @@ def _report_fingerprint(vault_path: Path, override: PrivacyTierOverride) -> None
     """
     del override  # served at ceiling=all only; see the docstring above.
 
-    from creek.config import load_config
     from creek.generate.ai_style.fingerprint import (
         build_fingerprint,
         save_fingerprint,
     )
 
-    full_config = load_config()
+    # Was a bare ``load_config()``, which resolves ``creek_config.yaml``
+    # against the *current directory* and never reads the vault's own file —
+    # so ``--vault X`` silently ignored X's settings and this half of the
+    # feature only looked wired. Moving to the vault's config corrects both
+    # ``voice_audience_weighting`` and ``ai_style`` in one line (#1313).
+    full_config = _load_config_for_vault(vault_path, warn_on_missing=False)
     config = full_config.ai_style
     fingerprint = build_fingerprint(
         vault_path,
@@ -5862,7 +5889,11 @@ def save_cmd(
 # ---------------------------------------------------------------------------
 
 
-def _load_config_for_vault(vault: Path | None) -> CreekConfig:
+def _load_config_for_vault(
+    vault: Path | None,
+    *,
+    warn_on_missing: bool = True,
+) -> CreekConfig:
     """Load :class:`CreekConfig`, auto-discovering ``--vault``'s config (issue #322).
 
     Wraps :func:`creek.config.resolve_config_path` + :func:`load_config`
@@ -5875,12 +5906,17 @@ def _load_config_for_vault(vault: Path | None) -> CreekConfig:
     Args:
         vault: Vault root from the command's ``--vault`` flag, or
             ``None`` when the command was invoked without one.
+        warn_on_missing: Whether a missing config file logs the multi-line
+            "running with built-in defaults" warning. The ``report`` command
+            already resolved and warned once before dispatch, so its
+            per-handler re-resolutions (#1313) pass ``False`` rather than
+            repeat the same warning two or three times in one invocation.
 
     Returns:
         A fully-validated :class:`CreekConfig`.
     """
     config_path = resolve_config_path(vault, None)
-    return load_config(config_path)
+    return load_config(config_path, warn_on_missing=warn_on_missing)
 
 
 def _resolve_vault(vault: Path | None) -> Path:

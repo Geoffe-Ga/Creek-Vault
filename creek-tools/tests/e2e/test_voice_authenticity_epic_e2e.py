@@ -119,18 +119,64 @@ def _write_open_citation_essay(vault: Path) -> None:
     )
 
 
+_E2E_WEIGHTING_CASES = [True, False]
+assert len(_E2E_WEIGHTING_CASES) == 2, (
+    "Both halves are required: the True case alone passed before and after "
+    "#1313, because the probe used to report its own built-in default."
+)
+
+
+def _set_vault_weighting(vault: Path, *, enabled: bool) -> None:
+    """Write the vault's config with ``voice_audience_weighting`` set.
+
+    Args:
+        vault: Vault root.
+        enabled: Value for ``voice_audience_weighting.enabled``.
+    """
+    import yaml
+
+    from creek.config import CreekConfig
+
+    data = CreekConfig().model_dump(mode="json")
+    data["vault_path"] = str(vault)
+    data["voice_audience_weighting"]["enabled"] = enabled
+    (vault / "00-Creek-Meta" / "creek_config.yaml").write_text(
+        yaml.dump(data, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
 @pytest.mark.e2e
-def test_voice_authenticity_epic_end_to_end(tmp_path: Path) -> None:
-    """All four epic acceptance points hold on one vault."""
+@pytest.mark.parametrize("enabled", _E2E_WEIGHTING_CASES)
+def test_voice_authenticity_epic_end_to_end(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    enabled: bool,
+) -> None:
+    """All four epic acceptance points hold on one vault.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Used to unset ``CREEK_CONFIG``, which outranks the
+            vault's own file in ``resolve_config_path`` — with it set in the
+            environment the seeded config is never read and the ``False`` row
+            would report ``True`` for the wrong reason.
+        enabled: The vault's configured audience-weighting value. Point (d)
+            must report the vault's setting rather than a fabricated default
+            (#1313); the other three points are invariant to it.
+    """
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
     vault = tmp_path / "vault"
     (vault / "00-Creek-Meta").mkdir(parents=True)
     _ingest_claude_chat(vault)
     _write_open_citation_essay(vault)
+    _set_vault_weighting(vault, enabled=enabled)
 
     report = build_voice_authenticity_report(vault, draft_path=None)
 
-    # (a) AI turns are excluded from the voice corpus; (d) leak is low + weighting ON.
-    assert report.audience_mix.weighting_active is True
+    # (a) AI turns are excluded; (d) leak is low + weighting tracks the vault.
+    assert report.audience_mix.weighting_active is enabled
     assert report.ai_corpus_leak.leaked == 0
     from creek.vault.reader import iter_vault_fragments
 

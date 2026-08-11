@@ -777,6 +777,31 @@ def generate_lexicon(
             verbatim, so an admitted body lands in ``glossary.md`` byte for
             byte.
 
+    Note:
+        There is deliberately **no** ``audience_weighting`` parameter here, and
+        the collector below is deliberately built without one, even though
+        #1313 threaded that config into every other exemplar-path caller. Every
+        artifact this function writes is provably invariant to the weighting:
+
+        1. :meth:`VoiceExemplarCollector.collect_all_exemplars` performs no
+           ranking and no capping — it returns the whole eligible corpus, so
+           the multiplier has nothing to reorder or cut.
+        2. :meth:`VoicePatternExtractor.extract_patterns` is called with no
+           ``weights=``, and ``weights`` reaches only ``citation_density``.
+        3. :meth:`LexiconGenerator.build_lexicon` consumes *patterns* solely via
+           ``_build_metaphors``, which reads only ``metaphor_families``.
+
+        Threading the kwarg — or reaching for the weighted ``weights=`` hatch —
+        would therefore be an edit no test could fail on, and an untestable
+        no-op is worse than an honest omission: it reads as working wiring.
+        ``generate_lexicon`` is consequently absent from the audience-weighting
+        structural guard while remaining in the override guard. What protects
+        this path instead is the invariance tripwire
+        ``test_lexicon_output_is_invariant_to_the_audience_weighting`` in
+        ``tests/test_voice_audience_weighting_wiring.py``, which goes red the
+        day the lexicon starts consuming a weighted metric — something a guard
+        exclusion could never do.
+
     Returns:
         ``(lexicon, written_paths)``. When the vault has no qualifying
         exemplars, returns ``(None, [])`` and writes nothing — the caller
