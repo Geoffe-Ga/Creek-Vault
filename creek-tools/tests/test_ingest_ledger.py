@@ -18,9 +18,13 @@ import frontmatter
 from creek.cli import _run_ingest
 from creek.ingest import INGESTOR_REGISTRY
 from creek.ingest.ledger import LedgerRecord, SourceLedger
+from creek.ingest.pipeline import run_ingest
+from creek.ingest.spreadsheets import SpreadsheetIngestor
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from creek.ingest.pipeline import IngestRunResult
 
 
 def _make_vault(tmp_path: Path) -> Path:
@@ -198,3 +202,145 @@ class TestMarkdownLedgerWiring:
         vault = _make_vault(tmp_path)
         # No markdown ingest run -> no ledger file should exist.
         assert not SourceLedger.path_for(vault, "discord").exists()
+
+
+# ---- Per-sheet ledger identity for uploaded workbooks (#1305) ----------
+
+
+_UPLOAD_RELDIR = "00-Creek-Meta/adepthood/uploads"
+"""Vault-relative staging directory the upload path writes into."""
+
+_EXPECTED_SHEET_KEYS = {
+    f"{_UPLOAD_RELDIR}/book.xlsx#Budget",
+    f"{_UPLOAD_RELDIR}/book.xlsx#Notes",
+    f"{_UPLOAD_RELDIR}/book.xlsx#Q3",
+}
+"""The three per-sheet ``source_key`` values one staged workbook must produce."""
+
+
+def _stage_multi_sheet_workbook(vault: Path) -> Path:
+    """Write a real 3-sheet workbook into the upload staging directory.
+
+    Each sheet carries a header row and a data row so none of them is
+    dropped by the ``sheet.is_empty`` filter in ``SpreadsheetIngestor.parse``.
+    """
+    import openpyxl
+
+    staged = vault / _UPLOAD_RELDIR / "book.xlsx"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    workbook = openpyxl.Workbook()
+    first = workbook.active
+    assert first is not None
+    first.title = "Budget"
+    workbook.create_sheet(title="Notes")
+    workbook.create_sheet(title="Q3")
+    for index, name in enumerate(("Budget", "Notes", "Q3")):
+        worksheet = workbook[name]
+        worksheet.append(["item", "amount"])
+        worksheet.append([f"row-{index}", str(index * 10)])
+    workbook.save(staged)
+    return staged
+
+
+def _ingest_staged_workbook(vault: Path, staged: Path) -> IngestRunResult:
+    """Run the spreadsheet ingestor over the staged upload, ledger-backed."""
+    return run_ingest(
+        ingestor_cls=SpreadsheetIngestor,
+        source_type="spreadsheet",
+        input_path=staged,
+        vault_path=vault,
+        ledger_source="upload",
+    )
+
+
+def _fragment_paths(vault: Path) -> list[Path]:
+    """Return every fragment markdown file under ``01-Fragments``, sorted."""
+    return sorted((vault / "01-Fragments").rglob("*.md"))
+
+
+class TestUploadedWorkbookLedgerIdentity:
+    """A staged multi-sheet workbook is one ledgered unit per sheet (#1305)."""
+
+    def test_ledgered_multi_sheet_workbook_is_created_then_unchanged(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Three sheets create three fragments, then re-ingest as three unchanged.
+
+        Measured at HEAD, this run reports::
+
+            run1  created=1 updated=0 unchanged=2  files=1
+            run2  created=0 updated=0 unchanged=3  files=1
+
+        and the one surviving file holds the FIRST sheet (``Budget``) —
+        ``VaultWriter._write_model``'s duplicate-id early return
+        returns the already-written path for a duplicate id, so the first
+        writer wins and sheets 2..N are dropped. Any assertion phrased
+        around "the last sheet survives" would be red before *and* after
+        the fix and would certify nothing.
+
+        A per-sheet *fragment id* alone does not fix this run, which is
+        why the ledgered path needs its own test. ``derive_source_key``
+        keys on the file, so all three sheets resolve to one
+        ``origin_key``, one ``LedgerRecord``, and therefore one identity:
+        ``write_fragment_idempotent`` assigns ``fragment.id =
+        record.fragment_id`` on every branch of ``write_fragment_idempotent``
+        and the freshly-derived per-sheet ids are overwritten before the
+        write. The ledger key has to become per-sheet too.
+
+        ``updated`` must stay at zero on both runs. Nothing was edited
+        between them, so an ``updated`` count here is three sheets
+        overwriting each other in place — the loss wearing a success
+        message.
+        """
+        vault = _make_vault(tmp_path)
+        staged = _stage_multi_sheet_workbook(vault)
+
+        run1 = _ingest_staged_workbook(vault, staged)
+        assert run1.errors == [], run1.errors
+        assert (run1.created, run1.updated, run1.unchanged) == (3, 0, 0)
+        assert len(_fragment_paths(vault)) == 3
+
+        run2 = _ingest_staged_workbook(vault, staged)
+        assert run2.errors == [], run2.errors
+        assert (run2.created, run2.updated, run2.unchanged) == (0, 0, 3)
+        assert len(_fragment_paths(vault)) == 3
+
+    def test_ledgered_sheet_origin_keys_are_per_sheet_and_stable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Each sheet gets its own ``origin_key``, and it does not move on re-ingest.
+
+        ``source.origin_key`` is the key the RTBF purge sweep matches on,
+        so it is not merely an identity nicety: a workbook whose three
+        sheets share one key is three fragments the operator can only
+        delete as one, and a key that changes between two identical
+        ingests is a fragment the purge can no longer find at all.
+
+        At HEAD all three sheets derive the same key
+        (``00-Creek-Meta/adepthood/uploads/book.xlsx``), so the ledger
+        holds exactly one record and this test is red on the key set.
+        """
+        vault = _make_vault(tmp_path)
+        staged = _stage_multi_sheet_workbook(vault)
+
+        first = _ingest_staged_workbook(vault, staged)
+        assert first.errors == [], first.errors
+
+        ledger = SourceLedger.load(vault, source="upload")
+        assert len(ledger) == 3
+        assert ledger.live_keys() == _EXPECTED_SHEET_KEYS
+
+        posts = _written_fragments(vault)
+        assert len(posts) == 3
+        assert {post["source"]["origin_key"] for post in posts} == _EXPECTED_SHEET_KEYS
+        for post in posts:
+            record = ledger.get(post["source"]["origin_key"])
+            assert record is not None, post["source"]["origin_key"]
+            assert record.fragment_id == post["id"]
+
+        second = _ingest_staged_workbook(vault, staged)
+        assert second.errors == [], second.errors
+        reloaded = SourceLedger.load(vault, source="upload")
+        assert reloaded.live_keys() == _EXPECTED_SHEET_KEYS

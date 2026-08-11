@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import frontmatter
 import pytest
 
+from creek.ingest.base import assemble_ingested_fragment
 from creek.ingest.presentations import (
     PRESENTATION_EXTENSIONS,
     PresentationBackend,
@@ -25,9 +27,12 @@ from creek.ingest.spreadsheets import (
     WorkbookData,
 )
 from creek.models import SourcePlatform
+from creek.vault.writer import VaultWriter
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from creek.ingest.base import IngestedFragment, Ingestor
 
 
 # ---- Stub backends -----------------------------------------------------
@@ -1279,6 +1284,596 @@ class TestModuleExports:
 
         assert INGESTOR_REGISTRY["spreadsheet"] is SpreadsheetIngestor
         assert INGESTOR_REGISTRY["presentation"] is PresentationIngestor
+
+
+# =======================================================================
+# Per-sheet fragment identity (#1305)
+# =======================================================================
+#
+# ``SpreadsheetIngestor.parse`` emits one ``ParsedFragment`` per non-empty
+# sheet, but each one carries ``content=""``, the same hoisted
+# ``file_modified_time(raw.path)`` timestamp and the same ``source_path``.
+# ``generate_fragment_id(source, timestamp, content)`` therefore mints ONE
+# id for all N sheets, and ``VaultWriter._write_model``
+# (``VaultWriter._write_model``) takes the lock, calls
+# ``_find_existing_locked`` and returns the already-written path for a
+# duplicate id — FIRST WRITER WINS. Sheets 2..N are dropped in silence and
+# the one surviving file holds the FIRST sheet.
+#
+# The migration hazard runs the other way: a workbook with exactly ONE
+# non-empty sheet (every CSV, every single-sheet XLSX) and every
+# presentation must keep the byte-identical id and filename they have
+# today, or the fix orphans fragments already sitting in real vaults. The
+# ``_PIN_*`` constants below are that guard.
+
+
+_PINNED_MTIME = 1710500000
+"""Fixed epoch mtime for the pin tests, so the hashed timestamp is constant."""
+
+# Measured at HEAD against a RELATIVE source path (``book.xlsx``) whose
+# mtime is pinned to ``_PINNED_MTIME``, which makes both hash inputs
+# constant across machines and runs. Each value MUST be byte-identical
+# after the sheet discriminator lands; a change means an existing
+# single-unit fragment has been orphaned.
+#
+# The filename pins are the TAIL only: ``_compute_base_name`` prefixes
+# ``{date}-`` from ``Fragment.created`` (i.e. today), which is not a
+# property of this change and would make the pin a calendar flake.
+_PIN_XLSX_SINGLE_SHEET_ID = "frag-2ae23100e7a8"
+"""Fragment id of a one-sheet ``book.xlsx``; a ``frag-<12hex>`` literal."""
+
+_PIN_XLSX_SINGLE_SHEET_FILENAME_TAIL = "-book.md"
+"""Filename tail of a one-sheet ``book.xlsx``; expected ``-book.md``."""
+
+_PIN_CSV_ID = "frag-e2f9d18e46af"
+"""Fragment id of ``book.csv``; a ``frag-<12hex>`` literal."""
+
+_PIN_CSV_FILENAME_TAIL = "-book.md"
+"""Filename tail of ``book.csv``; expected ``-book.md``."""
+
+_PIN_PRESENTATION_ID = "frag-439246060197"
+"""Fragment id of ``deck.pptx``; a ``frag-<12hex>`` literal."""
+
+_PIN_PRESENTATION_FILENAME_TAIL = "-deck.md"
+"""Filename tail of ``deck.pptx``; expected ``-deck.md``."""
+
+
+# ---- Helpers: vault round-trip -----------------------------------------
+
+
+def _scaffold_vault(tmp_path: Path, name: str = "vault") -> Path:
+    """Create the minimum vault tree ``VaultWriter`` refuses to start without.
+
+    ``VaultWriter.__init__`` raises ``FileNotFoundError`` unless both
+    ``00-Creek-Meta/`` and ``01-Fragments/`` already exist; the
+    per-platform subfolder underneath is created by the writer itself.
+    """
+    vault = tmp_path / name
+    for relpart in ("00-Creek-Meta/Processing-Log", "01-Fragments"):
+        (vault / relpart).mkdir(parents=True, exist_ok=True)
+    return vault
+
+
+def _write_real_workbook(path: Path, sheet_names: list[str]) -> None:
+    """Write a genuine openpyxl workbook with one sheet per name.
+
+    Every sheet gets a header row plus one data row so none of them is
+    dropped by the ``sheet.is_empty`` filter in ``parse``.
+    """
+    import openpyxl
+
+    workbook = openpyxl.Workbook()
+    first = workbook.active
+    assert first is not None
+    first.title = sheet_names[0]
+    for name in sheet_names[1:]:
+        workbook.create_sheet(title=name)
+    for index, name in enumerate(sheet_names):
+        worksheet = workbook[name]
+        worksheet.append(["item", "amount"])
+        worksheet.append([f"row-{index}", str(index * 10)])
+    workbook.save(path)
+
+
+def _stub_workbook(sheet_names: list[str]) -> WorkbookData:
+    """Build canned :class:`WorkbookData` with one non-empty sheet per name.
+
+    Used where openpyxl cannot express the case under test — duplicate
+    sheet titles and blank sheet titles are both rejected or silently
+    renamed by the real writer, but a hand-built workbook (and a workbook
+    produced by some other tool) can carry them.
+    """
+    return WorkbookData(
+        sheets=tuple(
+            SheetData(
+                name=name,
+                headers=("item", "amount"),
+                rows=((f"row-{index}", str(index * 10)),),
+            )
+            for index, name in enumerate(sheet_names)
+        ),
+    )
+
+
+def _assemble_all(ingestor: Ingestor, source: Path) -> list[IngestedFragment]:
+    """Run the four-stage pipeline and assemble every fragment it yields."""
+    result = ingestor.ingest(source)
+    assert result.errors == [], result.errors
+    return [assemble_ingested_fragment(parsed) for parsed in result.fragments]
+
+
+def _write_all(vault: Path, assembled: list[IngestedFragment]) -> list[Path]:
+    """Write every assembled fragment through the real ``VaultWriter``."""
+    writer = VaultWriter(vault_path=vault)
+    return [writer.write_fragment(item.fragment, body=item.body) for item in assembled]
+
+
+def _fragment_files(vault: Path) -> list[Path]:
+    """Return every fragment markdown file under ``01-Fragments``, sorted."""
+    return sorted((vault / "01-Fragments").rglob("*.md"))
+
+
+def _title_part(path: Path) -> str:
+    """Return a fragment filename's stem with its ``YYYY-MM-DD-`` prefix removed.
+
+    ``_compute_base_name`` builds ``{date}-{sanitized-title}``; the date
+    is always the 10 characters of an ISO date, so the remainder is the
+    part this change is responsible for.
+    """
+    return path.stem[11:]
+
+
+class TestMultiSheetWorkbookIdentity:
+    """Every non-empty sheet must survive the write as its own fragment (#1305)."""
+
+    def test_multi_sheet_workbook_writes_one_file_per_sheet(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A 3-sheet workbook lands as three fragment files, one per sheet.
+
+        Pre-fix symptom (this is what makes the test RED, and it is *not*
+        what the issue body claims): all three sheets hash to the same
+        ``frag-<12hex>`` because ``parse`` gives each of them
+        ``content=""``, the same hoisted ``file_modified_time`` timestamp
+        and the same ``source_path``. ``VaultWriter._write_model``
+        (``VaultWriter._write_model``) holds the lock, finds the id
+        already indexed via ``_find_existing_locked`` and returns the
+        existing path without writing — so the FIRST writer wins. One file
+        survives and it holds the FIRST sheet (``Budget``); ``Notes`` and
+        ``Q3`` are dropped with no error, no warning and no duplicate.
+        """
+        source = tmp_path / "book.xlsx"
+        _write_real_workbook(source, ["Budget", "Notes", "Q3"])
+        vault = _scaffold_vault(tmp_path)
+
+        assembled = _assemble_all(SpreadsheetIngestor(), source)
+        _write_all(vault, assembled)
+
+        # (a) Three sheets, three distinct identities. No ``frag-`` literal
+        # is pinned here: the id hashes the absolute ``tmp_path``, so any
+        # literal would differ on every run.
+        assert len({item.fragment.id for item in assembled}) == 3
+
+        # (b) Three distinct identities, three files on disk.
+        files = _fragment_files(vault)
+        assert len(files) == 3
+
+        # (c) Each sheet's rendered heading appears in exactly one file.
+        texts = [path.read_text(encoding="utf-8") for path in files]
+        for heading in (
+            "# book.xlsx — Budget",
+            "# book.xlsx — Notes",
+            "# book.xlsx — Q3",
+        ):
+            occurrences = sum(text.count(heading) for text in texts)
+            assert occurrences == 1, f"{heading!r} appeared {occurrences} times"
+
+    def test_duplicate_sheet_names_still_get_distinct_ids(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Sheets named ``Q``, ``Q`` and ``""`` still produce three fragments.
+
+        Excel forbids duplicate sheet titles and openpyxl silently renames
+        the second one, so this workbook is built straight from the
+        backend's ``WorkbookData`` / ``SheetData`` dataclasses through the
+        ``backend`` seam — a file produced by another tool can carry both a
+        duplicate title and a blank one. The discriminator must therefore
+        be a *normalised, de-duplicated* unit key rather than the raw sheet
+        name; a raw-name key collapses the two ``Q`` sheets back into one
+        id and the blank-named sheet into an empty discriminator.
+
+        Pre-fix all three sheets share one id and first-writer-wins leaves
+        a single file behind.
+        """
+        source = tmp_path / "book.xlsx"
+        _write_xlsx_placeholder(source)
+        vault = _scaffold_vault(tmp_path)
+        backend = StubSpreadsheetBackend(
+            workbooks={"book.xlsx": _stub_workbook(["Q", "Q", ""])},
+        )
+
+        assembled = _assemble_all(SpreadsheetIngestor(backend=backend), source)
+        assert len(assembled) == 3
+        _write_all(vault, assembled)
+
+        assert len({item.fragment.id for item in assembled}) == 3
+        assert len(_fragment_files(vault)) == 3
+
+    def test_duplicate_sheet_names_get_distinct_titles_and_headings(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Two sheets named ``Data`` must be tellable apart *on disk*.
+
+        The sibling test above proves the two sheets get distinct ids and
+        two files. That is disambiguation in the index — an operator never
+        reads an index. Both user-visible strings, the ``title`` in
+        frontmatter and the ``# `` heading in the body, were derived from
+        the RAW ``metadata["sheet"]`` name, which is ``Data`` for both
+        sheets. So the fix produced two fragments the operator opens and
+        cannot distinguish: same title, same heading, same rendered table
+        shape, differing only in a ``frag-<12hex>`` id and a ``-1``
+        de-collision suffix the writer had to invent because the computed
+        filenames collided too.
+
+        The deduplicated ``source_unit`` (``Data`` / ``Data~2``) is the
+        string that already resolved this, and is what both surfaces must
+        consume. Asserted against file bytes rather than the assembled
+        model, because the frontmatter round-trip is where the sibling
+        keys ``sheet`` / ``rows`` / ``columns`` are silently dropped
+        (#1392) — an in-memory assertion would not have noticed that the
+        title is the only per-sheet marker left.
+        """
+        source = tmp_path / "book.xlsx"
+        _write_xlsx_placeholder(source)
+        vault = _scaffold_vault(tmp_path)
+        backend = StubSpreadsheetBackend(
+            workbooks={"book.xlsx": _stub_workbook(["Data", "Data"])},
+        )
+
+        assembled = _assemble_all(SpreadsheetIngestor(backend=backend), source)
+        _write_all(vault, assembled)
+
+        files = _fragment_files(vault)
+        assert len(files) == 2
+        loaded = [frontmatter.load(path) for path in files]
+
+        titles = sorted(str(post.metadata["title"]) for post in loaded)
+        assert titles == ["book — Data", "book — Data~2"]
+
+        headings = sorted(
+            line
+            for post in loaded
+            for line in post.content.splitlines()
+            if line.startswith("# ")
+        )
+        assert headings == ["# book.xlsx — Data", "# book.xlsx — Data~2"]
+
+        # Distinct titles mean distinct computed filenames, so the writer
+        # has no name clash to de-collide. A ``-1`` tail is the on-disk
+        # signature of two fragments that both wanted the same name.
+        assert sorted(_title_part(path) for path in files) == [
+            "book--Data",
+            "book--Data2",
+        ]
+
+    def test_inserting_a_first_sheet_does_not_re_mint_existing_ids(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Prepending a sheet leaves the other sheets' ids untouched.
+
+        This is the explicit rejection of the "use an empty discriminator
+        for sheet index 0" shortcut. Under that shortcut the workbook's
+        first sheet keeps the bare ``source_path`` identity, so inserting a
+        new sheet at the front hands the newcomer the id that used to
+        belong to the old first sheet. With first-writer-wins in
+        ``VaultWriter._write_model``'s duplicate-id early return, the
+        newcomer is then SILENTLY DROPPED as a duplicate of a fragment it
+        has nothing to do with, and every following sheet shifts one slot
+        and overwrites its neighbour's identity.
+
+        Both parses run against the same ``source_path`` string and the
+        same pinned mtime, so the timestamp and source inputs to
+        ``generate_fragment_id`` are held constant and only the sheet set
+        varies. Pre-fix, every sheet in both runs shares one id, so the
+        distinctness assertions fail first.
+        """
+        import os
+
+        source = tmp_path / "book.xlsx"
+        _write_xlsx_placeholder(source)
+        os.utime(source, (_PINNED_MTIME, _PINNED_MTIME))
+        vault = _scaffold_vault(tmp_path)
+
+        before = _assemble_all(
+            SpreadsheetIngestor(
+                backend=StubSpreadsheetBackend(
+                    workbooks={"book.xlsx": _stub_workbook(["Budget", "Notes"])},
+                ),
+            ),
+            source,
+        )
+        _write_all(vault, before)
+        ids_before = {item.fragment.title: item.fragment.id for item in before}
+        assert len(set(ids_before.values())) == 2
+
+        after = _assemble_all(
+            SpreadsheetIngestor(
+                backend=StubSpreadsheetBackend(
+                    workbooks={
+                        "book.xlsx": _stub_workbook(["Intro", "Budget", "Notes"]),
+                    },
+                ),
+            ),
+            source,
+        )
+        _write_all(vault, after)
+        ids_after = {item.fragment.title: item.fragment.id for item in after}
+        assert len(set(ids_after.values())) == 3
+
+        # The two pre-existing sheets keep the exact ids they were minted
+        # with; only the inserted sheet is new.
+        titles_before = sorted(ids_before)
+        for title in titles_before:
+            assert ids_after[title] == ids_before[title], title
+        new_ids = set(ids_after.values()) - set(ids_before.values())
+        assert len(new_ids) == 1
+
+        # Persisted state: the insert adds exactly one file and re-writing
+        # the two known sheets is a no-op, not a duplicate and not a drop.
+        assert len(_fragment_files(vault)) == 3
+
+    def test_re_ingesting_a_workbook_mints_no_new_files(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A second ingest of an unchanged workbook writes nothing new.
+
+        Idempotency on the default, non-ledgered path: the ids are a pure
+        function of ``(source, timestamp, content)``, so the second run
+        resolves to the same three fragments and ``_write_model`` returns
+        the existing paths. A ``-1`` suffixed stem would mean the writer
+        had to invent a filename because two different ids wanted the same
+        one.
+
+        Pre-fix this test fails on the first run already — one file, not
+        three.
+        """
+        source = tmp_path / "book.xlsx"
+        _write_real_workbook(source, ["Budget", "Notes", "Q3"])
+        vault = _scaffold_vault(tmp_path)
+
+        first = _assemble_all(SpreadsheetIngestor(), source)
+        _write_all(vault, first)
+        assert len(_fragment_files(vault)) == 3
+
+        second = _assemble_all(SpreadsheetIngestor(), source)
+        _write_all(vault, second)
+
+        assert {item.fragment.id for item in second} == {
+            item.fragment.id for item in first
+        }
+        files = _fragment_files(vault)
+        assert len(files) == 3
+        assert [path for path in files if path.stem.endswith("-1")] == []
+
+    def test_multi_sheet_filenames_are_distinct_and_well_formed(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Each sheet's file is named for its sheet, with no collision suffix.
+
+        ``_sanitize_title`` strips the em-dash and turns the two spaces
+        around it into two hyphens, so a title of ``book — Budget``
+        becomes the stem tail ``book--Budget`` (the date prefix comes from
+        ``Fragment.created`` and is stripped by :func:`_title_part`).
+
+        The blank-sheet-name case is checked in its own vault because
+        openpyxl will not create a sheet with an empty title. A blank name
+        must normalise to the literal ``sheet`` — an empty discriminator
+        would render ``book — `` and sanitise down to a bare ``book``,
+        colliding with any other unnamed sheet.
+
+        Pre-fix every sheet is titled ``book`` (``assemble_ingested_fragment``
+        falls back to the source stem because the spreadsheet frontmatter
+        carries no ``title``), and only one file is written at all.
+        """
+        source = tmp_path / "book.xlsx"
+        _write_real_workbook(source, ["Budget", "Notes", "Q3"])
+        vault = _scaffold_vault(tmp_path)
+        _write_all(vault, _assemble_all(SpreadsheetIngestor(), source))
+
+        files = _fragment_files(vault)
+        assert {_title_part(path) for path in files} == {
+            "book--Budget",
+            "book--Notes",
+            "book--Q3",
+        }
+        assert [path for path in files if path.stem.endswith("-")] == []
+        assert [path for path in files if path.stem.endswith("-1")] == []
+
+        blank_vault = _scaffold_vault(tmp_path, name="vault-blank")
+        blank_backend = StubSpreadsheetBackend(
+            workbooks={"book.xlsx": _stub_workbook(["Data", ""])},
+        )
+        blank_source = tmp_path / "blank" / "book.xlsx"
+        blank_source.parent.mkdir()
+        _write_xlsx_placeholder(blank_source)
+        _write_all(
+            blank_vault,
+            _assemble_all(SpreadsheetIngestor(backend=blank_backend), blank_source),
+        )
+        blank_files = _fragment_files(blank_vault)
+        assert {_title_part(path) for path in blank_files} == {
+            "book--Data",
+            "book--sheet",
+        }
+        assert [path for path in blank_files if path.stem.endswith("-")] == []
+
+    def test_sheet_rows_and_columns_do_not_survive_to_disk(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Sheet/rows/columns never reach disk; the title carries the sheet.
+
+        A deliberate, accepted drop rather than an oversight worth
+        widening the model for. ``generate_frontmatter`` emits ``sheet``,
+        ``rows`` and ``columns``, but ``Fragment.model_config``
+        leaves pydantic's default ``extra="ignore"``,
+        so ``Fragment.model_validate`` discards all three and
+        ``_write_model`` serialises only model fields. Per-sheet identity
+        is therefore carried by ``title``, by the filename, by the body
+        heading, and — on the ledgered path — by ``source.origin_key``.
+
+        ``TestSpreadsheetFrontmatter.test_frontmatter_records_platform_and_dimensions``
+        (~line 451) asserts those three keys on the dict the *ingestor*
+        returns. That remains true and is left alone; this test pins the
+        other half of the story, which is that they never reach the vault.
+
+        The frontmatter-key assertions hold before and after the fix; the
+        ``title`` assertion is the RED one, since today every sheet's
+        fragment is titled ``book`` from the source-stem fallback in
+        ``assemble_ingested_fragment``.
+
+        Revisiting the drop is tracked in #1392. If that issue decides to
+        surface the fields, this test is the one to update — deliberately,
+        not incidentally.
+        """
+        source = tmp_path / "book.xlsx"
+        _write_real_workbook(source, ["Budget", "Notes", "Q3"])
+        vault = _scaffold_vault(tmp_path)
+        _write_all(vault, _assemble_all(SpreadsheetIngestor(), source))
+
+        budget = [
+            path
+            for path in _fragment_files(vault)
+            if "# book.xlsx — Budget" in path.read_text(encoding="utf-8")
+        ]
+        assert len(budget) == 1
+        post = frontmatter.load(str(budget[0]))
+        assert "sheet" not in post.metadata
+        assert "rows" not in post.metadata
+        assert "columns" not in post.metadata
+        assert post["title"] == "book — Budget"
+
+
+class TestSingleUnitIdentityIsUnchanged:
+    """The migration carve-out: one-unit sources keep their exact identity.
+
+    Every test in this class is GREEN BEFORE AND AFTER the fix, by
+    construction — that is the point. A workbook with exactly one non-empty
+    sheet (which is every CSV and every single-sheet XLSX) and every
+    presentation must keep the byte-identical ``frag-<12hex>`` and the
+    byte-identical filename they have today. If any of these goes red, the
+    change has orphaned fragments that already exist in real vaults, and no
+    amount of correctness on the multi-sheet path pays for that.
+
+    Each test pins against a RELATIVE source path under a chdir'd
+    ``tmp_path`` and an mtime forced to :data:`_PINNED_MTIME`, so both
+    inputs ``generate_fragment_id`` hashes are constants rather than
+    per-run values.
+    """
+
+    def test_single_sheet_xlsx_id_is_unchanged_by_the_sheet_discriminator(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A one-sheet XLSX keeps its measured id and filename.
+
+        Green before and after. The carve-out under test: the sheet
+        discriminator is set only when a workbook yields two or more
+        non-empty sheets, so a single-sheet workbook keeps
+        ``source_unit=None``, hashes the bare ``source_path``, and titles
+        itself from the plain file stem.
+        """
+        import os
+        from pathlib import Path
+
+        monkeypatch.chdir(tmp_path)
+        source = Path("book.xlsx")
+        _write_real_workbook(source, ["Sheet1"])
+        os.utime(source, (_PINNED_MTIME, _PINNED_MTIME))
+        vault = _scaffold_vault(tmp_path)
+
+        assembled = _assemble_all(SpreadsheetIngestor(), source)
+        assert len(assembled) == 1
+        assert assembled[0].fragment.id == _PIN_XLSX_SINGLE_SHEET_ID
+
+        written = _write_all(vault, assembled)
+        assert len(_fragment_files(vault)) == 1
+        assert written[0].name.endswith(_PIN_XLSX_SINGLE_SHEET_FILENAME_TAIL)
+
+    def test_single_sheet_csv_id_is_unchanged_by_the_sheet_discriminator(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A CSV keeps its measured id and filename.
+
+        Green before and after, and load-bearing: ``_csv_text_to_workbook``
+        (creek/ingest/spreadsheets.py ~336) names a CSV's lone sheet after
+        the file stem, so a discriminator applied unconditionally — even a
+        name-based one — would move the id of every CSV fragment in every
+        vault. This test is what forbids that.
+        """
+        import os
+        from pathlib import Path
+
+        monkeypatch.chdir(tmp_path)
+        source = Path("book.csv")
+        source.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+        os.utime(source, (_PINNED_MTIME, _PINNED_MTIME))
+        vault = _scaffold_vault(tmp_path)
+
+        assembled = _assemble_all(SpreadsheetIngestor(), source)
+        assert len(assembled) == 1
+        assert assembled[0].fragment.id == _PIN_CSV_ID
+
+        written = _write_all(vault, assembled)
+        assert len(_fragment_files(vault)) == 1
+        assert written[0].name.endswith(_PIN_CSV_FILENAME_TAIL)
+
+    def test_presentation_fragment_id_is_unchanged_by_the_sheet_discriminator(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A presentation keeps its measured id and filename.
+
+        Green before and after. ``PresentationIngestor.parse``
+        (creek/ingest/presentations.py ~310) has the identical
+        ``content=""`` shape as the spreadsheet ingestor, so it is the
+        obvious place for a sheet-discriminator refactor to leak into. It
+        must be provably untouched: a deck is one unit and stays one unit.
+        """
+        import os
+        from pathlib import Path
+
+        monkeypatch.chdir(tmp_path)
+        source = Path("deck.pptx")
+        _write_pptx_placeholder(source)
+        os.utime(source, (_PINNED_MTIME, _PINNED_MTIME))
+        vault = _scaffold_vault(tmp_path)
+        backend = StubPresentationBackend(
+            presentations={
+                "deck.pptx": PresentationData(
+                    title=None,
+                    slides=(SlideData(index=1, title="Hello", body="World"),),
+                ),
+            },
+        )
+
+        assembled = _assemble_all(PresentationIngestor(backend=backend), source)
+        assert len(assembled) == 1
+        assert assembled[0].fragment.id == _PIN_PRESENTATION_ID
+
+        written = _write_all(vault, assembled)
+        assert len(_fragment_files(vault)) == 1
+        assert written[0].name.endswith(_PIN_PRESENTATION_FILENAME_TAIL)
 
 
 if __name__ == "__main__":

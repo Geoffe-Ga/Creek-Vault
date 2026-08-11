@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from creek.ingest.source_unit import SOURCE_UNIT_SEPARATOR
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -151,6 +153,55 @@ class SourceLedger:
     def live_keys(self) -> set[str]:
         """Return the tracked source keys that are not tombed (#674)."""
         return {key for key, rec in self._records.items() if not rec.tombed}
+
+    def all_keys(self) -> set[str]:
+        """Return every tracked source key, tombed or not (#1305).
+
+        The counterpart to :meth:`live_keys`, for the readers that must not
+        treat a tombed record as absence. A soft-tombed unit's fragment was
+        moved to ``10-Liminal/Orphaned/``, not deleted, so a gate deciding
+        whether an identity *owns anything* has to count it — ``live_keys``
+        answers a different question, and answering this one with it is how
+        a gate comes to admit a caller to content that still exists.
+
+        Returns:
+            All tracked source keys.
+        """
+        return set(self._records)
+
+    def records_for(self, base_key: str) -> list[tuple[str, LedgerRecord]]:
+        """Return every record keyed on *base_key* or a sub-unit of it (#1305).
+
+        :meth:`get` answers "what is this file's fragment", which stopped
+        being a question with one answer once one file could hold several
+        independently identified units — the sheets of a workbook. A caller
+        holding only the file's path (the ``creek.upload`` tool holds a
+        staged path, never a sheet name) has no way to enumerate the units
+        without this.
+
+        Both the exact key and its ``<base_key>#<unit>`` children are
+        returned, so a single-unit source still answers with its one record
+        and callers need no special case for the two shapes.
+
+        The ``#`` scan cannot mis-fire for the upload ledger, its only
+        caller: staged filenames come from ``creek_mcp.staged_names.safe_stem``,
+        whose slug regex excludes ``#`` outright, so no staged path can look
+        like a composed key.
+
+        Args:
+            base_key: The whole file's source key.
+
+        Returns:
+            ``(source_key, record)`` pairs ordered by key, so a caller that
+            reduces the list to one id — a response's ``fragment_id`` —
+            picks the same one on every run.
+        """
+        prefix = f"{base_key}{SOURCE_UNIT_SEPARATOR}"
+        return sorted(
+            (key, record)
+            for key, record in self._records.items()
+            if key == base_key or key.startswith(prefix)
+        )
 
     def __len__(self) -> int:
         """Return the number of distinct source keys tracked."""

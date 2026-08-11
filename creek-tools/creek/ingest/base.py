@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from creek._containment import assert_source_contained
 from creek.classify.tags_pass import apply_tags
+from creek.ingest.source_unit import compose_source_unit
 from creek.models import Fragment, FragmentLevel
 
 logger = logging.getLogger(__name__)
@@ -91,7 +92,31 @@ class ParsedFragment(BaseModel):
     """
 
     source_path: str
-    """Path to the original source file."""
+    """Path to the original source file.
+
+    Always the *whole file*, verbatim, even for an ingestor that emits
+    several fragments from it. Downstream consumers rely on that: the
+    per-file titles in :mod:`creek.ingest.code` and :mod:`creek.ingest.generic`,
+    the extension dispatch in :meth:`Ingestor.discover`, and — load-bearing
+    since #1304 — :func:`creek.ingest.routing.arbitrate`, which decides which
+    ingestor owns a file by grouping fragments on exactly this string. A
+    sub-unit discriminator belongs on :attr:`source_unit`, never here.
+    """
+
+    source_unit: str | None = None
+    """The sub-unit of :attr:`source_path` this fragment addresses (#1305).
+
+    ``None`` for the overwhelmingly common one-fragment-per-file case, and
+    for the *single*-sheet workbook — a CSV or a one-sheet XLSX derives
+    exactly the identity it derived before this field existed, which is what
+    keeps every such fragment already in an operator's vault from being
+    re-minted and duplicated on its next ingest.
+
+    Set only where one file genuinely contains several independently
+    identifiable units: today that is ``SpreadsheetIngestor``'s sheets. It
+    reaches identity through :attr:`identity_key` and nothing else, so
+    adding one cannot disturb a consumer of :attr:`source_path`.
+    """
 
     timestamp: datetime
     """Timestamp associated with this fragment."""
@@ -111,6 +136,25 @@ class ParsedFragment(BaseModel):
     markdown, html, code, …) that don't need structured payloads are
     not forced to set a slot they don't use.
     """
+
+    @property
+    def identity_key(self) -> str:
+        """Return the string that identifies this fragment's source (#1305).
+
+        The **only** input any identity derivation may take from a parsed
+        fragment's provenance: :func:`generate_fragment_id`, the provenance
+        entry in :meth:`Ingestor._process_fragment`, and the ledger key in
+        :func:`creek.ingest.pipeline.attach_origin_key` all read this rather
+        than :attr:`source_path`.
+
+        Equal to :attr:`source_path` whenever :attr:`source_unit` is unset,
+        so every ingestor that predates #1305 derives byte-identical ids.
+
+        Returns:
+            ``source_path`` composed with ``source_unit``, or ``source_path``
+            unchanged when there is no unit.
+        """
+        return compose_source_unit(self.source_path, self.source_unit)
 
 
 class ProvenanceEntry(BaseModel):
@@ -404,14 +448,23 @@ def assemble_ingested_fragment(parsed: ParsedFragment) -> IngestedFragment:
 
     Step 4 lives here rather than in each ingestor because this function
     is the **universal ingest chokepoint**: every adapter and every CLI
-    surface funnels through it (``creek/pipeline.py:498`` for ``creek
-    process``, ``creek/ingest/pipeline.py:309`` for ``creek ingest`` /
-    ``creek sync`` / the MCP tool, ``creek/ingest/discord.py:839`` for
-    Discord capture). Wiring it once here is what makes ``tags``
-    populated for markdown, Discord, ChatGPT, Substack and the rest in
-    one place, and it is why the ``creek process`` path needs no separate
-    call further down the pipeline — nothing between here and the write
-    mutates the body the hashtags come from.
+    surface funnels through it —
+    :meth:`creek.pipeline.Pipeline._run_ingestion` for ``creek process``,
+    :func:`creek.ingest.pipeline.run_ingest` for ``creek ingest`` /
+    ``creek sync`` / the ``creek.upload`` MCP tool,
+    :func:`creek_mcp.tools.ingest.ingest_tool` for the ``creek.ingest`` MCP
+    tool, and :mod:`creek.ingest.discord` for Discord capture. Wiring it
+    once here is what makes ``tags`` populated for markdown, Discord,
+    ChatGPT, Substack and the rest in one place, and it is why the ``creek
+    process`` path needs no separate call further down the pipeline —
+    nothing between here and the write mutates the body the hashtags come
+    from.
+
+    Callers are named by *symbol*, not by file and line. The four
+    ``path:line`` citations this paragraph used to carry had every one of
+    them rotted by the time #1305 read them (``creek/pipeline.py:498`` had
+    drifted into an unrelated function), and the MCP ingest tool — a real
+    caller — was missing entirely.
 
     Args:
         parsed: A parsed fragment produced by an ingestor's four-stage
@@ -440,7 +493,7 @@ def assemble_ingested_fragment(parsed: ParsedFragment) -> IngestedFragment:
     body: str = str(parsed.metadata["markdown"])
 
     frontmatter_dict["id"] = generate_fragment_id(
-        parsed.source_path,
+        parsed.identity_key,
         parsed.timestamp,
         parsed.content,
     )
@@ -709,8 +762,10 @@ class Ingestor(abc.ABC):
             ingestor_name: The class name of this ingestor.
             now: The current timestamp for provenance.
         """
+        # ``identity_key``, not ``source_path``: a provenance entry per sheet,
+        # matching the one fragment id per sheet the same key mints (#1305).
         frag_id = generate_fragment_id(
-            fragment.source_path, fragment.timestamp, fragment.content
+            fragment.identity_key, fragment.timestamp, fragment.content
         )
 
         # Stage 3: Convert to markdown
