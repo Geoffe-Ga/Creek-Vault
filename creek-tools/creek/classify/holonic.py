@@ -72,6 +72,7 @@ from creek.classify.weighted import (
     WeightedFragmentClassification,
 )
 from creek.models import (
+    Confidence,
     Dosage,
     Frequency,
     Mode,
@@ -189,6 +190,11 @@ def combine(
             effective_weights,
             top_k=top_k,
         ),
+        confidences=_combine_dimension(
+            [c.confidences for c in children],
+            effective_weights,
+            top_k=top_k,
+        ),
         overall_confidence=confidence,
         reasoning=reasoning,
     )
@@ -235,6 +241,7 @@ def decompose_prior(
         orientations=parent.orientations,
         dosages=parent.dosages,
         voice_registers=parent.voice_registers,
+        confidences=parent.confidences,
         overall_confidence=parent.overall_confidence * 0.5,
         reasoning=parent.reasoning,
     )
@@ -387,6 +394,12 @@ def _mean_normalised_jsd(
         ("orientations", Orientation),
         ("dosages", Dosage),
         ("voice_registers", VoiceRegister),
+        # Author stance counts toward the divergence penalty like any
+        # other dimension. Omitting it would let children that disagree
+        # maximally about how firmly the writer holds their claim
+        # contribute zero divergence, silently overstating the bubbled-up
+        # parent's ``overall_confidence`` (#1309).
+        ("confidences", Confidence),
     )
     divergences: list[float] = []
     for attr, enum_type in dimension_accessors:

@@ -25,6 +25,7 @@ from creek.classify.weighted import (
     WeightedFragmentClassification,
 )
 from creek.models import (
+    Confidence,
     Dosage,
     Frequency,
     Mode,
@@ -44,6 +45,7 @@ def _wfc(
     orientations: tuple[tuple[Orientation, float], ...] = (),
     dosages: tuple[tuple[Dosage, float], ...] = (),
     voice_registers: tuple[tuple[VoiceRegister, float], ...] = (),
+    confidences: tuple[tuple[Confidence, float], ...] = (),
     overall_confidence: float = 0.7,
     reasoning: str = "",
 ) -> WeightedFragmentClassification:
@@ -65,6 +67,7 @@ def _wfc(
         voice_registers=tuple(
             WeightedDimension(value=v, weight=w) for v, w in voice_registers
         ),
+        confidences=tuple(WeightedDimension(value=v, weight=w) for v, w in confidences),
         overall_confidence=overall_confidence,
         reasoning=reasoning,
     )
@@ -589,3 +592,56 @@ class TestDefensiveBranches:
         # skipped and parent confidence equals the mean.
         assert parent.frequencies[0].value is Frequency.F3
         assert parent.overall_confidence == pytest.approx(0.7)
+
+
+class TestConfidencesDimension:
+    """The author-stance axis is threaded through every holonic path (#1309)."""
+
+    def test_combine_rolls_up_children_confidences(self) -> None:
+        """A bubbled-up parent carries the children's author stance."""
+        agreeing = _wfc(
+            confidences=((Confidence.CONVICTION, 0.9),),
+            overall_confidence=0.8,
+        )
+        parent = combine([agreeing, agreeing])
+        assert parent.confidences != ()
+        assert parent.confidences[0].value is Confidence.CONVICTION
+
+    def test_decompose_prior_carries_confidences_down(self) -> None:
+        """A decomposed prior hands the parent's stance to its children."""
+        parent = _wfc(
+            confidences=((Confidence.SETTLED, 0.8),),
+            overall_confidence=0.8,
+        )
+        assert decompose_prior(parent, n_atoms=3).confidences == parent.confidences
+
+    def test_opposed_confidences_dampen_parent_confidence(self) -> None:
+        """Disagreement about author stance contributes to the JSD penalty.
+
+        The regression guard for a hole that nothing else catches.
+        ``_mean_normalised_jsd`` walks a hard-coded ``dimension_accessors``
+        table; ``confidences`` has to be listed there explicitly. If it is
+        omitted, ``combine`` and ``decompose_prior`` still thread the axis, so
+        every other test in this class stays green — but two children that
+        disagree maximally about how firmly the writer holds their claim
+        contribute ZERO divergence, and the parent's ``overall_confidence`` is
+        silently overstated.
+
+        Verified to be a real binding: deleting the ``("confidences",
+        Confidence)`` accessor turns this test, and only this test, red.
+        """
+        musing = _wfc(
+            confidences=((Confidence.MUSING, 0.9),),
+            overall_confidence=0.8,
+        )
+        conviction = _wfc(
+            confidences=((Confidence.CONVICTION, 0.9),),
+            overall_confidence=0.8,
+        )
+        opposed = combine([musing, conviction])
+        agreed = combine([musing, musing])
+
+        # Same per-child confidence in both cases, so any difference is
+        # attributable to the divergence penalty alone.
+        assert agreed.overall_confidence == pytest.approx(0.8)
+        assert opposed.overall_confidence < agreed.overall_confidence

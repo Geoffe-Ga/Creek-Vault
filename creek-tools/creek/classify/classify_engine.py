@@ -170,6 +170,15 @@ voice-proxy generation, the Writing Desk), which is a strict improvement
 on the prior behaviour where 100% of intimate content routed to the
 cloud, every time. Fixing the residual properly needs a local
 pre-classification pass, which is out of scope here.
+
+That "once, not every time" promise was true only of the single-pick
+path until #1309. The weighted path could not keep it: it had no
+author-stance axis to detect ``conviction`` with, and it overwrote
+``voice.confidence`` with ``None`` on every run — so the escalation
+never fired, and even a tier escalated by some other route lost the
+evidence explaining it. Both paths now reach the same tier for the
+same model verdict, and both leave the evidence in place across
+re-runs, so the residual above is genuinely one egress on either.
 """
 
 from __future__ import annotations
@@ -1489,10 +1498,11 @@ def _classify_one(
             dispatches through
             :func:`creek.classify.weighted.classify_weighted`, persists
             the resulting weighted profile to
-            :attr:`Fragment.weighted`, and derives the legacy
-            single-pick fields via
-            :meth:`WeightedFragmentClassification.to_legacy` so
-            downstream consumers stay synchronised. Has no effect on
+            :attr:`Fragment.weighted`, and merges the derived legacy
+            single-pick fields over the fragment via
+            :meth:`WeightedFragmentClassification.merge_onto` — a
+            dimension the profile is silent about keeps its prior
+            value rather than being reset. Has no effect on
             the rules path or on ``--method llm`` runs where the rule
             classifier already cleared the confidence floor; for those
             fragments :attr:`Fragment.weighted` stays ``None``.
@@ -1540,10 +1550,16 @@ def _classify_one_weighted(
     :attr:`ClassificationConfig.weighted_classification` is set.
     Populates :attr:`Fragment.weighted` with the full weighted
     profile and derives the legacy single-pick fields from the
-    profile's top entries via
-    :meth:`WeightedFragmentClassification.to_legacy` so existing
-    consumers (lint, compile, voice-skill generation) stay
-    synchronised. When the underlying call fails soft to an empty
+    profile's top entries, so existing consumers (lint, compile,
+    voice-skill generation) keep reading a canonical pick.
+
+    Those derived fields **merge** over the fragment's existing
+    classification rather than replacing it wholesale — a dimension
+    the profile is silent about leaves the prior value standing. The
+    merge rule, and why the wholesale form was a privacy defect, live
+    on :meth:`WeightedFragmentClassification.merge_onto` (#1309).
+
+    When the underlying call fails soft to an empty
     profile (whitespace-only body, provider unavailable, transport
     error, malformed YAML) nothing is derived from it: the input
     fragment is handed back untouched — rule verdict intact,
@@ -1581,15 +1597,7 @@ def _classify_one_weighted(
         # ``_record_if_preserved`` forever (#744, #1330).
         return fragment, True, ""
     weighted = result.classification
-    freq, wave, voice = weighted.to_legacy()
-    updated = fragment.model_copy(
-        update={
-            "weighted": weighted,
-            "frequency": freq,
-            "wavelength": wave,
-            "voice": voice,
-        },
-    )
+    updated = weighted.merge_onto(fragment)
     return updated, False, weighted.reasoning
 
 
