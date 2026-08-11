@@ -379,6 +379,31 @@ def _parse_since_arg(text: str) -> datetime:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
+def _print_ingest_warning(message: str) -> None:
+    """Show one ingest advisory to the operator, as it is detected (#1329).
+
+    Warnings go to the same stdout console as every other ``creek ingest``
+    advisory (``_warn_if_discovered_but_empty``, ``_print_pin_findings``)
+    rather than to stderr: this command's output is human prose, not data on a
+    pipe, and an advisory routed to a stream none of its neighbours use is one
+    an operator can lose.
+
+    The exit code is deliberately left alone. A warning reports vault state
+    that will cause trouble later, not a failure of this run — and
+    ``creek sync`` shares this path, so escalating would turn every scheduled
+    pass over an un-migrated vault into a hard failure.
+
+    ``escape`` and ``soft_wrap=True`` are load-bearing for the same reasons as
+    in :func:`_print_pin_findings`: the text carries a shell command the
+    operator is meant to copy, and rich would otherwise be free to wrap it
+    across lines (or read a bracketed path as markup).
+
+    Args:
+        message: The advisory text from the ingest pipeline.
+    """
+    console.print(f"[yellow]{escape(message)}[/yellow]", soft_wrap=True)
+
+
 def _run_ingest(
     *,
     ingestor_cls: type[Ingestor],
@@ -413,6 +438,12 @@ def _run_ingest(
         list of human-readable strings prefixed with ``[<source_type>]`` and
         ``discovered`` is how many inputs the ingestor's ``discover()`` found.
 
+        Operator advisories are **not** in this tuple. They are printed by
+        :func:`_print_ingest_warning` the moment the pipeline detects them, so
+        every caller of this helper surfaces them without having to remember
+        to — which is what went wrong when the un-pinned-vault advisory was
+        left to a return value nobody read (#1329).
+
     Raises:
         typer.Exit: With code ``1`` when the vault cannot be opened.
     """
@@ -427,6 +458,7 @@ def _run_ingest(
             reclassify_threshold=reclassify_threshold,
             since=since,
             incremental=incremental,
+            on_warning=_print_ingest_warning,
         )
     except FileNotFoundError as exc:
         console.print(f"[red]Vault unavailable: {exc}[/red]")

@@ -196,13 +196,16 @@ def test_a_bare_reingest_of_an_unpinned_vault_duplicates(tmp_path: Path) -> None
     assert len(_fragment_files(vault)) == 2
 
 
-def test_an_unpinned_vault_is_warned_about_before_it_is_duplicated(
+def test_an_unpinned_vault_advisory_is_recorded_in_the_run_result(
     tmp_path: Path,
 ) -> None:
-    """The operator is told the vault needs migrating, on the run that would hurt.
+    """The advisory reaches the structured result on the run that would hurt.
 
     Derived from the ledger's own emptiness rather than a separate version
-    marker, so there is only one piece of state that can be wrong.
+    marker, so there is only one piece of state that can be wrong. This asserts
+    the *result object* only; whether a human ever sees it is a separate
+    property, covered by
+    :func:`test_cli_ingest_prints_the_unpinned_vault_advisory_before_it_writes`.
     """
     vault = _make_vault(tmp_path)
     source = _make_source(tmp_path)
@@ -713,6 +716,78 @@ def test_cli_pin_source_ids_exits_one_on_a_missing_vault(tmp_path: Path) -> None
     )
 
     assert code == 1
+
+
+def _ingest_via_cli(vault: Path, src_dir: Path) -> tuple[int, str]:
+    """Run a bare ``creek ingest`` the way an operator does, through the CLI.
+
+    Every other un-pinned-vault assertion in this module calls
+    :func:`~creek.ingest.pipeline.run_ingest` directly, which is precisely how
+    the advisory could be produced, stored, and still never reach a human.
+
+    Args:
+        vault: Vault root.
+        src_dir: Directory holding the source files.
+
+    Returns:
+        ``(exit_code, output)`` with ANSI styling removed.
+    """
+    return _run_cli(
+        "ingest",
+        "--type",
+        "markdown",
+        "--input",
+        str(src_dir),
+        "--vault",
+        str(vault),
+        "--yes",
+    )
+
+
+def test_cli_ingest_prints_the_unpinned_vault_advisory_before_it_writes(
+    tmp_path: Path,
+) -> None:
+    """A plain ``creek ingest`` shows the advisory, ahead of its own write pass.
+
+    This is the whole safety mechanism: an advisory the operator never sees is
+    not an advisory. It is asserted on rendered output rather than on
+    ``IngestRunResult.warnings`` because the gap being guarded is exactly the
+    step between the two.
+
+    Ordering is part of the contract, not incidental. The advisory is emitted
+    at detection time — before the first fragment is written — so the operator
+    who is watching can still abort with nothing yet duplicated. Printed after
+    the run it would only ever be an explanation of damage already done.
+
+    The remedy command is asserted whole: it is meant to be copy-pasted, and a
+    line-wrap through the middle of it is a broken instruction.
+    """
+    vault = _make_vault(tmp_path)
+    source = _make_source(tmp_path)
+    _seed_pre_fix_fragment(vault, source)
+
+    code, output = _ingest_via_cli(vault, source.parent)
+
+    assert code == 0, output
+    assert "creek ingest --pin-source-ids --vault <vault>" in output
+    assert output.index("--pin-source-ids") < output.index("Ingest summary:")
+
+
+def test_cli_ingest_stays_quiet_about_a_pinned_vault(tmp_path: Path) -> None:
+    """A migrated vault gets no advisory, so the warning keeps its meaning.
+
+    Without this, printing the advisory unconditionally would pass the
+    companion test while training the operator to ignore it.
+    """
+    vault = _make_vault(tmp_path)
+    source = _make_source(tmp_path)
+    _seed_pre_fix_fragment(vault, source)
+    pin_source_ids(vault)
+
+    code, output = _ingest_via_cli(vault, source.parent)
+
+    assert code == 0, output
+    assert "--pin-source-ids" not in output
 
 
 def test_the_reproduction_diagnostic_counts_a_reproducing_fragment(

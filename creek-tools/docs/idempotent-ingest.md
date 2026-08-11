@@ -86,8 +86,19 @@ The migration **pins**; it does not re-mint. Existing ids never move.
   records no source file, is listed and skipped rather than guessed at.
 
 It is idempotent (a second run pins nothing) and `--dry-run` writes nothing.
-An un-migrated vault is detected on the next `creek ingest` and warned about
-before it is duplicated.
+
+An un-migrated vault is detected on the next ingest — the empty ledger is the
+marker — and the advisory naming the remedy is printed **before that run's
+write pass begins**, so an operator watching it can still abort with nothing
+yet duplicated. This covers every ingest driven through the CLI, `creek sync`
+included.
+
+It is an advisory, not a gate: the run continues and the exit code is
+unchanged. A warning describes vault state that will cause trouble, not a
+failure of the run in front of it, and making it fatal would hard-fail every
+scheduled `creek sync` over a vault that has not been migrated yet. So an
+*unattended* ingest over an un-migrated vault will still duplicate it. Pin
+first.
 
 ### Two behaviour changes worth knowing about
 

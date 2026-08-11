@@ -24,6 +24,7 @@ from creek.ingest.base import assemble_ingested_fragment
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from datetime import datetime
     from pathlib import Path
 
@@ -423,6 +424,7 @@ def run_ingest(
     incremental: bool = False,
     ledger_source: str | None = None,
     privacy_tier: PrivacyTier | None = None,
+    on_warning: Callable[[str], None] | None = None,
 ) -> IngestRunResult:
     """Run one ingestor and persist its output idempotently to the vault.
 
@@ -451,6 +453,14 @@ def run_ingest(
             Merged onto each fragment with
             :func:`creek.classify.privacy_pass.escalate`, so it can only
             raise the tier, never lower one the source already declared.
+        on_warning: Called with each operator advisory **at the moment it is
+            detected**, which for the un-pinned-vault advisory is before the
+            first fragment is written (#1329). Surfaces still get every warning
+            on :attr:`IngestRunResult.warnings`; this exists because an
+            advisory whose whole purpose is "stop before this run hurts you"
+            is worthless delivered after the run finished. Keeping it a plain
+            ``str`` callback leaves this module UI-agnostic — the caller
+            decides what printing means.
 
     Returns:
         An :class:`IngestRunResult` with the write tallies and any errors.
@@ -464,13 +474,25 @@ def run_ingest(
     filtering = since is not None or incremental
 
     warnings: list[str] = []
+
+    def warn(message: str) -> None:
+        """Record an advisory and hand it to the caller in the same breath.
+
+        The single way a warning enters this run. Appending to the list
+        without notifying *on_warning* is how an advisory becomes invisible,
+        so the two are not separable here.
+        """
+        warnings.append(message)
+        logger.warning("%s", message)
+        if on_warning is not None:
+            on_warning(message)
+
     # Checked BEFORE the write loop: once the loop has recorded its first
     # ledger entry the vault no longer looks un-pinned, and the advisory would
     # never fire for the very run it needed to warn about.
     unpinned = unpinned_vault_warning(ledger, vault_path)
     if unpinned is not None:
-        warnings.append(unpinned)
-        logger.warning("%s", unpinned)
+        warn(unpinned)
 
     errors: list[str] = [f"[{source_type}] {err}" for err in ingest_result.errors]
     written = 0
