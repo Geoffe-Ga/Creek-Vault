@@ -16,12 +16,19 @@ but wrong for a command that writes to the vault. Here a fragment that clears
 the gate but was not verified routes to the operator review queue, never to
 canonical compost. An embedding hit is a suspicion, not a finding.
 
-**Intimate content never reaches the verifier.** ``skip_intimate`` is forced
-on rather than plumbed through :class:`~creek.config.CompostConfig`, so no
-config edit or flag can send intimate fragment bodies to a cloud provider.
-``creek/cli.py``'s ``_build_compost_verifier`` carries a durable caveat about
-exactly this call site; ``creek.cli._build_scan_verifier`` is the tier-aware
-builder that caveat asks for.
+**Intimate content never reaches the verifier — or the vault.**
+``skip_intimate`` is forced on rather than plumbed through
+:class:`~creek.config.CompostConfig`, so no config edit or flag can send
+intimate fragment bodies to a cloud provider. ``creek/cli.py``'s
+``_build_compost_verifier`` carries a durable caveat about exactly this call
+site; ``creek.cli._build_scan_verifier`` is the tier-aware builder that caveat
+asks for. Two things widen that guarantee past egress (issue #1311):
+:meth:`~creek.generate.compost.CompostTracker._screen` removes withheld
+fragments at the detection boundary, so they reach the *note writer* no more
+than they reach the verifier; and :func:`_load_fragments` re-derives each
+tier from raw frontmatter, so a note that declares no tier at all fails
+closed to ``intimate`` instead of inheriting the model's ``unclassified``
+default.
 
 **Costs are quoted before they are incurred.** Detection runs gate-only
 first, so the candidate count — and therefore the LLM call count — is known
@@ -40,6 +47,7 @@ import frontmatter
 import yaml
 from pydantic import ValidationError
 
+from creek.classify.privacy_filter import raw_privacy_tier
 from creek.generate.compost import CANONICAL_RELDIR, CompostTracker
 from creek.generate.compost_verifier import CompostVerdict
 from creek.models import Thread
@@ -188,14 +196,37 @@ def _load_fragments(vault_path: Path) -> tuple[list[Fragment], dict[str, str]]:
     verifier is shown both. :func:`creek.vault.reader.iter_vault_fragments`
     is the only loader that returns them alongside the validated model.
 
+    Each fragment's ``privacy_tier`` is re-derived from its **raw**
+    frontmatter through :func:`creek.classify.privacy_filter.raw_privacy_tier`
+    before it leaves this function, following the precedent
+    ``creek.generate.mining`` sets for liminal fragments. Reading the tier
+    off the validated model instead would fail *open* on the one case that
+    matters: ``Fragment.privacy_tier`` defaults to ``unclassified`` when the
+    key is absent, so a hand-written or legacy note that never declared a
+    tier at all would be admitted, while ``raw_privacy_tier`` — and
+    therefore every other reader in the codebase — resolves the same file to
+    ``intimate``. Two tools that disagree about one file is a bug class, not
+    a style question (issue #1311).
+
+    The narrowing is scoped to the missing key: an explicit ``unclassified``
+    ranks with ``personal`` (#876/#961) and stays admitted. An
+    *unrecognised* tier string never reaches here — it fails
+    ``Fragment.model_validate`` and
+    :func:`creek.vault.reader.try_load_fragment` drops the note — which
+    ``tests/test_compost_scan.py`` pins so that behaviour stays a contract
+    rather than an accident.
+
     Args:
         vault_path: Root of the Obsidian vault.
 
     Returns:
-        ``(fragments, {fragment_id: body})``.
+        ``(fragments, {fragment_id: body})``, with tiers already narrowed.
     """
     records = iter_vault_fragments(vault_path / _FRAGMENTS_RELDIR)
-    fragments = [fragment for _path, fragment, _body, _raw in records]
+    fragments = [
+        fragment.model_copy(update={"privacy_tier": raw_privacy_tier(raw)})
+        for _path, fragment, _body, raw in records
+    ]
     bodies = {fragment.id: body for _path, fragment, body, _raw in records}
     return fragments, bodies
 

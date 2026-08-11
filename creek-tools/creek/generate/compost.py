@@ -36,7 +36,7 @@ from creek.models import (
 from creek.time import effective_authored_at, ensure_aware, now_la
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
 
     from creek.generate.compost_verifier import SupportsVerifyCompost
@@ -145,6 +145,32 @@ def _is_intimate(fragment: Fragment) -> bool:
     return fragment.privacy_tier == PrivacyTier.INTIMATE
 
 
+@dataclass(frozen=True)
+class _AdmittedFragments:
+    """The fragment sequence after withheld fragments have been screened out.
+
+    A distinct type rather than a bare list, so that a detector which has
+    not been screened is a mypy ``arg-type`` error rather than a privacy
+    leak found in production. Every private ``_detect_*`` method on
+    :class:`CompostTracker` takes one of these; nothing else may.
+
+    Attributes:
+        fragments: The admitted fragments, in input order. These are the
+            only fragments any detector may read — their IDs, titles and
+            timestamps are the only ones that may reach a compost note.
+        withheld_thread_titles: Titles of every thread linked by a
+            *withheld* fragment. Deliberately titles and not the
+            ``Fragment`` objects: the thread detector is the one that
+            copies ``frag.title`` and ``frag.id`` into a note, so handing
+            it withheld fragments would keep the leak one edit away. It is
+            also what makes suppression O(1) per thread instead of
+            re-parsing every withheld fragment's wikilinks per thread.
+    """
+
+    fragments: tuple[Fragment, ...]
+    withheld_thread_titles: frozenset[str]
+
+
 def _sanitize_filename(title: str) -> str:
     """Sanitise a title for use as part of a filename."""
     cleaned = re.sub(r"[^\w\s-]", "", title).strip()
@@ -248,8 +274,40 @@ class CompostTracker:
         3. Tagged projects that appear in early fragments but have not
            been mentioned for more than :attr:`project_gap_days`.
 
-        Paradox-tagged and intimate-tier fragments are skipped per
-        ``skip_paradox`` / ``skip_intimate`` on the constructor.
+        **Withheld fragments are screened out once, here, before any
+        detector runs.** Paradox-tagged fragments (``skip_paradox``) and
+        intimate-tier fragments (``skip_intimate``) are removed by
+        :meth:`_screen`, which is the single chokepoint: a withheld
+        fragment contributes no ID, no title, no excerpt, no count and no
+        date to any candidate, and — because the screen happens before
+        :meth:`_group_fragments_by_tag` — cannot bring a project identity
+        into existence. Screening at the boundary rather than inside each
+        detector is load-bearing, not tidiness: a project candidate's
+        ``source_id`` and ``title`` *are* the tag, which reaches the note's
+        filename and ``_Compost-Report.md``, so filtering the emitted
+        ``fragment_ids`` lists would leave a tag carried only by intimate
+        fragments naming a file in the vault (issue #1311).
+
+        Three consequences are deliberate:
+
+        * **Silent omission.** A thread named only by withheld fragments
+          yields no candidate at all. Emitting one with
+          ``_No related fragments were recorded._`` in place of its
+          fragment list would announce that the thread's only fragments are
+          protected — which is the fact being protected. Suppression is
+          conditioned on withheld-ness, never on emptiness: a thread whose
+          fragments simply have not been ingested still composts.
+        * **A project alive only in withheld fragments falls silent.**
+          Silence is measured over the admitted set, so such a project now
+          produces a compost note it would not have produced before. This
+          is accepted: no withheld fragment becomes admitted, and the note
+          is derived entirely from admitted fragments.
+        * **The thread reason is an accepted residual channel.**
+          :meth:`_thread_reason` reads ``Thread.last_seen`` from the
+          thread's own frontmatter, not from fragments, so a dormancy
+          window stamped by a withheld fragment survives screening.
+          ``02-Threads/<id>.md`` is an ordinary vault note, so this
+          discloses nothing a reader could not already see.
 
         Args:
             threads: Threads to scan.
@@ -263,47 +321,129 @@ class CompostTracker:
             A list of :class:`CompostCandidate` models, ordered
             thread-candidates → fragment-candidates → project-candidates.
         """
-        thread_candidates = self._detect_threads(threads, fragments)
+        admitted = self._screen(fragments)
+        thread_candidates = self._detect_threads(threads, admitted)
         fragment_candidates = self._detect_abandonment_fragments(
-            fragments,
+            admitted,
             fragment_bodies or {},
         )
-        project_candidates = self._detect_disappeared_projects(fragments)
+        project_candidates = self._detect_disappeared_projects(admitted)
         return [*thread_candidates, *fragment_candidates, *project_candidates]
+
+    def _is_withheld(self, fragment: Fragment) -> bool:
+        """Return whether *fragment* is excluded from compost detection.
+
+        The single predicate behind both skip policies. Keeping the
+        ``paradox`` and ``intimate`` tests in one place means a change to
+        either — issue #1210 moves paradox detection from ``tags`` to
+        ``emotional_texture`` — is a change to one expression rather than
+        to every detector.
+        """
+        if self._skip_paradox and _is_paradox(fragment):
+            return True
+        return self._skip_intimate and _is_intimate(fragment)
+
+    def _screen(self, fragments: list[Fragment]) -> _AdmittedFragments:
+        """Partition *fragments* into what detection may see and what it may not.
+
+        The one chokepoint enforcing ``skip_paradox`` / ``skip_intimate``.
+        Runs before every detector, so nothing downstream needs to know the
+        policies exist — and a detector added later is guarded by
+        construction. Withheld fragments are reduced immediately to the set
+        of thread titles they mention; no withheld :class:`Fragment` object
+        travels any further.
+
+        Args:
+            fragments: Every fragment loaded for this detection pass.
+
+        Returns:
+            The admitted fragments, plus every thread title any withheld
+            fragment names. That set is deliberately not "titles *only*
+            withheld fragments name": a thread also named by an admitted
+            fragment appears in it too, and :meth:`_thread_candidate`
+            draws the distinction by checking the set only when no
+            admitted fragment turned out to be related.
+        """
+        admitted: list[Fragment] = []
+        withheld_thread_titles: set[str] = set()
+        for fragment in fragments:
+            if self._is_withheld(fragment):
+                withheld_thread_titles.update(_fragment_thread_titles(fragment))
+            else:
+                admitted.append(fragment)
+        return _AdmittedFragments(
+            fragments=tuple(admitted),
+            withheld_thread_titles=frozenset(withheld_thread_titles),
+        )
 
     def _detect_threads(
         self,
         threads: list[Thread],
-        fragments: list[Fragment],
+        admitted: _AdmittedFragments,
     ) -> list[CompostCandidate]:
-        """Detect compost candidates whose source is a thread."""
+        """Detect compost candidates whose source is a thread.
+
+        Mirrors :meth:`_detect_disappeared_projects`: the per-source
+        decision lives in :meth:`_thread_candidate`, and this method only
+        collects what that returns.
+        """
         today = self._now.date()
         candidates: list[CompostCandidate] = []
         for thread in threads:
-            reason = self._thread_reason(thread, today)
-            if reason is None:
-                continue
-            related = [
-                frag
-                for frag in fragments
-                if thread.title in _fragment_thread_titles(frag)
-            ]
-            candidates.append(
-                CompostCandidate(
-                    source_type="thread",
-                    source_id=thread.id,
-                    title=thread.title,
-                    reason=reason,
-                    fragment_ids=[frag.id for frag in related],
-                    energy_fragment_ids=[
-                        frag.id for frag in related if _fragment_is_energetic(frag)
-                    ],
-                    energy_excerpts=[
-                        frag.title for frag in related if _fragment_is_energetic(frag)
-                    ],
-                ),
-            )
+            candidate = self._thread_candidate(thread, admitted, today)
+            if candidate is not None:
+                candidates.append(candidate)
         return candidates
+
+    def _thread_candidate(
+        self,
+        thread: Thread,
+        admitted: _AdmittedFragments,
+        today: date,
+    ) -> CompostCandidate | None:
+        """Return a candidate for *thread*, or ``None`` if it is not compost.
+
+        Two ways to return ``None``. The thread may simply not be dormant
+        or resolved. Or every fragment naming it may have been withheld, in
+        which case the candidate is omitted rather than written with an
+        empty fragment list — see the silent-omission paragraph on
+        :meth:`detect_compost_candidates`. That second condition tests
+        withheld-ness, never emptiness: a thread whose fragments have not
+        been ingested yet has no withheld fragments either, and must still
+        compost.
+        """
+        reason = self._thread_reason(thread, today)
+        if reason is None:
+            return None
+        related = self._related_fragments(thread, admitted)
+        if not related and thread.title in admitted.withheld_thread_titles:
+            return None
+        energetic = [frag for frag in related if _fragment_is_energetic(frag)]
+        return CompostCandidate(
+            source_type="thread",
+            source_id=thread.id,
+            title=thread.title,
+            reason=reason,
+            fragment_ids=[frag.id for frag in related],
+            energy_fragment_ids=[frag.id for frag in energetic],
+            energy_excerpts=[frag.title for frag in energetic],
+        )
+
+    @staticmethod
+    def _related_fragments(
+        thread: Thread,
+        admitted: _AdmittedFragments,
+    ) -> list[Fragment]:
+        """Return the admitted fragments that wiki-link *thread* by title.
+
+        Reads ``admitted.fragments`` and nothing else, so a withheld
+        fragment cannot be "related" to anything.
+        """
+        return [
+            frag
+            for frag in admitted.fragments
+            if thread.title in _fragment_thread_titles(frag)
+        ]
 
     def _thread_reason(self, thread: Thread, today: date) -> str | None:
         """Return a compost reason for *thread*, or ``None`` if not a candidate."""
@@ -316,25 +456,23 @@ class CompostTracker:
 
     def _detect_abandonment_fragments(
         self,
-        fragments: list[Fragment],
+        admitted: _AdmittedFragments,
         bodies: Mapping[str, str],
     ) -> list[CompostCandidate]:
         """Detect fragments that semantically describe abandonment (FEAT-018).
 
         Two-stage pipeline: embedding-similarity gate → optional LLM
-        verifier. Paradox-tagged and intimate-tier fragments are
-        skipped here so neither the embedding nor the verifier sees
-        them — important because the verifier may call out to a cloud
-        LLM and intimate content must never leave the device.
+        verifier. Neither the embedding gate nor the verifier can see a
+        paradox-tagged or intimate-tier fragment, because :meth:`_screen`
+        removed it upstream in :meth:`detect_compost_candidates` — the
+        guarantee is now structural rather than a check inside this loop.
+        That matters because the verifier may call out to a cloud LLM and
+        intimate content must never leave the device.
         """
         if self._similarity_fn is None:
             return []
         candidates: list[CompostCandidate] = []
-        for fragment in fragments:
-            if self._skip_paradox and _is_paradox(fragment):
-                continue
-            if self._skip_intimate and _is_intimate(fragment):
-                continue
+        for fragment in admitted.fragments:
             body = bodies.get(fragment.id, "")
             text = f"{fragment.title}\n{body}".strip() if body else fragment.title
             similarity = self._similarity_fn(text)
@@ -392,11 +530,19 @@ class CompostTracker:
 
     def _detect_disappeared_projects(
         self,
-        fragments: list[Fragment],
+        admitted: _AdmittedFragments,
     ) -> list[CompostCandidate]:
-        """Detect tagged projects that have fallen silent."""
+        """Detect tagged projects that have fallen silent.
+
+        Grouping runs over the admitted fragments only, so a tag carried
+        exclusively by withheld fragments never becomes a project identity
+        — which is the leak channel that filtering a candidate's
+        ``fragment_ids`` cannot close, since the identity *is* the tag.
+        Both the ``project_min_fragments`` count and the silence date are
+        therefore computed from admitted fragments alone.
+        """
         cutoff = self._now - timedelta(days=self.project_gap_days)
-        tag_fragments = self._group_fragments_by_tag(fragments)
+        tag_fragments = self._group_fragments_by_tag(admitted.fragments)
         candidates: list[CompostCandidate] = []
         for tag, frags in tag_fragments.items():
             candidate = self._project_candidate(tag, frags, cutoff)
@@ -406,7 +552,7 @@ class CompostTracker:
 
     @staticmethod
     def _group_fragments_by_tag(
-        fragments: list[Fragment],
+        fragments: Sequence[Fragment],
     ) -> dict[str, list[Fragment]]:
         """Group fragments by each tag they carry."""
         grouped: dict[str, list[Fragment]] = defaultdict(list)
