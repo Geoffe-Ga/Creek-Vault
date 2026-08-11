@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from creek.generate.mining import MiningRunReport
     from creek.ingest.base import Ingestor
     from creek.ingest.discord_dispatch import DiscordMode
+    from creek.ingest.pin_ids import PinResult
     from creek.link.link_engine import LinkSummary
     from creek.models import CompileTargetKind, Frequency, Mode, Phase
     from creek.purge import PurgeEngine, PurgeResult
@@ -378,6 +379,31 @@ def _parse_since_arg(text: str) -> datetime:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
+def _print_ingest_warning(message: str) -> None:
+    """Show one ingest advisory to the operator, as it is detected (#1329).
+
+    Warnings go to the same stdout console as every other ``creek ingest``
+    advisory (``_warn_if_discovered_but_empty``, ``_print_pin_findings``)
+    rather than to stderr: this command's output is human prose, not data on a
+    pipe, and an advisory routed to a stream none of its neighbours use is one
+    an operator can lose.
+
+    The exit code is deliberately left alone. A warning reports vault state
+    that will cause trouble later, not a failure of this run — and
+    ``creek sync`` shares this path, so escalating would turn every scheduled
+    pass over an un-migrated vault into a hard failure.
+
+    ``escape`` and ``soft_wrap=True`` are load-bearing for the same reasons as
+    in :func:`_print_pin_findings`: the text carries a shell command the
+    operator is meant to copy, and rich would otherwise be free to wrap it
+    across lines (or read a bracketed path as markup).
+
+    Args:
+        message: The advisory text from the ingest pipeline.
+    """
+    console.print(f"[yellow]{escape(message)}[/yellow]", soft_wrap=True)
+
+
 def _run_ingest(
     *,
     ingestor_cls: type[Ingestor],
@@ -412,6 +438,12 @@ def _run_ingest(
         list of human-readable strings prefixed with ``[<source_type>]`` and
         ``discovered`` is how many inputs the ingestor's ``discover()`` found.
 
+        Operator advisories are **not** in this tuple. They are printed by
+        :func:`_print_ingest_warning` the moment the pipeline detects them, so
+        every caller of this helper surfaces them without having to remember
+        to — which is what went wrong when the un-pinned-vault advisory was
+        left to a return value nobody read (#1329).
+
     Raises:
         typer.Exit: With code ``1`` when the vault cannot be opened.
     """
@@ -426,6 +458,7 @@ def _run_ingest(
             reclassify_threshold=reclassify_threshold,
             since=since,
             incremental=incremental,
+            on_warning=_print_ingest_warning,
         )
     except FileNotFoundError as exc:
         console.print(f"[red]Vault unavailable: {exc}[/red]")
@@ -1233,6 +1266,26 @@ def ingest(
         "-y",
         help="Skip the consent prompt for first-time sources (logged).",
     ),
+    pin_source_ids: bool = typer.Option(
+        False,
+        "--pin-source-ids",
+        help=(
+            "One-time migration: back-fill the ingest ledger with each existing "
+            "fragment's existing id, so no id moves under the #1329 "
+            "id-derivation fix. Operators MUST run this once after upgrading — "
+            "without it the next ingest mints a new id for every markdown "
+            "fragment already on disk and leaves the original behind as a "
+            "duplicate. Idempotent. --type / --input are ignored."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "With --pin-source-ids: print the plan and write nothing "
+            "(no ledger records, no frontmatter changes)."
+        ),
+    ),
     refresh_dates: bool = typer.Option(
         False,
         "--refresh-dates",
@@ -1285,18 +1338,25 @@ def ingest(
     input is idempotent: deterministic fragment IDs ensure existing
     files are recognised and skipped.
 
+    ``--pin-source-ids`` is a one-shot migration: it walks ``--vault``
+    (or the configured vault) and records each existing fragment's
+    **existing** id against its source in the ingest ledger, so the
+    #1329 id-derivation fix can never move an id already on disk.
+    ``--dry-run`` plans it without writing.
+
     ``--refresh-dates`` is a one-shot backfill: it walks
     ``--vault`` (or the configured vault), re-runs the per-format
     authored-date extraction chain against each fragment's source
     file, and rewrites the frontmatter in place. ``--type`` /
     ``--input`` are ignored in refresh mode.
     """
-    if refresh_dates:
-        _run_refresh_dates(vault)
-        return
-
-    if refresh_ai_chat:
-        _run_refresh_ai_chat(vault)
+    if _dispatch_ingest_migration(
+        vault,
+        pin_source_ids=pin_source_ids,
+        dry_run=dry_run,
+        refresh_dates=refresh_dates,
+        refresh_ai_chat=refresh_ai_chat,
+    ):
         return
 
     if type is None or input is None:
@@ -1343,6 +1403,143 @@ def ingest(
         source_type=type,
         strict=strict,
     )
+
+
+def _dispatch_ingest_migration(
+    vault: Path | None,
+    *,
+    pin_source_ids: bool,
+    dry_run: bool,
+    refresh_dates: bool,
+    refresh_ai_chat: bool,
+) -> bool:
+    """Run whichever one-shot migration ``creek ingest`` was asked for.
+
+    ``--pin-source-ids`` is checked before every other mode, including the two
+    refresh migrations: a vault that still needs pinning must not fall through
+    into a normal ingest, because that run is precisely the one that derives
+    fresh ids and duplicates it (#1329).
+
+    Args:
+        vault: ``--vault``, or ``None`` to use the configured vault.
+        pin_source_ids: Whether ``--pin-source-ids`` was given.
+        dry_run: Whether ``--dry-run`` was given.
+        refresh_dates: Whether ``--refresh-dates`` was given.
+        refresh_ai_chat: Whether ``--refresh-ai-chat`` was given.
+
+    Returns:
+        ``True`` when a migration ran and the caller should return
+        immediately; ``False`` to proceed with a normal ingest.
+
+    Raises:
+        typer.BadParameter: If ``--dry-run`` is combined with a migration that
+            does not support it.
+    """
+    if pin_source_ids:
+        _run_pin_source_ids(vault, dry_run=dry_run)
+        return True
+    if dry_run:
+        # Refusing beats ignoring. --dry-run is new to `creek ingest` and
+        # scoped to --pin-source-ids; silently running a different migration
+        # for real while the operator believes they asked for a preview is the
+        # worst possible reading of the flag.
+        msg = "--dry-run is only supported with --pin-source-ids."
+        raise typer.BadParameter(msg)
+    if refresh_dates:
+        _run_refresh_dates(vault)
+        return True
+    if refresh_ai_chat:
+        _run_refresh_ai_chat(vault)
+        return True
+    return False
+
+
+def _print_pin_findings(label: str, lines: list[str]) -> None:
+    """Print every finding under *label*, one per line, or nothing if there are none.
+
+    Findings are listed in full rather than counted. Each line names a
+    fragment the migration deliberately left unpinned, and an unpinned
+    fragment is one the next ingest can still orphan — a bare count would tell
+    the operator that a problem exists without telling them which file to fix.
+    Each line is markup-escaped because it carries a filesystem path, and a
+    path containing ``[`` would otherwise be swallowed as Rich markup or raise
+    ``MarkupError`` over the top of the message (#1310).
+
+    ``soft_wrap=True`` is load-bearing for the same reason: Rich's default
+    word-wrap breaks a long absolute path across lines mid-token, which is
+    exactly the string the operator needs to copy-paste into their next
+    command. Letting the terminal wrap it keeps the path intact.
+
+    Args:
+        label: Heading for this class of finding, e.g. ``"Conflicts"``.
+        lines: Human-readable finding lines from :class:`PinResult`.
+    """
+    if not lines:
+        return
+    console.print(f"[yellow]{label}: {len(lines)}[/yellow]")
+    for line in lines:
+        console.print(f"  [dim]{escape(line)}[/dim]", soft_wrap=True)
+
+
+def _render_pin_summary(result: PinResult, *, dry_run: bool) -> None:
+    """Render the one-screen summary of a ``--pin-source-ids`` run.
+
+    Args:
+        result: What the migration did, or would have done under *dry_run*.
+        dry_run: Whether this was a plan; when ``True`` nothing was written.
+    """
+    verb = "Would pin" if dry_run else "Pinned"
+    console.print(
+        f"[bold green]{verb} {result.pinned} existing fragment id(s) into the "
+        "ingest ledger.[/bold green]"
+    )
+    console.print(f"  already pinned: {result.already_pinned}")
+    console.print(f"  examined: {result.examined}")
+    if result.repaired:
+        # Surfaced rather than folded into "already pinned": a non-zero count
+        # is evidence that an earlier run did not finish, which the operator
+        # would otherwise have no way to learn.
+        console.print(
+            f"[yellow]  repaired {result.repaired} half-pinned fragment(s) left "
+            "by an interrupted earlier run.[/yellow]"
+        )
+    # Advisory only, and labelled as such on screen: a fragment that does not
+    # re-derive its own id is not a failure — its id was minted by the very
+    # build this migration exists to correct. Nothing is gated on this number,
+    # so nothing about the run should read as if a low one meant trouble.
+    console.print(
+        f"  re-derive their own id: {result.reproduced} "
+        "(advisory diagnostic only; nothing is gated on it)"
+    )
+    if dry_run:
+        console.print("[yellow]Dry run: nothing was written.[/yellow]")
+    _print_pin_findings("Conflicts (pinned none of these)", result.conflicts)
+    _print_pin_findings("Unpinnable", result.unpinnable)
+
+
+def _run_pin_source_ids(vault: Path | None, *, dry_run: bool) -> None:
+    """Execute the #1329 ``--pin-source-ids`` ledger back-fill.
+
+    Resolves the vault path (CLI flag → configured default), invokes
+    :func:`creek.ingest.pin_ids.pin_source_ids`, and renders a one-screen
+    summary. Exit codes mirror the rest of the CLI: 0 on success (regardless
+    of how many fragments were pinned, conflicted or were unpinnable), 1 if
+    the vault path is unusable.
+
+    Args:
+        vault: ``--vault``, or ``None`` to use the configured vault.
+        dry_run: ``--dry-run``; when ``True`` the plan is printed and neither
+            the ledger nor any frontmatter is written.
+    """
+    from creek.ingest.pin_ids import pin_source_ids
+
+    config = _load_config_for_vault(vault)
+    vault_path = vault or config.vault_path
+    if not vault_path.exists():
+        console.print(f"[red]Vault path does not exist: {vault_path}[/red]")
+        raise typer.Exit(code=1)
+
+    _render_pin_summary(pin_source_ids(vault_path, dry_run=dry_run), dry_run=dry_run)
 
 
 def _run_refresh_dates(vault: Path | None) -> None:

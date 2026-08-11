@@ -125,13 +125,21 @@ def _stage_upload(
 ) -> Path:
     """Write *raw* to its stable staged path and return it, skipping no-op writes.
 
-    The identical-bytes short-circuit is **not** an optimisation. Every
-    ingestor without an embedded date derives its parse timestamp from the
-    file's ``st_mtime``, and :func:`creek.ingest.base.generate_fragment_id`
-    hashes that timestamp — while ``write_fragment_idempotent``'s *unchanged*
-    branch never reassigns ``fragment.id``. Re-writing identical bytes would
-    therefore bump the mtime, mint a new id, and leave a duplicate fragment
-    behind on every idempotent re-send.
+    The identical-bytes short-circuit avoids a pointless write on an
+    idempotent re-send: an ingestor without an embedded date derives its parse
+    timestamp from the file's ``st_mtime``, and
+    :func:`creek.ingest.base.generate_fragment_id` hashes that timestamp, so
+    rewriting the same bytes would bump the mtime and derive a different id.
+
+    It is no longer load-bearing against *duplication*, and this docstring
+    should not be read as claiming otherwise. Uploads run under a borrowed
+    ledger (``UPLOAD_LEDGER_SOURCE``), and since #1329
+    ``write_fragment_idempotent`` assigns ``fragment.id = record.fragment_id``
+    on **every** branch — including the unchanged one, which previously wrote
+    whatever id had just been derived. A shifted derivation is therefore
+    absorbed by the ledger rather than turning into an orphan. Keeping the
+    short-circuit is still worth it; keeping a comment that asserts a hazard
+    the ledger now closes is how the hazard gets reopened.
 
     Args:
         vault_path: Vault root.

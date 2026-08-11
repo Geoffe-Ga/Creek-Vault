@@ -15,14 +15,18 @@ any surface can drive it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path  # runtime use: resolving recorded source paths
+from typing import TYPE_CHECKING, Final
 
 from creek.ingest.base import assemble_ingested_fragment
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from datetime import datetime
-    from pathlib import Path
 
     from creek.ingest.base import Ingestor, ParsedFragment
     from creek.ingest.ledger import LedgerRecord, SourceLedger
@@ -42,6 +46,9 @@ class IngestRunResult:
         tombed: Ledgered units soft-tombed because a full-source pass no longer
             saw them.
         skipped: Units skipped by incremental/``since`` filtering.
+        warnings: Non-fatal operator advisories. Unlike *errors*, these do not
+            mean anything failed — they mean the run detected a vault state
+            that will cause trouble if left alone (#1329).
     """
 
     written: int
@@ -52,6 +59,49 @@ class IngestRunResult:
     unchanged: int
     tombed: int
     skipped: int
+    warnings: list[str] = field(default_factory=list)
+
+
+def resolve_recorded_source(source_path: str, vault_path: Path) -> Path:
+    """Interpret a recorded ``source.original_file`` string as a path on disk.
+
+    ``source.original_file`` is stored **verbatim** as whatever path the ingest
+    run was handed — ``MarkdownIngestor.parse`` records ``str(raw.path)`` and
+    the CLI does not resolve ``--source`` — so a vault ingested with ``creek
+    ingest --source 00-Inbox`` from the vault root holds *relative* recorded
+    paths. A bare :class:`Path` of such a string is anchored to the current
+    working directory, which makes every later reader of that record answer a
+    different question depending on where it was invoked from.
+
+    Anchoring to the vault is the recovery: the vault root is a stable anchor
+    the reader already holds as an argument, and it is the directory a
+    vault-relative record was almost certainly written against.
+
+    The current directory still wins when it resolves, so a run made from the
+    original ingest's directory behaves exactly as before; the vault is
+    consulted only for a relative path that names nothing where it stands.
+    When neither locates a file the string is returned unchanged, so a caller
+    asking whether the source still exists gets the same honest ``no`` — this
+    widens what *resolves*, never what is assumed to exist.
+
+    Args:
+        source_path: The recorded ``source.original_file``, verbatim.
+        vault_path: Vault root, used to anchor a relative record.
+
+    Returns:
+        The best on-disk interpretation of *source_path*.
+    """
+    candidate = Path(source_path)
+    # The ``is_absolute`` arm states intent and saves a stat; it is not a
+    # behavioural branch. ``vault_path / <absolute>`` is that absolute path
+    # again, so an absolute record takes the same value either way — dropping
+    # this clause is an equivalent mutation, and no test can kill it.
+    if candidate.is_absolute() or candidate.exists():
+        return candidate
+    vault_anchored = vault_path / candidate
+    if vault_anchored.exists():
+        return vault_anchored
+    return candidate
 
 
 def derive_source_key(source_path: str, vault_path: Path) -> str:
@@ -60,14 +110,46 @@ def derive_source_key(source_path: str, vault_path: Path) -> str:
     Prefers the path relative to the vault root (the stable identity a
     re-ingested edit is matched on); falls back to the bare filename when the
     source lives outside the vault.
-    """
-    from pathlib import Path as _Path
 
-    candidate = _Path(source_path)
+    The recorded string is interpreted by :func:`resolve_recorded_source`
+    rather than being anchored to the current directory, so a relative record
+    keys the same way whichever directory the caller runs from. Sharing that
+    one resolution with the ``pin_ids`` migration is deliberate: two functions
+    disagreeing about where the same recorded path points is how the migration
+    came to call a live in-vault source deleted while this function happily
+    derived a key for it.
+    """
+    candidate = resolve_recorded_source(source_path, vault_path)
     try:
         return candidate.resolve().relative_to(vault_path.resolve()).as_posix()
     except ValueError:
         return candidate.name
+
+
+LEDGERED_SOURCE_TYPE: Final[str] = "markdown"
+"""The one source type whose identity is ledger-backed by default (#672).
+
+Three places have to agree on this name: :func:`ledger_for_source`, which
+loads that ledger; :func:`unpinned_vault_warning`, whose whole subject is
+that ledger; and the ``creek.ingest.pin_ids`` migration, which back-fills
+it. They agree by importing this constant rather than by each spelling
+``"markdown"`` and a comment promising to stay in step — a promise is not
+an enforcement, and the review that produced this constant found the
+advisory already consulting a different ledger than the migration wrote.
+"""
+
+TOMBING_SOURCES: frozenset[str] = frozenset({LEDGERED_SOURCE_TYPE})
+"""Source types whose directory ingest may soft-tomb units it no longer sees.
+
+Deliberately *narrower* than "has a ledger", and separate from it (#1329).
+:func:`resolve_ledger` lets a caller opt a non-markdown source type into
+ledger-backed *identity* via ``ledger_source``, and until this split that same
+opt-in silently armed :func:`tomb_missing_units` as well — so a directory
+ingest under a borrowed ledger would tomb every previously-recorded unit it
+did not happen to see. Identity and tombing are different questions; only a
+source whose directory listing is genuinely the full, authoritative set of
+live units belongs here.
+"""
 
 
 def ledger_for_source(source_type: str, vault_path: Path) -> SourceLedger | None:
@@ -76,7 +158,7 @@ def ledger_for_source(source_type: str, vault_path: Path) -> SourceLedger | None
     Only the markdown (journal) source is ledger-wired; append-only event
     sources keep their content-hashed ids untouched.
     """
-    if source_type != "markdown":
+    if source_type != LEDGERED_SOURCE_TYPE:
         return None
     from creek.ingest.ledger import SourceLedger
 
@@ -226,12 +308,22 @@ def write_fragment_idempotent(
 ) -> str:
     """Write or update the fragment; return ``"created"``/``"updated"``/``"unchanged"``.
 
-    When the ledger already maps this source unit to a fragment and the
-    content has *changed*, reuse that fragment id and rewrite it in place
-    (preserving classifications/links, flagging re-classification on a material
-    change per *reclassify_threshold*). Unchanged content falls through to the
-    normal write, where the deterministic id makes it an idempotent no-op. A
-    new unit (no prior ledger record) is written fresh and reported as created.
+    When the ledger already maps this source unit to a fragment, **the
+    ledger's recorded id wins on every branch** — changed, unchanged, or
+    tombed. That assignment is hoisted above the branches deliberately
+    (#1329): it used to happen only on the changed and tombed paths, leaving
+    the unchanged path to write whatever id the ingestor had just *derived*.
+    Any drift in id derivation — a timezone bug, a new hash input, a
+    refactor — therefore turned every unchanged ledgered unit into a silent
+    duplicate, because the writer's dedup keys on the id alone. Identity for
+    a mutable file source is ledger-backed by design (#672 SPEC R1); the
+    derivation is only how a *new* unit gets its first id.
+
+    Beyond identity: changed content is rewritten in place (preserving
+    classifications/links, flagging re-classification on a material change
+    per *reclassify_threshold*); unchanged content falls through to a write
+    the id makes a no-op; a new unit with no prior record is written fresh
+    and reported as created.
     """
     record = ledger_record(ledger, fragment)
     # `record is not None` guarantees `ledger is not None` (ledger_record
@@ -239,6 +331,9 @@ def write_fragment_idempotent(
     if record is None or ledger is None:
         writer.write_fragment(fragment, body=body)
         return "created"
+    # The ledger is the authority on this unit's identity, on every branch
+    # below. Do not push this back down into the branches (#1329).
+    fragment.id = record.fragment_id
     new_hash = ledger.content_hash(parsed.content)
     if record.tombed:
         restored = restore_tombed(
@@ -249,7 +344,6 @@ def write_fragment_idempotent(
             writer.write_fragment(fragment, body=body)
         return "updated"
     if record.content_hash != new_hash:
-        fragment.id = record.fragment_id
         updated = writer.update_fragment(
             fragment, body, reclassify_threshold=reclassify_threshold
         )
@@ -257,9 +351,11 @@ def write_fragment_idempotent(
             # File gone out of band: recreate under the preserved id.
             writer.write_fragment(fragment, body=body)
         return "updated"
-    # Known unit, content unchanged: idempotent no-op (the deterministic id
-    # dedups the write). Reported as unchanged so it never inflates the
-    # updated counter in the ingest summary.
+    # Known unit, content unchanged: idempotent no-op. The write resolves to
+    # the existing file because `fragment.id` is now the *ledgered* id and the
+    # writer's per-directory id index matches on it — the guarantee comes from
+    # the ledger, not from trusting the derivation to reproduce (#1329).
+    # Reported as unchanged so it never inflates the updated counter.
     writer.write_fragment(fragment, body=body)
     return "unchanged"
 
@@ -278,11 +374,19 @@ def tomb_missing_units(
     input never tombs — that guards the incremental epic from tombing every
     other unit when re-ingesting one file.
 
+    Tombing is additionally gated on *source_type* being in
+    :data:`TOMBING_SOURCES` (#1329). Holding a ledger is not sufficient: a
+    caller can borrow one via ``ledger_source`` purely to pin identity, and
+    that must not arm the tomb sweep for a source type whose directory
+    listing is not the authoritative set of live units.
+
     A tomb that fails on I/O is collected into *errors* and the unit is left
     live in the ledger so the next full-source pass retries it, rather than
     crashing the whole run. Returns the number of units actually tombed.
     """
     if ledger is None or not input_path.is_dir():
+        return 0
+    if source_type not in TOMBING_SOURCES:
         return 0
     tombed = 0
     for source_key in sorted(ledger.live_keys() - seen_keys):
@@ -326,6 +430,69 @@ def should_skip_unit(
     return not unit_is_changed(parsed.timestamp, content_hash, record, since)
 
 
+_UNPINNED_VAULT_WARNING = (
+    "This vault has markdown fragments but an empty ingest ledger, so it has "
+    "not been migrated for the #1329 id-derivation fix. Re-ingesting these "
+    "sources will mint new ids and leave the existing fragments behind as "
+    "duplicates. Run `creek ingest --pin-source-ids --vault <vault>` once "
+    "first (use --dry-run to preview)."
+)
+"""Advisory shown when a populated vault has no ledger records yet (#1329)."""
+
+
+def unpinned_vault_warning(
+    source_type: str,
+    vault_path: Path,
+) -> str | None:
+    """Return the un-pinned-vault advisory, or ``None`` when it does not apply.
+
+    A vault that already holds markdown fragments but whose **markdown**
+    ledger is empty predates the pin migration. The next ingest of those same
+    sources will derive ids under the corrected rule, fail to match anything,
+    and write duplicates — so the operator is told once, before that happens.
+
+    That ledger's own emptiness *is* the marker; deriving the signal from it
+    rather than from a version stamp in ``00-Creek-Meta/State/`` keeps this to
+    one piece of state. A second marker is a second thing that can be wrong.
+
+    **This deliberately does not accept a ledger.** It used to take whichever
+    ledger the run had resolved, and a run with a ``ledger_source`` override —
+    which the ``creek.upload`` MCP tool always passes, including for an
+    uploaded ``.md`` — therefore weighed an unrelated ledger's emptiness. That
+    produced a spurious warning on an already-migrated vault, and, worse, went
+    permanently silent on a genuinely un-pinned one as soon as the borrowed
+    ledger gained any record. The subject of this advisory is fixed by what
+    the advisory *says*, so it is looked up here from :data:`LEDGERED_SOURCE_TYPE`
+    and cannot be substituted by anything a caller overrides.
+
+    The run's *source_type* still gates it, because #1329 moved markdown id
+    derivation only: a document or image run has nothing to be warned about,
+    and a warning delivered on a run it does not apply to is trained-away
+    noise. Unlike the resolved ledger, ``source_type`` names the identity
+    scheme this run writes under and no override can move it.
+
+    Args:
+        source_type: Registry key of the ingestor being run, verbatim.
+        vault_path: Vault root.
+
+    Returns:
+        The advisory text, or ``None`` when this run writes under some other
+        source type's identity, or the vault is fresh or already pinned.
+    """
+    if source_type != LEDGERED_SOURCE_TYPE:
+        return None
+    from creek.ingest.ledger import SourceLedger
+
+    if len(SourceLedger.load(vault_path, source=LEDGERED_SOURCE_TYPE)) > 0:
+        return None
+    fragments_root = vault_path / "01-Fragments"
+    if not fragments_root.is_dir():
+        return None
+    if not any(fragments_root.rglob("*.md")):
+        return None
+    return _UNPINNED_VAULT_WARNING
+
+
 def run_ingest(
     *,
     ingestor_cls: type[Ingestor],
@@ -337,6 +504,7 @@ def run_ingest(
     incremental: bool = False,
     ledger_source: str | None = None,
     privacy_tier: PrivacyTier | None = None,
+    on_warning: Callable[[str], None] | None = None,
 ) -> IngestRunResult:
     """Run one ingestor and persist its output idempotently to the vault.
 
@@ -365,6 +533,14 @@ def run_ingest(
             Merged onto each fragment with
             :func:`creek.classify.privacy_pass.escalate`, so it can only
             raise the tier, never lower one the source already declared.
+        on_warning: Called with each operator advisory **at the moment it is
+            detected**, which for the un-pinned-vault advisory is before the
+            first fragment is written (#1329). Surfaces still get every warning
+            on :attr:`IngestRunResult.warnings`; this exists because an
+            advisory whose whole purpose is "stop before this run hurts you"
+            is worthless delivered after the run finished. Keeping it a plain
+            ``str`` callback leaves this module UI-agnostic — the caller
+            decides what printing means.
 
     Returns:
         An :class:`IngestRunResult` with the write tallies and any errors.
@@ -376,6 +552,27 @@ def run_ingest(
     ingest_result = ingestor_cls().ingest(input_path)
     ledger = resolve_ledger(source_type, vault_path, ledger_source)
     filtering = since is not None or incremental
+
+    warnings: list[str] = []
+
+    def warn(message: str) -> None:
+        """Record an advisory and hand it to the caller in the same breath.
+
+        The single way a warning enters this run. Appending to the list
+        without notifying *on_warning* is how an advisory becomes invisible,
+        so the two are not separable here.
+        """
+        warnings.append(message)
+        logger.warning("%s", message)
+        if on_warning is not None:
+            on_warning(message)
+
+    # Checked BEFORE the write loop: once the loop has recorded its first
+    # ledger entry the vault no longer looks un-pinned, and the advisory would
+    # never fire for the very run it needed to warn about.
+    unpinned = unpinned_vault_warning(source_type, vault_path)
+    if unpinned is not None:
+        warn(unpinned)
 
     errors: list[str] = [f"[{source_type}] {err}" for err in ingest_result.errors]
     written = 0
@@ -437,4 +634,5 @@ def run_ingest(
         unchanged=counts.get("unchanged", 0),
         tombed=tombed,
         skipped=skipped,
+        warnings=warnings,
     )
