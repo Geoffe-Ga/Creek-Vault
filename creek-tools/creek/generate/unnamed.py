@@ -43,6 +43,7 @@ from creek.models import Fragment
 from creek.time import effective_authored_at, effective_authored_date
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
     from creek.link.embeddings import EmbeddingLinker
@@ -183,16 +184,16 @@ class UnnamedDigestGenerator:
         Returns:
             Path to the generated digest markdown file.
         """
-        all_unnamed = self.load_unnamed_fragments(vault_path)
+        all_unnamed, excerpts = _load_unnamed_with_excerpts(vault_path)
         this_week = self.filter_fragments_in_week(all_unnamed, week_start)
         clusters = self.detect_unnamed_clusters(this_week)
         previous = self._load_history(vault_path, week_start)
         body = self._render_body(
-            vault_path,
             this_week,
             clusters,
             week_start,
             previous=previous,
+            excerpts=excerpts,
         )
         digest_path = self._write_digest(vault_path, week_start, body)
         self._append_history(
@@ -223,18 +224,10 @@ class UnnamedDigestGenerator:
         Returns:
             List of Fragment objects parsed from the vault.
         """
-        unnamed_dir = vault_path.joinpath(*_UNNAMED_SUBPATH)
-        if not unnamed_dir.is_dir():
-            return []
-
-        fragments: list[Fragment] = []
-        for md_file in sorted(unnamed_dir.rglob("*.md")):
-            if _DIGESTS_SUBFOLDER in md_file.relative_to(unnamed_dir).parts:
-                continue
-            fragment = _load_fragment(md_file)
-            if fragment is not None:
-                fragments.append(fragment)
-        return fragments
+        # A projection of the shared walk: each body is bound for one loop
+        # iteration and discarded, so this costs no more memory than the
+        # per-file parse it always did.
+        return [fragment for fragment, _body in _iter_unnamed_records(vault_path)]
 
     @staticmethod
     def filter_fragments_in_week(
@@ -333,28 +326,31 @@ class UnnamedDigestGenerator:
 
     def _render_body(
         self,
-        vault_path: Path,
         fragments: list[Fragment],
         clusters: list[list[Fragment]],
         week_start: date,
         *,
         previous: _HistoryEntry | None,
+        excerpts: dict[str, str],
     ) -> str:
         """Render the complete markdown body for the digest.
 
         Args:
-            vault_path: Path to the root of the Obsidian vault.
             fragments: Fragments observed this week.
             clusters: Similarity clusters detected this week.
             week_start: Monday of the target ISO week.
             previous: Previous history entry, or ``None`` when no prior
                 run has been recorded.
+            excerpts: Mapping of fragment ID to a short body excerpt, built
+                by :func:`_load_unnamed_with_excerpts` during the single
+                pass over the Unnamed tree. It covers every unnamed
+                fragment, not just *fragments*; the extra entries are
+                simply never looked up.
 
         Returns:
             The markdown body (without frontmatter).
         """
         week_end = week_start + timedelta(days=_WEEK_LENGTH_DAYS - 1)
-        excerpts = _build_excerpt_map(vault_path, fragments)
         sections = [
             f"# Unnamed Digest — {week_start.isoformat()} to {week_end.isoformat()}\n",
             _render_fragments_section(fragments, excerpts),
@@ -527,15 +523,20 @@ def _upsert_history_entry(
     return merged
 
 
-def _load_fragment(md_file: Path) -> Fragment | None:
-    """Parse a markdown file into a :class:`Fragment`, or ``None`` on failure.
+def _load_fragment(md_file: Path) -> tuple[Fragment, str] | None:
+    """Parse a markdown file into ``(fragment, body)``, or ``None`` on failure.
+
+    Returns the markdown body alongside the validated model so a caller that
+    needs an excerpt already has it and never reopens the file. The shape is
+    the one :func:`creek.generate.skills._load_fragment` already sets for the
+    same job in this package.
 
     Args:
         md_file: Path to the markdown file.
 
     Returns:
-        The parsed Fragment, or ``None`` when the file is not a valid
-        fragment record.
+        ``(fragment, body)`` when the file is a valid fragment record, or
+        ``None`` when it is not.
     """
     try:
         post = frontmatter.load(str(md_file))
@@ -546,7 +547,7 @@ def _load_fragment(md_file: Path) -> Fragment | None:
     if metadata.get("type") != "fragment":
         return None
     try:  # noqa: TRY101  # Separate failure modes: file IO vs schema validation each return None with distinct debug logs.
-        return Fragment.model_validate(metadata)
+        return Fragment.model_validate(metadata), post.content
     except ValidationError:
         logger.debug("Skipping invalid fragment frontmatter: %s", md_file)
         return None
@@ -585,48 +586,100 @@ def _connected_components(
     return [buckets[root] for root in sorted(buckets)]
 
 
-def _excerpt_from_file(fragment_path: Path | None) -> str:
-    """Read a short excerpt from the fragment's markdown body.
+def _excerpt_from_body(body: str) -> str:
+    """Cut a short, single-line excerpt from a fragment's markdown body.
+
+    Newlines collapse to spaces because the excerpt is rendered as a markdown
+    list item, where an embedded newline would break out of the bullet and
+    corrupt the digest's structure.
 
     Args:
-        fragment_path: Path to the fragment file, or ``None`` when
-            unavailable.
+        body: The fragment's markdown body, as already parsed from its file.
 
     Returns:
-        A trimmed excerpt of at most :data:`_EXCERPT_MAX_CHARS`
-        characters; empty string when no body is present.
+        A trimmed excerpt of at most :data:`_EXCERPT_MAX_CHARS` characters —
+        the last of which is an ellipsis when the body was truncated — or the
+        empty string when the body carries no text.
     """
-    if fragment_path is None or not fragment_path.exists():
+    collapsed = body.strip().replace("\n", " ")
+    if not collapsed:
         return ""
-    post = frontmatter.load(str(fragment_path))
-    body = post.content.strip().replace("\n", " ")
-    if not body:
-        return ""
-    if len(body) <= _EXCERPT_MAX_CHARS:
-        return body
-    return body[: _EXCERPT_MAX_CHARS - 1].rstrip() + "…"
+    if len(collapsed) <= _EXCERPT_MAX_CHARS:
+        return collapsed
+    return collapsed[: _EXCERPT_MAX_CHARS - 1].rstrip() + "…"
 
 
-def _find_fragment_file(vault_path: Path, fragment_id: str) -> Path | None:
-    """Locate the markdown file for a fragment by ID, under 10-Liminal/Unnamed/.
+def _iter_unnamed_records(vault_path: Path) -> Iterator[tuple[Fragment, str]]:
+    """Yield ``(fragment, body)`` for each valid fragment under ``Unnamed/``.
+
+    The single definition of the Unnamed walk: the directory guard, the
+    ``sorted`` ``rglob`` order (which is what makes duplicate-ID resolution
+    deterministic rather than filesystem-dependent), and the ``Digests/``
+    skip that keeps generated digests out of the fragment set.
+
+    This is deliberately a **lazy generator** — it ``yield``s, and must never
+    be "cleaned up" into a list comprehension. The laziness *is* the memory
+    property: each body is live only for the consumer's loop iteration, so a
+    vault with tens of thousands of unnamed notes never holds every body at
+    once. Materialising a list would keep every test in the suite green while
+    silently reintroducing unbounded retention.
+
+    Unlike :func:`creek.vault.reader.iter_vault_fragments`, which yields
+    ``(path, fragment, body, raw)``, this yields no path and no raw metadata:
+    nothing downstream consumes them now that excerpts come from the body in
+    hand, and carrying unused data would be dead weight.
 
     Args:
         vault_path: Path to the root of the Obsidian vault.
-        fragment_id: Fragment ID to find.
 
-    Returns:
-        The matching markdown path, or ``None`` if not found.
+    Yields:
+        ``(fragment, body)`` per markdown file that validates as a
+        :class:`Fragment`, in sorted path order.
     """
     unnamed_dir = vault_path.joinpath(*_UNNAMED_SUBPATH)
     if not unnamed_dir.is_dir():
-        return None
-    for md_file in unnamed_dir.rglob("*.md"):
+        return
+    for md_file in sorted(unnamed_dir.rglob("*.md")):
         if _DIGESTS_SUBFOLDER in md_file.relative_to(unnamed_dir).parts:
             continue
-        post = frontmatter.load(str(md_file))
-        if post.get("id") == fragment_id:
-            return md_file
-    return None
+        record = _load_fragment(md_file)
+        if record is not None:
+            yield record
+
+
+def _load_unnamed_with_excerpts(
+    vault_path: Path,
+) -> tuple[list[Fragment], dict[str, str]]:
+    """Load every unnamed fragment and its excerpt in one pass over the tree.
+
+    Exactly one frontmatter parse per unnamed markdown file for a whole digest
+    run (#1321): the excerpt is cut from the body of the file the fragment was
+    parsed from, so the tree is never rescanned to find a fragment's own file.
+    Only the truncated excerpts are retained — the bodies fall out of scope as
+    the generator advances.
+
+    Excerpts are built for *every* unnamed fragment, not just the target
+    week's. ``filter_fragments_in_week`` runs after this load, so restricting
+    the map would mean either duplicating that predicate here or holding all
+    bodies live until the filter runs. An out-of-week entry costs at most
+    :data:`_EXCERPT_MAX_CHARS` characters and is simply never looked up.
+
+    Args:
+        vault_path: Path to the root of the Obsidian vault.
+
+    Returns:
+        ``(fragments, {fragment_id: excerpt})``.
+    """
+    fragments: list[Fragment] = []
+    excerpts: dict[str, str] = {}
+    for fragment, body in _iter_unnamed_records(vault_path):
+        fragments.append(fragment)
+        # ``setdefault`` is first-wins, so a duplicated ID publishes the
+        # sorted-first file's excerpt — the deterministic successor to the old
+        # "first unsorted rglob match wins". Plain assignment would be
+        # last-wins: the same arbitrary pick, pointed the other way.
+        excerpts.setdefault(fragment.id, _excerpt_from_body(body))
+    return fragments, excerpts
 
 
 def _render_fragments_section(
@@ -660,26 +713,6 @@ def _render_fragments_section(
             lines.append(f"- Excerpt: {excerpt}")
         lines.append("")
     return "\n".join(lines) + "\n"
-
-
-def _build_excerpt_map(
-    vault_path: Path,
-    fragments: list[Fragment],
-) -> dict[str, str]:
-    """Build a mapping of fragment ID to a short markdown body excerpt.
-
-    Args:
-        vault_path: Path to the root of the Obsidian vault.
-        fragments: Fragments whose excerpts to resolve.
-
-    Returns:
-        Mapping of fragment ID to excerpt string.
-    """
-    excerpts: dict[str, str] = {}
-    for frag in fragments:
-        path = _find_fragment_file(vault_path, frag.id)
-        excerpts[frag.id] = _excerpt_from_file(path)
-    return excerpts
 
 
 def _render_clusters_section(clusters: list[list[Fragment]]) -> str:
