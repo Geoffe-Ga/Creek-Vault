@@ -884,6 +884,28 @@ class VaultWriter:
                 return found
         return None
 
+    def find_fragment(self, fragment_id: str) -> Path | None:
+        """Return the live fragment file for *fragment_id*, or ``None``.
+
+        The public read-only view of the per-directory id index that
+        :meth:`tomb_fragment` and :meth:`update_fragment` already navigate
+        by. Exposed for #1305's un-migrated-vault advisory, which has to
+        answer "does this vault still hold the id the old derivation would
+        have minted?" without walking and parsing every fragment file.
+
+        Read-only and index-backed, so asking is cheap and asking cannot
+        change anything.
+
+        Args:
+            fragment_id: The id to look for.
+
+        Returns:
+            The fragment's path, or ``None`` when the vault does not hold
+            it (including when ``01-Fragments/`` does not exist).
+        """
+        with self._lock:
+            return self._find_in_fragments_locked(fragment_id)
+
     def _relocate_fragment_locked(
         self,
         existing: Path,

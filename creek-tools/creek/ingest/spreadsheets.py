@@ -24,10 +24,11 @@ from __future__ import annotations
 
 import csv
 import logging
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import chardet
 
@@ -38,7 +39,11 @@ from creek.ingest.base import (
     file_modified_time,
     parse_authored_at,
 )
+from creek.ingest.source_unit import sanitize_unit
 from creek.models import SourcePlatform
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +85,73 @@ class SheetData:
     def is_empty(self) -> bool:
         """``True`` when neither headers nor rows carry any signal."""
         return not self.rows and not self.headers
+
+
+_BLANK_SHEET_UNIT = "sheet"
+"""Stand-in unit for a sheet whose name is blank or whitespace (#1305).
+
+A blank name has nothing to key on, and the two obvious alternatives are
+both wrong: an empty discriminator is a second spelling of "the whole
+file" (see :func:`~creek.ingest.source_unit.compose_source_unit`), and a
+bare positional index is not order-stable, because empty sheets are
+skipped and a sheet that gains content shifts every index after it.
+Normalising to a name lets the ordinary duplicate-name rule below carry
+the blank case too.
+"""
+
+
+def _sheet_unit_keys(sheets: Sequence[SheetData]) -> list[str | None]:
+    """Return the per-sheet source-unit discriminator for *sheets* (#1305).
+
+    Two rules, in this order.
+
+    **A single non-empty sheet gets no discriminator at all.** This is the
+    migration answer, achieved by construction rather than by a backfill:
+    every CSV and every one-sheet XLSX derives byte-identical identity
+    before and after #1305, so nothing already in an operator's vault is
+    re-minted and duplicated on its next ingest. There is no ledger to pin
+    spreadsheets into — ``ledger_for_source`` returns ``None`` for every
+    source type but markdown — so a #1329-style migration is unavailable
+    here, and this carve-out is what replaces it.
+
+    **Otherwise the discriminator is the sheet's name**, passed through
+    :func:`~creek.ingest.source_unit.sanitize_unit`, with a blank name
+    normalised to :data:`_BLANK_SHEET_UNIT` and the *n*-th (n>=2)
+    occurrence of an already-seen name suffixed ``~<n>``. Excel forbids
+    duplicate sheet names, but a hand-built or stub workbook does not, and
+    a bare name would silently restore the very collision this fixes.
+
+    The occurrence ordinal is counted over names, not positions, so
+    inserting a *differently* named sheet anywhere in the workbook leaves
+    every existing sheet's unit — and therefore its fragment id — untouched.
+    That order-stability is why the "empty discriminator for sheet index 0"
+    shortcut is rejected: an inserted first sheet would inherit the previous
+    first sheet's id, and because ``_write_model`` is first-writer-wins
+    (``creek/vault/writer.py``) the newcomer would then be silently dropped
+    while the real first sheet duplicated.
+
+    Args:
+        sheets: The workbook's non-empty sheets, in workbook order.
+
+    Returns:
+        One entry per input sheet, positionally aligned: ``None`` for the
+        single-sheet case, else the sheet's unit key.
+    """
+    if len(sheets) < 2:
+        return [None] * len(sheets)
+    seen: Counter[str] = Counter()
+    units: list[str | None] = []
+    for sheet in sheets:
+        # Sanitised BEFORE counting, not after: Excel permits ``#`` in a
+        # sheet title, and two titles that sanitise to the same string
+        # (``Rev#2`` and ``Rev-2``) must be seen here as the collision they
+        # are. Sanitising downstream of the counter would mint one unit —
+        # and so one id — for both, restoring this issue's own defect.
+        name = sanitize_unit(sheet.name.strip()) or _BLANK_SHEET_UNIT
+        seen[name] += 1
+        occurrence = seen[name]
+        units.append(name if occurrence == 1 else f"{name}~{occurrence}")
+    return units
 
 
 @dataclass(frozen=True)
@@ -436,10 +508,12 @@ class SpreadsheetIngestor(Ingestor):
         workbook = self.backend.read_workbook(raw.path, has_header=has_header)
         timestamp = file_modified_time(raw.path)
         authored_at = _extract_xlsx_authored_at(raw.path)
+        # Materialised before the loop because the *number* of non-empty
+        # sheets decides whether a discriminator is emitted at all (#1305).
+        sheets = [sheet for sheet in workbook.sheets if not sheet.is_empty]
+        units = _sheet_unit_keys(sheets)
         fragments: list[ParsedFragment] = []
-        for sheet in workbook.sheets:
-            if sheet.is_empty:
-                continue
+        for sheet, unit in zip(sheets, units, strict=True):
             column_count = (
                 len(sheet.headers)
                 if sheet.headers
@@ -455,7 +529,12 @@ class SpreadsheetIngestor(Ingestor):
                         "columns": column_count,
                         "authored_at": authored_at,
                     },
+                    # The whole file, always. The per-sheet discriminator
+                    # rides on ``source_unit``; overloading this string would
+                    # break `creek.ingest.routing.arbitrate`, which decides
+                    # ingestor ownership by grouping on it (#1304).
                     source_path=str(raw.path),
+                    source_unit=unit,
                     timestamp=timestamp,
                     payload=sheet,
                 ),
@@ -483,15 +562,45 @@ class SpreadsheetIngestor(Ingestor):
         ``modified``) lands on the frontmatter as an ISO string when
         present; absent for CSV and for XLSX files whose core
         properties carry no creation date.
+
+        #1305: ``title`` is now always emitted, and names the sheet when
+        the fragment carries a sheet unit. Two reasons it cannot be left
+        to the ``setdefault`` fallback in
+        :func:`~creek.ingest.base.assemble_ingested_fragment`. First, that
+        fallback is ``Path(source_path).stem``, which is the *workbook*
+        for every sheet — the fallback does not accidentally save us.
+        Second, ``sheet`` / ``rows`` / ``columns`` above never reach a
+        file: :class:`~creek.models.Fragment` leaves pydantic's default
+        ``extra="ignore"``, so ``Fragment.model_validate`` drops them.
+        After #1305 the title, the filename it produces, and the body
+        heading are the only per-sheet markers in the vault, which makes
+        emitting one a correctness requirement rather than a nicety. That
+        drop is accepted here and tracked in #1392 rather than fixed
+        under a bugfix, because widening what survives validation is a
+        repo-wide frontmatter change.
+
+        A fragment with **no** unit — a CSV, a one-sheet XLSX — gets the
+        bare stem, which is byte-identical to what the fallback produced
+        before this change. Naming the lone sheet there would move the
+        computed filename of every such fragment already in a vault; the
+        id pin is only half a pin if the filename still churns.
         """
+        original_file = str(
+            fragment.metadata.get("original_file", fragment.source_path)
+        )
+        stem = Path(original_file).stem
+        sheet_name = str(fragment.metadata.get("sheet", "")).strip()
+        # A blank sheet name falls back to its unit key rather than to the
+        # empty string, which would render as ``"book — "`` and sanitise to
+        # a bare ``book`` — indistinguishable from the no-unit case.
+        label = sheet_name or fragment.source_unit
+        title = f"{stem} — {label}" if fragment.source_unit else stem
         frontmatter_dict: dict[str, Any] = {
             "type": "fragment",
+            "title": title,
             "source": {
                 "platform": SourcePlatform.SPREADSHEET.value,
-                "original_file": fragment.metadata.get(
-                    "original_file",
-                    fragment.source_path,
-                ),
+                "original_file": original_file,
             },
             "sheet": fragment.metadata.get("sheet", ""),
             "rows": fragment.metadata.get("rows", 0),

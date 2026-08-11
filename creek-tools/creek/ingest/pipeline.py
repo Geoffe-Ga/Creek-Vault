@@ -20,12 +20,13 @@ from dataclasses import dataclass, field
 from pathlib import Path  # runtime use: resolving recorded source paths
 from typing import TYPE_CHECKING, Final
 
-from creek.ingest.base import assemble_ingested_fragment
+from creek.ingest.base import assemble_ingested_fragment, generate_fragment_id
+from creek.ingest.source_unit import compose_source_unit
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
     from datetime import datetime
 
     from creek.ingest.base import Ingestor, ParsedFragment
@@ -236,10 +237,25 @@ def attach_origin_key(
     fragment: Fragment,
     vault_path: Path,
 ) -> None:
-    """Stamp the fragment's ``source.origin_key`` before it is written (#672)."""
+    """Stamp the fragment's ``source.origin_key`` before it is written (#672).
+
+    The key addresses the *unit* the fragment came from, not merely the file
+    (#1305). Composed after :func:`derive_source_key` rather than by handing
+    it a pre-composed string, so that function keeps resolving a path that
+    actually exists on disk and the vault-relative/bare-filename choice is
+    made on the real file.
+
+    This is the half of #1305 a per-sheet fragment id does not reach.
+    ``derive_source_key`` keys on the file, so without the unit every sheet
+    of a workbook shares one ``origin_key`` and one ledger record, and
+    :func:`write_fragment_idempotent` then reassigns ``fragment.id`` to the
+    record's id and overwrites sheet 1 with sheet 2 — reporting ``updated``
+    while losing the content.
+    """
     if ledger is None:
         return
-    fragment.source.origin_key = derive_source_key(parsed.source_path, vault_path)
+    base_key = derive_source_key(parsed.source_path, vault_path)
+    fragment.source.origin_key = compose_source_unit(base_key, parsed.source_unit)
 
 
 def record_in_ledger(
@@ -493,6 +509,85 @@ def unpinned_vault_warning(
     return _UNPINNED_VAULT_WARNING
 
 
+_COLLAPSED_UNIT_WARNING_TEMPLATE = (
+    "This vault holds {count} fragment(s) written before #1305, when every "
+    "sheet of a multi-sheet workbook shared one fragment id and only the "
+    "FIRST reached disk. Each one is now superseded by the per-sheet "
+    "fragments this run writes, and is left in place: {sample}. Nothing is "
+    "deleted automatically — inspect with `creek purge source "
+    "--source-path <path> --match exact --dry-run`, and purge only what you "
+    "recognise. Links pointing at a superseded fragment keep resolving to "
+    "it until you do."
+)
+"""Advisory for a vault still holding pre-#1305 collapsed fragments."""
+
+_COLLAPSED_UNIT_SAMPLE = 3
+"""How many superseded ids the advisory names before it stops listing."""
+
+
+def collapsed_unit_warning(
+    writer: VaultWriter,
+    fragments: Sequence[ParsedFragment],
+) -> str | None:
+    """Return the pre-#1305 collapsed-fragment advisory, or ``None`` (#1305).
+
+    Before #1305 every sheet of a multi-sheet workbook derived the same
+    fragment id, so ``_write_model``'s first-writer-wins dedup kept sheet 1
+    and silently dropped the rest. This run writes each sheet under its own
+    id, which is the fix — but it also means the single fragment the old
+    derivation left in an operator's vault is now superseded by N new ones
+    and is not overwritten by any of them.
+
+    **Detected, reported, and left alone.** That is deliberately the same
+    answer #1304 gave the same shape of problem: naming the strays and
+    handing over a read-only inspection command, rather than deleting vault
+    content on the strength of a heuristic. Deleting a fragment is not
+    something an ingest run gets to decide, and the id recomputation below,
+    however exact, cannot know whether the operator has since edited that
+    file, linked to it, or curated it into a thread.
+
+    The detection needs no vault walk, no frontmatter parsing and no
+    scoping heuristic, because the superseded id is *exactly* what this
+    same fragment would have hashed to with no unit — same source path,
+    same timestamp, same content. So it is recomputed from the parsed
+    fragment in hand and looked up in the writer's id index. That also
+    sidesteps the two traps a frontmatter-based detector hits (``ingested``
+    reads back as a ``str``, and its trailing ``Z`` hashes differently from
+    the ``+00:00`` the derivation emits) by never reading frontmatter.
+
+    It follows that the advisory is self-clearing: once the operator purges
+    the superseded fragments, the lookup misses and the run goes quiet. It
+    is also silent on a fresh vault and on every single-unit source, which
+    keeps no unit and therefore has nothing to supersede.
+
+    Args:
+        writer: The vault writer, consulted read-only via
+            :meth:`~creek.vault.writer.VaultWriter.find_fragment`.
+        fragments: This run's parsed fragments, before any are written.
+
+    Returns:
+        The advisory text, or ``None`` when no superseded fragment is
+        present.
+    """
+    superseded: list[str] = []
+    for parsed in fragments:
+        if parsed.source_unit is None:
+            continue
+        legacy_id = generate_fragment_id(
+            parsed.source_path, parsed.timestamp, parsed.content
+        )
+        if legacy_id in superseded:
+            continue
+        if writer.find_fragment(legacy_id) is not None:
+            superseded.append(legacy_id)
+    if not superseded:
+        return None
+    sample = ", ".join(sorted(superseded)[:_COLLAPSED_UNIT_SAMPLE])
+    if len(superseded) > _COLLAPSED_UNIT_SAMPLE:
+        sample = f"{sample}, …"
+    return _COLLAPSED_UNIT_WARNING_TEMPLATE.format(count=len(superseded), sample=sample)
+
+
 def run_ingest(
     *,
     ingestor_cls: type[Ingestor],
@@ -573,6 +668,13 @@ def run_ingest(
     unpinned = unpinned_vault_warning(source_type, vault_path)
     if unpinned is not None:
         warn(unpinned)
+
+    # Same reason as above: checked before the write loop, so the operator
+    # is told about superseded fragments before the run that supersedes
+    # them finishes rather than after (#1305).
+    collapsed = collapsed_unit_warning(writer, ingest_result.fragments)
+    if collapsed is not None:
+        warn(collapsed)
 
     errors: list[str] = [f"[{source_type}] {err}" for err in ingest_result.errors]
     written = 0

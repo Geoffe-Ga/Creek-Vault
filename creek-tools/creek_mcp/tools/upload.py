@@ -63,6 +63,7 @@ from creek.ingest import INGESTOR_REGISTRY, route_to_ingestor
 from creek.ingest.journal_staging import UPLOAD_LEDGER_SOURCE, UPLOAD_STAGING_RELDIR
 from creek.ingest.ledger import SourceLedger
 from creek.ingest.pipeline import derive_source_key, run_ingest
+from creek.ingest.source_unit import split_source_unit
 from creek.models import PrivacyTier
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.read_gate import refuse_above_ceiling
@@ -158,12 +159,38 @@ def _stage_upload(
     return staged
 
 
-def _resolve_fragment_id(vault_path: Path, staged: Path) -> str | None:
-    """Return the fragment id the upload ledger mapped this staged file to."""
-    record = SourceLedger.load(vault_path, source=UPLOAD_LEDGER_SOURCE).get(
-        derive_source_key(str(staged), vault_path)
-    )
-    return record.fragment_id if record is not None else None
+def _resolve_fragment_ids(vault_path: Path, staged: Path) -> list[str]:
+    """Return every fragment id the upload ledger maps this staged file to.
+
+    Plural since #1305. One staged document can hold several independently
+    identified units — an uploaded ``.xlsx`` routes to ``SpreadsheetIngestor``,
+    which emits one fragment per sheet and ledgers each under its own
+    ``<staged path>#<sheet>`` key. The singular predecessor asked
+    :meth:`~creek.ingest.ledger.SourceLedger.get` for the bare staged path
+    and got ``None`` for exactly those uploads, and every one of this
+    module's four callers reads a ``None`` as *this id owns nothing*:
+
+    * :func:`_refuse_unadmitted_overwrite` would compute ``existing=None``
+      and admit a caller at ``ceiling=open`` to overwrite an intimate
+      workbook — the #970 gate defeated;
+    * :func:`_discard_unreferenced` would unlink a staged workbook that N
+      live fragments still reach through ``origin_key``, which is the RTBF
+      sweep's only route to those bytes;
+    * :func:`_refuse_extension_conflict` would report no conflict and fork
+      one ``external_id`` onto two live fragments;
+    * the response and audit entry would name one sheet out of N.
+
+    Args:
+        vault_path: Vault root.
+        staged: The staged file's path.
+
+    Returns:
+        The mapped fragment ids in ledger-key order, or ``[]`` when the
+        ledger knows nothing about this staged file.
+    """
+    ledger = SourceLedger.load(vault_path, source=UPLOAD_LEDGER_SOURCE)
+    base_key = derive_source_key(str(staged), vault_path)
+    return [record.fragment_id for _key, record in ledger.records_for(base_key)]
 
 
 def _existing_tier(vault_path: Path, fragment_ids: list[str]) -> PrivacyTier:
@@ -193,6 +220,65 @@ def _existing_tier(vault_path: Path, fragment_ids: list[str]) -> PrivacyTier:
         resolves to a readable fragment.
     """
     return max_source_tier(source_tiers(vault_path, fragment_ids))
+
+
+def _ledgered_names_for_id(vault_path: Path, external_id: str) -> dict[str, list[str]]:
+    """Return the fragment ids the upload LEDGER holds for *external_id* (#1305).
+
+    Grouped by staged filename, so a caller can ask both "does this id own
+    anything" and "does it own something under a *different* extension".
+
+    The ledger, not the staging directory, is the authority on what an
+    ``external_id`` owns — and after #1305 the difference is a privacy
+    ratchet rather than a nicety.
+
+    Purging **one** sheet of an N-sheet upload deletes the shared staged
+    workbook (that is the RTBF contract: the source bytes go) while the
+    other N-1 sheet fragments stay live, still ledgered, still possibly
+    ``intimate``. A survey keyed on :meth:`~pathlib.Path.iterdir` then sees
+    an empty staging dir, reports that the id owns nothing, and lets a
+    caller at ``ceiling=open`` through as a *creation*. The re-upload
+    restages to the same deterministic path, ``write_fragment_idempotent``
+    matches the surviving siblings by their intact ledger keys, and
+    overwrites intimate fragments with the low-ceiling caller's bytes —
+    reachable through two individually legitimate operations.
+
+    A ledger record survives the file it points at, so this survey does not
+    go blind at exactly the moment it matters.
+
+    Args:
+        vault_path: Vault root.
+        external_id: The caller's idempotency key.
+
+    Tombed records are counted too (:meth:`~creek.ingest.ledger.SourceLedger.all_keys`,
+    not ``live_keys``): a soft-tombed fragment still exists, under
+    ``10-Liminal/Orphaned/``, and for a gate whose failure mode is
+    *admitting* a caller, over-counting is the safe error.
+
+    Args:
+        vault_path: Vault root.
+        external_id: The caller's idempotency key.
+
+    Returns:
+        Staged filename mapped to the fragment ids ledgered under it (the
+        bare key and every ``…#<unit>`` child), ordered by ledger key.
+        Empty when the ledger knows nothing about this id.
+    """
+    stem = safe_stem(external_id)
+    staging = UPLOAD_STAGING_RELDIR.as_posix()
+    grouped: dict[str, list[str]] = {}
+    ledger = SourceLedger.load(vault_path, source=UPLOAD_LEDGER_SOURCE)
+    for key in sorted(ledger.all_keys()):
+        base, _unit = split_source_unit(key)
+        parent, _, name = base.rpartition("/")
+        if parent != staging:
+            continue
+        if name != stem and not name.startswith(f"{stem}."):
+            continue
+        record = ledger.get(key)
+        if record is not None:
+            grouped.setdefault(name, []).append(record.fragment_id)
+    return grouped
 
 
 def _staged_for_id(vault_path: Path, external_id: str) -> list[Path]:
@@ -253,10 +339,15 @@ def _refuse_unadmitted_overwrite(
         names neither the resolved fragment nor its tier.
     """
     del filename
+    # Surveyed from the LEDGER, not from a staging-directory listing
+    # (#1305). One staged workbook owns one fragment per sheet, so the
+    # survey is a flat union over units; and a ledger record outlives the
+    # staged file, so purging one sheet — which deletes the shared workbook
+    # while its siblings stay live and intimate — cannot blind this gate.
     ids = [
         fragment_id
-        for staged in _staged_for_id(vault_path, external_id)
-        if (fragment_id := _resolve_fragment_id(vault_path, staged)) is not None
+        for fragment_ids in _ledgered_names_for_id(vault_path, external_id).values()
+        for fragment_id in fragment_ids
     ]
     existing = None if not ids else _existing_tier(vault_path, ids)
     return refuse_above_ceiling(tool=TOOL_NAME, content_tier=existing, ceiling=ceiling)
@@ -286,7 +377,12 @@ def _discard_unreferenced(vault_path: Path, staged: Path) -> None:
         vault_path: Vault root.
         staged: The staged path the failed ingest was pointed at.
     """
-    if _resolve_fragment_id(vault_path, staged) is None:
+    # Deleted only when the ledger maps this staged path to NOTHING. A
+    # workbook whose sheets are ledgered under `<path>#<sheet>` keys has an
+    # empty *exact*-key lookup but a non-empty unit list, and unlinking it
+    # would destroy the bytes N live fragments still reach through
+    # `origin_key` (#1305).
+    if not _resolve_fragment_ids(vault_path, staged):
         staged.unlink(missing_ok=True)
 
 
@@ -323,18 +419,22 @@ def _refuse_extension_conflict(
         structured refusal naming the extension already bound to the id.
     """
     target = _upload_staged_path(vault_path, external_id, filename)
-    # Ledger-backed only. An unreferenced staged file is not a fragment anyone
-    # can purge, so treating it as a conflict would refuse with a remedy —
-    # "purge the existing fragment" — that cannot be carried out.
+    # Ledger-backed only, and now read straight off the ledger rather than
+    # off a directory listing (#1305). An unreferenced staged file is not a
+    # fragment anyone can purge, so treating it as a conflict would refuse
+    # with a remedy — "purge the existing fragment" — that cannot be carried
+    # out. Conversely a ledgered fragment whose staged bytes a sibling's
+    # purge already removed IS still a conflict, and a listing-based survey
+    # would miss exactly that case.
     conflicting = [
-        staged
-        for staged in _staged_for_id(vault_path, external_id)
-        if staged != target and _resolve_fragment_id(vault_path, staged) is not None
+        name
+        for name in _ledgered_names_for_id(vault_path, external_id)
+        if name != target.name
     ]
     if not conflicting:
         return None
     bound = ", ".join(
-        sorted({staged.suffix or "(no extension)" for staged in conflicting})
+        sorted({Path(name).suffix or "(no extension)" for name in conflicting})
     )
     return refusal_response(
         tool=TOOL_NAME,
@@ -725,8 +825,13 @@ def upload_tool(
         _discard_unreferenced(vault_path, staged)
         return result
 
-    fragment_id = _resolve_fragment_id(vault_path, staged)
-    affected = [fragment_id] if fragment_id else []
+    # Every fragment the staged document produced, in ledger-key order, so
+    # an RTBF request answered from this audit entry reaches all of them
+    # (#1305). ``fragment_id`` keeps its singular contract by naming the
+    # first in that order — deterministic across runs, and for the
+    # one-fragment-per-file majority it is still simply *the* fragment.
+    affected = _resolve_fragment_ids(vault_path, staged)
+    fragment_id = affected[0] if affected else None
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
         args=audit_args,

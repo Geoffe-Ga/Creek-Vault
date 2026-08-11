@@ -790,3 +790,560 @@ def test_a_corrected_extension_after_a_failed_ingest_is_accepted(
     assert retried["action"] == "created"
     assert len(_fragments(vault)) == 1
     assert len(_staged(vault)) == 1
+
+
+# --------------------------------------------------------------------------
+# Multi-sheet workbooks (#1305)
+#
+# A `.xlsx` routes to `SpreadsheetIngestor`, which emits one fragment per
+# non-empty sheet. Until #1305 all N shared one fragment id, so the ledgered
+# upload path wrote exactly one fragment and reported the other N-1 as
+# `unchanged` — the loss wearing a success message.
+#
+# The fix gives each sheet its own ledger key, which is what these tests are
+# really about: the upload tool resolves an `external_id` back to its
+# fragment through that key, and a staged path that now maps to N records
+# instead of 0-or-1 is load-bearing for the #970 tier gate, for
+# `_discard_unreferenced`, and for the audit log.
+# --------------------------------------------------------------------------
+
+_SHEET_NAMES = ("Budget", "Notes", "Q3")
+
+
+def _multi_sheet_xlsx_bytes(tmp_path: Path, marker: str = "june") -> bytes:
+    """Build a genuine three-sheet ``.xlsx`` and return its bytes.
+
+    Args:
+        tmp_path: Directory to build the workbook in.
+        marker: Cell value written into every sheet, so a caller can produce
+            byte-different content for the same sheet layout.
+
+    Returns:
+        The workbook's bytes.
+    """
+    path = tmp_path / f"multi-{marker}.xlsx"
+    workbook = Workbook()
+    first = workbook.active
+    assert first is not None
+    first.title = _SHEET_NAMES[0]
+    for index, name in enumerate(_SHEET_NAMES):
+        sheet = first if index == 0 else workbook.create_sheet(name)
+        sheet["A1"] = "label"
+        sheet["B1"] = "value"
+        sheet["A2"] = f"{name}-{marker}"
+        sheet["B2"] = index
+    workbook.save(path)
+    return path.read_bytes()
+
+
+def _origin_keys(vault: Path) -> list[str]:
+    """Return every fragment's ``source.origin_key``, sorted.
+
+    Args:
+        vault: Vault root.
+
+    Returns:
+        The sorted origin keys, with a missing key rendered as ``"<none>"``
+        so an absent key fails an equality assertion loudly.
+    """
+    keys = []
+    for path in _fragments(vault):
+        source = frontmatter.load(path).metadata.get("source", {})
+        key = source.get("origin_key") if isinstance(source, dict) else None
+        keys.append(str(key) if key else "<none>")
+    return sorted(keys)
+
+
+def test_multi_sheet_upload_writes_one_fragment_per_sheet(tmp_path: Path) -> None:
+    """An uploaded three-sheet workbook lands three fragments, not one.
+
+    Measured at HEAD before the fix: ``created=1 unchanged=2``, one file on
+    disk holding the FIRST sheet (``Budget``) — ``_write_model`` takes the
+    lock, finds the id already written and returns the existing path, so
+    writes 2..N are silent no-ops. The issue body's claim that the LAST
+    sheet survives is backwards.
+    """
+    vault = _vault(tmp_path / "vault")
+
+    result = upload_tool(
+        vault_path=vault,
+        filename="book.xlsx",
+        content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path)),
+        external_id="u-multi",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "ok"
+    assert result["action"] == "created"
+    fragments = _fragments(vault)
+    assert len(fragments) == 3, [p.name for p in fragments]
+    # The heading names the STAGED file, not the caller's filename: only the
+    # extension of a caller-supplied name is ever trusted, and only to route.
+    staged_name = f"{safe_stem('u-multi')}.xlsx"
+    headings = sorted(
+        line
+        for path in fragments
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.startswith("# ")
+    )
+    assert headings == [f"# {staged_name} — {name}" for name in sorted(_SHEET_NAMES)]
+
+
+def test_multi_sheet_upload_reports_every_sheet_in_the_audit_log(
+    tmp_path: Path,
+) -> None:
+    """``affected_fragment_ids`` must hold all three ids, each exactly once.
+
+    At HEAD the tool resolves the staged path to at most ONE ledger record,
+    so the response's ``fragment_id`` names a single sheet and the audit
+    entry under-reports what the call touched. An audit record that names
+    one of three fragments is a false record, and it is the record an RTBF
+    request is answered from.
+    """
+    vault = _vault(tmp_path / "vault")
+
+    result = upload_tool(
+        vault_path=vault,
+        filename="book.xlsx",
+        content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path)),
+        external_id="u-multi-audit",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    affected = result["affected_fragment_ids"]
+    assert len(affected) == 3
+    assert len(set(affected)) == 3
+    assert result["fragment_id"] == affected[0]
+    on_disk = {frontmatter.load(p).metadata["id"] for p in _fragments(vault)}
+    assert set(affected) == on_disk
+    entry = next(e for e in _audit(vault) if e.get("affected_fragment_ids"))
+    assert sorted(entry["affected_fragment_ids"]) == sorted(affected)
+
+
+def test_multi_sheet_upload_resend_is_a_true_no_op(tmp_path: Path) -> None:
+    """Re-sending identical bytes reports ``unchanged`` and adds no fragment.
+
+    ``updated`` here would be the failure this issue is about: post-fix but
+    pre-ledger-key, the run overwrote sheet 1 with sheet 2 and then sheet 3
+    and reported ``updated=2``, which reads like work was done.
+    """
+    vault = _vault(tmp_path / "vault")
+    payload = _b64(_multi_sheet_xlsx_bytes(tmp_path))
+
+    def _send() -> dict[str, Any]:
+        """Send the identical workbook under a stable external id."""
+        return upload_tool(
+            vault_path=vault,
+            filename="book.xlsx",
+            content_base64=payload,
+            external_id="u-multi-resend",
+            timestamp=_TS,
+            privacy_tier_ceiling=TierCeiling.OPEN,
+        )
+
+    first = _send()
+    keys_after_first = _origin_keys(vault)
+    second = _send()
+
+    assert first["action"] == "created"
+    assert second["action"] == "unchanged"
+    assert len(_fragments(vault)) == 3
+    assert len(_staged(vault)) == 1
+    # The origin key is the RTBF purge key; a key that moves on re-ingest
+    # silently drops the old fragment out of every purge the vault offers.
+    assert _origin_keys(vault) == keys_after_first
+    assert sorted(second["affected_fragment_ids"]) == sorted(
+        first["affected_fragment_ids"]
+    )
+
+
+def test_multi_sheet_origin_keys_name_each_sheet(tmp_path: Path) -> None:
+    """Each sheet fragment carries its own ``…/book.xlsx#<sheet>`` key."""
+    vault = _vault(tmp_path / "vault")
+
+    upload_tool(
+        vault_path=vault,
+        filename="book.xlsx",
+        content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path)),
+        external_id="u-multi-keys",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    staged_name = f"{safe_stem('u-multi-keys')}.xlsx"
+    base = f"{UPLOAD_STAGING_RELDIR.as_posix()}/{staged_name}"
+    assert _origin_keys(vault) == sorted(f"{base}#{name}" for name in _SHEET_NAMES)
+
+
+def test_multi_sheet_resend_is_still_refused_above_ceiling(tmp_path: Path) -> None:
+    """The #970 gate must still see an intimate workbook it cannot read.
+
+    GREEN at HEAD (one collapsed fragment resolves fine), and it is the
+    guard that the per-sheet ledger key does not defeat the gate. Resolving
+    the staged path to a single record returns ``None`` once the ledger
+    holds only ``…#<sheet>`` keys, which makes ``existing`` ``None`` and
+    ADMITS a caller at ``ceiling=open`` to overwrite intimate content.
+    Read this as a ratchet test, not as the issue's red test.
+    """
+    vault = _vault(tmp_path / "vault")
+    first = upload_tool(
+        vault_path=vault,
+        filename="book.xlsx",
+        content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path, marker="tender")),
+        external_id="u-multi-tier",
+        timestamp=_TS,
+        tier="intimate",
+        privacy_tier_ceiling=TierCeiling.INTIMATE,
+    )
+    assert first["status"] == "ok"
+    assert first["fragment_id"] is not None
+    assert len(first["affected_fragment_ids"]) == 3
+
+    refused = upload_tool(
+        vault_path=vault,
+        filename="book.xlsx",
+        content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path, marker="benign")),
+        external_id="u-multi-tier",
+        timestamp=_TS,
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert refused["status"] == "refused"
+    assert set(refused) == _REFUSAL_KEYS
+    assert refused["reason"] == GENERIC_ABOVE_CEILING_REASON
+    assert len(_fragments(vault)) == 3
+
+
+def test_multi_sheet_extension_conflict_is_still_refused(tmp_path: Path) -> None:
+    """A re-send of the same id under a new extension must still be refused.
+
+    ``_refuse_extension_conflict`` asks whether the OTHER staged paths for
+    this id resolve to a fragment. With per-sheet keys the bare staged path
+    resolves to nothing, so a single-record lookup would answer "no
+    conflict" and fork the id onto two live fragments, orphaning the
+    workbook's staged bytes.
+    """
+    vault = _vault(tmp_path / "vault")
+    upload_tool(
+        vault_path=vault,
+        filename="book.xlsx",
+        content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path)),
+        external_id="u-multi-ext",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    conflicted = upload_tool(
+        vault_path=vault,
+        filename="book.txt",
+        content_base64=_b64(b"a plain text re-type of the same document"),
+        external_id="u-multi-ext",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert conflicted["status"] == "refused"
+    assert ".xlsx" in conflicted["reason"]
+    assert len(_fragments(vault)) == 3
+    assert len(_staged(vault)) == 1
+
+
+def test_failed_resend_does_not_discard_a_referenced_workbook(
+    tmp_path: Path,
+) -> None:
+    """``_discard_unreferenced`` must not unlink a workbook three sheets cite.
+
+    Keyed on "does the ledger know this staged path", which with per-sheet
+    keys is no longer a single-record question. Answering it with a
+    single-record lookup deletes the staged bytes that three live fragments
+    still reach through ``origin_key`` — the RTBF sweep's only route to
+    them — on the first re-send whose ingest errors.
+    """
+    vault = _vault(tmp_path / "vault")
+    upload_tool(
+        vault_path=vault,
+        filename="book.xlsx",
+        content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path)),
+        external_id="u-multi-fail",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert len(_staged(vault)) == 1
+
+    failed = upload_tool(
+        vault_path=vault,
+        filename="book.xlsx",
+        content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path, marker="second")),
+        external_id="u-multi-fail",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        run=_failing_runner,
+    )
+
+    assert failed["status"] == "refused"
+    assert len(_staged(vault)) == 1, "a referenced workbook must survive a failure"
+    assert len(_fragments(vault)) == 3
+
+
+def test_single_sheet_upload_keeps_a_bare_origin_key(tmp_path: Path) -> None:
+    """A one-sheet workbook must be untouched by the sub-unit scheme.
+
+    The single-sheet carve-out is the migration answer: every CSV and
+    single-sheet XLSX already in an operator vault keeps its exact id, its
+    exact filename and its exact ``origin_key``, so re-ingesting an
+    untouched file after this change is still a no-op rather than a
+    duplicate. This pins the key half of that.
+    """
+    vault = _vault(tmp_path / "vault")
+
+    upload_tool(
+        vault_path=vault,
+        filename="budget.xlsx",
+        content_base64=_b64(_xlsx_bytes(tmp_path)),
+        external_id="u-single",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    staged_name = f"{safe_stem('u-single')}.xlsx"
+    assert _origin_keys(vault) == [f"{UPLOAD_STAGING_RELDIR.as_posix()}/{staged_name}"]
+    assert len(_fragments(vault)) == 1
+
+
+def test_multi_sheet_fragment_id_is_stable_under_sheet_order(tmp_path: Path) -> None:
+    """The response's singular ``fragment_id`` must not depend on sheet order.
+
+    ``fragment_id`` reduces N sheets to one id, and callers persist it as
+    the handle they later purge by. Reducing by *ledger-key order* makes
+    that choice a property of the workbook; reducing by dict-insertion
+    order makes it a property of the order the JSONL happened to be
+    written and re-read in, which is not a promise the ledger makes.
+
+    Sheet names are deliberately anti-alphabetical so the two orders
+    disagree: insertion gives ``Zeta`` first, key order gives ``Alpha``.
+    """
+    vault = _vault(tmp_path / "vault")
+    names = ("Zeta", "Alpha", "Mid")
+    path = tmp_path / "ordered.xlsx"
+    workbook = Workbook()
+    first = workbook.active
+    assert first is not None
+    first.title = names[0]
+    for index, name in enumerate(names):
+        sheet = first if index == 0 else workbook.create_sheet(name)
+        sheet["A1"] = "label"
+        sheet["A2"] = name
+    workbook.save(path)
+
+    result = upload_tool(
+        vault_path=vault,
+        filename="ordered.xlsx",
+        content_base64=_b64(path.read_bytes()),
+        external_id="u-order",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    staged_name = f"{safe_stem('u-order')}.xlsx"
+    base = f"{UPLOAD_STAGING_RELDIR.as_posix()}/{staged_name}"
+    assert _origin_keys(vault) == sorted(f"{base}#{name}" for name in names)
+    # Alphabetically first key, not workbook-first sheet.
+    alpha_id = frontmatter.load(
+        next(
+            p
+            for p in _fragments(vault)
+            if frontmatter.load(p).metadata["source"]["origin_key"] == f"{base}#Alpha"
+        )
+    ).metadata["id"]
+    assert result["fragment_id"] == alpha_id
+    assert result["affected_fragment_ids"][0] == alpha_id
+
+
+def test_purging_one_sheet_does_not_open_the_tier_gate_on_its_siblings(
+    tmp_path: Path,
+) -> None:
+    """Purge one sheet, then re-upload at ``open``: still refused.
+
+    The two-step privacy bypass this guards. Purging ONE sheet fragment of
+    an N-sheet intimate upload deletes the shared staged workbook — that is
+    the RTBF contract, the source bytes go — while the other N-1 sheet
+    fragments stay live, intimate, and still ledgered.
+
+    A #970 overwrite gate that surveys the STAGING DIRECTORY then sees
+    nothing, concludes the ``external_id`` owns nothing, and admits a
+    caller at ``ceiling=open`` as a *creation*. The re-upload restages to
+    the same deterministic path, ``write_fragment_idempotent`` matches the
+    surviving siblings by their intact ledger keys, and overwrites intimate
+    content with the low-ceiling caller's bytes. Two individually
+    legitimate operations, one tier bypass.
+
+    A ledger record outlives the file it points at, which is why the survey
+    reads the ledger.
+    """
+    vault = _vault(tmp_path / "vault")
+    first = upload_tool(
+        vault_path=vault,
+        filename="book.xlsx",
+        content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path, marker="tender")),
+        external_id="u-purge-gate",
+        timestamp=_TS,
+        tier="intimate",
+        privacy_tier_ceiling=TierCeiling.INTIMATE,
+    )
+    assert first["status"] == "ok"
+    victim, *survivors = sorted(first["affected_fragment_ids"])
+    assert len(survivors) == 2
+
+    purge = PurgeEngine(vault).purge_fragment(victim)
+
+    assert purge.journal_staged_removed == 1
+    assert _staged(vault) == [], "the shared workbook is gone, by design"
+    assert len(_fragments(vault)) == 2, "the sibling sheets are still live"
+
+    refused = upload_tool(
+        vault_path=vault,
+        filename="book.xlsx",
+        content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path, marker="benign")),
+        external_id="u-purge-gate",
+        timestamp=_TS,
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert refused["status"] == "refused"
+    assert set(refused) == _REFUSAL_KEYS
+    assert refused["reason"] == GENERIC_ABOVE_CEILING_REASON
+    # Nothing restaged, and the surviving intimate fragments are untouched.
+    assert _staged(vault) == []
+    assert len(_fragments(vault)) == 2
+    assert {frontmatter.load(p).metadata["id"] for p in _fragments(vault)} == set(
+        survivors
+    )
+    assert _leaking_files(vault, b"benign") == []
+
+
+def test_extension_conflict_survives_a_purge_of_the_staged_bytes(
+    tmp_path: Path,
+) -> None:
+    """A ledgered fragment whose staged bytes are gone is still a conflict.
+
+    Same root cause as the tier-gate case: the conflict survey must read
+    the ledger, not a directory listing. Otherwise purging one sheet lets
+    the same ``external_id`` be re-sent under a different extension, forking
+    it onto a second live fragment while the first's siblings remain.
+    """
+    vault = _vault(tmp_path / "vault")
+    first = upload_tool(
+        vault_path=vault,
+        filename="book.xlsx",
+        content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path)),
+        external_id="u-purge-ext",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    PurgeEngine(vault).purge_fragment(sorted(first["affected_fragment_ids"])[0])
+    assert _staged(vault) == []
+
+    conflicted = upload_tool(
+        vault_path=vault,
+        filename="book.txt",
+        content_base64=_b64(b"a plain text re-type of the same document"),
+        external_id="u-purge-ext",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert conflicted["status"] == "refused"
+    assert ".xlsx" in conflicted["reason"]
+    assert _staged(vault) == []
+    assert len(_fragments(vault)) == 2
+
+
+def test_a_tombed_ledger_record_still_closes_the_tier_gate(tmp_path: Path) -> None:
+    """A soft-tombed record must not read as "this id owns nothing".
+
+    Tombing is unreachable for uploads today — ``tomb_missing_units``
+    requires both a ``TOMBING_SOURCES`` source type and a *directory*
+    input, and ``creek.upload`` always passes a single file — so this
+    seeds the record directly rather than pretending to reach it.
+
+    The branch is kept because tombing is a soft delete: the fragment
+    still exists under ``10-Liminal/Orphaned/``. Surveying ``live_keys``
+    would hand a caller at ``ceiling=open`` a clean "creation" over
+    content that is merely filed elsewhere, and the day uploads become
+    tombable that would be a silent tier bypass rather than a new bug.
+    """
+    from creek.ingest.ledger import SourceLedger
+
+    vault = _vault(tmp_path / "vault")
+    first = upload_tool(
+        vault_path=vault,
+        filename="tender.txt",
+        content_base64=_b64(b"a tender upload " + _SECRET),
+        external_id="u-tombed",
+        timestamp=_TS,
+        tier="intimate",
+        privacy_tier_ceiling=TierCeiling.INTIMATE,
+    )
+    assert first["status"] == "ok"
+
+    ledger = SourceLedger.load(vault, source="upload")
+    key = next(iter(ledger.live_keys()))
+    record = ledger.get(key)
+    assert record is not None
+    ledger.record(key, record.fragment_id, record.content_hash, tombed=True)
+    assert SourceLedger.load(vault, source="upload").live_keys() == set()
+
+    refused = upload_tool(
+        vault_path=vault,
+        filename="tender.txt",
+        content_base64=_b64(b"benign overwrite attempt"),
+        external_id="u-tombed",
+        timestamp=_TS,
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert refused["status"] == "refused"
+    assert refused["reason"] == GENERIC_ABOVE_CEILING_REASON
+    assert _leaking_files(vault, _SECRET) != [], "the intimate content survives"
+
+
+def test_a_same_named_key_outside_the_staging_dir_does_not_block_an_upload(
+    tmp_path: Path,
+) -> None:
+    """The survey is scoped to the staging dir, so a stem collision elsewhere
+    cannot produce a phantom refusal.
+
+    The upload ledger is shared machinery: ``derive_source_key`` falls back
+    to a bare filename for an out-of-vault source, and a borrowed ledger
+    could hold a key under some other directory. Matching on the filename
+    alone would let such a key masquerade as this ``external_id``'s own
+    content and refuse a legitimate first upload — a gate that fails
+    *closed* on unrelated state is still a gate that is wrong.
+    """
+    from creek.ingest.ledger import SourceLedger
+
+    vault = _vault(tmp_path / "vault")
+    stem = safe_stem("u-scoped")
+    decoy_ledger = SourceLedger.load(vault, source="upload")
+    decoy_ledger.record(f"01-Fragments/{stem}.txt", "frag-decoy", "deadbeef")
+    decoy_ledger.record(f"{stem}.txt", "frag-decoy-bare", "deadbeef")
+
+    result = upload_tool(
+        vault_path=vault,
+        filename="notes.txt",
+        content_base64=_b64(b"a perfectly ordinary first upload"),
+        external_id="u-scoped",
+        timestamp=_TS,
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "ok"
+    assert result["action"] == "created"
+    assert len(_fragments(vault)) == 1
+    assert "frag-decoy" not in result["affected_fragment_ids"]

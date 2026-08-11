@@ -41,6 +41,7 @@ import yaml
 from pydantic import BaseModel, Field
 
 from creek.ingest.journal_staging import ADEPTHOOD_STAGING_RELDIRS
+from creek.ingest.source_unit import split_source_unit
 from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog, PurgeOutcomeStatus
 
 if TYPE_CHECKING:
@@ -981,25 +982,76 @@ class PurgeEngine:
         origin_key = _extract_source_origin_key(post)
         if not origin_key:
             return
-        staged_path = self._resolve_pointer_in_vault(
-            origin_key,
-            field="source.origin_key",
-        )
+        staged_path = self._resolve_staged_source(origin_key)
         if staged_path is None:
-            return
-        if not self._in_any_staging_root(staged_path):
-            logger.warning(
-                "Ignoring source.origin_key %r that resolves outside "
-                "the Adepthood staging dirs %s",
-                origin_key,
-                [str(reldir) for reldir in ADEPTHOOD_STAGING_RELDIRS],
-            )
-            return
-        if not staged_path.is_file():
             return
         result.journal_staged_removed += 1
         if not self.dry_run:
             staged_path.unlink(missing_ok=True)
+
+    def _resolve_staged_source(self, origin_key: str) -> Path | None:
+        """Resolve *origin_key* to the staged file to delete, or ``None``.
+
+        Tries the key whole, then — only if that named no file — as a
+        ``<path>#<unit>`` sub-unit key whose path half is the real staged
+        document (#1305). Both guards are re-applied on the fallback: the
+        recovered path must resolve inside the vault
+        (:meth:`_resolve_pointer_in_vault`) and inside a declared staging
+        root (:meth:`_in_any_staging_root`). The fallback therefore only
+        ever widens what is deleted *within* the staging roots — a ratchet
+        in the restrictive direction, never a relaxation.
+
+        Order is load-bearing in both directions. Whole-key-first means a
+        genuinely ``#``-named document (``report#1.xlsx``) keeps resolving
+        to itself rather than steering the delete at a different file
+        called ``report``; ``#`` is legal in a POSIX filename, so the split
+        is a hypothesis and must never pre-empt the literal reading.
+        Fallback-at-all is what stops an uploaded workbook surviving an
+        RTBF request: since #1305 each sheet's ``origin_key`` names a
+        sub-unit, which resolves inside the staging root but is not a file,
+        so the ``is_file()`` check alone left the operator's document on
+        disk after the erasure meant to remove it.
+
+        Args:
+            origin_key: The fragment's ``source.origin_key``, verbatim.
+
+        Returns:
+            The staged file to unlink, or ``None`` to skip — a missing,
+            unresolvable, out-of-vault or out-of-staging key is a no-op
+            rather than an error, per this engine's pointer contract.
+        """
+        for candidate_key in self._staged_key_candidates(origin_key):
+            resolved = self._resolve_pointer_in_vault(
+                candidate_key,
+                field="source.origin_key",
+            )
+            if resolved is None:
+                continue
+            if not self._in_any_staging_root(resolved):
+                logger.warning(
+                    "Ignoring source.origin_key %r that resolves outside "
+                    "the Adepthood staging dirs %s",
+                    candidate_key,
+                    [str(reldir) for reldir in ADEPTHOOD_STAGING_RELDIRS],
+                )
+                continue
+            if resolved.is_file():
+                return resolved
+        return None
+
+    @staticmethod
+    def _staged_key_candidates(origin_key: str) -> list[str]:
+        """Return *origin_key* readings to try, most literal first (#1305).
+
+        Args:
+            origin_key: The fragment's ``source.origin_key``, verbatim.
+
+        Returns:
+            The whole key, followed by its path half when it carries a
+            sub-unit suffix. One entry for every key that does not.
+        """
+        base, unit = split_source_unit(origin_key)
+        return [origin_key] if unit is None else [origin_key, base]
 
     def _purge_voice_artifacts(
         self,

@@ -286,8 +286,12 @@ class FragmentationEngine:
         Returns:
             List of child fragments with parent_id metadata.
         """
+        # ``identity_key``, not ``source_path``, so a parent that addresses a
+        # sub-unit of a file (a workbook sheet) derives a distinct parent id
+        # rather than colliding with its siblings (#1305). Identical to
+        # ``source_path`` for every fragment that carries no unit.
         parent_id = generate_fragment_id(
-            parent.source_path,
+            parent.identity_key,
             parent.timestamp,
             parent.content,
         )
