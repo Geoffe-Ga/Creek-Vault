@@ -1,9 +1,11 @@
-"""Skeleton ``creek sync`` command — dry-run plan + state round-trip (#676).
+"""``creek sync`` plan echoing + state round-trip (#676).
 
 Tier A is the cheap per-source pass (pull → incremental ingest → rules
 classify); Tier B is the nightly global pass (LLM classify → link → index).
-This skeleton only echoes the ordered plan and round-trips
-``00-Creek-Meta/State/sync/last-run.json`` — no real execution.
+This module covers the ``--dry-run`` surface — echoing the ordered plan and
+round-tripping ``00-Creek-Meta/State/sync/last-run.json``. Real tier execution
+shipped in #678 and is covered by ``test_sync_exec.py``; a bare invocation
+(no ``--dry-run``) executes the tier for real.
 """
 
 from __future__ import annotations

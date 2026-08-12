@@ -24,6 +24,31 @@ creek sync --tier B --vault /path/to/vault    # nightly global pass
 creek sync --tier A --dry-run --vault ...      # echo the plan without running
 ```
 
+## A bare invocation executes — `--dry-run` is opt-in
+
+There is no preview mode by default. `creek sync --tier B` really runs: **one
+LLM call per unclassified fragment** across the whole vault, then the link pass,
+then a full index rebuild. On a cloud `classification` provider that is real
+token spend and real data egress. Pass `--dry-run` to see the ordered plan
+without any of it.
+
+Before a real Tier-B pass, `creek sync` prints what it is about to do —
+including how many fragments it may bill for — and then:
+
+| where it runs | what happens |
+|---|---|
+| Interactive terminal (stdin is a TTY) | asks `Continue?`; answering no aborts before any step runs and records nothing |
+| Scheduled or piped (launchd, systemd, cron, CI, any non-TTY) | **proceeds unprompted**, and says so in the output |
+
+The scheduled case is deliberate: the units written by `--install-schedule` are
+bare `creek sync --tier B` invocations with no stdin, so a prompt there would
+block a timer nobody is watching. It does mean the confirmation protects the
+operator at a keyboard and **not** the nightly run — the cost line is printed
+either way precisely so the scheduler log records what the pass cost. Use
+`--yes` to skip the prompt in an interactive shell.
+
+Tier A is not gated: it is the cheap, offline pass.
+
 ## Enabling sources
 
 Each source has an on/off toggle under `sync.sources` in your config. The
