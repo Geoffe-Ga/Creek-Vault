@@ -23,6 +23,7 @@ from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import frontmatter
+import yaml
 
 from creek.generate.compost_verifier import CompostVerdict
 from creek.models import (
@@ -66,6 +67,39 @@ _HIGH_CONFIDENCE: frozenset[str] = frozenset(
 
 _UNKNOWN_REASON: str = "unknown"
 """Rendered when a candidate has no recorded reason."""
+
+_SOURCE_KEYS: tuple[str, ...] = (
+    "original_fragment",
+    "original_thread",
+    "original_project",
+)
+"""Frontmatter keys naming the source a compost note was written for.
+
+``CompostTracker._build_metadata`` writes exactly one of these per note,
+chosen by ``source_type``. Reading all three back is what makes a re-scan
+idempotent across all three candidate kinds.
+"""
+
+_WIKILINK_RE = re.compile(r"\[\[(.+)\]\]")
+"""Matches the ``[[id]]`` form used for fragment and thread back-references.
+
+Project sources are stored bare (a tag, not a note), so unwrapping has to
+tolerate both shapes.
+"""
+
+_MAX_FILENAME_ORDINALS: int = 10_000
+"""Cap on the paths :func:`_resolve_compost_note_path` probes.
+
+Counts the unsuffixed name, so a cap of 3 means ``stem``, ``stem-1``,
+``stem-2``. Mirrors ``creek.vault.writer._MAX_FILENAME_COLLISION_RETRIES``:
+high enough that no real vault reaches it, low enough that a runaway
+collision pattern surfaces as a loud ``RuntimeError`` rather than an
+infinite loop. The probe is
+dearer than the writer's — it parses each occupant rather than attempting an
+exclusive create — so a stem shared by *n* identities costs O(n²) reads across
+the batch. That is the same cost profile the writer already accepts, and it
+only bites a vault that has already gone degenerate.
+"""
 
 
 @dataclass
@@ -126,13 +160,16 @@ def _fragment_is_energetic(fragment: Fragment) -> bool:
     return str(fragment.praxis_potential) == PraxisPotential.EXPLICIT.value
 
 
+def _unwrap_source_id(value: object) -> str:
+    """Return the bare source ID from a ``[[wikilink]]`` or plain string."""
+    text = str(value).strip()
+    match = _WIKILINK_RE.fullmatch(text)
+    return match.group(1) if match else text
+
+
 def _fragment_thread_titles(fragment: Fragment) -> list[str]:
     """Extract wiki-linked thread titles from a fragment's ``threads`` list."""
-    titles: list[str] = []
-    for raw in fragment.threads:
-        match = re.fullmatch(r"\[\[(.+)\]\]", raw.strip())
-        titles.append(match.group(1) if match else raw.strip())
-    return titles
+    return [_unwrap_source_id(raw) for raw in fragment.threads]
 
 
 def _is_paradox(fragment: Fragment) -> bool:
@@ -176,6 +213,134 @@ def _sanitize_filename(title: str) -> str:
     cleaned = re.sub(r"[^\w\s-]", "", title).strip()
     cleaned = re.sub(r"\s+", "-", cleaned)
     return cleaned[:80] or "compost"
+
+
+def _candidate_source_pair(candidate: CompostCandidate) -> tuple[str, str]:
+    """Return the frontmatter ``(key, value)`` pair identifying *candidate*.
+
+    The single place ``source_type`` is mapped onto one of
+    :data:`_SOURCE_KEYS`. :meth:`CompostTracker._build_metadata` writes the
+    pair; :func:`_compost_source_of` reads it back; the note-path resolver
+    compares them. Thread and fragment sources are wiki-linked because they
+    are notes; a project source is a bare tag.
+
+    Args:
+        candidate: The compost candidate about to be written.
+
+    Returns:
+        The source key and the value exactly as it is written to disk.
+    """
+    if candidate.source_type == "thread":
+        return ("original_thread", f"[[{candidate.source_id}]]")
+    if candidate.source_type == "fragment":
+        return ("original_fragment", f"[[{candidate.source_id}]]")
+    return ("original_project", candidate.source_id)
+
+
+def _compost_source_of(post: frontmatter.Post) -> tuple[str, str] | None:
+    """Return the ``(source key, raw value)`` pair *post* records, or ``None``.
+
+    ``None`` means "this note's identity cannot be positively established as
+    a compost source" and covers two shapes: the note is not
+    ``type: compost`` at all (the ``_Compost-Report.md`` shell, or an
+    unrelated note that happened to want the same filename), or it carries
+    none of :data:`_SOURCE_KEYS`.
+
+    The value is returned **as written**, wrapper and all. Comparing through
+    :func:`_unwrap_source_id` would collapse a fragment with id ``X`` and a
+    project tagged ``X`` onto one identity, and those are two different
+    things that must not overwrite each other (#1334).
+
+    Args:
+        post: A parsed markdown note.
+
+    Returns:
+        The first recorded source pair, or ``None``.
+    """
+    if post.get("type") != "compost":
+        return None
+    for key in _SOURCE_KEYS:
+        raw = post.get(key)
+        if raw is not None:
+            return (key, str(raw))
+    return None
+
+
+def _recorded_compost_source(note: Path) -> tuple[str, str] | None:
+    """Return the source pair a compost note on disk records, or ``None``.
+
+    The disk-facing companion to :func:`_compost_source_of`, and the single
+    extractor both the note writer and
+    :func:`creek.generate.compost_scan.load_composted_source_ids` resolve
+    identity through — so the index and the writer can never disagree about
+    who owns what (#1334). A note that cannot be read or parsed is reported
+    as ``None`` (identity unestablished) rather than raising, which is what
+    makes the resolver step over a damaged neighbour instead of clobbering
+    it.
+
+    Args:
+        note: Path to a candidate markdown note.
+
+    Returns:
+        The recorded ``(source key, raw value)`` pair, or ``None``.
+    """
+    try:
+        post = frontmatter.load(str(note))
+    except (OSError, ValueError, yaml.YAMLError):
+        logger.debug("Skipping unreadable compost note: %s", note)
+        return None
+    return _compost_source_of(post)
+
+
+def _resolve_compost_note_path(
+    target_dir: Path,
+    stem: str,
+    identity: tuple[str, str],
+) -> Path:
+    """Return the path *identity*'s note owns under *target_dir*.
+
+    Probes ``stem.md``, ``stem-1.md``, ``stem-2.md``, … and returns the first
+    path that is either free or already occupied by a note recording
+    *identity*. A path occupied by anything else — a different source, or a
+    note whose identity :func:`_recorded_compost_source` cannot establish —
+    is skipped, never overwritten.
+
+    Deliberately *not* ``VaultWriter._atomic_create``: that helper advances on
+    occupancy, so it would mint a new file every run and never converge. This
+    one advances on ownership, so the file count is bounded by the number of
+    distinct identities.
+
+    Only exact paths are probed — never ``glob``/``iterdir``, which would make
+    a batch quadratic in directory size at 35k-fragment scale.
+
+    Args:
+        target_dir: Directory the note will be written into.
+        stem: Filename stem (without ``.md``) the candidate naturally wants.
+        identity: The candidate's ``(source key, raw value)`` pair.
+
+    Returns:
+        The path to write to.
+
+    Raises:
+        RuntimeError: If every one of :data:`_MAX_FILENAME_ORDINALS` probed
+            paths belongs to someone else.
+    """
+    # The ordinal loop is duplicated in creek/generate/decisions.py on
+    # purpose. Hoisting a shared filename builder is explicitly out of scope
+    # for #1334 and is issue #1417's job; merging them here would pre-empt it.
+    for ordinal in range(_MAX_FILENAME_ORDINALS):
+        suffix = "" if ordinal == 0 else f"-{ordinal}"
+        candidate_path = target_dir / f"{stem}{suffix}.md"
+        if (
+            not candidate_path.exists()
+            or _recorded_compost_source(candidate_path) == identity
+        ):
+            return candidate_path
+    msg = (
+        f"Could not allocate a unique filename for '{stem}.md' in "
+        f"{target_dir} after {_MAX_FILENAME_ORDINALS} attempts"
+    )
+    raise RuntimeError(msg)
 
 
 class CompostTracker:
@@ -614,7 +779,7 @@ class CompostTracker:
         """Write a compost note for *candidate* into the vault.
 
         Canonical compost notes live at
-        ``10-Liminal/Compost/<date>-<sanitised-title>.md``. Candidates
+        ``10-Liminal/Compost/<date>-<sanitised-title>[-N].md``. Candidates
         whose verifier returned ``ambiguous`` (``candidate.for_review``
         is ``True``) instead route to *review_queue_relpath* so the
         operator can triage them before they are filed canonically.
@@ -623,6 +788,33 @@ class CompostTracker:
         reason, tags, and fragment links. The body carries the three
         required sections ("What it was", "Why it composted", "What
         energy remains") plus a trailing list of all related fragments.
+
+        ``[-N]`` is the collision ordinal. The stem is derived from the
+        title alone, so two different sources can want it — the sanitiser's
+        80-character truncation manufactures collisions by itself, and every
+        untitled candidate of a given day wants ``<date>-compost.md`` — so
+        the path is resolved by *ownership*:
+        :func:`_resolve_compost_note_path` probes ``-1``, ``-2``, … until it
+        finds a path that is free or already records this candidate's
+        ``(source key, source id)`` pair. **A note recording a different
+        source is never overwritten** (#1334). A note this candidate already
+        owns *is* rewritten in place; that refresh is deliberate, and is what
+        the index gate in
+        :func:`~creek.generate.compost_scan.run_compost_scan` keeps
+        production from reaching.
+
+        "Already owns" means *at today's stem*. The stem embeds the
+        tracker's clock date, so a note this candidate owns from an earlier
+        day is never probed, and a direct call on a later day writes a
+        second note rather than refreshing the first — the same caveat
+        ``creek/generate/paradox.py`` carries (#1320). The index gate spans
+        every date, so production is unaffected.
+
+        The disambiguator is a bare integer on purpose. A project
+        candidate's ``source_id`` *is* its tag, which can be derived from
+        intimate fragments, so no identity-derived string may be added to a
+        filename to keep two notes apart; an ordinal discloses nothing but a
+        collision count (#1311 / PR #1404).
 
         Args:
             candidate: The compost candidate to record.
@@ -634,6 +826,10 @@ class CompostTracker:
 
         Returns:
             Path to the written note.
+
+        Raises:
+            RuntimeError: If :data:`_MAX_FILENAME_ORDINALS` consecutive
+                candidate filenames all belong to other sources.
         """
         if candidate.for_review:
             target_dir = vault_path / review_queue_relpath
@@ -647,8 +843,12 @@ class CompostTracker:
         post = frontmatter.Post(content=body)
         post.metadata.update(metadata)
 
-        filename = f"{today.isoformat()}-{_sanitize_filename(candidate.title)}.md"
-        note_path = target_dir / filename
+        stem = f"{today.isoformat()}-{_sanitize_filename(candidate.title)}"
+        note_path = _resolve_compost_note_path(
+            target_dir,
+            stem,
+            _candidate_source_pair(candidate),
+        )
         note_path.write_text(frontmatter.dumps(post), encoding="utf-8")
         return note_path
 
@@ -657,7 +857,12 @@ class CompostTracker:
         candidate: CompostCandidate,
         today: date,
     ) -> dict[str, object]:
-        """Build the frontmatter metadata dict for *candidate*."""
+        """Build the frontmatter metadata dict for *candidate*.
+
+        The source key/value comes from :func:`_candidate_source_pair`, the
+        same function the note-path resolver compares against, so the writer
+        and every reader of a note's identity cannot drift (#1334).
+        """
         tags = ["compost"]
         if candidate.for_review:
             tags.append("compost-review")
@@ -669,12 +874,8 @@ class CompostTracker:
             "fragments": [f"[[{fid}]]" for fid in candidate.fragment_ids],
             "tags": tags,
         }
-        if candidate.source_type == "thread":
-            metadata["original_thread"] = f"[[{candidate.source_id}]]"
-        elif candidate.source_type == "fragment":
-            metadata["original_fragment"] = f"[[{candidate.source_id}]]"
-        else:
-            metadata["original_project"] = candidate.source_id
+        source_key, source_value = _candidate_source_pair(candidate)
+        metadata[source_key] = source_value
         if candidate.similarity is not None:
             metadata["embedding_similarity"] = round(candidate.similarity, 4)
         if candidate.verifier_reasoning is not None:
@@ -749,14 +950,23 @@ class CompostTracker:
         compost_dir: Path,
         report_path: Path,
     ) -> list[tuple[str, str]]:
-        """Return ``(title, filename)`` tuples for compost notes in *compost_dir*."""
+        """Return ``(title, filename)`` tuples for compost notes in *compost_dir*.
+
+        ``yaml.YAMLError`` joins the skip tuple because #1334 made an
+        unparseable neighbour *survivable*: the note-path resolver now steps
+        over a note whose identity it cannot establish instead of
+        overwriting it. That is the right call, but it means a malformed
+        note persists in ``10-Liminal/Compost/`` where it used to be
+        clobbered — so this scan, which ``creek fill`` runs over the same
+        folder, would newly crash on it. Same bug class as issue #1416.
+        """
         notes: list[tuple[str, str]] = []
         for md_file in sorted(compost_dir.glob("*.md")):
             if md_file == report_path:
                 continue
             try:
                 post = frontmatter.load(str(md_file))
-            except (OSError, ValueError):
+            except (OSError, ValueError, yaml.YAMLError):
                 continue
             if post.get("type") != "compost":
                 continue
@@ -766,14 +976,20 @@ class CompostTracker:
 
     @staticmethod
     def _load_active_threads(threads_dir: Path) -> list[tuple[str, str]]:
-        """Return ``(title, id)`` tuples for active thread notes."""
+        """Return ``(title, id)`` tuples for active thread notes.
+
+        Skips unparseable notes for the same reason as
+        :meth:`_load_existing_compost_notes`: the two run in one pass from
+        :meth:`generate_compost_report`, and a report that dies on one bad
+        thread note is no more use than one that dies on a bad compost note.
+        """
         if not threads_dir.exists():
             return []
         active: list[tuple[str, str]] = []
         for md_file in sorted(threads_dir.glob("*.md")):
             try:
                 post = frontmatter.load(str(md_file))
-            except (OSError, ValueError):
+            except (OSError, ValueError, yaml.YAMLError):
                 continue
             status = str(post.get("status") or "")
             if status != ThreadStatus.ACTIVE.value:
