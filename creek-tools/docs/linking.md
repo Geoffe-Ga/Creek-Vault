@@ -22,9 +22,23 @@ creek link --vault ~/Obsidian/Creek-Vault --method eddies
 
 ## Resonances (embeddings)
 
-`creek.link.embeddings.EmbeddingLinker` encodes each fragment's title with a sentence-transformer model and emits a resonance edge whenever the cosine similarity exceeds `EmbeddingsConfig.similarity_threshold`.
+`creek.link.embeddings.EmbeddingLinker` encodes each fragment's title with a sentence-transformer model and emits a resonance edge whenever the cosine similarity meets or exceeds `EmbeddingsConfig.similarity_threshold` — a pair sitting exactly on the threshold resonates.
 
 > **Resonance edges are not persisted.** They are computed in memory, counted, and dropped. There is no resonance writer anywhere in the codebase and `Fragment` has no `resonances` field — only `threads` and `eddies`. The only thing `--method embeddings` writes is the vector cache at `00-Creek-Meta/embeddings.parquet`, which the `threads` and `eddies` linkers then reuse. Earlier revisions of this page documented a `links: resonances:` frontmatter block; no version of Creek has ever written one. Persisting resonances is unbuilt work, not a regression.
+
+### Reading the run summary
+
+`creek link --method embeddings` reports three counts, and they legitimately differ:
+
+| Count      | Meaning                                                                        |
+|------------|---------------------------------------------------------------------------------|
+| `scanned`  | Fragments loaded from the vault — the corpus size.                              |
+| `computed` | Vectors the local model actually produced this run — cache misses only.         |
+| `cached`   | Rows in `00-Creek-Meta/embeddings.parquet` after the run.                       |
+
+`computed` is zero on a warm cache — that's normal, not a failure. It's the number this line used to report as "embedded" regardless of whether the model did anything. `cached` is the whole cache rewritten from fresh hits plus any newly-computed vectors, so a fully warm run reports the entire corpus under `cached` while `computed` sits at zero.
+
+`no vectors written` after a run that reports vectors `computed` means the cache write itself failed — check the log for the warning. Linking still succeeded and the resonance count is still accurate; the only cost is that those vectors get recomputed next run instead of served from cache. On an empty vault, `no vectors written` just means there was nothing to cache.
 
 ### Tuning
 

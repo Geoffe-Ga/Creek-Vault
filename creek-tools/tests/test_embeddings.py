@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pytest
@@ -1010,3 +1010,320 @@ class TestHierarchyAwareFiltering:
         )
         assert edge.from_level == "document"
         assert edge.to_level == "document"
+
+
+# ---- Issue #1337: count_resonances / find_resonances parity ----------------
+
+_PARITY_CLUSTERS = 4
+"""Dense clusters in the parity corpus."""
+
+_PARITY_PER_CLUSTER = 12
+"""Vectors per cluster; 4 x 12 = 48 vectors keeps the property in the unit lane."""
+
+_PARITY_DIMS = 16
+"""Vector width — wide enough that random cluster centres stay far apart."""
+
+_PARITY_NOISE = 0.15
+"""Per-coordinate jitter around a centre; small enough to keep a cluster dense."""
+
+_PARITY_SEED = 1337
+"""Fixed RNG seed so the corpus, and therefore the edge counts, reproduce."""
+
+_PARITY_SKIP_WINDOW = 2
+"""Sibling-suppression radius passed to both callables, identically."""
+
+
+def _parity_corpus() -> dict[str, list[float]]:
+    """Build the seeded 48-vector corpus of four dense clusters.
+
+    Members of a cluster sit at cosine ~0.98 of one another and clusters
+    are mutually near-orthogonal, so at the default 0.75 threshold the
+    corpus yields hundreds of edges rather than the handful (often zero)
+    that pure standard-normal noise produces. A vacuous ``0 == 0`` parity
+    is the main way this property could rot, so the edge count is asserted
+    non-zero in every parametrisation.
+
+    Returns:
+        Mapping of fragment ID to embedding vector, IDs in cluster order.
+    """
+    rng = np.random.default_rng(_PARITY_SEED)
+    centres = rng.standard_normal((_PARITY_CLUSTERS, _PARITY_DIMS))
+    corpus: dict[str, list[float]] = {}
+    for index in range(_PARITY_CLUSTERS * _PARITY_PER_CLUSTER):
+        centre = centres[index // _PARITY_PER_CLUSTER]
+        vector = centre + _PARITY_NOISE * rng.standard_normal(_PARITY_DIMS)
+        corpus[f"frag-parity-{index:03d}"] = [float(x) for x in vector]
+    return corpus
+
+
+def _parity_hierarchy(corpus: dict[str, list[float]]) -> dict[str, Fragment]:
+    """Give each dense cluster a parent and eleven ordered children.
+
+    The hierarchy is laid over the clusters rather than across them so that
+    suppression actually bites: parent/child pairs are near-identical (and
+    therefore ancestor-suppressed) and adjacent siblings fall inside the
+    skip window. Enough non-adjacent sibling pairs survive that the edge
+    count stays comfortably above zero.
+
+    Args:
+        corpus: The parity corpus, whose IDs are in cluster order.
+
+    Returns:
+        Mapping of fragment ID to :class:`Fragment` with hierarchy fields.
+    """
+    ids = list(corpus)
+    fragments: dict[str, Fragment] = {}
+    for cluster in range(_PARITY_CLUSTERS):
+        start = cluster * _PARITY_PER_CLUSTER
+        members = ids[start : start + _PARITY_PER_CLUSTER]
+        parent_id, child_ids = members[0], members[1:]
+        fragments[parent_id] = _hier_fragment(
+            parent_id,
+            child_ids=child_ids,
+            level="document",
+        )
+        for child_id in child_ids:
+            fragments[child_id] = _hier_fragment(
+                child_id,
+                parent_id=parent_id,
+                level="paragraph",
+            )
+    return fragments
+
+
+@pytest.mark.parametrize("resonance_method", ["exact", "topk"])
+@pytest.mark.parametrize("with_hierarchy", [False, True])
+def test_count_resonances_matches_find_resonances_length(
+    resonance_method: Literal["exact", "topk"],
+    with_hierarchy: bool,
+) -> None:
+    """``count_resonances`` must never drift from ``len(find_resonances(...))``.
+
+    Issue #1337: the CLI reports the similarity-edge count next to the
+    persisted-vector count, and the edge count is the one number in that
+    sentence with no artifact behind it — nothing writes resonances to the
+    vault. Counting them without materialising ``Resonance`` objects is
+    therefore worth doing, but it forks the traversal, and a fork is a
+    place where two answers can quietly diverge.
+
+    This is the drift alarm. Both discovery strategies are exercised
+    (``exact`` emits every above-threshold pair; ``topk`` caps each
+    fragment's neighbours) and each is run with and without a hierarchy
+    mapping, so the FEAT-024 suppression branch is covered on both paths —
+    four combinations, any one of which could be the one a shortcut
+    forgets. The non-zero assertion is load-bearing: an empty corpus makes
+    the parity ``0 == 0`` and the whole property vacuous.
+    """
+    linker = EmbeddingLinker(
+        config=EmbeddingsConfig(
+            similarity_threshold=0.75,
+            resonance_method=resonance_method,
+        ),
+    )
+    corpus = _parity_corpus()
+    fragments = _parity_hierarchy(corpus) if with_hierarchy else None
+
+    edges = linker.find_resonances(
+        corpus,
+        fragments,
+        sibling_skip_window=_PARITY_SKIP_WINDOW,
+    )
+    counted = linker.count_resonances(
+        corpus,
+        fragments,
+        sibling_skip_window=_PARITY_SKIP_WINDOW,
+    )
+
+    assert len(edges) > 0, (
+        "the parity corpus must yield edges under "
+        f"{resonance_method}/hierarchy={with_hierarchy}, or 0 == 0 makes "
+        "this property vacuous"
+    )
+    assert isinstance(counted, int)
+    assert counted == len(edges)
+
+
+def test_count_resonances_builds_no_resonance_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Counting must not construct a ``Resonance`` per edge.
+
+    Issue #1337: the edge count reported by ``creek link --method
+    embeddings`` was ``len(find_resonances(...))``, so every above-threshold
+    pair became a Pydantic model whose only purpose was to be counted and
+    dropped. Measured at ~1KB of heap per edge, which at the documented
+    35k-fragment scale (6.9% pair density, per #338's 188-fragment sample)
+    is tens of gigabytes — an out-of-memory failure, not a slowdown.
+
+    The parity test next door pins that the two answers agree; agreement is
+    exactly what a lazy implementation risks losing, but it is also what a
+    lazy-looking implementation that quietly rebuilds the list would keep.
+    This is the assertion that separates them, and it is behavioural rather
+    than a memory measurement: a spy on the constructor counts objects,
+    which is deterministic, where a peak-heap threshold would be flaky.
+    """
+    constructed = 0
+    real_resonance = Resonance
+
+    def _spy(**kwargs: Any) -> Resonance:
+        """Count each ``Resonance`` the code under test builds."""
+        nonlocal constructed
+        constructed += 1
+        return real_resonance(**kwargs)
+
+    linker = EmbeddingLinker(
+        config=EmbeddingsConfig(similarity_threshold=0.75),
+    )
+    corpus = _parity_corpus()
+
+    monkeypatch.setattr("creek.link.embeddings.Resonance", _spy)
+
+    counted = linker.count_resonances(corpus)
+    assert counted > 0, "vacuous unless the corpus actually resonates"
+    assert constructed == 0, (
+        f"count_resonances built {constructed} Resonance object(s); "
+        "counting must allocate nothing per edge"
+    )
+
+    # The control: the same traversal via find_resonances builds exactly one
+    # object per edge, so the zero above is a property of counting and not
+    # of the spy failing to intercept.
+    edges = linker.find_resonances(corpus)
+    assert constructed == len(edges) > 0
+
+
+def test_exact_pair_scan_yields_before_finishing_the_traversal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact path must be a real generator, not a list behind one.
+
+    Issue #1337: returning ``list[tuple[int, int, float]]`` instead of
+    ``list[Resonance]`` looks like a fix and is not — at a measured ~120
+    bytes per tuple it is still gigabytes at 35k fragments. Laziness is
+    invisible in the return value, so it is pinned here through
+    observable work instead: every candidate pair is routed through
+    ``_is_hierarchy_suppressed``, so a lazy scan that has yielded only its
+    first triple must have consulted it strictly fewer times than a
+    completed one. An eager implementation makes the two counts equal and
+    fails, whatever its element type.
+    """
+    from creek.link import embeddings as embeddings_module
+
+    calls = 0
+    real_check = embeddings_module._is_hierarchy_suppressed
+
+    def _spy(*args: Any, **kwargs: Any) -> bool:
+        """Tally each hierarchy check the traversal performs."""
+        nonlocal calls
+        calls += 1
+        return bool(real_check(*args, **kwargs))
+
+    linker = EmbeddingLinker(
+        config=EmbeddingsConfig(similarity_threshold=0.75),
+    )
+    corpus = _parity_corpus()
+    fragments = _parity_hierarchy(corpus)
+    scan = linker._prepare_scan(corpus, fragments, _PARITY_SKIP_WINDOW)
+    assert scan is not None
+
+    monkeypatch.setattr(embeddings_module, "_is_hierarchy_suppressed", _spy)
+    stats = embeddings_module._ScanStats()
+    generator = embeddings_module._resonances_exact(scan, stats)
+    next(generator)
+    after_first = calls
+
+    remaining = sum(1 for _ in generator)
+    after_all = calls
+
+    assert remaining > 0, "vacuous unless the corpus yields more than one edge"
+    assert after_first < after_all, (
+        f"the scan consulted the hierarchy {after_first} time(s) before its "
+        f"first yield and {after_all} in total; equal counts mean the "
+        "traversal ran to completion eagerly"
+    )
+
+
+def test_count_resonances_peak_memory_does_not_hold_the_edge_set() -> None:
+    """Counting must stream the pair scan, not drain it into a list.
+
+    Issue #1337: replacing ``list[Resonance]`` with ``list[tuple[int, int,
+    float]]`` looks like the fix and is not. It kills the ~1KB-per-edge
+    Pydantic cost but keeps a per-edge allocation of its own, which at the
+    documented 35k-fragment scale is still gigabytes. The
+    ``count_resonances`` body must therefore *consume* the generator
+    lazily; ``len(list(...))`` is the mutant this test exists to kill, and
+    it is invisible to every count-based assertion because it returns the
+    right number.
+
+    Laziness has no observable return value, so it is measured. The corpus
+    is three tight seeded clusters at ~0.999 intra-cluster cosine, which
+    makes edges vastly outnumber fragments and puts the edge set — not the
+    row-block matmul — in charge of peak memory. Measured on this corpus:
+    **3.3 MB streaming versus 18.3 MB via ``list()``**, a 5.5x separation.
+    The ceiling below sits between them with roughly 2.4x headroom over the
+    streaming figure, and ``tracemalloc`` counts Python allocations rather
+    than RSS, so the number is deterministic rather than machine-dependent.
+    """
+    import tracemalloc
+
+    fragment_count = 900
+    rng = np.random.default_rng(_PARITY_SEED)
+    centres = rng.standard_normal((3, 8))
+    corpus = {
+        f"frag-dense-{index:04d}": [
+            float(value) for value in centres[index % 3] + 0.02 * rng.standard_normal(8)
+        ]
+        for index in range(fragment_count)
+    }
+    linker = EmbeddingLinker(config=EmbeddingsConfig(similarity_threshold=0.75))
+
+    tracemalloc.start()
+    tracemalloc.reset_peak()
+    counted = linker.count_resonances(corpus)
+    _, peak_bytes = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    # Vacuity guard: the property is only meaningful when the edge set is
+    # far larger than the corpus that would otherwise dominate the peak.
+    assert counted > 100 * fragment_count, (
+        f"{counted} edge(s) over {fragment_count} fragments is too sparse "
+        "for peak memory to say anything about holding the edge set"
+    )
+    ceiling_bytes = 8_000_000
+    assert peak_bytes < ceiling_bytes, (
+        f"counting {counted} edge(s) peaked at {peak_bytes / 1e6:.1f} MB, "
+        f"over the {ceiling_bytes / 1e6:.0f} MB ceiling — the edge set is "
+        "being retained rather than streamed"
+    )
+
+
+def test_similarity_threshold_is_inclusive_at_the_boundary() -> None:
+    """A pair sitting exactly on the threshold resonates.
+
+    ``EmbeddingsConfig.similarity_threshold`` is documented as the
+    *minimum* cosine similarity for linking, so the comparison is ``>=``
+    and a pair landing precisely on it must be emitted. Random corpora
+    never land exactly on a float boundary, so this case had no coverage
+    and a ``>=`` to ``>`` slip in the pair scan was invisible — the kind of
+    off-by-one that quietly drops edges at whatever threshold an operator
+    has tuned to. Identical unit vectors give an exact 1.0 with no
+    floating-point slack, which is what makes the boundary testable at all.
+
+    Pinned while #1337 rewrote this traversal into a generator; the
+    comparison itself is unchanged, and this is the assertion that says so.
+    """
+    linker = EmbeddingLinker(config=EmbeddingsConfig(similarity_threshold=1.0))
+    corpus = {"frag-boundary-a": [1.0, 0.0], "frag-boundary-b": [1.0, 0.0]}
+
+    edges = linker.find_resonances(corpus)
+
+    assert len(edges) == 1
+    assert edges[0].similarity == pytest.approx(1.0)
+    assert linker.count_resonances(corpus) == 1
+
+    # And the exclusive reading really is distinguishable here: nudge the
+    # threshold above 1.0 and the same pair drops out, so the assertion
+    # above is about the boundary and not about the pair being trivially
+    # similar.
+    above = EmbeddingLinker(config=EmbeddingsConfig(similarity_threshold=1.0001))
+    assert above.find_resonances(corpus) == []

@@ -116,6 +116,14 @@ class LinkSummary:
             is what lets ``creek process`` attribute local-model work to
             the run that paid for it instead of re-counting the corpus
             (#1303).
+        vectors_persisted: Rows present in
+            ``00-Creek-Meta/embeddings.parquet`` as written by *this* run.
+            Deliberately distinct from ``fragments_embedded``: the cache is
+            rewritten whole from fresh cache hits plus new vectors, so a
+            fully warm run persists the entire corpus while computing none
+            of it. ``0`` means nothing reached disk — an empty vault, or a
+            swallowed ``OSError`` from the cache write. The CLI reports
+            this rather than asserting that vectors were cached (#1337).
     """
 
     method: str
@@ -131,6 +139,7 @@ class LinkSummary:
     clusters_split: int = 0
     oversized_discarded: int = 0
     fragments_embedded: int = 0
+    vectors_persisted: int = 0
 
 
 @dataclass(frozen=True)
@@ -148,11 +157,17 @@ class EmbeddingPass:
         computed: Vectors computed by the model on this pass (cache
             misses).
         reused: Vectors served verbatim from the on-disk parquet cache.
+        persisted: Rows this pass actually wrote to the parquet — ``0``
+            when the write failed or never happened. Required, with no
+            default: the number has to be *measured* by the write, and a
+            default would let a future pass silently under-report the one
+            thing the field exists to make honest (#1337).
     """
 
     vectors: dict[str, list[float]]
     computed: int
     reused: int
+    persisted: int
 
 
 def run_link(
@@ -191,7 +206,7 @@ def run_link(
         return LinkSummary(method=method, fragment_count=0, link_count=0)
 
     if method == "embeddings":
-        link_count, embedded = _run_embeddings(
+        link_count, embedding_pass = _run_embeddings(
             fragments=fragments,
             config=config,
             cache_path=cache_path,
@@ -201,7 +216,8 @@ def run_link(
             fragment_count=len(fragments),
             link_count=link_count,
             similarity_edges=link_count,
-            fragments_embedded=embedded,
+            fragments_embedded=embedding_pass.computed,
+            vectors_persisted=embedding_pass.persisted,
         )
     if method == "temporal":
         temporal = TemporalLinker()
@@ -285,6 +301,7 @@ def _run_threads(
             clusters_split=detector.clusters_split,
             oversized_discarded=detector.oversized_discarded,
             fragments_embedded=embedding_pass.computed,
+            vectors_persisted=embedding_pass.persisted,
         )
 
     updated_fragments = detector.assign_fragments_to_threads(fragments, threads)
@@ -312,6 +329,7 @@ def _run_threads(
         clusters_split=detector.clusters_split,
         oversized_discarded=detector.oversized_discarded,
         fragments_embedded=embedding_pass.computed,
+        vectors_persisted=embedding_pass.persisted,
     )
 
 
@@ -377,6 +395,7 @@ def _run_eddies(
             clusters_split=detector.clusters_split,
             oversized_discarded=detector.oversized_discarded,
             fragments_embedded=embedding_pass.computed,
+            vectors_persisted=embedding_pass.persisted,
         )
 
     updated_fragments = detector.assign_fragments_to_eddies(fragments, eddies)
@@ -404,6 +423,7 @@ def _run_eddies(
         clusters_split=detector.clusters_split,
         oversized_discarded=detector.oversized_discarded,
         fragments_embedded=embedding_pass.computed,
+        vectors_persisted=embedding_pass.persisted,
     )
 
 
@@ -554,7 +574,7 @@ def _run_embeddings(
     fragments: list[Fragment],
     config: CreekConfig,
     cache_path: Path,
-) -> tuple[int, int]:
+) -> tuple[int, EmbeddingPass]:
     """Compute embeddings, optionally re-using the on-disk cache.
 
     Args:
@@ -563,12 +583,15 @@ def _run_embeddings(
         cache_path: Where to read/write the cached embeddings parquet.
 
     Returns:
-        ``(resonance_edges_discovered, vectors_actually_computed)``. The
-        resonance edges are computed in memory and returned to the caller
-        for reporting only — there is no ``Resonance`` writer anywhere in
-        the codebase and :class:`~creek.models.Fragment` has no
-        ``resonances`` field, so nothing about them reaches the vault
-        (#1303). Only the vectors are persisted, in the parquet cache.
+        ``(resonance_edges_discovered, embedding_pass)``. The edge count is
+        obtained from :meth:`~EmbeddingLinker.count_resonances`, which walks
+        the same traversal as ``find_resonances`` without materialising a
+        ``Resonance`` per pair — the objects were only ever built to call
+        ``len`` on them, at a measured ~1KB of heap each (#1337). Nothing
+        about the edges reaches the vault: there is no ``Resonance`` writer
+        anywhere in the codebase and :class:`~creek.models.Fragment` has no
+        ``resonances`` field (#1303). Only the vectors are persisted, in
+        the parquet cache, and the pass reports how many rows landed there.
     """
     embedding_pass = _load_or_compute_embeddings(
         fragments=fragments,
@@ -579,12 +602,12 @@ def _run_embeddings(
     # FEAT-024: hierarchy-aware filtering needs both the fragment map
     # (parent/child relations) and the configured sibling skip window.
     fragments_by_id = {f.id: f for f in fragments}
-    resonances = EmbeddingLinker(config=config.embeddings).find_resonances(
+    edges = EmbeddingLinker(config=config.embeddings).count_resonances(
         embedding_pass.vectors,
         fragments_by_id,
         sibling_skip_window=config.linking.hierarchy_sibling_skip_window,
     )
-    return len(resonances), embedding_pass.computed
+    return edges, embedding_pass
 
 
 def _load_or_compute_embeddings(
@@ -608,8 +631,9 @@ def _load_or_compute_embeddings(
         cache_path: Embedding cache path.
 
     Returns:
-        An :class:`EmbeddingPass` carrying the vectors plus the split
-        between freshly computed and cache-served entries.
+        An :class:`EmbeddingPass` carrying the vectors, the split between
+        freshly computed and cache-served entries, and the row count the
+        cache write actually landed on disk.
     """
     linker = EmbeddingLinker(config=config.embeddings)
 
@@ -623,11 +647,19 @@ def _load_or_compute_embeddings(
     }
     embeddings.update(new_vectors)
 
-    _persist_cache(linker, fragments, cached, new_vectors, fresh_ids, cache_path)
+    persisted = _persist_cache(
+        linker,
+        fragments,
+        cached,
+        new_vectors,
+        fresh_ids,
+        cache_path,
+    )
     return EmbeddingPass(
         vectors=embeddings,
         computed=len(new_vectors),
         reused=len(fresh_ids),
+        persisted=persisted,
     )
 
 
@@ -687,7 +719,7 @@ def _persist_cache(
     new_vectors: dict[str, list[float]],
     fresh_ids: set[str],
     cache_path: Path,
-) -> None:
+) -> int:
     """Write the merged cache back to disk, degrading gracefully on IO errors.
 
     Args:
@@ -697,6 +729,12 @@ def _persist_cache(
         new_vectors: Vectors produced this run.
         fresh_ids: Fragment IDs whose cached entry is still valid.
         cache_path: Cache parquet path.
+
+    Returns:
+        Rows actually written to *cache_path* — the whole merged entry set
+        on success, ``0`` when the write raised. The cache is rewritten
+        whole, so on a fully warm run this is the corpus size even though
+        no vector was computed (#1337).
     """
     new_entries = linker.build_cache_entries(fragments, new_vectors)
     entries = {frag.id: cached[frag.id] for frag in fragments if frag.id in fresh_ids}
@@ -708,11 +746,15 @@ def _persist_cache(
         # Disk full / permission denied / read-only volume. Linking
         # itself succeeded — losing the cache only costs a recompute on
         # the next run, so we degrade gracefully instead of crashing.
+        # The operator still learns about it: the zero returned here is
+        # what the CLI prints instead of claiming vectors were cached.
         logger.warning(
             "Failed to persist embeddings cache to %s: %s",
             cache_path,
             exc,
         )
+        return 0
+    return len(entries)
 
 
 def _load_fragments(vault_path: Path) -> list[Fragment]:

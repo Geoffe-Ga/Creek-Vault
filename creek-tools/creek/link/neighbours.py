@@ -5,7 +5,7 @@ Eddy DBSCAN (:mod:`creek.link.eddies`) and paradox candidate generation
 fragments whose embedding cosine similarity clears a threshold. A pure-Python
 double loop makes that O(N²) in interpreted code, which does not finish on a
 ~35k-fragment vault. This module mirrors the blocked-numpy approach used by
-:meth:`creek.link.embeddings.EmbeddingLinker._resonances_topk`: it L2-normalises
+:func:`creek.link.embeddings._resonances_topk`: it L2-normalises
 the embedding matrix once, then computes cosine similarities one row-block at a
 time (``block @ matrix.T``) so peak memory is ``block_rows x N`` rather than the
 full ``N x N`` product. The neighbour sets returned are identical (up to
