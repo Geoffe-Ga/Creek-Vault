@@ -136,6 +136,29 @@ def test_glossed_jargon_raises_no_jargon_finding() -> None:
     assert not any(f.dimension == "unglossed_jargon" for f in result.findings)
 
 
+def test_ordinary_english_verbs_do_not_block_pass() -> None:
+    """Plain prose using "rising"/"absorb"/"collaborate"/"express" reaches PASS.
+
+    Issue #1343's acceptance criterion. Those four words are ordinary English
+    verbs *and* lower-cased ontology surface forms, so today each raises a MID
+    ``unglossed_jargon`` finding on this body. ``reflection.py`` turns any
+    finding into REVISE, and ``AuthorConductor`` loops REVISE until
+    ``max_rounds`` is spent and then ESCALATEs to a human — so an essay about
+    bread becomes unshippable. Asserted as the exact verdict plus an empty
+    finding list: "no jargon finding" alone would pass while some other
+    dimension quietly took over the block.
+    """
+    body = (
+        "The bread was rising in the pan while I waited. I could not absorb "
+        "what he said. We collaborate on Tuesdays and express ourselves badly."
+    )
+
+    result = ReflectionNode().review(body, _grounded())
+
+    assert result.decision == "PASS"
+    assert result.findings == []
+
+
 def test_privacy_leak_revises_with_privacy_finding(tmp_path: Path) -> None:
     """A cited intimate fragment leaked above the OPEN default → privacy finding."""
     secret = "the intimate confession nobody should publish"
