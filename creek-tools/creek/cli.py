@@ -2665,6 +2665,14 @@ def _format_link_summary(summary: LinkSummary) -> str:
     to disk (eddies). Per-method strings name the actual side effect so
     operators can correlate the number with what they see on disk.
 
+    The embeddings sentence carries three separate numbers because they
+    are three separate facts and every pairing of them can differ:
+    *scanned* is the corpus size, *computed* is the local-model work this
+    run paid for (zero on a warm cache), and *cached* is what the parquet
+    holds after the write (the whole corpus on that same warm run, or zero
+    if the write failed). The similarity edges sit outside all three —
+    nothing persists them at all (#1337).
+
     Args:
         summary: The link summary returned by
             :func:`creek.link.link_engine.run_link`.
@@ -2681,11 +2689,18 @@ def _format_link_summary(summary: LinkSummary) -> str:
         # the parquet. Only the vectors are — the similarity edges are
         # computed in memory and dropped, because there is no Resonance
         # writer and Fragment has no ``resonances`` field.
+        # #1337: the remaining three claims are now measured rather than
+        # assumed. "embedded" conflated the corpus with the vectors this
+        # run computed (a warm cache computes none), and the cache clause
+        # was a hardcoded assertion that survived an empty vault and a
+        # swallowed OSError alike. Only the *edges* clause says "not
+        # persisted", so that phrase unambiguously pins the edge claim.
         body = (
-            f"Embeddings linker: {fragments} fragment(s) embedded, "
+            f"Embeddings linker: {fragments} fragment(s) scanned, "
+            f"{summary.fragments_embedded} vector(s) computed, "
             f"{summary.similarity_edges} similarity edge(s) computed in memory "
-            f"(not persisted — no resonance writer exists); vectors cached in "
-            f"00-Creek-Meta/embeddings.parquet."
+            f"(not persisted — no resonance writer exists); "
+            f"{_format_embeddings_cache_clause(summary)}."
         )
     elif summary.method == "eddies":
         body = (
@@ -2717,6 +2732,41 @@ def _format_link_summary(summary: LinkSummary) -> str:
         msg = f"Unknown link method: {summary.method!r}"
         raise ValueError(msg)
     return f"[bold green]{body}[/bold green]"
+
+
+def _format_embeddings_cache_clause(summary: LinkSummary) -> str:
+    """Render the parquet clause for the embeddings sentence.
+
+    Issue #1337: the clause used to be a constant asserting that vectors
+    had been cached, which stayed true-looking on the two paths where
+    nothing reached disk — a fragmentless vault (the cache write never
+    runs) and a swallowed ``OSError`` from a full or read-only volume.
+    Both now say so out loud, which is the only operator-visible trace of
+    that deliberately-swallowed error.
+
+    Extracted rather than inlined for the same reason as
+    :func:`_format_cluster_stats`: xenon's ``--max-modules B`` bites on
+    this module's aggregate, so branches live in their own small function.
+
+    Args:
+        summary: The link summary being rendered.
+
+    Returns:
+        The clause naming the row count the run persisted, or the explicit
+        admission that it persisted none.
+    """
+    # Named from the canonical constants rather than a literal, so a
+    # rename of the cache file cannot leave the sentence pointing at a
+    # path that no longer exists.
+    from creek.link.embeddings import (
+        EMBEDDINGS_CACHE_DIR,
+        EMBEDDINGS_CACHE_FILENAME,
+    )
+
+    cache_label = f"{EMBEDDINGS_CACHE_DIR}/{EMBEDDINGS_CACHE_FILENAME}"
+    if summary.vectors_persisted > 0:
+        return f"{summary.vectors_persisted} vector(s) cached in {cache_label}"
+    return f"no vectors written to {cache_label}"
 
 
 def _format_cluster_stats(summary: LinkSummary) -> str:

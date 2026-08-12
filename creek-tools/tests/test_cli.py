@@ -1299,6 +1299,115 @@ def test_link_rebuild_clears_embeddings_cache(tmp_path: Path) -> None:
     assert not cache_path.exists()
 
 
+# ----- Issue #1337: the embeddings sentence must match the parquet -----------
+
+_SEEDED_FRAGMENTS = 4
+"""Fragment count for the #1337 seeded-vault fixtures.
+
+Every expected number below is derived from this constant or read back off
+the parquet, so growing the fixture can never turn a test vacuous.
+"""
+
+_CACHED_VECTORS_RE = re.compile(
+    r"(\d+) vector\(s\) cached in 00-Creek-Meta/embeddings\.parquet",
+)
+"""Recovers the operator-facing cached-vector count from the CLI sentence."""
+
+_EMBEDDING_CACHE_COLUMNS = {
+    "fragment_id",
+    "content_hash",
+    "model_name",
+    "embedding",
+    "computed_at",
+}
+"""The parquet's entire schema — vectors and their freshness keys, no edges."""
+
+
+class _FlatEncoder:
+    """Deterministic stand-in for the sentence-transformer model.
+
+    Row ``i`` is ``[1.0, 0.001 * i]``, so every pair of fragments sits well
+    above the default 0.75 cosine threshold and the similarity-edge count is
+    a stable ``C(n, 2)``. The shared conftest mock returns random
+    384-dimension vectors instead, which are near-orthogonal — under it "0
+    edges" is the usual answer, which is useless for a test about the edge
+    clause. ``EmbeddingLinker.generate_embeddings`` wraps whatever ``encode``
+    returns in ``numpy.asarray``, so a nested list is an exact stand-in for
+    the real model's ndarray.
+    """
+
+    def encode(
+        self,
+        texts: str | list[str],
+        **_kwargs: object,
+    ) -> list[list[float]]:
+        """Return one deterministic vector per entry in *texts*.
+
+        Args:
+            texts: A single text, or the batch the linker passes.
+            **_kwargs: ``show_progress_bar`` / ``batch_size``; ignored.
+
+        Returns:
+            One ``[1.0, 0.001 * i]`` row per input text.
+        """
+        batch = [texts] if isinstance(texts, str) else list(texts)
+        return [[1.0, 0.001 * index] for index, _text in enumerate(batch)]
+
+
+def _seed_embeddings_vault(vault: Path, *, count: int) -> Path:
+    """Seed *vault* with *count* fragments plus the meta directory.
+
+    Args:
+        vault: Vault root to create.
+        count: Number of fragment files to write under ``01-Fragments/``.
+
+    Returns:
+        The embeddings parquet path — which does not exist yet, so a test
+        can assert on its absence as well as its contents.
+    """
+    from creek.link.embeddings import embeddings_cache_path
+    from creek.models import Fragment, FragmentSource, SourcePlatform
+    from tests.helpers import write_fragment_file
+
+    (vault / "00-Creek-Meta").mkdir(parents=True, exist_ok=True)
+    for index in range(count):
+        write_fragment_file(
+            vault=vault,
+            fragment=Fragment(
+                id=f"frag-1337vector{index:02d}",
+                title=f"Vector fragment {index}",
+                source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+            ),
+            body=f"Body of vector fragment {index}.",
+        )
+    return embeddings_cache_path(vault)
+
+
+def _run_link_embeddings(vault: Path) -> tuple[int, str]:
+    """Run ``creek link --method embeddings`` under the deterministic encoder.
+
+    Args:
+        vault: Vault root to link.
+
+    Returns:
+        ``(exit_code, output)``, the output ANSI-stripped and
+        whitespace-collapsed: the honest sentence is longer than the pinned
+        200-column test terminal, so Rich wraps it mid-clause and raw
+        substring assertions would fail for the wrong reason.
+    """
+    from unittest.mock import patch
+
+    with patch(
+        "creek.link.embeddings.EmbeddingLinker.load_model",
+        return_value=_FlatEncoder(),
+    ):
+        result = runner.invoke(
+            app,
+            ["link", "--vault", str(vault), "--method", "embeddings"],
+        )
+    return result.exit_code, " ".join(_strip_ansi(result.output).split())
+
+
 def test_link_embeddings_output_phrases_similarity_edges(tmp_path: Path) -> None:
     """Embeddings CLI output explicitly says "similarity edges", not "links".
 
@@ -1309,23 +1418,162 @@ def test_link_embeddings_output_phrases_similarity_edges(tmp_path: Path) -> None
     Issue #1303 finished the job: the #338 wording said the *edges* were
     cached in the parquet, when in fact only the *vectors* are — the
     edges are computed and dropped, because no resonance writer exists.
-    The output must therefore name both halves. The two assertions below
-    are unchanged from #338 on purpose: the accurate vocabulary has to
-    survive the rewording, not be replaced by it.
+    The output must therefore name both halves. The three vocabulary
+    assertions below are unchanged from #338/#1303 on purpose: the
+    accurate vocabulary has to survive the rewording, not be replaced by
+    it. They read the whitespace-normalised output because the honest
+    sentence no longer fits the pinned terminal width.
+
+    Issue #1337 ties the sentence to the artifact, and the tie runs both
+    ways. The vault is *seeded*, so a parquet genuinely exists (the
+    pre-#1337 version of this test ran against an empty vault where no
+    parquet was ever written, and still asserted the word
+    "embeddings.parquet" appeared — it would have passed with the cache
+    deleted from the codebase). The cached count printed to the operator
+    is compared against ``num_rows`` on disk, derived not hardcoded, and
+    the column set is asserted exactly. Add an edge column to the cache
+    later and the schema assertion fires; claim cached edges in the
+    sentence without adding that column and the wording assertion fires.
+    Neither half can move without the other.
     """
+    import pyarrow.parquet as pq
+
+    vault = tmp_path / "vault"
+    cache_path = _seed_embeddings_vault(vault, count=_SEEDED_FRAGMENTS)
+
+    exit_code, output = _run_link_embeddings(vault)
+
+    assert exit_code == 0, output
+    # #338 phrasing — accurate to what the embeddings method does.
+    assert "similarity edge" in output.lower()
+    assert "embeddings.parquet" in output
+    # #1303: and it must not claim the edges themselves were persisted.
+    assert "not persisted" in output.lower()
+
+    # #1337 tie, half one: the number the operator reads is the number of
+    # rows the artifact actually holds.
+    assert cache_path.exists(), output
+    table = pq.read_table(cache_path)
+    match = _CACHED_VECTORS_RE.search(output)
+    assert match is not None, f"no cached-vector count in output: {output}"
+    assert int(match.group(1)) == table.num_rows
+
+    # #1337 tie, half two: the cache stores vectors and freshness keys and
+    # nothing else. An added edge column fires here.
+    assert set(table.column_names) == _EMBEDDING_CACHE_COLUMNS
+
+    # Because there is no edge column, the sentence may not claim the edges
+    # were cached — only the vectors were.
+    assert "edge(s) cached" not in output
+    assert "edges cached" not in output
+
+
+def test_link_embeddings_warm_run_reports_zero_vectors_computed(
+    tmp_path: Path,
+) -> None:
+    """A second identical run must report the vectors it did *not* compute.
+
+    Issue #1337, lie one: the sentence read ``{fragment_count} fragment(s)
+    embedded``, so a fully warm cache still claimed the whole corpus had
+    been embedded even though ``LinkSummary.fragments_embedded`` was ``0``
+    and the local model was never invoked. ``N fragment(s) embedded`` is
+    the exact substring the defect printed, so its absence is asserted
+    directly rather than inferred from the replacement wording.
+
+    The cached count is still tied to ``num_rows``: a warm run rewrites the
+    same rows, so the parquet must hold the whole corpus even though this
+    run computed none of it.
+    """
+    import pyarrow.parquet as pq
+
+    vault = tmp_path / "vault"
+    cache_path = _seed_embeddings_vault(vault, count=_SEEDED_FRAGMENTS)
+
+    cold_code, cold_output = _run_link_embeddings(vault)
+    assert cold_code == 0, cold_output
+    expected_cold = (
+        f"{_SEEDED_FRAGMENTS} fragment(s) scanned, "
+        f"{_SEEDED_FRAGMENTS} vector(s) computed,"
+    )
+    assert expected_cold in cold_output
+
+    warm_code, warm_output = _run_link_embeddings(vault)
+    assert warm_code == 0, warm_output
+    expected_warm = f"{_SEEDED_FRAGMENTS} fragment(s) scanned, 0 vector(s) computed,"
+    assert expected_warm in warm_output
+    assert f"{_SEEDED_FRAGMENTS} fragment(s) embedded" not in warm_output
+
+    table = pq.read_table(cache_path)
+    assert table.num_rows == _SEEDED_FRAGMENTS
+    match = _CACHED_VECTORS_RE.search(warm_output)
+    assert match is not None, f"no cached-vector count in output: {warm_output}"
+    assert int(match.group(1)) == table.num_rows
+
+
+def test_link_embeddings_empty_vault_admits_nothing_was_cached(
+    tmp_path: Path,
+) -> None:
+    """An empty vault must not claim vectors reached the parquet.
+
+    Issue #1337, lie two: ``run_link`` returns early for a fragmentless
+    vault, so ``_persist_cache`` never runs and no parquet is created — yet
+    the sentence still ended "vectors cached in
+    00-Creek-Meta/embeddings.parquet". The disk assertion and the wording
+    assertion live in the same test on purpose: separated, one could be
+    weakened without the other noticing, which is exactly how the claim
+    and the artifact drifted apart in the first place.
+    """
+    from creek.link.embeddings import embeddings_cache_path
+
     vault = tmp_path / "vault"
     (vault / "01-Fragments").mkdir(parents=True)
+    cache_path = embeddings_cache_path(vault)
 
-    result = runner.invoke(
-        app,
-        ["link", "--vault", str(vault), "--method", "embeddings"],
+    exit_code, output = _run_link_embeddings(vault)
+
+    assert exit_code == 0, output
+    assert not cache_path.exists()
+    assert "no vectors written to 00-Creek-Meta/embeddings.parquet" in output
+    assert "vector(s) cached in" not in output
+    assert "0 fragment(s) scanned, 0 vector(s) computed," in output
+
+
+def test_link_embeddings_cache_write_failure_is_admitted(tmp_path: Path) -> None:
+    """A swallowed cache-write error must reach the operator as a zero count.
+
+    Issue #1337, lie three: ``_persist_cache`` catches ``OSError`` (disk
+    full, read-only volume) and logs a warning, so linking exits 0 with no
+    parquet on disk while the sentence claimed the vectors were cached.
+    Graceful degradation is deliberate and stays — losing the cache only
+    costs a recompute — so the exit code is pinned at 0. The fix is not to
+    fail the run but to stop lying about it: the honest count *is* the
+    remedy for the swallowed error, making it visible to the operator
+    instead of only to the log.
+
+    The run's real work is asserted too, so an implementation that reported
+    ``0 vector(s) computed`` alongside the failed write — conflating
+    "computed" with "persisted" — would fail here.
+    """
+    from unittest.mock import patch
+
+    vault = tmp_path / "vault"
+    cache_path = _seed_embeddings_vault(vault, count=_SEEDED_FRAGMENTS)
+
+    with patch(
+        "creek.link.embeddings.EmbeddingLinker.save_cache",
+        side_effect=OSError("disk full"),
+    ):
+        exit_code, output = _run_link_embeddings(vault)
+
+    assert exit_code == 0, output
+    assert not cache_path.exists()
+    assert "no vectors written to 00-Creek-Meta/embeddings.parquet" in output
+    assert "vector(s) cached in" not in output
+    expected_work = (
+        f"{_SEEDED_FRAGMENTS} fragment(s) scanned, "
+        f"{_SEEDED_FRAGMENTS} vector(s) computed,"
     )
-    assert result.exit_code == 0, result.output
-    # New phrasing — accurate to what the embeddings method does.
-    assert "similarity edge" in result.output.lower()
-    assert "embeddings.parquet" in result.output
-    # #1303: and it must not claim the edges themselves were persisted.
-    assert "not persisted" in result.output.lower()
+    assert expected_work in output
 
 
 def test_link_embeddings_model_unavailable_exits_nonzero(

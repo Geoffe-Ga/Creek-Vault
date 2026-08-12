@@ -83,3 +83,21 @@ to locate the originating commit for any reference below.
   operator's edits: it now preserves the local version alongside as
   `<name>.bak` (e.g. `mediums/essay.MEDIUM.md.bak`) before
   overwriting.
+- **`creek link --method embeddings` now reports what actually happened on
+  disk, not an assumption about it** (#1337). The summary line used to claim
+  a single "N fragment(s) embedded" count regardless of cache state; it now
+  reports three independent numbers — `scanned` (fragments loaded from the
+  vault), `computed` (vectors the model actually produced this run, i.e.
+  cache misses only — legitimately zero on a warm cache), and `cached`
+  (rows in `00-Creek-Meta/embeddings.parquet` after the run). When nothing
+  reached disk — an empty vault, or a cache write that failed — the line
+  now says `no vectors written` instead of silently repeating a stale count;
+  a failed cache write was previously swallowed into a log line only, with
+  the CLI still exiting 0. Separately, counting resonance edges no longer
+  materializes a `Resonance` object per pair
+  (`EmbeddingLinker.count_resonances` walks the same traversal as
+  `find_resonances` without allocating them), making peak memory
+  independent of edge count. Resonance edges are still not persisted, and
+  the `embeddings.parquet` schema is unchanged (`fragment_id`,
+  `content_hash`, `model_name`, `embedding`, `computed_at`) — no on-disk
+  format changed, and no migration is needed.
