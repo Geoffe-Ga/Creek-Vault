@@ -38,10 +38,13 @@ LevelPolicy = Literal["leaves", "documents", "all"]
 _DOCUMENT_LEVELS: frozenset[str] = frozenset({"document", "session"})
 """Structural levels treated as "whole-source"-grained.
 
-``document`` is the default for any flat ingestion; ``session`` is the
-coarsest level the FEAT-022 zoom-out aggregator produces. Anything
-finer (sentence, paragraph, subsection, section, exchange, burst) is
-explicitly *not* a document for wavelength-read purposes.
+``document`` is the default for any flat ingestion; ``session`` was the
+coarsest level the FEAT-022 zoom-out aggregator produced before issue
+#1342 (ADR-0011) retired it — no production path mints a ``session``
+fragment now, though the value remains valid for a legacy or
+hand-authored one. Anything finer (sentence, paragraph, subsection,
+section, exchange, burst) is explicitly *not* a document for
+wavelength-read purposes.
 """
 
 

@@ -96,10 +96,12 @@ Known residuals
   so it evicts nothing and admits nothing.
 * **FEAT-023 re-atomized children are tagged one pass late.** The
   splitter and the re-atomizer build :class:`~creek.ingest.base.IngestedFragment`
-  directly (``creek/atomize/split.py:264``,
-  ``creek/classify/reatomize.py:525,613``), bypassing the ingest
-  chokepoint, so a freshly-derived child carries ``tags: []`` until the
-  next classify pass sees it.
+  directly (``creek.atomize.split._build_children`` and
+  :func:`creek.classify.reatomize.bubble_up_weighted`), bypassing the
+  ingest chokepoint, so a freshly-derived child carries ``tags: []``
+  until the next classify pass sees it. Named by symbol, not by line
+  number: the previous citation pointed into a function issue #1342
+  deleted, and nothing would have flagged the rot.
 * **Human-looking Discord channel mentions are admitted.**
   ``#living-room`` (17 occurrences) and ``#family-business`` (14) survive
   every filter here, because at classify time only the rendered form

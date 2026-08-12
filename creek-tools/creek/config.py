@@ -432,22 +432,6 @@ class LinkingConfig(BaseModel):
     eddy_min_fragments: int = 5
     """Minimum fragments required to form an Eddy."""
 
-    exchange_max_gap_minutes: int = Field(default=30, ge=1)
-    """Maximum minute-gap between consecutive messages still grouped into
-    the same ``exchange`` by the FEAT-022 aggregator. Inclusive boundary.
-    """
-
-    burst_similarity_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
-    """Cosine-similarity floor below which two consecutive exchanges start
-    separate ``burst``-level parents in the FEAT-022 aggregator.
-    Inclusive boundary.
-    """
-
-    session_max_gap_minutes: int = Field(default=360, ge=1)
-    """Maximum minute-gap between consecutive bursts still grouped into the
-    same ``session`` by the FEAT-022 aggregator. Inclusive boundary.
-    """
-
     hierarchy_sibling_skip_window: int = Field(default=2, ge=0)
     """FEAT-024 sibling-suppression window for hierarchy-aware linking.
 
@@ -460,16 +444,6 @@ class LinkingConfig(BaseModel):
     parent's ``child_ids`` list. ``0`` disables sibling suppression
     entirely (ancestor suppression still applies); the default of ``2``
     skips immediate and one-removed neighbours on either side.
-    """
-
-    cross_source_aggregation: bool = False
-    """When ``True``, the FEAT-027 aggregator drops the source-identity
-    gate so a single exchange/burst/session may span multiple sources
-    once the temporal/similarity thresholds permit. Each parent records
-    every contributing source key as a ``source/<key>`` tag while child
-    fragments retain their original :class:`~creek.models.FragmentSource`
-    pointers. ``False`` (default) preserves the single-source behaviour
-    introduced by FEAT-022.
     """
 
     # ---- Detector thresholds (issue #880) ----
@@ -642,10 +616,12 @@ class ClassificationConfig(BaseModel):
     When ``False`` (default) the classify pipeline behaves exactly as
     it did before FEAT-023: a single pass over each fragment, no
     structural decomposition. When ``True``, low-confidence /
-    ``unclassified`` results trigger the zoom-in splitter (FEAT-021) or
-    zoom-out aggregator (FEAT-022), recursing until a leaf reaches the
-    confidence threshold, a terminal level (sentence / session), or
-    :attr:`reatomize_max_depth`.
+    ``unclassified`` results trigger the zoom-in splitter (FEAT-021),
+    recursing until a leaf reaches the confidence threshold, a terminal
+    level, or :attr:`reatomize_max_depth`. Fragments the splitter is
+    the wrong tool for — chat messages, which the retired FEAT-022
+    aggregator was to have coarsened (issue #1342, ADR-0011) — are left
+    exactly as they are.
     """
 
     reatomize_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -665,14 +641,58 @@ class ClassificationConfig(BaseModel):
     whatever classification it has, even if still ``unclassified``.
     """
 
-    reatomize_direction: Literal["auto", "split", "aggregate"] = "auto"
+    reatomize_direction: Literal["auto", "split"] = "auto"
     """FEAT-023 direction-choice override.
 
     ``"auto"`` (default) routes by ``source.platform`` and ``level``
     per the heuristic in :mod:`creek.classify.reatomize`. ``"split"``
-    or ``"aggregate"`` force a single direction regardless of source
-    — useful for triage runs over a known-uniform corpus.
+    forces zoom-in regardless of source — useful for triage runs over a
+    known-uniform corpus. The third value this field once accepted,
+    ``"aggregate"``, was retired with the operator it selected (issue
+    #1342, ADR-0011) and is now rejected outright; see
+    :meth:`reject_retired_aggregate_direction`.
     """
+
+    @field_validator("reatomize_direction", mode="before")
+    @classmethod
+    def reject_retired_aggregate_direction(cls, v: object) -> object:
+        """Refuse the retired ``aggregate`` direction instead of coercing it.
+
+        Runs ``mode="before"`` so the stale value is caught with its own
+        message rather than by pydantic's generic "not a permitted
+        literal" error, which would tell an operator what is legal but
+        not what happened to the value in their YAML.
+
+        Rejecting is deliberate: mapping ``aggregate`` to ``auto`` would
+        be a *behaviour change*, not a migration. Under the retired
+        value a non-chat fragment stopped where it was; under ``auto``
+        the same fragment splits, minting child fragments in a vault
+        that never had them. Failing loudly is both the honest answer
+        and the strictly behaviour-preserving one.
+
+        Args:
+            v: The raw ``reatomize_direction`` value from YAML, env or a
+                direct constructor call, before literal validation.
+
+        Returns:
+            ``v`` unchanged for every value other than ``"aggregate"``;
+            pydantic then validates it against the ``Literal``.
+
+        Raises:
+            ValueError: If ``v`` is ``"aggregate"``.
+        """
+        if v == "aggregate":
+            msg = (
+                "classification.reatomize_direction: 'aggregate' was retired "
+                "with the FEAT-022 zoom-out aggregator (issue #1342, "
+                "ADR-0011) — it selected an operator no production code path "
+                "ever invoked, so the setting did nothing. Use 'auto' or "
+                "'split'. Note that 'auto' is not a drop-in replacement: it "
+                "splits fragments this value left untouched. Coarsening work "
+                "is tracked in issue #1457."
+            )
+            raise ValueError(msg)
+        return v
 
     weighted_classification: bool = False
     """Opt-in switch for weighted classification across the holarchy.

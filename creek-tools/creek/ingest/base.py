@@ -404,10 +404,10 @@ def generate_child_fragment_id(
     indistinguishable from root IDs downstream and the same dedup,
     indexing, and resonance code paths work for both.
 
-    Re-running the splitter (FEAT-021) or aggregator (FEAT-022) against
-    an unchanged parent must produce the same child IDs in the same
-    order so the second run is a no-op — that idempotency is why the
-    tuple is ``(parent_id, level, index)`` and not, say,
+    Re-running the splitter (FEAT-021) against an unchanged parent must
+    produce the same child IDs in the same order so the second run is a
+    no-op — that idempotency is why the tuple is
+    ``(parent_id, level, index)`` and not, say,
     ``(parent_id, child_content)`` (content-keyed IDs would change
     every time a trivial whitespace edit landed upstream and explode
     the resonance graph).

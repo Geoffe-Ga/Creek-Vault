@@ -154,16 +154,6 @@ class TestLinkingConfig:
         with pytest.raises(ValueError, match="greater than or equal to 0"):
             LinkingConfig(hierarchy_sibling_skip_window=-1)
 
-    def test_cross_source_aggregation_default_is_false(self) -> None:
-        """FEAT-027: cross-source aggregation is opt-in (default False)."""
-        cfg = LinkingConfig()
-        assert cfg.cross_source_aggregation is False
-
-    def test_cross_source_aggregation_accepts_true(self) -> None:
-        """FEAT-027: operators can flip cross-source aggregation on."""
-        cfg = LinkingConfig(cross_source_aggregation=True)
-        assert cfg.cross_source_aggregation is True
-
     def test_detector_threshold_defaults_match_previous_constants(self) -> None:
         """Issue #880: the five formerly-hardcoded knobs keep their values.
 
@@ -280,9 +270,22 @@ class TestClassificationConfig:
             ClassificationConfig(reatomize_max_depth=0)
 
     def test_reatomize_direction_rejects_unknown_value(self) -> None:
-        """Only ``auto`` / ``split`` / ``aggregate`` are accepted."""
+        """Only ``auto`` / ``split`` are accepted."""
         with pytest.raises(ValueError, match="reatomize_direction"):
             ClassificationConfig(reatomize_direction="sideways")
+
+    def test_reatomize_direction_rejects_retired_aggregate_value(self) -> None:
+        """``aggregate`` is refused outright, never silently rewritten (#1342).
+
+        The FEAT-022 zoom-out aggregator had no production caller, so
+        ``reatomize_direction: aggregate`` in a vault's YAML did nothing
+        at all. ADR-0011 retires the operator. Coercing the stale value
+        to ``auto`` would preserve the original sin — the config would
+        keep claiming a behaviour it does not have — so the loader must
+        raise, and the message must name the retirement and the issue.
+        """
+        with pytest.raises(ValueError, match=r"(?is)retired.*1342|1342.*retired"):
+            ClassificationConfig(reatomize_direction="aggregate")
 
 
 class TestRedactionConfig:
@@ -700,14 +703,56 @@ class TestLoadConfig:
         assert cfg.linking.thread_window_days == 30
         assert cfg.linking.stream_episode_max_gap_hours == 24
 
-    def test_loads_cross_source_aggregation_flag(self, tmp_path: Path) -> None:
-        """YAML ``linking.cross_source_aggregation: true`` is honoured."""
+    def test_load_config_ignores_retired_linking_aggregation_keys(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A legacy vault carrying the retired FEAT-022 knobs still loads (#1342).
+
+        ADR-0011 deletes four ``linking:`` fields that only ever fed the
+        zoom-out aggregator. Every vault ``creek init`` has ever scaffolded
+        carries them, so the loader must ignore them rather than reject the
+        file — an operator should not have to hand-edit YAML to run
+        ``creek link`` after upgrading. ``LinkingConfig`` declares no
+        ``model_config``, so pydantic's default ``extra='ignore'`` does
+        exactly that.
+
+        The surviving-neighbour assertion is load-bearing: without it this
+        test would pass just as happily if the entire ``linking:`` block
+        were being discarded, which is the failure mode "unknown keys are
+        tolerated" most easily degrades into.
+        """
         config_file = tmp_path / "creek_config.yaml"
-        config_data = {"linking": {"cross_source_aggregation": True}}
+        retired = (
+            "exchange_max_gap_minutes",
+            "burst_similarity_threshold",
+            "session_max_gap_minutes",
+            "cross_source_aggregation",
+        )
+        config_data = {
+            "linking": {
+                # All four at non-default values, so a loader that silently
+                # kept them would be caught by the hasattr sweep below
+                # rather than by a value that happens to match the default.
+                "exchange_max_gap_minutes": 99,
+                "burst_similarity_threshold": 0.99,
+                "session_max_gap_minutes": 999,
+                "cross_source_aggregation": True,
+                # A surviving key, also non-default.
+                "temporal_window_hours": 42,
+            },
+        }
         config_file.write_text(yaml.dump(config_data))
 
         cfg = load_config(config_file)
-        assert cfg.linking.cross_source_aggregation is True
+
+        for name in retired:
+            assert not hasattr(cfg.linking, name), (
+                f"linking.{name} was retired by ADR-0011 (#1342) but "
+                "LinkingConfig still exposes it"
+            )
+        assert cfg.linking.temporal_window_hours == 42
+        assert cfg.linking.hierarchy_sibling_skip_window == 2
 
     def test_loads_cleaning_section(self, tmp_path: Path) -> None:
         """load_config() should load cleaning section from YAML."""

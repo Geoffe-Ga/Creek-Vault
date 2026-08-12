@@ -269,10 +269,9 @@ Before [#1333](https://github.com/Geoffe-Ga/Creek-Vault/issues/1333) each run ke
 creek ingest --type claude --input ~/exports/claude --vault ~/Vault
 ```
 
-The Claude and ChatGPT sources are unledgered (only `markdown` is — see [Idempotency](#idempotency) above), so nothing records those turns as already processed and the re-ingest genuinely recovers the missing text. Two things to know before running it:
+The Claude and ChatGPT sources are unledgered (only `markdown` is — see [Idempotency](#idempotency) above), so nothing records those turns as already processed and the re-ingest genuinely recovers the missing text. One thing to know before running it:
 
 * Nothing is deleted or rewritten. The recovered turn has different content, so it hashes to a **new** fragment id and is written alongside the truncated fragment already in the vault, which stays exactly where it is. Expect near-duplicates for every affected turn and remove the short ones by hand.
-* Aggregate parents built over those turns (`creek atomize`, FEAT-022) hash their ordered child ids, so a recovered child mints a new parent too and the old parent is left behind the same way.
 
 Turn *numbering* is unaffected: a run collapses into the same single turn it always produced, so `turn_index` and the `(turn N)` titles do not shift. The one exception is a ChatGPT conversation with a system or tool node between a question and its answer, which used to yield no fragments at all and now yields the turn it should always have.
 

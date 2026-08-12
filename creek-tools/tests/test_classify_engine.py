@@ -876,6 +876,80 @@ def test_run_classify_reatomize_invokes_orchestrator(tmp_path: Path) -> None:
     spy.assert_called()
 
 
+def test_reatomize_writes_no_children_for_a_weak_chat_document(
+    tmp_path: Path,
+) -> None:
+    """A weak chat-source ``document`` yields no child files, before or after #1342.
+
+    This test is GREEN before and after the FEAT-022 retirement. It exists
+    to prove the retirement changed nothing observable.
+
+    A Discord-sourced ``document`` at low confidence is the one input that
+    ever reached the zoom-out branch of :func:`classify_reatomize`. Before
+    #1342 the orchestrator answered ``aggregate``, discovered it had no
+    siblings, and returned a childless leaf; after #1342 it answers
+    ``none`` and returns a childless leaf. Only the ``stop_reason`` string
+    differs — the tree shape, and therefore the vault on disk, is
+    identical.
+
+    The body is deliberately the same multi-paragraph text the zoom-in
+    tests use, so the splitter *would* emit three children if the
+    heuristic routed this fragment to ``split``. A "simplification" of the
+    retirement that dropped the chat-source branch and let everything fall
+    through to the splitter would turn this test red — which is the point.
+
+    The orchestrator spy keeps the assertion honest: without it the empty
+    result would also be satisfied by re-atomization never running at all.
+
+    Note on ``method``: the engine only builds a ``VaultWriter`` when
+    ``method == "llm"`` (see ``run_classify``), so a ``rules`` run cannot
+    reach the orchestrator and would make this pin vacuous. The LLM is
+    mocked to return an unclassified fragment, which is what makes the
+    root weak.
+    """
+    vault = tmp_path / "vault"
+    parent = Fragment(
+        id="frag-chatdoc0001",
+        title="a chat message that will not classify",
+        source=FragmentSource(platform=SourcePlatform.DISCORD),
+    )
+    _write_fragment(vault=vault, fragment=parent, body=_MULTI_PARAGRAPH_BODY)
+
+    config = CreekConfig()
+    config.classification.reatomize = True
+    config.classification.confidence_threshold = 1.0
+
+    with (
+        patch(
+            "creek.classify.classify_engine.LLMClassifier.classify_with_reasoning",
+            side_effect=lambda f, content="": LLMClassificationResult(
+                fragment=f,
+                reasoning="",
+            ),
+        ),
+        patch(
+            "creek.classify.classify_engine.classify_reatomize",
+            wraps=__import__(
+                "creek.classify.reatomize",
+                fromlist=["classify_reatomize"],
+            ).classify_reatomize,
+        ) as spy,
+    ):
+        run_classify(
+            vault_path=vault,
+            config=config,
+            method="llm",
+            force=False,
+        )
+
+    spy.assert_called()
+    fragments_root = vault / "01-Fragments"
+    written = sorted(
+        p.relative_to(vault).as_posix() for p in fragments_root.rglob("*.md")
+    )
+    assert written == ["01-Fragments/Notes/frag-chatdoc0001.md"]
+
+
 # ---- --method llm fails loudly when the provider is unavailable ----
 
 

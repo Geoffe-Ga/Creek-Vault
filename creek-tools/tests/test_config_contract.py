@@ -65,7 +65,7 @@ from typing import TYPE_CHECKING, Final, Union, get_args, get_origin
 import pytest
 from pydantic import BaseModel
 
-from creek.config import CreekConfig
+from creek.config import ClassificationConfig, CreekConfig
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -79,12 +79,6 @@ _CLEANING: Final[str] = (
     "wire-in tracked by #1041"
 )
 
-_AGGREGATION: Final[str] = (
-    "declared dormant: creek/atomize/aggregate.py segments on its own "
-    "AggregationConfig defaults, so this vault knob never reaches it; "
-    "tracked by #1041"
-)
-
 _LLM_BATCH_SIZE: Final[str] = (
     "declared dormant: no LLM call site reads LLMConfig.batch_size — the only "
     "batch_size read is EmbeddingsConfig's; tracked by #1041"
@@ -95,12 +89,6 @@ DORMANT_CONFIG_FIELDS: Final[dict[str, str]] = {
     "ocr.engine": "declared dormant: OCR wire-in tracked by #1041",
     "ocr.languages": "declared dormant: OCR wire-in tracked by #1041",
     "ocr.min_confidence": "declared dormant: OCR wire-in tracked by #1041",
-    "linking.cross_source_aggregation": (
-        "declared dormant: cross-source aggregation wire-in tracked by #1041"
-    ),
-    "linking.burst_similarity_threshold": _AGGREGATION,
-    "linking.exchange_max_gap_minutes": _AGGREGATION,
-    "linking.session_max_gap_minutes": _AGGREGATION,
     "llm.default.batch_size": _LLM_BATCH_SIZE,
     "llm.classification.batch_size": _LLM_BATCH_SIZE,
     "llm.generation.batch_size": _LLM_BATCH_SIZE,
@@ -1003,7 +991,7 @@ def test_config_fields_are_derived_from_the_live_model() -> None:
     """The inventory comes from the model, so it cannot silently drift."""
     paths = model_leaf_paths(CreekConfig)
 
-    assert "linking.cross_source_aggregation" in paths
+    assert "linking.hierarchy_sibling_skip_window" in paths
     assert "cleaning.discord.strip_emoji" in paths
     assert len(paths) > len(CreekConfig.model_fields), (
         "nested config blocks must contribute leaf paths, not one path each"
@@ -1098,6 +1086,84 @@ def test_timezone_field_may_not_return_without_a_production_reader() -> None:
         "knob shipped into every vault. Do not re-add it to "
         "DORMANT_CONFIG_FIELDS — that is the loophole this test exists to "
         "close. Either wire it to a real consumer, or delete the field again."
+    )
+
+
+_RETIRED_AGGREGATOR_MARKERS: Final[tuple[str, ...]] = (
+    "creek.atomize.aggregate",
+    "AggregationConfig",
+    "AggregateLevel",
+)
+"""Source tokens that can only come from the retired FEAT-022 aggregator.
+
+Matching on the names rather than on a single import spelling means the
+guard survives ``from creek.atomize import AggregationConfig``, a
+parenthesised multi-line import, and a re-export through
+``creek/atomize/__init__.py`` alike.
+"""
+
+
+def test_zoom_out_aggregator_may_not_return_without_a_production_consumer() -> None:
+    """FEAT-022 may come back only alongside a real production caller.
+
+    Issue #1342 deleted ``creek/atomize/aggregate.py`` and the zoom-out
+    half of ``creek/classify/reatomize.py``: the whole operator had zero
+    production callers, so ``creek classify --reatomize
+    --reatomize-direction aggregate`` was a silent no-op that looked, from
+    the CLI, exactly like a feature. ADR-0011 records the retirement.
+
+    Dead code is not merely idle — it is a standing claim. Four
+    ``LinkingConfig`` knobs and one CLI value existed solely to tune an
+    operator nothing invoked, three ``StopReason`` tokens named outcomes
+    nothing could produce, and each of those survived every gate in this
+    repo because ``ruff``, ``mypy --strict``, ``radon`` and ``interrogate``
+    are all perfectly content with a well-typed, well-documented module
+    that no one calls.
+
+    Like :func:`test_timezone_field_may_not_return_without_a_production_reader`
+    above, and unlike the generic dormancy gate
+    (:func:`test_every_config_field_is_consumed_or_declared_dormant`), this
+    guard cannot be silenced by re-adding an entry to
+    :data:`DORMANT_CONFIG_FIELDS` — it never consults that allowlist. The
+    allowlist is exactly how ``linking.burst_similarity_threshold`` and its
+    three siblings survived from #1041 all the way to #1342: each was
+    declared dormant, each declaration cited an issue, and the ratchet
+    dutifully held them in place for a year. This test can express what
+    that one cannot: the aggregator does not come back *dormant*. It comes
+    back wired, or it does not come back.
+
+    Two clauses, because the retirement has two halves:
+
+    * no module under ``creek/`` or ``creek_mcp/`` names the aggregator
+      (its module path or either of its two public type names);
+    * ``aggregate`` is not a legal ``classification.reatomize_direction``,
+      so no vault YAML and no CLI invocation can request it.
+    """
+    reintroduced = sorted(
+        path.relative_to(_CREEK_TOOLS_ROOT).as_posix()
+        for path in _production_files()
+        if any(
+            marker in path.read_text(encoding="utf-8")
+            for marker in _RETIRED_AGGREGATOR_MARKERS
+        )
+    )
+    assert not reintroduced, (
+        "These production modules reference the FEAT-022 zoom-out aggregator, "
+        f"which issue #1342 retired for having no callers at all: {reintroduced}. "
+        "If the operator is genuinely wanted again, reintroduce it together "
+        "with the production call site that invokes it, and supersede "
+        "ADR-0011 — do not restore the module on its own."
+    )
+
+    directions = get_args(
+        ClassificationConfig.model_fields["reatomize_direction"].annotation,
+    )
+    assert "aggregate" not in directions, (
+        "ClassificationConfig.reatomize_direction accepts 'aggregate' again. "
+        f"Legal values are {list(directions)}. Issue #1342 removed that value "
+        "because selecting it did nothing: there was no aggregator call site "
+        "for the CLI flag or the YAML key to reach. Re-add it only with the "
+        "consumer that makes it mean something."
     )
 
 

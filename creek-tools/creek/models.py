@@ -46,11 +46,15 @@ FragmentLevel = Literal[
 
 The first four values (``sentence`` … ``section``) describe levels carved
 *down* from a longer document by the FEAT-021 zoom-in splitter. The last
-three (``exchange``, ``burst``, ``session``) describe levels stitched
-*up* from short messages by the FEAT-022 zoom-out aggregator. ``document``
-is the default for any flat ingestion — a chat conversation, an essay, a
-note — and is therefore what every pre-FEAT-020 fragment is treated as
-when it loads without an explicit ``level`` field.
+three (``exchange``, ``burst``, ``session``) once described levels
+stitched *up* from short messages by the FEAT-022 zoom-out aggregator;
+issue #1342 (ADR-0011) retired that operator, so no production path mints
+them today. The three values stay in the type as vocabulary — a legacy or
+hand-authored fragment may still carry one — but nothing currently
+produces one. ``document`` is the default for any flat ingestion — a chat
+conversation, an essay, a note — and is therefore what every
+pre-FEAT-020 fragment is treated as when it loads without an explicit
+``level`` field.
 """
 
 
