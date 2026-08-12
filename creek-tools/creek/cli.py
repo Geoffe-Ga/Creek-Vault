@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import sys
+import textwrap
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -166,6 +167,15 @@ _SOURCE_COVERAGE_SAMPLE: Final[int] = 10
 The full lists live on :class:`~creek.pipeline.PipelineResult`; the
 summary only samples them so a large source tree cannot bury the rest of
 the report.
+"""
+
+_CRON_NOTICE_WIDTH: Final[int] = 74
+"""Wrap width for the ``--install-schedule`` cron-refusal prose.
+
+Wrapped here rather than by the console so every line keeps its ``#``
+comment marker: the block is meant to be read as one commented note, and
+a console-folded continuation line would lose the marker. 74 plus the
+four-character indent stays inside Rich's 80-column default.
 """
 
 
@@ -1081,6 +1091,46 @@ def _install_launchd(
     console.print(f"# To activate: launchctl load {tier_a} && launchctl load {tier_b}")
 
 
+def _print_cron_alternative(vault_path: Path, minutes: int, hour: int) -> None:
+    """Print the equivalent crontab, or say honestly why there isn't one.
+
+    An irregular Tier-A cadence is a supported configuration, not a failure:
+    the systemd units written alongside this are correct. Only the cron *hint*
+    is unavailable, so this prints an explanation and the command still exits
+    0. No cron line at all is printed in that case — not even the correct
+    Tier-B one — because vixie rejects a crontab as a whole, so a half-file
+    pasted into ``crontab -e`` would install nothing.
+
+    Args:
+        vault_path: The vault the emitted commands target.
+        minutes: The configured Tier-A cadence, in minutes.
+        hour: The configured Tier-B nightly hour.
+    """
+    from creek.sync import UnrepresentableCadenceError, render_crontab
+
+    try:
+        cron = render_crontab(
+            vault=vault_path,
+            tier_a_minutes=minutes,
+            tier_b_hour=hour,
+        )
+    except UnrepresentableCadenceError as exc:
+        console.print("# No crontab is printed for this cadence:")
+        for line in textwrap.wrap(
+            str(exc),
+            width=_CRON_NOTICE_WIDTH,
+            break_on_hyphens=False,
+        ):
+            console.print(f"#   {line}")
+        console.print("#   The systemd timer above is monotonic instead:")
+        console.print("#   it keeps the interval, but ticks missed while the")
+        console.print("#   host was off get no catch-up.")
+    else:
+        console.print("# Or as cron (crontab -e):")
+        for line in cron.splitlines():
+            console.print(f"#   {line}")
+
+
 def _install_systemd(
     vault_path: Path,
     minutes: int,
@@ -1088,7 +1138,7 @@ def _install_systemd(
     out_dir: Path | None,
 ) -> None:
     """Write systemd service+timer units (and print the cron alternative)."""
-    from creek.sync import render_crontab, render_systemd_units
+    from creek.sync import render_systemd_units
 
     units = render_systemd_units(
         vault=vault_path, tier_a_minutes=minutes, tier_b_hour=hour
@@ -1103,14 +1153,14 @@ def _install_systemd(
     ):
         (base / fname).write_text(content, encoding="utf-8")
         console.print(f"# wrote {base / fname}")
+    # daemon-reload first: systemd caches a unit it previously refused to load,
+    # so re-installing over a broken timer looks like a no-op without it.
+    console.print("# To activate: systemctl --user daemon-reload")
     console.print(
-        "# To activate: systemctl --user enable --now "
+        "#   then: systemctl --user enable --now "
         "creek-sync-tier-a.timer creek-sync-tier-b.timer",
     )
-    console.print("# Or as cron (crontab -e):")
-    cron = render_crontab(vault=vault_path, tier_a_minutes=minutes, tier_b_hour=hour)
-    for line in cron.splitlines():
-        console.print(f"#   {line}")
+    _print_cron_alternative(vault_path, minutes, hour)
 
 
 def _install_schedule(host: str, vault: Path | None, out_dir: Path | None) -> None:
