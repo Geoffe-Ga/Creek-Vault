@@ -2197,7 +2197,7 @@ def redact(
         False, "--apply", help="Apply redactions to matched files"
     ),
     review: bool = typer.Option(
-        False, "--review", help="Render the review queue for a vault"
+        False, "--review", help="Re-scan a vault and render its review queue"
     ),
     source: Path | None = typer.Option(
         None, "--source", help="Source path (scan/apply)"
@@ -2220,7 +2220,7 @@ def redact(
         False, "--yes", "-y", help="Skip the confirmation prompt (apply)"
     ),
 ) -> None:
-    """Scan for sensitive data, apply redactions, or review the queue.
+    """Scan for sensitive data, apply redactions, or review a vault.
 
     Exactly one of ``--scan``, ``--apply``, or ``--review`` must be given.
     """

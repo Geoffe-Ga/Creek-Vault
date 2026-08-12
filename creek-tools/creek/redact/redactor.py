@@ -1,4 +1,4 @@
-"""Redactor — replace sensitive data with safe markers and log redactions.
+"""Redactor — replace sensitive data with safe markers.
 
 The :class:`Redactor` re-scans content to locate match positions (since
 :class:`RedactionMatch` intentionally does **not** store the matched text)
@@ -43,22 +43,16 @@ token shape rather than on a reported finding. That asymmetry is
 deliberate, fail-closed behaviour — a missed secret is unrecoverable
 once written, whereas over-redaction is visible in the output and
 fixable via ``false_positive_allowlist``.
-
-Redaction logs are written as JSON with a session salt in the header so
-that hashes can be correlated within a session but not reversed.
 """
 
-import json
 import re
-from pathlib import Path
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 from creek.config import RedactionConfig
 from creek.redact.patterns import PATTERN_METADATA, REDACTION_PATTERNS
 from creek.redact.scanner import (
     HIGH_ENTROPY_CANDIDATE,
     HIGH_ENTROPY_PATTERN_NAME,
-    RedactionMatch,
     entropy_threshold,
     has_high_entropy_region,
     post_validate,
@@ -212,7 +206,7 @@ def _select_marker_name(contributors: list[_Span]) -> str:
 
 
 class Redactor:
-    """Replace sensitive data in text and log redactions.
+    """Replace sensitive data in text with safe markers.
 
     Because :class:`RedactionMatch` never stores matched text, the
     redactor must re-scan content using the same patterns to locate
@@ -221,7 +215,8 @@ class Redactor:
     Args:
         config: Redaction configuration (allowlist, custom patterns).
         salt: The session salt used by the scanner that produced the
-            matches — stored in the log header for correlation.
+            matches, kept on the instance so hashes from that same
+            scan session can be correlated.
     """
 
     def __init__(self, config: RedactionConfig, salt: bytes) -> None:
@@ -489,34 +484,3 @@ class Redactor:
                 )
             )
         return spans
-
-    def log_redactions(
-        self,
-        matches: list[RedactionMatch],
-        log_path: Path,
-    ) -> None:
-        """Write redaction matches to a JSON log file.
-
-        If the log file already exists, appends to the ``entries`` list.
-        The log header includes the hex-encoded session salt so hashes
-        can be correlated within the same scan session.
-
-        Args:
-            matches: List of redaction matches to log.
-            log_path: Path to the JSON log file.
-        """
-        data: dict[str, Any]
-        entries: list[Any]
-
-        if log_path.exists():
-            data = json.loads(log_path.read_text())
-            entries = list(data.get("entries", []))
-        else:
-            data = {"salt_hex": self.salt.hex()}
-            entries = []
-
-        for match in matches:
-            entries.append(match.model_dump(mode="json"))
-
-        data["entries"] = entries
-        log_path.write_text(json.dumps(data, indent=2))

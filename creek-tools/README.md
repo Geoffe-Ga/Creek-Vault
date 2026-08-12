@@ -60,7 +60,7 @@ creek init --vault ~/Obsidian/Creek-Vault
 # 1. Scan for secrets before anything else.
 creek redact --scan --source ~/exports --report
 
-# 2. Apply redactions (writes a queue under <source>/.creek-redactions/).
+# 2. Apply redactions (rewrites source files in place — no undo; back up first).
 creek redact --apply --source ~/exports --dry-run    # preview
 creek redact --apply --source ~/exports              # commit
 
@@ -94,8 +94,8 @@ Every command is also documented under [`docs/`](docs/) with end-to-end examples
 
 | Command | Purpose | Doc |
 |---------|---------|-----|
-| `creek redact --scan`   | Scan a source for secrets, API keys, and PII. Writes a structured report. | [redaction](docs/redaction.md) |
-| `creek redact --apply`  | Apply queued redactions to source files. Supports `--dry-run` and `--yes`. | [redaction](docs/redaction.md) |
+| `creek redact --scan`   | Scan a source for secrets, API keys, and PII. Prints a report; writes no files. | [redaction](docs/redaction.md) |
+| `creek redact --apply`  | Re-scan and rewrite matches in source files in place. No undo. Supports `--dry-run` and `--yes`. | [redaction](docs/redaction.md) |
 | `creek redact --review` | Render the review queue for a vault. | [redaction](docs/redaction.md) |
 | `creek purge fragment`  | Delete a fragment and scrub every reference (right-to-be-forgotten). | [cleaning-and-purge](docs/cleaning-and-purge.md) |
 | `creek purge source`    | Delete every fragment ingested from a given source. | [cleaning-and-purge](docs/cleaning-and-purge.md) |

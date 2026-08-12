@@ -412,7 +412,7 @@ class OCRConfig(BaseModel):
     """Tesseract language codes for OCR."""
 
     min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
-    """Minimum OCR confidence below which a fragment lands in the review queue.
+    """Minimum OCR confidence below which a fragment is tagged in frontmatter.
 
     Image and scanned-PDF ingestors compare the per-page confidence
     reported by the engine to this threshold; a fragment whose OCR

@@ -273,11 +273,14 @@ class TestPipelineStages:
 
         Retargeted from ``scan_directory`` to ``scan_batch`` by #1087: the
         pipeline needs the full :class:`~creek.redact.scanner.ScanSummary` so
-        it can see ``files_skipped_symlink``, and ``scan_directory`` throws
-        the counters away. The assertion is unchanged in strength — with
-        redaction disabled the scanner must not be entered at all, and
-        ``scan_directory`` delegates to ``scan_batch``, so patching the
-        deeper call still catches a caller that went round the front door.
+        it can see ``files_skipped_symlink``, and the old wrapper threw the
+        counters away. The assertion is unchanged in strength — with
+        redaction disabled the scanner must not be entered at all.
+
+        #1338 then deleted that wrapper outright: it had no production
+        caller left once every read path had moved to ``scan_batch``, so
+        ``scan_batch`` is now the scanner's only directory entry point and
+        patching it cannot be gone round.
         """
         config = CreekConfig()
         config.redaction.enabled = False
@@ -291,8 +294,9 @@ class TestPipelineStages:
     def test_redaction_enabled_scans_directory(self, vault_path, source_path):
         """Test that redaction scanner is called when enabled.
 
-        Retargeted from ``scan_directory`` to ``scan_batch`` by #1087, for the
-        reason given on ``test_redaction_disabled``. The stand-in is a real
+        Retargeted from the deleted ``scan_directory`` wrapper to
+        ``scan_batch`` by #1087, for the reason given on
+        ``test_redaction_disabled``. The stand-in is a real
         ``ScanSummary`` rather than a ``MagicMock`` deliberately: the pipeline
         now reads ``summary.files_skipped_symlink`` off the result, and a
         ``MagicMock`` answers every attribute with a truthy object — which

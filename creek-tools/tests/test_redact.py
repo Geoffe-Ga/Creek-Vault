@@ -3,8 +3,8 @@
 Tests cover:
 - REDACTION_PATTERNS compilation and matching
 - RedactionMatch model (must NOT store matched text, only salted hashes)
-- RedactionScanner: scan_file, scan_directory, generate_report
-- Redactor: redact_content, log_redactions
+- RedactionScanner: scan_file, scan_batch, generate_markdown_summary
+- Redactor: redact_content
 - False positive allowlisting
 - Custom pattern support
 - Security: ensure sensitive data never leaks into match objects
@@ -12,7 +12,6 @@ Tests cover:
 - File extension filtering (Issue #14)
 - Directory exclusion patterns (Issue #14)
 - Context extraction (Issue #14)
-- JSON report generation (Issue #14)
 - Markdown summary (Issue #14)
 - Review queue generation (Issue #14)
 - Batch scanning with ScanSummary (Issue #14)
@@ -324,38 +323,6 @@ class TestRedactionScanner:
         assert ssn_match.line_number == 3
         assert email_match.line_number == 5
 
-    def test_scan_directory(self, tmp_path: Path) -> None:
-        """scan_directory should recursively scan all files."""
-        sub = tmp_path / "sub"
-        sub.mkdir()
-
-        (tmp_path / "file1.txt").write_text("SSN: 123-45-6789\n")
-        (sub / "file2.txt").write_text("email: test@example.com\n")
-
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-        matches = scanner.scan_directory(tmp_path)
-
-        match_types = {m.match_type for m in matches}
-        assert "ssn" in match_types
-        assert "email" in match_types
-        assert len(matches) >= 2
-
-    def test_scan_directory_empty(self, tmp_path: Path) -> None:
-        """scan_directory on empty directory should return empty list."""
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-        matches = scanner.scan_directory(tmp_path)
-        assert matches == []
-
-    def test_scan_directory_nonexistent(self) -> None:
-        """scan_directory should raise FileNotFoundError for missing directory."""
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-
-        with pytest.raises(FileNotFoundError):
-            scanner.scan_directory(Path("/nonexistent/directory"))
-
     def test_false_positive_allowlist(self, tmp_path: Path) -> None:
         """Matches in the false_positive_allowlist should be excluded."""
         test_file = tmp_path / "allowed.txt"
@@ -392,49 +359,6 @@ class TestRedactionScanner:
         scanner = RedactionScanner(config=config)
         assert isinstance(scanner.salt, bytes)
         assert len(scanner.salt) == 16
-
-
-# ---------------------------------------------------------------------------
-# RedactionScanner.generate_report
-# ---------------------------------------------------------------------------
-
-
-class TestGenerateReport:
-    """Tests for RedactionScanner.generate_report."""
-
-    def test_report_empty_matches(self) -> None:
-        """Report for empty matches should indicate no findings."""
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-        report = scanner.generate_report([])
-        assert "no" in report.lower() or "0" in report
-
-    def test_report_with_matches(self, tmp_path: Path) -> None:
-        """Report should include match count and types."""
-        test_file = tmp_path / "report.txt"
-        test_file.write_text("SSN: 123-45-6789\nemail: test@example.com\n")
-
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-        matches = scanner.scan_file(test_file)
-        report = scanner.generate_report(matches)
-
-        assert "ssn" in report.lower()
-        assert "email" in report.lower()
-        assert isinstance(report, str)
-        assert len(report) > 0
-
-    def test_report_contains_file_paths(self, tmp_path: Path) -> None:
-        """Report should reference the file paths where matches were found."""
-        test_file = tmp_path / "report_file.txt"
-        test_file.write_text("SSN: 123-45-6789\n")
-
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-        matches = scanner.scan_file(test_file)
-        report = scanner.generate_report(matches)
-
-        assert "report_file.txt" in report
 
 
 # ---------------------------------------------------------------------------
@@ -549,81 +473,6 @@ class TestRedactor:
 
         assert "4111-1111-1111-1111" not in result
         assert "[REDACTED:credit_card]" in result
-
-    def test_log_redactions_creates_file(self, tmp_path: Path) -> None:
-        """log_redactions should create or append to the log file."""
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-        redactor = Redactor(config=config, salt=scanner.salt)
-
-        log_path = tmp_path / "redactions.json"
-
-        matches = [
-            RedactionMatch(
-                file_path=Path("test.txt"),
-                line_number=1,
-                match_type="ssn",
-                salted_hash="abc123",
-            ),
-        ]
-
-        redactor.log_redactions(matches, log_path)
-        assert log_path.exists()
-
-        data = json.loads(log_path.read_text())
-        assert isinstance(data, dict)
-        assert "salt_hex" in data
-        assert "entries" in data
-        assert len(data["entries"]) == 1
-        assert data["entries"][0]["match_type"] == "ssn"
-
-    def test_log_redactions_appends(self, tmp_path: Path) -> None:
-        """Calling log_redactions twice should append, not overwrite."""
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-        redactor = Redactor(config=config, salt=scanner.salt)
-
-        log_path = tmp_path / "redactions.json"
-
-        matches1 = [
-            RedactionMatch(
-                file_path=Path("a.txt"),
-                line_number=1,
-                match_type="ssn",
-                salted_hash="hash1",
-            ),
-        ]
-        matches2 = [
-            RedactionMatch(
-                file_path=Path("b.txt"),
-                line_number=2,
-                match_type="email",
-                salted_hash="hash2",
-            ),
-        ]
-
-        redactor.log_redactions(matches1, log_path)
-        redactor.log_redactions(matches2, log_path)
-
-        data = json.loads(log_path.read_text())
-        assert len(data["entries"]) == 2
-
-    def test_log_redactions_no_sensitive_data(self, tmp_path: Path) -> None:
-        """Log file must NOT contain any actual sensitive data."""
-        test_file = tmp_path / "pii.txt"
-        sensitive = "123-45-6789"
-        test_file.write_text(f"SSN: {sensitive}\n")
-
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-        matches = scanner.scan_file(test_file)
-
-        redactor = Redactor(config=config, salt=scanner.salt)
-        log_path = tmp_path / "redactions.json"
-        redactor.log_redactions(matches, log_path)
-
-        log_content = log_path.read_text()
-        assert sensitive not in log_content
 
 
 # ---------------------------------------------------------------------------
@@ -1063,8 +912,8 @@ class TestBinaryDetection:
         """is_binary should return False for nonexistent files."""
         assert not RedactionScanner.is_binary(tmp_path / "no_such_file")
 
-    def test_scan_directory_skips_binary(self, tmp_path: Path) -> None:
-        """scan_directory should skip binary files with supported extensions."""
+    def test_scan_batch_skips_binary(self, tmp_path: Path) -> None:
+        """scan_batch should skip binary files with supported extensions."""
         (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
         # Use a supported extension (.txt) with binary content
         binary_file = tmp_path / "binary.txt"
@@ -1284,20 +1133,6 @@ class TestScanSummary:
         assert summary.files_skipped_extension == 0
         assert summary.matches == []
 
-    def test_scan_directory_delegates_to_scan_batch(self, tmp_path: Path) -> None:
-        """scan_directory should return the same matches as scan_batch."""
-        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
-
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-
-        dir_matches = scanner.scan_directory(tmp_path)
-        # Re-create scanner to reset salt (hashes will differ), but check counts
-        scanner2 = RedactionScanner(config=config)
-        summary = scanner2.scan_batch(tmp_path)
-
-        assert len(dir_matches) == len(summary.matches)
-
 
 # ---------------------------------------------------------------------------
 # Progress Bar (Issue #14)
@@ -1306,16 +1141,6 @@ class TestScanSummary:
 
 class TestProgressBar:
     """Tests for tqdm progress bar during scanning."""
-
-    def test_scan_directory_with_progress(self, tmp_path: Path) -> None:
-        """scan_directory with progress=True should not raise."""
-        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
-
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-        matches = scanner.scan_directory(tmp_path, progress=True)
-
-        assert len(matches) >= 1
 
     def test_scan_batch_with_progress(self, tmp_path: Path) -> None:
         """scan_batch with progress=True should not raise."""
@@ -1326,116 +1151,6 @@ class TestProgressBar:
         summary = scanner.scan_batch(tmp_path, progress=True)
 
         assert summary.files_scanned >= 1
-
-
-# ---------------------------------------------------------------------------
-# JSON Report Generation (Issue #14)
-# ---------------------------------------------------------------------------
-
-
-class TestJsonReport:
-    """Tests for JSON report generation."""
-
-    def test_json_report_created(self, tmp_path: Path) -> None:
-        """generate_json_report should create a JSON file."""
-        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
-
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-        summary = scanner.scan_batch(tmp_path)
-
-        report_path = tmp_path / "report" / "redaction-report.json"
-        scanner.generate_json_report(summary, report_path)
-
-        assert report_path.exists()
-
-    def test_json_report_structure(self, tmp_path: Path) -> None:
-        """JSON report should contain scan_statistics and findings_by_file."""
-        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
-
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-        summary = scanner.scan_batch(tmp_path)
-
-        report_path = tmp_path / "redaction-report.json"
-        scanner.generate_json_report(summary, report_path)
-
-        data = json.loads(report_path.read_text())
-        assert "scan_statistics" in data
-        assert "findings_by_file" in data
-
-        stats = data["scan_statistics"]
-        assert "files_scanned" in stats
-        assert "files_skipped_binary" in stats
-        assert "files_skipped_extension" in stats
-        assert "total_findings" in stats
-        assert "by_severity" in stats
-        assert "by_type" in stats
-
-    def test_json_report_match_metadata(self, tmp_path: Path) -> None:
-        """JSON report findings should contain match metadata."""
-        (tmp_path / "data.txt").write_text("SSN: 123-45-6789\n")
-
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-        summary = scanner.scan_batch(tmp_path)
-
-        report_path = tmp_path / "redaction-report.json"
-        scanner.generate_json_report(summary, report_path)
-
-        data = json.loads(report_path.read_text())
-        findings = data["findings_by_file"]
-        assert len(findings) > 0
-
-        for _file, file_matches in findings.items():
-            for match in file_matches:
-                assert "line_number" in match
-                assert "match_type" in match
-                assert "severity" in match
-                assert "salted_hash" in match
-
-    def test_json_report_creates_parent_dirs(self, tmp_path: Path) -> None:
-        """generate_json_report should create parent directories."""
-        summary = ScanSummary()
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-
-        deep_path = tmp_path / "a" / "b" / "c" / "report.json"
-        scanner.generate_json_report(summary, deep_path)
-
-        assert deep_path.exists()
-
-    def test_json_report_empty_summary(self, tmp_path: Path) -> None:
-        """JSON report for empty summary should have zero totals."""
-        summary = ScanSummary()
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-
-        report_path = tmp_path / "empty-report.json"
-        scanner.generate_json_report(summary, report_path)
-
-        data = json.loads(report_path.read_text())
-        assert data["scan_statistics"]["total_findings"] == 0
-        assert data["findings_by_file"] == {}
-
-    def test_json_report_severity_sorted(self, tmp_path: Path) -> None:
-        """Findings in JSON report should be sorted by severity."""
-        f = tmp_path / "mixed.txt"
-        f.write_text("email: test@example.com\nSSN: 123-45-6789\n")
-
-        config = RedactionConfig()
-        scanner = RedactionScanner(config=config)
-        summary = scanner.scan_batch(tmp_path)
-
-        report_path = tmp_path / "report.json"
-        scanner.generate_json_report(summary, report_path)
-
-        data = json.loads(report_path.read_text())
-        for _file, file_matches in data["findings_by_file"].items():
-            severities = [m["severity"] for m in file_matches]
-            order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "unknown": 4}
-            ranks = [order.get(s, 4) for s in severities]
-            assert ranks == sorted(ranks)
 
 
 # ---------------------------------------------------------------------------
@@ -3305,7 +3020,7 @@ class TestHighEntropyMaskedRunLeak:
 # target resolves *outside* it is opened, matched, reported, and counted in
 # ``files_scanned``. Three callers inherit the hole (``creek redact
 # --scan/--apply/--review`` via ``_scan_source``, ``creek.redact.scan`` over
-# MCP, and ``creek process`` via ``scan_directory``), which is why the tests
+# MCP, and ``creek process`` via ``scan_batch``), which is why the tests
 # below sit on the chokepoint rather than on any one caller.
 #
 # The admission policy under test is the one the shipped SEC-003 *write* guard

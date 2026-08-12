@@ -10,25 +10,23 @@ This page covers the `creek redact` CLI. For the read-only MCP tool version of t
 
 `creek redact` is dispatched by exactly one of `--scan`, `--apply`, or `--review`. Mixing them is an error.
 
-| Mode      | Reads from        | Writes to                          | Purpose |
-|-----------|-------------------|------------------------------------|---------|
-| `--scan`  | `--source`        | `<source>/.creek-redactions/queue.json` (+ optional `report.md`) | Find sensitive content. |
-| `--apply` | the queue         | the source files (and the queue)   | Replace matches with placeholders. |
-| `--review`| `--vault`         | stdout                             | Render the vault's review queue. |
+| Mode      | Reads from              | Writes to                                       | Purpose |
+|-----------|--------------------------|-------------------------------------------------|---------|
+| `--scan`  | `--source`               | nothing — `--report` prints to the console      | Find sensitive content. |
+| `--apply` | `--source` (re-scanned)  | the source files, in place, plus the audit log  | Replace matches with placeholders. |
+| `--review`| `--vault`                | stdout                                          | Render the vault's review queue. |
 
 ## Workflow
 
 ```bash
-# 1. Scan the export.
+# 1. Scan the export; --report prints a markdown summary to the console.
 creek redact --scan --source ~/exports/journal --report
 
-# 2. Read the report.
-$EDITOR ~/exports/journal/.creek-redactions/report.md
-
-# 3. Preview what would change.
+# 2. Preview what --apply would change, without touching anything.
 creek redact --apply --source ~/exports/journal --dry-run
 
-# 4. Commit the changes (skips confirmation with -y).
+# 3. Commit the changes (skips confirmation with -y). Back up first — see
+#    the warning under "What `--apply` does" below.
 creek redact --apply --source ~/exports/journal -y
 ```
 
@@ -56,7 +54,7 @@ Configuration in `RedactionConfig`:
 | Field                       | Effect |
 |-----------------------------|--------|
 | `enabled`                   | Master switch. |
-| `dry_run`                   | When `true`, `--apply` plans but doesn't write. |
+| `dry_run`                   | When `true`, `--apply` plans but never modifies a source file. It still appends dry-run-marked entries to the audit log. |
 | `custom_patterns`           | Extra regex name → pattern map merged with built-ins. |
 | `false_positive_allowlist`  | Strings whose presence cancels a match (test fixtures, sample keys). |
 | `supported_extensions`      | File extensions the scanner walks. |
@@ -64,24 +62,56 @@ Configuration in `RedactionConfig`:
 | `min_confidence`            | Generic high-entropy threshold; `0.0` flags any base64url-ish ≥20 chars, `1.0` requires near-random. Default `0.6` (3.7 bits/char), governing both the whole-run and the sub-run window gate — see [What `--apply` does](#what---apply-does). |
 | `replacement_template`      | Marker template used by `--apply`; must contain `{name}`. Default `[REDACTED:{name}]`. |
 
-## Output formats
+## What the report looks like
 
-`--scan --report` produces a markdown report with one section per file:
+`--scan --report` renders a markdown summary to the console — it writes no
+files anywhere. One table per file:
 
 ```markdown
 ## /journals/2026-04-12.md
 
-| Line | Pattern        | Excerpt           |
-|------|----------------|-------------------|
-|   42 | aws_access_key | AKIAIOSFODNN7…    |
-|   88 | email          | sgsg@example.com  |
+| Line | Type           | Severity |
+|------|----------------|----------|
+|   42 | aws_access_key | critical |
+|   88 | email          | medium   |
 ```
 
-The structured queue at `<source>/.creek-redactions/queue.json` is what `--apply` actually consumes. It records the offset, the pattern that matched, and the replacement string — so applying is reversible if you keep the queue around.
+The table never shows the matched text — only the line number, the pattern
+name, and its severity. This is deliberate, and it follows from the scanner's
+core invariant: a finding carries a salted SHA-256 hash of what matched, never
+the text, so this report has no matched content available to print.
+
+That invariant is about what the scanner *stores*. It is not a promise that no
+Creek command ever puts a secret on your screen: `--review` deliberately quotes
+the surrounding source lines — see [Reviewing inside the vault](#reviewing-inside-the-vault).
 
 ## What `--apply` does
 
-For every queued match:
+### `--apply` rewrites your files in place, and there is no undo
+
+`--apply` does not consume anything `--scan` left behind — there is nothing
+to consume. It re-scans the source from scratch and rewrites every matching
+file in place, replacing each matched span with the marker. There is no
+queue, no `.bak`, and no restore path: the original bytes are gone once the
+write lands. The audit trail at `<vault>/00-Creek-Meta/audit/redact.jsonl`
+records *that* a file was rewritten and which pattern names fired — never
+the original text, never an offset — so it is a forensic record, not an
+undo log.
+
+**Back up your source tree before you run `--apply`.** Copy it, commit it,
+or run `--dry-run` first and read the output — but assume the run is
+final.
+
+It rewrites more than fragment bodies. Every file whose extension is in
+`supported_extensions` is in scope, including structured `.yaml` and
+`.json` files, where a replacement marker can leave the file invalid or
+quietly change its meaning. In particular, a vault-wide `--apply` still
+rewrites `<vault>/00-Creek-Meta/creek_config.yaml` — an open bug, **tracked
+in #1398 and not fixed**. Only `00-Creek-Meta/audit/` and the legacy purge
+log are excluded unconditionally. Point `--source` at the narrowest tree
+that needs cleaning rather than at a whole vault.
+
+For every match found by the scan:
 
 1. Replaces the match with the marker rendered from
    `RedactionConfig.replacement_template` (default `[REDACTED:{name}]`;
@@ -109,8 +139,7 @@ For every queued match:
    #909). Strings on `false_positive_allowlist` are exempt from this
    widening — a regex match inside such a string still redacts only its
    own span.
-2. Marks the queue entry as `applied: true` and stamps the timestamp.
-3. Refuses to write through symlinks (path-traversal guard): before any
+2. Refuses to write through symlinks (path-traversal guard): before any
    file is read or rewritten the source tree is walked and the run is
    aborted if any descendant symlink resolves outside the source root.
    The same guard is applied to `creek redact --review`.
@@ -141,11 +170,15 @@ runs of 40+ characters, which measured a **0%** detection rate for a
 full 20-character secret hidden behind a 12–19 character masker — a
 constructible, total, silent leak.
 
-`--dry-run` walks the queue without modifying any source file — useful for sanity-checking a big batch before committing.
+`--dry-run` performs the same scan and shows what would change, without modifying any source file — useful for sanity-checking a big batch before committing. It does still write dry-run-marked audit entries; see [the audit trail](#the-audit-trail).
 
 ## Reviewing inside the vault
 
-Once a fragment has landed in the vault, the source-side queue is no longer the right tool. Use `creek redact --review --vault <path>` to print every fragment whose `redaction.status` is `pending_review` (typically because a match landed in non-redactable content like image OCR text and needs a human decision).
+Once a fragment has landed in the vault, use `creek redact --review --vault <path>` to re-scan the whole tree and render a **Redaction Review Queue** — every finding, with surrounding context and a checkbox, so a human can triage true positives from false alarms. It is not filtered by any frontmatter field; it lists everything the scan turns up, every time you run it. Nothing is written: the queue is printed to stdout and is gone when your terminal scrollback is.
+
+The context block quotes the file's own lines **verbatim**, which means it prints the matched secret in cleartext. That is the point — you cannot tell a real key from a git hash without seeing it — but it makes `--review` output unsafe to paste into a ticket, a chat, or an LLM prompt without reading it first.
+
+OCR ingestion (`creek/ingest/images.py`) separately tags a low-confidence fragment `review: pending_review` in its frontmatter as a marker for humans. No command reads or filters on that key — it is informational only, not a queue.
 
 ## Right-to-be-forgotten
 
@@ -229,12 +262,16 @@ Two known residuals:
   now protected. Rewriting a hash-chained log needs a chain-aware operation —
   that is purge-shaped work, tracked in #1397.
 - `<vault>/00-Creek-Meta/creek_config.yaml` **is** still rewritten by a
-  vault-wide apply, which can redact your own `false_positive_allowlist`
-  entries. Tracked in #1398.
-
-There is also a second, unrelated redaction log: `Redactor.log_redactions`
-writes an unchained file with `write_text`. It has no production caller and is
-not the audit trail; do not confuse the two.
+  vault-wide apply. The `false_positive_allowlist` entries themselves are
+  safe — the allowlist check is exact-string membership, so an allowlisted
+  string is the one class of value the rewrite cannot touch. The hazard is
+  everything *else* in the file: `exclude_patterns` tokens, custom
+  `patterns`, paths, and comments are all in scope and can be replaced
+  with `[REDACTED:…]` markers, silently changing the config's meaning or
+  breaking its YAML. Concretely, an `exclude_patterns` entry like
+  `backups-AKIAIOSFODNN7EXAMPLE` becomes
+  `[REDACTED:high_entropy_string]`. Tracked in #1398, not fixed by this
+  change.
 
 ## How `creek process` interacts with redaction
 
