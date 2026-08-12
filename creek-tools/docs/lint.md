@@ -44,8 +44,37 @@ creek lint --since 7d                       # include semantic checks
 Deterministic (always run by default):
 
 - `broken-links` — wiki-links / relative links that do not resolve.
-- `orphan-compiled` — Threads / Eddies / Praxis / Frequency-indexes
-  that no fragment links to.
+  Surveys every `*.md` in the vault except three directories holding
+  Creek's own machine-written documents *about* the vault:
+  `00-Creek-Meta/Processing-Log/` and `00-Creek-Meta/State/` both
+  render findings back as vault content — three successive `creek
+  lint` runs over a vault holding ONE genuine broken link reported 1,
+  then 2, then 3 — and `00-Creek-Meta/Ontology/` (the deployed spec,
+  whose line 746 *documents* wiki-link syntax with a backticked
+  `[[note-name]]` example: the one finding a whole-vault scan produces
+  on a fresh 32-file `creek init` vault; #1460 tracks the code-span-
+  aware fix that would let this prefix be dropped). Nothing else is
+  withheld — `00-Creek-Meta/Tag-Garden.md` stays surveyed, since it
+  emits real `[[fragment-id]]` links. `creek clean broken-links`
+  shares this same scanner and scope.
+- `orphan-compiled` — Threads / Eddies / Praxis pages that nothing in
+  that same surveyed set links to (a page's link to itself does not
+  count). A page is never a candidate when its frontmatter `type` is
+  one Creek's own `IndexGenerator` writes (`frequency-index`,
+  `thread-index`, `eddy-map`, `temporal-index`, `source-index` — the
+  set `creek.generate.indexes.GENERATED_INDEX_TYPES`): these are
+  Dataview query notes nothing is ever expected to link. Before this
+  exclusion existed, a vault that had run `creek index` reported `13
+  orphan compiled page(s)`, all thirteen false — twelve of them
+  generated-index pages, the thirteenth cited only from an
+  `08-Decisions` brief the old fragments-only survey never read.
+  The exclusion needs an *explicit* declaration: a page with no `type`
+  key, an unrecognised `type`, no frontmatter at all, or a header YAML
+  cannot parse stays a candidate and is still reported when nothing
+  links it. The default has to fall that way — were it the other way,
+  any page could exempt itself from the check by writing a broken
+  header, and a check that falls silent is the same end state as the
+  false-positive storm it replaces.
 - `skill-size` — `.SKILL.md` files over their declared word budget
   (proxy for the ≤1500-token limit pinned by `lint.SKILL.md`); also
   enforces ≤3000 words on root `AGENTS.md`.

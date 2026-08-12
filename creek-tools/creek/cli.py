@@ -6294,7 +6294,12 @@ def clean_stale_reviews(
 def clean_broken_links(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
 ) -> None:
-    """Scan fragments for wiki-links pointing to nonexistent files."""
+    """Scan the vault for wiki-links pointing to nonexistent files.
+
+    Surveys every markdown file except Creek's own report folders
+    (``00-Creek-Meta/Processing-Log/``, ``State/``, ``Ontology/``), which
+    quote findings back and would inflate the count on each rerun.
+    """
     from creek.clean.hygiene import BrokenLinkScanner
 
     vault_path = _resolve_vault(vault)

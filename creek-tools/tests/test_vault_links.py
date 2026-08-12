@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from creek.vault.links import build_link_index
+from creek.vault.links import build_link_index, iter_link_sources, read_header_meta
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -200,3 +200,233 @@ def test_empty_vault_yields_an_empty_index(vault: Path) -> None:
 
     assert index.resolve("anything") is None
     assert "anything" not in index
+
+
+# ---------------------------------------------------------------------------
+# iter_link_sources — whose outbound links Creek surveys (#1344)
+# ---------------------------------------------------------------------------
+#
+# ``broken-links`` surveyed ``01-Fragments`` alone while reporting a
+# whole-vault verdict, and ``orphan-compiled`` counted inbound links from
+# ``01-Fragments`` and ``10-Liminal`` alone. Widening either to the literal
+# whole vault makes Creek read its own output back as content: three
+# successive ``creek lint`` runs over a vault with ONE genuine broken link
+# reported 1, then 2, then 3, because ``lint-<date>.md`` renders every finding
+# as ``- `src` → `[[target]]` ``. This is the one definition of the surveyed
+# set, and of the three prefixes it withholds.
+
+
+def _relative(vault: Path, paths: list[Path]) -> list[str]:
+    """Render *paths* as POSIX, vault-relative strings, order preserved."""
+    return [path.relative_to(vault).as_posix() for path in paths]
+
+
+def test_iter_link_sources_includes_every_content_directory(vault: Path) -> None:
+    """Every folder a human or a generator writes links into is surveyed.
+
+    ``00-Creek-Meta/Tag-Garden.md`` is in the list deliberately: it emits real
+    ``[[fragment-id]]`` links, so carving out the whole of ``00-Creek-Meta``
+    to escape the report feedback loop would be a weakening.
+    """
+    expected = [
+        "00-Creek-Meta/Tag-Garden.md",
+        "01-Fragments/Notes/f.md",
+        "02-Threads/Active/t.md",
+        "04-Praxis/Daily/p.md",
+        "05-Wavelength/Observations/w.md",
+        "07-Voice/Drafts/v.md",
+        "08-Decisions/Active/d.md",
+        "10-Liminal/Compost/l.md",
+    ]
+    for relpath in expected:
+        _page(vault, relpath)
+
+    assert _relative(vault, iter_link_sources(vault)) == expected
+
+
+def test_iter_link_sources_excludes_processing_log(vault: Path) -> None:
+    """``creek lint`` writes its report here; re-reading it doubles findings."""
+    _page(vault, "01-Fragments/Notes/f.md")
+    _page(vault, "00-Creek-Meta/Processing-Log/lint-2026-08-09.md")
+    _page(vault, "00-Creek-Meta/Processing-Log/2026/archived-lint.md")
+
+    assert _relative(vault, iter_link_sources(vault)) == ["01-Fragments/Notes/f.md"]
+
+
+def test_iter_link_sources_excludes_state(vault: Path) -> None:
+    """``creek state`` echoes findings into ``latest.md``; same feedback loop."""
+    _page(vault, "01-Fragments/Notes/f.md")
+    _page(vault, "00-Creek-Meta/State/latest.md")
+
+    assert _relative(vault, iter_link_sources(vault)) == ["01-Fragments/Notes/f.md"]
+
+
+def test_iter_link_sources_excludes_ontology(vault: Path) -> None:
+    """The deployed spec documents wiki-link syntax rather than linking pages.
+
+    Its ``[[note-name]]`` example is the only finding a whole-vault scan
+    produces on a fresh 32-file ``creek init`` vault.
+    """
+    _page(vault, "01-Fragments/Notes/f.md")
+    _page(vault, "00-Creek-Meta/Ontology/creek_ontology_agent_prompt.md")
+
+    assert _relative(vault, iter_link_sources(vault)) == ["01-Fragments/Notes/f.md"]
+
+
+def test_iter_link_sources_is_sorted(vault: Path) -> None:
+    """Deterministic order: two runs on one vault must report identically."""
+    for relpath in (
+        "03-Eddies/mmm.md",
+        "02-Threads/zzz.md",
+        "01-Fragments/aaa.md",
+    ):
+        _page(vault, relpath)
+
+    assert _relative(vault, iter_link_sources(vault)) == [
+        "01-Fragments/aaa.md",
+        "02-Threads/zzz.md",
+        "03-Eddies/mmm.md",
+    ]
+
+
+def test_iter_link_sources_on_a_missing_vault_returns_empty(tmp_path: Path) -> None:
+    """A path that does not exist yields no sources and does not raise."""
+    assert iter_link_sources(tmp_path / "no-such-vault") == []
+
+
+def test_iter_link_sources_keeps_similarly_named_siblings(vault: Path) -> None:
+    """The carve-out matches path components, not string prefixes.
+
+    ``str(path).startswith("00-Creek-Meta/State")`` would swallow
+    ``State-Machine-Notes.md`` and ``Processing-Logs-Archive.md`` — operator
+    notes that live beside the excluded folders and carry real links.
+    """
+    _page(vault, "00-Creek-Meta/State-Machine-Notes.md")
+    _page(vault, "00-Creek-Meta/Processing-Logs-Archive.md")
+    _page(vault, "00-Creek-Meta/State/latest.md")
+    _page(vault, "00-Creek-Meta/Processing-Log/lint-2026-08-09.md")
+
+    assert _relative(vault, iter_link_sources(vault)) == [
+        "00-Creek-Meta/Processing-Logs-Archive.md",
+        "00-Creek-Meta/State-Machine-Notes.md",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# read_header_meta — the public, header-only frontmatter read (#1344)
+# ---------------------------------------------------------------------------
+
+
+def test_read_header_meta_returns_the_frontmatter_mapping(vault: Path) -> None:
+    """The parsed header comes back whole, not just the names it declares."""
+    page = _page(vault, "02-Threads/Meta.md", title="Long Walks", aliases=["Walks"])
+
+    assert read_header_meta(page) == {"title": "Long Walks", "aliases": ["Walks"]}
+
+
+def test_read_header_meta_returns_empty_without_frontmatter(vault: Path) -> None:
+    """A bare markdown page declares nothing; it does not raise."""
+    page = vault / "02-Threads" / "Plainer.md"
+    page.write_text("Just a body, no header.\n", encoding="utf-8")
+
+    assert read_header_meta(page) == {}
+
+
+def test_read_header_meta_returns_empty_on_malformed_yaml(vault: Path) -> None:
+    """One unparseable header must not cost a whole-vault walk its run."""
+    page = vault / "02-Threads" / "Malformed.md"
+    page.write_text("---\ntype: [unclosed\n---\n\nBody.\n", encoding="utf-8")
+
+    assert read_header_meta(page) == {}
+
+
+def test_read_header_meta_stops_at_the_closing_fence(vault: Path) -> None:
+    """The body is never read, so a second fence in it cannot forge a type.
+
+    This is the observable consequence of the header-only bound: a 35k-file
+    vault must not pay to load every body just to learn a page's type.
+    """
+    page = vault / "02-Threads" / "Fenced.md"
+    page.write_text(
+        "---\ntype: thread\n---\n\nBody text.\n\n---\ntype: forged\n---\n",
+        encoding="utf-8",
+    )
+
+    assert read_header_meta(page) == {"type": "thread"}
+
+
+# ---------------------------------------------------------------------------
+# read_header_meta — "malformed YAML" means every way YAML can be malformed
+# ---------------------------------------------------------------------------
+#
+# ``yaml.safe_load`` does not funnel every failure through ``YAMLError``. Its
+# constructors call ``int()`` and ``datetime.date()`` on the scanned text and
+# let those raise ``ValueError`` straight through. Catching ``YAMLError``
+# alone therefore kept the promise for a broken *fence* and broke it for a
+# broken *value* — and because ``build_link_index`` reads the header of every
+# file in the vault, one such file aborted the whole of ``creek lint`` and
+# ``creek state``. Measured before the fix: ``ValueError: month must be in
+# 1..12`` propagating out of ``build_link_index``.
+
+
+def test_read_header_meta_returns_empty_on_an_oversized_integer(vault: Path) -> None:
+    """A 5000-digit scalar exceeds CPython's int-parsing limit, and is not YAML's.
+
+    Well inside the 64 KiB header cap, so no size guard catches it first:
+    ``int()`` raises ``ValueError`` from inside PyYAML's own constructor.
+    """
+    page = vault / "02-Threads" / "Bigint.md"
+    page.write_text(f"---\nn: {'1' * 5000}\n---\n\nBody.\n", encoding="utf-8")
+
+    assert read_header_meta(page) == {}
+
+
+def test_read_header_meta_returns_empty_on_an_impossible_date(vault: Path) -> None:
+    """``created: 2020-13-45`` resolves as a timestamp, then fails to construct.
+
+    ``created`` is written by the ingest parsers from export metadata nobody
+    in this system authored, so an impossible date is a reachable input rather
+    than a contrived one.
+    """
+    page = vault / "02-Threads" / "Baddate.md"
+    page.write_text("---\ncreated: 2020-13-45\n---\n\nBody.\n", encoding="utf-8")
+
+    assert read_header_meta(page) == {}
+
+
+def test_build_link_index_survives_a_header_that_breaks_the_constructor(
+    vault: Path,
+) -> None:
+    """One poisoned header must not cost the whole vault its index.
+
+    This is the consequence that matters: the index is built once per lint or
+    state run over every ``*.md`` in the vault, so a single unlucky file took
+    down both commands entirely rather than costing itself its aliases.
+    """
+    (vault / "02-Threads" / "Poison.md").write_text(
+        "---\ncreated: 2020-13-45\n---\n\nBody.\n",
+        encoding="utf-8",
+    )
+    _page(vault, "02-Threads/Healthy.md", title="Long Walks")
+
+    index = build_link_index(vault)
+
+    assert index.resolve("Long Walks") == vault / "02-Threads" / "Healthy.md"
+    assert index.resolve("Poison") == vault / "02-Threads" / "Poison.md"
+
+
+def test_unsurveyed_prefixes_track_the_writers_own_constants() -> None:
+    """The deny list must name the directories the writers actually write to.
+
+    ``_UNSURVEYED_PREFIXES`` restates paths that ``creek lint`` and
+    ``creek state`` define for themselves. If either writer's constant moves
+    and this one does not, the guard silently stops matching, the report
+    becomes a link source again, and the feedback loop reopens with the whole
+    suite still green — the failure mode this test exists to make loud.
+    """
+    from creek.generate.state import _STATE_SUBPATH
+    from creek.lint.runner import _PROCESSING_LOG
+    from creek.vault.links import _UNSURVEYED_PREFIXES
+
+    assert _PROCESSING_LOG in _UNSURVEYED_PREFIXES
+    assert _STATE_SUBPATH in _UNSURVEYED_PREFIXES

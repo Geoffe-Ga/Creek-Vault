@@ -37,13 +37,13 @@ creek clean stale-reviews --vault ~/Obsidian/Creek-Vault --age-days 14
 
 ### `creek clean broken-links`
 
-Scans every fragment for wiki-links pointing to nonexistent files. Common causes: a target was renamed, a target was purged, a typo.
+Scans the vault for wiki-links pointing to nonexistent files — the same scanner and vault-wide scope as `creek lint`'s `broken-links` check; see [`lint.md`](lint.md#check-names) for the withheld report folders and why. Common causes: a target was renamed, a target was purged, a typo.
 
 ```bash
 creek clean broken-links --vault ~/Obsidian/Creek-Vault
 ```
 
-The report groups broken links by source fragment so you can fix them in batches.
+The report groups broken links by source file so you can fix them in batches. A source is any surveyed page, not only a fragment — a thread, a decision brief or a wavelength observation can carry a stale link too.
 
 ### `creek clean duplicates`
 
