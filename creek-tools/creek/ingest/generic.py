@@ -23,7 +23,6 @@ from typing import Any
 import chardet
 
 from creek.ingest.base import (
-    LA_TZ,
     Ingestor,
     ParsedFragment,
     RawDocument,
@@ -31,6 +30,7 @@ from creek.ingest.base import (
     normalize_encoding,
 )
 from creek.models import SourcePlatform
+from creek.time import LA_TZ
 
 logger = logging.getLogger(__name__)
 

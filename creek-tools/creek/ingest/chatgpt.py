@@ -22,7 +22,6 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from creek.ingest.base import (
-    LA_TZ,
     Ingestor,
     ParsedFragment,
     RawDocument,
@@ -30,6 +29,7 @@ from creek.ingest.base import (
 )
 from creek.ingest.turns import group_turn_runs, merge_turn_texts
 from creek.models import Authorship
+from creek.time import LA_TZ
 
 if TYPE_CHECKING:
     from pathlib import Path

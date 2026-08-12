@@ -415,7 +415,7 @@ def _get_file_timestamp(path: Path) -> datetime:
     Returns:
         A timezone-aware datetime from the file's modification time.
     """
-    from creek.ingest.base import LA_TZ
+    from creek.time import LA_TZ
 
     mtime = path.stat().st_mtime
     return datetime.fromtimestamp(mtime, tz=LA_TZ)

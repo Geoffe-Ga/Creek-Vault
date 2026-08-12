@@ -665,7 +665,8 @@ class DiscordIngestor(Ingestor):
             ts_str: The ISO 8601 timestamp string.
 
         Returns:
-            A timezone-aware datetime in the configured timezone.
+            A timezone-aware datetime in America/Los_Angeles, the anchor
+            every normalized Creek timestamp uses (:data:`creek.time.LA_TZ`).
         """
         if not ts_str:
             return normalize_timestamp("1970-01-01T00:00:00Z", None)

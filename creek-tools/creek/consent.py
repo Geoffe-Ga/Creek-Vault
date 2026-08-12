@@ -39,7 +39,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field, ValidationError
 
 from creek._fsio import atomic_write_text
-from creek.ingest.base import LA_TZ
+from creek.time import LA_TZ
 
 logger = logging.getLogger(__name__)
 

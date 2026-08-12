@@ -91,10 +91,6 @@ _LLM_BATCH_SIZE: Final[str] = (
 )
 
 DORMANT_CONFIG_FIELDS: Final[dict[str, str]] = {
-    "timezone": (
-        "declared dormant: no production code normalises timestamps through "
-        "it yet; wire-in tracked by #1041"
-    ),
     "ocr.enabled": "declared dormant: OCR wire-in tracked by #1041",
     "ocr.engine": "declared dormant: OCR wire-in tracked by #1041",
     "ocr.languages": "declared dormant: OCR wire-in tracked by #1041",
@@ -1062,6 +1058,46 @@ def test_dormant_reason_cites_an_issue(path: str, reason: str) -> None:
     assert _ISSUE_REFERENCE.search(reason), (
         f"DORMANT_CONFIG_FIELDS[{path!r}] must cite an issue number so the "
         f"next engineer can find the decision; got {reason!r}."
+    )
+
+
+def test_timezone_field_may_not_return_without_a_production_reader() -> None:
+    """``timezone`` may exist on ``CreekConfig`` only if production reads it.
+
+    Issue #1339 deleted ``CreekConfig.timezone``: it had zero production
+    readers, and wiring it in would have made fragment ids config-dependent,
+    because :func:`creek.ingest.base.generate_fragment_id` hashes
+    ``timestamp.isoformat()``. A vault re-ingested under a different
+    ``timezone:`` would mint a second id for every fragment it already held.
+
+    This guard deliberately does **not** consult
+    :data:`DORMANT_CONFIG_FIELDS`. The generic gate above
+    (:func:`test_every_config_field_is_consumed_or_declared_dormant`) can be
+    silenced by re-adding a dormancy entry — which is exactly how the field
+    survived from #1041 to #1339 — so it cannot express "this one never comes
+    back dead". This one can: the only way to make it pass with the field
+    present is to reintroduce it *together with a real production reader*,
+    which is what #1339 asks of anyone who wants the knob back.
+
+    The scan is trustworthy here for a specific reason: per this module's
+    docstring, ``creek/config.py`` itself is excluded from
+    :func:`_consumed_config_fields`, "it is where the fields are *defined*".
+    So the deletion's migration shim — a ``model_validator(mode="before")``
+    living in ``config.py`` that pops the stale key and warns, and which
+    necessarily mentions the string ``"timezone"`` — provably cannot fool
+    this guard into seeing a reader that does not exist.
+    """
+    if "timezone" not in model_leaf_paths(CreekConfig):
+        return
+
+    assert "timezone" in _consumed_config_fields(), (
+        "CreekConfig declares a `timezone` field again, and no production "
+        "code under creek/ or creek_mcp/ reads it (creek/config.py excluded: "
+        "the migration shim's mention of the key does not count as a reader). "
+        "Issue #1339 deleted this field precisely because it was a dormant "
+        "knob shipped into every vault. Do not re-add it to "
+        "DORMANT_CONFIG_FIELDS — that is the loophole this test exists to "
+        "close. Either wire it to a real consumer, or delete the field again."
     )
 
 

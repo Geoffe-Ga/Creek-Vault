@@ -528,7 +528,7 @@ def test_main_config_flag_sets_env_var_before_build_server(
     from creek_mcp import server as server_module
 
     config_file = tmp_path / "vault-config.yaml"
-    config_file.write_text("timezone: UTC\n")
+    config_file.write_text("vault_path: /vaults/x\n")
     monkeypatch.delenv(CONFIG_PATH_ENV_VAR, raising=False)
 
     captured_env: dict[str, str | None] = {}

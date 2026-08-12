@@ -666,7 +666,7 @@ class TestDiscordIngestorParse:
         assert "[SPOILER: secret]" in fragments[0].content
 
     def test_parse_timestamp_normalization(self) -> None:
-        """Should normalize timestamp to configured timezone."""
+        """Should normalize timestamp to America/Los_Angeles."""
         messages = [
             _make_msg(timestamp="2024-11-10T20:00:00+00:00"),
         ]

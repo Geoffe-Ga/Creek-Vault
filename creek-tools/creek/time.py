@@ -9,12 +9,14 @@ produce naive datetimes that fail to compare against tz-aware ones with
 values that arrive from outside that discipline — persisted frontmatter,
 legacy callers — making them safe to compare without moving the clock.
 
-The constant :data:`LA_TZ` is defined here as a dependency-free home
-for the timezone helpers; :mod:`creek.ingest.base` independently
-defines its own equal constant of the same name to preserve the
-historical import path some callers still use. Neither re-exports the
-other — each module owns its own definition, and the two simply agree
-on the same ``ZoneInfo("America/Los_Angeles")`` value.
+This module is the single, dependency-free home of :data:`LA_TZ`: the
+constant is declared here exactly once and imported everywhere else
+(#1339). :mod:`creek.ingest.base` is among those importers and
+re-exports it, so the historical ``from creek.ingest.base import
+LA_TZ`` path some callers still use keeps resolving to this one
+definition. The LA anchor is an ontology mandate, not a preference, so
+it gets one place to change, audit and reason about — not two constants
+that agree until somebody edits one of them.
 """
 
 from __future__ import annotations

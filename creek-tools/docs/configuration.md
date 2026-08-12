@@ -38,14 +38,24 @@ The summary is consumed by the audit report (FEAT-006).
 ```yaml
 vault_path: ~/Obsidian/Creek-Vault
 source_drive: ~/exports
-timezone: America/Los_Angeles
 ```
 
 | Field          | Default         | Notes |
 |----------------|-----------------|-------|
 | `vault_path`   | `.`             | Absolute path to the Obsidian vault. |
 | `source_drive` | `.`             | Default `--source` for `creek process` / `creek ingest`. |
-| `timezone`     | `America/Los_Angeles` | Used for every `datetime` written into frontmatter. |
+
+**`timezone` was removed in #1339.** It had zero production readers, and a
+configurable anchor would have been actively harmful: `generate_fragment_id`
+(`creek/ingest/base.py`) hashes `timestamp.isoformat()`, whose rendered UTC
+offset changes with the zone, so a settable `timezone` would mint a
+different `frag-…` id for the same instant depending on operator config —
+reopening the id-derivation bug #1329 already required a vault migration
+(`creek/ingest/pin_ids.py`) to fix. Creek anchors every timestamp it writes
+to **America/Los_Angeles** by ontology mandate §8.3 (`creek/time.py`,
+`LA_TZ`) — a design invariant, not a per-operator preference. If your
+`creek_config.yaml` still has a `timezone:` line, the file still loads, but
+you'll see a `WARNING` on load: the key is ignored and safe to delete.
 
 ## `llm` — language model provider
 
