@@ -37,10 +37,11 @@ import frontmatter
 import pytest
 
 from creek.ingest import INGESTOR_REGISTRY, generic
-from creek.ingest.base import LA_TZ, RawDocument, assemble_ingested_fragment
+from creek.ingest.base import RawDocument, assemble_ingested_fragment
 from creek.ingest.generic import GenericIngestor
 from creek.ingest.pipeline import run_ingest
 from creek.models import SourcePlatform
+from creek.time import LA_TZ
 from creek.vault.writer import VaultWriter
 
 if TYPE_CHECKING:

@@ -15,12 +15,18 @@ These tests pin the facts that earlier code regressed on:
    ``ingested`` / ``authored_at`` to America/Los_Angeles at validation
    time (issue #976), so offsetless YAML frontmatter cannot smuggle a
    naive datetime into a vault that also holds tz-aware ones.
+6. The LA anchor has exactly one production definition — ``LA_TZ`` in
+   :mod:`creek.time` (issue #1339). Two constants that merely *agree*
+   today are two places to change tomorrow.
 """
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import Final
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -88,6 +94,81 @@ def test_la_tz_constant_matches_zoneinfo() -> None:
     """The exported ``LA_TZ`` constant is the LA zoneinfo, not a tzname str."""
     sample = datetime(2026, 4, 1, tzinfo=LA_TZ)
     assert sample.utcoffset() == ZoneInfo("America/Los_Angeles").utcoffset(sample)
+
+
+_CREEK_TOOLS_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
+"""The ``creek-tools`` package root — the directory holding ``creek/``."""
+
+_PRODUCTION_ROOTS: Final[tuple[Path, ...]] = (
+    _CREEK_TOOLS_ROOT / "creek",
+    _CREEK_TOOLS_ROOT / "creek_mcp",
+)
+"""Production source trees scanned for ``LA_TZ`` definitions (``tests/`` excluded).
+
+Test modules legitimately mint their own local ``LA_TZ`` for fixtures; the
+single-definition rule is about production code, where a second constant is a
+second thing to change.
+"""
+
+_LA_TZ_ASSIGNMENT: Final[re.Pattern[str]] = re.compile(
+    r"^\s*LA_TZ\s*(?::[^=\n]+)?=[^=]",
+    re.MULTILINE,
+)
+"""Matches an assignment to ``LA_TZ`` (annotated or not), never a comparison.
+
+Anchored to an assignment so that ``from creek.time import LA_TZ`` and prose
+mentions in docstrings do not count as definitions.
+"""
+
+
+def _production_files_declaring_la_tz() -> list[str]:
+    """Return the production files that assign ``LA_TZ``, as relative paths.
+
+    Returns:
+        Repo-relative POSIX paths (e.g. ``creek/time.py``), sorted, one per
+        file containing at least one ``LA_TZ = ...`` assignment.
+    """
+    return [
+        source.relative_to(_CREEK_TOOLS_ROOT).as_posix()
+        for root in _PRODUCTION_ROOTS
+        for source in sorted(root.rglob("*.py"))
+        if _LA_TZ_ASSIGNMENT.search(source.read_text(encoding="utf-8"))
+    ]
+
+
+def test_la_tz_is_declared_exactly_once_in_production() -> None:
+    """``LA_TZ`` is defined once, in ``creek/time.py``, and re-exported (#1339).
+
+    ``creek.ingest.base`` used to mint its own ``ZoneInfo("America/Los_Angeles")``
+    under the same name. The two constants happened to agree, which is precisely
+    the failure mode: the LA anchor is an ontology mandate (§8.3), so it needs
+    one definition to change, audit, and reason about — not two that agree until
+    someone edits one of them.
+
+    The source scan is the load-bearing assertion, and it has to be: an
+    *identity* check (``creek.ingest.base.LA_TZ is creek.time.LA_TZ``) cannot
+    prove single-definition, because :class:`~zoneinfo.ZoneInfo` caches its
+    instances by key — two independently constructed
+    ``ZoneInfo("America/Los_Angeles")`` objects are already the same object,
+    so such a check passes just as happily against the duplicated constant.
+    The second assertion therefore pins a different fact: the historical
+    ``from creek.ingest.base import LA_TZ`` path must keep resolving, to the
+    LA zone, so the five modules importing it from there do not break on
+    consolidation.
+    """
+    declaring = _production_files_declaring_la_tz()
+    assert declaring == ["creek/time.py"], (
+        "LA_TZ must be defined exactly once, in creek/time.py; "
+        f"found definitions in: {declaring}"
+    )
+
+    from creek.ingest.base import LA_TZ as REEXPORTED_LA_TZ
+
+    sample = datetime(2026, 4, 1, tzinfo=REEXPORTED_LA_TZ)
+    assert sample.utcoffset() == ZoneInfo("America/Los_Angeles").utcoffset(sample), (
+        "creek.ingest.base.LA_TZ must stay importable and anchored to "
+        "America/Los_Angeles; existing importers depend on that path"
+    )
 
 
 class TestFragmentDefaultTimestamps:

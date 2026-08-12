@@ -1,9 +1,11 @@
 """Tests for creek.config module — configuration loader with Pydantic Settings."""
 
+import logging
 from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from creek.config import (
     CONFIG_PATH_ENV_VAR,
@@ -589,7 +591,6 @@ class TestCreekConfig:
         cfg = CreekConfig()
         assert cfg.vault_path == Path(".")
         assert cfg.source_drive == Path(".")
-        assert cfg.timezone == "America/Los_Angeles"
         # Nested models should exist with their own defaults. ``llm`` is now a
         # per-stage LLMRoutingConfig (#646) whose ``default`` is an LLMConfig.
         assert isinstance(cfg.llm, LLMRoutingConfig)
@@ -603,27 +604,11 @@ class TestCreekConfig:
         assert isinstance(cfg.sources, SourcePaths)
         assert isinstance(cfg.cleaning, CleaningConfig)
 
-    def test_valid_timezone(self) -> None:
-        """CreekConfig should accept a valid timezone string."""
-        cfg = CreekConfig(timezone="Europe/London")
-        assert cfg.timezone == "Europe/London"
-
-    def test_invalid_timezone_rejected(self) -> None:
-        """CreekConfig must reject an invalid timezone string."""
-        with pytest.raises(ValueError, match="Invalid timezone"):
-            CreekConfig(timezone="Not/A/Timezone")
-
     def test_env_var_override_vault_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """CREEK_VAULT_PATH env var should override the default."""
         monkeypatch.setenv("CREEK_VAULT_PATH", "/tmp/my-vault")  # nosec B108
         cfg = CreekConfig()
         assert cfg.vault_path == Path("/tmp/my-vault")  # nosec B108
-
-    def test_env_var_override_timezone(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """CREEK_TIMEZONE env var should override the default."""
-        monkeypatch.setenv("CREEK_TIMEZONE", "UTC")
-        cfg = CreekConfig()
-        assert cfg.timezone == "UTC"
 
     def test_env_var_override_source_drive(
         self, monkeypatch: pytest.MonkeyPatch
@@ -646,14 +631,12 @@ class TestLoadConfig:
         """load_config() should return defaults when YAML file does not exist."""
         cfg = load_config(tmp_path / "nonexistent.yaml")
         assert cfg.vault_path == Path(".")
-        assert cfg.timezone == "America/Los_Angeles"
 
     def test_loads_yaml_file(self, tmp_path: Path) -> None:
         """load_config() should load values from a YAML file."""
         config_file = tmp_path / "creek_config.yaml"
         config_data = {
             "vault_path": "/home/user/vault",
-            "timezone": "America/New_York",
             "llm": {"provider": "anthropic", "model": "claude-3"},
             "embeddings": {"similarity_threshold": 0.85},
         }
@@ -661,7 +644,6 @@ class TestLoadConfig:
 
         cfg = load_config(config_file)
         assert cfg.vault_path == Path("/home/user/vault")
-        assert cfg.timezone == "America/New_York"
         assert cfg.llm.default.provider == "anthropic"
         assert cfg.llm.default.model == "claude-3"
         assert cfg.embeddings.similarity_threshold == 0.85
@@ -758,13 +740,13 @@ class TestLoadConfigEnvVar:
     ) -> None:
         """``CREEK_CONFIG`` is honoured when ``config_path`` is None."""
         config_file = tmp_path / "vault-config.yaml"
-        config_file.write_text(yaml.dump({"timezone": "UTC"}))
+        config_file.write_text(yaml.dump({"vault_path": "/vaults/from-env"}))
         monkeypatch.setenv(CONFIG_PATH_ENV_VAR, str(config_file))
         # Ensure cwd has no fallback creek_config.yaml that could mask the env var.
         monkeypatch.chdir(tmp_path)
 
         cfg = load_config()
-        assert cfg.timezone == "UTC"
+        assert cfg.vault_path == Path("/vaults/from-env")
 
     def test_explicit_config_path_overrides_env_var(
         self,
@@ -773,13 +755,13 @@ class TestLoadConfigEnvVar:
     ) -> None:
         """An explicit ``config_path`` argument wins over the env var."""
         env_file = tmp_path / "from-env.yaml"
-        env_file.write_text(yaml.dump({"timezone": "UTC"}))
+        env_file.write_text(yaml.dump({"vault_path": "/vaults/from-env"}))
         cli_file = tmp_path / "from-cli.yaml"
-        cli_file.write_text(yaml.dump({"timezone": "Europe/London"}))
+        cli_file.write_text(yaml.dump({"vault_path": "/vaults/from-cli"}))
         monkeypatch.setenv(CONFIG_PATH_ENV_VAR, str(env_file))
 
         cfg = load_config(cli_file)
-        assert cfg.timezone == "Europe/London"
+        assert cfg.vault_path == Path("/vaults/from-cli")
 
     def test_env_var_pointing_to_missing_file_raises(
         self,
@@ -800,11 +782,14 @@ class TestLoadConfigEnvVar:
     ) -> None:
         """An empty (or whitespace) env var behaves as if unset."""
         monkeypatch.setenv(CONFIG_PATH_ENV_VAR, "   ")
+        # A stray CREEK_VAULT_PATH in the ambient environment would otherwise
+        # override the built-in default this test is asserting.
+        monkeypatch.delenv("CREEK_VAULT_PATH", raising=False)
         monkeypatch.chdir(tmp_path)
 
         cfg = load_config()
         # No creek_config.yaml in tmp_path → defaults populated.
-        assert cfg.timezone == "America/Los_Angeles"
+        assert cfg.vault_path == Path(".")
 
     def test_unset_env_var_uses_cwd_default(
         self,
@@ -814,11 +799,11 @@ class TestLoadConfigEnvVar:
         """When the env var is unset, behaviour matches the historical contract."""
         monkeypatch.delenv(CONFIG_PATH_ENV_VAR, raising=False)
         config_file = tmp_path / "creek_config.yaml"
-        config_file.write_text(yaml.dump({"timezone": "Asia/Tokyo"}))
+        config_file.write_text(yaml.dump({"vault_path": "/vaults/from-cwd"}))
         monkeypatch.chdir(tmp_path)
 
         cfg = load_config()
-        assert cfg.timezone == "Asia/Tokyo"
+        assert cfg.vault_path == Path("/vaults/from-cwd")
 
 
 # ---------------------------------------------------------------------------
@@ -839,7 +824,11 @@ class TestGenerateDefaultConfig:
             data = yaml.safe_load(f)
         assert isinstance(data, dict)
         assert "vault_path" in data
-        assert "timezone" in data
+        # Issue #1339: the dead ``timezone`` knob was deleted, so freshly
+        # generated configs must stop shipping it — otherwise every new vault
+        # is born with a key the loader only tolerates for backwards
+        # compatibility.
+        assert "timezone" not in data
 
     def test_roundtrip(self, tmp_path: Path) -> None:
         """Generated config should round-trip back through load_config."""
@@ -848,7 +837,6 @@ class TestGenerateDefaultConfig:
 
         cfg = load_config(output)
         assert cfg.vault_path == Path(".")
-        assert cfg.timezone == "America/Los_Angeles"
         assert cfg.llm.default.provider == "ollama"
         assert cfg.embeddings.model == "all-MiniLM-L6-v2"
         assert cfg.google_drive.scopes == [
@@ -951,3 +939,207 @@ class TestVoiceConfigRoundtrip:
             config.ai_style.voice_distance_target
             <= config.ai_style.voice_distance_upper
         )
+
+
+# ---------------------------------------------------------------------------
+# Deletion of the dormant ``timezone`` field (issue #1339)
+# ---------------------------------------------------------------------------
+
+
+class TestTimezoneFieldDeleted:
+    """The dormant ``timezone`` knob is gone, behind a migration shim (#1339).
+
+    ``CreekConfig.timezone`` had zero production readers. Wiring it would have
+    made every fragment id a function of the setting — ``generate_fragment_id``
+    (``creek/ingest/base.py``) hashes ``timestamp.isoformat()``, whose rendered
+    UTC offset changes with the zone, so one instant yields a different
+    ``frag-…`` id per configured timezone. That is exactly the id-derivation
+    bug #1329 had to migrate vaults out of, so the field was **deleted**
+    instead of wired: Creek's anchor is America/Los_Angeles by ontology
+    mandate §8.3 (:data:`creek.time.LA_TZ`), not an operator knob.
+
+    Deletion needs a shim because ``CreekConfig`` forbids extra keys and
+    ``generate_default_config`` dumps the whole model — so every
+    ``creek_config.yaml`` ever written by ``creek init`` carries a
+    ``timezone:`` line. Without the shim, deleting the field would turn 100%
+    of existing operator configs into a hard ``ValidationError`` at load.
+    """
+
+    def test_timezone_is_not_a_config_field(self) -> None:
+        """``timezone`` is no longer a field on ``CreekConfig`` (#1339).
+
+        Named explicitly so a revert fails with the reason attached rather
+        than as a puzzling knock-on elsewhere: re-adding the field either
+        re-introduces a dead knob (caught by ``test_config_contract.py``) or,
+        if wired, makes fragment ids config-dependent again.
+        """
+        assert "timezone" not in CreekConfig.model_fields
+
+    def test_stale_timezone_key_still_loads(self, tmp_path: Path) -> None:
+        """A pre-#1339 config carrying ``timezone:`` still loads (#1339).
+
+        The migration path for every vault already on disk: the stale key is
+        dropped, and the rest of the file survives untouched.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(
+            yaml.dump(
+                {
+                    "timezone": "America/Los_Angeles",
+                    "vault_path": "/vaults/legacy",
+                },
+            ),
+        )
+
+        cfg = load_config(config_file)
+
+        assert not hasattr(cfg, "timezone")
+        assert "timezone" not in cfg.model_dump()
+        # The shim drops one key; it must not swallow the rest of the config.
+        assert cfg.vault_path == Path("/vaults/legacy")
+
+    def test_stale_timezone_key_warns_it_is_ignored(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Dropping the stale key is announced, not silent (#1339).
+
+        An operator who set ``timezone: Europe/London`` believed it did
+        something. Discarding that quietly would leave them believing it
+        still does, so the load emits a WARNING naming the key.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(yaml.dump({"timezone": "Europe/London"}))
+
+        with caplog.at_level(logging.WARNING, logger="creek.config"):
+            load_config(config_file)
+
+        messages = [record.getMessage() for record in caplog.records]
+        timezone_warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING and "timezone" in record.getMessage()
+        ]
+        assert timezone_warnings, (
+            f"no WARNING naming 'timezone'; records were {messages}"
+        )
+        # Substance, not prose: the operator must learn the key is dead.
+        assert any(
+            phrase in message.lower()
+            for message in timezone_warnings
+            for phrase in ("ignored", "obsolete", "no longer", "removed")
+        ), f"WARNING never says the key is ignored/obsolete: {timezone_warnings}"
+
+    def test_any_stale_timezone_value_is_tolerated(self, tmp_path: Path) -> None:
+        """A nonsense ``timezone:`` value now loads instead of raising (#1339).
+
+        Pins that the validator was *removed* rather than left half-alive: a
+        value the old ``validate_timezone`` rejected must sail through, because
+        nothing validates a key nothing reads.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(
+            yaml.dump({"timezone": "Not/A/Timezone", "vault_path": "/vaults/legacy"}),
+        )
+
+        cfg = load_config(config_file)
+
+        assert not hasattr(cfg, "timezone")
+        assert cfg.vault_path == Path("/vaults/legacy")
+
+    def test_genuinely_unknown_key_is_still_rejected(self, tmp_path: Path) -> None:
+        """The shim must not be implemented as a blanket ``extra='ignore'``.
+
+        The one-way ratchet: dropping *one* named, historically-generated key
+        is a migration; accepting *any* unknown key turns every config typo
+        into a silent no-op. ``redction:`` is a plausible ``redaction:`` typo.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(yaml.dump({"redction": {"enabled": True}}))
+
+        with pytest.raises(ValidationError) as excinfo:
+            load_config(config_file)
+
+        errors = excinfo.value.errors()
+        assert [error["type"] for error in errors] == ["extra_forbidden"]
+        assert [error["loc"] for error in errors] == [("redction",)]
+
+    def test_unknown_key_rejected_even_beside_a_stale_timezone(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Popping ``timezone`` must not amnesty its neighbours (#1339).
+
+        Guards the shim shape: it removes one key by name, rather than
+        clearing whatever the model would otherwise reject.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(
+            yaml.dump({"timezone": "UTC", "redction": {"enabled": True}}),
+        )
+
+        with pytest.raises(ValidationError) as excinfo:
+            load_config(config_file)
+
+        assert [error["loc"] for error in excinfo.value.errors()] == [("redction",)]
+
+    def test_stray_creek_timezone_env_var_is_inert(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A leftover ``CREEK_TIMEZONE`` export must not break startup (#1339).
+
+        pydantic-settings silently drops env vars that match no field, so the
+        operator whose shell profile still exports it gets defaults rather
+        than a crash. Pinned here so it cannot regress into a hard failure.
+        """
+        monkeypatch.setenv("CREEK_TIMEZONE", "Europe/London")
+
+        cfg = CreekConfig()
+
+        assert not hasattr(cfg, "timezone")
+        assert "timezone" not in cfg.model_dump()
+
+    def test_modern_config_loads_silently(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A config without the stale key warns about nothing (#1339).
+
+        The deprecation notice must be conditional on the key being present.
+        Hoisting the ``logger.warning`` above the shim's guard would make
+        every single load noisy forever, and every other test in this class
+        would still pass — so the silence is pinned explicitly.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(yaml.dump({"vault_path": "/vaults/modern"}))
+
+        with caplog.at_level(logging.WARNING, logger="creek.config"):
+            cfg = load_config(config_file)
+
+        assert cfg.vault_path == Path("/vaults/modern")
+        assert [record.getMessage() for record in caplog.records] == []
+
+    @pytest.mark.parametrize("payload", [None, 42], ids=["none", "int"])
+    def test_non_mapping_input_still_raises_a_validation_error(
+        self,
+        payload: object,
+    ) -> None:
+        """A non-``dict`` payload fails as pydantic's error, not the shim's.
+
+        The shim runs before pydantic has coerced anything, so it must not
+        assume it was handed a container. Dropping its ``isinstance`` guard
+        makes ``_OBSOLETE_TIMEZONE_KEY not in data`` raise ``TypeError:
+        argument of type 'int' is not iterable`` from *inside* validation,
+        instead of the ``ValidationError`` callers are written to handle.
+
+        Both payloads are deliberately non-iterable: a ``list`` or ``str``
+        would support ``in`` and so pass even without the guard (#1339).
+
+        Args:
+            payload: A non-mapping value handed straight to validation.
+        """
+        with pytest.raises(ValidationError):
+            CreekConfig.model_validate(payload)

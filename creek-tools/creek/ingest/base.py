@@ -31,12 +31,13 @@ from creek.classify.tags_pass import apply_tags
 from creek.ingest.source_unit import compose_source_unit
 from creek.models import Fragment, FragmentLevel
 
+# ``LA_TZ`` — the target timezone for all normalized timestamps — is declared
+# once in :mod:`creek.time` and imported here (#1339). This module re-exports
+# it so the historical ``from creek.ingest.base import LA_TZ`` path keeps
+# resolving for out-of-tree callers.
+from creek.time import LA_TZ
+
 logger = logging.getLogger(__name__)
-
-# ---- Constants ----
-
-LA_TZ = ZoneInfo("America/Los_Angeles")
-"""Target timezone for all normalized timestamps."""
 
 # ---- Pydantic Models ----
 

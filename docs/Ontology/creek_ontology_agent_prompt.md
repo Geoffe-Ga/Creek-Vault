@@ -897,7 +897,6 @@ pytz = "^2024.1"         # Timezone normalization
 # creek_config.yaml
 vault_path: "/path/to/Creek-Vault"
 source_drive: "/path/to/external/drive"
-timezone: "America/Los_Angeles"
 
 llm:
   # DEFAULT: Local-only processing via Ollama. No data leaves your machine.

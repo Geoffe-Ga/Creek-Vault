@@ -15,7 +15,6 @@ import re
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
-from zoneinfo import ZoneInfo
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -1746,12 +1745,22 @@ class DiscordSourceConfig(BaseModel):
         return value
 
 
+_OBSOLETE_TIMEZONE_KEY = "timezone"
+"""Config key deleted by #1339, still present in every pre-#1339 vault config.
+
+Creek anchors every timestamp it writes to America/Los_Angeles by ontology
+mandate §8.3 (:data:`creek.time.LA_TZ`); the knob had no production reader, and
+wiring one would have made fragment ids config-dependent (see
+:meth:`CreekConfig._drop_obsolete_timezone`).
+"""
+
+
 class CreekConfig(BaseSettings):
     """Top-level Creek configuration.
 
     Values are loaded from a YAML file and can be overridden by
     environment variables prefixed with ``CREEK_`` (e.g.
-    ``CREEK_VAULT_PATH``, ``CREEK_TIMEZONE``).
+    ``CREEK_VAULT_PATH``, ``CREEK_SOURCE_DRIVE``).
     """
 
     model_config = SettingsConfigDict(
@@ -1763,9 +1772,6 @@ class CreekConfig(BaseSettings):
 
     source_drive: Path = Path()
     """Path to the mounted source drive containing raw exports."""
-
-    timezone: str = "America/Los_Angeles"
-    """IANA timezone for timestamp normalisation."""
 
     llm: LLMRoutingConfig = Field(default_factory=LLMRoutingConfig)
     """Per-stage LLM routing (#642). A legacy flat ``llm`` block is promoted to
@@ -1832,26 +1838,61 @@ class CreekConfig(BaseSettings):
     discord: DiscordSourceConfig = Field(default_factory=DiscordSourceConfig)
     """Discord ingest mode toggles (data_package | exporter | bot_capture)."""
 
-    @field_validator("timezone")
+    @model_validator(mode="before")
     @classmethod
-    def validate_timezone(cls, v: str) -> str:
-        """Validate that *v* is a recognised IANA timezone.
+    def _drop_obsolete_timezone(cls, data: object) -> object:
+        """Discard the pre-#1339 ``timezone:`` key, loudly (#1339).
+
+        The field was deleted rather than wired: it had no production reader,
+        and :func:`creek.ingest.base.generate_fragment_id` hashes
+        ``timestamp.isoformat()`` — whose rendered UTC offset changes with the
+        zone — so an operator-settable anchor would mint a second id for every
+        fragment on re-ingest, reopening the bug #1329 had to migrate vaults
+        out of.
+
+        A shim is required because this model forbids extra keys while
+        :func:`generate_default_config` dumps the whole model, so every
+        ``creek_config.yaml`` ``creek init`` has ever written carries a
+        ``timezone:`` line. Without this, deletion would turn every existing
+        config into a hard ``ValidationError`` at load. It lives on the model
+        rather than in :func:`load_config` because direct construction reaches
+        validation without passing through that loader's YAML dict —
+        :func:`generate_default_config` builds its own ``CreekConfig()``, and
+        the environment-variable settings source populates the model whether or
+        not a config file was ever read.
+
+        Exactly one key is removed, by name: ``extra='forbid'`` still rejects
+        everything else, so a typo stays a loud error rather than a silent
+        no-op.
 
         Args:
-            v: Timezone string to validate.
+            data: The raw input to validation — a ``dict`` for YAML and
+                settings-source loads, but any object at all when a caller
+                hands one straight to ``model_validate``.
 
         Returns:
-            The validated timezone string.
-
-        Raises:
-            ValueError: If the timezone is not recognised by ``zoneinfo``.
+            *data* unchanged, or a new ``dict`` without the obsolete key.
+            Anything that is not a ``dict`` passes straight through, so it
+            still fails with pydantic's own ``ValidationError`` rather than
+            an ``AttributeError`` raised from inside this validator.
         """
-        try:
-            ZoneInfo(v)
-        except KeyError as exc:
-            msg = f"Invalid timezone: {v}"
-            raise ValueError(msg) from exc
-        return v
+        if not isinstance(data, dict) or _OBSOLETE_TIMEZONE_KEY not in data:
+            return data
+        logger.warning(
+            "Ignoring obsolete `%s` key in your Creek config: it is no longer "
+            "a setting. Creek anchors every timestamp it writes to "
+            "America/Los_Angeles by design, so the key had no effect and can "
+            "be deleted from your config file (issue #1339).",
+            _OBSOLETE_TIMEZONE_KEY,
+        )
+        # A copy, not a pop. As a ``BaseSettings``, this model is handed a
+        # dict its settings sources freshly merged, so an in-place ``del``
+        # would not actually reach the caller's parsed YAML today — but that
+        # is an implementation detail of pydantic-settings, not a promise.
+        # Copying keeps the validator side-effect-free regardless.
+        remaining = dict(data)
+        del remaining[_OBSOLETE_TIMEZONE_KEY]
+        return remaining
 
     @cached_property
     def model_router(self) -> "ModelRouter":

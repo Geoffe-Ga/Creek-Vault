@@ -28,8 +28,8 @@ from creek.classify.constants import (
     MANUAL_METHOD,
 )
 from creek.classify.review import ReviewQueueGenerator
-from creek.ingest.base import LA_TZ
 from creek.models import Fragment, Frequency, FrequencyClassification
+from creek.time import LA_TZ
 from creek.vault.reader import try_load_fragment
 
 if TYPE_CHECKING:
