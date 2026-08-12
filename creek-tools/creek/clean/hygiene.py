@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 from pydantic import BaseModel, Field
 
-from creek.vault.links import build_link_index
+from creek.vault.links import build_link_index, iter_link_sources
 
 logger = logging.getLogger(__name__)
 
@@ -508,7 +508,17 @@ class StaleReviewScanner:
 
 
 class BrokenLinkScanner:
-    """Scan fragments for wiki-links and relative links to nonexistent files.
+    """Scan the vault for wiki-links and relative links to nonexistent files.
+
+    The survey is :func:`creek.vault.links.iter_link_sources`: the whole vault
+    minus Creek's own report folders (``00-Creek-Meta/Processing-Log/``,
+    ``00-Creek-Meta/State/``, ``00-Creek-Meta/Ontology/``). Scanning
+    ``01-Fragments`` alone — the behaviour before #1344 — made a dangling link
+    on a thread, praxis or decision page invisible while ``creek lint``
+    published the count as a whole-vault verdict. Scanning the *literal* whole
+    vault is the other failure: the lint report renders every finding as
+    ``- `src` → `[[target]]` ``, so three successive runs over a vault holding
+    ONE genuine broken link reported 1, then 2, then 3.
 
     Wiki-links resolve through :func:`creek.vault.links.build_link_index`,
     which knows every name a page can be linked by — filename stem,
@@ -522,42 +532,46 @@ class BrokenLinkScanner:
         """Scan the vault for broken links.
 
         Checks wiki-links (``[[Target]]``) and relative markdown links
-        (``[text](path)``) in all fragment files.
+        (``[text](path)``) in every surveyed source file — the whole vault
+        except Creek's own report folders, which quote findings back and would
+        otherwise inflate the count run over run.
 
         Args:
             vault_path: Root of the Obsidian vault.
 
         Returns:
-            A :class:`BrokenLinkResult` with broken link details.
+            A :class:`BrokenLinkResult` whose ``total_files_scanned`` counts
+            the files actually surveyed, so the "across N file(s)" line
+            ``creek lint`` prints does not overstate its own coverage.
         """
-        fragment_files = _list_fragment_files(vault_path)
+        source_files = iter_link_sources(vault_path)
         link_index = build_link_index(vault_path)
 
         broken_links: dict[str, list[str]] = {}
         total_broken = 0
 
-        for frag_file in fragment_files:
-            file_broken = self._check_file(frag_file, link_index, vault_path)
+        for source_file in source_files:
+            file_broken = self._check_file(source_file, link_index, vault_path)
             if file_broken:
-                broken_links[str(frag_file)] = file_broken
+                broken_links[str(source_file)] = file_broken
                 total_broken += len(file_broken)
 
         return BrokenLinkResult(
             broken_links=broken_links,
-            total_files_scanned=len(fragment_files),
+            total_files_scanned=len(source_files),
             total_broken=total_broken,
         )
 
     def _check_file(
         self,
-        frag_file: Path,
+        source_file: Path,
         link_index: LinkIndex,
         vault_path: Path,
     ) -> list[str]:
         """Check a single file for broken links.
 
         Args:
-            frag_file: Path to the fragment file.
+            source_file: Path to the surveyed markdown file.
             link_index: Vault-wide name → page index. A wiki-link is broken
                 only when nothing in the vault answers to its target under
                 any of its names.
@@ -566,7 +580,7 @@ class BrokenLinkScanner:
         Returns:
             List of broken link targets found in this file.
         """
-        content = frag_file.read_text(encoding="utf-8", errors="replace")
+        content = source_file.read_text(encoding="utf-8", errors="replace")
         broken: list[str] = [
             f"[[{target}]]"
             for target in _extract_wikilinks(content)
@@ -576,7 +590,7 @@ class BrokenLinkScanner:
         broken.extend(
             target
             for target in _extract_relative_links(content)
-            if self._is_broken_local_link(target, frag_file, vault_path)
+            if self._is_broken_local_link(target, source_file, vault_path)
         )
 
         return broken
@@ -584,7 +598,7 @@ class BrokenLinkScanner:
     @staticmethod
     def _is_broken_local_link(
         target: str,
-        frag_file: Path,
+        source_file: Path,
         vault_path: Path,
     ) -> bool:
         """Check whether a relative target resolves to no existing file.
@@ -597,15 +611,15 @@ class BrokenLinkScanner:
 
         Args:
             target: A relative link target (no URL scheme).
-            frag_file: The fragment file containing the link.
+            source_file: The surveyed file containing the link.
             vault_path: Root of the vault for resolving relative paths.
 
         Returns:
             True if the target resolves to no existing file under either
-            the fragment's directory or the vault root.
+            the source file's directory or the vault root.
         """
         try:
-            resolved = (frag_file.parent / target).resolve()
+            resolved = (source_file.parent / target).resolve()
             vault_resolved = (vault_path / target).resolve()
             missing = not resolved.exists() and not vault_resolved.exists()
         except OSError:

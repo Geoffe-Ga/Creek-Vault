@@ -1,4 +1,9 @@
-"""Deterministic check: wiki-links and relative links must resolve."""
+"""Deterministic check: wiki-links and relative links must resolve.
+
+Surveyed across the whole vault minus Creek's own machine-written reports —
+see :func:`creek.vault.links.iter_link_sources` for the three withheld
+directories and the argument for each.
+"""
 
 from __future__ import annotations
 
@@ -10,11 +15,16 @@ from creek.lint._result import CheckResult
 
 
 def run(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
-    """Scan fragments for broken wiki-links / relative markdown links.
+    """Scan the surveyed vault for broken wiki-links / relative markdown links.
 
-    Wraps :class:`creek.clean.hygiene.BrokenLinkScanner`. The ``since``
-    parameter is accepted for interface consistency but ignored — the
-    scanner is already fast enough that filtering by mtime adds little.
+    Wraps :class:`creek.clean.hygiene.BrokenLinkScanner`, whose survey is
+    :func:`creek.vault.links.iter_link_sources` — every ``*.md`` in the vault
+    except Creek's own report folders, which quote findings back and would
+    inflate the count on each successive run (#1344).
+
+    The ``since`` parameter is accepted for interface consistency but
+    ignored — the scanner is already fast enough that filtering by mtime adds
+    little.
 
     The source is rendered **vault-relative**, matching every sibling check
     (``compost``, ``unnamed``, ``skill_size_budget``, ``orphan_compiled``).
@@ -28,8 +38,10 @@ def run(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
     falsified the standing "no path in the artefact is absolute" claim in
     ``docs/generation.md``.
 
-    ``relative_to`` cannot raise: the scanner builds every key from
-    ``vault_path / "01-Fragments"`` by the same lexical join used here.
+    ``relative_to`` cannot raise: every key the scanner emits comes from
+    :func:`~creek.vault.links.iter_link_sources`, which enumerates
+    ``vault_path.rglob("*.md")`` — the same lexical join off ``vault_path``
+    used here.
     """
     del since  # interface symmetry only
     scan = BrokenLinkScanner().scan(vault_path)

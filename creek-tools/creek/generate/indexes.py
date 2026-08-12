@@ -22,7 +22,7 @@ never ran.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from creek.models import Frequency
 from creek.scaffold import VAULT_TEMPLATE_DIR
@@ -32,6 +32,44 @@ if TYPE_CHECKING:
 
 _FREQUENCY_ROOT = "06-Frequencies"
 """Vault-relative folder holding the per-frequency subdirectories."""
+
+FREQUENCY_INDEX_TYPE: Final[str] = "frequency-index"
+"""Frontmatter ``type`` written to each ``06-Frequencies/F*/F*-Index.md``."""
+
+THREAD_INDEX_TYPE: Final[str] = "thread-index"
+"""Frontmatter ``type`` written to ``02-Threads/Thread-Index.md``."""
+
+EDDY_MAP_TYPE: Final[str] = "eddy-map"
+"""Frontmatter ``type`` written to ``03-Eddies/Eddy-Map.md``."""
+
+TEMPORAL_INDEX_TYPE: Final[str] = "temporal-index"
+"""Frontmatter ``type`` written to ``00-Creek-Meta/Temporal-Index.md``."""
+
+SOURCE_INDEX_TYPE: Final[str] = "source-index"
+"""Frontmatter ``type`` written to ``00-Creek-Meta/Source-Index.md``."""
+
+GENERATED_INDEX_TYPES: frozenset[str] = frozenset(
+    {
+        FREQUENCY_INDEX_TYPE,
+        THREAD_INDEX_TYPE,
+        EDDY_MAP_TYPE,
+        TEMPORAL_INDEX_TYPE,
+        SOURCE_INDEX_TYPE,
+    }
+)
+"""The definition of "a page Creek generated as navigation".
+
+A page declaring one of these types is a Dataview *query* — something nothing
+is ever expected to wiki-link. ``orphan-compiled`` therefore excludes them from
+candidacy: reporting them tells the operator to review pages Creek itself wrote
+moments earlier (#1344 measured twelve such false positives out of thirteen).
+
+The generator methods below consume these same constants, so the set and the
+frontmatter actually written cannot drift. All five are listed even though only
+``frequency-index``, ``thread-index`` and ``eddy-map`` land inside the compiled
+directories the check inspects — the set answers "did Creek generate this as
+navigation", not "is it in a compiled folder".
+"""
 
 
 def _canonical_frequency_dirname(freq_code: str) -> str:
@@ -547,7 +585,7 @@ class IndexGenerator:
 
             color = FREQUENCY_COLORS[freq]
             frontmatter = {
-                "type": "frequency-index",
+                "type": FREQUENCY_INDEX_TYPE,
                 "frequency": freq_code,
                 "color": color,
                 "title": f'"{freq_code} — {name} Index"',
@@ -571,7 +609,7 @@ class IndexGenerator:
             Path to the generated thread index file.
         """
         frontmatter = {
-            "type": "thread-index",
+            "type": THREAD_INDEX_TYPE,
             "title": '"Thread Index"',
         }
 
@@ -613,7 +651,7 @@ class IndexGenerator:
             Path to the generated eddy map file.
         """
         frontmatter = {
-            "type": "eddy-map",
+            "type": EDDY_MAP_TYPE,
             "title": '"Eddy Map"',
         }
 
@@ -648,7 +686,7 @@ class IndexGenerator:
             Path to the generated temporal index file.
         """
         frontmatter = {
-            "type": "temporal-index",
+            "type": TEMPORAL_INDEX_TYPE,
             "title": '"Temporal Index"',
         }
 
@@ -690,7 +728,7 @@ class IndexGenerator:
             Path to the generated source index file.
         """
         frontmatter = {
-            "type": "source-index",
+            "type": SOURCE_INDEX_TYPE,
             "title": '"Source Index"',
         }
 

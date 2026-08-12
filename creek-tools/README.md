@@ -128,7 +128,7 @@ Every command is also documented under [`docs/`](docs/) with end-to-end examples
 |---------|---------|-----|
 | `creek clean orphans`       | Identify fragments with zero links after N days. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
 | `creek clean stale-reviews` | Find review queue items older than N days. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
-| `creek clean broken-links`  | Scan fragments for wiki-links pointing to nonexistent files. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
+| `creek clean broken-links`  | Scan the vault for wiki-links pointing to nonexistent files. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
 | `creek clean duplicates`    | Run the dedup sweep and emit a review report. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
 | `creek clean report`        | Summary statistics on vault health. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
 

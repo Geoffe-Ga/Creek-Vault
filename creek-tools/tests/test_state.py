@@ -1652,3 +1652,57 @@ def test_cli_state_budget_fails_when_over_budget(populated_vault: Path) -> None:
 
     assert result.exit_code != 0
     assert "budget" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# #1344: the drift section stays fragment-scoped as the link survey widens
+# ---------------------------------------------------------------------------
+
+
+def test_section_drift_warnings_omits_non_fragment_sources(
+    empty_vault: Path,
+) -> None:
+    """A broken link on a thread page must not reach the drift section.
+
+    ``BrokenLinkScanner`` now surveys the whole vault minus Creek's own
+    report folders (#1344), but ``## Drift warnings`` renders only sources in
+    ``admitted_paths`` — which holds admitted *fragments*. #969 gates this
+    section by source precisely so an above-ceiling path never lands in a
+    committable artefact; widening the scanner must not widen the section.
+    """
+    base = datetime(2026, 4, 1, tzinfo=UTC)
+    _write_fragment(
+        empty_vault,
+        frag_id="frag-link",
+        title="Linker",
+        created=base,
+        body="See [[Missing Fragment Target]] for context.",
+    )
+    thread_meta = {
+        "type": "thread",
+        "id": "thread-link",
+        "title": "Thread Link",
+        "status": "active",
+        "first_seen": date(2026, 4, 1).isoformat(),
+        "last_seen": date(2026, 4, 15).isoformat(),
+        "fragment_count": 1,
+    }
+    thread = empty_vault / "02-Threads" / "Active" / "thread-link.md"
+    thread.write_text(
+        frontmatter.dumps(
+            frontmatter.Post(
+                content="See [[Nonexistent Thread Target]] for context.",
+                **thread_meta,
+            ),
+        ),
+        encoding="utf-8",
+    )
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_drift_warnings()
+
+    assert section.startswith("## Drift warnings")
+    assert "Missing Fragment Target" in section
+    assert "Nonexistent Thread Target" not in section
+    assert "thread-link" not in section

@@ -593,6 +593,65 @@ class TestBrokenLinkScanner:
         broken_targets = next(iter(result.broken_links.values()))
         assert broken_targets == ["[[missing]]"]
 
+    def test_scan_covers_non_fragment_sources(self, tmp_path: Path) -> None:
+        """Threads, praxis and decisions carry links too (#1344).
+
+        The scanner surveyed ``01-Fragments`` alone while ``creek lint``
+        reported its count as a whole-vault verdict, so a dangling link on a
+        compiled page was invisible no matter how many times it ran.
+        """
+        vault = _make_vault(tmp_path)
+        source = _write_md_file(
+            vault / "02-Threads" / "Active" / "t.md",
+            "See [[ghost-thread]] here.",
+        )
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_broken == 1
+        assert result.broken_links[str(source)] == ["[[ghost-thread]]"]
+
+    def test_total_files_scanned_counts_every_surveyed_file(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The count reports the survey, which is no longer fragments-only.
+
+        ``creek lint`` renders this number as "across N file(s)", so leaving
+        it at the fragment count would keep the verdict overstating its own
+        coverage even after the survey widened (#1344).
+        """
+        vault = _make_vault(tmp_path)
+        _write_fragment(vault, "f1", content="No links at all.")
+        _write_md_file(vault / "02-Threads" / "Active" / "t.md", "Thread body.")
+        _write_md_file(vault / "00-Creek-Meta" / "Tag-Garden.md", "Garden body.")
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_files_scanned == 3
+        assert result.total_broken == 0
+
+    def test_scan_skips_creek_report_directories(self, tmp_path: Path) -> None:
+        """Creek's own reports echo findings; reading them back inflates them.
+
+        ``lint-<date>.md`` renders each finding as ``- `src` → `[[target]]` ``
+        and ``State/latest.md`` echoes the same lines, so a literal
+        whole-vault survey grew one genuine broken link into 1, then 2, then 3
+        over three successive runs (#1344).
+        """
+        vault = _make_vault(tmp_path)
+        _write_md_file(
+            vault / "00-Creek-Meta" / "Processing-Log" / "lint-2026-08-09.md",
+            "- `01-Fragments/Conversations/a.md` → `[[ghost]]`\n",
+        )
+        _write_md_file(
+            vault / "00-Creek-Meta" / "State" / "latest.md",
+            "- Broken links in `x`: [[phantom]]\n",
+        )
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.broken_links == {}
+        assert result.total_broken == 0
+        assert result.total_files_scanned == 0
+
 
 # ---------------------------------------------------------------------------
 # DuplicateScanner tests
