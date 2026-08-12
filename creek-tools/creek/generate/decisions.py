@@ -75,6 +75,27 @@ _VALID_PHASES: frozenset[str] = frozenset(
     },
 )
 
+_SOURCE_FRAGMENTS_HEADING: str = "## source fragments"
+"""Lowercased body heading whose first bullet names a note's source fragment.
+
+Compared against ``line.strip().lower()``, so a note that capitalises the
+heading differently still identifies itself.
+"""
+
+_MAX_FILENAME_ORDINALS: int = 10_000
+"""Cap on the paths :func:`_resolve_decision_note_path` probes.
+
+Counts the unsuffixed name, so a cap of 3 means ``stem``, ``stem-1``,
+``stem-2``. Mirrors ``creek.vault.writer._MAX_FILENAME_COLLISION_RETRIES``:
+high enough that no real vault reaches it, low enough that a runaway
+collision pattern surfaces as a loud ``RuntimeError`` rather than an
+infinite loop. The probe is
+dearer than the writer's — it parses each occupant rather than attempting an
+exclusive create — so a stem shared by *n* identities costs O(n²) reads across
+the batch. That is the same cost profile the writer already accepts, and it
+only bites a vault that has already gone degenerate.
+"""
+
 
 def _sanitize_title(title: str) -> str:
     """Sanitise a title string into a safe filename component.
@@ -107,6 +128,96 @@ def _build_frequency_context(fragment: Fragment) -> list[Frequency]:
     for sec in fragment.frequency.secondary:
         freqs.append(Frequency(sec))
     return freqs
+
+
+def _decision_source_fragment_id(post: frontmatter.Post) -> str | None:
+    """Return the source fragment id *post* records, or ``None``.
+
+    The identity rule, in one place: the first bullet under the note body's
+    ``## Source Fragments`` heading. ``None`` means the note declares no
+    source fragment at all — a hand-written Decision note, or one whose
+    generated section the operator removed — and therefore that its identity
+    cannot be positively established.
+
+    Args:
+        post: A parsed Decision note.
+
+    Returns:
+        The recorded source fragment id, or ``None``.
+    """
+    in_source_section = False
+    for line in post.content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            in_source_section = stripped.lower() == _SOURCE_FRAGMENTS_HEADING
+            continue
+        if in_source_section and stripped.startswith("- "):
+            return stripped[2:].strip()
+    return None
+
+
+def _recorded_decision_source(note: Path) -> str | None:
+    """Return the source fragment id a Decision note on disk records, or ``None``.
+
+    Args:
+        note: Path to a candidate markdown note.
+
+    Returns:
+        The recorded source fragment id, or ``None``.
+    """
+    post = _load_post(note)
+    return None if post is None else _decision_source_fragment_id(post)
+
+
+def _resolve_decision_note_path(
+    target_dir: Path,
+    stem: str,
+    fragment_id: str,
+) -> Path:
+    """Return the path *fragment_id*'s Decision note owns under *target_dir*.
+
+    Probes ``stem.md``, ``stem-1.md``, ``stem-2.md``, … and returns the first
+    path that is either free or already occupied by a note recording
+    *fragment_id*. A path occupied by anything else — a different fragment,
+    or a note whose identity :func:`_recorded_decision_source` cannot
+    establish — is skipped, never overwritten.
+
+    Deliberately *not* ``VaultWriter._atomic_create``: that helper advances on
+    occupancy, so it would mint a new file every run and never converge. This
+    one advances on ownership, so the file count is bounded by the number of
+    distinct source fragments.
+
+    Only exact paths are probed — never ``glob``/``iterdir``, which would make
+    a batch quadratic in directory size at 35k-fragment scale.
+
+    Args:
+        target_dir: Directory the note will be written into.
+        stem: Filename stem (without ``.md``) the candidate naturally wants.
+        fragment_id: The candidate's source fragment id — its identity.
+
+    Returns:
+        The path to write to.
+
+    Raises:
+        RuntimeError: If every one of :data:`_MAX_FILENAME_ORDINALS` probed
+            paths belongs to another fragment.
+    """
+    # The ordinal loop is duplicated in creek/generate/compost.py on purpose.
+    # Hoisting a shared filename builder is explicitly out of scope for #1334
+    # and is issue #1417's job; merging them here would pre-empt it.
+    for ordinal in range(_MAX_FILENAME_ORDINALS):
+        suffix = "" if ordinal == 0 else f"-{ordinal}"
+        note_path = target_dir / f"{stem}{suffix}.md"
+        if (
+            not note_path.exists()
+            or _recorded_decision_source(note_path) == fragment_id
+        ):
+            return note_path
+    msg = (
+        f"Could not allocate a unique filename for '{stem}.md' in "
+        f"{target_dir} after {_MAX_FILENAME_ORDINALS} attempts"
+    )
+    raise RuntimeError(msg)
 
 
 class DecisionDetector:
@@ -186,12 +297,47 @@ class DecisionDetector:
         Generates a markdown file with YAML frontmatter in
         ``08-Decisions/Active/``, defaulting to ``sensing`` status.
 
+        The filename is ``<date>-<sanitised fragment title>[-N].md``, falling
+        back to ``<date>[-N].md`` when the title sanitises to nothing. Because
+        that stem is derived from the title alone, two different fragments can
+        want it — :func:`_sanitize_title`'s 80-character truncation
+        manufactures collisions by itself, and every untitled candidate of a
+        given day wants the same bare date — so the path is resolved by
+        *ownership* rather than by name: :func:`_resolve_decision_note_path`
+        probes ``-1``, ``-2``, … until it finds a path that is free or already
+        records this candidate's source fragment. **A note recording a
+        different fragment is never overwritten** (#1334).
+
+        **A note this candidate already owns is refreshed in place, and the
+        refresh is destructive.** The rewritten note carries a freshly minted
+        ``id:`` and its ``status:`` resets to ``sensing``, discarding whatever
+        phase the operator had advanced it to along with any prose they added
+        beneath the generated sections. That is today's behaviour and is
+        preserved deliberately: :func:`generate_decisions` is index-gated and
+        never calls this method for a fragment already captured, so production
+        does not reach that branch. Callers that invoke this method directly
+        inherit the clobber.
+
+        "Already owns" means *at today's stem*. The stem embeds
+        ``date.today()``, so a note this candidate owns from an earlier day
+        is never probed, and a direct call on a later day writes a second
+        note rather than refreshing the first. ``creek/generate/paradox.py``
+        carries the same caveat for the same reason (#1320): a filename
+        containing the date is not a stable identity across runs. Production
+        is unaffected — the index spans both folders and every date, so
+        :func:`generate_decisions` skips the candidate before the stem is
+        ever built.
+
         Args:
             candidate: The DecisionCandidate to create a note for.
             vault_path: Path to the root of the Obsidian vault.
 
         Returns:
             Path to the created decision note file.
+
+        Raises:
+            RuntimeError: If :data:`_MAX_FILENAME_ORDINALS` consecutive
+                candidate filenames all belong to other fragments.
         """
         decision_id = _generate_decision_id()
         today = date.today()
@@ -217,12 +363,12 @@ class DecisionDetector:
         target_dir.mkdir(parents=True, exist_ok=True)
 
         sanitized = _sanitize_title(candidate.fragment_title)
-        filename = (
-            f"{today.isoformat()}-{sanitized}.md"
-            if sanitized
-            else f"{today.isoformat()}.md"
+        stem = f"{today.isoformat()}-{sanitized}" if sanitized else today.isoformat()
+        note_path = _resolve_decision_note_path(
+            target_dir,
+            stem,
+            candidate.fragment_id,
         )
-        note_path = target_dir / filename
 
         note_path.write_text(frontmatter.dumps(post), encoding="utf-8")
         return note_path
@@ -481,15 +627,32 @@ def _jaccard(a: set[str], b: set[str]) -> float:
 def _load_post(path: Path) -> frontmatter.Post | None:
     """Safely load a frontmatter post from disk.
 
+    ``yaml.YAMLError`` is caught alongside ``OSError`` and ``ValueError``
+    because it is neither: a note whose frontmatter will not parse used to
+    escape this helper and crash the caller. Every call site already treats
+    ``None`` as "skip this note", so widening the tuple is what they all
+    meant — and :func:`_recorded_decision_source` now depends on it, having
+    taken over the inline handler
+    :func:`_existing_decision_fragment_ids` used to carry. Same bug class as
+    issue #1416.
+
+    The tuple is **not** exhaustive, and this docstring should not be read
+    as claiming it is: ``frontmatter.load`` passes the parsed mapping as
+    keyword arguments, so a non-string YAML key (``2024-01-01:``, ``true:``,
+    ``1:``) still raises ``TypeError`` past this handler. That gap is
+    pre-existing and shared with the sibling scans; it is tracked on #1416
+    rather than widened blindly here, because ``TypeError`` also covers
+    genuine programming errors that should not be silently skipped.
+
     Args:
         path: The markdown file path.
 
     Returns:
-        Loaded post, or ``None`` if the file cannot be parsed.
+        Loaded post, or ``None`` if the file cannot be read or parsed.
     """
     try:
         return frontmatter.load(str(path))
-    except (OSError, ValueError):
+    except (OSError, ValueError, yaml.YAMLError):
         return None
 
 
@@ -1003,10 +1166,12 @@ def decision_from_note(note_path: Path) -> Decision:
 def _existing_decision_fragment_ids(vault_path: Path) -> set[str]:
     """Return the source fragment ids already captured by Decision notes (#581).
 
-    Scans ``08-Decisions/{Active,Archive}/`` and reads each note's first
-    ``## Source Fragments`` bullet — the source fragment id — so a re-run can
-    skip candidates whose decision note already exists. Unreadable notes are
-    skipped rather than crashing the report.
+    Walks ``08-Decisions/{Active,Archive}/`` and reads each note's identity
+    through :func:`_recorded_decision_source` — the same extractor the note
+    writer resolves filenames with, so the index and the writer can never
+    disagree about who owns what (#1334). A re-run therefore skips candidates
+    whose Decision note already exists. Unreadable notes are skipped rather
+    than crashing the report.
 
     Args:
         vault_path: Root of the Obsidian vault.
@@ -1021,19 +1186,9 @@ def _existing_decision_fragment_ids(vault_path: Path) -> set[str]:
         if not folder.is_dir():
             continue
         for md_file in folder.rglob("*.md"):
-            try:
-                post = frontmatter.load(str(md_file))
-            except (OSError, ValueError, yaml.YAMLError):
-                continue
-            in_source_section = False
-            for line in post.content.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("## "):
-                    in_source_section = stripped.lower() == "## source fragments"
-                    continue
-                if in_source_section and stripped.startswith("- "):
-                    seen.add(stripped[2:].strip())
-                    break
+            fragment_id = _recorded_decision_source(md_file)
+            if fragment_id is not None:
+                seen.add(fragment_id)
     return seen
 
 
@@ -1050,6 +1205,19 @@ def generate_decisions(
     candidate whose source fragment is not already captured by an existing note
     — so re-running is idempotent and never duplicates notes for one fragment.
 
+    Since #1334 that guarantee holds in both directions: the index gate stops
+    one fragment getting two notes, and :func:`_resolve_decision_note_path`
+    stops two distinct candidates sharing one *file*. Before the fix, two
+    candidates whose titles sanitised to the same stem landed on the same
+    path; the second write destroyed the first, the index only ever saw the
+    survivor, and every later run re-detected and re-wrote the loser —
+    oscillating forever and churning the surviving note's ``id:`` each time.
+
+    A vault already damaged that way heals on the next run: the survivor is
+    left byte-for-byte alone and the fragment it displaced is written to the
+    next free ordinal. Content the pre-fix clobber already destroyed is gone
+    and cannot be recovered.
+
     Args:
         vault_path: Root of the Obsidian vault.
         override: Tier ceiling (#968), applied to each fragment's *raw*
@@ -1062,8 +1230,9 @@ def generate_decisions(
             ``tests/test_mcp_report_tier_ceiling.py``'s
             ``test_production_report_callers_always_state_an_override``).
             The stakes here are unusually concrete: a generated note's
-            ``title:`` frontmatter *and* its filename are a source
-            fragment's title verbatim.
+            ``title:`` frontmatter is a source fragment's title verbatim, and
+            its filename is that same title sanitised — plus a ``-N`` ordinal
+            when another fragment already holds the name.
 
     Returns:
         Paths of the newly written Decision notes; empty when there are no new

@@ -38,7 +38,6 @@ and printable before a single verification request goes out.
 from __future__ import annotations
 
 import logging
-import re
 from collections import Counter
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
@@ -48,7 +47,12 @@ import yaml
 from pydantic import ValidationError
 
 from creek.classify.privacy_filter import raw_privacy_tier
-from creek.generate.compost import CANONICAL_RELDIR, CompostTracker
+from creek.generate.compost import (
+    CANONICAL_RELDIR,
+    CompostTracker,
+    _recorded_compost_source,
+    _unwrap_source_id,
+)
 from creek.generate.compost_verifier import CompostVerdict
 from creek.models import Thread
 from creek.vault.reader import iter_vault_fragments
@@ -70,25 +74,6 @@ _FRAGMENTS_RELDIR: str = "01-Fragments"
 
 _THREADS_RELDIR: str = "02-Threads"
 """Vault-relative folder the scan reads threads from."""
-
-_SOURCE_KEYS: tuple[str, ...] = (
-    "original_fragment",
-    "original_thread",
-    "original_project",
-)
-"""Frontmatter keys naming the source a compost note was written for.
-
-``CompostTracker._build_metadata`` writes exactly one of these per note,
-chosen by ``source_type``. Reading all three back is what makes a re-scan
-idempotent across all three candidate kinds.
-"""
-
-_WIKILINK_RE = re.compile(r"\[\[(.+)\]\]")
-"""Matches the ``[[id]]`` form used for fragment and thread back-references.
-
-Project sources are stored bare (a tag, not a note), so unwrapping has to
-tolerate both shapes.
-"""
 
 
 @dataclass(frozen=True)
@@ -133,13 +118,6 @@ class CompostScanResult:
     skipped_existing: int
 
 
-def _unwrap_source_id(value: object) -> str:
-    """Return the bare source ID from a ``[[wikilink]]`` or plain string."""
-    text = str(value).strip()
-    match = _WIKILINK_RE.fullmatch(text)
-    return match.group(1) if match else text
-
-
 def _safe_post(md_file: Path) -> frontmatter.Post | None:
     """Return a parsed frontmatter post, or ``None`` when it will not parse."""
     try:
@@ -163,6 +141,17 @@ def load_composted_source_ids(
     keys are ignored — which is how the ``_Compost-Report.md`` shell
     (``type: compost-report``) stays out of the index.
 
+    Per-note extraction is delegated to
+    ``creek.generate.compost._recorded_compost_source``, which lives beside
+    the metadata writer so reader and writer cannot drift (#1334). It yields
+    the ``(source key, raw value)`` *pair*; this index projects that down to
+    the unwrapped id, because the unwrapped id is what
+    :func:`run_compost_scan` filters candidates on. The pair matters to the
+    writer, which must not let a project tagged ``X`` land on the note
+    recording fragment ``X``. Flattening it here keeps this function's
+    long-standing contract — including its long-standing blind spot, that a
+    project tagged ``X`` is skipped once fragment ``X`` has been composted.
+
     Args:
         vault_path: Root of the Obsidian vault.
         review_queue_relpath: Vault-relative review-queue path, normally
@@ -178,14 +167,11 @@ def load_composted_source_ids(
         if not folder.exists():
             continue
         for md_file in sorted(folder.rglob("*.md")):
-            post = _safe_post(md_file)
-            if post is None or post.get("type") != "compost":
+            recorded = _recorded_compost_source(md_file)
+            if recorded is None:
                 continue
-            for key in _SOURCE_KEYS:
-                raw = post.get(key)
-                if raw is not None:
-                    seen.add(_unwrap_source_id(raw))
-                    break
+            _key, raw = recorded
+            seen.add(_unwrap_source_id(raw))
     return seen
 
 
@@ -396,7 +382,17 @@ def run_compost_scan(
     2. **Verify and write.** Survivors are routed by :func:`_route` and
        written via
        :meth:`~creek.generate.compost.CompostTracker.create_compost_note`,
-       which already handles canonical-vs-review-queue placement.
+       which already handles canonical-vs-review-queue placement, and which
+       since #1334 gives two sources sharing a title two files instead of
+       one. That is what the idempotency claim above rests on. Before #1334
+       a write destroyed the note recording the *other* source, so the index
+       this run read back had only ever seen the survivor, and the scan
+       re-detected and re-verified the loser on every subsequent run,
+       forever. A write can no longer destroy another source's note.
+
+    A vault already damaged that way heals on the next scan: the surviving
+    note is left byte-for-byte alone, and the source it displaced is written
+    to the next free ordinal.
 
     ``skip_intimate`` is forced on regardless of *config*: this function
     feeds fragment bodies to a potentially cloud-hosted verifier, and the

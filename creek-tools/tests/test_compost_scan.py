@@ -50,6 +50,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
+    from creek.generate.compost_scan import CompostScanResult
+
 _NOW = datetime(2026, 4, 1, 12, 0, 0)
 """Deterministic reference clock for every scan in this module."""
 
@@ -960,3 +962,299 @@ def test_embedding_threshold_from_config_is_honoured(vault: Path) -> None:
 
     assert verifier.calls == []
     assert result.plan.fragment_candidates == 0
+
+
+# ---- Issue #1334: a colliding filename makes the scan oscillate forever -----
+#
+# ``CompostTracker.create_compost_note`` names its output
+# ``<date>-<sanitised title>.md``; ``load_composted_source_ids`` indexes notes
+# by the ``original_*`` frontmatter key. When two candidates share a title the
+# second write lands on the first note's path, the index only ever sees the
+# survivor, and the next scan re-detects, re-verifies, and re-files the
+# candidate it just destroyed:
+#
+#   run1: review_queued=2 skipped=0 files=1 sources=['[[frag-b]]']
+#   run2: review_queued=1 skipped=1 files=1 sources=['[[frag-a]]']
+#   run3: review_queued=1 skipped=1 files=1 sources=['[[frag-b]]']  ... forever
+#
+# With a verifier wired that oscillation is not just churn: it is one extra
+# LLM call every run, for as long as the vault exists.
+
+
+_OSCILLATION_TITLE = "Letting this go"
+"""Title shared by the two colliding fragment candidates below."""
+
+_OSCILLATION_SLUG = "Letting-this-go"
+"""``_sanitize_filename(_OSCILLATION_TITLE)`` — the stem both want."""
+
+_STAMP = _NOW.date().isoformat()
+"""The datestamp every note written under :data:`_NOW` carries."""
+
+_BODY_A = "I am done with the essay."
+"""Body of ``frag-a`` — distinct so verifier calls are attributable."""
+
+_BODY_B = "I am done with the album."
+"""Body of ``frag-b`` — distinct so verifier calls are attributable."""
+
+_SEEDED_SURVIVOR_NOTE = """---
+composted_date: '2026-04-01'
+fragments:
+- '[[frag-b]]'
+operator_note: I want to keep this one
+original_fragment: '[[frag-b]]'
+reason: Embedding-similarity 0.95
+tags:
+- compost
+- compost-review
+title: Letting this go
+type: compost
+---
+
+## What it was
+
+A fragment titled **Letting this go** that composted back into the vault.
+
+## Why it composted
+
+I stopped caring about the album in March, and writing that down helped.
+
+## Related Fragments
+
+- [[frag-b]]
+"""
+"""A review-queue note left behind by the #1334 collision, then hand-edited.
+
+``operator_note`` and the second body paragraph are the operator's own work.
+Today's writer destroys both the next time ``frag-a`` is re-detected.
+"""
+
+
+def _compost_identity(note_path: Path) -> tuple[str, str]:
+    """Return the ``(source key, raw value)`` identity a compost note records.
+
+    Read with ``frontmatter.load``, never through
+    :func:`load_composted_source_ids`: identity read back through the module's
+    own reader stops being evidence the moment that reader learns to repair
+    what it finds. The ``[[…]]`` wrapper is left on deliberately —
+    ``_unwrap_source_id`` collapses a fragment called ``X`` and a project
+    tagged ``X`` onto one string, and keeping them apart is the point.
+
+    Args:
+        note_path: Path to a compost note.
+
+    Returns:
+        The first ``(key, value)`` pair found, or ``("", "")`` when none is.
+    """
+    post = frontmatter.load(str(note_path))
+    for key in ("original_fragment", "original_thread", "original_project"):
+        raw = post.get(key)
+        if raw is not None:
+            return (key, str(raw))
+    return ("", "")
+
+
+def _recorded_fragment(note_path: Path) -> str:
+    """Return the raw ``original_fragment`` value a note records on disk."""
+    return str(frontmatter.load(str(note_path)).get("original_fragment"))
+
+
+def _queued_notes(vault_path: Path, config: CompostConfig) -> list[Path]:
+    """Return the review-queue notes, sorted by name."""
+    return _notes_in(vault_path, config.review_queue_relpath)
+
+
+def _scan_no_llm(vault_path: Path, config: CompostConfig) -> CompostScanResult:
+    """Run one gate-only (``--no-llm``) scan under the module clock."""
+    return run_compost_scan(
+        vault_path,
+        similarity_fn=_always_high,
+        verifier=None,
+        config=config,
+        now=_NOW,
+    )
+
+
+def _seed_two_colliding_fragments(vault_path: Path) -> None:
+    """Write ``frag-a`` and ``frag-b``: one title, two distinguishable bodies."""
+    _write_fragment(
+        vault_path,
+        frag_id="frag-a",
+        title=_OSCILLATION_TITLE,
+        body=_BODY_A,
+    )
+    _write_fragment(
+        vault_path,
+        frag_id="frag-b",
+        title=_OSCILLATION_TITLE,
+        body=_BODY_B,
+    )
+
+
+def test_three_consecutive_scans_settle_with_one_note_per_fragment(
+    vault: Path,
+) -> None:
+    """THE HEADLINE (#1334): runs 2 and 3 must write nothing at all.
+
+    A single-run assertion would pass today for the wrong reason — run 1
+    already *reports* two review-queue writes while leaving one file on disk.
+    Three runs are needed to see the oscillation, and the load-bearing
+    assertion is the set of identities recorded on disk: two notes both
+    recording ``[[frag-b]]`` satisfy ``len(files) == 2`` and are still the bug.
+    """
+    _seed_two_colliding_fragments(vault)
+    config = CompostConfig()
+
+    first = _scan_no_llm(vault, config)
+    snapshot_1 = {path.name for path in _queued_notes(vault, config)}
+    second = _scan_no_llm(vault, config)
+    snapshot_2 = {path.name for path in _queued_notes(vault, config)}
+    third = _scan_no_llm(vault, config)
+    snapshot_3 = {path.name for path in _queued_notes(vault, config)}
+
+    assert first.composted == []
+    assert len(first.review_queued) == 2
+    assert first.skipped_existing == 0
+    assert second.review_queued == []
+    assert second.skipped_existing == 2
+    assert third.review_queued == []
+    assert third.skipped_existing == 2
+
+    assert snapshot_1 == snapshot_2 == snapshot_3
+    assert snapshot_1 == {
+        f"{_STAMP}-{_OSCILLATION_SLUG}.md",
+        f"{_STAMP}-{_OSCILLATION_SLUG}-1.md",
+    }
+    assert {_recorded_fragment(path) for path in _queued_notes(vault, config)} == {
+        "[[frag-a]]",
+        "[[frag-b]]",
+    }
+    assert _notes_in(vault, _CANONICAL_RELDIR) == []
+
+
+def test_a_vault_already_in_the_post_collision_state_heals_without_loss(
+    vault: Path,
+) -> None:
+    """The migration ruling, made executable (#1334).
+
+    The vault starts damaged: one review-queue note at the natural path
+    recording ``frag-b``, hand-edited by the operator; ``frag-a`` has no note
+    at all. The next scan must restore ``frag-a`` onto an ordinal and leave the
+    survivor byte-for-byte alone — no path move, no lost frontmatter key, no
+    lost prose — and the scan after that must write nothing.
+    """
+    _seed_two_colliding_fragments(vault)
+    config = CompostConfig()
+    queue_dir = vault / config.review_queue_relpath
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    survivor = queue_dir / f"{_STAMP}-{_OSCILLATION_SLUG}.md"
+    survivor.write_text(_SEEDED_SURVIVOR_NOTE, encoding="utf-8")
+    original_bytes = survivor.read_bytes()
+
+    first = _scan_no_llm(vault, config)
+    second = _scan_no_llm(vault, config)
+
+    assert len(first.review_queued) == 1
+    assert first.skipped_existing == 1
+    healed = first.review_queued[0]
+    assert healed.name == f"{_STAMP}-{_OSCILLATION_SLUG}-1.md"
+    assert _recorded_fragment(healed) == "[[frag-a]]"
+
+    assert survivor.read_bytes() == original_bytes
+    post = frontmatter.load(str(survivor))
+    assert post.get("operator_note") == "I want to keep this one"
+    assert "writing that down helped" in post.content
+
+    assert second.review_queued == []
+    assert second.skipped_existing == 2
+    assert len(_queued_notes(vault, config)) == 2
+
+
+def test_a_fragment_and_a_project_sharing_an_id_get_separate_notes(
+    vault: Path,
+) -> None:
+    """Identity is the ``(source_key, source_id)`` PAIR, not the bare id (#1334).
+
+    ``compost_scan._unwrap_source_id`` strips the ``[[ ]]``, so a *fragment*
+    with id ``Portland`` and a *project* tagged ``Portland`` both flatten to
+    ``"Portland"`` — two different things wanting one filename. A resolver that
+    compared unwrapped ids alone would call the second write a refresh of the
+    first and silently destroy it.
+
+    The project fragments are back-dated (see :data:`_BACK_DATED`) because the
+    180-day silence detector never fires on the ``_RECENT`` default, and a
+    project test where no project candidate exists is vacuously green — hence
+    the explicit plan-count assertions before anything is read off disk.
+    """
+    _write_fragment(
+        vault,
+        frag_id="Portland",
+        title="Portland",
+        body="I am done thinking about moving.",
+    )
+    for idx in (1, 2):
+        _write_fragment(
+            vault,
+            frag_id=f"f-tagged-{idx}",
+            title=f"Notes from the trip ({idx})",
+            body="Ordinary trip notes.",
+            tags=["Portland"],
+            created=_BACK_DATED,
+        )
+    verifier = _StubVerifier(default=CompostVerdict.YES)
+
+    result = run_compost_scan(
+        vault,
+        similarity_fn=_similarity_by_title({"Portland": 0.95}),
+        verifier=verifier,
+        config=CompostConfig(),
+        now=_NOW,
+    )
+
+    # Anti-vacuity: both candidate kinds must genuinely have been produced.
+    assert result.plan.fragment_candidates == 1
+    assert result.plan.project_candidates == 1
+    assert result.plan.thread_candidates == 0
+    assert len(verifier.calls) == 1
+    assert len(result.composted) == 2
+    assert result.review_queued == []
+
+    notes = _notes_in(vault, _CANONICAL_RELDIR)
+    assert {path.name: _compost_identity(path) for path in notes} == {
+        f"{_STAMP}-Portland.md": ("original_fragment", "[[Portland]]"),
+        f"{_STAMP}-Portland-1.md": ("original_project", "Portland"),
+    }
+
+
+def test_a_settled_vault_stops_re_spending_llm_calls(vault: Path) -> None:
+    """The oscillation costs one verification per run, forever (#1334).
+
+    Two candidates should cost two calls in total, however many times the scan
+    runs. Today run 1 spends two and every later run spends one more, because
+    the note that would have recorded the loser was overwritten by the winner.
+    """
+    _seed_two_colliding_fragments(vault)
+    verifier = _StubVerifier(default=CompostVerdict.YES)
+    config = CompostConfig()
+
+    for _ in range(3):
+        run_compost_scan(
+            vault,
+            similarity_fn=_always_high,
+            verifier=verifier,
+            config=config,
+            now=_NOW,
+        )
+
+    assert len(verifier.calls) == 2
+    assert {title for title, _body in verifier.calls} == {_OSCILLATION_TITLE}
+    assert {body for _title, body in verifier.calls} == {_BODY_A, _BODY_B}
+
+    notes = _notes_in(vault, _CANONICAL_RELDIR)
+    assert {path.name for path in notes} == {
+        f"{_STAMP}-{_OSCILLATION_SLUG}.md",
+        f"{_STAMP}-{_OSCILLATION_SLUG}-1.md",
+    }
+    assert {_recorded_fragment(path) for path in notes} == {
+        "[[frag-a]]",
+        "[[frag-b]]",
+    }

@@ -19,10 +19,12 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
     from pathlib import Path
 
+from creek.generate import compost as compost_mod
 from creek.generate.compost import (
     CompostCandidate,
     CompostTracker,
     _AdmittedFragments,
+    _sanitize_filename,
 )
 from creek.generate.compost_verifier import (
     CompostVerdict,
@@ -1462,3 +1464,534 @@ class TestScreenedFragmentBoundary:
         assert len(threads) == 1
         assert threads[0].fragment_ids == ["f-open"]
         assert threads[0].reason == "Dormant for 455 days"
+
+
+# ---- Issue #1334: colliding compost filenames destroy notes -----------------
+#
+# ``create_compost_note`` names its output ``<date>-<sanitised title>.md`` but
+# ``compost_scan.load_composted_source_ids`` indexes notes by a *different*
+# key — the ``original_fragment`` / ``original_thread`` / ``original_project``
+# frontmatter pair. Two candidates sharing a title therefore land on one path:
+# the second overwrites the first, the read-back index only ever sees the
+# survivor, and the scan re-queues (and re-verifies) the one it just lost.
+#
+# The fix resolves the path by IDENTITY OWNERSHIP, not path occupancy:
+#
+#   1. the natural name ``<date>-<slug>.md`` when it is free;
+#   2. that same name when the note already there records *this* identity —
+#      a legitimate refresh, preserved deliberately;
+#   3. otherwise the next ordinal — ``-1``, ``-2``, … — applying the same rule
+#      at each step, when the occupant records a *different* identity or one
+#      that cannot be positively established as ours (unreadable, malformed
+#      YAML, not ``type: compost``, or carrying no source key at all).
+#
+# Identity here is the PAIR ``(source_key, source_id)``, not the bare id:
+# ``compost_scan._unwrap_source_id`` strips the ``[[ ]]``, so a *fragment*
+# called ``X`` and a *project* tagged ``X`` both flatten to ``"X"`` while being
+# two different things that must not overwrite each other.
+
+
+_COMPOST_TITLE = "Letting this go"
+"""Compost title shared by the colliding candidates in this section."""
+
+_COMPOST_SLUG = "Letting-this-go"
+"""``_sanitize_filename(_COMPOST_TITLE)`` — the stem both candidates want."""
+
+_LONG_COMPOST_TITLE_A = (
+    "Should I move to Portland or stay in the city where everything "
+    "already makes sense anyway"
+)
+"""A title longer than the 80-character truncation in ``_sanitize_filename``."""
+
+_LONG_COMPOST_TITLE_B = (
+    "Should I move to Portland or stay in the city where everything "
+    "already makes sensory sense"
+)
+"""A *different* title that survives truncation as the same stem as A."""
+
+_COLLIDING_COMPOST_STEM = (
+    "Should-I-move-to-Portland-or-stay-in-the-city-where-everything-already-makes-sen"
+)
+"""The 80-character stem both long titles collapse to.
+
+Produced by ``compost._sanitize_filename``'s ``[:80]`` truncation.
+"""
+
+_SOURCE_KEYS_READ_BY_TESTS: tuple[str, ...] = (
+    "original_fragment",
+    "original_thread",
+    "original_project",
+)
+"""The three source keys, restated here rather than imported.
+
+``compost._SOURCE_KEYS`` is the production reader's list; a test that
+borrows it would go green on a fix that quietly stopped writing one of them.
+"""
+
+_MALFORMED_COMPOST_NOTE = """---
+title: [unclosed
+type: compost
+---
+
+Whatever this file is, the writer must not clobber it.
+"""
+"""A neighbour whose YAML frontmatter will not parse at all."""
+
+_FOREIGN_TYPE_COMPOST_NOTE = """---
+title: Letting this go
+type: journal
+---
+
+An ordinary journal entry that happens to want this filename.
+"""
+"""A readable neighbour that is not a compost note at all."""
+
+_NO_SOURCE_KEY_COMPOST_NOTE = """---
+composted_date: '2026-04-01'
+reason: Hand-written by the operator
+tags:
+- compost
+title: Letting this go
+type: compost
+---
+
+## What it was
+
+A compost note that names no source, so its identity cannot be established.
+"""
+"""A ``type: compost`` neighbour carrying none of the three source keys."""
+
+_DAMAGED_COMPOST_NEIGHBOURS: dict[str, str] = {
+    "malformed-yaml": _MALFORMED_COMPOST_NOTE,
+    "no-source-key": _NO_SOURCE_KEY_COMPOST_NOTE,
+    "not-a-compost-note": _FOREIGN_TYPE_COMPOST_NOTE,
+}
+"""Neighbour shapes whose identity cannot be established as ours.
+
+Each must push the incoming note onto an ordinal and must come through the
+write byte-identical. Emptying a parametrize list makes its tests vanish
+behind a green gate, so
+:func:`test_the_damaged_compost_neighbour_matrix_is_not_empty` pins the keys.
+"""
+
+
+def _compost_notes(vault: Path) -> list[Path]:
+    """Return every note at the top of ``10-Liminal/Compost``, sorted by name."""
+    return sorted((vault / "10-Liminal" / "Compost").glob("*.md"))
+
+
+def _compost_identity(note_path: Path) -> tuple[str, str]:
+    """Return the ``(source key, raw value)`` identity a compost note records.
+
+    Read with ``frontmatter.load`` and never through
+    :mod:`creek.generate.compost_scan`'s own readers — a self-healing reader
+    would make the assertion vacuous. The ``[[…]]`` wrapper is deliberately
+    left on: ``_unwrap_source_id`` collapses a fragment called ``X`` and a
+    project tagged ``X`` onto one string, which is exactly the conflation
+    #1334 asks the writer to stop making.
+
+    Args:
+        note_path: Path to a compost note.
+
+    Returns:
+        The first ``(key, value)`` pair found, or ``("", "")`` when the note
+        records no source at all.
+    """
+    post = frontmatter.load(str(note_path))
+    for key in _SOURCE_KEYS_READ_BY_TESTS:
+        raw = post.get(key)
+        if raw is not None:
+            return (key, str(raw))
+    return ("", "")
+
+
+def _fragment_candidate(source_id: str, title: str) -> CompostCandidate:
+    """Build a fragment-sourced compost candidate.
+
+    Args:
+        source_id: The source fragment id — half of the note's identity.
+        title: The title the filename is derived from.
+
+    Returns:
+        A populated :class:`~creek.generate.compost.CompostCandidate`.
+    """
+    return CompostCandidate(
+        source_type="fragment",
+        source_id=source_id,
+        title=title,
+        reason="Embedding-similarity 0.99",
+        fragment_ids=[source_id],
+    )
+
+
+def _seed_compost_note(vault: Path, *, filename: str, source_id: str) -> Path:
+    """Write a well-formed compost note recording *source_id* at *filename*.
+
+    Args:
+        vault: Vault root.
+        filename: Filename to write inside ``10-Liminal/Compost``.
+        source_id: The source fragment id the note records — its identity.
+
+    Returns:
+        The path written.
+    """
+    folder = vault / "10-Liminal" / "Compost"
+    folder.mkdir(parents=True, exist_ok=True)
+    post = frontmatter.Post(content="## What it was\n\nA stranger's note.\n")
+    post.metadata.update(
+        {
+            "type": "compost",
+            "title": _COMPOST_TITLE,
+            "composted_date": "2026-04-01",
+            "reason": "Seeded by a test",
+            "fragments": [f"[[{source_id}]]"],
+            "tags": ["compost"],
+            "original_fragment": f"[[{source_id}]]",
+        },
+    )
+    path = folder / filename
+    path.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return path
+
+
+def test_the_damaged_compost_neighbour_matrix_is_not_empty() -> None:
+    """Guard the #1334 neighbour parametrize list against silently emptying."""
+    assert set(_DAMAGED_COMPOST_NEIGHBOURS) == {
+        "malformed-yaml",
+        "no-source-key",
+        "not-a-compost-note",
+    }
+
+
+class TestCompostNoteIdentityCollision:
+    """Two same-stemmed compost identities must become two notes (#1334)."""
+
+    def test_two_identities_sharing_a_title_get_their_own_note(
+        self,
+        tracker: CompostTracker,
+        reference_now: datetime,
+        vault_path: Path,
+    ) -> None:
+        """The second write must not land on the first note's path (#1334).
+
+        The load-bearing assertion is the set of identities recorded on disk,
+        not the file count: two notes both recording ``[[frag-b]]`` would
+        satisfy ``len(notes) == 2`` and still be the bug.
+        """
+        stamp = reference_now.date().isoformat()
+
+        first = tracker.create_compost_note(
+            _fragment_candidate("frag-a", _COMPOST_TITLE),
+            vault_path,
+        )
+        second = tracker.create_compost_note(
+            _fragment_candidate("frag-b", _COMPOST_TITLE),
+            vault_path,
+        )
+
+        assert first.name == f"{stamp}-{_COMPOST_SLUG}.md"
+        assert second.name == f"{stamp}-{_COMPOST_SLUG}-1.md"
+        assert {_compost_identity(path) for path in _compost_notes(vault_path)} == {
+            ("original_fragment", "[[frag-a]]"),
+            ("original_fragment", "[[frag-b]]"),
+        }
+
+    def test_recreating_the_same_candidate_refreshes_the_one_note(
+        self,
+        tracker: CompostTracker,
+        vault_path: Path,
+    ) -> None:
+        """REGRESSION GUARD against adopting a path-occupancy counter-suffix.
+
+        The tempting shortcut for #1334 is ``VaultWriter._atomic_create``'s
+        counter (``VaultWriter._atomic_create``), which advances on *occupancy*.
+        Dropped in here it would mint a second file for one composted source
+        and break the direct-call refresh contract #1320/#1417 rely on. Branch
+        2 of the resolver — "occupied by a note recording the same identity" —
+        exists precisely to keep this test green.
+        """
+        candidate = _fragment_candidate("frag-refresh", _COMPOST_TITLE)
+
+        first = tracker.create_compost_note(candidate, vault_path)
+        second = tracker.create_compost_note(candidate, vault_path)
+
+        assert second == first
+        assert not first.stem.endswith("-1")
+        assert _compost_notes(vault_path) == [first]
+        assert _compost_identity(first) == ("original_fragment", "[[frag-refresh]]")
+
+    def test_titles_colliding_only_after_truncation_get_two_notes(
+        self,
+        tracker: CompostTracker,
+        reference_now: datetime,
+        vault_path: Path,
+    ) -> None:
+        """Two distinct titles truncate to one 80-char stem — still two notes.
+
+        The strongest evidence that the #1334 fix belongs in the *write* and
+        not in the naming: no amount of care in ``_sanitize_filename`` can keep
+        these apart, because the collision is created by the truncation the
+        sanitiser exists to apply (``compost._sanitize_filename``).
+        """
+        assert len(_COLLIDING_COMPOST_STEM) == 80
+        assert _LONG_COMPOST_TITLE_A != _LONG_COMPOST_TITLE_B
+        assert _sanitize_filename(_LONG_COMPOST_TITLE_A) == _COLLIDING_COMPOST_STEM
+        assert _sanitize_filename(_LONG_COMPOST_TITLE_B) == _COLLIDING_COMPOST_STEM
+        stamp = reference_now.date().isoformat()
+
+        first = tracker.create_compost_note(
+            _fragment_candidate("frag-f1", _LONG_COMPOST_TITLE_A),
+            vault_path,
+        )
+        second = tracker.create_compost_note(
+            _fragment_candidate("frag-f2", _LONG_COMPOST_TITLE_B),
+            vault_path,
+        )
+
+        assert first.name == f"{stamp}-{_COLLIDING_COMPOST_STEM}.md"
+        assert second.name == f"{stamp}-{_COLLIDING_COMPOST_STEM}-1.md"
+        assert {_compost_identity(path) for path in _compost_notes(vault_path)} == {
+            ("original_fragment", "[[frag-f1]]"),
+            ("original_fragment", "[[frag-f2]]"),
+        }
+
+    def test_both_empty_titled_candidates_get_their_own_note(
+        self,
+        tracker: CompostTracker,
+        reference_now: datetime,
+        vault_path: Path,
+    ) -> None:
+        """The ``<date>-compost.md`` fallback is *more* collision-prone.
+
+        ``_sanitize_filename`` substitutes the literal word ``compost`` when the
+        sanitised title is empty, so every untitled candidate of a given day
+        wants the same filename. The resolver has to wrap the final filename,
+        not just the sanitised-title branch.
+        """
+        assert _sanitize_filename("") == "compost"
+        stamp = reference_now.date().isoformat()
+
+        first = tracker.create_compost_note(
+            _fragment_candidate("frag-g1", ""),
+            vault_path,
+        )
+        second = tracker.create_compost_note(
+            _fragment_candidate("frag-g2", ""),
+            vault_path,
+        )
+
+        assert first.name == f"{stamp}-compost.md"
+        assert second.name == f"{stamp}-compost-1.md"
+        assert {_compost_identity(path) for path in _compost_notes(vault_path)} == {
+            ("original_fragment", "[[frag-g1]]"),
+            ("original_fragment", "[[frag-g2]]"),
+        }
+
+    def test_a_title_ending_in_dash_one_does_not_hijack_an_ordinal(
+        self,
+        tracker: CompostTracker,
+        reference_now: datetime,
+        vault_path: Path,
+    ) -> None:
+        """A real title may sanitise to another identity's *suffixed* name.
+
+        ``frag-b`` was pushed onto ``…-Letting-this-go-1.md`` by the collision
+        with ``frag-a``. ``frag-c``'s genuine title, "Letting this go 1",
+        sanitises to exactly that stem. Ownership-based resolution probes the
+        path, finds a stranger, and advances to ``…-Letting-this-go-1-1.md``;
+        occupancy-blind logic silently overwrites ``frag-b``.
+        """
+        stamp = reference_now.date().isoformat()
+
+        first = tracker.create_compost_note(
+            _fragment_candidate("frag-a", _COMPOST_TITLE),
+            vault_path,
+        )
+        second = tracker.create_compost_note(
+            _fragment_candidate("frag-b", _COMPOST_TITLE),
+            vault_path,
+        )
+        third = tracker.create_compost_note(
+            _fragment_candidate("frag-c", f"{_COMPOST_TITLE} 1"),
+            vault_path,
+        )
+
+        assert first.name == f"{stamp}-{_COMPOST_SLUG}.md"
+        assert second.name == f"{stamp}-{_COMPOST_SLUG}-1.md"
+        assert third.name == f"{stamp}-{_COMPOST_SLUG}-1-1.md"
+        assert _compost_identity(second) == ("original_fragment", "[[frag-b]]")
+        assert {_compost_identity(path) for path in _compost_notes(vault_path)} == {
+            ("original_fragment", "[[frag-a]]"),
+            ("original_fragment", "[[frag-b]]"),
+            ("original_fragment", "[[frag-c]]"),
+        }
+
+
+class TestCompostDamagedNeighbour:
+    """A neighbour we cannot claim is never overwritten (#1334)."""
+
+    @pytest.mark.parametrize("shape", sorted(_DAMAGED_COMPOST_NEIGHBOURS))
+    def test_a_neighbour_of_unestablished_identity_is_never_clobbered(
+        self,
+        tracker: CompostTracker,
+        reference_now: datetime,
+        vault_path: Path,
+        shape: str,
+    ) -> None:
+        """Unreadable, foreign, or source-less — all three mean advance.
+
+        Today all three are silently replaced, because the writer only asks
+        whether the *name* is the one it wants.
+
+        Args:
+            tracker: Tracker with the deterministic 2026-04-01 clock.
+            reference_now: That clock, for deriving the expected datestamp.
+            vault_path: Vault fixture with ``10-Liminal/Compost`` present.
+            shape: Key into :data:`_DAMAGED_COMPOST_NEIGHBOURS`.
+        """
+        stem = f"{reference_now.date().isoformat()}-{_COMPOST_SLUG}"
+        neighbour = vault_path / "10-Liminal" / "Compost" / f"{stem}.md"
+        neighbour.write_text(_DAMAGED_COMPOST_NEIGHBOURS[shape], encoding="utf-8")
+        original_bytes = neighbour.read_bytes()
+
+        written = tracker.create_compost_note(
+            _fragment_candidate("frag-new", _COMPOST_TITLE),
+            vault_path,
+        )
+
+        assert written.name == f"{stem}-1.md"
+        assert neighbour.read_bytes() == original_bytes
+        assert _compost_identity(written) == ("original_fragment", "[[frag-new]]")
+        assert len(_compost_notes(vault_path)) == 2
+
+
+class TestCompostOrdinalCap:
+    """The ordinal probe loop is bounded and fails loudly (#1334)."""
+
+    def test_the_module_declares_a_named_ordinal_cap(self) -> None:
+        """The bound is a named module constant, not an inline magic number.
+
+        No exact value is pinned: the contract is only that the cap is high
+        enough that no real vault reaches it, mirroring
+        ``creek/vault/writer.py``'s ``_MAX_FILENAME_COLLISION_RETRIES``.
+        """
+        assert hasattr(compost_mod, "_MAX_FILENAME_ORDINALS"), (
+            "#1334: creek.generate.compost must name its ordinal-loop bound "
+            "_MAX_FILENAME_ORDINALS so tests can lower it without creating "
+            "thousands of files"
+        )
+        assert compost_mod._MAX_FILENAME_ORDINALS >= 1000
+
+    def test_exhausting_the_ordinals_raises_runtime_error(
+        self,
+        tracker: CompostTracker,
+        reference_now: datetime,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Every probed path belongs to a stranger — raise, never spin or clobber.
+
+        The cap is patched down rather than seeding its production value's
+        worth of files; the production value is asserted separately above.
+        """
+        # ``raising=False`` so that, before the fix lands, this test fails on
+        # the *behaviour* below rather than erroring on a missing attribute.
+        monkeypatch.setattr(compost_mod, "_MAX_FILENAME_ORDINALS", 3, raising=False)
+        stem = f"{reference_now.date().isoformat()}-{_COMPOST_SLUG}"
+        for index, suffix in enumerate(("", "-1", "-2")):
+            _seed_compost_note(
+                vault_path,
+                filename=f"{stem}{suffix}.md",
+                source_id=f"frag-stranger-{index}",
+            )
+
+        with pytest.raises(RuntimeError, match="unique filename") as excinfo:
+            tracker.create_compost_note(
+                _fragment_candidate("frag-homeless", _COMPOST_TITLE),
+                vault_path,
+            )
+
+        assert stem in str(excinfo.value)
+        assert len(_compost_notes(vault_path)) == 3
+
+    def test_the_last_ordinal_within_the_cap_is_still_used(
+        self,
+        tracker: CompostTracker,
+        reference_now: datetime,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A cap of 3 probes three paths — the natural one, ``-1`` and ``-2``.
+
+        The boundary companion to the exhaustion test: without it, an
+        off-by-one that gives up an ordinal early would go unnoticed.
+        """
+        # ``raising=False`` so that, before the fix lands, this test fails on
+        # the *behaviour* below rather than erroring on a missing attribute.
+        monkeypatch.setattr(compost_mod, "_MAX_FILENAME_ORDINALS", 3, raising=False)
+        stem = f"{reference_now.date().isoformat()}-{_COMPOST_SLUG}"
+        for index, suffix in enumerate(("", "-1")):
+            _seed_compost_note(
+                vault_path,
+                filename=f"{stem}{suffix}.md",
+                source_id=f"frag-stranger-{index}",
+            )
+
+        written = tracker.create_compost_note(
+            _fragment_candidate("frag-late", _COMPOST_TITLE),
+            vault_path,
+        )
+
+        assert written.name == f"{stem}-2.md"
+        assert _compost_identity(written) == ("original_fragment", "[[frag-late]]")
+        assert len(_compost_notes(vault_path)) == 3
+
+
+class TestCompostReportSurvivesTheNotesTheResolverPreserves:
+    """The report must tolerate the malformed notes #1334 stopped clobbering."""
+
+    @pytest.mark.parametrize(
+        ("folder", "filename"),
+        [
+            ("10-Liminal/Compost", "2026-04-01-broken.md"),
+            ("02-Threads", "thread-broken.md"),
+        ],
+    )
+    def test_a_malformed_note_does_not_crash_the_report(
+        self,
+        tracker: CompostTracker,
+        vault_path: Path,
+        folder: str,
+        filename: str,
+    ) -> None:
+        """An unparseable neighbour is skipped, not fatal (#1334).
+
+        Before #1334 the note-path resolver overwrote whatever sat at the
+        name it wanted, so a malformed note in ``10-Liminal/Compost/`` was
+        destroyed on the next write and this scan rarely met one. The
+        resolver now steps over a note whose identity it cannot establish —
+        deliberately, so nothing is lost — which means malformed notes
+        persist and ``creek fill``'s report run walks straight into them.
+        Both loaders therefore have to skip rather than raise.
+
+        Args:
+            tracker: Tracker under test.
+            vault_path: Vault root.
+            folder: Vault-relative folder to plant the bad note in.
+            filename: Name of the bad note.
+        """
+        target = vault_path / folder
+        target.mkdir(parents=True, exist_ok=True)
+        (target / filename).write_text(
+            "---\ntype: [unclosed\n---\n\nbody\n",
+            encoding="utf-8",
+        )
+
+        report = tracker.generate_compost_report(vault_path)
+
+        assert report.is_file()
+        text = report.read_text(encoding="utf-8")
+        assert "Active Threads" in text
+        # Not merely "did not crash": the bad note must be *skipped*, not
+        # half-rendered into the listing from a partially-parsed post.
+        assert filename.removesuffix(".md") not in text

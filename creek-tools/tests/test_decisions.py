@@ -14,9 +14,12 @@ from pathlib import Path
 import frontmatter
 import pytest
 
+from creek.generate import decisions as decisions_mod
 from creek.generate.decisions import (
     DECISION_KEYWORDS,
     DecisionDetector,
+    _sanitize_title,
+    generate_decisions,
 )
 from creek.models import (
     Confidence,
@@ -703,3 +706,646 @@ class TestUpdateDecisionPhase:
         assert any(
             frontmatter.load(str(f))["id"] == "decision-arch0001" for f in active_files
         )
+
+
+# ---- Issue #1334: colliding filenames destroy notes and oscillate forever ----
+#
+# ``create_decision_note`` names its output ``<today>-<sanitised title>.md`` but
+# ``_existing_decision_fragment_ids`` indexes notes by a *different* key — the
+# source fragment id in the body. Two candidates sharing a title therefore land
+# on one path: the second overwrites the first, the read-back index only ever
+# sees the survivor, and the generator rediscovers the fragment it just lost:
+#
+#   run1: written=2 files=1 survivor=frag-b id=decision-31eecda0
+#   run2: written=1 files=1 survivor=frag-a id=decision-1dbcf6ef
+#   run3: written=1 files=1 survivor=frag-b id=decision-0be4a97a  ... forever
+#
+# The fix resolves the path by IDENTITY OWNERSHIP, not path occupancy:
+#
+#   1. the natural name ``<date>-<slug>.md`` when it is free;
+#   2. that same name when the note already there records *this* identity —
+#      a legitimate refresh, which is today's direct-call contract and is
+#      preserved deliberately (see the ``_atomic_create`` guard below);
+#   3. otherwise the next ordinal — ``-1``, ``-2``, … — applying the same rule
+#      at each step, when the occupant records a *different* identity or an
+#      identity that cannot be positively established as ours (unreadable,
+#      malformed YAML, or no ``## Source Fragments`` bullet).
+#
+# The resolver probes exact paths; it never lists the directory. The ordinal
+# loop is bounded by a named module constant and exhaustion raises loudly.
+
+
+_PORTLAND_TITLE = "Should I move to Portland"
+"""Decision title shared by the colliding candidates in this section."""
+
+_PORTLAND_SLUG = "Should-I-move-to-Portland"
+"""``_sanitize_title(_PORTLAND_TITLE)`` — the stem both candidates want."""
+
+_LONG_TITLE_A = (
+    "Should I move to Portland or stay in the city where everything "
+    "already makes sense anyway"
+)
+"""A title longer than the 80-character truncation in ``_sanitize_title``."""
+
+_LONG_TITLE_B = (
+    "Should I move to Portland or stay in the city where everything "
+    "already makes sensory sense"
+)
+"""A *different* title that survives truncation as the same stem as A."""
+
+_COLLIDING_STEM = (
+    "Should-I-move-to-Portland-or-stay-in-the-city-where-everything-already-makes-sen"
+)
+"""The 80-character stem both long titles collapse to.
+
+Produced by ``decisions._sanitize_title``'s ``[:80]`` truncation.
+"""
+
+_MALFORMED_DECISION_NOTE = """---
+title: [unclosed
+status: sensing
+---
+
+Whatever this file is, the writer must not clobber it.
+"""
+"""A neighbour whose YAML frontmatter will not parse at all."""
+
+_UNIDENTIFIED_DECISION_NOTE = """---
+id: decision-stranger1
+status: sensing
+title: Should I move to Portland
+type: decision
+---
+
+## Options
+
+- Move to Portland
+- Stay where I am
+"""
+"""A well-formed neighbour carrying no ``## Source Fragments`` bullet."""
+
+_DAMAGED_DECISION_NEIGHBOURS: dict[str, str] = {
+    "malformed-yaml": _MALFORMED_DECISION_NOTE,
+    "no-source-fragments-bullet": _UNIDENTIFIED_DECISION_NOTE,
+}
+"""Neighbour shapes whose identity cannot be established as ours.
+
+Every one of them must push the incoming note onto an ordinal and must come
+through the write byte-identical. Emptying a parametrize list makes its tests
+vanish behind a green gate, so
+:func:`test_the_damaged_decision_neighbour_matrix_is_not_empty` pins the keys.
+"""
+
+_SEEDED_DECISION_NOTE = """---
+confidence_score: 0.7
+detection_method: keyword
+frequency_context:
+- F1
+- F5
+id: decision-survivor01
+opened: '2026-04-01'
+status: deliberating
+title: Should I move to Portland
+type: decision
+wavelength_phase_at_opening: rising
+---
+
+## Source Fragments
+
+- frag-b
+
+## Options
+
+- Move to Portland
+- Stay where I am
+
+## Criteria
+
+- Cost of living
+
+I keep coming back to the light in November.
+"""
+"""A vault already in the post-collision state: one survivor, operator-edited.
+
+``status`` has been advanced to ``deliberating`` and a line of the operator's
+own prose has been added under the generated sections. Today's writer destroys
+both on the next run.
+"""
+
+
+def _decision_fragment(frag_id: str, title: str) -> Fragment:
+    """Build a keyword-detectable fragment with a caller-chosen id and title.
+
+    Args:
+        frag_id: Fragment ID, also the filename stem under ``01-Fragments``.
+        title: Fragment title — the string that becomes the note's filename.
+
+    Returns:
+        A :class:`~creek.models.Fragment` that ``detect_decisions`` flags.
+    """
+    return Fragment(
+        id=frag_id,
+        title=title,
+        source=FragmentSource(platform=SourcePlatform.CLAUDE),
+        created=datetime(2025, 3, 10, 14, 0, 0),
+        frequency=FrequencyClassification(
+            primary=Frequency.F1,
+            secondary=[Frequency.F5],
+        ),
+        wavelength=WavelengthClassification(phase=Phase.RISING),
+        voice=VoiceClassification(confidence=Confidence.EXPLORING),
+        praxis_potential=PraxisPotential.EXPLICIT,
+        tags=["decision"],
+    )
+
+
+def _candidate(frag_id: str, title: str) -> DecisionCandidate:
+    """Build a candidate for direct ``create_decision_note`` calls.
+
+    Args:
+        frag_id: The source fragment id — the note's *identity* under #1334.
+        title: The fragment title the filename is derived from.
+
+    Returns:
+        A populated :class:`~creek.models.DecisionCandidate`.
+    """
+    return DecisionCandidate(
+        fragment_id=frag_id,
+        fragment_title=title,
+        matched_keywords=["should i"],
+        detection_method="keyword",
+        confidence_score=0.8,
+        wavelength_phase_at_detection="rising",
+        frequency_context=["F1", "F5"],
+    )
+
+
+def _active_notes(vault: Path) -> list[Path]:
+    """Return every note in ``08-Decisions/Active``, sorted by name."""
+    return sorted((vault / "08-Decisions" / "Active").glob("*.md"))
+
+
+def _note_names(vault: Path) -> set[str]:
+    """Return the filenames currently present in ``08-Decisions/Active``."""
+    return {path.name for path in _active_notes(vault)}
+
+
+def _source_fragment_of(note_path: Path) -> str:
+    """Return the source fragment id a decision note records, read from disk.
+
+    Deliberately re-implements the parse rather than calling
+    ``creek.generate.decisions._existing_decision_fragment_ids``. A test that
+    reads identity back through the module's own extractor stops being evidence
+    the moment that extractor learns to repair or infer what it is looking for
+    — the self-healing-reader trap. ``frontmatter.load`` and nothing else.
+
+    Args:
+        note_path: Path to a decision note.
+
+    Returns:
+        The first bullet under ``## Source Fragments``, or ``""`` when the
+        note records no source fragment at all.
+    """
+    post = frontmatter.load(str(note_path))
+    in_source_section = False
+    for line in post.content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            in_source_section = stripped.lower() == "## source fragments"
+            continue
+        if in_source_section and stripped.startswith("- "):
+            return stripped[2:].strip()
+    return ""
+
+
+def _natural_and_ordinal(paths: list[Path]) -> tuple[Path, Path]:
+    """Split exactly two note paths into the unsuffixed one and the ``-1`` one.
+
+    Args:
+        paths: The two notes written for one colliding title.
+
+    Returns:
+        ``(natural, ordinal)``, having asserted that the ordinal's stem is
+        precisely the natural stem plus ``-1`` — the suffix convention
+        ``VaultWriter._atomic_create`` already uses.
+    """
+    assert len(paths) == 2, f"expected two notes, got {[p.name for p in paths]}"
+    natural = [p for p in paths if not p.stem.endswith("-1")]
+    ordinal = [p for p in paths if p.stem.endswith("-1")]
+    assert len(natural) == 1, f"expected one unsuffixed note, got {natural}"
+    assert len(ordinal) == 1, f"expected one '-1' note, got {ordinal}"
+    assert ordinal[0].stem == f"{natural[0].stem}-1"
+    return natural[0], ordinal[0]
+
+
+def _seed_decision_note(
+    vault: Path,
+    *,
+    filename: str,
+    source_id: str,
+    decision_id: str = "decision-seeded001",
+) -> Path:
+    """Write a well-formed decision note recording *source_id* at *filename*.
+
+    Args:
+        vault: Vault root.
+        filename: Filename to write inside ``08-Decisions/Active``.
+        source_id: The source fragment id the note records — its identity.
+        decision_id: Value for the note's ``id`` frontmatter key.
+
+    Returns:
+        The path written.
+    """
+    active = vault / "08-Decisions" / "Active"
+    active.mkdir(parents=True, exist_ok=True)
+    post = frontmatter.Post(
+        content=f"## Source Fragments\n\n- {source_id}\n\n## Options\n\n- _One_\n",
+        type="decision",
+        id=decision_id,
+        title=_PORTLAND_TITLE,
+        status="sensing",
+        opened=date(2026, 4, 1).isoformat(),
+        wavelength_phase_at_opening="rising",
+    )
+    path = active / filename
+    path.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return path
+
+
+def test_the_damaged_decision_neighbour_matrix_is_not_empty() -> None:
+    """Guard the #1334 neighbour parametrize list against silently emptying."""
+    assert set(_DAMAGED_DECISION_NEIGHBOURS) == {
+        "malformed-yaml",
+        "no-source-fragments-bullet",
+    }
+
+
+class TestDecisionNoteIdentityCollision:
+    """Two same-stemmed decision identities must become two notes (#1334)."""
+
+    def test_three_runs_settle_with_one_note_per_identity(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """The headline oscillation: run 1 writes both, runs 2 and 3 write nothing.
+
+        A single-run assertion would pass today for the wrong reason — run 1
+        already *reports* ``written=2`` while leaving one file on disk. The
+        load-bearing assertion is therefore the set of identities recorded on
+        disk: two notes both recording ``frag-b`` satisfy ``len(files) == 2``
+        and are still exactly the #1334 bug.
+        """
+        _seed_fragment(vault_path, _decision_fragment("frag-a", _PORTLAND_TITLE))
+        _seed_fragment(vault_path, _decision_fragment("frag-b", _PORTLAND_TITLE))
+        before = date.today()
+
+        first = generate_decisions(vault_path)
+        snapshot_1 = _note_names(vault_path)
+        second = generate_decisions(vault_path)
+        snapshot_2 = _note_names(vault_path)
+        third = generate_decisions(vault_path)
+        snapshot_3 = _note_names(vault_path)
+        after = date.today()
+
+        assert len(first) == 2
+        assert second == []
+        assert third == []
+        assert snapshot_1 == snapshot_2 == snapshot_3
+
+        notes = _active_notes(vault_path)
+        natural, ordinal = _natural_and_ordinal(notes)
+        # ``before``/``after`` bracket the run so a suite straddling local
+        # midnight cannot produce a false failure; in every other run they
+        # are the same day and the assertion is exact.
+        assert natural.stem in {
+            f"{day.isoformat()}-{_PORTLAND_SLUG}" for day in (before, after)
+        }
+        assert ordinal.stem == f"{natural.stem}-1"
+
+        assert {_source_fragment_of(path) for path in notes} == {"frag-a", "frag-b"}
+        contents = [frontmatter.load(str(path)).content for path in notes]
+        assert sum("\n- frag-a\n" in text for text in contents) == 1
+        assert sum("\n- frag-b\n" in text for text in contents) == 1
+
+    def test_note_ids_and_bytes_do_not_churn_across_runs(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Each note's ``id:`` survives runs 2 and 3 untouched (#1334).
+
+        Today the surviving note is rewritten every run, so its ``id:`` churns
+        (``decision-31eecda0`` → ``decision-1dbcf6ef`` → ``decision-0be4a97a``)
+        and every operator edit beneath it is destroyed. Bytes are compared as
+        well as ids, because "did not rewrite" is the property that matters.
+        """
+        _seed_fragment(vault_path, _decision_fragment("frag-a", _PORTLAND_TITLE))
+        _seed_fragment(vault_path, _decision_fragment("frag-b", _PORTLAND_TITLE))
+
+        generate_decisions(vault_path)
+        ids_first = {
+            path.name: frontmatter.load(str(path))["id"]
+            for path in _active_notes(vault_path)
+        }
+        bytes_first = {
+            path.name: path.read_bytes() for path in _active_notes(vault_path)
+        }
+        generate_decisions(vault_path)
+        bytes_second = {
+            path.name: path.read_bytes() for path in _active_notes(vault_path)
+        }
+        generate_decisions(vault_path)
+        bytes_third = {
+            path.name: path.read_bytes() for path in _active_notes(vault_path)
+        }
+        ids_third = {
+            path.name: frontmatter.load(str(path))["id"]
+            for path in _active_notes(vault_path)
+        }
+
+        assert len(ids_first) == 2
+        assert len(set(ids_first.values())) == 2
+        assert all(str(value).startswith("decision-") for value in ids_first.values())
+        assert ids_third == ids_first
+        assert bytes_second == bytes_first
+        assert bytes_third == bytes_first
+
+    def test_recreating_the_same_candidate_refreshes_the_one_note(
+        self,
+        detector: DecisionDetector,
+        vault_path: Path,
+    ) -> None:
+        """REGRESSION GUARD against adopting a path-occupancy counter-suffix.
+
+        The tempting shortcut for #1334 is ``VaultWriter._atomic_create``'s
+        counter (``VaultWriter._atomic_create``), which advances on *occupancy*.
+        Dropped in here it would mint a second file for one decision and break
+        the direct-call refresh contract that #1320/#1417 rely on. Branch 2 of
+        the #1334 resolver — "occupied by a note recording the same identity" —
+        exists precisely to keep this test green.
+        """
+        candidate = _candidate("frag-refresh", _PORTLAND_TITLE)
+
+        first = detector.create_decision_note(candidate, vault_path)
+        second = detector.create_decision_note(candidate, vault_path)
+
+        assert second == first
+        assert not first.stem.endswith("-1")
+        assert _active_notes(vault_path) == [first]
+        assert _source_fragment_of(first) == "frag-refresh"
+
+    def test_titles_colliding_only_after_truncation_get_two_notes(
+        self,
+        detector: DecisionDetector,
+        vault_path: Path,
+    ) -> None:
+        """Two distinct titles truncate to one 80-char stem — still two notes.
+
+        The strongest evidence that the #1334 fix belongs in the *write* and
+        not in the naming: no amount of care in ``_sanitize_title`` can keep
+        these two apart, because the collision is created by the truncation
+        the sanitiser exists to apply (``decisions._sanitize_title``).
+        """
+        assert len(_COLLIDING_STEM) == 80
+        assert _LONG_TITLE_A != _LONG_TITLE_B
+        assert _sanitize_title(_LONG_TITLE_A) == _COLLIDING_STEM
+        assert _sanitize_title(_LONG_TITLE_B) == _COLLIDING_STEM
+        before = date.today()
+
+        first = detector.create_decision_note(
+            _candidate("frag-f1", _LONG_TITLE_A),
+            vault_path,
+        )
+        second = detector.create_decision_note(
+            _candidate("frag-f2", _LONG_TITLE_B),
+            vault_path,
+        )
+        after = date.today()
+
+        assert first != second
+        assert first.stem in {
+            f"{day.isoformat()}-{_COLLIDING_STEM}" for day in (before, after)
+        }
+        assert second.stem == f"{first.stem}-1"
+        assert {_source_fragment_of(path) for path in _active_notes(vault_path)} == {
+            "frag-f1",
+            "frag-f2",
+        }
+
+    def test_both_empty_titled_candidates_get_their_own_note(
+        self,
+        detector: DecisionDetector,
+        vault_path: Path,
+    ) -> None:
+        """The ``<date>.md`` fallback is *more* collision-prone, not exempt.
+
+        ``create_decision_note`` drops the slug entirely when the sanitised
+        title is empty, so every untitled candidate of a given day wants the
+        same filename. The resolver has to wrap the final filename, not just
+        the sanitised-title branch.
+        """
+        assert _sanitize_title("") == ""
+        before = date.today()
+
+        first = detector.create_decision_note(_candidate("frag-g1", ""), vault_path)
+        second = detector.create_decision_note(_candidate("frag-g2", ""), vault_path)
+        after = date.today()
+
+        assert first.stem in {day.isoformat() for day in (before, after)}
+        assert second.stem == f"{first.stem}-1"
+        assert {_source_fragment_of(path) for path in _active_notes(vault_path)} == {
+            "frag-g1",
+            "frag-g2",
+        }
+
+    def test_a_title_ending_in_dash_one_does_not_hijack_an_ordinal(
+        self,
+        detector: DecisionDetector,
+        vault_path: Path,
+    ) -> None:
+        """A real title may sanitise to another identity's *suffixed* name.
+
+        ``frag-b`` was pushed onto ``…-Portland-1.md`` by the collision with
+        ``frag-a``. ``frag-c``'s genuine title, "Should I move to Portland 1",
+        sanitises to exactly that stem. Ownership-based resolution probes the
+        path, finds a stranger, and advances to ``…-Portland-1-1.md``;
+        occupancy-blind logic silently overwrites ``frag-b``.
+        """
+        first = detector.create_decision_note(
+            _candidate("frag-a", _PORTLAND_TITLE),
+            vault_path,
+        )
+        second = detector.create_decision_note(
+            _candidate("frag-b", _PORTLAND_TITLE),
+            vault_path,
+        )
+        third = detector.create_decision_note(
+            _candidate("frag-c", f"{_PORTLAND_TITLE} 1"),
+            vault_path,
+        )
+
+        assert second.stem == f"{first.stem}-1"
+        assert third.stem == f"{first.stem}-1-1"
+        assert _source_fragment_of(first) == "frag-a"
+        assert _source_fragment_of(second) == "frag-b"
+        assert _source_fragment_of(third) == "frag-c"
+        assert len(_active_notes(vault_path)) == 3
+
+
+class TestDecisionDamagedVaultSelfHeal:
+    """Vaults already damaged by #1334 heal without losing operator work."""
+
+    def test_the_survivor_is_untouched_and_the_lost_note_reappears(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """The migration ruling, made executable (#1334).
+
+        The vault starts in the post-collision state: one note at the natural
+        path recording ``frag-b``, advanced to ``deliberating`` and carrying a
+        line of the operator's own prose; ``frag-a`` has no note at all. The
+        next run must restore ``frag-a`` onto an ordinal and leave the survivor
+        byte-for-byte alone — no path move, no ``id:`` churn, no lost prose.
+        """
+        _seed_fragment(vault_path, _decision_fragment("frag-a", _PORTLAND_TITLE))
+        _seed_fragment(vault_path, _decision_fragment("frag-b", _PORTLAND_TITLE))
+        survivor = (
+            vault_path
+            / "08-Decisions"
+            / "Active"
+            / f"{date.today().isoformat()}-{_PORTLAND_SLUG}.md"
+        )
+        survivor.write_text(_SEEDED_DECISION_NOTE, encoding="utf-8")
+        original_bytes = survivor.read_bytes()
+
+        first = generate_decisions(vault_path)
+        second = generate_decisions(vault_path)
+
+        assert len(first) == 1
+        assert second == []
+        assert survivor.read_bytes() == original_bytes
+        post = frontmatter.load(str(survivor))
+        assert post["status"] == "deliberating"
+        assert post["id"] == "decision-survivor01"
+        assert "I keep coming back to the light in November." in post.content
+        assert _source_fragment_of(survivor) == "frag-b"
+
+        healed = first[0]
+        assert healed.name == f"{survivor.stem}-1.md"
+        assert _source_fragment_of(healed) == "frag-a"
+        assert len(_active_notes(vault_path)) == 2
+
+    @pytest.mark.parametrize("shape", sorted(_DAMAGED_DECISION_NEIGHBOURS))
+    def test_a_neighbour_of_unestablished_identity_is_never_clobbered(
+        self,
+        detector: DecisionDetector,
+        vault_path: Path,
+        shape: str,
+    ) -> None:
+        """An identity we cannot establish as ours means advance (#1334).
+
+        An unreadable neighbour and a neighbour with no ``## Source Fragments``
+        bullet both fail to establish ownership. Today both are silently
+        replaced, because the writer only asks whether the *name* is the one it
+        wants.
+
+        Args:
+            detector: The detector under test.
+            vault_path: Vault fixture with ``08-Decisions/Active`` present.
+            shape: Key into :data:`_DAMAGED_DECISION_NEIGHBOURS`.
+        """
+        stem = f"{date.today().isoformat()}-{_PORTLAND_SLUG}"
+        neighbour = vault_path / "08-Decisions" / "Active" / f"{stem}.md"
+        neighbour.write_text(_DAMAGED_DECISION_NEIGHBOURS[shape], encoding="utf-8")
+        original_bytes = neighbour.read_bytes()
+
+        written = detector.create_decision_note(
+            _candidate("frag-new", _PORTLAND_TITLE),
+            vault_path,
+        )
+
+        assert written.name == f"{stem}-1.md"
+        assert neighbour.read_bytes() == original_bytes
+        assert _source_fragment_of(written) == "frag-new"
+        assert len(_active_notes(vault_path)) == 2
+
+
+class TestDecisionOrdinalCap:
+    """The ordinal probe loop is bounded and fails loudly (#1334)."""
+
+    def test_the_module_declares_a_named_ordinal_cap(self) -> None:
+        """The bound is a named module constant, not an inline magic number.
+
+        No exact value is pinned: the contract is only that the cap is high
+        enough that no real vault reaches it, mirroring
+        ``creek/vault/writer.py``'s ``_MAX_FILENAME_COLLISION_RETRIES``.
+        """
+        assert hasattr(decisions_mod, "_MAX_FILENAME_ORDINALS"), (
+            "#1334: creek.generate.decisions must name its ordinal-loop bound "
+            "_MAX_FILENAME_ORDINALS so tests can lower it without creating "
+            "thousands of files"
+        )
+        assert decisions_mod._MAX_FILENAME_ORDINALS >= 1000
+
+    def test_exhausting_the_ordinals_raises_runtime_error(
+        self,
+        detector: DecisionDetector,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Every probed path belongs to a stranger — raise, never spin or clobber.
+
+        The cap is patched down rather than seeding its production value's
+        worth of files; the production value is asserted separately above.
+        """
+        # ``raising=False`` so that, before the fix lands, this test fails on
+        # the *behaviour* below rather than erroring on a missing attribute.
+        monkeypatch.setattr(decisions_mod, "_MAX_FILENAME_ORDINALS", 3, raising=False)
+        stem = f"{date.today().isoformat()}-{_PORTLAND_SLUG}"
+        for index, suffix in enumerate(("", "-1", "-2")):
+            _seed_decision_note(
+                vault_path,
+                filename=f"{stem}{suffix}.md",
+                source_id=f"frag-stranger-{index}",
+                decision_id=f"decision-stranger{index}",
+            )
+
+        with pytest.raises(RuntimeError, match="unique filename") as excinfo:
+            detector.create_decision_note(
+                _candidate("frag-homeless", _PORTLAND_TITLE),
+                vault_path,
+            )
+
+        assert stem in str(excinfo.value)
+        assert len(_active_notes(vault_path)) == 3
+
+    def test_the_last_ordinal_within_the_cap_is_still_used(
+        self,
+        detector: DecisionDetector,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A cap of 3 probes three paths — the natural one, ``-1`` and ``-2``.
+
+        The boundary companion to the exhaustion test: without it, an
+        off-by-one that gives up an ordinal early would go unnoticed.
+        """
+        # ``raising=False`` so that, before the fix lands, this test fails on
+        # the *behaviour* below rather than erroring on a missing attribute.
+        monkeypatch.setattr(decisions_mod, "_MAX_FILENAME_ORDINALS", 3, raising=False)
+        stem = f"{date.today().isoformat()}-{_PORTLAND_SLUG}"
+        for index, suffix in enumerate(("", "-1")):
+            _seed_decision_note(
+                vault_path,
+                filename=f"{stem}{suffix}.md",
+                source_id=f"frag-stranger-{index}",
+                decision_id=f"decision-stranger{index}",
+            )
+
+        written = detector.create_decision_note(
+            _candidate("frag-late", _PORTLAND_TITLE),
+            vault_path,
+        )
+
+        assert written.name == f"{stem}-2.md"
+        assert _source_fragment_of(written) == "frag-late"
+        assert len(_active_notes(vault_path)) == 3
