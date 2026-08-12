@@ -12,6 +12,7 @@ file — they must come from environment variables.
 import logging
 import os
 import re
+from contextlib import suppress
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -26,6 +27,27 @@ if TYPE_CHECKING:
     from creek.classify.llm.router import ModelRouter
 
 logger = logging.getLogger(__name__)
+
+PrivacyTierName = Literal["open", "personal", "intimate", "unclassified"]
+"""Hand-maintained mirror of :class:`creek.models.PrivacyTier`'s values.
+
+This module **cannot** import :mod:`creek.models` at any position: that module
+imports back into this one at the bottom of the file (the ``# noqa: E402``
+import at ``creek/models.py:1153``, which reaches
+``creek/generate/ai_style/model.py:20`` and its
+``from creek.config import AIStyleCategory``), so a module-level
+``from creek.models import PrivacyTier`` here resolves against a partially
+initialised ``creek.config`` and dies with ``ImportError``. A
+``TYPE_CHECKING`` import does not help either: a Pydantic field's *default
+value* needs a real object at class-creation time.
+
+The mirror is therefore a duplicate by necessity, and it is pinned equal to the
+enum by ``tests/test_config.py::TestAuthorMaxReproducedTier::
+test_the_literal_mirrors_every_privacy_tier`` — the only thing standing between
+a fifth tier added to the enum and an operator whose configured value is
+silently rejected. The same reasoning (and the same shape) as
+:data:`AIStyleCategory` below.
+"""
 
 CONFIG_PATH_ENV_VAR = "CREEK_CONFIG"
 """Environment variable that, when set, supplies the default config path.
@@ -1327,6 +1349,74 @@ class AuthorConfig(BaseModel):
     reflection node is a deterministic judge today, so like
     :attr:`synthesis_model` this is reserved-and-dormant: ``None`` falls back to
     ``llm.model``."""
+
+    max_reproduced_tier: PrivacyTierName = "open"
+    """Highest privacy tier a finished draft may reproduce **verbatim** (#1354).
+
+    The ceiling the HARD ``privacy_compliance`` gate actually enforces is the
+    *more restrictive* of this key and the medium contract's
+    ``default_privacy_tier``, so a contract — which is authored inside the
+    vault, at ``00-Creek-Meta/Skills/mediums/<medium>.MEDIUM.md``, alongside the
+    content it is meant to protect — can only ever **narrow** the gate. Before
+    #1354 the contract was the sole source, and one edited YAML line inside the
+    vault disarmed the gate on both ``creek author`` and the ``creek.author``
+    MCP verb.
+
+    At the shipped default (``open``, the strictest rank) this key is the
+    stricter of the pair for every one of the six shipped medium templates, so
+    the contract's declared tier is inert for this gate; the contract only
+    starts to matter once an operator deliberately raises this key. That
+    asymmetry is the point: the permissive direction lives in
+    ``creek_config.yaml``, which no template deploys and no vault-editing agent
+    is expected to touch.
+
+    Distinct from the **admission** axis owned by ``creek author
+    --include-tier`` and the MCP ``privacy_tier_ceiling`` argument: those govern
+    what the desk's specialists may *retrieve* as evidence; this governs what
+    the finished prose may *reproduce*.
+    """
+
+    @field_validator("max_reproduced_tier", mode="before")
+    @classmethod
+    def _coerce_max_reproduced_tier(cls, value: object) -> str:
+        """Fail closed to ``open`` for an unrecognised reproduction ceiling.
+
+        Mirrors :meth:`creek.models.AuthorProfile._coerce_privacy_tier`: it
+        **returns**, it never raises. A ``ValidationError`` escaping from here
+        would turn one typo in ``creek_config.yaml`` into a crashed review
+        inside a HARD privacy gate, and the pressure that follows a crashed
+        gate is to skip the gate.
+
+        Args:
+            value: The raw value as YAML or the environment handed it over — a
+                tier name, ``None`` for a bare ``max_reproduced_tier:`` key, or
+                anything at all.
+
+        Returns:
+            The canonical tier name, or ``"open"`` (the strictest ceiling) when
+            *value* is not one. The pre-INC-003 spelling ``"public"`` resolves
+            to ``"open"`` through :meth:`creek.models.PrivacyTier._missing_`.
+        """
+        # Function-local, and it has to be: see :data:`PrivacyTierName` for the
+        # import cycle that forbids reaching ``creek.models`` from module scope.
+        from creek.models import PrivacyTier
+
+        if isinstance(value, str):
+            with suppress(ValueError):
+                return PrivacyTier(value).value
+        if value is None:
+            logger.warning(
+                "'author.max_reproduced_tier' is null; failing closed to %r.",
+                PrivacyTier.OPEN.value,
+            )
+        else:
+            logger.warning(
+                "author.max_reproduced_tier %r is not a recognised privacy "
+                "tier; failing closed to %r.",
+                value,
+                PrivacyTier.OPEN.value,
+            )
+        return PrivacyTier.OPEN.value
 
 
 class AIStyleConfig(BaseModel):

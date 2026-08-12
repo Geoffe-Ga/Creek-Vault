@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
+import yaml
 
 from creek.author.checks import (
     _TIER_RANK,
@@ -1302,3 +1303,754 @@ def test_rubric_cannot_soften_a_verdict(tmp_path: Path) -> None:
     assert weighted.findings == baseline.findings
     assert zeroed.decision == baseline.decision
     assert zeroed.findings == baseline.findings
+
+
+# ---------------------------------------------------------------------------
+# #1354 — the privacy ceiling must not be raisable from inside the vault
+#
+# ``check_privacy_compliance`` takes its ceiling from exactly one place: the
+# medium contract's ``default_privacy_tier``. A medium contract is loaded from
+# ``<vault>/00-Creek-Meta/Skills/mediums/<medium>.MEDIUM.md`` — i.e. from
+# *inside the vault*, alongside the content it is meant to protect. Editing one
+# YAML line in a skill file therefore disarms a HARD gate, and a contract
+# declaring ``unclassified`` disarms it completely for every tier.
+#
+# The ceiling becomes the MORE RESTRICTIVE (lower ``_TIER_RANK``) of an
+# operator-set ``author.max_reproduced_tier`` in ``creek_config.yaml`` and the
+# contract's declared tier. A vault-authored contract can then only ever
+# *narrow* the gate; widening it takes a deliberate edit to the config.
+# ---------------------------------------------------------------------------
+
+
+def _write_vault_config(vault: Path, tier: str) -> None:
+    """Write ``<vault>/00-Creek-Meta/creek_config.yaml`` declaring the ceiling.
+
+    The file is written through ``yaml.safe_dump`` so the on-disk shape is
+    whatever :func:`creek.config.load_config` would itself round-trip, rather
+    than a hand-formatted string that only happens to parse.
+
+    Args:
+        vault: Vault root; ``00-Creek-Meta`` is created if absent.
+        tier: Value for ``author.max_reproduced_tier``. Deliberately typed as
+            a bare ``str`` so a test can write a value the model must reject
+            (see :func:`test_a_garbage_configured_tier_fails_closed_to_open`).
+    """
+    meta = vault / "00-Creek-Meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    (meta / "creek_config.yaml").write_text(
+        yaml.safe_dump({"author": {"max_reproduced_tier": tier}}),
+        encoding="utf-8",
+    )
+
+
+def test_a_contract_alone_cannot_widen_the_privacy_gate(tmp_path: Path) -> None:
+    """A vault-authored contract cannot licence its own leak (#1354).
+
+    The headline defect. The contract declares ``intimate``, so today the
+    intimate fragment sits at exactly the ceiling, ``rank > ceiling`` is
+    ``False``, and the draft ships the protected body with zero findings —
+    even though nobody outside the vault ever agreed to that ceiling.
+
+    With no ``creek_config.yaml`` the configured tier is its default ``open``,
+    which is stricter than the contract's ``intimate``, so the effective
+    ceiling must be ``open`` and the leak must be one ``HIGH`` finding.
+
+    Measured at HEAD: ``[]``.
+
+    Args:
+        tmp_path: Vault root for this case.
+    """
+    _seed_fragment(tmp_path, "frag-a", _LEAK_SECRET, PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(
+        medium="research", default_privacy_tier=PrivacyTier.INTIMATE
+    )
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, contract
+    )
+
+    assert [(f.dimension, f.severity) for f in findings] == [
+        ("privacy_compliance", "HIGH")
+    ]
+    assert "'frag-a'" in findings[0].message
+    assert "'intimate'" in findings[0].message
+    assert "'open'" in findings[0].message
+    assert "author.max_reproduced_tier" in findings[0].message
+
+
+def test_an_unclassified_contract_cannot_disarm_the_gate_for_an_unvouched_fragment(
+    tmp_path: Path,
+) -> None:
+    """``default_privacy_tier: unclassified`` is a total off-switch today (#1354).
+
+    ``_TIER_RANK`` tops out at ``UNCLASSIFIED``, so a contract declaring that
+    tier sets ``ceiling = 3`` and no fragment tier can ever exceed it. Measured
+    at HEAD, the whole ``unclassified`` contract column is zeros for all five
+    fragment shapes — including this one, a fragment file with no
+    ``privacy_tier`` key at all, which is the content *nobody has vouched for*.
+
+    This test also records that the issue body's claim — that "only
+    ``unclassified`` fragments would still be caught" under such a contract —
+    is measurably false. Nothing is caught. Under an ``unclassified`` ceiling
+    the gate does not exist.
+
+    Args:
+        tmp_path: Vault root for this case.
+    """
+    _seed_fragment(tmp_path, "frag-a", _LEAK_SECRET, tier=None)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(
+        medium="research", default_privacy_tier=PrivacyTier.UNCLASSIFIED
+    )
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, contract
+    )
+
+    assert [(f.dimension, f.severity) for f in findings] == [
+        ("privacy_compliance", "HIGH")
+    ]
+    assert "'unclassified'" in findings[0].message
+    assert "'open'" in findings[0].message
+
+
+def test_a_contract_declaring_personal_cannot_disarm_the_gate_for_a_personal_fragment(
+    tmp_path: Path,
+) -> None:
+    """The graded case: one notch of widening is still widening (#1354).
+
+    The escalation is not all-or-nothing. A contract that quietly moves from
+    ``open`` to ``personal`` buys itself verbatim reproduction of every
+    ``personal`` fragment, which is the realistic edit — far less conspicuous
+    than declaring ``unclassified`` — and at HEAD it succeeds.
+
+    Args:
+        tmp_path: Vault root for this case.
+    """
+    _seed_fragment(tmp_path, "frag-a", _LEAK_SECRET, PrivacyTier.PERSONAL)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(
+        medium="research", default_privacy_tier=PrivacyTier.PERSONAL
+    )
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, contract
+    )
+
+    assert [(f.dimension, f.severity) for f in findings] == [
+        ("privacy_compliance", "HIGH")
+    ]
+    assert "'personal'" in findings[0].message
+    assert "'open'" in findings[0].message
+
+
+def test_the_effective_ceiling_is_the_more_restrictive_not_the_more_permissive(
+    tmp_path: Path,
+) -> None:
+    """Pin the fold direction: ``min`` of the ranks, never ``max`` (#1354).
+
+    Do not delete this test; it is the only direct detector of the
+    ``min``->``max`` inversion. Every other assertion in this file survives
+    that mutation somewhere, because most rows of the matrix agree under either
+    fold — the two ceilings differ in only one direction and the fragment tier
+    often sits outside both.
+
+    Here the configured tier is its default ``open`` (rank 0) and the contract
+    declares ``intimate`` (rank 2). ``min`` resolves the effective ceiling to
+    ``open``, so the intimate fragment leaks and this is one finding. ``max``
+    resolves it to ``intimate``, the fragment sits at the ceiling, and the
+    function returns zero findings while the protected body sits verbatim in
+    the draft.
+
+    Args:
+        tmp_path: Vault root for this case.
+    """
+    _seed_fragment(tmp_path, "frag-a", _LEAK_SECRET, PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(
+        medium="research", default_privacy_tier=PrivacyTier.INTIMATE
+    )
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, contract
+    )
+
+    leaks = [f for f in findings if f.dimension == "privacy_compliance"]
+    assert len(leaks) == 1, findings
+    assert "'open'" in leaks[0].message
+
+
+# ---------------------------------------------------------------------------
+# The full ceiling matrix.
+#
+# Both expectation tables below are written out BY HAND. Deriving them from
+# ``_TIER_RANK`` (or from any ``min``/``max`` expression) would make the test
+# and the implementation share a single bug: invert the fold in both places and
+# the suite stays green. Every entry here is an independent statement about
+# what the gate should do.
+# ---------------------------------------------------------------------------
+
+_CONFIG_ABSENT = "absent"
+"""The ``configured`` key meaning "no ``creek_config.yaml`` in the vault at all".
+
+Distinct from ``"open"`` on disk even though the two must behave identically:
+the default has to hold for a vault that predates the key, not only for one
+whose operator wrote it out.
+"""
+
+_CONFIGURED_KEYS = ("open", "personal", "intimate", "unclassified", _CONFIG_ABSENT)
+"""Every state ``author.max_reproduced_tier`` can be in — one vault per entry."""
+
+_CONTRACT_KEYS = ("open", "personal", "intimate", "unclassified")
+"""Every tier a vault-authored medium contract can declare."""
+
+_FRAGMENT_KEYS = ("open", "personal", "intimate", "unclassified", "unvouched")
+"""Every cited-fragment shape, including the file with no ``privacy_tier`` key."""
+
+_MATRIX_FRAGMENT_TIERS: dict[str, PrivacyTier | None] = {
+    "open": PrivacyTier.OPEN,
+    "personal": PrivacyTier.PERSONAL,
+    "intimate": PrivacyTier.INTIMATE,
+    "unclassified": PrivacyTier.UNCLASSIFIED,
+    "unvouched": None,
+}
+"""Tier stamped on each seeded fragment; ``None`` omits the key entirely."""
+
+_MATRIX_FRAGMENT_BODIES: dict[str, str] = {
+    "open": "the open note about weekday grocery lists",
+    "personal": "the personal note about a birthday dinner",
+    "intimate": "the intimate letter I never mailed anywhere",
+    "unclassified": "the unclassified page nobody has reviewed yet",
+    "unvouched": "the unvouched scrap left in a drawer somewhere",
+}
+"""One distinct protected sentence per fragment, all reproduced verbatim.
+
+Each is seven words — over ``_MIN_PROTECTED_LEAK_WORDS``, so none can pass
+vacuously — plain English, and carries no legacy taxonomy alias, so
+``privacy_compliance`` is the only dimension any of them can raise. No sentence
+contains another, so a draft reproducing one cannot accidentally reproduce a
+second and change the finding count.
+"""
+
+_EFFECTIVE_CEILING: dict[tuple[str, str], str] = {
+    # An ``open`` contract already declares the strictest ceiling there is, so
+    # nothing the operator configures can widen it.
+    ("open", "open"): "open",
+    ("open", "personal"): "open",
+    ("open", "intimate"): "open",
+    ("open", "unclassified"): "open",
+    ("open", _CONFIG_ABSENT): "open",
+    # A ``personal`` contract is narrowed by a stricter config and holds
+    # against a laxer one.
+    ("personal", "open"): "open",
+    ("personal", "personal"): "personal",
+    ("personal", "intimate"): "personal",
+    ("personal", "unclassified"): "personal",
+    ("personal", _CONFIG_ABSENT): "open",
+    # An ``intimate`` contract: the config governs until the config is the
+    # laxer of the two.
+    ("intimate", "open"): "open",
+    ("intimate", "personal"): "personal",
+    ("intimate", "intimate"): "intimate",
+    ("intimate", "unclassified"): "intimate",
+    ("intimate", _CONFIG_ABSENT): "open",
+    # ``unclassified`` is the total off-switch at HEAD. Under the fold the
+    # config alone decides, because no ceiling is laxer than this one.
+    ("unclassified", "open"): "open",
+    ("unclassified", "personal"): "personal",
+    ("unclassified", "intimate"): "intimate",
+    ("unclassified", "unclassified"): "unclassified",
+    ("unclassified", _CONFIG_ABSENT): "open",
+}
+"""``(contract tier, configured key)`` -> the tier the gate must actually use."""
+
+_FLAGGED: dict[tuple[str, str], bool] = {
+    # An ``open`` fragment is at or below every ceiling — never a leak.
+    ("open", "open"): False,
+    ("open", "personal"): False,
+    ("open", "intimate"): False,
+    ("open", "unclassified"): False,
+    ("personal", "open"): True,
+    ("personal", "personal"): False,
+    ("personal", "intimate"): False,
+    ("personal", "unclassified"): False,
+    ("intimate", "open"): True,
+    ("intimate", "personal"): True,
+    ("intimate", "intimate"): False,
+    ("intimate", "unclassified"): False,
+    ("unclassified", "open"): True,
+    ("unclassified", "personal"): True,
+    ("unclassified", "intimate"): True,
+    ("unclassified", "unclassified"): False,
+    # An unvouched fragment loads as ``unclassified``, so it must be flagged
+    # exactly where the explicit ``unclassified`` row is.
+    ("unvouched", "open"): True,
+    ("unvouched", "personal"): True,
+    ("unvouched", "intimate"): True,
+    ("unvouched", "unclassified"): False,
+}
+"""``(fragment tier, effective ceiling)`` -> whether the verbatim leak is flagged."""
+
+_CASES = [
+    pytest.param(
+        fragment,
+        contract,
+        configured,
+        id=f"frag-{fragment}-contract-{contract}-config-{configured}",
+    )
+    for fragment in _FRAGMENT_KEYS
+    for contract in _CONTRACT_KEYS
+    for configured in _CONFIGURED_KEYS
+]
+"""The full 5 x 4 x 5 cross product of fragment, contract and configured tier."""
+
+# Guard the matrix against being quietly emptied: an empty ``parametrize``
+# list collects zero tests and reports nothing, which is a green gate with the
+# coverage silently gone. This turns that into a collection error instead.
+assert len(_CASES) == 100, len(_CASES)
+
+
+@pytest.fixture(scope="module")
+def ceiling_matrix_vaults(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> dict[str, Path]:
+    """Build one vault per configured-tier state, shared by all 100 cases.
+
+    Module-scoped on purpose: :func:`creek.config.load_config` parses a real
+    YAML file on every call (~19ms measured), and the matrix would otherwise
+    build and re-parse one hundred vaults. Five is enough — the configured tier
+    is the only axis that lives on disk; the contract and the cited fragment
+    are both per-call arguments.
+
+    Each vault holds all five fragment shapes under distinct ids
+    (``frag-open`` … ``frag-unvouched``), each carrying its own protected
+    sentence, so a case selects its subject by citing one id.
+
+    Args:
+        tmp_path_factory: Session temp-directory factory; each vault gets its
+            own root so a config written for one case cannot reach another.
+
+    Returns:
+        A mapping of configured key (including ``"absent"``, which writes no
+        config file at all) to that vault's root.
+    """
+    vaults: dict[str, Path] = {}
+    for configured in _CONFIGURED_KEYS:
+        vault = tmp_path_factory.mktemp(f"ceiling-{configured}")
+        for name, tier in _MATRIX_FRAGMENT_TIERS.items():
+            body = _MATRIX_FRAGMENT_BODIES[name]
+            _seed_fragment(vault, f"frag-{name}", body, tier)
+        if configured != _CONFIG_ABSENT:
+            _write_vault_config(vault, configured)
+        vaults[configured] = vault
+    return vaults
+
+
+@pytest.mark.parametrize(("fragment", "contract_tier", "configured"), _CASES)
+def test_privacy_ceiling_matrix(
+    ceiling_matrix_vaults: dict[str, Path],
+    fragment: str,
+    contract_tier: str,
+    configured: str,
+) -> None:
+    """Every (fragment, contract, config) triple gets the verdict it should (#1354).
+
+    One hundred cases, each a verbatim reproduction of exactly one cited
+    fragment's protected sentence. The expectation is looked up in two
+    hand-written tables — :data:`_EFFECTIVE_CEILING` and :data:`_FLAGGED` — so
+    the test states the intended behaviour independently of how the
+    implementation computes it.
+
+    At HEAD the configured tier is ignored entirely, so every column of this
+    matrix collapses onto the contract's declared tier. Twenty of the hundred
+    cases then return the wrong verdict, and every one of the twenty is a
+    missed leak — never a false alarm.
+
+    Args:
+        ceiling_matrix_vaults: The five pre-built vaults.
+        fragment: Which seeded fragment the draft cites and reproduces.
+        contract_tier: The tier the medium contract declares.
+        configured: The ``author.max_reproduced_tier`` state of the vault.
+    """
+    vault = ceiling_matrix_vaults[configured]
+    frag_id = f"frag-{fragment}"
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=[frag_id])]
+    )
+    contract = MediumContract(
+        medium="research", default_privacy_tier=PrivacyTier(contract_tier)
+    )
+    expected_ceiling = _EFFECTIVE_CEILING[(contract_tier, configured)]
+    expected_flagged = _FLAGGED[(fragment, expected_ceiling)]
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_MATRIX_FRAGMENT_BODIES[fragment]),
+        evidence,
+        vault,
+        contract,
+    )
+
+    assert len(findings) == (1 if expected_flagged else 0), findings
+    if expected_flagged:
+        assert findings[0].dimension == "privacy_compliance"
+        assert findings[0].severity == "HIGH"
+        assert f"'{frag_id}'" in findings[0].message
+        assert f"'{expected_ceiling}'" in findings[0].message
+
+
+def test_a_configured_ceiling_is_narrowed_further_by_a_stricter_contract(
+    tmp_path: Path,
+) -> None:
+    """A contract may still tighten a raised configured ceiling (#1354).
+
+    The operator has permitted ``personal`` reproduction globally, but this
+    medium's contract declares ``open``. The stricter of the two governs, so
+    the personal fragment's protected text is still a leak, and the finding
+    must attribute the ceiling to the contract rather than to the config —
+    otherwise the operator debugging it goes and edits the wrong file.
+
+    Args:
+        tmp_path: Vault root for this case.
+    """
+    _write_vault_config(tmp_path, "personal")
+    _seed_fragment(tmp_path, "frag-a", _LEAK_SECRET, PrivacyTier.PERSONAL)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(medium="research", default_privacy_tier=PrivacyTier.OPEN)
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, contract
+    )
+
+    assert [(f.dimension, f.severity) for f in findings] == [
+        ("privacy_compliance", "HIGH")
+    ]
+    assert "the medium contract" in findings[0].message
+    assert "'open'" in findings[0].message
+
+
+def test_a_configured_ceiling_widens_a_permissive_contract_only_up_to_itself(
+    tmp_path: Path,
+) -> None:
+    """The configured tier is a cap, not a licence for everything above it (#1354).
+
+    Configured ``personal`` against a contract declaring ``intimate``. The
+    effective ceiling is ``personal``, so the two halves must disagree:
+
+    * a ``personal`` fragment reproduced verbatim is permitted — zero findings;
+    * an ``intimate`` one is not — one ``HIGH`` finding, attributed to
+      ``author.max_reproduced_tier``.
+
+    Both halves live in one test because either alone is satisfiable by a
+    degenerate implementation: "always flag" passes the second, "never flag"
+    passes the first.
+
+    Args:
+        tmp_path: Vault root holding both fragments.
+    """
+    permitted = "the personal note about a birthday dinner"
+    protected = "the intimate letter I never mailed anywhere"
+    _write_vault_config(tmp_path, "personal")
+    _seed_fragment(tmp_path, "frag-p", permitted, PrivacyTier.PERSONAL)
+    _seed_fragment(tmp_path, "frag-i", protected, PrivacyTier.INTIMATE)
+    contract = MediumContract(
+        medium="research", default_privacy_tier=PrivacyTier.INTIMATE
+    )
+
+    at_the_ceiling = check_privacy_compliance(
+        _draft_reproducing(permitted),
+        EvidenceBundle(
+            claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-p"])]
+        ),
+        tmp_path,
+        contract,
+    )
+    above_the_ceiling = check_privacy_compliance(
+        _draft_reproducing(protected),
+        EvidenceBundle(
+            claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-i"])]
+        ),
+        tmp_path,
+        contract,
+    )
+
+    assert at_the_ceiling == []
+    assert [(f.dimension, f.severity) for f in above_the_ceiling] == [
+        ("privacy_compliance", "HIGH")
+    ]
+    assert "author.max_reproduced_tier" in above_the_ceiling[0].message
+    assert "'personal'" in above_the_ceiling[0].message
+
+
+def test_a_stricter_contract_still_governs_when_the_config_is_raised(
+    tmp_path: Path,
+) -> None:
+    """``MediumContract.default_privacy_tier`` is not a dead field (#1354).
+
+    This is the test that proves it. Everywhere else in this suite the config's
+    ``open`` default is the stricter of the pair, so an implementation that
+    ignored the contract entirely and used the configured tier alone would pass
+    — and the fix would have replaced one single-source ceiling with another.
+
+    Here the operator has raised the configured ceiling to ``intimate`` and the
+    contract declares ``personal``. The contract is now the stricter source, so
+    it must win the fold and the intimate fragment must still be flagged, with
+    the message naming the contract as the source.
+
+    Args:
+        tmp_path: Vault root for this case.
+    """
+    _write_vault_config(tmp_path, "intimate")
+    _seed_fragment(tmp_path, "frag-a", _LEAK_SECRET, PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(
+        medium="research", default_privacy_tier=PrivacyTier.PERSONAL
+    )
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, contract
+    )
+
+    assert [(f.dimension, f.severity) for f in findings] == [
+        ("privacy_compliance", "HIGH")
+    ]
+    assert "the medium contract" in findings[0].message
+    assert "'personal'" in findings[0].message
+
+
+def test_an_operator_may_deliberately_permit_intimate_reproduction(
+    tmp_path: Path,
+) -> None:
+    """The escape hatch exists, and only the operator can reach it (#1354).
+
+    Configured ``intimate`` and a contract declaring ``intimate``: both sources
+    agree, so the intimate fragment sits at the ceiling and reproducing it is
+    permitted. This is the deliberate, operator-only escape hatch — someone
+    drafting from their own journal for their own eyes.
+
+    What makes it safe is *where it lives*: ``creek_config.yaml``, which no
+    template deploys with a raised value, and which a skill file cannot write.
+    The same permission is unreachable from
+    ``00-Creek-Meta/Skills/mediums/<medium>.MEDIUM.md``, which ``creek init``
+    deploys by default and any vault-editing agent can rewrite.
+
+    Args:
+        tmp_path: Vault root for this case.
+    """
+    _write_vault_config(tmp_path, "intimate")
+    _seed_fragment(tmp_path, "frag-a", _LEAK_SECRET, PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(
+        medium="research", default_privacy_tier=PrivacyTier.INTIMATE
+    )
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, contract
+    )
+
+    assert findings == []
+
+
+def test_a_missing_contract_still_gates_at_the_strictest_ceiling_under_a_raised_config(
+    tmp_path: Path,
+) -> None:
+    """A raised config must not loosen the contract-less ceiling (#1310, #1354).
+
+    ``_NO_CONTRACT_CEILING`` is ``OPEN``, and it is a *declared* ceiling, not an
+    absence of one — so it enters the fold like any other and wins the ``min``
+    against a configured ``intimate``. A contract-less caller therefore keeps
+    the strict gate #1310 gave it, however high the operator set the config.
+
+    Treating "no contract" as "no opinion" and deferring to the config would
+    silently re-open the hole #1310 closed: ``creek author`` shipping an
+    intimate fragment's protected text to stdout with ``verdict=PASS``.
+
+    Args:
+        tmp_path: Vault root for this case.
+    """
+    _write_vault_config(tmp_path, "intimate")
+    _seed_fragment(tmp_path, "frag-a", _LEAK_SECRET, PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, None
+    )
+
+    assert [(f.dimension, f.severity) for f in findings] == [
+        ("privacy_compliance", "HIGH")
+    ]
+    assert "no medium contract" in findings[0].message
+    assert "'open'" in findings[0].message
+
+
+def test_a_garbage_configured_tier_fails_closed_to_open(tmp_path: Path) -> None:
+    """An unparseable configured tier gates at ``open``, it does not raise (#1354).
+
+    ``author.max_reproduced_tier: not-a-tier`` is a typo, not consent. The
+    field validator must fall back to ``open`` rather than raise, because a
+    ``ValidationError`` escaping a HARD leak gate turns a typo into a crashed
+    review — and the pressure that follows is to catch the exception and skip
+    the check, which is worse than either.
+
+    The contract declares ``intimate``, so a config that silently *raised* the
+    ceiling instead of failing closed would show up as zero findings.
+
+    Args:
+        tmp_path: Vault root for this case.
+    """
+    _write_vault_config(tmp_path, "not-a-tier")
+    _seed_fragment(tmp_path, "frag-a", _LEAK_SECRET, PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(
+        medium="research", default_privacy_tier=PrivacyTier.INTIMATE
+    )
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, contract
+    )
+
+    assert [(f.dimension, f.severity) for f in findings] == [
+        ("privacy_compliance", "HIGH")
+    ]
+    assert "'open'" in findings[0].message
+
+
+def test_a_malformed_vault_config_fails_closed_to_open(tmp_path: Path) -> None:
+    """A config file that is not valid YAML gates at ``open`` (#1354).
+
+    A truncated or half-edited ``creek_config.yaml`` makes ``yaml.safe_load``
+    raise before any field validator can run, so the fail-closed behaviour has
+    to be implemented one level up from the model. The gate must still return
+    findings rather than let a ``YAMLError`` escape into the reflection loop.
+
+    Args:
+        tmp_path: Vault root for this case.
+    """
+    meta = tmp_path / "00-Creek-Meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    (meta / "creek_config.yaml").write_text(
+        "author: {max_reproduced_tier: [unclosed\n", encoding="utf-8"
+    )
+    _seed_fragment(tmp_path, "frag-a", _LEAK_SECRET, PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(
+        medium="research", default_privacy_tier=PrivacyTier.INTIMATE
+    )
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, contract
+    )
+
+    assert [(f.dimension, f.severity) for f in findings] == [
+        ("privacy_compliance", "HIGH")
+    ]
+    assert "'open'" in findings[0].message
+
+
+def test_an_unranked_contract_tier_still_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unranked contract tier cannot beat the configured ceiling (#509, #1354).
+
+    ``_LEAST_RESTRICTIVE_RANK`` is the fail-closed rank for a contract tier
+    missing from ``_TIER_RANK`` — a future :class:`~creek.models.PrivacyTier`
+    nobody added to the table. Deleting ``PERSONAL`` from the table simulates
+    exactly that, and the contract's ceiling drops to rank 0.
+
+    The fold must not lose that property: the configured ``open`` is at the
+    same rank, so the effective ceiling is still ``open`` and the intimate
+    fragment is still flagged. An implementation that read the *tier* rather
+    than its rank — or that let an unranked contract short-circuit the fold —
+    would gate at ``personal`` here and let the leak through.
+
+    Args:
+        tmp_path: Vault root for this case.
+        monkeypatch: Removes ``PERSONAL`` from ``_TIER_RANK`` for this test.
+    """
+    monkeypatch.delitem(_TIER_RANK, PrivacyTier.PERSONAL)
+    _seed_fragment(tmp_path, "frag-a", _LEAK_SECRET, PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(
+        medium="research", default_privacy_tier=PrivacyTier.PERSONAL
+    )
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, contract
+    )
+
+    assert [(f.dimension, f.severity) for f in findings] == [
+        ("privacy_compliance", "HIGH")
+    ]
+    assert "'intimate'" in findings[0].message
+
+
+def test_an_unranked_contract_tier_cannot_outrank_a_raised_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unranked contract tier still *wins* the fold, at rank 0 (#509, #1354).
+
+    The twin of
+    :func:`test_an_unranked_contract_tier_still_fails_closed`, and the case
+    that actually detects the fallback's direction. That test leaves the
+    configured ceiling at its default ``open`` (rank 0), where
+    ``_LEAST_RESTRICTIVE_RANK`` and ``_MOST_RESTRICTIVE_RANK`` yield the same
+    verdict — the config ties or wins either way — so flipping
+    ``_ceiling_rank``'s fallback to the most-restrictive rank leaves it green.
+    MEASURED: that mutation survived the entire privacy lane until this test
+    existed.
+
+    Here the operator has deliberately raised the ceiling to ``intimate``
+    (rank 2) and the contract declares an unranked ``personal``. Failing closed
+    means the unranked contract is treated as rank 0 — the strictest ceiling
+    there is — so it beats the raised config, the effective ceiling is
+    ``personal``, and the intimate leak is still flagged and still attributed
+    to the contract. Under the inverted fallback the contract would score
+    rank 3, the config would win at ``intimate``, and an intimate fragment
+    would be reproduced verbatim with no finding at all.
+
+    Args:
+        tmp_path: Vault root for this case.
+        monkeypatch: Removes ``PERSONAL`` from ``_TIER_RANK`` for this test.
+    """
+    monkeypatch.delitem(_TIER_RANK, PrivacyTier.PERSONAL)
+    _write_vault_config(tmp_path, "intimate")
+    _seed_fragment(tmp_path, "frag-a", _LEAK_SECRET, PrivacyTier.INTIMATE)
+    evidence = EvidenceBundle(
+        claims=[EvidenceClaim(claim="a claim", source_fragments=["frag-a"])]
+    )
+    contract = MediumContract(
+        medium="research", default_privacy_tier=PrivacyTier.PERSONAL
+    )
+
+    findings = check_privacy_compliance(
+        _draft_reproducing(_LEAK_SECRET), evidence, tmp_path, contract
+    )
+
+    assert [(f.dimension, f.severity) for f in findings] == [
+        ("privacy_compliance", "HIGH")
+    ]
+    assert "the medium contract" in findings[0].message

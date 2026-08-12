@@ -428,6 +428,31 @@ ai_style:
 
 `voice_distance_target` is the value the post-composition de-slop rewrite loop drives toward; it is distinct from `voice_distance_upper` (the accepted ceiling) and is **clamped** to the ceiling if configured above it. The guard always stamps a `voice_guard_status` on the draft (`rewritten`, `measured_only:*`, or `skipped:*`) — it never silently passes a mannered draft through. See [generation](./generation.md#voice-fidelity-feat-040).
 
+## `author` — the Writing Desk
+
+```yaml
+author:
+  max_author_rounds: 3
+  graph_breadth_bound: 25
+  graph_depth_bound: 2
+  retrieval_top_k: 5
+  max_reproduced_tier: open
+  voice_model: null           # falls back to llm.model
+  synthesis_model: null       # reserved; not yet read (#474)
+  reflection_model: null      # reserved; not yet read (#474)
+```
+
+| Field                 | Default   | Notes |
+|------------------------|-----------|-------|
+| `max_author_rounds`    | `3`       | Max Conductor voice/reflect rounds before escalation. Bounded `[1, 10]`. |
+| `graph_breadth_bound`  | `25`      | Max fragments the Graph specialist's backlink walk expands at each depth level. Minimum `1`. |
+| `graph_depth_bound`    | `2`       | Max backlink hops the Graph specialist walks from its seed (`0` = seed only). Minimum `0`. |
+| `retrieval_top_k`      | `5`       | How many top-ranked fragments the Retrieval specialist surfaces as evidence. Minimum `1`. |
+| `max_reproduced_tier`  | `"open"`  | Highest privacy tier a finished draft may reproduce **verbatim**. One of `open` \| `personal` \| `intimate` \| `unclassified`; `open` is the *strictest* value, not the loosest. The HARD `privacy_compliance` gate enforces the more restrictive of this key and the medium contract's `default_privacy_tier` — a contract can only narrow the gate, never widen it. An unrecognised or null value fails closed to `open`. Full discussion, including the trust-boundary and drift-detection caveats: [writing-desk.md § The reproduction ceiling](./writing-desk.md#the-reproduction-ceiling). |
+| `voice_model`          | `null`    | Per-agent model override for the voice call. `null` (default) falls back to `llm.model`. |
+| `synthesis_model`      | `null`    | Reserved override for the synthesis step. Synthesis is deterministic today (no LLM call), so this is documented but **dormant**: falls back to `llm.model` and nothing reads it yet. |
+| `reflection_model`     | `null`    | Reserved override for the reflection step. Reflection is a deterministic judge today, so like `synthesis_model` this is documented but **dormant**. |
+
 ## Environment variables
 
 Every leaf field can be overridden by a `CREEK_…` env-var. Nested keys use double underscores:

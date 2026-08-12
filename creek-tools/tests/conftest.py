@@ -10,7 +10,9 @@ Provides auto-use fixtures that:
   because a Rich console caches its width at construction and creek's console
   is constructed at collection time -- see that hook's docstring (#1141), and
 - clear the process-global elevated-authorization failure budget so the
-  #914 purge lockout cannot leak from one test into the next.
+  #914 purge lockout cannot leak from one test into the next, and
+- hide an ambient ``CREEK_CONFIG`` so a config file the operator exported in
+  their own shell cannot decide the outcome of a vault-driven test (#1354).
 
 Also provides the opt-in :func:`short_write` fixture (issue #987), which
 simulates partial ``os.write`` returns so the vault/save writers can be
@@ -25,6 +27,8 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+
+from creek.config import CONFIG_PATH_ENV_VAR
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -82,6 +86,42 @@ def _pin_terminal_width(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setenv("COLUMNS", _TEST_TERMINAL_COLUMNS)
     monkeypatch.setenv("LINES", _TEST_TERMINAL_LINES)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_creek_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hide an ambient ``CREEK_CONFIG`` from every test (#1354).
+
+    The HARD privacy leak gate now reads ``author.max_reproduced_tier`` from
+    the vault's own ``creek_config.yaml``, resolved through
+    :func:`creek.config.resolve_config_path`. That resolver consults
+    ``CREEK_CONFIG`` *before* it looks inside the vault, and
+    :func:`creek.config.load_config` does the same when handed no path. So an
+    operator who exports ``CREEK_CONFIG`` in their shell silently redirects
+    every vault-driven privacy test at their own config file — a file that may
+    raise a ceiling the test expects to be ``open``, or, if the path no longer
+    exists, make the resolver raise ``FileNotFoundError`` from inside a check
+    that is supposed to be total.
+
+    Either way the local run and CI disagree, and the direction of the
+    disagreement is the dangerous one: locally green, and green for a reason
+    that has nothing to do with the code under test. The tests that drive a
+    real vault through the gate — and so inherit that ambient state — are
+    ``tests/test_reflection.py``, ``tests/test_chat_medium.py``,
+    ``tests/test_essay_medium.py``, ``tests/test_how_to_medium.py``,
+    ``tests/test_book_report_medium.py``,
+    ``tests/test_research_piece_medium.py`` and ``tests/test_author_desk.py``.
+
+    Deleting the variable here does not take the capability away from tests
+    that want it: fixture set-up runs before the test body, so a test that
+    calls ``monkeypatch.setenv(CONFIG_PATH_ENV_VAR, ...)`` itself still sets it
+    on a clean slate and still has it restored at teardown.
+
+    Args:
+        monkeypatch: Restores the variable (if the environment had one) when
+            the test finishes.
+    """
+    monkeypatch.delenv(CONFIG_PATH_ENV_VAR, raising=False)
 
 
 @pytest.fixture(autouse=True)
