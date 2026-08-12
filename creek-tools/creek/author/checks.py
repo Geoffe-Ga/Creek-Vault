@@ -19,6 +19,7 @@ check reuses the FEAT-040.x AI-style scanner
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -26,6 +27,7 @@ from typing import TYPE_CHECKING
 import yaml
 
 from creek.author.models import ReflectionFinding
+from creek.config import load_config, resolve_config_path
 from creek.generate.ai_style.scanner import scan
 from creek.generate.grounding import scan_biographical_sentences
 from creek.generate.jargon import detect_unglossed_jargon
@@ -49,6 +51,8 @@ if TYPE_CHECKING:
     from creek.generate.ai_style.model import VoiceFingerprint
     from creek.generate.grounding import EmbeddingFn
     from creek.models import MediumContract
+
+logger = logging.getLogger(__name__)
 
 #: Privacy tiers from least to most restrictive; index = restrictiveness rank.
 #: ``UNCLASSIFIED`` is treated as the most restrictive (fail closed) — this
@@ -456,20 +460,170 @@ def _leaks_any_body(cited: _CitedFragment, body: str) -> bool:
     return any(_is_verbatim_leak(stored.strip(), body) for stored in cited.bodies)
 
 
+_CONFIG_SOURCE = "author.max_reproduced_tier"
+"""Names the operator's ``creek_config.yaml`` key as the ceiling's source.
+
+Every ``_..._SOURCE`` constant is rendered verbatim into a finding message, and
+``creek/cli.py``'s ``_emit_author_result`` prints those through Rich — so none
+of them may contain square brackets, which Rich would read as markup
+(``test_author_refusal_survives_markup_in_a_fragment_id``)."""
+
+_CONTRACT_SOURCE = "the medium contract"
+"""Names the medium contract as the ceiling's source.
+
+Deliberately silent about *which* file: a contract is either the shipped
+template or a vault copy shadowing it, and naming one path would send an
+operator to edit a file that may not be the one in play."""
+
+_NO_CONTRACT_SOURCE = "no medium contract"
+"""Names :data:`_NO_CONTRACT_CEILING` as the ceiling's source.
+
+Kept distinct from :data:`_CONTRACT_SOURCE` so the message says whether a
+contract was read and declared this tier or none was found at all — two
+different repairs."""
+
+
+def _ceiling_rank(tier: PrivacyTier) -> int:
+    """Return the restrictiveness rank of a *ceiling* tier.
+
+    The counterpart of :func:`_fragment_rank`, and the fail-closed direction is
+    the opposite one: an unranked ceiling drops to
+    :data:`_LEAST_RESTRICTIVE_RANK` (rank 0, the strictest ceiling there is), so
+    more cited tiers count as over-tier rather than fewer (#509).
+
+    Both sides of the ceiling fold in :func:`_resolve_effective_ceiling` go
+    through here, so an unranked tier on *either* side fails closed rather than
+    winning the comparison by accident.
+
+    Args:
+        tier: A candidate ceiling tier.
+
+    Returns:
+        The tier's rank; higher is more permissive as a ceiling.
+    """
+    return _TIER_RANK.get(tier, _LEAST_RESTRICTIVE_RANK)
+
+
+@dataclass(frozen=True, slots=True)
+class _EffectiveCeiling:
+    """The tier the leak gate enforces, plus which authority set it.
+
+    The source travels with the tier because the finding message has to name the
+    file an operator would edit to change the verdict: the two authorities live
+    in different places (``creek_config.yaml`` outside the vault, the medium
+    contract inside it) and pointing at the wrong one is a wasted debugging
+    session.
+
+    Attributes:
+        tier: The effective ceiling — the more restrictive of the two sources.
+        source: One of :data:`_CONFIG_SOURCE`, :data:`_CONTRACT_SOURCE` or
+            :data:`_NO_CONTRACT_SOURCE`.
+    """
+
+    tier: PrivacyTier
+    source: str
+
+
+def _configured_max_reproduced_tier(vault: Path) -> PrivacyTier:
+    """Read ``author.max_reproduced_tier`` from *vault*'s config, failing closed.
+
+    This is the half of the ceiling an in-vault medium contract cannot reach:
+    ``creek_config.yaml`` lives at ``00-Creek-Meta/creek_config.yaml`` and no
+    template deploys it with a raised value (#1354).
+
+    A config this function cannot read gates at :attr:`PrivacyTier.OPEN` rather
+    than propagating: the MCP ``creek.author`` verb must not surface a traceback
+    from inside a HARD gate. The caught set is exact, never widened — a stale
+    ``CREEK_CONFIG`` raises ``FileNotFoundError`` (``creek/config.py:83-89``),
+    which is an ``OSError``; pydantic's ``ValidationError`` subclasses
+    ``ValueError``; ``yaml.YAMLError`` subclasses neither.
+
+    The conversion itself cannot raise, and needs no second coercion:
+    ``max_reproduced_tier`` is a ``Literal`` of exactly the four tier names,
+    whose ``before`` validator already fails closed to ``"open"`` for anything
+    else. The ``except`` exists for I/O and YAML failure alone.
+
+    Args:
+        vault: The vault root whose config is consulted.
+
+    Returns:
+        The operator's configured reproduction ceiling, or
+        :attr:`PrivacyTier.OPEN` when the config cannot be read.
+    """
+    try:
+        config = load_config(resolve_config_path(vault, None), warn_on_missing=False)
+    except (OSError, ValueError, yaml.YAMLError):
+        logger.warning(
+            "Could not read author.max_reproduced_tier from the config for "
+            "vault %s; failing closed to %r.",
+            vault,
+            PrivacyTier.OPEN.value,
+        )
+        return PrivacyTier.OPEN
+    return PrivacyTier(config.author.max_reproduced_tier)
+
+
+def _resolve_effective_ceiling(
+    contract: MediumContract | None,
+    configured: PrivacyTier,
+) -> _EffectiveCeiling:
+    """Fold the two ceiling authorities into the one the gate enforces.
+
+    "More restrictive" is the **lower** :data:`_TIER_RANK` — a ``min``, never a
+    ``max``. Word-association runs the other way ("take the more restrictive
+    tier" reads like ``max``), and taking ``max`` here ships either a no-op or a
+    widening of a HARD privacy gate;
+    ``test_the_effective_ceiling_is_the_more_restrictive_not_the_more_permissive``
+    is the direct detector for that inversion.
+
+    Ranks are compared, not tiers, so an unranked tier on either side falls to
+    :data:`_LEAST_RESTRICTIVE_RANK` and fails closed (#509).
+
+    Ties go to the config (``<=``, not ``<``) for two reasons. At the shipped
+    default both sources are ``open``, and the message should then name the
+    authority that a vault-authored contract cannot widen. And an unranked
+    contract tier ties at rank 0 with a configured ``open`` — it must never be
+    *named* as the ceiling, since its rank is a fail-closed guess rather than
+    something the contract declared.
+
+    Args:
+        contract: The medium contract, or ``None`` for a contract-less caller.
+        configured: The operator's ``author.max_reproduced_tier``.
+
+    Returns:
+        The effective ceiling and the authority that set it.
+    """
+    declared, source = (
+        (_NO_CONTRACT_CEILING, _NO_CONTRACT_SOURCE)
+        if contract is None
+        else (PrivacyTier(contract.default_privacy_tier), _CONTRACT_SOURCE)
+    )
+    if _ceiling_rank(configured) <= _ceiling_rank(declared):
+        return _EffectiveCeiling(configured, _CONFIG_SOURCE)
+    return _EffectiveCeiling(declared, source)
+
+
 def check_privacy_compliance(
     body: str,
     evidence: EvidenceBundle,
     vault: Path | None,
     contract: MediumContract | None,
 ) -> list[ReflectionFinding]:
-    """Flag a draft that leaks text above the contract's privacy tier (HARD).
+    """Flag a draft that leaks text above the effective privacy ceiling (HARD).
 
-    For each cited fragment whose resolved tier is *more restrictive* than the
-    contract's ``default_privacy_tier``, the draft breaches privacy iff the body
-    still contains that fragment's protected text. The check is deterministic;
-    only *vault* being ``None`` skips it, because without a vault there is no
-    file to resolve a tier or a protected body from. A missing *contract* does
-    **not** skip: it gates at :data:`_NO_CONTRACT_CEILING` (#1310). A cited
+    The ceiling has **two** sources and is the more restrictive of them: the
+    operator's ``author.max_reproduced_tier`` in ``creek_config.yaml`` and the
+    medium contract's ``default_privacy_tier`` (see
+    :func:`_resolve_effective_ceiling`). Until #1354 the contract was the only
+    source — and a contract is authored *inside the vault*, so one edited YAML
+    line in a skill file disarmed this gate. A contract can now only narrow it.
+
+    For each cited fragment whose resolved tier is *more restrictive* than that
+    ceiling, the draft breaches privacy iff the body still contains that
+    fragment's protected text. The check is deterministic; only *vault* being
+    ``None`` skips it, because without a vault there is no file to resolve a
+    tier, a protected body, or a configured ceiling from. A missing *contract*
+    does **not** skip: it gates at :data:`_NO_CONTRACT_CEILING` (#1310). A cited
     fragment id with no matching file in the vault is unresolvable (its tier
     cannot be known) and is skipped rather than guessed — the hard citation gate
     still requires every claim to carry an id.
@@ -477,9 +631,12 @@ def check_privacy_compliance(
     Args:
         body: The drafted prose under review.
         evidence: The evidence the draft was rendered from.
-        vault: The vault root, or ``None`` to skip the check.
-        contract: The medium contract whose ``default_privacy_tier`` is the
-            ceiling, or ``None`` to gate at :data:`_NO_CONTRACT_CEILING`.
+        vault: The vault root, or ``None`` to skip the check. Also the root the
+            configured half of the ceiling is read from.
+        contract: The medium contract whose ``default_privacy_tier`` is one of
+            the two ceiling sources — it applies only where it is stricter than
+            the configured tier — or ``None`` to fold
+            :data:`_NO_CONTRACT_CEILING` in instead.
 
     Returns:
         One ``HIGH`` finding per leaked over-tier fragment, dimension
@@ -487,15 +644,16 @@ def check_privacy_compliance(
     """
     if vault is None:
         return []
-    # Pydantic stores tiers as the underlying str; coerce back to the enum so
-    # the ordering lookup and display are well-defined. With no contract there
-    # is no declared ceiling to coerce, so fail closed at the strictest one.
-    ceiling_tier = (
-        _NO_CONTRACT_CEILING
-        if contract is None
-        else PrivacyTier(contract.default_privacy_tier)
+    # Reads the vault config on every call. Measured at 18.6ms against a real
+    # config and 0.5ms with none, and `review` runs once per round, bounded by
+    # `author.max_author_rounds` (<= 10) — at most ten reads per run, each
+    # alongside an LLM call. No module-level memo on purpose: it would go stale
+    # across vaults within one pytest session and hide a bad read, and the
+    # value of this chokepoint is that exactly one place decides the ceiling.
+    effective = _resolve_effective_ceiling(
+        contract, _configured_max_reproduced_tier(vault)
     )
-    ceiling = _TIER_RANK.get(ceiling_tier, _LEAST_RESTRICTIVE_RANK)
+    ceiling = _ceiling_rank(effective.tier)
     findings: list[ReflectionFinding] = []
     # Sorted by fragment id so a draft leaking several fragments always reports
     # them in the same order, whichever subtree resolved each one first.
@@ -512,8 +670,9 @@ def check_privacy_compliance(
                     severity="HIGH",
                     message=(
                         f"Cited fragment {frag_id!r} is {cited.tier.value!r} "
-                        f"(above the {ceiling_tier.value!r} "
-                        "default) yet its protected text appears in the draft."
+                        f"(above the effective {effective.tier.value!r} ceiling, "
+                        f"set by {effective.source}) yet its protected text "
+                        "appears in the draft."
                     ),
                 )
             )

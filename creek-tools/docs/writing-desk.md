@@ -98,6 +98,9 @@ specialists it polices. A cited fragment id present in more than one subtree
 resolves to its **most restrictive** tier, and every body stored under that id
 is checked against the draft — the lower-tier twins' bodies included, because
 the tier is a property of the id rather than of the file that happened to win.
+The ceiling a cited fragment's tier is checked against has two sources and is
+the more restrictive of them — see [The reproduction
+ceiling](#the-reproduction-ceiling) below.
 
 A clean draft returns `PASS`. One or more findings return `REVISE`, which the
 conductor retries within the round budget. A draft that cannot be authored at
@@ -120,6 +123,58 @@ Desk settings live under the `author:` section of `creek_config.yaml`
 - `graph_depth_bound` — max backlink hops from the seed (default `2`).
 - `retrieval_top_k` — how many top-ranked fragments the Retrieval agent surfaces
   (default `5`).
+- `max_reproduced_tier` — the highest privacy tier a finished draft may
+  reproduce **verbatim** (default `"open"`, the strictest rank). See [The
+  reproduction ceiling](#the-reproduction-ceiling) below.
+
+### The reproduction ceiling
+
+`author.max_reproduced_tier` (values `open` | `personal` | `intimate` |
+`unclassified`, default `"open"`) is the operator's half of the
+`privacy_compliance` gate's ceiling. The gate enforces the **more
+restrictive** of this key and the medium contract's `default_privacy_tier` —
+"more restrictive" is the **lower** rank in the tier ordering `open` (0) <
+`personal` (1) < `intimate` (2) < `unclassified` (3), so `open` is the
+strictest possible ceiling, not the loosest. A tie between the two sources
+(both `open`, at the shipped default) goes to `author.max_reproduced_tier`. An
+unrecognised or null value fails closed to `open`, with a warning logged —
+never a crash inside a HARD gate.
+
+**No trust boundary is created by this key.** `creek_config.yaml` lives at
+`<vault>/00-Creek-Meta/creek_config.yaml` — *inside* the vault, editable by
+exactly the same actor who can edit the medium contract at
+`00-Creek-Meta/Skills/mediums/<medium>.MEDIUM.md`. This change does not make
+widening the reproduction ceiling impossible; it makes it deliberate,
+single-sourced, and self-evidently security-relevant — a change to
+`author:` in `creek_config.yaml`, not an incidental YAML edit buried in a
+medium's contract.
+
+**This does take the widening lever out of `creek skills sync`'s drift
+surface.** That command's drift guard covers `00-Creek-Meta/Skills/` only, so
+moving the permissive lever into `creek_config.yaml` moves it outside that
+detection entirely. `creek skills sync` is not a mitigation here: since #1306
+it *refuses* to sync when it detects medium drift, and a refusal **leaves a
+tampered contract in place** rather than repairing it.
+
+**All six shipped medium templates declare `default_privacy_tier: open`** —
+already the strictest rank — so at the shipped default,
+`MediumContract.default_privacy_tier` is **inert** for this gate on every
+shipped medium: it narrows nothing until an operator deliberately raises
+`max_reproduced_tier` above `open`. The field is retained on purpose and is
+not dead: once `max_reproduced_tier` is raised — e.g. to `intimate` — a
+contract declaring `personal` narrows the effective ceiling to `personal` for
+that medium. The escape hatch for a medium that may legitimately reproduce
+above-`open` text is `author.max_reproduced_tier`, and only that: it is
+reachable by an operator editing `creek_config.yaml`, never by a skill file
+that any template deploys by default.
+
+**This is a different axis from admission.** `creek author --include-tier`
+and the MCP `privacy_tier_ceiling` parameter govern what the desk's
+specialists may *retrieve* as evidence from the vault. `max_reproduced_tier`
+governs what the finished prose may *reproduce verbatim* once retrieved. A
+specialist admitted to read intimate content under a broad `--include-tier`
+can still be blocked, at reflection time, from shipping that content's exact
+words in the draft.
 
 ### Model tiers
 
@@ -145,6 +200,10 @@ author:
   graph_breadth_bound: 25
   graph_depth_bound: 2
   retrieval_top_k: 5
+  # Highest tier a finished draft may reproduce verbatim. "open" (the
+  # default) is the strictest rank, and this key is vault-wide: raising it
+  # lifts the floor for every medium, and each contract narrows from there.
+  max_reproduced_tier: open
   # Point the owner-voice render at a different tier than the rest of the
   # pipeline. Unset (the default) reuses llm.model above.
   voice_model: claude-opus-4-1

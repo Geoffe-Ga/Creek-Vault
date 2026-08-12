@@ -8,11 +8,12 @@ from unittest import mock
 
 import pytest
 import typer
+import yaml
 from typer.testing import CliRunner
 
 from creek import cli as creek_cli
 from creek.author.client import AuthorLLMClient
-from creek.author.contracts import CHAT_MAX_CHARS
+from creek.author.contracts import CHAT_MAX_CHARS, MEDIUMS_TEMPLATE_DIR
 from creek.classify.llm.completion import Completion
 from creek.cli import _compose_author_query, app
 from tests.helpers import write_raw_fragment_file
@@ -775,3 +776,333 @@ def test_author_refusal_survives_markup_in_a_fragment_id(
     assert "THE-BODY-THAT-MUST-NOT-SHIP" not in plain, plain
     for frag_id in hostile_ids:
         assert frag_id in plain, plain
+
+
+# ---------------------------------------------------------------------------
+# #1354 — a contract deployed *inside the vault* must not raise the ceiling
+#
+# ``check_privacy_compliance`` takes its ceiling from exactly one place: the
+# medium contract's ``default_privacy_tier``. And ``_resolve_contract_path``
+# (``creek/author/contracts.py:111-117``) prefers the vault-deployed
+# ``00-Creek-Meta/Skills/mediums/<medium>.MEDIUM.md`` over the packaged
+# template. So one YAML line, edited inside the vault, disarms a HARD gate on
+# the very content that vault exists to protect — and #1310's refusal, pinned
+# above, silently stops firing.
+#
+# The fix keeps ``check_privacy_compliance``'s signature unchanged and folds in
+# a new ``author.max_reproduced_tier`` (default ``open``) read from
+# ``<vault>/00-Creek-Meta/creek_config.yaml``: the effective ceiling is the
+# MORE restrictive of the configured tier and the contract's declared tier. A
+# vault-authored skill file can then only ever *narrow* the gate; widening it
+# takes a deliberate operator edit to the config.
+#
+# These are the CLI end of that claim. Their MCP twins live in
+# ``tests/test_mcp_author_privacy.py``; the two surfaces are asserted
+# separately because "one read covers both" is the thing being proven, not an
+# assumption either file may make about the other.
+# ---------------------------------------------------------------------------
+
+
+def _deploy_tampered_contract(vault: Path, medium: str, tier: str) -> None:
+    """Deploy *medium*'s packaged contract into *vault*, widened to *tier*.
+
+    Copies ``MEDIUMS_TEMPLATE_DIR / f"{medium}.MEDIUM.md"`` to the deployed
+    path the loader prefers and rewrites the single
+    ``default_privacy_tier: open`` line. **Everything else about the contract
+    stays byte-for-byte the shipped template** — structure, specialist weights
+    and the full reflection rubric — so the contract remains conformant,
+    ``_preflight_medium_contract`` (``creek/cli.py:5862``) loads it without
+    complaint, and it cannot be what refuses.
+
+    That distinction is the whole reason this helper copies rather than
+    hand-writes: the malformed-contract path
+    (``default_privacy_tier: not-a-real-tier``) is already pinned by
+    :func:`test_author_refuses_when_the_medium_contract_is_unusable`, which
+    must stay green, and a tampered contract that merely failed to parse would
+    prove nothing at all about the privacy ceiling. The refusals asserted below
+    have to come from the leak gate, not from the preflight.
+
+    Args:
+        vault: Vault root; ``00-Creek-Meta/Skills/mediums`` is created if absent.
+        medium: Medium slug whose packaged contract is copied and tampered with.
+        tier: The ``default_privacy_tier`` value declared in place of ``open``.
+    """
+    packaged = (MEDIUMS_TEMPLATE_DIR / f"{medium}.MEDIUM.md").read_text(
+        encoding="utf-8",
+    )
+    tampered = packaged.replace(
+        "default_privacy_tier: open",
+        f"default_privacy_tier: {tier}",
+    )
+    # Guard against a template edit turning every test below vacuous: if the
+    # packaged contract stops declaring ``open``, the "tampering" is a no-op
+    # and the assertions would pass against an untouched ceiling.
+    assert tampered != packaged, f"{medium} template no longer declares 'open'"
+    deployed = vault / "00-Creek-Meta" / "Skills" / "mediums"
+    deployed.mkdir(parents=True, exist_ok=True)
+    (deployed / f"{medium}.MEDIUM.md").write_text(tampered, encoding="utf-8")
+
+
+def _write_vault_config(vault: Path, tier: str) -> None:
+    """Write ``<vault>/00-Creek-Meta/creek_config.yaml`` declaring the ceiling.
+
+    Serialized with ``yaml.safe_dump`` so the on-disk shape is whatever
+    :func:`creek.config.load_config` would itself round-trip, rather than a
+    hand-formatted string that only happens to parse.
+
+    Args:
+        vault: Vault root; ``00-Creek-Meta`` is created if absent.
+        tier: Value written to ``author.max_reproduced_tier``.
+    """
+    meta = vault / "00-Creek-Meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    (meta / "creek_config.yaml").write_text(
+        yaml.safe_dump({"author": {"max_reproduced_tier": tier}}),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("tier", ["personal", "intimate", "unclassified"])
+def test_a_deployed_contract_cannot_raise_the_privacy_ceiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tier: str,
+) -> None:
+    """A skill file in the vault cannot licence ``creek author`` to leak (#1354).
+
+    The end-to-end form of the defect, driven through the real CLI: one
+    intimate fragment, one tampered ``research`` contract deployed into the
+    vault, no config. The configured ceiling is its default ``open``, which is
+    stricter than anything the contract declares, so the effective ceiling must
+    stay ``open`` and the run must refuse exactly as
+    :func:`test_author_withholds_intimate_text_leaked_by_the_deterministic_render`
+    does against the untampered template.
+
+    MEASURED at HEAD with this exact vault: ``contract=intimate`` -> ``exit 0``
+    with :data:`_INTIMATE_SENTENCE` on stdout, and ``contract=unclassified`` ->
+    ``exit 0`` with the sentence on stdout. Those two cases are the
+    reproduction. ``contract=personal`` already refuses at HEAD (an intimate
+    fragment exceeds even the widened ``personal`` ceiling) and is carried here
+    as the control that the fix leaves already-correct behaviour alone — drop
+    it and nothing detects an over-fix that only ever narrows to ``open``.
+
+    VACUITY GUARD — ``--include-tier intimate`` is mandatory, not incidental.
+    Without it the #660 retrieval override defaults to ``OPEN``, the intimate
+    fragment is filtered out before the desk sees it, the draft contains no
+    protected text, and this test would pass at HEAD for entirely the wrong
+    reason: nothing leaked because nothing was retrieved. The same applies to
+    ``title == body`` in the seeding call — the deterministic renderer emits
+    fragment *titles* as claims while the gate matches *bodies*, so only when
+    the two are identical does the hermetic, no-LLM path reproduce protected
+    text at all.
+
+    Args:
+        tmp_path: Root for the synthetic vault.
+        monkeypatch: Used to drop an ambient ``CREEK_CONFIG``.
+        tier: The ``default_privacy_tier`` the deployed contract declares.
+    """
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+    vault = _vault(tmp_path)
+    write_raw_fragment_file(
+        vault,
+        "01-Fragments/Notes",
+        "frag-int",
+        _INTIMATE_SENTENCE,
+        body=_INTIMATE_SENTENCE,
+        privacy_tier="intimate",
+    )
+    _deploy_tampered_contract(vault, "research", tier)
+
+    result = runner.invoke(
+        app,
+        [
+            "author",
+            "--medium",
+            "research",
+            "--query",
+            "father",
+            "--vault",
+            str(vault),
+            "--include-tier",
+            "intimate",
+        ],
+    )
+
+    plain = _collapse(result.output)
+    assert _collapse(_INTIMATE_SENTENCE) not in plain, plain
+    assert "privacy_compliance" in plain, plain
+    assert "verdict=ESCALATE" in plain, plain
+    assert result.exit_code != 0, plain
+
+
+def test_an_operator_configured_ceiling_deliberately_permits_the_reproduction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator *can* widen the gate — from the config, and only there (#1354).
+
+    **Do not delete this test as redundant with the refusals above.** It is the
+    only thing that distinguishes the fix from a blanket refusal. Every other
+    test in this section asserts that protected text is withheld; a "fix" that
+    hardcoded ``open`` as the ceiling, or that simply refused whenever any
+    contract declared above ``open``, would satisfy all of them and quietly
+    remove a capability the ceiling is supposed to be *configurable* for.
+
+    The widening is reachable by exactly one route: an operator editing
+    ``<vault>/00-Creek-Meta/creek_config.yaml``. It is emphatically **not**
+    reachable from a medium contract, which deploys by default from the
+    packaged templates and is rewritten by ``creek skills sync``. Config and
+    contract agree on ``intimate`` here, so the fold has nothing to narrow, the
+    cited fragment sits *at* the effective ceiling, and the draft ships.
+
+    This case already passes at HEAD (``exit 0`` with the sentence on stdout)
+    and must still pass afterwards — it is a control, not a reproduction.
+
+    Args:
+        tmp_path: Root for the synthetic vault.
+        monkeypatch: Used to drop an ambient ``CREEK_CONFIG``.
+    """
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+    vault = _vault(tmp_path)
+    write_raw_fragment_file(
+        vault,
+        "01-Fragments/Notes",
+        "frag-int",
+        _INTIMATE_SENTENCE,
+        body=_INTIMATE_SENTENCE,
+        privacy_tier="intimate",
+    )
+    _deploy_tampered_contract(vault, "research", "intimate")
+    _write_vault_config(vault, "intimate")
+
+    result = runner.invoke(
+        app,
+        [
+            "author",
+            "--medium",
+            "research",
+            "--query",
+            "father",
+            "--vault",
+            str(vault),
+            "--include-tier",
+            "intimate",
+        ],
+    )
+
+    plain = _collapse(result.output)
+    assert result.exit_code == 0, plain
+    assert _collapse(_INTIMATE_SENTENCE) in plain, plain
+
+
+def test_a_configured_ceiling_below_the_contract_still_governs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The graded case: ``personal`` config vs ``intimate`` contract (#1354).
+
+    The fold is not "config wins" and not "contract wins" — it is the more
+    restrictive of the two, and this is the row where those three rules give
+    different answers. The operator configured ``personal`` (rank 1) while the
+    deployed contract declares ``intimate`` (rank 2), so the effective ceiling
+    is ``personal`` and the cited *intimate* fragment is still above it: the
+    body must be withheld.
+
+    A fix that let the contract win whenever a config key was present would
+    ship the protected sentence here while every other test in this section
+    stayed green.
+
+    Args:
+        tmp_path: Root for the synthetic vault.
+        monkeypatch: Used to drop an ambient ``CREEK_CONFIG``.
+    """
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+    vault = _vault(tmp_path)
+    write_raw_fragment_file(
+        vault,
+        "01-Fragments/Notes",
+        "frag-int",
+        _INTIMATE_SENTENCE,
+        body=_INTIMATE_SENTENCE,
+        privacy_tier="intimate",
+    )
+    _deploy_tampered_contract(vault, "research", "intimate")
+    _write_vault_config(vault, "personal")
+
+    result = runner.invoke(
+        app,
+        [
+            "author",
+            "--medium",
+            "research",
+            "--query",
+            "father",
+            "--vault",
+            str(vault),
+            "--include-tier",
+            "intimate",
+        ],
+    )
+
+    plain = _collapse(result.output)
+    assert _collapse(_INTIMATE_SENTENCE) not in plain, plain
+    assert "privacy_compliance" in plain, plain
+    assert result.exit_code != 0, plain
+
+
+def test_a_dry_run_against_a_tampered_contract_is_unaffected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--dry-run`` neither refuses nor consults the new key (#1354).
+
+    **This test passes today and must keep passing.** The dry-run branch
+    (``creek/cli.py:6039-6060``) renders no body — it prints the plan and the
+    evidence *counts* and returns before ``_preflight_medium_contract`` and
+    before ``run_author`` — so there is nothing for the privacy gate to gate
+    and the gate never runs. It is the control that pins the blast radius of
+    the fix: adding a ceiling must not turn a planning command into a refusal,
+    and must not introduce a config read on a branch that has never needed one
+    (a vault with no ``creek_config.yaml``, or an unreadable one, must still
+    plan).
+
+    Same tampered ``intimate`` contract as its refusing sibling above, so the
+    only difference between green here and red there is the flag.
+
+    Args:
+        tmp_path: Root for the synthetic vault.
+        monkeypatch: Used to drop an ambient ``CREEK_CONFIG``.
+    """
+    monkeypatch.delenv("CREEK_CONFIG", raising=False)
+    vault = _vault(tmp_path)
+    write_raw_fragment_file(
+        vault,
+        "01-Fragments/Notes",
+        "frag-int",
+        _INTIMATE_SENTENCE,
+        body=_INTIMATE_SENTENCE,
+        privacy_tier="intimate",
+    )
+    _deploy_tampered_contract(vault, "research", "intimate")
+
+    result = runner.invoke(
+        app,
+        [
+            "author",
+            "--medium",
+            "research",
+            "--query",
+            "father",
+            "--vault",
+            str(vault),
+            "--include-tier",
+            "intimate",
+            "--dry-run",
+        ],
+    )
+
+    plain = _collapse(result.output)
+    assert result.exit_code == 0, plain
+    assert "privacy_compliance" not in plain, plain
+    # The plan/evidence summary is counts only; no body, and so no leak.
+    assert _collapse(_INTIMATE_SENTENCE) not in plain, plain

@@ -205,20 +205,31 @@ other `medium` returns `status: error` naming the wired set.
 **A condemned draft is refused, not returned ([#1353](https://github.com/Geoffe-Ga/Creek-Vault/issues/1353)).**
 When the Writing Desk's HARD privacy check raises a `privacy_compliance`
 finding — the drafted prose reproduces a cited fragment's protected text
-verbatim, above the medium contract's `default_privacy_tier` — the verb
+verbatim, above the **effective reproduction ceiling**
+([#1354](https://github.com/Geoffe-Ga/Creek-Vault/issues/1354)) — the verb
 answers `status: "refused"` and **omits `body`, `claims` and `provenance`
-entirely**. It still carries `medium`, `query`, `verdict`, `rounds`, a fixed
-`reason`, and `privacy_findings`: the offending findings' `dimension`,
-`severity` and `message`, where each message names the fragment id and both
-tiers involved — the fragment's own tier and the contract default it exceeded
-— and no corpus text. The keys are *absent*, never `""` or `null` — a
-falsy-but-present `body` is exactly the shape that lets a caller print nothing
-and believe it published a draft, whereas a missing key raises at the moment
-of the refusal. Until #1353 this envelope answered `status: ok` with the
-verdict, the finding **and** the protected text still in `body`. The CLI half
-of the same leak was [#1310](https://github.com/Geoffe-Ga/Creek-Vault/issues/1310),
-closed separately by #1352, so `creek author` and `creek.author` now withhold
-a condemned draft on the same trigger.
+entirely**. That effective ceiling has two sources and is the more
+restrictive of them: the operator's `author.max_reproduced_tier` in
+`creek_config.yaml` (default `open`, the strictest rank) and the medium
+contract's `default_privacy_tier`; a contract can only ever narrow the
+ceiling, never widen it. The refused response still carries `medium`,
+`query`, `verdict`, `rounds`, a fixed `reason`, and `privacy_findings`: the
+offending findings' `dimension`, `severity` and `message`, where each message
+now names the fragment id, the fragment's own tier, the effective ceiling it
+exceeded, and which of the two sources set that ceiling
+(`author.max_reproduced_tier`, the medium contract, or no medium contract at
+all) — and no corpus text, e.g.:
+
+`Cited fragment 'frag-int' is 'intimate' (above the effective 'open' ceiling, set by author.max_reproduced_tier) yet its protected text appears in the draft.`
+
+The keys are *absent*, never `""` or `null` — a falsy-but-present `body` is
+exactly the shape that lets a caller print nothing and believe it published a
+draft, whereas a missing key raises at the moment of the refusal. Until #1353
+this envelope answered `status: ok` with the verdict, the finding **and** the
+protected text still in `body`. The CLI half of the same leak was
+[#1310](https://github.com/Geoffe-Ga/Creek-Vault/issues/1310), closed
+separately by #1352, so `creek author` and `creek.author` now withhold a
+condemned draft on the same trigger.
 
 Three details that are easy to misread:
 
@@ -233,10 +244,17 @@ Three details that are easy to misread:
   refusing on the verdict would withhold ordinary drafts.
 - **`tier_ceiling_enforced` stays `true`.** It is a claim about the #660
   retrieval filter, which ran and did its job; the breach is against a
-  *different* gate, the medium contract's `default_privacy_tier` (`open` in
-  all six shipped templates). At `ceiling=all` the caller *is* admitted to
-  intimate content, which is precisely why this leak survived every
-  `ceiling=open` probe.
+  *different* gate — the effective reproduction ceiling described above, the
+  more restrictive of `author.max_reproduced_tier` (`open` by default) and the
+  medium contract's `default_privacy_tier` (`open` in all six shipped
+  templates). This is a different axis from the `privacy_tier_ceiling`
+  parameter (documented below, under "Every tool requires a
+  `privacy_tier_ceiling` parameter"): `privacy_tier_ceiling` governs what a
+  caller is *admitted* to retrieve as evidence, while the effective
+  reproduction ceiling governs what the finished draft may *reproduce*
+  verbatim. At `ceiling=all` the caller *is* admitted to *read* intimate
+  content — that says nothing about whether the drafted prose may reproduce
+  it — which is precisely why this leak survived every `ceiling=open` probe.
 
 Returning the text under a second key (`withheld_body` and similar) was
 considered and **rejected**: the whole envelope is serialized to the client —

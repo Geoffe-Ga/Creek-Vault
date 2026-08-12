@@ -1,7 +1,9 @@
 """Tests for creek.config module — configuration loader with Pydantic Settings."""
 
 import logging
+import warnings
 from pathlib import Path
+from typing import get_args
 
 import pytest
 import yaml
@@ -10,6 +12,7 @@ from pydantic import ValidationError
 from creek.config import (
     CONFIG_PATH_ENV_VAR,
     AIStyleConfig,
+    AuthorConfig,
     ChatbotCleaningConfig,
     ClassificationConfig,
     CleaningConfig,
@@ -33,6 +36,7 @@ from creek.config import (
     generate_default_config,
     load_config,
 )
+from creek.models import PrivacyTier
 
 # ---------------------------------------------------------------------------
 # Individual nested model defaults
@@ -1188,3 +1192,120 @@ class TestTimezoneFieldDeleted:
         """
         with pytest.raises(ValidationError):
             CreekConfig.model_validate(payload)
+
+
+class TestAuthorMaxReproducedTier:
+    """Tests for ``AuthorConfig.max_reproduced_tier`` (#1354).
+
+    The privacy ceiling the Writing Desk's HARD leak gate enforces used to come
+    from the medium contract alone — and a medium contract is authored *inside
+    the vault*, so one edited YAML line disarmed the gate. This field moves the
+    permission out of the vault and into the operator's ``creek_config.yaml``,
+    where the effective ceiling becomes the more restrictive of the two.
+
+    Every invalid value therefore has to fail **closed**, at ``open``: this is
+    the input to a security gate, and the alternative — raising — turns a typo
+    into a crashed review, which is the pressure that gets checks skipped.
+    """
+
+    def test_defaults_to_the_strictest_tier(self) -> None:
+        """An operator who never touched the key gets the strictest ceiling.
+
+        The default is what every existing vault gets on upgrade, so it must
+        be the value that can only *narrow* the gate relative to today.
+        """
+        assert AuthorConfig().max_reproduced_tier == "open"
+
+    def test_a_garbage_value_fails_closed_to_open(self) -> None:
+        """An unrecognised tier string is ignored, not raised on.
+
+        Validated through ``model_validate`` rather than the keyword
+        constructor because that is the path a real config takes: the string
+        arrives from ``yaml.safe_load`` inside :func:`load_config`, where no
+        static type ever constrained it.
+        """
+        cfg = AuthorConfig.model_validate({"max_reproduced_tier": "banana"})
+
+        assert cfg.max_reproduced_tier == "open"
+
+    def test_an_explicit_null_fails_closed_to_open(self) -> None:
+        """``max_reproduced_tier:`` with no value parses as ``None``.
+
+        A bare key with an empty value is the single most likely hand-edit
+        mistake, and YAML hands it over as ``None`` rather than as a missing
+        key — so the field default never fires and the validator has to.
+        """
+        cfg = AuthorConfig.model_validate({"max_reproduced_tier": None})
+
+        assert cfg.max_reproduced_tier == "open"
+
+    def test_a_valid_tier_is_accepted(self) -> None:
+        """A deliberate operator choice survives validation unchanged.
+
+        The fail-closed cases above are all satisfied by a validator that
+        hard-codes ``"open"``; this is what stops that.
+        """
+        cfg = AuthorConfig(max_reproduced_tier="intimate")
+
+        assert cfg.max_reproduced_tier == "intimate"
+
+    def test_the_legacy_public_alias_maps_to_open(self) -> None:
+        """The pre-INC-003 spelling ``"public"`` still means ``open``.
+
+        :meth:`creek.models.PrivacyTier._missing_` maps the legacy value and
+        emits a :class:`DeprecationWarning`. An older vault's config must land
+        on ``open`` — the same tier — rather than fall through the alias into
+        the garbage path, which would also give ``open`` but by accident.
+
+        The warning is suppressed rather than asserted on: whether the
+        validator routes through the enum (and so re-emits it) is an
+        implementation detail; that ``"public"`` means ``open`` is not.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            cfg = AuthorConfig.model_validate({"max_reproduced_tier": "public"})
+
+        assert cfg.max_reproduced_tier == "open"
+
+    def test_the_literal_mirrors_every_privacy_tier(self) -> None:
+        """``PrivacyTierName`` must list exactly the tiers the enum defines.
+
+        ``creek/config.py`` cannot import :mod:`creek.models` at module level:
+        ``creek/models.py`` imports back from ``creek.config`` at the bottom of
+        the file (the ``# noqa: E402`` import at ``creek/models.py:1153``), so
+        the pair is only acyclic in one direction. The ``Literal`` is therefore
+        a **hand-maintained mirror** of
+        :class:`~creek.models.PrivacyTier`, and nothing but this test keeps the
+        two honest.
+
+        The drift matters in the dangerous direction: add a fifth tier to the
+        enum, forget the mirror, and an operator who configures the new tier
+        gets it silently rejected and replaced by the fail-closed default —
+        or, worse, the leak gate compares a name the ceiling table has never
+        heard of.
+
+        The import is local so this file still collects (and its ~200 other
+        tests still run) on a tree where the alias does not exist yet.
+        """
+        from creek.config import PrivacyTierName
+
+        assert set(get_args(PrivacyTierName)) == {tier.value for tier in PrivacyTier}
+
+    def test_generate_default_config_seeds_the_key(self, tmp_path: Path) -> None:
+        """``creek init`` writes the key out, at the safe default.
+
+        A field that only exists in Python is a field operators never discover.
+        ``generate_default_config`` is what ``creek init`` calls, so the
+        generated ``creek_config.yaml`` is where an operator learns the
+        ceiling is theirs to set — and it has to arrive at ``open``, not at
+        whatever the last vault-authored contract happened to declare.
+
+        Args:
+            tmp_path: Destination directory for the generated config.
+        """
+        output = tmp_path / "creek_config.yaml"
+
+        generate_default_config(output)
+
+        data = yaml.safe_load(output.read_text(encoding="utf-8"))
+        assert data["author"]["max_reproduced_tier"] == "open"
