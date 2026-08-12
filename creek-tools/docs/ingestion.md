@@ -257,6 +257,25 @@ creek ingest --refresh-ai-chat --vault ~/Vault
 
 It walks `01-Fragments/`, re-splits each merged Claude/ChatGPT fragment into a human (`self`) and a quarantined AI (`ai`, `voice_weight=0.0`) fragment, and removes the merged file. Running it twice is a no-op; a vault with no merged chat fragments is unchanged. Afterwards, `creek voice-authenticity` (see [generation](./generation.md#voice-fidelity-feat-040)) should report a near-zero AI-corpus leak.
 
+### Split messages are one turn
+
+A turn is not a message. Sending a thought in two messages before the model replies is ordinary usage, and so is a model that answers in two. Both ingestors now merge each run of consecutive same-role messages into one turn, joined by a **blank line** — a bare newline would let an indented code block or a list sent as its own message be absorbed into the previous paragraph. Anything that is neither a human nor an assistant message (a system prompt, a tool result) is skipped and no longer breaks the turn around it.
+
+Before [#1333](https://github.com/Geoffe-Ga/Creek-Vault/issues/1333) each run kept exactly one message and dropped the rest silently. The costly half was the human side: those fragments are `source.author = self`, so the voice fingerprint was trained on a filtered sample of how the operator actually writes.
+
+**Recovering an affected vault.** Re-ingest the export:
+
+```bash
+creek ingest --type claude --input ~/exports/claude --vault ~/Vault
+```
+
+The Claude and ChatGPT sources are unledgered (only `markdown` is — see [Idempotency](#idempotency) above), so nothing records those turns as already processed and the re-ingest genuinely recovers the missing text. Two things to know before running it:
+
+* Nothing is deleted or rewritten. The recovered turn has different content, so it hashes to a **new** fragment id and is written alongside the truncated fragment already in the vault, which stays exactly where it is. Expect near-duplicates for every affected turn and remove the short ones by hand.
+* Aggregate parents built over those turns (`creek atomize`, FEAT-022) hash their ordered child ids, so a recovered child mints a new parent too and the old parent is left behind the same way.
+
+Turn *numbering* is unaffected: a run collapses into the same single turn it always produced, so `turn_index` and the `(turn N)` titles do not shift. The one exception is a ChatGPT conversation with a system or tool node between a question and its answer, which used to yield no fragments at all and now yields the turn it should always have.
+
 ## Document attribution (the name on the file)
 
 A DOCX carries `core_properties.author` and a PDF carries `/Author` — Word stamps one on every save. That name answers "what name is on the file", which is **not** the question `source.author` answers ("whose views does this stand for?", on the `self|ai|other|collaborative` axis). Ingest keeps the two apart:
