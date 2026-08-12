@@ -1152,6 +1152,127 @@ def _sync_validate_source(
         raise typer.Exit(code=2)
 
 
+def _sync_tier_b_fragment_count(vault_path: Path) -> int:
+    """Count the fragments a Tier-B pass could bill an LLM call for (#1335).
+
+    An upper bound, not an invoice: the pass skips fragments that are already
+    classified (``force=False``), so the announcement says "up to".
+
+    Args:
+        vault_path: Vault root whose ``01-Fragments`` tree is measured.
+
+    Returns:
+        The number of fragment notes under ``01-Fragments``, or ``0`` when
+        that directory does not exist yet.
+    """
+    root = vault_path / "01-Fragments"
+    if not root.exists():
+        return 0
+    return sum(1 for _ in root.rglob("*.md"))
+
+
+def _sync_gate_tier_b(
+    tier_norm: str,
+    vault_path: Path,
+    *,
+    dry_run: bool,
+    assume_yes: bool,
+) -> None:
+    """Announce Tier B's cost and, at a TTY, confirm it before spending (#1335).
+
+    Only a real Tier-B pass is gated: Tier A is the cheap per-source chain and
+    a dry run spends nothing. The announcement is unconditional because a
+    scheduler log is the only place a nightly Tier-B pass is otherwise opaque;
+    the *confirmation* is TTY-gated because every unit
+    :mod:`creek.sync.schedule` installs invokes a bare
+    ``creek sync --tier B --vault <path>`` with no ``--yes`` and no stdin, and
+    a prompt there would block forever on a question nobody can answer. The
+    skipped confirmation is stated out loud rather than left as an invisible
+    fork in behaviour.
+
+    All of this command's added branching lives here so ``sync`` itself gains
+    none, mirroring the :func:`_gate_consent` pair above.
+
+    Args:
+        tier_norm: The normalised tier, ``"A"`` or ``"B"``.
+        vault_path: Vault root the pass would classify.
+        dry_run: Whether this invocation only echoes the plan.
+        assume_yes: Whether ``--yes`` waived the confirmation.
+
+    Raises:
+        typer.Exit: With code ``1`` when the operator declines, before any
+            step (and before ``last-run.json``) is touched.
+    """
+    if tier_norm != "B" or dry_run:
+        return
+    count = _sync_tier_b_fragment_count(vault_path)
+    console.print(
+        f"[bold][sync] Tier B will classify up to {count} fragments "
+        f"(one LLM call each), then link and rebuild the index.[/bold]",
+    )
+    if not _is_interactive():
+        console.print("[sync] non-interactive; proceeding without confirmation.")
+        return
+    if not _confirm("Continue?", assume_yes=assume_yes):
+        console.print("[yellow]Aborted.[/yellow]")
+        raise typer.Exit(code=1)
+
+
+def _sync_dispatch_guarded(
+    tier_norm: str,
+    *,
+    dry_run: bool,
+    config: CreekConfig,
+    vault_path: Path,
+    source: str | None,
+) -> dict[str, int] | None:
+    """Dispatch the tier, turning a provider refusal into a legible exit (#1335).
+
+    ``creek classify --method llm`` already catches this refusal; the sync path
+    did not, so a Tier-B tick with an unreachable provider (or no cloud
+    consent) died with an unhandled traceback into a scheduler log. The
+    exception carries its own provider-specific remediation, so this prints
+    that text rather than restating it, and lets the exit propagate before
+    ``last-run.json`` can record a pass that never ran.
+
+    The handler wraps the whole dispatch rather than only the Tier-B branch,
+    which is wider than the risk it covers but cannot misfire: Tier A always
+    classifies with ``method="rules"``, and
+    :func:`~creek.classify.classify_engine.run_classify` only builds the
+    provider-backed tier classifiers — the sole thing that raises this — when
+    the method is ``"llm"``. Keeping one handler here rather than two keeps
+    ``sync`` itself free of a ``try`` block.
+
+    Args:
+        tier_norm: The normalised tier, ``"A"`` or ``"B"``.
+        dry_run: Whether to echo the plan instead of executing it.
+        config: The resolved vault config.
+        vault_path: Vault root to operate on.
+        source: Optional single Tier-A source override.
+
+    Returns:
+        Per-source ingested counts for a real Tier-A run, else ``None``.
+
+    Raises:
+        typer.Exit: With code ``1`` when the configured LLM provider refuses.
+    """
+    from creek.classify.classify_engine import LLMProviderUnavailableError
+
+    try:
+        counts = _sync_dispatch(
+            tier_norm,
+            dry_run=dry_run,
+            config=config,
+            vault_path=vault_path,
+            source=source,
+        )
+    except LLMProviderUnavailableError as exc:
+        console.print(f"[red][sync] tier {tier_norm} aborted: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    else:
+        return counts
+
+
 @app.command()
 def sync(
     tier: str = typer.Option(
@@ -1163,7 +1284,16 @@ def sync(
         help="Limit a Tier-A run to one source (explicitly overrides its toggle)",
     ),
     dry_run: bool = typer.Option(
-        False, "--dry-run", help="Echo the plan without executing (current default)"
+        False,
+        "--dry-run",
+        help=(
+            "Echo the ordered plan and run nothing. Opt-in: a bare invocation "
+            "executes the tier, and Tier B spends one LLM call per "
+            "unclassified fragment before linking and rebuilding the index."
+        ),
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the interactive Tier-B confirmation."
     ),
     install_schedule: str | None = typer.Option(
         None,
@@ -1187,8 +1317,15 @@ def sync(
     ``--tier A`` is the cheap per-source pass (pull -> incremental ingest ->
     rules classify) for each enabled source; ``--tier B`` is the nightly global
     pass (LLM classify -> link -> index). Linking and indexing run only in Tier
-    B (R6). ``--dry-run`` echoes the ordered plan without executing. Every run
-    records ``00-Creek-Meta/State/sync/last-run.json``; because every step is
+    B (R6). A bare invocation executes the chosen tier; ``--dry-run`` is the
+    opt-in that echoes the ordered plan and runs nothing.
+
+    Tier B spends one LLM call per unclassified fragment, so it announces that
+    cost on every run and asks for confirmation **only at an interactive
+    terminal**: ``--yes`` skips the question, and a scheduled or otherwise
+    non-interactive run (every unit ``--install-schedule`` writes) proceeds
+    unprompted. Every run records
+    ``00-Creek-Meta/State/sync/last-run.json``; because every step is
     idempotent, a missed tick self-heals on the next run (no catch-up queue).
 
     ``--install-schedule launchd|systemd`` emits the host's schedule units and
@@ -1212,8 +1349,11 @@ def sync(
     config = _load_config_for_vault(vault)
     vault_path = vault or config.vault_path
     _sync_validate_source(tier_norm, source, config)
+    # After validation on purpose: announcing a cost for an invocation that is
+    # about to be rejected as a usage error would be misleading.
+    _sync_gate_tier_b(tier_norm, vault_path, dry_run=dry_run, assume_yes=yes)
 
-    source_counts = _sync_dispatch(
+    source_counts = _sync_dispatch_guarded(
         tier_norm,
         dry_run=dry_run,
         config=config,
@@ -5692,7 +5832,10 @@ def author(
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
-        help="Print the pipeline plan and stub evidence summary without authoring.",
+        help=(
+            "Print the pipeline plan and the gathered evidence summary, "
+            "without voicing or reflection."
+        ),
     ),
     max_rounds: int | None = typer.Option(
         None,

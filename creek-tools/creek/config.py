@@ -1650,9 +1650,11 @@ class SyncConfig(BaseModel):
     """Scheduling configuration for ``creek sync`` (#676 / SPEC R3).
 
     Holds the per-source enable toggles and the two-tier cadence. The cadence
-    values are config-tunable (decision #5) even though the skeleton command
-    does not schedule anything yet — a later issue emits the launchd/systemd
-    units that read them.
+    values are config-tunable (decision #5) and are read by
+    :func:`~creek.sync.schedule.render_launchd_plists`,
+    :func:`~creek.sync.schedule.render_systemd_units` and
+    :func:`~creek.sync.schedule.render_crontab`, which
+    ``creek sync --install-schedule launchd|systemd`` writes to disk.
     """
 
     tier_a_interval_minutes: int = Field(default=30, ge=1)

@@ -123,8 +123,12 @@ def resolve_tier_a_plan(source: str) -> list[str]:
 
     Tier A is the cheap, per-source pass: pull the source, incrementally
     ingest it, then run the offline rules classifier. This is a *plan* (an
-    ordered list of human-readable step strings) — the skeleton command echoes
-    it; real execution lands in a later issue.
+    ordered list of human-readable step strings), which is all
+    ``creek sync --tier A --dry-run`` prints. A bare ``creek sync --tier A``
+    does not use this function at all: #678 shipped real execution, and the
+    equivalent steps are run for real by
+    :func:`~creek.cli._sync_run_tier_a`. Keep the two in step — this list is
+    what the operator is shown when they ask what the tier *would* do.
     """
     ingest_type = sync_ingest_type(source)
     return [

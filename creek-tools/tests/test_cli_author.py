@@ -151,6 +151,27 @@ def test_author_command_surface_is_not_stale_stub_text() -> None:
     assert "real, deterministic" in author_cmd.__doc__.lower()
 
 
+def test_author_help_does_not_call_the_evidence_summary_a_stub() -> None:
+    """``--dry-run``'s help must not call the evidence summary a stub (#1335).
+
+    The sibling of the ``creek sync`` help fix. ``author --dry-run`` calls the
+    conductor's real ``gather_evidence`` and prints the real claim and
+    source-fragment counts (asserted by
+    :func:`test_author_dry_run_prints_plan_and_evidence`), but the option's
+    help string still advertised a "stub evidence summary" — telling the
+    operator the numbers are fake when they are not, which is exactly the
+    class of drift #1335 is about. The docstring at ``cli.py`` already says
+    the desk does real work; the option help has to agree.
+    """
+    result = runner.invoke(app, ["author", "--help"])
+
+    assert result.exit_code == 0, result.output
+    flat = _flatten_panel(result.output)
+    # Guards the negative assertion below against a vacuous pass on empty help.
+    assert "--dry-run" in flat, flat
+    assert "stub evidence" not in flat.lower(), flat
+
+
 def test_author_run_prints_verdict(tmp_path: Path) -> None:
     """A full author run prints the verdict and a body."""
     result = runner.invoke(
