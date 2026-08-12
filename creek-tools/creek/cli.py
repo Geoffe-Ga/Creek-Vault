@@ -6336,6 +6336,21 @@ def clean_report(
 # ---------------------------------------------------------------------------
 
 
+_MAX_DELETED_FILE_ROWS = 20
+"""How many deleted paths the purge summary table prints before capping.
+
+A vault purge used to report the three top-level folders it walked, so
+an unbounded table was three rows. Since #1340 it reports one row per
+destroyed fragment, which at vault scale is a scrollback flood that
+pushes the counts — the part an operator actually reads — off screen.
+Twenty is enough to recognise *what kind* of content was destroyed
+without becoming the output. The remainder is always stated, never
+silently dropped: a truncated erasure record that does not admit it is
+truncated is worse than a long one, and ``PurgeAuditEntry`` does not
+carry ``deleted_files``, so there is no log to defer the operator to.
+"""
+
+
 def _render_voice_purge_notes(result: PurgeResult) -> None:
     """Render the ``07-Voice`` sweep's count, follow-up, and any shortfall.
 
@@ -6394,13 +6409,25 @@ def _render_purge_result(result: PurgeResult) -> None:
             f"Intimate stubs removed: {result.intimate_stubs_removed}",
         )
     _render_voice_purge_notes(result)
+    _render_deleted_files(result.deleted_files)
 
-    if result.deleted_files:
-        table = Table(title="Deleted files")
-        table.add_column("Path", style="dim")
-        for path in result.deleted_files:
-            table.add_row(path)
-        console.print(table)
+
+def _render_deleted_files(paths: list[str]) -> None:
+    """Print the deleted-path table, capped at :data:`_MAX_DELETED_FILE_ROWS`.
+
+    Args:
+        paths: Every path the purge deleted (or would delete).
+    """
+    if not paths:
+        return
+    table = Table(title="Deleted files")
+    table.add_column("Path", style="dim")
+    for path in paths[:_MAX_DELETED_FILE_ROWS]:
+        table.add_row(path)
+    console.print(table)
+    hidden = len(paths) - _MAX_DELETED_FILE_ROWS
+    if hidden > 0:
+        console.print(f"[dim]... and {hidden} more (of {len(paths)}).[/dim]")
 
 
 def _confirm(message: str, *, assume_yes: bool) -> bool:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -1940,7 +1941,20 @@ def test_vault_purge_deletes_content_preserves_structure(
 
     result = engine.purge_vault(VAULT_PURGE_CONFIRMATION)
 
-    assert result.fragments_affected >= 1
+    # Exactly one fragment existed, so exactly one was destroyed. The
+    # loose ``>= 1`` this replaces was satisfied by the pre-#1340 count
+    # of 3 — the number of top-level *directories* the wipe walked, two
+    # of them empty.
+    assert result.fragments_affected == 1
+    assert result.affected_fragment_ids == ["frag-A"]
+    # Real files only. A directory path in an RTBF deletion record is
+    # neither a fragment nor an auditable erasure of one.
+    assert sorted(result.deleted_files) == sorted(
+        [
+            str(vault / "01-Fragments" / "Conversations" / "Alpha.md"),
+            str(vault / "02-Threads" / "Active" / "Waves.md"),
+        ],
+    )
     # Top-level content folders still exist
     assert (vault / "01-Fragments").is_dir()
     assert (vault / "02-Threads").is_dir()
@@ -1959,8 +1973,351 @@ def test_vault_purge_dry_run_preserves(tmp_path: Path) -> None:
     result = engine.purge_vault(VAULT_PURGE_CONFIRMATION)
 
     assert result.dry_run is True
-    assert result.fragments_affected >= 1
+    assert result.fragments_affected == 1
+    assert result.affected_fragment_ids == ["frag-A"]
     assert frag.exists()
+
+
+# ---------------------------------------------------------------------------
+# #1340 — a vault purge counts fragment FILES, never folders
+#
+# ``purge_vault`` reported ``fragments_affected = len(deleted_files)``,
+# and ``deleted_files`` held the *top-level* entries of each content
+# folder — directories, mostly. A vault holding 500 fragments in
+# ``01-Fragments/Conversations`` therefore certified "3 fragments
+# deleted, affected_fragments=[]" to the compliance log while destroying
+# all 500. These tests pin the count, the ids, and the shape of
+# ``deleted_files`` against the filesystem rather than against each
+# other.
+# ---------------------------------------------------------------------------
+
+_VAULT_PURGE_CORPUS = 500
+"""Fragment count for the #1340 acceptance criterion, verbatim from the issue.
+
+Large enough that the defect is unmistakable (the pre-fix report said
+``3``) and small enough to stay a unit test.
+"""
+
+_RECONCILIATION_CORPUS = 20
+"""Smaller corpus for the dry/apply comparison — the 500 lives in one test."""
+
+
+def _seed_fragment_corpus(vault: Path, count: int) -> list[str]:
+    """Write *count* fragments spread across two nested subdirectories.
+
+    Nesting is the point: the defect counted the top-level entries of
+    ``01-Fragments``, so a corpus that lives two levels down is
+    invisible to it no matter how large.
+
+    Args:
+        vault: Vault root.
+        count: How many fragment files to write.
+
+    Returns:
+        The ids written, in creation order.
+    """
+    ids: list[str] = []
+    for index in range(count):
+        subfolder = "Conversations/2024" if index % 2 == 0 else "Messages/Archive/2025"
+        frag_id = f"frag-{index:04d}"
+        _write_fragment(vault, frag_id, f"Note-{index:04d}", subfolder=subfolder)
+        ids.append(frag_id)
+    return ids
+
+
+def _relative_deleted_files(result: PurgeResult, vault: Path) -> list[str]:
+    """Return ``deleted_files`` as sorted paths relative to their own vault.
+
+    Two vaults built for a dry/apply comparison live under different
+    ``tmp_path`` roots, so the absolute strings can never be equal even
+    when the engine behaved identically. Stripping each result's own
+    root is what makes the comparison meaningful.
+
+    Args:
+        result: The purge result whose ``deleted_files`` to normalise.
+        vault: The vault root that result was produced against.
+
+    Returns:
+        Sorted root-relative path strings.
+    """
+    prefix = str(vault)
+    return sorted(path.removeprefix(prefix) for path in result.deleted_files)
+
+
+def _last_vault_outcome(vault: Path) -> PurgeAuditEntry:
+    """Return the last ``vault``-operation ``outcome`` line from the audit log.
+
+    Args:
+        vault: Vault root whose ``purge.jsonl`` to read.
+
+    Returns:
+        The final outcome entry written by a ``purge_vault`` call.
+    """
+    outcomes = [
+        entry
+        for entry in PurgeAuditLog(vault).read()
+        if entry.phase == "outcome" and entry.operation == "vault"
+    ]
+    assert outcomes, "purge_vault must write an outcome line"
+    return outcomes[-1]
+
+
+def test_vault_purge_counts_every_fragment_file_not_the_folders(
+    tmp_path: Path,
+) -> None:
+    """500 fragments are reported as 500, and every id is named (#1340).
+
+    The acceptance criterion of the issue, asserted three ways that can
+    fail independently: against the number counted off the filesystem
+    *before* the purge, against the literal 500, and against the audit
+    log the compliance officer actually reads. An internal counter
+    checked only against another internal counter can drift the same way
+    twice.
+    """
+    vault = _make_vault(tmp_path)
+    expected_ids = _seed_fragment_corpus(vault, _VAULT_PURGE_CORPUS)
+    on_disk_before = sorted((vault / "01-Fragments").rglob("*.md"))
+    assert len(on_disk_before) == _VAULT_PURGE_CORPUS
+
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert result.fragments_affected == len(on_disk_before)
+    assert result.fragments_affected == _VAULT_PURGE_CORPUS
+    assert len(result.affected_fragment_ids) == _VAULT_PURGE_CORPUS
+    assert set(result.affected_fragment_ids) == set(expected_ids)
+    outcome = _last_vault_outcome(vault)
+    assert outcome.fragments_deleted == _VAULT_PURGE_CORPUS
+    assert len(outcome.affected_fragments) == _VAULT_PURGE_CORPUS
+    assert list((vault / "01-Fragments").rglob("*.md")) == []
+
+
+def test_vault_purge_records_no_deleted_file_for_an_empty_directory(
+    tmp_path: Path,
+) -> None:
+    """An empty folder is removed from disk but is not a deleted *file* (#1340).
+
+    ``deleted_files`` is a record of destroyed content. An empty
+    directory destroyed nothing, so it must contribute zero entries —
+    while still disappearing, because the wipe's job is unchanged.
+    """
+    vault = _make_vault(tmp_path)
+    empty = vault / "02-Threads" / "Dormant"
+    empty.mkdir()
+    _write_thread(vault, "thread-1", "Waves")
+
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert result.deleted_files == [str(vault / "02-Threads" / "Active" / "Waves.md")]
+    assert result.fragments_affected == 0
+    assert result.affected_fragment_ids == []
+    assert not empty.exists()
+    assert (vault / "02-Threads").is_dir()
+
+
+def test_vault_purge_deleted_files_names_files_and_no_directory(
+    tmp_path: Path,
+) -> None:
+    """``deleted_files`` is exactly the regular files, nested ones included.
+
+    Asserted as an exact set rather than with a post-hoc ``is_dir()``
+    sweep: after the purge everything named is gone, so ``is_dir()``
+    answers ``False`` for a directory path too and would pass vacuously.
+    The directory paths are collected *before* the purge instead, and
+    the record is required to be disjoint from them.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha", subfolder="Conversations/2024/May")
+    nested = vault / "01-Fragments" / "Conversations" / "2024" / "May" / "Alpha.md"
+    _write_thread(vault, "thread-1", "Waves")
+    (vault / "03-Eddies" / "Stale").mkdir()
+    directories_before = {
+        str(path)
+        for folder in ("01-Fragments", "02-Threads", "03-Eddies", "04-Praxis")
+        for path in (vault / folder).rglob("*")
+        if path.is_dir()
+    }
+
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert sorted(result.deleted_files) == sorted(
+        [
+            str(nested),
+            str(vault / "02-Threads" / "Active" / "Waves.md"),
+        ],
+    )
+    assert directories_before.isdisjoint(result.deleted_files)
+    assert result.fragments_affected == 1
+    assert result.affected_fragment_ids == ["frag-A"]
+
+
+def test_vault_purge_counts_unidentifiable_fragments_but_names_no_id(
+    tmp_path: Path,
+) -> None:
+    """The count and the id list are deliberately asymmetric (#1340).
+
+    A vault purge destroys every file under ``01-Fragments`` whether or
+    not the engine can read an id out of it, so the *count* must include
+    a fragment with no ``id`` and one whose frontmatter will not parse.
+    The id list cannot: naming an id nobody recorded would be a
+    fabrication in a compliance record. Under-counting the destruction
+    is the worse error, so the asymmetry resolves that way.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    no_id = vault / "01-Fragments" / "Conversations" / "no-id.md"
+    no_id.write_text("---\ntitle: Untitled\n---\nA body.\n", encoding="utf-8")
+    broken = vault / "01-Fragments" / "Messages" / "broken.md"
+    broken.write_text("---\ntitle: [unclosed\n---\nA body.\n", encoding="utf-8")
+
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert result.fragments_affected == 3
+    assert result.affected_fragment_ids == ["frag-A"]
+    assert list((vault / "01-Fragments").rglob("*.md")) == []
+
+
+def test_vault_purge_dry_run_predicts_its_own_apply(tmp_path: Path) -> None:
+    """A dry vault purge and its apply twin agree on count, ids, and paths.
+
+    Two vaults seeded identically, one previewed and one destroyed. The
+    enumeration pass has to run *before* the wipe for this to hold: read
+    the ids afterwards and the apply run would report none.
+    """
+    dry_vault = _make_vault(tmp_path / "dry")
+    apply_vault = _make_vault(tmp_path / "apply")
+    for target in (dry_vault, apply_vault):
+        _seed_fragment_corpus(target, _RECONCILIATION_CORPUS)
+
+    dry = PurgeEngine(dry_vault, dry_run=True).purge_vault(VAULT_PURGE_CONFIRMATION)
+    applied = PurgeEngine(apply_vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert dry.fragments_affected == applied.fragments_affected
+    assert dry.fragments_affected == _RECONCILIATION_CORPUS
+    assert dry.affected_fragment_ids == applied.affected_fragment_ids
+    assert _relative_deleted_files(dry, dry_vault) == _relative_deleted_files(
+        applied,
+        apply_vault,
+    )
+
+
+def test_vault_purge_never_counts_staged_adepthood_files_as_fragments(
+    tmp_path: Path,
+) -> None:
+    """Staged source files count on their own counter only (#845/#1023/#1340).
+
+    ``_wipe_adepthood_staging``'s contract is documented at
+    ``engine.py:1343-1344``: staged files are source material, never
+    appended to ``deleted_files`` and never inflating
+    ``fragments_affected``. Until #1340 that held only because the
+    ``fragments_affected`` assignment happened to run before the staging
+    sweep. Statement order is not an invariant; this test is.
+    """
+    vault = _make_vault(tmp_path)
+    _frag_a, staged_a = _write_journal_fragment_with_staged(
+        vault,
+        "frag-J1",
+        "entry-one",
+    )
+    _frag_b, staged_b = _write_journal_fragment_with_staged(
+        vault,
+        "frag-J2",
+        "entry-two",
+    )
+
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert result.journal_staged_removed == 2
+    assert result.fragments_affected == 2
+    assert sorted(result.affected_fragment_ids) == ["frag-J1", "frag-J2"]
+    assert sorted(result.deleted_files) == sorted(
+        [
+            str(vault / "01-Fragments" / "Journal" / "entry-one.md"),
+            str(vault / "01-Fragments" / "Journal" / "entry-two.md"),
+        ],
+    )
+    assert not staged_a.exists()
+    assert not staged_b.exists()
+
+
+def test_the_vault_deletion_record_never_walks_through_a_symlink(
+    tmp_path: Path,
+) -> None:
+    """A symlinked folder does not put out-of-vault paths in the record (#1340).
+
+    Recording recursive files instead of top-level entries means the
+    walk meets whatever the vault contains, and ``rglob`` will scandir a
+    symlinked directory it is anchored on. A vault holding
+    ``01-Fragments/ext -> <somewhere else>`` therefore had every file
+    behind that link enumerated into ``deleted_files`` — which is copied
+    into the MCP tool payload and shown to the operator.
+
+    Two things are wrong with that at once. It names paths outside the
+    vault in the record of an erasure that never touched them, and it
+    previews deletions the apply run cannot make: ``shutil.rmtree``
+    refuses a symlinked directory outright.
+    """
+    outside = tmp_path / "outside_the_vault"
+    (outside / "private").mkdir(parents=True)
+    (outside / "secret.pdf").write_text("sensitive", encoding="utf-8")
+    (outside / "private" / "deeper.txt").write_text("deeper", encoding="utf-8")
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    link = vault / "01-Fragments" / "ext"
+    link.symlink_to(outside, target_is_directory=True)
+
+    result = PurgeEngine(vault, dry_run=True).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert result.deleted_files == [
+        str(vault / "01-Fragments" / "Conversations" / "Alpha.md"),
+    ]
+    # Nothing behind the link is named, and nothing behind it is touched.
+    assert (outside / "secret.pdf").exists()
+    assert (outside / "private" / "deeper.txt").exists()
+
+
+def test_an_aborted_vault_purge_certifies_no_deletion_it_did_not_make(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial vault purge must never over-claim in the audit log (#1340).
+
+    The census that names the fragments has to run *before* the wipe,
+    because afterwards the files are gone. Committing it to the result
+    at that point, though, hands ``_run_audited``'s ``except`` clause a
+    fully populated count: the very first ``rmtree`` fails, nothing is
+    deleted, and the surviving hash-chained compliance record still
+    reads ``fragments_deleted: 1`` and names ``frag-A`` as erased.
+
+    Of the two ways to be wrong, an RTBF record that over-claims is the
+    dangerous one — it tells an operator content is gone while it is
+    sitting on disk. So the counts are committed only after the
+    destructive section has run.
+
+    The assertion is paired deliberately: the audit number *and* the
+    filesystem. A counter checked against another counter can agree
+    while both are wrong, which is the whole defect this issue exists
+    to close.
+    """
+    import shutil as shutil_mod
+
+    vault = _make_vault(tmp_path)
+    frag = _write_fragment(vault, "frag-A", "Alpha")
+
+    def exploding_rmtree(*_args: object, **_kwargs: object) -> None:
+        """Fail the first wipe, before anything has been removed."""
+        msg = "simulated mid-purge OSError"
+        raise OSError(msg)
+
+    monkeypatch.setattr(shutil_mod, "rmtree", exploding_rmtree)
+
+    with pytest.raises(OSError, match="simulated mid-purge"):
+        PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert frag.exists(), "nothing was deleted, so the audit must claim nothing"
+    outcome = _last_vault_outcome(vault)
+    assert outcome.status == "partial"
+    assert outcome.fragments_deleted == 0
+    assert outcome.affected_fragments == []
 
 
 # ---------------------------------------------------------------------------
@@ -3722,7 +4079,9 @@ def test_fragment_purge_records_provenance_scrubs_in_result(tmp_path: Path) -> N
 
     # YAML list entry + one body mention = 2 substitutions in the praxis
     # file. The deleted fragment file itself is excluded from the scrub.
-    assert result.provenance_scrubbed >= 2
+    # Exact, not ``>=``: a count that can drift upward is exactly how a
+    # dry run came to report six scrubs for an apply that did one.
+    assert result.provenance_scrubbed == 2
 
 
 def test_fragment_purge_audit_outcome_records_provenance_scrubs(
@@ -3746,7 +4105,8 @@ def test_fragment_purge_audit_outcome_records_provenance_scrubs(
     ]
     outcome = entries[-1]
     assert outcome.phase == "outcome"
-    assert outcome.provenance_scrubbed >= 1
+    # YAML list entry + one body mention in the draft.
+    assert outcome.provenance_scrubbed == 2
 
 
 def test_fragment_purge_dry_run_does_not_scrub(tmp_path: Path) -> None:
@@ -3764,7 +4124,9 @@ def test_fragment_purge_dry_run_does_not_scrub(tmp_path: Path) -> None:
 
     result = PurgeEngine(vault, dry_run=True).purge_fragment("frag-A")
 
-    assert result.provenance_scrubbed >= 1
+    # The same 2 the apply twin of this fixture reports: a dry run that
+    # cannot be trusted to predict its apply is not a preview.
+    assert result.provenance_scrubbed == 2
     assert draft.read_text(encoding="utf-8") == before
 
 
@@ -3781,7 +4143,7 @@ def test_source_purge_scrubs_provenance_for_each_fragment(tmp_path: Path) -> Non
         metadata={"source_fragments": ["frag-A", "frag-B"]},
     )
 
-    PurgeEngine(vault).purge_source("claude")
+    result = PurgeEngine(vault).purge_source("claude")
 
     text = derived.read_text(encoding="utf-8")
     assert "frag-A" not in text
@@ -3791,6 +4153,11 @@ def test_source_purge_scrubs_provenance_for_each_fragment(tmp_path: Path) -> Non
     # list in flow ([a, b]) or block style — robust today, brittle if the
     # serialiser ever switches.
     assert text.count("[purged]") >= 4
+    # The *substitution* count has no such dependency: the engine counts
+    # what it replaced, whatever shape the serialiser wrote. Pin it
+    # exactly, because the file-text assertion above cannot tell a
+    # correct 4 from a double-counted 8.
+    assert result.provenance_scrubbed == 4
 
 
 def test_purged_marker_reparses_as_nested_list_in_yaml(tmp_path: Path) -> None:
@@ -4057,8 +4424,11 @@ def test_source_purge_skips_undecodable_file_with_malformed_yaml(
     matched despite an undecodable body. It does not license deleting
     files by absence of evidence, which on a *scoped* purge would be
     unbounded collateral loss. The operator's total-RTBF hammer,
-    ``purge_vault``, still reaches such files, because it wipes folder
-    contents without ever parsing frontmatter.
+    ``purge_vault``, still reaches such files: it wipes folder contents
+    wholesale rather than matching each file against criteria. Since
+    #1340 it does read every fragment's frontmatter, but only to name
+    the ids in the audit record — a file it cannot parse is still
+    deleted, and is still counted, merely unnamed.
     """
     vault = _make_vault(tmp_path)
     frag = _write_fragment(vault, "frag-A", "Alpha", platform="claude")
@@ -4229,3 +4599,409 @@ def test_source_purge_warns_when_fragment_body_is_undecodable(
         if record.levelno == logging.WARNING and str(frag) in record.getMessage()
     ]
     assert len(naming_the_file) >= 1
+
+
+# ---------------------------------------------------------------------------
+# #1340 — a dry run must predict its own apply
+#
+# Two independent causes, both pinned here. (a) A counted-only deletion
+# stays on disk in a dry run, so a later fragment's pass re-counts a file
+# the apply run had already destroyed. (b) A counted-only *rewrite* stays
+# unwritten, so a later pass reads bytes the apply run had already
+# scrubbed — no deletion involved anywhere, which is why a fix that only
+# tracks removed paths does not close it.
+# ---------------------------------------------------------------------------
+
+_RECONCILIATION_BODY_A = "Alpha body: the first shared passage."
+"""Body of the first reconciliation fragment, quoted verbatim by the profile."""
+
+_RECONCILIATION_BODY_B = "Bravo body: the second shared passage."
+"""Body of the second reconciliation fragment, quoted verbatim by the profile."""
+
+_RECONCILIATION_STUB_POINTER = f"{_INTIMATE_STUB_DIR}/shared.md"
+"""One stub, pointed at by *both* fragments — the double-count in miniature."""
+
+_POISONED_LEDGER_TEXT = "ledger lie: this text must never reach the filesystem"
+"""What a poisoned dry-run ledger claims a file says, in the safety test.
+
+If this string ever lands on disk, an apply run consulted the dry-run
+bookkeeping — the one thing the ledger is forbidden to influence.
+"""
+
+
+def _build_reconciliation_vault(root: Path) -> Path:
+    """Build the shared dry/apply fixture: every coupling at once (#1340).
+
+    Each ingredient is a way one fragment's purge changes what the next
+    fragment's purge can still find, which is exactly what a dry run
+    fails to model when it deletes and rewrites nothing:
+
+    - two ``claude`` fragments that reference each other **by id** (the
+      provenance scrub) and **by title wikilink** (the wiki scrub);
+    - a single intimate stub both fragments point at, so the second pass
+      re-counts a stub the first already unlinked;
+    - one ``Register-Samples`` copy per fragment, plus one shared
+      ``casual-profile.md`` quoting both bodies and one shared
+      ``Lexicon/glossary.md`` naming both ids — shared voice artifacts
+      the first pass deletes and the second must not re-count.
+
+    Args:
+        root: Directory to create the vault under.
+
+    Returns:
+        The vault root path.
+    """
+    vault = _make_vault(root)
+    stub_path = vault / _RECONCILIATION_STUB_POINTER
+    stub_path.parent.mkdir(parents=True, exist_ok=True)
+    stub_path.write_text(
+        frontmatter.dumps(
+            frontmatter.Post(
+                content="The shared intimate body.\n",
+                type="intimate-stub",
+                privacy_tier="intimate",
+            ),
+        ),
+        encoding="utf-8",
+    )
+    pairs = (
+        ("frag-A", "Alpha", _RECONCILIATION_BODY_A, "frag-B", "Bravo"),
+        ("frag-B", "Bravo", _RECONCILIATION_BODY_B, "frag-A", "Alpha"),
+    )
+    for frag_id, title, body, other_id, other_title in pairs:
+        target = vault / "01-Fragments" / "Conversations" / f"{title}.md"
+        target.write_text(
+            frontmatter.dumps(
+                frontmatter.Post(
+                    content=f"{body} See {other_id} and [[{other_title}]].\n",
+                    id=frag_id,
+                    title=title,
+                    type="fragment",
+                    source={
+                        "platform": "claude",
+                        "original_file": f"{frag_id}.json",
+                    },
+                    threads=[],
+                    eddies=[],
+                    saved_from={
+                        "source_kind": "answer",
+                        "intimate_body_pointer": _RECONCILIATION_STUB_POINTER,
+                    },
+                ),
+            ),
+            encoding="utf-8",
+        )
+        sample = vault / "07-Voice" / "Register-Samples" / "casual" / f"{frag_id}.md"
+        sample.parent.mkdir(parents=True, exist_ok=True)
+        sample.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+    profile = vault / "07-Voice" / "casual-profile.md"
+    profile.write_text(
+        "### Sample Passages\n\n"
+        f"{_RECONCILIATION_BODY_A} See frag-B and [[Bravo]].\n\n"
+        f"{_RECONCILIATION_BODY_B} See frag-A and [[Alpha]].\n",
+        encoding="utf-8",
+    )
+    glossary = vault / "07-Voice" / "Lexicon" / "glossary.md"
+    glossary.parent.mkdir(parents=True, exist_ok=True)
+    glossary.write_text("- [[frag-A]] — a\n- [[frag-B]] — b\n", encoding="utf-8")
+    return vault
+
+
+def _copy_reconciliation_vaults(tmp_path: Path) -> tuple[Path, Path]:
+    """Return byte-identical dry and apply copies of the shared fixture.
+
+    ``copytree`` rather than building twice: identical *inputs* are the
+    whole premise of the comparison, and a copy cannot drift from the
+    original the way two constructions can.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+
+    Returns:
+        Tuple of ``(dry_vault, apply_vault)`` roots.
+    """
+    source = _build_reconciliation_vault(tmp_path / "source")
+    dry_vault = tmp_path / "dry" / "vault"
+    apply_vault = tmp_path / "apply" / "vault"
+    shutil.copytree(source, dry_vault)
+    shutil.copytree(source, apply_vault)
+    return dry_vault, apply_vault
+
+
+def test_a_dry_source_purge_predicts_its_apply_exactly(tmp_path: Path) -> None:
+    """Dry and apply results are the *same object*, field for field (#1340).
+
+    Full-object equality rather than a hand-picked field list: the
+    divergence has already appeared on four different counters
+    (``intimate_stubs_removed``, ``provenance_scrubbed``,
+    ``voice_artifacts_removed``, ``wikilinks_removed``), and a field
+    list has to be remembered while a model dump does not.
+
+    ``dry_run`` is excluded because it is the one field that *must*
+    differ. ``deleted_files`` is excluded because it holds absolute
+    paths under two different ``tmp_path`` roots, so it can never be
+    equal as written — it is compared separately, root-relative, rather
+    than dropped.
+    """
+    dry_vault, apply_vault = _copy_reconciliation_vaults(tmp_path)
+
+    dry = PurgeEngine(dry_vault, dry_run=True).purge_source("claude")
+    applied = PurgeEngine(apply_vault).purge_source("claude")
+
+    ignored = {"dry_run", "deleted_files"}
+    assert dry.model_dump(exclude=ignored) == applied.model_dump(exclude=ignored)
+    assert _relative_deleted_files(dry, dry_vault) == _relative_deleted_files(
+        applied,
+        apply_vault,
+    )
+
+
+def test_the_provenance_scrub_count_is_the_same_dry_or_applied(
+    tmp_path: Path,
+) -> None:
+    """The narrow unit behind the full-object comparison (#1340).
+
+    Equality alone would be satisfied by two runs that are wrong in the
+    same direction, so the agreed value is asserted too: two id mentions
+    survive to be scrubbed once the shared voice artifacts have gone —
+    one in the sibling fragment, one in its ``Register-Samples`` copy.
+    """
+    dry_vault, apply_vault = _copy_reconciliation_vaults(tmp_path)
+
+    dry = PurgeEngine(dry_vault, dry_run=True).purge_source("claude")
+    applied = PurgeEngine(apply_vault).purge_source("claude")
+
+    assert applied.provenance_scrubbed == 2
+    assert dry.provenance_scrubbed == applied.provenance_scrubbed
+
+
+def test_a_dry_run_predicts_its_apply_when_nothing_is_deleted(
+    tmp_path: Path,
+) -> None:
+    """The rewrite-driven divergence, with no deletion anywhere (#1340).
+
+    Two fragments share the title ``Alpha``, and a praxis note that
+    **survives both purges** carries two ``[[Alpha]]`` wikilinks. The
+    apply run scrubs them on the first fragment's pass and finds none on
+    the second; the dry run, having written nothing, finds the same two
+    twice and reports four.
+
+    This is the case a removed-paths-only ledger cannot close: ``p1.md``
+    is never deleted in either mode, so nothing about it is ever
+    "removed". Only remembering the *text* the apply run would have
+    written makes the second pass agree.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    twin = vault / "01-Fragments" / "Conversations" / "Alpha-2.md"
+    twin.write_text(
+        frontmatter.dumps(
+            frontmatter.Post(
+                content="A second note that shares the Alpha title.\n",
+                id="frag-B",
+                title="Alpha",
+                type="fragment",
+                source={"platform": "claude", "original_file": "frag-B.json"},
+                threads=[],
+                eddies=[],
+            ),
+        ),
+        encoding="utf-8",
+    )
+    note = _write_derived_note(
+        vault,
+        subfolder="04-Praxis",
+        name="p1",
+        body="See [[Alpha]] and again [[Alpha]].",
+        metadata={"type": "praxis"},
+    )
+    dry_engine = PurgeEngine(vault, dry_run=True)
+
+    dry = dry_engine.purge_source("claude")
+    applied = PurgeEngine(vault).purge_source("claude")
+
+    assert applied.wikilinks_removed == 2
+    assert dry.wikilinks_removed == applied.wikilinks_removed
+    # The praxis note is collateral neither run may delete.
+    assert note.exists()
+
+
+def test_the_voice_sweep_matches_the_same_way_dry_or_applied(
+    tmp_path: Path,
+) -> None:
+    """The voice content match reads disk in both modes, and must (#1340).
+
+    Every other counted sweep consults the dry-run ledger so a preview
+    does not re-count work an apply run had already done. The voice
+    content match must **not**, and this fixture is why.
+
+    ``casual-profile.md`` quotes only Bravo's body, so purging Alpha
+    does not delete it — but Alpha's reference scrub does rewrite it,
+    because the quoted passage carries an ``[[Alpha]]`` wikilink. That
+    same scrub rewrites Bravo's own file. Needle and haystack therefore
+    move together: disk-vs-disk agrees between the two modes, while
+    overlaying only the haystack compares an unscrubbed needle against
+    a scrubbed one and reports a deletion the apply run makes and the
+    preview does not.
+
+    Measured on this fixture with a haystack-only overlay in place:
+    ``voice_artifacts_removed`` dry 0 against apply 1. This test is the
+    reason that overlay is not in the tree; it fails if anyone adds one.
+    """
+    body_b = "Bravo body quoting [[Alpha]] inside it."
+    source = _make_vault(tmp_path / "source")
+    for frag_id, title, body in (
+        ("frag-A", "Alpha", "Alpha body all its own."),
+        ("frag-B", "Bravo", body_b),
+    ):
+        _write_fragment(source, frag_id, title, body=body, platform="claude")
+    profile = source / "07-Voice" / "casual-profile.md"
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    profile.write_text(f"### Sample Passages\n{body_b}\n", encoding="utf-8")
+    dry_vault = tmp_path / "dry" / "vault"
+    apply_vault = tmp_path / "apply" / "vault"
+    shutil.copytree(source, dry_vault)
+    shutil.copytree(source, apply_vault)
+
+    dry = PurgeEngine(dry_vault, dry_run=True).purge_source("claude")
+    applied = PurgeEngine(apply_vault).purge_source("claude")
+
+    assert applied.voice_artifacts_removed == 1
+    assert dry.voice_artifacts_removed == applied.voice_artifacts_removed
+
+
+def test_an_apply_run_ignores_the_dry_run_ledger_entirely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ledger that lies about everything cannot change an apply run (#1340).
+
+    The safety property of the whole change: the dry-run bookkeeping is
+    *populated* on every run but *consulted* only under ``dry_run``, so
+    nothing it holds can alter what is deleted or rewritten for real.
+    Arguing that from the diff is not proof; poisoning the ledger and
+    watching the filesystem is.
+
+    The poison is applied twice over. The engine's own ledger instance is
+    told the fragment and the note are already gone and that the note's
+    text is a bogus constant. Then every :class:`DryRunLedger` in the
+    process is made to answer the same way, so a ledger the engine
+    rebuilds part-way through a run is a liar too — the invariant is that
+    *no* query reaches an apply run, not that one particular object is
+    ignored.
+
+    Every assertion is against the filesystem, because a counter and a
+    file can drift apart and it is the file that has to be erased.
+    """
+    from creek.purge.dryrun import DryRunLedger
+
+    vault = _make_vault(tmp_path)
+    frag = _write_fragment(vault, "frag-A", "Alpha")
+    note = _write_derived_note(
+        vault,
+        subfolder="04-Praxis",
+        name="p1",
+        body="See [[Alpha]] and frag-A.",
+        metadata={"source_fragments": ["frag-A"]},
+    )
+    engine = PurgeEngine(vault)
+    ledgers = [
+        value for value in vars(engine).values() if isinstance(value, DryRunLedger)
+    ]
+    assert len(ledgers) == 1, "the engine must hold exactly one DryRunLedger"
+    ledgers[0].mark_removed(frag)
+    ledgers[0].mark_removed(note)
+    ledgers[0].set_text(note, _POISONED_LEDGER_TEXT)
+    monkeypatch.setattr(DryRunLedger, "is_removed", lambda _self, _path: True)
+    monkeypatch.setattr(
+        DryRunLedger,
+        "text_for",
+        lambda _self, _path: _POISONED_LEDGER_TEXT,
+    )
+
+    result = engine.purge_fragment("frag-A")
+
+    assert not frag.exists()
+    text = note.read_text(encoding="utf-8")
+    assert _POISONED_LEDGER_TEXT not in text
+    assert "frag-A" not in text
+    assert "[[Alpha]]" not in text
+    assert text.count("[purged]") == 2
+    assert result.wikilinks_removed == 1
+    assert result.provenance_scrubbed == 2
+
+
+def test_a_second_operation_on_one_engine_starts_from_a_clean_ledger(
+    tmp_path: Path,
+) -> None:
+    """Sequential purges on one engine share no dry-run state (#1340).
+
+    The glossary is swept as a voice artifact by the *first* purge (it
+    carries ``[[frag-A]]``) but not by the second (it names ``frag-B``
+    only in prose). So a ledger left over from the first operation would
+    hide the glossary from the second operation's scrub, and the second
+    result would under-report by exactly one — a stale preview of a file
+    that is still sitting on disk.
+
+    A dry engine is used deliberately: in apply mode the glossary really
+    is gone by the second call, so only the dry lane can tell a reset
+    ledger from a leaked one.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    _write_fragment(vault, "frag-B", "Bravo")
+    glossary = vault / "07-Voice" / "Lexicon" / "glossary.md"
+    glossary.parent.mkdir(parents=True, exist_ok=True)
+    glossary_text = "- [[frag-A]] — a\n- see also frag-B here\n"
+    glossary.write_text(glossary_text, encoding="utf-8")
+    engine = PurgeEngine(vault, dry_run=True)
+
+    first = engine.purge_fragment("frag-A")
+    second = engine.purge_fragment("frag-B")
+
+    # The glossary is swept for frag-A, so its frag-A mention is not also
+    # counted as a scrub — the apply run would have no file left to scrub.
+    assert first.voice_artifacts_removed == 1
+    assert first.provenance_scrubbed == 0
+    # ...but the second operation must see the glossary exactly as the
+    # filesystem still holds it.
+    assert second.voice_artifacts_removed == 0
+    assert second.provenance_scrubbed == 1
+    assert glossary.read_text(encoding="utf-8") == glossary_text
+
+
+# ---------------------------------------------------------------------------
+# #1340 — the CLI's "Deleted files" table is bounded
+# ---------------------------------------------------------------------------
+
+
+def test_the_deleted_files_table_is_capped_and_says_how_many_it_hid(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An over-long deletion prints a bounded table and an honest remainder.
+
+    Counting files instead of folders turns a three-row table into one
+    row per destroyed fragment, which is a scrollback flood at vault
+    scale. The corpus is sized off the cap itself, so the test cannot
+    pass by agreeing with a magic number it also chose — and the hidden
+    rows have to be *reported*, because a table that silently truncates
+    an erasure record is worse than a long one.
+    """
+    from creek.cli import _MAX_DELETED_FILE_ROWS, _render_purge_result
+
+    hidden = 3
+    paths = [f"/v/f{index}.md" for index in range(_MAX_DELETED_FILE_ROWS + hidden)]
+    result = PurgeResult(
+        operation="vault",
+        target="entire vault",
+        deleted_files=paths,
+        fragments_affected=len(paths),
+    )
+
+    _render_purge_result(result)
+
+    out = capsys.readouterr().out
+    assert paths[0] in out
+    assert paths[-1] not in out
+    assert sum(1 for path in paths if path in out) == _MAX_DELETED_FILE_ROWS
+    assert f"{hidden} more" in out

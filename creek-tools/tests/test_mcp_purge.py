@@ -654,6 +654,57 @@ def test_the_previously_dropped_counters_reach_the_caller(vault: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# A vault purge names what it destroyed (#1340)
+# ---------------------------------------------------------------------------
+
+
+def _purge_the_whole_vault(vault_path: Path) -> dict[str, object]:
+    """Destroy the seeded vault through the MCP tool with a valid token."""
+    return purge_vault_tool(
+        vault_path=vault_path,
+        confirm_vault_path=str(vault_path),
+        auth_token=ELEVATED_TOKEN,
+        consumer="claude-code",
+    )
+
+
+def test_a_vault_purge_payload_counts_fragments_and_names_their_ids(
+    vault: Path,
+) -> None:
+    """The caller is told how many fragments died, and which (#1340).
+
+    The engine used to hand the tool the number of top-level *folders*
+    it walked and an empty id list, so an MCP client watching a
+    right-to-be-forgotten request could not tell it apart from a purge
+    of an empty vault. One fragment is seeded, so one is the answer.
+    """
+    payload = _purge_the_whole_vault(vault)
+
+    assert payload["status"] == "ok"
+    assert payload["fragments_affected"] == 1
+    assert payload["affected_fragment_ids"] == ["frag-001"]
+    assert not (vault / "01-Fragments" / "Notes" / "frag-001.md").exists()
+
+
+def test_a_vault_purge_records_the_fragment_ids_in_the_mcp_audit_log(
+    vault: Path,
+) -> None:
+    """``mcp.jsonl`` carries the ids too, not just the payload (#1340).
+
+    The audit log is the surface that outlives the call, and
+    ``_audit_success`` copies ``affected_fragment_ids`` straight off the
+    result — so an empty list in the result is an unreconstructable
+    compliance record, not merely a terse response.
+    """
+    _purge_the_whole_vault(vault)
+
+    entries = _audit_entries(vault)
+    assert len(entries) == 1
+    assert entries[0]["tool"] == "creek.purge.vault"
+    assert entries[0]["affected_fragment_ids"] == ["frag-001"]
+
+
+# ---------------------------------------------------------------------------
 # The gate is not brute-forceable (#914)
 # ---------------------------------------------------------------------------
 

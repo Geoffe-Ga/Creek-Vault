@@ -33,6 +33,7 @@ import logging
 import re
 import shutil
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 
@@ -43,6 +44,7 @@ from pydantic import BaseModel, Field
 from creek.ingest.journal_staging import ADEPTHOOD_STAGING_RELDIRS
 from creek.ingest.source_unit import split_source_unit
 from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog, PurgeOutcomeStatus
+from creek.purge.dryrun import DryRunLedger
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -222,6 +224,93 @@ def _read_bytes_for_match(path: Path) -> bytes:
         return b""
 
 
+def _regular_files_under(entry: Path) -> list[str]:
+    """List the regular files *entry* stands for, for a deletion record.
+
+    A file stands for itself; a directory stands for every regular file
+    it contains, recursively; anything else (an empty directory, a
+    broken symlink) stands for nothing. That last case is the point of
+    the helper: ``purge_vault`` deletes whole top-level entries, but the
+    record it leaves behind has to name destroyed *content*, and an
+    empty directory destroyed none (#1340).
+
+    A symlink is never walked *through*. ``rglob`` will happily scandir
+    a symlinked directory it is anchored on, so without the guard a
+    vault holding ``01-Fragments/ext -> /home/someone/Documents`` had
+    every file behind that link enumerated into the erasure record —
+    naming out-of-vault paths in an audit log that survives the purge,
+    and previewing deletions the apply run cannot make (``shutil.rmtree``
+    refuses a symlinked directory outright). A symlink *to a file* is
+    still named, because ``unlink`` really does destroy that alias; a
+    symlink to a directory stands for nothing, because nothing behind it
+    is this purge's to claim. The ``is_symlink`` test has to come first:
+    ``is_file`` follows links and would answer for the target.
+
+    Args:
+        entry: A top-level entry the vault wipe is about to remove.
+
+    Returns:
+        Sorted path strings, empty when nothing readable is destroyed.
+    """
+    if entry.is_symlink():
+        return [str(entry)] if entry.is_file() else []
+    if entry.is_file():
+        return [str(entry)]
+    return sorted(str(path) for path in entry.rglob("*") if path.is_file())
+
+
+def _apply_scrubs(
+    text: str,
+    wiki_pattern: re.Pattern[str] | None,
+    prov_pattern: re.Pattern[str] | None,
+) -> tuple[str, int, int]:
+    """Apply the wiki-link and provenance substitutions to one file's text.
+
+    Pure and mode-blind: the dry-run/apply distinction lives entirely in
+    where :meth:`PurgeEngine._scrub_one_file` gets this text from and
+    what it does with the result.
+
+    Args:
+        text: The file's current contents.
+        wiki_pattern: Wiki-link regex, or ``None`` to skip that pass.
+        prov_pattern: Fragment-ID regex, or ``None`` to skip that pass.
+
+    Returns:
+        A ``(scrubbed_text, wikilinks_removed, provenance_scrubbed)``
+        triple.
+    """
+    wiki_count = prov_count = 0
+    if wiki_pattern is not None:
+        text, wiki_count = wiki_pattern.subn("", text)
+    if prov_pattern is not None:
+        # NOTE: PURGED_MARKER is bracket-flavoured, so substituting it
+        # inside a YAML flow sequence (source_fragments: [a, b]) nests
+        # the scrubbed entry on re-parse — see PURGED_MARKER.
+        text, prov_count = prov_pattern.subn(PURGED_MARKER, text)
+    return text, wiki_count, prov_count
+
+
+@dataclass(frozen=True)
+class _VaultFragmentCensus:
+    """What a full-vault wipe is about to destroy, read before it runs.
+
+    Carried as a value rather than written straight onto a
+    :class:`PurgeResult` so that :meth:`PurgeEngine.purge_vault` can read
+    the vault *before* the wipe while committing the numbers *after* it —
+    see that method for why an abort must not leave the audit log
+    certifying an erasure that never happened.
+
+    Attributes:
+        file_count: Every ``.md`` file under ``01-Fragments/``, including
+            those carrying no usable id.
+        fragment_ids: The subset of those files that declared a string
+            ``id`` in frontmatter.
+    """
+
+    file_count: int
+    fragment_ids: list[str]
+
+
 class PurgeResult(BaseModel):
     """Outcome of a single purge operation.
 
@@ -232,7 +321,13 @@ class PurgeResult(BaseModel):
             audit log (e.g. ``{"fragment_id": "frag-abc"}``).
         affected_fragment_ids: IDs of fragments touched by the operation.
         dry_run: Whether deletions were only previewed.
-        deleted_files: Paths of files deleted (or that would be deleted).
+        deleted_files: Paths of the regular **files** deleted (or that
+            would be deleted). Never a directory: a removed directory is
+            represented by the files it contained, so an empty one
+            contributes no entry at all while still being removed from
+            disk. A deletion record for a right-to-be-forgotten request
+            has to name the content that was destroyed, and a directory
+            path names none of it (#1340).
         fragments_affected: Number of fragments directly affected.
         wikilinks_removed: Number of wiki-link references scrubbed.
         threads_updated: Thread files whose metadata changed.
@@ -354,6 +449,10 @@ class PurgeEngine:
         self.vault_path = vault_path
         self.dry_run = dry_run
         self.audit_log = PurgeAuditLog(vault_path)
+        # Re-created per operation by :meth:`_run_audited`; built here so
+        # the attribute always exists, including for the direct callers
+        # of the private helpers.
+        self._ledger = DryRunLedger()
 
     # -- Fragment purge ---------------------------------------------------
 
@@ -413,7 +512,9 @@ class PurgeEngine:
             )
             self._purge_intimate_stub(post, result)
             self._purge_staged_source_entry(post, result)
-            if not self.dry_run:
+            if self.dry_run:
+                self._ledger.mark_removed(frag_file)
+            else:
                 frag_file.unlink()
             result.embeddings_removed = self._purge_cache_for(
                 result.affected_fragment_ids,
@@ -617,6 +718,15 @@ class PurgeEngine:
         top-level vault content folders are removed. The purge log
         itself is preserved.
 
+        Every fragment is enumerated and its frontmatter read **before**
+        the wipe begins, so the result (and through it the compliance
+        audit line) reports how many fragments were destroyed and names
+        their ids. That read is the operation's one scaling cost: it is
+        O(fragments) in both file reads and YAML parses, where the wipe
+        itself is a handful of ``rmtree`` calls. It cannot be deferred —
+        read the ids after the wipe and there is nothing left to read
+        them from (#1340).
+
         Args:
             confirmation: Must equal :data:`VAULT_PURGE_CONFIRMATION`
                 exactly.
@@ -647,18 +757,112 @@ class PurgeEngine:
 
         def body() -> None:
             """Wipe every vault-content folder, mutating ``result``."""
+            # Read strictly BEFORE the wipe — the files are about to stop
+            # existing — but commit to ``result`` strictly AFTER it.
+            #
+            # The order is a compliance property, not a style choice. On
+            # an abort, ``_run_audited`` writes a ``status="partial"``
+            # outcome line from whatever ``result`` holds at that moment.
+            # Assigning the census up front made that line certify
+            # ``fragments_deleted: N`` — naming every id — for a vault
+            # where the very first ``rmtree`` had failed and all N files
+            # were still on disk. An RTBF record that over-claims an
+            # erasure is worse than one that under-claims it, so the
+            # counts land only once the destructive section has run.
+            census = self._census_fragments_for_vault_purge()
             for folder in _VAULT_CONTENT_FOLDERS:
                 folder_path = self.vault_path / folder
                 if not folder_path.is_dir():
                     continue
                 self._wipe_folder_contents(folder_path, result)
-            result.fragments_affected = len(result.deleted_files)
             self._wipe_adepthood_staging(result)
+            result.fragments_affected = census.file_count
+            result.affected_fragment_ids.extend(census.fragment_ids)
             result.embeddings_removed = self._delete_cache_file()
 
         return self._run_audited(result, body)
 
     # -- Private helpers -------------------------------------------------
+
+    def _skip_as_removed(self, path: Path) -> bool:
+        """Report whether a dry run should treat *path* as already gone.
+
+        The single gate on the dry-run ledger (#1340). Every consultation
+        of :attr:`_ledger` for a *removal* routes through here, so the
+        safety property — "the ledger is populated on every run but
+        queried only under ``dry_run``" — is structural rather than a
+        promise that has to be re-audited at four call sites. Poison the
+        ledger and an apply run still deletes and rewrites exactly what
+        it always did, because it never asks.
+
+        Ordering at each call site is load-bearing in the other
+        direction: this check must come **after** the containment guards
+        (``_resolve_pointer_in_vault``, ``_in_any_staging_root``, the
+        intimate-stub-root check, ``_contained_voice_artifact``), never
+        before. Those are fail-closed security controls whose whole point
+        is to run before anything is counted.
+
+        Args:
+            path: The file a later pass in this operation is about to
+                consider.
+
+        Returns:
+            ``True`` only in a dry run, and only for a path an apply run
+            would already have unlinked by this point.
+        """
+        return self.dry_run and self._ledger.is_removed(path)
+
+    def _census_fragments_for_vault_purge(self) -> _VaultFragmentCensus:
+        """Read what a full-vault wipe is about to destroy (#1340).
+
+        ``purge_vault`` used to report ``len(deleted_files)``, which held
+        the *top-level entries* of each content folder — so a vault of
+        500 fragments in ``01-Fragments/Conversations`` certified "3
+        fragments deleted, affected_fragments=[]" to the compliance log
+        while destroying all 500.
+
+        Deliberately **pure**: it reads the vault and returns, rather
+        than writing through to the caller's :class:`PurgeResult`. The
+        census has to run before the wipe (the files are about to stop
+        existing) but must not reach the audit log before the wipe has
+        actually happened, or an abort mid-wipe writes a
+        ``status="partial"`` line certifying an erasure that did not
+        occur. Returning the numbers lets :meth:`purge_vault` order those
+        two facts independently.
+
+        The count and the id list are deliberately asymmetric, mirroring
+        :meth:`_purge_single`'s existing contract exactly:
+        ``file_count`` counts **every** ``.md`` file under
+        ``01-Fragments/`` — including one with no ``id`` and one whose
+        YAML will not parse, because the wipe destroys those too and an
+        erasure record that under-counts destruction is the worse error —
+        while ``fragment_ids`` gains only the subset carrying a real
+        string id, because naming an id nobody recorded would be a
+        fabrication in a compliance record.
+
+        :meth:`_list_fragment_files` is reused rather than re-deriving
+        the glob: it sorts, and a dry run's id list is compared against
+        its apply twin's, which an unsorted walk across two directories
+        could make flake. The loader is the read-only
+        :meth:`_load_frontmatter_for_match` — nothing here is ever
+        written back.
+
+        Returns:
+            The file count and the ids read off those files.
+        """
+        fragment_files = self._list_fragment_files()
+        fragment_ids: list[str] = []
+        for frag_file in fragment_files:
+            post = self._load_frontmatter_for_match(frag_file)
+            if post is None:
+                continue
+            frag_id = post.get("id")
+            if isinstance(frag_id, str):
+                fragment_ids.append(frag_id)
+        return _VaultFragmentCensus(
+            file_count=len(fragment_files),
+            fragment_ids=fragment_ids,
+        )
 
     def _require_vault_marker(self) -> None:
         """Refuse to operate on a directory that is not a Creek vault (GAP-003).
@@ -778,7 +982,15 @@ class PurgeEngine:
         )
         self._purge_intimate_stub(post, result)
         self._purge_staged_source_entry(post, result)
-        if not self.dry_run:
+        # The two arms are the same act recorded two ways: a dry run
+        # notes what an apply run would have destroyed here, so the next
+        # fragment's passes walk the world that deletion would have left
+        # behind. Only the dry arm writes to the ledger — an apply run
+        # never reads it, so populating it there would resolve() and
+        # retain a path per deletion for nobody.
+        if self.dry_run:
+            self._ledger.mark_removed(frag_file)
+        else:
             frag_file.unlink()
 
     def _resolve_pointer_in_vault(self, pointer: str, *, field: str) -> Path | None:
@@ -900,8 +1112,17 @@ class PurgeEngine:
             return
         if not stub_path.is_file():
             return
+        # After both containment guards, never before them: this only
+        # suppresses a *double* count in a preview, and must not be able
+        # to stand in for a refusal. Two notes can point at one stub, so
+        # without it a dry run reports two removals for an apply that
+        # does one (#1340).
+        if self._skip_as_removed(stub_path):
+            return
         result.intimate_stubs_removed += 1
-        if not self.dry_run:
+        if self.dry_run:
+            self._ledger.mark_removed(stub_path)
+        else:
             stub_path.unlink(missing_ok=True)
 
     @staticmethod
@@ -985,8 +1206,15 @@ class PurgeEngine:
         staged_path = self._resolve_staged_source(origin_key)
         if staged_path is None:
             return
+        # After the containment guards inside _resolve_staged_source, for
+        # the reason spelled out in _purge_intimate_stub: two fragments
+        # split out of one staged document share an origin_key.
+        if self._skip_as_removed(staged_path):
+            return
         result.journal_staged_removed += 1
-        if not self.dry_run:
+        if self.dry_run:
+            self._ledger.mark_removed(staged_path)
+        else:
             staged_path.unlink(missing_ok=True)
 
     def _resolve_staged_source(self, origin_key: str) -> Path | None:
@@ -1116,13 +1344,19 @@ class PurgeEngine:
         for candidate in self._iter_voice_artifacts(fragment_id, body):
             target = self._contained_voice_artifact(candidate, contained_root)
             # Checked before the counter so a dry run never previews a
-            # deletion the real run would refuse, and de-duplicated
-            # because two passes can name the same note.
-            if target is None or target in seen:
+            # deletion the real run would refuse; de-duplicated because
+            # two passes can name the same note; and, in a dry run only,
+            # skipped when an earlier fragment in this same operation
+            # already claimed it — a profile and a glossary are shared
+            # artifacts, so the apply run has no file left to delete by
+            # the time the second fragment looks (#1340).
+            if target is None or target in seen or self._skip_as_removed(target):
                 continue
             seen.add(target)
             result.voice_artifacts_removed += 1
-            if not self.dry_run:
+            if self.dry_run:
+                self._ledger.mark_removed(target)
+            else:
                 target.unlink(missing_ok=True)
 
     @staticmethod
@@ -1286,6 +1520,20 @@ class PurgeEngine:
         a recorded, exact link from the id the caller holds to the note
         holding its prose.
 
+        Reads the file's real bytes, deliberately **not** the dry-run
+        ledger's pending rewrite (#1340). The other counted sweeps
+        consult the ledger so a preview does not re-count work an apply
+        run had already done; this one must not, because both sides of
+        its comparison move together. The needle is the purged
+        fragment's body, read from disk, and the haystack is a derived
+        note, read from disk; an earlier pass's scrub rewrites *both*,
+        so disk-vs-disk already agrees between a dry run and its apply.
+        Overlaying only the haystack would compare an unscrubbed needle
+        against a scrubbed haystack and invent a divergence that is not
+        there — measured at ``voice_artifacts_removed`` dry 0 / apply 1
+        on exactly that fixture. Pinned by
+        ``test_the_voice_sweep_matches_the_same_way_dry_or_applied``.
+
         Args:
             fragment_id: Id of the fragment being purged.
 
@@ -1341,7 +1589,12 @@ class PurgeEngine:
         request. Staged files are source material, not fragments, so
         they are counted on ``journal_staged_removed`` only — never
         appended to ``deleted_files`` and never inflating
-        ``fragments_affected``.
+        ``fragments_affected``. Since #1340 that separation is
+        structural: ``fragments_affected`` is enumerated from
+        ``01-Fragments/`` alone by
+        :meth:`_count_fragments_for_vault_purge`, where it previously
+        held only because this sweep happened to run *after* the
+        ``len(deleted_files)`` assignment.
 
         The walk is non-recursive by design (the staging layouts are
         flat), so anything that is not a file — a subdirectory an
@@ -1618,7 +1871,12 @@ class PurgeEngine:
         wiki_total = 0
         prov_total = 0
         for md_file in self._list_vault_md_files():
-            if md_file == exclude:
+            # Two separate concerns: *exclude* is the file being deleted
+            # right now, while the ledger names the files an apply run
+            # would already have deleted earlier in this operation — a
+            # sibling fragment, a swept voice artifact — and which are
+            # therefore still on disk only because this is a preview.
+            if md_file == exclude or self._skip_as_removed(md_file):
                 continue
             wiki_count, prov_count = self._scrub_one_file(
                 md_file,
@@ -1637,6 +1895,13 @@ class PurgeEngine:
     ) -> tuple[int, int]:
         """Apply the wiki-link and provenance scrubs to a single file.
 
+        Split three ways — read, substitute, persist — because the two
+        ends of it are where a dry run has to diverge from an apply run
+        (#1340): the read may have to come from a rewrite this operation
+        only *pretended* to make, and the write may have to become that
+        pretence. The substitution in the middle is identical in both
+        modes and is pure, so it lives outside the class entirely.
+
         Args:
             md_file: Markdown file to scrub.
             wiki_pattern: Wiki-link regex, or ``None`` to skip that pass.
@@ -1647,11 +1912,43 @@ class PurgeEngine:
             this file. ``(0, 0)`` when the file cannot be read or is not
             valid UTF-8.
         """
+        text = self._scrub_input_text(md_file)
+        if text is None:
+            return 0, 0
+        scrubbed, wiki_count, prov_count = _apply_scrubs(
+            text,
+            wiki_pattern,
+            prov_pattern,
+        )
+        if wiki_count or prov_count:
+            self._persist_scrub(md_file, scrubbed)
+        return wiki_count, prov_count
+
+    def _scrub_input_text(self, md_file: Path) -> str | None:
+        """Return the text the scrub should operate on, or ``None`` to skip.
+
+        In a dry run the ledger wins when it holds a pending rewrite for
+        *md_file*: an apply run would have written those bytes on an
+        earlier fragment's pass, so reading the stale file instead makes
+        the preview re-count references the real run had already
+        scrubbed. In an apply run the ledger is never consulted at all,
+        which is what keeps its contents unable to affect a real purge.
+
+        Args:
+            md_file: Markdown file about to be scrubbed.
+
+        Returns:
+            The text to scrub, or ``None`` when the file cannot be read.
+        """
+        if self.dry_run:
+            pending = self._ledger.text_for(md_file)
+            if pending is not None:
+                return pending
         try:
-            text = md_file.read_text(encoding="utf-8")
+            return md_file.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
             # Skipping is the only safe response to an undecodable file:
-            # this method writes ``text`` back, so an ``errors="replace"``
+            # the caller writes ``text`` back, so an ``errors="replace"``
             # read here would persist U+FFFD over the operator's bytes.
             # A reference living inside such a file therefore survives
             # unscrubbed: an accepted trade-off, since the alternative is
@@ -1664,18 +1961,25 @@ class PurgeEngine:
                 md_file,
                 type(exc).__name__,
             )
-            return 0, 0
-        wiki_count = prov_count = 0
-        if wiki_pattern is not None:
-            text, wiki_count = wiki_pattern.subn("", text)
-        if prov_pattern is not None:
-            # NOTE: PURGED_MARKER is bracket-flavoured, so substituting it
-            # inside a YAML flow sequence (source_fragments: [a, b]) nests
-            # the scrubbed entry on re-parse — see PURGED_MARKER.
-            text, prov_count = prov_pattern.subn(PURGED_MARKER, text)
-        if (wiki_count or prov_count) and not self.dry_run:
-            md_file.write_text(text, encoding="utf-8")
-        return wiki_count, prov_count
+            return None
+
+    def _persist_scrub(self, md_file: Path, text: str) -> None:
+        """Write the scrubbed text, or record it as a dry run's pretence.
+
+        The two branches are mutually exclusive by construction, and
+        that matters beyond tidiness: buffering text in an apply run
+        would hold the full contents of every rewritten file for the
+        lifetime of the operation, which at 35k fragments is a memory
+        blow-up in exchange for something no apply run ever reads.
+
+        Args:
+            md_file: Markdown file that was scrubbed.
+            text: Its scrubbed contents.
+        """
+        if self.dry_run:
+            self._ledger.set_text(md_file, text)
+            return
+        md_file.write_text(text, encoding="utf-8")
 
     def _decrement_counts(
         self,
@@ -1737,12 +2041,21 @@ class PurgeEngine:
     ) -> None:
         """Remove every file/subdirectory inside a vault folder.
 
+        What is *deleted* is unchanged: each top-level entry goes in one
+        ``rmtree`` or ``unlink``, which is why the walk stays top-level.
+        What is *recorded* is not: ``deleted_files`` now names the
+        regular files that were destroyed, recursively, instead of the
+        directories that held them (#1340). A directory path in a
+        right-to-be-forgotten deletion record names no destroyed
+        content, and an empty directory destroyed none — so it
+        contributes no entry while still being removed from disk.
+
         Args:
             folder_path: Folder whose contents should be removed.
             result: Result accumulator to update with deleted paths.
         """
         for entry in sorted(folder_path.iterdir()):
-            result.deleted_files.append(str(entry))
+            result.deleted_files.extend(_regular_files_under(entry))
             if self.dry_run:
                 continue
             if entry.is_dir():
@@ -1786,6 +2099,10 @@ class PurgeEngine:
         SIGKILL between the intent write and the first destructive op
         leaves a forensic trail naming what was being attempted.
 
+        This is also the operation boundary for the dry-run ledger
+        (:class:`~creek.purge.dryrun.DryRunLedger`), which is rebuilt
+        here so no two operations on one engine share bookkeeping.
+
         Args:
             result: Result accumulator the body will populate.
             body: Callable that does the actual destructive work and
@@ -1799,6 +2116,11 @@ class PurgeEngine:
                 outcome line has been written.
         """
         operation_id = uuid.uuid4().hex
+        # One ledger per operation. Carrying the previous call's over
+        # would hide a file from the next preview that is still sitting
+        # on disk, so a sequence of dry runs on one engine would drift
+        # further from the truth with every call (#1340).
+        self._ledger = DryRunLedger()
         self._write_intent_audit(result, operation_id)
         try:
             body()
