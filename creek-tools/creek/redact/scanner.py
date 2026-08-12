@@ -14,7 +14,6 @@ Enhanced features (Issue #14):
 - File extension filtering
 - Configurable directory exclusion patterns
 - Progress bar via tqdm during directory scans
-- JSON report generation with match metadata
 - Markdown summary grouped by file and severity
 - Review queue with context for human review
 """
@@ -22,7 +21,6 @@ Enhanced features (Issue #14):
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import math
 import os
@@ -69,6 +67,15 @@ _UNREAD_FILES_CAVEAT = (
 
 A clean result reached by *not looking* reads identically to a clean tree,
 which is the one place a silent skip in a safety scanner does real harm.
+"""
+
+FINDINGS_TABLE_HEADER = "| Line | Type | Severity |"
+"""Column header of the per-file findings table in the markdown summary.
+
+Exported rather than spelled twice: the table
+:meth:`RedactionScanner.generate_markdown_summary` renders and the copy
+of it quoted in ``docs/redaction.md`` are the same table, and two
+literals are how the two surfaces drift apart.
 """
 
 HIGH_ENTROPY_PATTERN_NAME = "high_entropy_string"
@@ -378,30 +385,6 @@ class RedactionScanner:
             )
         return results
 
-    def scan_directory(
-        self,
-        dir_path: Path,
-        *,
-        progress: bool = False,
-    ) -> list[RedactionMatch]:
-        """Recursively scan all files in a directory for sensitive data.
-
-        Skips binary files and files with unsupported extensions.
-        Respects exclusion patterns from configuration.
-
-        Args:
-            dir_path: Path to the directory to scan.
-            progress: If ``True``, display a tqdm progress bar.
-
-        Returns:
-            Aggregated list of :class:`RedactionMatch` objects.
-
-        Raises:
-            FileNotFoundError: If *dir_path* does not exist.
-        """
-        summary = self.scan_batch(dir_path, progress=progress)
-        return summary.matches
-
     def scan_batch(
         self,
         dir_path: Path,
@@ -476,43 +459,6 @@ class RedactionScanner:
             files_skipped_symlink=files_skipped_symlink,
         )
 
-    def generate_report(self, matches: list[RedactionMatch]) -> str:
-        """Generate a human-readable report from a list of matches.
-
-        Args:
-            matches: Redaction matches to summarise.
-
-        Returns:
-            Multi-line string report suitable for console output.
-        """
-        if not matches:
-            return "Redaction scan complete: 0 findings."
-
-        lines: list[str] = [
-            f"Redaction scan complete: {len(matches)} finding(s).",
-            "",
-        ]
-
-        by_type: dict[str, int] = {}
-        by_file: dict[str, list[RedactionMatch]] = {}
-
-        for match in matches:
-            by_type[match.match_type] = by_type.get(match.match_type, 0) + 1
-            file_key = str(match.file_path)
-            by_file.setdefault(file_key, []).append(match)
-
-        lines.append("By type:")
-        for match_type, count in sorted(by_type.items()):
-            lines.append(f"  {match_type}: {count}")
-
-        lines.extend(("", "By file:"))
-        for file_key, file_matches in sorted(by_file.items()):
-            lines.append(f"  {file_key}:")
-            for fm in file_matches:
-                lines.append(f"    line {fm.line_number}: {fm.match_type}")
-
-        return "\n".join(lines)
-
     @staticmethod
     def extract_context(
         file_path: Path,
@@ -542,55 +488,6 @@ class RedactionScanner:
         start = max(0, line_number - 1 - window)
         end = min(len(all_lines), line_number + window)
         return all_lines[start:end]
-
-    def generate_json_report(
-        self,
-        summary: ScanSummary,
-        output_path: Path,
-    ) -> None:
-        """Write a structured JSON report to *output_path*.
-
-        The report contains scan statistics and match details grouped
-        by file and sorted by severity.
-
-        Args:
-            summary: The scan summary to serialise.
-            output_path: Destination file path for the JSON report.
-        """
-        by_file: dict[str, list[dict[str, object]]] = defaultdict(list)
-
-        for match in summary.matches:
-            severity = _get_severity(match.match_type)
-            by_file[str(match.file_path)].append(
-                {
-                    "line_number": match.line_number,
-                    "match_type": match.match_type,
-                    "severity": severity,
-                    "salted_hash": match.salted_hash,
-                }
-            )
-
-        # Sort each file's matches by severity rank.
-        for file_matches in by_file.values():
-            file_matches.sort(key=lambda m: _severity_rank(str(m["severity"])))
-
-        report: dict[str, object] = {
-            "scan_statistics": {
-                "files_scanned": summary.files_scanned,
-                "files_skipped_binary": summary.files_skipped_binary,
-                "files_skipped_extension": summary.files_skipped_extension,
-                "total_findings": len(summary.matches),
-                "by_severity": _count_by_severity(summary.matches),
-                "by_type": _count_by_type(summary.matches),
-            },
-            "findings_by_file": dict(by_file),  # noqa: FURB123  # converts defaultdict to plain dict for JSON-serialised output.
-        }
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            json.dumps(report, indent=2, default=str) + "\n",
-            encoding="utf-8",
-        )
 
     def generate_markdown_summary(self, summary: ScanSummary) -> str:
         """Generate a human-readable markdown summary of scan results.
@@ -644,7 +541,7 @@ class RedactionScanner:
                 (
                     f"### `{file_key}`",
                     "",
-                    "| Line | Type | Severity |",
+                    FINDINGS_TABLE_HEADER,
                     "|------|------|----------|",
                 )
             )
@@ -1106,19 +1003,4 @@ def _count_by_severity(matches: list[RedactionMatch]) -> dict[str, int]:
     for match in matches:
         sev = _get_severity(match.match_type)
         counts[sev] = counts.get(sev, 0) + 1
-    return counts
-
-
-def _count_by_type(matches: list[RedactionMatch]) -> dict[str, int]:
-    """Count matches grouped by pattern type.
-
-    Args:
-        matches: List of redaction matches.
-
-    Returns:
-        Dictionary mapping match type to count.
-    """
-    counts: dict[str, int] = {}
-    for match in matches:
-        counts[match.match_type] = counts.get(match.match_type, 0) + 1
     return counts

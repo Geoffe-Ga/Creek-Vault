@@ -404,8 +404,11 @@ class ImageIngestor(Ingestor):
                 can reconcile per-fragment language with the engine
                 that produced them.
             min_confidence: OCR-confidence threshold below which a
-                produced fragment is tagged for the review queue. Mirrors
-                :pyattr:`creek.config.OCRConfig.min_confidence`.
+                produced fragment is tagged ``review: pending_review`` in
+                its frontmatter. The tag is a marker for a human reader;
+                no command filters on it — in particular ``creek redact
+                --review`` selects by findings, not by this key (#1338).
+                Mirrors :pyattr:`creek.config.OCRConfig.min_confidence`.
         """
         self.engine = engine if engine is not None else PytesseractOcrEngine(language)
         self.language = language

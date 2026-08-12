@@ -102,7 +102,7 @@ ocr:
 | `enabled`        | `true`         | If `false`, `creek ingest --type images` will skip OCR. |
 | `engine`         | `pytesseract`  | Engine name. (Custom engines are injected at the API level — see `creek.ingest.images.OcrEngine`.) |
 | `languages`      | `[eng]`        | Tesseract language codes. |
-| `min_confidence` | `0.6`          | Per-page OCR confidence below which the resulting fragment is tagged `review: pending_review` in frontmatter and surfaced by `creek redact --review`. Range `[0.0, 1.0]`. |
+| `min_confidence` | `0.6`          | Per-page OCR confidence below which the resulting fragment is tagged `review: pending_review` in frontmatter, as a marker for a human — no command currently filters on this key. Range `[0.0, 1.0]`. |
 
 ## `linking` — resonance / thread / eddy thresholds
 

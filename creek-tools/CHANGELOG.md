@@ -65,6 +65,18 @@ to locate the originating commit for any reference below.
 
 ### Removed
 
+- **Four report surfaces on the redaction classes, none of which had a
+  production caller** (#1338): `RedactionScanner.scan_directory`,
+  `.generate_report`, `.generate_json_report`, and
+  `Redactor.log_redactions`. Every shipped read path — `creek redact
+  --scan/--apply/--review`, the `creek.redact.scan` MCP tool, and
+  `creek process` — reaches the scanner through `scan_batch`, and the
+  console report through `generate_markdown_summary`. Deleting
+  `log_redactions` also retires the only code that wrote the session
+  salt to disk in cleartext beside the hashes it exists to protect.
+  There is no longer a JSON report surface; the typed statistics
+  contract on the MCP tool is unaffected (see #1292).
+
 - The repo no longer ships empty placeholder directories for
   `01-Fragments/` … `10-Liminal/` or `00-Creek-Meta/`. User vault
   content lives outside this repository (default suggested location:
@@ -72,6 +84,30 @@ to locate the originating commit for any reference below.
 
 ### Fixed
 
+- **The redaction docs promised a queue that has never existed and an
+  `--apply` that is reversible; neither was true** (#1338). On a
+  redaction tool the docs are the operator's contract, and the most
+  dangerous line — "applying is reversible if you keep the queue
+  around" — invited an unrecoverable in-place rewrite of an
+  irreplaceable export with no backup. Corrected against executed
+  behaviour: `--scan` writes **no files at all** (`--report` prints to
+  the console; the dot-directory and JSON queue the docs named under
+  `<source>` were never created by any code path), `--apply` re-scans
+  from scratch and rewrites matching
+  files **in place with no undo**, and `--review` lists **every**
+  finding rather than filtering on a `pending_review` marker — nothing
+  in the codebase reads that key. `docs/redaction.md` gains an explicit
+  back-up-first warning covering the parts that are worse than merely
+  irreversible: structured `.yaml`/`.json` files are in scope, and a
+  vault-wide run still rewrites `creek_config.yaml` (#1398, not fixed
+  here). The sample report table no longer shows an `Excerpt` column of
+  secret text, which contradicted the module's own never-store
+  invariant. Also corrected: the previous `#1398` note claimed
+  `false_positive_allowlist` entries get redacted — they are
+  exact-string exempt and are the one value in that file the rewrite
+  cannot touch; the real hazard is `exclude_patterns`, custom
+  `patterns`, paths and comments. Two new suites pin the prose to
+  behaviour so it cannot drift back.
 - **The drift guard that refuses to overwrite a hand-edited skill file
   now covers medium contracts too, not just schema skills, and it now
   lives inside the shared deployment primitive itself** (#1306).
