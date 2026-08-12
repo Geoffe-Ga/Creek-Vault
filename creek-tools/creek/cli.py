@@ -12,7 +12,7 @@ import textwrap
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Literal, NoReturn, cast
+from typing import TYPE_CHECKING, Final, Literal, NoReturn, cast, get_args
 
 import typer
 from rich.console import Console
@@ -26,7 +26,12 @@ from creek.classify.privacy_filter import (
     parse_include_tier,
     record_privacy_override,
 )
-from creek.config import AIStyleConfig, load_config, resolve_config_path
+from creek.config import (
+    AIStyleConfig,
+    ClassificationConfig,
+    load_config,
+    resolve_config_path,
+)
 from creek.consent import ConsentLogUnavailableError, ConsentManager
 from creek.models import PraxisPotential, PrivacyTier
 from creek.pipeline import (
@@ -2241,7 +2246,25 @@ def redact(
 
 
 _CLASSIFY_METHODS = ("rules", "llm")
-_REATOMIZE_DIRECTIONS = ("auto", "split", "aggregate")
+
+_REATOMIZE_DIRECTIONS: Final[tuple[str, ...]] = get_args(
+    ClassificationConfig.model_fields["reatomize_direction"].annotation,
+)
+"""Directions ``creek classify --reatomize-direction`` accepts.
+
+Derived from the config ``Literal`` rather than retyped beside it, so the
+flag and the YAML key cannot drift apart — the same fix #1259 applied to
+the link methods and report types in :mod:`creek.surface_modes`. When
+``aggregate`` was retired (#1342) the hand-written copy here was the last
+place still advertising it.
+"""
+
+_RETIRED_REATOMIZE_DIRECTION: Final[str] = "aggregate"
+"""The one direction that is refused with an explanation, not just a list.
+
+An operator's shell script may still pass it, and "unknown value" alone
+would read as a typo rather than as a deliberate removal.
+"""
 
 
 _CLASSIFY_METHOD_HELP: str = (
@@ -2253,6 +2276,26 @@ _CLASSIFY_METHOD_HELP: str = (
     "still honored) to be set in the environment before the run "
     "(data-egress acknowledgement; see issue #320)."
 )
+
+
+def _print_retired_direction_hint(direction: str) -> None:
+    """Explain the removal when a rejected direction is the retired one.
+
+    Extracted rather than inlined: ``classify`` is already a long line of
+    guards and xenon's ``--max-modules B`` bites on this module's total
+    score, so the extra branch lives here.
+
+    Args:
+        direction: The rejected ``--reatomize-direction`` value.
+    """
+    if direction != _RETIRED_REATOMIZE_DIRECTION:
+        return
+    console.print(
+        "[yellow]That value named the FEAT-022 zoom-out aggregator, which "
+        "no code path ever invoked from this flag: passing it did nothing. "
+        "It was retired by issue #1342 (ADR-0011). Coarsening work is "
+        "tracked in issue #1457.[/yellow]",
+    )
 
 
 def _preflight_cloud_consent(config: CreekConfig) -> None:
@@ -2366,8 +2409,8 @@ def classify(
         help=(
             "Enable confidence-driven re-atomization for this run "
             "regardless of the YAML default. Below-threshold or unclassified "
-            "fragments are re-atomized (split or aggregated) and re-classified "
-            "until a leaf clears the threshold or a terminal level is reached."
+            "fragments are split and re-classified until a leaf clears the "
+            "threshold or a terminal level is reached."
         ),
     ),
     reatomize_direction: str = typer.Option(
@@ -2375,7 +2418,7 @@ def classify(
         "--reatomize-direction",
         help=(
             "Override the direction heuristic. 'auto' routes by "
-            "source/level; 'split' forces zoom-in; 'aggregate' forces zoom-out."
+            "source/level; 'split' forces zoom-in."
         ),
     ),
 ) -> None:
@@ -2416,6 +2459,7 @@ def classify(
             f"[red]Unknown --reatomize-direction {reatomize_direction!r}. "
             f"Supported: {', '.join(_REATOMIZE_DIRECTIONS)}.[/red]",
         )
+        _print_retired_direction_hint(reatomize_direction)
         raise typer.Exit(code=2)
 
     config = _load_config_for_vault(vault)
@@ -2435,7 +2479,7 @@ def classify(
             update={
                 "reatomize": True,
                 "reatomize_direction": cast(
-                    "Literal['auto', 'split', 'aggregate']",
+                    "Literal['auto', 'split']",
                     reatomize_direction,
                 ),
             },

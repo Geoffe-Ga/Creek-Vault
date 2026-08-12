@@ -290,8 +290,7 @@ def _hierarchy_index(
     - ``sibling_positions[child_id] = (parent_id, index)`` records each
       child's slot in its parent's ``child_ids`` list. Built from the
       *parent's* declaration so the index is anchored in the canonical
-      sibling order (which the FEAT-021 splitter and FEAT-022 aggregator
-      both emit deterministically).
+      sibling order (which the FEAT-021 splitter emits deterministically).
 
     Args:
         fragments: Mapping of fragment ID to :class:`Fragment`, or

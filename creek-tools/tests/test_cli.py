@@ -600,6 +600,39 @@ def test_classify_rejects_unknown_reatomize_direction(tmp_path: Path) -> None:
     assert "reatomize-direction" in result.output
 
 
+def test_classify_rejects_retired_aggregate_direction(tmp_path: Path) -> None:
+    """``--reatomize-direction aggregate`` is refused, and says why (#1342).
+
+    FEAT-022's zoom-out aggregator had zero production callers, so
+    ``aggregate`` was a silent no-op: the flag was accepted, the run
+    proceeded, and nothing aggregated. ADR-0011 retires the operator, and
+    a retired value must fail loudly rather than keep pretending. The
+    message has to name the retirement and the issue so an operator whose
+    script still passes the flag learns where the decision lives instead
+    of just seeing "unknown value".
+    """
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+    result = runner.invoke(
+        app,
+        [
+            "classify",
+            "--vault",
+            str(vault),
+            "--reatomize",
+            "--reatomize-direction",
+            "aggregate",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    # Rich styles and hard-wraps console output, so strip ANSI and collapse
+    # whitespace before substring-asserting (same idiom as the help tests
+    # above). Assert on wrapping-robust single tokens, never a phrase.
+    normalised = re.sub(r"\s+", " ", _strip_ansi(result.output)).lower()
+    assert "retired" in normalised
+    assert "1342" in normalised
+
+
 def test_classify_reatomize_help_lists_flag() -> None:
     """The classify help text advertises the FEAT-023 flags."""
     result = runner.invoke(app, ["classify", "--help"])
