@@ -24,8 +24,10 @@ omitted the field had its content filed in the clear; both now return
 ``{"status": "refused", ...}`` naming the missing ``tier``. An input becoming
 mandatory is a strictly larger break than the optional *response* field that
 carried 0.5.0 for these same two tools, so it cannot carry less than a minor.
-This row also covers ``creek.save``, which took the identical break in #1495
-one commit earlier without a bump — a miss, not a precedent, and cheaper to
+This row also covers ``creek.save``, which took the identical break for issue
+#1434 — shipped as PR #1495, one commit before this one — without a bump. Both
+numbers are given because the rest of the tree cites the issue while the
+missing bump is a property of the PR: a miss, not a precedent, and cheaper to
 absorb into this row than to leave the published version silent about a
 mandatory input on a third write verb. **No ``/v1`` wire shape moves**:
 ``JournalUpsertRequest.tier`` never had a default, and ``creek.upload`` has no

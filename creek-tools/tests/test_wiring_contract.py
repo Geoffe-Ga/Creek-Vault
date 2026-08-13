@@ -1510,6 +1510,9 @@ MCP_CONTRACT: Final[Mapping[str, Surface]] = {
         shape=Shape.WRITES,
         why="#1024: an entry accepted over the wire but never landed in the vault",
         derived_from=("creek.vault.writer:VaultWriter",),
+        # ``tier`` is required as of #1494 — ``creek.journal`` refuses a call
+        # that omits it rather than defaulting to ``open``, so the contract
+        # must name one to exercise the write path at all.
         kwargs={
             "content": CANARY,
             "external_id": "j-canary-1",
@@ -1522,6 +1525,8 @@ MCP_CONTRACT: Final[Mapping[str, Surface]] = {
         shape=Shape.WRITES,
         why="#1024: an upload acknowledged but not ingested",
         derived_from=("creek.ingest:INGESTOR_REGISTRY",),
+        # ``tier`` is required as of #1494, exactly as for ``creek.journal``
+        # above — an omitted tier is refused before a byte is decoded.
         kwargs={
             "filename": "canary.md",
             "content_base64": base64.b64encode(
