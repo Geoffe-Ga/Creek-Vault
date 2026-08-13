@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
     from datetime import datetime
 
-    from creek.ingest.base import Ingestor, ParsedFragment
+    from creek.ingest.base import Ingestor, IngestResult, ParsedFragment
     from creek.ingest.ledger import LedgerRecord, SourceLedger
     from creek.models import Fragment, PrivacyTier
     from creek.vault.writer import VaultWriter
@@ -395,12 +395,37 @@ def tomb_missing_units(
     seen_keys: set[str],
     errors: list[str],
     source_type: str,
+    *,
+    discovery_complete: bool,
 ) -> int:
     """Soft-tomb ledgered units absent from a full-source pass (#674).
 
     Only a directory (full-source) input computes a gone set; a single-file
     input never tombs — that guards the incremental epic from tombing every
     other unit when re-ingesting one file.
+
+    **The pass must first have been able to see the whole source.** Tombing
+    is a soft-delete driven by *absence*, and absence means nothing when the
+    walk that failed to see a key could not read part of the tree: the key's
+    source may be sitting in exactly the part that could not be listed. So
+    ``discovery_complete=False`` returns 0 before anything else is
+    considered — the gone set is not computable, not merely inadvisable
+    (#1444).
+
+    *discovery_complete* is keyword-only with **no default**, copying the
+    ``warn(..., *, ceiling_safe)`` precedent in :func:`run_ingest`. mypy
+    strict covers ``creek/``, so a future caller that has not thought about
+    whether its pass had the authority to delete cannot compile; a default of
+    ``True`` would be fail-open, which is the defect rather than its fix.
+
+    **Why an incomplete pass only warns and still exits 0.** ``creek.cli``'s
+    ``_warn_if_discovered_but_empty`` returns early on ``written > 0 or
+    discovered == 0``, so it structurally cannot catch this shape, and
+    widening it would change behaviour for unrelated sources. Routing a new
+    exit code out of ``_run_ingest`` would mean widening the public
+    :class:`IngestRunResult` dataclass, which ``creek_mcp`` reads. A
+    ``--strict`` flag is therefore left for its own issue; nothing is
+    destroyed either way, which is the property that had to hold.
 
     Tombing is additionally gated on *source_type* being in
     :data:`TOMBING_SOURCES` (#1329). Holding a ledger is not sufficient: a
@@ -421,6 +446,15 @@ def tomb_missing_units(
         does not count. The figure is printed to the operator verbatim, so
         it may only ever name work that happened.
     """
+    # First, above every other guard. An incomplete enumeration cannot tell
+    # "the operator deleted this unit" from "the walk could not read the
+    # directory it lives in", so there is no gone set to compute. Being first
+    # is also what covers the ``ledger_source`` hazard documented on
+    # :func:`run_ingest`: a borrowed ledger plus a directory input is exactly
+    # the shape that arms this sweep for a source type whose listing was
+    # never authoritative to begin with.
+    if not discovery_complete:
+        return 0
     if ledger is None or not input_path.is_dir():
         return 0
     if source_type not in TOMBING_SOURCES:
@@ -629,16 +663,22 @@ _COLLAPSED_UNIT_SAMPLE = 3
 """How many superseded ids the advisory names before it stops listing."""
 
 
-class CollapsedUnitAdvisory(NamedTuple):
-    """The pre-#1305 advisory in both of its disclosure forms.
+class Advisory(NamedTuple):
+    """An operator advisory in both of its disclosure forms.
+
+    Named for the shape rather than for one producer, because
+    :func:`pre_write_advisories` collects several of them into one
+    homogeneous list; a per-advisory type would make that list heterogeneous
+    for no gain, since every producer answers the same two questions.
 
     Attributes:
-        message: What an operator at a terminal sees. It names the superseded
-            ids, which is the only thing that tells them *which* fragments to
-            inspect, so this form is the useful one — and the one that may
-            not cross a tier ceiling.
-        ceiling_safe: What may cross a tier ceiling. The same finding, and the
-            same count, with every interpolated vault id withheld.
+        message: What an operator at a terminal sees, in full detail. It may
+            name real vault content — the superseded ids of the pre-#1305
+            advisory, the operator's own source path in the #1444 one —
+            which is what makes it the useful form, and the one that may not
+            cross a tier ceiling.
+        ceiling_safe: What may cross a tier ceiling. The same finding with
+            every interpolated vault id and filesystem path withheld.
     """
 
     message: str
@@ -648,7 +688,7 @@ class CollapsedUnitAdvisory(NamedTuple):
 def collapsed_unit_warning(
     writer: VaultWriter,
     fragments: Sequence[ParsedFragment],
-) -> CollapsedUnitAdvisory | None:
+) -> Advisory | None:
     """Return the pre-#1305 collapsed-fragment advisory, or ``None`` (#1305).
 
     Before #1305 every sheet of a multi-sheet workbook derived the same
@@ -711,10 +751,151 @@ def collapsed_unit_warning(
     if len(superseded) > _COLLAPSED_UNIT_SAMPLE:
         sample = f"{sample}, …"
     count = len(superseded)
-    return CollapsedUnitAdvisory(
+    return Advisory(
         message=_COLLAPSED_UNIT_WARNING_TEMPLATE.format(count=count, sample=sample),
         ceiling_safe=_COLLAPSED_UNIT_SAFE_TEMPLATE.format(count=count),
     )
+
+
+_INCOMPLETE_DISCOVERY_TEMPLATE = (
+    "Ingest did not see all of {path}; {count} part(s) could not be listed "
+    "or read. Nothing was removed on this pass's evidence."
+)
+"""Advisory for a pass whose discovery could not enumerate the whole source.
+
+The console rendering. ``{path}`` interpolates the operator's own filesystem
+layout, which is exactly why it must not leave this process for a caller whose
+ceiling has not admitted it — see :data:`_INCOMPLETE_DISCOVERY_SAFE_MESSAGE`
+for the form that may.
+
+"listed **or** read" because the count aggregates two genuinely different
+failures: a subtree whose ``scandir`` was refused (recorded by
+``_enumerate_markdown_paths``' ``onerror`` as "cannot list …") and a candidate
+file whose ``read_bytes()`` was refused ("cannot read …"). Saying only "read"
+would misdescribe the directory case, and the operator's next move — go look at
+the ``errors`` lines, which name each one precisely — is the same either way.
+"""
+
+_INCOMPLETE_DISCOVERY_SAFE_MESSAGE = (
+    "Ingest did not see the whole source; nothing was removed on this pass's evidence."
+)
+"""The content-free twin of :data:`_INCOMPLETE_DISCOVERY_TEMPLATE` (#1372).
+
+Interpolates nothing at all. The path is withheld because a source path *is*
+operator filesystem layout; the count goes with it, because a count of
+unreadable parts of a named tree is a fact about that tree's shape. What
+survives is the finding and its consequence, which is what the remote caller
+actually needs in order to know this run's evidence was incomplete.
+"""
+
+
+def incomplete_discovery_advisory(
+    ingest_result: IngestResult,
+    input_path: Path,
+) -> Advisory | None:
+    """Return the incomplete-discovery advisory, or ``None`` when it does not apply.
+
+    Disarming :func:`tomb_missing_units` is necessary but not sufficient: a
+    run that quietly ingests nothing looks exactly like a run with nothing to
+    do, so without this the operator never learns a folder went unreadable —
+    and on the ``creek sync`` surface, which prints no summary and reads no
+    return value, nothing at all would be said (#1329/#1444).
+
+    **The wording deliberately does not claim the orphan sweep was skipped.**
+    This advisory fires for every ingestor and for single-*file* inputs too —
+    ``creek_mcp.tools.upload`` routes an uploaded file through
+    :func:`run_ingest` — and on that path :func:`tomb_missing_units`' own
+    ``not input_path.is_dir()`` guard means no sweep was ever armed. "The
+    sweep was skipped" would simply be false there. What is true on every
+    path is that the pass saw only part of the source and destroyed nothing
+    on that partial evidence, so that is what it says.
+
+    The two renderings are built here, at the producer, for the same reason
+    :func:`run_ingest`'s ``warn`` closure demands the decision at the
+    producer: this is the only place that knows what was interpolated. A
+    downstream scrub would have to recognise an operator's directory layout
+    by shape, and that guess is not available.
+
+    The count is :meth:`~creek.ingest.base.IngestResult.discovery_failure_count`
+    — the number of failures the discovery stage actually recorded on
+    ``errors``, so every part it counts is a line the operator can go and
+    read. It is printed verbatim, so like ``tombed`` it may only ever name
+    work that happened.
+
+    Args:
+        ingest_result: The completed ingest, consulted for
+            :attr:`~creek.ingest.base.IngestResult.discovery_complete` and
+            the failure count.
+        input_path: The source the operator named, verbatim.
+
+    Returns:
+        The advisory in both disclosure forms, or ``None`` when discovery
+        saw the whole source.
+    """
+    if ingest_result.discovery_complete:
+        return None
+    return Advisory(
+        message=_INCOMPLETE_DISCOVERY_TEMPLATE.format(
+            path=input_path,
+            count=ingest_result.discovery_failure_count(),
+        ),
+        ceiling_safe=_INCOMPLETE_DISCOVERY_SAFE_MESSAGE,
+    )
+
+
+def pre_write_advisories(
+    *,
+    source_type: str,
+    vault_path: Path,
+    writer: VaultWriter,
+    ingest_result: IngestResult,
+    input_path: Path,
+) -> list[Advisory]:
+    """Collect every advisory that must be raised BEFORE the first write.
+
+    All three of these are checked before :func:`run_ingest`'s write loop,
+    and each for its own reason:
+
+    * **Incomplete discovery.** The run destroyed nothing on partial
+      evidence, and a run that quietly writes little or nothing is
+      indistinguishable from a run with nothing to do (#1444).
+    * **Un-pinned vault.** Once the loop has recorded its first ledger entry
+      the vault no longer *looks* un-pinned, so an advisory raised afterwards
+      would never fire for the very run it needed to warn about (#1329).
+    * **Collapsed pre-#1305 units.** The operator is told which fragments
+      this run supersedes before the run that supersedes them finishes,
+      rather than after (#1305).
+
+    Gathering them here keeps :func:`run_ingest` — already at the project's
+    complexity ceiling — from growing a branch per advisory, and makes the
+    ordering of the operator's console output one readable list instead of an
+    implicit consequence of statement order.
+
+    Args:
+        source_type: Registry key of the ingestor being run.
+        vault_path: Vault root.
+        writer: The vault writer, consulted read-only.
+        ingest_result: The completed ingest, before anything is written.
+        input_path: The source the operator named, verbatim.
+
+    Returns:
+        The advisories that apply, in the order they should be delivered.
+        Empty when the run has nothing to say.
+    """
+    advisories: list[Advisory] = []
+    incomplete = incomplete_discovery_advisory(ingest_result, input_path)
+    if incomplete is not None:
+        advisories.append(incomplete)
+    unpinned = unpinned_vault_warning(source_type, vault_path)
+    if unpinned is not None:
+        # It travels verbatim: the text is a fixed constant with no
+        # interpolation, so it names a command rather than a fragment, and
+        # withholding it from an MCP caller would be caution with no subject.
+        advisories.append(Advisory(message=unpinned, ceiling_safe=unpinned))
+    collapsed = collapsed_unit_warning(writer, ingest_result.fragments)
+    if collapsed is not None:
+        advisories.append(collapsed)
+    return advisories
 
 
 def run_ingest(
@@ -820,23 +1001,16 @@ def run_ingest(
         if on_warning is not None:
             on_warning(message)
 
-    # Checked BEFORE the write loop: once the loop has recorded its first
-    # ledger entry the vault no longer looks un-pinned, and the advisory would
-    # never fire for the very run it needed to warn about.
-    #
-    # It travels verbatim: the text is a fixed constant with no interpolation,
-    # so it names a command rather than a fragment and withholding it from an
-    # MCP caller would be caution with no subject.
-    unpinned = unpinned_vault_warning(source_type, vault_path)
-    if unpinned is not None:
-        warn(unpinned, ceiling_safe=unpinned)
-
-    # Same reason as above: checked before the write loop, so the operator
-    # is told about superseded fragments before the run that supersedes
-    # them finishes rather than after (#1305).
-    collapsed = collapsed_unit_warning(writer, ingest_result.fragments)
-    if collapsed is not None:
-        warn(collapsed.message, ceiling_safe=collapsed.ceiling_safe)
+    # Raised BEFORE the write loop, every one of them; see
+    # :func:`pre_write_advisories` for why each cannot wait until after.
+    for advisory in pre_write_advisories(
+        source_type=source_type,
+        vault_path=vault_path,
+        writer=writer,
+        ingest_result=ingest_result,
+        input_path=input_path,
+    ):
+        warn(advisory.message, ceiling_safe=advisory.ceiling_safe)
 
     errors: list[str] = [f"[{source_type}] {err}" for err in ingest_result.errors]
     written = 0
@@ -887,7 +1061,13 @@ def run_ingest(
         counts[action] = counts.get(action, 0) + 1
 
     tombed = tomb_missing_units(
-        ledger, writer, input_path, seen_keys, errors, source_type
+        ledger,
+        writer,
+        input_path,
+        seen_keys,
+        errors,
+        source_type,
+        discovery_complete=ingest_result.discovery_complete,
     )
     return IngestRunResult(
         written=written,
