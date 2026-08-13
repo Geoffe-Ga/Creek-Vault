@@ -293,6 +293,19 @@ invariant from FEAT-010 does not apply. Authorization is the only
 gate, and refusals are themselves audited so a hostile client
 cannot probe the gate silently.
 
+Contract `0.6.0` (#1453) added two integer counters to every
+`creek.purge.*` result. `ledger_rows_removed` is the number of ingest-ledger
+rows a scoped purge physically erased — rows, not files, because one source
+unit accumulates an appended row per ingest and one erased fragment routinely
+takes several with it. `meta_artifacts_removed` is the number of files a
+whole-vault purge destroyed under `00-Creek-Meta/`, which it now sweeps
+deny-by-default; see [Cleaning and purge](./cleaning-and-purge.md) for the
+exhaustive keep list. Each counter is zero for the operation the other one
+describes, and neither can carry vault content. `_result_payload` forwards
+every field of `PurgeResult`, so both appear on the wire automatically —
+which is why the contract minor moved. `SUPPORTED_CONTRACT_MINORS` keeps
+serving `0.5`, `0.4`, `0.3` and `0.2`.
+
 Every tool requires a `privacy_tier_ceiling` parameter
 (`open` | `personal` | `intimate` | `all`); default is `open`. Note
 that `open` is the *most restrictive* setting — it restricts the

@@ -78,6 +78,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.5",
     "0.4",
     "0.3",
     "0.2",
@@ -106,6 +107,13 @@ carries a field the client can ignore, and the window is published on
 ``GET /v1/capabilities`` for a client that wants to move. ``0.4``, ``0.3`` and
 ``0.2`` are all retained and every client already sending
 ``X-Creek-Contract-Version: 0.2`` keeps being served.
+
+Contract 0.6 (#1453) is a pure MCP-surface move again, of the 0.3/0.4 kind:
+``creek.purge.*`` results gained ``ledger_rows_removed`` and
+``meta_artifacts_removed``, two integer counters that reach the wire because
+``_result_payload`` dumps every field of the result model. No ``/v1`` response
+shape moved, so a ``0.5`` client is served byte-identically on every ``/v1``
+route it already calls.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the

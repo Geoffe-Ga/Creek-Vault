@@ -145,6 +145,47 @@ decision:
 | **gone** | a ledgered `source_key` is absent from a full-source pass | **soft-tomb** — the fragment moves to `10-Liminal/Orphaned/` and is marked `lifecycle: orphaned` (never hard-deleted) |
 | **re-added** | a tombed `source_key` reappears | **restore** — the tombed fragment is moved back and un-marked under its preserved id |
 
+### The ledger is destroyed by a purge (#1453)
+
+The ledger has one more lifecycle event than the table above: **erasure**. It
+is the vault's stored mapping from a source path to a fragment id to a full
+unsalted SHA-256 of that source's content, so a right-to-be-forgotten request
+has to take it with them.
+
+- `creek purge vault` destroys every `00-Creek-Meta/State/ingest/*.jsonl`
+  outright, as part of the deny-by-default sweep of `00-Creek-Meta/`.
+- `creek purge fragment` / `source` / `source-path` / `daterange` erase the
+  rows naming the purged ids, plus every row naming a source unit those ids
+  came from — the ledger is append-only, so a superseded row still carries the
+  source path and an earlier draft's content hash. A ledger file left with no
+  rows is unlinked.
+- `creek purge classifications` touches no rows. It deletes nothing, and
+  wiping its rows would re-mint an id for every unchanged file in the vault on
+  the next ingest.
+
+**This changes the unchanged / changed / gone contract after an erasure**, and
+the change is not subtle:
+
+- Every remaining source unit is **created**, not **unchanged** — there is no
+  record to compare a hash against. A re-ingest of an untouched source
+  directory reports creations, not no-ops.
+- Nothing is **tombed**. `live_keys()` is empty, so the gone branch has no
+  ledgered key to miss and a full-source pass over an emptied vault reports
+  `0 tombed`. That matters: without the erasure the gone branch would see
+  every purged unit as vanished and soft-tomb fragments that no longer exist.
+- The `_UNPINNED_VAULT_WARNING` advisory stays silent, because it is guarded on
+  the vault holding fragments — after a vault purge it holds none.
+- **The re-ingested fragment carries the same id as before the purge.** The
+  ledger is not what reissues it: `generate_fragment_id` hashes source path,
+  timestamp and content, and `MarkdownIngestor._resolve_timestamp` is a pure
+  function of epoch mtime specifically so ids reproduce. Remove the ledger
+  directory from a vault entirely and the same file still re-ingests under the
+  same id. Anyone who can re-derive that id already holds the plaintext it was
+  derived from; what the erasure removes is the vault's own record of the
+  mapping. Making a purged id unreissuable would require salting fragment ids —
+  a separate change touching dedup, the writer id-index, and every
+  deterministic-id test.
+
 ### Full-source vs single-file
 
 The **gone** branch only runs on a *full-source directory* pass (the whole

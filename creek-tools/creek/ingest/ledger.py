@@ -17,14 +17,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from creek.ingest.source_unit import SOURCE_UNIT_SEPARATOR
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Iterable
 
 _LEDGER_RELPARTS: tuple[str, ...] = ("00-Creek-Meta", "State", "ingest")
 
@@ -48,6 +51,33 @@ class LedgerRecord:
     content_hash: str
     last_seen: str
     tombed: bool = False
+
+
+def _loads_object(line: str) -> dict[str, object] | None:
+    """Parse one JSONL line into a raw object, or ``None``.
+
+    Stops short of :meth:`SourceLedger._record_from_dict`'s completeness
+    check on purpose. The erasure pass in :func:`forget_fragment_ids` has
+    to recognise a row by its ``fragment_id`` even when the row is too
+    damaged to be a valid mapping — a truncated line still names the
+    fragment in cleartext, and the whole point of an erasure is that the
+    name goes away.
+
+    Args:
+        line: One raw line of a ledger file.
+
+    Returns:
+        The parsed JSON object, or ``None`` when the line is blank,
+        not valid JSON, or not an object.
+    """
+    text = line.strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 class SourceLedger:
@@ -135,14 +165,8 @@ class SourceLedger:
     @classmethod
     def _parse_line(cls, line: str) -> LedgerRecord | None:
         """Parse one JSONL line into a record, or ``None`` if malformed."""
-        text = line.strip()
-        if not text:
-            return None
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(data, dict):
+        data = _loads_object(line)
+        if data is None:
             return None
         return cls._record_from_dict(data)
 
@@ -258,3 +282,182 @@ class SourceLedger:
         )
         with self._path.open("a", encoding="utf-8") as handle:
             handle.write(f"{line}\n")
+
+
+def ledger_dir(vault_path: Path) -> Path:
+    """Return the directory holding every per-source ledger file.
+
+    This module owns :data:`_LEDGER_RELPARTS`; callers that need the
+    location — the purge engine, the docs pin — ask here rather than
+    restating the layout, so moving the ledger moves one constant.
+
+    Args:
+        vault_path: Vault root containing ``00-Creek-Meta/``.
+
+    Returns:
+        The ``00-Creek-Meta/State/ingest/`` directory (which need not
+        exist).
+    """
+    return vault_path.joinpath(*_LEDGER_RELPARTS)
+
+
+def _doomed_source_keys(lines: list[str], doomed_ids: frozenset[str]) -> set[str]:
+    """Collect the source keys belonging to any doomed fragment id.
+
+    The first of two passes. A source unit accumulates one appended row
+    per ingest, each carrying that revision's id and content hash, so
+    matching on ``fragment_id`` alone leaves every superseded row on
+    disk — and those rows hold hashes of *earlier drafts of the same
+    private text*, plus the source path, which is the join the erasure
+    exists to break.
+
+    Args:
+        lines: Raw lines of one ledger file.
+        doomed_ids: Fragment ids being erased.
+
+    Returns:
+        Every ``source_key`` that any doomed row names.
+    """
+    keys: set[str] = set()
+    for line in lines:
+        data = _loads_object(line)
+        if data is None or data.get("fragment_id") not in doomed_ids:
+            continue
+        key = data.get("source_key")
+        if isinstance(key, str) and key:
+            keys.add(key)
+    return keys
+
+
+def _line_is_doomed(
+    line: str,
+    doomed_ids: frozenset[str],
+    doomed_keys: set[str],
+) -> bool:
+    """Report whether one raw ledger line must not survive the erasure.
+
+    An unparseable line is matched as text. It is the case that matters
+    most: a half-written row is exactly the shape a crash leaves behind,
+    it still spells the fragment id in cleartext, and no structured
+    matcher can see it.
+
+    Args:
+        line: One raw line of the ledger file.
+        doomed_ids: Fragment ids being erased.
+        doomed_keys: Source keys any doomed row named.
+
+    Returns:
+        ``True`` when the line names a doomed id or a doomed source key.
+    """
+    data = _loads_object(line)
+    if data is None:
+        return any(fragment_id in line for fragment_id in doomed_ids)
+    return (
+        data.get("fragment_id") in doomed_ids or data.get("source_key") in doomed_keys
+    )
+
+
+def _rewrite_atomically(path: Path, lines: list[str]) -> None:
+    """Replace *path*'s contents with *lines*, atomically.
+
+    Temp file in the same directory plus ``os.replace``, so a crash
+    mid-write leaves either the whole old ledger or the whole new one —
+    never a truncated file whose surviving bytes are an arbitrary prefix
+    of somebody's erased source path.
+
+    Args:
+        path: The ledger file to rewrite.
+        lines: The surviving lines, without trailing newlines.
+    """
+    handle, raw_name = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=f"{path.name}.",
+        suffix=".tmp",
+    )
+    tmp_path = path.with_name(Path(raw_name).name)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.writelines(f"{line}\n" for line in lines)
+        tmp_path.replace(path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _forget_in_file(
+    path: Path,
+    doomed_ids: frozenset[str],
+    *,
+    dry_run: bool,
+) -> int:
+    """Erase every doomed row from one ledger file.
+
+    Args:
+        path: One ``<source>.jsonl`` ledger file.
+        doomed_ids: Fragment ids being erased.
+        dry_run: Count what would be erased and write nothing.
+
+    Returns:
+        The number of rows erased (or that would be).
+    """
+    lines = path.read_text(encoding="utf-8").splitlines()
+    doomed_keys = _doomed_source_keys(lines, doomed_ids)
+    survivors: list[str] = []
+    removed = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        if _line_is_doomed(line, doomed_ids, doomed_keys):
+            removed += 1
+        else:
+            survivors.append(line)
+    if removed == 0 or dry_run:
+        return removed
+    if survivors:
+        _rewrite_atomically(path, survivors)
+    else:
+        path.unlink()
+    return removed
+
+
+def forget_fragment_ids(
+    vault_path: Path,
+    fragment_ids: Iterable[str],
+    *,
+    dry_run: bool = False,
+) -> int:
+    """Physically erase every ledger row naming any of *fragment_ids* (#1453).
+
+    The ledger is otherwise append-only, and deliberately so: it is an
+    event log whose last line per key wins. An erasure cannot be
+    expressed in that vocabulary. Appending a tombstone leaves the
+    original row — source path, fragment id and a full unsalted SHA-256
+    of the body — verbatim on disk, and blanking a row in place is worse
+    than useless: :meth:`SourceLedger._record_from_dict` rejects an empty
+    ``content_hash``, so the row becomes invisible to every reader while
+    still spelling the fragment id in cleartext. The row is therefore
+    physically removed, and a file left with no rows is unlinked rather
+    than left as a husk naming its source.
+
+    Args:
+        vault_path: Vault root containing ``00-Creek-Meta/``.
+        fragment_ids: The ids being erased. Empty strings are ignored;
+            an empty collection is a no-op, never a wildcard.
+        dry_run: Count the rows that would be erased and write nothing,
+            leaving every ledger byte identical.
+
+    Returns:
+        The number of rows erased (or that would be, in a dry run).
+    """
+    doomed = frozenset(
+        fragment_id for fragment_id in fragment_ids if fragment_id.strip()
+    )
+    if not doomed:
+        return 0
+    directory = ledger_dir(vault_path)
+    if not directory.is_dir():
+        return 0
+    return sum(
+        _forget_in_file(path, doomed, dry_run=dry_run)
+        for path in sorted(directory.glob("*.jsonl"))
+    )

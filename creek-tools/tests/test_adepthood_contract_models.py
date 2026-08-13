@@ -1379,13 +1379,14 @@ def test_the_compatibility_window_only_ever_widens() -> None:
     somebody bumps :data:`CONTRACT_VERSION` and forgets this tuple.
 
     ``0.4`` joins the list at the 0.5 bump (#1372, the advisory fields on
-    ``creek.journal`` / ``creek.upload`` / ``creek.link``). It is the case
-    this guard exists for: the tuple's head entry is *derived* from
-    :data:`CONTRACT_VERSION`, so bumping the version and nothing else
-    silently shifts ``0.4`` out of the window rather than widening it, and
-    every live Adepthood consumer sending ``X-Creek-Contract-Version: 0.4``
-    starts being refused. Nothing about the change warranted that — the one
-    new ``/v1`` field is optional and omitted when empty.
+    ``creek.journal`` / ``creek.upload`` / ``creek.link``); ``0.5`` joins it
+    at the 0.6 bump (#1453, the two ``creek.purge.*`` erasure counters). Each
+    is the case this guard exists for: the tuple's head entry is *derived*
+    from :data:`CONTRACT_VERSION`, so bumping the version and nothing else
+    silently shifts the outgoing minor out of the window rather than widening
+    it, and every live Adepthood consumer still sending it starts being
+    refused. Neither change warranted that — 0.5's one new ``/v1`` field is
+    optional and omitted when empty, and 0.6 moved no ``/v1`` shape at all.
     """
-    for retired_minor in ("0.2", "0.3", "0.4"):
+    for retired_minor in ("0.2", "0.3", "0.4", "0.5"):
         assert retired_minor in SUPPORTED_CONTRACT_MINORS

@@ -247,11 +247,39 @@ from most to least likely:
 - **Embedding-cache reverse engineering.** Sentence-transformer
   embeddings can be partially inverted by an attacker who already has
   the cache file. Treat the cache as as-sensitive as the source text.
-- **Anti-forensic guarantees.** `creek purge vault` and
-  `creek gdrive --revoke` do best-effort secure-erase passes (write
-  zeros, then unlink). Modern SSDs and copy-on-write filesystems
-  (APFS, btrfs, ZFS) cannot guarantee that the original bytes are
-  unrecoverable from raw flash.
+- **Anti-forensic guarantees — there are none.** `creek purge` and
+  `creek gdrive --revoke` do a plain `unlink` / `shutil.rmtree`. There
+  is **no** secure-erase pass anywhere in `creek/purge/`: nothing
+  overwrites a file before removing it. (This entry previously claimed
+  "best-effort secure-erase passes (write zeros, then unlink)". That
+  was never true of any released version — #1453.) Deleted content is
+  therefore recoverable by ordinary undelete tooling until the blocks
+  are reused, and on modern SSDs and copy-on-write filesystems (APFS,
+  btrfs, ZFS) even an overwriting implementation could not guarantee
+  the original bytes are unrecoverable from raw flash. Full-disk
+  encryption is the mitigation; a zero-fill pass would not have been
+  one.
+- **What survives an erasure.** A purge is scoped to the vault, and
+  some of the vault is deliberately kept. `00-Creek-Meta/audit/*.jsonl`
+  and the legacy `Processing-Log/purge-log.json` survive by design —
+  they are the compliance record, and the whole-vault entry among them
+  names every fragment id the vault held. `creek_config.yaml` survives
+  because it is the vault marker and holds operator configuration only;
+  the `privacy_tier` ratchet is **not** there, being per-fragment
+  frontmatter that is destroyed with the fragments, so
+  `audit/privacy.jsonl` above is the surviving record that a tier was
+  ever raised. Everything else under `00-Creek-Meta/` is destroyed
+  deny-by-default (#1453) — **including the `creek init` scaffold**
+  (`Ontology/`, `Skills/`, `Templates/`, `Scripts/`), because `Skills/`
+  is where operators drop their own skill files and one of those may
+  quote a purged fragment. Redeploy with `creek init` / `creek skills
+  sync`. The exhaustive keep list, and a test pinning it against the
+  code, are in
+  [cleaning-and-purge.md](../cleaning-and-purge.md). Outside the vault
+  nothing is touched: original source exports, shell history, editor
+  swap files, Spotlight/Tracker indexes, Time Machine and other backup
+  snapshots, and any git history of the vault all retain content a
+  purge removed from the working tree.
 - **Multi-tenant safety.** The vault is single-user by design.
 
 ## Recommended hygiene

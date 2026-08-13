@@ -251,18 +251,21 @@ surface and MCP.
 
 The three capability routes — `PUT /v1/journal-entries/{external_id}`,
 `POST /v1/reflections` and `GET /v1/wheel` — require
-`X-Creek-Contract-Version: <major.minor>`, for example `0.5`. The comparison is
+`X-Creek-Contract-Version: <major.minor>`, for example `0.6`. The comparison is
 strict membership against the server's `supported_contract_minors`: a missing
 header, a full patch version like `0.2.0`, or anything unrecognised is `409
 incompatible_version`, refused before any vault read.
 
 That set is a **window, and it widens before it narrows**. It currently holds
-`0.5`, `0.4`, `0.3` and `0.2`. The `0.3.0` and `0.4.0` moves both came from the
-MCP surface and changed no `/v1` shape — `0.3.0` added `creek.upload` (#1023),
-`0.4.0` gave `creek.purge.*` its `partial` status (#1246). `0.5.0` (#1372) is
-the first that did: `JournalUpsertResponse` gained an *optional* `warnings`
-field, omitted from the payload entirely when the write produced no advisory.
-Every client still sending `0.4`, `0.3` or `0.2` is served exactly as before.
+`0.6`, `0.5`, `0.4`, `0.3` and `0.2`. The `0.3.0`, `0.4.0` and `0.6.0` moves all
+came from the MCP surface and changed no `/v1` shape — `0.3.0` added
+`creek.upload` (#1023), `0.4.0` gave `creek.purge.*` its `partial` status
+(#1246), and `0.6.0` gave `creek.purge.*` the `ledger_rows_removed` and
+`meta_artifacts_removed` erasure counters (#1453). `0.5.0` (#1372) is the only
+one that moved a `/v1` shape: `JournalUpsertResponse` gained an *optional*
+`warnings` field, omitted from the payload entirely when the write produced no
+advisory. Every client still sending `0.5`, `0.4`, `0.3` or `0.2` is served
+exactly as before.
 Read the window off `GET /v1/capabilities` rather than assuming the newest
 minor is the only one accepted.
 

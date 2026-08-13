@@ -15,8 +15,17 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.5.0"
+CONTRACT_VERSION: Final[str] = "0.6.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.6.0 (#1453): ``creek.purge.*`` results carry two new erasure counters,
+``ledger_rows_removed`` (ingest-ledger rows erased by a scoped purge) and
+``meta_artifacts_removed`` (files destroyed by the deny-by-default sweep of
+``00-Creek-Meta/`` during a whole-vault purge). ``_result_payload`` forwards
+every field of the result model, so both reach the wire without any payload
+code change — which is exactly why the minor has to move: a client validating
+the payload closed would otherwise meet two keys it never negotiated. Both are
+plain integers and neither can carry vault content.
 
 0.5.0 (#1372): ``creek.journal`` and ``creek.upload`` now return the
 content-free ``warnings`` their ingest run produced, and ``creek.link``

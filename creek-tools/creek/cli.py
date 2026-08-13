@@ -6698,6 +6698,14 @@ def _render_purge_result(result: PurgeResult) -> None:
         console.print(
             f"Intimate stubs removed: {result.intimate_stubs_removed}",
         )
+    if result.ledger_rows_removed:
+        console.print(
+            f"Ledger rows removed: {result.ledger_rows_removed}",
+        )
+    if result.meta_artifacts_removed:
+        console.print(
+            f"Meta artifacts removed: {result.meta_artifacts_removed}",
+        )
     _render_voice_purge_notes(result)
     _render_deleted_files(result.deleted_files)
 

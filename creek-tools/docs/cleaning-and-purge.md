@@ -143,7 +143,65 @@ creek purge daterange --start 2025-01-01 --end 2025-01-31 --vault ~/Obsidian/Cre
 
 ### `creek purge vault`
 
-Nuclear option: destroys every fragment, thread, eddy, and resonance. Leaves the directory structure and `00-Creek-Meta/` intact. This is **never** undoable.
+Nuclear option: destroys every fragment, thread, eddy, and resonance. Leaves the directory structure intact. This is **never** undoable.
+
+Since #1453 it also sweeps `00-Creek-Meta/`, **deny-by-default**: every regular file under that directory is destroyed unless it appears in the keep column of the table below. The default used to be the other way round — `00-Creek-Meta/` was preserved whole — which meant a whole-vault right-to-be-forgotten request left behind the ingest ledger (source path → fragment id → a full unsalted SHA-256 of the body), the provenance log (whose paths are built from fragment *titles*), the consent log (operator name and original source directory), the dedup manifest (content-hash → id) and the Discord capture-staging root (raw plaintext).
+
+The scaffold `creek init` deploys — `Ontology/`, `Skills/`, `Templates/`, `Scripts/` — is **swept too**. It looks like a safe keep and is not: `Skills/` is explicitly where operators drop their own skill files, so it holds first-class operator content that may quote a fragment. Keeping it would have made this purge *weaker than a scoped one*, which already scrubs titles and fragment ids out of `00-Creek-Meta/Skills` via the reference pass. Nothing is lost that the tool cannot restore — `creek init --vault <path>` redeploys all four trees and `creek skills sync` redeploys the skill tree alone.
+
+Inverting the default is the point. An enumerated wipe-list stops being correct the moment somebody adds a twenty-first artifact, and it fails *silently*: nothing goes red when a new leak appears. Under deny-by-default a new artifact is destroyed by an erasure unless somebody deliberately writes down why it should survive. `tests/test_purge_meta_survivors.py` pins this table against `creek/purge/meta.py`, so a keep-list change that is not documented here fails the build, and vice versa.
+
+#### What survives `creek purge vault` under `00-Creek-Meta/`
+
+<!-- META-SURVIVOR-TABLE:BEGIN -->
+
+| Path (under `00-Creek-Meta/`) | Disposition | Reason |
+| --- | --- | --- |
+| `creek_config.yaml` | keep | The vault marker `purge_vault` checks for (GAP-003). Delete it and `creek` stops recognising the directory as a vault — including for the *next* purge, whose marker check would refuse. Holds operator configuration and no vault-derived content. |
+| `audit/purge.jsonl` | keep | The erasure record itself. |
+| `audit/privacy.jsonl` | keep | Privacy-tier ratchet history. |
+| `audit/redact.jsonl` | keep | Redaction record — what was scrubbed, and when. |
+| `audit/mcp.jsonl` | keep | Hash-chained MCP tool audit log with its own chain verifier. An MCP-invoked purge appends to it *around* the purge, so sweeping it would destroy the chain the operation is about to write into. |
+| `Processing-Log/purge-log.json` | keep | The pre-Batch-C spelling of `audit/purge.jsonl`. It is migrated into the new log automatically — but only when the new log is empty, which it is not in any vault that has purged before; otherwise the migration warns and skips. Sweeping it would destroy un-migrated erasure records in the common case. |
+| `Skills/lint.SKILL.md` | wipe | `creek init` scaffold — but `Skills/` is explicitly the directory operators drop their **own** skills into (`deploy_skills` creates it for exactly that, and `detect_drifted_skills` compares only the canonical set so operator files are left alone). A custom skill may quote a fragment's title, id or body. Keeping the prefix would make the whole-vault purge weaker than a scoped one, which already scrubs this tree via `_scrub_references`. Restore with `creek skills sync`. |
+| `Skills/.gitkeep` | wipe | Same prefix; redeployed by `creek init`. |
+| `Ontology/creek_ontology_agent_prompt.md` | wipe | `creek init` scaffold, swept on the same terms — the directory is operator-writable and nothing here is a compliance record. Restore with `creek init --vault <path>`. |
+| `Ontology/.gitkeep` | wipe | Same prefix; redeployed by `creek init`. |
+| `Templates/.gitkeep` | wipe | Same prefix; redeployed by `creek init`. |
+| `Scripts/.gitkeep` | wipe | Same prefix; redeployed by `creek init`. |
+| `embeddings.parquet` | exempt | Destroyed, but by `_delete_cache_file()`, which reports the row count it removed. Sweeping it first would silently zero that number. Exempt means "another pass owns destroying this", not "this survives". |
+| `State/ingest/markdown.jsonl` | wipe | The ingest ledger, one file per source. Maps source path → fragment id → full unsalted SHA-256 of the body. The leak #1453 was filed for. |
+| `State/ingest/upload.jsonl` | wipe | Same, for the `creek.upload` MCP tool's ledger. |
+| `State/latest.md` | wipe | Renders eddy, thread and praxis **titles** verbatim. |
+| `State/2026-W33.md` | wipe | Dated state snapshots, same content as `latest.md`. |
+| `State/sync/last-run.json` | wipe | Sync cursor; names synced sources. |
+| `State/discord/cursor.json` | wipe | Discord read cursor; names channels. |
+| `State/discord/capture-staging/messages/general/messages.json` | wipe | Raw captured plaintext, nested two levels deep. Swept by the recursive walk — **not** by `ADEPTHOOD_STAGING_RELDIRS`, whose walker is non-recursive by design and would sweep nothing here. |
+| `State/.gitkeep` | wipe | Scaffold marker under a non-kept prefix; `creek init` redeploys it. |
+| `Processing-Log/provenance.jsonl` | wipe | Records each written fragment's absolute path, and that path is built from the fragment's **title** — cleartext, and worse than any hash. Already documented as "not compliance-grade, allowed to be lossy", which forecloses a compliance defence for keeping it. |
+| `Processing-Log/consent-log.json` | wipe | Original source directory and the operator's name. |
+| `Processing-Log/run-summary.jsonl` | wipe | Per-run ingest counts and source names. |
+| `Processing-Log/tag-history.json` | wipe | Tag history derived from fragment content. |
+| `Processing-Log/unnamed-history.json` | wipe | Naming history derived from fragment content. |
+| `Processing-Log/compile-gaps.jsonl` | wipe | Compile diagnostics quoting fragment material. |
+| `Processing-Log/llm-progress.jsonl` | wipe | Per-fragment LLM progress, keyed by fragment id. |
+| `Processing-Log/paradoxes-during-compile.jsonl` | wipe | Quotes fragment content. |
+| `Processing-Log/.gitkeep` | wipe | Scaffold marker under a non-kept prefix; `creek init` redeploys it. |
+| `dedup-manifest.json` | wipe | content-hash → fragment_id. A plaintext-confirmation oracle joined to the id. |
+| `voice-fingerprint.json` | wipe | Derived from the operator's own writing. |
+| `Temporal-Index.md` | wipe | Index naming fragments and titles. |
+| `Source-Index.md` | wipe | Index naming source paths. |
+| `Tag-Garden.md` | wipe | Index naming tags derived from content. |
+| `Inbound/ch1/staged.md` | wipe | Staged inbound content awaiting ingest — source plaintext. |
+| `audit/compile-t1.hash` | wipe | `audit/compile-<target_id>.hash` is a content hash, not a compliance record. |
+
+<!-- META-SURVIVOR-TABLE:END -->
+
+Two consequences an operator will notice:
+
+- **The scaffold must be redeployed.** Run `creek init --vault <path>` (or `creek skills sync` for the skill tree alone) after a vault purge. Any skill file you authored yourself is gone, deliberately.
+- **Consent must be re-recorded.** `Processing-Log/consent-log.json` is destroyed, so the next ingest asks again. That is deliberate: the log names the original source directory and the operator.
+- **Re-ingesting the same source produces the same fragment id.** Destroying the ledger does *not* make a purged id unreissuable, and nothing in `creek purge` can. `generate_fragment_id` hashes source path, mtime-derived timestamp and content, and `MarkdownIngestor._resolve_timestamp` is a pure function of epoch mtime precisely so ids reproduce. Verified by removing the ledger directory from a vault entirely and re-ingesting: the same id came back. Anyone able to re-derive the id already holds the plaintext it was derived from, so the id discloses nothing they did not have; what the erasure removes is the vault's own stored *mapping* from source path and content hash to that id. Making a purged id unreissuable would require salting fragment ids, which is a separate change.
 
 Before the wipe loop runs, the engine verifies that the target directory is a Creek vault by checking for the `00-Creek-Meta/creek_config.yaml` marker file that `creek init` deploys (GAP-003). The check runs *before* the intent audit line is written, so a refusal leaves the audit log untouched. Both the interactive and `--force-non-interactive` paths go through the same check — no carve-out. A `--vault` typo that points at an unrelated directory with coincidentally numeric-prefix folders therefore exits non-zero with a clear message naming the marker the engine looked for, rather than silently wiping the wrong tree.
 
@@ -276,15 +334,17 @@ incomplete erasure as incomplete.
 
 A dry run's counters now agree with what the same call would apply, exactly, across `intimate_stubs_removed`, `provenance_scrubbed`, `voice_artifacts_removed`, and `wikilinks_removed` (#1340). They used to diverge for two independent reasons: a counted-only deletion left the artifact on disk for a later pass in the same run to find and count again, and a counted-only rewrite left the *old* bytes on disk so a later pass matched references the real run had already scrubbed. Both are closed by a per-operation dry-run ledger that records what an apply run would have deleted and written; the engine populates it on every run but consults it only under `dry_run`, so nothing the ledger holds can change what a real purge deletes or rewrites.
 
-`creek redact --apply` writes alongside it at `<vault>/00-Creek-Meta/audit/redact.jsonl`, using its own three-phase schema — `phase` (`intent` / `file` / `outcome`), `operation_id`, `status`, `failure_reason` and `files`, on top of the per-file `source_path` / `pattern_names` / `match_counts` fields. It is documented in full, including what an `intent` line without an `outcome` line does and does not prove, at [redaction.md → The audit trail](redaction.md#the-audit-trail); the table above describes `purge.jsonl` only. Note that `creek redact --apply` never rewrites `00-Creek-Meta/audit/` or the legacy `Processing-Log/purge-log.json`, so redaction cannot launder records into the purge chain via the legacy-migration path. Privacy-tier overrides (e.g. `creek mine --include-tier intimate`) write to `<vault>/00-Creek-Meta/audit/privacy.jsonl`. Operational provenance from ingestion stays at `<vault>/00-Creek-Meta/Processing-Log/provenance.jsonl` (separate location: not compliance-grade, allowed to be lossy).
+`creek redact --apply` writes alongside it at `<vault>/00-Creek-Meta/audit/redact.jsonl`, using its own three-phase schema — `phase` (`intent` / `file` / `outcome`), `operation_id`, `status`, `failure_reason` and `files`, on top of the per-file `source_path` / `pattern_names` / `match_counts` fields. It is documented in full, including what an `intent` line without an `outcome` line does and does not prove, at [redaction.md → The audit trail](redaction.md#the-audit-trail); the table above describes `purge.jsonl` only. Note that `creek redact --apply` never rewrites `00-Creek-Meta/audit/` or the legacy `Processing-Log/purge-log.json`, so redaction cannot launder records into the purge chain via the legacy-migration path. Privacy-tier overrides (e.g. `creek mine --include-tier intimate`) write to `<vault>/00-Creek-Meta/audit/privacy.jsonl`. Operational provenance from ingestion is written to `<vault>/00-Creek-Meta/Processing-Log/provenance.jsonl`, which is explicitly **not** compliance-grade and allowed to be lossy — and that is precisely why `creek purge vault` now destroys it (#1453). Each line records a written fragment's absolute path, and `_compute_base_name` builds that path out of the fragment's **title**, so the file holds cleartext titles for every fragment the vault ever contained. A record that is permitted to lose entries cannot be the reason an erasure request is refused.
 
-A pre-Batch-C `Processing-Log/purge-log.json` from older installs is migrated automatically on first read or write — every legacy entry is replayed into the new chain, a `purge.audit.migration` marker is recorded, and the old file is removed.
+A pre-Batch-C `Processing-Log/purge-log.json` from older installs is migrated automatically on first read or write — every legacy entry is replayed into the new chain, a `purge.audit.migration` marker is recorded, and the old file is removed. Migration only runs while the new log is still **empty**; once `audit/purge.jsonl` has any content the migration logs a warning and skips, leaving both files in place for an operator to reconcile by hand. Because that half-migrated state is the norm rather than the exception in a vault that has purged before, `purge-log.json` is on the vault-purge keep-list (#1453): sweeping it would destroy erasure records that had never reached the new chain.
 
 The audit trail itself is **not purgeable** by `creek` — it's the system's compliance record. You can `git rm` it manually, but that's outside the tool.
 
-That retention point sharpens now that `creek purge vault` names every fragment it destroys (#1340): the roster written to `purge.jsonl` after a whole-vault purge is the complete list of ids that vault held under `01-Fragments/`. A fragment id is a truncated SHA-256 over source, timestamp, and content — not reversible, and it confirms membership only to someone who already holds the exact original — but it is a durable record of *what existed*, and it outlives the erasure that produced it. An operator who needs that roster gone has to remove the log out of band, by the same `git rm` above. At 35k fragments the roster is roughly 700 KB on a single JSONL line; the hash chain is unaffected, because verification hashes the stored line bytes, not anything derived from them.
+That retention point sharpens now that `creek purge vault` names every fragment it destroys (#1340): the roster written to `purge.jsonl` after a whole-vault purge is the complete list of ids that vault held under `01-Fragments/`. A fragment id is a truncated SHA-256 over source, timestamp, and content — not reversible, and it confirms membership only to someone who already holds the exact original — but it is a durable record of *what existed*, and it outlives the erasure that produced it. When auditing what a purge leaves behind, the question to ask of each surviving artifact is whether it names **a fragment id, a source path, a title, a content hash, or raw content**. The first two are the obvious ones and they are not the worst: `provenance.jsonl` leaked a cleartext title and `State/latest.md` leaked eddy, thread and praxis titles verbatim, and a filter written around ids and paths alone would have cleared both. An operator who needs that roster gone has to remove the log out of band, by the same `git rm` above. At 35k fragments the roster is roughly 700 KB on a single JSONL line; the hash chain is unaffected, because verification hashes the stored line bytes, not anything derived from them.
 
-The roster is not the only thing that survives, and it is not the most identifying. `purge_vault` preserves `00-Creek-Meta/` apart from the Adepthood staging roots and the embeddings cache, so the ingest ledger under `00-Creek-Meta/State/ingest/` also outlives a whole-vault purge — and it maps each fragment id to the **source path** that produced it, which the roster does not. Whether that is intended is tracked in #1453; until it is settled, treat "what survives a vault purge under `00-Creek-Meta/`" as wider than the audit log alone.
+The roster used not to be the only thing that survives, and it was not the most identifying: `purge_vault` preserved `00-Creek-Meta/` apart from the Adepthood staging roots and the embeddings cache, so the ingest ledger under `00-Creek-Meta/State/ingest/` outlived a whole-vault purge — mapping each fragment id to the **source path** that produced it and to a full unsalted SHA-256 of its body, neither of which the roster holds. #1453 settled that: the ledger is destroyed, along with everything else under `00-Creek-Meta/` that is not in the keep table above. What survives is now an explicit, tested list rather than "whatever nobody thought to sweep".
+
+Scoped purges close the same hole on the path an actual erasure request takes. `creek purge fragment`, `source`, `source-path` and `daterange` erase every ledger row naming a purged id — and every row naming a source unit one of those ids came from, because the ledger is append-only and a superseded row still carries the source path and an earlier draft's content hash. The rows are physically removed and a ledger file left with no rows is unlinked; tombstoning was rejected because a row whose `content_hash` is blanked is rejected by the loader, and so becomes invisible to every reader while still spelling the fragment id on disk. `creek purge classifications` deliberately touches no rows: it deletes nothing, and wiping its rows would make the next ingest re-mint an id for every unchanged file in the vault.
 
 ## Recovery
 
