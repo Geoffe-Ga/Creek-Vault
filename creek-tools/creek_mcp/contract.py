@@ -15,8 +15,22 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.6.0"
+CONTRACT_VERSION: Final[str] = "0.7.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.7.0 (#1494): ``creek.journal`` and ``creek.upload`` now **require** an
+explicit ``tier``. Both used to default it to ``open``, so a client that
+omitted the field had its content filed in the clear; both now return
+``{"status": "refused", ...}`` naming the missing ``tier``. An input becoming
+mandatory is a strictly larger break than the optional *response* field that
+carried 0.5.0 for these same two tools, so it cannot carry less than a minor.
+This row also covers ``creek.save``, which took the identical break in #1495
+one commit earlier without a bump — a miss, not a precedent, and cheaper to
+absorb into this row than to leave the published version silent about a
+mandatory input on a third write verb. **No ``/v1`` wire shape moves**:
+``JournalUpsertRequest.tier`` never had a default, and ``creek.upload`` has no
+``/v1`` route at all, so this is a 0.3.0/0.4.0-shaped bump and
+``SUPPORTED_CONTRACT_MINORS`` is widened rather than shifted.
 
 0.6.0 (#1453): ``creek.purge.*`` results carry two new erasure counters,
 ``ledger_rows_removed`` (ingest-ledger rows erased by a scoped purge) and
