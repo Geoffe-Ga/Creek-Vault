@@ -269,6 +269,8 @@ def author_tool(
             stub, which is what makes the wire past the desk assertable.
         medium: Target medium (``research`` or ``chat``).
         max_rounds: Optional override for the voice/reflect round bound.
+            Defaults to the vault's ``author.max_author_rounds`` config (3),
+            mirroring the ``creek author --max-rounds`` help (#1465).
         dry_run: When set, return the plan + evidence summary, not a draft.
         privacy_tier_ceiling: Privacy gate (FEAT-010).
         consumer: Audit consumer identifier.
