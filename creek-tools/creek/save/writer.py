@@ -79,10 +79,17 @@ class SaveRequest:
 def save_to_vault(request: SaveRequest, *, vault_path: Path) -> Path:
     """Write *request* to the vault and return the resulting markdown path.
 
-    Honours the paradox routing rule (paradox always lands in
-    ``10-Liminal/Paradoxes/`` and is filtered as ``open`` regardless of
-    the requested tier) and the privacy-tier filter, including the
-    intimate-body redirect to ``10-Liminal/Compost/intimate-stubs/``.
+    Honours the paradox *routing* rule — paradox always lands in
+    ``10-Liminal/Paradoxes/`` — and the privacy-tier filter, including
+    the intimate-body redirect to ``10-Liminal/Compost/intimate-stubs/``.
+
+    Routing is the only thing ``--target paradox`` overrides. The tier is
+    the caller's, unconditionally. Until #1491 this function substituted
+    ``PrivacyTier.OPEN`` for every paradox save on the reasoning that a
+    paradox preserves *the fact* of a contradiction rather than the
+    contradictory content — but the fact is already carried by the note's
+    location, title, tags and ``saved_from`` provenance, so forcing the
+    tier bought nothing and filed intimate-derived bodies in the clear.
 
     Args:
         request: The save payload.
@@ -91,9 +98,7 @@ def save_to_vault(request: SaveRequest, *, vault_path: Path) -> Path:
     Returns:
         Absolute path of the written vault note.
     """
-    effective_tier = (
-        PrivacyTier.OPEN if request.target == SaveTarget.PARADOX else request.tier
-    )
+    effective_tier = request.tier
     filtered = pre_save_filter(
         request.body,
         tier=effective_tier,
