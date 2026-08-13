@@ -72,7 +72,7 @@ These are non-negotiable:
 2. **Never edit the contributing fragments to align them.** Fragments are append-only after ingest; the Paradox note is the only place the contradiction is named.
 3. **Never auto-promote a Paradox to a Thread or Eddy.** A Thread tells a directional story; an Eddy is a topic cluster. A Paradox is neither — it is the system honoring §10.2 of the spec.
 4. **Never delete a Paradox note silently.** Deletion goes through `creek purge` with elevated auth; a paradox that "no longer feels true" is itself data about the human's wavelength position.
-5. **Never let a Paradox short-circuit privacy tiers.** If either contributing fragment is `intimate`, the Paradox note inherits `intimate` and the inclusion rules in `privacy-tier.SKILL.md` apply.
+5. **Paradox notes are always written at `open`, with the full body in the clear — regardless of the `--tier` you pass.** `creek/save/writer.py` forces `PrivacyTier.OPEN` for `--target paradox` unconditionally; there is no tier-protected paradox. If either contributing fragment is `intimate` (or `personal`), do **not** route it through a Paradox — name a different target (`unnamed`, `thread`, `eddy`, or `praxis`) with the appropriate `--tier` instead, so the intimate content gets the redaction/off-vault-stash treatment it needs. Tracked as a known leak: [Creek-Vault#1491](https://github.com/Geoffe-Ga/Creek-Vault/issues/1491).
 
 ## When a paradox does get re-examined
 

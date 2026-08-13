@@ -28,7 +28,7 @@ creek save --target <thread|eddy|praxis|paradox|unnamed|draft> \
 | `--provenance`    | Comma-separated fragment IDs (e.g. `frag-001,frag-002`).                                                                 |
 | `--source`        | Opaque source identifier — conversation/discord-msg/claude-session.                                                      |
 | `--source-kind`   | `discord` / `claude-session` / `manual` (default) / `mcp`.                                                               |
-| `--tier`          | Privacy tier. **Required** when `--provenance` is empty or the body comes from stdin.                                    |
+| `--tier`          | **Required.** Privacy tier (`open`/`personal`/`intimate`). Never inferred — see "Tier is always explicit" below.         |
 | `--full-body`     | Allow personal-tier bodies through unredacted (off by default).                                                          |
 | `--vault`         | Vault root; falls back to the configured default.                                                                        |
 
@@ -86,16 +86,21 @@ stub parked outside that directory survives the purge and must be
 removed explicitly. See
 [Purge](cleaning-and-purge.md#purge-right-to-be-forgotten).
 
-### Tier defaulting
+### Tier is always explicit
 
-* `--tier` always wins when supplied.
-* No `--tier` + `--provenance` supplied → defaults to `open`. (A
-  future revision will derive this from the source fragments' max
-  tier; the v1 surface requires the operator to be explicit if they
-  want a stricter default.)
-* No `--tier` + no `--provenance` → the command **refuses** with a
-  clear error. This is the regression case FEAT-009 calls out by
-  name: silent defaults are how intimate content leaks into vaults.
+* `--tier` is **required** on every save. There is no default and no
+  automatic inheritance — not from `--provenance`, not from the source
+  fragments, regardless of whether provenance is supplied.
+* Omitting `--tier` **refuses** the save with a clear error and exit
+  code 2, whether or not `--provenance` is present.
+* The doctrine that a derived note carries the most-restrictive tier
+  of its sources still holds — but it is the **calling agent's** job
+  to determine that tier (the most-restrictive tier among the
+  contributing fragments) and pass it explicitly as `--tier`. Nothing
+  in `creek save` computes it for you.
+* This is the regression case FEAT-009 calls out by name: silent
+  defaults are how intimate content leaks into vaults. Requiring an
+  explicit `--tier` on every call is the fix.
 
 ## Provenance frontmatter
 
@@ -162,8 +167,8 @@ Coverage lives in `tests/test_save.py`:
   stub-relpath under `10-Liminal/Compost/intimate-stubs/`.
 * `creek save --target paradox` always lands in
   `10-Liminal/Paradoxes/`.
-* `creek save` with no `--tier` and no `--provenance` exits 2 with a
-  clear error.
+* `creek save` with no `--tier` exits 2, with or without
+  `--provenance`.
 * `intimate`-tier saves never write the full body anywhere under the
   tracked vault tree (verified by file-system inspection).
 * End-to-end thread save round-trip via `CliRunner`.
