@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 
 from creek.cli import app, console
 from creek.ingest.base import IngestResult
+from creek.ingest.gdrive import DownloadResult, DriveFile
 
 runner = CliRunner()
 
@@ -5364,3 +5365,199 @@ def test_ingest_no_warning_when_no_inputs_discovered(
 
     assert result.exit_code == 0, result.output
     assert "WARNING" not in result.output
+
+
+# ---- gdrive --download accounting (#1372) ----
+
+
+def _flat_output(text: str) -> str:
+    """Return *text* ANSI-free with Rich's soft wrapping collapsed to spaces.
+
+    The accounting line the tests below assert on is a single sentence Rich
+    is free to wrap; rejoining it means the assertion is about what the
+    operator reads, not about where the terminal happened to break it.
+
+    Args:
+        text: Raw captured CLI output.
+
+    Returns:
+        The single-spaced, escape-free form of *text*.
+    """
+    return " ".join(_strip_ansi(text).split())
+
+
+def _listed_drive_file(name: str) -> DriveFile:
+    """Build a Drive listing entry named *name*.
+
+    :class:`~creek.ingest.gdrive.DriveFile` is a frozen dataclass with no
+    defaults, so every field is supplied; only ``name`` is load-bearing here,
+    because it is the one thing an operator can act on.
+
+    Args:
+        name: The file name as Drive reports it.
+
+    Returns:
+        A fully populated listing entry.
+    """
+    from datetime import UTC, datetime
+
+    return DriveFile(
+        id=f"id-{name}",
+        name=name,
+        mime_type="application/octet-stream",
+        modified_time=datetime(2026, 4, 1, tzinfo=UTC),
+        size=2048,
+        parent_path="",
+    )
+
+
+class _CannedConnector:
+    """A Drive connector stand-in whose ``fetch_to`` returns a fixed result."""
+
+    def __init__(self, result: DownloadResult) -> None:
+        """Store the result ``fetch_to`` will hand back."""
+        self.result = result
+
+    def fetch_to(self, _staging: Path) -> DownloadResult:
+        """Return the canned result without contacting Drive."""
+        return self.result
+
+
+def _install_canned_download(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    result: DownloadResult,
+) -> None:
+    """Point ``creek gdrive --download`` at a connector yielding *result*.
+
+    ``build_drive_connector`` is imported inside the command body
+    (cli.py:4641), so the seam is the attribute on :mod:`creek.ingest.gdrive`
+    rather than a name bound in :mod:`creek.cli`.
+
+    Args:
+        monkeypatch: The test's patcher.
+        tmp_path: Somewhere harmless for the config's vault/source roots.
+        result: The outcome the download should report.
+    """
+    from creek.config import CreekConfig
+    from creek.ingest.gdrive import GoogleApiDriveClient
+
+    monkeypatch.setattr(
+        "creek.cli.load_config",
+        lambda *_a, **_k: CreekConfig(vault_path=tmp_path, source_drive=tmp_path),
+    )
+    monkeypatch.setattr(GoogleApiDriveClient, "is_available", lambda _self: True)
+    monkeypatch.setattr(
+        "creek.ingest.gdrive.build_drive_connector",
+        lambda *_a, **_k: _CannedConnector(result),
+    )
+
+
+class TestGdriveDownloadAccounting:
+    """``creek gdrive --download`` must account for every file it listed (#1372).
+
+    The handler printed ``Downloaded N / Skipped M (unchanged) files`` and
+    never looked at ``result.errors``, so a three-file listing where two files
+    403'd rendered as "Downloaded 1 / Skipped 0" and exited 0 — arithmetic the
+    operator cannot check, against a folder only Google can enumerate.
+    """
+
+    def test_every_listed_file_is_accounted_for(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Downloaded + Skipped + Failed covers the listing, and names the failures.
+
+        Both filenames, not just the count: a partial download is only
+        actionable if the operator knows which documents did not arrive.
+        """
+        staging = tmp_path / "stg"
+        _install_canned_download(
+            monkeypatch,
+            tmp_path,
+            DownloadResult(
+                downloaded=(staging / "alpha.docx",),
+                skipped=(),
+                errors=(
+                    (_listed_drive_file("beta.docx"), RuntimeError("HTTP 403")),
+                    (_listed_drive_file("gamma.docx"), RuntimeError("HTTP 500")),
+                ),
+            ),
+        )
+
+        result = runner.invoke(app, ["gdrive", "--download", "--staging", str(staging)])
+
+        flat = _flat_output(result.stdout)
+        assert "Downloaded 1 / Skipped 0 (unchanged) / Failed 2" in flat, flat
+        assert "beta.docx" in flat, flat
+        assert "gamma.docx" in flat, flat
+        assert result.exit_code == 0, result.output
+
+    def test_total_failure_exits_nonzero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing fetched, nothing already current, and errors — that is a failure.
+
+        A run that produced no files at all exited 0, so a schedule that
+        chains ``creek gdrive --download && creek ingest ...`` marched
+        straight on to ingest an empty staging directory and reported success.
+        """
+        staging = tmp_path / "stg"
+        _install_canned_download(
+            monkeypatch,
+            tmp_path,
+            DownloadResult(
+                downloaded=(),
+                skipped=(),
+                errors=((_listed_drive_file("beta.docx"), RuntimeError("HTTP 401")),),
+            ),
+        )
+
+        result = runner.invoke(app, ["gdrive", "--download", "--staging", str(staging)])
+
+        assert result.exit_code == 1, result.output
+
+    def test_a_warm_incremental_tick_with_one_failure_exits_zero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two files already up to date plus one failure is not a failed run.
+
+        ``errors and not downloaded`` is the predicate that looks natural and
+        is wrong: on a warm incremental tick *every* healthy file is skipped
+        rather than downloaded, so that test would declare total failure for
+        the ordinary steady state — the case that runs every thirty minutes.
+        The skip set has to count as work that succeeded.
+        """
+        staging = tmp_path / "stg"
+        _install_canned_download(
+            monkeypatch,
+            tmp_path,
+            DownloadResult(
+                downloaded=(),
+                skipped=(staging / "alpha.docx", staging / "delta.docx"),
+                errors=((_listed_drive_file("beta.docx"), RuntimeError("HTTP 500")),),
+            ),
+        )
+
+        result = runner.invoke(app, ["gdrive", "--download", "--staging", str(staging)])
+
+        assert result.exit_code == 0, result.output
+
+    def test_attempted_accounts_for_every_listed_file(self, tmp_path: Path) -> None:
+        """``attempted`` is downloaded + skipped + errors — the size of the listing.
+
+        The number the printed accounting line is measured against. Kept as a
+        property on the result rather than recomputed at each call site, so
+        the CLI and any future caller cannot disagree about what "every file"
+        means.
+        """
+        result = DownloadResult(
+            downloaded=(tmp_path / "a",),
+            skipped=(tmp_path / "b", tmp_path / "c"),
+            errors=(
+                (_listed_drive_file("d.docx"), RuntimeError("x")),
+                (_listed_drive_file("e.docx"), RuntimeError("y")),
+                (_listed_drive_file("f.docx"), RuntimeError("z")),
+            ),
+        )
+
+        assert result.attempted == 6

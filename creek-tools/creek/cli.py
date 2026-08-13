@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from creek.generate.mining import MiningRunReport
     from creek.ingest.base import Ingestor
     from creek.ingest.discord_dispatch import DiscordMode
+    from creek.ingest.gdrive import DownloadResult
     from creek.ingest.pin_ids import PinResult
     from creek.link.link_engine import LinkSummary
     from creek.models import CompileTargetKind, Frequency, Mode, Phase
@@ -617,6 +618,7 @@ def _warn_if_discovered_but_empty(
     discovered: int,
     source_type: str,
     strict: bool,
+    label: str | None = None,
 ) -> None:
     """Warn (and optionally exit non-zero) when inputs parsed to 0 fragments.
 
@@ -625,14 +627,29 @@ def _warn_if_discovered_but_empty(
     inputs but none parsed, signalling an unrecognized format. ``--strict``
     turns the warning into a non-zero exit for pipelines/CI.
 
+    Args:
+        written: Fragments the ingest actually produced.
+        discovered: Inputs ``discover()`` found.
+        source_type: The ingestor type the run used.
+        strict: Whether to turn the warning into a non-zero exit.
+        label: What to call the run in the message, defaulting to
+            *source_type*. ``creek sync`` needs this because
+            :func:`creek.pipeline.sync_ingest_type` maps ``journal ->
+            markdown`` and ``essays -> substack``, so a line built from the
+            ingestor type alone announces "discovered 2 substack input(s)" —
+            a word that appears in neither the operator's ``sync.sources``
+            toggles nor the scheduler's argv, and unattributable to any one
+            source when a tick runs several.
+
     Raises:
         typer.Exit: With code ``1`` when *strict* and the condition holds.
     """
     if written > 0 or discovered == 0:
         return
     console.print(
-        f"[yellow]WARNING: discovered {discovered} {source_type} input(s) but "
-        "produced 0 fragments — the export format may be unrecognized.[/yellow]",
+        f"[yellow]WARNING: discovered {discovered} {label or source_type} "
+        "input(s) but produced 0 fragments — the export format may be "
+        "unrecognized.[/yellow]",
     )
     if strict:
         raise typer.Exit(code=1)
@@ -839,12 +856,43 @@ def _sync_state_path(vault_path: Path) -> Path:
     return vault_path / "00-Creek-Meta" / "State" / "sync" / "last-run.json"
 
 
+_MAX_RECORDED_FAILURES: Final = 5
+"""How many failure lines per source ``last-run.json`` stores.
+
+A revoked token or a quota wall fails *every* file in the folder, and this
+file is rewritten inside the operator's vault on every tick. The recorded
+``failure_count`` therefore stays exact — the number is never a lie — while
+the stored lines are a bounded sample.
+"""
+
+
+@dataclass(frozen=True)
+class SourceRunRecord:
+    """What one Tier-A source did this tick, beyond how much it ingested.
+
+    An ``ingested`` of zero is what a healthy quiet tick and a totally failed
+    one both look like, which is the whole of #1372. The failures are
+    already-rendered operator-readable strings rather than exceptions: they
+    are printed, JSON-serialised into ``last-run.json``, and read back by
+    ``creek sync --status``.
+
+    Attributes:
+        ingested: Fragments this source's ingest step wrote.
+        failures: One line per advisory the tick produced for this source,
+            each naming the step it came from (``pull:``, ``ingest:``,
+            ``skipped:``) so the operator knows where to look.
+    """
+
+    ingested: int = 0
+    failures: tuple[str, ...] = ()
+
+
 def _write_sync_state(
     vault_path: Path,
     tier: str,
     *,
     dry_run: bool,
-    source_counts: dict[str, int] | None = None,
+    source_records: dict[str, SourceRunRecord] | None = None,
 ) -> dict[str, object] | None:
     """Write the sync last-run state, returning the prior state if any (#676).
 
@@ -853,6 +901,13 @@ def _write_sync_state(
     records its last ``{tier, at, ingested}``. Sources untouched by this run
     keep their prior entry, so ``--status`` always reflects the latest run of
     each source.
+
+    Each touched source additionally records ``failures`` (a sample, capped at
+    :data:`_MAX_RECORDED_FAILURES`) and the exact ``failure_count`` (#1372).
+    Both keys are additive: every ``last-run.json`` already on disk predates
+    them, so readers must treat them as optional. A whole per-source entry is
+    assigned rather than merged into, so a clean re-run of a source clears the
+    failures it recorded last tick instead of accumulating them forever.
     """
     state_path = _sync_state_path(vault_path)
     prior: dict[str, object] | None = None
@@ -866,12 +921,74 @@ def _write_sync_state(
     prior_sources = prior.get("sources", {}) if isinstance(prior, dict) else {}
     # Guard against a corrupted file where "sources" is not a dict.
     sources = dict(prior_sources) if isinstance(prior_sources, dict) else {}
-    for name, ingested in (source_counts or {}).items():
-        sources[name] = {"tier": tier, "at": now, "ingested": ingested}
+    for name, record in (source_records or {}).items():
+        sources[name] = {
+            "tier": tier,
+            "at": now,
+            "ingested": record.ingested,
+            "failures": list(record.failures[:_MAX_RECORDED_FAILURES]),
+            "failure_count": len(record.failures),
+        }
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state = {"tier": tier, "at": now, "dry_run": dry_run, "sources": sources}
     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
     return prior
+
+
+def _status_row(name: str, entry: object) -> tuple[str, ...]:
+    """Build one ``--status`` table row for source *name* from its entry.
+
+    ``last-run.json`` is plain JSON in a folder the operator can open and
+    edit, so every read here is defensive in the same way the surrounding
+    reader already is: a non-dict entry, a missing key, or a hand-mangled
+    ``"failure_count": "nope"`` degrades the cell rather than killing the
+    table an operator opened *because* they suspect something is wrong.
+
+    The count falls back to the length of ``failures`` before it falls back
+    to zero, so a pre-#1372 entry — which has neither key — reads as ``0``
+    while an entry written by a version that recorded only the lines still
+    reports them honestly.
+
+    Args:
+        name: The source name (the row's first cell).
+        entry: The recorded per-source block, of unverified shape.
+
+    Returns:
+        The row's cells, in the table's column order.
+    """
+    cells = entry if isinstance(entry, dict) else {}
+    failures = cells.get("failures")
+    count = cells.get("failure_count")
+    if not isinstance(count, int):
+        count = len(failures) if isinstance(failures, list) else 0
+    return (
+        name,
+        str(cells.get("tier", "")),
+        str(cells.get("at", "")),
+        str(cells.get("ingested", "")),
+        str(count),
+    )
+
+
+def _print_status_failures(sources: dict[str, object]) -> None:
+    """Print the failure lines the last tick recorded for each source (#1372).
+
+    The count in the table says only that something is wrong; these lines
+    name the file the operator now has to go and fetch by hand. Recorded
+    text is escaped because it carries remote-supplied file names, and an
+    unbalanced Rich tag inside one of them would otherwise abort the very
+    command being used to diagnose the failure.
+
+    Args:
+        sources: The ``sources`` block, source name -> recorded entry.
+    """
+    for name, entry in sorted(sources.items()):
+        cells = entry if isinstance(entry, dict) else {}
+        failures = cells.get("failures")
+        if not isinstance(failures, list):
+            continue
+        for line in failures:
+            console.print(f"[yellow]  {name}: {escape(str(line))}[/yellow]")
 
 
 def _sync_status(vault_path: Path) -> None:
@@ -893,16 +1010,11 @@ def _sync_status(vault_path: Path) -> None:
     if not isinstance(sources, dict) or not sources:
         console.print("[dim](no per-source runs recorded yet)[/dim]")
         return
-    table = Table("source", "last tier", "last run", "ingested")
+    table = Table("source", "last tier", "last run", "ingested", "failed")
     for name, entry in sorted(sources.items()):
-        cells = entry if isinstance(entry, dict) else {}
-        table.add_row(
-            name,
-            str(cells.get("tier", "")),
-            str(cells.get("at", "")),
-            str(cells.get("ingested", "")),
-        )
+        table.add_row(*_status_row(name, entry))
     console.print(table)
+    _print_status_failures(sources)
 
 
 def _sync_tier_a(
@@ -937,17 +1049,25 @@ def _sync_source_input(source: str, config: CreekConfig) -> Path | None:
     return config.source_drive / rel
 
 
-def _sync_pull(source: str, config: CreekConfig, _vault_path: Path) -> None:
-    """Pull a remote source into staging (Tier A, #678).
+def _sync_pull(source: str, config: CreekConfig, _vault_path: Path) -> tuple[str, ...]:
+    """Pull a remote source into staging; return what failed (Tier A, #678).
 
     Only Google Drive has a pull step today (it mirrors files into a local
     staging directory via the existing read-only downloader); local sources
     such as the journal are already on disk and no-op here. Connector
     generalisation is a later epic. (``_vault_path`` is unused but kept so all
     step helpers share a uniform ``(source, config, vault_path)`` shape.)
+
+    ``download_all`` records each per-file failure and keeps going, so the
+    return value is advisory, never fatal: the caller folds it into the
+    source's :class:`SourceRunRecord` and the tick still exits 0 (#1372).
+
+    Returns:
+        One line per thing this pull failed to fetch — empty when the pull
+        succeeded, was not applicable, or had nothing to do.
     """
     if source != "gdrive":
-        return
+        return ()
     from creek.ingest.gdrive import GoogleApiDriveClient, GoogleDriveDownloader
 
     client = GoogleApiDriveClient(config.google_drive)
@@ -956,18 +1076,57 @@ def _sync_pull(source: str, config: CreekConfig, _vault_path: Path) -> None:
             "[yellow][sync] Google Drive libraries unavailable; skipping pull."
             "[/yellow]",
         )
-        return
+        # Recorded, not merely printed: nothing was pulled, and an operator
+        # reading `--status` and believing their ingest is current is exactly
+        # the harm this issue exists to fix.
+        return ("pull: Google Drive libraries unavailable",)
     staging = config.source_drive / config.google_drive.staging_dir
-    GoogleDriveDownloader(client=client, config=config.google_drive).download_all(
-        staging,
-    )
+    result = GoogleDriveDownloader(
+        client=client, config=config.google_drive
+    ).download_all(staging)
+    for line in result.failure_lines:
+        # Escaped: the line leads with a remote-supplied file name, and an
+        # unbalanced Rich tag inside one would abort the whole tick.
+        detail = escape(line)
+        console.print(f"[yellow][sync] {source}: pull failed — {detail}[/yellow]")
+    return tuple(f"pull: {line}" for line in result.failure_lines)
 
 
-def _sync_ingest_source(source: str, config: CreekConfig, vault_path: Path) -> int:
-    """Incrementally ingest one Tier-A source; return the units processed (#678).
+def _render_source_errors(source: str, errors: Sequence[str]) -> tuple[str, ...]:
+    """Print one source's ingest errors the way ``creek ingest`` does (#1372).
 
-    Returns ``0`` when the source has no ingestor (e.g. gdrive) or its path is
-    missing — both are logged so a scheduled run's no-ops are diagnosable.
+    Same shape as the block at the end of :func:`ingest` — a count line, then
+    one dim line per error — but source-prefixed. The source name has to
+    travel with the errors because the strings are already prefixed with the
+    *ingestor* type (``[markdown]``), which is not the name the operator
+    toggled on in ``sync.sources`` and not what they see in the argv.
+
+    Args:
+        source: The configured source name this ingest ran for.
+        errors: The ingestor's per-input error strings.
+
+    Returns:
+        The same errors, prefixed for :class:`SourceRunRecord` — empty when
+        there were none.
+    """
+    if not errors:
+        return ()
+    console.print(f"[yellow][sync] {source}: {len(errors)} ingest error(s)[/yellow]")
+    for err in errors:
+        console.print(f"  [dim]{escape(err)}[/dim]")
+    return tuple(f"ingest: {err}" for err in errors)
+
+
+def _sync_ingest_source(
+    source: str, config: CreekConfig, vault_path: Path
+) -> SourceRunRecord:
+    """Incrementally ingest one Tier-A source; report what it did (#678/#1372).
+
+    Returns an empty record when the source has no ingestor (e.g. gdrive), and
+    a record carrying a failure line when its path is missing — a renamed
+    folder or an unmounted source drive is the most common way a schedule
+    silently stops ingesting, so it belongs in the durable record and not only
+    in a log nobody reads.
     """
     from creek.ingest import INGESTOR_REGISTRY
     from creek.pipeline import sync_ingest_type
@@ -975,7 +1134,7 @@ def _sync_ingest_source(source: str, config: CreekConfig, vault_path: Path) -> i
     ingest_type = sync_ingest_type(source)
     ingestor_cls = INGESTOR_REGISTRY.get(ingest_type)
     if ingestor_cls is None:
-        return 0  # e.g. gdrive is a downloader, not an ingestor
+        return SourceRunRecord()  # e.g. gdrive is a downloader, not an ingestor
     input_path = _sync_source_input(source, config)
     if input_path is None or not input_path.exists():
         console.print(
@@ -983,8 +1142,10 @@ def _sync_ingest_source(source: str, config: CreekConfig, vault_path: Path) -> i
             f"({input_path}).[/yellow]",
         )
         logger.info("sync.tier_a.skip source=%s reason=path-missing", source)
-        return 0
-    written, _errors, _discovered = _run_ingest(
+        return SourceRunRecord(
+            failures=(f"skipped: source path not found ({input_path})",),
+        )
+    written, errors, discovered = _run_ingest(
         ingestor_cls=ingestor_cls,
         source_type=ingest_type,
         input_path=input_path,
@@ -992,8 +1153,22 @@ def _sync_ingest_source(source: str, config: CreekConfig, vault_path: Path) -> i
         reclassify_threshold=config.classification.reclassify_on_edit_threshold,
         incremental=True,
     )
+    recorded = _render_source_errors(source, errors)
+    # There is no `creek sync --strict`, and there must not be one here by
+    # accident: `strict=True` raises `typer.Exit(1)`, which propagates out of
+    # `_sync_run_tier_a` and straight past the `_write_sync_state` call in
+    # `sync` — exactly the way the LLM-provider abort does. One unrecognized
+    # export would then both fail the launchd unit and destroy the record
+    # that the tick ran at all, which is the harm this issue exists to fix.
+    _warn_if_discovered_but_empty(
+        written=written,
+        discovered=discovered,
+        source_type=ingest_type,
+        label=f"{source} ({ingest_type})",
+        strict=False,
+    )
     logger.info("sync.tier_a.ingest source=%s ingested=%d", source, written)
-    return written
+    return SourceRunRecord(ingested=written, failures=recorded)
 
 
 def _sync_classify(vault_path: Path, config: CreekConfig, method: str) -> None:
@@ -1021,20 +1196,28 @@ def _sync_run_tier_a(
     config: CreekConfig,
     vault_path: Path,
     sources: list[str],
-) -> dict[str, int]:
-    """Execute Tier A; return per-source ingested counts (#678/#680).
+) -> dict[str, SourceRunRecord]:
+    """Execute Tier A; return what each source did (#678/#680/#1372).
 
     Per source: pull + incremental ingest, then one rules-classify pass.
     Linking and indexing are **never** invoked here (R6: they are O(n²)/global
     and belong to Tier B).
+
+    A source's pull failures and its ingest failures are merged into one
+    record, in that order: they happened to the same source in the same tick,
+    and the operator reads ``last-run.json`` by source, not by step.
     """
-    counts: dict[str, int] = {}
+    records: dict[str, SourceRunRecord] = {}
     for source in sources:
-        _sync_pull(source, config, vault_path)
-        counts[source] = _sync_ingest_source(source, config, vault_path)
+        pull_failures = _sync_pull(source, config, vault_path)
+        record = _sync_ingest_source(source, config, vault_path)
+        records[source] = SourceRunRecord(
+            ingested=record.ingested,
+            failures=(*pull_failures, *record.failures),
+        )
     _sync_classify(vault_path, config, "rules")
     logger.info("sync.tier_a.done count=%d", len(sources))
-    return counts
+    return records
 
 
 def _sync_run_tier_b(config: CreekConfig, vault_path: Path) -> None:
@@ -1052,11 +1235,11 @@ def _sync_dispatch(
     config: CreekConfig,
     vault_path: Path,
     source: str | None,
-) -> dict[str, int] | None:
-    """Echo (dry-run) or execute the chosen sync tier; return Tier-A counts.
+) -> dict[str, SourceRunRecord] | None:
+    """Echo (dry-run) or execute the chosen sync tier; return Tier-A records.
 
-    Returns the per-source ingested counts for a real Tier-A run (for the
-    status file), or ``None`` for dry-run / Tier-B runs.
+    Returns what each source did on a real Tier-A run (for the status file),
+    or ``None`` for dry-run / Tier-B runs.
     """
     if tier_norm == "A":
         if dry_run:
@@ -1280,7 +1463,7 @@ def _sync_dispatch_guarded(
     config: CreekConfig,
     vault_path: Path,
     source: str | None,
-) -> dict[str, int] | None:
+) -> dict[str, SourceRunRecord] | None:
     """Dispatch the tier, turning a provider refusal into a legible exit (#1335).
 
     ``creek classify --method llm`` already catches this refusal; the sync path
@@ -1306,7 +1489,7 @@ def _sync_dispatch_guarded(
         source: Optional single Tier-A source override.
 
     Returns:
-        Per-source ingested counts for a real Tier-A run, else ``None``.
+        Per-source run records for a real Tier-A run, else ``None``.
 
     Raises:
         typer.Exit: With code ``1`` when the configured LLM provider refuses.
@@ -1314,7 +1497,7 @@ def _sync_dispatch_guarded(
     from creek.classify.classify_engine import LLMProviderUnavailableError
 
     try:
-        counts = _sync_dispatch(
+        records = _sync_dispatch(
             tier_norm,
             dry_run=dry_run,
             config=config,
@@ -1325,7 +1508,7 @@ def _sync_dispatch_guarded(
         console.print(f"[red][sync] tier {tier_norm} aborted: {exc}[/red]")
         raise typer.Exit(code=1) from exc
     else:
-        return counts
+        return records
 
 
 @app.command()
@@ -1408,7 +1591,7 @@ def sync(
     # about to be rejected as a usage error would be misleading.
     _sync_gate_tier_b(tier_norm, vault_path, dry_run=dry_run, assume_yes=yes)
 
-    source_counts = _sync_dispatch_guarded(
+    source_records = _sync_dispatch_guarded(
         tier_norm,
         dry_run=dry_run,
         config=config,
@@ -1417,7 +1600,7 @@ def sync(
     )
 
     prior = _write_sync_state(
-        vault_path, tier_norm, dry_run=dry_run, source_counts=source_counts
+        vault_path, tier_norm, dry_run=dry_run, source_records=source_records
     )
     if prior is not None:
         console.print(
@@ -4585,6 +4768,64 @@ def _gdrive_check() -> None:
         )
 
 
+def _render_download_outcome(result: DownloadResult, staging_dir: Path) -> None:
+    """Account for every file the Drive listing offered (#1372).
+
+    Downloaded + skipped + failed is :attr:`DownloadResult.attempted`, i.e.
+    the whole listing. Until this existed the line reported only the first
+    two, so a three-file listing where two downloads failed printed
+    ``Downloaded 1 / Skipped 0`` — indistinguishable from a listing that only
+    ever held one file, and the two lost files were named nowhere.
+
+    Extracted rather than inlined so the handler that calls it stays under
+    the cyclomatic-complexity gate: it already carries the mode-selection
+    branches and the broad Drive ``except``.
+
+    Args:
+        result: The outcome of the connector's fetch.
+        staging_dir: Where the files were mirrored, echoed for the operator.
+    """
+    console.print(
+        f"[bold green]Downloaded {len(result.downloaded)} / "
+        f"Skipped {len(result.skipped)} (unchanged) / "
+        f"Failed {len(result.errors)} files to "
+        f"{staging_dir}[/bold green]",
+    )
+    for line in result.failure_lines:
+        # Escaped for the same reason as the sync-path render: the line leads
+        # with a remote-supplied file name, and an unbalanced Rich tag inside
+        # one would abort the command instead of reporting the failure.
+        console.print(f"  [yellow]{escape(line)}[/yellow]")
+
+
+def _download_is_total_failure(result: DownloadResult) -> bool:
+    """Return ``True`` when a download listed files and landed none (#1372).
+
+    Every listed file errored and none was already up to date, so the staging
+    directory gained nothing: a schedule chaining ``creek gdrive --download &&
+    creek ingest ...`` would otherwise march on and report success over an
+    empty directory.
+
+    The ``not result.skipped`` term is the load-bearing one. The predicate
+    that looks natural — errors and nothing downloaded — declares total
+    failure on a routine warm incremental tick, where *every* healthy file is
+    reported as skipped rather than downloaded; one 403 among two up-to-date
+    files would then make a healthy scheduled unit look failed every thirty
+    minutes. Partial failure stays exit 0 and is discoverable from the
+    ``Failed`` count :func:`_render_download_outcome` prints.
+
+    Kept out of the caller so the handler stays inside the complexity gate:
+    a three-term predicate inline pushes ``gdrive`` past it.
+
+    Args:
+        result: The outcome of the connector's fetch.
+
+    Returns:
+        Whether the run should exit non-zero.
+    """
+    return bool(result.errors) and not result.downloaded and not result.skipped
+
+
 @app.command()
 def gdrive(
     download: bool = typer.Option(False, help="Download from Google Drive"),
@@ -4666,11 +4907,11 @@ def gdrive(
         console.print(f"[red]Google Drive download failed: {exc}[/red]")
         raise typer.Exit(code=1) from exc
 
-    console.print(
-        f"[bold green]Downloaded {len(result.downloaded)} / "
-        f"Skipped {len(result.skipped)} (unchanged) files to "
-        f"{staging_dir}[/bold green]",
-    )
+    _render_download_outcome(result, staging_dir)
+    # Non-zero only when the listing was non-empty and NOTHING landed — see
+    # the predicate's docstring for why a partial failure must stay exit 0.
+    if _download_is_total_failure(result):
+        raise typer.Exit(code=1)
 
 
 @skills_app.command("generate")

@@ -258,6 +258,13 @@ def _render(result: dict[str, Any], context: RequestContext) -> Response:
             fragment_id=str(result["fragment_id"]),
             action=JournalAction(result["action"]),
             tier=WireTierCeiling(result["tier"]),
+            # ``.get``, never ``result["warnings"]``: a missing key here would
+            # land a *successful* write in the ``internal_error`` fallback
+            # below, and that branch must not become newly reachable because
+            # an advisory field was added. ``or None`` collapses the
+            # no-advisory list to absent, so a quiet write dumps exactly the
+            # bytes it did before this field existed (#1372).
+            warnings=result.get("warnings") or None,
         )
     except (ValidationError, ValueError, KeyError):
         # A success in some *other* shape this contract cannot express: a key
@@ -265,7 +272,10 @@ def _render(result: dict[str, Any], context: RequestContext) -> Response:
         # wire enums cannot name. Nothing the caller can act on, so it lands in
         # the same server-fault bucket as the unresolved id above.
         return error_response(ErrorCode.INTERNAL_ERROR, context)
-    return json_response(payload.model_dump(mode="json"), HTTP_OK)
+    # ``exclude_none`` so the optional ``warnings`` is absent rather than null
+    # when the write was quiet. Every other field on the response is required,
+    # so this cannot drop a key an existing consumer reads (#1372).
+    return json_response(payload.model_dump(mode="json", exclude_none=True), HTTP_OK)
 
 
 async def handle_journal_upsert(request: Request) -> Response:

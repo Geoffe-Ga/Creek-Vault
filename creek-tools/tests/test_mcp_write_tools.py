@@ -2528,3 +2528,113 @@ def test_audit_log_read_side_does_not_emit_write_fields(vault: Path) -> None:
     assert "created_path" not in entry
     assert "created_tier" not in entry
     assert "affected_fragment_ids" not in entry
+
+
+# ---------------------------------------------------------------------------
+# link — the cluster-health counts the CLI renders and MCP dropped (#1372)
+# ---------------------------------------------------------------------------
+
+
+class TestLinkAdvisoryFields:
+    """``creek.link`` must report cluster health, not just totals.
+
+    The tool returned ``method``/``fragment_count``/``link_count`` and
+    nothing else, so the three counts ``creek link`` prints on the console
+    stopped at the MCP boundary. The empty-vault tests above cannot see
+    this: every one of these fields is ``0`` on an empty vault, which is
+    also what a payload that never carried them looks like.
+    """
+
+    @staticmethod
+    def _link_with_summary(
+        vault: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> dict[str, object]:
+        """Run ``link_tool`` over a stubbed summary with degenerate clustering.
+
+        The linker itself is not under test — reproducing a 521-fragment
+        discard from real embeddings would need a corpus and a model — so
+        ``run_link`` is replaced at the tool's own import site and the
+        summary is handed over verbatim. What is under test is the
+        translation from :class:`~creek.link.link_engine.LinkSummary` to
+        the response dict.
+
+        Args:
+            vault: Vault fixture.
+            monkeypatch: Pytest monkeypatch fixture.
+
+        Returns:
+            The tool's response payload.
+        """
+        from creek.link.link_engine import LinkSummary
+
+        summary = LinkSummary(
+            method="eddies",
+            fragment_count=1200,
+            link_count=18,
+            eddies_detected=18,
+            eddies_written=18,
+            member_fragments_updated=679,
+            largest_cluster_fragments=12,
+            clusters_split=6,
+            oversized_discarded=521,
+        )
+
+        def _fake_run_link(**_kwargs: object) -> LinkSummary:
+            """Return the fixed summary, ignoring what the tool asked for."""
+            return summary
+
+        monkeypatch.setattr("creek_mcp.tools.link.run_link", _fake_run_link)
+        return link_tool(
+            vault_path=vault,
+            method="eddies",
+            privacy_tier_ceiling=TierCeiling.OPEN,
+        )
+
+    def test_link_reports_the_fragments_it_discarded(
+        self,
+        vault: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """All three cluster-health counts reach the caller, with their values.
+
+        ``creek/cli.py:2833-2841`` renders exactly these on the CLI
+        console, and a discard is data loss — those fragments carry no
+        wiki-link at all — so an MCP caller that cannot see it believes
+        the link pass succeeded when 521 fragments were dropped to noise.
+
+        Args:
+            vault: Vault fixture.
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        result = self._link_with_summary(vault, monkeypatch)
+
+        assert result["status"] == "ok", result
+        assert result["largest_cluster_fragments"] == 12
+        assert result["clusters_split"] == 6
+        assert result["oversized_discarded"] == 521
+
+    def test_link_counts_are_plain_integers_not_content(
+        self,
+        vault: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """These three need no ceiling gate, and their type is the reason.
+
+        They come off a frozen dataclass of counts and can never name a
+        fragment, quote one, or vary with a caller's admission — unlike
+        the ingest advisories, whose text interpolates real vault ids and
+        therefore crosses the boundary only in a content-free form.
+
+        Args:
+            vault: Vault fixture.
+            monkeypatch: Pytest monkeypatch fixture.
+        """
+        result = self._link_with_summary(vault, monkeypatch)
+
+        for key in (
+            "largest_cluster_fragments",
+            "clusters_split",
+            "oversized_discarded",
+        ):
+            assert isinstance(result[key], int), key

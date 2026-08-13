@@ -76,17 +76,41 @@ runtime version string it is a prefix of. Compatibility is negotiated at minor
 granularity: a patch bump is invisible to the consumer, a minor bump is not.
 """
 
-SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (CONTRACT_MINOR, "0.3", "0.2")
+SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
+    CONTRACT_MINOR,
+    "0.4",
+    "0.3",
+    "0.2",
+)
 """Every contract minor this server can still serve.
 
-The widening this constant's shape anticipated has happened twice, and both
-times for the same reason: the *MCP tool surface* moved while no ``/v1`` wire
-shape did. Contract 0.3 (#1023) added the ``creek.upload`` tool; contract 0.4
-(#1246) gave ``creek.purge.*`` a third status, ``partial``, so an erasure that
-fell short stops reporting unqualified ``ok``. Neither touched a route, a
-published schema, or an existing ``/v1`` response, so ``0.3`` and ``0.2`` are
-both retained and every client already sending
+The widening this constant's shape anticipated has happened three times.
+Contract 0.3 (#1023) added the ``creek.upload`` tool; contract 0.4 (#1246)
+gave ``creek.purge.*`` a third status, ``partial``, so an erasure that fell
+short stops reporting unqualified ``ok``. Both moved the *MCP tool surface*
+while no ``/v1`` wire shape moved at all.
+
+Contract 0.5 (#1372) is the first that is not purely that. It gave
+``creek.journal``, ``creek.upload`` and ``creek.link`` the operator advisories
+they had been computing and dropping, and it added one **optional** field —
+``warnings`` on :class:`JournalUpsertResponse` — to a published ``/v1``
+response and its committed schema. Be precise about what that costs an older
+client, because the honest answer is not "nothing": the field defaults to
+``None`` and the route dumps with ``exclude_none``, so a write that produced
+no advisory is byte-identical to what it was before, which is the ordinary
+case — but a write that *did* produce one now carries an extra key regardless
+of the minor the caller negotiated. A ``0.4`` consumer validating closed sees
+it in exactly that case. It is retained here anyway, because refusing every
+``0.4`` request outright is strictly worse than serving one that occasionally
+carries a field the client can ignore, and the window is published on
+``GET /v1/capabilities`` for a client that wants to move. ``0.4``, ``0.3`` and
+``0.2`` are all retained and every client already sending
 ``X-Creek-Contract-Version: 0.2`` keeps being served.
+
+Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
+is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
+version alone silently drops the outgoing current minor out of this window and
+strands every client still sending it.
 
 It is a *list* on the wire because the compatibility window is expected to
 widen before it ever narrows, and the client needs to see the whole window
@@ -612,6 +636,17 @@ class JournalUpsertResponse(_WireModel):
         action: Whether the write created, updated, or changed nothing.
         tier: The tier the entry was created at. Not expressible as
             ``intimate``, for the same reason as on the request.
+        warnings: Content-free operator advisories this write produced, and
+            absent entirely when there were none (#1372). Optional rather
+            than an always-present empty list on purpose: ``_WireModel`` is
+            ``extra="forbid"`` and this server still serves contract minors
+            0.2, 0.3 and 0.4, so an unconditional key would put an
+            unnegotiated field in every ``200`` those clients receive. Paired
+            with ``exclude_none`` at the dump, the quiet write stays
+            byte-identical to what it was before this field existed. Every
+            entry is proven free of vault content at the producer — see
+            :attr:`creek.ingest.pipeline.IngestRunResult.ceiling_safe_warnings`
+            — so nothing here varies with the caller's ceiling.
     """
 
     status: Literal["ok"] = Field(description="Always ok; failure is an error.")
@@ -620,6 +655,12 @@ class JournalUpsertResponse(_WireModel):
     fragment_id: str = Field(description="Vault-side fragment identity.")
     action: JournalAction = Field(description="Created, updated, or unchanged.")
     tier: WireTierCeiling = Field(description="Tier the entry was created at.")
+    warnings: list[str] | None = Field(
+        default=None,
+        description=(
+            "Content-free operator advisories this write produced; absent when none."
+        ),
+    )
 
 
 class ReflectionRequest(_WireModel):

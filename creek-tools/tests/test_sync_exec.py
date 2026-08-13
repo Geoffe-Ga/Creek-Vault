@@ -8,12 +8,15 @@ idempotent, a re-run produces no duplicates.
 
 from __future__ import annotations
 
+import json
 import re
-from typing import TYPE_CHECKING
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, ClassVar
 
 from typer.testing import CliRunner
 
 from creek.cli import (
+    SourceRunRecord,
     _sync_classify,
     _sync_index,
     _sync_ingest_source,
@@ -24,6 +27,7 @@ from creek.cli import (
     app,
 )
 from creek.config import CreekConfig, SyncConfig
+from creek.ingest.gdrive import DownloadResult, DriveFile, GoogleApiDriveClient
 from tests.helpers import write_raw_fragment_file
 
 if TYPE_CHECKING:
@@ -111,10 +115,14 @@ def _spy_steps(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Replace the sync step helpers with recorders; return the call log."""
     calls: list[str] = []
     monkeypatch.setattr(
-        "creek.cli._sync_pull", lambda s, _c, _v: calls.append(f"pull:{s}")
+        "creek.cli._sync_pull", lambda s, _c, _v: calls.append(f"pull:{s}") or ()
     )
+    # ``list.append`` returns ``None``, which ``_sync_run_tier_a`` stored as the
+    # ingested count — so under this spy ``last-run.json`` was already writing
+    # ``"ingested": null``. Returning the real record shape corrects that.
     monkeypatch.setattr(
-        "creek.cli._sync_ingest_source", lambda s, _c, _v: calls.append(f"ingest:{s}")
+        "creek.cli._sync_ingest_source",
+        lambda s, _c, _v: calls.append(f"ingest:{s}") or SourceRunRecord(),
     )
     monkeypatch.setattr(
         "creek.cli._sync_classify", lambda _v, _c, m: calls.append(f"classify:{m}")
@@ -678,3 +686,477 @@ class TestTierBConfirmationGate:
         assert "set CREEK_CLOUD_CONSENT=1" in flat, flat
         assert "Traceback" not in result.output, result.output
         assert not _sync_state_path(vault).exists(), "an aborted run recorded itself"
+
+
+# ---- Tier-A advisory surfacing (#1372) ----------------------------------
+
+
+def _lines_with(text: str, needle: str) -> list[str]:
+    """Return the ANSI-free lines of *text* that contain *needle*.
+
+    Presence somewhere in the whole capture is weaker than these tests need:
+    an advisory that names a failure on one line and its source on another is
+    unattributable in a scheduler log, and a flattened haystack cannot tell
+    that apart from a properly attributed line. ``tests/conftest.py`` pins the
+    terminal at 200 columns, comfortably wider than any line asserted through
+    this helper, so Rich does not wrap them.
+
+    Args:
+        text: Raw captured CLI output.
+        needle: Substring the returned lines must contain.
+
+    Returns:
+        Every matching line, in order; empty when there is no match.
+    """
+    return [line for line in _ANSI_RE.sub("", text).splitlines() if needle in line]
+
+
+def _advisory_vault(tmp_path: Path) -> tuple[Path, Path]:
+    """Scaffold the vault a real Tier-A pass writes into, plus its source root.
+
+    Args:
+        tmp_path: The test's temporary directory.
+
+    Returns:
+        The ``(vault, source_drive)`` pair. The source drive is deliberately
+        *not* created, so a test that needs a source directory makes exactly
+        the one it means to — and the missing-path test gets a genuine miss.
+    """
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta/Processing-Log", "01-Fragments"):
+        (vault / d).mkdir(parents=True, exist_ok=True)
+    return vault, tmp_path / "src"
+
+
+def _drive_file(name: str) -> DriveFile:
+    """Build a Drive listing entry named *name*.
+
+    Every field is supplied because :class:`~creek.ingest.gdrive.DriveFile` is
+    a frozen dataclass with no defaults; only ``name`` is load-bearing here —
+    it is the one thing an operator can act on when a download fails.
+
+    Args:
+        name: The file name as Drive reports it.
+
+    Returns:
+        A fully populated listing entry.
+    """
+    return DriveFile(
+        id=f"id-{name}",
+        name=name,
+        mime_type="application/octet-stream",
+        modified_time=datetime(2026, 4, 1, tzinfo=UTC),
+        size=1024,
+        parent_path="",
+    )
+
+
+class _StubDriveDownloader:
+    """A ``GoogleDriveDownloader`` stand-in that returns a canned result.
+
+    ``_sync_pull`` imports the downloader *inside* the function body, so the
+    patchable seam is the attribute on :mod:`creek.ingest.gdrive` rather than
+    a name bound in :mod:`creek.cli`. The canned result lives on the class and
+    is swapped per test by ``monkeypatch.setattr``, which restores it.
+    """
+
+    result: ClassVar[DownloadResult] = DownloadResult(downloaded=(), skipped=())
+
+    def __init__(self, *, client: object, config: object) -> None:
+        """Accept the real downloader's keyword-only construction and ignore it."""
+        self._client = client
+        self._config = config
+
+    def download_all(self, _staging_dir: Path) -> DownloadResult:
+        """Return the canned result instead of calling Drive."""
+        return type(self).result
+
+
+def _install_fake_drive(
+    monkeypatch: pytest.MonkeyPatch,
+    result: DownloadResult,
+) -> None:
+    """Make the Tier-A Drive pull yield *result* without touching the network.
+
+    Args:
+        monkeypatch: The test's patcher.
+        result: The outcome ``download_all`` should report.
+    """
+    monkeypatch.setattr(GoogleApiDriveClient, "is_available", lambda _self: True)
+    monkeypatch.setattr(_StubDriveDownloader, "result", result)
+    monkeypatch.setattr(
+        "creek.ingest.gdrive.GoogleDriveDownloader", _StubDriveDownloader
+    )
+
+
+def _state_sources(vault: Path) -> dict[str, dict[str, object]]:
+    """Return the per-source block recorded in the vault's ``last-run.json``.
+
+    Args:
+        vault: Vault root whose sync state to read.
+
+    Returns:
+        The ``sources`` mapping, source name -> recorded entry.
+    """
+    state = json.loads(_sync_state_path(vault).read_text(encoding="utf-8"))
+    return dict(state["sources"])
+
+
+class TestTierAAdvisorySurfacing:
+    """A Tier-A tick must name what it failed to fetch or parse (#1372).
+
+    ``creek sync --tier A`` threw away every advisory its own steps produced:
+    the :class:`~creek.ingest.gdrive.DownloadResult` from the Drive pull
+    (called as a bare expression statement at cli.py:961) and both the error
+    list and the discovered count from the ingest (bound to ``_errors`` /
+    ``_discovered`` at cli.py:987). The entire visible output of a run that
+    fetched nothing and parsed nothing was ``ran tier=A; wrote last-run.json``
+    at exit 0 — byte-identical to a healthy tick with no new material.
+
+    Every stdout assertion below reads ``result.stdout`` and never the
+    combined capture: ``download_all`` logs a warning per failure
+    (gdrive.py:1033) and Python's last-resort handler puts that on stderr, so
+    an assertion against the merged stream would pass against the unfixed CLI
+    and prove nothing.
+    """
+
+    def test_sync_names_the_file_drive_failed_to_download(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 403'd Drive file is named on stdout, attributed to its source.
+
+        The filename is the payload: a failure *count* tells the operator that
+        their vault is incomplete without telling them what is missing from
+        it, which is barely better than the silence it replaces. The source
+        name has to be on the same line, because a tick runs several sources
+        and a bare filename in a scheduler log belongs to none of them.
+        """
+        vault, src = _advisory_vault(tmp_path)
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault",
+            lambda _v: _fake_config(vault, src, {"gdrive": True}),
+        )
+        _install_fake_drive(
+            monkeypatch,
+            DownloadResult(
+                downloaded=(),
+                skipped=(),
+                errors=(
+                    (
+                        _drive_file("the-important-one.docx"),
+                        RuntimeError("HTTP 403 quota exceeded"),
+                    ),
+                ),
+            ),
+        )
+
+        result = runner.invoke(
+            app,
+            ["sync", "--tier", "A", "--source", "gdrive", "--vault", str(vault)],
+        )
+
+        flat = _flatten(result.stdout)
+        assert "the-important-one.docx" in flat, result.stdout
+        assert "HTTP 403 quota exceeded" in flat, result.stdout
+        # Not ``[sync] gdrive: ...``: ``console`` has Rich markup enabled, so
+        # the literal ``[sync]`` prefix every line in this command carries is
+        # parsed as a style tag and never reaches stdout — the issue's own
+        # capture of the unfixed run is " ran tier=A; wrote last-run.json".
+        assert "gdrive: pull failed" in flat, result.stdout
+        naming = _lines_with(result.stdout, "the-important-one.docx")
+        assert naming, result.stdout
+        assert all("gdrive" in line for line in naming), naming
+
+    def test_a_partial_drive_failure_still_exits_zero_and_writes_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One 403 must not abort the tick — this is the regression fence.
+
+        ``download_all`` records each per-file failure and keeps going by
+        design (gdrive.py:1007-1012), precisely so a transient quota or
+        network blip on file N does not abandon files N+1 onward. The way to
+        break that from up here is to copy the abort precedent at
+        cli.py:1323-1326, which raises ``typer.Exit`` and therefore skips the
+        ``_write_sync_state`` call at cli.py:1419 — leaving ``--status``
+        naming the *previous* tick as the most recent one indefinitely while
+        the schedule keeps failing.
+
+        This assertion is green both before and after the fix on purpose. It
+        constrains the fix rather than demonstrating the bug: making failures
+        loud must not also make them fatal.
+        """
+        vault, src = _advisory_vault(tmp_path)
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault",
+            lambda _v: _fake_config(vault, src, {"gdrive": True}),
+        )
+        _install_fake_drive(
+            monkeypatch,
+            DownloadResult(
+                downloaded=(),
+                skipped=(),
+                errors=(
+                    (
+                        _drive_file("the-important-one.docx"),
+                        RuntimeError("HTTP 403 quota exceeded"),
+                    ),
+                ),
+            ),
+        )
+
+        result = runner.invoke(
+            app,
+            ["sync", "--tier", "A", "--source", "gdrive", "--vault", str(vault)],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert _sync_state_path(vault).exists(), result.output
+
+    def test_the_state_file_records_the_drive_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``last-run.json`` carries the failure, not merely an ``ingested: 0``.
+
+        Stdout belongs to whoever was watching the tick, and a launchd or
+        systemd run has nobody. ``last-run.json`` is the only durable record,
+        and ``{"ingested": 0}`` in it is indistinguishable from "nothing new
+        arrived" — which is exactly how a Drive folder that 403s every thirty
+        minutes reads today.
+        """
+        vault, src = _advisory_vault(tmp_path)
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault",
+            lambda _v: _fake_config(vault, src, {"gdrive": True}),
+        )
+        _install_fake_drive(
+            monkeypatch,
+            DownloadResult(
+                downloaded=(),
+                skipped=(),
+                errors=(
+                    (
+                        _drive_file("the-important-one.docx"),
+                        RuntimeError("HTTP 403 quota exceeded"),
+                    ),
+                ),
+            ),
+        )
+
+        runner.invoke(
+            app,
+            ["sync", "--tier", "A", "--source", "gdrive", "--vault", str(vault)],
+        )
+
+        entry = _state_sources(vault)["gdrive"]
+        assert entry["failure_count"] == 1, entry
+        raw = _sync_state_path(vault).read_text(encoding="utf-8")
+        assert "the-important-one.docx" in raw, raw
+
+    def test_a_clean_rerun_clears_the_recorded_failures(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A healed source stops reporting the failure it had last tick.
+
+        ``_write_sync_state`` merges per-source entries across runs, so a
+        failure list that is appended to rather than replaced would make one
+        bad tick permanent: every later ``--status`` would keep showing a file
+        that has long since downloaded fine, and the operator would learn to
+        ignore the column.
+        """
+        vault, src = _advisory_vault(tmp_path)
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault",
+            lambda _v: _fake_config(vault, src, {"gdrive": True}),
+        )
+        argv = ["sync", "--tier", "A", "--source", "gdrive", "--vault", str(vault)]
+
+        _install_fake_drive(
+            monkeypatch,
+            DownloadResult(
+                downloaded=(),
+                skipped=(),
+                errors=((_drive_file("flaky.docx"), RuntimeError("HTTP 503")),),
+            ),
+        )
+        first = runner.invoke(app, argv)
+        assert first.exit_code == 0, first.output
+        assert _state_sources(vault)["gdrive"]["failure_count"] == 1
+
+        _install_fake_drive(monkeypatch, DownloadResult(downloaded=(), skipped=()))
+        second = runner.invoke(app, argv)
+
+        assert second.exit_code == 0, second.output
+        entry = _state_sources(vault)["gdrive"]
+        assert entry["failure_count"] == 0, entry
+        assert entry["failures"] == [], entry
+
+    def test_recorded_failures_are_capped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Twelve failures are counted exactly and stored at most five.
+
+        A revoked token or a quota wall fails *every* file in the folder, and
+        this state file is rewritten inside the operator's vault every thirty
+        minutes. The count stays exact so the number is never a lie; the
+        stored lines are a sample, because hundreds of strings per tick is a
+        different problem from the silence this issue is fixing.
+        """
+        vault, src = _advisory_vault(tmp_path)
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault",
+            lambda _v: _fake_config(vault, src, {"gdrive": True}),
+        )
+        _install_fake_drive(
+            monkeypatch,
+            DownloadResult(
+                downloaded=(),
+                skipped=(),
+                errors=tuple(
+                    (_drive_file(f"doomed-{i:02d}.docx"), RuntimeError(f"err {i}"))
+                    for i in range(12)
+                ),
+            ),
+        )
+
+        result = runner.invoke(
+            app,
+            ["sync", "--tier", "A", "--source", "gdrive", "--vault", str(vault)],
+        )
+
+        assert result.exit_code == 0, result.output
+        entry = _state_sources(vault)["gdrive"]
+        assert entry["failure_count"] == 12, entry
+        failures = entry["failures"]
+        assert isinstance(failures, list), entry
+        assert len(failures) == 5, failures
+
+    def test_sync_surfaces_the_unrecognized_export_guard(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The #595 guard fires from ``sync``, not only from ``creek ingest``.
+
+        ``creek ingest --type chatgpt`` prints "the export format may be
+        unrecognized" on a discovered-but-empty run and exits 1 under
+        ``--strict``. ``creek sync`` calls the very same ``_run_ingest`` and
+        drops the discovered count on the floor (cli.py:987), so the scheduled
+        path — the one that actually runs every day, unattended — was the one
+        place that guard never reached.
+
+        A real ChatGPT ingestor against a real file, deliberately: stubbing
+        ``_run_ingest`` here would check the guard's wiring against a
+        discovered count this test invented, and #595 exists precisely because
+        real discovery and real parsing disagreed.
+        """
+        vault, src = _advisory_vault(tmp_path)
+        export = src / "chatbot-exports" / "chatgpt"
+        export.mkdir(parents=True)
+        (export / "conversations.json").write_text(
+            json.dumps([{"nope": 1}]), encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault",
+            lambda _v: _fake_config(vault, src, {"chatgpt": True}),
+        )
+
+        result = runner.invoke(
+            app,
+            ["sync", "--tier", "A", "--source", "chatgpt", "--vault", str(vault)],
+        )
+
+        assert result.exit_code == 0, result.output
+        flat = _flatten(result.stdout)
+        assert "the export format may be unrecognized" in flat, result.stdout
+
+    def test_the_sync_guard_names_the_source_not_the_ingestor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guard line says ``essays`` — the name the operator configured.
+
+        ``creek/pipeline.py:112`` maps ``essays -> substack`` (and
+        ``journal -> markdown``), so a guard line built from ``source_type``
+        alone announces "discovered 2 substack input(s)": a word that appears
+        nowhere in the operator's ``sync.sources`` toggles and nowhere in the
+        argv the scheduler ran. With several sources in one tick, that line is
+        unattributable to any of them.
+
+        The equivalent test for ``--source chatgpt`` would be vacuous, since
+        chatgpt maps to itself and the label and the ingestor type are the
+        same string — it would pass against the unfixed code.
+        """
+        vault, src = _advisory_vault(tmp_path)
+        (src / "writing" / "substack").mkdir(parents=True)
+        monkeypatch.setattr("creek.cli._run_ingest", lambda **_kw: (0, [], 2))
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault",
+            lambda _v: _fake_config(vault, src, {"essays": True}),
+        )
+
+        result = runner.invoke(
+            app,
+            ["sync", "--tier", "A", "--source", "essays", "--vault", str(vault)],
+        )
+
+        guard = _lines_with(result.stdout, "may be unrecognized")
+        assert guard, result.stdout
+        assert any("essays" in line for line in guard), guard
+
+    def test_sync_renders_per_source_ingest_errors(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A per-file ingest error reaches stdout, alongside its source name.
+
+        ``_run_ingest`` returns the ingestor's error list and ``creek ingest``
+        prints it; sync bound it to ``_errors`` and dropped it (cli.py:987).
+        The source name has to travel with the errors because the strings
+        themselves are prefixed with the *ingestor* type (``[markdown]``),
+        which is not the name the operator toggled on.
+        """
+        vault, src = _advisory_vault(tmp_path)
+        (src / "personal" / "journal").mkdir(parents=True)
+        monkeypatch.setattr(
+            "creek.cli._run_ingest", lambda **_kw: (0, ["[markdown] boom"], 1)
+        )
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault",
+            lambda _v: _fake_config(vault, src, {"journal": True}),
+        )
+
+        result = runner.invoke(
+            app,
+            ["sync", "--tier", "A", "--source", "journal", "--vault", str(vault)],
+        )
+
+        flat = _flatten(result.stdout)
+        # The ``[markdown]`` prefix itself is unassertable: Rich parses it as
+        # a style tag and renders it away, which is a second reason the source
+        # name has to be supplied by the caller rather than read off the error.
+        assert "boom" in flat, result.stdout
+        assert "journal" in flat, result.stdout
+
+    def test_a_missing_source_path_is_recorded_as_a_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A source whose directory has vanished is recorded, not only printed.
+
+        The skip already prints a yellow line (cli.py:981-984) and logs
+        ``reason=path-missing``, but it returned a bare ``0`` and the state
+        file recorded ``ingested: 0`` — identical to a healthy tick with
+        nothing new. A renamed folder or an unmounted source drive is the most
+        common way a schedule silently stops ingesting, so the durable record
+        is where it has to land.
+        """
+        vault, src = _advisory_vault(tmp_path)
+        # The journal directory is deliberately never created.
+        monkeypatch.setattr(
+            "creek.cli._load_config_for_vault",
+            lambda _v: _fake_config(vault, src, {"journal": True}),
+        )
+
+        result = runner.invoke(app, ["sync", "--tier", "A", "--vault", str(vault)])
+
+        assert result.exit_code == 0, result.output
+        entry = _state_sources(vault)["journal"]
+        assert entry["failure_count"] == 1, entry
+        failures = entry["failures"]
+        assert isinstance(failures, list), entry
+        assert any("source path not found" in str(line) for line in failures), failures
