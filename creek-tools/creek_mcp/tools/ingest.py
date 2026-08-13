@@ -4,6 +4,25 @@ The ingestor's default tier is ``personal`` (matches the CLI), so
 ``ceiling=open`` calls are refused before any source data is read.
 ``affected_fragment_ids`` records what the run produced; the ingestor
 errors flow back in the response without entering the audit body.
+
+**Deliberately excluded from the #1372 advisory work, and not because it is
+already covered.** #1372 gave ``creek.journal``, ``creek.upload`` and
+``creek.link`` the operator advisories they were computing and dropping. This
+tool has none to drop: it never calls
+:func:`creek.ingest.pipeline.run_ingest`, which is where advisories are
+produced. It re-implements the write loop inline (below) and writes no ledger,
+so it is structurally *mute* rather than lossy — an un-pinned vault or a
+pre-#1305 collapsed fragment goes unreported here whatever a caller's ceiling
+admits. A blanket claim that "no MCP surface drops an advisory" is therefore
+**not** satisfied by leaving this tool as it is.
+
+Converting it is a write-semantics change, not an observability one, which is
+why it was not folded in: ``run_ingest`` with a ``ledger_source`` plus a
+*directory* ``input_path`` arms :func:`creek.ingest.pipeline.tomb_missing_units`
+for that ledger (see the ``ledger_source`` hazard note in ``run_ingest``'s
+docstring), which can soft-tomb every previously-ledgered unit the pass does
+not see. That is a vault-mutating decision this tool has never made and cannot
+acquire as a side effect of adding a response field. (#1467.)
 """
 
 from __future__ import annotations

@@ -322,6 +322,7 @@ def test_a_missing_version_header_is_409(vault: Path, method: str, path: str) ->
 @pytest.mark.parametrize(
     ("minor", "expected"),
     [
+        ("0.5", _OK_STATUS),
         ("0.4", _OK_STATUS),
         ("0.3", _OK_STATUS),
         ("0.2", _OK_STATUS),
@@ -335,6 +336,7 @@ def test_a_missing_version_header_is_409(vault: Path, method: str, path: str) ->
     ids=[
         "current-minor",
         "previous-minor",
+        "third-served-minor",
         "oldest-served-minor",
         "patch",
         "other-patch",
@@ -355,15 +357,16 @@ def test_the_version_header_is_matched_strictly(
     sharper: the gate either lets the request through to the route or refuses
     it with ``409``.
 
-    All three served minors reach the handler: ``0.4`` is the current one, and
-    ``0.3`` and ``0.2`` are retained by
+    All four served minors reach the handler: ``0.5`` is the current one, and
+    ``0.4``, ``0.3`` and ``0.2`` are retained by
     :data:`creek_mcp.api.models.SUPPORTED_CONTRACT_MINORS` because no ``/v1``
-    wire shape changed when the contract moved either time (``creek.upload``
-    in #1023, the ``creek.purge.*`` ``partial`` status in #1246 — both
-    MCP-only). The ``0.3`` and ``0.2`` rows are the tripwire for a *narrowed*
-    window — if either goes red, a contract bump shifted the supported set
-    instead of widening it and existing clients started getting
-    ``incompatible_version``.
+    wire shape changed when the contract moved any of those times
+    (``creek.upload`` in #1023 and the ``creek.purge.*`` ``partial`` status in
+    #1246, both MCP-only; the ingest advisories in #1372, whose one ``/v1``
+    addition is an optional field omitted when empty). The ``0.4``, ``0.3``
+    and ``0.2`` rows are the tripwire for a *narrowed* window — if any goes
+    red, a contract bump shifted the supported set instead of widening it and
+    existing clients started getting ``incompatible_version``.
 
     ``0.2.0`` spells a served minor with a patch component and is deliberately
     refused: the header's published grammar is ``major.minor``, and a server

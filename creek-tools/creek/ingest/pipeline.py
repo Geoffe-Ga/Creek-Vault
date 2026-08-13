@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path  # runtime use: resolving recorded source paths
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, NamedTuple
 
 from creek.ingest.base import assemble_ingested_fragment, generate_fragment_id
 from creek.ingest.source_unit import compose_source_unit
@@ -49,7 +49,18 @@ class IngestRunResult:
         skipped: Units skipped by incremental/``since`` filtering.
         warnings: Non-fatal operator advisories. Unlike *errors*, these do not
             mean anything failed — they mean the run detected a vault state
-            that will cause trouble if left alone (#1329).
+            that will cause trouble if left alone (#1329). Written for an
+            operator at a terminal, so an advisory here may name real vault
+            fragments: this channel is **not** safe to hand to a caller whose
+            tier ceiling has not admitted them.
+        ceiling_safe_warnings: The subset of *warnings* proven free of vault
+            content — the only advisory channel that may cross an MCP tier
+            ceiling (#1372). Proven at the producer, which is the one place
+            that knows what it interpolated; see :func:`run_ingest`'s ``warn``
+            closure. An advisory with no content-free form is simply absent
+            here rather than sanitised, so this list can be shorter than
+            *warnings* but never longer and never says anything *warnings*
+            does not.
     """
 
     written: int
@@ -61,6 +72,7 @@ class IngestRunResult:
     tombed: int
     skipped: int
     warnings: list[str] = field(default_factory=list)
+    ceiling_safe_warnings: list[str] = field(default_factory=list)
 
 
 def resolve_recorded_source(source_path: str, vault_path: Path) -> Path:
@@ -586,16 +598,57 @@ _COLLAPSED_UNIT_WARNING_TEMPLATE = (
     "recognise. Links pointing at a superseded fragment keep resolving to "
     "it until you do."
 )
-"""Advisory for a vault still holding pre-#1305 collapsed fragments."""
+"""Advisory for a vault still holding pre-#1305 collapsed fragments.
+
+The console rendering. ``{sample}`` interpolates real pre-existing vault
+fragment ids, which is exactly why it must never leave this process for a
+caller whose ceiling has not admitted them — see
+:data:`_COLLAPSED_UNIT_SAFE_TEMPLATE` for the form that may.
+"""
+
+_COLLAPSED_UNIT_SAFE_TEMPLATE = (
+    "This vault holds {count} fragment(s) written before #1305, when every "
+    "sheet of a multi-sheet workbook shared one fragment id and only the "
+    "FIRST reached disk. Each one is now superseded by the per-sheet "
+    "fragments this run writes, and is left in place. Run the same ingest "
+    "at a terminal to see which fragments. Nothing is deleted automatically "
+    "— inspect with `creek purge source --source-path <path> --match exact "
+    "--dry-run`, and purge only what you recognise. Links pointing at a "
+    "superseded fragment keep resolving to it until you do."
+)
+"""The content-free twin of :data:`_COLLAPSED_UNIT_WARNING_TEMPLATE` (#1372).
+
+Interpolates ``{count}`` and nothing else. The count stays because an
+advisory that suppresses the number as well as the ids reports no data loss
+at all; what is withheld is only the ``{sample}`` clause, replaced by the
+instruction that recovers it through a surface — the terminal — where the
+operator is entitled to every fragment in their own vault.
+"""
 
 _COLLAPSED_UNIT_SAMPLE = 3
 """How many superseded ids the advisory names before it stops listing."""
 
 
+class CollapsedUnitAdvisory(NamedTuple):
+    """The pre-#1305 advisory in both of its disclosure forms.
+
+    Attributes:
+        message: What an operator at a terminal sees. It names the superseded
+            ids, which is the only thing that tells them *which* fragments to
+            inspect, so this form is the useful one — and the one that may
+            not cross a tier ceiling.
+        ceiling_safe: What may cross a tier ceiling. The same finding, and the
+            same count, with every interpolated vault id withheld.
+    """
+
+    message: str
+    ceiling_safe: str
+
+
 def collapsed_unit_warning(
     writer: VaultWriter,
     fragments: Sequence[ParsedFragment],
-) -> str | None:
+) -> CollapsedUnitAdvisory | None:
     """Return the pre-#1305 collapsed-fragment advisory, or ``None`` (#1305).
 
     Before #1305 every sheet of a multi-sheet workbook derived the same
@@ -632,9 +685,14 @@ def collapsed_unit_warning(
             :meth:`~creek.vault.writer.VaultWriter.find_fragment`.
         fragments: This run's parsed fragments, before any are written.
 
+    Both renderings are built here, from the one ``superseded`` list, because
+    this is the only place that knows which ids were interpolated (#1372). A
+    downstream filter would have to guess, and the guess is not available: an
+    id-shaped regex catches an id but not a fragment title or a body excerpt.
+
     Returns:
-        The advisory text, or ``None`` when no superseded fragment is
-        present.
+        The advisory in both disclosure forms, or ``None`` when no superseded
+        fragment is present.
     """
     superseded: list[str] = []
     for parsed in fragments:
@@ -652,7 +710,11 @@ def collapsed_unit_warning(
     sample = ", ".join(sorted(superseded)[:_COLLAPSED_UNIT_SAMPLE])
     if len(superseded) > _COLLAPSED_UNIT_SAMPLE:
         sample = f"{sample}, …"
-    return _COLLAPSED_UNIT_WARNING_TEMPLATE.format(count=len(superseded), sample=sample)
+    count = len(superseded)
+    return CollapsedUnitAdvisory(
+        message=_COLLAPSED_UNIT_WARNING_TEMPLATE.format(count=count, sample=sample),
+        ceiling_safe=_COLLAPSED_UNIT_SAFE_TEMPLATE.format(count=count),
+    )
 
 
 def run_ingest(
@@ -702,7 +764,11 @@ def run_ingest(
             advisory whose whole purpose is "stop before this run hurts you"
             is worthless delivered after the run finished. Keeping it a plain
             ``str`` callback leaves this module UI-agnostic — the caller
-            decides what printing means.
+            decides what printing means. It receives the *operator* rendering,
+            which may name real vault fragments, so it is for a surface with a
+            console and an operator standing at it; a surface answering a
+            remote caller reads
+            :attr:`IngestRunResult.ceiling_safe_warnings` instead (#1372).
 
     Returns:
         An :class:`IngestRunResult` with the write tallies and any errors.
@@ -716,32 +782,61 @@ def run_ingest(
     filtering = since is not None or incremental
 
     warnings: list[str] = []
+    ceiling_safe_warnings: list[str] = []
 
-    def warn(message: str) -> None:
+    def warn(message: str, *, ceiling_safe: str | None) -> None:
         """Record an advisory and hand it to the caller in the same breath.
 
         The single way a warning enters this run. Appending to the list
         without notifying *on_warning* is how an advisory becomes invisible,
         so the two are not separable here.
+
+        *message* is what an operator at a terminal sees, and it is allowed to
+        name real vault fragments. *ceiling_safe* is the same finding in a form
+        proven free of vault content, and it is the only one that may cross an
+        MCP tier ceiling; a caller with no console — every MCP tool — gets only
+        that one (#1372). ``None`` means this advisory has no content-free form
+        and therefore does not travel.
+
+        Deciding here, at the producer, is the whole point. The producer is the
+        only place that knows what it interpolated; a downstream scrub would
+        have to guess which substrings are vault content, and the guess is not
+        available — an id-shaped regex catches an id but not a fragment title
+        or a body excerpt. For the same reason *ceiling_safe* is keyword-only
+        with **no default**: mypy strict covers ``creek/``, so every present and
+        future advisory producer is forced to state which it is. A default of
+        ``ceiling_safe=message`` would be fail-open, which is the defect rather
+        than the fix.
+
+        Args:
+            message: The operator-facing advisory, in full detail.
+            ceiling_safe: The content-free rendering of the same advisory, or
+                ``None`` when it has none.
         """
         warnings.append(message)
         logger.warning("%s", message)
+        if ceiling_safe is not None:
+            ceiling_safe_warnings.append(ceiling_safe)
         if on_warning is not None:
             on_warning(message)
 
     # Checked BEFORE the write loop: once the loop has recorded its first
     # ledger entry the vault no longer looks un-pinned, and the advisory would
     # never fire for the very run it needed to warn about.
+    #
+    # It travels verbatim: the text is a fixed constant with no interpolation,
+    # so it names a command rather than a fragment and withholding it from an
+    # MCP caller would be caution with no subject.
     unpinned = unpinned_vault_warning(source_type, vault_path)
     if unpinned is not None:
-        warn(unpinned)
+        warn(unpinned, ceiling_safe=unpinned)
 
     # Same reason as above: checked before the write loop, so the operator
     # is told about superseded fragments before the run that supersedes
     # them finishes rather than after (#1305).
     collapsed = collapsed_unit_warning(writer, ingest_result.fragments)
     if collapsed is not None:
-        warn(collapsed)
+        warn(collapsed.message, ceiling_safe=collapsed.ceiling_safe)
 
     errors: list[str] = [f"[{source_type}] {err}" for err in ingest_result.errors]
     written = 0
@@ -804,4 +899,5 @@ def run_ingest(
         tombed=tombed,
         skipped=skipped,
         warnings=warnings,
+        ceiling_safe_warnings=ceiling_safe_warnings,
     )

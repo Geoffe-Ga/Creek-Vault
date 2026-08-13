@@ -1368,7 +1368,7 @@ def test_every_contract_version_earns_a_change_log_row() -> None:
 
 
 def test_the_compatibility_window_only_ever_widens() -> None:
-    """Every minor ever served is still served (#1023, #1246).
+    """Every minor ever served is still served (#1023, #1246, #1372).
 
     :data:`SUPPORTED_CONTRACT_MINORS` is the promise that a bump does
     not strand existing clients, and the promise is only worth anything
@@ -1377,6 +1377,15 @@ def test_the_compatibility_window_only_ever_widens() -> None:
     to be answered now gets ``incompatible_version``, which is a
     deliberate breaking change and must not happen by omission when
     somebody bumps :data:`CONTRACT_VERSION` and forgets this tuple.
+
+    ``0.4`` joins the list at the 0.5 bump (#1372, the advisory fields on
+    ``creek.journal`` / ``creek.upload`` / ``creek.link``). It is the case
+    this guard exists for: the tuple's head entry is *derived* from
+    :data:`CONTRACT_VERSION`, so bumping the version and nothing else
+    silently shifts ``0.4`` out of the window rather than widening it, and
+    every live Adepthood consumer sending ``X-Creek-Contract-Version: 0.4``
+    starts being refused. Nothing about the change warranted that — the one
+    new ``/v1`` field is optional and omitted when empty.
     """
-    for retired_minor in ("0.2", "0.3"):
+    for retired_minor in ("0.2", "0.3", "0.4"):
         assert retired_minor in SUPPORTED_CONTRACT_MINORS

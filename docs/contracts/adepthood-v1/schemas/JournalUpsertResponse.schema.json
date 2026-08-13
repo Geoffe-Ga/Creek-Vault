@@ -21,7 +21,7 @@
     }
   },
   "additionalProperties": false,
-  "description": "The result of an idempotent journal write.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call was served under \u2014 the caller's own\n        declared value, echoed for correlation.\n    external_id: The consumer-side identity of the entry, unchanged.\n    fragment_id: The vault-side identity now backing it.\n    action: Whether the write created, updated, or changed nothing.\n    tier: The tier the entry was created at. Not expressible as\n        ``intimate``, for the same reason as on the request.",
+  "description": "The result of an idempotent journal write.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call was served under \u2014 the caller's own\n        declared value, echoed for correlation.\n    external_id: The consumer-side identity of the entry, unchanged.\n    fragment_id: The vault-side identity now backing it.\n    action: Whether the write created, updated, or changed nothing.\n    tier: The tier the entry was created at. Not expressible as\n        ``intimate``, for the same reason as on the request.\n    warnings: Content-free operator advisories this write produced, and\n        absent entirely when there were none (#1372). Optional rather\n        than an always-present empty list on purpose: ``_WireModel`` is\n        ``extra=\"forbid\"`` and this server still serves contract minors\n        0.2, 0.3 and 0.4, so an unconditional key would put an\n        unnegotiated field in every ``200`` those clients receive. Paired\n        with ``exclude_none`` at the dump, the quiet write stays\n        byte-identical to what it was before this field existed. Every\n        entry is proven free of vault content at the producer \u2014 see\n        :attr:`creek.ingest.pipeline.IngestRunResult.ceiling_safe_warnings`\n        \u2014 so nothing here varies with the caller's ceiling.",
   "properties": {
     "action": {
       "$ref": "#/$defs/JournalAction",
@@ -50,6 +50,22 @@
     "tier_ceiling": {
       "$ref": "#/$defs/WireTierCeiling",
       "description": "Ceiling the call ran at."
+    },
+    "warnings": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Content-free operator advisories this write produced; absent when none.",
+      "title": "Warnings"
     }
   },
   "required": [

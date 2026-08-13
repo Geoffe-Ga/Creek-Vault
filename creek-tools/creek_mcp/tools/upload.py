@@ -685,9 +685,10 @@ def upload_tool(
     Returns:
         ``{status, tool, tier_ceiling, external_id, filename, timestamp,
         source_type, fragment_id, affected_fragment_ids, action, tier,
-        size_bytes}`` on
-        success (``action`` ∈ ``created``/``updated``/``unchanged``), or a
-        structured four-key refusal — carrying
+        size_bytes, warnings}`` on
+        success (``action`` ∈ ``created``/``updated``/``unchanged``;
+        ``warnings`` is the run's content-free advisory channel, an empty list
+        when the run was quiet), or a structured four-key refusal — carrying
         :data:`~creek_mcp.read_gate.GENERIC_ABOVE_CEILING_REASON`, naming
         neither the protected fragment nor its tier, when the overwrite gate
         fires (#970).
@@ -817,4 +818,12 @@ def upload_tool(
         "action": _action_of(result),
         "tier": upload_tier.value,
         "size_bytes": len(raw),
+        # ``ceiling_safe_warnings``, never ``warnings``: it is the only ingest
+        # advisory channel that may cross this boundary, because the operator
+        # channel interpolates real vault fragment ids this caller's ceiling
+        # may not admit. See the ``warn`` doctrine in creek/ingest/pipeline.py
+        # for why that call is made at the producer (#1372). This is the
+        # surface that most needs it — the collapsed-unit advisory reports
+        # actual data loss and fires on the multi-sheet-workbook path.
+        "warnings": list(result.ceiling_safe_warnings),
     }

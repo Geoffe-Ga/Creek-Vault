@@ -770,3 +770,89 @@ def test_the_parity_harness_can_actually_fail() -> None:
             Outcome(kind="ok", payload={"action": "created"}),
             Outcome(kind="ok", payload={"action": "unchanged"}),
         )
+
+
+# --------------------------------------------------------------------------- #
+# Advisories on the wire (#1372)
+# --------------------------------------------------------------------------- #
+
+
+def _unpin(vault_path: Path) -> None:
+    """Leave *vault_path* looking un-migrated for the #1329 id-derivation fix.
+
+    :func:`creek.ingest.pipeline.unpinned_vault_warning` fires when the
+    markdown ingest ledger is empty and ``01-Fragments`` already holds
+    markdown — a real pre-#1329 vault, and the one state in which an
+    Adepthood consumer's writes silently mint duplicates. Seeding that state
+    is how this module gets a genuine advisory out of the production code
+    path rather than injecting one at the seam.
+
+    Args:
+        vault_path: The seeded vault to age.
+    """
+    stray = vault_path / "01-Fragments" / "Notes" / "pre-existing.md"
+    stray.write_text("---\nid: frag-0ldc0ffee123\n---\nA note.\n", encoding="utf-8")
+
+
+def test_a_quiet_write_is_byte_identical_to_what_it_was_before(vault: Path) -> None:
+    """No advisory means no ``warnings`` key at all — not ``null``, not ``[]``.
+
+    This is the whole compatibility argument for adding a field to a published
+    ``/v1`` response. ``JournalUpsertResponse.warnings`` defaults to ``None``
+    and the route dumps with ``exclude_none``, so the ordinary write serves a
+    consumer negotiating contract minor ``0.4`` exactly the bytes it served
+    before the field existed. Drop ``exclude_none`` and every ``200`` starts
+    carrying ``"warnings": null`` to clients that never negotiated it —
+    against a model whose whole family is ``extra="forbid"`` precisely because
+    this repo expects consumers to validate closed.
+
+    Args:
+        vault: A seeded vault, with a fresh ledger and no stray fragments.
+    """
+    body = envelope(_put(vault))
+
+    assert body["status"] == "ok"
+    assert "warnings" not in body
+
+
+def test_an_advisory_the_run_produced_reaches_the_wire(vault: Path) -> None:
+    """A real un-pinned vault puts the #1329 advisory on the response.
+
+    The counterpart to the test above, and the reason the field was added:
+    ``journal_ingest_tool`` has always computed this advisory and the adapter
+    has always dropped it, so an Adepthood consumer syncing into an
+    un-migrated vault was answered ``ok`` while every entry it sent minted a
+    duplicate. ``_render`` builds the model field by field, so a key the tool
+    sets but the model does not declare is silently re-dropped here — which is
+    why this assertion is on the HTTP body and not on the tool's dict.
+
+    Args:
+        vault: A seeded vault, aged into the pre-#1329 state.
+    """
+    _unpin(vault)
+
+    body = envelope(_put(vault))
+
+    assert body["status"] == "ok"
+    assert any("--pin-source-ids" in advisory for advisory in body["warnings"])
+
+
+def test_the_wire_advisory_names_no_vault_fragment(vault: Path) -> None:
+    """Whatever crosses ``/v1`` carries no fragment id but its own.
+
+    The advisory channel the route reads is
+    :attr:`creek.ingest.pipeline.IngestRunResult.ceiling_safe_warnings`, whose
+    entries are content-free by construction at the producer. The operator
+    channel — which interpolates real superseded ids — must never reach a
+    remote caller, so this asserts on the serialised advisories rather than on
+    the whole body, which legitimately carries the id this very call created.
+
+    Args:
+        vault: A seeded vault, aged into the pre-#1329 state.
+    """
+    _unpin(vault)
+
+    advisories = json.dumps(envelope(_put(vault))["warnings"])
+
+    assert advisories != "[]"
+    assert "frag-" not in advisories

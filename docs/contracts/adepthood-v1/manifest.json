@@ -1,6 +1,6 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.4.0",
+  "contract_version": "0.5.0",
   "files": [
     {
       "capability": "capabilities",
@@ -13,7 +13,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "1e71ebae858872068ca0c70570f09bf145027d8460bebc584eb7dabb5aca2610",
+      "sha256": "b583ee121a414042bc1b7be775df1f6e8d308930d1751fcb933d108ac8f38fc5",
       "state": "empty"
     },
     {
@@ -41,7 +41,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "8e8485ff6b7da18e3c54a35ea8198db1f389e69e8698ccff8c3030ea4f65733c",
+      "sha256": "7af1a9b7d8ce05f020e037e7d3cf93647d549084ead07ba01abbd2af06af3a77",
       "state": "success"
     },
     {
@@ -251,7 +251,7 @@
       "capability": null,
       "model": "JournalUpsertResponse",
       "path": "schemas/JournalUpsertResponse.schema.json",
-      "sha256": "acbcdc550fe2e7aa46ed8e2d692c06f1a153b508b953d6b98345ef1bd2477b1e",
+      "sha256": "8cb954012d4b4bf49c679386900f1e3b5ef6a8bb0375bed10d9f2d10105e4796",
       "state": null
     },
     {

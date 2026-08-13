@@ -42,6 +42,11 @@ def link_tool(
     parameter is recorded for the audit trail; like ``classify`` the
     linker does not produce new tiered content, so the ceiling is not
     a gate here — every caller can re-link.
+
+    The response carries the same cluster-health counts ``creek link``
+    prints — ``largest_cluster_fragments``, ``clusters_split`` and
+    ``oversized_discarded`` — because a discarded fragment is data loss and
+    a caller who cannot see it reads a lossy pass as a clean one (#1372).
     """
     if method not in LINK_METHODS:
         return refusal_response(
@@ -73,4 +78,16 @@ def link_tool(
         "method": summary.method,
         "fragment_count": summary.fragment_count,
         "link_count": summary.link_count,
+        # The cluster-health counts ``creek link`` renders on the console
+        # (``creek.cli._format_cluster_stats``) and this tool used to drop
+        # (#1372). Named rather than cited by line, because a line range in a
+        # 5000-line module is wrong the next time anything above it moves. A
+        # discard is data loss — those fragments carry no wiki-link at all —
+        # so a caller who cannot see it believes the pass succeeded. All three
+        # are plain ints on a frozen dataclass of counts
+        # (creek/link/link_engine.py:63+): they can never name a fragment, so
+        # unlike the ingest advisories they need no ceiling gate.
+        "largest_cluster_fragments": summary.largest_cluster_fragments,
+        "clusters_split": summary.clusters_split,
+        "oversized_discarded": summary.oversized_discarded,
     }

@@ -334,9 +334,11 @@ def journal_ingest_tool(
             :func:`creek.ingest.pipeline.run_ingest`.
 
     Returns:
-        ``{status, tool, tier_ceiling, external_id, fragment_id, action, tier}``
-        on success (``action`` ∈ ``created``/``updated``/``unchanged``), or a
-        structured refusal — the canonical four-key one carrying
+        ``{status, tool, tier_ceiling, external_id, fragment_id, action, tier,
+        warnings}`` on success (``action`` ∈
+        ``created``/``updated``/``unchanged``; ``warnings`` is the run's
+        content-free advisory channel, an empty list when the run was quiet),
+        or a structured refusal — the canonical four-key one carrying
         :data:`~creek_mcp.read_gate.GENERIC_ABOVE_CEILING_REASON`, naming
         neither the protected fragment nor its tier, when the overwrite gate
         fires (#970).
@@ -445,4 +447,10 @@ def journal_ingest_tool(
         "fragment_id": fragment_id,
         "action": _action_of(result),
         "tier": entry_tier.value,
+        # ``ceiling_safe_warnings``, never ``warnings``: it is the only ingest
+        # advisory channel that may cross this boundary, because the operator
+        # channel interpolates real vault fragment ids this caller's ceiling
+        # may not admit. See the ``warn`` doctrine in creek/ingest/pipeline.py
+        # for why that call is made at the producer (#1372).
+        "warnings": list(result.ceiling_safe_warnings),
     }

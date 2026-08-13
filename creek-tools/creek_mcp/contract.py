@@ -15,8 +15,20 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.4.0"
-"""Semantic version of the Adepthood ↔ Creek MCP contract (draft)."""
+CONTRACT_VERSION: Final[str] = "0.5.0"
+"""Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.5.0 (#1372): ``creek.journal`` and ``creek.upload`` now return the
+content-free ``warnings`` their ingest run produced, and ``creek.link``
+returns the three cluster-health counts the CLI console renders. Bumping a
+minor for three tools gaining response fields follows the precedent set by
+0.3.0 (one new tool) and 0.4.0 (one new status value).
+
+**Bumping this string is not sufficient on its own.**
+:data:`creek_mcp.api.models.SUPPORTED_CONTRACT_MINORS` derives its head entry
+from here, so the outgoing minor has to be added to that tuple by hand in the
+same change or every client still sending it is refused.
+"""
 
 ONTOLOGY_VERSION: Final[str] = "aptitude-wavelength/2026-05-23"
 """Pinned version of the shared frequency/phase vocabulary.
