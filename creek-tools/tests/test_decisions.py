@@ -21,6 +21,7 @@ from creek.generate.decisions import (
     _sanitize_title,
     generate_decisions,
 )
+from creek.classify.privacy_filter import PrivacyTierOverride
 from creek.models import (
     Confidence,
     DecisionCandidate,
@@ -30,6 +31,7 @@ from creek.models import (
     FrequencyClassification,
     Phase,
     PraxisPotential,
+    PrivacyTier,
     SourcePlatform,
     VoiceClassification,
     WavelengthClassification,
@@ -1349,3 +1351,187 @@ class TestDecisionOrdinalCap:
         assert written.name == f"{stem}-2.md"
         assert _source_fragment_of(written) == "frag-late"
         assert len(_active_notes(vault_path)) == 3
+
+
+# ---------------------------------------------------------------------------
+# #1431 — the unconditional intimate screen in generate_decisions
+#
+# Every case here is driven at ``PrivacyTierOverride.ALL`` on purpose. ALL is
+# the widest ceiling — the one ``creek fill`` states for every step and the one
+# ``creek report`` uses when no ``--include-tier`` is typed — so it is the
+# ceiling at which the ordinary rank cutoff admits everything and the screen is
+# the only thing left. A case pinned at ``OPEN`` would pass on the cutoff alone
+# and prove nothing.
+# ---------------------------------------------------------------------------
+
+
+def _tiered_fragment(frag_id: str, title: str, tier: PrivacyTier) -> Fragment:
+    """Return a decision-signalling fragment at *tier*.
+
+    The title must open with ``"Should I"`` or
+    ``DecisionDetector._detect_keywords`` never flags it and every assertion
+    below would pass for the wrong reason.
+
+    Args:
+        frag_id: Fragment id.
+        title: Fragment title — the value that reaches the note's filename.
+        tier: The declared privacy tier.
+
+    Returns:
+        The fragment.
+    """
+    return Fragment(
+        id=frag_id,
+        title=title,
+        source=FragmentSource(platform=SourcePlatform.JOURNAL),
+        created=datetime(2025, 3, 10, 14, 0, 0),
+        frequency=FrequencyClassification(primary=Frequency.F1),
+        wavelength=WavelengthClassification(phase=Phase.RISING),
+        voice=VoiceClassification(confidence=Confidence.EXPLORING),
+        praxis_potential=PraxisPotential.EXPLICIT,
+        privacy_tier=tier,
+    )
+
+
+def test_generate_decisions_screens_an_intimate_fragment_at_the_all_ceiling(
+    vault_path: Path,
+) -> None:
+    """An ``intimate`` fragment gets no Decision note, even at ``ALL`` (#1431).
+
+    ``ALL`` is the operator's explicit "show me everything" override for the
+    tier *ceiling*, and for the other five reports that is the end of it. It is
+    not the end of it here, because a Decision note's filename is the source
+    fragment's title sanitised and that filename is visible to anything that
+    lists the directory — Obsidian's file pane, ``ls``, Spotlight, a sync
+    client — with no front matter attached to declare what it came from.
+    """
+    _seed_fragment(
+        vault_path,
+        _tiered_fragment("frag-intimate", "Should I leave my marriage", PrivacyTier.INTIMATE),
+    )
+
+    written = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
+
+    assert written == []
+    assert not list((vault_path / "08-Decisions" / "Active").glob("*.md"))
+
+
+def test_generate_decisions_still_writes_an_open_fragments_note(
+    vault_path: Path,
+) -> None:
+    """Positive control: the screen drops intimate content, not all content.
+
+    Without this, :func:`test_generate_decisions_screens_an_intimate_fragment_at_the_all_ceiling`
+    is satisfied by a generator that writes nothing ever.
+    """
+    _seed_fragment(
+        vault_path,
+        _tiered_fragment("frag-open", "Should I buy a bicycle", PrivacyTier.OPEN),
+    )
+
+    written = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
+
+    assert len(written) == 1
+    assert "Should-I-buy-a-bicycle" in written[0].name
+
+
+def test_generate_decisions_admits_an_explicitly_unclassified_fragment(
+    vault_path: Path,
+) -> None:
+    """``privacy_tier: unclassified`` written out is admitted, not screened.
+
+    The screen fails *closed on a missing key*, which is not the same rule as
+    "screen anything that isn't neatly tiered". An explicit ``unclassified`` is
+    a statement the pipeline made — ``VaultWriter._write_model`` serialises
+    ``model_dump(mode="json")``, so it is what an unclassified fragment
+    actually looks like on disk — and it ranks with ``personal``, below the
+    screen. This is the assertion that stops the fail-closed reader being
+    widened by a later edit into a blanket "untidy means intimate" rule.
+    """
+    _seed_fragment(
+        vault_path,
+        _tiered_fragment(
+            "frag-unclassified",
+            "Should I take the job",
+            PrivacyTier.UNCLASSIFIED,
+        ),
+    )
+
+    written = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
+
+    assert len(written) == 1
+    assert "Should-I-take-the-job" in written[0].name
+
+
+def test_generate_decisions_screens_a_fragment_with_no_privacy_tier_key(
+    vault_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A note with no ``privacy_tier:`` key at all is withheld (#1431).
+
+    This is the case that decides *which* tier reader the screen uses, and it
+    is the mutant-killer for that choice. The model reader
+    (``tier_of``/``fragment.privacy_tier``) resolves a missing key to
+    ``unclassified`` and would admit this fragment — writing
+    ``08-Decisions/Active/<date>-Should-I-leave-my-marriage-with-SECRET.md``
+    on the day the fix merges. ``raw_privacy_tier`` reads the raw front matter
+    and fails closed to ``intimate``, which is the same answer
+    ``tests/test_mcp_report_tier_ceiling.py``'s
+    ``test_fragment_with_no_privacy_tier_key_fails_closed_to_intimate``
+    already pins for report artifacts.
+
+    The fragment is hand-written rather than seeded through ``_seed_fragment``
+    precisely because ``_seed_fragment`` dumps the model and therefore always
+    emits the key — the keyless shape only exists for legacy and hand-authored
+    notes.
+    """
+    frags = vault_path / "01-Fragments" / "Conversations"
+    frags.mkdir(parents=True, exist_ok=True)
+    (frags / "frag-notier.md").write_text(
+        "---\ntype: fragment\nid: frag-notier\n"
+        'title: "Should I leave my marriage with SECRET"\n'
+        "source:\n  platform: journal\n  author: self\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING", logger="creek.generate.decisions"):
+        written = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
+
+    assert written == []
+    assert not list((vault_path / "08-Decisions" / "Active").glob("*.md"))
+    assert any("withheld" in r.getMessage() for r in caplog.records), (
+        "a fail-closed screen that disables the report must say so; "
+        f"records={[r.getMessage() for r in caplog.records]}"
+    )
+
+
+def test_generate_decisions_stays_idempotent_with_the_screen(
+    vault_path: Path,
+) -> None:
+    """A second run after the screen writes nothing and mutates no bytes (#1431).
+
+    The screen runs *before* detection, so the withheld fragment never reaches
+    the ``_existing_decision_fragment_ids`` gate or the #1334 ownership
+    resolution in ``_resolve_decision_note_path``. Those two are what stop the
+    admitted fragment's note being re-written on every run, and a screen that
+    perturbed the fragment list could have made the second run re-detect and
+    clobber. Bytes are compared, not just the return value: a rewrite with a
+    fresh ``id:`` is exactly the oscillation #1334 fixed.
+    """
+    _seed_fragment(
+        vault_path,
+        _tiered_fragment("frag-open", "Should I buy a bicycle", PrivacyTier.OPEN),
+    )
+    _seed_fragment(
+        vault_path,
+        _tiered_fragment("frag-intimate", "Should I leave my marriage", PrivacyTier.INTIMATE),
+    )
+
+    first = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
+    before = {p: p.read_bytes() for p in (vault_path / "08-Decisions").rglob("*.md")}
+    second = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
+    after = {p: p.read_bytes() for p in (vault_path / "08-Decisions").rglob("*.md")}
+
+    assert len(first) == 1
+    assert second == []
+    assert after == before

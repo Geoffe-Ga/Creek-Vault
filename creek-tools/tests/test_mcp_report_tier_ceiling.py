@@ -1791,3 +1791,96 @@ def test_every_audience_weighted_symbol_is_actually_called_somewhere() -> None:
         f"{_AUDIENCE_WEIGHTING_CALLER_MODULES} calls. An entry no call site "
         "matches is an assertion about nothing."
     )
+
+
+# ---------------------------------------------------------------------------
+# T9 — decisions carries a second, non-defeasible screen (#1431)
+# ---------------------------------------------------------------------------
+
+
+_ALL_CEILINGS = [
+    pytest.param(TierCeiling.OPEN, id="open"),
+    pytest.param(TierCeiling.PERSONAL, id="personal"),
+    pytest.param(TierCeiling.INTIMATE, id="intimate"),
+    pytest.param(TierCeiling.ALL, id="all"),
+]
+"""Every :class:`TierCeiling` member, one parametrize row each.
+
+Spelled out rather than derived from ``list(TierCeiling)`` so the ids stay
+readable in a failure line; the length guard inside the test below is what
+stops a newly added ceiling from quietly skipping this proof.
+"""
+
+
+@pytest.mark.parametrize("ceiling", _ALL_CEILINGS)
+def test_decisions_never_names_an_intimate_fragment_at_any_ceiling(
+    ceiling: TierCeiling,
+    tmp_path: Path,
+) -> None:
+    """An ``intimate`` title never reaches an ``08-Decisions`` filename (#1431).
+
+    Unlike every other report gated by #968, ``decisions`` writes a source
+    fragment's title verbatim into a *filename* that then sits in the vault
+    tree, visible to Obsidian's file pane, to ``ls``, to Spotlight and to any
+    sync client — with no frontmatter to declare what tier it came from. The
+    ceiling is the operator's dial; this screen is not, which is why the
+    assertion is parametrized over *every* ceiling including ``ALL``.
+
+    The ceiling parametrization is the point. At ``ceiling=open`` the ordinary
+    rank cutoff already excludes the intimate fragment, and
+    ``test_report_at_open_ceiling_excludes_above_ceiling_content[decisions]``
+    was already green before this fix — a test pinned at the *narrowest*
+    ceiling would have proven nothing. The defect lives at ``intimate`` and
+    ``all``, the two widest ceilings, and those are the two rows that were red
+    before the screen existed.
+
+    The FILENAME assertion is written directly against ``rglob`` rather than
+    through :func:`_artifact_blob`, even though that helper happens to include
+    paths today. Path coverage there is one "simplify this to contents-only"
+    refactor away from disappearing, and the filename is this defect's primary
+    surface; the check must not be able to retire silently.
+
+    Args:
+        ceiling: The ceiling the report is driven at.
+        tmp_path: pytest's per-test temporary directory.
+    """
+    assert len(_ALL_CEILINGS) == len(list(TierCeiling)), (
+        "TierCeiling gained a member that this parametrization does not cover. "
+        "A ceiling with no row here is a ceiling at which the intimate screen "
+        "is unproven."
+    )
+
+    vault = _build_decisions_vault(tmp_path)
+    result = report_tool(
+        vault_path=vault,
+        report_type="decisions",
+        privacy_tier_ceiling=ceiling,
+    )
+    assert result["status"] == "ok"
+
+    leaked = [
+        str(path.relative_to(vault))
+        for path in (vault / "08-Decisions").rglob("*")
+        if _INTIMATE_CANARY in str(path.relative_to(vault))
+    ]
+    assert not leaked, (
+        f"at privacy_tier_ceiling={ceiling.value!r} an intimate fragment's "
+        f"title reached an 08-Decisions FILENAME: {leaked}. The note's own "
+        "front matter cannot label a path."
+    )
+
+    blob = _artifact_blob(vault, ("08-Decisions",))
+    assert _INTIMATE_CANARY not in blob, (
+        f"at privacy_tier_ceiling={ceiling.value!r} the intimate title reached "
+        f"08-Decisions content — the generated note's `title:` is the source "
+        f"fragment's title verbatim:\n\n{blob}"
+    )
+    assert _OPEN_CANARY in blob, (
+        f"at privacy_tier_ceiling={ceiling.value!r} the open fragment lost its "
+        "Decision note, so the exclusion assertions above are vacuous. A screen "
+        "that drops everything is an outage wearing a gate's costume."
+    )
+    assert list(vault.glob("08-Decisions/Active/*.md")), (
+        f"no Decision note at all was written at "
+        f"privacy_tier_ceiling={ceiling.value!r}."
+    )
