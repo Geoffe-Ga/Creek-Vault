@@ -78,6 +78,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.6",
     "0.5",
     "0.4",
     "0.3",
@@ -114,6 +115,15 @@ Contract 0.6 (#1453) is a pure MCP-surface move again, of the 0.3/0.4 kind:
 ``_result_payload`` dumps every field of the result model. No ``/v1`` response
 shape moved, so a ``0.5`` client is served byte-identically on every ``/v1``
 route it already calls.
+
+Contract 0.7 (#1494) is the same kind again, and the sharpest case yet for
+widening rather than shifting. ``creek.journal`` and ``creek.upload`` stopped
+defaulting ``tier`` to ``open`` and now refuse a call that omits it, so a
+``0.6`` client's *MCP* writes genuinely have to change. Its ``/v1`` traffic
+does not: ``JournalUpsertRequest.tier`` never had a default, so the HTTP
+adapter already required what MCP now requires, and ``creek.upload`` has no
+``/v1`` route to move. Dropping ``0.6`` here would therefore refuse a
+correct-by-construction ``/v1`` client over a break it cannot even express.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the

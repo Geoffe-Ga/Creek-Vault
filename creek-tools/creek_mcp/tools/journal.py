@@ -35,8 +35,9 @@ rather than through ``write_tier_allowed``.
 
 Gate ordering, all of it load-bearing:
 
-1. malformed calls (blank ``content``/``external_id``, unknown ``tier``) refuse
-   without an audit entry — there is no meaningful tier to record yet;
+1. malformed calls (blank ``content``/``external_id``, missing ``tier``,
+   unknown ``tier``) refuse without an audit entry — there is no meaningful
+   tier to record yet;
 2. ``write_tier_allowed`` on the *incoming* tier — audited, then refused;
 3. the overwrite gate on the tier of the *resolved existing* fragment —
    audited, then refused;
@@ -130,7 +131,12 @@ from creek.models import PrivacyTier
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.read_gate import refuse_above_ceiling
 from creek_mcp.staged_names import safe_stem
-from creek_mcp.tier_ceiling import TierCeiling, refusal_response, write_tier_allowed
+from creek_mcp.tier_ceiling import (
+    TIER_REQUIRED_REASON,
+    TierCeiling,
+    refusal_response,
+    write_tier_allowed,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -259,7 +265,7 @@ def _refuse_unadmitted_overwrite(
 
 
 def _validated_entry_tier(
-    *, content: str, external_id: str, tier: str, ceiling: TierCeiling
+    *, content: str, external_id: str, tier: str | None, ceiling: TierCeiling
 ) -> PrivacyTier | dict[str, Any]:
     """Return the parsed entry tier, or the refusal a malformed call earns.
 
@@ -271,21 +277,39 @@ def _validated_entry_tier(
     Args:
         content: The journal entry body.
         external_id: The caller's idempotency key.
-        tier: The caller's declared tier, as the raw string it arrived as.
+        tier: The caller's declared tier, as the raw string it arrived as, or
+            ``None`` when the caller named no tier at all. Absence is
+            **refused, never defaulted** (#1494): only the caller knows what
+            the entry it is filing was derived from, so a default here filed
+            intimate-derived content in the clear — and did, until it was
+            removed.
         ceiling: The caller's admission ceiling, echoed in a refusal.
 
     Returns:
         The parsed :class:`~creek.models.PrivacyTier`, or a structured refusal
-        naming which malformation was found. The two reasons stay distinct
-        and specific: neither is derived from vault content, so neither is an
+        naming which malformation was found. The three reasons stay distinct
+        and specific: none is derived from vault content, so none is an
         oracle, and a client whose call is simply wrong deserves to be told
         which way it is wrong.
+
+        Their order is load-bearing and mirrors ``save_tool``'s — the
+        argument-shape check first (there, an unknown ``target``), then the
+        missing tier, then the parse. Hoisting the missing-tier guard above
+        the blank check would answer a call that is wrong in both ways with
+        the tier complaint, leaving nothing to prove blank content is refused
+        at all.
     """
     if not content.strip() or not external_id.strip():
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=ceiling,
             reason="content and external_id are required",
+        )
+    if tier is None:
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=ceiling,
+            reason=TIER_REQUIRED_REASON,
         )
     try:
         return PrivacyTier(tier)
@@ -312,7 +336,7 @@ def journal_ingest_tool(
     content: str,
     external_id: str,
     timestamp: str | None = None,
-    tier: str = "open",
+    tier: str | None = None,
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
     run: _Runner | None = None,
@@ -326,6 +350,10 @@ def journal_ingest_tool(
             id updates in place; a new id creates a new fragment.
         timestamp: ISO-8601 entry time; defaults to now (UTC) when absent.
         tier: The entry's privacy tier (``open``/``personal``/``intimate``).
+            **Required**: it has no default, and omitting it is refused rather
+            than filled in as ``open`` (#1494). Only the caller knows what the
+            entry was derived from, so a default here filed intimate-derived
+            journal content in the clear.
         privacy_tier_ceiling: The caller's admission ceiling — an entry whose
             tier exceeds it is refused, not downgraded, and so is an update
             that would overwrite a fragment the ceiling could not read.

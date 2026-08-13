@@ -467,10 +467,10 @@ def build_server(
         content: str,
         external_id: str,
         timestamp: str | None = None,
-        tier: str = "open",
+        tier: str | None = None,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Ingest one Adepthood journal entry as a vault fragment (idempotent)."""
+        """Ingest one journal entry as a fragment, idempotently; ``tier`` required."""
         return journal_ingest_tool(
             vault_path=vault,
             content=content,
@@ -487,10 +487,10 @@ def build_server(
         content_base64: str,
         external_id: str,
         timestamp: str | None = None,
-        tier: str = "open",
+        tier: str | None = None,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Stage one uploaded document's bytes and ingest it as a vault fragment."""
+        """Stage one uploaded document and ingest it; ``tier`` required."""
         return upload_tool(
             vault_path=vault,
             filename=filename,

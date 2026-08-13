@@ -36,7 +36,7 @@ from creek_mcp.httpapi.journal import (
     REPLACEMENT_CHARACTER,
     journal_refusal_code,
 )
-from creek_mcp.tier_ceiling import TierCeiling
+from creek_mcp.tier_ceiling import TIER_REQUIRED_REASON, TierCeiling
 from creek_mcp.tools.journal import journal_ingest_tool
 from tests.adapter_parity import (
     Outcome,
@@ -568,6 +568,27 @@ def test_every_tool_refusal_maps_onto_the_taxonomy(
         code: The wire code it must map to.
     """
     assert journal_refusal_code(reason) == code
+
+
+def test_journal_refusal_code_maps_the_missing_tier_refusal() -> None:
+    """The missing-tier refusal is ``invalid_request``, not ``internal_error``.
+
+    A direct unit test on a pure function rather than a route drive, because
+    the route cannot produce this reason today:
+    :class:`~creek_mcp.api.models.JournalUpsertRequest`'s ``tier``
+    (``creek_mcp/api/models.py:614``) has no default and is typed
+    :class:`~creek_mcp.api.models.WireTierCeiling`, so a body that omits it
+    fails schema validation and never reaches the tool. Driving a request
+    would therefore assert Pydantic's behaviour, not this mapping.
+
+    The mapping is defence in depth. :func:`journal_refusal_code` documents
+    itself as *total by construction* and fails closed to ``internal_error``
+    for anything it does not recognise, so a fifth refusal reason arriving
+    from the tool — as one now does — would be published to ``/v1`` consumers
+    as a server fault rather than as the caller error it is. The wiring is
+    cheap; noticing the gap after the fact is not.
+    """
+    assert journal_refusal_code(TIER_REQUIRED_REASON) is ErrorCode.INVALID_REQUEST
 
 
 def test_an_ingest_failure_does_not_echo_the_underlying_message(

@@ -51,6 +51,7 @@ from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
 from creek_mcp.httpapi.vault import configured_vault
 from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
+from creek_mcp.tier_ceiling import TIER_REQUIRED_REASON
 from creek_mcp.tools.journal import journal_ingest_tool
 
 if TYPE_CHECKING:
@@ -120,13 +121,28 @@ def journal_refusal_code(reason: str) -> ErrorCode:
     pinned by a behavioural test that drives the real tool through the route, so
     a reworded reason surfaces as a wrong status code rather than as silence.
 
+    :data:`~creek_mcp.tier_ceiling.TIER_REQUIRED_REASON` is the exception on
+    both counts. It *is* imported — it is one shared literal with a name of its
+    own, read by all three write verbs — and it is pinned by a direct unit test
+    on this function rather than through the route, because the route cannot
+    produce it today: :class:`~creek_mcp.api.models.JournalUpsertRequest`'s
+    ``tier`` (``creek_mcp/api/models.py:614``) has no default and is typed
+    :class:`~creek_mcp.api.models.WireTierCeiling`, so a body omitting it fails
+    schema validation and never reaches the tool. The mapping is therefore
+    defence in depth: this function is total and fails closed to
+    ``internal_error``, so the day that reason does reach it — a new caller
+    path, a relaxed field — it is published as the caller error it is rather
+    than as a server fault (#1494).
+
     Args:
         reason: The ``reason`` field of a structured tool refusal.
 
     Returns:
         The published :class:`~creek_mcp.api.models.ErrorCode`.
     """
-    if reason == _BLANK_CALL_REASON or reason.startswith(_UNKNOWN_TIER_PREFIX):
+    if reason in (_BLANK_CALL_REASON, TIER_REQUIRED_REASON) or reason.startswith(
+        _UNKNOWN_TIER_PREFIX
+    ):
         return ErrorCode.INVALID_REQUEST
     if reason == GENERIC_ABOVE_CEILING_REASON or reason.endswith(_ABOVE_CEILING_SUFFIX):
         return ErrorCode.PRIVACY_REFUSED

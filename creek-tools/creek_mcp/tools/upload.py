@@ -37,8 +37,8 @@ Three limits are stated here rather than left for a reader to discover:
 Gate ordering, all of it load-bearing and asserted from outside:
 
 1. malformed calls (blank ``filename`` / ``external_id`` / ``content_base64``,
-   unknown ``tier``) refuse without an audit entry — there is no meaningful
-   tier to record yet;
+   missing ``tier``, unknown ``tier``) refuse without an audit entry — there
+   is no meaningful tier to record yet;
 2. ``write_tier_allowed`` on the *incoming* tier — audited, then refused;
 3. the encoded-length cap, then the decode, then the decoded-size cap;
 4. the #970 overwrite gate on the tier of the *resolved existing* fragment —
@@ -68,7 +68,12 @@ from creek.models import PrivacyTier
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.read_gate import refuse_above_ceiling
 from creek_mcp.staged_names import safe_stem, safe_suffix
-from creek_mcp.tier_ceiling import TierCeiling, refusal_response, write_tier_allowed
+from creek_mcp.tier_ceiling import (
+    TIER_REQUIRED_REASON,
+    TierCeiling,
+    refusal_response,
+    write_tier_allowed,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -454,7 +459,7 @@ def _validated_upload(
     filename: str,
     external_id: str,
     content_base64: str,
-    tier: str,
+    tier: str | None,
     ceiling: TierCeiling,
 ) -> PrivacyTier | dict[str, Any]:
     """Return the parsed upload tier, or the refusal a malformed call earns.
@@ -467,19 +472,37 @@ def _validated_upload(
         filename: The caller's original filename.
         external_id: The caller's idempotency key.
         content_base64: The base64 payload, checked here only for emptiness.
-        tier: The caller's declared tier, as the raw string it arrived as.
+        tier: The caller's declared tier, as the raw string it arrived as, or
+            ``None`` when the caller named no tier at all. Absence is
+            **refused, never defaulted** (#1494): only the caller knows what
+            the document it is uploading holds, so a default here filed
+            intimate-derived bytes in the clear — and did, until it was
+            removed.
         ceiling: The caller's admission ceiling, echoed in a refusal.
 
     Returns:
         The parsed :class:`~creek.models.PrivacyTier`, or a structured
-        refusal naming which malformation was found. Neither reason is
-        derived from vault content, so neither is an oracle.
+        refusal naming which malformation was found. None of the three
+        reasons is derived from vault content, so none is an oracle.
+
+        Their order is load-bearing and mirrors ``save_tool``'s — the
+        argument-shape check first (there, an unknown ``target``), then the
+        missing tier, then the parse. Hoisting the missing-tier guard above
+        the blank check would answer a call that is wrong in both ways with
+        the tier complaint, leaving nothing to prove a blank payload is
+        refused at all.
     """
     if not filename.strip() or not external_id.strip() or not content_base64.strip():
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=ceiling,
             reason="filename, external_id and content_base64 are required",
+        )
+    if tier is None:
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=ceiling,
+            reason=TIER_REQUIRED_REASON,
         )
     try:
         return PrivacyTier(tier)
@@ -642,7 +665,7 @@ def upload_tool(
     content_base64: str,
     external_id: str,
     timestamp: str | None = None,
-    tier: str = "open",
+    tier: str | None = None,
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
     run: _Runner | None = None,
@@ -675,6 +698,10 @@ def upload_tool(
             written into the staged file — a binary document has nowhere to
             put it — so the fragment's timestamp comes from the ingestor.
         tier: The document's privacy tier (``open``/``personal``/``intimate``).
+            **Required**: it has no default, and omitting it is refused rather
+            than filled in as ``open`` (#1494). Only the caller knows what the
+            document holds, so a default here staged and filed
+            intimate-derived bytes in the clear.
         privacy_tier_ceiling: The caller's admission ceiling — an upload whose
             tier exceeds it is refused, not downgraded, and so is an update
             that would overwrite a fragment the ceiling could not read.
