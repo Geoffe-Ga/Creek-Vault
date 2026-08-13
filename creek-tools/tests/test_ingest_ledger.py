@@ -479,6 +479,131 @@ def test_forget_removes_an_unparseable_line_that_still_names_the_id(
     assert "frag-doomed" not in path.read_text(encoding="utf-8")
 
 
+def test_forget_removes_a_line_truncated_before_its_fragment_id(
+    tmp_path: Path,
+) -> None:
+    """The hard truncation case: source path present, id absent (#1453).
+
+    :meth:`SourceLedger._append` serialises ``source_key`` *before*
+    ``fragment_id``, so a crash landing between the two leaves a damaged
+    line naming the doomed **source path** and nothing else. Matching an
+    unparseable line on ``doomed_ids`` alone cannot see it, and the path
+    — the join the erasure exists to break — survives.
+    """
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    path = SourceLedger.path_for(vault, "markdown")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"{json.dumps(_row('therapy.md', 'frag-doomed', _FORGET_HASH))}\n"
+        '{"source_key": "therapy.md", "fragm\n'
+        f"{json.dumps(_row('recipes.md', 'frag-safe', 'b' * 64))}\n",
+        encoding="utf-8",
+    )
+
+    removed = forget_fragment_ids(vault, ["frag-doomed"])
+
+    assert removed == 2
+    text = path.read_text(encoding="utf-8")
+    assert "therapy.md" not in text
+    assert "frag-safe" in text
+
+
+def test_forget_removes_a_truncated_line_naming_a_non_ascii_source_path(
+    tmp_path: Path,
+) -> None:
+    """The doomed key must be matched in the shape disk actually holds (#1453).
+
+    :meth:`SourceLedger._append` serialises at ``json.dumps``' default
+    ``ensure_ascii=True``, so ``café.md`` reaches disk as the twelve
+    characters ``caf\\u00e9.md`` while :func:`_doomed_source_keys`
+    recovers it decoded. Matching the decoded needle against the raw
+    line misses — and vault paths are note titles, which are full of
+    accents, CJK and emoji.
+    """
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    path = SourceLedger.path_for(vault, "markdown")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"{json.dumps(_row('café.md', 'frag-doomed', _FORGET_HASH))}\n"
+        '{"source_key": "caf\\u00e9.md", "fragm\n'
+        f"{json.dumps(_row('recipes.md', 'frag-safe', 'b' * 64))}\n",
+        encoding="utf-8",
+    )
+
+    removed = forget_fragment_ids(vault, ["frag-doomed"])
+
+    assert removed == 2
+    text = path.read_text(encoding="utf-8")
+    assert "caf" not in text
+    assert "frag-safe" in text
+
+
+def test_forget_erases_around_a_non_utf8_byte_without_mangling_survivors(
+    tmp_path: Path,
+) -> None:
+    """A corrupt byte degrades to "erase what's parseable" (#1453).
+
+    The scoped purge deliberately runs the ledger erasure *before* the
+    embeddings-cache purge so an unreadable derived file cannot veto the
+    erasure. A strict UTF-8 read hands the ledger that same veto back.
+    The tolerant decode is mirrored on write, so an untouched line
+    round-trips byte-for-byte rather than being silently mangled.
+    """
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    path = SourceLedger.path_for(vault, "markdown")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doomed = json.dumps(_row("therapy.md", "frag-doomed", _FORGET_HASH)).encode("utf-8")
+    # Both branches, and neither line is doomed: one corrupt line still
+    # parses, so it is judged by the structured matcher, while the other is
+    # truncated too and falls through to the text fallback. That second one
+    # is where this diff's two halves intersect.
+    parseable = b'{"source_key": "notes.md", "note": "caf\xe9"}'
+    truncated = b'{"source_key": "notes.md", "note": "caf\xe9'
+    survivor = json.dumps(_row("recipes.md", "frag-safe", "b" * 64)).encode("utf-8")
+    path.write_bytes(b"\n".join((doomed, parseable, truncated, survivor)) + b"\n")
+
+    removed = forget_fragment_ids(vault, ["frag-doomed"])
+
+    assert removed == 1
+    # Exact bytes, not membership: this pins ordering, line count and the
+    # absence of framing mutation as well as the undecodable byte itself.
+    assert path.read_bytes() == b"\n".join((parseable, truncated, survivor)) + b"\n"
+
+
+def test_a_corrupt_ledger_file_does_not_veto_erasure_in_later_files(
+    tmp_path: Path,
+) -> None:
+    """One undecodable file must not block the rest of the glob (#1453).
+
+    ``sorted(directory.glob("*.jsonl"))`` walks every source ledger in
+    name order, so an abort on the first file silently spares every file
+    after it — a whole-erasure failure caused by a byte in an unrelated
+    source's log.
+    """
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    corrupt = SourceLedger.path_for(vault, "markdown")
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    raw = b'{"source_key": "notes.md", "note": "caf\xe9"}\n'
+    corrupt.write_bytes(raw)
+    later = _write_rows(vault, "upload", [_row("b.docx", "frag-doomed", "2" * 64)])
+    # The property under test is "a *later* file", so the ordering the glob
+    # relies on is asserted rather than assumed; a rename would otherwise
+    # turn this into a vacuous pass.
+    assert corrupt.name < later.name
+
+    assert forget_fragment_ids(vault, ["frag-doomed"]) == 1
+    assert not later.exists()
+    assert corrupt.read_bytes() == raw
+
+
 def test_forget_unlinks_a_ledger_left_with_no_rows(tmp_path: Path) -> None:
     """An emptied ledger file is removed, not left as a husk naming its source."""
     from creek.ingest.ledger import forget_fragment_ids

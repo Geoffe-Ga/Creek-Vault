@@ -22,7 +22,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from creek.ingest.source_unit import SOURCE_UNIT_SEPARATOR
 
@@ -30,6 +30,16 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
 _LEDGER_RELPARTS: tuple[str, ...] = ("00-Creek-Meta", "State", "ingest")
+
+_CORRUPT_BYTE_POLICY: Final[str] = "surrogateescape"
+"""How the erasure path decodes a ledger byte that is not valid UTF-8.
+
+One constant because read and write must agree: ``surrogateescape``
+smuggles an undecodable byte through as a lone surrogate and emits the
+original byte again on the way out, so a corrupt line that survives the
+erasure round-trips unchanged. Diverge the two and the rewrite would
+either crash or silently rewrite somebody's bytes.
+"""
 
 
 @dataclass(frozen=True)
@@ -329,6 +339,29 @@ def _doomed_source_keys(lines: list[str], doomed_ids: frozenset[str]) -> set[str
     return keys
 
 
+def _text_shapes(value: str) -> tuple[str, str]:
+    """Both shapes *value* can take inside a raw ledger line.
+
+    :meth:`SourceLedger._append` serialises with ``json.dumps`` at its
+    default ``ensure_ascii=True``, so a value holding any non-ASCII
+    character reaches disk **escaped** — ``café.md`` is stored as the
+    twelve characters ``caf\\u00e9.md`` — while :func:`_doomed_source_keys`
+    recovers it *decoded* through ``json.loads``. Matching one shape
+    against the other silently misses, and vault source keys are note
+    titles: accents, CJK and emoji are the norm, not the exception. The
+    same divergence applies to an embedded ``"`` or ``\\``.
+
+    Args:
+        value: A fragment id or source key being searched for.
+
+    Returns:
+        The decoded value and its on-disk JSON-escaped spelling. For a
+        plain ASCII value the two are identical, so this adds no
+        over-match surface.
+    """
+    return value, json.dumps(value)[1:-1]
+
+
 def _line_is_doomed(
     line: str,
     doomed_ids: frozenset[str],
@@ -336,10 +369,21 @@ def _line_is_doomed(
 ) -> bool:
     """Report whether one raw ledger line must not survive the erasure.
 
-    An unparseable line is matched as text. It is the case that matters
-    most: a half-written row is exactly the shape a crash leaves behind,
-    it still spells the fragment id in cleartext, and no structured
-    matcher can see it.
+    An unparseable line is matched as text, against ids *and* source
+    keys, in both of the shapes :func:`_text_shapes` describes. It is
+    the case that matters most: a half-written row is exactly the shape
+    a crash leaves behind, and no structured matcher can see it. Keys
+    are needed as well as ids because :meth:`SourceLedger._append`
+    serialises ``source_key`` before ``fragment_id`` — a truncation
+    landing between the two leaves a line naming the doomed source path
+    with no id on it at all, and the path is the join the erasure exists
+    to break.
+
+    Substring matching can over-match, but here it is costless rather
+    than merely acceptable: the only lines reaching this branch are the
+    ones :func:`_loads_object` rejected, which is the same set
+    :meth:`SourceLedger._parse_line` discards on load. An over-matched
+    line is by construction a line no reader could have used.
 
     Args:
         line: One raw line of the ledger file.
@@ -351,7 +395,11 @@ def _line_is_doomed(
     """
     data = _loads_object(line)
     if data is None:
-        return any(fragment_id in line for fragment_id in doomed_ids)
+        return any(
+            shape in line
+            for value in (*doomed_ids, *doomed_keys)
+            for shape in _text_shapes(value)
+        )
     return (
         data.get("fragment_id") in doomed_ids or data.get("source_key") in doomed_keys
     )
@@ -365,6 +413,30 @@ def _rewrite_atomically(path: Path, lines: list[str]) -> None:
     never a truncated file whose surviving bytes are an arbitrary prefix
     of somebody's erased source path.
 
+    Durability scope: atomicity here is against ordinary process death,
+    not power loss. Neither the temp file nor the parent directory is
+    ``fsync``-ed, so bytes ``os.replace`` has already committed may still
+    be sitting in the OS page cache. This matches the ledger's own
+    append path (:meth:`SourceLedger._append` does not fsync either) and
+    the same explicit carve-out in :mod:`creek.vault.writer`. The
+    fsync-ing writers in this tree each fsync for a reason this function
+    does not share: :class:`creek.audit.AuditLog` because its records
+    *are* the tamper-evidence,
+    :func:`creek.confidential.keyvault.save_key_vault` because the vault
+    is the only copy and a torn write turns a recoverable state into
+    permanent lockout, and :func:`creek.ingest.gdrive._secure_erase`
+    because an overwrite-before-unlink is worthless until the bytes
+    reach the platter. Widening this to fsync is a change to the whole
+    ledger's durability contract, not to this function.
+
+    Encode errors are handled with ``surrogateescape``, mirroring
+    :func:`_forget_in_file`'s read, so an undecodable byte on a
+    surviving line is emitted as the original byte rather than as a
+    substitution character. Line *framing* is not preserved and never
+    was: the read translates universal newlines and ``splitlines`` cuts
+    on more separators than ``\\n``, so every survivor is re-joined with
+    a bare ``\\n``.
+
     Args:
         path: The ledger file to rewrite.
         lines: The surviving lines, without trailing newlines.
@@ -376,7 +448,12 @@ def _rewrite_atomically(path: Path, lines: list[str]) -> None:
     )
     tmp_path = path.with_name(Path(raw_name).name)
     try:
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        with os.fdopen(
+            handle,
+            "w",
+            encoding="utf-8",
+            errors=_CORRUPT_BYTE_POLICY,
+        ) as stream:
             stream.writelines(f"{line}\n" for line in lines)
         tmp_path.replace(path)
     except BaseException:
@@ -392,6 +469,17 @@ def _forget_in_file(
 ) -> int:
     """Erase every doomed row from one ledger file.
 
+    The read is decoded with ``surrogateescape``, not strict UTF-8. A
+    single corrupt byte anywhere under the ledger directory would
+    otherwise raise :exc:`UnicodeDecodeError` and abort the erasure —
+    and because :func:`forget_fragment_ids` walks the files in sorted
+    order, one bad file would spare every file after it too. That is the
+    exact veto the scoped purge reorders itself to deny a corrupt
+    embeddings cache, so the ledger must not hand it back. Undecodable
+    bytes are preserved rather than dropped, and mirrored on write by
+    :func:`_rewrite_atomically`, so the byte itself survives a rewrite
+    unchanged instead of being silently mangled into ``U+FFFD``.
+
     Args:
         path: One ``<source>.jsonl`` ledger file.
         doomed_ids: Fragment ids being erased.
@@ -400,7 +488,10 @@ def _forget_in_file(
     Returns:
         The number of rows erased (or that would be).
     """
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = path.read_text(
+        encoding="utf-8",
+        errors=_CORRUPT_BYTE_POLICY,
+    ).splitlines()
     doomed_keys = _doomed_source_keys(lines, doomed_ids)
     survivors: list[str] = []
     removed = 0
