@@ -6357,9 +6357,11 @@ def author(
     # #1310: route through ``run_author`` rather than driving a conductor
     # directly, so the run carries the medium contract (the privacy ceiling the
     # HARD gate needs) and the chat character ceiling, both of which
-    # ``Conductor.run`` alone does not apply. ``max_rounds`` stays explicit:
-    # ``rounds`` came from this vault's ``author.max_author_rounds``, which must
-    # keep winning over ``run_author``'s bare ``AuthorConfig()`` fallback.
+    # ``Conductor.run`` alone does not apply. #1465: ``max_rounds`` stays
+    # explicit because ``config`` above resolves from the RAW ``--vault`` flag
+    # while ``vault_path`` falls back to ``config.vault_path`` when the flag is
+    # omitted — two different roots. Dropping the argument would silently start
+    # sourcing the budget from a different file than the one already read here.
     draft_result = run_author(
         medium=medium,
         query=effective_query,

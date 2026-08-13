@@ -578,7 +578,10 @@ def build_server(
         dry_run: bool = False,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Author a draft for a query via the Writing Desk."""
+        """Author a draft for a query via the Writing Desk.
+
+        ``max_rounds`` defaults to the vault's ``author.max_author_rounds`` (3).
+        """
         return author_tool(
             vault_path=vault,
             query=query,
