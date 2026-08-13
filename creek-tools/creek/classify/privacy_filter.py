@@ -461,6 +461,14 @@ def within_ceiling(raw: Mapping[str, object], override: PrivacyTierOverride) -> 
     the ``allow_intimate`` consent gate in :mod:`creek.generate.voice`:
     admission is ``allow_intimate`` **and** ``within_ceiling``.
 
+    ``decisions`` is no longer gated by this function *alone* either (#1431).
+    :func:`creek.generate.decisions._admitted_decision_fragments` applies a
+    second, **unconditional** ``intimate`` screen after this gate says yes,
+    because ``decisions`` is the one report that puts a source fragment's title
+    into its artifact's *filename* — where no front matter can label it. This
+    ceiling stays what it has always been, the operator's dial; that screen is
+    not a dial, and ``PrivacyTierOverride.ALL`` does not lift it.
+
     Args:
         raw: The note's raw frontmatter, as loaded by the caller.
         override: The admission ceiling. ``PrivacyTierOverride.ALL`` admits

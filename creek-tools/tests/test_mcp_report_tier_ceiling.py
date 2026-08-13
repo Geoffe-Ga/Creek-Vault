@@ -780,6 +780,16 @@ def test_report_at_all_ceiling_admits_everything(
     ``below_canary is None`` is the flag for that case — it marks the artifact,
     not the tier, which is why it gates both sentinels here.
 
+    ``decisions`` carries one further rule this test deliberately does not
+    weaken (#1431): on top of the ceiling it applies an *unconditional*
+    ``intimate`` screen, because its artifact's filename is a source
+    fragment's title. Rather than soften the invariant above for that row, its
+    ``above_canary`` was moved onto a ``personal`` fragment — above
+    ``ceiling=open``, below the screen — so the assertion here still means
+    exactly what it says. The invariant itself, and its wording, stay verbatim
+    for all six report types; the intimate case is proved separately by
+    :func:`test_decisions_never_names_an_intimate_fragment_at_any_ceiling`.
+
     Args:
         case: The report type under test and its fixture.
         tmp_path: pytest's per-test temporary directory.

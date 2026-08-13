@@ -14,6 +14,7 @@ from pathlib import Path
 import frontmatter
 import pytest
 
+from creek.classify.privacy_filter import PrivacyTierOverride
 from creek.generate import decisions as decisions_mod
 from creek.generate.decisions import (
     DECISION_KEYWORDS,
@@ -21,7 +22,6 @@ from creek.generate.decisions import (
     _sanitize_title,
     generate_decisions,
 )
-from creek.classify.privacy_filter import PrivacyTierOverride
 from creek.models import (
     Confidence,
     DecisionCandidate,
@@ -1407,7 +1407,9 @@ def test_generate_decisions_screens_an_intimate_fragment_at_the_all_ceiling(
     """
     _seed_fragment(
         vault_path,
-        _tiered_fragment("frag-intimate", "Should I leave my marriage", PrivacyTier.INTIMATE),
+        _tiered_fragment(
+            "frag-intimate", "Should I leave my marriage", PrivacyTier.INTIMATE
+        ),
     )
 
     written = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
@@ -1421,7 +1423,8 @@ def test_generate_decisions_still_writes_an_open_fragments_note(
 ) -> None:
     """Positive control: the screen drops intimate content, not all content.
 
-    Without this, :func:`test_generate_decisions_screens_an_intimate_fragment_at_the_all_ceiling`
+    Without this,
+    :func:`test_generate_decisions_screens_an_intimate_fragment_at_the_all_ceiling`
     is satisfied by a generator that writes nothing ever.
     """
     _seed_fragment(
@@ -1524,7 +1527,9 @@ def test_generate_decisions_stays_idempotent_with_the_screen(
     )
     _seed_fragment(
         vault_path,
-        _tiered_fragment("frag-intimate", "Should I leave my marriage", PrivacyTier.INTIMATE),
+        _tiered_fragment(
+            "frag-intimate", "Should I leave my marriage", PrivacyTier.INTIMATE
+        ),
     )
 
     first = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
