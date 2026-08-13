@@ -4,9 +4,23 @@ Builds a :class:`~creek.generate.ai_style.model.VoiceFingerprint` from
 genuinely user-authored vault content — the false-positive authority and
 distance baseline every detector consults. The single most important
 property is the **authorship filter**: only self-authored text feeds the
-fingerprint, and for conversation platforms (ChatGPT / Claude) only the
-*user-turn* portion is used, never the assistant's reply — otherwise the
-baseline would be poisoned with the very AI accent we are trying to detect.
+fingerprint, and never the assistant's reply — otherwise the baseline
+would be poisoned with the very AI accent we are trying to detect.
+
+For a conversation platform (ChatGPT / Claude) the filter is not "keep
+the user-turn portion" but a decision per body *shape*, made by
+:func:`creek.ingest.turns.split_conversation_body` (#1426):
+
+* a **per-turn split** human fragment — the shape both ingestors have
+  written since #1333/#553, a plain blockquote with no ``**User**:``
+  marker — contributes **in full**;
+* a **merged** pre-split body contributes **only its human half**;
+* an **assistant-only** body, where no human half can be identified,
+  contributes **nothing**.
+
+Reading only the marker, as this module did until #1426, silently
+excluded the first of those three — every chat turn the operator has
+written since per-turn attribution shipped.
 
 Pure and deterministic; reads fragment bodies only (never frontmatter
 values), and writes a single JSON artifact under the vault.
@@ -24,6 +38,7 @@ import yaml
 
 from creek.generate.ai_style.features import FINGERPRINT_FEATURES
 from creek.generate.ai_style.model import FeatureStat, VoiceFingerprint
+from creek.ingest.turns import CONVERSATION_PLATFORMS, split_conversation_body
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -32,16 +47,26 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-FINGERPRINT_VERSION = 1
-"""Schema version stamped into the persisted fingerprint JSON."""
+FINGERPRINT_VERSION = 2
+"""Schema version stamped into the persisted fingerprint JSON.
+
+v2 is #1426: the *corpus* changed, not the JSON layout. Split-era human
+chat turns now contribute where they were previously dropped, so every
+rate in a v1 artifact was measured over a strictly smaller sample and is
+no longer comparable with a freshly built one. Bumping the version makes
+:func:`load_fingerprint` ignore a persisted v1 file and log that
+``creek report --type fingerprint`` should rebuild it, rather than let a
+stale baseline keep scoring drafts.
+"""
 
 _FRAGMENTS_SUBDIR = "01-Fragments"
-_CONVERSATION_PLATFORMS = frozenset({"chatgpt", "claude"})
 _SELF = "self"
 _INTIMATE = "intimate"
 
-# Conversation bodies render turns as blockquotes:
+# The *merged* pre-split rendering marked its turns inside the blockquote:
 #   > **User**: ...        > **Assistant**: ...
+# These two patterns serve `extract_user_turns` alone, which is off the
+# fingerprint path since #1426; a split-era body carries neither marker.
 _USER_MARKER = re.compile(r"^\**user\**\s*:\s*(.*)$", re.IGNORECASE)
 _ASSISTANT_MARKER = re.compile(r"^\**assistant\**\s*:", re.IGNORECASE)
 
@@ -52,19 +77,35 @@ def _strip_quote(line: str) -> str:
 
 
 def extract_user_turns(body: str) -> str | None:
-    """Return only the user-turn text from a conversation *body*.
+    """Return only the user-turn text from a marker-delimited *body*.
 
     Walks the ``> **User**:`` / ``> **Assistant**:`` blockquote structure,
     accumulating text under user turns and dropping everything under
     assistant turns.
 
+    **This is the legacy marker parser and it is no longer on the
+    fingerprint path** (#1426). It is retained as public API — it is
+    exported from :mod:`creek.generate.ai_style` — but
+    :func:`_user_text` now dispatches on body shape via
+    :func:`creek.ingest.turns.split_conversation_body` instead, for two
+    reasons this function cannot be fixed into:
+
+    * It treats any line's *contents* as a speaker cue. A bare ``user:``
+      inside the operator's own prose — a pasted log line, say — is read
+      as the start of a turn, silently deleting everything written
+      before it. The loss is invisible: the body is still non-``None``
+      and the fragment still counts.
+    * It cannot see the split-era shapes at all. A per-turn human
+      fragment carries no ``**User**:`` marker, so it returns ``None``
+      for the shape that is now the common case.
+
     Args:
         body: A conversation fragment body.
 
     Returns:
-        The joined user-turn text, or ``None`` when no ``**User**:`` marker
-        is present (the body cannot be split cleanly, so it is excluded
-        rather than risk fingerprinting AI text).
+        The joined user-turn text, or ``None`` when no ``**User**:``
+        marker is present. That ``None`` no longer means "excluded from
+        the fingerprint" — nothing on the fingerprint path consults it.
     """
     parts: list[str] = []
     speaker: str | None = None
@@ -90,8 +131,23 @@ def extract_user_turns(body: str) -> str | None:
 def _user_text(platform: str, body: str) -> str | None:
     """Return the fingerprint-eligible text for a fragment body.
 
-    Conversation platforms yield only their user-turn; everything else
-    yields the whole body.
+    A conversation platform yields the human half its body *shape*
+    identifies — the whole turn when the body is already per-turn split,
+    the operator's half alone when it is merged, and nothing at all when
+    only the model's words can be found. Every other platform yields the
+    whole body. The discriminator is the shape, not the presence of a
+    ``**User**:`` marker.
+
+    The rejected alternative was the one the issue proposed: fall back to
+    the whole body when no ``**Assistant**:`` marker is present. It was
+    measured and it fails on the bodies it was meant to protect, because
+    a *merged pre-split Claude* body never carried an ``Assistant``
+    marker either — the human turn was blockquoted and the reply followed
+    as plain prose. Under that fallback such a body measures **173.9
+    AI-vocabulary hits per 1000 words**, and the legacy ``"> \\n\\n{AI
+    reply}"`` shape (an image-only or tool-only human send, whose human
+    half is ``""``) measures **217.4**. Keep the human half whatever the
+    shape, or keep nothing.
 
     Args:
         platform: The fragment's source platform.
@@ -99,11 +155,11 @@ def _user_text(platform: str, body: str) -> str | None:
 
     Returns:
         The user-authored text, or ``None`` when a conversation body has no
-        recoverable user turn.
+        recoverable human half (and when a body is empty once stripped).
     """
-    if platform in _CONVERSATION_PLATFORMS:
-        return extract_user_turns(body)
-    return body.strip() or None
+    if platform not in CONVERSATION_PLATFORMS:
+        return body.strip() or None
+    return split_conversation_body(platform, body).human or None
 
 
 def _audience_factor(
@@ -159,8 +215,9 @@ def _eligible_texts(
 ) -> list[tuple[float, str]]:
     """Collect ``(weight, user_text)`` pairs for self-authored fragments.
 
-    Applies the authorship filter (self-authored only; conversation
-    user-turn only) and the privacy policy (intimate excluded unless
+    Applies the authorship filter (self-authored only; for a conversation
+    platform, the human half its body shape identifies — see
+    :func:`_user_text`) and the privacy policy (intimate excluded unless
     *include_intimate*). When *audience_weighting* is supplied, each fragment's
     weight is additionally multiplied by its audience-authority factor so
     audience-facing documents dominate the fingerprint (#633).
@@ -193,6 +250,12 @@ def _eligible_texts(
             logger.warning("Skipping unreadable fragment: %s", md_file)
             continue
         source = post.metadata.get("source", {})
+        # This gate is the *only* thing keeping a ChatGPT AI turn out. Once a
+        # conversation is split per-turn, ChatGPT's renderer blockquotes both
+        # roles with no heading and no marker, so an AI turn's body is
+        # shape-indistinguishable from a human one — `_user_text` would hand
+        # back the model's prose in full. There is no body-shape backstop for
+        # it; only `source.author != self`.
         if not isinstance(source, dict) or source.get("author") != _SELF:
             continue
         if not include_intimate and post.metadata.get("privacy_tier") == _INTIMATE:
