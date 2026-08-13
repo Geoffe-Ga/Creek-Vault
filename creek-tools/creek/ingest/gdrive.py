@@ -43,7 +43,7 @@ import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 
 import httpx
 
@@ -178,6 +178,17 @@ class GoogleApiUnavailableError(RuntimeError):
     """Raised when a Drive call is made but the API client is not installed."""
 
 
+_FAILURE_REASON_CHARS: Final = 160
+"""How much of each ``str(exc)`` :attr:`DownloadResult.failure_lines` keeps.
+
+``googleapiclient.errors.HttpError.__str__`` embeds the whole request URI —
+file id and query parameters included — and these lines are printed into
+scheduler logs and persisted into a file inside the user's vault. The reason
+is therefore a truncated sample; the exception *type* is rendered separately,
+ahead of the truncation point, so it can never be the part that is cut.
+"""
+
+
 @dataclass(frozen=True)
 class DownloadResult:
     """Outcome of a :meth:`GoogleDriveDownloader.download_all` invocation.
@@ -195,6 +206,12 @@ class DownloadResult:
             download that failed mid-loop. ``download_all`` records
             each failure and continues so a transient quota/network
             error mid-sync does not abandon the rest of the run.
+        all_paths: Read-only property — downloaded + skipped, in
+            listing order.
+        failure_lines: Read-only property — one operator-actionable
+            line per entry of ``errors``.
+        attempted: Read-only property — how many files the listing
+            offered, i.e. the total the three tuples partition.
     """
 
     downloaded: tuple[Path, ...]
@@ -205,6 +222,38 @@ class DownloadResult:
     def all_paths(self) -> tuple[Path, ...]:
         """Return the union of downloaded + skipped paths in listing order."""
         return (*self.downloaded, *self.skipped)
+
+    @property
+    def failure_lines(self) -> tuple[str, ...]:
+        """Return one operator-actionable line per recorded failure.
+
+        The file *name* leads, because it is the thing an operator greps a
+        scheduler log for and the only thing they can act on: a failure
+        count tells them their vault is incomplete without telling them
+        what is missing from it. The exception type is named separately so
+        it survives the :data:`_FAILURE_REASON_CHARS` truncation applied to
+        the reason.
+        """
+        return tuple(
+            f"{drive_file.name}: {type(exc).__name__}: "
+            f"{str(exc)[:_FAILURE_REASON_CHARS]}"
+            for drive_file, exc in self.errors
+        )
+
+    @property
+    def attempted(self) -> int:
+        """Return how many files the Drive listing offered.
+
+        Downloaded + skipped + errors covers every listed file, because
+        :meth:`GoogleDriveDownloader.download_all` routes each one to
+        exactly one of the three tuples: the path-traversal guard raises
+        eagerly *outside* the per-file ``try``, since a malicious
+        ``parent_path`` is a configuration bug rather than a per-file
+        failure. Kept here rather than recomputed at each call site so the
+        CLI and any future caller cannot disagree about what "every file"
+        means.
+        """
+        return len(self.downloaded) + len(self.skipped) + len(self.errors)
 
 
 # ---- Default Drive client ----------------------------------------------
