@@ -47,6 +47,11 @@ from creek.ingest.images import _extract_exif_authored_at
 from creek.ingest.markdown import _extract_authored_at_from_frontmatter
 from creek.ingest.presentations import _extract_pptx_authored_at
 from creek.ingest.spreadsheets import _extract_xlsx_authored_at
+from creek.ingest.turns import (
+    CONVERSATION_PLATFORMS,
+    BodyShape,
+    split_conversation_body,
+)
 from creek.models import Authorship, Fragment
 from creek.vault.reader import try_load_fragment
 from creek.vault.writer import VaultWriter
@@ -294,8 +299,12 @@ def _rewrite_frontmatter(md_file: Path, metadata: dict[str, object]) -> None:
 # human turn (``self``) and the AI turn (``ai`` / ``voice_weight=0.0``) — by
 # parsing the stored body. It is opt-in (``creek ingest --refresh-ai-chat``)
 # and idempotent: a freshly-split vault has no merged fragments left to touch.
-
-_AI_CHAT_PLATFORMS: frozenset[str] = frozenset({"claude", "chatgpt"})
+#
+# The body parsing itself lives in :mod:`creek.ingest.turns` (#1426), shared
+# with the voice fingerprint: "which half of this body did the operator write?"
+# is one question, and answering it twice is how the fingerprint came to
+# recognise only the shape this migration produces *from*, never the shape it
+# produces.
 
 
 @dataclass
@@ -316,54 +325,32 @@ class ResplitResult:
     errors: list[str] = field(default_factory=list)
 
 
-def _parse_claude_merged(body: str) -> tuple[str, str] | None:
-    """Split a merged Claude body into ``(human, assistant)`` or ``None``.
-
-    The pre-split Claude body blockquotes the human turn (``> ...``) and
-    follows it with the assistant's plain prose. A body with no blockquote
-    *or* no plain prose is not a merged turn (e.g. an already-split human
-    fragment is entirely blockquoted), so this returns ``None``.
-    """
-    quoted = [line[1:].lstrip() for line in body.split("\n") if line.startswith(">")]
-    plain = [
-        line for line in body.split("\n") if not line.startswith(">") and line.strip()
-    ]
-    human = "\n".join(quoted).strip()
-    assistant = "\n".join(plain).strip()
-    if not human or not assistant:
-        return None
-    return human, assistant
-
-
-def _parse_chatgpt_merged(body: str) -> tuple[str, str] | None:
-    """Split a merged ChatGPT body into ``(human, assistant)`` or ``None``.
-
-    The pre-split ChatGPT body carries a ``# Title`` heading and a blockquoted
-    ``**User**: …`` / ``**Assistant**: …`` pair. A body lacking both markers is
-    not a merged turn and returns ``None``.
-    """
-    cleaned: list[str] = []
-    for line in body.split("\n"):
-        if line.startswith(">"):
-            cleaned.append(line[1:].lstrip())
-        elif not line.startswith("# "):
-            cleaned.append(line)
-    text = "\n".join(cleaned)
-    if "**User**:" not in text or "**Assistant**:" not in text:
-        return None
-    user_part, _, assistant_part = text.partition("**Assistant**:")
-    human = user_part.replace("**User**:", "").strip()
-    assistant = assistant_part.strip()
-    if not human or not assistant:
-        return None
-    return human, assistant
-
-
 def _split_turns(platform: str, body: str) -> tuple[str, str] | None:
-    """Dispatch to the platform's merged-body parser."""
-    if platform == "claude":
-        return _parse_claude_merged(body)
-    return _parse_chatgpt_merged(body)
+    """Return both turns of a genuinely *merged* body, else ``None``.
+
+    The ``MERGED`` projection of
+    :func:`creek.ingest.turns.split_conversation_body`. Only a body whose
+    human *and* assistant halves were both recovered is a merged turn; a
+    ``SPLIT`` body (already per-turn) or an ``UNRECOVERABLE`` one (the
+    model's words alone, a placeholder, a non-conversation body) yields
+    ``None``.
+
+    A non-``None`` verdict is destructive here in a way it is not for the
+    voice fingerprint: :func:`_resplit_fragment` reacts to one by writing
+    two fragments and unlinking the original, so a shape newly read as
+    merged is a fragment newly deleted from an operator's vault.
+
+    Args:
+        platform: The fragment's ``source.platform``.
+        body: The stored fragment body.
+
+    Returns:
+        ``(human, assistant)`` for a merged body; ``None`` otherwise.
+    """
+    parsed = split_conversation_body(platform, body)
+    if parsed.shape is not BodyShape.MERGED:
+        return None
+    return parsed.human, parsed.assistant
 
 
 def _build_split_fragment(
@@ -446,7 +433,7 @@ def _resplit_fragment(
         return
     fragment, body, _raw = record
     platform = str(fragment.source.platform)
-    if platform not in _AI_CHAT_PLATFORMS or str(fragment.source.author) != "self":
+    if platform not in CONVERSATION_PLATFORMS or str(fragment.source.author) != "self":
         result.skipped += 1
         return
     turns = _split_turns(platform, body)

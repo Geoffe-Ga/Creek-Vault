@@ -185,7 +185,7 @@ def test_merged_run_human_fragment_is_skipped(tmp_path: Path) -> None:
 
     Consecutive human messages now merge into one turn separated by a blank
     line, so a human fragment body is no longer a single paragraph — and
-    ``_parse_claude_merged`` reads any *non-blank* line that escapes the
+    ``turns._split_claude`` reads any *non-blank* line that escapes the
     blockquote as the assistant's prose. (A blank separator is safe whether
     or not it carries the ``>``; the parser drops blank lines from that
     bucket. A non-blank one is not.) So the guarantee this test pins is
