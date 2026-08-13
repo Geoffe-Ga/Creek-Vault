@@ -194,8 +194,9 @@ rather than reading as "no hold."
 | `main-not-green` | `LGTM` + green, the lane is behind, and the `push: main` CI run that justifies merging while behind (#1157) is **not** green — red, still running, or unreadable (`scripts/ralph/main-health.sh`). The relaxation is suspended for the duration: **wait, and do not sync** — a sync would import the breakage, burn a CI round, and re-report as this lane's own `ci-failed`. Fails closed: a missing or non-executable helper holds the lane too. A `behind_by == 0` lane never asks and still merges, so the PR that fixes `main` is never blocked (#1159). |
 | `review-quota-exhausted` | `LGTM` + green + `mergeStateStatus CLEAN`, the lane would otherwise print `behind`, and `scripts/ralph/review-quota.sh` has positively proven the `claude-review` reviewer is out of quota. `behind`'s remedy — `fleet.sh sync` — would push a merge commit that invalidates the LGTM under the stale-verdict guard, and with the reviewer out of quota that verdict cannot be re-earned. **Wait, and do not sync** (and never `fleet.sh release` this lane — see Failure modes below). Un-wedges on its own the moment either: the recorded `resetsAt` passes, or any newer `code-review.yml` run anywhere concludes `success`; either way the token reverts to `behind` and the lane proceeds normally. **Fails closed in the OPPOSITE direction from `main-not-green`** — see below; a missing, non-executable, or merely-uncertain `review-quota.sh` answer does **not** hold the lane, it falls through to today's `behind` → sync. `main-not-green` takes precedence when both would apply (decided earlier, inside `branch_is_current`), but the outcome is identical either way since both remedies are "wait." |
 | `pending` | CI still running, or no checks registered yet. Wait. |
-| `ci-failed` | A **non-review** check failed or errored. Advance via `ci-debugging`. |
-| `review-failed` | Every failing check in the status rollup is `claude-review` itself, so CI is green and **the code needs no change** (#1200). The reviewer malfunctioned — rate limit, timeout, `cancel-in-progress` cancellation, or one of `code-review.yml`'s deliberate `exit 1` paths. **Do not dispatch `ci-debugging`**: re-run the failed review (`gh run rerun --failed <id>`) and re-classify. `#1201` is still open, so there is no `workflow_dispatch` and a rerun replays the old workflow file — fine for a rate-limit retry, an empty commit otherwise. A strict **refinement** of `ci-failed`, never a replacement: an unreadable rollup, a failed probe, a surplus field, a non-numeric count, zero failing entries or any unclassifiable entry all stay `ci-failed`, so the token can never swallow a real failure. A non-review check still **running** beside the failed review reads `pending`, not this. |
+| `ci-failed` | A **non-review** check is **positively proven** failed or errored — the rollup shows at least one failing entry that isn't the reviewer. Advance via `ci-debugging`. |
+| `ci-unreadable` | The status rollup could not be read or reconciled with `gh pr checks`'s own exit code — a failed tally probe, a surplus field, a non-numeric count, an unclassifiable entry, or zero failing entries while `gh pr checks` exited non-zero (#1407, #1420). **Nothing is known to be red.** Non-terminal — it is in `watch-pr.sh`'s `IN_FLIGHT_TOKENS`, so the lane keeps polling and self-resolves: a genuinely red tree reads `ci-failed` on the next readable poll, a green one reads `ready`/`behind`/etc. **Do not dispatch `ci-debugging`** — that is the exact bug this token exists to stop (#1408). If the watcher instead prints `timeout ci-unreadable`, the rollup has been unreadable for ~30 minutes straight — treat it as tooling weather, re-check by hand, never convert it into a `ci-debugging` dispatch. |
+| `review-failed` | Every failing check in the status rollup is `claude-review` itself, so CI is green and **the code needs no change** (#1200). The reviewer malfunctioned — rate limit, timeout, `cancel-in-progress` cancellation, or one of `code-review.yml`'s deliberate `exit 1` paths. **Do not dispatch `ci-debugging`**: re-run the failed review (`gh run rerun --failed <id>`) and re-classify. `#1201` is still open, so there is no `workflow_dispatch` and a rerun replays the old workflow file — fine for a rate-limit retry, an empty commit otherwise. A strict **refinement** of `ci-failed`, never a replacement: an unreadable rollup, a failed probe, a surplus field, a non-numeric count, zero failing entries or any unclassifiable entry now read `ci-unreadable` instead — a non-terminal wait, not this token — so `review-failed` still can never swallow a real failure. A non-review check still **running** beside the failed review reads `pending`, not this. |
 | `changes-requested` | CI green + a **fresh** verdict (posted after the HEAD commit) that is not `LGTM` — `CHANGES_REQUESTED` or `COMMENTS`. Gate 4 failed: advance via `address-feedback` (`ralph-tick.md` Step 2) now. A stale non-LGTM stays `awaiting-review`, and an unreadable verdict lookup fails closed (tooling error / `awaiting-review`) — never this token. |
 | `awaiting-review` | CI green but no verdict for the current HEAD yet — none posted, or only a stale one (it predates HEAD, LGTM or not). Wait, or check for a hidden merge conflict masquerading as a missing review (see `ralph-tick.md` Step 1). |
 | `optout` | `do-not-auto-merge` on the PR's own labels, or on the labels of the last issue it closes. Leave the lane **entirely** alone — no merge, no sync, no dispatch; a lane it already occupies stays occupied. |
@@ -286,16 +287,23 @@ pre-commit hook alone, i.e. not at all for anyone who bypassed it.)
   per-lane hot watcher: pidfile idempotence (`already-watching` on a live pid,
   takeover of a stale/garbage one, removal on exit), settling on the first
   token outside `pending`/`awaiting-review`/`main-not-green`/
-  `review-quota-exhausted` (including that `changes-requested` falls out of the
-  in-flight set and wakes promptly, that `review-failed` does the same for the
-  same reason — it is actionable, so sleeping on it would burn the full
+  `review-quota-exhausted`/`ci-unreadable` (including that `changes-requested`
+  falls out of the in-flight set and wakes promptly, that `review-failed` does
+  the same for the same reason — it is actionable, so sleeping on it would burn the full
   ~30-minute timeout on a state nothing resolves by itself (#1200) — and that
   `main-not-green` stays IN it — a
   watcher that exited on it would be relaunched and exit again, busy-waking the
   whole fleet for as long as `main` stayed red), the same busy-wake pin for
   `review-quota-exhausted` (staying in-flight through a poll and only exiting
   once the token flips to `behind`, and timing out as a wait state — not a
-  settled token — when the quota window outlasts `TIMEOUT`), `gone` on a
+  settled token — when the quota window outlasts `TIMEOUT`), the same pin again
+  for `ci-unreadable` (in-flight because no action is available while nothing is
+  known to be wrong; exiting on it would busy-wake the fleet on every transient
+  probe failure AND route the orchestrator into dispatching a fix worker at a
+  possibly-green tree, which is #1408 itself — plus that a durable red still
+  surfaces as `ci-failed` on the next readable poll, and that a rollup unreadable
+  for the whole window times out as `timeout ci-unreadable` rather than stalling
+  forever), `gone` on a
   merged/closed PR, `timeout <last-token>` at the deadline, and that transient
   `pr-ready.sh` / `gh` failures never kill the watcher — every wait outcome
   exits 0.

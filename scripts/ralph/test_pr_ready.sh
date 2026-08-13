@@ -281,22 +281,44 @@ mkdir -p "$BIN"
 #                   for this one expression the two engines cannot diverge.
 #   TALLY_RAW     — bypass the jq entirely and print this as the probe's whole
 #                   answer, for the malformed shapes no fixture can produce
-#                   (surplus field, non-numeric counts, empty). Honoured with
+#                   (surplus field, non-numeric counts, empty, too few). THE
+#                   WELL-FORMED ANSWER IS FIVE FIELDS SINCE #1408 —
+#                   `fail|review|pending|unknown|total` — so a fixture written for
+#                   the old four-field shape now lands on a DIFFERENT guard than
+#                   its name claims (`1|1|0|0|x` was the surplus case and is now a
+#                   non-numeric TOTAL). Every TALLY_RAW below was re-counted when
+#                   the total was added; a new one must be too. Honoured with
 #                   `+set` rather than `:-` so `TALLY_RAW=''` reproduces an EMPTY
-#                   answer, which must fail closed to `ci-failed`.
+#                   answer, which must fail closed to `ci-unreadable`.
 #   TALLY_EC      — exit code of the tally probe; 1 plays a failed lookup, which
-#                   must fail closed to `ci-failed`, never to the new token.
+#                   must fail closed to `ci-unreadable` (#1408): a probe we could
+#                   not read is not evidence of a red tree, and the token that
+#                   says so is non-terminal.
 #   TALLY_SENTINEL — file the tally arm touches when it is called. Same laziness
 #                   argument as COMPARE_SENTINEL, plus a POSITIVE assertion the
-#                   other probes lack: the `ci-failed` lane MUST probe. A `--jq`
+#                   other probes lack: the CI-failure lane MUST probe. A `--jq`
 #                   that throws, or a helper defined below its call site, makes
-#                   the probe silently inert and every token reverts to today's
-#                   `ci-failed` — which looks exactly like an unfixed bug. Only a
-#                   `probed … "yes"` case catches that independently of a token.
+#                   the probe silently inert and every token revert to
+#                   `ci-unreadable` — which since #1408 is NON-TERMINAL, so an
+#                   inert probe no longer over-dispatches, it STALLS every lane
+#                   until watch-pr.sh's timeout. Only a `probed … "yes"` case
+#                   catches that independently of a token.
 #   UNSET DEFAULT — with none of the above set the arm prints NOTHING, which
-#                   parses non-numeric and fails closed to `ci-failed`. That is
-#                   what keeps every pre-existing `CHECKS_EC=1` assertion in this
-#                   file byte-identical.
+#                   parses non-numeric and fails closed to `ci-unreadable`.
+#                   READ THIS BEFORE WRITING A `CHECKS_EC=1` CASE. Until #1408
+#                   this default was what kept every pre-existing bare
+#                   `CHECKS_EC=1` assertion byte-identical, because an empty tally
+#                   and a genuinely red tree both answered `ci-failed`. #1408
+#                   SPLIT THEM AND BROKE THAT PROMISE, and this file's six
+#                   repairs are the proof: `exit 1 → ci-failed`, `exit 2 →
+#                   ci-failed` and the four `lazy …: ci-failed lane token` pins
+#                   are all about a FAILING CHECK, not about an unreadable probe,
+#                   so each was given a real red fixture ($CI_RED_TALLY, below)
+#                   rather than being retargeted at the new token — retargeting
+#                   would have kept them green while deleting what they say. A
+#                   new case that means "CI is red" must set that fixture too; a
+#                   bare `CHECKS_EC=1` now means "CI is red AND we cannot read the
+#                   rollup", which is `ci-unreadable`.
 #   VERDICT       — the "<createdAt>|<isLGTM>" scalar the verdict jq resolves to
 #   VERDICT_PR    — the THIRD field of that scalar (issue #1181): the PR number
 #                   the selected comment's `<!-- creek-review pr=N -->` marker
@@ -658,10 +680,21 @@ check "exit 8 → pending" "pending" \
 check "exit 1 + 'no checks reported' stderr → pending" "pending" "$(CHECKS_NO_CHECKS=1 run 100)"
 
 # --- CI failure surfaced: non-0/non-8 exit → ci-failed ---------------------
+# THE FIXTURE IS PART OF THE ASSERTION (#1408). What these two say is "a
+# non-0/non-8 exit from `gh pr checks` is a CI FAILURE", so the rollup behind
+# them has to show a genuinely failing non-review check. A bare `CHECKS_EC=1`
+# leaves the tally arm answering NOTHING, and since #1408 an unparseable tally is
+# `ci-unreadable` — a claim about the PROBE, not about the tree. Retargeting
+# these at that token would have kept them green while silently deleting the only
+# two assertions in this file about the exit code itself. So they get a red tree
+# instead. `rt` is the rollup-payload helper defined above; the fixture is named
+# once here and reused by the four `lazy …: ci-failed lane token` pins further
+# down, which are repairs of exactly the same kind.
+CI_RED_TALLY="$(rt '{"name":"ci","conclusion":"FAILURE"}')"
 check "exit 1 → ci-failed" "ci-failed" \
-  "$(CHECKS_EC=1 run 100)"
+  "$(CHECKS_EC=1 TALLY_JSON="$CI_RED_TALLY" run 100)"
 check "exit 2 → ci-failed" "ci-failed" \
-  "$(CHECKS_EC=2 run 100)"
+  "$(CHECKS_EC=2 TALLY_JSON="$CI_RED_TALLY" run 100)"
 
 # --- ready: green + CLEAN + fresh LGTM -------------------------------------
 check "green + CLEAN + fresh LGTM → ready" "ready" \
@@ -2103,8 +2136,13 @@ tok="$(CHECKS_EC=8 BEHIND_BY=22 COMPARE_SENTINEL="$S_PENDING" run 100)" || tok="
 check "lazy compare: pending lane token" "pending" "$tok"
 probed "lazy compare: pending lane does not probe" "no" "$S_PENDING"
 
+# $CI_RED_TALLY, not a bare CHECKS_EC=1 (#1408): this lane is named for the token
+# a RED TREE produces, so the rollup has to contain one. Without it the tally is
+# empty and the lane reads `ci-unreadable`, which would rename the case rather
+# than test it. Same repair on the three lanes below.
 S_CIFAIL="$WORK/probe-cifail"
-tok="$(CHECKS_EC=1 BEHIND_BY=22 COMPARE_SENTINEL="$S_CIFAIL" run 100)" || tok="exit-$?"
+tok="$(CHECKS_EC=1 BEHIND_BY=22 TALLY_JSON="$CI_RED_TALLY" \
+       COMPARE_SENTINEL="$S_CIFAIL" run 100)" || tok="exit-$?"
 check "lazy compare: ci-failed lane token" "ci-failed" "$tok"
 probed "lazy compare: ci-failed lane does not probe" "no" "$S_CIFAIL"
 
@@ -2362,7 +2400,8 @@ check "lazy main-health: pending lane token" "pending" "$tok"
 probed "lazy main-health: pending lane does not probe" "no" "$M_PENDING"
 
 M_CIFAIL="$WORK/main-health-cifail"
-tok="$(CHECKS_EC=1 BEHIND_BY=22 MAIN_HEALTH_SENTINEL="$M_CIFAIL" run 100)" || tok="exit-$?"
+tok="$(CHECKS_EC=1 BEHIND_BY=22 TALLY_JSON="$CI_RED_TALLY" \
+       MAIN_HEALTH_SENTINEL="$M_CIFAIL" run 100)" || tok="exit-$?"
 check "lazy main-health: ci-failed lane token" "ci-failed" "$tok"
 probed "lazy main-health: ci-failed lane does not probe" "no" "$M_CIFAIL"
 
@@ -2684,7 +2723,7 @@ check "lazy quota: pending lane token" "pending" "$tok"
 probed "lazy quota: pending lane does not probe" "no" "$Q_PENDING"
 
 Q_CIFAIL="$WORK/quota-cifail"
-tok="$(CHECKS_EC=1 BEHIND_BY=22 REVIEW_QUOTA=exhausted \
+tok="$(CHECKS_EC=1 BEHIND_BY=22 REVIEW_QUOTA=exhausted TALLY_JSON="$CI_RED_TALLY" \
        REVIEW_QUOTA_SENTINEL="$Q_CIFAIL" run 100)" || tok="exit-$?"
 check "lazy quota: ci-failed lane token" "ci-failed" "$tok"
 probed "lazy quota: ci-failed lane does not probe" "no" "$Q_CIFAIL"
@@ -2915,8 +2954,15 @@ tok="$(CHECKS_EC=8 PR_AUTHOR="$DEPENDABOT" REVIEW_SENTINEL="$R_PENDING" run 100)
 check "lazy review-gate: pending token" "pending" "$tok"
 probed "lazy review-gate: pending does not probe" "no" "$R_PENDING"
 
+# TALLY_JSON here does NOT trip REVIEW_SENTINEL, and the stub's own comment at
+# its `--json statusCheckRollup` arm is the reason: `--json author,
+# statusCheckRollup` (the review-gate call, which is what that sentinel watches)
+# is claimed by the EARLIER `--json author` arm, and this fixture is served by the
+# later, disjoint arm. So the `does not probe` assertion below still means what it
+# says.
 R_CIFAIL="$WORK/review-cifail"
-tok="$(CHECKS_EC=1 PR_AUTHOR="$DEPENDABOT" REVIEW_SENTINEL="$R_CIFAIL" run 100)" || tok="exit-$?"
+tok="$(CHECKS_EC=1 PR_AUTHOR="$DEPENDABOT" TALLY_JSON="$CI_RED_TALLY" \
+       REVIEW_SENTINEL="$R_CIFAIL" run 100)" || tok="exit-$?"
 check "lazy review-gate: ci-failed token" "ci-failed" "$tok"
 probed "lazy review-gate: ci-failed does not probe" "no" "$R_CIFAIL"
 
@@ -2953,16 +2999,33 @@ probed "lazy review-gate: no-verdict lane DOES probe" "yes" "$R_NOVERDICT"
 # PR's code") read identically to a failing test suite. The orchestrator then
 # dispatched a `ci-debugging` fix worker at code with nothing wrong with it.
 #
-# `ci_failure_token` now reads the status rollup ON THAT BRANCH ONLY and splits
-# it three ways. THE POLARITY IS THE WHOLE POINT: `ci-failed` remains the default
-# answer, and every unproven shape funnels back to it. The cases below are
-# deliberately weighted toward that fence — a dozen of them assert that TODAY's
-# answer is unchanged, and they were green before the fix as well as after.
+# `ci_failure_token` reads the status rollup ON THAT BRANCH ONLY and splits it
+# FOUR ways — #1408 added the fourth, and with it the only correction #1200's
+# design needed.
 #
-# NOTHING HERE CAN EVER PRODUCE `ready`. This branch is reached only when
-# `gh pr checks` exited non-zero, and the helper's entire codomain is
-# {review-failed, pending, ci-failed}. The change is merge-safety one-way by
-# construction, not by assertion.
+# THE POLARITY IS STILL THE POINT, BUT IT IS NO LONGER "EVERYTHING UNPROVEN IS
+# `ci-failed`". #1200 sent six distinct inputs to that one TERMINAL token and only
+# one of them was an actual failing check; the other five meant "we could not read
+# the rollup, or could not reconcile it with `gh pr checks`'s non-zero exit", and
+# on #1420 that dispatched a `ci-debugging` worker at a head with three concluded
+# GREEN runs. So `ci-failed` is now reserved for a POSITIVELY PROVEN non-review
+# red, and those five shapes answer `ci-unreadable`. That token is NON-TERMINAL —
+# it is in watch-pr.sh's IN_FLIGHT_TOKENS — which is what makes it still
+# fail-closed in the sense that matters: it advances no lane, and a durable red
+# surfaces as `ci-failed` on the very next readable poll.
+#
+# THE MERGE-SAFETY ARGUMENT SURVIVES THE WIDENING AND IS RESTATED, NOT DROPPED.
+# The sentence it used to rest on — "the helper's entire codomain is
+# {review-failed, pending, ci-failed}" — is now false; the codomain has a fourth
+# member. What carries the weight is the part that is unchanged: `ready` is NOT in
+# the codomain, before #1408 or after, and this branch is only reached once
+# `gh pr checks` has ALREADY exited non-zero. No answer this helper can give makes
+# any PR more mergeable. Widening it costs a stalled lane, never a bad merge.
+#
+# The risk that runs the other way — a genuinely red tree HIDDEN behind the new
+# token — is real, is created by the guard ORDER rather than by the token, and is
+# fenced by exactly one behavioural pin: (m2) below. Read that block before
+# touching the ladder.
 CR_FAIL='{"name":"claude-review","conclusion":"FAILURE"}'
 CQ_OK='{"name":"Some Other Job","conclusion":"SUCCESS"}'
 
@@ -2976,41 +3039,92 @@ check "tally: review + another check failing → ci-failed" "ci-failed" \
 check "tally: only a non-review check failing → ci-failed" "ci-failed" \
   "$(CHECKS_EC=1 TALLY_JSON="$(rt '{"name":"ci","conclusion":"FAILURE"}')" run 100)"
 
-# (d)-(g) THE FAIL-CLOSED FENCE: every unreadable answer is `ci-failed`. A probe
-# that cannot be trusted must never be the reason a lane stops being debugged.
-check "tally: probe exits non-zero → ci-failed" "ci-failed" \
+# (d)-(g) THE UNREADABLE FENCE: every answer we cannot PARSE is `ci-unreadable`
+# (#1408), and the retitle from "fail-closed to `ci-failed`" is the whole point.
+# Each of these shapes is a statement about the PROBE — it errored, or answered
+# something no version of this expression emits — and a probe that cannot be
+# trusted is not evidence about the tree. It must never be the reason a lane stops
+# being debugged, and equally never the reason a fix worker is dispatched at code
+# with nothing wrong with it.
+#
+# NON-TERMINAL IS STILL FAIL-CLOSED. None of these advances a lane one inch:
+# `ci-unreadable` is not `ready`, it is not mergeable, and it is in watch-pr.sh's
+# IN_FLIGHT_TOKENS, so the lane keeps polling. The first poll that CAN read the
+# rollup answers `ci-failed` if the tree really is red, and the lane is debugged
+# one interval later than it would have been. That is the entire cost.
+check "tally: probe exits non-zero → ci-unreadable" "ci-unreadable" \
   "$(CHECKS_EC=1 TALLY_EC=1 TALLY_JSON="$(rt "$CR_FAIL,$CQ_OK")" run 100)"
-check "tally: surplus field → ci-failed" "ci-failed" \
-  "$(CHECKS_EC=1 TALLY_RAW='1|1|0|0|x' run 100)"
-check "tally: empty answer → ci-failed" "ci-failed" \
+# SIX fields, not five. The well-formed answer gained an entry total in #1408, so
+# the old `1|1|0|0|x` fixture is no longer a surplus-field case at all: `x` lands
+# in `tot`, `rest` is empty, the surplus guard waves it through and the NUMERIC
+# LOOP catches it. This assertion would have gone on passing under its old name
+# while the guard it exists to test became unreachable dead code.
+check "tally: surplus SIXTH field → ci-unreadable" "ci-unreadable" \
+  "$(CHECKS_EC=1 TALLY_RAW='1|1|0|0|2|x' run 100)"
+check "tally: empty answer → ci-unreadable" "ci-unreadable" \
   "$(CHECKS_EC=1 TALLY_RAW='' run 100)"
-check "tally: non-numeric counts → ci-failed" "ci-failed" \
-  "$(CHECKS_EC=1 TALLY_RAW='a|b|c|d' run 100)"
-check "tally: too FEW fields → ci-failed" "ci-failed" \
+# FIVE non-numeric fields for the mirror-image reason: with four it would become a
+# too-FEW-fields case wearing a non-numeric case's name, and the guard below would
+# lose its only pure fixture.
+check "tally: non-numeric counts → ci-unreadable" "ci-unreadable" \
+  "$(CHECKS_EC=1 TALLY_RAW='a|b|c|d|e' run 100)"
+check "tally: too FEW fields → ci-unreadable" "ci-unreadable" \
   "$(CHECKS_EC=1 TALLY_RAW='1|1' run 100)"
 # A count that is WELL-FORMED IN SHAPE but non-numeric in ONE field, chosen so
-# every other guard would wave it through (rest empty, four fields, ft/fr/po all
-# sane). This is the case that makes the numeric-shape loop load-bearing, and the
-# loop earns its place by ORDER as much as by existence: `[[ "zzz" -eq 0 ]]` does
-# not merely compare false, it ABORTS under `set -u` with `zzz: unbound
+# every other guard would wave it through (rest empty, five fields, ft/fr/po/tot
+# all sane). This is the case that makes the numeric-shape loop load-bearing, and
+# the loop earns its place by ORDER as much as by existence: `[[ "zzz" -eq 0 ]]`
+# does not merely compare false, it ABORTS under `set -u` with `zzz: unbound
 # variable`, because bash arithmetic contexts evaluate a bare word as a variable
 # name. Reaching any `-eq` guard with an unvalidated field would therefore exit 1
 # printing NO TOKEN AT ALL — which pr-ready.sh's contract reserves for tooling
 # errors and the orchestrator cannot act on. So this asserts the TOKEN, not just
-# the absence of `review-failed`.
-check "tally: non-numeric in one field → ci-failed, not a crash" "ci-failed" \
-  "$(CHECKS_EC=1 TALLY_RAW='1|1|0|zzz' run 100)"
+# the absence of `review-failed`. The fixture carries the fifth field #1408 added,
+# for the same reason the surplus case gained a sixth.
+check "tally: non-numeric in one field → ci-unreadable, not a crash" "ci-unreadable" \
+  "$(CHECKS_EC=1 TALLY_RAW='1|1|0|zzz|2' run 100)"
 t_rc=0
-CHECKS_EC=1 TALLY_RAW='1|1|0|zzz' run 100 >/dev/null || t_rc=$?
+CHECKS_EC=1 TALLY_RAW='1|1|0|zzz|2' run 100 >/dev/null || t_rc=$?
 check "tally: non-numeric count still exits 0 (never a bare `set -u` abort)" "0" "$t_rc"
+# …AND THE SAME HAZARD NOW REACHES THE TOTAL, which is the easy half of #1408 to
+# leave out. The four counts are what the guards compare and the total is "only a
+# diagnostic", so a fix that reads a fifth field and omits it from the numeric
+# loop looks finished. It is not: `tot` is still read into a variable under
+# `set -u`, and the day any guard or arithmetic touches it a non-numeric value
+# aborts the script with no token at all — the wedged-lane outcome the `un` case
+# above exists to forbid. Pinned by TOKEN and by EXIT CODE, exactly like that one.
+check "tally: non-numeric TOTAL alone → ci-unreadable" "ci-unreadable" \
+  "$(CHECKS_EC=1 TALLY_RAW='1|1|0|0|zzz' run 100)"
+t_rc=0
+CHECKS_EC=1 TALLY_RAW='1|1|0|0|zzz' run 100 >/dev/null || t_rc=$?
+check "tally: non-numeric TOTAL still exits 0 (never a bare `set -u` abort)" "0" "$t_rc"
 
-# (h) DISAGREEMENT. `gh pr checks` de-duplicates check runs by name; the rollup
-# carries one entry per triggering event, so it can only ever hold MORE failing
-# entries, never fewer. A rollup with ZERO failures while gh exited non-zero is
-# therefore not "the reviewer broke" — it is a transport error, an auth failure,
-# or a view of the world we cannot reconcile. Fail closed.
-check "tally: zero failing entries but gh exited 1 → ci-failed" "ci-failed" \
+# (h) THE MOTIVATING INSTANCE — #1408, reproduced from #1420 at head 3c35251.
+# `gh pr checks` de-duplicates check runs by name; the rollup carries one entry
+# per triggering event, so it can only ever hold MORE failing entries, never
+# fewer. A rollup with ZERO failures while gh exited non-zero is therefore not
+# "the reviewer broke" — it is a transport error, an auth failure, or a view of
+# the world we cannot reconcile.
+#
+# THAT ANALYSIS WAS ALWAYS RIGHT. The conclusion drawn from it — "fail closed",
+# meaning the TERMINAL `ci-failed` — was not, and it is the bug. A view we cannot
+# reconcile is precisely NOT evidence of a red tree, and #1420 is the measurement:
+# three CONCLUDED GREEN runs at that head, three immediate re-probes every one of
+# which answered `ready`, and the PR merged normally. What the loop did in between
+# was exit the watcher and dispatch a `ci-debugging` fix worker at code with
+# nothing wrong with it. Unreadable is now its own answer, and it keeps the lane
+# polling instead of routing it to Step 2.
+check "tally: zero failing entries but gh exited 1 → ci-unreadable (#1420)" "ci-unreadable" \
   "$(CHECKS_EC=1 TALLY_JSON="$(rt "$CQ_OK"',{"name":"ci","conclusion":"SUCCESS"}')" run 100)"
+
+# (h2) ARM 5b — THE ONE THE ISSUE BODY NEVER NAMES, AND IT IS STRICTLY WORSE. The
+# same transport error, but a non-review check is still RUNNING: nothing has
+# failed anywhere, the tree is mid-build, and HEAD answers the terminal
+# `ci-failed`. The orchestrator then dispatches a fix worker at a tree that has
+# not finished compiling. Tally 0|0|1|0 — no failures at all, so the `pending` arm
+# far below is never reached and the zero-failure floor is what decides.
+check "tally: transport error while a non-review check is still RUNNING → ci-unreadable" "ci-unreadable" \
+  "$(CHECKS_EC=1 TALLY_JSON="$(rt '{"name":"ci","conclusion":null}')" run 100)"
 
 # (i) D1 — ANY-FAILURE-COUNTS, per entry, never de-duped by name. A re-run HEAD
 # shows both the stale FAILURE and the fresh SUCCESS under one name. With nothing
@@ -3044,23 +3158,63 @@ check "tally: StatusContext named claude-review is not the review check" "ci-fai
   "$(CHECKS_EC=1 TALLY_JSON="$(rt '{"__typename":"StatusContext","context":"claude-review","state":"FAILURE"}')" run 100)"
 
 # (m) An enum GitHub has not invented yet is UNCLASSIFIABLE, and unclassifiable
-# fails closed — we cannot claim "only the reviewer failed" about a state we
-# cannot read. This is the guard that keeps the fix safe against GitHub's API
-# growing a new conclusion after this PR merges.
-check "tally: unknown conclusion enum → ci-failed" "ci-failed" \
+# is UNREADABLE: we cannot claim "only the reviewer failed" about a state we
+# cannot read, and — the half #1200 got wrong — we cannot claim the tree is RED on
+# the strength of it either. This is the guard that keeps the fix safe against
+# GitHub's API growing a new conclusion after this PR merges. Tally 0|0|0|1.
+check "tally: unknown conclusion enum → ci-unreadable" "ci-unreadable" \
   "$(CHECKS_EC=1 TALLY_JSON="$(rt '{"name":"ci","conclusion":"WEIRD_NEW_ENUM"}')" run 100)"
 # …and the case that actually makes the `unknown` guard load-bearing, rather
 # than leaving it shadowed by the zero-failures floor above: an unreadable entry
 # sitting BESIDE a genuinely failed review, where every other guard is satisfied
 # (one failure, and it is the review). We must not report "only the reviewer
 # failed" while holding an entry we could not classify — it may be the red test
-# suite. Tally 1|1|0|1.
-check "tally: failed review + an UNCLASSIFIABLE entry → ci-failed" "ci-failed" \
+# suite. That reasoning is untouched by #1408; only the destination changes, from
+# the terminal token to the one that says "unreadable" out loud. Tally 1|1|0|1.
+#
+# THIS CASE REACHES THE `un` GUARD ONLY BECAUSE `fr == ft` — i.e. only because
+# nothing but the review is PROVABLY failing. That is a property of the guard
+# ORDER (the hoisted non-review-red guard sits above `un`), not of this fixture,
+# and (m2) immediately below is what holds it.
+check "tally: failed review + an UNCLASSIFIABLE entry → ci-unreadable" "ci-unreadable" \
   "$(CHECKS_EC=1 TALLY_JSON="$(rt "$CR_FAIL"',{"name":"ci","conclusion":"WEIRD_NEW_ENUM"}')" run 100)"
 
+# (m2) ⚠ THE ANTI-MASKING FENCE — THE ONLY TEST IN THIS FILE THAT PROVES THE
+# REORDER, and the reason #1408 is a two-part change rather than five flipped
+# literals. Flip the five unreadable arms while leaving `un != 0` ABOVE the
+# genuine-failure arm and tally 1|0|0|1 — a check that GENUINELY FAILED, beside
+# one entry whose conclusion enum GitHub has just invented — goes from terminal
+# `ci-failed` to non-terminal `ci-unreadable`. The lane then polls a red tree
+# until watch-pr.sh times out and nobody is ever dispatched to fix it. That is a
+# strictly worse bug than the one being fixed, shipped inside the fix.
+#
+# Reachable from the REAL jq, not only from a TALLY_RAW fixture, which is why this
+# is driven through TALLY_JSON:
+# `{"name":"ci","conclusion":"FAILURE"},{"name":"lint","conclusion":"WEIRD"}`
+# tallies 1|0|0|1|2.
+#
+# ⚠ RECORDED HERE BECAUSE IT IS THE TRAP (#1408 audit §4): the "single emission"
+# SHAPE invariant — awk the function body, count `echo "ci-failed"`, assert 1 —
+# DOES NOT REDDEN ON THE REORDER REVERT. It reads exactly 1 on the correct build
+# AND exactly 1 on the masking build, because moving a line does not change how
+# many lines there are. It certifies shape, not safety, and it must never be
+# allowed to stand in for this assertion. Only the behavioural pin catches
+# masking.
+check "tally: a genuinely red non-review check beside an UNCLASSIFIABLE entry still → ci-failed" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_JSON="$(rt '{"name":"ci","conclusion":"FAILURE"},{"name":"lint","conclusion":"WEIRD_NEW_ENUM"}')" run 100)"
+# The SECOND reorder pin, stated through TALLY_RAW rather than derived from a
+# payload: MULTIPLE failures, one of which IS the review, plus an unclassifiable
+# entry. Here `fr != ft` is what proves a non-review check is red, and that proof
+# has to outrank the unreadable entry by the same precedence — so a PARTIAL hoist
+# (one that guards only the `fr == 0` shape (m2) uses) still fails this.
+check "tally: 2 failures incl. the review + an unclassifiable entry → ci-failed" "ci-failed" \
+  "$(CHECKS_EC=1 TALLY_RAW='2|1|0|1|4' run 100)"
+
 # (n) D2 — A STILL-RUNNING NON-REVIEW CHECK BESIDE A FAILED REVIEW IS `pending`.
-# THIS IS A DELIBERATE BEHAVIOUR CHANGE and the one sub-case where HEAD's answer
-# (`ci-failed`) is replaced by something other than the new token. gh reports
+# THIS IS A DELIBERATE BEHAVIOUR CHANGE. It was #1200's one sub-case where the
+# pre-#1200 answer (`ci-failed`) was replaced by something other than that PR's
+# new token, and #1408 leaves it exactly where it is: a tally that we CAN read,
+# saying the tree is still building, is not an unreadable one. gh reports
 # failure in preference to pending, so this branch IS reachable with CI
 # unfinished — and it is the DOMINANT real timing: `claude-review` dies inside
 # ~2 min on a rate limit while the 3-python matrix runs ~14 min. Emitting
@@ -3102,7 +3256,15 @@ check "tally: review-failed lane prints exactly one line" "1" "$(printf '%s\n' "
 # and not a stderr-only diagnostic; the message is for the human reading a log.)
 err="$(CHECKS_EC=1 TALLY_JSON="$(rt "$CR_FAIL,$CQ_OK")" run_err 100)"
 says "tally diagnostic: review-failed lane names claude-review" 'failing: claude-review' "$err"
-says "tally diagnostic: review-failed lane prints the counts" 'fail=1 review=1 pending=0 unknown=0' "$err"
+# `total=2` IS PART OF THE PATTERN, NOT DECORATION. `says` matches with `grep -Eqi`,
+# which is unanchored, so the pre-#1408 pattern (`… unknown=0`) goes on matching a
+# line that has grown a ` total=2` suffix — i.e. it is VACUOUS with respect to the
+# field #1408 adds, and the fifth count could be dropped from the diagnostic with
+# this assertion still green. The value is spelled out because the fixture has
+# exactly two rollup entries; a total that stopped counting entries would print
+# something else.
+says "tally diagnostic: review-failed lane prints the counts, total included" \
+  'fail=1 review=1 pending=0 unknown=0 total=2' "$err"
 err="$(CHECKS_EC=1 TALLY_JSON="$(rt "$CR_FAIL"',{"name":"ci","conclusion":"FAILURE"}')" run_err 100)"
 says "tally diagnostic: ci-failed lane names claude-review too" 'failing: claude-review' "$err"
 says "tally diagnostic: ci-failed lane names the OTHER culprit" 'failing: ci$' "$err"
@@ -3120,11 +3282,20 @@ says "tally: pipe-bearing name still reaches the diagnostic intact" 'failing: a\
 
 # --- the tally probe is LAZY, and — uniquely — PROVABLY NOT INERT ------------
 # Four negative sentinels for the usual rate-limit reason, and one POSITIVE one
-# that the other probes in this file do not have. It is the load-bearing case:
-# a `--jq` that throws, or a helper defined below its call site, makes the probe
-# silently never run, every token reverts to `ci-failed`, and all twelve
-# fail-closed cases above go on passing while the fix does nothing at all. Only
-# `probed … "yes"` can tell "correctly conservative" from "completely inert".
+# that the other probes in this file do not have. It is the load-bearing case: a
+# `--jq` that throws, or a helper defined below its call site, makes the probe
+# silently never run, every token reverts to the unset-default answer, and every
+# fail-closed case above goes on passing while the fix does nothing at all.
+#
+# #1408 CHANGED WHAT INERTNESS COSTS, AND MADE THIS SENTINEL MORE LOAD-BEARING,
+# NOT LESS. Under #1200 an inert probe reverted every token to `ci-failed`, which
+# is TERMINAL: the symptom was over-dispatching fix workers — the original bug,
+# loudly, on lanes somebody was already looking at. It now reverts to
+# `ci-unreadable`, which is NON-TERMINAL: an inert probe dispatches nothing at
+# all, it STALLS the lane until watch-pr.sh's ~30-minute timeout, on every lane at
+# once, and the fleet simply goes quiet. A quieter failure is a harder one to
+# notice, and nothing else in this file can see it. Only `probed … "yes"` tells
+# "correctly conservative" apart from "completely inert".
 T_GREEN="$WORK/tally-green"
 tok="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H VERDICT="$FRESH|true" BEHIND_BY=0 \
        TALLY_SENTINEL="$T_GREEN" run 100)" || tok="exit-$?"
@@ -3938,6 +4109,125 @@ for trig in push pull_request; do
     ok "ralph-recap-tests.yml runs this suite on $trig changes to iteration-trigger.yml"
   else
     bad "ralph-recap-tests.yml's $trig paths: omit .github/workflows/iteration-trigger.yml — the second merge-clearance path could drop its author filter with no coupling check run at all (#1199)"
+  fi
+done
+
+# === issue #1408: `ci-unreadable` where a token is ENUMERATED ================
+# A new token is only worth having if the things that ROUTE on it know it exists:
+# the watcher that must keep polling, the fleet reference an operator reads at
+# 3am, the orchestrator prompt that decides what to do, and pr-ready.sh's own
+# header, which every other enumeration is downstream of.
+#
+# EVERY CHECK HERE IS BOUNDARY-ANCHORED, and that is the difference between a
+# coupling test and a decoration. `grep -qF ci-unreadable` passes on a token
+# mentioned once inside a comment — which is exactly the shared-substring failure
+# the ITER_MARKER_ERE post-mortem above records, on a file where the substring was
+# genuinely present and the code that consumed it had been deleted. So each of
+# these demands the STRUCTURE the consumer actually reads: a table row, a routing
+# bullet, an array line, a header entry.
+#
+# Bracket expressions (`[|]`) rather than `\|` in the ERE. The bytes matched are
+# the same on GNU and BSD grep, but `\|` is an escaped alternation operator and a
+# grep that read it as alternation would turn the pattern into "`^` OR … OR
+# empty", which matches every line in the file — a vacuous check that can never
+# fail. Not a risk worth taking on an assertion whose whole job is to fail.
+RALPH_DIR="$(dirname "$READY")"
+FLEET_MD="$RALPH_DIR/FLEET.md"
+WATCHER_SH="$RALPH_DIR/watch-pr.sh"
+# $AUTHZ_ROOT is the repo root, computed once in the #1199 block above; read from
+# there rather than recomputed, the same one-definition discipline $ITER_MARKER
+# and the allowlist literals are used with.
+TICK_MD="$AUTHZ_ROOT/.claude/commands/ralph-tick.md"
+
+# FLEET.md holds the token reference as a MARKDOWN TABLE, one row per token, so a
+# ROW is the requirement. A token that appears only in the surrounding prose is
+# one an operator scanning that table will not find, and will conclude the lane is
+# in a state that cannot happen.
+if [[ ! -f "$FLEET_MD" ]]; then
+  bad "cannot find scripts/ralph/FLEET.md — the operator-facing token table is unverified (#1408)"
+elif grep -qE '^[|] `ci-unreadable` [|]' "$FLEET_MD"; then
+  ok "FLEET.md's token table has a row for \`ci-unreadable\`"
+else
+  bad "FLEET.md has no '| \`ci-unreadable\` |' table ROW — pr-ready.sh can print a token the fleet reference does not list (#1408)"
+fi
+
+# ralph-tick.md routes on the token in Step 1, and its routing list is a BULLET
+# per token: a leading dash, then the token name bold-and-code-fenced, then the
+# rule. The regex below is that shape. Anchored for the same reason as FLEET.md's
+# row: that file discusses tokens in prose throughout, so "the string appears"
+# says nothing about the loop knowing what to DO with it — and what to do is the
+# non-obvious half here, since the correct action is "keep waiting", plus an
+# escalation policy for `timeout ci-unreadable` (#1408 §6).
+if [[ ! -f "$TICK_MD" ]]; then
+  bad "cannot find .claude/commands/ralph-tick.md — the orchestrator's routing table is unverified (#1408)"
+elif grep -qE '^- \*\*`ci-unreadable`\*\*' "$TICK_MD"; then
+  ok "ralph-tick.md has a Step-1 routing bullet for \`ci-unreadable\`"
+else
+  bad "ralph-tick.md has no '- **\`ci-unreadable\`**' routing bullet — the orchestrator meets a token it has no rule for, and the persistent-stall escalation is unwritten (#1408)"
+fi
+
+# THE ONE IN THIS BLOCK THAT IS NOT DOCUMENTATION. `ci-unreadable` being
+# NON-TERMINAL *is* the fix — it is what makes an unreadable probe cost one poll
+# instead of a fix worker — and it is one array literal in watch-pr.sh. Asserted
+# on THAT LINE, never file-wide: the token is discussed at length in that file's
+# header, so a whole-file grep would stay green with the array untouched and the
+# entire fix inert. The line is extracted first so the failure message can show
+# what the array actually says.
+if [[ ! -f "$WATCHER_SH" ]]; then
+  bad "cannot find scripts/ralph/watch-pr.sh — the in-flight set is unverified (#1408)"
+else
+  in_flight_line="$(grep -E '^readonly -a IN_FLIGHT_TOKENS=\(' "$WATCHER_SH" | head -n 1 || true)"
+  if [[ -z "$in_flight_line" ]]; then
+    bad "watch-pr.sh no longer declares 'readonly -a IN_FLIGHT_TOKENS=(' — the set this suite couples to has been renamed or restructured (#1408)"
+  elif grep -qF -- 'ci-unreadable' <<<"$in_flight_line"; then
+    ok "watch-pr.sh's IN_FLIGHT_TOKENS array line carries \`ci-unreadable\`"
+  else
+    bad "watch-pr.sh's IN_FLIGHT_TOKENS line ('$in_flight_line') does not carry ci-unreadable — the token would be TERMINAL, the watcher would exit on it, and #1408 would be a rename of ci-failed rather than a fix"
+  fi
+fi
+
+# pr-ready.sh's own header is the definitive table; every other enumeration in
+# this repo is downstream of it. Anchored to the table's SHAPE — `#`, indent,
+# the bare token, then the COLUMN GAP, then a description — so a passing mention
+# inside one of the long rationale blocks below it cannot satisfy this. The
+# `{2,}` is what does that work: a prose sentence writes `# ci-unreadable is …`
+# with ONE space, while every row of that table pads the token out to the
+# description column.
+if grep -qE '^#[[:space:]]+ci-unreadable[[:space:]]{2,}[^[:space:]]' "$READY"; then
+  ok "pr-ready.sh's header token table documents \`ci-unreadable\`"
+else
+  bad "pr-ready.sh's header token table has no 'ci-unreadable' entry — the script prints a token its own contract does not define (#1408)"
+fi
+
+# await-claude-review/SKILL.md is the PROSE merge-clearance path, and #1408 §9
+# places it legitimately outside the exception-free set: an agent reading it needs
+# to know the token exists and means "keep waiting", but the file has no table row
+# or bullet shape to anchor to. So the requirement is looser AND STATED — the
+# literal must appear somewhere in the file. This is deliberately the weakest
+# check in the block; the four above are the ones that carry the coupling.
+if [[ ! -f "$SKILL_MD" ]]; then
+  bad "cannot find await-claude-review/SKILL.md — the prose merge-clearance path is unverified (#1408)"
+elif grep -qF -- 'ci-unreadable' "$SKILL_MD"; then
+  ok "await-claude-review/SKILL.md mentions \`ci-unreadable\`"
+else
+  bad "await-claude-review/SKILL.md never mentions ci-unreadable — an agent following that skill meets a token it has no rule for, on a path that clears merges (#1408)"
+fi
+
+# …AND THESE MUST ACTUALLY RUN, the same argument the `code-review.yml`,
+# `SKILL.md` and `iteration-trigger.yml` loops above make.
+# `.claude/commands/ralph-tick.md` is not in ralph-recap-tests.yml's filters, so
+# the routing-bullet assertion this file now makes about it can be falsified by a
+# PR that edits only that file, with CI green — the unwired-gate failure those
+# `paths:` lists exist to prevent. Both triggers: a `push`-only filter still lets
+# the drift land through a PR, and a `pull_request`-only filter misses a direct
+# push to `main`. `recap_trigger_block` is REUSED rather than the YAML re-parsed,
+# so all four of these loops read the workflow exactly the same way.
+for trig in push pull_request; do
+  trig_block="$(recap_trigger_block "$trig")"
+  if [[ -n "$trig_block" ]] && grep -q 'ralph-tick\.md' <<<"$trig_block"; then
+    ok "ralph-recap-tests.yml runs this suite on $trig changes to ralph-tick.md"
+  else
+    bad "ralph-recap-tests.yml's $trig paths: omit .claude/commands/ralph-tick.md — the orchestrator's routing table could lose a token's rule with no coupling check run at all (#1408)"
   fi
 done
 

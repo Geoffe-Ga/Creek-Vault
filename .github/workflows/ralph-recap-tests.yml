@@ -59,6 +59,16 @@ name: Ralph Tooling Tests
 # merge) — but only await-claude-review was watched here. So that assertion could
 # have been falsified by a one-line edit to the unwatched file with CI green,
 # which is the unwired-gate failure these two `paths:` lists exist to prevent.
+#
+# .claude/commands/ralph-tick.md is the sixth, added for #1408, and it is the same
+# argument a third time on the file that matters most: it is the ORCHESTRATOR's
+# routing table — what the loop DOES with each token pr-ready.sh prints — and
+# test_pr_ready.sh now asserts it carries a Step-1 bullet for `ci-unreadable` plus
+# the escalation policy for a lane that times out on it. Unwatched, that assertion
+# could be falsified by a PR touching only that file, with CI green, and the loop
+# would meet a token it has no rule for. Both triggers for the reason already
+# given: a `push`-only filter still lets the drift land through a PR and a
+# `pull_request`-only filter misses a direct push to `main`.
 on:
   push:
     paths:
@@ -69,6 +79,7 @@ on:
       - ".github/workflows/iteration-trigger.yml"
       - ".claude/skills/await-claude-review/SKILL.md"
       - ".claude/skills/address-feedback/SKILL.md"
+      - ".claude/commands/ralph-tick.md"
   pull_request:
     paths:
       - "scripts/ralph/**"
@@ -78,6 +89,7 @@ on:
       - ".github/workflows/iteration-trigger.yml"
       - ".claude/skills/await-claude-review/SKILL.md"
       - ".claude/skills/address-feedback/SKILL.md"
+      - ".claude/commands/ralph-tick.md"
 
 permissions:
   contents: read

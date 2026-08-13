@@ -196,8 +196,8 @@ posted **after** the PR's HEAD commit (stale-verdict guard):
 ```bash
 STATUS=$(scripts/ralph/pr-ready.sh "$PR_NUM") && RC=0 || RC=$?
 # ready | ready-unreviewed | behind | main-not-green | review-quota-exhausted |
-# pending | ci-failed | review-failed | changes-requested | awaiting-review |
-# optout
+# pending | ci-failed | ci-unreadable | review-failed | changes-requested |
+# awaiting-review | optout
 ```
 The exit code is captured explicitly (`RC`) — the helper now exits non-zero
 when it cannot classify a lane at all, and an unchecked `$STATUS` would just
@@ -354,8 +354,19 @@ Then act on `$STATUS`:
   re-kicking (`gh run rerun`, empty commits) will produce a review. Resolve the
   conflict (`fleet.sh sync` → conflict-fix worker → push); the post-resolution
   push triggers the PR's real CI + review.
-- **`ci-failed`** — a **non-review** check failed. Advance it via Step 2
-  (`ci-debugging`).
+- **`ci-failed`** — a non-review check is **positively proven** failed (the
+  rollup says so). Advance it via Step 2 (`ci-debugging`).
+- **`ci-unreadable`** — nothing is known to be red. The classifier could not
+  read or reconcile the status rollup with `gh pr checks`'s own exit code — a
+  failed tally probe, a surplus field, a non-numeric count, an unclassifiable
+  entry, or zero failing entries while `gh pr checks` exited non-zero (this is
+  what actually happened on #1407 and #1420: a transient `gh` error beside a
+  fully green rollup). **Do NOT dispatch `ci-debugging`** — that is the entire
+  bug this token exists to stop. Leave the lane; the Step 5 watcher keeps
+  polling because `ci-unreadable` is in the in-flight set, and it self-resolves
+  in both directions on the next readable poll — a genuinely red tree reads
+  `ci-failed`, a green one reads `ready`/`behind`/etc. See Step 5's
+  `timeout ci-unreadable` policy below for the bounded case.
 - **`review-failed`** — every failing check is `claude-review` itself, so CI is
   fine and **the code needs no change** (issue #1200). The reviewer
   malfunctioned: a rate limit, a timeout, a `cancel-in-progress` cancellation,
@@ -531,14 +542,28 @@ Code session and **does not exist** in a local terminal session.
    scripts/ralph/watch-pr.sh "$PR_NUM"        # Bash tool, run_in_background: true
    ```
    A background task's exit re-invokes this session, and the watcher exits —
-   printing `WATCH <PR> <token>` — the moment `pr-ready.sh`'s token leaves
-   `pending`/`awaiting-review` (or `gone` when the PR merges/closes, or
-   `timeout <last-token>` at ~30 min). **The watcher's exit IS the per-lane
-   wake** — seconds after the verdict or CI settles, instead of the full
-   fallback sleep. Its pidfile (`/tmp/ralph-watch-<repo>-<PR>.pid`) makes
-   relaunching **idempotent**: a duplicate exits immediately with
+   printing `WATCH <PR> <token>` — the moment `pr-ready.sh`'s token leaves the
+   in-flight set (`pending`/`awaiting-review`/`main-not-green`/
+   `review-quota-exhausted`/`ci-unreadable`) (or `gone` when the PR
+   merges/closes, or `timeout <last-token>` at ~30 min). **The watcher's exit
+   IS the per-lane wake** — seconds after the verdict or CI settles, instead
+   of the full fallback sleep. Its pidfile (`/tmp/ralph-watch-<repo>-<PR>.pid`)
+   makes relaunching **idempotent**: a duplicate exits immediately with
    `already-watching`, so just launch one for every in-flight PR each wake
    without bookkeeping.
+
+   **`timeout ci-unreadable` — the persistent-stall escalation (#1408 §6):** a
+   rollup that stays unreadable for the full ~30-minute window is a TOOLING
+   fault, not a code fault — the tally probe itself (`gh pr checks`) has been
+   failing or unparseable on every poll, not the tree. Re-classify once by
+   hand: `gh pr view "$PR_NUM" --json statusCheckRollup`. If that read is
+   clean, just relaunch the watcher — the prior run's unreadability was
+   transient. If it is still unreadable, this is tooling weather: report it
+   (or file an issue if it recurs) and leave the lane; do not burn a retry
+   loop on it. **NEVER convert a `timeout ci-unreadable` into a
+   `ci-debugging` dispatch** — nothing about the timeout proves the tree is
+   red, only that the classifier could not tell either way, and dispatching a
+   fix worker on that basis is precisely the bug #1408 closes.
 2. **`ScheduleWakeup` long fallback** (~1200–1800s) stays armed as the safety
    net — it covers a killed watcher, a reboot, and anything else that slips
    past the pidfiles.

@@ -40,7 +40,11 @@
 #                    normally. Fails closed in the INVERTED direction — see the
 #                    polarity block below (#1160).
 #   pending          CI still running (or no checks registered yet) → wait for a later wake
-#   ci-failed        a NON-review check is failing/errored → Step 2 (ci-debugging)
+#   ci-failed        a NON-review check is POSITIVELY PROVEN failing/errored — a
+#                    rollup we could READ, holding at least one failing entry that
+#                    is not the reviewer's → Step 2 (ci-debugging). A rollup we
+#                    could not read is NOT this token; see `ci-unreadable` below
+#                    (#1408).
 #   review-failed    EVERY failing rollup entry is the `claude-review` check, so
 #                    CI itself is fine and THE CODE NEEDS NO CHANGE. The reviewer
 #                    malfunctioned: a rate limit, a timeout, a `cancel-in-progress`
@@ -60,6 +64,21 @@
 #                    is a strict narrowing of `ci-failed` and must not be
 #                    "harmonised" back into it: collapsing the two restores the
 #                    misroute, and no test above the token level would notice.
+#   ci-unreadable    the check rollup could not be READ, or cannot be RECONCILED
+#                    with `gh pr checks` having exited non-zero: it holds ZERO
+#                    failing entries, or an entry this script cannot classify, or
+#                    the answer was malformed, or the probe itself failed. Every
+#                    one of those is a statement about the PROBE and not about the
+#                    tree — NOTHING IS KNOWN TO BE RED — so explicitly do NOT
+#                    dispatch a `ci-debugging` worker; doing that at a head with
+#                    three concluded GREEN runs is the bug this token exists to
+#                    stop (#1408, observed on #1407 and #1420). NON-TERMINAL: it is
+#                    in watch-pr.sh's IN_FLIGHT_TOKENS, so the lane keeps polling
+#                    and self-resolves — a durable red surfaces as `ci-failed` on
+#                    the first readable poll, one interval later. Bounded by
+#                    watch-pr.sh's ~30-minute TIMEOUT, which exits
+#                    `timeout ci-unreadable`; ralph-tick.md carries the escalation
+#                    policy for a lane that stays unreadable for the whole window.
 #   changes-requested CI green + a FRESH verdict (posted after HEAD) exists and is
 #                    not LGTM (CHANGES_REQUESTED / COMMENTS) → Step 2
 #                    (address-feedback). This is Gate 4 FAILED — an actionable
@@ -305,8 +324,9 @@
 #
 # TOKEN PRECEDENCE (deliberate, pinned by test_pr_ready.sh): `optout` is checked
 # before everything else; then CI state (`pending` / `ci-failed` /
-# `review-failed`), exactly as it always was — #1200 subdivided that middle rung
-# without moving it; the verdict is only consulted once CI is green. So
+# `review-failed` / `ci-unreadable`), exactly as it always was — #1200 subdivided
+# that middle rung and #1408 subdivided it once more, neither of them moving it;
+# the verdict is only consulted once CI is green. So
 # `changes-requested` never outranks `pending`/`ci-failed` — a lane whose CI is
 # still running classifies `pending` even if the verdict already landed, and the
 # wake arrives when CI resolves (green → `changes-requested`, red → `ci-failed`;
@@ -462,16 +482,26 @@
 #     `behind` → sync.
 #   provenance (#1181): anything that is not a well-formed marker naming THIS PR
 #     REFUSES the verdict — main-health.sh's polarity, not review-quota.sh's.
-#   ci tally (#1200): anything that does not POSITIVELY prove "every failing
-#     entry is the review check" stays `ci-failed` — an unreadable rollup, a
-#     non-zero probe exit, a surplus field, a non-numeric count, zero failing
-#     entries, or any entry shape the expression cannot classify. This is a
-#     REFINEMENT of an existing token, not a new claim: `ci-failed` was this
-#     branch's only answer before #1200 and remains its default, so an inverted
-#     reading can only ever cost a wasted fix worker (today's behaviour), never
-#     swallow a real CI failure. It is also the only one of the four that cannot
-#     affect mergeability in either direction — the whole branch is downstream of
-#     a non-zero `gh pr checks`, and none of its three tokens is `ready`.
+#   ci tally (#1200, CORRECTED BY #1408): the fail-closed DIRECTION is unchanged
+#     — nothing about the tree is believed without proof — but the DESTINATION
+#     moved, and it had to. `ci-failed` now requires POSITIVE proof of a red:
+#     a rollup we could read, holding a failing entry that is not the reviewer's,
+#     and the hoisted guard in `ci_failure_token` is what makes that proof outrank
+#     everything below it. Everything we merely cannot READ — an unreadable
+#     rollup, a non-zero probe exit, a surplus field, a non-numeric count, zero
+#     failing entries, or any entry shape the expression cannot classify — reads
+#     `ci-unreadable` instead. Sending those five shapes to a TERMINAL token was
+#     the #1408 defect: a transient `gh` error beside a fully GREEN rollup printed
+#     `ci-failed` and dispatched a fix worker at a tree with nothing red (#1407,
+#     #1420). `ci-unreadable` is NON-TERMINAL — watch-pr.sh keeps polling — so the
+#     inverted reading now costs one poll interval instead of a wasted worker, and
+#     it still cannot swallow a real CI failure: a durable red is `ci-failed` on
+#     the first readable poll.
+#     THE MERGE-SAFETY ARGUMENT IS UNCHANGED AND IS WHAT LICENSES THE WIDENING.
+#     `ready` is not in this helper's codomain, and the whole branch is downstream
+#     of a non-zero `gh pr checks`, so nothing this polarity does can make a PR
+#     more mergeable in either direction — it is still the only one of the four
+#     with that property. It costs a stalled lane, never a bad merge.
 # THE FOUR POLARITIES ARE DELIBERATELY NOT UNIFORM; the first two are argued
 # here, the third in the block that follows, and the fourth at
 # `ci_failure_token`. Read them before making any of them agree.
@@ -685,15 +715,24 @@ readonly MIN_NON_REVIEW_SUCCESSES=1
 # NOT a defect in this PR's code". This expression is what `ci_failure_token`
 # asks the rollup, on that branch only.
 #
-# THE ANSWER IS TWO-PART, AND THE SPLIT IS A SECURITY BOUNDARY. Line 1 is FOUR
+# THE ANSWER IS TWO-PART, AND THE SPLIT IS A SECURITY BOUNDARY. Line 1 is FIVE
 # COUNTS and nothing else: total failing, failing-and-named-`claude-review`,
-# non-review entries still in flight, and unclassifiable. Lines 2+ are
-# human-readable `failing: <name>` diagnostics that are NEVER field-split. A
-# check name is author-controlled (anyone who can add a workflow `name:` picks
-# it), and this file has already paid once for the `|`-shifting class the
-# surplus-field guards below call out — so the decision line carries no
-# author-controlled text at all. Proven: an entry named `a|b` yields `1|0|0|0`
-# on line 1 and `  failing: a|b` on line 2.
+# non-review entries still in flight, unclassifiable, and — since #1408 — the
+# total number of rollup ENTRIES. Lines 2+ are human-readable `failing: <name>`
+# diagnostics that are NEVER field-split. A check name is author-controlled
+# (anyone who can add a workflow `name:` picks it), and this file has already
+# paid once for the `|`-shifting class the surplus-field guards below call out —
+# so the decision line carries no author-controlled text at all. Proven: an entry
+# named `a|b` yields `1|0|0|0|1` on line 1 and `  failing: a|b` on line 2.
+#
+# THE FIFTH COUNT IS PURELY DIAGNOSTIC — no guard compares it, and one must not
+# start. It exists because the first four are INDISTINGUISHABLE between a fully
+# green rollup, an empty one, and a payload with no `statusCheckRollup` key at
+# all: every one of those tallies `0|0|0|0`, which is exactly what made #1420's
+# log line unreadable and the diagnosis slow. The entry total tells those three
+# apart in a log. It is emphatically NOT the guard: the condition that matters is
+# zero FAILING entries, never zero entries, and a fix keyed on emptiness would
+# have missed the instance that motivated #1408 (see `ci_failure_token`).
 #
 # NO REGEX ANYWHERE — membership is array `index`, which behaves identically in
 # the system `jq` (Oniguruma) the test suite runs and in the gojq (RE2) that
@@ -734,7 +773,8 @@ readonly ROLLUP_TALLY_JQ='def cls($s):
 | (($f|length)|tostring)
   + "|" + (([$f[] | select(.n == "'"$REVIEW_CHECK_NAME"'")]|length)|tostring)
   + "|" + (([$e[] | select(.c == "wait" and .n != "'"$REVIEW_CHECK_NAME"'")]|length)|tostring)
-  + "|" + (([$e[] | select(.c == "unknown")]|length)|tostring),
+  + "|" + (([$e[] | select(.c == "unknown")]|length)|tostring)
+  + "|" + (($e|length)|tostring),
   ($f[] | "  failing: " + (if .n == "" then "<unnamed>" else .n end))'
 
 die() { echo "pr-ready: $1" >&2; exit 2; }
@@ -1135,9 +1175,10 @@ if [[ -n "$issue_n" ]]; then
   fi
 fi
 
-# Which flavour of "not green" this is (#1200) → `review-failed` | `pending` |
-# `ci-failed`. Called ONLY from the non-zero/non-no-checks branch below, so no
-# lane that has already decided pays for the extra API call.
+# Which flavour of "not green" this is (#1200, widened by #1408) →
+# `review-failed` | `pending` | `ci-failed` | `ci-unreadable`. Called ONLY from
+# the non-zero/non-no-checks branch below, so no lane that has already decided
+# pays for the extra API call.
 #
 # DEFINED HERE, NOT BESIDE `review_gate_absent`. Bash resolves a function name at
 # CALL time, and the call site is a dozen lines below this point; a definition
@@ -1146,32 +1187,50 @@ fi
 # passing. That is the failure mode the POSITIVE laziness sentinel in
 # test_pr_ready.sh exists to catch, and this placement is the other half of it.
 #
-# IT EMITS THE TOKEN ITSELF and always returns 0. The three-way decision lives in
+# IT EMITS THE TOKEN ITSELF and always returns 0. The four-way decision lives in
 # exactly one place, so there is no way to add a guard here and forget the arm
 # that consumes it — a predicate-plus-caller split had precisely that bug, with
 # an unreachable clause that made its own pending case answer `review-failed`.
 #
-# EVERY GUARD FUNNELS TO `ci-failed`. That is the fail-closed polarity made
-# structural rather than promised: `ci-failed` is what this branch printed before
-# #1200 and it stays the answer for every shape we cannot positively prove is a
-# lone reviewer malfunction. The inverse mistake — reading a genuinely red tree
-# as a broken reviewer — would leave a real failure un-debugged, which is far
-# worse than today's wasted fix worker. Note also that this helper's whole
-# codomain is {review-failed, pending, ci-failed}: it can never make a PR MORE
-# mergeable, because `ready` is not in it and this branch is only reached when
-# `gh pr checks` already exited non-zero.
+# EXACTLY ONE GUARD STILL FUNNELS TO `ci-failed`, AND IT IS LOAD-BEARING (#1408).
+# That guard is the hoisted `ft >= 1 && fr != ft` test below; do not read the
+# paragraph that follows as licence to delete it. What changed is that no
+# UNREADABLE-SHAPE guard funnels there any more. #1200 built the ladder that
+# way — `ci-failed` was what this branch printed before it, so every shape we
+# could not positively prove was a lone reviewer malfunction stayed there — and
+# the result was SIX distinct inputs collapsing onto one TERMINAL token, exactly
+# one of which was an actual failing check. On #1420 a transient probe error
+# beside a rollup of three CONCLUDED GREEN runs printed `ci-failed`, the watcher
+# exited, and the orchestrator dispatched a `ci-debugging` worker at code with
+# nothing wrong with it (#1407 was the same shape). So `ci-failed` is now reserved
+# for a POSITIVELY PROVEN non-review red, and the five unreadable shapes answer
+# `ci-unreadable`.
+#
+# THE FAIL-CLOSED PROPERTY SURVIVES; IT IS RESTATED, NOT DROPPED. The sentence it
+# used to rest on — "this helper's whole codomain is {review-failed, pending,
+# ci-failed}" — is false now that the codomain has a fourth member. What carries
+# the weight is the half that did not change: `ready` is NOT in the codomain,
+# before #1408 or after, and this branch is only reached once `gh pr checks` has
+# ALREADY exited non-zero, so no answer this helper can give makes any PR more
+# mergeable. Widening it costs a stalled lane, never a bad merge. Nor can it
+# swallow a red: `ci-unreadable` advances no lane, it is in watch-pr.sh's
+# IN_FLIGHT_TOKENS so the lane keeps polling, and a durable failure reads
+# `ci-failed` on the first poll that CAN be read — one interval later, and that is
+# the entire cost. The inverse mistake — reading a genuinely red tree as a broken
+# reviewer, or as merely unreadable — is still the one that leaves a real failure
+# un-debugged, and the guard ORDER below is what prevents it.
 #
 # WHY A TOKEN AND NOT JUST A DIAGNOSTIC: #1270 — watch-pr.sh discards this
 # script's stderr. On the local polling path the message below is invisible, so a
 # stderr-only fix would change nothing the loop can act on. The stderr lines are
 # for the human reading a log; the TOKEN is for the orchestrator.
 ci_failure_token() {
-  local answer counts names ft fr po un rest n
+  local answer counts names ft fr po un tot rest n
   # Declared and assigned separately: `local x="$(…)"` masks the command
   # substitution's exit status (SC2155), which here would swallow a failed probe.
   answer=""
   answer="$(gh pr view "${gh_args[@]}" --json statusCheckRollup \
-    --jq "$ROLLUP_TALLY_JQ" 2>/dev/null)" || { echo "ci-failed"; return 0; }
+    --jq "$ROLLUP_TALLY_JQ" 2>/dev/null)" || { echo "ci-unreadable"; return 0; }
   counts="${answer%%$'\n'*}"
   names="${answer#"$counts"}"; names="${names#$'\n'}"
   # `if … fi`, NEVER `[[ -n "$names" ]] && printf …`: under `set -euo pipefail` an
@@ -1184,21 +1243,53 @@ ci_failure_token() {
   # Split by FIELD COUNT with a surplus-field guard, the same discipline as the
   # mergeStateStatus and rollup answers: a count cannot contain a `|`, so a
   # surplus field means the answer is malformed.
-  IFS='|' read -r ft fr po un rest <<<"$counts"
-  printf 'pr-ready: PR #%s check tally fail=%s review=%s pending=%s unknown=%s\n' \
-    "$pr" "$ft" "$fr" "$po" "$un" >&2
-  [[ -z "$rest" ]] || { echo "ci-failed"; return 0; }        # surplus field
-  for n in "$ft" "$fr" "$po" "$un"; do
-    [[ "$n" =~ ^[0-9]+$ ]] || { echo "ci-failed"; return 0; }  # empty / malformed
+  IFS='|' read -r ft fr po un tot rest <<<"$counts"
+  printf 'pr-ready: PR #%s check tally fail=%s review=%s pending=%s unknown=%s total=%s\n' \
+    "$pr" "$ft" "$fr" "$po" "$un" "$tot" >&2
+  [[ -z "$rest" ]] || { echo "ci-unreadable"; return 0; }      # surplus SIXTH field
+  # `$tot` is validated with the four counts even though no guard compares it: it
+  # is read into a variable under `set -u`, so the day anything DOES touch it a
+  # non-numeric value would abort with no token at all — a wedged lane, which is
+  # the one outcome this whole ladder exists to avoid.
+  for n in "$ft" "$fr" "$po" "$un" "$tot"; do
+    [[ "$n" =~ ^[0-9]+$ ]] || { echo "ci-unreadable"; return 0; }  # empty / malformed
   done
-  [[ "$un" -eq 0 ]]     || { echo "ci-failed"; return 0; }   # an entry we cannot read
+  # A NON-REVIEW CHECK IS POSITIVELY PROVEN RED — at least one failing entry, and
+  # they are not all the reviewer's. This is the ONE shape that earns the terminal
+  # token, so it is the only claim this helper makes about the tree.
+  #
+  # HOISTED ABOVE THE UNREADABLE GUARDS, AND THE ORDER IS THE FIX (#1408). Under
+  # #1200 the `un` guard below ran FIRST and answered `ci-failed`, so ordering did
+  # not matter; now that it answers `ci-unreadable`, a tally of `1|0|0|1` — a check
+  # that GENUINELY FAILED, beside one entry whose conclusion enum GitHub has just
+  # invented — would go from terminal to non-terminal and the lane would poll a red
+  # tree until watch-pr.sh timed out with nobody ever dispatched to fix it. That is
+  # a strictly worse bug than the one #1408 closes, and it is reachable from the
+  # REAL rollup, not only from a test fixture. Proven red is proven red regardless
+  # of what else we cannot read, so it outranks everything below.
+  #
+  # `if … fi`, NEVER `[[ … ]] && …`, for the reason spelled out at the `names`
+  # printf above: an AND-list whose overall status is 1 is an errexit trigger, and
+  # this function runs inside command substitution where errexit is NOT suspended.
+  # The single-condition guards keep the `|| { …; return 0; }` idiom, which is safe
+  # because the `||` makes the list's status 0 on both branches.
+  if [[ "$ft" -ge 1 && "$fr" -ne "$ft" ]]; then echo "ci-failed"; return 0; fi
+  [[ "$un" -eq 0 ]]     || { echo "ci-unreadable"; return 0; }  # an entry we cannot read
   # DISAGREEMENT: `gh pr checks` de-duplicates check runs by name (newest wins)
   # while the rollup carries one entry per triggering event, so the rollup can
   # only ever hold MORE failing entries than gh saw, never fewer. Zero failures
   # here while gh exited non-zero therefore is not "the reviewer broke" — it is a
   # transport error, an auth failure, or a view we cannot reconcile.
-  [[ "$ft" -ge 1 ]]     || { echo "ci-failed"; return 0; }
-  [[ "$fr" -eq "$ft" ]] || { echo "ci-failed"; return 0; }   # a NON-review check is red
+  #
+  # THAT ANALYSIS WAS ALWAYS RIGHT; THE CONCLUSION #1200 DREW FROM IT WAS BACKWARDS
+  # (#1408). A view we cannot reconcile is precisely NOT evidence of a red tree, and
+  # #1420 is the measurement: three CONCLUDED GREEN runs at that head, three
+  # immediate re-probes all reading `ready`, and the PR merged normally — while the
+  # loop exited the watcher and dispatched a `ci-debugging` worker in between
+  # (#1407 was the same shape). Note this arm also covers the case nothing named:
+  # zero failures with a sibling still RUNNING, i.e. a transport error at a tree
+  # that has not finished building. Both keep the lane polling now.
+  [[ "$ft" -ge 1 ]]     || { echo "ci-unreadable"; return 0; }
   # D2 (#1200): a non-review check still in flight beside a failed review. gh
   # reports failure in preference to pending, so this branch is reachable while
   # CI is unfinished — and this is the DOMINANT real timing, because
@@ -1208,11 +1299,11 @@ ci_failure_token() {
   # claim a tree is proven when it is not. `pending` claims neither, is in
   # watch-pr.sh's IN_FLIGHT_TOKENS so the lane keeps polling, and self-resolves on
   # the next poll either way — sibling red → `ci-failed`, green → `review-failed`.
-  # It cannot hide a real failure: any non-review FAILING entry was already caught
-  # one line above. Accepted cost: a lane whose sibling check is genuinely stuck
-  # waits out watch-pr.sh's timeout. Entries named `claude-review` are excluded
-  # from this count upstream in ROLLUP_TALLY_JQ — the review's own re-run already
-  # being in flight is the remedy, not a reason to wait.
+  # It cannot hide a real failure: any non-review FAILING entry gives `ft > fr` and
+  # was already caught by the hoisted guard. Accepted cost: a lane whose sibling is
+  # genuinely stuck waits out watch-pr.sh's timeout. Entries named `claude-review`
+  # are excluded from this count upstream in ROLLUP_TALLY_JQ — the review's own
+  # re-run already being in flight is the remedy, not a reason to wait.
   [[ "$po" -eq 0 ]]     || { echo "pending"; return 0; }
   echo "review-failed"
 }
@@ -1236,9 +1327,11 @@ elif [[ "$ci_ec" -ne 0 ]]; then
   if grep -qi "$NO_CHECKS_SIG" <<<"$ci_err"; then
     echo "pending"
   else
-    # Something is genuinely not green. Ask the rollup WHICH check, so a broken
-    # `claude-review` is not mistaken for a red tree (#1200). Still `ci-failed`
-    # unless the rollup positively proves otherwise.
+    # Something is not green — or something is not READABLE. Ask the rollup WHICH
+    # check, so a broken `claude-review` is not mistaken for a red tree (#1200).
+    # `ci-failed` ONLY if the rollup positively proves a non-review check red; a
+    # rollup we cannot read, or cannot reconcile with this non-zero exit, answers
+    # the non-terminal `ci-unreadable` and the lane keeps polling (#1408).
     ci_failure_token
   fi
   exit 0
