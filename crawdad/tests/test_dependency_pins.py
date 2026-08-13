@@ -2,9 +2,11 @@
 
 Most pins here answer specific CVEs; the tests guard both the declared
 floor and the resolved lock so a future relock cannot regress onto a
-vulnerable release. The ``rpds-py`` pin at the end of this file is the
-exception — it answers a versioning-scheme migration rather than an
-advisory — but it is guarded the same two ways for the same reason.
+vulnerable release. Two pins are not advisories at all — ``rpds-py``
+answers a versioning-scheme migration and ``openai`` an HTTP-transport
+swap — but both are guarded the same two ways for the same reason.
+Read the paragraph for a pin before changing it: the reason a bound
+exists decides which half of it is load-bearing.
 
 ``mcp`` (issue #862): mcp 1.27.1 carries CVE-2026-52869 —
 cross-principal session injection on the Streamable HTTP bearer-token
@@ -96,6 +98,35 @@ constraint is a bare CalVer floor with no ceiling, and
 ``test_rpds_py_constraint_admits_future_calver_releases`` fails if
 anyone adds one in the SemVer shape.
 
+``openai`` (issue #1479): the second non-CVE pin — an OSV query for
+PyPI/openai returns zero advisories, so read this bound as a
+transport hold rather than the security ratchet most of this file
+describes. openai 3.0.0 (published 2026-08-12) replaced its
+``httpx<1,>=0.23.0`` requirement with ``httpx2<3,>=2.7.0``, and httpx2
+is a *separate distribution* rather than a version bump: taking it
+also drags httpcore2==2.10.0, truststore>=0.10 and idna>=3.18 into
+the graph. ``mcp>=1.28.1,<2.0.0`` caps the other half of that same
+httpx2 swap (issue #998), so the two majors have to be adopted
+jointly or not at all, which is what the ceiling holds open. openai
+2.54.0, the newest 2.x, still requires ``httpx<1,>=0.23.0`` and
+offers httpx2 only behind an opt-in extra, so the whole 2.x line is
+safe; the floor is 2.41.0, the release both locks already resolve,
+because a floor records what this project has run and never a version
+it has not — and it is asserted from both ends, admitting 2.41.0
+while rejecting the release below it, so dropping the floor is as red
+as dropping the ceiling.
+
+The stake here is sharper than a future relock. crawdad CI provisions
+with ``pip install -e ".[dev]"`` — a *live* PyPI resolve that honours
+neither ``uv.lock`` nor ``[tool.uv].constraint-dependencies`` — so an
+unbounded ``openai>=1.0`` is not a hypothetical: openai 3.0.0 and its
+httpx2/httpcore2 stack already reached a green main build that way
+(CI run 31740475473). The bound in ``[project].dependencies`` is what
+stops it, which is also where the two projects differ: crawdad
+declares openai as a base dependency, while creek-tools declares it
+in ``[project.optional-dependencies].openai``, so the two
+``_openai_specifier()`` helpers read different TOML tables by design.
+
 Two independent guards per package:
 
 * **pyproject floor** — the declared specifier must reject the last
@@ -183,6 +214,25 @@ _RPDS_PY_CALVER_FLOOR = Version("2026.6.3")
 #: which excludes it while still admitting the floor.
 _RPDS_PY_FUTURE_CALVER_PROBE = Version("2027.1.1")
 
+#: The openai release both locks already resolve; the floor records
+#: what this project has run, never a version it has not.
+_OPENAI_LOCKED_FLOOR = Version("2.41.0")
+
+#: openai 3.0.0 swapped httpx for httpx2 — a separate distribution,
+#: not a version bump. This is the release the ceiling excludes.
+_OPENAI_HTTPX2_MAJOR = Version("3.0.0")
+
+#: A far-future major. Probes for a lazy ``!=3.0.0`` exclusion
+#: masquerading as a ceiling: that admits 99.0.0, a real ceiling does
+#: not.
+_OPENAI_FUTURE_MAJOR_PROBE = Version("99.0.0")
+
+#: The floor this pin replaced. Without it the ceiling alone would
+#: satisfy every other assertion here, so a regression to a bare
+#: ``openai<3.0.0`` — or back to ``>=1.0,<3.0.0`` — would pass. The
+#: floor is half the pin and is tested from both ends.
+_OPENAI_PRE_BOUND_FLOOR = Version("1.0")
+
 #: Shell builtins that only *look up* a command (``command -v
 #: pip-audit``) instead of running it; a lookup must not count as an
 #: audit.
@@ -210,6 +260,46 @@ def _locked_mcp_version() -> Version:
         if package["name"] == "mcp":
             return Version(str(package["version"]))
     pytest.fail("mcp has no [[package]] entry in uv.lock")
+
+
+def _openai_specifier() -> SpecifierSet:
+    """Return the ``openai`` specifier set from ``[project].dependencies``.
+
+    crawdad declares openai as a *base* dependency — ``CRAWDAD_PROVIDER``
+    selects the backend at runtime, so every install carries the SDK —
+    rather than as the optional extra creek-tools declares it in
+    (``[project.optional-dependencies].openai``). The two projects'
+    helpers therefore read different tables.
+
+    Returns:
+        The specifier set attached to the ``openai`` entry in
+        ``[project].dependencies``. Fails the calling test if the entry
+        is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    dependencies: list[str] = pyproject["project"]["dependencies"]
+    for entry in dependencies:
+        requirement = Requirement(entry)
+        if requirement.name == "openai":
+            return requirement.specifier
+    pytest.fail("openai is not declared in [project].dependencies of pyproject.toml")
+
+
+def _locked_openai_version() -> Version:
+    """Return the resolved ``openai`` version pinned in ``uv.lock``.
+
+    Returns:
+        The ``openai`` version resolved in the lockfile. Fails the
+        calling test if the lock has no ``openai`` package entry.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == "openai":
+            return Version(str(package["version"]))
+    pytest.fail("openai has no [[package]] entry in uv.lock")
 
 
 def _pyasn1_constraint_specifier() -> SpecifierSet:
@@ -601,6 +691,84 @@ def test_locked_mcp_at_or_above_patched_release() -> None:
         f"uv.lock pins mcp {locked}, below the CVE-patched "
         f"{_PATCHED_VERSION} (CVE-2026-52869 / CVE-2026-52870 / "
         "CVE-2026-59950); run a relock after raising the pyproject floor"
+    )
+
+
+def test_openai_ceiling_rejects_the_httpx2_major() -> None:
+    """The specifier excludes openai 3.0.0, the httpx2 release.
+
+    No advisory is involved — OSV reports nothing for PyPI/openai. What
+    3.0.0 changes is the transport: ``httpx<1,>=0.23.0`` became
+    ``httpx2<3,>=2.7.0``, a separate distribution arriving with
+    httpcore2, truststore and idna>=3.18. crawdad CI resolves live from
+    PyPI (``pip install -e ".[dev]"``), so an open floor is not a future
+    relock risk — that stack already landed on a green main build. The
+    ``<3.0.0`` ceiling is what stops it, and it may lift only jointly
+    with the mcp cap on the same swap.
+
+    The second assertion is the one that catches a half-measure: a bare
+    ``!=3.0.0`` reads like a ceiling and is not one.
+    """
+    specifier = _openai_specifier()
+    assert str(_OPENAI_HTTPX2_MAJOR) not in specifier, (
+        f"openai specifier {specifier!r} admits {_OPENAI_HTTPX2_MAJOR}, "
+        "which replaces httpx with httpx2 — a separate distribution, not "
+        "a version bump — dragging httpcore2, truststore and idna>=3.18 "
+        "into an environment CI resolves live from PyPI; the ceiling must "
+        "be <3.0.0 and may move only jointly with the mcp<2.0.0 cap on "
+        "the same swap (#1479, #998)"
+    )
+    assert str(_OPENAI_FUTURE_MAJOR_PROBE) not in specifier, (
+        f"openai specifier {specifier!r} admits "
+        f"{_OPENAI_FUTURE_MAJOR_PROBE}; an exclusion of the single "
+        "release (`!=3.0.0`) is not a ceiling — it re-admits 3.0.1 and "
+        "every later major carrying the same httpx2 stack. Write a real "
+        "upper bound (#1479, #998)"
+    )
+
+
+def test_openai_floor_accepts_the_locked_release() -> None:
+    """The specifier accepts 2.41.0 and rejects the unbounded floor.
+
+    Both ends matter. The first assertion keeps the bound from
+    overshooting the resolution the project actually runs; the second
+    keeps the floor itself in place, since a ceiling-only regression to
+    ``openai<3.0.0`` satisfies every other assertion in this file — and
+    here that floor is what a live ``pip install -e ".[dev]"`` resolve
+    reads, not just a lock.
+    """
+    specifier = _openai_specifier()
+    assert str(_OPENAI_LOCKED_FLOOR) in specifier, (
+        f"openai specifier {specifier!r} rejects {_OPENAI_LOCKED_FLOOR}, "
+        "the version uv.lock already resolves; a floor records what this "
+        "project has actually run, never a version it has not, so "
+        "bounding openai must not exclude today's resolution (#1479)"
+    )
+    assert str(_OPENAI_PRE_BOUND_FLOOR) not in specifier, (
+        f"openai specifier {specifier!r} admits "
+        f"{_OPENAI_PRE_BOUND_FLOOR}, the unbounded floor this pin "
+        "replaced; the ceiling is only half the bound, and a bare "
+        f"`<{_OPENAI_HTTPX2_MAJOR}` would let a resolver drop years "
+        "below what this project has ever run (#1479)"
+    )
+
+
+def test_locked_openai_satisfies_the_declared_specifier() -> None:
+    """``uv.lock`` resolves openai inside the declared bound.
+
+    ``uv.lock`` is the reproducibility contract ``uv sync`` users
+    install and the surface ``scripts/security.sh`` audits via ``uv
+    export --locked``. A manifest bounded to the 2.x line while the lock
+    sits outside that bound is precisely the drift this pair of guards
+    exists to catch — the declaration would be right and the resolved
+    environment still wrong.
+    """
+    locked = _locked_openai_version()
+    assert str(locked) in _openai_specifier(), (
+        f"uv.lock pins openai {locked}, which the declared specifier "
+        f"{_openai_specifier()!r} rejects; a bounded manifest with a lock "
+        "outside the bound is the drift this guards — run `uv lock` after "
+        "changing the openai declaration (#1479)"
     )
 
 

@@ -667,7 +667,7 @@ requires-dist = [
     { name = "mcp", specifier = ">=1.28.1,<2.0.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=2.1.0,<2.2.0" },
     { name = "numpy", marker = "extra == 'embeddings'", specifier = ">=2.4.4" },
-    { name = "openai", marker = "extra == 'openai'", specifier = ">=1.0" },
+    { name = "openai", marker = "extra == 'openai'", specifier = ">=2.41.0,<3.0.0" },
     { name = "openpyxl", marker = "extra == 'spreadsheets'", specifier = ">=3.1" },
     { name = "pdf2image", marker = "extra == 'ocr'", specifier = ">=1.0" },
     { name = "pdfminer-six", marker = "extra == 'documents'", specifier = ">=20260107" },
