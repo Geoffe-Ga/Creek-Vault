@@ -14,9 +14,10 @@
 # It polls `scripts/ralph/pr-ready.sh <PR>` (the single authoritative
 # classifier — never a rollup grep) every INTERVAL seconds and exits the moment
 # the token leaves the IN-FLIGHT set {pending, awaiting-review, main-not-green,
-# review-quota-exhausted}; every other token (ready, ready-unreviewed, behind,
-# ci-failed, review-failed, changes-requested, optout) is a state the
-# orchestrator acts on, so it is worth a wake. Output is exactly one line:
+# review-quota-exhausted, ci-unreadable}; every other token (ready,
+# ready-unreviewed, behind, ci-failed, review-failed, changes-requested, optout)
+# is a state the orchestrator acts on, so it is worth a wake. Output is exactly
+# one line:
 #
 #   WATCH <PR> already-watching     another live watcher owns this PR (pidfile)
 #   WATCH <PR> <token>              the lane settled; <token> is pr-ready.sh's
@@ -42,7 +43,7 @@ set -euo pipefail
 readonly DEFAULT_INTERVAL=30
 readonly DEFAULT_TIMEOUT=1800
 
-# pr-ready.sh's in-flight tokens — the ONLY four on which the lane is genuinely
+# pr-ready.sh's in-flight tokens — the ONLY five on which the lane is genuinely
 # "wait for GitHub". Everything else it prints calls for orchestrator action.
 #
 # `main-not-green` (issue #1159) is the third: the lane is held because `main`'s
@@ -68,7 +69,7 @@ readonly DEFAULT_TIMEOUT=1800
 # the API budget for days, precisely when nobody can merge anything and that
 # budget is the scarce thing.
 #
-# `review-failed` (issue #1200) IS DELIBERATELY *NOT* A FIFTH. It is the exact
+# `review-failed` (issue #1200) IS DELIBERATELY *NOT* IN THIS SET. It is the exact
 # INVERSE of the two arguments above: those tokens are in this set because
 # nothing the orchestrator can do will change them, whereas `review-failed` means
 # a `claude-review` run broke (rate limit, timeout, `cancel-in-progress`, or one
@@ -81,7 +82,28 @@ readonly DEFAULT_TIMEOUT=1800
 # precisely why pr-ready.sh emits `pending` rather than `review-failed` when a
 # non-review check is still RUNNING beside the failed review (its D2 note): that
 # case genuinely IS a wait, and it routes to the in-flight token that says so.
-readonly -a IN_FLIGHT_TOKENS=(pending awaiting-review main-not-green review-quota-exhausted)
+#
+# `ci-unreadable` (issue #1408) IS THE FIFTH, and it is the exact INVERSE of the
+# `review-failed` paragraph above: that token is excluded because an action IS
+# available and only the orchestrator can take it, whereas here NO action exists
+# because nothing is known to be wrong. pr-ready.sh prints it when it could not
+# READ the check rollup — the probe errored, or answered a shape it cannot
+# reconcile with `gh pr checks` having exited non-zero — which is a statement
+# about the probe and not about the tree. The remedy is simply the next poll, and
+# nothing the orchestrator can do makes GitHub answerable any sooner.
+# Leaving it out would fail in BOTH directions at once: #1159's busy-wake storm
+# (exit on the first poll, get relaunched, exit again, for as long as GitHub
+# stays unanswerable), AND — this is the whole of #1408 — a terminal unreadable
+# token is indistinguishable to the orchestrator from a terminal `ci-failed`, so
+# the wake dispatches a `ci-debugging` fix worker at a GREEN tree. On PR #1420 it
+# did exactly that at a head carrying three concluded green runs, which three
+# immediate re-probes all read as `ready`. Nothing hides behind the wait: a
+# durable red is readable, so the very next poll prints `ci-failed` and the
+# watcher exits on it. And the wait is BOUNDED — a rollup unreadable for the full
+# window exits `WATCH <PR> timeout ci-unreadable`, a distinct greppable string
+# that `.claude/commands/ralph-tick.md` carries the escalation policy for, so a
+# persistently unreadable lane escalates rather than being re-watched forever.
+readonly -a IN_FLIGHT_TOKENS=(pending awaiting-review main-not-green review-quota-exhausted ci-unreadable)
 
 # `gh pr view --json state` values that mean the PR no longer exists to watch.
 readonly MERGED_STATE="MERGED"

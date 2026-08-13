@@ -26,14 +26,18 @@
 #   error tolerance a pr-ready tooling failure (exit 2, empty stdout) or a
 #                   failed `gh` state lookup keeps the loop alive — transient
 #                   GitHub weather must not kill the watcher or fake a wake.
-#   in-flight set   FOUR tokens keep the watcher waiting, not two:
-#                   `main-not-green` (issue #1159) and
-#                   `review-quota-exhausted` (issue #1160) joined {pending,
-#                   awaiting-review}. Both are WAIT states — the lane is held
-#                   until `main`'s CI recovers, or until the reviewer's rate
-#                   limit window resets, and nothing the orchestrator can do
-#                   shortens either — so a watcher that exited on one would be
-#                   relaunched immediately and exit immediately again, forever.
+#   in-flight set   FIVE tokens keep the watcher waiting, not two:
+#                   `main-not-green` (issue #1159), `review-quota-exhausted`
+#                   (issue #1160) and `ci-unreadable` (issue #1408) joined
+#                   {pending, awaiting-review}. All three are WAIT states — the
+#                   lane is held until `main`'s CI recovers, until the reviewer's
+#                   rate limit window resets, or until GitHub answers a rollup
+#                   query we can actually parse, and nothing the orchestrator can
+#                   do shortens any of them — so a watcher that exited on one
+#                   would be relaunched immediately and exit immediately again,
+#                   forever. `ci-unreadable` is the sharpest of the three: it is
+#                   terminal-vs-in-flight that decides whether an unreadable probe
+#                   costs one poll or a fix worker dispatched at a green tree.
 #
 # Run:  bash scripts/ralph/test_watch_pr.sh
 set -euo pipefail
@@ -241,6 +245,58 @@ out="$(TOKENS="review-quota-exhausted" run_watch 119 0.2 1)" || rc=$?
 check "review-quota-exhausted alone times out as a wait state" \
   "WATCH 119 timeout review-quota-exhausted" "$out"
 check "review-quota-exhausted timeout exits 0" "0" "$rc"
+
+# --- THE SAME BUSY-WAKE PIN, FOR `ci-unreadable` (issue #1408) ---------------
+# This token means "pr-ready.sh could not READ the check rollup" — the probe
+# errored, or answered a shape it could not reconcile with `gh pr checks` having
+# exited non-zero. That is a statement about the PROBE, not about the tree, and
+# like the two above it is a WAIT: the remedy is the next poll, and nothing the
+# orchestrator can do makes GitHub answerable any sooner.
+#
+# Leaving it OUT of IN_FLIGHT_TOKENS is not merely #1159's busy-wake — IT IS
+# ISSUE #1408 ITSELF, because a terminal unreadable token is indistinguishable to
+# the orchestrator from a terminal `ci-failed`: the watcher exits, that IS the
+# wake, and Step 2 dispatches a `ci-debugging` fix worker. On PR #1420 it did that
+# at a head carrying three CONCLUDED GREEN runs; three immediate re-probes all
+# read `ready` and the PR merged normally. So this case is the fix, not a
+# refinement of it, and it is what makes the token non-terminal.
+rc=0
+out="$(TOKENS="ci-unreadable,ci-unreadable,ready" run_watch 121)" || rc=$?
+check "ci-unreadable is in-flight; ready wakes" "WATCH 121 ready" "$out"
+check "ci-unreadable busy-wake pin exits 0" "0" "$rc"
+check "ci-unreadable busy-wake pin polled exactly 3 times (never woke early)" "3" \
+  "$(polls 121)"
+
+# THE SAFETY DIRECTION, and the answer to the only real objection to #1408: does
+# a non-terminal token let a genuine failure HIDE? No. `ci-unreadable` is only
+# ever the answer to a poll that could not be read; the moment one CAN be read and
+# the tree really is red, pr-ready.sh says `ci-failed`, which is still terminal,
+# so the watcher wakes and the lane is debugged. The new token can delay a fix
+# worker by one poll interval. It cannot cancel one — and a token that could would
+# be a worse bug than the one #1408 closes.
+out="$(TOKENS="ci-unreadable,ci-failed" run_watch 122)"
+check "a durable red surfaces on the next readable poll" "WATCH 122 ci-failed" "$out"
+check "ci-unreadable → ci-failed case polled exactly twice" "2" "$(polls 122)"
+
+# THE RESIDUAL RISK, AND WHAT BOUNDS IT (#1408 §6). The argument above rests on
+# "the next poll can be read". If the rollup probe fails PERSISTENTLY — a dead
+# token, a GitHub outage, a `--jq` that throws — every poll answers
+# `ci-unreadable` and the lane never becomes terminal on its own. That is a stall
+# traded for an over-dispatch, and a stall with no escalation would be a new
+# failure mode rather than a fix.
+#
+# This is the assertion that bounds it: the watch times out like any other wait
+# state, exits 0, and carries the token out with it as the distinct, greppable
+# string `timeout ci-unreadable`. `.claude/commands/ralph-tick.md` carries the
+# matching orchestrator policy for that string — that a persistently unreadable
+# lane escalates rather than being re-watched forever — and test_pr_ready.sh's
+# #1408 documentation block asserts the policy is written down. This case is what
+# makes the string it routes on real.
+rc=0
+out="$(TOKENS="ci-unreadable" run_watch 123 0.2 1)" || rc=$?
+check "ci-unreadable alone times out as a wait state" \
+  "WATCH 123 timeout ci-unreadable" "$out"
+check "ci-unreadable timeout exits 0" "0" "$rc"
 
 # --- gone: a merged/closed PR ends the watch --------------------------------
 rc=0
