@@ -116,14 +116,28 @@ repos:
   rev: v2.3.1
   hooks:
   - id: refurb
-- repo: https://github.com/jendrikseipp/vulture
-  rev: v2.10
+# Local hook: the dead-code gate (issue #1395). Was the upstream
+# jendrikseipp/vulture repo at rev v2.10 with `--min-confidence 80` over
+# creek-tools/creek/ — a check that could not fail, because vulture scores
+# unused functions/methods/classes at 60%. It also pinned 2.10 while
+# uv.lock resolves 2.16, so the hook and the rest of the toolchain ran
+# different versions. Routing through the wrapper removes both problems:
+# one policy, one version (whatever uv.lock installs), no threshold to
+# drift. `language: system` for the same reason as pylint-fast below.
+- repo: local
   hooks:
   - id: vulture
-    args:
-    - creek-tools/creek/
-    - --min-confidence
-    - '80'
+    name: vulture (dead code, per-type confidence floors)
+    entry: creek-tools/scripts/lint-vulture.sh
+    language: system
+    types: [python]
+    # The gate fixes its own scan scope; passing staged filenames would
+    # narrow it and reopen the hole this hook exists to close.
+    pass_filenames: false
+    # `scripts/` is in the trigger list because lint_vulture.py is the
+    # policy: editing a floor or a carve-out must re-run the gate, not
+    # wait for the next commit that happens to touch creek/.
+    files: ^creek-tools/(creek|creek_mcp|tests|scripts)/
 - repo: https://github.com/econchick/interrogate
   rev: 1.7.0
   hooks:

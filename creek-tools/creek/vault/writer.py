@@ -1911,30 +1911,6 @@ class VaultWriter:
         )
         raise RuntimeError(msg)
 
-    def _generate_filename(self, model: BaseModel, target_dir: Path) -> str:
-        """Return a unique filename for *model* under *target_dir*.
-
-        Retained for tests and tooling that introspect the writer; the
-        production path uses :meth:`_atomic_create` directly to avoid
-        the TOCTOU window between filename selection and file creation.
-        New callers should prefer :meth:`_atomic_create`.
-
-        Args:
-            model: The model to generate a filename for.
-            target_dir: The directory where the file will be written.
-
-        Returns:
-            A unique filename string ending in ``.md``.
-        """
-        base_name = self._compute_base_name(model)
-        filename = f"{base_name}.md"
-        if not (target_dir / filename).exists():
-            return filename
-        counter = 1
-        while (target_dir / f"{base_name}-{counter}.md").exists():
-            counter += 1
-        return f"{base_name}-{counter}.md"
-
     def _log_provenance_locked(
         self,
         model_id: str,
@@ -1969,13 +1945,3 @@ class VaultWriter:
                 "written_at": datetime.now(tz=UTC).isoformat(),
             },
         )
-
-    def _log_provenance(
-        self,
-        model_id: str,
-        model_type: str,
-        file_path: Path,
-    ) -> None:
-        """Backwards-compatible shim for callers that bypass ``_write_model``."""
-        with self._lock:
-            self._log_provenance_locked(model_id, model_type, file_path)

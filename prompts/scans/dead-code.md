@@ -26,12 +26,20 @@ decision-needed). A run that finds none is a valid, successful, zero-issue run.
 - Note vulture's confidence percentage per hit (run from `creek-tools/`):
 
   ```bash
-  cd creek-tools && uv run vulture creek creek_mcp
+  ./scripts/lint-vulture.sh
   ```
 
-  Sweep `crawdad/crawdad` too (`uv run vulture ../crawdad/crawdad`). The repo
-  may carry a vulture allowlist / config in `pyproject.toml` — respect it; an
-  allowlisted symbol is not a finding.
+  Do not run the raw `vulture` binary directly — at its default settings it
+  skips the repo's per-type confidence floors (see
+  `creek-tools/scripts/lint_vulture.py`'s module docstring), so its findings
+  will not match what the gate reports.
+
+  Sweep `crawdad/crawdad` too (`uv run vulture ../crawdad/crawdad`); crawdad
+  is out of the gate's scope entirely, so its findings are un-triaged, not
+  filtered by any policy. There is no vulture allowlist anywhere in this
+  repo, and none is planned — a symbol the gate spares is spared
+  categorically (a framework registers it, or the language itself invokes
+  it), never by name. The remedy for a real finding is deletion.
 - Dependencies: cross-check unused entries in `creek-tools/pyproject.toml`
   (runtime deps and the dev extra, pinned in `creek-tools/uv.lock`) and
   crawdad's package config.
