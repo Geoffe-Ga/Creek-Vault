@@ -127,6 +127,29 @@ declares openai as a base dependency, while creek-tools declares it
 in ``[project.optional-dependencies].openai``, so the two
 ``_openai_specifier()`` helpers read different TOML tables by design.
 
+``setuptools`` (issue #1258): setuptools 81.0.0 carries PYSEC-2026-3447
+(CVE-2026-59890, GHSA-h35f-9h28-mq5c — path traversal in the
+``PackageIndex`` download path), fixed in 83.0.0. Unlike every other
+floor in this file it does *not* live in
+``[tool.uv].constraint-dependencies``, and deliberately so: crawdad's
+runtime graph has no setuptools consumer at all (``grep -c 'name =
+"setuptools"' crawdad/uv.lock`` reports 0, against 3 in creek-tools'
+lock), so a constraint here would tighten the resolution of a package
+that is never resolved — the DEP-003 precedent explicitly covers
+packages *already in the graph*. The one surface that does name
+setuptools is ``[build-system].requires``, which governs the isolated
+environment the build backend runs in, and it sat at ``>=68.0``:
+admitting 81.0.0 itself, the exact release the advisory is filed
+against. That is the surface guarded below, bounded to
+``>=83.0.0,<85.0.0``. 84.0.0 is the vetted release — the newest one
+reviewed for this band, and what creek-tools' lock resolves; crawdad's
+lock has no setuptools entry to resolve. setuptools versions under
+SemVer, so ``<85.0.0`` still admits every future 84.x patch, including
+the next security fix, while the unreleased major waits for a
+deliberate adoption. The guard discovers the declarations rather than
+naming them, so if crawdad ever gains a setuptools consumer and a
+constraint beside it, the new surface is covered the day it is added.
+
 Two independent guards per package:
 
 * **pyproject floor** — the declared specifier must reject the last
@@ -159,8 +182,9 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from packaging.requirements import Requirement
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import SpecifierSet
+from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -198,6 +222,63 @@ _PYTHON_MULTIPART_PATCHED_VERSION = Version("0.0.31")
 #: First starlette release with both advisories fixed; 1.3.0 fixed
 #: only PYSEC-2026-248, leaving PYSEC-2026-249 open until 1.3.1.
 _STARLETTE_PATCHED_VERSION = Version("1.3.1")
+
+#: First setuptools release containing the fix for PYSEC-2026-3447
+#: (CVE-2026-59890 / GHSA-h35f-9h28-mq5c — path traversal in the
+#: ``PackageIndex`` download path). Held identical to creek-tools'
+#: floor: the two projects build with the same backend and letting
+#: them admit different setuptools bands is the split this pin
+#: prevents.
+_SETUPTOOLS_PATCHED_VERSION = Version("83.0.0")
+
+#: The release the advisory is filed against, and the one
+#: ``[build-system].requires = ["setuptools>=68.0"]`` still admits
+#: today. crawdad's lock never mentions setuptools, so the build
+#: backend's own resolve is the *only* thing standing between this
+#: release and a build — there is no lockfile assertion to fall back
+#: on here.
+_SETUPTOOLS_LAST_VULNERABLE = Version("81.0.0")
+
+#: The vetted setuptools release: the newest one reviewed for this
+#: band, and what creek-tools' lock resolves. crawdad's ``uv.lock``
+#: has no setuptools entry at all, so the band is asserted against the
+#: vetted release rather than a locked one — but it is still asserted
+#: from both ends, since a ceiling that excluded the release the
+#: backend actually installs would break every build.
+_SETUPTOOLS_LOCKED_VERSION = Version("84.0.0")
+
+#: The next major — unreleased, so no changelog has been read and no
+#: build has run against it. setuptools has removed long-deprecated
+#: surfaces at majors before (``setup.py test``, ``easy_install``, the
+#: bundled distutils shim), so the ceiling holds it for a deliberate
+#: adoption exactly as mcp is held at <2.0.0.
+_SETUPTOOLS_UNVETTED_MAJOR = Version("85.0.0")
+
+#: A far-future major. Probes for a lazy ``!=85.0.0`` exclusion posing
+#: as a ceiling: that satisfies the assertion on 85.0.0 while
+#: re-admitting 85.0.1 and every later major. Only a probe well past
+#: the bound tells a real upper bound from a single-release exclusion.
+_SETUPTOOLS_FUTURE_MAJOR_PROBE = Version("999.0.0")
+
+#: Dotted paths of the tables whose lists hold PEP 508 requirement
+#: strings. The setuptools walk visits only these — see
+#: ``_setuptools_declarations`` for why walking the whole document
+#: would be a hazard rather than a thoroughness.
+_DEPENDENCY_TABLE_PATHS = frozenset(
+    {
+        "build-system.requires",
+        "project.dependencies",
+        "tool.uv.constraint-dependencies",
+        "tool.uv.build-constraint-dependencies",
+        "tool.uv.override-dependencies",
+    }
+)
+
+#: Dotted-path prefixes under which *every* child list declares
+#: dependencies: one list per extra in ``[project.optional-dependencies]``
+#: and one per group in ``[dependency-groups]``. Named as prefixes
+#: because the extra and group names are open-ended.
+_DEPENDENCY_TABLE_PREFIXES = ("project.optional-dependencies.", "dependency-groups.")
 
 #: The last rpds-py release on the abandoned SemVer line, and the
 #: version both locks were frozen at before issue #1185.
@@ -552,6 +633,137 @@ def _locked_starlette_version() -> Version:
         if package["name"] == "starlette":
             return Version(str(package["version"]))
     pytest.fail("starlette has no [[package]] entry in uv.lock")
+
+
+def _is_dependency_declaring(path: str) -> bool:
+    """Return whether a dotted TOML path names a dependency list.
+
+    Args:
+        path: Dotted path of a value in the parsed document, such as
+            ``build-system.requires``.
+
+    Returns:
+        ``True`` when a list at ``path`` holds PEP 508 requirement
+        strings — the fixed dependency tables, plus every extra under
+        ``[project.optional-dependencies]`` and every group under
+        ``[dependency-groups]``.
+    """
+    return path in _DEPENDENCY_TABLE_PATHS or path.startswith(
+        _DEPENDENCY_TABLE_PREFIXES
+    )
+
+
+def _setuptools_entries_at(
+    path: str, entries: list[object]
+) -> list[tuple[str, SpecifierSet]]:
+    """Return the ``setuptools`` requirements declared in one list.
+
+    Args:
+        path: Dotted path of the list, carried into every result pair so
+            a failing assertion can name the surface at fault.
+        entries: The list exactly as ``tomllib`` parsed it. Non-string
+            elements are skipped (``[dependency-groups]`` may hold
+            ``{include-group = "..."}`` inline tables), as is anything
+            ``packaging`` refuses to parse.
+
+    Returns:
+        One ``(path, specifier)`` pair per ``setuptools`` entry, matched
+        on the canonical (PEP 503) name so ``Setuptools`` or
+        ``SETUPTOOLS`` cannot slip past the comparison.
+    """
+    found: list[tuple[str, SpecifierSet]] = []
+    for entry in entries:
+        if not isinstance(entry, str):
+            continue
+        try:
+            requirement = Requirement(entry)
+        except InvalidRequirement:
+            continue
+        if canonicalize_name(requirement.name) == "setuptools":
+            found.append((path, requirement.specifier))
+    return found
+
+
+def _walk_for_setuptools(
+    node: object, path: str, found: list[tuple[str, SpecifierSet]]
+) -> None:
+    """Accumulate the ``setuptools`` declarations reachable from *node*.
+
+    List elements are walked under the *same* dotted path, because an
+    array of tables (``[[tool.mypy.overrides]]``) gives every one of its
+    entries that single path — which is also why the result is a list of
+    pairs rather than a mapping keyed by path.
+
+    Args:
+        node: A parsed TOML value. Typed ``object`` and narrowed with
+            ``isinstance`` so ``tomllib``'s ``Any`` cannot leak into the
+            annotated return of ``_setuptools_declarations`` under
+            mypy's ``warn_return_any``.
+        path: Dotted path of ``node``; the empty string at the document
+            root.
+        found: Accumulator, appended to in place.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            child = f"{path}.{key}" if path else str(key)
+            _walk_for_setuptools(value, child, found)
+        return
+    if not isinstance(node, list):
+        return
+    if _is_dependency_declaring(path):
+        found.extend(_setuptools_entries_at(path, node))
+    for element in node:
+        _walk_for_setuptools(element, path, found)
+
+
+def _setuptools_declarations() -> list[tuple[str, SpecifierSet]]:
+    """Return every ``setuptools`` requirement ``pyproject.toml`` declares.
+
+    setuptools can be declared on two independent surfaces:
+    ``[tool.uv].constraint-dependencies``, which governs the resolution
+    graph behind ``uv.lock``, and ``[build-system].requires``, which
+    governs the isolated environment the build backend runs in. crawdad
+    uses only the second — nothing in its runtime graph consumes
+    setuptools, so there is no resolution to constrain — and nothing in
+    this file read ``[build-system]`` before issue #1258, which is how
+    ``setuptools>=68.0`` sat here admitting the PYSEC-2026-3447 release
+    unremarked. Discovering the declarations beats naming them: if a
+    consumer and a constraint ever appear, the new surface is guarded
+    the day it is added.
+
+    The walk is deliberately *restricted* to dependency-declaring table
+    paths instead of reading every list in the document. An
+    unrestricted walk parses every string in the file — well over a
+    hundred, across two dozen table paths — including the ``module``
+    lists of this pyproject's ``[[tool.mypy.overrides]]`` entries. Those
+    are module patterns, not requirements: a pattern like
+    ``setuptools.*`` raises ``InvalidRequirement`` and is skipped
+    harmlessly, but the bare form ``module = ["setuptools"]`` parses
+    cleanly into a requirement with an *empty* specifier, and an empty
+    ``SpecifierSet`` admits 81.0.0. A future mypy override written that
+    way would then fail the parity guard with a security verdict about
+    a line that has nothing to do with dependency resolution — a false
+    alarm that teaches the next reader to distrust the guard.
+    Restricted, the walk finds exactly ``build-system.requires``.
+
+    One boundary is worth stating because it is invisible from here:
+    this walk only reads PEP 508 requirement strings, so it cannot see
+    a ``[tool.uv.sources]`` entry, which redirects a dependency to a
+    git/path/URL source and bypasses version specifiers entirely.
+    Neither project declares that table today; if one ever does, this
+    guard does not cover it and a separate assertion is needed.
+
+    Returns:
+        One ``(dotted path, specifier)`` pair per declaration, in
+        document order. A list rather than a mapping because
+        array-of-tables entries share a dotted path and a mapping would
+        silently drop all but the last of them.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    found: list[tuple[str, SpecifierSet]] = []
+    _walk_for_setuptools(pyproject, "", found)
+    return found
 
 
 def _security_script_commands() -> list[str]:
@@ -1045,6 +1257,80 @@ def test_locked_starlette_at_or_above_patched_release() -> None:
         "the exported lock is audited, so relock after adding the "
         "constraint"
     )
+
+
+def test_every_setuptools_declaration_carries_the_vetted_band() -> None:
+    """Every declared setuptools surface carries the same vetted band.
+
+    crawdad declares setuptools exactly once, in
+    ``[build-system].requires`` — the isolated environment the build
+    backend runs in. It gets no ``[tool.uv].constraint-dependencies``
+    entry because nothing in its runtime graph consumes setuptools
+    (``grep -c 'name = "setuptools"' crawdad/uv.lock`` reports 0), and
+    a constraint tightens the resolution of a package already in the
+    graph rather than putting one there. So the build surface is the
+    *whole* pin here: there is no lock assertion to fall back on, and
+    at ``>=68.0`` it admitted 81.0.0, the PYSEC-2026-3447 release
+    itself (#1258).
+
+    The guard discovers the declarations rather than naming them, so a
+    constraint added later — should crawdad ever gain a setuptools
+    consumer — is covered the day it appears. The count assertion is
+    what keeps that honest: a walk that returned nothing would
+    otherwise make the loop below vacuous and the test green.
+    """
+    declarations = _setuptools_declarations()
+    assert len(declarations) >= 1, (
+        f"the pyproject walk found {len(declarations)} setuptools "
+        f"declaration(s) ({declarations!r}); crawdad declares setuptools "
+        "in [build-system].requires, so an empty result means the walk is "
+        "broken, and a guard iterating an empty list passes while "
+        "checking nothing"
+    )
+    paths = {path for path, _ in declarations}
+    assert {"build-system.requires"} <= paths, (
+        f"the setuptools walk reached {sorted(paths)}, missing "
+        "build-system.requires — the surface that selects the setuptools "
+        "build backend, and the only one crawdad declares. Nothing else "
+        "bounds it: crawdad's uv.lock has no setuptools entry to audit "
+        "(#1258)"
+    )
+    for path, specifier in declarations:
+        assert str(_SETUPTOOLS_LAST_VULNERABLE) not in specifier, (
+            f"{path} declares setuptools {specifier!r}, which admits "
+            f"{_SETUPTOOLS_LAST_VULNERABLE} — the release carrying "
+            "PYSEC-2026-3447 / CVE-2026-59890, path traversal in the "
+            "PackageIndex download path. The build backend resolves this "
+            "surface live, so the floor must be "
+            f"{_SETUPTOOLS_PATCHED_VERSION} (#1258)"
+        )
+        assert str(_SETUPTOOLS_UNVETTED_MAJOR) not in specifier, (
+            f"{path} declares setuptools {specifier!r}, which admits "
+            f"{_SETUPTOOLS_UNVETTED_MAJOR}; that major is unreleased, so "
+            "no changelog has been read and no build has run against it. "
+            f"Carry the same <{_SETUPTOOLS_UNVETTED_MAJOR} ceiling "
+            "creek-tools carries (#1258)"
+        )
+        assert str(_SETUPTOOLS_FUTURE_MAJOR_PROBE) not in specifier, (
+            f"{path} declares setuptools {specifier!r}, which admits "
+            f"{_SETUPTOOLS_FUTURE_MAJOR_PROBE}; an exclusion of the one "
+            f"release (`!={_SETUPTOOLS_UNVETTED_MAJOR}`) reads like a "
+            "ceiling and is not one — it re-admits 85.0.1 and every later "
+            "major. Write a real upper bound (#1258)"
+        )
+        assert str(_SETUPTOOLS_PATCHED_VERSION) in specifier, (
+            f"{path} declares setuptools {specifier!r}, which rejects "
+            f"{_SETUPTOOLS_PATCHED_VERSION}, the first release carrying "
+            "the PYSEC-2026-3447 fix; the floor is 83.0.0 and no ceiling "
+            "may swallow it (#1258)"
+        )
+        assert str(_SETUPTOOLS_LOCKED_VERSION) in specifier, (
+            f"{path} declares setuptools {specifier!r}, which rejects "
+            f"{_SETUPTOOLS_LOCKED_VERSION}, the vetted release this band "
+            "was reviewed against and the one creek-tools' lock resolves; "
+            "a band that excludes the build the backend installs breaks "
+            "every build instead of failing here (#1258)"
+        )
 
 
 def test_security_script_audits_installed_environment() -> None:

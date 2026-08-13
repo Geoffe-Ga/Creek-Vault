@@ -66,8 +66,28 @@ dev = [
     "uv>=0.11.16",
 ]
 
+# setuptools is declared here and nowhere else in this file. This list
+# governs the PEP 518 isolated environment the build backend runs in —
+# a surface independent of [tool.uv].constraint-dependencies below,
+# which only governs the resolution graph behind uv.lock and provably
+# does not reach the backend (with the constraint bounded to <84.0.0 a
+# wheel build still ran setuptools 84.0.0; bounding this list produced
+# 83.0.0). crawdad gets no setuptools constraint entry because it has
+# nothing to constrain: `grep -c 'name = "setuptools"' crawdad/uv.lock`
+# reports 0, against 3 in creek-tools' lock, so crawdad has no runtime
+# or transitive setuptools consumer and the build backend is its only
+# setuptools surface. The floor is PYSEC-2026-3447 (CVE-2026-59890,
+# path traversal in the PackageIndex download path), fixed in 83.0.0;
+# `>=68.0` previously sat here admitting 81.0.0, the CVE release. The
+# ceiling is SemVer `<85.0.0` — 84.0.0 is vetted (its removals were
+# distutils C-compiler internals a pure-Python build never touches) and
+# every future 84.x patch still resolves freely, while 85.0.0 needs its
+# own review first. The band is held identical to creek-tools' two
+# setuptools surfaces; move them together. This bound never reaches
+# uv.lock, so its guard test in tests/test_dependency_pins.py is the
+# only thing holding it (#1258).
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=83.0.0,<85.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.uv]
