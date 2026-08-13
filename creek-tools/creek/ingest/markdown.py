@@ -7,6 +7,8 @@ take priority). Files without frontmatter receive fresh Creek frontmatter.
 
 Exports:
     MarkdownIngestor: Concrete ``Ingestor`` subclass for markdown files.
+    _enumerate_markdown_paths: Walk a directory for ``.md`` paths, reporting
+        every subtree it could not list.
     _detect_document_type: Classify content as journal, essay, technical, or notes.
     _infer_platform: Map document type and path to a ``SourcePlatform``.
     _merge_frontmatter: Merge Creek defaults with existing frontmatter.
@@ -15,6 +17,7 @@ Exports:
 from __future__ import annotations
 
 import logging
+import os
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -24,6 +27,7 @@ import frontmatter
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
+    PartialDiscoveryError,
     RawDocument,
     file_modified_time,
     normalize_encoding,
@@ -264,6 +268,69 @@ def _extract_authored_at_from_frontmatter(fm_data: dict[str, Any]) -> datetime |
     return None
 
 
+_MARKDOWN_SUFFIX = ".md"
+"""The one filename suffix this ingestor discovers, matched CASE-SENSITIVELY.
+
+``rglob("*.md")`` — the glob :func:`_enumerate_markdown_paths` replaces — is
+itself case-sensitive: measured on a case-insensitive APFS volume, a file
+named ``B.MD`` was matched by neither the glob nor this suffix test. So
+``name.lower().endswith(...)`` would not be a tidy-up, it would silently
+WIDEN what ingest picks up relative to every vault ingested before it.
+"""
+
+
+def _enumerate_markdown_paths(dir_path: Path) -> tuple[list[Path], list[str]]:
+    """List every ``.md`` path under *dir_path*, recording what it could not read.
+
+    ``os.walk(..., onerror=...)`` replaces ``Path.rglob("*.md")`` for exactly
+    one reason: ``rglob`` **swallows** a ``scandir`` failure, so a
+    subdirectory the process cannot list is indistinguishable from an empty
+    one, and the walk reports success with no documents. That is what let one
+    permission change silently orphan a whole corpus (#1444).
+
+    Parity with the glob it replaces is deliberate in three places:
+
+    * ``followlinks=False`` is what reproduces ``**``'s refusal to descend
+      through a symlinked directory. Do not change it.
+    * The suffix test is case-sensitive; see :data:`_MARKDOWN_SUFFIX`.
+    * The accumulated FULL paths are sorted once at the end, which is the
+      order ``sorted(dir_path.rglob("*.md"))`` produced. Sorting per-directory
+      basenames instead would not be the same order.
+
+    A real directory or a symlinked directory named ``*.md`` lands in the
+    walk's ``dirnames`` rather than its ``filenames``, so unlike the glob this
+    never offers one as a candidate — measured, and the reason the caller's
+    ``is_file()`` filter is now defence in depth rather than the only guard.
+
+    Args:
+        dir_path: Directory to walk.
+
+    Returns:
+        A tuple of (sorted candidate paths, one reason per unlistable
+        subtree). An empty reasons list means the enumeration saw the whole
+        tree.
+    """
+    reasons: list[str] = []
+
+    def _record(error: OSError) -> None:
+        """Record a subtree the walk could not list, then let it walk on.
+
+        Args:
+            error: The ``scandir`` failure, whose ``filename`` is the path
+                that could not be listed.
+        """
+        reasons.append(f"cannot list {error.filename}: {error}")
+
+    found: list[Path] = []
+    for parent, _dirnames, filenames in os.walk(
+        dir_path, onerror=_record, followlinks=False
+    ):
+        for name in filenames:
+            if name.endswith(_MARKDOWN_SUFFIX):
+                found.append(Path(parent) / name)
+    return sorted(found), reasons
+
+
 # ---- MarkdownIngestor ----
 
 
@@ -280,14 +347,20 @@ class MarkdownIngestor(Ingestor):
         """Find all ``.md`` files at the given source path (recursively).
 
         If ``source_path`` is a file, returns a single-element list for
-        that file. If it is a directory, recursively globs for ``*.md``.
-        If the path does not exist, returns an empty list.
+        that file. If it is a directory, it is walked recursively for
+        ``*.md``. If the path does not exist, returns an empty list.
 
         Args:
             source_path: A file or directory path to search.
 
         Returns:
             A list of ``RawDocument`` objects for each discovered file.
+
+        Raises:
+            PartialDiscoveryError: When the directory walk could not list some
+                subtree or could not read some candidate file. Carries the
+                documents it did read, so the caller keeps the harvest
+                while learning the enumeration was incomplete (#1444).
         """
         if not source_path.exists():
             return []
@@ -320,23 +393,52 @@ class MarkdownIngestor(Ingestor):
     def _read_directory(self, dir_path: Path) -> list[RawDocument]:
         """Recursively discover all .md files in a directory.
 
+        Two passes, because they fail in different ways and both failures
+        matter: enumeration answers "which subtrees could be listed", reading
+        answers "which candidates could be opened". Either can come back
+        partial, and a partial pass reports itself by raising
+        :class:`~creek.ingest.base.PartialDiscoveryError` **carrying everything it
+        did read** — so an unreadable corner of the tree costs the tombing
+        pass and never the ingest (#1444).
+
         Args:
             dir_path: Directory path to search.
 
         Returns:
-            A list of RawDocument objects for each .md file found.
+            A list of RawDocument objects for each .md file read.
+
+        Raises:
+            PartialDiscoveryError: When any subtree could not be listed or any
+                candidate file could not be read. Carries the documents that
+                *were* read plus one reason per failure.
         """
+        candidates, reasons = _enumerate_markdown_paths(dir_path)
         docs: list[RawDocument] = []
-        for md_file in sorted(dir_path.rglob("*.md")):
-            # Alone among the ingestors this walk had no ``is_file()`` filter,
-            # so a directory or a dangling link named ``*.md`` reached
-            # ``read_bytes()`` and raised. ``_discover_safe`` would collect
-            # that and return ``[]``, which arms ``tomb_missing_units`` — one
-            # unreadable entry would orphan the whole source. Robustness fix
-            # alongside #1294's containment gate, not the containment fix.
-            if not md_file.is_file():
+        for md_file in candidates:
+            # Defence in depth (#1378): ``*.md`` also matches a real directory
+            # and a dangling symlink, and ``read_bytes()`` on either raises.
+            # Skipping them keeps an ordinary junk entry from being reported
+            # as an unreadable part of the source. It is no longer what stands
+            # between one bad entry and a buried corpus — that is
+            # ``IngestResult.discovery_complete``'s job, which disarms the
+            # tomb sweep for any pass that could not see the whole source
+            # (#1444).
+            #
+            # ``is_file()`` is inside the ``try`` with the read, not before
+            # it. ``Path.is_file()`` swallows ENOENT/ENOTDIR/EBADF/ELOOP but
+            # NOT EACCES, so a permission failure from its internal ``stat``
+            # — an ancestor's execute bit revoked between the enumeration
+            # above and this entry — would otherwise escape ``_read_directory``
+            # entirely, past the ``raise`` below, and discard every document
+            # already read. The harvest survives a bad entry uniformly or the
+            # guarantee is not one.
+            try:
+                if not md_file.is_file():
+                    continue
+                raw_bytes = md_file.read_bytes()
+            except OSError as exc:
+                reasons.append(f"cannot read {md_file}: {exc}")
                 continue
-            raw_bytes = md_file.read_bytes()
             _text, encoding = normalize_encoding(raw_bytes)
             docs.append(
                 RawDocument(
@@ -346,6 +448,8 @@ class MarkdownIngestor(Ingestor):
                     detected_encoding=encoding,
                 )
             )
+        if reasons:
+            raise PartialDiscoveryError(docs, reasons)
         return docs
 
     def parse(self, raw: RawDocument) -> list[ParsedFragment]:

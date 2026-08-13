@@ -1964,23 +1964,47 @@ def test_the_containment_walk_visits_each_directory_once(
 def test_an_unreadable_markdown_entry_does_not_tomb_the_whole_source(
     tmp_path: Path,
 ) -> None:
-    """A dangling in-tree ``*.md`` link must not orphan every fragment.
+    """A dangling in-tree ``*.md`` link must be skipped SILENTLY, not reported.
 
     Mutation survivor: deleting ``MarkdownIngestor._read_directory``'s
     ``is_file()`` filter left the suite green, because every other fixture
     here either refuses before discovery or contains only readable files.
 
-    The filter is not cosmetic. ``rglob("*.md")`` yields directories and
-    dangling links as readily as files, and that walk — alone among the
-    eleven ingestors — called ``read_bytes()`` on whatever it got. The raise
-    lands in ``_discover_safe``, which collects it and returns ``[]``; an
-    empty discovery leaves ``seen_keys`` empty; and ``tomb_missing_units``
-    then soft-tombs every live ledger key. So one stale alias inside the
-    source silently orphans every fragment previously ingested from it.
+    The filter is not cosmetic. The directory walk yields dangling links as
+    readily as files, and that walk — alone among the eleven ingestors —
+    called ``read_bytes()`` on whatever it got. The raise lands in
+    ``_discover_safe``, which collects it and returns ``[]``; an empty
+    discovery leaves ``seen_keys`` empty; and ``tomb_missing_units`` then
+    soft-tombs every live ledger key. So one stale alias inside the source
+    silently orphaned every fragment previously ingested from it.
 
     This is the same failure the containment refusal is routed around,
     reached through a path containment deliberately admits: the link points
     *inside* the root, so there is nothing to refuse.
+
+    ---------------------------------------------------------------------
+    Why the vault assertions alone stopped being enough (#1444)
+    ---------------------------------------------------------------------
+    #1444 gave ``IngestResult`` a ``discovery_complete`` flag and made an
+    incomplete discovery disarm the tomb sweep. That closes the *orphaning*
+    consequence of deleting the ``is_file()`` filter as well — so with only
+    ``_vault_orphans(vault) == []`` and ``_vault_fragments(vault) == before``
+    to check, **this test passed on the very mutant it was written to kill**
+    (measured: 1 passed). The new gate caught what the filter used to.
+
+    So the assertions moved to what is still uniquely the filter's job. A
+    dangling in-tree link is an ordinary, expected thing to find in a source
+    tree; it is *not* a part of the source the run failed to see. The filter
+    is what keeps that distinction, and deleting it now routes the link
+    through ``PartialDiscoveryError`` instead: ``second.errors`` gains a "cannot
+    read" line, ``second.warnings`` gains an incomplete-discovery advisory,
+    and the operator is told their source is damaged when nothing is wrong.
+    Both of those are asserted empty here, and either one kills the mutant.
+
+    ``second.unchanged == 3`` is the anti-vacuity companion, verified
+    empirically rather than assumed: it pins that all three fragments were
+    genuinely re-examined on the second pass, so "no errors" cannot be
+    satisfied by a run that quietly did nothing.
 
     Args:
         tmp_path: Pytest-provided temporary directory.
@@ -2025,4 +2049,25 @@ def test_an_unreadable_markdown_entry_does_not_tomb_the_whole_source(
     assert _vault_fragments(vault) == before, (
         "the live fragment set changed after re-ingesting an unchanged "
         f"source.\n\nbefore={before}\nafter={_vault_fragments(vault)}"
+    )
+    assert second.unchanged == 3, (
+        "the second pass did not re-examine all three fragments, so the "
+        "'no errors' assertion below would be satisfied by a run that "
+        "quietly did nothing.\n\n"
+        f"unchanged={second.unchanged} written={second.written} "
+        f"discovered={second.discovered} errors={second.errors}"
+    )
+    assert second.errors == [], (
+        "a dangling in-tree link was reported as a part of the source that "
+        "could not be read. is_file() must skip it silently: it is an "
+        "ordinary stale alias, not damage, and routing it through "
+        "PartialDiscoveryError tells the operator their source is broken when "
+        f"nothing is.\n\nerrors={second.errors}"
+    )
+    assert second.warnings == [], (
+        "an incomplete-discovery advisory fired for a dangling in-tree "
+        "link. The #1444 gate is for parts of the source the walk genuinely "
+        "could not see; a link with no target is not one of them, and "
+        "warning every run would train the operator to ignore the advisory "
+        f"that matters.\n\nwarnings={second.warnings}"
     )

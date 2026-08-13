@@ -158,11 +158,18 @@ from most to least likely:
   well as `filenames`, which is what closes that. One consequence
   worth recording because it was nearly the opposite of a fix:
   ingestion's refusal must propagate out of `Ingestor.ingest` rather
-  than being collected by `_discover_safe`, because an empty
-  discovery leaves `run_ingest`'s `seen_keys` empty and
-  `tomb_missing_units` then soft-tombs every live ledger key — one
-  stray link would have orphaned every fragment previously ingested
-  from that source. One further defect surfaced only on Python 3.13
+  than being collected by `_discover_safe`. At the time the reason was
+  a destructive one — an empty discovery left `run_ingest`'s
+  `seen_keys` empty and `tomb_missing_units` soft-tombed every live
+  ledger key, so one stray link would have orphaned every fragment
+  previously ingested from that source. **That mechanism is closed as
+  of #1444**: `_discover_safe` now clears
+  `IngestResult.discovery_complete` on every failure arm, and the tomb
+  sweep refuses to run on a pass that could not enumerate its whole
+  source, because absence cannot be proven from a partial walk. The
+  rule itself stands on its own footing regardless: a containment
+  refusal must be *refused*, not degraded into a partial pass that
+  proceeds. One further defect surfaced only on Python 3.13
   and is recorded because the mechanism generalises: the predicate
   resolved with `Path.resolve(strict=False)`, whose behaviour on a
   symlink **cycle** pathlib never specified. On 3.11/3.12 it raises
