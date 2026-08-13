@@ -42,9 +42,11 @@ import yaml
 from pydantic import BaseModel, Field
 
 from creek.ingest.journal_staging import ADEPTHOOD_STAGING_RELDIRS
+from creek.ingest.ledger import forget_fragment_ids
 from creek.ingest.source_unit import split_source_unit
 from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog, PurgeOutcomeStatus
 from creek.purge.dryrun import DryRunLedger
+from creek.purge.meta import META_RELDIR, sweep_unkept_meta
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -366,6 +368,24 @@ class PurgeResult(BaseModel):
             :attr:`fragments_affected`: these are derived copies, not
             fragments, and the same rule already governs
             :attr:`journal_staged_removed`.
+        ledger_rows_removed: Number of ingest-ledger **rows** physically
+            erased from ``00-Creek-Meta/State/ingest/*.jsonl`` because
+            they named a purged fragment, or named a source unit a
+            purged fragment came from (#1453). Rows, not files: one
+            source unit accumulates an appended row per ingest, so a
+            single erased fragment routinely takes several rows with it,
+            and the count an operator needs is of *mappings destroyed*.
+            Set by the scoped purges only — a whole-vault purge destroys
+            the ledger files outright, where they are counted as files
+            on :attr:`meta_artifacts_removed` instead of being counted
+            twice.
+        meta_artifacts_removed: Number of **files** destroyed by the
+            deny-by-default sweep of ``00-Creek-Meta/`` during a
+            whole-vault purge (#1453). Files, not rows: the sweep does
+            not read what it deletes, and cannot — its whole premise is
+            that it need not understand a future artifact to refuse to
+            let it survive an erasure. Zero for every scoped purge,
+            which sweeps nothing.
         voice_body_undecodable: Ids of the purged fragments whose body
             could not be decoded as strict UTF-8, so the content-keyed
             ``<register>-profile.md`` pass could not run for them
@@ -392,6 +412,8 @@ class PurgeResult(BaseModel):
     intimate_stubs_removed: int = 0
     journal_staged_removed: int = 0
     voice_artifacts_removed: int = 0
+    ledger_rows_removed: int = 0
+    meta_artifacts_removed: int = 0
     voice_body_undecodable: list[str] = Field(default_factory=list)
 
     @property
@@ -516,9 +538,7 @@ class PurgeEngine:
                 self._ledger.mark_removed(frag_file)
             else:
                 frag_file.unlink()
-            result.embeddings_removed = self._purge_cache_for(
-                result.affected_fragment_ids,
-            )
+            self._purge_scoped_tail(result)
 
         return self._run_audited(result, body)
 
@@ -546,9 +566,7 @@ class PurgeEngine:
             matches = self._fragments_from_source(source_type)
             for frag_file, post in matches:
                 self._purge_single(frag_file, post, result)
-            result.embeddings_removed = self._purge_cache_for(
-                result.affected_fragment_ids,
-            )
+            self._purge_scoped_tail(result)
 
         return self._run_audited(result, body)
 
@@ -600,9 +618,7 @@ class PurgeEngine:
             matches = self._fragments_from_source_path(source_path, match=match)
             for frag_file, post in matches:
                 self._purge_single(frag_file, post, result)
-            result.embeddings_removed = self._purge_cache_for(
-                result.affected_fragment_ids,
-            )
+            self._purge_scoped_tail(result)
 
         return self._run_audited(result, body)
 
@@ -703,9 +719,7 @@ class PurgeEngine:
                 if created is None or not (start <= created <= end):
                     continue
                 self._purge_single(frag_file, post, result)
-            result.embeddings_removed = self._purge_cache_for(
-                result.affected_fragment_ids,
-            )
+            self._purge_scoped_tail(result)
 
         return self._run_audited(result, body)
 
@@ -776,6 +790,7 @@ class PurgeEngine:
                     continue
                 self._wipe_folder_contents(folder_path, result)
             self._wipe_adepthood_staging(result)
+            self._wipe_meta_artifacts(result)
             result.fragments_affected = census.file_count
             result.affected_fragment_ids.extend(census.fragment_ids)
             result.embeddings_removed = self._delete_cache_file()
@@ -933,6 +948,86 @@ class PurgeEngine:
             embeddings_cache_path(self.vault_path),
             dry_run=self.dry_run,
         )
+
+    def _purge_scoped_tail(self, result: PurgeResult) -> None:
+        """Run the erasure passes every *scoped* purge owes (#1453).
+
+        Ordering is load-bearing and runs against intuition: the ledger
+        erasure goes **first**, the embedding-cache scrub second. A
+        corrupt ``embeddings.parquet`` raises an unhandled
+        ``ArrowInvalid`` out of the cache layer and aborts the whole
+        operation, so a cache scrub sequenced first lets an unreadable
+        derived file veto the right-to-be-forgotten work — the erasure
+        that actually matters is the one that must not be skippable.
+
+        Deliberately **not** called from :meth:`purge_classifications`.
+        A classification reset deletes nothing; wiping its ledger rows
+        would make the next ingest re-mint an id for every unchanged
+        file in the vault, which is a behaviour change dressed up as a
+        privacy fix.
+
+        Args:
+            result: Result accumulator. ``ledger_rows_removed`` and
+                ``embeddings_removed`` are both set from it.
+        """
+        result.ledger_rows_removed = forget_fragment_ids(
+            self.vault_path,
+            result.affected_fragment_ids,
+            dry_run=self.dry_run,
+        )
+        result.embeddings_removed = self._purge_cache_for(
+            result.affected_fragment_ids,
+        )
+
+    def _wipe_meta_artifacts(self, result: PurgeResult) -> None:
+        """Sweep everything unkept out of ``00-Creek-Meta/`` (#1453).
+
+        ``purge_vault`` wipes the ten numbered content folders and used
+        to leave this directory whole, so a whole-vault erasure left
+        behind the ingest ledger, the provenance log's title-derived
+        paths, the consent log, the dedup manifest's content-hash → id
+        oracle and the Discord capture-staging plaintext. The policy
+        (and the reason for each survivor) lives in
+        :mod:`creek.purge.meta`; this method is only the engine's half
+        of the wiring.
+
+        Called strictly **before** :meth:`_delete_cache_file`, which
+        raises an unhandled ``ArrowInvalid`` on a corrupt parquet (#1480)
+        — a sweep sequenced after it would inherit that abort and the
+        erasure would not happen at all.
+
+        Swept paths are counted but deliberately **not** appended to
+        ``deleted_files``, following the ``journal_staged_removed``
+        precedent — and here the separation is load-bearing rather than
+        merely consistent. ``deleted_files`` is copied into the audit
+        entry and the MCP payload, both of which outlive the purge, and
+        some of these paths are themselves identifying:
+        ``State/discord/capture-staging/messages/<channel>/messages.json``
+        names a channel. Writing the roster of destroyed artifacts into
+        the one file the erasure preserves would re-create a smaller
+        version of the leak being closed.
+
+        Args:
+            result: Result accumulator; ``meta_artifacts_removed`` is
+                set to the number of files destroyed (counted-only in a
+                dry run).
+        """
+        result.meta_artifacts_removed = sweep_unkept_meta(
+            self.vault_path / META_RELDIR,
+            skip=self._skip_as_removed,
+            remove=self._remove_meta_artifact,
+        )
+
+    def _remove_meta_artifact(self, path: Path) -> None:
+        """Destroy one swept ``00-Creek-Meta/`` file, or pretend to.
+
+        Args:
+            path: The file the sweep has decided against.
+        """
+        if self.dry_run:
+            self._ledger.mark_removed(path)
+            return
+        path.unlink()
 
     def _purge_single(
         self,
@@ -1619,7 +1714,15 @@ class PurgeEngine:
                 if not staged_file.is_file():
                     continue
                 result.journal_staged_removed += 1
-                if not self.dry_run:
+                if self.dry_run:
+                    # The meta sweep walks this same directory a moment
+                    # later. Without the mark it meets a file this pass
+                    # only *pretended* to unlink and counts it a second
+                    # time, so the preview over-reports against its own
+                    # apply twin — the one thing a preview of an
+                    # irreversible erasure must never do (#1340).
+                    self._ledger.mark_removed(staged_file)
+                else:
                     staged_file.unlink(missing_ok=True)
 
     def _find_fragment_by_id(
@@ -2220,6 +2323,8 @@ class PurgeEngine:
             intimate_stubs_removed=result.intimate_stubs_removed,
             journal_staged_removed=result.journal_staged_removed,
             voice_artifacts_removed=result.voice_artifacts_removed,
+            ledger_rows_removed=result.ledger_rows_removed,
+            meta_artifacts_removed=result.meta_artifacts_removed,
             dry_run=result.dry_run,
             phase="outcome",
             operation_id=operation_id,

@@ -5005,3 +5005,626 @@ def test_the_deleted_files_table_is_capped_and_says_how_many_it_hid(
     assert paths[-1] not in out
     assert sum(1 for path in paths if path in out) == _MAX_DELETED_FILE_ROWS
     assert f"{hidden} more" in out
+
+
+# ---------------------------------------------------------------------------
+# Ingest-ledger erasure and the deny-by-default 00-Creek-Meta sweep (#1453)
+# ---------------------------------------------------------------------------
+
+_LEDGER_HASH = "e29568dd0772c2a8ac12fc4a677d3b6a678baa35f8b17fe0f7c76b59dacd3335"
+"""A full unsalted SHA-256, the shape the ledger really stores."""
+
+
+def _write_ledger_row(
+    vault: Path,
+    source: str,
+    *,
+    source_key: str,
+    fragment_id: str,
+    content_hash: str = _LEDGER_HASH,
+    append: bool = False,
+) -> Path:
+    """Hand-write one ingest-ledger row, bypassing :class:`SourceLedger`.
+
+    Written as raw bytes on purpose. Every assertion in this section
+    reads the file back as raw text too, because ``SourceLedger.load``
+    silently drops any line ``_record_from_dict`` rejects — a blanked or
+    truncated row would read as absent through the API while its
+    ``fragment_id`` still sat on disk.
+
+    Args:
+        vault: Vault root.
+        source: Ingestor key, naming the ``<source>.jsonl`` file.
+        source_key: The source unit's stable vault-relative identity.
+        fragment_id: The fragment id that unit maps to.
+        content_hash: SHA-256 of the source content at last ingest.
+        append: Append to an existing ledger instead of overwriting it.
+
+    Returns:
+        Path to the ledger file written.
+    """
+    path = vault / "00-Creek-Meta" / "State" / "ingest" / f"{source}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(
+        {
+            "source_key": source_key,
+            "fragment_id": fragment_id,
+            "content_hash": content_hash,
+            "last_seen": "2026-08-13T00:00:00+00:00",
+            "tombed": False,
+        },
+    )
+    with path.open("a" if append else "w", encoding="utf-8") as handle:
+        handle.write(f"{line}\n")
+    return path
+
+
+def test_scoped_fragment_purge_erases_the_ledger_row_that_names_it(
+    tmp_path: Path,
+) -> None:
+    """``purge fragment`` erases the ledger row mapping source to id (#1453).
+
+    The ordinary right-to-be-forgotten path. The issue frames the defect
+    as whole-vault-only, but a scoped purge is what an actual erasure
+    request runs, and at HEAD it deleted the fragment file and left the
+    row — source path, fragment id and a full unsalted SHA-256 of the
+    body — intact on disk.
+
+    Asserted against the file's raw text, never ``SourceLedger.load``:
+    the loader skips rows it cannot parse, so a mangled row reads as
+    absent through the API while still naming the purged fragment.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-T1", "Therapy")
+    ledger = _write_ledger_row(
+        vault,
+        "markdown",
+        source_key="2024-05-01-therapy.md",
+        fragment_id="frag-T1",
+    )
+
+    PurgeEngine(vault).purge_fragment("frag-T1")
+
+    remaining = ledger.read_text(encoding="utf-8") if ledger.exists() else ""
+    assert "frag-T1" not in remaining
+    assert "2024-05-01-therapy.md" not in remaining
+    assert _LEDGER_HASH not in remaining
+
+
+def test_scoped_purge_erases_older_history_rows_for_the_same_source(
+    tmp_path: Path,
+) -> None:
+    """Earlier appends for the purged unit go too (#1453).
+
+    The ledger is append-only, so one source unit accumulates a row per
+    ingest — each carrying that revision's content hash. Matching on
+    ``fragment_id`` alone leaves every superseded row behind, and those
+    rows hold hashes of *earlier drafts of the same private text*.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-T2", "Therapy")
+    ledger = _write_ledger_row(
+        vault,
+        "markdown",
+        source_key="2024-05-01-therapy.md",
+        fragment_id="frag-OLD",
+        content_hash="a" * 64,
+    )
+    _write_ledger_row(
+        vault,
+        "markdown",
+        source_key="2024-05-01-therapy.md",
+        fragment_id="frag-T2",
+        append=True,
+    )
+    _write_ledger_row(
+        vault,
+        "markdown",
+        source_key="other-note.md",
+        fragment_id="frag-KEEP",
+        content_hash="b" * 64,
+        append=True,
+    )
+
+    PurgeEngine(vault).purge_fragment("frag-T2")
+
+    remaining = ledger.read_text(encoding="utf-8")
+    assert "frag-T2" not in remaining
+    assert "frag-OLD" not in remaining
+    assert "a" * 64 not in remaining
+    assert "frag-KEEP" in remaining
+    assert "other-note.md" in remaining
+
+
+def test_scoped_purge_dry_run_counts_rows_and_writes_no_byte(
+    tmp_path: Path,
+) -> None:
+    """A previewed scoped purge reports the rows it would erase, and erases none.
+
+    A preview of an irreversible erasure must predict its apply twin
+    exactly and change nothing. Byte-for-byte comparison, not a row
+    count: a rewrite that happened to preserve the row count would still
+    be a write a dry run promised not to make.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-T3", "Therapy")
+    ledger = _write_ledger_row(
+        vault,
+        "markdown",
+        source_key="2024-05-01-therapy.md",
+        fragment_id="frag-T3",
+    )
+    before = ledger.read_bytes()
+
+    dry = PurgeEngine(vault, dry_run=True).purge_fragment("frag-T3")
+
+    assert dry.ledger_rows_removed == 1
+    assert ledger.read_bytes() == before
+
+    applied = PurgeEngine(vault).purge_fragment("frag-T3")
+    assert applied.ledger_rows_removed == dry.ledger_rows_removed
+
+
+def test_classifications_purge_leaves_the_ledger_intact(tmp_path: Path) -> None:
+    """Resetting classifications is not an erasure, so no row is touched (#1453).
+
+    ``purge_classifications`` rewrites frontmatter and deletes nothing.
+    Wiping its ledger rows would make the next ingest re-mint an id for
+    every unchanged file in the vault — a behaviour change dressed up as
+    a privacy fix.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-C1", "Classified")
+    ledger = _write_ledger_row(
+        vault,
+        "markdown",
+        source_key="classified.md",
+        fragment_id="frag-C1",
+    )
+    before = ledger.read_bytes()
+
+    PurgeEngine(vault).purge_classifications()
+
+    assert ledger.read_bytes() == before
+
+
+def test_source_path_purge_erases_the_ledger_row(tmp_path: Path) -> None:
+    """``purge source-path`` (INC-008) erases rows too (#1453).
+
+    Omitted from the issue's blast radius, and it is a first-class
+    erasure entrypoint: an operator handed a filename runs this one.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment_with_original(
+        vault,
+        "frag-S1",
+        "Note",
+        original_file="/src/note.md",
+    )
+    ledger = _write_ledger_row(
+        vault,
+        "markdown",
+        source_key="note.md",
+        fragment_id="frag-S1",
+    )
+
+    result = PurgeEngine(vault).purge_source_path("/src/note.md")
+
+    assert result.ledger_rows_removed == 1
+    assert not ledger.exists()
+
+
+def test_scoped_purge_unlinks_a_ledger_file_left_with_no_rows(
+    tmp_path: Path,
+) -> None:
+    """An emptied ledger file is removed, not left as a zero-byte husk (#1453)."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-T4", "Only")
+    ledger = _write_ledger_row(
+        vault,
+        "markdown",
+        source_key="only.md",
+        fragment_id="frag-T4",
+    )
+
+    PurgeEngine(vault).purge_fragment("frag-T4")
+
+    assert not ledger.exists()
+
+
+# -- The deny-by-default vault sweep ---------------------------------------
+
+_SWEPT_META_RELPATHS: tuple[str, ...] = (
+    "State/ingest/markdown.jsonl",
+    "State/ingest/upload.jsonl",
+    "State/latest.md",
+    "State/2026-W33.md",
+    "State/sync/last-run.json",
+    "State/discord/cursor.json",
+    "State/discord/capture-staging/messages/general/messages.json",
+    "State/.gitkeep",
+    "Processing-Log/provenance.jsonl",
+    "Processing-Log/consent-log.json",
+    "Processing-Log/run-summary.jsonl",
+    "Processing-Log/tag-history.json",
+    "Processing-Log/unnamed-history.json",
+    "Processing-Log/compile-gaps.jsonl",
+    "Processing-Log/llm-progress.jsonl",
+    "Processing-Log/paradoxes-during-compile.jsonl",
+    "Processing-Log/.gitkeep",
+    "dedup-manifest.json",
+    "voice-fingerprint.json",
+    "Temporal-Index.md",
+    "Source-Index.md",
+    "Tag-Garden.md",
+    "Inbound/ch1/staged.md",
+    "audit/compile-t1.hash",
+    "Skills/lint.SKILL.md",
+    "Skills/my-own.SKILL.md",
+    "Skills/.gitkeep",
+    "Ontology/creek_ontology_agent_prompt.md",
+    "Ontology/.gitkeep",
+    "Templates/.gitkeep",
+    "Scripts/.gitkeep",
+)
+"""Every ``00-Creek-Meta/`` artifact a vault purge must destroy.
+
+An explicit literal list, never an ``rglob`` of the seeded tree: this
+repository's own checkout contains a real ``creek-tools/00-Creek-Meta/``,
+and a fixture that discovers its own inputs cannot distinguish an
+artifact it seeded from one the purge itself wrote.
+"""
+
+_KEPT_META_RELPATHS: tuple[str, ...] = (
+    "creek_config.yaml",
+    "Processing-Log/purge-log.json",
+    "audit/purge.jsonl",
+    "audit/privacy.jsonl",
+    "audit/redact.jsonl",
+    "audit/mcp.jsonl",
+)
+"""Every ``00-Creek-Meta/`` artifact a vault purge must preserve."""
+
+
+def _seed_meta_artifacts(vault: Path) -> None:
+    """Write one file at every relpath the sweep is specified against.
+
+    Args:
+        vault: Vault root.
+    """
+    for relpath in (*_SWEPT_META_RELPATHS, *_KEPT_META_RELPATHS):
+        target = vault / "00-Creek-Meta" / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"seeded {relpath}\n", encoding="utf-8")
+
+
+def _surviving_meta_relpaths(vault: Path) -> set[str]:
+    """Return every regular file left under ``00-Creek-Meta/``, vault-relative.
+
+    Args:
+        vault: Vault root.
+
+    Returns:
+        Slash-joined paths relative to ``00-Creek-Meta/``.
+    """
+    meta = vault / "00-Creek-Meta"
+    return {
+        str(path.relative_to(meta).as_posix())
+        for path in meta.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_vault_purge_sweeps_every_unkept_meta_artifact(tmp_path: Path) -> None:
+    """``purge vault`` destroys all of ``00-Creek-Meta/`` bar the keep-list (#1453).
+
+    Deny-by-default, asserted as an exact set equality rather than a
+    subset: a sweep that merely deletes *at least* the listed artifacts
+    tells you nothing about the twenty-first artifact somebody adds next
+    month, and a keep-list that quietly grows is how a leak reopens.
+
+    Everything that survives is a compliance record or the vault marker.
+    Nothing survives merely because it looked harmless — the ``creek
+    init`` scaffold is swept too, because ``Skills/`` is the directory
+    operators drop their own skill files into.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-V1", "Vaulted")
+    _seed_meta_artifacts(vault)
+
+    PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    survivors = _surviving_meta_relpaths(vault)
+    assert survivors == set(_KEPT_META_RELPATHS)
+    assert (vault / "00-Creek-Meta" / "creek_config.yaml").exists()
+
+
+def test_vault_purge_sweeps_nested_discord_capture_staging(
+    tmp_path: Path,
+) -> None:
+    """Raw capture plaintext nested two levels deep is swept (#1453, AC #8).
+
+    ``stage_capture_as_data_package`` writes
+    ``capture-staging/messages/<channel>/messages.json``, so the obvious
+    fix — adding the root to ``ADEPTHOOD_STAGING_RELDIRS`` — sweeps
+    nothing: that walker is ``iterdir()``, non-recursive by documented
+    design. The test seeds the real nested layout so a vacuous fix
+    cannot pass it.
+    """
+    vault = _make_vault(tmp_path)
+    staged = (
+        vault
+        / "00-Creek-Meta"
+        / "State"
+        / "discord"
+        / "capture-staging"
+        / "messages"
+        / "general"
+        / "messages.json"
+    )
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_text('[{"content": "raw discord plaintext"}]\n', encoding="utf-8")
+
+    PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert not staged.exists()
+
+
+def test_vault_purge_counts_every_meta_artifact_it_destroys(
+    tmp_path: Path,
+) -> None:
+    """The sweep is counted, so the audit line can say what it erased (#1453)."""
+    vault = _make_vault(tmp_path)
+    _seed_meta_artifacts(vault)
+
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert result.meta_artifacts_removed == len(_SWEPT_META_RELPATHS)
+
+
+def test_a_keep_is_matched_by_path_and_never_by_string_prefix(
+    tmp_path: Path,
+) -> None:
+    """``audit/purge.jsonl`` is kept; ``audit/purge.jsonl.bak`` is not.
+
+    A ``startswith`` keep-test shelters anything whose path merely
+    begins with a kept one, which is the cheapest way to smuggle content
+    past a deny-by-default sweep: name the file after something on the
+    list. ``is_relative_to`` compares path components and cannot be
+    fooled that way.
+    """
+    vault = _make_vault(tmp_path)
+    audit = vault / "00-Creek-Meta" / "audit"
+    audit.mkdir(parents=True, exist_ok=True)
+    lookalike = audit / "purge.jsonl.bak"
+    lookalike.write_text("a copy naming every purged id\n", encoding="utf-8")
+
+    PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert (audit / "purge.jsonl").exists()
+    assert not lookalike.exists()
+
+
+def test_a_vault_purge_destroys_an_operator_authored_skill_file(
+    tmp_path: Path,
+) -> None:
+    """``00-Creek-Meta/Skills/`` is swept — it is not inert scaffold (#1453).
+
+    ``deploy_skills`` creates that directory explicitly so "a vault
+    always has a ``Skills/`` directory to drop operator-authored skills
+    into", and ``detect_drifted_skills`` compares only the canonical set
+    so operator files there are deliberately left alone. It therefore
+    holds first-class operator content, and a custom skill may quote a
+    fragment's title, id or body.
+
+    Keeping the prefix — the obvious reading of "``creek init``
+    scaffold" — would have made the whole-vault purge **weaker than a
+    scoped one**: ``_scrub_references`` already walks
+    ``00-Creek-Meta/Skills`` during ``purge_fragment`` and rewrites
+    wiki-links and bare id mentions found there. The nuclear option must
+    not preserve what the targeted one cleans. Nothing is lost that
+    ``creek init`` / ``creek skills sync`` cannot redeploy.
+    """
+    vault = _make_vault(tmp_path)
+    skills = vault / "00-Creek-Meta" / "Skills"
+    skills.mkdir(parents=True, exist_ok=True)
+    custom = skills / "my-own.SKILL.md"
+    custom.write_text(
+        "Always cross-reference [[Therapy notes]] (frag-T1) when summarising.\n",
+        encoding="utf-8",
+    )
+    canonical = skills / "lint.SKILL.md"
+    canonical.write_text(
+        "canonical, redeployable by `creek skills sync`\n",
+        encoding="utf-8",
+    )
+
+    PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert not custom.exists()
+    assert not canonical.exists()
+
+
+def test_vault_purge_leaves_the_embeddings_cache_to_the_cache_delete(
+    tmp_path: Path,
+) -> None:
+    """``embeddings.parquet`` is exempt from the sweep, not kept (#1453).
+
+    It must still be destroyed — and still be *counted* by
+    ``_delete_cache_file``, which reports the row count it removed.
+    Sweeping it first would make that return zero and turn a real
+    deletion into a silent one.
+    """
+    from creek.purge.meta import SWEEP_EXEMPT
+
+    assert [str(item) for item in SWEEP_EXEMPT] == ["embeddings.parquet"]
+
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-E1", "Embedded")
+    cache = _seed_embeddings_cache(vault, ["frag-E1"])
+
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert result.meta_artifacts_removed == 0
+    assert result.embeddings_removed == 1
+    assert not cache.exists()
+
+
+def test_a_corrupt_embeddings_parquet_does_not_veto_the_ledger_erasure(
+    tmp_path: Path,
+) -> None:
+    """A truncated parquet aborts the purge, but only after the erasure (#1453).
+
+    ``delete_embeddings_cache`` reads the parquet footer and raises an
+    unhandled ``ArrowInvalid`` on a corrupt file, aborting the whole
+    operation. Ordering is the defence: the meta sweep runs strictly
+    before it, so a corrupt cache cannot veto the right-to-be-forgotten
+    work. The crash itself is a separate defect, tracked as #1480; this
+    test asserts the erasure survives it, not that it is gone.
+    """
+    pa_lib = pytest.importorskip("pyarrow.lib")
+    vault = _make_vault(tmp_path)
+    _write_ledger_row(
+        vault,
+        "markdown",
+        source_key="2024-05-01-therapy.md",
+        fragment_id="frag-P1",
+    )
+    cache = vault / "00-Creek-Meta" / "embeddings.parquet"
+    cache.write_bytes(b"PAR1")
+
+    with pytest.raises(pa_lib.ArrowInvalid):
+        PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    ingest_dir = vault / "00-Creek-Meta" / "State" / "ingest"
+    assert not any(ingest_dir.glob("*.jsonl"))
+
+
+def test_vault_purge_dry_run_predicts_its_own_meta_sweep(tmp_path: Path) -> None:
+    """The previewed meta count equals the apply count, staged files included.
+
+    ``_wipe_adepthood_staging`` walks two directories *inside* the sweep
+    root and, in a dry run, counts them without unlinking. Without the
+    dry arm marking them removed, the sweep meets them still on disk and
+    counts them a second time — so this test needs at least one staged
+    Adepthood file to have any teeth.
+    """
+    dry_vault = _make_vault(tmp_path / "dry")
+    apply_vault = _make_vault(tmp_path / "apply")
+    for target in (dry_vault, apply_vault):
+        _seed_meta_artifacts(target)
+        _write_journal_fragment_with_staged(target, "frag-D1", "entry-one")
+
+    dry = PurgeEngine(dry_vault, dry_run=True).purge_vault(VAULT_PURGE_CONFIRMATION)
+    applied = PurgeEngine(apply_vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert dry.journal_staged_removed == applied.journal_staged_removed == 1
+    assert dry.meta_artifacts_removed == applied.meta_artifacts_removed
+    assert dry.meta_artifacts_removed == len(_SWEPT_META_RELPATHS)
+    # The preview destroyed nothing: every seeded artifact, kept or not,
+    # is still on disk, and so is the staged file it counted.
+    assert _surviving_meta_relpaths(dry_vault) == (
+        set(_SWEPT_META_RELPATHS)
+        | set(_KEPT_META_RELPATHS)
+        | {"adepthood/journal/entry-one.md"}
+    )
+    assert _surviving_meta_relpaths(apply_vault) == set(_KEPT_META_RELPATHS)
+
+
+def test_vault_purge_audit_entry_records_the_meta_sweep(tmp_path: Path) -> None:
+    """Whatever is wiped is audited, like every other purge counter (AC #11)."""
+    vault = _make_vault(tmp_path)
+    _seed_meta_artifacts(vault)
+
+    PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    entries = PurgeAuditLog(vault).read()
+    outcomes = [e for e in entries if e.phase == "outcome" and e.operation == "vault"]
+    assert outcomes
+    assert outcomes[-1].meta_artifacts_removed == len(_SWEPT_META_RELPATHS)
+
+
+def test_scoped_purge_audit_entry_records_the_ledger_rows(tmp_path: Path) -> None:
+    """The scoped erasure counter reaches the compliance log too (AC #11)."""
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A1", "Audited")
+    _write_ledger_row(
+        vault,
+        "markdown",
+        source_key="audited.md",
+        fragment_id="frag-A1",
+    )
+
+    PurgeEngine(vault).purge_fragment("frag-A1")
+
+    entries = PurgeAuditLog(vault).read()
+    outcomes = [e for e in entries if e.phase == "outcome"]
+    assert outcomes[-1].ledger_rows_removed == 1
+
+
+def test_a_purge_log_line_predating_the_erasure_counters_still_parses(
+    tmp_path: Path,
+) -> None:
+    """``purge.jsonl`` is append-only, so old lines must survive the new fields.
+
+    Add, never rename — the precedent the audit module already spells
+    out. A log written before #1453 has neither counter, and a reader
+    that refused it would break the very record a purge preserves.
+    """
+    legacy = {
+        "timestamp": "2026-01-01T00:00:00+00:00",
+        "operation": "fragment",
+        "criteria": {"fragment_id": "frag-OLD"},
+        "affected_fragments": ["frag-OLD"],
+        "fragments_deleted": 1,
+    }
+    entry = PurgeAuditEntry.model_validate(legacy)
+
+    assert entry.ledger_rows_removed == 0
+    assert entry.meta_artifacts_removed == 0
+
+
+def test_the_cli_reports_both_erasure_counters(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An operator is told what the erasure destroyed beyond the fragments."""
+    from creek.cli import _render_purge_result
+
+    _render_purge_result(
+        PurgeResult(
+            operation="vault",
+            target="entire vault",
+            ledger_rows_removed=3,
+            meta_artifacts_removed=7,
+        ),
+    )
+
+    out = capsys.readouterr().out
+    assert "3" in out
+    assert "7" in out
+    assert "Ledger rows removed" in out
+    assert "Meta artifacts removed" in out
+
+
+def test_the_meta_sweep_keeps_its_roster_out_of_the_surviving_record(
+    tmp_path: Path,
+) -> None:
+    """Swept artifacts are counted, never named in ``deleted_files`` (#1453).
+
+    ``deleted_files`` is copied into ``purge.jsonl`` and the MCP payload,
+    both of which survive the erasure. Some swept paths are themselves
+    identifying — ``capture-staging/messages/<channel>/messages.json``
+    names a channel — so writing the roster into the one file a purge
+    preserves would re-create a smaller version of the leak being closed.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-R1", "Recorded")
+    _seed_meta_artifacts(vault)
+
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert result.meta_artifacts_removed == len(_SWEPT_META_RELPATHS)
+    assert not [path for path in result.deleted_files if "00-Creek-Meta" in path]
+    assert result.deleted_files == [
+        str(vault / "01-Fragments" / "Conversations" / "Recorded.md"),
+    ]

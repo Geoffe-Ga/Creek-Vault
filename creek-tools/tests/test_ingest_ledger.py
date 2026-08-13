@@ -14,6 +14,7 @@ import json
 from typing import TYPE_CHECKING
 
 import frontmatter
+import pytest
 
 from creek.cli import _run_ingest
 from creek.ingest import INGESTOR_REGISTRY
@@ -344,3 +345,427 @@ class TestUploadedWorkbookLedgerIdentity:
         assert second.errors == [], second.errors
         reloaded = SourceLedger.load(vault, source="upload")
         assert reloaded.live_keys() == _EXPECTED_SHEET_KEYS
+
+
+# ---------------------------------------------------------------------------
+# forget_fragment_ids — the erasure path (#1453)
+# ---------------------------------------------------------------------------
+
+_FORGET_HASH = "e29568dd0772c2a8ac12fc4a677d3b6a678baa35f8b17fe0f7c76b59dacd3335"
+"""A full unsalted SHA-256, the shape the ledger really stores."""
+
+
+def _write_rows(vault: Path, source: str, rows: list[dict[str, object]]) -> Path:
+    """Hand-write raw ledger rows, bypassing :class:`SourceLedger`.
+
+    Args:
+        vault: Vault root.
+        source: Ingestor key naming the ``<source>.jsonl`` file.
+        rows: Row objects, written one per line in order.
+
+    Returns:
+        Path to the ledger file.
+    """
+    path = SourceLedger.path_for(vault, source)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "".join(f"{json.dumps(row)}\n" for row in rows),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _row(source_key: str, fragment_id: str, content_hash: str) -> dict[str, object]:
+    """Build one well-formed ledger row.
+
+    Args:
+        source_key: Stable vault-relative identity of the source unit.
+        fragment_id: The fragment id it maps to.
+        content_hash: SHA-256 of the source content.
+
+    Returns:
+        A row object ready for :func:`_write_rows`.
+    """
+    return {
+        "source_key": source_key,
+        "fragment_id": fragment_id,
+        "content_hash": content_hash,
+        "last_seen": "2026-08-13T00:00:00+00:00",
+        "tombed": False,
+    }
+
+
+def test_forget_removes_the_row_naming_the_doomed_id(tmp_path: Path) -> None:
+    """The row mapping source path to purged id is physically gone (#1453)."""
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    ledger = _write_rows(
+        vault,
+        "markdown",
+        [
+            _row("therapy.md", "frag-doomed", _FORGET_HASH),
+            _row("recipes.md", "frag-safe", "b" * 64),
+        ],
+    )
+
+    removed = forget_fragment_ids(vault, ["frag-doomed"])
+
+    assert removed == 1
+    text = ledger.read_text(encoding="utf-8")
+    assert "frag-doomed" not in text
+    assert "therapy.md" not in text
+    assert _FORGET_HASH not in text
+    assert "frag-safe" in text
+
+
+def test_forget_takes_the_whole_history_of_a_doomed_source_unit(
+    tmp_path: Path,
+) -> None:
+    """Superseded rows for the same unit go too (#1453).
+
+    The ledger is append-only, so one source unit accumulates a row per
+    ingest and each carries that revision's hash. Matching on
+    ``fragment_id`` alone leaves hashes of *earlier drafts of the same
+    private text* on disk, still joined to the source path.
+    """
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    ledger = _write_rows(
+        vault,
+        "markdown",
+        [
+            _row("therapy.md", "frag-v1", "1" * 64),
+            _row("therapy.md", "frag-v2", "2" * 64),
+            _row("therapy.md", "frag-current", _FORGET_HASH),
+            _row("recipes.md", "frag-safe", "b" * 64),
+        ],
+    )
+
+    removed = forget_fragment_ids(vault, ["frag-current"])
+
+    assert removed == 3
+    text = ledger.read_text(encoding="utf-8")
+    assert "therapy.md" not in text
+    for digest in ("1" * 64, "2" * 64, _FORGET_HASH):
+        assert digest not in text
+    assert text == f"{json.dumps(_row('recipes.md', 'frag-safe', 'b' * 64))}\n"
+
+
+def test_forget_removes_an_unparseable_line_that_still_names_the_id(
+    tmp_path: Path,
+) -> None:
+    """A half-written row is the case a structured matcher cannot see (#1453).
+
+    A crash mid-append leaves a truncated line. It is not valid JSON, so
+    every reader skips it — and it still spells the fragment id in
+    cleartext, which is exactly what an erasure has to remove.
+    """
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    path = SourceLedger.path_for(vault, "markdown")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f'{{"source_key": "therapy.md", "fragment_id": "frag-doomed", "conte\n'
+        f"{json.dumps(_row('recipes.md', 'frag-safe', 'b' * 64))}\n",
+        encoding="utf-8",
+    )
+
+    removed = forget_fragment_ids(vault, ["frag-doomed"])
+
+    assert removed == 1
+    assert "frag-doomed" not in path.read_text(encoding="utf-8")
+
+
+def test_forget_removes_a_line_truncated_before_its_fragment_id(
+    tmp_path: Path,
+) -> None:
+    """The hard truncation case: source path present, id absent (#1453).
+
+    :meth:`SourceLedger._append` serialises ``source_key`` *before*
+    ``fragment_id``, so a crash landing between the two leaves a damaged
+    line naming the doomed **source path** and nothing else. Matching an
+    unparseable line on ``doomed_ids`` alone cannot see it, and the path
+    — the join the erasure exists to break — survives.
+    """
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    path = SourceLedger.path_for(vault, "markdown")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"{json.dumps(_row('therapy.md', 'frag-doomed', _FORGET_HASH))}\n"
+        '{"source_key": "therapy.md", "fragm\n'
+        f"{json.dumps(_row('recipes.md', 'frag-safe', 'b' * 64))}\n",
+        encoding="utf-8",
+    )
+
+    removed = forget_fragment_ids(vault, ["frag-doomed"])
+
+    assert removed == 2
+    text = path.read_text(encoding="utf-8")
+    assert "therapy.md" not in text
+    assert "frag-safe" in text
+
+
+def test_forget_removes_a_truncated_line_naming_a_non_ascii_source_path(
+    tmp_path: Path,
+) -> None:
+    """The doomed key must be matched in the shape disk actually holds (#1453).
+
+    :meth:`SourceLedger._append` serialises at ``json.dumps``' default
+    ``ensure_ascii=True``, so ``café.md`` reaches disk as the twelve
+    characters ``caf\\u00e9.md`` while :func:`_doomed_source_keys`
+    recovers it decoded. Matching the decoded needle against the raw
+    line misses — and vault paths are note titles, which are full of
+    accents, CJK and emoji.
+    """
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    path = SourceLedger.path_for(vault, "markdown")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"{json.dumps(_row('café.md', 'frag-doomed', _FORGET_HASH))}\n"
+        '{"source_key": "caf\\u00e9.md", "fragm\n'
+        f"{json.dumps(_row('recipes.md', 'frag-safe', 'b' * 64))}\n",
+        encoding="utf-8",
+    )
+
+    removed = forget_fragment_ids(vault, ["frag-doomed"])
+
+    assert removed == 2
+    text = path.read_text(encoding="utf-8")
+    assert "caf" not in text
+    assert "frag-safe" in text
+
+
+def test_forget_erases_around_a_non_utf8_byte_without_mangling_survivors(
+    tmp_path: Path,
+) -> None:
+    """A corrupt byte degrades to "erase what's parseable" (#1453).
+
+    The scoped purge deliberately runs the ledger erasure *before* the
+    embeddings-cache purge so an unreadable derived file cannot veto the
+    erasure. A strict UTF-8 read hands the ledger that same veto back.
+    The tolerant decode is mirrored on write, so an untouched line
+    round-trips byte-for-byte rather than being silently mangled.
+    """
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    path = SourceLedger.path_for(vault, "markdown")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doomed = json.dumps(_row("therapy.md", "frag-doomed", _FORGET_HASH)).encode("utf-8")
+    # Both branches, and neither line is doomed: one corrupt line still
+    # parses, so it is judged by the structured matcher, while the other is
+    # truncated too and falls through to the text fallback. That second one
+    # is where this diff's two halves intersect.
+    parseable = b'{"source_key": "notes.md", "note": "caf\xe9"}'
+    truncated = b'{"source_key": "notes.md", "note": "caf\xe9'
+    survivor = json.dumps(_row("recipes.md", "frag-safe", "b" * 64)).encode("utf-8")
+    path.write_bytes(b"\n".join((doomed, parseable, truncated, survivor)) + b"\n")
+
+    removed = forget_fragment_ids(vault, ["frag-doomed"])
+
+    assert removed == 1
+    # Exact bytes, not membership: this pins ordering, line count and the
+    # absence of framing mutation as well as the undecodable byte itself.
+    assert path.read_bytes() == b"\n".join((parseable, truncated, survivor)) + b"\n"
+
+
+def test_a_corrupt_ledger_file_does_not_veto_erasure_in_later_files(
+    tmp_path: Path,
+) -> None:
+    """One undecodable file must not block the rest of the glob (#1453).
+
+    ``sorted(directory.glob("*.jsonl"))`` walks every source ledger in
+    name order, so an abort on the first file silently spares every file
+    after it — a whole-erasure failure caused by a byte in an unrelated
+    source's log.
+    """
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    corrupt = SourceLedger.path_for(vault, "markdown")
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    raw = b'{"source_key": "notes.md", "note": "caf\xe9"}\n'
+    corrupt.write_bytes(raw)
+    later = _write_rows(vault, "upload", [_row("b.docx", "frag-doomed", "2" * 64)])
+    # The property under test is "a *later* file", so the ordering the glob
+    # relies on is asserted rather than assumed; a rename would otherwise
+    # turn this into a vacuous pass.
+    assert corrupt.name < later.name
+
+    assert forget_fragment_ids(vault, ["frag-doomed"]) == 1
+    assert not later.exists()
+    assert corrupt.read_bytes() == raw
+
+
+def test_forget_unlinks_a_ledger_left_with_no_rows(tmp_path: Path) -> None:
+    """An emptied ledger file is removed, not left as a husk naming its source."""
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    ledger = _write_rows(
+        vault,
+        "markdown",
+        [_row("therapy.md", "frag-doomed", _FORGET_HASH)],
+    )
+
+    assert forget_fragment_ids(vault, ["frag-doomed"]) == 1
+    assert not ledger.exists()
+
+
+def test_forget_dry_run_counts_and_leaves_every_byte(tmp_path: Path) -> None:
+    """The preview predicts its apply twin exactly and writes nothing."""
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    ledger = _write_rows(
+        vault,
+        "markdown",
+        [
+            _row("therapy.md", "frag-v1", "1" * 64),
+            _row("therapy.md", "frag-doomed", _FORGET_HASH),
+            _row("recipes.md", "frag-safe", "b" * 64),
+        ],
+    )
+    before = ledger.read_bytes()
+
+    dry = forget_fragment_ids(vault, ["frag-doomed"], dry_run=True)
+
+    assert ledger.read_bytes() == before
+    assert dry == forget_fragment_ids(vault, ["frag-doomed"])
+
+
+def test_forget_sweeps_every_source_ledger_not_just_one(tmp_path: Path) -> None:
+    """A fragment can be named by more than one ``<source>.jsonl``."""
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    md = _write_rows(vault, "markdown", [_row("a.md", "frag-doomed", "1" * 64)])
+    up = _write_rows(vault, "upload", [_row("b.docx", "frag-doomed", "2" * 64)])
+
+    assert forget_fragment_ids(vault, ["frag-doomed"]) == 2
+    assert not md.exists()
+    assert not up.exists()
+
+
+def test_forget_with_no_ids_is_a_no_op_never_a_wildcard(tmp_path: Path) -> None:
+    """An empty id collection erases nothing.
+
+    The dangerous reading of "forget these ids" with an empty list is
+    "forget everything". A scoped purge that matched no fragments hands
+    exactly that, on every run.
+    """
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    ledger = _write_rows(vault, "markdown", [_row("a.md", "frag-safe", "1" * 64)])
+    before = ledger.read_bytes()
+
+    assert forget_fragment_ids(vault, []) == 0
+    assert forget_fragment_ids(vault, ["", "   "]) == 0
+    assert ledger.read_bytes() == before
+
+
+def test_forget_tolerates_a_vault_with_no_ledger_directory(tmp_path: Path) -> None:
+    """A vault that has never ingested is not an error condition."""
+    from creek.ingest.ledger import forget_fragment_ids
+
+    assert forget_fragment_ids(_make_vault(tmp_path), ["frag-doomed"]) == 0
+
+
+def test_forget_leaves_no_temp_file_behind(tmp_path: Path) -> None:
+    """The atomic rewrite cleans up after itself.
+
+    The temp file holds the surviving rows *and* is written into the
+    ledger directory, so one left behind is both litter and a second
+    copy of data the next erasure would not know to look for.
+    """
+    from creek.ingest.ledger import forget_fragment_ids, ledger_dir
+
+    vault = _make_vault(tmp_path)
+    _write_rows(
+        vault,
+        "markdown",
+        [
+            _row("therapy.md", "frag-doomed", _FORGET_HASH),
+            _row("recipes.md", "frag-safe", "b" * 64),
+        ],
+    )
+
+    forget_fragment_ids(vault, ["frag-doomed"])
+
+    assert sorted(p.name for p in ledger_dir(vault).iterdir()) == ["markdown.jsonl"]
+
+
+def test_forget_drops_blank_lines_without_counting_them(tmp_path: Path) -> None:
+    """A blank line is not a row, so it is neither erased nor counted.
+
+    It still must not survive the rewrite: a file whose only remaining
+    content is whitespace would keep the ledger *file* alive, and the
+    filename itself names the source type.
+    """
+    from creek.ingest.ledger import forget_fragment_ids
+
+    vault = _make_vault(tmp_path)
+    path = SourceLedger.path_for(vault, "markdown")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"\n{json.dumps(_row('therapy.md', 'frag-doomed', _FORGET_HASH))}\n\n",
+        encoding="utf-8",
+    )
+
+    assert forget_fragment_ids(vault, ["frag-doomed"]) == 1
+    assert not path.exists()
+
+
+def test_a_failed_rewrite_leaves_no_temp_file_and_re_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash mid-rewrite cleans up its temp file and does not swallow (#1453).
+
+    The temp file holds the *surviving* rows, so one abandoned in the
+    ledger directory is a second copy of data the next erasure has no
+    reason to look at. And the failure must propagate: ``_run_audited``
+    turns it into a ``status="partial"`` outcome line, and an erasure
+    that silently failed while reporting success is the worst outcome
+    available here.
+    """
+    from creek.ingest import ledger as ledger_module
+    from creek.ingest.ledger import forget_fragment_ids, ledger_dir
+
+    vault = _make_vault(tmp_path)
+    _write_rows(
+        vault,
+        "markdown",
+        [
+            _row("therapy.md", "frag-doomed", _FORGET_HASH),
+            _row("recipes.md", "frag-safe", "b" * 64),
+        ],
+    )
+
+    def _boom(self: Path, target: Path) -> Path:
+        """Fail the atomic replace.
+
+        Args:
+            self: The temp file.
+            target: The ledger path.
+
+        Raises:
+            OSError: Always.
+        """
+        msg = "disk went away"
+        raise OSError(msg)
+
+    monkeypatch.setattr(ledger_module.Path, "replace", _boom)
+
+    with pytest.raises(OSError, match="disk went away"):
+        forget_fragment_ids(vault, ["frag-doomed"])
+
+    assert sorted(p.name for p in ledger_dir(vault).iterdir()) == ["markdown.jsonl"]

@@ -108,6 +108,23 @@ class PurgeAuditEntry(BaseModel):
             removed. Without this field the outcome line reported a
             successful erasure while the body survived in a derived
             artifact.
+        ledger_rows_removed: Number of ingest-ledger rows physically
+            erased from ``00-Creek-Meta/State/ingest/*.jsonl`` because
+            they named a purged fragment or the source unit it came
+            from (#1453). Rows, not files: one source unit accumulates
+            an appended row per ingest, so one erased fragment takes
+            several rows with it. Zero for a whole-vault purge, which
+            destroys the files outright and counts them below rather
+            than counting the same erasure twice; dry-runs count what
+            *would* be erased.
+        meta_artifacts_removed: Number of files destroyed by the
+            deny-by-default sweep of ``00-Creek-Meta/`` during a
+            whole-vault purge (#1453). Files, not rows — the sweep does
+            not read what it deletes. Zero for every scoped purge;
+            dry-runs count what *would* be removed. Without this field
+            the outcome line reported a completed erasure while the
+            source-path → fragment-id → content-hash mapping survived
+            in the vault.
         operator: Who performed the purge.
         dry_run: Whether the purge was a dry-run preview.
         phase: GAP-002 discriminator. ``"intent"`` is written before
@@ -144,6 +161,8 @@ class PurgeAuditEntry(BaseModel):
     intimate_stubs_removed: int = 0
     journal_staged_removed: int = 0
     voice_artifacts_removed: int = 0
+    ledger_rows_removed: int = 0
+    meta_artifacts_removed: int = 0
     operator: str = _DEFAULT_OPERATOR
     dry_run: bool = False
 
@@ -179,6 +198,8 @@ def _coerce_legacy_entry(raw: dict[str, Any]) -> dict[str, Any]:
     upgraded.setdefault("intimate_stubs_removed", 0)
     upgraded.setdefault("journal_staged_removed", 0)
     upgraded.setdefault("voice_artifacts_removed", 0)
+    upgraded.setdefault("ledger_rows_removed", 0)
+    upgraded.setdefault("meta_artifacts_removed", 0)
     # GAP-002 fields take their schema defaults via Pydantic when
     # absent, so we leave them out here rather than fabricating a
     # phase / operation_id that doesn't correspond to anything on disk.
@@ -349,6 +370,8 @@ class PurgeAuditLog:
             "intimate_stubs_removed": 0,
             "journal_staged_removed": 0,
             "voice_artifacts_removed": 0,
+            "ledger_rows_removed": 0,
+            "meta_artifacts_removed": 0,
             "operator": "system",
             "dry_run": False,
             "migrated_entries": migrated_count,
