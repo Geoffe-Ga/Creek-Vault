@@ -32,7 +32,30 @@ never import (precedent: the pyjwt>=2.13.0 constraint, DEP-003).
 ``PackageIndex`` download path). Fixed in setuptools 83.0.0. setuptools
 is build/dev tooling — transitive, never a runtime import — so its
 floor lives in ``[tool.uv].constraint-dependencies`` rather than
-``[project].dependencies`` (DEP-003 precedent).
+``[project].dependencies`` (DEP-003 precedent). The band is
+``>=83.0.0,<85.0.0`` (issue #1258). The floor does not move: 83.0.0 is
+still the first patched release. The ceiling is new, and reads the way
+the mcp ``<2.0.0`` cap reads rather than as a second advisory — 84.0.0
+is the release ``uv.lock`` resolves and every build here has actually
+run against, setuptools versions under SemVer so ``<85.0.0`` keeps
+admitting every future 84.x patch (including the next security fix),
+and 85.0.0 does not exist yet, so nothing about it has been read or
+tested.
+
+setuptools is declared on *two* independent surfaces, which is the
+part worth remembering. ``[tool.uv].constraint-dependencies`` governs
+the resolution graph — what lands in ``uv.lock``.
+``[build-system].requires`` governs the isolated environment the build
+backend runs in, and the constraint provably does not reach it:
+constrained to ``<84.0.0`` a build still ran setuptools 84.0.0, while
+bounding ``[build-system].requires`` produced 83.0.0. Only the second
+surface was left at ``>=68.0`` by #861, which admits 81.0.0 itself —
+the exact release the pin exists to exclude — because no test in this
+file read ``[build-system]`` at all. Both surfaces now carry the
+identical band and must move together;
+``test_every_setuptools_declaration_carries_the_vetted_band``
+discovers them instead of naming them, so a third declaration is
+guarded the day it is added rather than the day someone remembers.
 
 ``torch`` (issue #861): torch 2.12.1 carries PYSEC-2025-194
 (CVE-2025-3000, GHSA-rrmf-rvhw-rf47). Fixed in torch 2.13.0. torch is
@@ -138,7 +161,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-from packaging.requirements import Requirement
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
@@ -162,6 +185,55 @@ _PYASN1_PATCHED_VERSION = Version("0.6.4")
 #: First setuptools release containing the fix for PYSEC-2026-3447
 #: (CVE-2026-59890 / GHSA-h35f-9h28-mq5c).
 _SETUPTOOLS_PATCHED_VERSION = Version("83.0.0")
+
+#: The release PYSEC-2026-3447 / CVE-2026-59890 is filed against, and
+#: the one ``[build-system].requires = ["setuptools>=68.0"]`` still
+#: admits today. Named separately from the floor because it is asserted
+#: against *every* declared surface, not only the uv constraint the
+#: #861 pin reached: a build backend that resolves 81.0.0 runs the
+#: vulnerable PackageIndex download path however clean the lock is.
+_SETUPTOOLS_LAST_VULNERABLE = Version("81.0.0")
+
+#: The setuptools release ``uv.lock`` resolves and every build in this
+#: project has therefore actually run against. The band is asserted
+#: from both ends: a ceiling that excludes today's resolution would
+#: fail at provisioning time in CI rather than here, so this probe
+#: keeps a bound from overshooting what the project runs.
+_SETUPTOOLS_LOCKED_VERSION = Version("84.0.0")
+
+#: The next major — which does not exist yet, so no changelog has been
+#: read and no build has run against it. setuptools has removed
+#: long-deprecated surfaces at majors before (``setup.py test``,
+#: ``easy_install``, the bundled distutils shim), so the ceiling holds
+#: it for a deliberate adoption exactly as mcp is held at <2.0.0. This
+#: is the release the ceiling exists to exclude.
+_SETUPTOOLS_UNVETTED_MAJOR = Version("85.0.0")
+
+#: A far-future major. Probes for a lazy ``!=85.0.0`` exclusion posing
+#: as a ceiling: that satisfies the assertion on 85.0.0 while
+#: re-admitting 85.0.1 and every later major. Only a probe well past
+#: the bound tells a real upper bound from a single-release exclusion.
+_SETUPTOOLS_FUTURE_MAJOR_PROBE = Version("999.0.0")
+
+#: Dotted paths of the tables whose lists hold PEP 508 requirement
+#: strings. The setuptools walk visits only these — see
+#: ``_setuptools_declarations`` for why walking the whole document
+#: would be a hazard rather than a thoroughness.
+_DEPENDENCY_TABLE_PATHS = frozenset(
+    {
+        "build-system.requires",
+        "project.dependencies",
+        "tool.uv.constraint-dependencies",
+        "tool.uv.build-constraint-dependencies",
+        "tool.uv.override-dependencies",
+    }
+)
+
+#: Dotted-path prefixes under which *every* child list declares
+#: dependencies: one list per extra in ``[project.optional-dependencies]``
+#: and one per group in ``[dependency-groups]``. Named as prefixes
+#: because the extra and group names are open-ended.
+_DEPENDENCY_TABLE_PREFIXES = ("project.optional-dependencies.", "dependency-groups.")
 
 #: First torch release containing the fix for PYSEC-2025-194
 #: (CVE-2025-3000 / GHSA-rrmf-rvhw-rf47).
@@ -365,6 +437,133 @@ def _locked_setuptools_version() -> Version:
         if package["name"] == "setuptools":
             return Version(str(package["version"]))
     pytest.fail("setuptools has no [[package]] entry in uv.lock")
+
+
+def _is_dependency_declaring(path: str) -> bool:
+    """Return whether a dotted TOML path names a dependency list.
+
+    Args:
+        path: Dotted path of a value in the parsed document, such as
+            ``tool.uv.constraint-dependencies``.
+
+    Returns:
+        ``True`` when a list at ``path`` holds PEP 508 requirement
+        strings — the fixed dependency tables, plus every extra under
+        ``[project.optional-dependencies]`` and every group under
+        ``[dependency-groups]``.
+    """
+    return path in _DEPENDENCY_TABLE_PATHS or path.startswith(
+        _DEPENDENCY_TABLE_PREFIXES
+    )
+
+
+def _setuptools_entries_at(
+    path: str, entries: list[object]
+) -> list[tuple[str, SpecifierSet]]:
+    """Return the ``setuptools`` requirements declared in one list.
+
+    Args:
+        path: Dotted path of the list, carried into every result pair so
+            a failing assertion can name the surface at fault.
+        entries: The list exactly as ``tomllib`` parsed it. Non-string
+            elements are skipped (``[dependency-groups]`` may hold
+            ``{include-group = "..."}`` inline tables), as is anything
+            ``packaging`` refuses to parse.
+
+    Returns:
+        One ``(path, specifier)`` pair per ``setuptools`` entry, matched
+        on the canonical (PEP 503) name so ``Setuptools`` or
+        ``SETUPTOOLS`` cannot slip past the comparison.
+    """
+    found: list[tuple[str, SpecifierSet]] = []
+    for entry in entries:
+        if not isinstance(entry, str):
+            continue
+        try:
+            requirement = Requirement(entry)
+        except InvalidRequirement:
+            continue
+        if canonicalize_name(requirement.name) == "setuptools":
+            found.append((path, requirement.specifier))
+    return found
+
+
+def _walk_for_setuptools(
+    node: object, path: str, found: list[tuple[str, SpecifierSet]]
+) -> None:
+    """Accumulate the ``setuptools`` declarations reachable from *node*.
+
+    List elements are walked under the *same* dotted path, because an
+    array of tables (``[[tool.mypy.overrides]]``) gives every one of its
+    entries that single path — which is also why the result is a list of
+    pairs rather than a mapping keyed by path.
+
+    Args:
+        node: A parsed TOML value. Typed ``object`` and narrowed with
+            ``isinstance`` so ``tomllib``'s ``Any`` cannot leak into the
+            annotated return of ``_setuptools_declarations`` under
+            mypy's ``warn_return_any``.
+        path: Dotted path of ``node``; the empty string at the document
+            root.
+        found: Accumulator, appended to in place.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            child = f"{path}.{key}" if path else str(key)
+            _walk_for_setuptools(value, child, found)
+        return
+    if not isinstance(node, list):
+        return
+    if _is_dependency_declaring(path):
+        found.extend(_setuptools_entries_at(path, node))
+    for element in node:
+        _walk_for_setuptools(element, path, found)
+
+
+def _setuptools_declarations() -> list[tuple[str, SpecifierSet]]:
+    """Return every ``setuptools`` requirement ``pyproject.toml`` declares.
+
+    setuptools is declared on two independent surfaces —
+    ``[tool.uv].constraint-dependencies``, which governs the resolution
+    graph behind ``uv.lock``, and ``[build-system].requires``, which
+    governs the isolated environment the build backend runs in — and no
+    test in this file read the second one until issue #1258. That
+    blindness is how ``setuptools>=68.0`` survived the #861 pin while
+    still admitting 81.0.0. Discovering the declarations beats naming
+    them: a surface added later is guarded the day it appears.
+
+    The walk is deliberately *restricted* to dependency-declaring table
+    paths instead of reading every list in the document. An
+    unrestricted walk parses 105 strings across 24 table paths in this
+    pyproject, among them ``tool.mypy.overrides.module``. Those are
+    module patterns, not requirements: ``setuptools.*`` raises
+    ``InvalidRequirement`` and is skipped harmlessly, but the bare form
+    ``module = ["setuptools"]`` parses cleanly into a requirement with
+    an *empty* specifier, and an empty ``SpecifierSet`` admits 81.0.0.
+    A future mypy override written that way would then fail the parity
+    guard with a security verdict about a line that has nothing to do
+    with dependency resolution — a false alarm that teaches the next
+    reader to distrust the guard. Restricted, the walk finds exactly
+    ``build-system.requires`` and ``tool.uv.constraint-dependencies``.
+
+    One boundary is worth stating because it is invisible from here:
+    this walk only reads PEP 508 requirement strings, so it cannot see
+    a ``[tool.uv.sources]`` entry, which redirects a dependency to a
+    git/path/URL source and bypasses version specifiers entirely.
+    Neither project declares that table today; if one ever does, this
+    guard does not cover it and a separate assertion is needed.
+
+    Returns:
+        One ``(dotted path, specifier)`` pair per declaration, in
+        document order. A list rather than a mapping because
+        array-of-tables entries share a dotted path and a mapping would
+        silently drop all but the last of them.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    found: list[tuple[str, SpecifierSet]] = []
+    _walk_for_setuptools(pyproject, "", found)
+    return found
 
 
 def _torch_constraint_specifier() -> SpecifierSet:
@@ -675,12 +874,62 @@ def test_setuptools_floor_accepts_patched_release() -> None:
     )
 
 
+def test_setuptools_ceiling_rejects_the_unvetted_next_major() -> None:
+    """The constraint excludes setuptools 85.0.0 and everything past it.
+
+    No advisory is involved in the ceiling — read it the way the mcp
+    ``<2.0.0`` and openai ``<3.0.0`` caps read rather than as a second
+    CVE. 84.0.0 is the release ``uv.lock`` resolves and every build in
+    this project has actually run against; 85.0.0 does not exist yet,
+    so no changelog has been read and no build has been tried, and
+    setuptools has removed long-deprecated surfaces at majors before
+    (``setup.py test``, ``easy_install``, the bundled distutils shim).
+    Holding the band at ``>=83.0.0,<85.0.0`` costs nothing the pin was
+    for: setuptools versions under SemVer, so every future 84.x patch —
+    the next security fix included — still resolves.
+
+    The 999.0.0 probe is the assertion that catches a half-measure. A
+    bare ``!=85.0.0`` satisfies the first assertion, reads like a
+    ceiling, and is not one: it re-admits 85.0.1 and every later major.
+    """
+    specifier = _setuptools_constraint_specifier()
+    assert str(_SETUPTOOLS_UNVETTED_MAJOR) not in specifier, (
+        f"setuptools constraint {specifier!r} admits "
+        f"{_SETUPTOOLS_UNVETTED_MAJOR}, a major nobody has reviewed — it "
+        "is unreleased, so no changelog has been read and no build has "
+        f"run against it, while {_SETUPTOOLS_LOCKED_VERSION} is what this "
+        "project actually builds with; the ceiling must be "
+        f"<{_SETUPTOOLS_UNVETTED_MAJOR} (#1258)"
+    )
+    assert str(_SETUPTOOLS_FUTURE_MAJOR_PROBE) not in specifier, (
+        f"setuptools constraint {specifier!r} admits "
+        f"{_SETUPTOOLS_FUTURE_MAJOR_PROBE}; an exclusion of the single "
+        f"release (`!={_SETUPTOOLS_UNVETTED_MAJOR}`) is not a ceiling — it "
+        "re-admits 85.0.1 and every later major. Write a real upper "
+        "bound (#1258)"
+    )
+    assert str(_SETUPTOOLS_LOCKED_VERSION) in specifier, (
+        f"setuptools constraint {specifier!r} rejects "
+        f"{_SETUPTOOLS_LOCKED_VERSION}, the release uv.lock already "
+        "resolves and every build here runs on; a ceiling has to sit "
+        "above today's resolution, so `<84.0.0` — one release too low — "
+        "is wrong even though it does exclude 85.0.0 (#1258)"
+    )
+
+
 def test_locked_setuptools_at_or_above_patched_release() -> None:
     """``uv.lock`` resolves setuptools to >= 83.0.0.
 
     The lockfile is what CI installs and what pip-audit inspects; a
     correct constraint floor with a stale lock still ships the
     vulnerable 81.0.0.
+
+    The floor assertion is only half of it. Once the constraint carries
+    a ceiling as well (#1258), a lock can drift off the *top* of the
+    declared band — a ``uv lock --upgrade`` landing 85.0.0 satisfies
+    ``>= 83.0.0`` while sitting outside ``>=83.0.0,<85.0.0`` — so the
+    second assertion reads the whole band, the way
+    ``test_locked_openai_satisfies_the_declared_specifier`` does.
     """
     locked = _locked_setuptools_version()
     assert locked >= _SETUPTOOLS_PATCHED_VERSION, (
@@ -689,6 +938,91 @@ def test_locked_setuptools_at_or_above_patched_release() -> None:
         "CVE-2026-59890); pip-audit inspects the lock, so relock after "
         "raising the constraint"
     )
+    assert str(locked) in _setuptools_constraint_specifier(), (
+        f"uv.lock pins setuptools {locked}, which the declared "
+        f"constraint {_setuptools_constraint_specifier()!r} rejects; a "
+        "bounded manifest with a lock outside the band is the drift this "
+        "pair of guards exists to catch, and the only assertion that "
+        "would notice an upgrade past the ceiling — run `uv lock` after "
+        "changing the constraint (#1258)"
+    )
+
+
+def test_every_setuptools_declaration_carries_the_vetted_band() -> None:
+    """Every declared setuptools surface carries the same vetted band.
+
+    ``[tool.uv].constraint-dependencies`` governs the resolution graph
+    that produces ``uv.lock``. ``[build-system].requires`` governs the
+    isolated environment the build backend runs in, and the constraint
+    does not reach it: constrained to ``<84.0.0`` a build still ran
+    setuptools 84.0.0, while bounding ``[build-system].requires``
+    produced 83.0.0. They are two surfaces, both able to select a
+    setuptools build, and only one of them was guarded — which is how
+    ``setuptools>=68.0`` sat in this pyproject admitting 81.0.0, the
+    PYSEC-2026-3447 release the whole pin exists to exclude, through
+    #861 and every review since (#1258).
+
+    The guard discovers the declarations rather than naming them, so a
+    third surface — a uv override, a dependency group, a build
+    constraint — is covered the day it is added instead of the day
+    someone remembers this file exists. The count assertion is what
+    keeps that honest: a walk that returned nothing would otherwise
+    make the loop below vacuous and the test green.
+    """
+    declarations = _setuptools_declarations()
+    assert len(declarations) >= 2, (
+        f"the pyproject walk found {len(declarations)} setuptools "
+        f"declaration(s) ({declarations!r}); this project declares "
+        "setuptools twice — [build-system].requires and "
+        "[tool.uv].constraint-dependencies — so a shorter result means "
+        "the walk is broken, and a guard iterating an empty list passes "
+        "while checking nothing"
+    )
+    paths = {path for path, _ in declarations}
+    assert {"build-system.requires", "tool.uv.constraint-dependencies"} <= paths, (
+        f"the setuptools walk reached {sorted(paths)}, missing one of the "
+        "two surfaces that select a setuptools build: "
+        "build-system.requires (the isolated build backend) and "
+        "tool.uv.constraint-dependencies (the resolution graph). Neither "
+        "can stand in for the other — a constraint bounded to <84.0.0 "
+        "still built with 84.0.0 (#1258)"
+    )
+    for path, specifier in declarations:
+        assert str(_SETUPTOOLS_LAST_VULNERABLE) not in specifier, (
+            f"{path} declares setuptools {specifier!r}, which admits "
+            f"{_SETUPTOOLS_LAST_VULNERABLE} — the release carrying "
+            "PYSEC-2026-3447 / CVE-2026-59890, path traversal in the "
+            "PackageIndex download path. Every surface that can select a "
+            f"setuptools build must floor at {_SETUPTOOLS_PATCHED_VERSION}, "
+            "not just the uv constraint (#1258)"
+        )
+        assert str(_SETUPTOOLS_UNVETTED_MAJOR) not in specifier, (
+            f"{path} declares setuptools {specifier!r}, which admits "
+            f"{_SETUPTOOLS_UNVETTED_MAJOR}; that major is unreleased, so "
+            "no changelog has been read and no build has run against it. "
+            f"Carry the same <{_SETUPTOOLS_UNVETTED_MAJOR} ceiling here as "
+            "on every other setuptools surface (#1258)"
+        )
+        assert str(_SETUPTOOLS_FUTURE_MAJOR_PROBE) not in specifier, (
+            f"{path} declares setuptools {specifier!r}, which admits "
+            f"{_SETUPTOOLS_FUTURE_MAJOR_PROBE}; an exclusion of the one "
+            f"release (`!={_SETUPTOOLS_UNVETTED_MAJOR}`) reads like a "
+            "ceiling and is not one — it re-admits 85.0.1 and every later "
+            "major. Write a real upper bound (#1258)"
+        )
+        assert str(_SETUPTOOLS_PATCHED_VERSION) in specifier, (
+            f"{path} declares setuptools {specifier!r}, which rejects "
+            f"{_SETUPTOOLS_PATCHED_VERSION}, the first release carrying "
+            "the PYSEC-2026-3447 fix; the floor is 83.0.0 on every "
+            "surface and no ceiling may swallow it (#1258)"
+        )
+        assert str(_SETUPTOOLS_LOCKED_VERSION) in specifier, (
+            f"{path} declares setuptools {specifier!r}, which rejects "
+            f"{_SETUPTOOLS_LOCKED_VERSION}, the release uv.lock resolves "
+            "and this project builds with; a band that excludes today's "
+            "resolution fails at provisioning time instead of here, and a "
+            "bound must record what the project has run (#1258)"
+        )
 
 
 def test_torch_floor_rejects_last_vulnerable_release() -> None:
