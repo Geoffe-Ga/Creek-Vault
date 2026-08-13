@@ -167,6 +167,59 @@ class Callback:
 HANDLER = Callback()
 """
 
+# ``@mcp.tool`` matches the wildcard ``@*.tool`` but none of the exact
+# patterns, so this fixture is the only thing that exercises a wildcard.
+_WILDCARD_TOOL_SOURCE = """
+class Registry:
+    \"\"\"Stand-in for an MCP server's tool registry.\"\"\"
+
+    def tool(self, fn: object) -> object:
+        \"\"\"Register and return the callback unchanged.\"\"\"
+        return fn
+
+
+mcp = Registry()
+
+
+@mcp.tool
+def registered_tool(value: int) -> int:
+    \"\"\"Invoked through the registry, never by name.\"\"\"
+    return value
+
+
+def orphaned_sibling(value: int) -> int:
+    \"\"\"Dead: no decorator, no caller.\"\"\"
+    return value - 1
+"""
+
+# An overloaded function nobody calls. All three definitions share one
+# name, so without the carve-out vulture reports the same dead symbol
+# three times -- once per ``def``.
+_OVERLOAD_SOURCE = """
+from typing import overload
+
+
+@overload
+def widen(value: int) -> int: ...
+@overload
+def widen(value: str) -> str: ...
+def widen(value: object) -> object:
+    \"\"\"Never called anywhere.\"\"\"
+    return value
+"""
+
+# ``clamp`` is called, so the only finding is the statement after the
+# return -- vulture's one 100%-confidence category.
+_UNREACHABLE_SOURCE = """
+def clamp(value: int) -> int:
+    \"\"\"Return the value; the line after the return can never run.\"\"\"
+    return value
+    value += 1
+
+
+RESULT = clamp(1)
+"""
+
 _ENUM_MISSING_SOURCE = """
 from enum import Enum
 
@@ -221,6 +274,13 @@ _CARVE_OUT_CASES = (
         "orphaned_method",
         "method",
         id="enum-_missing_-hook",
+    ),
+    pytest.param(
+        _WILDCARD_TOOL_SOURCE,
+        "registered_tool",
+        "orphaned_sibling",
+        "function",
+        id="wildcard-tool-decorator",
     ),
 )
 
@@ -567,6 +627,55 @@ def test_confidence_floors_keep_the_noisy_tier_out_and_let_the_rest_in(
     parameter_finding = _one(findings, "unused_parameter")
     assert parameter_finding.lineno == _line_of(_FLOORS_SOURCE, "def scale"), (
         "the unused-parameter finding must point at the signature that declares it"
+    )
+
+
+def test_unreachable_code_is_reported_at_its_own_floor(tmp_path: Path) -> None:
+    """The 100%-confidence category must actually reach the report (#1395).
+
+    ``unreachable_code`` is the one finding vulture proves from control
+    flow rather than infers, and it sits in the >=90 band with
+    ``variable`` and ``import``. It is the only floor with no production
+    instance in this repo, so without a synthetic fixture the entry in
+    CONFIDENCE_FLOORS would be pinned as a constant and never exercised
+    -- a floor nobody has watched work.
+    """
+    package = _write_package(tmp_path, {"module": _UNREACHABLE_SOURCE})
+
+    findings = _scan(package)
+
+    assert [(f.typ, f.confidence) for f in findings] == [("unreachable_code", 100)], (
+        "the statement after the return is provably dead and must be "
+        f"reported; findings were {findings!r}"
+    )
+    assert findings[0].confidence >= CONFIDENCE_FLOORS["unreachable_code"], (
+        "the finding must clear its own floor, or this test is asserting "
+        "something the policy did not decide"
+    )
+
+
+def test_overload_stubs_collapse_to_one_finding(tmp_path: Path) -> None:
+    """A dead overloaded function is reported once, not once per stub.
+
+    ``@overload`` stubs are erased at runtime and share their name with
+    the implementation, so a dead overloaded function yields one ``def``
+    worth of real news and two decoys. Without the carve-out this
+    fixture reports three findings for one symbol; with it, exactly one,
+    pointing at the implementation a developer would actually delete.
+
+    This is the carve-out's whole job, and it is why the assertion is on
+    the finding's *line number* rather than just its name -- all three
+    definitions are called ``widen``, so a name-only assertion would pass
+    on the noisy behaviour too.
+    """
+    package = _write_package(tmp_path, {"module": _OVERLOAD_SOURCE})
+
+    findings = _scan(package)
+
+    implementation_line = _line_of(_OVERLOAD_SOURCE, "def widen(value: object)")
+    assert [(f.name, f.lineno) for f in findings] == [("widen", implementation_line)], (
+        "a dead overloaded function must be reported exactly once, at its "
+        f"implementation (line {implementation_line}); got {findings!r}"
     )
 
 

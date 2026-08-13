@@ -134,7 +134,10 @@ repos:
     # The gate fixes its own scan scope; passing staged filenames would
     # narrow it and reopen the hole this hook exists to close.
     pass_filenames: false
-    files: ^creek-tools/(creek|creek_mcp|tests)/
+    # `scripts/` is in the trigger list because lint_vulture.py is the
+    # policy: editing a floor or a carve-out must re-run the gate, not
+    # wait for the next commit that happens to touch creek/.
+    files: ^creek-tools/(creek|creek_mcp|tests|scripts)/
 - repo: https://github.com/econchick/interrogate
   rev: 1.7.0
   hooks:
