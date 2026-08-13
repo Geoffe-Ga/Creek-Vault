@@ -195,7 +195,7 @@ strings become `{"len": N}`), tagged with the `consumer`, tamper-evident via a
 ## Ontology version
 
 The shared vocabulary — **Adepthood Aspects = Creek APTITUDE frequencies =
-Archetypal Wavelength phases** — is defined canonically in
+Archetypal Wavelength Modes = Adepthood Stages** — is defined canonically in
 [`docs/Ontology/creek_ontology_agent_prompt.md`](../Ontology/creek_ontology_agent_prompt.md)
 (frequencies §6.1, Wavelength §7) and implemented as the single source of truth in
 `creek-tools/creek/generate/ontology_glossary.py`, `…/indexes.py`, and
@@ -230,6 +230,14 @@ sides MUST treat a mismatch in this string as "renegotiate the contract".
 `rising → peaking → withdrawal → diminishing → bottoming_out → restoration`
 (plus `unclassified`). A six-phase rise-and-fall cycle; an entry sits at one
 phase.
+
+**Phases are not Modes.** This is the one confusion worth guarding against, and
+it has already produced wrong text in both repos. A *Mode* is one of the ten
+colour-keyed positions above — the functional stance named in §7.2 (Inhabit,
+Express, Collaborate, Integrate, Absorb, and Clear Light's Be), so Beige's Mode
+is Inhabit (Do) and Clear Light's is Be (Both/Neither). A *phase* is where in
+the six-part cycle something sits. Ten of one, six of the other, different
+axes; only the Modes belong in the `Aspects = frequencies = Stages` identity.
 
 ## Open questions (resolve before `Accepted`)
 
