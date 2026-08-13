@@ -54,36 +54,6 @@ _SPOILER_PATTERN = re.compile(r"\|\|(.+?)\|\|")
 """Regex pattern matching Discord spoiler tags ``||content||``."""
 
 
-# ---- Helper data structures ----
-
-
-class _MessageGroup:
-    """A group of temporally or reply-linked Discord messages.
-
-    Attributes:
-        channel_name: The name of the source Discord channel.
-        messages: Ordered list of message dicts in this group.
-        channel_id: The Discord channel ID string.
-    """
-
-    def __init__(
-        self,
-        channel_name: str,
-        messages: list[dict[str, Any]],
-        channel_id: str,
-    ) -> None:
-        """Initialise a message group.
-
-        Args:
-            channel_name: The display name of the channel.
-            messages: The list of message dicts in this group.
-            channel_id: The Discord channel ID string.
-        """
-        self.channel_name = channel_name
-        self.messages = messages
-        self.channel_id = channel_id
-
-
 # ---- Discord formatting helpers ----
 
 

@@ -45,8 +45,10 @@ install -r requirements-dev.txt` still works as an unpinned fallback.
 ./scripts/security.sh           # Bandit + pip-audit scans
 ./scripts/complexity.sh         # Radon/Xenon complexity analysis
 ./scripts/coverage-per-file.sh  # Per-file coverage gate (TEST-002)
+./scripts/lint-vulture.sh       # Dead-code gate (vulture, per-type confidence floors); in check-all.sh + CI
 ./scripts/lint-extended.sh      # Optional: pylint, refurb, tryceratops, vulture, interrogate, shellcheck
-                                # (not in check-all.sh; CI runs the subset that matters for the gate)
+                                # (not in check-all.sh; CI runs the subset that matters for the gate —
+                                # vulture itself IS gated, via lint-vulture.sh above, not this script)
 ./scripts/pr-status.sh list        # List recent CI workflow runs
 ./scripts/pr-status.sh view ID     # View workflow run results
 ./scripts/pr-status.sh watch ID    # Watch workflow run progress

@@ -2661,37 +2661,3 @@ def _render_fragment_section(
     if not entries:
         return ""
     return "## Source fragments\n\n" + "\n\n".join(entries)
-
-
-def _render_thread_section(
-    ids: tuple[str, ...],
-    threads: dict[str, Thread],
-) -> str:
-    """Return the ``## Threads`` block for the given IDs."""
-    entries: list[str] = []
-    for tid in ids:
-        if tid not in threads:
-            continue
-        thread = threads[tid]
-        desc = thread.description.strip() or "(no description)"
-        entries.append(f"### {tid}: {thread.title}\n{desc}")
-    if not entries:
-        return ""
-    return "## Threads\n\n" + "\n\n".join(entries)
-
-
-def _render_eddy_section(
-    ids: tuple[str, ...],
-    eddies: dict[str, Eddy],
-) -> str:
-    """Return the ``## Eddies`` block for the given IDs."""
-    entries: list[str] = []
-    for eid in ids:
-        if eid not in eddies:
-            continue
-        eddy = eddies[eid]
-        desc = eddy.description.strip() or "(no description)"
-        entries.append(f"### {eid}: {eddy.title}\n{desc}")
-    if not entries:
-        return ""
-    return "## Eddies\n\n" + "\n\n".join(entries)

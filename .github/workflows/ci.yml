@@ -164,6 +164,21 @@ jobs:
         # strictly stronger gate than the old per-leg default.
         run: ./scripts/lint-refurb.sh
 
+      - name: Run Vulture (dead-code gate)
+        # Issue #1395. Vulture used to run only from a pre-commit hook —
+        # and CI runs no pre-commit step, so it never ran here at all.
+        # Worse, that hook passed `--min-confidence 80`, which excludes
+        # the entire unused-function/method/class tier vulture scores at
+        # 60%: the check could not fail. ./scripts/lint-vulture.sh is now
+        # the single definition of the policy (per-type confidence
+        # floors, tests/ as a reference source, categorical carve-outs
+        # for framework-registered and language-invoked symbols).
+        #
+        # It belongs in this un-matrixed job for the same reason refurb
+        # does: it reads source and its verdict does not vary by
+        # interpreter, so running it three times would only cost time.
+        run: ./scripts/lint-vulture.sh
+
       - name: Upload security reports
         uses: actions/upload-artifact@v7
         if: always()

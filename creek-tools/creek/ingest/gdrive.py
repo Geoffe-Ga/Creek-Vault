@@ -1091,23 +1091,6 @@ class GoogleDriveDownloader:
             errors=tuple(errors),
         )
 
-    def changed_files(self, staging_dir: Path) -> list[DriveFile]:
-        """Return Drive files not already up-to-date in *staging_dir* (#683).
-
-        The incremental set surfaced via the connector's
-        ``list_changed_since`` — the same staging-mtime predicate
-        :meth:`download_all` uses to skip unchanged files, expressed as a
-        standalone listing (no download side effects).
-        """
-        return [
-            drive_file
-            for drive_file in self.list_files()
-            if not self._is_up_to_date(
-                self._target_path(drive_file, staging_dir),
-                drive_file,
-            )
-        ]
-
     def _resolve(self, file_id: str) -> DriveFile:
         """Return the :class:`DriveFile` for *file_id* from the cached listing."""
         if self._listing_cache is None:
@@ -1208,9 +1191,9 @@ class GoogleDriveDownloader:
 class GoogleDriveConnector:
     """Adapt the read-only Drive downloader to ``RemoteSourceConnector`` (#683).
 
-    Wraps a :class:`GoogleDriveDownloader` (and its staging directory) so Drive
-    satisfies the source-agnostic connector contract without changing any
-    download behaviour. ``fetch_to`` delegates to ``download_all`` (whose own
+    Wraps a :class:`GoogleDriveDownloader` so Drive satisfies the
+    source-agnostic connector contract without changing any download
+    behaviour. ``fetch_to`` delegates to ``download_all`` (whose own
     staging-mtime skip is unchanged); ``list_changed_since`` is driven by a
     **persisted cursor** (#684) — the last-seen Drive ``modified_time`` — so a
     fresh process or new host resumes incrementally. The cursor stores only a
@@ -1220,12 +1203,10 @@ class GoogleDriveConnector:
     def __init__(
         self,
         downloader: GoogleDriveDownloader,
-        staging: Path,
         cursor_path: Path,
     ) -> None:
-        """Bind the connector to a downloader, staging dir, and cursor file."""
+        """Bind the connector to a downloader and its cursor file."""
         self._downloader = downloader
-        self._staging = staging
         self._cursor_path = cursor_path
 
     def is_available(self) -> bool:
@@ -1313,7 +1294,7 @@ def build_drive_connector(
         if cursor_path is not None
         else resolved_staging / ".creek-connector-cursor.json"
     )
-    return GoogleDriveConnector(downloader, resolved_staging, resolved_cursor)
+    return GoogleDriveConnector(downloader, resolved_cursor)
 
 
 __all__ = [

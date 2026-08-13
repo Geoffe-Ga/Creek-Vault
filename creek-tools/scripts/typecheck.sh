@@ -63,7 +63,13 @@ if command -v mypy &> /dev/null; then
     # creek_mcp/ (MCP server, auth, token policy, path confinement).
     # creek_mcp/ was outside the target list until issue #925 — keep the
     # two of them together here and in .github/workflows/ci.yml.
-    python -m mypy creek/ creek_mcp/ || {
+    #
+    # scripts/ joined the list in issue #1395, which added
+    # scripts/lint_vulture.py. Fixing an ungated gate by adding a second
+    # ungated one would be no fix at all, so the dead-code policy module
+    # is type-checked (and, via pyproject's coverage source, covered)
+    # exactly like product code.
+    python -m mypy creek/ creek_mcp/ scripts/ || {
         echo "✗ Type checking failed" >&2
         exit 1
     }

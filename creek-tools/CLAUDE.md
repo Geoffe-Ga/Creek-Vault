@@ -46,6 +46,7 @@ Always invoke tools through `./scripts/*` instead of directly.
 | Lint code | `ruff check .` | `./scripts/lint.sh` |
 | Modernisation hints | `refurb creek/` | `./scripts/lint-refurb.sh` |
 | Exception hygiene | `tryceratops creek/` | `./scripts/lint-tryceratops.sh` |
+| Dead-code detection | `vulture creek/` | `./scripts/lint-vulture.sh` |
 | All checks | *(run each tool)* | `./scripts/check-all.sh` |
 | Security scan | `bandit -r src/` | `./scripts/security.sh` |
 
@@ -322,6 +323,8 @@ creek-tools/
 │   ├── test.sh                       # Run test suite (--unit / --integration / --e2e / --all)
 │   ├── lint.sh                       # Ruff lint
 │   ├── lint-extended.sh              # pylint, refurb, tryceratops, vulture, interrogate
+│   ├── lint-vulture.sh               # Dead-code gate wrapper — the one entrypoint (issue #1395)
+│   ├── lint_vulture.py               # Dead-code gate policy; see its module docstring
 │   ├── format.sh                     # Ruff format
 │   ├── typecheck.sh                  # MyPy strict (CI-001)
 │   ├── security.sh                   # Bandit + pip-audit (with documented ignores; DEP-003)
@@ -426,8 +429,14 @@ All code must meet these standards before merging to main:
   `scripts/lint-tryceratops.sh`. The `# noqa: TRY…  # <one-liner>`
   escape hatch is reserved for intentional separation of failure modes
   and documented `ValueError` schema contracts.
-- **Vulture**: pre-commit-only today; tracked under a follow-up to
-  STYLE-001 to be gated once the dead-code surface is groomed.
+- **Vulture (dead-code detection)**: zero findings. Gated by
+  `scripts/lint-vulture.sh` in both `check-all.sh` and CI (issue
+  #1395). Per-type confidence floors, not one uniform threshold — see
+  `scripts/lint_vulture.py`'s module docstring for the policy and its
+  five documented blindnesses, the largest being code kept alive only
+  by its own tests. Unlike refurb/tryceratops there is **no allowlist
+  and no `# noqa`-style escape hatch**: the only remedy for a real
+  finding is deletion.
 
 #### Documentation Standards
 - **Google-style Docstrings**: All public APIs
