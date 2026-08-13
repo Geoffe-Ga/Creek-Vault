@@ -16,7 +16,15 @@ dependencies = [
     # injection on Streamable HTTP bearer transport). Fixed in 1.28.1.
     "mcp>=1.28.1,<2.0.0",
     "anthropic>=0.40.0",
-    "openai>=1.0",
+    # Transport hold, not a CVE (OSV reports no advisories for openai):
+    # openai 3.0.0 swapped `httpx<1,>=0.23.0` for `httpx2<3,>=2.7.0` — a
+    # separate distribution, not a version bump — dragging httpcore2,
+    # truststore and idna>=3.18 in alongside httpx. CI installs with
+    # `pip install -e ".[dev]"`, a live PyPI resolve, so an open ceiling
+    # is not a future risk: 3.0.0 already reached a green main build
+    # that way. `mcp>=1.28.1,<2.0.0` caps the other half of the same
+    # swap (#998). Floor is the release uv.lock already resolves.
+    "openai>=2.41.0,<3.0.0",
     "google-genai>=1.0",
     "pydantic>=2.0.0",
     "pyyaml>=6.0.0",
