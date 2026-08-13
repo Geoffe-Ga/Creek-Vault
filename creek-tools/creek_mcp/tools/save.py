@@ -21,6 +21,7 @@ from creek.models import PrivacyTier
 from creek.save import SaveRequest, SaveTarget, save_to_vault
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import (
+    TIER_REQUIRED_REASON,
     TierCeiling,
     refusal_response,
     write_tier_allowed,
@@ -69,7 +70,7 @@ def save_tool(
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
-            reason="tier is required; pass open|personal|intimate explicitly",
+            reason=TIER_REQUIRED_REASON,
         )
     try:
         save_tier = PrivacyTier(tier)

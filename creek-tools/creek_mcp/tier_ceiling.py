@@ -23,6 +23,7 @@ Two distinct questions are answered here, both off the same ranking:
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Final
 
 from creek.classify.privacy_filter import PrivacyTierOverride
 from creek.models import PrivacyTier
@@ -259,6 +260,27 @@ def write_tier_allowed(write_tier: PrivacyTier, ceiling: TierCeiling) -> bool:
     silently downgraded.
     """
     return tier_allowed(write_tier, ceiling)
+
+
+TIER_REQUIRED_REASON: Final[str] = (
+    "tier is required; pass open|personal|intimate explicitly"
+)
+"""The refusal every write verb owes a caller who omitted ``tier``.
+
+Shared rather than repeated, and it lives beside :func:`refusal_response`
+because two independent consumers must read the *same bytes*:
+
+* the three write tools — ``creek.save`` (#1434), ``creek.journal`` and
+  ``creek.upload`` (#1494) — each refuse an omitted tier rather than filing
+  the caller's content at a defaulted ``open``. A client that learns the
+  refusal from one verb must recognise it from the other two, so a single
+  literal is what makes the three read alike;
+* the ``/v1`` ``ErrorCode`` table in :mod:`creek_mcp.httpapi.journal`, which
+  maps this refusal to ``invalid_request``. It keys on this constant rather
+  than on a retyped copy of the string, so rewording the sentence moves the
+  mapping with it instead of silently dropping the reason into that
+  function's fail-closed ``internal_error`` default.
+"""
 
 
 def refusal_response(

@@ -1510,7 +1510,12 @@ MCP_CONTRACT: Final[Mapping[str, Surface]] = {
         shape=Shape.WRITES,
         why="#1024: an entry accepted over the wire but never landed in the vault",
         derived_from=("creek.vault.writer:VaultWriter",),
-        kwargs={"content": CANARY, "external_id": "j-canary-1", **_ALL},
+        kwargs={
+            "content": CANARY,
+            "external_id": "j-canary-1",
+            "tier": "open",
+            **_ALL,
+        },
         effect=Effect(writes=("01-Fragments/Journal/*.md",), contains=(CANARY,)),
     ),
     "creek.upload": Surface(
@@ -1523,6 +1528,7 @@ MCP_CONTRACT: Final[Mapping[str, Surface]] = {
                 f"# Canary\n\n{CANARY}\n".encode(),
             ).decode(),
             "external_id": "u-canary-1",
+            "tier": "open",
             **_ALL,
         },
         effect=Effect(

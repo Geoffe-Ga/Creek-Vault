@@ -225,6 +225,7 @@ def test_oversize_upload_is_refused_before_anything_is_written(
         filename="huge.txt",
         content_base64=payload,
         external_id="u-big",
+        tier="open",
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
 
@@ -256,6 +257,7 @@ def test_document_bytes_never_enter_the_audit_log(tmp_path: Path) -> None:
         filename="memo.txt",
         content_base64=encoded,
         external_id="u-audit",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
@@ -362,6 +364,7 @@ def test_identical_resend_is_a_true_no_op(tmp_path: Path) -> None:
             filename="steady.txt",
             content_base64=payload,
             external_id="u-noop",
+            tier="open",
             timestamp=_TS,
             privacy_tier_ceiling=TierCeiling.OPEN,
         )
@@ -390,6 +393,7 @@ def test_changed_bytes_update_the_same_fragment_in_place(tmp_path: Path) -> None
             filename="draft.txt",
             content_base64=_b64(text.encode("utf-8")),
             external_id="u-edit",
+            tier="open",
             timestamp=_TS,
             privacy_tier_ceiling=TierCeiling.OPEN,
         )
@@ -470,6 +474,7 @@ def test_a_file_that_produces_no_fragment_is_refused_not_reported_ok(
         filename=filename,
         content_base64=_b64(payload),
         external_id=f"u-{filename}",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
@@ -489,6 +494,7 @@ def test_ingest_failure_is_a_structured_refusal(tmp_path: Path) -> None:
         filename="note.txt",
         content_base64=_b64(b"a note that never lands"),
         external_id="u-fail",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
         run=_failing_runner,
@@ -504,6 +510,7 @@ def test_ingest_failure_is_a_structured_refusal(tmp_path: Path) -> None:
         filename="note.txt",
         content_base64=_b64(b"a note with nowhere to land"),
         external_id="u-gone",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
@@ -548,6 +555,44 @@ def test_malformed_arguments_refuse_without_an_audit_entry(
     assert not (vault / MCP_AUDIT_RELPATH).exists()
 
 
+def test_omitted_tier_is_refused_before_anything_is_written(tmp_path: Path) -> None:
+    """An OMITTED ``tier`` is a malformed call too, not an ``open`` upload (#1494).
+
+    ``tier=`` is left out of the call entirely rather than passed as ``None``,
+    deliberately: omission is what a real caller does, and it is what makes
+    this single test kill two mutations — restoring ``tier: str = "open"`` on
+    :func:`~creek_mcp.tools.upload.upload_tool`, and deleting the ``tier is
+    None`` guard. Passing ``tier=None`` explicitly would kill only the second.
+
+    The reason substring is required rather than decorative: ``PrivacyTier``
+    raises ``ValueError`` on ``None``, so with the guard gone this call still
+    answers ``status: refused`` — with reason ``unknown tier None`` — and an
+    assertion on the status alone would be blind to the whole fix.
+
+    The staging dir is asserted absent because an upload that got past this
+    gate would have written the caller's bytes to disk before any later
+    refusal could fire, which is the leak the tier default caused.
+    """
+    vault = _vault(tmp_path)
+
+    result = upload_tool(
+        vault_path=vault,
+        filename="notes.md",
+        content_base64=_b64(b"# Note\n\nA document whose tier nobody named.\n"),
+        external_id="u-no-tier",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert result["tool"] == TOOL_NAME
+    assert set(result) == _REFUSAL_KEYS
+    assert "tier is required" in str(result["reason"])
+    assert _fragments(vault) == []
+    assert not (vault / UPLOAD_STAGING_RELDIR).exists()
+    assert not (vault / MCP_AUDIT_RELPATH).exists()
+
+
 def test_staging_path_and_origin_key_are_stable(tmp_path: Path) -> None:
     """The staging dir and the ledger key it produces are pinned (#845/#1023).
 
@@ -562,6 +607,7 @@ def test_staging_path_and_origin_key_are_stable(tmp_path: Path) -> None:
         filename="budget.xlsx",
         content_base64=_b64(_xlsx_bytes(tmp_path)),
         external_id="u-xlsx",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
@@ -870,6 +916,7 @@ def test_multi_sheet_upload_writes_one_fragment_per_sheet(tmp_path: Path) -> Non
         filename="book.xlsx",
         content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path)),
         external_id="u-multi",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
@@ -908,6 +955,7 @@ def test_multi_sheet_upload_reports_every_sheet_in_the_audit_log(
         filename="book.xlsx",
         content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path)),
         external_id="u-multi-audit",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
@@ -939,6 +987,7 @@ def test_multi_sheet_upload_resend_is_a_true_no_op(tmp_path: Path) -> None:
             filename="book.xlsx",
             content_base64=payload,
             external_id="u-multi-resend",
+            tier="open",
             timestamp=_TS,
             privacy_tier_ceiling=TierCeiling.OPEN,
         )
@@ -968,6 +1017,7 @@ def test_multi_sheet_origin_keys_name_each_sheet(tmp_path: Path) -> None:
         filename="book.xlsx",
         content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path)),
         external_id="u-multi-keys",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
@@ -1032,6 +1082,7 @@ def test_multi_sheet_extension_conflict_is_still_refused(tmp_path: Path) -> None
         filename="book.xlsx",
         content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path)),
         external_id="u-multi-ext",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
@@ -1041,6 +1092,7 @@ def test_multi_sheet_extension_conflict_is_still_refused(tmp_path: Path) -> None
         filename="book.txt",
         content_base64=_b64(b"a plain text re-type of the same document"),
         external_id="u-multi-ext",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
@@ -1068,6 +1120,7 @@ def test_failed_resend_does_not_discard_a_referenced_workbook(
         filename="book.xlsx",
         content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path)),
         external_id="u-multi-fail",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
@@ -1078,6 +1131,7 @@ def test_failed_resend_does_not_discard_a_referenced_workbook(
         filename="book.xlsx",
         content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path, marker="second")),
         external_id="u-multi-fail",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
         run=_failing_runner,
@@ -1104,6 +1158,7 @@ def test_single_sheet_upload_keeps_a_bare_origin_key(tmp_path: Path) -> None:
         filename="budget.xlsx",
         content_base64=_b64(_xlsx_bytes(tmp_path)),
         external_id="u-single",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
@@ -1143,6 +1198,7 @@ def test_multi_sheet_fragment_id_is_stable_under_sheet_order(tmp_path: Path) -> 
         filename="ordered.xlsx",
         content_base64=_b64(path.read_bytes()),
         external_id="u-order",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
@@ -1241,6 +1297,7 @@ def test_extension_conflict_survives_a_purge_of_the_staged_bytes(
         filename="book.xlsx",
         content_base64=_b64(_multi_sheet_xlsx_bytes(tmp_path)),
         external_id="u-purge-ext",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
@@ -1252,6 +1309,7 @@ def test_extension_conflict_survives_a_purge_of_the_staged_bytes(
         filename="book.txt",
         content_base64=_b64(b"a plain text re-type of the same document"),
         external_id="u-purge-ext",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
     )

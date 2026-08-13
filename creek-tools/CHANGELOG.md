@@ -32,6 +32,28 @@ to locate the originating commit for any reference below.
 
 ### Breaking changes
 
+- **`tier` is now required on every `creek.journal` and `creek.upload`
+  call (#1494).** Both verbs previously declared `tier: str = "open"` —
+  twice each, once on the tool function and again, independently, on the
+  `build_server` wrapper that MCP clients actually reach — so a caller
+  that omitted `tier` had its content filed as `open` and said so
+  nowhere. That inverts the fail-closed rule the deployed
+  `privacy-tier.SKILL.md` states as rule 1, "Never write `tier: open` by
+  default": ordinary journaling is `personal` by that skill's own table,
+  escalating to `intimate` for recovery, trauma or sexuality content, so
+  the default was silently down-tiering exactly the material the tier
+  system exists to protect. The `privacy_tier_ceiling` machinery could
+  not catch it, because at `ceiling=open` a defaulted `open` is trivially
+  within the caller's own ceiling. Both tools now return
+  `{"status": "refused", ...}` naming the missing `tier`, before anything
+  is staged, ingested, or audited. To preserve the old behaviour, pass
+  `tier: "open"` explicitly. `PUT /v1/journal-entries/{external_id}` is
+  unaffected — `JournalUpsertRequest.tier` never had a default — and
+  `creek.upload` has no `/v1` route at all, so this restores MCP parity
+  with the HTTP adapter rather than changing it. Vaults already
+  scaffolded keep the old rule-5 `privacy-tier.SKILL.md` text, which
+  names only `creek save`/`creek.save`, until `creek skills sync` or a
+  re-`creek init` re-deploys the updated template.
 - **`--tier`/`tier` is now required on every `creek save` and `creek.save`
   call (#1434); neither transport infers, defaults, or derives a tier
   from anything, including `--provenance`/`provenance` or the source
