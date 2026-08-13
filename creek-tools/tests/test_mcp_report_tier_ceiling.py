@@ -71,7 +71,11 @@ _INTIMATE_CANARY = "CANARY-RPT-INTIMATE-8c4e"
 """Above ``ceiling=open`` for ``tags`` / ``decisions`` / ``mode-profiles``."""
 
 _PERSONAL_CANARY = "CANARY-RPT-PERSONAL-1f95"
-"""Above ``ceiling=open`` for the three voice-corpus reports (see module doc)."""
+"""Above ``ceiling=open`` for the three voice-corpus reports (see module doc).
+
+Also the above-ceiling canary for ``decisions`` since #1431 — see
+:func:`_build_decisions_vault`.
+"""
 
 _NOTIER_CANARY = "CANARY-RPT-NOTIER-6b02"
 """Carried by a fragment whose front matter has no ``privacy_tier`` key at all."""
@@ -245,13 +249,26 @@ def _build_tags_vault(root: Path) -> Path:
 
 
 def _build_decisions_vault(root: Path) -> Path:
-    """Seed two decision-signalling fragments, one ``open`` and one ``intimate``.
+    """Seed three decision-signalling fragments: ``open``, ``personal``, ``intimate``.
 
-    Both titles open with ``"Should I"`` so ``DecisionDetector._detect_keywords``
-    flags them; the canary rides in the title, which ends up verbatim in the
-    generated note's filename *and* its ``title:`` front matter.
-    ``08-Decisions/Active/`` is deliberately left absent so the idempotency skip
-    in ``_existing_decision_fragment_ids`` cannot suppress either note.
+    All three titles open with ``"Should I"`` so
+    ``DecisionDetector._detect_keywords`` flags them; the canary rides in the
+    title, which ends up verbatim in the generated note's filename *and* its
+    ``title:`` front matter. ``08-Decisions/Active/`` is deliberately left
+    absent so the idempotency skip in ``_existing_decision_fragment_ids``
+    cannot suppress any note.
+
+    The ``personal`` fragment exists because of #1431. ``generate_decisions``
+    now carries an unconditional intimate screen on top of the ceiling gate, so
+    the ``intimate`` fragment is written at *no* ceiling — which would make the
+    two permissive-direction proofs vacuous if they kept using it as their
+    above-ceiling canary. ``personal`` is the tier that is *above*
+    ``ceiling=open`` (so ``test_report_at_open_ceiling_excludes_above_ceiling_content``
+    and the inverted-gate obedience proof stay real) yet *below* the new screen
+    (so ``test_report_at_all_ceiling_admits_everything`` still proves that
+    ``ALL`` filters nothing it is not required to). The ``intimate`` fragment
+    stays exactly as it was: it is the subject of
+    :func:`test_decisions_never_names_an_intimate_fragment_at_any_ceiling`.
 
     Args:
         root: Directory the vault is created inside.
@@ -279,6 +296,16 @@ def _build_decisions_vault(root: Path) -> Path:
             privacy_tier="intimate",
         ),
         "Intimate body.",
+    )
+    _write_note(
+        vault,
+        "01-Fragments/Notes/frag-personal.md",
+        _fragment_metadata(
+            frag_id="frag-personal",
+            title=f"Should I keep {_PERSONAL_CANARY}",
+            privacy_tier="personal",
+        ),
+        "Personal body.",
     )
     return vault
 
@@ -602,7 +629,11 @@ _CASES: tuple[_ReportCase, ...] = (
     _ReportCase(
         report_type="decisions",
         build=_build_decisions_vault,
-        above_canary=_INTIMATE_CANARY,
+        # ``personal``, not ``intimate`` (#1431): ``generate_decisions`` screens
+        # intimate fragments unconditionally, so an intimate above-canary would
+        # be absent at *every* ceiling and the ALL-admits-everything and
+        # inverted-gate proofs would both pass without the gate doing anything.
+        above_canary=_PERSONAL_CANARY,
         below_canary=_OPEN_CANARY,
         artifact_roots=("08-Decisions",),
         positive_glob="08-Decisions/Active/*.md",
