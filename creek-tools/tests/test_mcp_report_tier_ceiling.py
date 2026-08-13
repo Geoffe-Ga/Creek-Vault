@@ -71,7 +71,11 @@ _INTIMATE_CANARY = "CANARY-RPT-INTIMATE-8c4e"
 """Above ``ceiling=open`` for ``tags`` / ``decisions`` / ``mode-profiles``."""
 
 _PERSONAL_CANARY = "CANARY-RPT-PERSONAL-1f95"
-"""Above ``ceiling=open`` for the three voice-corpus reports (see module doc)."""
+"""Above ``ceiling=open`` for the three voice-corpus reports (see module doc).
+
+Also the above-ceiling canary for ``decisions`` since #1431 — see
+:func:`_build_decisions_vault`.
+"""
 
 _NOTIER_CANARY = "CANARY-RPT-NOTIER-6b02"
 """Carried by a fragment whose front matter has no ``privacy_tier`` key at all."""
@@ -245,13 +249,26 @@ def _build_tags_vault(root: Path) -> Path:
 
 
 def _build_decisions_vault(root: Path) -> Path:
-    """Seed two decision-signalling fragments, one ``open`` and one ``intimate``.
+    """Seed three decision-signalling fragments: ``open``, ``personal``, ``intimate``.
 
-    Both titles open with ``"Should I"`` so ``DecisionDetector._detect_keywords``
-    flags them; the canary rides in the title, which ends up verbatim in the
-    generated note's filename *and* its ``title:`` front matter.
-    ``08-Decisions/Active/`` is deliberately left absent so the idempotency skip
-    in ``_existing_decision_fragment_ids`` cannot suppress either note.
+    All three titles open with ``"Should I"`` so
+    ``DecisionDetector._detect_keywords`` flags them; the canary rides in the
+    title, which ends up verbatim in the generated note's filename *and* its
+    ``title:`` front matter. ``08-Decisions/Active/`` is deliberately left
+    absent so the idempotency skip in ``_existing_decision_fragment_ids``
+    cannot suppress any note.
+
+    The ``personal`` fragment exists because of #1431. ``generate_decisions``
+    now carries an unconditional intimate screen on top of the ceiling gate, so
+    the ``intimate`` fragment is written at *no* ceiling — which would make the
+    two permissive-direction proofs vacuous if they kept using it as their
+    above-ceiling canary. ``personal`` is the tier that is *above*
+    ``ceiling=open`` (so ``test_report_at_open_ceiling_excludes_above_ceiling_content``
+    and the inverted-gate obedience proof stay real) yet *below* the new screen
+    (so ``test_report_at_all_ceiling_admits_everything`` still proves that
+    ``ALL`` filters nothing it is not required to). The ``intimate`` fragment
+    stays exactly as it was: it is the subject of
+    :func:`test_decisions_never_names_an_intimate_fragment_at_any_ceiling`.
 
     Args:
         root: Directory the vault is created inside.
@@ -279,6 +296,16 @@ def _build_decisions_vault(root: Path) -> Path:
             privacy_tier="intimate",
         ),
         "Intimate body.",
+    )
+    _write_note(
+        vault,
+        "01-Fragments/Notes/frag-personal.md",
+        _fragment_metadata(
+            frag_id="frag-personal",
+            title=f"Should I keep {_PERSONAL_CANARY}",
+            privacy_tier="personal",
+        ),
+        "Personal body.",
     )
     return vault
 
@@ -602,7 +629,11 @@ _CASES: tuple[_ReportCase, ...] = (
     _ReportCase(
         report_type="decisions",
         build=_build_decisions_vault,
-        above_canary=_INTIMATE_CANARY,
+        # ``personal``, not ``intimate`` (#1431): ``generate_decisions`` screens
+        # intimate fragments unconditionally, so an intimate above-canary would
+        # be absent at *every* ceiling and the ALL-admits-everything and
+        # inverted-gate proofs would both pass without the gate doing anything.
+        above_canary=_PERSONAL_CANARY,
         below_canary=_OPEN_CANARY,
         artifact_roots=("08-Decisions",),
         positive_glob="08-Decisions/Active/*.md",
@@ -748,6 +779,16 @@ def test_report_at_all_ceiling_admits_everything(
     :func:`test_rhetorical_pattern_counts_are_identical_across_ceilings`.
     ``below_canary is None`` is the flag for that case — it marks the artifact,
     not the tier, which is why it gates both sentinels here.
+
+    ``decisions`` carries one further rule this test deliberately does not
+    weaken (#1431): on top of the ceiling it applies an *unconditional*
+    ``intimate`` screen, because its artifact's filename is a source
+    fragment's title. Rather than soften the invariant above for that row, its
+    ``above_canary`` was moved onto a ``personal`` fragment — above
+    ``ceiling=open``, below the screen — so the assertion here still means
+    exactly what it says. The invariant itself, and its wording, stay verbatim
+    for all six report types; the intimate case is proved separately by
+    :func:`test_decisions_never_names_an_intimate_fragment_at_any_ceiling`.
 
     Args:
         case: The report type under test and its fixture.
@@ -1759,4 +1800,97 @@ def test_every_audience_weighted_symbol_is_actually_called_somewhere() -> None:
         f"_AUDIENCE_WEIGHTING_CALL_NAMES lists {sorted(missing)}, which none of "
         f"{_AUDIENCE_WEIGHTING_CALLER_MODULES} calls. An entry no call site "
         "matches is an assertion about nothing."
+    )
+
+
+# ---------------------------------------------------------------------------
+# T9 — decisions carries a second, non-defeasible screen (#1431)
+# ---------------------------------------------------------------------------
+
+
+_ALL_CEILINGS = [
+    pytest.param(TierCeiling.OPEN, id="open"),
+    pytest.param(TierCeiling.PERSONAL, id="personal"),
+    pytest.param(TierCeiling.INTIMATE, id="intimate"),
+    pytest.param(TierCeiling.ALL, id="all"),
+]
+"""Every :class:`TierCeiling` member, one parametrize row each.
+
+Spelled out rather than derived from ``list(TierCeiling)`` so the ids stay
+readable in a failure line; the length guard inside the test below is what
+stops a newly added ceiling from quietly skipping this proof.
+"""
+
+
+@pytest.mark.parametrize("ceiling", _ALL_CEILINGS)
+def test_decisions_never_names_an_intimate_fragment_at_any_ceiling(
+    ceiling: TierCeiling,
+    tmp_path: Path,
+) -> None:
+    """An ``intimate`` title never reaches an ``08-Decisions`` filename (#1431).
+
+    Unlike every other report gated by #968, ``decisions`` writes a source
+    fragment's title verbatim into a *filename* that then sits in the vault
+    tree, visible to Obsidian's file pane, to ``ls``, to Spotlight and to any
+    sync client — with no frontmatter to declare what tier it came from. The
+    ceiling is the operator's dial; this screen is not, which is why the
+    assertion is parametrized over *every* ceiling including ``ALL``.
+
+    The ceiling parametrization is the point. At ``ceiling=open`` the ordinary
+    rank cutoff already excludes the intimate fragment, and
+    ``test_report_at_open_ceiling_excludes_above_ceiling_content[decisions]``
+    was already green before this fix — a test pinned at the *narrowest*
+    ceiling would have proven nothing. The defect lives at ``intimate`` and
+    ``all``, the two widest ceilings, and those are the two rows that were red
+    before the screen existed.
+
+    The FILENAME assertion is written directly against ``rglob`` rather than
+    through :func:`_artifact_blob`, even though that helper happens to include
+    paths today. Path coverage there is one "simplify this to contents-only"
+    refactor away from disappearing, and the filename is this defect's primary
+    surface; the check must not be able to retire silently.
+
+    Args:
+        ceiling: The ceiling the report is driven at.
+        tmp_path: pytest's per-test temporary directory.
+    """
+    assert len(_ALL_CEILINGS) == len(list(TierCeiling)), (
+        "TierCeiling gained a member that this parametrization does not cover. "
+        "A ceiling with no row here is a ceiling at which the intimate screen "
+        "is unproven."
+    )
+
+    vault = _build_decisions_vault(tmp_path)
+    result = report_tool(
+        vault_path=vault,
+        report_type="decisions",
+        privacy_tier_ceiling=ceiling,
+    )
+    assert result["status"] == "ok"
+
+    leaked = [
+        str(path.relative_to(vault))
+        for path in (vault / "08-Decisions").rglob("*")
+        if _INTIMATE_CANARY in str(path.relative_to(vault))
+    ]
+    assert not leaked, (
+        f"at privacy_tier_ceiling={ceiling.value!r} an intimate fragment's "
+        f"title reached an 08-Decisions FILENAME: {leaked}. The note's own "
+        "front matter cannot label a path."
+    )
+
+    blob = _artifact_blob(vault, ("08-Decisions",))
+    assert _INTIMATE_CANARY not in blob, (
+        f"at privacy_tier_ceiling={ceiling.value!r} the intimate title reached "
+        f"08-Decisions content — the generated note's `title:` is the source "
+        f"fragment's title verbatim:\n\n{blob}"
+    )
+    assert _OPEN_CANARY in blob, (
+        f"at privacy_tier_ceiling={ceiling.value!r} the open fragment lost its "
+        "Decision note, so the exclusion assertions above are vacuous. A screen "
+        "that drops everything is an outage wearing a gate's costume."
+    )
+    assert list(vault.glob("08-Decisions/Active/*.md")), (
+        f"no Decision note at all was written at "
+        f"privacy_tier_ceiling={ceiling.value!r}."
     )

@@ -2019,8 +2019,18 @@ def test_report_decisions_generates_note(tmp_path: Path) -> None:
     (vault / "00-Creek-Meta").mkdir(parents=True)
     frags = vault / "01-Fragments" / "Conversations"
     frags.mkdir(parents=True)
+    # ``privacy_tier: open`` is stated rather than omitted (#1431). The screen
+    # ``generate_decisions`` now applies reads the *raw* front matter and fails
+    # closed, so a note with no ``privacy_tier:`` key ranks intimate and is
+    # withheld. Omitting the key here was never realistic vault state:
+    # ``VaultWriter._write_model`` (creek/vault/writer.py:1385) serialises
+    # ``model.model_dump(mode="json")``, so every pipeline-written fragment
+    # carries the key explicitly. The keyless case is not swept under the rug —
+    # ``test_report_decisions_withholds_a_fragment_with_no_privacy_tier_key``
+    # below pins it.
     (frags / "frag-decide99.md").write_text(
         '---\ntype: fragment\nid: frag-decide99\ntitle: "Should I move to the coast"\n'
+        "privacy_tier: open\n"
         "source:\n  platform: journal\n  author: self\n---\nbody\n",
         encoding="utf-8",
     )
@@ -2033,6 +2043,230 @@ def test_report_decisions_generates_note(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "Decision notes generated" in result.output
     assert any((vault / "08-Decisions" / "Active").glob("*.md"))
+
+
+def test_report_decisions_withholds_a_fragment_with_no_privacy_tier_key(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A keyless fragment is withheld, and the withholding is announced (#1431).
+
+    The decisions screen reads
+    :func:`creek.classify.privacy_filter.raw_privacy_tier`, which fails closed:
+    a note whose front matter has no ``privacy_tier:`` key ranks ``intimate``
+    rather than the model's ``unclassified``. That is the same answer
+    ``tests/test_mcp_report_tier_ceiling.py``'s
+    ``test_fragment_with_no_privacy_tier_key_fails_closed_to_intimate`` already
+    pins for report artifacts, and picking the model reader instead would leave
+    the #1431 filename leak reproducible for exactly this fragment shape.
+
+    The consequence is deliberately made loud rather than silent. ``creek
+    report`` otherwise prints "no new decision candidates found", which for a
+    hand-written or legacy vault would be a false statement produced by the
+    fix; the withheld count in the log is what distinguishes "nothing to
+    report" from "something was refused". Only the count is logged — never an
+    id and never a title, since the title is the leaking value.
+    """
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    frags = vault / "01-Fragments" / "Conversations"
+    frags.mkdir(parents=True)
+    (frags / "frag-notier.md").write_text(
+        '---\ntype: fragment\nid: frag-notier\ntitle: "Should I move to the coast"\n'
+        "source:\n  platform: journal\n  author: self\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING", logger="creek.generate.decisions"):
+        result = runner.invoke(
+            app,
+            ["report", "--type", "decisions", "--vault", str(vault)],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "No decision notes generated" in result.output
+    assert not list((vault / "08-Decisions").rglob("*.md"))
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("withheld" in r.getMessage() for r in warnings), (
+        "the fail-closed screen dropped the only candidate without saying so; "
+        f"records={[r.getMessage() for r in caplog.records]}"
+    )
+    assert any("1" in r.getMessage() for r in warnings), (
+        "the warning must carry the withheld count so an operator can tell "
+        "'nothing to report' from 'something was refused'."
+    )
+    assert not any("coast" in r.getMessage() for r in caplog.records), (
+        "the warning must carry a count only — logging the title would move "
+        "the leak from the filename to the log."
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1431 — the intimate title must not reach stdout either
+# ---------------------------------------------------------------------------
+
+_INTIMATE_DECISION_CANARY = "Jane-Doe-of-Springfield-Illinois"
+"""Sentinel carried in an intimate fragment's title.
+
+Restricted to ``[A-Za-z0-9-]`` because
+``creek.generate.decisions._sanitize_title`` strips everything else out of the
+filename it derives from the title, and the filename is the surface under test.
+"""
+
+
+def _seed_intimate_decision_vault(tmp_path: Path) -> Path:
+    """Build a vault whose only decision candidate is an ``intimate`` fragment.
+
+    A second, ``open`` fragment rides along as the positive control: without it
+    a "the canary is absent" assertion is satisfied by a command that printed
+    nothing at all.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+
+    Returns:
+        The vault root.
+    """
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    frags = vault / "01-Fragments" / "Conversations"
+    frags.mkdir(parents=True)
+    (frags / "frag-intimate.md").write_text(
+        "---\ntype: fragment\nid: frag-intimate\n"
+        f'title: "Should I leave my marriage with {_INTIMATE_DECISION_CANARY}"\n'
+        "privacy_tier: intimate\n"
+        "source:\n  platform: journal\n  author: self\n---\nbody\n",
+        encoding="utf-8",
+    )
+    (frags / "frag-open.md").write_text(
+        "---\ntype: fragment\nid: frag-open\n"
+        'title: "Should I buy a bicycle"\n'
+        "privacy_tier: open\n"
+        "source:\n  platform: journal\n  author: self\n---\nbody\n",
+        encoding="utf-8",
+    )
+    return vault
+
+
+def _squashed(text: str) -> str:
+    """Return *text* with ANSI escapes removed and every whitespace run deleted.
+
+    Whitespace is *deleted*, not collapsed to single spaces, and that is the
+    whole point. Rich hard-wraps the ``Decision notes generated (N): <path>``
+    line at the console width, and it wraps mid-token: at 80 columns the
+    pre-fix output is
+    ``'…with-Jane-Doe-of-Sprin\\ngfield-Illinois.md'``. A plain
+    ``canary not in result.output`` therefore passes while the title is printed
+    in full — a vacuous assertion that would have declared #1431 fixed.
+
+    Args:
+        text: Captured CLI output.
+
+    Returns:
+        The output with ANSI stripped and all whitespace removed.
+    """
+    return "".join(_strip_ansi(text).split())
+
+
+def test_report_decisions_never_echoes_an_intimate_title_to_stdout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``creek report --type decisions`` must not print an intimate title (#1431).
+
+    ``_report_decisions`` joins ``str(p.relative_to(vault_path))`` for every
+    written path into a Rich message, so suppressing only the *file* while
+    still echoing its name is not a fix — the title would reach the terminal,
+    the scrollback and any captured build log regardless.
+
+    With no ``--include-tier`` the report runs unfiltered
+    (``PrivacyTierOverride.ALL``), which is the ceiling the defect lives at.
+
+    The console width is pinned to 80 for the duration so the wrap hazard
+    :func:`_squashed` guards against is actually exercised rather than merely
+    described; ``tests/conftest.py`` otherwise pins it wide enough that the
+    line fits and the guard would never be tested.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    vault = _seed_intimate_decision_vault(tmp_path)
+    monkeypatch.setattr(console, "width", 80)
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "decisions", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    squashed = _squashed(result.output)
+    assert "Should-I-buy-a-bicycle" in squashed, (
+        "the open fragment's note was not announced, so the exclusion "
+        f"assertion below is vacuous. output={result.output!r}"
+    )
+    assert _INTIMATE_DECISION_CANARY not in squashed, (
+        "an intimate fragment's title was echoed to stdout by `creek report "
+        f"--type decisions`. output={result.output!r}"
+    )
+    leaked = [
+        str(p.relative_to(vault))
+        for p in (vault / "08-Decisions").rglob("*")
+        if _INTIMATE_DECISION_CANARY in str(p.relative_to(vault))
+    ]
+    assert not leaked, f"intimate title in an 08-Decisions filename: {leaked}"
+
+
+def test_fill_report_decisions_step_never_echoes_an_intimate_title(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``creek fill`` ``report/decisions`` step is gated too (#1431).
+
+    ``fill`` is the surface the issue was reported against, and it is the
+    strictest one: ``_build_fill_steps`` states ``PrivacyTierOverride.ALL`` for
+    every step because ``fill`` has no ``--include-tier`` of its own, so the
+    ceiling gate admits everything and only the unconditional screen stands
+    between an intimate title and the vault tree.
+
+    The production ``_build_fill_steps`` plan is built and its real
+    ``report/decisions`` lambda invoked, rather than driving the whole command:
+    ``fill``'s first step instantiates a ``SentenceTransformer`` and reaches
+    for model weights over the network. Nothing is stubbed in exchange — the
+    callable invoked here is the production lambda with the production
+    arguments.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    from creek.cli import _build_fill_steps, _load_config_for_vault
+
+    vault = _seed_intimate_decision_vault(tmp_path)
+    monkeypatch.setattr(console, "width", 80)
+
+    steps = dict(
+        _build_fill_steps(vault, _load_config_for_vault(vault), with_compost=False),
+    )
+    assert "report/decisions" in steps
+    with console.capture() as captured:
+        steps["report/decisions"]()
+
+    squashed = _squashed(captured.get())
+    assert "Should-I-buy-a-bicycle" in squashed, (
+        "the open fragment's note was not announced by the fill step, so the "
+        f"exclusion assertion below is vacuous. output={captured.get()!r}"
+    )
+    assert _INTIMATE_DECISION_CANARY not in squashed, (
+        "the `creek fill` report/decisions step echoed an intimate fragment's "
+        f"title. output={captured.get()!r}"
+    )
+    leaked = [
+        str(p.relative_to(vault))
+        for p in (vault / "08-Decisions").rglob("*")
+        if _INTIMATE_DECISION_CANARY in str(p.relative_to(vault))
+    ]
+    assert not leaked, f"intimate title in an 08-Decisions filename: {leaked}"
 
 
 def test_report_lexicon_no_exemplars_is_friendly(tmp_path: Path) -> None:

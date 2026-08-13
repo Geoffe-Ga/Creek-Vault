@@ -19,6 +19,20 @@ fragments and untierable by construction — ``generate_decisions`` writes
 ``08-Decisions/Active/*.md`` whose ``title:`` *is* a source fragment's title
 verbatim — so scanning them at ``ceiling=open`` would read back content a
 ``ceiling=all`` run had distilled there.
+
+Since #1431 that Decision-note example is narrower than it was:
+``generate_decisions`` now refuses to write a note for an ``intimate``
+fragment at any ceiling, so the titles it distils into ``08-Decisions`` stop
+at ``personal``. The fragment-derived-only rule stands unchanged — ``Thread``,
+``Eddy`` and ``Praxis`` notes are still untierable, and a ``personal`` title
+read back at ``ceiling=open`` would still be a leak.
+
+For the record, because #1431 asked: the Tag Garden is **not** a second
+instance of that leak. :data:`_SCAN_DIRS` does include ``08-Decisions``, but
+this scan reads the ``tags:`` key and nothing else — never a ``title:`` — and
+``DecisionDetector.create_decision_note`` builds its ``frontmatter.Post``
+without any ``tags:`` key at all. No decision title can reach
+``Tag-Garden.md``.
 """
 
 from __future__ import annotations

@@ -11,6 +11,7 @@ of the Creek Ontology.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date
@@ -19,7 +20,11 @@ from typing import TYPE_CHECKING
 import frontmatter
 import yaml
 
-from creek.classify.privacy_filter import PrivacyTierOverride, within_ceiling
+from creek.classify.privacy_filter import (
+    PrivacyTierOverride,
+    raw_privacy_tier,
+    within_ceiling,
+)
 from creek.models import (
     Decision,
     DecisionCandidate,
@@ -27,6 +32,7 @@ from creek.models import (
     Frequency,
     Phase,
     PraxisPotential,
+    PrivacyTier,
     _generate_decision_id,
 )
 from creek.vault.reader import iter_vault_fragments
@@ -35,6 +41,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.models import Fragment
+
+logger = logging.getLogger(__name__)
 
 DECISION_KEYWORDS: tuple[str, ...] = (
     "should i",
@@ -296,6 +304,18 @@ class DecisionDetector:
 
         Generates a markdown file with YAML frontmatter in
         ``08-Decisions/Active/``, defaulting to ``sensing`` status.
+
+        **This method applies no privacy screen and trusts its caller.** The
+        ``intimate`` screen added by #1431 lives upstream in
+        :func:`_admitted_decision_fragments`, which filters the *fragments*
+        before they ever become candidates — a :class:`DecisionCandidate`
+        carries no tier field, so by the time one reaches here the information
+        needed to screen it is gone. Production is covered, because
+        :func:`generate_decisions` is the only live producer into
+        ``08-Decisions``. A caller that builds a candidate itself and invokes
+        this method directly inherits the responsibility: ``candidate
+        .fragment_title`` is written verbatim into both the ``title:`` front
+        matter and the filename stem.
 
         The filename is ``<date>-<sanitised fragment title>[-N].md``, falling
         back to ``<date>[-N].md`` when the title sanitises to nothing. Because
@@ -1194,6 +1214,91 @@ def _existing_decision_fragment_ids(vault_path: Path) -> set[str]:
     return seen
 
 
+def _admitted_decision_fragments(
+    vault_path: Path,
+    override: PrivacyTierOverride,
+) -> tuple[list[Fragment], int]:
+    """Return the fragments decisions may name, and how many were withheld (#1431).
+
+    Two independent conditions, in this order:
+
+    1. :func:`~creek.classify.privacy_filter.within_ceiling` — the shared #968
+       tier ceiling. This is the operator's dial: ``--include-tier``, or the
+       MCP ``privacy_tier_ceiling``, or the ``ALL`` that ``creek fill`` states
+       for every step because it has no tier flag of its own.
+    2. An **unconditional** intimate screen. This one is not a dial, and it is
+       not defeasible by any caller. It is here because ``decisions`` is the
+       one report whose artifact carries a source fragment's title in its
+       *filename*: ``create_decision_note`` sanitises ``fragment_title`` into
+       the stem, and that name is then visible to Obsidian's file pane, to
+       ``ls``, to Spotlight and to any sync client, with no front matter
+       attached that could declare what tier it came from. A ceiling of ``ALL``
+       is a reasonable instruction to include intimate *content* in a report;
+       it is not an instruction to spell an intimate title out in the vault
+       tree. (#1431 chose this — screen the fragment and write nothing —
+       over stubbing the title, because a stubbed title collapses every
+       intimate candidate onto the bare ``<date>`` stem that untitled
+       candidates already contend for under
+       :data:`_MAX_FILENAME_ORDINALS`.)
+
+    The screen reads :func:`~creek.classify.privacy_filter.raw_privacy_tier`,
+    not the model's ``fragment.privacy_tier``, for two reasons. It is the
+    reader ``within_ceiling`` itself reduces to, so the gate and the screen can
+    never end up holding two different tier opinions inside one expression. And
+    it fails closed: a note whose front matter has **no** ``privacy_tier:`` key
+    ranks ``intimate`` rather than the model's ``unclassified``, which is the
+    answer ``tests/test_mcp_report_tier_ceiling.py``'s
+    ``test_fragment_with_no_privacy_tier_key_fails_closed_to_intimate``
+    already pins for report artifacts. The model reader would leave the #1431
+    filename reproducible for exactly that fragment shape. An *explicit*
+    ``privacy_tier: unclassified`` is unaffected — it ranks with ``personal``
+    and still gets its note — and every pipeline-written fragment states the
+    key, because :meth:`creek.vault.writer.VaultWriter._write_model`
+    serialises ``model_dump(mode="json")``.
+
+    This differs from the sibling rule in :mod:`creek.generate.compost`, and
+    the difference is deliberate rather than an oversight:
+    ``CompostTracker.__init__`` takes ``skip_intimate: bool = True``, a
+    constructor *default* a caller can switch off, forced on only inside
+    ``run_compost_scan`` — and forced there because that scan feeds fragment
+    bodies to a potentially cloud-hosted verifier. Decisions makes no LLM call
+    at all; its harm is local filesystem visibility, which no caller has a
+    legitimate reason to opt into.
+
+    Withheld fragments are counted rather than named. The count exists so the
+    screen cannot disable a report in silence — see :func:`generate_decisions`
+    — and it is a count and nothing else because the title is the leaking
+    value.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+        override: The #968 tier ceiling to apply.
+
+    Returns:
+        ``(admitted fragments, number withheld by the intimate screen)``. The
+        count covers only condition 2; fragments refused by the ceiling are not
+        counted, since that refusal is what the operator asked for.
+    """
+    admitted: list[Fragment] = []
+    withheld = 0
+    for _path, fragment, _body, raw in iter_vault_fragments(
+        vault_path / "01-Fragments",
+    ):
+        # Kept as a literal ``within_ceiling(...)`` call resolved from module
+        # globals, never folded into ``tier_within_override(raw_privacy_tier(
+        # raw), override)``: the inverted-gate obedience proof in
+        # tests/test_mcp_report_tier_ceiling.py monkeypatches
+        # ``creek.generate.decisions.within_ceiling`` and asserts it was
+        # actually called.
+        if not within_ceiling(raw, override):
+            continue
+        if raw_privacy_tier(raw) is PrivacyTier.INTIMATE:
+            withheld += 1
+            continue
+        admitted.append(fragment)
+    return admitted, withheld
+
+
 def generate_decisions(
     vault_path: Path,
     *,
@@ -1231,22 +1336,42 @@ def generate_decisions(
             state an override explicitly (pinned by
             ``tests/test_mcp_report_tier_ceiling.py``'s
             ``test_production_report_callers_always_state_an_override``).
-            The stakes here are unusually concrete: a generated note's
-            ``title:`` frontmatter is a source fragment's title verbatim, and
-            its filename is that same title sanitised — plus a ``-N`` ordinal
-            when another fragment already holds the name.
+
+            The ceiling is **not** the whole admission rule here, and since
+            #1431 it is not the strictest part of it. The stakes are unusually
+            concrete: a generated note's ``title:`` frontmatter is a source
+            fragment's title verbatim, and its filename is that same title
+            sanitised — plus a ``-N`` ordinal when another fragment already
+            holds the name. So on top of the ceiling,
+            :func:`_admitted_decision_fragments` applies an unconditional
+            ``intimate`` screen that **no value of this argument can lift**,
+            reading the fail-closed
+            :func:`~creek.classify.privacy_filter.raw_privacy_tier`. See that
+            helper for why the reader is the fail-closed one and why this rule
+            is non-defeasible where compost's ``skip_intimate`` is a default.
+
+            One consequence is worth stating plainly, because it is
+            irreversible from inside the pipeline: ``privacy_tier`` is a
+            one-way ratchet (``creek/vault/writer.py`` — even ``creek classify
+            --force`` merges through ``escalate``, which never lowers a tier),
+            so once a fragment is intimate, or is a hand-written note with no
+            ``privacy_tier:`` key at all, it is excluded from this report until
+            somebody edits that note's front matter by hand. That is the only
+            way back in.
 
     Returns:
         Paths of the newly written Decision notes; empty when there are no new
-        decision candidates.
+        decision candidates — or when every candidate was screened.
     """
-    fragments = [
-        fragment
-        for _path, fragment, _body, raw in iter_vault_fragments(
-            vault_path / "01-Fragments",
+    fragments, withheld = _admitted_decision_fragments(vault_path, override)
+    if withheld:
+        logger.warning(
+            "%d fragment(s) withheld from the decisions report: intimate tier, "
+            "or no privacy_tier key at all (which fails closed to intimate). "
+            "Re-run `creek classify`, or set privacy_tier by hand, to include "
+            "them.",
+            withheld,
         )
-        if within_ceiling(raw, override)
-    ]
     detector = DecisionDetector()
     already = _existing_decision_fragment_ids(vault_path)
     written: list[Path] = []
