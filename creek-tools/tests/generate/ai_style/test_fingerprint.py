@@ -385,6 +385,73 @@ class TestSplitTurnCorpus:
         assert build_fingerprint(tmp_path, _CONFIG).fragment_count == 0
         assert _corpus(tmp_path) == []
 
+    def test_chatgpt_body_with_only_an_assistant_marker_is_excluded(
+        self, tmp_path: Path
+    ) -> None:
+        """The ChatGPT sibling of the assistant-only merged body stays out.
+
+        Found in review of PR #1486. A ChatGPT body that kept its
+        ``**Assistant**:`` marker but lost its ``**User**:`` one — a truncated
+        export, or a hand edit that took the top off the file — has no
+        identifiable human half, exactly like the Claude ``"> \\n\\n{AI
+        reply}"`` shape above. Dispatching on the *absence* of ``**User**:``
+        alone read the whole thing, marker and model reply together, as the
+        operator's own words.
+
+        This is a regression the shape table did not model, not a
+        pre-existing hole: the retired ``extract_user_turns`` never sets
+        ``saw_user`` for this body and returns ``None``, so the fingerprint
+        excluded it before #1426. The rule that closes it is stated over the
+        recovered halves rather than over this body shape — a human half
+        still carrying an ``**Assistant**:`` marker was never separated from
+        the model in the first place, whichever arm produced it.
+
+        Args:
+            tmp_path: pytest temporary directory used as the vault root.
+        """
+        _write_fragment(
+            tmp_path,
+            "trunc.md",
+            platform="chatgpt",
+            body="# Conversation (turn 1)\n\n> **Assistant**: " + _AI_PROSE + "\n",
+        )
+
+        assert build_fingerprint(tmp_path, _CONFIG).fragment_count == 0
+        assert _corpus(tmp_path) == []
+
+    def test_claude_platform_body_with_chatgpt_markers_is_excluded(
+        self, tmp_path: Path
+    ) -> None:
+        """The same hole on the Claude arm, from the same review's audit.
+
+        For ``platform: claude`` the blockquote *is* the role signal — the
+        merged Claude rendering left the model's reply unquoted — so a body
+        carrying ChatGPT's ``**User**:``/``**Assistant**:`` markers inside the
+        quote hands every line, the model's included, to the human half.
+
+        This one narrows against HEAD rather than restoring it:
+        ``extract_user_turns`` is platform-blind and walked the markers, so it
+        returned ``"my question"`` and dropped the reply. Honouring markers on
+        the Claude arm is not available as a fix — it would make
+        ``resplit_merged_ai_chat`` call this body ``MERGED`` and
+        ``md_file.unlink()`` a fragment the shipped
+        ``_parse_claude_merged`` has always returned ``None`` for. Between
+        losing one hand-edited fragment's question and admitting a model reply
+        to the false-positive authority, the corpus keeps neither.
+
+        Args:
+            tmp_path: pytest temporary directory used as the vault root.
+        """
+        _write_fragment(
+            tmp_path,
+            "mislabelled.md",
+            platform="claude",
+            body="> **User**: my question\n>\n> **Assistant**: " + _AI_PROSE,
+        )
+
+        assert build_fingerprint(tmp_path, _CONFIG).fragment_count == 0
+        assert _corpus(tmp_path) == []
+
     def test_merged_chatgpt_yields_only_the_user_half(self, tmp_path: Path) -> None:
         """The historical ``**User**:``/``**Assistant**:`` body is unchanged.
 

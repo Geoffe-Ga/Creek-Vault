@@ -69,6 +69,18 @@ that entire model reply to the voice corpus at 217.4 AI-vocabulary hits
 per 1000 words. When the human half cannot be found, contribute
 nothing.
 
+That rule is enforced **once, over the recovered halves** — see
+:func:`_reject_unseparated` — and not once per shape inside each arm.
+The first cut of this module did the latter and shipped the exact hole
+the rule exists to prevent, in both arms at once: a ChatGPT body that
+kept its ``**Assistant**:`` marker but lost its ``**User**:`` one, and a
+``platform: claude`` body carrying ChatGPT's markers, each read the
+model's own reply as the operator's. Both were invisible because each
+arm was audited against the shapes its author had enumerated, and
+neither had enumerated those. A shape table can only assert the rows
+somebody thought of; a rule over the output holds for the rows nobody
+did.
+
 Both arms take a blockquote marker off with ``line[1:].lstrip()``, which
 removes **exactly one**. The rendering adds one marker, so the parse
 removes one: every writer of a stored body interpolates ``f"> {line}"``,
@@ -324,15 +336,21 @@ def _split_chatgpt(body: str) -> tuple[str, str]:
     unquoted, is discarded.
 
     With no ``**User**:`` marker there is nothing to partition on, and
-    the whole (unquoted, de-headed) text is the human's; see this
-    module's docstring for why no blockquote-shape branch is added here,
-    and for why ``line[1:].lstrip()`` removes only one marker.
+    the whole (unquoted, de-headed) text is *proposed* as the human's;
+    see this module's docstring for why no blockquote-shape branch is
+    added here, and for why ``line[1:].lstrip()`` removes only one
+    marker. That proposal is not the verdict: a body that lost its
+    ``**User**:`` marker while keeping its ``**Assistant**:`` one falls
+    to :func:`_reject_unseparated`, which is where this arm's output
+    stops being trusted as the operator's.
 
     Args:
         body: The stored fragment body.
 
     Returns:
-        ``(human, assistant)``; either may be ``""``.
+        ``(human, assistant)`` as proposed, before
+        :func:`_reject_unseparated` vets the human half; either may be
+        ``""``.
     """
     cleaned: list[str] = []
     for line in body.split("\n"):
@@ -345,6 +363,69 @@ def _split_chatgpt(body: str) -> tuple[str, str]:
         return text.strip(), ""
     user_part, _, assistant_part = text.partition("**Assistant**:")
     return user_part.replace("**User**:", "").strip(), assistant_part.strip()
+
+
+def _reject_unseparated(human: str, assistant: str) -> tuple[str, str]:
+    """Void a "human" half that still contains the model's speaker marker.
+
+    The safety rule applied to both arms' output rather than inside
+    either of them, because the hole it closes appeared in both and the
+    next arm would inherit it (found reviewing #1486). An
+    ``**Assistant**:`` marker surviving into ``human`` means the split did
+    not actually separate the speakers — whatever follows that marker is
+    the model's, and it is sitting on the operator's side of the result.
+    Each arm reaches that state on a differently-damaged body:
+
+    * ChatGPT, marker lost from the front. ``_split_chatgpt`` partitions
+      on ``**User**:``, so a body truncated or hand-edited down to
+      ``"# Title\\n\\n> **Assistant**: …"`` has nothing to partition on
+      and the model's whole reply reads as the human's. The retired
+      ``extract_user_turns`` excluded this body (it never sets
+      ``saw_user``), so admitting it would be a regression, not an
+      inherited bug.
+    * Claude, markers present but the platform says otherwise.
+      ``_split_claude`` reads the blockquote as the role signal — which
+      it is, for a Claude rendering — so ChatGPT's markers inside the
+      quote put every line, reply included, in the human half.
+
+    Honouring markers on the Claude arm is not available as the fix: it
+    would classify that body ``MERGED``, and ``resplit_merged_ai_chat``
+    reacts to ``MERGED`` by writing two fragments and ``md_file.unlink()``
+    -ing a file the shipped ``_parse_claude_merged`` has always returned
+    ``None`` for. Voiding the half keeps the migration's verdict exactly
+    where it was on every shape while denying the corpus the reply.
+
+    Two costs, both measured and both paid deliberately:
+
+    * On the Claude body above the operator's own question goes too,
+      where the platform-blind ``extract_user_turns`` would have kept it.
+    * The test is a plain substring, so an operator who writes the
+      literal ``**Assistant**:`` **in their own prose** loses that
+      fragment from the corpus. This one *is* reachable through a shipped
+      writer — ``ClaudeIngestor.convert_to_markdown`` blockquotes
+      whatever they typed — unlike the two damage cases above. It is
+      accepted rather than narrowed (to a line-start test, say) because
+      the marker is a speaker label wherever it appears: a body that
+      contains one is a body whose speakers this module cannot tell
+      apart, and the loss is one fragment's exclusion rather than the
+      admission of a model reply. The migration's verdict is unaffected —
+      that body is entirely blockquoted, so ``_parse_claude_merged``
+      returned ``None`` for it before and it is non-``MERGED`` now.
+
+    Between losing a fragment and feeding a model reply to the
+    false-positive authority, this keeps neither.
+
+    Args:
+        human: The human half an arm recovered.
+        assistant: The assistant half an arm recovered.
+
+    Returns:
+        The two halves unchanged, or ``("", <both, joined>)`` when the
+        human half was never separated from the model's.
+    """
+    if "**Assistant**:" not in human:
+        return human, assistant
+    return "", "\n".join(part for part in (human, assistant) if part)
 
 
 def _classify(human: str, assistant: str) -> BodyShape:
@@ -374,6 +455,11 @@ def split_conversation_body(platform: str, body: str) -> ConversationTurns:
     fingerprint consult. See this module's docstring for the five body
     shapes it must read and why the two consumers share it.
 
+    The platform arm proposes; :func:`_reject_unseparated` disposes. The
+    safety property — when the human half cannot be identified,
+    contribute nothing — is enforced once here, over the halves, rather
+    than by each arm over the shapes its author happened to enumerate.
+
     Args:
         platform: The fragment's ``source.platform``. Anything other
             than ``"claude"`` takes the ChatGPT arm; callers gate on
@@ -383,7 +469,6 @@ def split_conversation_body(platform: str, body: str) -> ConversationTurns:
     Returns:
         A :class:`ConversationTurns` carrying the shape and both halves.
     """
-    human, assistant = (
-        _split_claude(body) if platform == "claude" else _split_chatgpt(body)
-    )
+    proposed = _split_claude(body) if platform == "claude" else _split_chatgpt(body)
+    human, assistant = _reject_unseparated(*proposed)
     return ConversationTurns(_classify(human, assistant), human, assistant)

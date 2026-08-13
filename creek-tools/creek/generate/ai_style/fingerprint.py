@@ -22,6 +22,12 @@ Reading only the marker, as this module did until #1426, silently
 excluded the first of those three — every chat turn the operator has
 written since per-turn attribution shipped.
 
+The catalogue of on-disk body shapes, the reachability of each, and the
+reasoning behind each verdict are **not** restated here.
+:mod:`creek.ingest.turns` is their single source; the three bullets
+above are a summary of it, kept short deliberately, and if they ever
+disagree with it the parser's own docstring is the one that is right.
+
 Pure and deterministic; reads fragment bodies only (never frontmatter
 values), and writes a single JSON artifact under the vault.
 """

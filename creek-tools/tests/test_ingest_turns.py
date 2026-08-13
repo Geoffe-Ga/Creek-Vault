@@ -368,6 +368,24 @@ _SHAPE_TABLE: list[tuple[str, str, str, BodyShape, str, str]] = [
         "body for frag-xyz",
     ),
     (
+        "k-chatgpt-assistant-only-no-user-marker",
+        "chatgpt",
+        "# Conversation (turn 1)\n\n> **Assistant**: " + _AI_PROSE + "\n",
+        BodyShape.UNRECOVERABLE,
+        "",
+        "**Assistant**: " + _AI_PROSE,
+    ),
+    (
+        "k2-chatgpt-merged-empty-human",
+        "chatgpt",
+        "# Conversation (turn 1)\n\n> **User**:\n>\n> **Assistant**: "
+        + _AI_PROSE
+        + "\n",
+        BodyShape.UNRECOVERABLE,
+        "",
+        _AI_PROSE,
+    ),
+    (
         "l-claude-ai-turn-only",
         "claude",
         _AI_PROSE,
@@ -391,11 +409,76 @@ _SHAPE_TABLE: list[tuple[str, str, str, BodyShape, str, str]] = [
         "my question\n\nAI plain prose here",
         "",
     ),
+    (
+        "o-chatgpt-prose-before-the-user-marker",
+        "chatgpt",
+        "# Chat\n\n"
+        "> a stray note I prepended myself\n"
+        ">\n"
+        "> **User**: my question\n"
+        ">\n"
+        "> **Assistant**: a short reply\n",
+        BodyShape.MERGED,
+        "a stray note I prepended myself\n\n my question",
+        "a short reply",
+    ),
+    (
+        "p-claude-body-carrying-chatgpt-markers",
+        "claude",
+        "> **User**: my question\n>\n> **Assistant**: " + _AI_PROSE,
+        BodyShape.UNRECOVERABLE,
+        "",
+        "**User**: my question\n\n**Assistant**: " + _AI_PROSE,
+    ),
+    (
+        "q-claude-operator-typed-the-marker-themselves",
+        "claude",
+        "> I pasted the transcript and it read **Assistant**: go on,\n"
+        "> which is when I finally laughed.",
+        BodyShape.UNRECOVERABLE,
+        "",
+        "I pasted the transcript and it read **Assistant**: go on,\n"
+        "which is when I finally laughed.",
+    ),
 ]
 """``(id, platform, body, shape, human, assistant)`` for every body shape.
 
 The ids carry the letters used in the issue's shape inventory so a row can be
-matched to the discussion that produced it.
+matched to the discussion that produced it. That inventory itself jumped from
+``(j)`` to ``(l)``: no ``(k)`` case was ever written down, considered, or
+dropped — the letter was simply skipped when the list was typed, and this table
+copied the letters verbatim. The gap in the sequence was the visible edge of a
+real gap in coverage, found in review of PR #1486: neither ChatGPT body that
+carries no identifiable human half was represented here, and one of them
+(``k``) was misclassified as ``SPLIT``, feeding the model's own reply to the
+voice corpus. ``k``/``k2`` now fill the letter and the hole together.
+
+Rows ``o`` and ``p`` come from the whole-table asymmetry audit that review
+asked for, one per arm:
+
+* ``p`` is the second instance of ``k``'s class and is fixed with it — a body
+  whose speaker markers survive but whose ``source.platform`` says ``claude``,
+  where the blockquote (not the marker) is the role signal, so every marked
+  line reads as the operator's.
+* ``o`` is the audited near-miss that is deliberately **not** changed: text
+  ahead of an intact ``**User**:`` marker stays in the human half. Dropping it
+  would make the migration ``md_file.unlink()`` a fragment whose leading text
+  it had preserved for as long as it has shipped, and no writer or truncation
+  puts model prose there — losing the front of a body destroys the ``**User**:``
+  marker with it, which is exactly case ``k``. The stray double space in the
+  expected human half is that parity, pinned: ``_parse_chatgpt_merged``
+  ``.replace("**User**:", "")`` leaves the marker's trailing space behind
+  mid-string, where ``.strip()`` cannot reach it.
+
+Row ``q`` is the **price** of that fix rather than an instance of the bug, pinned
+here so it cannot become a silent surprise later: the rule tests for the marker
+as a plain substring, so an operator who types ``**Assistant**:`` inside their
+own prose loses that fragment from the voice corpus. Unlike ``k`` and ``p`` this
+one is reachable through a shipped writer — ``convert_to_markdown`` blockquotes
+whatever they typed. It is accepted rather than narrowed to a line-start test,
+because the marker is a speaker label wherever it sits and the failure mode is
+exclusion, never admission. Its pre-change refresh verdict is ``None``, same as
+now, so the migration never saw this body either.
 """
 
 _SHAPE_IDS: list[str] = [row[0] for row in _SHAPE_TABLE]
@@ -415,9 +498,17 @@ _PRE_CHANGE_REFRESH: dict[str, tuple[str, str] | None] = {
     "h-claude-user-colon-in-prose": None,
     "i-claude-assistant-colon-in-prose": None,
     "j-claude-placeholder-body": None,
+    "k-chatgpt-assistant-only-no-user-marker": None,
+    "k2-chatgpt-merged-empty-human": None,
     "l-claude-ai-turn-only": None,
     "m-claude-nested-quote": None,
     "n-chatgpt-unmarkered-escaping-prose": None,
+    "o-chatgpt-prose-before-the-user-marker": (
+        "a stray note I prepended myself\n\n my question",
+        "a short reply",
+    ),
+    "p-claude-body-carrying-chatgpt-markers": None,
+    "q-claude-operator-typed-the-marker-themselves": None,
 }
 """What ``refresh._split_turns`` returned for each row **before** #1426.
 
@@ -478,7 +569,7 @@ class TestSplitConversationBody:
         A parametrize list that loses its rows produces zero tests and a green
         run, which is indistinguishable from a passing suite.
         """
-        assert len(_SHAPE_TABLE) == 14
+        assert len(_SHAPE_TABLE) == 19
         assert len(set(_SHAPE_IDS)) == len(_SHAPE_TABLE)
 
     @pytest.mark.parametrize(
@@ -544,6 +635,40 @@ class TestSplitConversationBody:
         assert expected is shape
         assert parsed.shape is expected
 
+    @pytest.mark.parametrize(
+        ("platform", "body"),
+        [(row[1], row[2]) for row in _SHAPE_TABLE],
+        ids=_SHAPE_IDS,
+    )
+    def test_the_human_half_never_carries_the_model_s_words(
+        self, platform: str, body: str
+    ) -> None:
+        """No shape may put the model's own text in the human half.
+
+        The safety property stated once for the whole table rather than row
+        by row, so a shape added later inherits it instead of having to
+        remember it. Two independent witnesses of a leak:
+
+        * an ``**Assistant**:`` marker inside ``human`` means the split did
+          not actually separate the speakers — whatever follows that marker
+          is the model's, and it is still sitting on the operator's side;
+        * :data:`_AI_PROSE` is the fixture that stands in for a model reply
+          in every row that has one, so its appearance in ``human`` is the
+          leak itself rather than a proxy for it.
+
+        Review of PR #1486 found rows ``k`` and ``p`` failing both witnesses:
+        a per-row table can only assert the rows somebody thought of, and
+        neither of those two had been.
+
+        Args:
+            platform: The conversation platform.
+            body: The stored fragment body.
+        """
+        parsed = split_conversation_body(platform, body)
+
+        assert "**Assistant**:" not in parsed.human
+        assert _AI_PROSE not in parsed.human
+
     def test_result_is_immutable(self) -> None:
         """``ConversationTurns`` is frozen, so no consumer can edit a verdict.
 
@@ -604,7 +729,7 @@ class TestSplitConversationBodyMatchesRefresh:
     def test_the_refresh_table_covers_every_shape(self) -> None:
         """Every table row states a pre-change verdict; no row is skipped."""
         assert set(_PRE_CHANGE_REFRESH) == set(_SHAPE_IDS)
-        assert len(_PRE_CHANGE_REFRESH) == 14
+        assert len(_PRE_CHANGE_REFRESH) == 19
 
     @pytest.mark.parametrize(
         ("platform", "body", "expected_refresh"),
