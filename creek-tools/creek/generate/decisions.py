@@ -639,10 +639,12 @@ def _load_post(path: Path) -> frontmatter.Post | None:
     The tuple is **not** exhaustive, and this docstring should not be read
     as claiming it is: ``frontmatter.load`` passes the parsed mapping as
     keyword arguments, so a non-string YAML key (``2024-01-01:``, ``true:``,
-    ``1:``) still raises ``TypeError`` past this handler. That gap is
-    pre-existing and shared with the sibling scans; it is tracked on #1416
-    rather than widened blindly here, because ``TypeError`` also covers
-    genuine programming errors that should not be silently skipped.
+    ``1:``) still raises ``TypeError`` past this handler. The synchronicity
+    scans closed that gap by dropping ``frontmatter`` for the header-only
+    :func:`creek.vault.links.read_header_meta` (#1416); this loader has not
+    yet followed, and the remaining gap is tracked on #1475 rather than
+    widened blindly here, because ``TypeError`` also covers genuine
+    programming errors that should not be silently skipped.
 
     Args:
         path: The markdown file path.

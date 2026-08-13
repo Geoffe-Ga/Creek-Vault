@@ -227,10 +227,10 @@ class TestReadBackScanRobustness:
         """A hand-broken note is skipped, not fatal.
 
         ``frontmatter.loads`` raises ``yaml.ParserError`` here, which is **not**
-        a ``ValueError`` — the sibling scan at
-        ``synchronicity._existing_synchronicity_pairs`` catches only
-        ``(OSError, ValueError)`` and does crash on this input (tracked
-        separately). This scan must not.
+        a ``ValueError``. The sibling scan at
+        ``creek.generate.synchronicity._existing_synchronicity_pairs`` now reads
+        headers only, via ``creek.vault.links.read_header_meta``, and survives
+        the same input (#1416). This scan must too.
         """
         broken = vault / "10-Liminal" / "Paradoxes" / "2019-05-05-broken.md"
         broken.write_text(

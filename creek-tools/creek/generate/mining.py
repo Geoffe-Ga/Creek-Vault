@@ -62,6 +62,7 @@ from creek.models import (
     ThreadStatus,
     VoiceRegister,
 )
+from creek.vault.links import read_header_meta
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -567,10 +568,7 @@ def _load_synchronicities(root: Path) -> list[tuple[str, str, float]]:
         return []
     pairs: list[tuple[str, str, float]] = []
     for md_file in sorted(root.rglob("*.md")):
-        post = _safe_post(md_file)
-        if post is None:
-            continue
-        meta = post.metadata
+        meta = read_header_meta(md_file)
         frag_a = meta.get("fragment_a_id")
         frag_b = meta.get("fragment_b_id")
         similarity = meta.get("similarity")

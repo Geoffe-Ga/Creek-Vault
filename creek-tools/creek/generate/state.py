@@ -90,6 +90,7 @@ from creek.generate.wavelength import (
 )
 from creek.hierarchy import select_by_policy
 from creek.models import Eddy, Fragment, Frequency, Praxis, PrivacyTier, Thread
+from creek.vault.links import read_header_meta
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -562,10 +563,7 @@ def _load_synchronicities(root: Path) -> list[_SynchronicityRow]:
         return []
     rows: list[_SynchronicityRow] = []
     for md_file in sorted(root.rglob("*.md")):
-        post = _safe_post(md_file)
-        if post is None:
-            continue
-        meta = post.metadata
+        meta = read_header_meta(md_file)
         if meta.get("type") != "synchronicity":
             continue
         sync_id = meta.get("id")
