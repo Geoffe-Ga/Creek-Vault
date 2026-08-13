@@ -9,6 +9,7 @@ compost step, and the summary reports real per-folder counts.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -20,6 +21,11 @@ from creek.cli import app
 from creek.generate import compost as compost_mod
 from creek.generate import indexes as indexes_mod
 from creek.link import link_engine
+from tests.synchronicity_support import (
+    plant_hostile_entry,
+    seed_synchronicity_vault,
+    sync_notes,
+)
 
 if TYPE_CHECKING:
     from datetime import tzinfo
@@ -28,6 +34,21 @@ if TYPE_CHECKING:
     import pytest
 
 runner = CliRunner()
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Return *text* with ANSI escape sequences removed.
+
+    Typer/Click's Rich formatter splits styled lines across colour
+    segments when the terminal supports ANSI, and the literal substring
+    then disappears from ``result.output``. Stripping ANSI before a
+    substring assertion keeps it environment-independent — the same guard
+    ``tests/test_cli.py`` uses.
+    """
+    return _ANSI_RE.sub("", text)
+
 
 _EXPECTED_ORDER = [
     "link/embeddings",
@@ -864,3 +885,54 @@ def test_tags_hint_failure_never_crashes_fill(
         )
 
     assert any("tag" in record.getMessage().lower() for record in caplog.records)
+
+
+# ---- Issue #1416: the synchronicity step over an operator-edited folder ----
+
+
+def test_fill_synchronicity_step_survives_a_hand_broken_note(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``creek fill`` must *complete* the synchronicity step, not survive it.
+
+    Asserting ``exit_code == 0`` alone would be vacuous here: the fill loop
+    at ``creek/cli.py:3645-3656`` wraps every step in ``except Exception``,
+    logs ``fill step %s failed: %s``, prints ``[fill] {label} failed:
+    {exc}`` and carries on — so ``creek fill`` already exits 0 at HEAD with
+    this note in the vault, having quietly written no synchronicities at
+    all. The real assertions are therefore the **absence** of the
+    ``report/synchronicity failed`` line and the presence on disk of the
+    note the seeded vault earned.
+
+    Every other step stays a recorder; only ``_report_synchronicity`` is
+    restored to the production function, so the test measures that step and
+    not the orchestration around it.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        monkeypatch: Fixture used to install the step recorders.
+    """
+    real_report_synchronicity = cli_mod._report_synchronicity
+    vault, _config = seed_synchronicity_vault(tmp_path)
+    plant_hostile_entry(vault, "hand-broken-yaml")
+    calls: list[str] = []
+    _install_recorders(monkeypatch, calls)
+    monkeypatch.setattr(
+        cli_mod,
+        "_report_synchronicity",
+        real_report_synchronicity,
+    )
+
+    result = runner.invoke(app, ["fill", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert "report/synchronicity failed" not in _strip_ansi(result.output)
+    # Every other step is still a recorder, and still ran in order — the one
+    # unrecorded label is the real function this test installed.
+    assert calls == [
+        label for label in _EXPECTED_ORDER if label != "report/synchronicity"
+    ]
+    real_notes = [p for p in sync_notes(vault) if p.is_file()]
+    generated = [p for p in real_notes if p.name != "hostile-yaml.md"]
+    assert len(generated) == 1

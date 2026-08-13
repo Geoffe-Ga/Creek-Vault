@@ -14,10 +14,8 @@ from __future__ import annotations
 from datetime import datetime  # noqa: TC003  # used at runtime as a parameter type
 from pathlib import Path  # noqa: TC003  # plain stdlib import; no lazy benefit
 
-import frontmatter
-import yaml
-
 from creek.lint._result import CheckResult
+from creek.vault.links import read_header_meta
 
 _SYNC_DIR: tuple[str, ...] = ("10-Liminal", "Synchronicities")
 
@@ -29,13 +27,10 @@ def run(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
     findings: list[str] = []
     if sync_dir.is_dir():
         for note in sorted(sync_dir.glob("*.md")):
-            try:
-                post = frontmatter.load(str(note))
-            except (OSError, ValueError, yaml.YAMLError):
+            meta = read_header_meta(note)
+            if meta.get("type") != "synchronicity":
                 continue
-            if post.get("type") != "synchronicity":
-                continue
-            sync_id = str(post.get("id") or note.stem)
+            sync_id = str(meta.get("id") or note.stem)
             findings.append(
                 f"- `{sync_id}` (recorded in `10-Liminal/Synchronicities/`)"
             )
