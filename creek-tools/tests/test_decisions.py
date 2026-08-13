@@ -1540,3 +1540,51 @@ def test_generate_decisions_stays_idempotent_with_the_screen(
     assert len(first) == 1
     assert second == []
     assert after == before
+
+
+def test_generate_decisions_counts_only_screened_not_ceiling_refused_fragments(
+    vault_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The withheld count covers the intimate screen only, not the ceiling (#1431).
+
+    ``_admitted_decision_fragments`` evaluates ``within_ceiling`` *first* and
+    counts nothing it refuses, because a ceiling refusal is what the operator
+    asked for and warning about it would be noise. Only the unconditional
+    screen — the rule no caller asked for and no caller can lift — is counted.
+
+    One vault, two ceilings, is what makes that distinction observable. The
+    *same* intimate fragment is ceiling-refused at ``OPEN`` (silent) and
+    screen-refused at ``ALL`` (counted). Asserting the count at one ceiling
+    alone would be satisfied by a helper that counted every exclusion.
+    """
+    _seed_fragment(
+        vault_path,
+        _tiered_fragment("frag-open", "Should I buy a bicycle", PrivacyTier.OPEN),
+    )
+    _seed_fragment(
+        vault_path,
+        _tiered_fragment(
+            "frag-intimate",
+            "Should I leave my marriage",
+            PrivacyTier.INTIMATE,
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger="creek.generate.decisions"):
+        generate_decisions(vault_path, override=PrivacyTierOverride.OPEN)
+    ceiling_refused = [r for r in caplog.records if "withheld" in r.getMessage()]
+    caplog.clear()
+
+    with caplog.at_level("WARNING", logger="creek.generate.decisions"):
+        generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
+    screen_refused = [
+        r.getMessage() for r in caplog.records if "withheld" in r.getMessage()
+    ]
+
+    assert ceiling_refused == [], (
+        "a fragment the operator's own ceiling excluded was counted as "
+        f"withheld: {[r.getMessage() for r in ceiling_refused]}"
+    )
+    assert len(screen_refused) == 1, screen_refused
+    assert "1 fragment" in screen_refused[0], screen_refused[0]
