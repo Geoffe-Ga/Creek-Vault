@@ -33,10 +33,10 @@ Privacy tiers come from spec §13.2 and gate what `creek save` will write. The d
 | Tier | Sources (examples) | Auto-save default |
 |---|---|---|
 | **Open** | Published essays, public Discord messages | Full save (title + body + frontmatter). |
-| **Personal** | Chatbot conversations, private Discord messages | Title + summary only by default. Body saves only when the human passes `--include-body` per call. |
-| **Intimate** | Journal entries, recovery-related content | **Never auto-saves.** Human must invoke save explicitly with `--tier intimate --consent` per call; otherwise the operation refuses. Never enters voice-proxy generation. |
+| **Personal** | Chatbot conversations, private Discord messages | Title + summary only by default. Body saves only when the human passes `--full-body` per call. |
+| **Intimate** | Journal entries, recovery-related content | **Never auto-saves.** Human must invoke save explicitly with `--tier intimate` per call; otherwise the operation refuses. Never enters voice-proxy generation. |
 
-Privacy tier is inherited from the source conversation/fragment. A reflection generated during a conversation that touched intimate content is intimate by default; the agent must explicitly down-tier with human consent.
+`--tier` is **required** on every `creek save` / `creek.save` call — there is no default and no automatic inheritance. The doctrine still holds that a derived note should carry the most-restrictive tier of its sources, but the agent must determine that tier itself (the most-restrictive tier among the conversation's contributing fragments) and pass it explicitly as `--tier`. A call that omits `--tier` is refused outright, never defaulted.
 
 ## Required frontmatter
 
@@ -89,7 +89,7 @@ Save uses these names verbatim (INC-019 reconciliation):
 1. **Auto-filing is opt-in per command.** A `/crawdad reflect` that auto-files everything is the wrong default. Save is explicit, both for privacy and because the human owns what enters the vault.
 2. **Paradoxes route to `paradox`, never to `thread` or `eddy`.** A regression test (FEAT-009) verifies this. Saving a contradiction as a synthesis page is a bug, not a feature.
 3. **Provenance is required, not optional.** A save without `contributing_fragments` provenance is rejected. If the answer didn't draw on fragments, it's not a save target — it's a new fragment, route through `creek ingest` instead.
-4. **The human can always overwrite.** The auto-generated title, the proposed destination, the inherited tier — all are defaults. The human's explicit choice wins.
+4. **The human can always overwrite.** The auto-generated title and the proposed destination are defaults, and the human's explicit choice wins. The tier is not among them: it is never a default and never inferred — the agent must determine it and pass `--tier` explicitly, or the save is refused.
 5. **Liminal destinations are first-class.** `paradox` and `unnamed` are not consolation prizes; they are the right destinations when they're the right destinations. Honor them.
 
 ## What save does not do

@@ -5868,10 +5868,24 @@ _SAVE_TARGET_HELP = (
     "to 05-Wavelength/Observations/."
 )
 _SAVE_TIER_HELP = (
-    "Privacy tier (open|personal|intimate). Required when stdin is the body "
-    "source; defaults to the source fragments' max tier when --provenance "
-    "is supplied."
+    "Privacy tier (open|personal|intimate). Required on every save; "
+    "creek save never infers a tier from --provenance."
 )
+_SAVE_TIER_REQUIRED_MSG = (
+    "--tier is required. Pass --tier open|personal|intimate explicitly; "
+    "creek save never infers a tier from --provenance."
+)
+"""Refusal text when ``--tier`` is omitted for a file-sourced body."""
+_SAVE_TIER_REQUIRED_STDIN_MSG = (
+    "--tier is required when the body comes from stdin. "
+    "Pass --tier open|personal|intimate explicitly."
+)
+"""Refusal text when ``--tier`` is omitted and the body arrived on stdin.
+
+Distinct from :data:`_SAVE_TIER_REQUIRED_MSG` because the stdin shape has
+no ``--body`` path for the operator to look at: naming stdin tells them
+which half of the invocation the missing flag belongs to.
+"""
 _SAVE_SOURCE_KINDS: tuple[str, ...] = (
     "discord",
     "claude-session",
@@ -5978,28 +5992,38 @@ def _warn_if_paradox_downgrades_tier(
 
 def _resolve_save_tier(
     tier: PrivacyTier | None,
-    provenance: tuple[str, ...],
     *,
     came_from_stdin: bool,
 ) -> PrivacyTier:
-    """Resolve the effective tier per FEAT-009's tier-defaulting rule.
+    """Return the operator's explicit tier, or refuse the save (issue #1434).
 
-    * Explicit ``--tier`` always wins.
-    * Otherwise, when ``--provenance`` is supplied *and* the body did
-      not come from stdin, default to ``open`` (the v1 surface; a
-      future revision will derive from the source fragments' max tier).
-    * No tier and either no provenance or stdin body → refuse so the
-      operator makes an intentional choice.
+    The tier is always explicit. There is no default and no inheritance:
+    ``creek save`` never derives a tier from ``--provenance`` or from the
+    source fragments, because only the caller knows what the body it is
+    filing was actually derived from. Omitting ``--tier`` is a refusal,
+    not a hint. Previously an omitted ``--tier`` resolved to ``open``
+    whenever ``--provenance`` was supplied, which filed content derived
+    from an ``intimate`` fragment in the clear.
+
+    Args:
+        tier: The parsed ``--tier`` value, or ``None`` when it was omitted.
+        came_from_stdin: Whether the body arrived on stdin. Selects the
+            wording of the refusal so the message matches the invocation
+            the operator actually typed.
+
+    Returns:
+        The tier the note must be filed at.
+
+    Raises:
+        typer.Exit: With code 2 when ``--tier`` was omitted.
     """
     if tier is not None:
         return tier
-    if not provenance or came_from_stdin:
-        console.print(
-            "[red]--tier is required when --provenance is empty or the body "
-            "comes from stdin. Pass --tier open|personal|intimate explicitly.[/red]",
-        )
-        raise typer.Exit(code=2)
-    return PrivacyTier.OPEN
+    message = (
+        _SAVE_TIER_REQUIRED_STDIN_MSG if came_from_stdin else _SAVE_TIER_REQUIRED_MSG
+    )
+    console.print(f"[red]{message}[/red]")
+    raise typer.Exit(code=2)
 
 
 author_llm_factory: VoiceClientFactory | None = None
@@ -6416,7 +6440,6 @@ def save_cmd(
     )
     effective_tier = _resolve_save_tier(
         parsed_tier,
-        fragments,
         came_from_stdin=came_from_stdin,
     )
     _warn_if_paradox_downgrades_tier(save_target, parsed_tier)

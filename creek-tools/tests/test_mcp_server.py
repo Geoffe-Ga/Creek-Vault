@@ -322,6 +322,46 @@ def test_call_tool_save_through_mcp(vault: Path) -> None:
     assert structured["tool"] == "creek.save"
 
 
+def test_call_tool_save_through_mcp_refuses_without_tier(vault: Path) -> None:
+    """The registered tool must refuse an omitted ``tier``, not default it.
+
+    ``creek_mcp.tools.save.save_tool`` dropping its ``tier="open"`` default
+    is not enough on its own: ``build_server``'s ``creek.save`` wrapper
+    carries a second, independent default and forwards it explicitly. If
+    that one regressed to ``"open"``, every unit test against ``save_tool``
+    would stay green while the actual MCP transport — the surface the
+    deployed SKILL files instruct agents to call — kept filing
+    intimate-derived bodies in the clear. This drives the real registered
+    tool so both defaults are pinned (issue #1434).
+    """
+    for relparts in (
+        ("10-Liminal", "Unnamed"),
+        ("00-Creek-Meta", "audit"),
+    ):
+        (vault.joinpath(*relparts)).mkdir(parents=True, exist_ok=True)
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
+    )
+    body = "Derived from an intimate fragment; never file this in the clear."
+    result = asyncio.run(
+        server.call_tool(
+            "creek.save",
+            {
+                "target": "unnamed",
+                "body": body,
+                "title": "Derived via MCP",
+                "provenance": ["frag-intimate-001"],
+                "privacy_tier_ceiling": "open",
+            },
+        ),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "refused"
+    assert "tier is required" in str(structured["reason"])
+    assert list((vault / "10-Liminal" / "Unnamed").glob("*.md")) == []
+
+
 def test_every_tool_requires_privacy_tier_ceiling_parameter(vault: Path) -> None:
     """The FEAT-010 acceptance criterion: ceiling is in every tool's schema.
 

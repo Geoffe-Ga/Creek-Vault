@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -926,3 +927,232 @@ def test_stub_relpath_preserves_non_word_chars_as_hyphens() -> None:
     assert _stub_relpath_for("hello!world").name == "hello-world.md"
     assert _stub_relpath_for("why this matters?").name == "why-this-matters.md"
     assert _stub_relpath_for("multi!!!bang").name == "multi-bang.md"
+
+
+# ---- `--tier` is mandatory, never inferred (issue #1434) ----
+
+
+_LEAK_SENTINEL = (
+    "Derived from an intimate fragment and must never be filed in the clear."
+)
+
+
+def _normalise_cli_output(text: str) -> str:
+    """Strip ANSI styling and collapse whitespace runs in rendered CLI text.
+
+    Typer renders both help and usage errors through Rich, which re-wraps to
+    the terminal width and can split a single flag across style spans. Either
+    makes a naive substring assertion pass — or fail — for the wrong reason,
+    so every assertion below about rendered text goes through here first.
+
+    Args:
+        text: Raw ``result.output`` from :class:`typer.testing.CliRunner`.
+
+    Returns:
+        The same text with ANSI escape sequences removed and every run of
+        whitespace collapsed to a single space.
+    """
+    return re.sub(r"\s+", " ", re.sub(r"\x1b\[[0-9;]*m", "", text))
+
+
+def test_cli_save_refuses_provenance_without_tier_and_writes_nothing(
+    tmp_path: Path,
+) -> None:
+    """``--provenance`` without ``--tier`` must refuse, never infer ``open``.
+
+    This is the #1434 fail-open regression. ``_resolve_save_tier`` returns
+    ``PrivacyTier.OPEN`` whenever ``--provenance`` is supplied and the body
+    did not come from stdin, so a note derived from an ``intimate`` fragment
+    is filed in the clear under ``10-Liminal/Unnamed`` carrying
+    ``privacy_tier: open``. No tier is ever inferred: the operator states one
+    or the save refuses.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+    """
+    vault = _scaffold_vault(tmp_path / "vault")
+    (vault / "01-Fragments" / "f1.md").write_text(
+        "---\n"
+        "id: frag-intimate-001\n"
+        "type: fragment\n"
+        "privacy_tier: intimate\n"
+        "---\n"
+        "The intimate source material.\n",
+        encoding="utf-8",
+    )
+    body_file = tmp_path / "answer.md"
+    body_file.write_text(_LEAK_SENTINEL, encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "save",
+            "--target",
+            "unnamed",
+            "--body",
+            str(body_file),
+            "--title",
+            "Derived from an intimate fragment",
+            "--provenance",
+            "frag-intimate-001",
+            "--vault",
+            str(vault),
+        ],
+    )
+
+    # Load-bearing: the note must not exist at all.
+    assert list((vault / "10-Liminal" / "Unnamed").glob("*.md")) == [], result.output
+    # And the body must not have landed anywhere else under the vault either.
+    # Scoping a leak check to the one subtree you expected is the #1341
+    # regression shape, so this walks the whole vault root.
+    leaked = [
+        path
+        for path in vault.rglob("*")
+        if path.is_file()
+        and _LEAK_SENTINEL in path.read_text(encoding="utf-8", errors="ignore")
+    ]
+    assert leaked == []
+    assert result.exit_code == 2, result.output
+    assert "--tier" in _normalise_cli_output(result.output)
+
+
+_SAVE_TIER_CASES = (
+    pytest.param("open", "frag-intimate-001", False, 0, True, id="tier+prov+file"),
+    pytest.param("open", "frag-intimate-001", True, 0, True, id="tier+prov+stdin"),
+    pytest.param("open", None, False, 0, True, id="tier+noprov+file"),
+    pytest.param("open", None, True, 0, True, id="tier+noprov+stdin"),
+    pytest.param(None, "frag-intimate-001", False, 2, False, id="notier+prov+file"),
+    pytest.param(None, "frag-intimate-001", True, 2, False, id="notier+prov+stdin"),
+    pytest.param(None, None, False, 2, False, id="notier+noprov+file"),
+    pytest.param(None, None, True, 2, False, id="notier+noprov+stdin"),
+)
+"""The full ``--tier`` x ``--provenance`` x body-source cross-product (#1434).
+
+Eight rows, because the tier rule must not depend on the other two axes:
+whether provenance was supplied and whether the body arrived from a file or
+from stdin are exactly the conditions ``_resolve_save_tier`` branches on
+today. Each row carries ``(tier, provenance, from_stdin, expect_exit,
+expect_note)``.
+"""
+
+
+@pytest.mark.parametrize(
+    ("tier", "provenance", "from_stdin", "expect_exit", "expect_note"),
+    _SAVE_TIER_CASES,
+)
+def test_save_tier_behaviour_table(
+    tmp_path: Path,
+    tier: str | None,
+    provenance: str | None,
+    from_stdin: bool,
+    expect_exit: int,
+    expect_note: bool,
+) -> None:
+    """Pin the tier contract across every combination of the other inputs.
+
+    The rule after #1434 has no exceptions: an explicit ``--tier`` files a
+    note at that tier, and an omitted ``--tier`` exits 2 having written
+    nothing — whatever ``--provenance`` says and wherever the body came from.
+    The four no-tier rows are the specification the fix must satisfy; today
+    the file-plus-provenance row files a note instead of refusing.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        tier: The ``--tier`` value, or ``None`` to omit the flag entirely.
+        provenance: The ``--provenance`` value, or ``None`` to omit the flag.
+        from_stdin: Send the body through stdin rather than a file.
+        expect_exit: The exit code the invocation must produce.
+        expect_note: Whether exactly one note may exist afterwards.
+    """
+    vault = _scaffold_vault(tmp_path / "vault")
+    body_text = "A synthesis worth filing."
+    argv = ["save", "--target", "unnamed", "--title", "Table case"]
+    stdin: str | None = None
+    if from_stdin:
+        argv += ["--body", "-"]
+        stdin = body_text
+    else:
+        body_file = tmp_path / "table-body.md"
+        body_file.write_text(body_text, encoding="utf-8")
+        argv += ["--body", str(body_file)]
+    if tier is not None:
+        argv += ["--tier", tier]
+    if provenance is not None:
+        argv += ["--provenance", provenance]
+    argv += ["--vault", str(vault)]
+
+    result = runner.invoke(app, argv, input=stdin)
+
+    written = sorted((vault / "10-Liminal" / "Unnamed").glob("*.md"))
+    if expect_note:
+        assert result.exit_code == expect_exit, result.output
+        assert len(written) == 1, result.output
+        assert frontmatter.load(str(written[0]))["privacy_tier"] == "open"
+    else:
+        assert written == [], f"a note was filed with no --tier: {written}"
+        assert result.exit_code == expect_exit, result.output
+        # The two refusals are worded differently on purpose: the stdin shape
+        # has no --body path for the operator to look at, so it names stdin.
+        # Asserting the wording per branch is what keeps `came_from_stdin`
+        # load-bearing — collapsing both messages into one would otherwise
+        # pass every other assertion here.
+        refusal = _normalise_cli_output(result.output)
+        if from_stdin:
+            assert "when the body comes from stdin" in refusal
+        else:
+            assert "never infers a tier from --provenance" in refusal
+
+
+def test_save_tier_case_table_keeps_the_full_cross_product() -> None:
+    """The table must keep all eight rows, and shrinking it must fail here.
+
+    Deleting rows from a parametrize list never turns a test red — the
+    deleted cases simply stop running, so privacy coverage disappears behind
+    a green gate. This guard converts that deletion into a failure, and the
+    id check stops two rows collapsing into one by accident.
+    """
+    assert len(_SAVE_TIER_CASES) == 8
+    assert len({case.id for case in _SAVE_TIER_CASES}) == 8
+
+
+def test_save_tier_help_and_behaviour_agree(tmp_path: Path) -> None:
+    """What ``--tier`` advertises and what it does must move together.
+
+    #1434 *is* that drift: the help promised a tier that "defaults to the
+    source fragments' max tier" while the code returned ``open`` without
+    reading a single fragment. Asserting the help in one test and the
+    behaviour in another lets the two drift apart again, so both halves are
+    coupled here. The help is normalised first because Typer re-wraps it
+    across terminal lines, which would let a naive substring check pass for
+    the wrong reason.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+    """
+    help_text = _normalise_cli_output(runner.invoke(app, ["save", "--help"]).output)
+    assert "defaults to" not in help_text
+    assert "source fragments" not in help_text
+    # Tied to _SAVE_TIER_HELP verbatim rather than a bare "Required": the
+    # unscoped word also appears in unrelated help (``purge vault``), so it
+    # would survive the --tier row losing its own requirement notice.
+    assert "Required on every save" in help_text
+
+    vault = _scaffold_vault(tmp_path / "vault")
+    body_file = tmp_path / "answer.md"
+    body_file.write_text("A synthesis worth filing.", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "save",
+            "--target",
+            "unnamed",
+            "--body",
+            str(body_file),
+            "--provenance",
+            "frag-intimate-001",
+            "--vault",
+            str(vault),
+        ],
+    )
+    assert list((vault / "10-Liminal" / "Unnamed").glob("*.md")) == []
+    assert result.exit_code == 2, result.output

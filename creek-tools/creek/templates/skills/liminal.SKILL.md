@@ -91,7 +91,7 @@ Liminal notes use the canonical taxonomy verbatim (INC-019). Phases: Rising, Pea
 
 - **Not a backlog.** Items here are not waiting to be processed.
 - **Not a junk drawer.** Routing decisions are deliberate, per the rules above.
-- **Not exempt from privacy tiers.** A Liminal note inherits the most-restrictive tier of its contributing fragments. See `privacy-tier.SKILL.md`.
+- **Not exempt from privacy tiers.** A Liminal note inherits the most-restrictive tier of its contributing fragments — but the agent must determine that tier and pass it explicitly via `--tier` when saving; `creek save` will refuse rather than guess. See `privacy-tier.SKILL.md`.
 - **Not a place to bypass `creek purge`.** Deletion still requires elevated auth.
 
 ## Reference

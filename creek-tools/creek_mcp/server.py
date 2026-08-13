@@ -595,7 +595,7 @@ def build_server(
         target: str,
         body: str,
         title: str | None = None,
-        tier: str = "open",
+        tier: str | None = None,
         provenance: list[str] | None = None,
         source_kind: str = "mcp",
         source_id: str | None = None,
@@ -603,7 +603,7 @@ def build_server(
         full_body: bool = False,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Save a Discord/Claude answer back into the vault."""
+        """Save a Discord/Claude answer back into the vault; ``tier`` required."""
         return save_tool(
             vault_path=vault,
             target=target,

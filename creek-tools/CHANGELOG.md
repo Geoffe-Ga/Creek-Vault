@@ -32,6 +32,21 @@ to locate the originating commit for any reference below.
 
 ### Breaking changes
 
+- **`--tier`/`tier` is now required on every `creek save` and `creek.save`
+  call (#1434); neither transport infers, defaults, or derives a tier
+  from anything, including `--provenance`/`provenance` or the source
+  fragments. This breaks any `creek save` caller that relied on
+  `--provenance` implying `--tier open`, and any MCP client that called
+  `creek.save` without a `tier`. You will find out immediately: the CLI
+  exits 2 with a message naming `--tier`, and the MCP tool returns
+  `{"status": "refused", ...}` naming the missing `tier`. To preserve
+  the old behaviour, pass `--tier open` (CLI) or `tier: "open"` (MCP)
+  explicitly. The doctrine that a derived note carries the
+  most-restrictive tier of its sources still applies — it is now the
+  calling agent's job to determine that tier and pass it, not the
+  tool's. Vaults already scaffolded keep the old (permissive-reading)
+  `save.SKILL.md`/`privacy-tier.SKILL.md` text until `creek skills
+  sync` or a re-`creek init` re-deploys the updated templates.
 - **`creek skills` is now a typer subapp** (FEAT-019). Replace existing
   invocations:
   - `creek skills --generate --vault <vault>`

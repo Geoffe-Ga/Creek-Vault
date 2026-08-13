@@ -1616,7 +1616,16 @@ MCP_CONTRACT: Final[Mapping[str, Surface]] = {
         shape=Shape.WRITES,
         why="#580: the save target routing table is where artefacts get orphaned",
         derived_from=("creek.save:SaveTarget", "creek.save:TARGET_SUBDIRS"),
-        kwargs={"target": "observation", "title": "Canary obs", "body": CANARY, **_ALL},
+        # ``tier`` is required as of #1434 — ``creek.save`` refuses a call
+        # that omits it rather than defaulting to ``open``, so the contract
+        # must name one to exercise the write path at all.
+        kwargs={
+            "target": "observation",
+            "title": "Canary obs",
+            "body": CANARY,
+            "tier": "open",
+            **_ALL,
+        },
         effect=Effect(writes=("05-Wavelength/Observations/*.md",), contains=(CANARY,)),
     ),
     "creek.ingest": Surface(

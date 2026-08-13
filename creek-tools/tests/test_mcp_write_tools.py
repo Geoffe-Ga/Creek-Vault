@@ -271,6 +271,39 @@ def test_save_refuses_unknown_tier(vault: Path) -> None:
     assert "unknown tier" in result["reason"]
 
 
+def test_save_refuses_when_tier_is_omitted(vault: Path) -> None:
+    """Omitting ``tier`` is refused; the tool never picks a tier for you.
+
+    At HEAD ``save_tool``'s signature carries ``tier: str = "open"``, so this
+    exact call returns ``{'status': 'ok', 'created_tier': 'open'}`` and files
+    a body derived from an ``intimate`` fragment in the clear under
+    ``10-Liminal/Unnamed`` — the MCP half of #1434, matching the CLI's
+    ``_resolve_save_tier`` fail-open. A caller that does not state a tier
+    gets a structured refusal instead, on both transports.
+
+    Args:
+        vault: Vault fixture.
+    """
+    body = "Derived from an intimate fragment; never file this in the clear."
+    result = save_tool(
+        vault_path=vault,
+        target="unnamed",
+        body=body,
+        title="Derived via MCP",
+        provenance=["frag-intimate-001"],
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "refused"
+    assert "tier is required" in result["reason"]
+    assert list((vault / "10-Liminal" / "Unnamed").glob("*.md")) == []
+    # An audit entry for the refusal is permitted but not required here; if
+    # one was written it must not carry the body verbatim, mirroring
+    # ``test_save_refuses_when_tier_exceeds_ceiling``.
+    audit_path = vault / MCP_AUDIT_RELPATH
+    if audit_path.exists():
+        assert body not in audit_path.read_text(encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # ingest
 # ---------------------------------------------------------------------------
