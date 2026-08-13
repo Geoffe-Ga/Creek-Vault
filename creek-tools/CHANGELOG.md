@@ -32,6 +32,36 @@ to locate the originating commit for any reference below.
 
 ### Breaking changes
 
+- **`creek save --target paradox` now honours `--tier` instead of forcing
+  `open` (#1491).** `creek/save/writer.py` used to substitute
+  `PrivacyTier.OPEN` for any paradox save, so `--target paradox --tier
+  intimate` filed the note with `privacy_tier: open` **and the full body in
+  the clear**, while the CLI printed a yellow "will be widened" note and the
+  `creek.save` MCP tool printed nothing at all. The MCP transport compounded
+  it: the tool's response and its entry in the hash-chained audit log at
+  `00-Creek-Meta/audit/mcp.jsonl` both reported `created_tier: intimate`
+  while the artifact on disk was `open` — an auditor reading the
+  tamper-evident log would have believed the note was protected. The read
+  side inherited the same defect, because the stamped `open` defeats
+  `_admitted_liminal_notes`' fail-closed check and served intimate-derived
+  paradox bodies to open-ceiling consumers.
+
+  Routing is unchanged — a paradox save still always lands in
+  `10-Liminal/Paradoxes/`, and the *fact* of the contradiction is still
+  preserved by the note's location, title, tags and `saved_from` provenance.
+  Only the body moves: at `intimate` it is diverted to the gitignored
+  `10-Liminal/Compost/intimate-stubs/` directory with
+  `saved_from.intimate_body_pointer` naming it and the vault note reduced to
+  a tier-redacted summary; at `personal` it is summarised unless
+  `--full-body` is passed. **This is MCP-client-visible with no version
+  negotiation** — a `creek.save` call at `target=paradox, tier=intimate` no
+  longer returns a path to a note containing the body — mirroring the #1495
+  precedent on the same surface. Paradox notes saved at `intimate` also now
+  disappear from the Liminal Watch below `--include-tier intimate`. The
+  widening warning is gone with the widening, and the deployed
+  `paradox.SKILL.md` / `privacy-tier.SKILL.md` rules that told agents to route
+  intimate material away from paradox have been rewritten.
+
 - **`tier` is now required on every `creek.journal` and `creek.upload`
   call (#1494).** Both verbs previously declared `tier: str = "open"` —
   twice each, once on the tool function and again, independently, on the

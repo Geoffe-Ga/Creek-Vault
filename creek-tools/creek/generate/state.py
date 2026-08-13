@@ -492,12 +492,17 @@ def _admitted_liminal_notes(
 ) -> list[tuple[str, PrivacyTier]]:
     """Return admitted ``(file stem, tier)`` pairs under one liminal subfolder.
 
-    ``10-Liminal/Unnamed`` notes are fragments and carry ``privacy_tier``;
-    ``10-Liminal/Paradoxes`` notes are ``type: paradox`` and have no tier field
-    in their model at all. Reading the *raw* frontmatter through
+    ``10-Liminal/Unnamed`` notes are fragments and carry ``privacy_tier``.
+    ``10-Liminal/Paradoxes`` has two producers: a *detector*-written note
+    (:func:`creek.generate.paradox.create_paradox_note`, behind
+    ``creek report --type paradox``) is ``type: paradox`` with no tier field in
+    its model at all, while a *save*-written one (``creek save --target
+    paradox``) carries an explicit ``privacy_tier`` like any other note
+    (#1491). Reading the *raw* frontmatter through
     :func:`~creek.classify.privacy_filter.within_ceiling` is what lets one gate
-    serve both: the paradox note fails closed to ``intimate`` because nobody
-    vouched for it, not because it was classified.
+    serve all three: the detector's paradox note fails closed to ``intimate``
+    because nobody vouched for it, not because it was classified, and the
+    saved one is gated by the tier its author actually named.
 
     This is one of two readers admitting ``10-Liminal`` notes into one
     document; the other is
@@ -928,8 +933,10 @@ class StateReportGenerator:
         #969: the rendered name is a file *stem*, which for an ``Unnamed``
         note is the operator's own words. Admission is decided at load time by
         :func:`_admitted_liminal_notes`; the consequence worth stating is that
-        a ``Paradoxes`` note carries no ``privacy_tier`` field in its model at
-        all, so it fails closed and is dropped below ``ceiling=intimate``.
+        a *detector*-written ``Paradoxes`` note carries no ``privacy_tier``
+        field in its model at all, so it fails closed and is dropped below
+        ``ceiling=intimate``, while a ``creek save --target paradox`` note
+        carries an explicit tier and is dropped by *that* (#1491).
         """
         body: list[str] = []
         for sub in _LIMINAL_SUBDIRS:

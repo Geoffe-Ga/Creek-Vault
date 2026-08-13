@@ -45,18 +45,23 @@ creek save --target <thread|eddy|praxis|paradox|unnamed|draft> \
 
 **Paradox routing is unconditional.** A `--target paradox` save
 *always* lands in `10-Liminal/Paradoxes/`, no matter what other
-flags are passed. The paradox tier-filter is forced to `open` because
-what we're preserving is the *fact* of the contradiction, not the
-contradictory content itself.
+flags are passed. **The tier is not.** Paradox honours `--tier`
+exactly like every other target: the routing override is the only
+override.
 
-> ⚠️ **Paradox saves are always `tier=open`.** Even if you pass
-> `--tier intimate` (or `--tier personal`) the body is written to the
-> vault in full. The paradox target preserves the contradiction, not
-> a tier-protected summary. The CLI emits a yellow stderr warning
-> when this widening happens. If you need the body protected, use
-> `--target unnamed --tier intimate` instead — that diverts the
-> sensitive body to the gitignored compost directory and writes only
-> a title-only summary into the vault.
+> ⚠️ **This changed in #1491.** Paradox saves used to force
+> `tier=open`, writing the body into the vault in full even when you
+> passed `--tier intimate`, on the reasoning that what is preserved
+> is the *fact* of the contradiction. That reasoning holds — but the
+> fact does not require the body. The location, title, tags and
+> `saved_from` provenance record the contradiction on their own, so
+> an `intimate` paradox body is now diverted to the gitignored
+> `10-Liminal/Compost/intimate-stubs/` directory (with
+> `saved_from.intimate_body_pointer` naming it) and a `personal` body
+> is summarised, both exactly as they are for any other target. The
+> paradox note itself still lands in `10-Liminal/Paradoxes/`. The
+> yellow stderr warning about widening is gone, because nothing is
+> widened any more.
 
 ## Privacy-tier rules
 
@@ -167,6 +172,13 @@ Coverage lives in `tests/test_save.py`:
   stub-relpath under `10-Liminal/Compost/intimate-stubs/`.
 * `creek save --target paradox` always lands in
   `10-Liminal/Paradoxes/`.
+* `creek save --target paradox --tier intimate` writes
+  `privacy_tier: intimate` and no cleartext body — asserted at the
+  writer seam, through the CLI, and through the `creek.save` MCP
+  tool, so the guarantee cannot hold on one transport only (#1491).
+* A one-way-ratchet table over every
+  (`SaveTarget` × tier × `--full-body`) combination asserts no save
+  ever files a note at a tier weaker than the one requested.
 * `creek save` with no `--tier` exits 2, with or without
   `--provenance`.
 * `intimate`-tier saves never write the full body anywhere under the

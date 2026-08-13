@@ -17,7 +17,7 @@ import frontmatter
 import pytest
 from typer.testing import CliRunner
 
-from creek.classify.privacy_filter import pre_save_filter
+from creek.classify.privacy_filter import pre_save_filter, tier_sensitivity
 from creek.cli import app
 from creek.models import PrivacyTier
 from creek.save import (
@@ -231,34 +231,363 @@ def test_paradox_always_lands_in_liminal_paradoxes(vault: Path) -> None:
     assert path.parent == vault / "10-Liminal" / "Paradoxes"
 
 
-def test_paradox_tier_is_open_even_if_caller_passes_intimate(vault: Path) -> None:
-    """Per the FEAT, a paradox save records *the fact* of the contradiction.
+# ---- Paradox must honour the tier the operator stated (issue #1491) ----
 
-    Tier-filtering for the paradox target is forced to ``open`` so the
-    body lands in the vault unredacted — what's preserved is the
-    contradiction, not a tier-protected summary. This is a deliberate
-    privacy trade-off the operator opts into by choosing ``paradox``;
-    the CLI emits a stderr warning when ``--tier intimate`` (or
-    ``personal``) is combined with ``--target paradox`` so the
-    behaviour isn't silent.
+# The title is written into the vault note in the clear by
+# ``_title_only_summary`` and slugified into the filename, and an untitled
+# save derives its title from the body's FIRST line (``writer._derive_title``).
+# So every test below passes an explicit title that shares no substring with
+# the canary, and keeps the canary off line 1. Without that, the correct fix
+# still leaves the canary in the vault note and the whole battery reads as
+# "the fix does not work". The title-in-the-clear exposure itself is #1505.
+_PARADOX_TITLE = "Both true at once"
+_PARADOX_SECRET = "CLEARTEXT-CANARY-1491"
+_PARADOX_BODY = (
+    "Two framings collide.\n\n"
+    + _PARADOX_SECRET
+    + " is the part that must never land in the vault."
+)
+
+_REDACTED_BODY = f"[Tier-redacted summary: {_PARADOX_TITLE}]"
+"""The exact body a tier-redacted save leaves behind in the vault note.
+
+Compared for equality rather than by substring, so a redaction that started
+emitting the summary *alongside* the body would still fail here.
+
+The trailing newline :func:`creek.classify.privacy_filter._title_only_summary`
+produces is deliberately absent: ``frontmatter.dumps`` ends its template with
+``.strip()`` and ``frontmatter.parse`` returns ``content.strip()``, so neither
+the bytes on disk nor ``Post.content`` ever carry it.
+"""
+
+
+def _stub_files(vault: Path) -> list[Path]:
+    """Return the intimate stubs currently under the gitignored compost dir.
+
+    Args:
+        vault: Vault root.
+
+    Returns:
+        Every ``*.md`` under ``10-Liminal/Compost/intimate-stubs``, sorted by
+        name so a count assertion reads the same on every filesystem.
     """
-    paradox_body = "Both A and not-A appear true under different framings."
-    request = _make_request(
-        SaveTarget.PARADOX,
-        body=paradox_body,
-        tier=PrivacyTier.INTIMATE,
+    return sorted((vault / "10-Liminal" / "Compost" / "intimate-stubs").glob("*.md"))
+
+
+def test_paradox_intimate_body_never_lands_in_the_vault(vault: Path) -> None:
+    """A paradox save at ``intimate`` files an intimate note, not an open one.
+
+    Issue #1491. :func:`~creek.save.writer.save_to_vault` opens with
+    ``effective_tier = OPEN if request.target == SaveTarget.PARADOX else
+    request.tier``, so the tier the operator stated is discarded before
+    :func:`~creek.classify.privacy_filter.pre_save_filter` is ever consulted:
+    the note is stamped ``privacy_tier: open`` and carries the body in full.
+
+    FEAT-009's paradox rule is a *routing* rule — "always lands in
+    ``10-Liminal/Paradoxes/``" — and where a note is filed says nothing about
+    who may read it once it is there. Implementing the routing rule as a tier
+    rule turns choosing ``--target paradox`` into an unannounced
+    declassification of whatever the operator was holding.
+
+    Three separate claims, because each can fail on its own:
+
+    * the frontmatter tier is what every downstream consumer keys on
+      (``creek state``, the MCP read gate, ``creek report``), so an ``open``
+      stamp is the thing that actually widens the audience;
+    * the *raw file bytes* are searched rather than ``post.content``, because
+      the body is not the only place the answer can surface — frontmatter
+      carries ``title`` and ``saved_from`` as well, and a leak into either is
+      still a leak;
+    * the filename is searched because ``_compose_base_name`` slugifies the
+      title into it, and a directory listing is readable by anyone with the
+      folder open, whatever the note says inside.
+
+    Args:
+        vault: Minimal vault scaffold.
+    """
+    path = save_to_vault(
+        _make_request(
+            SaveTarget.PARADOX,
+            body=_PARADOX_BODY,
+            title=_PARADOX_TITLE,
+            tier=PrivacyTier.INTIMATE,
+        ),
+        vault_path=vault,
     )
-    path = save_to_vault(request, vault_path=vault)
+
     post = frontmatter.load(str(path))
-    assert post["type"] == "paradox"
+    assert post["privacy_tier"] == "intimate", (
+        "a paradox save was filed at a tier the operator never asked for; "
+        f"frontmatter says {post['privacy_tier']!r}"
+    )
+    raw = path.read_text(encoding="utf-8")
+    assert _PARADOX_SECRET not in raw, (
+        f"the intimate body is in the clear on disk at {path}:\n\n{raw}"
+    )
+    assert _PARADOX_SECRET not in path.name
+
+
+def test_paradox_intimate_body_is_diverted_to_the_stub(vault: Path) -> None:
+    """The intimate paradox body reaches the compost stub, not the note (#1491).
+
+    The tier stamp on its own is not the fix.
+    :func:`~creek.classify.privacy_filter.pre_save_filter` is what routes an
+    intimate body into the gitignored
+    ``10-Liminal/Compost/intimate-stubs/`` directory and leaves a title-only
+    summary behind, and it only does that when it is handed the tier the
+    operator stated — so this pins the *consequence* of the stamp rather than
+    trusting the stamp to imply it.
+
+    The body is asserted **present** in the stub as well as absent from the
+    note. A "fix" that dropped the intimate body on the floor would satisfy
+    every absence assertion in this file while destroying the operator's
+    answer, and that is the failure mode a privacy battery is most likely to
+    reward by accident.
+
+    Args:
+        vault: Minimal vault scaffold.
+    """
+    path = save_to_vault(
+        _make_request(
+            SaveTarget.PARADOX,
+            body=_PARADOX_BODY,
+            title=_PARADOX_TITLE,
+            tier=PrivacyTier.INTIMATE,
+        ),
+        vault_path=vault,
+    )
+
+    stubs = _stub_files(vault)
+    assert len(stubs) == 1, f"expected exactly one intimate stub, got {stubs}"
+    assert _PARADOX_SECRET in stubs[0].read_text(encoding="utf-8"), (
+        "the intimate body reached neither the vault note nor the stub — the "
+        "operator's answer was lost rather than protected"
+    )
+
+    post = frontmatter.load(str(path))
+    assert post.content == _REDACTED_BODY
+    pointer = post["saved_from"].get("intimate_body_pointer")
+    assert pointer, "the note must record where its intimate body was stashed"
+    assert (vault / pointer).exists()
+
+
+def test_paradox_personal_is_summarised_and_full_body_is_personal_only(
+    vault: Path,
+) -> None:
+    """The whole tier ladder must survive ``--target paradox`` (#1491).
+
+    Pinning ``intimate`` alone would admit a fix that special-cased that one
+    tier and left ``personal`` still force-widened to ``open``. Three saves
+    into one vault, each under its own title so the filenames cannot collide:
+
+    1. ``personal`` — summarised. The body never reaches the vault and no stub
+       is written, because personal content is redacted in place rather than
+       stashed off-vault.
+    2. ``personal`` + ``full_body`` — the operator's explicit opt-in puts the
+       body in the vault *at* ``personal``, still with no stub. This row is
+       what stops the fix being "paradox redacts everything now", which would
+       be a different bug wearing the same green tests.
+    3. ``intimate`` + ``full_body`` — the opt-in must never escape
+       ``intimate``. :func:`~creek.classify.privacy_filter.pre_save_filter`
+       checks ``INTIMATE`` before it looks at ``full_body`` for exactly that
+       reason, and ``--target paradox`` must not become a second way around
+       it.
+
+    The stub count is asserted after every phase rather than once at the end,
+    because the stub directory accumulates across the three saves and a single
+    closing count could not say *which* save wrote one.
+
+    Args:
+        vault: Minimal vault scaffold.
+    """
+    summarised = save_to_vault(
+        _make_request(
+            SaveTarget.PARADOX,
+            body=_PARADOX_BODY,
+            title=_PARADOX_TITLE,
+            tier=PrivacyTier.PERSONAL,
+        ),
+        vault_path=vault,
+    )
+    assert frontmatter.load(str(summarised))["privacy_tier"] == "personal"
+    assert _PARADOX_SECRET not in summarised.read_text(encoding="utf-8")
+    assert _stub_files(vault) == []
+
+    opted_in = save_to_vault(
+        _make_request(
+            SaveTarget.PARADOX,
+            body=_PARADOX_BODY,
+            title=f"{_PARADOX_TITLE} again",
+            tier=PrivacyTier.PERSONAL,
+            full_body=True,
+        ),
+        vault_path=vault,
+    )
+    assert frontmatter.load(str(opted_in))["privacy_tier"] == "personal"
+    assert _PARADOX_SECRET in opted_in.read_text(encoding="utf-8"), (
+        "--full-body at personal must still put the body in the vault; a "
+        "paradox fix that redacted it would break the opt-in instead"
+    )
+    assert _stub_files(vault) == []
+
+    sealed = save_to_vault(
+        _make_request(
+            SaveTarget.PARADOX,
+            body=_PARADOX_BODY,
+            title=f"{_PARADOX_TITLE} third",
+            tier=PrivacyTier.INTIMATE,
+            full_body=True,
+        ),
+        vault_path=vault,
+    )
+    assert frontmatter.load(str(sealed))["privacy_tier"] == "intimate"
+    assert _PARADOX_SECRET not in sealed.read_text(encoding="utf-8")
+    stubs = _stub_files(vault)
+    assert len(stubs) == 1, f"expected exactly one intimate stub, got {stubs}"
+    assert _PARADOX_SECRET in stubs[0].read_text(encoding="utf-8")
+
+
+def test_paradox_open_is_unchanged(vault: Path) -> None:
+    """A paradox save at ``open`` still files the contradiction verbatim.
+
+    A non-regression control for the common path, **not** a #1491 acceptance
+    criterion: this passes before the fix and must keep passing after it. It
+    is what separates "paradox honours the stated tier" from "paradox redacts
+    everything now" — the second would satisfy every leak assertion in this
+    battery while making the target useless for the job it exists to do, which
+    is preserving a contradiction in full.
+
+    Args:
+        vault: Minimal vault scaffold.
+    """
+    path = save_to_vault(
+        _make_request(
+            SaveTarget.PARADOX,
+            body=_PARADOX_BODY,
+            title=_PARADOX_TITLE,
+            tier=PrivacyTier.OPEN,
+        ),
+        vault_path=vault,
+    )
+
+    post = frontmatter.load(str(path))
     assert post["privacy_tier"] == "open"
-    # Force-to-open must actually let the body through, otherwise the
-    # rule would be a no-op: assert the body content lands in the
-    # vault note rather than just trusting the tier field.
-    assert paradox_body in post.content
-    # And nothing gets diverted to the intimate-stubs directory.
-    stubs_dir = vault / "10-Liminal" / "Compost" / "intimate-stubs"
-    assert not list(stubs_dir.glob("*.md"))
+    assert _PARADOX_SECRET in path.read_text(encoding="utf-8")
+    assert _stub_files(vault) == []
+
+
+# ---- The one-way ratchet: no save may weaken the tier it was given ----
+
+_RATCHET_TIERS = (PrivacyTier.OPEN, PrivacyTier.PERSONAL, PrivacyTier.INTIMATE)
+"""The three tiers an operator can state on a save.
+
+``UNCLASSIFIED`` is excluded on purpose: it is what the pipeline writes for
+content nobody has classified yet, never something ``creek save`` asks an
+operator to choose, and ``--tier`` does not offer it.
+"""
+
+_RATCHET_CASES = [
+    (target, tier, full_body)
+    for target in SaveTarget
+    for tier in _RATCHET_TIERS
+    for full_body in (False, True)
+]
+"""Every ``(target, tier, full_body)`` combination the save surface accepts.
+
+The full cross-product rather than the paradox rows alone, because #1491 is a
+*shape* of bug — one target quietly rewriting the operator's tier — and the
+only assertion that can rule the shape out everywhere is one that runs
+everywhere. Seven of the eight targets are expected to pass unchanged; they
+are the control that says the ratchet is a property of ``save``, not a
+patch on ``paradox``.
+"""
+
+_RATCHET_IDS = [
+    f"{target.value}-{tier.value}-{'fullbody' if full_body else 'summary'}"
+    for target, tier, full_body in _RATCHET_CASES
+]
+"""Readable node ids, one per row of :data:`_RATCHET_CASES`, positionally parallel."""
+
+
+def test_ratchet_table_is_not_empty() -> None:
+    """The ratchet table must keep every row, and shrinking it must fail here.
+
+    Deleting rows from a ``parametrize`` list never turns a test red — the
+    deleted cases simply stop running, so privacy coverage vanishes behind a
+    green gate. Asserting the table's size separately converts that deletion
+    into a failure.
+
+    The three axes are counted **separately, and never mixed into one set**.
+    :class:`~creek.save.SaveTarget` and :class:`~creek.models.PrivacyTier` are
+    both ``StrEnum``, so their members hash as bare strings *across* class
+    boundaries: a single ``{*SaveTarget, *_RATCHET_TIERS}`` would silently
+    collapse any pair that happened to share a value, and the size assertion
+    would then be measuring the collision instead of the table.
+    """
+    assert len({target.value for target in SaveTarget}) == 8
+    assert len({tier.value for tier in _RATCHET_TIERS}) == 3
+    assert len(_RATCHET_CASES) == 48
+    assert len(set(_RATCHET_IDS)) == 48
+
+
+@pytest.mark.parametrize(
+    ("target", "tier", "full_body"),
+    _RATCHET_CASES,
+    ids=_RATCHET_IDS,
+)
+def test_no_save_ever_writes_weaker_than_requested(
+    vault: Path,
+    target: SaveTarget,
+    tier: PrivacyTier,
+    full_body: bool,
+) -> None:
+    """``creek save`` may harden a tier, never soften one (#1491).
+
+    The invariant the paradox branch broke, stated once for the whole surface:
+    the tier recorded on disk is at least as sensitive as the tier the caller
+    asked for. Ranking through
+    :func:`~creek.classify.privacy_filter.tier_sensitivity` rather than a rank
+    table written here is deliberate — this repository keeps four tier
+    rankings that disagree about ``unclassified`` *on purpose*, and a fifth
+    invented in a test file would be a fifth opinion nobody reconciled.
+
+    ``>=`` rather than ``==`` because hardening is a legitimate outcome (a
+    future rule may raise a tier on the way in) while softening never is.
+    Equality for the paradox rows specifically is pinned by the tests above,
+    so this row cannot be satisfied by a blanket upgrade to ``intimate``.
+
+    The intimate rows carry a second, on-disk claim: whatever the frontmatter
+    says, the canary must not be in the file. A stamp is a label, and #1491
+    was a case of the label and the bytes disagreeing.
+
+    Args:
+        vault: Minimal vault scaffold.
+        target: One :class:`~creek.save.SaveTarget`.
+        tier: The tier the caller states.
+        full_body: The ``--full-body`` opt-in.
+    """
+    path = save_to_vault(
+        _make_request(
+            target,
+            body=_PARADOX_BODY,
+            title=_PARADOX_TITLE,
+            tier=tier,
+            full_body=full_body,
+        ),
+        vault_path=vault,
+    )
+
+    post = frontmatter.load(str(path))
+    written = PrivacyTier(post["privacy_tier"])
+    assert tier_sensitivity(written) >= tier_sensitivity(tier), (
+        f"a {target.value} save asked for {tier.value} and was filed as "
+        f"{written.value} — the save surface weakened the operator's tier"
+    )
+    if tier is PrivacyTier.INTIMATE:
+        assert _PARADOX_SECRET not in path.read_text(encoding="utf-8"), (
+            f"an intimate {target.value} save (full_body={full_body}) left "
+            f"the body in the clear at {path}"
+        )
 
 
 # ---- pre_save_filter ----
@@ -640,28 +969,75 @@ def test_cli_save_unknown_source_kind_exits_two(tmp_path: Path) -> None:
     assert "source-kind" in result.output.lower()
 
 
-def test_cli_save_paradox_intimate_warns_about_tier_widening(tmp_path: Path) -> None:
-    """``--target paradox --tier intimate`` warns that the body is unprotected.
+_STUB_PREFIX = "10-Liminal/Compost/intimate-stubs"
+"""The only place under the vault an intimate body may legitimately appear."""
 
-    Paradox saves force tier=open per the FEAT — the body lands in
-    the vault unredacted. A user passing ``--tier intimate`` for
-    protection deserves a visible heads-up rather than silent
-    widening; the CLI emits a yellow stderr note explaining the
-    consequence and pointing at unprotected target alternatives.
+
+def _files_containing(vault: Path, needle: str) -> list[str]:
+    """Return every vault-relative path whose *bytes* contain *needle*.
+
+    Walks the whole vault rather than the one subtree the leak was expected
+    in. Scoping a leak check to the directory you already suspect is the #1341
+    regression shape, and one save touches more than its target folder: a
+    stub, an index, an audit row.
+
+    ``read_bytes`` over ``rglob("*")`` rather than ``read_text`` over
+    ``rglob("*.md")``, the same shape as
+    ``tests/test_purge_voice_artifacts.py``'s helper and for the same reason:
+    residue is not confined to markdown, and a text read raises on the first
+    undecodable byte instead of reporting a leak.
+
+    Args:
+        vault: Vault root.
+        needle: The sentinel to search for.
+
+    Returns:
+        POSIX-style vault-relative paths, sorted, so a failure message names
+        the offending files in a stable order.
     """
-    vault = _scaffold_vault(tmp_path / "vault")
+    probe = needle.encode("utf-8")
+    return sorted(
+        path.relative_to(vault).as_posix()
+        for path in vault.rglob("*")
+        if path.is_file() and probe in path.read_bytes()
+    )
+
+
+def test_cli_save_paradox_intimate_writes_no_cleartext_body(tmp_path: Path) -> None:
+    """The CLI transport must not file an intimate paradox body in the clear.
+
+    Issue #1491, end to end. The writer-seam tests above pin the defect at
+    :func:`~creek.save.writer.save_to_vault`; this one pins it where the
+    operator actually meets it, because ``creek save`` is the surface that
+    accepts ``--tier intimate`` and therefore the surface that made the
+    promise.
+
+    The leak assertion is stated over the **whole vault**, not over the
+    paradox folder: the question is not "did the note keep the body" but
+    "is the body anywhere a reader without intimate access can reach it", and
+    ``10-Liminal/Compost/intimate-stubs/`` is the single gitignored exception.
+
+    The scan also asserts the canary is present in *at least one* file. An
+    "absent everywhere" assertion is trivially satisfied by a save that lost
+    the body, which would read as a fix and be a data-loss bug.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+    """
     body_file = tmp_path / "answer.md"
-    body_file.write_text("Two contradictory framings.", encoding="utf-8")
+    body_file.write_text(_PARADOX_BODY, encoding="utf-8")
+    vault = _scaffold_vault(tmp_path / "vault")
+
     result = runner.invoke(
         app,
         [
             "save",
             "--target",
             "paradox",
+            "--title",
+            _PARADOX_TITLE,
             "--body",
             str(body_file),
-            "--title",
-            "Both true",
             "--provenance",
             "frag-001",
             "--tier",
@@ -670,36 +1046,23 @@ def test_cli_save_paradox_intimate_warns_about_tier_widening(tmp_path: Path) -> 
             str(vault),
         ],
     )
+
     assert result.exit_code == 0, result.output
-    assert "tier=open" in result.output.lower() or "widened" in result.output.lower()
-    # Open-tier paradox: nothing diverted to the intimate-stubs dir.
-    stubs_dir = vault / "10-Liminal" / "Compost" / "intimate-stubs"
-    assert not list(stubs_dir.glob("*.md"))
+    notes = list((vault / "10-Liminal" / "Paradoxes").glob("*.md"))
+    assert len(notes) == 1, result.output
+    assert frontmatter.load(str(notes[0]))["privacy_tier"] == "intimate"
 
-
-def test_cli_save_paradox_open_does_not_warn(tmp_path: Path) -> None:
-    """``--target paradox --tier open`` is the expected path; no warning."""
-    vault = _scaffold_vault(tmp_path / "vault")
-    body_file = tmp_path / "answer.md"
-    body_file.write_text("contradiction body", encoding="utf-8")
-    result = runner.invoke(
-        app,
-        [
-            "save",
-            "--target",
-            "paradox",
-            "--body",
-            str(body_file),
-            "--provenance",
-            "frag-001",
-            "--tier",
-            "open",
-            "--vault",
-            str(vault),
-        ],
+    carriers = _files_containing(vault, _PARADOX_SECRET)
+    assert carriers, (
+        "the intimate body reached no file under the vault at all — it was "
+        "lost rather than sealed, which is a data-loss bug wearing a fix's "
+        "costume"
     )
-    assert result.exit_code == 0, result.output
-    assert "widened" not in result.output.lower()
+    stray = [path for path in carriers if not path.startswith(_STUB_PREFIX)]
+    assert stray == [], (
+        "the intimate body is readable outside the gitignored intimate-stubs "
+        f"directory: {stray}"
+    )
 
 
 def test_cli_save_missing_body_path_exits_two(tmp_path: Path) -> None:

@@ -71,9 +71,17 @@ What `render` excludes at each ceiling is tabulated in
 [`generation.md`](generation.md#what-each-section-does-at-a-tier-ceiling-969).
 The four exclusions worth knowing before you call it:
 
-* `10-Liminal/Paradoxes` notes are `type: paradox` and carry no `privacy_tier`
-  field at all, so they fail closed and vanish from the Liminal Watch below
-  `ceiling=intimate`. Any note missing the key behaves the same way.
+* `10-Liminal/Paradoxes` notes come from two producers and are gated
+  differently. **Detector-written** ones
+  (`creek/generate/paradox.py::create_paradox_note`, behind
+  `creek report --type paradox`) are `type: paradox` and carry no
+  `privacy_tier` field at all, so they fail closed and vanish from the Liminal
+  Watch below `ceiling=intimate` — nobody vouched for them. **Save-written**
+  ones (`creek save --target paradox`, and the `creek.save` MCP tool) carry an
+  explicit `privacy_tier` and are gated by it like any other note, so an
+  `open` paradox save stays visible at `ceiling=open` and an `intimate` one
+  disappears below `ceiling=intimate` (#1491). Any note missing the key behaves
+  like the detector case.
 * The **lint summary** is a verbatim copy of a Processing-Log artefact and is
   untierable row by row, so it is rendered only at `ceiling=intimate` or
   broader. This closes the caveat `creek_mcp/read_gate.py` recorded under
