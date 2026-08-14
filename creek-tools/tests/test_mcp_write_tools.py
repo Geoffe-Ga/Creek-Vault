@@ -304,6 +304,75 @@ def test_save_refuses_when_tier_is_omitted(vault: Path) -> None:
         assert body not in audit_path.read_text(encoding="utf-8")
 
 
+def test_save_at_unclassified_redacts_the_body_under_a_personal_ceiling(
+    vault: Path,
+) -> None:
+    """An ``unclassified`` MCP save must not file its body in the clear (#1508).
+
+    The machine-reachable half of #1508: no operator in the loop. A client at
+    ``ceiling=personal`` — the ordinary configuration, not a privileged one —
+    could call ``creek.save`` with ``tier="unclassified"`` and land the body
+    unredacted in the vault note, because
+    :func:`~creek.classify.privacy_filter.pre_save_filter` branched on
+    ``tier == PrivacyTier.PERSONAL`` and ``unclassified`` matched neither of
+    its two named tiers. Choosing the *less* specific tier produced *more*
+    exposure — the exact inverse of the one-way ratchet the save path enforces
+    everywhere else.
+
+    **Admission is correct here and must stay correct.** ``personal`` is the
+    lowest ceiling that admits ``unclassified`` (#961), so ``status == "ok"``
+    is the right answer and this test must not be read as "the ceiling should
+    have refused it". The defect is what happens *after* admission, which is
+    why the assertion is on the bytes of the written note rather than on the
+    tool's verdict.
+
+    ``created_tier`` is pinned alongside, because the other tempting wrong fix
+    is to silently upgrade the stamp to ``personal``: that would redact the
+    body while rewriting a tier the caller stated, and every downstream
+    consumer keys on the stamp.
+
+    The title is deliberately innocuous and shares no substring with the
+    canary. ``_title_only_summary`` writes it into the vault note in the clear
+    and ``_compose_base_name`` slugifies it into the filename, so a title
+    carrying the canary would leave the correct fix looking broken — the
+    standing instruction recorded at ``tests/test_save.py:240-252``.
+
+    Args:
+        vault: Vault fixture.
+    """
+    canary = "MCP-CANARY-1508"
+    body = f"line one {canary}\nline two innocuous"
+
+    result = save_tool(
+        vault_path=vault,
+        target="unnamed",
+        body=body,
+        title="Innocuous Title",
+        tier="unclassified",
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+
+    assert result["status"] == "ok", (
+        "ceiling=personal is the lowest ceiling that admits unclassified "
+        f"(#961); the tool answered {result!r}"
+    )
+    assert result["created_tier"] == "unclassified", (
+        "the caller stated tier=unclassified and the tool reported "
+        f"{result['created_tier']!r}"
+    )
+
+    written = list((vault / "10-Liminal" / "Unnamed").glob("*.md"))
+    assert len(written) == 1, f"expected exactly one saved note, got {written}"
+    raw = written[0].read_text(encoding="utf-8")
+    assert canary not in raw, (
+        f"an unclassified MCP save left the body in the clear at {written[0]}:\n\n{raw}"
+    )
+    assert "[Tier-redacted summary: Innocuous Title]" in raw, (
+        "the note carries neither the body nor the title-only summary; the "
+        f"caller's content was lost rather than redacted:\n\n{raw}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # save — the created tier the caller stated is the tier written (issue #1491)
 # ---------------------------------------------------------------------------

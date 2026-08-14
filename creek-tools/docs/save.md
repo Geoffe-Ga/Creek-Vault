@@ -29,7 +29,7 @@ creek save --target <thread|eddy|praxis|paradox|unnamed|draft> \
 | `--source`        | Opaque source identifier — conversation/discord-msg/claude-session.                                                      |
 | `--source-kind`   | `discord` / `claude-session` / `manual` (default) / `mcp`.                                                               |
 | `--tier`          | **Required.** Privacy tier (`open`/`personal`/`intimate`). Never inferred — see "Tier is always explicit" below.         |
-| `--full-body`     | Allow personal-tier bodies through unredacted (off by default).                                                          |
+| `--full-body`     | Allow `personal` **and `unclassified`** bodies through unredacted (off by default; they rank together, #876/#961).       |
 | `--vault`         | Vault root; falls back to the configured default.                                                                        |
 
 ## Destination routing
@@ -68,11 +68,26 @@ override.
 `creek save` honours the tier system in `docs/security/` and
 `creek/classify/privacy_filter.py`:
 
-| Tier       | Vault body                                                              | Off-vault stash                                       |
-| ---------- | ----------------------------------------------------------------------- | ----------------------------------------------------- |
-| `open`     | Full body                                                               | None                                                  |
-| `personal` | Title-only summary; full body only when `--full-body` is passed         | None                                                  |
-| `intimate` | Title-only summary, with `intimate_body_pointer` in frontmatter         | Full body to `10-Liminal/Compost/intimate-stubs/`     |
+| Tier           | Vault body                                                              | Off-vault stash                                       |
+| -------------- | ----------------------------------------------------------------------- | ----------------------------------------------------- |
+| `open`         | Full body                                                               | None                                                  |
+| `unclassified` | Title-only summary; full body only when `--full-body` is passed         | None                                                  |
+| `personal`     | Title-only summary; full body only when `--full-body` is passed         | None                                                  |
+| `intimate`     | Title-only summary, with `intimate_body_pointer` in frontmatter         | Full body to `10-Liminal/Compost/intimate-stubs/`     |
+
+The branch is chosen by the tier's **rank** in
+`creek.classify.privacy_filter.tier_sensitivity`, not by its name, so
+`unclassified` — which ranks with `personal` (#876/#961), because
+untiered content is content nobody has vouched for — is redacted
+exactly as `personal` is, and a tier the ranking has never heard of is
+handled as `intimate`. Until #1508 the filter compared against the two
+names instead, so `unclassified` matched neither and its body was written
+into the vault note in the clear: choosing the *less* specific tier
+produced *more* exposure, the exact inverse of the one-way ratchet the
+save path otherwise enforces (see the ratchet table under Tests below).
+Selecting on rank rather than name also means a tier added to
+`PrivacyTier` later is redacted by default instead of falling through
+to this verbatim write.
 
 `10-Liminal/Compost/intimate-stubs/` is gitignored at the repo level
 by the existing whitelist gitignore (`10-Liminal/**` ignores
@@ -207,6 +222,15 @@ Coverage lives in `tests/test_save.py`:
 * Each destination type produces a note in the correct directory.
 * `pre_save_filter(body, tier=intimate)` returns title-only and the
   stub-relpath under `10-Liminal/Compost/intimate-stubs/`.
+* An 8-row (every `PrivacyTier` × `--full-body`) table declares
+  `pre_save_filter`'s whole decision by hand — vault body, stub body and
+  stub path per row — and its size is asserted separately, so deleting a
+  row fails instead of silently not running (#1508). The two `open` rows
+  are the positive control that the cleartext check can fire at all. A
+  ninth case passes a tier the ranking has never heard of: it must take
+  the *intimate* branch, and it is the only test that can see that
+  threshold, since over the four real members `rank >= 2` and
+  `tier == INTIMATE` select the same rows.
 * `creek save --target paradox` always lands in
   `10-Liminal/Paradoxes/`.
 * `creek save --target paradox --tier intimate` writes

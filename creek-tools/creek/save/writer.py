@@ -64,7 +64,8 @@ class SaveRequest:
         source_kind: ``discord`` / ``claude-session`` / ``manual`` / ``mcp``.
         source_id: Opaque source identifier (conversation ID, etc.).
         saved_by: Operator or MCP client name.
-        full_body: When True, allow personal-tier bodies through. It
+        full_body: When True, allow personal- and unclassified-tier
+            bodies through (they rank together, #876/#961). It
             widens the body only; the title and filename stay guarded
             (see :func:`_fallback_title`).
     """
