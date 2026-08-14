@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 import frontmatter
 
 from creek._fsio import create_exclusive
-from creek.classify.privacy_filter import pre_save_filter
+from creek.classify.privacy_filter import pre_save_filter, tier_sensitivity
 from creek.models import (
     Authorship,
     Eddy,
@@ -56,13 +56,17 @@ class SaveRequest:
     Attributes:
         target: Destination type chosen by the operator.
         body: Raw markdown body of the answer.
-        title: Optional title; falls back to a derived slug.
+        title: Optional title, written verbatim at every tier. When
+            absent, :func:`_fallback_title` supplies one — the body's
+            first line at ``open``, a content digest above it (#1505).
         tier: Privacy tier this save is operating under.
         provenance: IDs of fragments that contributed to the answer.
         source_kind: ``discord`` / ``claude-session`` / ``manual`` / ``mcp``.
         source_id: Opaque source identifier (conversation ID, etc.).
         saved_by: Operator or MCP client name.
-        full_body: When True, allow personal-tier bodies through.
+        full_body: When True, allow personal-tier bodies through. It
+            widens the body only; the title and filename stay guarded
+            (see :func:`_fallback_title`).
     """
 
     target: SaveTarget
@@ -142,7 +146,7 @@ def _compose_metadata(
     intimate_pointer: str | None,
 ) -> dict[str, Any]:
     """Build the frontmatter dict for *request*."""
-    metadata = _shape_for_target(request)
+    metadata = _shape_for_target(request, effective_tier=effective_tier)
     # Most targets are typed by their target name; ``ai-as-user`` shapes a real
     # fragment and supplies its own ``type: fragment`` — don't clobber it.
     metadata.setdefault("type", request.target.value)
@@ -154,15 +158,38 @@ def _compose_metadata(
     return metadata
 
 
-def _shape_for_target(request: SaveRequest) -> dict[str, Any]:
+def _shape_for_target(
+    request: SaveRequest,
+    *,
+    effective_tier: PrivacyTier,
+) -> dict[str, Any]:
     """Return target-specific frontmatter scaffolding.
 
     Thread/Eddy/Praxis use their Pydantic model so the resulting
     frontmatter is round-trippable through the ingestion pipeline.
     Paradox/Unnamed/Draft are unmodelled — we shape them by hand so
     the file is still a clean Obsidian note.
+
+    This is the single chokepoint where a save's title is decided, which
+    is why the tier arrives here at all: an operator-supplied title is
+    written verbatim, and everything else defers to
+    :func:`_fallback_title`, whose guard is the whole of #1505.
+
+    Args:
+        request: The save payload.
+        effective_tier: The tier the note is actually being written at —
+            the same value :func:`_compose_metadata` stamps into
+            ``privacy_tier``. See :func:`_fallback_title` for why this is
+            threaded rather than read off ``request``.
+
+    Returns:
+        A frontmatter dict for the request's target, always carrying a
+        ``title``.
     """
-    title = (request.title or "").strip() or _derive_title(request.body)
+    title = (request.title or "").strip() or _fallback_title(
+        request,
+        effective_tier=effective_tier,
+    )
     if request.target == SaveTarget.THREAD:
         return Thread(title=title).model_dump(mode="json")
     if request.target == SaveTarget.EDDY:
@@ -226,8 +253,99 @@ def _saved_from_block(
     return block
 
 
+def _fallback_title(
+    request: SaveRequest,
+    *,
+    effective_tier: PrivacyTier,
+) -> str:
+    """Choose a title when the operator supplied none, without leaking body text.
+
+    :func:`~creek.classify.privacy_filter.pre_save_filter` redacts the
+    *body* above ``open``, but the title escapes into three surfaces it
+    never touches: the frontmatter ``title:``, the filename (which
+    :func:`_compose_base_name` slugifies out of it), and — under
+    ``ai-as-user`` — the fragment ``id``, which
+    :func:`_shape_ai_as_user_fragment` builds out of the title slug. Those
+    surfaces have the *wider* audience. The title and the id are the two
+    frontmatter fields a reader sees without opening the body, and the id
+    is the note's stable handle, so it is what other notes, Dataview
+    queries and the Retrieval specialist quote back. The filename is
+    louder still: a directory listing, the Obsidian sidebar, ``git
+    status``, a backup or sync client, and the ``created_path`` field of
+    the hash-chained MCP audit log all show it without ever opening the
+    file. So deriving the title from line 1 of the body published private
+    content in the clear while the body beside it sat redacted (#1505).
+    Above ``open`` we stand in a content-addressed placeholder instead.
+
+    Four things here look like obvious simplifications and are not:
+
+    1. It ranks *effective_tier*, **never** ``request.tier``. The two are
+       equal only because the paradox tier override was removed in #1491
+       (PR #1507) — their divergence *was* that defect. A future routing
+       rule that hardens a tier on the way in would leave a
+       ``request.tier`` guard reading ``open`` while the note it guards is
+       stamped ``intimate``. Read the tier the note is actually written
+       at, which is the one :func:`_compose_metadata` puts in the
+       frontmatter.
+    2. It compares a rank, not membership of a set. ``--tier
+       unclassified`` parses: ``_parse_save_tier`` in :mod:`creek.cli` is
+       a bare ``PrivacyTier(value)``, and only the *error message* leaves
+       ``unclassified`` out of the advertised options.
+       :func:`~creek.classify.privacy_filter.tier_sensitivity` ranks
+       ``unclassified`` at 1 alongside ``personal`` (#876), so ``> 0``
+       covers it where ``tier in {INTIMATE, PERSONAL}`` would fail open on
+       it — and it reuses the one reader-caution table this repo already
+       treats as canonical rather than inventing a fifth opinion about
+       what ``unclassified`` means.
+    3. ``request.full_body`` does **not** relax the guard. ``--full-body``
+       widens the *body*, which one reader opens on purpose; the filename
+       has the wider audience. One rule with no exceptions is what keeps
+       this from being reintroduced. The remedy for a private note that
+       needs a descriptive filename is ``--title``, which is still written
+       verbatim at every tier — only the operator can vouch for their own
+       title.
+    4. The placeholder carries a content digest, not a date. A ``<target>
+       <date>`` stand-in collides on every same-day same-target untitled
+       save, walking :func:`_atomic_create` out to ``-999`` and then
+       *raising* at :data:`_MAX_COLLISION_RETRIES` — which would lose an
+       intimate save — and it would double the date, since
+       :func:`_compose_base_name` already prefixes ``YYYY-MM-DD``. The
+       digest is not *zero* disclosure — it is a content-equality and
+       content-confirmation oracle, so an adversary holding a guess can
+       test it — but it publishes far less than the line it replaces, and
+       no more than every ``ai-as-user`` note has carried at every tier
+       since FEAT-041 §7, where
+       :func:`_shape_ai_as_user_fragment` appends the same
+       ``sha256(body)[:8]`` unconditionally.
+
+    Known cosmetic consequence, left alone on purpose: under ``--target
+    ai-as-user`` the id reads
+    ``ai-as-user-untitled-ai-as-user-<digest>-<digest>``, the same digest
+    twice over, because :func:`_shape_ai_as_user_fragment` appends its own
+    copy. Deduping would mean special-casing one target inside a privacy
+    guard, which is not worth the diff.
+
+    Args:
+        request: The save payload; supplies the body to digest and the
+            target name that makes the placeholder legible.
+        effective_tier: The tier the note is actually being written at.
+
+    Returns:
+        The body's first non-empty line at ``open``; otherwise an
+        ``untitled <target> <digest>`` placeholder that quotes nothing.
+    """
+    if tier_sensitivity(effective_tier) > 0:
+        digest = hashlib.sha256(request.body.encode("utf-8")).hexdigest()[:8]
+        return f"untitled {request.target.value} {digest}"
+    return _derive_title(request.body)
+
+
 def _derive_title(body: str) -> str:
-    """Pull the first non-empty line of *body* as a fallback title."""
+    """Pull the first non-empty line of *body* as a fallback title.
+
+    The ``open``-tier path only — every other tier is intercepted by
+    :func:`_fallback_title`, because this returns verbatim body text.
+    """
     for line in body.splitlines():
         stripped = line.strip().lstrip("# ").strip()
         if stripped:

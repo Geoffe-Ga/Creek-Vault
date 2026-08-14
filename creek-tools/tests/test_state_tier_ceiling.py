@@ -3252,12 +3252,17 @@ def test_state_read_fails_closed_on_a_non_yaml_frontmatter_error(
 # ---------------------------------------------------------------------------
 
 # The title is written into the vault note in the clear by
-# ``_title_only_summary`` and slugified into the filename, and an untitled
-# save derives its title from the body's FIRST line (``writer._derive_title``).
-# So every test below passes an explicit title that shares no substring with
-# the canary, and keeps the canary off line 1. Without that, the correct fix
-# still leaves the canary in the vault note and the whole battery reads as
-# "the fix does not work". The title-in-the-clear exposure itself is #1505.
+# ``_title_only_summary`` and slugified into the filename. So every test below
+# passes an explicit title that shares no substring with the canary, and keeps
+# the canary off line 1. Without that, the correct fix still leaves the canary
+# in the vault note and the whole battery reads as "the fix does not work".
+#
+# The standing instruction survives #1505 unchanged, and the reason is worth
+# keeping straight. #1505 stopped an *untitled* save from deriving its title
+# from the body's first line above ``open`` (``writer._fallback_title``); at
+# ``open`` it still derives, and an *operator-supplied* title is still written
+# verbatim at every tier, which is exactly what these tests supply. So the
+# title remains a cleartext surface here by design, not by defect.
 _PARADOX_TITLE = "Both true at once"
 _PARADOX_SECRET = "CLEARTEXT-CANARY-1491"
 _PARADOX_BODY = (

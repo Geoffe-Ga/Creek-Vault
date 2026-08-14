@@ -5867,6 +5867,21 @@ _SAVE_TARGET_HELP = (
     "11-Other-Authors/ai-as-user/; observation files raw wavelength reflections "
     "to 05-Wavelength/Observations/."
 )
+_SAVE_TITLE_HELP = (
+    "Optional title, written verbatim at every tier. Omit it and the note "
+    "is titled from the body's first line at --tier open only; above open "
+    "it gets a non-revealing 'untitled <target> <digest>' stand-in, because "
+    "the title is also the filename (issue #1505)."
+)
+"""Help for ``--title``.
+
+Spells out the tier-conditional fallback because the flag's blast radius is
+not where an operator looks for it: the title is written into the note's
+frontmatter in the clear, slugified into the *filename*, and — for
+``ai-as-user`` — embedded in the fragment ``id``. Advertising only
+"optional" is what let #1505 read as intended behaviour for two releases.
+"""
+
 _SAVE_TIER_HELP = (
     "Privacy tier (open|personal|intimate). Required on every save; "
     "creek save never infers a tier from --provenance."
@@ -6370,7 +6385,11 @@ def save_cmd(
         "--body",
         help="Path to the body file, '-' for stdin, or omitted for stdin.",
     ),
-    title: str | None = typer.Option(None, "--title", help="Optional title."),
+    title: str | None = typer.Option(
+        None,
+        "--title",
+        help=_SAVE_TITLE_HELP,
+    ),
     provenance: str | None = typer.Option(
         None,
         "--provenance",
@@ -6404,6 +6423,14 @@ def save_cmd(
     bodies are summarised unless ``--full-body`` is passed; paradox
     saves always land in ``10-Liminal/Paradoxes/`` and, since #1491,
     honour ``--tier`` there exactly like every other target.
+
+    ``--title`` is optional but not free above ``open``. The title is
+    written in the clear, slugified into the filename, and (for
+    ``ai-as-user``) embedded in the fragment ``id``, so since #1505 an
+    omitted ``--title`` falls back to the body's first line only at
+    ``open``; above it the note is titled ``untitled <target>
+    <digest>``. ``--full-body`` does not relax that — it widens the
+    body, not the filename. Pass ``--title`` to name a private note.
     """
     from creek.save import SaveRequest, save_to_vault
 

@@ -24,7 +24,7 @@ creek save --target <thread|eddy|praxis|paradox|unnamed|draft> \
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | `--target`        | **Required.** Destination type. No auto-classification in v1.                                                            |
 | `--body`          | Path to a markdown file, `-` for stdin, or omitted to read stdin.                                                        |
-| `--title`         | Optional. Falls back to the first non-empty body line.                                                                   |
+| `--title`         | Optional. Omitted, it falls back to the first non-empty body line **at `--tier open` only** — see "An omitted `--title`" below (#1505). |
 | `--provenance`    | Comma-separated fragment IDs (e.g. `frag-001,frag-002`).                                                                 |
 | `--source`        | Opaque source identifier — conversation/discord-msg/claude-session.                                                      |
 | `--source-kind`   | `discord` / `claude-session` / `manual` (default) / `mcp`.                                                               |
@@ -90,6 +90,43 @@ refused and nothing is deleted. Accepted side effect: a hand-authored
 stub parked outside that directory survives the purge and must be
 removed explicitly. See
 [Purge](cleaning-and-purge.md#purge-right-to-be-forgotten).
+
+### An omitted `--title` is not derived from the body above `open`
+
+A title is *not* a redacted surface. It is written into the vault note's
+frontmatter in the clear, slugified into the **filename**, and — for
+`--target ai-as-user` — built into the fragment `id`, the note's stable
+handle that other notes, Dataview queries and retrieval quote back. The
+filename is the loudest of the three: a directory listing, the Obsidian
+sidebar, `git status`, a backup or sync client, and the `created_path`
+field of the hash-chained MCP audit log all show it without ever opening
+the note.
+
+So deriving the title from the body's first line is safe only when the
+body itself is safe. Since #1505:
+
+| Tier                        | Untitled save is titled                          |
+| --------------------------- | ------------------------------------------------ |
+| `open`                      | First non-empty body line (unchanged)            |
+| `unclassified` / `personal` / `intimate` | `untitled <target> <8-hex content digest>` |
+
+The rank comes from
+`creek.classify.privacy_filter.tier_sensitivity`, so `unclassified`
+(which ranks with `personal`, #876) is covered too — `--tier
+unclassified` parses even though the CLI does not advertise it.
+
+**`--full-body` does not relax this.** It widens the *body*, which one
+reader sees on purpose; the filename has the wider audience. One rule
+with no exceptions is what keeps the leak from being reintroduced. If
+you want a descriptive filename on a private save, pass `--title`
+explicitly — an operator-supplied title is still written verbatim at
+every tier, because only the operator can say whether it is safe.
+
+The digest disambiguates: two untitled `intimate` thread saves with
+different bodies get different filenames, and identical bodies fall
+through to the writer's existing collision-retry suffix. It publishes
+nothing new — `--target ai-as-user` has appended the same
+`sha256(body)[:8]` to every fragment `id` since FEAT-041 §7.
 
 ### Tier is always explicit
 
@@ -179,6 +216,12 @@ Coverage lives in `tests/test_save.py`:
 * A one-way-ratchet table over every
   (`SaveTarget` × tier × `--full-body`) combination asserts no save
   ever files a note at a tier weaker than the one requested.
+* A 64-row (`SaveTarget` × every `PrivacyTier` × `--full-body`) table
+  asserts that an untitled save derives its title from the body's first
+  line **only** at `open` — checked on all three surfaces the title
+  reaches (frontmatter, filename, and the `ai-as-user` fragment `id`) —
+  and the sixteen `open` rows are the positive control that the
+  derivation still works where it is safe (#1505).
 * `creek save` with no `--tier` exits 2, with or without
   `--provenance`.
 * `intimate`-tier saves never write the full body anywhere under the
