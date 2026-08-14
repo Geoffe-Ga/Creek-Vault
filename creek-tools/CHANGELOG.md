@@ -32,6 +32,32 @@ to locate the originating commit for any reference below.
 
 ### Breaking changes
 
+- **An untitled `creek save` above `open` no longer takes its title from the
+  body's first line (#1505).** `creek/save/writer.py` fell back to
+  `_derive_title(request.body)` whenever `--title` was absent, at *every*
+  tier. A title is not a redacted surface: it is written into the note's
+  frontmatter in the clear, slugified into the **filename**, and — for
+  `--target ai-as-user` — built into the fragment `id`, the note's stable
+  handle, which other notes and Dataview queries quote back. So an untitled
+  `--tier intimate` save published line 1 of the intimate body in a
+  directory listing, the Obsidian sidebar, `git status`, and the
+  `created_path` field of the hash-chained MCP audit log — none of which
+  require opening the note — while the body it sat next to was correctly
+  reduced to `[Tier-redacted summary: (untitled)]`. Untitled saves
+  at any tier that `creek.classify.privacy_filter.tier_sensitivity` ranks
+  above `open` — `unclassified` (which ranks with `personal`, #876),
+  `personal`, `intimate` — are now titled `untitled <target> <8-hex content
+  digest>` instead. `--full-body` does **not** relax the guard: it widens the
+  body, which one reader opens on purpose, while the filename has the wider
+  audience. `open` is untouched, and an operator-supplied `--title` is still
+  written verbatim at every tier — only the operator can say whether their
+  own title is safe. **User-visible:** untitled non-open saves get different
+  filenames than they used to. Nothing migrates existing notes, so a live
+  vault will hold both conventions; Obsidian links resolve by path, so no
+  existing link breaks. The separate defect that an `unclassified` save
+  writes its *body* in the clear is [#1508](https://github.com/Geoffe-Ga/Creek-Vault/issues/1508),
+  and is not fixed here.
+
 - **`creek save --target paradox` now honours `--tier` instead of forcing
   `open` (#1491).** `creek/save/writer.py` used to substitute
   `PrivacyTier.OPEN` for any paradox save, so `--target paradox --tier

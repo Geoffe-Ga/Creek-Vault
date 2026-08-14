@@ -234,12 +234,17 @@ def test_paradox_always_lands_in_liminal_paradoxes(vault: Path) -> None:
 # ---- Paradox must honour the tier the operator stated (issue #1491) ----
 
 # The title is written into the vault note in the clear by
-# ``_title_only_summary`` and slugified into the filename, and an untitled
-# save derives its title from the body's FIRST line (``writer._derive_title``).
-# So every test below passes an explicit title that shares no substring with
-# the canary, and keeps the canary off line 1. Without that, the correct fix
-# still leaves the canary in the vault note and the whole battery reads as
-# "the fix does not work". The title-in-the-clear exposure itself is #1505.
+# ``_title_only_summary`` and slugified into the filename. So every test below
+# passes an explicit title that shares no substring with the canary, and keeps
+# the canary off line 1. Without that, the correct fix still leaves the canary
+# in the vault note and the whole battery reads as "the fix does not work".
+#
+# The standing instruction survives #1505 unchanged, and the reason is worth
+# keeping straight. #1505 stopped an *untitled* save from deriving its title
+# from the body's first line above ``open`` (``writer._fallback_title``); at
+# ``open`` it still derives, and an *operator-supplied* title is still written
+# verbatim at every tier, which is exactly what these tests supply. So the
+# title remains a cleartext surface here by design, not by defect.
 _PARADOX_TITLE = "Both true at once"
 _PARADOX_SECRET = "CLEARTEXT-CANARY-1491"
 _PARADOX_BODY = (
@@ -482,8 +487,21 @@ _RATCHET_TIERS = (PrivacyTier.OPEN, PrivacyTier.PERSONAL, PrivacyTier.INTIMATE)
 """The three tiers an operator can state on a save.
 
 ``UNCLASSIFIED`` is excluded on purpose: it is what the pipeline writes for
-content nobody has classified yet, never something ``creek save`` asks an
-operator to choose, and ``--tier`` does not offer it.
+content nobody has classified yet, never one of the three ``creek save``
+asks an operator to choose.
+
+It is **not** excluded because the parser rejects it. ``_parse_save_tier``
+in :mod:`creek.cli` is a bare ``PrivacyTier(value)``, so ``--tier
+unclassified`` parses cleanly and the save executes; only the *error
+message* filters ``UNCLASSIFIED`` out of the list of values it advertises.
+An earlier revision of this docstring claimed "``--tier`` does not offer
+it", which would have justified leaving an operator-reachable tier
+untested on the strength of a guarantee the code does not make.
+
+So the exclusion here is a statement about the advertised menu, not about
+reachability, and it is scoped to *this* table. The untitled-title table
+further down (:data:`_DERIVES_FROM_BODY`) deliberately covers all four
+tiers, ``unclassified`` included, for exactly that reason.
 """
 
 _RATCHET_CASES = [
@@ -865,7 +883,14 @@ def test_cli_save_paradox_routing(tmp_path: Path) -> None:
 
 
 def test_save_falls_back_to_first_body_line_when_title_missing(vault: Path) -> None:
-    """When ``--title`` is omitted, the first non-empty body line becomes it."""
+    """At ``open``, an omitted ``--title`` becomes the first non-empty body line.
+
+    Scoped to ``open`` since #1505: above that tier the fallback is a
+    content digest, not body text, and
+    :func:`test_untitled_save_derives_its_title_from_the_body_only_at_open`
+    owns the other three tiers. This row is the ``open`` affordance itself
+    and must keep working.
+    """
     request = SaveRequest(
         target=SaveTarget.UNNAMED,
         body="\n\n# Derived from body\n\nThe rest of the answer.",
@@ -1519,3 +1544,512 @@ def test_save_tier_help_and_behaviour_agree(tmp_path: Path) -> None:
     )
     assert list((vault / "10-Liminal" / "Unnamed").glob("*.md")) == []
     assert result.exit_code == 2, result.output
+
+
+# ---- An untitled save must not derive its title from private content (#1505) ----
+
+_UNTITLED_SECRET = "CLEARTEXT-CANARY-1505"
+"""The sentinel that stands in for whatever the operator's first line says.
+
+Deliberately built out of characters ``slugify_filename`` *preserves*:
+``creek/save/_slug.py:80-84`` keeps ``[\\w-]`` verbatim and does not lower-case
+(the docstring at line 65 says so explicitly, and ``_INVALID_CHARS_RE`` only
+touches characters outside that class). So this exact string survives the trip
+through ``_compose_base_name`` into the filename. A canary containing spaces,
+punctuation, or upper-case letters that the slug rewrote would make every
+``in path.name`` assertion below pass for the wrong reason — vacuously green
+against a filename that is still leaking, just in a different spelling.
+"""
+
+_UNTITLED_BODY = (
+    f"{_UNTITLED_SECRET} is the body's first line.\n\n"
+    "The rest of the answer, which nobody derives a title from."
+)
+"""A body whose secret sits on line 1 — the line ``_derive_title`` reads.
+
+The mirror image of :data:`_PARADOX_BODY`, which keeps its canary *off* line 1
+precisely so the #1491 battery could not be confused by this defect. Here the
+canary is on line 1 on purpose: that is the whole exposure.
+"""
+
+_UNTITLED_REDACTED_BODY = "[Tier-redacted summary: (untitled)]"
+"""The exact body a tier-redacted *untitled* save leaves in the vault note.
+
+``(untitled)`` rather than a title, because
+:func:`~creek.classify.privacy_filter.pre_save_filter` is handed
+``request.title`` — the **raw** operator title, ``None`` here — and never the
+derived one. That is why the body is already safe at HEAD and why no red
+assertion in this section touches it.
+
+Compared for equality rather than by substring, for the same reason
+:data:`_REDACTED_BODY` is: a redaction that began emitting the summary
+*alongside* the body would satisfy a substring check while leaking everything.
+The trailing newline ``_title_only_summary`` emits is absent for the reason
+recorded there — ``frontmatter.dumps`` ends on ``.strip()``.
+"""
+
+_OPERATOR_SUPPLIED_TITLE = "Both true at once"
+"""An explicit title, which the fix must keep writing verbatim at every tier."""
+
+_OPERATOR_TITLED_BODY = (
+    f"A first line that is safe to look at.\n\n{_UNTITLED_SECRET} sits below the fold."
+)
+"""Body for the operator-titled control: canary deliberately *not* on line 1.
+
+If the canary were on line 1 the control could not distinguish "the operator's
+title was honoured" from "the derived title happened to be safe".
+"""
+
+_DERIVES_FROM_BODY: dict[PrivacyTier, bool] = {
+    PrivacyTier.OPEN: True,
+    PrivacyTier.UNCLASSIFIED: False,
+    PrivacyTier.PERSONAL: False,
+    PrivacyTier.INTIMATE: False,
+}
+"""Whether an untitled save may take its title from the body, per tier.
+
+A **literal declaration of the intended behaviour**, written out by hand. It
+never calls :func:`~creek.classify.privacy_filter.tier_sensitivity`, or any
+other function under test, to compute its own expectations — a table derived
+from the implementation agrees with the implementation by construction and can
+only ever assert that the code equals itself. Four rows written down are four
+decisions somebody has to argue with.
+
+The single ``True`` row — ``OPEN`` — is a live **positive control**, not
+filler. It expands to sixteen of the sixty-four cases below (eight targets
+times two ``full_body`` values), so a quarter of this battery is asserting
+that the derivation still *happens*. Deriving a title from the first line
+is a *feature* at
+``open``: it is what makes ``creek save --target thread <<< "…"`` usable
+without a flag. A fix that over-reaches and returns the ``untitled <target>
+<digest>`` fallback unconditionally would satisfy every leak assertion in this
+file while quietly destroying that affordance, and the ``open`` rows are what
+turn that outcome red instead of green.
+
+``UNCLASSIFIED`` maps to ``False`` because
+:func:`~creek.classify.privacy_filter.tier_sensitivity` ranks it ``1`` (#876):
+untiered content is content nobody has vouched for. Note what this row does
+**not** claim — see
+:func:`test_untitled_redacted_body_is_unchanged_by_the_title_fix`.
+"""
+
+_UNTITLED_CASES: list[tuple[SaveTarget, PrivacyTier, bool]] = [
+    (target, tier, full_body)
+    for target in SaveTarget
+    for tier in _DERIVES_FROM_BODY
+    for full_body in (False, True)
+]
+"""Every ``(target, tier, full_body)`` an untitled save can be made under.
+
+``full_body`` is the third axis and it is **mandatory**, not decoration. The
+obvious wrong fix is a guard spelled ``if tier_sensitivity(tier) > 0 and not
+request.full_body``, reasoning that ``--full-body`` is an operator opt-in to
+putting the content in the vault. It is not an opt-in to putting the content in
+the *filename*: ``--full-body`` relaxes ``pre_save_filter``'s body redaction at
+``personal`` and nothing else. Without this axis a 32-row battery goes green
+while every ``personal --full-body`` untitled save keeps writing line 1 into
+the title, the filename, and — on ``ai-as-user`` — the fragment id.
+
+The full target cross-product for the same reason :data:`_RATCHET_CASES` takes
+it: #1505 is a property of the writer's title fallback, which every target
+shares, so an assertion that ran on one target would be a patch on that target.
+"""
+
+_UNTITLED_IDS = [
+    f"{target.value}-{tier.value}-{'fullbody' if full_body else 'summary'}"
+    for target, tier, full_body in _UNTITLED_CASES
+]
+"""Readable node ids, one per row of :data:`_UNTITLED_CASES`, positionally parallel."""
+
+_UNTITLED_REDACTED_CASES = (
+    pytest.param(PrivacyTier.INTIMATE, False, id="intimate-summary"),
+    pytest.param(PrivacyTier.INTIMATE, True, id="intimate-fullbody"),
+    pytest.param(PrivacyTier.PERSONAL, False, id="personal-summary"),
+)
+"""The ``(tier, full_body)`` rows whose vault body is redacted *today*.
+
+Exactly the rows :func:`~creek.classify.privacy_filter.pre_save_filter`
+redacts: ``INTIMATE`` unconditionally, ``PERSONAL`` only without the
+``--full-body`` opt-in. ``personal --full-body`` and all four ``unclassified``
+rows are excluded because their bodies reach the vault in the clear — by design
+for the first, by the separate defect **#1508** for the rest — and asserting
+redaction there would fail for a reason that has nothing to do with #1505.
+"""
+
+
+def test_untitled_title_table_covers_every_target_tier_and_full_body() -> None:
+    """The untitled table must keep every row, and shrinking it must fail here.
+
+    Deleting rows from a ``parametrize`` list never turns a test red — the
+    deleted cases simply stop running, so privacy coverage vanishes behind a
+    green gate. Asserting the table's size separately converts that deletion
+    into a failure.
+
+    The axes are counted **separately, and never mixed into one set**, for the
+    reason :func:`test_ratchet_table_is_not_empty` records:
+    :class:`~creek.save.SaveTarget` and :class:`~creek.models.PrivacyTier` are
+    both ``StrEnum``, so their members hash as bare strings *across* class
+    boundaries. A single ``{*SaveTarget, *_DERIVES_FROM_BODY}`` would silently
+    collapse any pair that happened to share a value, and the size assertion
+    would then be measuring the collision instead of the table.
+
+    ``set(_DERIVES_FROM_BODY) == set(PrivacyTier)`` is the row this file needs
+    most. The expectations are declared per tier, so a fifth ``PrivacyTier``
+    member added later would otherwise be *silently untested*: it would neither
+    appear in the cross-product nor raise a ``KeyError``, and the new tier's
+    untitled saves would leak with the whole battery green. Equality forces
+    whoever adds it to write down a ``True`` or a ``False`` on purpose.
+    """
+    assert len({target.value for target in SaveTarget}) == 8
+    assert len({tier.value for tier in _DERIVES_FROM_BODY}) == 4
+    assert set(_DERIVES_FROM_BODY) == set(PrivacyTier)
+    assert len(_UNTITLED_CASES) == 64
+    assert len(set(_UNTITLED_IDS)) == 64
+    # The sibling regression table below is guarded here too, for the same
+    # reason: three rows that quietly became two would never announce it.
+    assert len(_UNTITLED_REDACTED_CASES) == 3
+
+
+@pytest.mark.parametrize(
+    ("target", "tier", "full_body"),
+    _UNTITLED_CASES,
+    ids=_UNTITLED_IDS,
+)
+def test_untitled_save_derives_its_title_from_the_body_only_at_open(
+    vault: Path,
+    target: SaveTarget,
+    tier: PrivacyTier,
+    full_body: bool,
+) -> None:
+    """An untitled save above ``open`` must not title itself from line 1 (#1505).
+
+    :func:`~creek.save.writer._shape_for_target` falls back to
+    ``_derive_title(request.body)`` whenever no title was supplied, and that
+    helper returns the body's **first non-empty line**. Above ``open`` that
+    single string is then copied onto three separate surfaces, each with its
+    own audience:
+
+    1. the frontmatter ``title:`` — rendered by Obsidian's file explorer, its
+       search, and every backlink pane, next to a note stamped
+       ``privacy_tier: intimate``;
+    2. the **filename** — ``_compose_base_name`` slugifies the title into it,
+       and a directory listing is readable by anyone with the folder open,
+       whatever the note says inside. It also survives into any backup, sync
+       client, or ``ls`` output that never opens the file at all;
+    3. on ``--target ai-as-user``, the Fragment ``id`` composed by
+       ``_shape_ai_as_user_fragment`` out of the title slug — a *second*
+       frontmatter copy of the leak, and the one that is the note's stable
+       handle, so it is what other notes, Dataview queries and the Retrieval
+       specialist quote back. A fix that cleaned only the filename would leave
+       this one behind, which is why it is asserted separately.
+
+    Deliberately *not* asserted: the vault note **body**. ``pre_save_filter``
+    is handed ``request.title`` — the raw operator title, ``None`` here — and
+    never the derived one, so an untitled ``intimate``/``personal`` body is
+    already the literal :data:`_UNTITLED_REDACTED_BODY` at HEAD. A body
+    assertion here would be green before the fix and would misreport this
+    battery's meaning; it is pinned as a regression instead, further down.
+
+    Every claim compares ``is expected`` against :data:`_DERIVES_FROM_BODY`
+    rather than asserting a bare ``not in``. Identity against a declared
+    expectation is what makes the ``open`` rows a **positive control**: on
+    those rows the canary must be *present*, so a fallback that fires
+    unconditionally turns them red instead of sailing through.
+
+    The filename claim is only meaningful because ``slugify_filename``
+    preserves case and keeps every ``[\\w-]`` character
+    (``creek/save/_slug.py:80-84``) — see :data:`_UNTITLED_SECRET`.
+
+    Args:
+        vault: Minimal vault scaffold.
+        target: One :class:`~creek.save.SaveTarget`.
+        tier: The tier the caller states.
+        full_body: The ``--full-body`` opt-in, which must not relax the guard.
+    """
+    expected = _DERIVES_FROM_BODY[tier]
+
+    path = save_to_vault(
+        _make_request(
+            target,
+            body=_UNTITLED_BODY,
+            title=None,
+            tier=tier,
+            full_body=full_body,
+        ),
+        vault_path=vault,
+    )
+
+    post = frontmatter.load(str(path))
+    assert (_UNTITLED_SECRET in str(post["title"])) is expected, (
+        f"frontmatter title of an untitled {target.value} save at "
+        f"{tier.value} (full_body={full_body}) is {post['title']!r}; "
+        f"carrying the body's first line should be {expected}"
+    )
+    assert (_UNTITLED_SECRET in path.name) is expected, (
+        f"the filename of an untitled {target.value} save at {tier.value} "
+        f"(full_body={full_body}) is {path.name!r}; carrying the body's "
+        f"first line should be {expected}"
+    )
+    if target is SaveTarget.AI_AS_USER:
+        assert (_UNTITLED_SECRET in str(post["id"])) is expected, (
+            "the fragment id of an untitled ai-as-user save at "
+            f"{tier.value} (full_body={full_body}) is {post['id']!r} — "
+            "`creek index` copies this id into the vault-wide "
+            ".id-index.jsonl, which is read at the open tier"
+        )
+
+
+def test_untitled_intimate_fallback_title_has_a_fixed_shape(vault: Path) -> None:
+    """The replacement title must be mechanical, and pinned to *this* shape (#1505).
+
+    Absence is not enough. "Do not use the first line" leaves open a family of
+    plausible-sounding successors that are the same bug with a shorter
+    reach — the first *word*, the longest noun phrase, an extracted keyword,
+    a one-line LLM summary. Each of those still derives the title from the
+    protected content and would satisfy a test that only checked the canary
+    was gone, because a canary is one token and a summary can leak a sentence
+    without repeating it.
+
+    So the shape is pinned instead: a fixed literal, the target's own name,
+    and eight hex digits of a content digest. Nothing in that grammar has room
+    for a word of the body. It stays compatible with the digest the fix uses
+    for disambiguation — see
+    :func:`test_untitled_intimate_saves_disambiguate_rather_than_collide` — so
+    the two tests constrain the same string from opposite directions rather
+    than fighting.
+
+    ``fullmatch`` rather than ``search``: a prefixed or suffixed title would
+    otherwise pass while carrying arbitrary text alongside the safe part.
+
+    Args:
+        vault: Minimal vault scaffold.
+    """
+    path = save_to_vault(
+        _make_request(
+            SaveTarget.THREAD,
+            body=_UNTITLED_BODY,
+            title=None,
+            tier=PrivacyTier.INTIMATE,
+        ),
+        vault_path=vault,
+    )
+
+    title = str(frontmatter.load(str(path))["title"])
+    assert re.fullmatch(r"untitled [a-z-]+ [0-9a-f]{8}", title), (
+        f"an untitled intimate save titled itself {title!r}; the fallback "
+        "must be 'untitled <target> <8 hex digits>' and nothing else"
+    )
+
+
+def test_untitled_intimate_saves_disambiguate_rather_than_collide(
+    vault: Path,
+) -> None:
+    """Two untitled intimate saves on one day must not fight over one filename.
+
+    A shape guard on the fix rather than a #1505 red row: it passes at HEAD
+    (where distinct first lines already yield distinct slugs) and must keep
+    passing afterwards. What it forbids is the *simplification* — dropping the
+    content digest for a bare ``untitled <target>``, whose filename stem is
+    then identical for every untitled save of that target on a given day.
+
+    That is not a cosmetic outcome. ``_compose_base_name`` already prefixes the
+    date, so a digest-free fallback makes ``_atomic_create`` walk ``-1``,
+    ``-2``, … on every subsequent save, and at
+    :data:`~creek.save.writer._MAX_COLLISION_RETRIES` (``writer.py:49``, 1000)
+    it **raises** ``RuntimeError`` — an intimate save refused outright, whose
+    body is already sitting in a compost stub the vault note will now never
+    point at. Silently slower, then abruptly lossy.
+
+    Three saves, because two cannot separate "distinct bodies get distinct
+    names" from "identical bodies still get filed". Bodies one and three are
+    byte-identical, so the digest is identical too, so the third *must* land
+    on the collision suffix rather than overwrite or vanish.
+
+    The stem is also asserted to be the first's plus exactly ``-1``, which
+    pins that the date is not embedded a second time inside the title: a
+    fallback spelled ``untitled <target> <date>`` would produce
+    ``2026-08-13-untitled-thread-2026-08-13.md``, and comparing whole stems is
+    what makes that visible instead of a substring check that shrugs.
+
+    Args:
+        vault: Minimal vault scaffold.
+    """
+    stems = [
+        save_to_vault(
+            _make_request(
+                SaveTarget.THREAD,
+                body=body,
+                title=None,
+                tier=PrivacyTier.INTIMATE,
+            ),
+            vault_path=vault,
+        ).stem
+        for body in ("alpha one", "beta two", "alpha one")
+    ]
+
+    assert stems[0] != stems[1], (
+        "two untitled intimate saves with different bodies share the stem "
+        f"{stems[0]!r}; every later save now pays a collision walk"
+    )
+    assert stems[2] == f"{stems[0]}-1", (
+        f"the repeat of the first body landed at {stems[2]!r}, expected "
+        f"{stems[0]}-1 — the collision suffix is the only thing standing "
+        "between identical untitled saves and a RuntimeError"
+    )
+
+
+@pytest.mark.parametrize(("tier", "full_body"), _UNTITLED_REDACTED_CASES)
+def test_untitled_redacted_body_is_unchanged_by_the_title_fix(
+    vault: Path,
+    tier: PrivacyTier,
+    full_body: bool,
+) -> None:
+    """Fixing the title must not disturb the body redaction (regression, not red).
+
+    Green before the #1505 fix and green after. It exists because the fix
+    changes the string that flows into ``_shape_for_target``, and the same
+    request object also feeds :func:`~creek.classify.privacy_filter.pre_save_filter`
+    — so the tempting "tidy-up" of routing the *derived* title into the filter
+    as well would rewrite this body from ``(untitled)`` to the first line of
+    the content, turning the summary itself into the leak. Equality, not
+    substring, for the reason :data:`_REDACTED_BODY` records.
+
+    **What the green ``unclassified`` rows above do not mean.** This table
+    covers ``intimate`` and ``personal``-without-opt-in only. An
+    ``unclassified`` untitled save gets a safe *title* once #1505 lands, and
+    its **body is still written into the vault in the clear** — ``pre_save_filter``
+    falls through to the unredacted return for that tier, even though
+    :func:`~creek.classify.privacy_filter.tier_sensitivity` ranks it ``1``
+    alongside ``personal`` (#876). That divergence is tracked as **#1508** and
+    is deliberately out of scope here. No test in this file pins the
+    cleartext ``unclassified`` body as *expected* behaviour, because a test
+    asserting it would have to be deleted to fix #1508 — and a privacy defect
+    with a test defending it is a defect nobody can close.
+
+    Args:
+        vault: Minimal vault scaffold.
+        tier: A tier whose untitled body is redacted today.
+        full_body: The ``--full-body`` opt-in.
+    """
+    path = save_to_vault(
+        _make_request(
+            SaveTarget.THREAD,
+            body=_UNTITLED_BODY,
+            title=None,
+            tier=tier,
+            full_body=full_body,
+        ),
+        vault_path=vault,
+    )
+
+    post = frontmatter.load(str(path))
+    assert post.content == _UNTITLED_REDACTED_BODY, (
+        f"an untitled {tier.value} save (full_body={full_body}) wrote "
+        f"{post.content!r} into the vault note; the redacted summary must "
+        f"stay exactly {_UNTITLED_REDACTED_BODY!r}"
+    )
+
+
+def test_untitled_intimate_still_lands_the_full_body_in_the_stub(
+    vault: Path,
+) -> None:
+    """Suppressing the title must not drop the operator's answer (#1505).
+
+    The failure mode a privacy battery is most likely to reward by accident:
+    every absence assertion in this section is satisfied just as well by a
+    save that wrote nothing at all. So the body is asserted **present**, in
+    full, at the one place it is allowed to be.
+
+    The stub path is asserted as a literal ``intimate.md`` rather than
+    globbed, because ``_stub_relpath_for`` reads the **raw** title — ``None``
+    here, hence its ``"intimate"`` default — and the fix must not start
+    feeding it the new fallback. If it did, the stub filename would become
+    ``untitled-thread-<digest>.md``: harmless in itself, but it would silently
+    orphan every ``intimate_body_pointer`` already written into existing vault
+    notes, which is the compatibility promise ``creek/save/_slug.py``'s module
+    docstring was written to protect.
+
+    That constant name has its own defect, and this assertion is deliberately
+    not a claim that it is *good*: because ``_stub_relpath_for`` reads the raw
+    title, **every** untitled intimate save in a vault lands on this one stem
+    and ladders ``intimate-1.md``, ``intimate-2.md``, … until
+    ``_MAX_COLLISION_RETRIES`` raises. That is tracked as **#1509** and needs a
+    pointer-migration story, so it is out of scope here. Whoever fixes it will
+    have to change this assertion on purpose, which is the point.
+
+    Args:
+        vault: Minimal vault scaffold.
+    """
+    path = save_to_vault(
+        _make_request(
+            SaveTarget.THREAD,
+            body=_UNTITLED_BODY,
+            title=None,
+            tier=PrivacyTier.INTIMATE,
+        ),
+        vault_path=vault,
+    )
+
+    stub = vault / INTIMATE_STUB_RELPATH / "intimate.md"
+    present = _stub_files(vault)
+    assert stub.exists(), f"no intimate stub at {stub}; found {present}"
+    assert _UNTITLED_SECRET in stub.read_text(encoding="utf-8"), (
+        "the intimate body reached neither the vault note nor the stub — the "
+        "operator's answer was lost rather than protected"
+    )
+    pointer = frontmatter.load(str(path))["saved_from"].get("intimate_body_pointer")
+    assert pointer == str(INTIMATE_STUB_RELPATH / "intimate.md"), (
+        f"the note points at {pointer!r}, which is not where the body went"
+    )
+
+
+@pytest.mark.parametrize("tier", list(PrivacyTier))
+def test_operator_title_is_still_written_verbatim_at_every_tier(
+    vault: Path,
+    tier: PrivacyTier,
+) -> None:
+    """An explicit ``--title`` is intended behaviour at every tier (AC #2, #1505).
+
+    The other half of the contract, and the reason the fix keys on "no title
+    was supplied" rather than on the tier alone. A title the operator typed is
+    a string they chose to put in a filename; #1505 is about a string the
+    *writer* chose for them out of content they were protecting. Redacting the
+    former would be a different bug wearing this one's fix, and it would land
+    at ``intimate`` — precisely where an over-cautious patch is most tempting.
+
+    Both surfaces are checked, because the title reaches them by two different
+    routes and a fix could break either alone: the frontmatter through
+    ``_shape_for_target``, the filename through ``_compose_base_name``.
+
+    The expected slug is written out as a literal rather than computed by
+    calling ``slugify_filename``. Calling it would make the assertion agree
+    with the slugifier by construction and would no longer notice a fix that
+    started lower-casing or stripping the operator's title on its way to disk;
+    the literal preserves the case ``creek/save/_slug.py:65`` promises.
+
+    Args:
+        vault: Minimal vault scaffold.
+        tier: Every :class:`~creek.models.PrivacyTier`, ``unclassified``
+            included — it is reachable from ``--tier`` (see
+            :data:`_RATCHET_TIERS`).
+    """
+    path = save_to_vault(
+        _make_request(
+            SaveTarget.THREAD,
+            body=_OPERATOR_TITLED_BODY,
+            title=_OPERATOR_SUPPLIED_TITLE,
+            tier=tier,
+        ),
+        vault_path=vault,
+    )
+
+    post = frontmatter.load(str(path))
+    assert post["title"] == _OPERATOR_SUPPLIED_TITLE, (
+        f"a {tier.value} save with an explicit title was filed as "
+        f"{post['title']!r} — the operator's own words were rewritten"
+    )
+    assert "Both-true-at-once" in path.name, (
+        f"a {tier.value} save with an explicit title landed at {path.name!r}; "
+        "the operator's title must still slugify into the filename"
+    )
+    assert _UNTITLED_SECRET not in path.name

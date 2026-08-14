@@ -309,12 +309,17 @@ def test_save_refuses_when_tier_is_omitted(vault: Path) -> None:
 # ---------------------------------------------------------------------------
 
 # The title is written into the vault note in the clear by
-# ``_title_only_summary`` and slugified into the filename, and an untitled
-# save derives its title from the body's FIRST line (``writer._derive_title``).
-# So every test below passes an explicit title that shares no substring with
-# the canary, and keeps the canary off line 1. Without that, the correct fix
-# still leaves the canary in the vault note and the whole battery reads as
-# "the fix does not work". The title-in-the-clear exposure itself is #1505.
+# ``_title_only_summary`` and slugified into the filename. So every test below
+# passes an explicit title that shares no substring with the canary, and keeps
+# the canary off line 1. Without that, the correct fix still leaves the canary
+# in the vault note and the whole battery reads as "the fix does not work".
+#
+# The standing instruction survives #1505 unchanged, and the reason is worth
+# keeping straight. #1505 stopped an *untitled* save from deriving its title
+# from the body's first line above ``open`` (``writer._fallback_title``); at
+# ``open`` it still derives, and an *operator-supplied* title is still written
+# verbatim at every tier, which is exactly what these tests supply. So the
+# title remains a cleartext surface here by design, not by defect.
 _PARADOX_TITLE = "Both true at once"
 _PARADOX_SECRET = "CLEARTEXT-CANARY-1491"
 _PARADOX_BODY = (
@@ -2910,3 +2915,104 @@ class TestLinkAdvisoryFields:
             "oversized_discarded",
         ):
             assert isinstance(result[key], int), key
+
+
+# ---------------------------------------------------------------------------
+# save — an untitled save must not title itself from line 1 (issue #1505)
+# ---------------------------------------------------------------------------
+
+_UNTITLED_SECRET = "CLEARTEXT-CANARY-1505"
+"""Sentinel standing in for whatever the operator's first line actually says.
+
+Named apart from :data:`_PARADOX_SECRET` on purpose: that one is kept *off*
+line 1 so the #1491 battery cannot be confused by this defect, and this one is
+put *on* line 1 because being on line 1 is the entire exposure. One shared
+constant would make the two batteries impossible to tell apart on a failure.
+
+Built from characters ``slugify_filename`` preserves verbatim
+(``creek/save/_slug.py:80-84`` keeps ``[\\w-]`` and does not lower-case), so it
+survives into the filename unchanged — a canary the slug rewrote would make
+the search below miss a filename that is still leaking.
+"""
+
+_UNTITLED_BODY = (
+    f"{_UNTITLED_SECRET} is the body's first line.\n\n"
+    "The rest of the answer, which nobody derives a title from."
+)
+"""An intimate body whose secret sits on the line ``_derive_title`` reads."""
+
+
+def test_untitled_intimate_save_over_mcp_leaks_no_first_line(vault: Path) -> None:
+    """An untitled intimate MCP save must seal line 1, not publish it (#1505).
+
+    The CLI half of this is pinned in ``tests/test_save.py``; this is the same
+    defect reached through :func:`~creek_mcp.tools.save.save_tool`, where it
+    has a third carrier the CLI does not have. When no ``title`` is supplied,
+    :func:`~creek.save.writer._shape_for_target` derives one from the body's
+    first line, and that derived string reaches:
+
+    * the frontmatter ``title:`` of a note stamped ``privacy_tier: intimate``;
+    * the note's **filename**, via ``_compose_base_name``'s slugify; and
+    * ``created_path`` in the hash-chained audit log at
+      ``00-Creek-Meta/audit/mcp.jsonl`` — so the tamper-evident record of the
+      save is itself a copy of the leak, in a file whose whole purpose is to
+      be readable by someone auditing what the tool did.
+
+    **The vacuous-test trap this test is shaped to avoid.**
+    ``save_tool`` refuses ``tier="intimate"`` under the default
+    ``privacy_tier_ceiling=TierCeiling.OPEN`` (``creek_mcp/tools/save.py:84-95``)
+    and returns *before* ``save_to_vault`` ever runs. Written the obvious way
+    — default ceiling, then "assert the canary is nowhere" — this test passes
+    against a note that was never written, at every commit, forever. So the
+    ceiling is widened to ``ALL`` and ``status == "ok"`` is asserted **first**,
+    the same shape
+    :func:`test_save_paradox_intimate_does_not_leak_and_reports_the_true_tier`
+    uses two hundred lines up.
+
+    The search then goes through :func:`_files_containing`, which byte-walks
+    the *whole* vault rather than the target folder — the note, the stub and
+    the audit row live in three different subtrees, so a scoped search would
+    miss two of the three. Presence is asserted before absence: a fix that
+    dropped the intimate body on the floor would satisfy every "not here"
+    claim while destroying the operator's answer.
+
+    The audit row is then asserted to *exist* and to name a real note before
+    its contents are checked, for the same reason. ``_files_containing``
+    covers ``created_path`` only transitively — a save that skipped auditing
+    altogether would leave nothing to find and pass the byte-walk in
+    silence, which is the exact shape of the vacuous pass this test is built
+    to refuse.
+
+    Args:
+        vault: Vault fixture.
+    """
+    result = save_tool(
+        vault_path=vault,
+        target="thread",
+        body=_UNTITLED_BODY,
+        tier="intimate",
+        privacy_tier_ceiling=TierCeiling.ALL,
+        provenance=["frag-001"],
+    )
+
+    assert result["status"] == "ok", result
+
+    carriers = _files_containing(vault, _UNTITLED_SECRET)
+    assert carriers, (
+        "the intimate body reached no file under the vault at all — it was "
+        "lost rather than sealed"
+    )
+    audit = _read_audit(vault)
+    assert audit, "the save wrote no audit row at all"
+    created_path = str(audit[-1]["created_path"])
+    assert created_path.endswith(".md"), created_path
+
+    stray = [path for path in carriers if not path.startswith(_STUB_PREFIX)]
+    assert stray == [], (
+        "an untitled intimate save put the body's first line outside the "
+        f"gitignored intimate-stubs directory: {stray}"
+    )
+    assert _UNTITLED_SECRET not in created_path, (
+        "the hash-chained audit log records the leaked slug in "
+        f"created_path: {created_path!r}"
+    )
