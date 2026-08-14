@@ -32,6 +32,32 @@ to locate the originating commit for any reference below.
 
 ### Breaking changes
 
+- **An `unclassified` `creek save` no longer writes its body into the vault in
+  the clear (#1508).** `creek.classify.privacy_filter.pre_save_filter` branched
+  on `tier == PrivacyTier.INTIMATE` and `tier == PrivacyTier.PERSONAL`, so
+  `unclassified` — the tier every fragment carries until `creek classify` runs —
+  matched neither name and fell through to the verbatim return. Meanwhile the
+  MCP ceiling already treated that same tier as needing a `personal` ceiling to
+  be *read* (#961), so the two halves of the privacy system disagreed about one
+  tier: content the reader refused to serve, the writer filed in cleartext. Both
+  thresholds are now read off `_TIER_RANK` through `tier_sensitivity`, so
+  `unclassified` is summarised exactly as `personal` is, and a tier the ranking
+  has never heard of is handled as `intimate` — summary in the vault, body to
+  the gitignored `10-Liminal/Compost/intimate-stubs/` directory. `--full-body`
+  is honoured at `unclassified` exactly as at `personal`, because the read side
+  already normalises `UNCLASSIFIED` to `PERSONAL` before applying the same
+  opt-in, and a save stricter than the read it feeds would contradict the
+  ranking. **User-visible on both transports:** `creek save --tier unclassified`
+  and a `creek.save` MCP call at that tier now file a `[Tier-redacted summary:
+  …]` note instead of the body. Pass `--full-body` to keep the old behaviour.
+  Nothing migrates notes already written in the clear. Alongside it,
+  `creek_mcp.tier_ceiling.tier_allowed` stopped ending on a bare
+  `_CEILING_RANK[ceiling]` subscript, which raised `KeyError` across the MCP
+  boundary its own docstring promised not to raise across; an unrecognised
+  ceiling is now refused rather than raised on. That branch is unreachable from
+  production — `creek_mcp.policy._parse_ceiling` rejects an unknown ceiling
+  first — so it is defence in depth, not a live hole.
+
 - **An untitled `creek save` above `open` no longer takes its title from the
   body's first line (#1505).** `creek/save/writer.py` fell back to
   `_derive_title(request.body)` whenever `--title` was absent, at *every*
@@ -56,7 +82,8 @@ to locate the originating commit for any reference below.
   vault will hold both conventions; Obsidian links resolve by path, so no
   existing link breaks. The separate defect that an `unclassified` save
   writes its *body* in the clear is [#1508](https://github.com/Geoffe-Ga/Creek-Vault/issues/1508),
-  and is not fixed here.
+  which is fixed in its own entry above rather than here — the title half
+  and the body half were kept apart on purpose.
 
 - **`creek save --target paradox` now honours `--tier` instead of forcing
   `open` (#1491).** `creek/save/writer.py` used to substitute

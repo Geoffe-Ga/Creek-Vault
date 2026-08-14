@@ -11,7 +11,7 @@ import errno
 import os
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import frontmatter
 import pytest
@@ -692,6 +692,233 @@ def test_pre_save_filter_intimate_ignores_full_body() -> None:
     assert result.stub_relpath is not None
 
 
+# ---- Every tier x --full-body: the pre_save_filter decision table (#1508) ----
+
+_PRE_SAVE_SUMMARY = f"{_REDACTED_BODY}\n"
+"""The exact ``vault_body`` a redacting :func:`pre_save_filter` call returns.
+
+:func:`~creek.classify.privacy_filter._title_only_summary` ends its string with
+a trailing newline and ``pre_save_filter`` hands that value straight back, so
+the *direct-call* tests below compare against this constant.
+:data:`_REDACTED_BODY` is the same string *after* ``frontmatter`` has stripped
+it — ``frontmatter.dumps`` ends its template with ``.strip()`` and
+``frontmatter.parse`` returns ``content.strip()`` — so the *on-disk* tests
+compare against that one instead.
+
+Derived from :data:`_REDACTED_BODY` rather than retyped, deliberately: two
+independently-typed spellings of one sentence drift, and once they had, the
+pair could no longer say which layer changed.
+"""
+
+_PRE_SAVE_ROWS: tuple[tuple[PrivacyTier, bool, str, str | None, bool], ...] = (
+    (PrivacyTier.OPEN, False, _PARADOX_BODY, None, False),
+    (PrivacyTier.OPEN, True, _PARADOX_BODY, None, False),
+    (PrivacyTier.UNCLASSIFIED, False, _PRE_SAVE_SUMMARY, None, False),
+    (PrivacyTier.UNCLASSIFIED, True, _PARADOX_BODY, None, False),
+    (PrivacyTier.PERSONAL, False, _PRE_SAVE_SUMMARY, None, False),
+    (PrivacyTier.PERSONAL, True, _PARADOX_BODY, None, False),
+    (PrivacyTier.INTIMATE, False, _PRE_SAVE_SUMMARY, _PARADOX_BODY, True),
+    (PrivacyTier.INTIMATE, True, _PRE_SAVE_SUMMARY, _PARADOX_BODY, True),
+)
+"""The whole ``pre_save_filter`` decision table, one row per ``(tier, full_body)``.
+
+Each row is ``(tier, full_body, expected_vault_body, expected_stub_body,
+expects_stub_relpath)``.
+
+Every expectation is **declared here, by hand**. The table never calls
+:func:`~creek.classify.privacy_filter.tier_sensitivity`, or anything else under
+test, to compute what it expects: a table derived from the implementation
+agrees with the implementation by construction and can only assert that the
+code equals itself. Eight rows written down are eight decisions somebody has to
+argue with.
+
+The two ``open`` rows are the **positive control**, and they are what proves
+the canary check can fire at all. On those rows the secret must be *present* in
+``vault_body``, so an over-reaching "redact everything now" fix — which would
+satisfy every absence assertion in this file — turns them red instead of green.
+
+The ``unclassified`` + ``full_body=True`` row records the decided
+``--full-body`` semantics: the opt-in is honoured at ``unclassified`` exactly
+as it is at ``personal``. The read side already normalises ``UNCLASSIFIED`` to
+``PERSONAL`` (:func:`~creek.classify.privacy_filter._effective_tier`) and then
+applies the same opt-in, so a save stricter than the read it feeds would
+contradict the #876/#961 ranking this table is built on. If that decision is
+ever revisited, this row has to be *changed* — not deleted. A deleted row
+asserts nothing and announces nothing.
+
+A plain tuple of tuples rather than ``pytest.param`` objects, because
+:func:`test_pre_save_filter_table_covers_every_tier_and_full_body` reads the
+tier back out of ``row[0]`` to compare the table's tier set against
+:class:`~creek.models.PrivacyTier`; a ``ParameterSet`` hides its values behind
+an attribute, and that guard would have to reach into pytest internals to see
+them.
+"""
+
+_PRE_SAVE_IDS = [
+    f"{tier.value}-{'fullbody' if full_body else 'summary'}"
+    for tier, full_body, *_rest in _PRE_SAVE_ROWS
+]
+"""Readable node ids, one per row of :data:`_PRE_SAVE_ROWS`, positionally parallel."""
+
+
+def test_pre_save_filter_table_covers_every_tier_and_full_body() -> None:
+    """The decision table must keep every row, and shrinking it must fail here.
+
+    Deleting a row from a ``parametrize`` list never turns a test red — the
+    deleted case simply stops running, so privacy coverage vanishes behind a
+    green gate. Asserting the table's size separately converts that deletion
+    into a failure.
+
+    ``{row[0] for row in _PRE_SAVE_ROWS} == set(PrivacyTier)`` is the row this
+    section needs most. The expectations are declared per tier, so a fifth
+    :class:`~creek.models.PrivacyTier` member added later would otherwise be
+    *silently untested*: it would neither appear in the table nor raise a
+    ``KeyError``, and its saves could leak with the whole battery green.
+    Equality forces whoever adds it to write down its two expectations —
+    ``full_body`` false and true — on purpose.
+
+    The tier count is taken over ``{tier.value ...}`` rather than over the
+    members, for the reason :func:`test_ratchet_table_is_not_empty` records:
+    :class:`~creek.models.PrivacyTier` is a ``StrEnum``, so its members hash as
+    bare strings and a set mixed with another ``StrEnum``'s members would
+    silently collapse any pair that shared a value.
+    """
+    assert len({tier.value for tier in PrivacyTier}) == 4
+    assert {row[0] for row in _PRE_SAVE_ROWS} == set(PrivacyTier)
+    assert len(_PRE_SAVE_ROWS) == 8
+    assert len(set(_PRE_SAVE_IDS)) == 8
+
+
+@pytest.mark.parametrize(
+    ("tier", "full_body", "expected_vault_body", "expected_stub_body", "expects_stub"),
+    _PRE_SAVE_ROWS,
+    ids=_PRE_SAVE_IDS,
+)
+def test_pre_save_filter_redacts_by_rank_not_by_tier_equality(
+    tier: PrivacyTier,
+    full_body: bool,
+    expected_vault_body: str,
+    expected_stub_body: str | None,
+    expects_stub: bool,
+) -> None:
+    """``pre_save_filter`` must branch on the tier's *rank*, not its name (#1508).
+
+    ``unclassified`` is the row this test exists for.
+    :func:`~creek.classify.privacy_filter.tier_sensitivity` ranks it ``1``,
+    alongside ``personal`` (#876/#961), and the MCP ceiling admits it only at a
+    ``personal``-or-broader ceiling — yet ``pre_save_filter`` branched on
+    ``tier == PrivacyTier.INTIMATE`` and ``tier == PrivacyTier.PERSONAL``, so
+    the one tier that matches neither name fell through to the verbatim return
+    and put its body into the vault note in the clear.
+
+    The ``intimate`` rows are checked at **both** ``full_body`` values because
+    the intimate branch must stay **first**. Reordering it below the
+    personal/unclassified branch would send an intimate ``full_body=False``
+    save into the summary branch, which returns ``stub_body=None`` — silently
+    **destroying** the operator's body rather than stashing it. That outcome
+    satisfies every absence assertion a privacy battery would otherwise make,
+    which is exactly why the stub body is asserted by equality here.
+
+    Every claim is an equality (or an identity against a declared expectation),
+    never a substring or a truthiness check, for the reason
+    :data:`_REDACTED_BODY` records: a call that returned nothing at all must
+    not be able to satisfy a row.
+
+    Args:
+        tier: The tier the caller states.
+        full_body: The ``--full-body`` opt-in.
+        expected_vault_body: The body this row says must reach the vault note.
+        expected_stub_body: The body this row says must reach the gitignored
+            stub, or ``None`` when no stub is owed.
+        expects_stub: Whether this row says a stub path must be composed.
+    """
+    result = pre_save_filter(
+        _PARADOX_BODY,
+        tier=tier,
+        title=_PARADOX_TITLE,
+        full_body=full_body,
+    )
+    canary_expected = expected_vault_body == _PARADOX_BODY
+
+    assert result.vault_body == expected_vault_body, (
+        f"a {tier.value} save (full_body={full_body}) put "
+        f"{result.vault_body!r} in the vault note"
+    )
+    assert result.stub_body == expected_stub_body, (
+        f"a {tier.value} save (full_body={full_body}) stashed "
+        f"{result.stub_body!r} in the stub"
+    )
+    assert (result.stub_relpath is not None) is expects_stub, (
+        f"a {tier.value} save (full_body={full_body}) composed stub_relpath "
+        f"{result.stub_relpath!r}; a stub path was expected: {expects_stub}"
+    )
+    assert (_PARADOX_SECRET in result.vault_body) is canary_expected, (
+        f"a {tier.value} save (full_body={full_body}) should carry the canary "
+        f"in its vault body: {canary_expected}; it returned "
+        f"{result.vault_body!r}"
+    )
+
+
+@pytest.mark.parametrize("full_body", [False, True])
+def test_pre_save_filter_unranked_tier_stashes_the_body(full_body: bool) -> None:
+    """A tier nobody ranked must take the *intimate* branch (#1508).
+
+    :func:`~creek.classify.privacy_filter.tier_sensitivity` fail-closes an
+    unranked tier to rank ``2`` — ``intimate``'s rank — so an unrecognised
+    future tier must be handled as intimate content: the vault note gets the
+    title-only summary and the full body goes to the gitignored compost stub.
+
+    **This is the only test in the suite that can see the intimate
+    threshold.** Reverting the rank comparison to ``tier ==
+    PrivacyTier.INTIMATE`` leaves all eight enum-member rows of
+    :data:`_PRE_SAVE_ROWS` byte-identical — measured, not assumed: over the
+    four members of :class:`~creek.models.PrivacyTier`, ``_TIER_RANK`` reads
+    ``open`` 0, ``unclassified`` 1, ``personal`` 1, ``intimate`` 2, so
+    ``rank >= 2`` and ``tier == INTIMATE`` select exactly the same two rows.
+    Deleting this test therefore removes the entire safety net for that half
+    of the fix, with nothing turning red.
+
+    Both ``full_body`` values are exercised, because the mutant fails
+    differently at each: at ``full_body=True`` the equality branch leaks the
+    cleartext body into the vault note, and at ``full_body=False`` it discards
+    the body entirely (``stub_body=None``) — a leak and a data loss from one
+    line of code.
+
+    :func:`~creek.classify.privacy_filter.pre_save_filter` is called
+    **directly** rather than through :func:`~creek.save.writer.save_to_vault`,
+    because the writer cannot serialise a non-enum tier into frontmatter; the
+    invalid value is spelled with :func:`~typing.cast` rather than a type
+    ignore, following the three live precedents at
+    ``tests/test_mcp_tier_ceiling.py:187``, ``:296`` and ``:418``.
+
+    Args:
+        full_body: The ``--full-body`` opt-in, which an unranked tier must
+            ignore exactly as ``intimate`` does.
+    """
+    unknown = cast("PrivacyTier", "not-a-tier")
+
+    result = pre_save_filter(
+        _PARADOX_BODY,
+        tier=unknown,
+        title=_PARADOX_TITLE,
+        full_body=full_body,
+    )
+
+    assert result.vault_body == _PRE_SAVE_SUMMARY, (
+        f"an unranked tier (full_body={full_body}) put {result.vault_body!r} "
+        "in the vault note; a tier nobody can vouch for must be summarised"
+    )
+    assert result.stub_body == _PARADOX_BODY, (
+        f"an unranked tier (full_body={full_body}) stashed "
+        f"{result.stub_body!r}; the body must reach the stub intact rather "
+        "than being dropped on the floor"
+    )
+    assert result.stub_relpath is not None, (
+        f"an unranked tier (full_body={full_body}) composed no stub path, so "
+        "the body it withheld from the vault has nowhere to go"
+    )
+
+
 # ---- Intimate full-body never lands in the vault tree ----
 
 
@@ -724,6 +951,109 @@ def test_intimate_save_never_writes_full_body_into_vault(vault: Path) -> None:
         and sensitive in p.read_text(encoding="utf-8")
     ]
     assert leakages == []
+
+
+def test_unclassified_save_redacts_the_body_on_disk(vault: Path) -> None:
+    """An ``unclassified`` save leaves a summary on disk, not the body (#1508).
+
+    AC#1: the end-to-end proof that the rank-based fix in
+    :func:`~creek.classify.privacy_filter.pre_save_filter` reaches the *bytes*
+    on disk, through :mod:`creek.save.writer`, and not merely the filter's
+    return value. The direct-call table above can be satisfied by a filter
+    whose result the writer then ignores; this cannot.
+
+    Four separate claims, because each can fail on its own:
+
+    * ``post.content`` is the redacted summary, by **equality** — a redaction
+      that emitted the summary *alongside* the body would pass a substring
+      check while leaking everything;
+    * the canary is absent from the **whole file**, frontmatter included. A
+      tier stamp is a label; #1491 was a case of the label and the bytes
+      disagreeing, and ``title`` / ``saved_from`` are cleartext surfaces the
+      body redaction never touches;
+    * **no compost stub is written**. ``unclassified`` ranks with ``personal``,
+      not with ``intimate``: it is redacted in place, not stashed off-vault. A
+      fix that reached the summary by routing every non-``open`` tier down the
+      intimate branch would satisfy the first two claims and quietly start
+      littering the gitignored stub directory with untiered content;
+    * the frontmatter still says ``unclassified``. The fix redacts, it does not
+      upgrade the stamp — the tier the operator stated is what gets recorded,
+      and silently rewriting it to ``personal`` would be the one-way ratchet
+      pinned by :func:`test_no_save_ever_writes_weaker_than_requested` running
+      in the wrong direction.
+
+    Args:
+        vault: Minimal vault scaffold.
+    """
+    path = save_to_vault(
+        _make_request(
+            SaveTarget.UNNAMED,
+            body=_PARADOX_BODY,
+            title=_PARADOX_TITLE,
+            tier=PrivacyTier.UNCLASSIFIED,
+        ),
+        vault_path=vault,
+    )
+
+    post = frontmatter.load(str(path))
+    raw = path.read_text(encoding="utf-8")
+    assert post.content == _REDACTED_BODY, (
+        f"an unclassified save wrote {post.content!r} into the vault note; "
+        f"the redacted summary must be exactly {_REDACTED_BODY!r}"
+    )
+    assert _PARADOX_SECRET not in raw, (
+        f"the unclassified body is in the clear on disk at {path}:\n\n{raw}"
+    )
+    assert _stub_files(vault) == [], (
+        "an unclassified save wrote a compost stub; only intimate bodies are "
+        "stashed off-vault, and untiered content must not be filed there"
+    )
+    assert post["privacy_tier"] == "unclassified", (
+        "an unclassified save was stamped "
+        f"{post['privacy_tier']!r} — the fix redacts the body, it does not "
+        "rewrite the tier the operator stated"
+    )
+
+
+def test_unclassified_save_honours_full_body_on_disk(vault: Path) -> None:
+    """``--full-body`` at ``unclassified`` still files the body (#1508).
+
+    The positive control at the on-disk layer, and the decided semantics
+    written down: the opt-in is honoured at ``unclassified`` exactly as it is
+    at ``personal``. The read side already normalises ``UNCLASSIFIED`` to
+    ``PERSONAL`` (:func:`~creek.classify.privacy_filter._effective_tier`) and
+    then applies :func:`~creek.classify.privacy_filter._allows_full_personal_body`,
+    so making the save side stricter than the read side would contradict the
+    #876/#961 ranking the fix is built on.
+
+    Without this test the whole #1508 battery would be satisfied by "redact
+    every unclassified save unconditionally", which is a different behaviour
+    change wearing this one's fix and would silently break an operator opt-in
+    that works at every other tier.
+
+    Args:
+        vault: Minimal vault scaffold.
+    """
+    path = save_to_vault(
+        _make_request(
+            SaveTarget.UNNAMED,
+            body=_PARADOX_BODY,
+            title=_PARADOX_TITLE,
+            tier=PrivacyTier.UNCLASSIFIED,
+            full_body=True,
+        ),
+        vault_path=vault,
+    )
+
+    post = frontmatter.load(str(path))
+    assert _PARADOX_SECRET in path.read_text(encoding="utf-8"), (
+        "--full-body at unclassified must still put the body in the vault; a "
+        "#1508 fix that redacted it would break the opt-in instead"
+    )
+    assert post.content == _PARADOX_BODY, (
+        f"an unclassified --full-body save wrote {post.content!r}; the "
+        "operator's body must reach the note intact, not in part"
+    )
 
 
 # ---- CLI ----
@@ -1665,15 +1995,21 @@ _UNTITLED_REDACTED_CASES = (
     pytest.param(PrivacyTier.INTIMATE, False, id="intimate-summary"),
     pytest.param(PrivacyTier.INTIMATE, True, id="intimate-fullbody"),
     pytest.param(PrivacyTier.PERSONAL, False, id="personal-summary"),
+    pytest.param(PrivacyTier.UNCLASSIFIED, False, id="unclassified-summary"),
 )
 """The ``(tier, full_body)`` rows whose vault body is redacted *today*.
 
 Exactly the rows :func:`~creek.classify.privacy_filter.pre_save_filter`
-redacts: ``INTIMATE`` unconditionally, ``PERSONAL`` only without the
-``--full-body`` opt-in. ``personal --full-body`` and all four ``unclassified``
-rows are excluded because their bodies reach the vault in the clear — by design
-for the first, by the separate defect **#1508** for the rest — and asserting
-redaction there would fail for a reason that has nothing to do with #1505.
+redacts: ``INTIMATE`` unconditionally, and ``PERSONAL`` / ``UNCLASSIFIED`` —
+which rank together at ``1`` (#876/#961) — without the ``--full-body`` opt-in.
+``personal --full-body`` and ``unclassified --full-body`` are excluded because
+their bodies reach the vault in the clear **by the decided ``--full-body``
+semantics**, not by defect, so asserting redaction there would fail for a
+reason that has nothing to do with #1505.
+
+**#1508** is the change that moved ``unclassified-summary`` into this table: it
+replaced the filter's equality-on-two-members branch with a rank test read off
+:data:`~creek.classify.privacy_filter._TIER_RANK`.
 """
 
 
@@ -1706,8 +2042,8 @@ def test_untitled_title_table_covers_every_target_tier_and_full_body() -> None:
     assert len(_UNTITLED_CASES) == 64
     assert len(set(_UNTITLED_IDS)) == 64
     # The sibling regression table below is guarded here too, for the same
-    # reason: three rows that quietly became two would never announce it.
-    assert len(_UNTITLED_REDACTED_CASES) == 3
+    # reason: four rows that quietly became three would never announce it.
+    assert len(_UNTITLED_REDACTED_CASES) == 4
 
 
 @pytest.mark.parametrize(
@@ -1914,17 +2250,17 @@ def test_untitled_redacted_body_is_unchanged_by_the_title_fix(
     the content, turning the summary itself into the leak. Equality, not
     substring, for the reason :data:`_REDACTED_BODY` records.
 
-    **What the green ``unclassified`` rows above do not mean.** This table
-    covers ``intimate`` and ``personal``-without-opt-in only. An
-    ``unclassified`` untitled save gets a safe *title* once #1505 lands, and
-    its **body is still written into the vault in the clear** — ``pre_save_filter``
-    falls through to the unredacted return for that tier, even though
-    :func:`~creek.classify.privacy_filter.tier_sensitivity` ranks it ``1``
-    alongside ``personal`` (#876). That divergence is tracked as **#1508** and
-    is deliberately out of scope here. No test in this file pins the
-    cleartext ``unclassified`` body as *expected* behaviour, because a test
-    asserting it would have to be deleted to fix #1508 — and a privacy defect
-    with a test defending it is a defect nobody can close.
+    **What this table covers.** ``intimate`` unconditionally, plus
+    ``personal`` and ``unclassified`` without the ``--full-body`` opt-in.
+    ``unclassified`` joined it in **#1508**, which replaced
+    ``pre_save_filter``'s equality-on-two-members branch with a rank test read
+    off :data:`~creek.classify.privacy_filter._TIER_RANK` — so
+    ``tier_sensitivity(tier) == 1`` now redacts whichever tier carries that
+    rank, instead of only the one named ``personal``. The
+    ``unclassified-summary`` row is therefore red until that rank test lands
+    and green from then on, while the other three rows stay green throughout —
+    deliberately, because a privacy defect with a test defending it is a defect
+    nobody can close.
 
     Args:
         vault: Minimal vault scaffold.

@@ -11,8 +11,8 @@ from creek.classify.privacy_filter import _TIER_RANK as _READER_RANK
 from creek.classify.privacy_filter import PrivacyTierOverride
 from creek.classify.privacy_pass import _ESCALATION_RANK
 from creek.models import PrivacyTier
-from creek_mcp.tier_ceiling import _TIER_RANK as _MCP_RANK
 from creek_mcp.tier_ceiling import (
+    _CEILING_RANK,
     CEILING_ROUTING_TIER,
     TierCeiling,
     TierCeilingViolationError,
@@ -21,7 +21,9 @@ from creek_mcp.tier_ceiling import (
     tier_allowed,
     tier_sensitivity,
     to_privacy_override,
+    write_tier_allowed,
 )
+from creek_mcp.tier_ceiling import _TIER_RANK as _MCP_RANK
 
 
 def test_tier_ceiling_values_match_cli_override() -> None:
@@ -296,6 +298,73 @@ def test_routing_tier_unknown_ceiling_fails_closed() -> None:
     unknown = cast("TierCeiling", "not-a-ceiling")
     assert routing_tier(unknown, None) is PrivacyTier.INTIMATE
     assert routing_tier(unknown, PrivacyTier.OPEN) is PrivacyTier.INTIMATE
+
+
+def test_tier_allowed_unknown_ceiling_refuses_rather_than_raising() -> None:
+    """An unrecognised *ceiling* must be refused, not raised on (#1508).
+
+    :func:`~creek_mcp.tier_ceiling.tier_allowed` ends on a **bare subscript**,
+    ``tier_sensitivity(tier) <= _CEILING_RANK[ceiling]``, so a ceiling the
+    table has never heard of raises :class:`KeyError` straight across the MCP
+    boundary. That contradicts the promise the function's own docstring makes
+    immediately above that subscript — "so an unrecognised tier is refused
+    rather than raising across the MCP boundary". The *tier* half of it is
+    kept, by :func:`~creek_mcp.tier_ceiling.tier_sensitivity`'s ``.get`` with a
+    fail-closed default; it is the **ceiling** argument that breaks it, in the
+    function that makes it. :func:`routing_tier` above already reads its
+    ceiling through ``.get`` with a fail-closed default, which is what makes
+    the sibling test directly above this one green; admission never got the
+    same treatment.
+
+    The bogus value is the string ``"not-a-ceiling"`` and **not**
+    :attr:`~creek.models.PrivacyTier.PERSONAL`, and that choice is
+    load-bearing. :class:`~creek_mcp.tier_ceiling.TierCeiling` and
+    :class:`~creek.models.PrivacyTier` are both ``StrEnum``, so their members
+    hash as bare strings *across* class boundaries: ``_CEILING_RANK`` would
+    happily answer ``1`` for ``PrivacyTier.PERSONAL``, no ``KeyError`` would be
+    raised, and the test would pass vacuously against the unfixed code while
+    appearing to prove the opposite.
+
+    **This branch is unreachable from production, on purpose.** The MCP
+    boundary's :func:`creek_mcp.policy._parse_ceiling`
+    (``creek_mcp/policy.py:151-183``) returns ``None`` for any string that does
+    not name a member, long before :func:`tier_allowed` is called, so this is
+    fail-closed defence-in-depth rather than a live hole. It is also the reason
+    this test matters: it is the only coverage that branch will ever have, and
+    an unreachable branch with no test is an unreachable branch that quietly
+    stops working.
+
+    :func:`~creek_mcp.tier_ceiling.write_tier_allowed` is pinned alongside
+    because it is the wrapper every write verb actually calls; it delegates
+    today, and a future divergence must not leave the write side raising while
+    the read side refuses.
+    """
+    unknown = cast("TierCeiling", "not-a-ceiling")
+
+    assert tier_allowed(PrivacyTier.OPEN, unknown) is False
+    assert tier_allowed(PrivacyTier.INTIMATE, unknown) is False
+    assert write_tier_allowed(PrivacyTier.OPEN, unknown) is False
+    assert write_tier_allowed(PrivacyTier.INTIMATE, unknown) is False
+
+
+def test_ceiling_rank_covers_every_ceiling() -> None:
+    """Every :class:`TierCeiling` member carries a rank (#1508).
+
+    Modelled on ``set(CEILING_ROUTING_TIER) == set(TierCeiling)`` above, and
+    needed for the same reason turned inside out. Now that
+    :func:`~creek_mcp.tier_ceiling.tier_allowed` returns a silent ``False`` for
+    an unranked ceiling instead of raising, this equality is the only thing
+    keeping that silence from mattering: a fifth ``TierCeiling`` member added
+    without a :data:`~creek_mcp.tier_ceiling._CEILING_RANK` entry would be
+    refused *everywhere*, at every tier, with nothing anywhere turning red —
+    a total outage of a ceiling, wearing a fail-closed refusal's clothes.
+
+    ``_CEILING_RANK`` is referenced nowhere in the codebase outside its own
+    module — this test's import is the only other reference to it — so no
+    other test can catch that. Set equality rather than a length check, so a
+    member swapped for another of the same count still fails.
+    """
+    assert set(_CEILING_RANK) == set(TierCeiling)
 
 
 # ---------------------------------------------------------------------------

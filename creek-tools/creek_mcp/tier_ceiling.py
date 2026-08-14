@@ -107,6 +107,10 @@ _TIER_RANK = {
 }
 
 
+# Completeness is the failure mode here, and it is silent: since #1508
+# :func:`tier_allowed` refuses an unranked ceiling instead of raising, so
+# ``test_ceiling_rank_covers_every_ceiling`` in
+# ``tests/test_mcp_tier_ceiling.py`` is what makes a missing entry red.
 _CEILING_RANK = {
     TierCeiling.OPEN: 0,
     TierCeiling.PERSONAL: 1,
@@ -243,10 +247,35 @@ def tier_allowed(tier: PrivacyTier, ceiling: TierCeiling) -> bool:
     rather than with ``open``. The rank comes from
     :func:`tier_sensitivity`, so an unrecognised tier is refused rather
     than raising across the MCP boundary.
+
+    Since #1508 the *ceiling* half of that promise is kept too. It used to
+    end on a bare ``_CEILING_RANK[ceiling]`` subscript, which raised
+    :class:`KeyError` across the very boundary the tier half was careful
+    not to raise across. Both halves now fail closed, and an unrecognised
+    ceiling admits **nothing** — not even ``open``. The refusal is spelled
+    as an explicit ``None`` check rather than as the ``.get(…, default)``
+    :func:`routing_tier` uses, because here the fail-closed answer is not
+    another rank but a refusal.
+
+    This is defence in depth, not a live hole:
+    :func:`creek_mcp.policy._parse_ceiling` (``creek_mcp/policy.py:151-183``)
+    returns ``None`` for any value that does not name a member, before
+    :func:`tier_allowed` is ever reached, so no MCP caller can drive the
+    branch, and mypy-strict rejects it at every internal call site.
+
+    What keeps the new silent ``False`` from mattering is
+    ``test_ceiling_rank_covers_every_ceiling`` in
+    ``tests/test_mcp_tier_ceiling.py``. :data:`_CEILING_RANK` is
+    referenced nowhere outside this module, so a fifth
+    :class:`TierCeiling` member added without a rank entry would
+    otherwise be refused everywhere, at every tier, with nothing red.
     """
     if ceiling is TierCeiling.ALL:
         return True
-    return tier_sensitivity(tier) <= _CEILING_RANK[ceiling]
+    rank = _CEILING_RANK.get(ceiling)
+    if rank is None:
+        return False
+    return tier_sensitivity(tier) <= rank
 
 
 def write_tier_allowed(write_tier: PrivacyTier, ceiling: TierCeiling) -> bool:

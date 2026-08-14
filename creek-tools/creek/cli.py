@@ -6430,7 +6430,7 @@ def save_cmd(
     full_body: bool = typer.Option(
         False,
         "--full-body",
-        help="Allow personal-tier bodies into the vault unredacted.",
+        help="Allow personal/unclassified bodies into the vault unredacted.",
     ),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
 ) -> None:
@@ -6441,7 +6441,8 @@ def save_cmd(
     privacy-tier policy: intimate bodies are diverted to the
     gitignored ``10-Liminal/Compost/intimate-stubs/`` directory and
     only a title-only summary is written into the vault; personal
-    bodies are summarised unless ``--full-body`` is passed; paradox
+    and unclassified bodies (which rank together, #876/#961) are
+    summarised unless ``--full-body`` is passed; paradox
     saves always land in ``10-Liminal/Paradoxes/`` and, since #1491,
     honour ``--tier`` there exactly like every other target.
 
