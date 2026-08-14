@@ -117,7 +117,7 @@ _MEASURED_DEPTH = 158
 _CORE_ROUTED_WRAPPERS = 11
 _CONSUMER_ONLY_WRAPPERS = frozenset({"scan-groom.yml"})
 _GROOM_RATIONALE = (
-    "scan-groom.yml is the one justified exception: it is a CONSUMER that "
+    "scan-groom.yml is the one justified BYPASS: it is a CONSUMER that "
     "shrinks the queue (closes resolved/stale issues, dedupes, promotes "
     "needs-triage), so it has its own thin workflow and must NOT be gated "
     "-- above the ceiling it is the only automated path that lowers the "
@@ -126,6 +126,48 @@ _GROOM_RATIONALE = (
     "also skips the backlog ceiling and can file issues into a full queue "
     "-- either route it through the core or justify it here explicitly."
 )
+
+# --- The second exemption, and why it is a DIFFERENT kind ---------------
+#
+# There are exactly two exemptions and they are not the same mechanism.
+# Keeping them distinct is the point: "exempt" must never become a
+# generic escape hatch that the next wrapper can claim by asserting it.
+#
+#   groom    -- BYPASS. Not a producer at all. It never reaches the core,
+#               so there is no gate to disable. Exempt because gating a
+#               drain deadlocks the thing the cap exists to protect.
+#   security -- ENFORCEMENT OFF. A producer that DOES route through the
+#               core, keeps the gate job, keeps its `max_issues` cap, and
+#               is measured on every run -- but declares
+#               `enforce_backlog_ceiling: false` so depth does not
+#               suppress it.
+#
+# The security exemption is an operator decision (2026-08-14), recorded
+# because the numbers make the trade concrete: `agent-ready` stood at 163
+# against a ceiling of 90, so gating security would have suppressed CVE
+# and injection findings until the backlog fell by 73 issues -- an
+# indefinite window with security findings unfiled, introduced by a
+# backlog-hygiene change. A missed security issue costs more than a
+# redundant one; that asymmetry does not hold for the other ten scans.
+_SECURITY_WRAPPER = "scan-security.yml"
+_CEILING_EXEMPT_WRAPPERS = frozenset({_SECURITY_WRAPPER})
+_ENFORCE_INPUT = "enforce_backlog_ceiling"
+_SECURITY_RATIONALE = (
+    "scan-security.yml is exempt from ENFORCEMENT (not from the core): a "
+    "missed security finding costs more than a redundant one, and at the "
+    "measured 163-vs-90 the gate would have suppressed CVE and injection "
+    "findings indefinitely. It stays a producer -- routed through the "
+    "core, still capped by max_issues, still measured -- and the "
+    "exemption is a single explicit `enforce_backlog_ceiling: false` at "
+    "its own call site, never an implicit default. If you are adding a "
+    "SECOND enforcement exemption, that is a policy change and needs the "
+    "operator, not a green test."
+)
+
+# scan-security's per-run cap is what stops an exempt producer flooding
+# the queue it is no longer throttled by. Pinned, so "exempt" can never
+# quietly become "exempt and uncapped".
+_SECURITY_MAX_ISSUES_DEFAULT = "5"
 
 # An env key that looks like a second, independent backlog ceiling.
 _CEILING_ENV_KEY_RE = re.compile(r"MAX.*QUEUE|.*CEILING")
@@ -559,6 +601,16 @@ def test_gate_job_guards_the_issue_writing_job() -> None:
         assert f"needs.{gate_id}.outputs.proceed" in condition, (
             f"job {writer_id!r} runs regardless of the gate: its if: is {condition!r}"
         )
+        # The exemption is part of the guard, not a bypass around it: the
+        # condition must consult BOTH the measured verdict and the
+        # per-caller enforcement switch. Dropping the switch silently
+        # re-gates scan-security, which the operator ruled out; dropping
+        # the verdict ungates everything.
+        assert f"inputs.{_ENFORCE_INPUT}" in condition, (
+            f"job {writer_id!r} ignores {_ENFORCE_INPUT}, so the security "
+            f"exemption is inert and that scan is gated again. "
+            f"{_SECURITY_RATIONALE}"
+        )
 
 
 def test_gate_step_never_interpolates_workflow_expressions_into_shell() -> None:
@@ -763,6 +815,171 @@ def test_every_core_routed_wrapper_forwards_the_ceiling_override() -> None:
     assert core_inputs[_OVERRIDE_INPUT].get("required") is False, (
         f"{_OVERRIDE_INPUT} must be optional; every wrapper forwards it "
         "unconditionally and an unset dispatch input arrives empty"
+    )
+
+
+def test_the_security_scan_is_exempt_by_explicit_declaration() -> None:
+    """Security is exempt because it says so, not because it drifted.
+
+    Operator decision, 2026-08-14, at a measured 163 ``agent-ready``
+    against a ceiling of 90: gating security would have suppressed CVE
+    and injection findings until the backlog fell by 73 issues.
+
+    Delete this and the exemption can be lost in a refactor -- security
+    silently rejoins the throttle and stops filing above the cap, which
+    is the failure the operator ruled out. Every other test here would
+    stay green, because a gated scan is the *default* shape.
+    """
+    wrapper = WORKFLOWS_DIR / _SECURITY_WRAPPER
+    assert wrapper.is_file(), f"{_SECURITY_WRAPPER} does not exist"
+
+    routed_jobs = _core_routed_jobs(wrapper)
+    assert routed_jobs, (
+        f"{_SECURITY_WRAPPER} no longer routes through the core. Exempt "
+        f"from ENFORCEMENT is not the same as detached from the pipeline. "
+        f"{_SECURITY_RATIONALE}"
+    )
+
+    declared = [
+        job.get("with", {}).get(_ENFORCE_INPUT)
+        for job in routed_jobs
+        if isinstance(job.get("with"), dict)
+    ]
+    assert declared, (
+        f"{_SECURITY_WRAPPER} passes no {_ENFORCE_INPUT!r} to the core, so "
+        f"it inherits the default and IS gated. {_SECURITY_RATIONALE}"
+    )
+    for value in declared:
+        assert value is False, (
+            f"{_SECURITY_WRAPPER} sets {_ENFORCE_INPUT}={value!r}; the "
+            f"exemption requires a literal `false`. {_SECURITY_RATIONALE}"
+        )
+
+
+def test_the_exempt_scan_is_still_a_capped_producer() -> None:
+    """Exempt from the ceiling, still bounded by its own per-run cap.
+
+    Delete this and `scan-security.yml` can be turned into something
+    else -- a consumer, an uncapped producer, a scan of a different
+    name -- while keeping an exemption granted to it as a *capped
+    security producer*. `max_issues` is what stops the one scan the
+    ceiling no longer throttles from flooding the queue, so it is
+    pinned rather than merely present.
+    """
+    wrapper = WORKFLOWS_DIR / _SECURITY_WRAPPER
+    routed_jobs = _core_routed_jobs(wrapper)
+    assert routed_jobs, f"{_SECURITY_WRAPPER} does not route through the core"
+
+    for job in routed_jobs:
+        with_mapping = job.get("with", {})
+        assert with_mapping.get("scan_name") == "security", (
+            f"{_SECURITY_WRAPPER} no longer runs the security scan: "
+            f"scan_name={with_mapping.get('scan_name')!r}"
+        )
+        assert "max_issues" in with_mapping, (
+            f"{_SECURITY_WRAPPER} forwards no max_issues cap. An exempt "
+            "producer with no cap is unbounded above the ceiling."
+        )
+
+    dispatch = _triggers(wrapper).get("workflow_dispatch")
+    assert isinstance(dispatch, dict), f"{_SECURITY_WRAPPER} lost its dispatch"
+    inputs = dispatch.get("inputs", {})
+    assert isinstance(inputs, dict) and "max_issues" in inputs, (
+        f"{_SECURITY_WRAPPER} no longer declares a max_issues input"
+    )
+    assert str(inputs["max_issues"].get("default")) == _SECURITY_MAX_ISSUES_DEFAULT, (
+        f"{_SECURITY_WRAPPER}'s per-run cap changed from "
+        f"{_SECURITY_MAX_ISSUES_DEFAULT} to "
+        f"{inputs['max_issues'].get('default')!r}. The cap is the only "
+        "bound left on the one scan the ceiling does not throttle -- "
+        "raising it is a policy change, not a tweak."
+    )
+
+    # The producer half: the core it routes through is the one that
+    # invokes the issue writer. Parsed from the core's prompt, not
+    # grepped -- every wrapper NAMES scan-issue-writer in a comment.
+    core_prompts = [
+        str(step.get("with", {}).get("prompt", ""))
+        for step in workflow_steps(_CORE_WORKFLOW)
+        if isinstance(step.get("with"), dict)
+    ]
+    joined = "\n".join(prompt for prompt in core_prompts if prompt.strip())
+    assert joined, "_claude-scan.yml has no parseable prompt"
+    assert "scan-issue-writer" in joined, (
+        "the core no longer invokes scan-issue-writer, so routing through "
+        "it no longer makes scan-security a producer"
+    )
+
+
+def test_ceiling_exemptions_are_exactly_the_two_named_ones() -> None:
+    """Two exemptions, two distinct reasons, both declared here.
+
+    This is the allowlist-creep guard. Delete it and any wrapper can
+    quietly add ``enforce_backlog_ceiling: false`` and leave the
+    throttle -- which is how a targeted safety carve-out becomes a
+    generic escape hatch and the ceiling stops meaning anything.
+
+    The two mechanisms are deliberately different and are asserted
+    separately: groom BYPASSES the core entirely (it is not a
+    producer), while security routes through the core and keeps the
+    gate job but turns enforcement off.
+    """
+    wrappers = _scan_wrappers()
+    assert wrappers, "no scan-*.yml wrappers found; this test would be vacuous"
+
+    routed = [path for path in wrappers if _core_routed_jobs(path)]
+    assert routed, "no core-routed wrappers; this test would be vacuous"
+    assert len(routed) == _CORE_ROUTED_WRAPPERS
+
+    enforcement_off = {
+        path.name
+        for path in routed
+        for job in _core_routed_jobs(path)
+        if isinstance(job.get("with"), dict)
+        and job["with"].get(_ENFORCE_INPUT) is False
+    }
+    assert enforcement_off == _CEILING_EXEMPT_WRAPPERS, (
+        f"the set of wrappers with the ceiling switched OFF is "
+        f"{sorted(enforcement_off)}, expected "
+        f"{sorted(_CEILING_EXEMPT_WRAPPERS)}. {_SECURITY_RATIONALE}"
+    )
+
+    bypassing = {path.name for path in wrappers} - {path.name for path in routed}
+    assert bypassing == _CONSUMER_ONLY_WRAPPERS, (
+        f"wrappers bypassing the core: {sorted(bypassing)}. {_GROOM_RATIONALE}"
+    )
+    assert not (enforcement_off & bypassing), (
+        "a wrapper claims BOTH exemptions; they are different mechanisms "
+        "for different reasons and nothing should need both"
+    )
+
+
+def test_the_core_declares_the_enforcement_switch_defaulting_to_on() -> None:
+    """Gating is the default; exemption must be asked for.
+
+    Delete this and ``enforce_backlog_ceiling`` could default to
+    ``false``, which inverts the whole feature: every wrapper that does
+    not mention it -- ten of the eleven -- would stop being throttled,
+    and the two allowlist tests above would still pass because nobody
+    declared anything.
+    """
+    workflow_call = _triggers(_CORE_WORKFLOW).get("workflow_call", {})
+    inputs = workflow_call.get("inputs") if isinstance(workflow_call, dict) else {}
+    assert isinstance(inputs, dict) and _ENFORCE_INPUT in inputs, (
+        f"_claude-scan.yml declares no {_ENFORCE_INPUT!r} workflow_call input"
+    )
+
+    spec = inputs[_ENFORCE_INPUT]
+    assert spec.get("type") == "boolean", (
+        f"{_ENFORCE_INPUT} must be a boolean so `false` cannot be spelled "
+        f"as a truthy string; got type={spec.get('type')!r}"
+    )
+    assert spec.get("required") is False, (
+        f"{_ENFORCE_INPUT} must be optional: ten wrappers never mention it"
+    )
+    assert spec.get("default") is True, (
+        f"{_ENFORCE_INPUT} must default to true -- gating is the default "
+        f"and exemption is opt-in; got default={spec.get('default')!r}"
     )
 
 

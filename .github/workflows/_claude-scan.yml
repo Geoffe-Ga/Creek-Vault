@@ -47,6 +47,16 @@ on:
         required: false
         type: string
         default: ""
+      enforce_backlog_ceiling:
+        description: "Whether a full backlog suppresses this scan. Default true. Only scan-security.yml sets false — see its header for the operator decision."
+        required: false
+        type: boolean
+        # Gating is the DEFAULT and exemption is opt-in. Inverting this
+        # would silently un-throttle the ten wrappers that never mention
+        # it, and no allowlist test would notice, because nobody would
+        # have declared anything. tests/test_backlog_ceiling_gate.py pins
+        # this value for exactly that reason.
+        default: true
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: true
@@ -99,6 +109,17 @@ jobs:
           BACKLOG_CEILING: ${{ inputs.backlog_ceiling }}
         run: scripts/ralph/backlog-gate.sh
 
+      # The measurement above runs for exempt scans too — knowing the depth
+      # is useful even when it does not gate — but a summary that says
+      # "standing down" beside a scan that then runs anyway is a lie the
+      # next reader has to debug. So say plainly which of the two it was.
+      - name: Note that this scan is exempt from enforcement
+        if: inputs.enforce_backlog_ceiling == false
+        run: |
+          set -euo pipefail
+          printf '%s\n' "This scan is EXEMPT from backlog-ceiling enforcement (see its wrapper for the operator decision); the measurement above is informational and does not suppress it." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
   scan:
     name: "Scan ${{ inputs.scan_name }}"
     runs-on: ubuntu-latest
@@ -110,7 +131,15 @@ jobs:
     # overall conclusion `success`, so a nightly stand-down is green — a
     # workflow that goes red every night is a workflow everyone learns to
     # ignore.
-    if: needs.gate.outputs.proceed == 'true'
+    #
+    # Two clauses, and the ORDER of the reading matters: a caller may switch
+    # enforcement off (only scan-security.yml does — operator decision at a
+    # measured 163 agent-ready against a ceiling of 90, where gating would have
+    # suppressed CVE and injection findings until the backlog fell by 73), but
+    # it cannot switch off the MEASUREMENT: the gate job still runs, still
+    # reports the depth, and the exempt scan still honours its own max_issues
+    # cap. Exempt from the throttle is not exempt from the pipeline.
+    if: inputs.enforce_backlog_ceiling == false || needs.gate.outputs.proceed == 'true'
     steps:
       - name: Checkout repository (recent history for churn/bug analysis)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
