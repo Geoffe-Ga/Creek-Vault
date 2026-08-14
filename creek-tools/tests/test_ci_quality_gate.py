@@ -56,7 +56,12 @@ _REQUIRED_GATES: dict[str, str] = {
     r"coverage report --fail-under": "aggregate coverage gate",
     r"coverage-per-file\.sh": "per-file coverage gate",
     r"complexity\.sh": "cyclomatic complexity gate",
-    r"crawdad": "crawdad check-all",
+    # Spelled as the gate branch itself, not the bare word "crawdad": #1501
+    # puts a crawdad-scoped temp path (`/tmp/crawdad-locked-requirements.txt`)
+    # into the crawdad job's `run:` block, so a loose `crawdad` would be
+    # satisfied by that filename and keep passing after someone deleted the
+    # gate script's crawdad branch — a guard green on the wrong line.
+    r"needs\.crawdad\.result": "crawdad job gated by quality-gate",
 }
 
 _GATE_JOB = "quality-gate"

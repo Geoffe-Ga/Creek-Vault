@@ -28,7 +28,7 @@ CrawDad v1.0 ships:
 
 ```bash
 cd crawdad
-pip install -e ".[dev]"
+uv sync --all-extras          # installs the pinned uv.lock (#1501)
 
 # Required env vars
 export DISCORD_BOT_TOKEN="…"
@@ -39,7 +39,7 @@ export ANTHROPIC_API_KEY="…"          # the key for the selected provider (def
 # export CRAWDAD_PROVIDER=gemini      # then set GOOGLE_API_KEY instead
 
 # Edit crawdad.yaml — see the example below
-crawdad run --config ./crawdad.yaml
+uv run crawdad run --config ./crawdad.yaml
 ```
 
 ## `crawdad.yaml` example

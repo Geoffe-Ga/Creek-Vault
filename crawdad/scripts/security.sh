@@ -12,23 +12,32 @@ bandit -r crawdad -ll
 # pip-audit runs twice because crawdad has two distinct dependency
 # surfaces, and each one answers a different question.
 #
-# 1. The installed environment — "is what CI actually imports
-#    vulnerable?" CI provisions with `pip install -e ".[dev]"`, and pip
-#    honours neither uv.lock nor [tool.uv].constraint-dependencies:
-#    both are invisible to it. Nothing else in the gate guards this
-#    surface, so a floor can be correct in pyproject and in the lock
-#    while CI still resolves a vulnerable transitive release.
+# 1. The installed environment — "is what is actually importable
+#    vulnerable?" Since #1501, CI provisions this environment FROM the
+#    exported lock (`uv export --locked --all-extras --no-emit-project
+#    --no-hashes`, piped into `uv pip install --system -r ...`, then
+#    `uv pip install --system --no-deps -e .`), so on a healthy tree
+#    this pass and the lock pass below largely agree. They are not the
+#    same artifact, though: the editable install layers the local
+#    `crawdad` package on top, and whatever the interpreter's own
+#    ensurepip seeded, or a PEP 517 build backend left behind, is
+#    present in the environment and invisible to a plain lock export.
+#    This pass also stands as the regression detector for #1501 itself:
+#    pip honours neither uv.lock nor [tool.uv].constraint-dependencies,
+#    so if a future edit reintroduces a live resolve (reverting to
+#    `pip install -e ".[dev]"`, say), the lock pass below would stay
+#    clean while this pass alone would report the drift.
 # 2. The exported lock — "is the reproducibility contract `uv sync`
 #    users install vulnerable?" All eight advisories of #979 lived
 #    here: an environment-only audit reported "No known vulnerabilities
 #    found" while uv.lock carried eight, so auditing the environment
 #    alone would have missed this entire issue.
 #
-# The gap between those two answers is what let the drift go unnoticed.
-# The sibling creek-tools gate gets away with a single bare pip-audit
-# only because its CI installs FROM the lock (`uv pip install -r
-# locked-requirements.txt`), which makes environment and lock the same
-# artifact. crawdad's CI does not, so crawdad needs both.
+# The gap between those two answers is what let the drift of #979 go
+# unnoticed, and #1501 narrowed that gap without closing it: the
+# installed environment is now DERIVED from the lock rather than
+# resolved independently of it, but a derived artifact is still not a
+# byte-identical copy of the lock export, so both passes keep running.
 
 echo "=== pip-audit: installed environment ==="
 # No --strict here: the local `crawdad` package is not published to

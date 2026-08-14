@@ -337,18 +337,28 @@ The bot does **not** exit on MCP subprocess failure. The pattern is:
 
 `scripts/security.sh` runs `pip-audit` twice because crawdad has two
 distinct dependency surfaces and each answers a different question.
-CI provisions with `pip install -e ".[dev]"`, and pip honours neither
-`uv.lock` nor `[tool.uv].constraint-dependencies` — both are invisible
-to it — so a bare `pip-audit` audits only what CI actually imports.
-The second run exports `uv.lock` (`uv export --quiet --locked
---all-extras --no-emit-project`) and audits that instead, since
-`uv.lock` is the reproducibility contract `uv sync` users install and
-is where all eight advisories of #979 lived; an environment-only audit
-would have reported clean while the lock carried eight. `--locked`
-doubles as a lock-freshness gate — if `pyproject.toml` and `uv.lock`
-have drifted, the export fails with "The lockfile at `uv.lock` needs
-to be updated" and the fix is `uv lock`, never dropping `--locked`.
-Do not add `--strict` to either `pip-audit` call: the local `crawdad`
-package isn't published to PyPI, so pip-audit always reports it as a
-benign SKIP, and `--strict` would turn that permanent skip into a
-permanent false failure.
+Since #1501, CI provisions the installed environment FROM the exported
+lock (`uv export --locked --all-extras --no-emit-project --no-hashes`
+piped into `uv pip install --system -r ...`, then `uv pip install
+--system --no-deps -e .`), so the first `pip-audit` call no longer
+audits a live PyPI resolve. It still audits a genuinely different
+artifact than the lock export below: the editable install layers the
+local `crawdad` package itself on top, and whatever the interpreter's
+own ensurepip seeded, or a PEP 517 build backend left behind, is
+present in the environment and invisible to a plain lock export. This
+pass also doubles as the regression detector for #1501 itself — pip
+honours neither `uv.lock` nor `[tool.uv].constraint-dependencies`, so
+if a future edit ever reintroduces a live resolve (reverting to `pip
+install -e ".[dev]"`, say), the lock pass below would stay clean while
+this pass alone would report the drift. The second run exports
+`uv.lock` (`uv export --quiet --locked --all-extras --no-emit-project`)
+and audits that instead, since `uv.lock` is the reproducibility
+contract `uv sync` users install and is where all eight advisories of
+#979 lived; an environment-only audit would have reported clean while
+the lock carried eight. `--locked` doubles as a lock-freshness gate —
+if `pyproject.toml` and `uv.lock` have drifted, the export fails with
+"The lockfile at `uv.lock` needs to be updated" and the fix is `uv
+lock`, never dropping `--locked`. Do not add `--strict` to either
+`pip-audit` call: the local `crawdad` package isn't published to PyPI,
+so pip-audit always reports it as a benign SKIP, and `--strict` would
+turn that permanent skip into a permanent false failure.
