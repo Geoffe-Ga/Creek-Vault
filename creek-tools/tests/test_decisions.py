@@ -19,8 +19,10 @@ from creek.generate import decisions as decisions_mod
 from creek.generate.decisions import (
     DECISION_KEYWORDS,
     DecisionDetector,
+    DecisionsReport,
     _sanitize_title,
     generate_decisions,
+    withheld_notice,
 )
 from creek.models import (
     Confidence,
@@ -81,7 +83,7 @@ def test_generate_decisions_writes_note(
 
     _seed_fragment(vault_path, keyword_fragment)
 
-    written = generate_decisions(vault_path)
+    written = generate_decisions(vault_path).notes
 
     assert len(written) == 1
     assert written[0].parent == vault_path / "08-Decisions" / "Active"
@@ -99,11 +101,11 @@ def test_generate_decisions_is_idempotent(
 
     _seed_fragment(vault_path, keyword_fragment)
 
-    first = generate_decisions(vault_path)
-    second = generate_decisions(vault_path)
+    first = generate_decisions(vault_path).notes
+    second = generate_decisions(vault_path).notes
 
     assert len(first) == 1
-    assert second == []
+    assert second == ()
 
 
 def test_generate_decisions_no_candidates(
@@ -115,7 +117,7 @@ def test_generate_decisions_no_candidates(
 
     _seed_fragment(vault_path, neutral_fragment)
 
-    assert generate_decisions(vault_path) == []
+    assert generate_decisions(vault_path).notes == ()
     assert not any((vault_path / "08-Decisions" / "Active").glob("*.md"))
 
 
@@ -1001,17 +1003,17 @@ class TestDecisionNoteIdentityCollision:
         _seed_fragment(vault_path, _decision_fragment("frag-b", _PORTLAND_TITLE))
         before = date.today()
 
-        first = generate_decisions(vault_path)
+        first = generate_decisions(vault_path).notes
         snapshot_1 = _note_names(vault_path)
-        second = generate_decisions(vault_path)
+        second = generate_decisions(vault_path).notes
         snapshot_2 = _note_names(vault_path)
-        third = generate_decisions(vault_path)
+        third = generate_decisions(vault_path).notes
         snapshot_3 = _note_names(vault_path)
         after = date.today()
 
         assert len(first) == 2
-        assert second == []
-        assert third == []
+        assert second == ()
+        assert third == ()
         assert snapshot_1 == snapshot_2 == snapshot_3
 
         notes = _active_notes(vault_path)
@@ -1219,11 +1221,11 @@ class TestDecisionDamagedVaultSelfHeal:
         survivor.write_text(_SEEDED_DECISION_NOTE, encoding="utf-8")
         original_bytes = survivor.read_bytes()
 
-        first = generate_decisions(vault_path)
-        second = generate_decisions(vault_path)
+        first = generate_decisions(vault_path).notes
+        second = generate_decisions(vault_path).notes
 
         assert len(first) == 1
-        assert second == []
+        assert second == ()
         assert survivor.read_bytes() == original_bytes
         post = frontmatter.load(str(survivor))
         assert post["status"] == "deliberating"
@@ -1412,9 +1414,9 @@ def test_generate_decisions_screens_an_intimate_fragment_at_the_all_ceiling(
         ),
     )
 
-    written = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
+    written = generate_decisions(vault_path, override=PrivacyTierOverride.ALL).notes
 
-    assert written == []
+    assert written == ()
     assert not list((vault_path / "08-Decisions" / "Active").glob("*.md"))
 
 
@@ -1432,7 +1434,7 @@ def test_generate_decisions_still_writes_an_open_fragments_note(
         _tiered_fragment("frag-open", "Should I buy a bicycle", PrivacyTier.OPEN),
     )
 
-    written = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
+    written = generate_decisions(vault_path, override=PrivacyTierOverride.ALL).notes
 
     assert len(written) == 1
     assert "Should-I-buy-a-bicycle" in written[0].name
@@ -1460,7 +1462,7 @@ def test_generate_decisions_admits_an_explicitly_unclassified_fragment(
         ),
     )
 
-    written = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
+    written = generate_decisions(vault_path, override=PrivacyTierOverride.ALL).notes
 
     assert len(written) == 1
     assert "Should-I-take-the-job" in written[0].name
@@ -1498,9 +1500,12 @@ def test_generate_decisions_screens_a_fragment_with_no_privacy_tier_key(
     )
 
     with caplog.at_level("WARNING", logger="creek.generate.decisions"):
-        written = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
+        written = generate_decisions(
+            vault_path,
+            override=PrivacyTierOverride.ALL,
+        ).notes
 
-    assert written == []
+    assert written == ()
     assert not list((vault_path / "08-Decisions" / "Active").glob("*.md"))
     assert any("withheld" in r.getMessage() for r in caplog.records), (
         "a fail-closed screen that disables the report must say so; "
@@ -1532,13 +1537,13 @@ def test_generate_decisions_stays_idempotent_with_the_screen(
         ),
     )
 
-    first = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
+    first = generate_decisions(vault_path, override=PrivacyTierOverride.ALL).notes
     before = {p: p.read_bytes() for p in (vault_path / "08-Decisions").rglob("*.md")}
-    second = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
+    second = generate_decisions(vault_path, override=PrivacyTierOverride.ALL).notes
     after = {p: p.read_bytes() for p in (vault_path / "08-Decisions").rglob("*.md")}
 
     assert len(first) == 1
-    assert second == []
+    assert second == ()
     assert after == before
 
 
@@ -1557,6 +1562,13 @@ def test_generate_decisions_counts_only_screened_not_ceiling_refused_fragments(
     *same* intimate fragment is ceiling-refused at ``OPEN`` (silent) and
     screen-refused at ``ALL`` (counted). Asserting the count at one ceiling
     alone would be satisfied by a helper that counted every exclusion.
+
+    Since #1487 the count is also part of the *return value*, and both are
+    asserted here. The log assertions alone would be satisfied by a
+    ``DecisionsReport.withheld`` hardwired to ``0`` — which is exactly the
+    field ``creek.cli._report_decisions`` branches on, so a wrong value there
+    silently restores the "no new decision candidates found" lie the issue is
+    about. The two ceilings pin both directions of that field.
     """
     _seed_fragment(
         vault_path,
@@ -1572,12 +1584,12 @@ def test_generate_decisions_counts_only_screened_not_ceiling_refused_fragments(
     )
 
     with caplog.at_level("WARNING", logger="creek.generate.decisions"):
-        generate_decisions(vault_path, override=PrivacyTierOverride.OPEN)
+        at_open = generate_decisions(vault_path, override=PrivacyTierOverride.OPEN)
     ceiling_refused = [r for r in caplog.records if "withheld" in r.getMessage()]
     caplog.clear()
 
     with caplog.at_level("WARNING", logger="creek.generate.decisions"):
-        generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
+        at_all = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
     screen_refused = [
         r.getMessage() for r in caplog.records if "withheld" in r.getMessage()
     ]
@@ -1588,3 +1600,227 @@ def test_generate_decisions_counts_only_screened_not_ceiling_refused_fragments(
     )
     assert len(screen_refused) == 1, screen_refused
     assert "1 fragment" in screen_refused[0], screen_refused[0]
+    assert at_open.withheld == 0, (
+        "#1487: the ceiling refusal leaked into the returned count, so the "
+        "CLI would announce a withholding the operator asked for."
+    )
+    assert at_all.withheld == 1, (
+        "#1487: the screen refusal never reached the return value, so the "
+        "CLI has nothing to announce and prints 'no new decision candidates "
+        "found' over a report it could not fully read."
+    )
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        (PrivacyTierOverride.OPEN, 0),
+        (PrivacyTierOverride.PERSONAL, 0),
+        (PrivacyTierOverride.INTIMATE, 1),
+        (PrivacyTierOverride.ALL, 1),
+    ],
+)
+def test_generate_decisions_withheld_count_across_every_ceiling(
+    vault_path: Path,
+    override: PrivacyTierOverride,
+    expected: int,
+) -> None:
+    """The withheld count is nonzero at *two* ceilings, not one (#1487).
+
+    This pins a claim that was wrong the first time it was written down. The
+    reasoning recorded in ``creek_mcp/tools/report.py::_generate_decisions``
+    for not widening the MCP envelope originally said the count is
+    "structurally always zero except at ``ceiling=all``". It is not.
+    :func:`~creek.classify.privacy_filter.tier_within_override` admits a tier
+    when its rank is ``<=`` the ceiling's, and ``INTIMATE`` ranks equal to
+    itself, so an intimate fragment clears ``ceiling=intimate`` as well and
+    only then meets the unconditional screen that counts it.
+
+    Enumerating **all four** overrides rather than the two interesting ones is
+    the point: a spot-check at ``OPEN`` and ``ALL`` is exactly what let the
+    wrong claim stand, because both endpoints agree with it. The two interior
+    ceilings are where it fails.
+
+    Args:
+        vault_path: Temporary vault root.
+        override: The tier ceiling under test.
+        expected: The withheld count that ceiling should produce.
+    """
+    _seed_fragment(
+        vault_path,
+        _tiered_fragment("frag-open", "Should I buy a bicycle", PrivacyTier.OPEN),
+    )
+    _seed_fragment(
+        vault_path,
+        _tiered_fragment(
+            "frag-intimate",
+            "Should I leave my marriage",
+            PrivacyTier.INTIMATE,
+        ),
+    )
+
+    report = generate_decisions(vault_path, override=override)
+
+    assert report.withheld == expected, (
+        f"at ceiling={override.value} the intimate screen should have counted "
+        f"{expected} fragment(s), not {report.withheld}. The ceiling is "
+        "evaluated first, so it decides whether the screen ever sees the "
+        "fragment at all."
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1487 — one wording, one source of it, and a return type no caller can misread
+#
+# The count used to reach ``logger.warning`` and die there, so ``creek report
+# --type decisions`` printed "no new decision candidates found" over a vault
+# whose only candidate had been refused. The fix returns the count and shares
+# one wording function between the log and the console; these tests pin the
+# wording, the ``None`` at zero, and the shape of the return value.
+# ---------------------------------------------------------------------------
+
+_EXPECTED_WITHHELD_NOTICE_ONE = (
+    "1 fragment(s) withheld from the decisions report: intimate tier, or no "
+    "privacy_tier key at all (which fails closed to intimate). Re-run `creek "
+    "classify` to tier a keyless note — a self-authored journal note is "
+    "tiered intimate and stays out — or set privacy_tier by hand. A tier "
+    "already recorded as intimate is never lowered."
+)
+"""The exact operator-facing wording at ``withheld == 1`` (#1487).
+
+Pinned in full, once, here — ``tests/test_cli.py`` asserts distinctive
+substrings of it against stdout rather than restating it, so there is only one
+copy of the sentence to keep true.
+
+Every clause is load-bearing and was checked by execution before being written:
+
+* "fragment(s)", never "candidate(s)" — the count is taken *before* detection
+  and includes withheld fragments that are not decision candidates at all.
+* "or no privacy_tier key at all (which fails closed to intimate)" — the
+  keyless case is the common one in a hand-written or legacy vault, and it is
+  the one an operator has no other way to diagnose.
+* "Re-run `creek classify` … — a self-authored journal note is tiered intimate
+  and stays out —" is stated *with* its exception because
+  ``creek/classify/privacy_pass.py`` assigns a tier outright to a keyless note
+  (the ratchet binds only an already-concrete tier), while
+  ``creek/classify/privacy.py`` classifies a self-authored journal note
+  ``INTIMATE`` unconditionally. Promising the re-run alone would print a new
+  false statement — the same class of defect this issue exists to remove.
+* "A tier already recorded as intimate is never lowered" — the ratchet, which
+  is what makes a hand edit the remedy for that case and not the first one.
+
+No square brackets anywhere: ``creek.cli.console`` is a Rich console and would
+eat them as markup.
+"""
+
+
+def test_withheld_notice_is_none_when_nothing_was_withheld() -> None:
+    """``withheld_notice(0)`` is ``None``, not an empty or zero-count string.
+
+    ``None`` is what makes the notice *conditional* by construction: the caller
+    writes ``if (notice := withheld_notice(n)) is not None``, so a truthy
+    sentinel here would print "0 fragment(s) withheld …" on every clean run.
+    Kills the mutant that returns the formatted string unconditionally.
+    """
+    assert withheld_notice(0) is None
+
+
+@pytest.mark.parametrize("count", [1, 2, 17])
+def test_withheld_notice_states_its_count_and_carries_no_markup(count: int) -> None:
+    """The notice interpolates the count and stays free of Rich markup (#1487).
+
+    Three counts, because a notice that hardcodes ``1`` — the mutant this
+    parametrize exists for — passes any single-count assertion. The
+    square-bracket guard is not cosmetic: the console prints this string
+    through Rich, which silently eats ``[anything]`` as a style tag, so a
+    bracketed clause would vanish from the operator's terminal while remaining
+    visible in the log.
+
+    Args:
+        count: Number of withheld fragments.
+    """
+    notice = withheld_notice(count)
+
+    assert notice is not None
+    assert notice.startswith(f"{count} fragment(s) withheld"), notice
+    assert "withheld" in notice
+    assert "[" not in notice, notice
+    assert "]" not in notice, notice
+
+
+def test_withheld_notice_states_the_exact_remedy() -> None:
+    """The full wording at ``withheld == 1`` is pinned verbatim (#1487).
+
+    This is the only full copy of the sentence in the suite. It is pinned by
+    equality rather than by substring because every clause was chosen against
+    an execution check of what ``creek classify`` actually does to a keyless
+    self-authored journal note — see
+    :data:`_EXPECTED_WITHHELD_NOTICE_ONE` — and a paraphrase would quietly
+    reintroduce a remedy that does not work.
+
+    It also holds the two substrings older tests depend on: ``"withheld"``
+    (``tests/test_cli.py``'s log assertion) and ``"1 fragment"``
+    (``test_generate_decisions_counts_only_screened_not_ceiling_refused_fragments``).
+    """
+    assert withheld_notice(1) == _EXPECTED_WITHHELD_NOTICE_ONE
+
+
+def test_decisions_report_is_not_iterable() -> None:
+    """``DecisionsReport`` must not be unpackable or iterable (#1487).
+
+    ``creek_mcp/tools/report.py`` does ``list(generate_decisions(...))``. Had
+    the new return value been a tuple or a NamedTuple, that call site would
+    have kept type-checking and kept running, and would have silently started
+    returning ``[[Path, …], 0]`` — a list whose first element is a list and
+    whose second is an int — into the MCP ``report_paths`` envelope. A plain
+    dataclass turns that into a loud ``TypeError`` no call site can miss.
+
+    ``notes`` is asserted to be a ``tuple`` for the same reason the empty-case
+    assertions elsewhere read ``== ()``: an immutable sequence cannot be
+    appended to by a caller that mistakes it for the old ``list[Path]``.
+    """
+    report = DecisionsReport(notes=(), withheld=0)
+
+    assert isinstance(report.notes, tuple)
+    with pytest.raises(TypeError):
+        list(report)
+
+
+def test_generate_decisions_logs_exactly_the_shared_notice(
+    vault_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The logged warning is byte-identical to ``withheld_notice`` (#1487).
+
+    The log and the console are two audiences for one fact, and the whole
+    point of routing both through ``withheld_notice`` is that they cannot
+    drift — an operator reading the terminal and a maintainer reading the log
+    must not be given two different explanations of the same refusal. This
+    kills the mutant that keeps the old inline ``logger.warning`` format string
+    alongside a new console message: both would contain "withheld", both would
+    contain the count, and every other assertion in the suite would still pass.
+
+    Args:
+        vault_path: Vault fixture.
+        caplog: Pytest log-capture fixture.
+    """
+    _seed_fragment(
+        vault_path,
+        _tiered_fragment(
+            "frag-intimate",
+            "Should I leave my marriage",
+            PrivacyTier.INTIMATE,
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger="creek.generate.decisions"):
+        report = generate_decisions(vault_path, override=PrivacyTierOverride.ALL)
+
+    assert report.withheld == 1
+    logged = [
+        r.getMessage() for r in caplog.records if r.name == "creek.generate.decisions"
+    ]
+    assert logged == [withheld_notice(report.withheld)], (
+        "#1487: the log wording and withheld_notice() have drifted apart, so "
+        "the console and the log now explain the same refusal differently."
+    )
