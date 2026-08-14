@@ -10,6 +10,18 @@ name: "Scan: Backlog grooming"
 # Runs daily at 04:00 UTC — BEFORE the day's producer scans (05:00+), so the
 # queue is deduped and trued-up against HEAD before new findings land.
 #
+# DELIBERATELY NOT BACKLOG-GATED (issue #1516). Every producer scan now stands
+# down above the shared agent-ready ceiling in scripts/ralph/backlog-gate.sh.
+# Groom is the one exemption, and it is exempt because of what it DOES, not
+# because of its name: its "net effect is a queue that shrinks"
+# (prompts/scans/groom.md:19). Above the ceiling it is the ONLY automated path
+# that lowers the count, so gating it would be self-deadlocking — the backlog
+# would be stranded above the cap with every producer standing down and nothing
+# left to drain it. `creek-tools/tests/test_backlog_ceiling_gate.py` keeps the
+# exemption honest: it asserts this workflow still invokes the
+# `backlog-grooming` skill and never the producer-side `scan-issue-writer`, so
+# rewriting groom into a producer reddens rather than quietly reopening the bug.
+#
 # Required configuration:
 #   secret  CLAUDE_CODE_OAUTH_TOKEN  - same token the other Claude workflows use.
 
