@@ -20,6 +20,10 @@ on:
         description: "Hard cap on issues created this run."
         required: false
         default: "5"
+      backlog_ceiling:
+        description: "Override the shared agent-ready backlog ceiling for this run (blank = default)."
+        required: false
+        default: ""
 
 jobs:
   run:
@@ -35,5 +39,16 @@ jobs:
       scan_name: todo
       max_issues: ${{ fromJSON(github.event.inputs.max_issues || '5') }}
       priority: P3
+      # Plumbing, not policy (issue #1516). The backlog check itself stays in
+      # exactly one place — scripts/ralph/backlog-gate.sh, run by the core's
+      # `gate` job — and every wrapper only forwards the per-run override. It
+      # has to be declared on each of the eleven wrappers anyway, because
+      # `gh workflow run` rejects an input the workflow does not declare, and
+      # the documented catch-up path is "raise the cap for one run".
+      #
+      # No `fromJSON` here, unlike max_issues: the empty string must survive as
+      # "use the default", and fromJSON('') is an error. `github.event.inputs`
+      # is null on a schedule trigger, which is what `|| ''` handles.
+      backlog_ceiling: ${{ github.event.inputs.backlog_ceiling || '' }}
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

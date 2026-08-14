@@ -16,6 +16,10 @@ on:
         description: "Hard cap on issues created this run."
         required: false
         default: "6"
+      backlog_ceiling:
+        description: "Override the shared agent-ready backlog ceiling for this run (blank = default)."
+        required: false
+        default: ""
 
 jobs:
   run:
@@ -31,5 +35,8 @@ jobs:
       scan_name: dead-code
       max_issues: ${{ fromJSON(github.event.inputs.max_issues || '6') }}
       priority: P3
+      # Plumbing only — the ceiling lives in the core's gate job. No fromJSON:
+      # an empty string must survive as "use the default". See scan-todo.yml.
+      backlog_ceiling: ${{ github.event.inputs.backlog_ceiling || '' }}
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
