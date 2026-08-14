@@ -1115,6 +1115,19 @@ def test_report_decisions_generates_note(vault: Path) -> None:
     here — this test is about *whether a Decision note is written*, and the
     ceiling behaviour it now depends on is pinned by
     ``tests/test_mcp_report_tier_ceiling.py``.
+
+    Since #1487 the ``report_paths`` assertion is elementwise, and that is the
+    behavioural backstop for this tool's one line of glue.
+    ``creek_mcp/tools/report.py`` does ``list(generate_decisions(...))``, and
+    ``generate_decisions`` now returns a two-field report rather than a list of
+    paths. Had that report been a tuple or a NamedTuple, the ``list(...)``
+    would have kept working and started yielding ``[[Path, …], 0]`` — one list
+    and one int — into this envelope. The old ``any("08-Decisions/Active" in p
+    …)`` would have raised ``TypeError`` on the int rather than failing on the
+    contract, and would have been just as satisfied by a single correct entry
+    beside any amount of junk. Asserting every entry is a ``str`` that ends
+    ``.md`` and starts ``08-Decisions/Active/`` is green before the refactor,
+    green after it, and red under exactly that regression.
     """
     frags = vault / "01-Fragments" / "Notes"
     frags.mkdir(parents=True, exist_ok=True)
@@ -1132,7 +1145,12 @@ def test_report_decisions_generates_note(vault: Path) -> None:
     )
     assert result["status"] == "ok"
     assert result["report_type"] == "decisions"
-    assert any("08-Decisions/Active" in p for p in result["report_paths"])
+    active = "08-Decisions/Active/"
+    report_paths = result["report_paths"]
+    assert report_paths, "the decisions report announced no written note"
+    assert all(isinstance(p, str) for p in report_paths), report_paths
+    assert all(p.endswith(".md") for p in report_paths), report_paths
+    assert all(p.startswith(active) for p in report_paths), report_paths
     assert _read_audit(vault)[-1]["tool"] == "creek.report"
 
 

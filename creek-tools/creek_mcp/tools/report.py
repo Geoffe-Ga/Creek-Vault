@@ -217,13 +217,31 @@ def _generate_lexicon(request: _ReportRequest) -> list[Path]:
 def _generate_decisions(request: _ReportRequest) -> list[Path]:
     """Draft Decision notes from decision-signalling fragments (#581).
 
+    ``DecisionsReport.withheld`` — the count ``creek report --type decisions``
+    prints on stdout since #1487 — is deliberately dropped here rather than
+    surfaced in the MCP envelope. ``_admitted_decision_fragments`` evaluates
+    the tier ceiling *before* the intimate screen, so a fragment the ceiling
+    already refused is never counted: the field is structurally zero at every
+    ceiling below ``intimate``. It can be nonzero at ``ceiling=intimate`` as
+    well as ``ceiling=all`` — ``tier_within_override`` admits a tier when its
+    rank is ``<=`` the ceiling's, and ``intimate`` ranks equal to itself, so
+    an intimate (or fail-closed keyless) fragment clears the ceiling and then
+    meets the unconditional screen. Two of the four ceilings, not one.
+    Carrying it would mean
+    widening :data:`_MCP_REPORTS`' uniform
+    ``Callable[[_ReportRequest], list[Path]]`` across all eleven report types,
+    ten of which could never populate it, for one reachable cell — the wrong
+    trade to make inside a bug fix. The envelope gap is tracked in #1511.
+
     Args:
         request: The resolved report request.
 
     Returns:
         One path per written Decision note.
     """
-    return list(generate_decisions(request.vault_path, override=request.override))
+    return list(
+        generate_decisions(request.vault_path, override=request.override).notes,
+    )
 
 
 def _generate_rhetorical_patterns(request: _ReportRequest) -> list[Path]:

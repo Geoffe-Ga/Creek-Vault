@@ -3882,25 +3882,46 @@ def _report_decisions(vault_path: Path, override: PrivacyTierOverride) -> None:
     fragment already captured by a note is skipped). Prints a friendly message
     when there are no new candidates.
 
+    When the unconditional intimate screen refused anything, the withheld
+    notice is printed on **stdout** — in *both* branches, and after the
+    headline either way. Before #1487 the count reached only a
+    ``logger.warning``, so an operator whose one candidate had been refused
+    read "no new decision candidates found" on stdout: a false statement
+    produced by the tool itself. Printing it in the success branch too is not
+    belt-and-braces — a mixed vault writes some notes and refuses others, and
+    a green success line with nothing beside it is how a partial report reads
+    as a complete one. The single exit path below is what makes "both
+    branches" hold by construction rather than by two call sites that can
+    drift apart.
+
     Args:
         vault_path: Vault root.
         override: Tier ceiling for the fragment walk (#968). A written note's
             filename and ``title:`` are a source fragment's title verbatim.
     """
-    from creek.generate.decisions import generate_decisions
+    from creek.generate.decisions import generate_decisions, withheld_notice
 
-    written_paths = generate_decisions(vault_path, override=override)
-    if not written_paths:
+    report = generate_decisions(vault_path, override=override)
+    if report.notes:
+        rels = ", ".join(str(p.relative_to(vault_path)) for p in report.notes)
         console.print(
-            "[yellow]No decision notes generated: "
-            "no new decision candidates found.[/yellow]",
+            f"[bold green]Decision notes generated ({len(report.notes)}): "
+            f"{rels}[/bold green]",
         )
-        return
-    rels = ", ".join(str(p.relative_to(vault_path)) for p in written_paths)
-    console.print(
-        f"[bold green]Decision notes generated ({len(written_paths)}): "
-        f"{rels}[/bold green]",
-    )
+    else:
+        # The "No decision notes generated" prefix is byte-stable across both
+        # tails; only the reason varies, because claiming there were no
+        # candidates over a vault this report could not fully read is the
+        # falsehood #1487 exists to remove.
+        tail = (
+            "no new candidates among the fragments this report could read."
+            if report.withheld
+            else "no new decision candidates found."
+        )
+        console.print(f"[yellow]No decision notes generated: {tail}[/yellow]")
+    notice = withheld_notice(report.withheld)
+    if notice is not None:
+        console.print(f"[yellow]{notice}[/yellow]")
 
 
 def _report_lexicon(vault_path: Path, override: PrivacyTierOverride) -> None:
