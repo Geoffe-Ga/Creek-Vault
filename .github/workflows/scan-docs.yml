@@ -8,8 +8,9 @@ name: "Scan: Documentation drift"
 # queue-depth hopper uses to refill the Ralph backlog off-schedule.
 
 on:
-  schedule:
-    - cron: "0 9 1,15 * *"       # biweekly (1st & 15th) 09:00 UTC
+  # [tracer-phase] scheduled run disabled — see docs/tracer-phase.md
+  # schedule:
+  # - cron: "0 9 1,15 * *"       # biweekly (1st & 15th) 09:00 UTC
   workflow_dispatch:
     inputs:
       max_issues:

@@ -8,8 +8,9 @@ name: "Scan: Mutation survivors"
 # queue-depth hopper uses to refill the Ralph backlog off-schedule.
 
 on:
-  schedule:
-    - cron: "0 8 8,22 * *"       # biweekly (8th & 22nd) 08:00 UTC — expensive, schedule-only (never hopper)
+  # [tracer-phase] scheduled run disabled — see docs/tracer-phase.md
+  # schedule:
+  # - cron: "0 8 8,22 * *"       # biweekly (8th & 22nd) 08:00 UTC — expensive, schedule-only (never hopper)
   workflow_dispatch:
     inputs:
       max_issues:

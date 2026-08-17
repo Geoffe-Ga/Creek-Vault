@@ -11,9 +11,10 @@ name: "Scan: TODO/FIXME harvest"
 # queue-depth hopper uses to refill the Ralph backlog off-schedule.
 
 on:
-  schedule:
-    # Weekly Friday 08:00 UTC, per the task table. (cron is UTC.)
-    - cron: "0 8 * * 5"
+  # [tracer-phase] scheduled run disabled — see docs/tracer-phase.md
+  # schedule:
+  # # Weekly Friday 08:00 UTC, per the task table. (cron is UTC.)
+  # - cron: "0 8 * * 5"
   workflow_dispatch:
     inputs:
       max_issues:

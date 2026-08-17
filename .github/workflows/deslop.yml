@@ -25,9 +25,10 @@ name: De-Slop
 #   secret  CLAUDE_CODE_OAUTH_TOKEN  - same token the other Claude workflows use.
 
 on:
-  schedule:
-    # Mondays at 08:00 UTC. (cron is UTC; GitHub may delay under load.)
-    - cron: "0 8 * * 1"
+  # [tracer-phase] scheduled run disabled — see docs/tracer-phase.md
+  # schedule:
+  # # Mondays at 08:00 UTC. (cron is UTC; GitHub may delay under load.)
+  # - cron: "0 8 * * 1"
   workflow_dispatch:
     inputs:
       area:

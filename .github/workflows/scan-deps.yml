@@ -8,8 +8,9 @@ name: "Scan: Dependencies"
 # queue-depth hopper uses to refill the Ralph backlog off-schedule.
 
 on:
-  schedule:
-    - cron: "0 6 * * *"       # daily 06:00 UTC (Dependabot runs daily)
+  # [tracer-phase] scheduled run disabled — see docs/tracer-phase.md
+  # schedule:
+  # - cron: "0 6 * * *"       # daily 06:00 UTC (Dependabot runs daily)
   workflow_dispatch:
     inputs:
       max_issues:

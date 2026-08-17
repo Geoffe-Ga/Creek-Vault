@@ -18,8 +18,9 @@ name: "Hopper: queue-depth refill"
 # No Claude token needed — pure gh + jq queue arithmetic.
 
 on:
-  schedule:
-    - cron: "23 * * * *"        # hourly, off the :00 mark to spread API load
+  # [tracer-phase] scheduled run disabled — see docs/tracer-phase.md
+  # schedule:
+  # - cron: "23 * * * *"        # hourly, off the :00 mark to spread API load
   workflow_dispatch:
 
 permissions:

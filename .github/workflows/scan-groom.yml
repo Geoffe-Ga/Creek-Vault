@@ -26,8 +26,9 @@ name: "Scan: Backlog grooming"
 #   secret  CLAUDE_CODE_OAUTH_TOKEN  - same token the other Claude workflows use.
 
 on:
-  schedule:
-    - cron: "0 4 * * *"        # daily 04:00 UTC, before producer scans
+  # [tracer-phase] scheduled run disabled — see docs/tracer-phase.md
+  # schedule:
+  # - cron: "0 4 * * *"        # daily 04:00 UTC, before producer scans
   workflow_dispatch:
 
 # issues: write covers close / comment / edit. No contents write: groom never
