@@ -58,10 +58,29 @@ the shutoff to take effect sooner.
 
 ## The priority scheme while this is in force
 
-- **P0** — on the tracer path. Nothing else may hold P0.
-- **P1** — has an open PR; finish what is in flight.
-- **P3** — everything else, parked.
+- **P0** — on the tracer path, carrying the `tracer` label (#1523, #1524,
+  #1526), plus four tier-safety guardrails (#1031, #1106, #1212, #1529) held at
+  P0 because the tracer runs are what push real journal content across the
+  boundary they protect.
+- **P1** — has an open PR; finish what is in flight. Currently empty.
+- **P2** — real, hand-written work that is neither on the path nor in flight.
+- **P3** — parked: scan-generated findings, deferred epics, and anything blocked
+  on an upstream decision.
 
-The ~200 `scan:*`-generated P3 issues are deliberately left open and untouched.
-They stop growing now that the scans are off, they do not compete with P0/P1 in
-`pick-next.sh`, and closing them would discard real machine-found findings.
+All 323 open issues now carry exactly one tier (7 / 0 / 149 / 167). The legacy
+`priority-high` / `priority-medium` / `priority-low` labels are retired.
+
+The `scan:*`-generated P3 issues are deliberately left open and untouched. They
+stop growing now that the scans are off, they do not compete with P0/P1 in
+`pick-next.sh`, and closing them would discard real machine-found findings. The
+P2/P3 boundary is not reached during this phase; it is kept because it carries
+real signal about relative value.
+
+## Known overlap, deliberately not resolved
+
+Epics #1041 ("six config surfaces ship to every vault and are read by nothing")
+and #1316 ("six `creek/clean` modules are unreachable … the whole `cleaning.*`
+config tree is dead") cover adjacent ground and may be the same work seen from
+two angles. They were **not** merged or closed: #1316 is the parent of the live
+decomposition #1517–#1520, and the two "sixes" are different sets. This needs an
+owner decision, not an automated one.
