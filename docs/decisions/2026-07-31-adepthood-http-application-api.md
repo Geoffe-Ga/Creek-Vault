@@ -313,8 +313,9 @@ is not a semantic identity.** Creek's `share` is a fraction of the
 per-stage `fullness` is curriculum completion in `[0, 1]` with no such
 summing constraint — they are genuinely different quantities that happen to
 both be ten numbers. `docs/decisions/2026-06-30-adepthood-creek-mcp-contract.md`
-pins the shared vocabulary as *frequencies = Aspects = Stages*,
-which is correct at the naming layer; it is Adepthood's own
+pins the shared vocabulary as the APTITUDE frequency axis and aligns
+*frequencies / Aspects / Stages* **at the naming layer only**, carrying this
+paragraph's hedge explicitly; it is Adepthood's own
 `docs/creek-vault-mcp-contract.md` that currently asserts the wheel is "the
 same shape as Adepthood's local `WheelBalanceResponse`" and that the two
 vocabularies are "one vocabulary under three names" at the *numeric* layer.
