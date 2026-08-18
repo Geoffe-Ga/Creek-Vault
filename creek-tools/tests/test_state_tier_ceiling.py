@@ -3238,3 +3238,143 @@ def test_state_read_fails_closed_on_a_non_yaml_frontmatter_error(
         "not parse' from 'this is above your ceiling' — an oracle over the "
         f"artifact the caller was not admitted to. Got: {response!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# A ``creek save``-written paradox note must carry a real tier (issue #1491)
+#
+# The detector-written counterpart — ``type: paradox`` with no ``privacy_tier``
+# key at all — is covered by ``_write_liminal_paradox`` and the ``paradox`` row
+# of ``_SECTIONS``. Both are left exactly as they were: they pin the
+# *fail-closed* path, where the reader excludes a note because nobody vouched
+# for it. What follows is the path that path cannot cover, because a save does
+# write a tier key and the reader is right to believe it.
+# ---------------------------------------------------------------------------
+
+# The title is written into the vault note in the clear by
+# ``_title_only_summary`` and slugified into the filename. So every test below
+# passes an explicit title that shares no substring with the canary, and keeps
+# the canary off line 1. Without that, the correct fix still leaves the canary
+# in the vault note and the whole battery reads as "the fix does not work".
+#
+# The standing instruction survives #1505 unchanged, and the reason is worth
+# keeping straight. #1505 stopped an *untitled* save from deriving its title
+# from the body's first line above ``open`` (``writer._fallback_title``); at
+# ``open`` it still derives, and an *operator-supplied* title is still written
+# verbatim at every tier, which is exactly what these tests supply. So the
+# title remains a cleartext surface here by design, not by defect.
+_PARADOX_TITLE = "Both true at once"
+_PARADOX_SECRET = "CLEARTEXT-CANARY-1491"
+_PARADOX_BODY = (
+    "Two framings collide.\n\n"
+    + _PARADOX_SECRET
+    + " is the part that must never land in the vault."
+)
+
+_PARADOX_CONTROL_TITLE = "Two readings of one morning"
+"""Title of the ``open``-tier positive control paradox note.
+
+Shares no substring with :data:`_PARADOX_TITLE`, so the two saves slugify to
+distinct filenames and neither can be mistaken for the other in a stem list.
+"""
+
+_PARADOX_CONTROL_BODY = "A contradiction the operator is happy to publish."
+"""Body of the control note — carries no canary, because it is meant to be read."""
+
+
+def test_save_written_intimate_paradox_is_excluded_below_intimate(
+    tmp_path: Path,
+) -> None:
+    """A saved intimate paradox must not reach an open-ceiling consumer (#1491).
+
+    :func:`_write_liminal_paradox` above covers the *detector*-written paradox
+    note, which carries no ``privacy_tier`` key at all;
+    :func:`~creek.generate.state._admitted_liminal_notes` excludes it below
+    ``intimate`` by failing closed on the missing key. That fixture is
+    deliberately untouched — it pins a different note shape excluded for a
+    different reason.
+
+    This is the ``creek save``-written counterpart, and it is the shape the
+    fail-closed read cannot rescue. A save *does* write a ``privacy_tier``
+    key, so the reader believes it — and at HEAD
+    :func:`~creek.save.writer.save_to_vault` writes ``open`` onto every
+    paradox note whatever tier the operator stated. The key is present, it is
+    wrong, and an intimate-derived contradiction therefore rides into a state
+    report rendered at ``--include-tier open``. Fail-closed reading protects
+    against silence, not against a confident lie.
+
+    Today the note is admitted at all four overrides. After the fix it is
+    admitted at ``intimate`` and ``all`` only.
+
+    The ``open`` control is what stops the exclusion assertions passing for
+    the wrong reason. A reader that returned nothing at all — a missing
+    folder, a glob that stopped matching, an exception swallowed by
+    ``_safe_post`` — would satisfy "the intimate stem is absent" at every
+    override while being an outage rather than a gate, so the control is
+    asserted *present* at all four.
+
+    The note's own bytes are checked first. If the body is in the clear inside
+    the paradox note, no reader-side ceiling anywhere downstream can contain
+    it, and the admission result below would be a detail rather than the
+    finding.
+
+    The save surface is imported inside the test, matching this module's
+    convention for the #969-era surface: a change there fails this test rather
+    than collapsing the whole file into one collection-time ``ImportError``.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    from creek.classify.privacy_filter import PrivacyTierOverride
+    from creek.generate.state import _admitted_liminal_notes
+    from creek.save import TARGET_SUBDIRS, SaveRequest, SaveTarget, save_to_vault
+
+    vault = tmp_path / "save-written-paradox"
+    stub_parts = ("10-Liminal", "Compost", "intimate-stubs")
+    for parts in (*TARGET_SUBDIRS.values(), stub_parts):
+        vault.joinpath(*parts).mkdir(parents=True, exist_ok=True)
+
+    sealed = save_to_vault(
+        SaveRequest(
+            target=SaveTarget.PARADOX,
+            body=_PARADOX_BODY,
+            title=_PARADOX_TITLE,
+            tier=PrivacyTier.INTIMATE,
+            provenance=("frag-001",),
+        ),
+        vault_path=vault,
+    )
+    control = save_to_vault(
+        SaveRequest(
+            target=SaveTarget.PARADOX,
+            body=_PARADOX_CONTROL_BODY,
+            title=_PARADOX_CONTROL_TITLE,
+            tier=PrivacyTier.OPEN,
+            provenance=("frag-002",),
+        ),
+        vault_path=vault,
+    )
+
+    assert _PARADOX_SECRET not in sealed.read_text(encoding="utf-8"), (
+        "the intimate body is in the clear inside the paradox note itself, so "
+        "no reader-side ceiling downstream can contain it"
+    )
+
+    folder = vault / "10-Liminal" / "Paradoxes"
+    for override in (PrivacyTierOverride.OPEN, PrivacyTierOverride.PERSONAL):
+        stems = [stem for stem, _tier in _admitted_liminal_notes(folder, override)]
+        assert sealed.stem not in stems, (
+            "a save-written intimate paradox note was admitted at "
+            f"--include-tier {override.value}: {stems}"
+        )
+        assert control.stem in stems, (
+            f"the open control vanished at --include-tier {override.value} "
+            f"too — the reader is returning nothing, not filtering: {stems}"
+        )
+    for override in (PrivacyTierOverride.INTIMATE, PrivacyTierOverride.ALL):
+        stems = [stem for stem, _tier in _admitted_liminal_notes(folder, override)]
+        assert sealed.stem in stems, (
+            "the intimate paradox note was withheld from an entitled "
+            f"--include-tier {override.value} consumer: {stems}"
+        )
+        assert control.stem in stems

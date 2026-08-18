@@ -1299,11 +1299,91 @@ def _admitted_decision_fragments(
     return admitted, withheld
 
 
+@dataclass(frozen=True, slots=True)
+class DecisionsReport:
+    """What one :func:`generate_decisions` run wrote, and what it refused.
+
+    Deliberately a plain dataclass rather than a tuple or a
+    :class:`typing.NamedTuple`, and that is a correctness choice rather than a
+    stylistic one. ``creek_mcp/tools/report.py`` consumes this function's
+    result as ``list(generate_decisions(...))``; against an *iterable* return
+    that call site would have kept type-checking and kept running, while
+    silently yielding ``[[Path, ...], 0]`` — a list whose first element is a
+    list and whose second is an int — straight into the MCP ``report_paths``
+    envelope. A non-iterable dataclass turns the same mistake into a
+    mypy-strict error at check time and a ``TypeError`` at run time, so no
+    call site can be missed when the return value grows a field (#1487).
+
+    ``notes`` is a ``tuple``, not a ``list``, so the report is immutable
+    through and through: a caller that mistakes it for the old ``list[Path]``
+    and appends to it fails loudly instead of mutating a result nobody
+    re-reads.
+
+    Attributes:
+        notes: Paths of the Decision notes this run newly wrote, in write
+            order. Empty when there was nothing new to write.
+        withheld: How many fragments the unconditional intimate screen in
+            :func:`_admitted_decision_fragments` refused. Counts that screen
+            only — never a ceiling refusal, which is what the operator asked
+            for. :func:`withheld_notice` turns it into the wording both the
+            log and the console use.
+    """
+
+    notes: tuple[Path, ...]
+    withheld: int
+
+
+def withheld_notice(withheld: int) -> str | None:
+    """Return the operator-facing explanation of a withholding, or ``None``.
+
+    This is the **single** source of that wording. It feeds both the
+    ``logger.warning`` in :func:`generate_decisions` and the console message
+    ``creek.cli._report_decisions`` prints, so a maintainer reading a log and
+    an operator reading a terminal cannot be handed two different
+    explanations of the same refusal (#1487).
+
+    The count is stated as "fragment(s)", never "candidate(s)": it is taken
+    *before* decision detection runs, so it includes withheld fragments that
+    were never decision candidates at all.
+
+    Both remedies the notice names were checked against what the pipeline
+    actually does. ``creek classify`` assigns a tier outright to a keyless
+    note (``creek/classify/privacy_pass.py:165-169`` — the ratchet is reached
+    only for a tier already on disk), so re-running it genuinely readmits
+    one; but ``creek/classify/privacy.py:136-140`` tiers a self-authored
+    ``platform: journal`` fragment ``INTIMATE`` unconditionally, and that is
+    the commonest keyless shape, so the exception is stated rather than left
+    for the operator to discover. Editing ``privacy_tier:`` by hand is the
+    remedy for that case and for an already-recorded ``intimate``.
+
+    The wording carries no square bracket anywhere on purpose: the console it
+    reaches is a Rich console, which would eat ``[anything]`` as a style tag
+    and drop the clause from the terminal while leaving it in the log.
+
+    Args:
+        withheld: Number of fragments the intimate screen refused.
+
+    Returns:
+        The notice, or ``None`` when nothing was withheld. ``None`` rather
+        than an empty string is what keeps the notice conditional by
+        construction at both call sites.
+    """
+    if withheld <= 0:
+        return None
+    return (
+        f"{withheld} fragment(s) withheld from the decisions report: intimate "
+        "tier, or no privacy_tier key at all (which fails closed to intimate). "
+        "Re-run `creek classify` to tier a keyless note — a self-authored "
+        "journal note is tiered intimate and stays out — or set privacy_tier "
+        "by hand. A tier already recorded as intimate is never lowered."
+    )
+
+
 def generate_decisions(
     vault_path: Path,
     *,
     override: PrivacyTierOverride = PrivacyTierOverride.ALL,
-) -> list[Path]:
+) -> DecisionsReport:
     """Detect decision candidates across the vault and write new notes (#581).
 
     Loads fragments via :func:`creek.vault.reader.iter_vault_fragments` (the
@@ -1350,28 +1430,35 @@ def generate_decisions(
             helper for why the reader is the fail-closed one and why this rule
             is non-defeasible where compost's ``skip_intimate`` is a default.
 
-            One consequence is worth stating plainly, because it is
-            irreversible from inside the pipeline: ``privacy_tier`` is a
-            one-way ratchet (``creek/vault/writer.py`` — even ``creek classify
-            --force`` merges through ``escalate``, which never lowers a tier),
-            so once a fragment is intimate, or is a hand-written note with no
-            ``privacy_tier:`` key at all, it is excluded from this report until
-            somebody edits that note's front matter by hand. That is the only
-            way back in.
+            How a screened fragment gets back in is worth stating precisely,
+            because getting it wrong prints a false remedy at the operator.
+            The ``privacy_tier`` ratchet binds a tier **already recorded on
+            disk** (``creek/classify/privacy_pass.py:165-169``: ``escalate``
+            is reached only on the ``not assigning`` branch), so an explicit
+            ``intimate`` is never lowered by ``creek classify``, even with
+            ``--force``, and a hand edit of the front matter is the only way
+            back in for that fragment. A note with **no** ``privacy_tier:``
+            key is not ratcheted at all — ``needs_tier`` is ``True`` when the
+            key is absent, so ``creek classify`` assigns it a tier outright
+            and can readmit it. The caveat that decides the common case:
+            ``creek/classify/privacy.py:136-140`` classifies a self-authored
+            ``platform: journal`` fragment ``INTIMATE`` unconditionally, so
+            for the commonest keyless shape re-running ``creek classify``
+            does *not* readmit it, and a hand edit of ``privacy_tier:`` is
+            again the remedy.
 
     Returns:
-        Paths of the newly written Decision notes; empty when there are no new
-        decision candidates — or when every candidate was screened.
+        A :class:`DecisionsReport` carrying the newly written note paths and
+        the number of fragments the intimate screen withheld. ``notes`` is
+        empty when there are no new decision candidates — or when every
+        candidate was screened, and telling those two cases apart is exactly
+        why ``withheld`` travels back to the caller instead of dying in the
+        log (#1487).
     """
     fragments, withheld = _admitted_decision_fragments(vault_path, override)
-    if withheld:
-        logger.warning(
-            "%d fragment(s) withheld from the decisions report: intimate tier, "
-            "or no privacy_tier key at all (which fails closed to intimate). "
-            "Re-run `creek classify`, or set privacy_tier by hand, to include "
-            "them.",
-            withheld,
-        )
+    notice = withheld_notice(withheld)
+    if notice is not None:
+        logger.warning("%s", notice)
     detector = DecisionDetector()
     already = _existing_decision_fragment_ids(vault_path)
     written: list[Path] = []
@@ -1380,4 +1467,4 @@ def generate_decisions(
             continue
         written.append(detector.create_decision_note(candidate, vault_path))
         already.add(candidate.fragment_id)
-    return written
+    return DecisionsReport(notes=tuple(written), withheld=withheld)

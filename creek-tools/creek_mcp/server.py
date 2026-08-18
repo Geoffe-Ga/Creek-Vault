@@ -467,10 +467,10 @@ def build_server(
         content: str,
         external_id: str,
         timestamp: str | None = None,
-        tier: str = "open",
+        tier: str | None = None,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Ingest one Adepthood journal entry as a vault fragment (idempotent)."""
+        """Ingest one journal entry as a fragment, idempotently; ``tier`` required."""
         return journal_ingest_tool(
             vault_path=vault,
             content=content,
@@ -487,10 +487,10 @@ def build_server(
         content_base64: str,
         external_id: str,
         timestamp: str | None = None,
-        tier: str = "open",
+        tier: str | None = None,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Stage one uploaded document's bytes and ingest it as a vault fragment."""
+        """Stage one uploaded document and ingest it; ``tier`` required."""
         return upload_tool(
             vault_path=vault,
             filename=filename,
@@ -578,7 +578,10 @@ def build_server(
         dry_run: bool = False,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Author a draft for a query via the Writing Desk."""
+        """Author a draft for a query via the Writing Desk.
+
+        ``max_rounds`` defaults to the vault's ``author.max_author_rounds`` (3).
+        """
         return author_tool(
             vault_path=vault,
             query=query,
@@ -595,7 +598,7 @@ def build_server(
         target: str,
         body: str,
         title: str | None = None,
-        tier: str = "open",
+        tier: str | None = None,
         provenance: list[str] | None = None,
         source_kind: str = "mcp",
         source_id: str | None = None,
@@ -603,7 +606,7 @@ def build_server(
         full_body: bool = False,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Save a Discord/Claude answer back into the vault."""
+        """Save a Discord/Claude answer back into the vault; ``tier`` required."""
         return save_tool(
             vault_path=vault,
             target=target,

@@ -16,8 +16,8 @@ The `generate` family of commands turns a classified, linked vault into the arte
 | `wavelength`     | `05-Wavelength/<period>-<date>.md`         | `creek.generate.wavelength` |
 | `synchronicity`  | `05-Wavelength/Synchronicities/`           | `creek.generate.synchronicity` |
 | `decision`       | `08-Decisions/<fragment>.md`               | `creek.generate.decisions` — see [`decisions.md`](decisions.md) |
-| `paradox`        | `04-Praxis/Paradoxes/`                     | `creek.generate.paradox` |
-| `compost`        | `04-Praxis/Compost/`                       | `creek.generate.compost` |
+| `paradox`        | `10-Liminal/Paradoxes/`                    | `creek.generate.paradox` |
+| `compost`        | `10-Liminal/Compost/`                      | `creek.generate.compost` |
 | `unnamed`        | `10-Liminal/Unnamed-Digest-<period>.md`    | `creek.generate.unnamed` |
 | `tags`           | `00-Creek-Meta/Tags/`                      | `creek.generate.tags` |
 | `lexicon`        | `09-Reference/Lexicon.md`                  | `creek.generate.lexicon` |
@@ -104,7 +104,7 @@ Every section except **Pre-LLM yield** narrows with the ceiling, and the artefac
 | 1 | Wavelength snapshot | Surveys the admitted corpus only. `Fragments observed:` is a per-tier count, and a count discloses the existence of what the rest of the report omitted. |
 | 2 | Vault summary | Same: counts and the frequency histogram are over admitted fragments, and the eddy/thread counts count *admitted* eddies and threads, so §2 cannot contradict §5/§6. |
 | 3 | Pre-LLM yield | **Ungated, deliberately.** The last line of `run-summary.jsonl` describes one pipeline *run* — a run id, a timestamp and four integers — and names no fragment, so there is nothing in it to filter by. |
-| 4 | Liminal Watch | A note is admitted only if its *raw* front matter is within the ceiling. `10-Liminal/Paradoxes/` notes are `type: paradox` and have no `privacy_tier` field in their model at all, so **they fail closed to `intimate` and disappear below `--include-tier intimate`**. Any hand-written note missing the key behaves the same way. |
+| 4 | Liminal Watch | A note is admitted only if its *raw* front matter is within the ceiling. `10-Liminal/Paradoxes/` has two producers and they gate differently. **Detector-written** notes (`creek report --type paradox`, via `creek.generate.paradox.create_paradox_note`) are `type: paradox` with no `privacy_tier` field in their model at all, so **they fail closed to `intimate` and disappear below `--include-tier intimate`** — not because they were classified but because nobody vouched for them. **Save-written** notes (`creek save --target paradox`) carry an explicit `privacy_tier` and are gated by it, so an `open` paradox save is admitted at `--include-tier open` and an `intimate` one is not (#1491). Any hand-written note missing the key behaves like the detector case. |
 | 5 | Active eddies | `Eddy` carries no `privacy_tier`, so its tier is *derived*: the maximum over the tiers of every fragment whose `eddies` wikilinks name it. An eddy with one `open` and one `intimate` member is `intimate`. **An eddy no fragment names has no tier evidence at all and is admitted only at `intimate` or broader** — including the "no fragments loaded, fall back to the stored `fragment_count`" path. |
 | 6 | Active threads | The same rule over `threads` wikilinks. |
 | 7 | Surprising connections | A row survives only when *both* endpoint ids resolve to admitted fragments. |

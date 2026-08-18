@@ -1998,6 +1998,14 @@ def test_report_decisions_no_candidates_is_friendly(tmp_path: Path) -> None:
     The handler is now real (not the #579 stub): an empty corpus prints the
     "no new decision candidates" message, writes nothing, and never emits the
     old "Would generate" stub text.
+
+    This is also the ``withheld == 0`` arm of #1487, and the two assertions
+    added for it are what keep the withheld notice *conditional*. The notice
+    must not appear — on stdout or stderr — for a vault where nothing was
+    refused, and the empty-vault tail must keep saying "no new decision
+    candidates found" rather than being flattened into the ``withheld > 0``
+    wording. ``result.output`` is deliberate for the negative: it folds stderr
+    in under click 8.4, so it also proves no spurious ``logger.warning`` fired.
     """
     vault = tmp_path / "vault"
     (vault / "00-Creek-Meta").mkdir(parents=True)
@@ -2011,6 +2019,14 @@ def test_report_decisions_no_candidates_is_friendly(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "No decision notes generated" in result.output
     assert "Would generate" not in result.output
+    assert "withheld" not in result.output, (
+        "#1487: nothing was refused on this vault, so the withheld notice "
+        f"must not print at all. output={result.output!r}"
+    )
+    assert "nonewdecisioncandidatesfound." in _squashed(result.stdout), (
+        "#1487: the withheld == 0 tail must stay byte-identical; only the "
+        f"withheld > 0 arm gets new wording. stdout={result.stdout!r}"
+    )
 
 
 def test_report_decisions_generates_note(tmp_path: Path) -> None:
@@ -2063,9 +2079,17 @@ def test_report_decisions_withholds_a_fragment_with_no_privacy_tier_key(
     The consequence is deliberately made loud rather than silent. ``creek
     report`` otherwise prints "no new decision candidates found", which for a
     hand-written or legacy vault would be a false statement produced by the
-    fix; the withheld count in the log is what distinguishes "nothing to
-    report" from "something was refused". Only the count is logged — never an
-    id and never a title, since the title is the leaking value.
+    fix; the withheld count is what distinguishes "nothing to report" from
+    "something was refused". Only the count is disclosed — never an id and
+    never a title, since the title is the leaking value.
+
+    Since #1487 that count reaches the operator on **stdout** as well as the
+    log, and the two strings come from one
+    :func:`creek.generate.decisions.withheld_notice` so they cannot drift.
+    This test keeps pinning the log half — ``creek`` is a library as well as a
+    CLI, and the warning is what a non-CLI embedder sees. The stdout half is
+    pinned by
+    ``test_report_decisions_announces_the_withheld_count_on_stdout`` below.
     """
     vault = tmp_path / "vault"
     (vault / "00-Creek-Meta").mkdir(parents=True)
@@ -2114,15 +2138,20 @@ filename it derives from the title, and the filename is the surface under test.
 """
 
 
-def _seed_intimate_decision_vault(tmp_path: Path) -> Path:
+def _seed_intimate_decision_vault(tmp_path: Path, *, with_open: bool = True) -> Path:
     """Build a vault whose only decision candidate is an ``intimate`` fragment.
 
     A second, ``open`` fragment rides along as the positive control: without it
     a "the canary is absent" assertion is satisfied by a command that printed
-    nothing at all.
+    nothing at all. ``with_open=False`` drops that control deliberately, for
+    the #1487 tests that need a vault where *every* fragment is refused and the
+    report therefore takes its empty branch — the arm where the headline says
+    "no new candidates among the fragments this report could read".
 
     Args:
         tmp_path: Pytest temporary directory.
+        with_open: Write the ``open`` positive-control fragment. Keyword-only
+            and defaulting to ``True`` so the #1431 callers are unchanged.
 
     Returns:
         The vault root.
@@ -2138,14 +2167,47 @@ def _seed_intimate_decision_vault(tmp_path: Path) -> Path:
         "source:\n  platform: journal\n  author: self\n---\nbody\n",
         encoding="utf-8",
     )
-    (frags / "frag-open.md").write_text(
-        "---\ntype: fragment\nid: frag-open\n"
-        'title: "Should I buy a bicycle"\n'
-        "privacy_tier: open\n"
+    if with_open:
+        (frags / "frag-open.md").write_text(
+            "---\ntype: fragment\nid: frag-open\n"
+            'title: "Should I buy a bicycle"\n'
+            "privacy_tier: open\n"
+            "source:\n  platform: journal\n  author: self\n---\nbody\n",
+            encoding="utf-8",
+        )
+    return vault
+
+
+def _write_keyless_decision_fragment(vault: Path, frag_id: str, title: str) -> Path:
+    """Write a hand-authored decision fragment with **no** ``privacy_tier:`` key.
+
+    This shape cannot be produced by dumping a :class:`~creek.models.Fragment`
+    — ``VaultWriter._write_model`` serialises ``model_dump(mode="json")`` and
+    therefore always states the key — so it is written literally. It is the
+    fragment shape the #1487 report actually meets in a hand-written or legacy
+    vault: ``raw_privacy_tier`` fails closed to ``intimate``, the fragment is
+    withheld, and before the fix the operator was told "no new decision
+    candidates found".
+
+    Args:
+        vault: Vault root (must already exist).
+        frag_id: Fragment id, also the filename stem.
+        title: Fragment title. Must open with "Should I" or the detector never
+            flags it.
+
+    Returns:
+        The path written.
+    """
+    frags = vault / "01-Fragments" / "Conversations"
+    frags.mkdir(parents=True, exist_ok=True)
+    path = frags / f"{frag_id}.md"
+    path.write_text(
+        f"---\ntype: fragment\nid: {frag_id}\n"
+        f'title: "{title}"\n'
         "source:\n  platform: journal\n  author: self\n---\nbody\n",
         encoding="utf-8",
     )
-    return vault
+    return path
 
 
 def _squashed(text: str) -> str:
@@ -2269,6 +2331,270 @@ def test_fill_report_decisions_step_never_echoes_an_intimate_title(
     assert not leaked, f"intimate title in an 08-Decisions filename: {leaked}"
 
 
+# ---------------------------------------------------------------------------
+# #1487 — the withheld count must reach the operator on stdout, in both branches
+#
+# Every positive assertion below targets ``result.stdout`` (or
+# ``console.capture()``), never ``result.output``. Under click 8.4
+# ``Result.output`` folds stderr in, so ``"withheld" in result.output`` is
+# already True at HEAD purely from the ``logger.warning`` — a vacuous assertion
+# that would declare #1487 fixed while the operator's terminal still says "no
+# new decision candidates found". The negatives use ``result.output``, where
+# folding stderr in makes the guard strictly stronger.
+# ---------------------------------------------------------------------------
+
+_WITHHELD_HEADLINE = (
+    "No decision notes generated: no new candidates among the fragments "
+    "this report could read."
+)
+"""Headline for the empty branch when something *was* refused (#1487).
+
+The ``No decision notes generated`` prefix is byte-identical to the
+``withheld == 0`` headline pinned above; only the tail differs, because saying
+"no new decision candidates found" over a vault the report could not fully read
+is the false statement this issue exists to remove.
+"""
+
+_WITHHELD_NOTICE_TAIL = "A tier already recorded as intimate is never lowered."
+"""Closing sentence of the withheld notice (#1487).
+
+Asserted alongside the count-bearing head so that a truncated or reworded
+notice cannot satisfy the tests by printing its first clause alone. The exact
+full wording is pinned once, in
+``tests/test_decisions.py::test_withheld_notice_states_the_exact_remedy``.
+"""
+
+
+def _withheld_notice_head(count: int) -> str:
+    """Return the count-bearing opening clause of the #1487 withheld notice.
+
+    Args:
+        count: The number of withheld fragments the notice must state.
+
+    Returns:
+        The literal (unsquashed) opening clause.
+    """
+    return f"{count} fragment(s) withheld from the decisions report"
+
+
+def test_report_decisions_announces_the_withheld_count_on_stdout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A keyless-only vault says so on stdout, not just in the log (#1487).
+
+    The reported defect, exactly: one hand-authored fragment with no
+    ``privacy_tier:`` key, the fail-closed screen refuses it, and stdout says
+    "no new decision candidates found" — a false statement, because there *was*
+    a candidate and the report simply could not read it. The count reached
+    ``logger.warning`` and died there.
+
+    Kills three mutants:
+
+    * deleting the ``console.print`` while leaving the ``logger.warning`` —
+      the assertions read ``result.stdout``, which excludes the log;
+    * ``if (notice := …) is not None:`` degraded to ``if False:``;
+    * keeping the ``withheld == 0`` tail on the ``withheld > 0`` branch.
+
+    Only the *count* may be disclosed: the canary assertion pins that the
+    withheld fragment's title never appears, in the sanitiser-proof
+    ``[A-Za-z0-9-]`` shape and through :func:`_squashed`, so an 80-column
+    mid-token wrap cannot hide a leak.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    _write_keyless_decision_fragment(
+        vault,
+        "frag-notier",
+        f"Should I leave my marriage with {_INTIMATE_DECISION_CANARY}",
+    )
+    monkeypatch.setattr(console, "width", 80)
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "decisions", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    squashed = _squashed(result.stdout)
+    assert _squashed(_withheld_notice_head(1)) in squashed, (
+        "#1487: the withheld count never reached stdout; the operator was "
+        f"told nothing was found. stdout={result.stdout!r}"
+    )
+    assert _squashed(_WITHHELD_NOTICE_TAIL) in squashed, (
+        "#1487: the notice was truncated — the operator got a count with no "
+        f"remedy and no ratchet caveat. stdout={result.stdout!r}"
+    )
+    assert _squashed(_WITHHELD_HEADLINE) in squashed, (
+        "#1487: the empty-branch headline must stop claiming 'no new decision "
+        f"candidates found' when a fragment was refused. stdout={result.stdout!r}"
+    )
+    assert _INTIMATE_DECISION_CANARY not in _squashed(result.output), (
+        "#1487: the notice must disclose a count and nothing else — naming "
+        f"the fragment moves the leak, it does not fix it. output={result.output!r}"
+    )
+    assert not list((vault / "08-Decisions").rglob("*.md"))
+
+
+def test_report_decisions_announces_the_withheld_count_alongside_written_notes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The notice prints in the *non-empty* branch too (#1487).
+
+    This is the half of the defect that survives a literal reading of AC1. On a
+    mixed vault the report writes ``Should-I-buy-a-bicycle`` and, before the
+    fix, says nothing whatsoever about the fragment it refused: the operator
+    sees a green success line and has no way to know the report was partial.
+    Fixing only the empty branch leaves this exactly as it was.
+
+    Kills the mutant that prints the notice from inside the ``if not
+    notes:`` early return — one exit path, two branches, one notice.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    vault = _seed_intimate_decision_vault(tmp_path)
+    monkeypatch.setattr(console, "width", 80)
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "decisions", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    squashed = _squashed(result.stdout)
+    assert "Decisionnotesgenerated" in squashed, (
+        "the open fragment's note was not announced, so the withheld "
+        "assertion below proves nothing about the success branch. "
+        f"stdout={result.stdout!r}"
+    )
+    assert "Should-I-buy-a-bicycle" in squashed, (
+        f"the admitted note was not named on stdout. stdout={result.stdout!r}"
+    )
+    assert _squashed(_withheld_notice_head(1)) in squashed, (
+        "#1487: a partial report announced its successes and stayed silent "
+        f"about its refusal. stdout={result.stdout!r}"
+    )
+    assert _squashed(_WITHHELD_NOTICE_TAIL) in squashed, (
+        f"#1487: the notice was truncated. stdout={result.stdout!r}"
+    )
+    assert _INTIMATE_DECISION_CANARY not in _squashed(result.output), (
+        "#1431/#1487: the withheld fragment's title reached the terminal. "
+        f"output={result.output!r}"
+    )
+
+
+def test_report_decisions_withheld_notice_states_the_real_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two withheld fragments are reported as two, not as one (#1487).
+
+    The count is interpolated, never spelled. This is the killer for a notice
+    that hardcodes ``1`` — or that reports ``len(something_else)`` — and it is
+    why the negative half matters as much as the positive: ``"2 fragment(s)"``
+    present is satisfied by a notice printed twice, once per fragment, each
+    claiming ``1``.
+
+    The two withheld fragments are deliberately different shapes — one
+    explicitly ``privacy_tier: intimate``, one keyless and failing closed —
+    because the count must span both refusal reasons the notice names.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    vault = _seed_intimate_decision_vault(tmp_path, with_open=False)
+    _write_keyless_decision_fragment(
+        vault,
+        "frag-notier",
+        "Should I sell the house",
+    )
+    monkeypatch.setattr(console, "width", 80)
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "decisions", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    squashed = _squashed(result.stdout)
+    assert _squashed(_withheld_notice_head(2)) in squashed, (
+        "#1487: two fragments were refused and the notice did not say two. "
+        f"stdout={result.stdout!r}"
+    )
+    assert _squashed(_withheld_notice_head(1)) not in _squashed(result.output), (
+        "#1487: the withheld count is hardcoded or per-fragment — the notice "
+        f"claimed one refusal on a vault with two. output={result.output!r}"
+    )
+    assert _squashed(_WITHHELD_HEADLINE) in squashed, (
+        "#1487: nothing could be read, so the headline must not claim there "
+        f"were no candidates. stdout={result.stdout!r}"
+    )
+    assert not list((vault / "08-Decisions").rglob("*.md"))
+
+
+def test_fill_report_decisions_step_announces_the_withheld_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``creek fill`` ``report/decisions`` step announces refusals too (#1487).
+
+    ``fill`` is the unattended surface, and the one that states
+    ``PrivacyTierOverride.ALL`` for every step because it has no
+    ``--include-tier`` of its own — so it is the run most likely to refuse
+    something and the run least likely to have anybody watching a log. The
+    notice must reach the same console the step's other output goes to.
+
+    Kills the mutant that puts the ``console.print`` in the ``creek report``
+    command body rather than in the shared ``_report_decisions`` helper both
+    surfaces call.
+
+    The production ``_build_fill_steps`` plan is built and its real
+    ``report/decisions`` lambda invoked, rather than driving the whole command:
+    ``fill``'s first step instantiates a ``SentenceTransformer`` and reaches
+    for model weights over the network.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    from creek.cli import _build_fill_steps, _load_config_for_vault
+
+    vault = _seed_intimate_decision_vault(tmp_path)
+    monkeypatch.setattr(console, "width", 80)
+
+    steps = dict(
+        _build_fill_steps(vault, _load_config_for_vault(vault), with_compost=False),
+    )
+    assert "report/decisions" in steps
+    with console.capture() as captured:
+        steps["report/decisions"]()
+
+    squashed = _squashed(captured.get())
+    assert "Should-I-buy-a-bicycle" in squashed, (
+        "the open fragment's note was not announced by the fill step, so the "
+        f"assertions below prove nothing. output={captured.get()!r}"
+    )
+    assert _squashed(_withheld_notice_head(1)) in squashed, (
+        "#1487: the fill step refused a fragment without telling the console. "
+        f"output={captured.get()!r}"
+    )
+    assert _squashed(_WITHHELD_NOTICE_TAIL) in squashed, (
+        f"#1487: the notice was truncated. output={captured.get()!r}"
+    )
+    assert _INTIMATE_DECISION_CANARY not in squashed, (
+        "#1431/#1487: the withheld fragment's title reached the console. "
+        f"output={captured.get()!r}"
+    )
+
+
 def test_report_lexicon_no_exemplars_is_friendly(tmp_path: Path) -> None:
     """``report --type lexicon`` on a vault with no exemplars is friendly (#580).
 
@@ -2306,18 +2632,48 @@ def test_report_rhetorical_patterns_no_exemplars_is_friendly(tmp_path: Path) -> 
     assert "No rhetorical patterns written" in result.output
 
 
-def test_report_rhetorical_patterns_generates(tmp_path: Path) -> None:
-    """``report --type rhetorical-patterns`` writes a per-register note (#582)."""
-    vault = tmp_path / "vault"
-    (vault / "00-Creek-Meta").mkdir(parents=True)
+def _seed_rhetorical_patterns_vault(vault: Path, *, tier_line: str) -> Path:
+    """Seed *vault* with one exemplar-qualifying fragment for the patterns report.
+
+    *tier_line* is spliced into the frontmatter verbatim, so a caller passes
+    either ``"privacy_tier: open\\n"`` or ``""`` — the empty string being the
+    only way to produce a file that never declared a tier at all, which is the
+    state #1212 is about and which no model-serialising helper can express.
+
+    Args:
+        vault: Vault root to create.
+        tier_line: The ``privacy_tier`` frontmatter line, or ``""`` to omit it.
+
+    Returns:
+        *vault*, for chaining.
+    """
+    (vault / "00-Creek-Meta").mkdir(parents=True, exist_ok=True)
     frags = vault / "01-Fragments" / "Journal"
-    frags.mkdir(parents=True)
+    frags.mkdir(parents=True, exist_ok=True)
     (frags / "ex-1.md").write_text(
         '---\ntype: fragment\nid: ex-1\ntitle: "T"\n'
+        f"{tier_line}"
         "source:\n  platform: journal\n  author: self\n"
         "voice:\n  voice_register: confessional\n  confidence: conviction\n"
         "---\nThe truth is we rise; as I said before, we rise.\n",
         encoding="utf-8",
+    )
+    return vault
+
+
+def test_report_rhetorical_patterns_generates(tmp_path: Path) -> None:
+    """``report --type rhetorical-patterns`` writes a per-register note (#582).
+
+    The fixture states ``privacy_tier: open`` explicitly (#1212). It used to
+    omit the key, which made this test depend on the very defect #1212 fixes:
+    an untiered fragment reaching the voice corpus at the CLI's default
+    ``ALL`` ceiling. Stating the tier keeps the test about *rhetorical-pattern
+    generation* rather than about tier admission, which
+    ``test_report_rhetorical_patterns_refuses_an_untiered_fragment`` owns.
+    """
+    vault = _seed_rhetorical_patterns_vault(
+        tmp_path / "vault",
+        tier_line="privacy_tier: open\n",
     )
 
     result = runner.invoke(
@@ -2328,6 +2684,56 @@ def test_report_rhetorical_patterns_generates(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "Rhetorical patterns written" in result.output
     assert (vault / "07-Voice" / "Rhetorical-Patterns" / "confessional.md").exists()
+
+
+def test_report_rhetorical_patterns_refuses_an_untiered_fragment(
+    tmp_path: Path,
+) -> None:
+    """A fragment with no ``privacy_tier`` key produces no patterns (#1212 AC1).
+
+    AC1 names ``rhetorical-patterns`` explicitly, and this is the surface as
+    the operator meets it: a bare ``creek report --type rhetorical-patterns``,
+    with no ``--include-tier``, which the CLI resolves to
+    ``PrivacyTierOverride.ALL``. At that ceiling the raw-frontmatter gate
+    short-circuits to "admit", leaving only the model-reading consent gate —
+    which sees Pydantic's ``unclassified`` default and cannot tell that the
+    file said nothing at all.
+
+    Both arms run, over two vaults identical but for that one frontmatter
+    line, because the negative arm alone is worthless: ``No rhetorical
+    patterns written`` is also what a vault the walk never reached would
+    print, and what a mis-typed fixture, a bad body, or an unqualifying
+    confidence would print. The positive arm is what proves the refusal is
+    about the tier.
+    """
+    untiered = _seed_rhetorical_patterns_vault(
+        tmp_path / "untiered-vault",
+        tier_line="",
+    )
+    tiered = _seed_rhetorical_patterns_vault(
+        tmp_path / "tiered-vault",
+        tier_line="privacy_tier: open\n",
+    )
+
+    refused = runner.invoke(
+        app,
+        ["report", "--type", "rhetorical-patterns", "--vault", str(untiered)],
+    )
+    admitted = runner.invoke(
+        app,
+        ["report", "--type", "rhetorical-patterns", "--vault", str(tiered)],
+    )
+
+    assert admitted.exit_code == 0, admitted.output
+    assert "Rhetorical patterns written" in admitted.output, (
+        "the tiered arm wrote nothing, so the untiered arm's silence says "
+        f"nothing about the tier. output={admitted.output!r}"
+    )
+    assert (tiered / "07-Voice" / "Rhetorical-Patterns" / "confessional.md").is_file()
+
+    assert refused.exit_code == 0, refused.output
+    assert "No rhetorical patterns written" in refused.output
+    assert not (untiered / "07-Voice" / "Rhetorical-Patterns").exists()
 
 
 def test_report_mode_profiles_no_data_is_friendly(tmp_path: Path) -> None:

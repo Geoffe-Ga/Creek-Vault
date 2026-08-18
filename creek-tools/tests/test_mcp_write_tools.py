@@ -17,7 +17,7 @@ import frontmatter
 import pytest
 
 from creek.classify.llm.router import ModelRouter
-from creek.classify.privacy_filter import PrivacyTierOverride
+from creek.classify.privacy_filter import PrivacyTierOverride, tier_sensitivity
 from creek.cli import _REPORT_DISPATCH
 from creek.compile.engine import PARADOX_LOG_RELPATH
 from creek.config import LLMConfig, LLMRoutingConfig
@@ -269,6 +269,352 @@ def test_save_refuses_unknown_tier(vault: Path) -> None:
     )
     assert result["status"] == "refused"
     assert "unknown tier" in result["reason"]
+
+
+def test_save_refuses_when_tier_is_omitted(vault: Path) -> None:
+    """Omitting ``tier`` is refused; the tool never picks a tier for you.
+
+    At HEAD ``save_tool``'s signature carries ``tier: str = "open"``, so this
+    exact call returns ``{'status': 'ok', 'created_tier': 'open'}`` and files
+    a body derived from an ``intimate`` fragment in the clear under
+    ``10-Liminal/Unnamed`` — the MCP half of #1434, matching the CLI's
+    ``_resolve_save_tier`` fail-open. A caller that does not state a tier
+    gets a structured refusal instead, on both transports.
+
+    Args:
+        vault: Vault fixture.
+    """
+    body = "Derived from an intimate fragment; never file this in the clear."
+    result = save_tool(
+        vault_path=vault,
+        target="unnamed",
+        body=body,
+        title="Derived via MCP",
+        provenance=["frag-intimate-001"],
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "refused"
+    assert "tier is required" in result["reason"]
+    assert list((vault / "10-Liminal" / "Unnamed").glob("*.md")) == []
+    # An audit entry for the refusal is permitted but not required here; if
+    # one was written it must not carry the body verbatim, mirroring
+    # ``test_save_refuses_when_tier_exceeds_ceiling``.
+    audit_path = vault / MCP_AUDIT_RELPATH
+    if audit_path.exists():
+        assert body not in audit_path.read_text(encoding="utf-8")
+
+
+def test_save_at_unclassified_redacts_the_body_under_a_personal_ceiling(
+    vault: Path,
+) -> None:
+    """An ``unclassified`` MCP save must not file its body in the clear (#1508).
+
+    The machine-reachable half of #1508: no operator in the loop. A client at
+    ``ceiling=personal`` — the ordinary configuration, not a privileged one —
+    could call ``creek.save`` with ``tier="unclassified"`` and land the body
+    unredacted in the vault note, because
+    :func:`~creek.classify.privacy_filter.pre_save_filter` branched on
+    ``tier == PrivacyTier.PERSONAL`` and ``unclassified`` matched neither of
+    its two named tiers. Choosing the *less* specific tier produced *more*
+    exposure — the exact inverse of the one-way ratchet the save path enforces
+    everywhere else.
+
+    **Admission is correct here and must stay correct.** ``personal`` is the
+    lowest ceiling that admits ``unclassified`` (#961), so ``status == "ok"``
+    is the right answer and this test must not be read as "the ceiling should
+    have refused it". The defect is what happens *after* admission, which is
+    why the assertion is on the bytes of the written note rather than on the
+    tool's verdict.
+
+    ``created_tier`` is pinned alongside, because the other tempting wrong fix
+    is to silently upgrade the stamp to ``personal``: that would redact the
+    body while rewriting a tier the caller stated, and every downstream
+    consumer keys on the stamp.
+
+    The title is deliberately innocuous and shares no substring with the
+    canary. ``_title_only_summary`` writes it into the vault note in the clear
+    and ``_compose_base_name`` slugifies it into the filename, so a title
+    carrying the canary would leave the correct fix looking broken — the
+    standing instruction recorded at ``tests/test_save.py:240-252``.
+
+    Args:
+        vault: Vault fixture.
+    """
+    canary = "MCP-CANARY-1508"
+    body = f"line one {canary}\nline two innocuous"
+
+    result = save_tool(
+        vault_path=vault,
+        target="unnamed",
+        body=body,
+        title="Innocuous Title",
+        tier="unclassified",
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+
+    assert result["status"] == "ok", (
+        "ceiling=personal is the lowest ceiling that admits unclassified "
+        f"(#961); the tool answered {result!r}"
+    )
+    assert result["created_tier"] == "unclassified", (
+        "the caller stated tier=unclassified and the tool reported "
+        f"{result['created_tier']!r}"
+    )
+
+    written = list((vault / "10-Liminal" / "Unnamed").glob("*.md"))
+    assert len(written) == 1, f"expected exactly one saved note, got {written}"
+    raw = written[0].read_text(encoding="utf-8")
+    assert canary not in raw, (
+        f"an unclassified MCP save left the body in the clear at {written[0]}:\n\n{raw}"
+    )
+    assert "[Tier-redacted summary: Innocuous Title]" in raw, (
+        "the note carries neither the body nor the title-only summary; the "
+        f"caller's content was lost rather than redacted:\n\n{raw}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# save — the created tier the caller stated is the tier written (issue #1491)
+# ---------------------------------------------------------------------------
+
+# The title is written into the vault note in the clear by
+# ``_title_only_summary`` and slugified into the filename. So every test below
+# passes an explicit title that shares no substring with the canary, and keeps
+# the canary off line 1. Without that, the correct fix still leaves the canary
+# in the vault note and the whole battery reads as "the fix does not work".
+#
+# The standing instruction survives #1505 unchanged, and the reason is worth
+# keeping straight. #1505 stopped an *untitled* save from deriving its title
+# from the body's first line above ``open`` (``writer._fallback_title``); at
+# ``open`` it still derives, and an *operator-supplied* title is still written
+# verbatim at every tier, which is exactly what these tests supply. So the
+# title remains a cleartext surface here by design, not by defect.
+_PARADOX_TITLE = "Both true at once"
+_PARADOX_SECRET = "CLEARTEXT-CANARY-1491"
+_PARADOX_BODY = (
+    "Two framings collide.\n\n"
+    + _PARADOX_SECRET
+    + " is the part that must never land in the vault."
+)
+
+_STUB_PREFIX = "10-Liminal/Compost/intimate-stubs"
+"""The only place under the vault an intimate body may legitimately appear."""
+
+
+def _files_containing(vault: Path, needle: str) -> list[str]:
+    """Return every vault-relative path whose *bytes* contain *needle*.
+
+    Walks the whole vault rather than the one subtree the leak was expected
+    in: over MCP a single ``save`` writes a note, possibly a stub, and an
+    audit row, so scoping the search to the target folder would miss two of
+    the three.
+
+    ``read_bytes`` over ``rglob("*")`` rather than ``read_text`` over
+    ``rglob("*.md")``, the same shape as
+    ``tests/test_purge_voice_artifacts.py``'s helper and for the same reason:
+    residue is not confined to markdown (``mcp.jsonl`` is not), and a text
+    read raises on the first undecodable byte instead of reporting a leak.
+
+    Args:
+        vault: Vault root.
+        needle: The sentinel to search for.
+
+    Returns:
+        POSIX-style vault-relative paths, sorted, so a failure message names
+        the offending files in a stable order.
+    """
+    probe = needle.encode("utf-8")
+    return sorted(
+        path.relative_to(vault).as_posix()
+        for path in vault.rglob("*")
+        if path.is_file() and probe in path.read_bytes()
+    )
+
+
+def test_save_paradox_intimate_does_not_leak_and_reports_the_true_tier(
+    vault: Path,
+) -> None:
+    """The response, the audit row, and the note must agree — and be right.
+
+    Issue #1491 over the MCP transport. Today this is a three-way
+    *disagreement*: ``save_tool`` returns ``created_tier: "intimate"``, appends
+    ``created_tier: "intimate"`` to the hash-chained log at
+    ``00-Creek-Meta/audit/mcp.jsonl`` — and
+    :func:`~creek.save.writer.save_to_vault` stamps the note ``open`` and
+    writes the body in full, because it rewrites ``paradox`` to ``open``
+    before filtering.
+
+    That combination is worse than the leak alone. An auditor reading the
+    tamper-evident log sees an intimate note filed by an entitled caller and
+    has no reason to look further, while the body sits in the clear in a
+    folder any ``ceiling=open`` reader can reach. A log that is trustworthy
+    about its own integrity and wrong about its content is an oracle pointing
+    the wrong way.
+
+    So all three are asserted against each other, and the on-disk value is
+    asserted twice — ``!= "open"`` names the specific regression, ``==
+    "intimate"`` refuses a fix that merely hardens to something else.
+
+    Args:
+        vault: Vault fixture.
+    """
+    result = save_tool(
+        vault_path=vault,
+        target="paradox",
+        body=_PARADOX_BODY,
+        title=_PARADOX_TITLE,
+        tier="intimate",
+        privacy_tier_ceiling=TierCeiling.ALL,
+        provenance=["frag-001"],
+    )
+
+    assert result["status"] == "ok", result
+    note = vault / result["saved_path"]
+    on_disk = frontmatter.load(str(note))["privacy_tier"]
+    assert on_disk != "open", (
+        "an intimate paradox save was filed at open — the tier the caller "
+        "stated was discarded on the way to disk"
+    )
+    assert on_disk == "intimate"
+
+    carriers = _files_containing(vault, _PARADOX_SECRET)
+    assert carriers, (
+        "the intimate body reached no file under the vault at all — it was "
+        "lost rather than sealed"
+    )
+    stray = [path for path in carriers if not path.startswith(_STUB_PREFIX)]
+    assert stray == [], (
+        "the intimate body is readable outside the gitignored intimate-stubs "
+        f"directory: {stray}"
+    )
+
+    assert result["created_tier"] == on_disk, (
+        f"the response claims {result['created_tier']!r} while the note on "
+        f"disk says {on_disk!r}"
+    )
+    assert _read_audit(vault)[-1]["created_tier"] == on_disk, (
+        "the tamper-evident audit log records a tier the note does not carry"
+    )
+
+
+_CEILING_CASES = [
+    (target, tier, ceiling)
+    for target in ("paradox", "unnamed", "thread")
+    for tier in (PrivacyTier.OPEN, PrivacyTier.PERSONAL, PrivacyTier.INTIMATE)
+    for ceiling in TierCeiling
+    if write_tier_allowed(tier, ceiling)
+]
+"""Every ``(target, tier, ceiling)`` the write-side gate actually admits.
+
+Filtered through :func:`~creek_mcp.tier_ceiling.write_tier_allowed` itself
+rather than transcribed, so the table cannot drift from the predicate it is
+meant to exercise: a policy change that admits or refuses a new pair moves
+these rows with it instead of leaving a hand-written copy quietly wrong.
+
+``paradox`` leads the target axis because it is the #1491 defect; ``unnamed``
+and ``thread`` are the controls that say the invariant belongs to ``save``
+rather than to one target's branch.
+"""
+
+_CEILING_IDS = [
+    f"{target}-{tier.value}-ceiling-{ceiling.value}"
+    for target, tier, ceiling in _CEILING_CASES
+]
+"""Readable node ids, one per row of :data:`_CEILING_CASES`, positionally parallel."""
+
+
+def test_ceiling_case_table_is_not_empty() -> None:
+    """The admitted-pairs table must have rows, and paradox must be among them.
+
+    A comprehension with a predicate can evaporate: tighten
+    :func:`~creek_mcp.tier_ceiling.write_tier_allowed` far enough and
+    :data:`_CEILING_CASES` becomes ``[]``, at which point the parametrised
+    test below stops running and reports nothing — a green gate over zero
+    privacy coverage. Three separate guards, because they fail for different
+    reasons:
+
+    * a non-empty table, against total evaporation;
+    * the exact row count, against silent shrinkage (nine admitted
+      ``(tier, ceiling)`` pairs — four for ``open``, three for ``personal``,
+      two for ``intimate`` — across three targets);
+    * ``paradox`` present by name, because it is the one target #1491 is
+      about and a filter that dropped it would leave the suite looking
+      thorough and testing the wrong thing.
+    """
+    assert len(_CEILING_CASES) > 0
+    assert len(_CEILING_CASES) == 27
+    assert len(set(_CEILING_IDS)) == 27
+    assert "paradox" in {case[0] for case in _CEILING_CASES}
+
+
+@pytest.mark.parametrize(
+    ("target", "tier", "ceiling"),
+    _CEILING_CASES,
+    ids=_CEILING_IDS,
+)
+def test_save_ceiling_never_widens_or_narrows_the_created_tier(
+    vault: Path,
+    target: str,
+    tier: PrivacyTier,
+    ceiling: TierCeiling,
+) -> None:
+    """An admitted save is written at exactly the tier the caller stated (#1491).
+
+    The ceiling is an *admission* gate — "may this caller create content this
+    sensitive?" — and once it has said yes it has no further say. It must not
+    round the created tier up toward itself, and it must certainly not round
+    it down: ``paradox`` at ``intimate`` under ``ceiling=all`` is admitted and
+    then filed at ``open``, which is the defect.
+
+    Both directions are asserted separately so a failure says which one broke,
+    and both rank through
+    :func:`~creek.classify.privacy_filter.tier_sensitivity` rather than a rank
+    table written here — this repository keeps four tier rankings that
+    disagree about ``unclassified`` on purpose, and a fifth invented in a test
+    file would be a fifth opinion nobody reconciled.
+
+    The last assertion closes the loop back to the gate: whatever landed on
+    disk must itself be admissible under the ceiling the caller declared.
+    Without it, "equals the requested tier" would still hold if both the
+    request and the write drifted above the ceiling together.
+
+    Args:
+        vault: Vault fixture.
+        target: The save target.
+        tier: The tier the caller states.
+        ceiling: The caller's declared ceiling.
+    """
+    title = f"{_PARADOX_TITLE} via {target} at {tier.value} under {ceiling.value}"
+    result = save_tool(
+        vault_path=vault,
+        target=target,
+        body=_PARADOX_BODY,
+        title=title,
+        tier=tier.value,
+        privacy_tier_ceiling=ceiling,
+        provenance=["frag-001"],
+    )
+
+    assert result["status"] == "ok", result
+    note = vault / result["saved_path"]
+    on_disk = PrivacyTier(frontmatter.load(str(note))["privacy_tier"])
+    assert tier_sensitivity(on_disk) >= tier_sensitivity(tier), (
+        f"an admitted {target} save asked for {tier.value} and was filed as "
+        f"{on_disk.value} — the write weakened the caller's tier"
+    )
+    assert tier_sensitivity(on_disk) <= tier_sensitivity(tier), (
+        f"an admitted {target} save asked for {tier.value} and was filed as "
+        f"{on_disk.value} — the ceiling rounded the created tier up"
+    )
+    assert on_disk is tier
+    assert write_tier_allowed(on_disk, ceiling), (
+        f"the note landed at {on_disk.value}, which ceiling "
+        f"{ceiling.value!r} does not admit"
+    )
+    if tier is PrivacyTier.INTIMATE:
+        assert _PARADOX_SECRET not in note.read_text(encoding="utf-8"), (
+            f"an intimate {target} save left the body in the clear at {note}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -838,6 +1184,19 @@ def test_report_decisions_generates_note(vault: Path) -> None:
     here — this test is about *whether a Decision note is written*, and the
     ceiling behaviour it now depends on is pinned by
     ``tests/test_mcp_report_tier_ceiling.py``.
+
+    Since #1487 the ``report_paths`` assertion is elementwise, and that is the
+    behavioural backstop for this tool's one line of glue.
+    ``creek_mcp/tools/report.py`` does ``list(generate_decisions(...))``, and
+    ``generate_decisions`` now returns a two-field report rather than a list of
+    paths. Had that report been a tuple or a NamedTuple, the ``list(...)``
+    would have kept working and started yielding ``[[Path, …], 0]`` — one list
+    and one int — into this envelope. The old ``any("08-Decisions/Active" in p
+    …)`` would have raised ``TypeError`` on the int rather than failing on the
+    contract, and would have been just as satisfied by a single correct entry
+    beside any amount of junk. Asserting every entry is a ``str`` that ends
+    ``.md`` and starts ``08-Decisions/Active/`` is green before the refactor,
+    green after it, and red under exactly that regression.
     """
     frags = vault / "01-Fragments" / "Notes"
     frags.mkdir(parents=True, exist_ok=True)
@@ -855,7 +1214,12 @@ def test_report_decisions_generates_note(vault: Path) -> None:
     )
     assert result["status"] == "ok"
     assert result["report_type"] == "decisions"
-    assert any("08-Decisions/Active" in p for p in result["report_paths"])
+    active = "08-Decisions/Active/"
+    report_paths = result["report_paths"]
+    assert report_paths, "the decisions report announced no written note"
+    assert all(isinstance(p, str) for p in report_paths), report_paths
+    assert all(p.endswith(".md") for p in report_paths), report_paths
+    assert all(p.startswith(active) for p in report_paths), report_paths
     assert _read_audit(vault)[-1]["tool"] == "creek.report"
 
 
@@ -2638,3 +3002,104 @@ class TestLinkAdvisoryFields:
             "oversized_discarded",
         ):
             assert isinstance(result[key], int), key
+
+
+# ---------------------------------------------------------------------------
+# save — an untitled save must not title itself from line 1 (issue #1505)
+# ---------------------------------------------------------------------------
+
+_UNTITLED_SECRET = "CLEARTEXT-CANARY-1505"
+"""Sentinel standing in for whatever the operator's first line actually says.
+
+Named apart from :data:`_PARADOX_SECRET` on purpose: that one is kept *off*
+line 1 so the #1491 battery cannot be confused by this defect, and this one is
+put *on* line 1 because being on line 1 is the entire exposure. One shared
+constant would make the two batteries impossible to tell apart on a failure.
+
+Built from characters ``slugify_filename`` preserves verbatim
+(``creek/save/_slug.py:80-84`` keeps ``[\\w-]`` and does not lower-case), so it
+survives into the filename unchanged — a canary the slug rewrote would make
+the search below miss a filename that is still leaking.
+"""
+
+_UNTITLED_BODY = (
+    f"{_UNTITLED_SECRET} is the body's first line.\n\n"
+    "The rest of the answer, which nobody derives a title from."
+)
+"""An intimate body whose secret sits on the line ``_derive_title`` reads."""
+
+
+def test_untitled_intimate_save_over_mcp_leaks_no_first_line(vault: Path) -> None:
+    """An untitled intimate MCP save must seal line 1, not publish it (#1505).
+
+    The CLI half of this is pinned in ``tests/test_save.py``; this is the same
+    defect reached through :func:`~creek_mcp.tools.save.save_tool`, where it
+    has a third carrier the CLI does not have. When no ``title`` is supplied,
+    :func:`~creek.save.writer._shape_for_target` derives one from the body's
+    first line, and that derived string reaches:
+
+    * the frontmatter ``title:`` of a note stamped ``privacy_tier: intimate``;
+    * the note's **filename**, via ``_compose_base_name``'s slugify; and
+    * ``created_path`` in the hash-chained audit log at
+      ``00-Creek-Meta/audit/mcp.jsonl`` — so the tamper-evident record of the
+      save is itself a copy of the leak, in a file whose whole purpose is to
+      be readable by someone auditing what the tool did.
+
+    **The vacuous-test trap this test is shaped to avoid.**
+    ``save_tool`` refuses ``tier="intimate"`` under the default
+    ``privacy_tier_ceiling=TierCeiling.OPEN`` (``creek_mcp/tools/save.py:84-95``)
+    and returns *before* ``save_to_vault`` ever runs. Written the obvious way
+    — default ceiling, then "assert the canary is nowhere" — this test passes
+    against a note that was never written, at every commit, forever. So the
+    ceiling is widened to ``ALL`` and ``status == "ok"`` is asserted **first**,
+    the same shape
+    :func:`test_save_paradox_intimate_does_not_leak_and_reports_the_true_tier`
+    uses two hundred lines up.
+
+    The search then goes through :func:`_files_containing`, which byte-walks
+    the *whole* vault rather than the target folder — the note, the stub and
+    the audit row live in three different subtrees, so a scoped search would
+    miss two of the three. Presence is asserted before absence: a fix that
+    dropped the intimate body on the floor would satisfy every "not here"
+    claim while destroying the operator's answer.
+
+    The audit row is then asserted to *exist* and to name a real note before
+    its contents are checked, for the same reason. ``_files_containing``
+    covers ``created_path`` only transitively — a save that skipped auditing
+    altogether would leave nothing to find and pass the byte-walk in
+    silence, which is the exact shape of the vacuous pass this test is built
+    to refuse.
+
+    Args:
+        vault: Vault fixture.
+    """
+    result = save_tool(
+        vault_path=vault,
+        target="thread",
+        body=_UNTITLED_BODY,
+        tier="intimate",
+        privacy_tier_ceiling=TierCeiling.ALL,
+        provenance=["frag-001"],
+    )
+
+    assert result["status"] == "ok", result
+
+    carriers = _files_containing(vault, _UNTITLED_SECRET)
+    assert carriers, (
+        "the intimate body reached no file under the vault at all — it was "
+        "lost rather than sealed"
+    )
+    audit = _read_audit(vault)
+    assert audit, "the save wrote no audit row at all"
+    created_path = str(audit[-1]["created_path"])
+    assert created_path.endswith(".md"), created_path
+
+    stray = [path for path in carriers if not path.startswith(_STUB_PREFIX)]
+    assert stray == [], (
+        "an untitled intimate save put the body's first line outside the "
+        f"gitignored intimate-stubs directory: {stray}"
+    )
+    assert _UNTITLED_SECRET not in created_path, (
+        "the hash-chained audit log records the leaked slug in "
+        f"created_path: {created_path!r}"
+    )

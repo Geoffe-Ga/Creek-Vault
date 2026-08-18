@@ -25,8 +25,8 @@ The system fails closed: when in doubt, restrict.
 |---|---|
 | Source classifier returns ambiguous or low-confidence privacy signal | `personal` |
 | Source classifier raises, the file is unreadable, or the tier field is missing | `intimate` |
-| Fragment touches an intimate-tier source even briefly during a conversation | `intimate` (the conversation inherits the most-restrictive contributing tier) |
-| Liminal note (Paradox / Unnamed / Synchronicity / Compost) | inherits the most-restrictive tier of its contributing fragments |
+| Fragment touches an intimate-tier source even briefly during a conversation | `intimate` (the conversation inherits the most-restrictive contributing tier — a rule the *agent* applies when it picks the `--tier`/`tier` value for a derived save; `creek save` and `creek.save` never compute this themselves) |
+| Liminal note (Paradox / Unnamed / Synchronicity / Compost) | inherits the most-restrictive tier of its contributing fragments — the agent determines that tier and passes it explicitly; the tooling does not derive it |
 | Reflection or save generated during a session that touched intimate content | `intimate` until the human explicitly down-tiers, per `save.SKILL.md` |
 
 The rule, in one line: **ambiguous → `personal`; unknown → `intimate`.** Never `open`.
@@ -52,8 +52,8 @@ Two flow-level rules that override the table:
 1. **Never write `tier: open` by default.** When the source classifier is silent, write `personal` (or `intimate`, per the fail-closed table).
 2. **Never include a personal-tier body in a generation prompt without `--include-tier personal` (or higher).** Title + summary is the default contract.
 3. **Never include an intimate-tier fragment in any generation flow without explicit consent on file.** A `--include-tier intimate` flag without consent fails closed.
-4. **Never let a Liminal note bypass tier inheritance.** A Paradox between a `personal` and an `intimate` fragment is `intimate`.
-5. **Never silently down-tier.** A `creek save` that touched intimate content saves as `intimate` unless the human explicitly down-tiers per `save.SKILL.md`'s consent flag.
+4. **Never let a Liminal note bypass tier inheritance.** An Unnamed / Synchronicity / Compost note derived from a `personal` and an `intimate` fragment is saved with `--tier intimate`. **Paradox is not an exception**: `creek save --target paradox` honours the tier you pass, diverting an intimate body to the gitignored stub directory while the paradox note itself still lands in `10-Liminal/Paradoxes/` — see `paradox.SKILL.md` rule 5.
+5. **Never silently down-tier.** `creek save`, `creek.save`, `creek.journal` and `creek.upload` all refuse outright when `--tier`/`tier` is omitted — there is no default and no inheritance. If the source content touched intimate material, the calling agent must determine that and pass `--tier intimate` (or `tier: "intimate"` over MCP) itself; the tool never infers or downgrades a tier on its own. This matters most on `creek.journal`: ordinary journaling is `personal` by the table above and escalates to `intimate` for recovery, trauma or sexuality, so an omitted tier that defaulted to `open` filed exactly the material rule 1 exists to protect in the clear ([Creek-Vault#1494](https://github.com/Geoffe-Ga/Creek-Vault/issues/1494)).
 
 ## Frontmatter
 
@@ -64,7 +64,7 @@ privacy_tier: open | personal | intimate
 consent: explicit | inherited      # required when tier is intimate
 ```
 
-`consent: explicit` requires a human-confirmed flag at the operation that produced the note (via `--consent` or interactive prompt). `consent: inherited` is acceptable only when the originating fragment already carries `consent: explicit`.
+`consent: explicit` requires a human-confirmed consent record at the operation that produced the note (an interactive prompt or documented human sign-off). `consent: inherited` is acceptable only when the originating fragment already carries `consent: explicit`.
 
 ## Canonical taxonomy
 

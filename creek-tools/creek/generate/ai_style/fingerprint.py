@@ -28,8 +28,14 @@ reasoning behind each verdict are **not** restated here.
 above are a summary of it, kept short deliberately, and if they ever
 disagree with it the parser's own docstring is the one that is right.
 
-Pure and deterministic; reads fragment bodies only (never frontmatter
-values), and writes a single JSON artifact under the vault.
+Pure and deterministic. Every *measured* feature is computed from
+fragment bodies alone; frontmatter is read only to decide eligibility and
+weight (``source.author``/``source.platform``, ``privacy_tier``,
+``audience``, ``representativeness``), never as a feature value. The tier
+read among those goes through
+:func:`creek.classify.privacy_filter.raw_privacy_tier` so this module has
+no tier opinion of its own (#1529). Writes a single JSON artifact under
+the vault.
 """
 
 from __future__ import annotations
@@ -42,9 +48,11 @@ from typing import TYPE_CHECKING
 import frontmatter
 import yaml
 
+from creek.classify.privacy_filter import raw_privacy_tier
 from creek.generate.ai_style.features import FINGERPRINT_FEATURES
 from creek.generate.ai_style.model import FeatureStat, VoiceFingerprint
 from creek.ingest.turns import CONVERSATION_PLATFORMS, split_conversation_body
+from creek.models import PrivacyTier
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -67,7 +75,6 @@ stale baseline keep scoring drafts.
 
 _FRAGMENTS_SUBDIR = "01-Fragments"
 _SELF = "self"
-_INTIMATE = "intimate"
 
 # The *merged* pre-split rendering marked its turns inside the blockquote:
 #   > **User**: ...        > **Assistant**: ...
@@ -185,6 +192,18 @@ def _audience_factor(
     is preserved. Missing values fall back to ``1.0`` so a new enum member never
     silently zeroes a fragment.
 
+    ``privacy_tier`` is the one axis exempt from that fall-back, because on
+    this path a zero is a **membership gate** (see :func:`_eligible_texts`)
+    and the tier is a one-way ratchet. It is resolved through
+    :func:`creek.classify.privacy_filter.raw_privacy_tier`, the repo's single
+    fail-closed raw-frontmatter reader, so an *absent*, empty, or unparseable
+    key weighs exactly as a declared ``intimate`` rather than as the
+    ``unclassified`` this defaulted to until #1529. The point is that the
+    multiplier cannot disagree with the admission gate above it about the same
+    file: two tier opinions inside one module is the bug class #1529 is, not a
+    style question. An explicit ``unclassified`` is untouched — it says out
+    loud what it is, and ranks with ``personal`` (#876/#961).
+
     Args:
         metadata: The fragment's frontmatter mapping.
         platform: The fragment's ``source.platform``.
@@ -201,7 +220,7 @@ def _audience_factor(
         1.0,
     )
     privacy = weighting.privacy_tier_authority.get(
-        str(metadata.get("privacy_tier", "unclassified")),
+        raw_privacy_tier(metadata).value,
         1.0,
     )
     representativeness = weighting.representativeness_authority.get(
@@ -224,9 +243,13 @@ def _eligible_texts(
     Applies the authorship filter (self-authored only; for a conversation
     platform, the human half its body shape identifies — see
     :func:`_user_text`) and the privacy policy (intimate excluded unless
-    *include_intimate*). When *audience_weighting* is supplied, each fragment's
-    weight is additionally multiplied by its audience-authority factor so
-    audience-facing documents dominate the fingerprint (#633).
+    *include_intimate*, where "intimate" is whatever
+    :func:`creek.classify.privacy_filter.raw_privacy_tier` says — so a
+    fragment with no ``privacy_tier`` key, an empty one, or an unparseable
+    one is excluded too, #1529). When *audience_weighting* is supplied,
+    each fragment's weight is additionally multiplied by its
+    audience-authority factor so audience-facing documents dominate the
+    fingerprint (#633).
 
     Args:
         vault_path: Vault root.
@@ -264,7 +287,14 @@ def _eligible_texts(
         # it; only `source.author != self`.
         if not isinstance(source, dict) or source.get("author") != _SELF:
             continue
-        if not include_intimate and post.metadata.get("privacy_tier") == _INTIMATE:
+        # Fail closed on the tier, through the one shared raw reader. This walk
+        # never builds a `Fragment`, so it cannot use `fragment_tier`; asking
+        # the frontmatter directly (`.get("privacy_tier") == "intimate"`, as
+        # this did until #1529) answers `False` for a file with no key at all
+        # and *admits* it — a raw read that fails open. `raw_privacy_tier`
+        # resolves absent/empty/unparseable to INTIMATE, which is refusal here.
+        tier = raw_privacy_tier(post.metadata)
+        if not include_intimate and tier is PrivacyTier.INTIMATE:
             continue
         platform = str(source.get("platform", "other"))
         text = _user_text(platform, post.content)

@@ -61,7 +61,7 @@ env:
   # by the pip-audit step, so this pin must stay on a release with no open
   # advisories (0.11.16 clears GHSA-w476-p2h3-79g9 / CVE-2025-13327 /
   # GHSA-pjjw-68hj-v9mw); bump it deliberately when pip-audit flags a newer
-  # one. Hoisted to workflow scope in #1141 so the four jobs that install it
+  # one. Hoisted to workflow scope in #1141 so the five jobs that install it
   # cannot drift apart on a security-relevant version.
   UV_PINNED_VERSION: '0.11.16'
   COVERAGE_THRESHOLD: 90
@@ -494,19 +494,60 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Cache pip dependencies
+      - name: Cache uv
         uses: actions/cache@v6
         with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-crawdad-${{ matrix.python-version }}-${{ hashFiles('crawdad/pyproject.toml') }}
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-crawdad-${{ matrix.python-version }}-${{ hashFiles('crawdad/uv.lock') }}
           restore-keys: |
-            ${{ runner.os }}-pip-crawdad-${{ matrix.python-version }}-
-            ${{ runner.os }}-pip-crawdad-
+            ${{ runner.os }}-uv-crawdad-${{ matrix.python-version }}-
+            ${{ runner.os }}-uv-crawdad-
 
-      - name: Install dependencies
+      - name: Install uv
+        run: python -m pip install "uv==${UV_PINNED_VERSION}"
+
+      - name: Install dependencies (locked)
+        # Provision from crawdad/uv.lock (#1501). The retired
+        # `pip install -e ".[dev]"` was a live PyPI resolve: pip reads
+        # neither uv.lock nor [tool.uv].constraint-dependencies, so the
+        # lock this project relocks and audits governed nothing that
+        # gated a merge. Measured drift at the time of the fix: 38 of
+        # 105 packages, including the gate's own toolchain (ruff, mypy,
+        # pytest) — CI was enforcing a different quality bar than the
+        # one committed here.
+        #
+        # Export-then-install into the SYSTEM Python, not
+        # `uv sync --locked`. uv sync provisions crawdad/.venv, while
+        # every gate script shells out to BARE tool names
+        # (crawdad/scripts/lint.sh:15, format.sh:17, typecheck.sh:8,
+        # docstrings.sh:8, complexity.sh:8, test.sh:26), so a virtualenv
+        # install fails check-all.sh with `ruff: command not found`.
+        # Only `--system` puts the console scripts where those scripts
+        # look for them.
+        #
+        # `--no-hashes` is load-bearing: `uv pip install -r` demands a
+        # hash for every requirement as soon as the file carries any.
+        # crawdad/scripts/security.sh deliberately KEEPS hashes on its
+        # own export, so `pip-audit --disable-pip` can resolve offline —
+        # the two exports differ on purpose; do not unify them.
+        #
+        # The temp file is crawdad-scoped. creek-tools' jobs export to
+        # /tmp/locked-requirements.txt; one shared name would be a
+        # single path holding either project's pinned set.
+        #
+        # Note what is gone: `pip install --upgrade pip setuptools
+        # wheel`. That line installed setuptools UNBOUNDED, walking past
+        # the setuptools>=83.0.0,<85.0.0 band in
+        # [build-system].requires (#1258) — and past that band's guard
+        # too, since crawdad/tests/test_dependency_pins.py walks
+        # pyproject.toml and a workflow line is invisible to a pyproject
+        # walk. Build tooling is now declared in `.[dev]` and decided by
+        # the lock like everything else.
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          pip install -e ".[dev]"
+          uv export --locked --all-extras --no-emit-project --no-hashes \
+            -o /tmp/crawdad-locked-requirements.txt
+          uv pip install --system -r /tmp/crawdad-locked-requirements.txt
+          uv pip install --system --no-deps -e .
 
       - name: Run check-all.sh
         # Single source of truth: identical script developers run locally.

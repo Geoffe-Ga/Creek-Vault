@@ -924,8 +924,14 @@ class PreSaveFilterResult:
     """Outcome of :func:`pre_save_filter`.
 
     Attributes:
-        vault_body: Markdown body to write into the vault note. For
-            non-open tiers this is a title-only summary.
+        vault_body: Markdown body to write into the vault note. The
+            full body at ``open`` rank, and at the ranks above it when
+            *full_body* was passed and the tier is below ``intimate``'s
+            rank; a title-only summary otherwise. See
+            :func:`pre_save_filter` for the two thresholds — "non-open"
+            was wrong in both directions, having never held for
+            ``unclassified`` (#1508) and still not holding for
+            ``personal --full-body``.
         stub_body: Full body destined for the gitignored intimate-stub
             file, or ``None`` when the tier does not require off-vault
             stashing.
@@ -964,14 +970,34 @@ def pre_save_filter(
 ) -> PreSaveFilterResult:
     """Apply tier-aware redaction to a ``creek save`` body.
 
-    The contract follows FEAT-009's "privacy enforcement" block:
+    The contract follows FEAT-009's "privacy enforcement" block, stated
+    as two thresholds on the tier's **rank** in :data:`_TIER_RANK` — read
+    through :func:`tier_sensitivity` — rather than as equality against
+    two named members, so a tier added later fails closed by default
+    instead of falling through to the verbatim return:
 
-    * ``open`` — full body is written into the vault.
-    * ``personal`` — body is replaced with a title-only summary unless
-      *full_body* is explicitly ``True``.
-    * ``intimate`` — body is replaced with a title-only summary in the
-      vault, and the full body is routed to the gitignored
-      ``10-Liminal/Compost/intimate-stubs/`` directory.
+    * rank at or above ``intimate``'s — ``intimate``, and any tier the
+      table has never heard of — writes a title-only summary into the
+      vault and routes the full body to the gitignored
+      ``10-Liminal/Compost/intimate-stubs/`` directory. *full_body* is
+      ignored here.
+    * rank above ``open``'s — ``personal`` and ``unclassified``, which
+      rank together at ``1`` (#876/#961) — writes a title-only summary
+      unless *full_body* is explicitly ``True``.
+    * rank ``open`` writes the full body.
+
+    #1508: the two equality tests this replaced let ``unclassified``
+    match neither and fall through to the verbatim return, so an
+    unclassified save wrote its body into the vault note in the clear —
+    while the MCP ceiling was simultaneously treating that same tier as
+    sensitive enough to need a ``personal`` ceiling. The two halves of
+    the privacy system disagreed about one tier. Ranking also makes save
+    agree with the **read** side, which already normalises
+    ``UNCLASSIFIED`` to ``PERSONAL`` in :func:`_effective_tier` before
+    applying :func:`_allows_full_personal_body`; *full_body* is
+    therefore honoured at ``unclassified`` exactly as it is at
+    ``personal``, because a save stricter than the read it feeds would
+    contradict the very ranking this fix is built on.
 
     Args:
         body: The raw answer body the operator wants to file back.
@@ -979,19 +1005,26 @@ def pre_save_filter(
             ``--tier``.
         title: Optional title — used to compose the title-only summary
             and the stub filename.
-        full_body: When ``True``, allow personal-tier bodies through
-            unredacted. Ignored for ``intimate``.
+        full_body: When ``True``, allow personal- and unclassified-tier
+            bodies through unredacted. Ignored for ``intimate`` and for
+            any unranked tier.
 
     Returns:
         A :class:`PreSaveFilterResult` describing what to write where.
     """
-    if tier == PrivacyTier.INTIMATE:
+    rank = tier_sensitivity(tier)
+    # Order is load-bearing, not stylistic: an intimate save with
+    # ``full_body=False`` satisfies both thresholds, and only this one
+    # stashes the body. Below the summary branch it would return
+    # ``stub_body=None`` — destroying the operator's body instead of
+    # diverting it.
+    if rank >= _TIER_RANK[PrivacyTier.INTIMATE]:
         return PreSaveFilterResult(
             vault_body=_title_only_summary(title),
             stub_body=body,
             stub_relpath=_stub_relpath_for(title),
         )
-    if tier == PrivacyTier.PERSONAL and not full_body:
+    if rank > _TIER_RANK[PrivacyTier.OPEN] and not full_body:
         return PreSaveFilterResult(
             vault_body=_title_only_summary(title),
             stub_body=None,

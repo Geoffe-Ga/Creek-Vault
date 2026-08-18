@@ -195,6 +195,7 @@ def test_call_tool_journal_ingests_entry_idempotently(vault: Path) -> None:
         "content": "A registered journal entry.",
         "external_id": "adep-srv-1",
         "timestamp": "2026-06-20T10:00:00+00:00",
+        "tier": "personal",
         "privacy_tier_ceiling": "personal",
     }
     first = _structured(
@@ -322,6 +323,152 @@ def test_call_tool_save_through_mcp(vault: Path) -> None:
     assert structured["tool"] == "creek.save"
 
 
+def test_call_tool_save_through_mcp_refuses_without_tier(vault: Path) -> None:
+    """The registered tool must refuse an omitted ``tier``, not default it.
+
+    ``creek_mcp.tools.save.save_tool`` dropping its ``tier="open"`` default
+    is not enough on its own: ``build_server``'s ``creek.save`` wrapper
+    carries a second, independent default and forwards it explicitly. If
+    that one regressed to ``"open"``, every unit test against ``save_tool``
+    would stay green while the actual MCP transport — the surface the
+    deployed SKILL files instruct agents to call — kept filing
+    intimate-derived bodies in the clear. This drives the real registered
+    tool so both defaults are pinned (issue #1434).
+    """
+    for relparts in (
+        ("10-Liminal", "Unnamed"),
+        ("00-Creek-Meta", "audit"),
+    ):
+        (vault.joinpath(*relparts)).mkdir(parents=True, exist_ok=True)
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
+    )
+    body = "Derived from an intimate fragment; never file this in the clear."
+    result = asyncio.run(
+        server.call_tool(
+            "creek.save",
+            {
+                "target": "unnamed",
+                "body": body,
+                "title": "Derived via MCP",
+                "provenance": ["frag-intimate-001"],
+                "privacy_tier_ceiling": "open",
+            },
+        ),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "refused"
+    assert "tier is required" in str(structured["reason"])
+    assert list((vault / "10-Liminal" / "Unnamed").glob("*.md")) == []
+
+
+def test_call_tool_journal_through_mcp_refuses_without_tier(vault: Path) -> None:
+    """``creek.journal`` must refuse an omitted ``tier``, not default it to open.
+
+    The wrapper default at ``creek_mcp/server.py:470`` is a SECOND, independent
+    default: ``_journal`` declares its own ``tier: str = "open"`` and forwards
+    it explicitly, so it is what a caller who omits the key actually gets.
+    Reverting only that wrapper — while keeping the fix in
+    ``creek_mcp/tools/journal.py`` — was measured through this same transport
+    to restore ``status: ok`` with ``privacy_tier: open`` stamped on the
+    fragment on disk, while every tool-level unit test in
+    ``tests/test_mcp_journal.py`` stayed green. Only a test driven through the
+    registered tool can see that, which is why this one exists (#1494).
+
+    The reason substring is load-bearing, not cosmetic: ``PrivacyTier(None)``
+    raises ``ValueError``, so deleting the ``tier is None`` guard still yields
+    ``status: refused`` — with reason ``unknown tier None``. A status-only
+    assertion cannot tell the fix from its absence.
+
+    The payload carries content no vault should hold in the clear, and the
+    filesystem is asserted on directly: a refusal that had already staged the
+    entry would be a correct-looking response over a leak.
+    """
+    for relparts in (
+        ("01-Fragments", "Journal"),
+        ("00-Creek-Meta", "adepthood", "journal"),
+        ("00-Creek-Meta", "audit"),
+    ):
+        (vault.joinpath(*relparts)).mkdir(parents=True, exist_ok=True)
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
+    )
+    result = asyncio.run(
+        server.call_tool(
+            "creek.journal",
+            {
+                "content": "I relapsed last night and I have not told anyone.",
+                "external_id": "j-no-tier-1",
+                "privacy_tier_ceiling": "open",
+            },
+        ),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "refused"
+    assert "tier is required" in str(structured["reason"])
+    assert list((vault / "01-Fragments" / "Journal").glob("*.md")) == []
+    assert list((vault / "00-Creek-Meta" / "adepthood" / "journal").glob("*")) == []
+    # The whole tree, not only the expected leaf: which subdirectory the
+    # markdown ingestor files a journal entry under is its business, and a
+    # glob aimed at the wrong folder would pass while the entry sat in
+    # another one.
+    assert list((vault / "01-Fragments").rglob("*.md")) == []
+
+
+def test_call_tool_upload_through_mcp_refuses_without_tier(vault: Path) -> None:
+    """``creek.upload`` must refuse an omitted ``tier``, not default it to open.
+
+    The twin of the journal case, and it needs its own test because the
+    defaults are its own: ``creek_mcp/server.py:490`` carries a ``tier: str =
+    "open"`` that is independent both of ``creek_mcp/tools/upload.py``'s and of
+    the journal wrapper's. Fixing three of the four and shipping is how this
+    defect survives, so all four are pinned separately (#1494).
+
+    ``"tier is required"`` is asserted rather than only ``refused`` because
+    ``PrivacyTier(None)`` raises, so the guard's absence still produces a
+    refusal — reading ``unknown tier None`` — and a status-only assertion
+    would pass over the restored default.
+
+    The staging dir and the fragment tree are both asserted empty: the upload
+    tool stages bytes to disk before ingesting them, so a document that
+    reached staging under a defaulted ``open`` is on disk in the clear
+    whatever the response says.
+    """
+    for relparts in (
+        ("00-Creek-Meta", "adepthood", "uploads"),
+        ("01-Fragments", "Unsorted"),
+        ("00-Creek-Meta", "audit"),
+    ):
+        (vault.joinpath(*relparts)).mkdir(parents=True, exist_ok=True)
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
+    )
+    result = asyncio.run(
+        server.call_tool(
+            "creek.upload",
+            {
+                "filename": "notes.md",
+                "content_base64": base64.b64encode(b"# Note\n\nbody\n").decode(
+                    "ascii",
+                ),
+                "external_id": "u-no-tier-1",
+                "privacy_tier_ceiling": "open",
+            },
+        ),
+    )
+    structured = _structured(result)
+    assert structured["status"] == "refused"
+    assert "tier is required" in str(structured["reason"])
+    assert list((vault / "00-Creek-Meta" / "adepthood" / "uploads").glob("*")) == []
+    assert list((vault / "01-Fragments" / "Unsorted").glob("*.md")) == []
+    # As above: the routed subdirectory is the ingestor's choice, so the
+    # emptiness claim is made over the whole fragment tree as well.
+    assert list((vault / "01-Fragments").rglob("*.md")) == []
+
+
 def test_every_tool_requires_privacy_tier_ceiling_parameter(vault: Path) -> None:
     """The FEAT-010 acceptance criterion: ceiling is in every tool's schema.
 
@@ -340,6 +487,45 @@ def test_every_tool_requires_privacy_tier_ceiling_parameter(vault: Path) -> None
         schema = tool.inputSchema
         assert "privacy_tier_ceiling" in schema["properties"], (
             f"{tool.name} missing privacy_tier_ceiling in its input schema"
+        )
+
+
+def test_no_write_tool_advertises_a_default_tier(vault: Path) -> None:
+    """No registered tool may publish a ``default`` for ``tier`` (#1494).
+
+    The forcing function, and the only assertion here that catches the *class*
+    rather than the instance. The published input schema is the surface MCP
+    clients read: a ``default`` on ``tier`` tells every client that omitting
+    the field is a supported call whose meaning the server has already chosen.
+    That default is generated from the ``build_server`` wrapper's own signature
+    and is independent of the tool function's, so a guard added in
+    ``creek_mcp/tools/*.py`` alone leaves the advertised contract unchanged.
+
+    It would have caught both #1434 (``creek.save``) and #1494
+    (``creek.journal`` / ``creek.upload``) at the point either was written, and
+    it catches the next one: a write verb added in a year with ``tier: str =
+    "open"`` fails HERE, with nobody involved having to remember this issue.
+
+    The subset floor is what keeps the loop honest. Asserting only "every tool
+    that has a ``tier`` property has no default" is vacuously true of an empty
+    set, so renaming the schema key — or moving the tier into a nested object
+    — would silently retire the whole gate. Naming the three write verbs that
+    must be in it means such a rename fails loudly instead.
+    """
+    server = build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
+    )
+    tools = asyncio.run(server.list_tools())
+    tier_tools = {
+        tool.name: tool.inputSchema["properties"]["tier"]
+        for tool in tools
+        if "tier" in tool.inputSchema["properties"]
+    }
+    assert {"creek.save", "creek.journal", "creek.upload"} <= tier_tools.keys()
+    for name, schema in tier_tools.items():
+        assert schema.get("default") is None, (
+            f"{name} advertises a default tier: {schema}"
         )
 
 

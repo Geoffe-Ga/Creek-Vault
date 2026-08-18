@@ -32,6 +32,126 @@ to locate the originating commit for any reference below.
 
 ### Breaking changes
 
+- **An `unclassified` `creek save` no longer writes its body into the vault in
+  the clear (#1508).** `creek.classify.privacy_filter.pre_save_filter` branched
+  on `tier == PrivacyTier.INTIMATE` and `tier == PrivacyTier.PERSONAL`, so
+  `unclassified` — the tier every fragment carries until `creek classify` runs —
+  matched neither name and fell through to the verbatim return. Meanwhile the
+  MCP ceiling already treated that same tier as needing a `personal` ceiling to
+  be *read* (#961), so the two halves of the privacy system disagreed about one
+  tier: content the reader refused to serve, the writer filed in cleartext. Both
+  thresholds are now read off `_TIER_RANK` through `tier_sensitivity`, so
+  `unclassified` is summarised exactly as `personal` is, and a tier the ranking
+  has never heard of is handled as `intimate` — summary in the vault, body to
+  the gitignored `10-Liminal/Compost/intimate-stubs/` directory. `--full-body`
+  is honoured at `unclassified` exactly as at `personal`, because the read side
+  already normalises `UNCLASSIFIED` to `PERSONAL` before applying the same
+  opt-in, and a save stricter than the read it feeds would contradict the
+  ranking. **User-visible on both transports:** `creek save --tier unclassified`
+  and a `creek.save` MCP call at that tier now file a `[Tier-redacted summary:
+  …]` note instead of the body. Pass `--full-body` to keep the old behaviour.
+  Nothing migrates notes already written in the clear. Alongside it,
+  `creek_mcp.tier_ceiling.tier_allowed` stopped ending on a bare
+  `_CEILING_RANK[ceiling]` subscript, which raised `KeyError` across the MCP
+  boundary its own docstring promised not to raise across; an unrecognised
+  ceiling is now refused rather than raised on. That branch is unreachable from
+  production — `creek_mcp.policy._parse_ceiling` rejects an unknown ceiling
+  first — so it is defence in depth, not a live hole.
+
+- **An untitled `creek save` above `open` no longer takes its title from the
+  body's first line (#1505).** `creek/save/writer.py` fell back to
+  `_derive_title(request.body)` whenever `--title` was absent, at *every*
+  tier. A title is not a redacted surface: it is written into the note's
+  frontmatter in the clear, slugified into the **filename**, and — for
+  `--target ai-as-user` — built into the fragment `id`, the note's stable
+  handle, which other notes and Dataview queries quote back. So an untitled
+  `--tier intimate` save published line 1 of the intimate body in a
+  directory listing, the Obsidian sidebar, `git status`, and the
+  `created_path` field of the hash-chained MCP audit log — none of which
+  require opening the note — while the body it sat next to was correctly
+  reduced to `[Tier-redacted summary: (untitled)]`. Untitled saves
+  at any tier that `creek.classify.privacy_filter.tier_sensitivity` ranks
+  above `open` — `unclassified` (which ranks with `personal`, #876),
+  `personal`, `intimate` — are now titled `untitled <target> <8-hex content
+  digest>` instead. `--full-body` does **not** relax the guard: it widens the
+  body, which one reader opens on purpose, while the filename has the wider
+  audience. `open` is untouched, and an operator-supplied `--title` is still
+  written verbatim at every tier — only the operator can say whether their
+  own title is safe. **User-visible:** untitled non-open saves get different
+  filenames than they used to. Nothing migrates existing notes, so a live
+  vault will hold both conventions; Obsidian links resolve by path, so no
+  existing link breaks. The separate defect that an `unclassified` save
+  writes its *body* in the clear is [#1508](https://github.com/Geoffe-Ga/Creek-Vault/issues/1508),
+  which is fixed in its own entry above rather than here — the title half
+  and the body half were kept apart on purpose.
+
+- **`creek save --target paradox` now honours `--tier` instead of forcing
+  `open` (#1491).** `creek/save/writer.py` used to substitute
+  `PrivacyTier.OPEN` for any paradox save, so `--target paradox --tier
+  intimate` filed the note with `privacy_tier: open` **and the full body in
+  the clear**, while the CLI printed a yellow "will be widened" note and the
+  `creek.save` MCP tool printed nothing at all. The MCP transport compounded
+  it: the tool's response and its entry in the hash-chained audit log at
+  `00-Creek-Meta/audit/mcp.jsonl` both reported `created_tier: intimate`
+  while the artifact on disk was `open` — an auditor reading the
+  tamper-evident log would have believed the note was protected. The read
+  side inherited the same defect, because the stamped `open` defeats
+  `_admitted_liminal_notes`' fail-closed check and served intimate-derived
+  paradox bodies to open-ceiling consumers.
+
+  Routing is unchanged — a paradox save still always lands in
+  `10-Liminal/Paradoxes/`, and the *fact* of the contradiction is still
+  preserved by the note's location, title, tags and `saved_from` provenance.
+  Only the body moves: at `intimate` it is diverted to the gitignored
+  `10-Liminal/Compost/intimate-stubs/` directory with
+  `saved_from.intimate_body_pointer` naming it and the vault note reduced to
+  a tier-redacted summary; at `personal` it is summarised unless
+  `--full-body` is passed. **This is MCP-client-visible with no version
+  negotiation** — a `creek.save` call at `target=paradox, tier=intimate` no
+  longer returns a path to a note containing the body — mirroring the #1495
+  precedent on the same surface. Paradox notes saved at `intimate` also now
+  disappear from the Liminal Watch below `--include-tier intimate`. The
+  widening warning is gone with the widening, and the deployed
+  `paradox.SKILL.md` / `privacy-tier.SKILL.md` rules that told agents to route
+  intimate material away from paradox have been rewritten.
+
+- **`tier` is now required on every `creek.journal` and `creek.upload`
+  call (#1494).** Both verbs previously declared `tier: str = "open"` —
+  twice each, once on the tool function and again, independently, on the
+  `build_server` wrapper that MCP clients actually reach — so a caller
+  that omitted `tier` had its content filed as `open` and said so
+  nowhere. That inverts the fail-closed rule the deployed
+  `privacy-tier.SKILL.md` states as rule 1, "Never write `tier: open` by
+  default": ordinary journaling is `personal` by that skill's own table,
+  escalating to `intimate` for recovery, trauma or sexuality content, so
+  the default was silently down-tiering exactly the material the tier
+  system exists to protect. The `privacy_tier_ceiling` machinery could
+  not catch it, because at `ceiling=open` a defaulted `open` is trivially
+  within the caller's own ceiling. Both tools now return
+  `{"status": "refused", ...}` naming the missing `tier`, before anything
+  is staged, ingested, or audited. To preserve the old behaviour, pass
+  `tier: "open"` explicitly. `PUT /v1/journal-entries/{external_id}` is
+  unaffected — `JournalUpsertRequest.tier` never had a default — and
+  `creek.upload` has no `/v1` route at all, so this restores MCP parity
+  with the HTTP adapter rather than changing it. Vaults already
+  scaffolded keep the old rule-5 `privacy-tier.SKILL.md` text, which
+  names only `creek save`/`creek.save`, until `creek skills sync` or a
+  re-`creek init` re-deploys the updated template.
+- **`--tier`/`tier` is now required on every `creek save` and `creek.save`
+  call (#1434); neither transport infers, defaults, or derives a tier
+  from anything, including `--provenance`/`provenance` or the source
+  fragments. This breaks any `creek save` caller that relied on
+  `--provenance` implying `--tier open`, and any MCP client that called
+  `creek.save` without a `tier`. You will find out immediately: the CLI
+  exits 2 with a message naming `--tier`, and the MCP tool returns
+  `{"status": "refused", ...}` naming the missing `tier`. To preserve
+  the old behaviour, pass `--tier open` (CLI) or `tier: "open"` (MCP)
+  explicitly. The doctrine that a derived note carries the
+  most-restrictive tier of its sources still applies — it is now the
+  calling agent's job to determine that tier and pass it, not the
+  tool's. Vaults already scaffolded keep the old (permissive-reading)
+  `save.SKILL.md`/`privacy-tier.SKILL.md` text until `creek skills
+  sync` or a re-`creek init` re-deploys the updated templates.
 - **`creek skills` is now a typer subapp** (FEAT-019). Replace existing
   invocations:
   - `creek skills --generate --vault <vault>`

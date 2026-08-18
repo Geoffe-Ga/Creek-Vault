@@ -10,6 +10,9 @@ This module provides:
 - **Abstract base class**: ``Ingestor`` defining the four-stage pipeline
   (discover, parse, convert, frontmatter) with a concrete ``ingest()``
   orchestrator.
+- **Discovery signalling**: ``PartialDiscoveryError``, which an ingestor raises to
+  report that it enumerated only part of a source while still handing back
+  what it read (#1444).
 """
 
 from __future__ import annotations
@@ -201,6 +204,15 @@ class IngestedFragment(BaseModel):
     body: str
 
 
+DISCOVERY_ERROR_PREFIX = "discover error: "
+"""Prefix under which every discovery-stage failure enters ``errors``.
+
+One string, read by both arms of :meth:`Ingestor._discover_safe` and by
+:meth:`IngestResult.discovery_failure_count`, so the count an operator is
+shown and the lines they read can never describe different sets.
+"""
+
+
 class IngestResult(BaseModel):
     """Result of a complete ingest pipeline run.
 
@@ -223,6 +235,86 @@ class IngestResult(BaseModel):
     Lets callers distinguish "no inputs found" (``discovered == 0``) from
     "inputs found but nothing parsed" (``discovered > 0`` yet ``fragments``
     empty) — the latter signals an unrecognized export format (#595)."""
+
+    discovery_complete: bool = True
+    """Whether ``discover()`` managed to enumerate the whole source (#1444).
+
+    ``True`` means the walk saw the whole tree, so a ledgered unit this pass
+    did not see can be *proven* absent and
+    :func:`creek.ingest.pipeline.tomb_missing_units` may soft-tomb it.
+    ``False`` means some part of the source could not be listed or read, which
+    makes absence unknowable rather than proven.
+
+    **The default is authoritative on purpose.** Every existing construction
+    of this model keeps exactly today's meaning, so #674's rule — a genuinely
+    *readable* empty directory MUST still tomb — survives untouched, and only
+    a discovery that reported a failure lowers the flag. An incomplete
+    enumeration is not evidence of deletion, so it must not arm the sweep."""
+
+    def mark_discovery_incomplete(self) -> None:
+        """Record that ``discover()`` did not see the whole source (#1444).
+
+        A method rather than an assignment at each call site: one grep
+        target for "who disarms the tomb sweep", and one home for the
+        reason. The transition is deliberately one-way — nothing raises
+        the flag back — because later success elsewhere in the tree cannot
+        un-fail the part the walk never reached.
+        """
+        self.discovery_complete = False
+
+    def discovery_failure_count(self) -> int:
+        """Count the discovery-stage failures recorded on this result.
+
+        Derived from :attr:`errors` rather than tallied into a second
+        field, so the number an operator is shown is exactly the number of
+        lines they can go and read; a second counter is a second thing that
+        can disagree. Discovery failures are the entries carrying
+        :data:`DISCOVERY_ERROR_PREFIX`, which only
+        :meth:`Ingestor._discover_safe` writes.
+
+        Returns:
+            How many discovery failures were recorded — necessarily ``0``
+            whenever :attr:`discovery_complete` is ``True``, because the
+            two are written by the same arms.
+        """
+        return sum(1 for err in self.errors if err.startswith(DISCOVERY_ERROR_PREFIX))
+
+
+class PartialDiscoveryError(Exception):
+    """``discover()`` enumerated part of a source but could not see all of it.
+
+    Raised rather than returned because :meth:`Ingestor.discover` —
+    ``(self, source_path) -> list[RawDocument]`` — is the public extension
+    point all eleven registered ingestors implement, and that signature has
+    no channel for "…and here is the part I could not see". Widening it to a
+    tuple would rewrite every implementation to carry a fact ten of them
+    never produce.
+
+    Unlike a bare ``raise OSError``, this one does **not** discard the
+    documents that *were* enumerated: :meth:`Ingestor._discover_safe` returns
+    them, so an unreadable corner of a tree costs the tombing pass and never
+    the ingest itself. A re-raise would return ``[]`` instead and turn one
+    unreadable junk folder into a permanent, silent ingest outage on the
+    unattended ``creek sync`` path (#1444). The idiom is
+    :attr:`http.client.IncompleteRead.partial`, which carries the bytes that
+    did arrive on the very exception reporting that the read was short.
+
+    Attributes:
+        documents: Everything the walk did successfully read.
+        reasons: One operator-readable line per part it could not, in the
+            house style of the ``errors`` channel they are recorded on.
+    """
+
+    def __init__(self, documents: list[RawDocument], reasons: list[str]) -> None:
+        """Carry the partial harvest alongside the reasons it is partial.
+
+        Args:
+            documents: Everything the walk did successfully read.
+            reasons: One operator-readable line per part it could not.
+        """
+        self.documents = documents
+        self.reasons = reasons
+        super().__init__(f"discovery incomplete: {'; '.join(reasons)}")
 
 
 # ---- Shared Utility Functions ----
@@ -669,13 +761,15 @@ class Ingestor(abc.ABC):
         # weaken it by overriding.
         #
         # It must stay OUTSIDE ``_discover_safe``, whose ``except Exception``
-        # collects failures into ``result.errors`` and returns ``[]``. An
-        # empty discovery leaves ``run_ingest``'s ``seen_keys`` empty, and
-        # ``creek/ingest/pipeline.py::tomb_missing_units`` then soft-tombs
-        # every ``ledger.live_keys()`` the pass did not see — so a refusal
-        # swallowed there would orphan every fragment previously ingested
-        # from this source. A containment guard must never become a deletion
-        # primitive (#1294).
+        # collects failures into ``result.errors``, returns ``[]`` and lets
+        # the run continue. A refusal is not a degraded pass: #1294 decided
+        # that the ingest *write* path refuses an escaping source outright
+        # rather than reading part of it, so ``EscapingSymlinkError`` has to
+        # propagate to the caller instead of becoming one more collected
+        # error on a run that then proceeds. (The orphaning that swallowing
+        # it used to cause is separately closed: ``_discover_safe`` now marks
+        # ``IngestResult.discovery_complete`` false on every failure arm,
+        # which disarms the tomb sweep — see #1444.)
         assert_source_contained(source_path)
         result = IngestResult()
         ingestor_name = type(self).__name__
@@ -696,17 +790,45 @@ class Ingestor(abc.ABC):
     ) -> list[RawDocument]:
         """Safely call discover(), catching and logging errors.
 
+        Both failure arms mark the result's discovery **incomplete**, and
+        that is the whole #1444 fix: the sole ``def ingest(self`` in
+        ``creek/ingest/`` is the one above, so all eleven registered
+        ingestors — and any future twelfth — inherit the protection by
+        construction rather than by each remembering to ask.
+
+        The arms differ only in what survives. :class:`PartialDiscoveryError`
+        carries the documents the walk *did* read, so an unreadable corner
+        costs the tombing pass and not the harvest; any other exception left
+        the ingestor with nothing to hand back, so the harvest is empty.
+
         Args:
             source_path: The path to discover documents at.
             result: The IngestResult to append errors to.
 
         Returns:
-            A list of discovered RawDocuments, or empty on error.
+            The documents discovery managed to read: all of them on success,
+            the partial harvest for :class:`PartialDiscoveryError`, empty
+            otherwise.
         """
         try:
             return self.discover(source_path)
+        except PartialDiscoveryError as partial:
+            result.errors.extend(
+                f"{DISCOVERY_ERROR_PREFIX}{reason}" for reason in partial.reasons
+            )
+            result.mark_discovery_incomplete()
+            logger.warning(
+                "Incomplete discovery for %s: %s",
+                source_path,
+                "; ".join(partial.reasons),
+            )
+            return partial.documents
         except Exception as exc:
-            result.errors.append(f"discover error: {exc}")
+            # Marked before the message is composed: a discovery that raised
+            # saw an unknown amount of its source, and "unknown" may not arm
+            # a deletion primitive whatever the exception turns out to say.
+            result.mark_discovery_incomplete()
+            result.errors.append(f"{DISCOVERY_ERROR_PREFIX}{exc}")
             logger.exception("Error during discover for %s", source_path)
             return []
 

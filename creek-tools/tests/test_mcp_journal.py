@@ -159,6 +159,7 @@ def test_resending_the_same_entry_is_idempotent(tmp_path: Path) -> None:
             vault_path=vault,
             content="A steady entry.",
             external_id="adep-002",
+            tier="open",
             timestamp=_TS,
             privacy_tier_ceiling=TierCeiling.PERSONAL,
         )
@@ -177,6 +178,7 @@ def test_editing_an_entry_updates_in_place(tmp_path: Path) -> None:
         vault_path=vault,
         content="The original wording.",
         external_id="adep-003",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.PERSONAL,
     )
@@ -184,6 +186,7 @@ def test_editing_an_entry_updates_in_place(tmp_path: Path) -> None:
         vault_path=vault,
         content="The revised, longer wording of the same entry.",
         external_id="adep-003",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.PERSONAL,
     )
@@ -227,16 +230,27 @@ def test_intimate_entry_is_stored_intimate_under_an_intimate_ceiling(
 
 
 def test_empty_content_is_refused(tmp_path: Path) -> None:
-    """A blank entry is a structured refusal, not a crash or an empty fragment."""
+    """A blank entry is a structured refusal, not a crash or an empty fragment.
+
+    The reason is asserted, not just the status, and that is the half this
+    test was missing (#1494). It used to omit ``tier`` as well, so once an
+    omitted tier became its own refusal this test would have gone on passing
+    while proving nothing about blank content at all — a green assertion
+    satisfied by the wrong gate. Naming the reason pins which gate fired, and
+    passing ``tier`` explicitly keeps the blank-content gate the only one this
+    call can trip.
+    """
     vault = _vault(tmp_path)
     result = journal_ingest_tool(
         vault_path=vault,
         content="   ",
         external_id="adep-006",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.PERSONAL,
     )
     assert result["status"] == "refused"
+    assert "content and external_id are required" in str(result["reason"])
 
 
 def test_unknown_tier_is_refused_before_anything_is_written(tmp_path: Path) -> None:
@@ -259,6 +273,42 @@ def test_unknown_tier_is_refused_before_anything_is_written(tmp_path: Path) -> N
     )
     assert result["status"] == "refused"
     assert "unknown tier" in str(result["reason"])
+    assert _fragments(vault) == []
+    assert _staged(vault) == []
+    assert not (vault / MCP_AUDIT_RELPATH).exists()
+
+
+def test_omitted_tier_is_refused_before_anything_is_written(tmp_path: Path) -> None:
+    """An OMITTED ``tier`` is refused too — never filled in as ``open`` (#1494).
+
+    ``tier=`` is left out of the call entirely rather than passed as ``None``,
+    and that is the whole point: omission is the caller's actual mistake, and
+    it is what makes this one test kill two separate mutations — restoring the
+    ``tier: str = "open"`` default, and deleting the ``tier is None`` guard.
+    An explicit ``tier=None`` would kill only the second.
+
+    The reason substring is required, not stylistic. ``PrivacyTier(None)``
+    raises ``ValueError``, so with the guard deleted this call still returns
+    ``status: refused`` — carrying ``unknown tier None`` — and a status-only
+    assertion could not tell the guard's presence from its absence.
+
+    Everything else mirrors the unknown-tier sibling above: a malformed call is
+    caught above both admission gates, so it leaves no fragment, no staged
+    entry and no audit entry — at this point there is no meaningful tier to
+    record.
+    """
+    vault = _vault(tmp_path)
+    result = journal_ingest_tool(
+        vault_path=vault,
+        content="an entry whose tier the caller never named",
+        external_id="adep-no-tier",
+        timestamp=_TS,
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+    assert result["status"] == "refused"
+    assert result["tool"] == TOOL_NAME
+    assert result["tier_ceiling"] == "personal"
+    assert "tier is required" in str(result["reason"])
     assert _fragments(vault) == []
     assert _staged(vault) == []
     assert not (vault / MCP_AUDIT_RELPATH).exists()
@@ -312,6 +362,7 @@ def test_slug_colliding_external_ids_stay_distinct(tmp_path: Path) -> None:
         vault_path=vault,
         content="entry A",
         external_id="a/b",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.PERSONAL,
     )
@@ -319,6 +370,7 @@ def test_slug_colliding_external_ids_stay_distinct(tmp_path: Path) -> None:
         vault_path=vault,
         content="entry B",
         external_id="a-b",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.PERSONAL,
     )
@@ -416,6 +468,7 @@ def test_staging_path_unchanged(tmp_path: Path) -> None:
         vault_path=vault,
         content="a steady entry",
         external_id="adep-846",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.PERSONAL,
     )

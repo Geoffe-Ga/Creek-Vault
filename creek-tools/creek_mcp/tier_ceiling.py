@@ -23,6 +23,7 @@ Two distinct questions are answered here, both off the same ranking:
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Final
 
 from creek.classify.privacy_filter import PrivacyTierOverride
 from creek.models import PrivacyTier
@@ -106,6 +107,10 @@ _TIER_RANK = {
 }
 
 
+# Completeness is the failure mode here, and it is silent: since #1508
+# :func:`tier_allowed` refuses an unranked ceiling instead of raising, so
+# ``test_ceiling_rank_covers_every_ceiling`` in
+# ``tests/test_mcp_tier_ceiling.py`` is what makes a missing entry red.
 _CEILING_RANK = {
     TierCeiling.OPEN: 0,
     TierCeiling.PERSONAL: 1,
@@ -242,10 +247,35 @@ def tier_allowed(tier: PrivacyTier, ceiling: TierCeiling) -> bool:
     rather than with ``open``. The rank comes from
     :func:`tier_sensitivity`, so an unrecognised tier is refused rather
     than raising across the MCP boundary.
+
+    Since #1508 the *ceiling* half of that promise is kept too. It used to
+    end on a bare ``_CEILING_RANK[ceiling]`` subscript, which raised
+    :class:`KeyError` across the very boundary the tier half was careful
+    not to raise across. Both halves now fail closed, and an unrecognised
+    ceiling admits **nothing** — not even ``open``. The refusal is spelled
+    as an explicit ``None`` check rather than as the ``.get(…, default)``
+    :func:`routing_tier` uses, because here the fail-closed answer is not
+    another rank but a refusal.
+
+    This is defence in depth, not a live hole:
+    :func:`creek_mcp.policy._parse_ceiling` (``creek_mcp/policy.py:151-183``)
+    returns ``None`` for any value that does not name a member, before
+    :func:`tier_allowed` is ever reached, so no MCP caller can drive the
+    branch, and mypy-strict rejects it at every internal call site.
+
+    What keeps the new silent ``False`` from mattering is
+    ``test_ceiling_rank_covers_every_ceiling`` in
+    ``tests/test_mcp_tier_ceiling.py``. :data:`_CEILING_RANK` is
+    referenced nowhere outside this module, so a fifth
+    :class:`TierCeiling` member added without a rank entry would
+    otherwise be refused everywhere, at every tier, with nothing red.
     """
     if ceiling is TierCeiling.ALL:
         return True
-    return tier_sensitivity(tier) <= _CEILING_RANK[ceiling]
+    rank = _CEILING_RANK.get(ceiling)
+    if rank is None:
+        return False
+    return tier_sensitivity(tier) <= rank
 
 
 def write_tier_allowed(write_tier: PrivacyTier, ceiling: TierCeiling) -> bool:
@@ -259,6 +289,27 @@ def write_tier_allowed(write_tier: PrivacyTier, ceiling: TierCeiling) -> bool:
     silently downgraded.
     """
     return tier_allowed(write_tier, ceiling)
+
+
+TIER_REQUIRED_REASON: Final[str] = (
+    "tier is required; pass open|personal|intimate explicitly"
+)
+"""The refusal every write verb owes a caller who omitted ``tier``.
+
+Shared rather than repeated, and it lives beside :func:`refusal_response`
+because two independent consumers must read the *same bytes*:
+
+* the three write tools — ``creek.save`` (#1434), ``creek.journal`` and
+  ``creek.upload`` (#1494) — each refuse an omitted tier rather than filing
+  the caller's content at a defaulted ``open``. A client that learns the
+  refusal from one verb must recognise it from the other two, so a single
+  literal is what makes the three read alike;
+* the ``/v1`` ``ErrorCode`` table in :mod:`creek_mcp.httpapi.journal`, which
+  maps this refusal to ``invalid_request``. It keys on this constant rather
+  than on a retyped copy of the string, so rewording the sentence moves the
+  mapping with it instead of silently dropping the reason into that
+  function's fail-closed ``internal_error`` default.
+"""
 
 
 def refusal_response(

@@ -3882,25 +3882,46 @@ def _report_decisions(vault_path: Path, override: PrivacyTierOverride) -> None:
     fragment already captured by a note is skipped). Prints a friendly message
     when there are no new candidates.
 
+    When the unconditional intimate screen refused anything, the withheld
+    notice is printed on **stdout** — in *both* branches, and after the
+    headline either way. Before #1487 the count reached only a
+    ``logger.warning``, so an operator whose one candidate had been refused
+    read "no new decision candidates found" on stdout: a false statement
+    produced by the tool itself. Printing it in the success branch too is not
+    belt-and-braces — a mixed vault writes some notes and refuses others, and
+    a green success line with nothing beside it is how a partial report reads
+    as a complete one. The single exit path below is what makes "both
+    branches" hold by construction rather than by two call sites that can
+    drift apart.
+
     Args:
         vault_path: Vault root.
         override: Tier ceiling for the fragment walk (#968). A written note's
             filename and ``title:`` are a source fragment's title verbatim.
     """
-    from creek.generate.decisions import generate_decisions
+    from creek.generate.decisions import generate_decisions, withheld_notice
 
-    written_paths = generate_decisions(vault_path, override=override)
-    if not written_paths:
+    report = generate_decisions(vault_path, override=override)
+    if report.notes:
+        rels = ", ".join(str(p.relative_to(vault_path)) for p in report.notes)
         console.print(
-            "[yellow]No decision notes generated: "
-            "no new decision candidates found.[/yellow]",
+            f"[bold green]Decision notes generated ({len(report.notes)}): "
+            f"{rels}[/bold green]",
         )
-        return
-    rels = ", ".join(str(p.relative_to(vault_path)) for p in written_paths)
-    console.print(
-        f"[bold green]Decision notes generated ({len(written_paths)}): "
-        f"{rels}[/bold green]",
-    )
+    else:
+        # The "No decision notes generated" prefix is byte-stable across both
+        # tails; only the reason varies, because claiming there were no
+        # candidates over a vault this report could not fully read is the
+        # falsehood #1487 exists to remove.
+        tail = (
+            "no new candidates among the fragments this report could read."
+            if report.withheld
+            else "no new decision candidates found."
+        )
+        console.print(f"[yellow]No decision notes generated: {tail}[/yellow]")
+    notice = withheld_notice(report.withheld)
+    if notice is not None:
+        console.print(f"[yellow]{notice}[/yellow]")
 
 
 def _report_lexicon(vault_path: Path, override: PrivacyTierOverride) -> None:
@@ -5867,11 +5888,40 @@ _SAVE_TARGET_HELP = (
     "11-Other-Authors/ai-as-user/; observation files raw wavelength reflections "
     "to 05-Wavelength/Observations/."
 )
-_SAVE_TIER_HELP = (
-    "Privacy tier (open|personal|intimate). Required when stdin is the body "
-    "source; defaults to the source fragments' max tier when --provenance "
-    "is supplied."
+_SAVE_TITLE_HELP = (
+    "Optional title, written verbatim at every tier. Omit it and the note "
+    "is titled from the body's first line at --tier open only; above open "
+    "it gets a non-revealing 'untitled <target> <digest>' stand-in, because "
+    "the title is also the filename (issue #1505)."
 )
+"""Help for ``--title``.
+
+Spells out the tier-conditional fallback because the flag's blast radius is
+not where an operator looks for it: the title is written into the note's
+frontmatter in the clear, slugified into the *filename*, and — for
+``ai-as-user`` — embedded in the fragment ``id``. Advertising only
+"optional" is what let #1505 read as intended behaviour for two releases.
+"""
+
+_SAVE_TIER_HELP = (
+    "Privacy tier (open|personal|intimate). Required on every save; "
+    "creek save never infers a tier from --provenance."
+)
+_SAVE_TIER_REQUIRED_MSG = (
+    "--tier is required. Pass --tier open|personal|intimate explicitly; "
+    "creek save never infers a tier from --provenance."
+)
+"""Refusal text when ``--tier`` is omitted for a file-sourced body."""
+_SAVE_TIER_REQUIRED_STDIN_MSG = (
+    "--tier is required when the body comes from stdin. "
+    "Pass --tier open|personal|intimate explicitly."
+)
+"""Refusal text when ``--tier`` is omitted and the body arrived on stdin.
+
+Distinct from :data:`_SAVE_TIER_REQUIRED_MSG` because the stdin shape has
+no ``--body`` path for the operator to look at: naming stdin tells them
+which half of the invocation the missing flag belongs to.
+"""
 _SAVE_SOURCE_KINDS: tuple[str, ...] = (
     "discord",
     "claude-session",
@@ -5949,57 +5999,40 @@ def _parse_save_tier(value: str | None) -> PrivacyTier | None:
         raise typer.Exit(code=2) from exc
 
 
-def _warn_if_paradox_downgrades_tier(
-    target: SaveTarget,
-    tier: PrivacyTier | None,
-) -> None:
-    """Print a stderr warning when paradox saves silently widen the tier.
-
-    Per the FEAT, ``--target paradox`` always lands in
-    ``10-Liminal/Paradoxes/`` with the body filtered as ``open`` —
-    *the fact* of the contradiction is what's preserved, not a
-    tier-protected summary. A user who passes ``--tier intimate`` or
-    ``--tier personal`` for protection is likely surprised when the
-    body lands in the vault unredacted, so we surface the override
-    explicitly rather than letting it pass silently.
-    """
-    if target != SaveTarget.PARADOX:
-        return
-    if tier is None or tier == PrivacyTier.OPEN:
-        return
-    console.print(
-        f"[yellow]Note: --target paradox forces tier=open for the body; "
-        f"--tier {tier.value} will be widened. The contradiction will be "
-        "written in full to 10-Liminal/Paradoxes/. Use --target unnamed "
-        "(or thread/eddy/praxis) with --tier intimate if you want the "
-        "body protected.[/yellow]",
-    )
-
-
 def _resolve_save_tier(
     tier: PrivacyTier | None,
-    provenance: tuple[str, ...],
     *,
     came_from_stdin: bool,
 ) -> PrivacyTier:
-    """Resolve the effective tier per FEAT-009's tier-defaulting rule.
+    """Return the operator's explicit tier, or refuse the save (issue #1434).
 
-    * Explicit ``--tier`` always wins.
-    * Otherwise, when ``--provenance`` is supplied *and* the body did
-      not come from stdin, default to ``open`` (the v1 surface; a
-      future revision will derive from the source fragments' max tier).
-    * No tier and either no provenance or stdin body → refuse so the
-      operator makes an intentional choice.
+    The tier is always explicit. There is no default and no inheritance:
+    ``creek save`` never derives a tier from ``--provenance`` or from the
+    source fragments, because only the caller knows what the body it is
+    filing was actually derived from. Omitting ``--tier`` is a refusal,
+    not a hint. Previously an omitted ``--tier`` resolved to ``open``
+    whenever ``--provenance`` was supplied, which filed content derived
+    from an ``intimate`` fragment in the clear.
+
+    Args:
+        tier: The parsed ``--tier`` value, or ``None`` when it was omitted.
+        came_from_stdin: Whether the body arrived on stdin. Selects the
+            wording of the refusal so the message matches the invocation
+            the operator actually typed.
+
+    Returns:
+        The tier the note must be filed at.
+
+    Raises:
+        typer.Exit: With code 2 when ``--tier`` was omitted.
     """
     if tier is not None:
         return tier
-    if not provenance or came_from_stdin:
-        console.print(
-            "[red]--tier is required when --provenance is empty or the body "
-            "comes from stdin. Pass --tier open|personal|intimate explicitly.[/red]",
-        )
-        raise typer.Exit(code=2)
-    return PrivacyTier.OPEN
+    message = (
+        _SAVE_TIER_REQUIRED_STDIN_MSG if came_from_stdin else _SAVE_TIER_REQUIRED_MSG
+    )
+    console.print(f"[red]{message}[/red]")
+    raise typer.Exit(code=2)
 
 
 author_llm_factory: VoiceClientFactory | None = None
@@ -6333,9 +6366,11 @@ def author(
     # #1310: route through ``run_author`` rather than driving a conductor
     # directly, so the run carries the medium contract (the privacy ceiling the
     # HARD gate needs) and the chat character ceiling, both of which
-    # ``Conductor.run`` alone does not apply. ``max_rounds`` stays explicit:
-    # ``rounds`` came from this vault's ``author.max_author_rounds``, which must
-    # keep winning over ``run_author``'s bare ``AuthorConfig()`` fallback.
+    # ``Conductor.run`` alone does not apply. #1465: ``max_rounds`` stays
+    # explicit because ``config`` above resolves from the RAW ``--vault`` flag
+    # while ``vault_path`` falls back to ``config.vault_path`` when the flag is
+    # omitted — two different roots. Dropping the argument would silently start
+    # sourcing the budget from a different file than the one already read here.
     draft_result = run_author(
         medium=medium,
         query=effective_query,
@@ -6371,7 +6406,11 @@ def save_cmd(
         "--body",
         help="Path to the body file, '-' for stdin, or omitted for stdin.",
     ),
-    title: str | None = typer.Option(None, "--title", help="Optional title."),
+    title: str | None = typer.Option(
+        None,
+        "--title",
+        help=_SAVE_TITLE_HELP,
+    ),
     provenance: str | None = typer.Option(
         None,
         "--provenance",
@@ -6391,7 +6430,7 @@ def save_cmd(
     full_body: bool = typer.Option(
         False,
         "--full-body",
-        help="Allow personal-tier bodies into the vault unredacted.",
+        help="Allow personal/unclassified bodies into the vault unredacted.",
     ),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
 ) -> None:
@@ -6402,8 +6441,18 @@ def save_cmd(
     privacy-tier policy: intimate bodies are diverted to the
     gitignored ``10-Liminal/Compost/intimate-stubs/`` directory and
     only a title-only summary is written into the vault; personal
-    bodies are summarised unless ``--full-body`` is passed; paradox
-    saves always land in ``10-Liminal/Paradoxes/``.
+    and unclassified bodies (which rank together, #876/#961) are
+    summarised unless ``--full-body`` is passed; paradox
+    saves always land in ``10-Liminal/Paradoxes/`` and, since #1491,
+    honour ``--tier`` there exactly like every other target.
+
+    ``--title`` is optional but not free above ``open``. The title is
+    written in the clear, slugified into the filename, and (for
+    ``ai-as-user``) embedded in the fragment ``id``, so since #1505 an
+    omitted ``--title`` falls back to the body's first line only at
+    ``open``; above it the note is titled ``untitled <target>
+    <digest>``. ``--full-body`` does not relax that — it widens the
+    body, not the filename. Pass ``--title`` to name a private note.
     """
     from creek.save import SaveRequest, save_to_vault
 
@@ -6416,10 +6465,8 @@ def save_cmd(
     )
     effective_tier = _resolve_save_tier(
         parsed_tier,
-        fragments,
         came_from_stdin=came_from_stdin,
     )
-    _warn_if_paradox_downgrades_tier(save_target, parsed_tier)
     vault_path = _resolve_vault(vault)
     request = SaveRequest(
         target=save_target,

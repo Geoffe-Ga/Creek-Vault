@@ -19,6 +19,8 @@ from creek.classify.llm.router import ModelRouter
 from creek.config import AuthorConfig, LLMRoutingConfig
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import pytest
 
     from creek.config import LLMConfig
@@ -55,8 +57,15 @@ def test_build_default_conductor_none_keeps_stub() -> None:
     assert conductor.voice.llm_client is None
 
 
-def test_run_author_threads_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``run_author`` forwards its llm_client to build_default_conductor."""
+def test_run_author_threads_client(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``run_author`` forwards its llm_client to build_default_conductor.
+
+    The vault has to be a real directory holding a real config file: since
+    #1465 ``run_author`` resolves its round budget from the vault's config.
+    """
     captured: dict[str, object] = {}
     fake_conductor = MagicMock()
     fake_conductor.run.return_value = MagicMock()
@@ -72,8 +81,20 @@ def test_run_author_threads_client(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr("creek.author.conductor._enforce_chat_ceiling", lambda d: d)
 
+    # The config file is load-bearing, not scenery. Since #1465 ``run_author``
+    # reads the vault's config; with a ``MagicMock`` vault
+    # ``resolve_config_path`` returns a truthy mock and ``yaml.safe_load``
+    # spins forever pulling mocks off the fake stream instead of raising, and
+    # a bare ``tmp_path`` would fall back to the cwd's ``creek_config.yaml``.
+    meta = tmp_path / "00-Creek-Meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    (meta / "creek_config.yaml").write_text(
+        "author:\n  max_author_rounds: 2\n",
+        encoding="utf-8",
+    )
+
     client = AuthorLLMClient(MagicMock())
-    run_author(medium="research", query="q", vault=MagicMock(), llm_client=client)
+    run_author(medium="research", query="q", vault=tmp_path, llm_client=client)
     assert captured["llm_client"] is client
 
 

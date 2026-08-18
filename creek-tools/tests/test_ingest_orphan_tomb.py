@@ -848,7 +848,13 @@ class TestTombOutcomeIsRecordedHonestly:
         """Run a full-source tomb sweep that sees no live source units."""
         errors: list[str] = []
         count = tomb_missing_units(
-            ledger, writer, vault / "01-Fragments", set(), errors, "markdown"
+            ledger,
+            writer,
+            vault / "01-Fragments",
+            set(),
+            errors,
+            "markdown",
+            discovery_complete=True,
         )
         return count, errors
 

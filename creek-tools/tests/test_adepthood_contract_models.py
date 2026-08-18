@@ -1368,7 +1368,7 @@ def test_every_contract_version_earns_a_change_log_row() -> None:
 
 
 def test_the_compatibility_window_only_ever_widens() -> None:
-    """Every minor ever served is still served (#1023, #1246, #1372).
+    """Every minor ever served is still served (#1023, #1246, #1372, #1494).
 
     :data:`SUPPORTED_CONTRACT_MINORS` is the promise that a bump does
     not strand existing clients, and the promise is only worth anything
@@ -1387,6 +1387,14 @@ def test_the_compatibility_window_only_ever_widens() -> None:
     it, and every live Adepthood consumer still sending it starts being
     refused. Neither change warranted that — 0.5's one new ``/v1`` field is
     optional and omitted when empty, and 0.6 moved no ``/v1`` shape at all.
+
+    ``0.6`` joins at the 0.7 bump (#1494, ``tier`` becoming mandatory on
+    ``creek.journal`` and ``creek.upload``). That one is the sharpest case in
+    the list for widening rather than shifting: the break is real, but it is
+    real only on MCP. ``JournalUpsertRequest.tier`` never had a default and
+    ``creek.upload`` has no ``/v1`` route, so a ``0.6``-pinned ``/v1`` client
+    was already sending exactly what the new contract demands — shifting the
+    window would refuse it over a change it cannot express.
     """
-    for retired_minor in ("0.2", "0.3", "0.4", "0.5"):
+    for retired_minor in ("0.2", "0.3", "0.4", "0.5", "0.6"):
         assert retired_minor in SUPPORTED_CONTRACT_MINORS

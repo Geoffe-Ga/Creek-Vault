@@ -401,6 +401,7 @@ def test_journal_carries_the_advisory_to_its_caller(tmp_path: Path) -> None:
     out = journal_ingest_tool(
         vault_path=vault,
         external_id="adep-1372-journal",
+        tier="open",
         content="a plain entry",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.PERSONAL,
@@ -428,6 +429,7 @@ def test_upload_carries_the_advisory_to_its_caller(tmp_path: Path) -> None:
         filename="book.xlsx",
         content_base64=_xlsx_base64(tmp_path),
         external_id="adep-1372-upload",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.PERSONAL,
         run=_runner_returning(ceiling_safe_warnings=[_SAFE_ADVISORY]),
@@ -460,6 +462,7 @@ def test_the_boundary_never_echoes_the_unsafe_channel_at_the_narrowest_ceiling(
     journal_out = journal_ingest_tool(
         vault_path=_mcp_vault(tmp_path / "journal"),
         external_id="adep-1372-leak-journal",
+        tier="open",
         content="a plain entry",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
@@ -470,6 +473,7 @@ def test_the_boundary_never_echoes_the_unsafe_channel_at_the_narrowest_ceiling(
         filename="book.xlsx",
         content_base64=_xlsx_base64(tmp_path),
         external_id="adep-1372-leak-upload",
+        tier="open",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.OPEN,
         run=unsafe,
@@ -496,6 +500,7 @@ def test_a_run_with_no_advisory_reports_an_empty_list(tmp_path: Path) -> None:
     out = journal_ingest_tool(
         vault_path=vault,
         external_id="adep-1372-quiet",
+        tier="open",
         content="a plain entry",
         timestamp=_TS,
         privacy_tier_ceiling=TierCeiling.PERSONAL,

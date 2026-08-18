@@ -81,7 +81,14 @@ creek-tools-api = "creek_mcp.httpapi.cli:main"
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40.0"]
-openai = ["openai>=1.0"]
+# Transport hold, not a CVE (OSV reports no advisories for openai):
+# openai 3.0.0 swapped `httpx<1,>=0.23.0` for `httpx2<3,>=2.7.0` — a
+# separate distribution, not a version bump — dragging httpcore2,
+# truststore and idna>=3.18 in beside the `httpx>=0.27.0` declared
+# above, i.e. two HTTP stacks in one environment. `mcp>=1.28.1,<2.0.0`
+# caps the other half of the same swap (#998), so the two majors move
+# together or not at all. Floor is the release both locks resolve.
+openai = ["openai>=2.41.0,<3.0.0"]
 gemini = ["google-genai>=1.0"]
 embeddings = [
     "sentence-transformers>=2.2.0",
@@ -173,8 +180,23 @@ dev = [
     "lxml-stubs>=0.5.1",
 ]
 
+# This list is a SECOND, independent setuptools declaration surface,
+# separate from [tool.uv].constraint-dependencies below — the two do
+# not substitute for each other. constraint-dependencies governs the
+# resolution graph behind uv.lock; [build-system].requires governs the
+# PEP 518 isolated environment the build backend itself runs in. The uv
+# constraint provably does not reach here: with the constraint bounded
+# to <84.0.0 a wheel build still reported `Generator: setuptools
+# (84.0.0)`, while bounding this list instead produced 83.0.0. So the
+# PYSEC-2026-3447 floor has to be repeated here or the backend is
+# unbounded — `>=68.0` sat here for the whole life of the #861 pin
+# admitting 81.0.0, the CVE release. The band is held IDENTICAL to the
+# constraint entry below; the two must move together. This bound is
+# invisible to uv.lock (verified: `uv lock --check` passes with only
+# this line changed), so its guard test in tests/test_dependency_pins.py
+# is the only thing holding it (#1258).
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=83.0.0,<85.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.uv]
@@ -195,8 +217,17 @@ constraint-dependencies = [
     "pip>=26.1.2",
     # Security: pin setuptools above PYSEC-2026-3447 (CVE-2026-59890,
     # path traversal in the PackageIndex download path) — build/dev
-    # tooling only, never a runtime import. Fixed in 83.0.0 (#861).
-    "setuptools>=83.0.0",
+    # tooling only, never a runtime import. Fixed in 83.0.0 (#861), and
+    # the floor stays there. 84.0.0 was vetted for the ceiling by
+    # building this wheel under both 83.0.0 and 84.0.0 and comparing the
+    # results: content-identical, differing only in the `Generator:`
+    # string inside .dist-info/WHEEL and RECORD's sha256 of that file.
+    # 84.0.0's removals were distutils C-compiler internals this
+    # pure-Python build never touches. The ceiling is SemVer `<85.0.0`,
+    # so every future 84.x PATCH still resolves freely; 85.0.0 requires
+    # its own review before the ceiling moves (#1258). Held identical to
+    # [build-system].requires above — move the two together.
+    "setuptools>=83.0.0,<85.0.0",
     "wheel>=0.47.0",
     # Security: pin pyasn1 above CVE-2026-59885 (quadratic OID-arc
     # decode DoS) and CVE-2026-59886 (REAL-exponent big-int DoS) —
