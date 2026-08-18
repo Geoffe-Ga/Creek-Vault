@@ -8,8 +8,11 @@ from typing import TYPE_CHECKING
 import pytest
 
 from creek.config import GoogleDriveConfig
+from creek.ingest import INGESTOR_REGISTRY
+from creek.ingest import gdrive as gdrive_module
 from creek.ingest.connectors import RemoteSourceConnector
 from creek.ingest.gdrive import (
+    _EXTENSION_ROUTES,
     GOOGLE_DOCS_MIME,
     GOOGLE_SHEETS_MIME,
     GOOGLE_SLIDES_MIME,
@@ -18,6 +21,8 @@ from creek.ingest.gdrive import (
     GoogleApiDriveClient,
     GoogleApiUnavailableError,
     GoogleDriveDownloader,
+    UnsupportedSourceError,
+    _Refuse,
     build_drive_connector,
     route_to_ingestor,
 )
@@ -332,6 +337,169 @@ class TestRouteToIngestor:
         from pathlib import Path
 
         assert route_to_ingestor(Path("mystery.xyz")) == "generic"
+
+    @pytest.mark.parametrize(
+        "name",
+        ["notes.yaml", "server.log", "outline.org", "README", "mystery.xyz"],
+    )
+    def test_plain_text_ish_content_keeps_the_generic_fallback(self, name: str) -> None:
+        """The refusal set is scoped to *structured* formats, not the fallback.
+
+        #1526 refuses conversation exports and archives; it deliberately does
+        NOT retire ``generic``, which stays the honest answer for content
+        that is simply text under an extension no ingestor claims. Without
+        this control the refusal set could creep until an ordinary ``.log``
+        was rejected and nobody noticed.
+        """
+        from pathlib import Path
+
+        assert route_to_ingestor(Path(name)) == "generic"
+
+    def test_every_routed_extension_reaches_a_live_non_generic_ingestor(
+        self,
+    ) -> None:
+        """Positive control (#1526 AC2): the routing half of the table is live.
+
+        Enumerates every routed entry rather than a hand-picked sample, so an
+        extension that silently degraded to ``generic`` — the whole defect —
+        cannot hide behind the parametrised happy cases above. The registry
+        membership assertion is the second half: a key that no longer names a
+        real ingestor would route "successfully" into a ``KeyError`` at
+        ingest time.
+        """
+        from pathlib import Path
+
+        routed = {
+            ext: key for ext, key in _EXTENSION_ROUTES.items() if isinstance(key, str)
+        }
+        # A positive control is worthless if the collection is empty, and a
+        # floor rather than an equality so that adding a genuinely new format
+        # is not a test failure while *deleting* one still is.
+        assert len(routed) >= 18, sorted(routed)
+        for ext, key in routed.items():
+            resolved = route_to_ingestor(Path(f"sample{ext}"))
+            assert resolved == key, ext
+            assert resolved != "generic", ext
+            assert resolved in INGESTOR_REGISTRY, ext
+
+    def test_conversations_json_no_longer_falls_through_to_generic(self) -> None:
+        """The #1526 defect itself, pinned.
+
+        Recorded at HEAD before the fix:
+        ``route_to_ingestor(Path("conversations.json")) == "generic"`` — a
+        ChatGPT export, the single most obvious thing a user uploads, routed
+        to the fallback that files it as one undifferentiated blob and
+        reports success.
+        """
+        from pathlib import Path
+
+        with pytest.raises(UnsupportedSourceError):
+            route_to_ingestor(Path("conversations.json"))
+
+    @pytest.mark.parametrize(
+        ("name", "suffix", "phrases"),
+        [
+            (
+                "conversations.json",
+                ".json",
+                [
+                    "'.json'",
+                    "single undifferentiated blob",
+                    "creek ingest --type",
+                    "--input <export-dir>",
+                    "#1525",
+                ],
+            ),
+            (
+                "messages.JSONL",
+                ".jsonl",
+                ["'.jsonl'", "creek ingest --type", "#1525"],
+            ),
+            (
+                "chatgpt-export.zip",
+                ".zip",
+                [
+                    "'.zip'",
+                    "container of many files",
+                    "Unpack it",
+                    "creek ingest --type",
+                    "#1525",
+                ],
+            ),
+            (
+                "backup.TAR",
+                ".tar",
+                ["'.tar'", "Unpack it", "creek ingest --type"],
+            ),
+            (
+                "memo.doc",
+                ".doc",
+                ["'.doc'", "Office Open XML", ".docx"],
+            ),
+        ],
+    )
+    def test_refused_extension_names_what_to_do_instead(
+        self, name: str, suffix: str, phrases: list[str]
+    ) -> None:
+        """#1526 AC3: assert the MESSAGE, not merely that it refused.
+
+        A bare refusal is only marginally better than the silent blob — the
+        user still does not know that their export has to be unpacked and fed
+        to ``creek ingest``. The remedy text is the deliverable, so it is what
+        is asserted.
+        """
+        from pathlib import Path
+
+        with pytest.raises(UnsupportedSourceError) as caught:
+            route_to_ingestor(Path(name))
+
+        message = str(caught.value)
+        assert caught.value.suffix == suffix
+        assert caught.value.guidance in message
+        for phrase in phrases:
+            assert phrase in message, (name, phrase, message)
+
+    def test_routes_and_refusals_are_one_declaration(self) -> None:
+        """#1526 AC4: there is no second list to go stale.
+
+        The structural half of AC4: the routed entries and the refused
+        entries are *partitions of the same dict*, so they cannot disagree
+        about an extension and neither can go stale against the other. The
+        behavioural half — that an extension added to the table is honoured
+        immediately, which is what a reintroduced sibling list would break —
+        is
+        ``test_an_extension_added_to_the_table_is_honoured_by_both_halves``.
+        """
+
+        routed = {ext for ext, key in _EXTENSION_ROUTES.items() if isinstance(key, str)}
+        refused = {
+            ext for ext, key in _EXTENSION_ROUTES.items() if isinstance(key, _Refuse)
+        }
+        assert routed | refused == set(_EXTENSION_ROUTES)
+        assert not routed & refused
+        assert routed and refused
+
+    def test_an_extension_added_to_the_table_is_honoured_by_both_halves(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#1526 AC4, the drift half: one edit, both behaviours.
+
+        Injects one routed and one refused extension into the single table
+        and asserts both take effect through the public function. A design
+        that kept a pre-computed sibling list would answer ``generic`` for
+        the injected route and return ``generic`` for the injected refusal.
+        """
+        from pathlib import Path
+
+        extended: dict[str, str | _Refuse] = dict(_EXTENSION_ROUTES)
+        extended[".fixture-route"] = "markdown"
+        extended[".fixture-refuse"] = _Refuse("Fixture remedy for issue #1526.")
+        monkeypatch.setattr(gdrive_module, "_EXTENSION_ROUTES", extended)
+
+        assert route_to_ingestor(Path("x.FIXTURE-ROUTE")) == "markdown"
+        with pytest.raises(UnsupportedSourceError) as caught:
+            route_to_ingestor(Path("x.fixture-refuse"))
+        assert "Fixture remedy for issue #1526." in str(caught.value)
 
 
 # ---- GoogleDriveDownloader.download_file ------------------------------
