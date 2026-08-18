@@ -197,6 +197,19 @@ Inverting the default is the point. An enumerated wipe-list stops being correct 
 
 <!-- META-SURVIVOR-TABLE:END -->
 
+##### What a row in that table does *not* promise
+
+<!-- META-SURVIVOR-POLICY:BEGIN -->
+
+A `keep` or `exempt` row shelters **exactly one regular file, at exactly that path**. Two edges follow from that, and both were real defects (#1484, #1485):
+
+- **A directory standing where a keep names a file is swept.** If `00-Creek-Meta/audit/redact.jsonl` or `00-Creek-Meta/embeddings.parquet` exists as a *directory*, the sweep walks into it and destroys everything inside, recursively, exactly as it would under any other name. The alternative — sheltering the subtree — turns one documented survivor into an unbounded number of undocumented ones on a right-to-be-forgotten path, while this table goes on claiming the vault is clean. Only a directory defeats a shelter; a symlink standing at a keep path is still sheltered, because a link is a single alias and cannot hide a subtree behind it.
+- **A dangling symlink is unlinked, never followed.** `purge vault` wipes the ten content folders *before* it sweeps `00-Creek-Meta/`, so a link there that pointed at a fragment is broken by the time the sweep meets it. It is still destroyed: the residue that matters is not the body the link no longer reaches but the **target string** it carries, and this vault's paths are title-derived — `01-Fragments/Journal/2026-03-11 therapy session.md` is itself private text. Unlinking removes the alias and nothing else, so a link out of the vault is taken without its target being touched. A symlink to a *directory* remains the one link the sweep leaves alone, matching the content wipe: the tree behind it is not this purge's to claim.
+
+Both edges are counted the same way everything else is, so `Meta artifacts removed` in a `--dry-run` preview is the number the apply run really performs.
+
+<!-- META-SURVIVOR-POLICY:END -->
+
 Two consequences an operator will notice:
 
 - **The scaffold must be redeployed.** Run `creek init --vault <path>` (or `creek skills sync` for the skill tree alone) after a vault purge. Any skill file you authored yourself is gone, deliberately.

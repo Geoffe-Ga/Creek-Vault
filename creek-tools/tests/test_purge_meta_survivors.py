@@ -429,18 +429,29 @@ def test_the_table_covers_all_three_dispositions() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_the_sweep_unlinks_a_symlink_to_a_file_but_never_follows_one_to_a_dir(
+def test_the_sweep_unlinks_a_symlink_to_a_file_or_to_nothing_but_never_to_a_dir(
     tmp_path: Path,
 ) -> None:
-    """The meta sweep copies the content wipe's symlink policy exactly.
+    """The meta sweep's whole symlink table, one case per link.
 
-    Two halves, and they disagree on purpose. A symlink *to a file* is
-    destroyed, because ``unlink`` really does destroy that alias and
-    leaving it would leave a live pointer into content the erasure was
-    supposed to remove. A symlink *to a directory* is neither followed
-    nor unlinked: the files behind it are not this purge's to claim, and
-    walking through one is how an erasure of a vault comes to delete
-    somebody's home directory.
+    Three dispositions, and they disagree on purpose.
+
+    * A symlink **to a file** is destroyed: ``unlink`` really does
+      destroy that alias, and leaving it would leave a live pointer into
+      content the erasure was supposed to remove.
+    * A symlink **to a directory** is neither followed nor unlinked: the
+      files behind it are not this purge's to claim, and walking through
+      one is how an erasure of a vault comes to delete somebody's home
+      directory.
+    * A **dangling** symlink is destroyed (#1485). ``Path.is_file()``
+      follows the link and answers ``False`` for a dangling one, so the
+      pre-#1485 walk dropped it on the floor — and the residue is not
+      the body, it is the *target string*, which in this vault is
+      routinely title-derived.
+
+    None of the three touches anything outside the meta root: both
+    out-of-vault targets are asserted intact afterwards, and the
+    dangling link's target is asserted never to have been created.
     """
     from creek.purge.meta import sweep_unkept_meta
 
@@ -450,9 +461,48 @@ def test_the_sweep_unlinks_a_symlink_to_a_file_but_never_follows_one_to_a_dir(
     (outside / "private").mkdir(parents=True)
     (outside / "private" / "secret.md").write_text("not ours\n", encoding="utf-8")
     (outside / "loose.md").write_text("aliased\n", encoding="utf-8")
+    never_created = outside / "private" / f"{_PRIVATE}.md"
 
     (meta / "link-to-file.md").symlink_to(outside / "loose.md")
     (meta / "link-to-dir").symlink_to(outside / "private", target_is_directory=True)
+    (meta / "link-to-nothing.md").symlink_to(never_created)
+
+    removed: list[Path] = []
+    count = sweep_unkept_meta(
+        meta,
+        skip=lambda _path: False,
+        remove=removed.append,
+    )
+
+    assert count == 2
+    assert removed == [meta / "link-to-file.md", meta / "link-to-nothing.md"]
+    assert (outside / "private" / "secret.md").exists()
+    assert (outside / "loose.md").exists()
+    assert not never_created.exists()
+
+
+def test_a_symlink_standing_at_a_kept_path_is_still_sheltered(
+    tmp_path: Path,
+) -> None:
+    """Only a *directory* defeats a shelter, not a link (#1484).
+
+    The #1484 policy is narrow on purpose: a keep or exempt entry stops
+    sheltering when a **directory** stands at its path, because only a
+    directory turns one documented survivor into an unbounded number of
+    undocumented ones. A symlink is a single alias, so it is sheltered
+    exactly as a regular file at that path would be, and the sweep does
+    not follow it to find out what it points at.
+    """
+    from creek.purge.meta import sweep_unkept_meta
+
+    meta = tmp_path / "00-Creek-Meta"
+    (meta / "audit").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_log = outside / "purge.jsonl"
+    real_log.write_text("{}\n", encoding="utf-8")
+    (meta / "audit" / "purge.jsonl").symlink_to(real_log)
+    (meta / "dedup-manifest.json").write_text("{}\n", encoding="utf-8")
 
     removed: list[Path] = []
     count = sweep_unkept_meta(
@@ -462,8 +512,9 @@ def test_the_sweep_unlinks_a_symlink_to_a_file_but_never_follows_one_to_a_dir(
     )
 
     assert count == 1
-    assert removed == [meta / "link-to-file.md"]
-    assert (outside / "private" / "secret.md").exists()
+    assert removed == [meta / "dedup-manifest.json"]
+    assert (meta / "audit" / "purge.jsonl").is_symlink()
+    assert real_log.exists()
 
 
 def test_the_sweep_is_a_no_op_on_a_vault_with_no_meta_directory(
@@ -521,3 +572,285 @@ def test_the_skip_predicate_suppresses_the_count_as_well_as_the_removal(
 
     assert count == 1
     assert removed == [fresh]
+
+
+# ---------------------------------------------------------------------------
+# A keep or exempt entry shelters a file, never a subtree (#1484)
+# ---------------------------------------------------------------------------
+
+_PRIVATE: Final[str] = "2026-03-11 therapy session"
+"""A recognisable title-derived string. Residue anywhere in the vault is a leak.
+
+Titles are the point. A purge that leaves a body behind is obviously
+broken; a purge that leaves a *name* behind looks clean and is not, which
+is why every assertion below searches filenames and symlink targets as
+well as file contents.
+"""
+
+_POLICY_BEGIN: Final[str] = "<!-- META-SURVIVOR-POLICY:BEGIN -->"
+_POLICY_END: Final[str] = "<!-- META-SURVIVOR-POLICY:END -->"
+
+
+def _minimal_vault(tmp_path: Path) -> Path:
+    """Build the smallest directory ``purge_vault`` accepts as a vault.
+
+    :func:`_seed_documented_vault` is deliberately not reused: it seeds a
+    real ``embeddings.parquet``, and these tests need to put a
+    **directory** at that path.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+
+    Returns:
+        The vault root.
+    """
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    (vault / "00-Creek-Meta" / "creek_config.yaml").write_text(
+        "# vault marker (GAP-003)\n",
+        encoding="utf-8",
+    )
+    (vault / "01-Fragments").mkdir()
+    return vault
+
+
+def _residue(vault: Path) -> str:
+    """Return every name, body and link target under *vault*, concatenated.
+
+    A dangling symlink's **target string** is residue too — that is the
+    whole of #1485 — so links are read with ``readlink`` rather than by
+    following them, which for a dangling link would read nothing at all
+    and make the assertion vacuous.
+
+    Args:
+        vault: Vault root.
+
+    Returns:
+        One string to search for a private marker.
+    """
+    parts: list[str] = []
+    for path in vault.rglob("*"):
+        parts.append(path.name)
+        if path.is_symlink():
+            parts.append(str(path.readlink()))
+        elif path.is_file():
+            parts.append(path.read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(parts)
+
+
+def _last_outcome(vault: Path) -> dict[str, object]:
+    """Return the final entry written to the preserved purge audit log.
+
+    Args:
+        vault: Vault root.
+
+    Returns:
+        The parsed last JSON line of ``00-Creek-Meta/audit/purge.jsonl``.
+    """
+    import json
+
+    log = vault / "00-Creek-Meta" / "audit" / "purge.jsonl"
+    lines = [line for line in log.read_text(encoding="utf-8").splitlines() if line]
+    assert lines, "the purge wrote no audit entry at all"
+    parsed = json.loads(lines[-1])
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+def test_a_directory_at_the_exempt_path_is_swept_not_sheltered(
+    tmp_path: Path,
+) -> None:
+    """``embeddings.parquet/`` as a directory shelters nothing (#1484).
+
+    The exempt tuple names one file another pass owns destroying. Before
+    this fix the keep/exempt decision was taken **before** the
+    ``is_dir()`` branch, so a directory standing at that path was skipped
+    whole and the walk never descended: every file beneath it survived a
+    whole-vault erasure while the survivor table still claimed the vault
+    was clean.
+
+    The purge then aborts — after the sweep, inside ``_delete_cache_file``,
+    because ``pq.read_metadata`` cannot open a directory. That is #1480,
+    and the ordering it forced (sweep first, cache delete second) is
+    exactly why the erasure still happens here.
+    """
+    vault = _minimal_vault(tmp_path)
+    leak = vault / "00-Creek-Meta" / "embeddings.parquet" / "State" / "ingest.jsonl"
+    leak.parent.mkdir(parents=True)
+    leak.write_text(f"{_PRIVATE}\n", encoding="utf-8")
+    assert _PRIVATE in _residue(vault)
+
+    with pytest.raises(OSError, match="directory"):
+        PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert not leak.exists()
+    assert _PRIVATE not in _residue(vault)
+
+
+def test_a_directory_at_a_keep_path_is_swept_and_previewed_identically(
+    tmp_path: Path,
+) -> None:
+    """A keep shelters one *file*; a directory at that path is swept (#1484).
+
+    ``audit/redact.jsonl`` is a keep entry that no other pass of
+    ``purge vault`` reads or writes, so it can stand as a directory
+    without disturbing anything else. Two files, one of them nested, so
+    the assertion proves the walk **descends** rather than merely
+    yielding the top entry — and, because ``is_kept`` used containment
+    matching, the nested one is the case a mere reordering of the
+    branches would still have missed.
+
+    Dry-run and apply are compared because a sweep that previews a
+    different number from the one it performs is the failure mode this
+    module exists to prevent (#1484 AC4).
+    """
+    vault = _minimal_vault(tmp_path)
+    kept = vault / "00-Creek-Meta" / "audit" / "redact.jsonl"
+    (kept / "nested").mkdir(parents=True)
+    (kept / "top.jsonl").write_text(f"{_PRIVATE} A\n", encoding="utf-8")
+    (kept / "nested" / "deep.jsonl").write_text(f"{_PRIVATE} B\n", encoding="utf-8")
+
+    preview = PurgeEngine(vault, dry_run=True).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert (kept / "top.jsonl").exists(), "a dry run destroyed something"
+    assert (kept / "nested" / "deep.jsonl").exists()
+
+    applied = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert preview.meta_artifacts_removed == 2
+    assert applied.meta_artifacts_removed == preview.meta_artifacts_removed
+    assert _PRIVATE not in _residue(vault)
+
+
+# ---------------------------------------------------------------------------
+# A dangling symlink is unlinked, never followed (#1485)
+# ---------------------------------------------------------------------------
+
+
+def _vault_with_a_link_to_a_fragment(tmp_path: Path) -> tuple[Path, Path]:
+    """Build a vault holding a meta link into a title-named fragment.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+
+    Returns:
+        The vault root and the link path under ``00-Creek-Meta/``.
+    """
+    vault = _minimal_vault(tmp_path)
+    journal = vault / "01-Fragments" / "Journal"
+    journal.mkdir(parents=True)
+    target = journal / f"{_PRIVATE}.md"
+    target.write_text("---\nid: frag-x\n---\n\nbody\n", encoding="utf-8")
+    link = vault / "00-Creek-Meta" / "latest-entry.md"
+    link.symlink_to(target)
+    return vault, link
+
+
+def test_a_symlink_the_content_wipe_left_dangling_is_unlinked(
+    tmp_path: Path,
+) -> None:
+    """The purge's own wipe makes the link dangle; the sweep must still take it.
+
+    ``purge_vault`` wipes the ten content folders **before** the meta
+    sweep, so a link under ``00-Creek-Meta/`` that pointed at a fragment
+    is already dangling when the sweep meets it. ``Path.is_file()``
+    follows the link and answers ``False`` for a dangling one, so the
+    pre-#1485 walk dropped it: the link survived the erasure carrying a
+    title-derived target string, and
+    ``01-Fragments/Journal/2026-03-11 therapy session.md`` is itself
+    private text.
+
+    ``Path.exists()`` also follows, so a dangling link is invisible to
+    it — the absence assertion goes through ``is_symlink`` or it would
+    pass on a link that is still there.
+    """
+    vault, link = _vault_with_a_link_to_a_fragment(tmp_path)
+    assert link.is_symlink()
+    assert _PRIVATE in _residue(vault)
+
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert not link.is_symlink(), "the dangling link survived the purge"
+    assert not link.exists()
+    assert result.meta_artifacts_removed == 1
+    assert _last_outcome(vault)["meta_artifacts_removed"] == 1
+    assert _PRIVATE not in _residue(vault)
+
+
+def test_the_dangling_link_preview_predicts_exactly_what_the_apply_removes(
+    tmp_path: Path,
+) -> None:
+    """Dry-run and apply agree on the count, which is the hard half (#1485 AC3).
+
+    The two runs meet *different filesystems*: a dry run does not wipe
+    the content folders, so the link is still resolvable and the
+    pre-#1485 walk counted it; the apply run wipes them first, so the
+    same link is dangling and the pre-#1485 walk counted nothing. A
+    preview that promises one removal and an apply that performs zero is
+    precisely the divergence the meta sweep exists to rule out.
+    """
+    vault, link = _vault_with_a_link_to_a_fragment(tmp_path)
+
+    preview = PurgeEngine(vault, dry_run=True).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert link.is_symlink(), "a dry run unlinked something"
+
+    applied = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert preview.meta_artifacts_removed == 1
+    assert applied.meta_artifacts_removed == preview.meta_artifacts_removed
+
+
+def test_a_dangling_link_out_of_the_vault_is_unlinked_without_touching_its_tree(
+    tmp_path: Path,
+) -> None:
+    """Unlinked, never followed, and never repaired (#1485 AC2).
+
+    Unlinking a symlink destroys the alias and nothing else, which is the
+    only reason taking a dangling link is safe. Asserted from the other
+    side too: the out-of-vault directory the link named still holds
+    exactly the sibling it held before, and the missing target was never
+    created.
+    """
+    vault = _minimal_vault(tmp_path)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    sibling = outside / "keep-me.md"
+    sibling.write_text("untouched\n", encoding="utf-8")
+    missing = outside / f"{_PRIVATE}.md"
+    link = vault / "00-Creek-Meta" / "pointer.md"
+    link.symlink_to(missing)
+
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert not link.is_symlink()
+    assert result.meta_artifacts_removed == 1
+    assert sibling.read_text(encoding="utf-8") == "untouched\n"
+    assert not missing.exists()
+    assert sorted(path.name for path in outside.iterdir()) == ["keep-me.md"]
+
+
+# ---------------------------------------------------------------------------
+# The policy is written down where an operator will read it (#1484 AC3)
+# ---------------------------------------------------------------------------
+
+
+def test_the_documented_policy_block_states_both_sweep_decisions() -> None:
+    """The survivor table is not the whole promise; the edge policy is too.
+
+    An operator reading only the table would conclude that
+    ``audit/redact.jsonl`` survives, full stop. It survives *as a file*.
+    The block pinned here is where the two edge decisions live — a
+    directory at a keep path is swept, a dangling symlink is unlinked —
+    and pinning it means the code cannot change its mind without the
+    documentation changing with it.
+    """
+    text = DOC_PATH.read_text(encoding="utf-8")
+
+    assert _POLICY_BEGIN in text, f"{DOC_PATH} lost its sweep-policy marker"
+    block = text.split(_POLICY_BEGIN, 1)[1].split(_POLICY_END, 1)[0].strip()
+
+    assert block, "the sweep-policy block is empty"
+    assert "directory" in block
+    assert "dangling" in block
+    assert "symlink" in block
