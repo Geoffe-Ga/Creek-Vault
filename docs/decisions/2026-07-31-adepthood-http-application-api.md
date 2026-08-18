@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (Creek side)
 - **Date**: 2026-07-31
-- **Contract version**: `0.7.0`
+- **Contract version**: `0.8.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23`
 - **Driving issues**: [#1072](https://github.com/Geoffe-Ga/Creek-Vault/issues/1072) (this decision), epic [#1071](https://github.com/Geoffe-Ga/Creek-Vault/issues/1071)
 - **Mirrors**: [`Geoffe-Ga/adepthood#2044`](https://github.com/Geoffe-Ga/adepthood/issues/2044)
@@ -157,21 +157,31 @@ responses, and that is correct rather than a generator artefact.
 
 | State | `status` | `vault.available` | `capabilities` | Both version strings present? |
 |---|---|---|---|---|
-| (a) present and usable | `ok` | `true` | all four | yes |
+| (a) present and usable | `ok` | `true` | all served (see below) | yes |
 | (b) reachable, uninitialized | `uninitialized` | `false` | `[]` | yes |
 | (c) reachable, contract-incompatible | `incompatible` | — | `[]` | yes |
 | (d) unreachable | — no body at all — | — | — | — |
 
 (d) is distinguished purely by transport outcome: connection refused, a
 DNS/TLS failure, a timeout, a non-JSON body, or an HTTP status outside the
-closed set the contract publishes — `{200, 401, 403, 404, 409, 422, 500,
-501, 503}` (`ALLOWED_HTTP_STATUSES` in the contract test suite, derived from
-`ERROR_STATUS`'s range plus `200`). A conforming client MUST map (d) to a
+closed set the contract publishes — `{200, 401, 403, 404, 409, 415, 422,
+500, 501, 503}` (`ALLOWED_HTTP_STATUSES` in the contract test suite, derived
+from `ERROR_STATUS`'s range plus `200`; `415` joined it at contract `0.8.0`
+with `unsupported_source`). A conforming client MUST map (d) to a
 distinct local state and MUST NOT synthesize a capabilities body, and MUST
 NOT fold it into "uninitialized" — those are different facts an operator
 needs to act on differently.
 
-**"All four" describes the completed epic, not every commit of it.** While
+**The advertised list is now caller-dependent (contract `0.8.0`).** It is the
+intersection of what this server implements with what the caller's declared
+contract minor published: `CAPABILITY_SINCE_MINOR` in `creek_mcp/api/models.py`
+is the one table, and `POST /v1/uploads` refuses a caller below `0.8` with
+`incompatible_version` off that same table, so what is withheld here is
+unreachable there. A caller that declares no minor at all is shown the full
+list — it has vendored nothing that a newer capability could contradict, and
+every content route refuses an undeclared minor anyway.
+
+**"All" describes the completed epic, not every commit of it.** While
 #1071 is being built out, `capabilities` advertises only the capabilities the
 running server actually implements: [#1074](https://github.com/Geoffe-Ga/Creek-Vault/issues/1074)
 ships `capabilities` alone, and #1075–#1077 each add one. A route that is
@@ -567,7 +577,7 @@ Not FastAPI.**
    taxonomy depends on. We would have to override it on every route anyway,
    which deletes the largest ergonomic reason to adopt the framework in the
    first place.
-4. The route table is five endpoints. The convenience a full framework buys
+4. The route table is six endpoints. The convenience a full framework buys
    scales with route-table size and does not clear the bar here.
 
 **Note for #1074**: Starlette must be **promoted to a declared direct
@@ -626,9 +636,9 @@ network MCP call. It is out of scope for #1117 and is tracked as follow-up
 
 [`docs/contracts/adepthood-v1/`](../contracts/adepthood-v1/) is the source of
 truth for the wire shapes in this repository:
-`manifest.json`, `retry-policy.json`, sixteen `schemas/*.schema.json` files
-(one per `CONTRACT_MODELS` entry), and twenty-eight
-`examples/<capability>/<state>.json` fixtures (four capabilities × seven
+`manifest.json`, `retry-policy.json`, eighteen `schemas/*.schema.json` files
+(one per `CONTRACT_MODELS` entry), and thirty-five
+`examples/<capability>/<state>.json` fixtures (five capabilities × seven
 states). Everything in the directory except its own `README.md` is
 **generated** by `build_bundle()`
 ([`creek_mcp/api/bundle.py`](../../creek-tools/creek_mcp/api/bundle.py)), and
@@ -718,3 +728,4 @@ restating the other.
 | `0.6.0` | 2026-08-13 | #1453 closes a right-to-be-forgotten leak, and the MCP half moves the shared contract minor. `creek.purge.*` results gain two integer counters: `ledger_rows_removed`, the ingest-ledger rows a scoped purge physically erased, and `meta_artifacts_removed`, the files a whole-vault purge destroyed under `00-Creek-Meta/` under its new deny-by-default sweep. `_result_payload` forwards every field of `PurgeResult`, so both reach the wire with no payload code change — which is precisely why the minor has to move rather than why it need not: a client validating the payload closed would otherwise meet two keys it never negotiated. **No `/v1` shape moved**, so this is a `0.3.0`/`0.4.0`-shaped bump rather than a `0.5.0`-shaped one, and a `0.5`-pinned client is served byte-identically on every `/v1` route it already calls. `SUPPORTED_CONTRACT_MINORS` is widened, not shifted, to keep serving `0.5` alongside `0.4`, `0.3` and `0.2`. Neither counter can carry vault content: both are plain integers, and the sweep's own record of *what* it destroyed never leaves the vault's audit log. |
 | `0.5.0` | 2026-08-12 | #1372 fixes five surfaces that computed operator-advisory data and threw it away at a boundary; the MCP/wire half moves the shared contract minor. Three MCP tools' return shapes changed: `creek.link` now reports `largest_cluster_fragments`, `clusters_split` and `oversized_discarded` — the cluster-health diagnostics `creek link` already printed to its console — and `creek.journal` / `creek.upload` now report `warnings`, the ingest run's content-free advisory channel. That is what carries the minor, by `contract.py`'s own rule: a tool's return shape moved. **Unlike `0.3.0` and `0.4.0`, a `/v1` shape moved too.** `JournalUpsertResponse` gained an *optional* `warnings` field, and the honest compatibility story is narrower than "invisible": the field defaults to `None` and the response is dumped with `exclude_none`, so a write that produced no advisory is byte-for-byte what it was before — the ordinary case. A write that DID produce an advisory now carries one additional key, and a `0.4`-pinned client validating the response shape closed should widen its validator or read the negotiated window off `GET /v1/capabilities`, rather than assume the newest minor is the only one accepted. `SUPPORTED_CONTRACT_MINORS` is widened, not shifted, to keep serving `0.4` alongside `0.3` and `0.2`, so no existing client is stranded. Every advisory crossing the MCP/`/v1` boundary is content-free *by construction at the producer*: `collapsed_unit_warning` interpolates real vault fragment ids that the caller's tier ceiling may not admit, so those ids reach the CLI console only, never a remote caller. |
 | `0.7.0` | 2026-08-13 | #1494 makes `tier` **mandatory** on `creek.journal` and `creek.upload`; the MCP tool surface's semantics move, so the shared contract minor moves. Both verbs declared `tier: str = "open"` twice each — once on the tool function and again, independently, on the `build_server` wrapper MCP clients actually reach — so a client that omitted the field had its content filed at `open` and was told so nowhere, and the `privacy_tier_ceiling` machinery could not catch it because at `ceiling=open` a defaulted `open` is trivially within the caller's own ceiling. Both now return `{"status": "refused", ...}` naming the missing `tier`, before anything is staged, ingested or audited. This row also covers **`creek.save`**, which took the identical break in [#1495](https://github.com/Geoffe-Ga/Creek-Vault/issues/1495) one commit earlier and shipped without a bump — recorded here retroactively because that was a miss rather than a precedent, and a published contract version that stays silent about a mandatory input on three write verbs is worse than a row that names all three late. An input becoming *required* is strictly larger than the optional **response** field that carried `0.5.0` for these same two tools, so it cannot carry less than a minor. **No `/v1` shape moved**, so this is a `0.3.0`/`0.4.0`-shaped bump rather than a `0.5.0`-shaped one: `JournalUpsertRequest.tier` (`creek_mcp/api/models.py:614`) never had a default and is typed `WireTierCeiling`, `PUT /v1/journal-entries/{external_id}` already passed `tier=parsed.tier.value` explicitly, and `creek.upload` has no `/v1` route at all — the HTTP adapter is the surface that already got this right, and this change restores MCP parity with it. `SUPPORTED_CONTRACT_MINORS` is widened, not shifted, to keep serving `0.6` alongside `0.5`, `0.4`, `0.3` and `0.2`; shifting it would refuse a `0.6`-pinned `/v1` client over a break it cannot express, since its journal writes already carried an explicit tier. `creek_mcp/httpapi/journal.py`'s `journal_refusal_code` maps the new `TIER_REQUIRED_REASON` to `invalid_request` as defence in depth, so the reason cannot fall through to `internal_error` in a function documented as total by construction. |
+| `0.8.0` | 2026-08-18 | #1524 publishes a **fifth capability**, `upload`, served by `POST /v1/uploads`. `creek.upload` has existed since contract `0.3.0` and has been MCP-only ever since, so no HTTP client could seed a vault with a document; this route exposes the existing tool and reimplements none of it — staging, extension dispatch, the ledger-backed `run_ingest`, the write-tier gate, the #970 overwrite gate and the audit append are all `upload_tool`'s, unchanged. The request is JSON + base64, never multipart, because Adepthood's client is JSON and its CI bans `python-multipart`. **This is the first bump since `0.2.0` that moves a `/v1` shape by addition rather than an MCP-only surface**, so it is also the first where widening `SUPPORTED_CONTRACT_MINORS` has to be argued rather than assumed: it costs a `0.7` client nothing, because every shape it already knows is byte-identical and the addition is a route it is neither told about nor served. Both halves of that come off one table, `CAPABILITY_SINCE_MINOR` — `GET /v1/capabilities` filters the advertised list with it and `_predates_the_capability` refuses the route with it, so a `0.2`-pinned client is told `upload` does not exist and finds that it does not. Riding along, all additive: two wire models (`UploadRequest`, `UploadResponse`); one error code, `unsupported_source`, which brings `415` into the published status set and carries #1526's remedy for a conversation export, an archive or a legacy binary Office document instead of letting it fall through to `500`; and a per-route request-body cap (`ROUTE_BODY_CAPS`) of ~13.4 MiB on the upload path alone — the base64 envelope of `MAX_UPLOAD_BYTES`, matching the 10 MiB document cap Adepthood already enforces — rather than raising the 1 MiB global cap every other route would then be allowed to buffer. `UploadResponse` deliberately publishes **no `tier` field**: a document's own frontmatter can escalate the fragment above the declared tier, so the field could only be a false claim (the #1491 defect) or a tier oracle. |

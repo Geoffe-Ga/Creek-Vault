@@ -15,8 +15,25 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.7.0"
+CONTRACT_VERSION: Final[str] = "0.8.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.8.0 (#1524): ``/v1`` publishes a **fifth capability**, ``upload``, served by
+``POST /v1/uploads``. This is the first bump since 0.2.0 that adds a route
+rather than only moving the MCP tool surface, and it is the reason the previous
+four bumps all had to widen ``SUPPORTED_CONTRACT_MINORS`` rather than shift it:
+a client pinned to an older minor is answered by a ``GET /v1/capabilities`` that
+does **not** list ``upload``, and ``POST /v1/uploads`` refuses it with
+``incompatible_version``, because a capability a client's vendored contract does
+not describe is one it must not be silently handed. Both halves read the same
+:data:`creek_mcp.api.models.CAPABILITY_SINCE_MINOR` table. Three further
+additions ride along, all of them additive: two wire models
+(``UploadRequest`` / ``UploadResponse``), one error code
+(:attr:`~creek_mcp.api.models.ErrorCode.UNSUPPORTED_SOURCE`) and — with it —
+``415`` joining the published status set, which is the one part of this bump an
+older client can meet on a route it already calls only if it starts calling a
+route it was never told about. ``creek.upload`` itself is unchanged: the route
+delegates to :func:`creek_mcp.tools.upload.upload_tool` and reimplements nothing.
 
 0.7.0 (#1494): ``creek.journal`` and ``creek.upload`` now **require** an
 explicit ``tier``. Both used to default it to ``open``, so a client that

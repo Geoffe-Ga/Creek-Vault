@@ -78,6 +78,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.7",
     "0.6",
     "0.5",
     "0.4",
@@ -124,6 +125,16 @@ does not: ``JournalUpsertRequest.tier`` never had a default, so the HTTP
 adapter already required what MCP now requires, and ``creek.upload`` has no
 ``/v1`` route to move. Dropping ``0.6`` here would therefore refuse a
 correct-by-construction ``/v1`` client over a break it cannot even express.
+
+Contract 0.8 (#1524) is the first since 0.2 that is **not** an MCP-only move:
+it publishes a fifth ``/v1`` route, ``POST /v1/uploads``, and with it the
+``upload`` capability, two wire models and one error code. Widening rather than
+shifting costs a ``0.7`` client nothing at all, because every ``/v1`` shape it
+already knows is byte-identical — the addition is a route it is not told about
+and cannot reach. That last clause is enforced, not hoped for: see
+:data:`CAPABILITY_SINCE_MINOR`, which drives both what
+``GET /v1/capabilities`` advertises to a given caller and which callers
+``POST /v1/uploads`` will answer.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
@@ -187,12 +198,16 @@ class WireTierCeiling(StrEnum):
 
 
 class Capability(StrEnum):
-    """The four capabilities ``/v1`` publishes.
+    """The five capabilities ``/v1`` publishes.
 
-    The list is identical for every minor in
-    :data:`SUPPORTED_CONTRACT_MINORS`: contract 0.3 grew the *MCP* tool surface
-    (``creek.upload``, #1023) and added no ``/v1`` route, so a ``0.2`` client
-    and a ``0.3`` client are answered from the same four names.
+    The list was identical for every minor in
+    :data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3
+    grew the *MCP* tool surface (``creek.upload``, #1023) and added no ``/v1``
+    route, so a ``0.2`` client and a ``0.7`` client were answered from the same
+    four names. Contract 0.8 (#1524) ends that by publishing ``UPLOAD``, and
+    the list is therefore **no longer minor-independent**: what a caller is
+    told, and what it is served, are both keyed on
+    :data:`CAPABILITY_SINCE_MINOR`.
 
     The values are also the directory names of the example matrix in
     :mod:`creek_mcp.api.bundle`, so the advertised capability list and the
@@ -203,12 +218,81 @@ class Capability(StrEnum):
         JOURNAL_UPSERT: Idempotent journal entry create/update.
         REFLECTIONS: Margin notes on an entry, care-guarded.
         WHEEL: Aggregate APTITUDE frequency distribution.
+        UPLOAD: Idempotent document upload — base64 bytes plus a filename,
+            dispatched to an ingestor by extension. Since contract 0.8.
     """
 
     CAPABILITIES = "capabilities"
     JOURNAL_UPSERT = "journal-upsert"
     REFLECTIONS = "reflections"
     WHEEL = "wheel"
+    UPLOAD = "upload"
+
+
+_FOUNDING_MINOR: Final[str] = "0.2"
+"""The minor ``/v1`` was first published at; the four founding capabilities."""
+
+_UPLOAD_MINOR: Final[str] = "0.8"
+"""The minor ``upload`` was published at (#1524).
+
+A literal, deliberately, and **not** :data:`CONTRACT_MINOR`. Written as the
+derived constant it would silently follow the next bump forward, at which point
+every client pinned to 0.8 — the very clients this table exists to serve — would
+stop being told about a capability they negotiated correctly for.
+"""
+
+CAPABILITY_SINCE_MINOR: Final[dict[Capability, str]] = {
+    Capability.CAPABILITIES: _FOUNDING_MINOR,
+    Capability.JOURNAL_UPSERT: _FOUNDING_MINOR,
+    Capability.REFLECTIONS: _FOUNDING_MINOR,
+    Capability.WHEEL: _FOUNDING_MINOR,
+    Capability.UPLOAD: _UPLOAD_MINOR,
+}
+"""The contract minor each capability was first published at.
+
+Total over :class:`Capability`, so no lookup can ``KeyError`` mid-request, and
+pinned as total by a test — a capability added without an entry here would
+otherwise be advertised to everyone including clients whose vendored contract
+predates it.
+
+**One table, two enforcement points, and that is the point.**
+:mod:`creek_mcp.httpapi.capabilities` filters the advertised list with it, and
+:func:`creek_mcp.httpapi.app._endpoint_for` refuses a route with it. Two
+separate tables would drift into the worst of both readings: a capability
+advertised but refused (a server calling itself a liar) or one refused but
+reachable (an endpoint a client integrates against without ever having
+negotiated it, which is the ``501``-stub hazard
+:mod:`creek_mcp.httpapi.handlers` documents, one layer up).
+
+Every value must be a served minor; nothing is ever *removed* from this table,
+because :data:`SUPPORTED_CONTRACT_MINORS` only ever widens.
+"""
+
+
+def minor_at_least(declared: str, required: str) -> bool:
+    """Return whether *declared* is at or above the *required* contract minor.
+
+    Compared componentwise as integers, never as strings. Lexicographic order
+    puts ``"0.10"`` below ``"0.8"``, so a string compare here would start
+    hiding capabilities from the newest clients on the day the minor reaches
+    double digits — a failure that cannot be caught by any test written before
+    that day unless the comparison is right from the start.
+
+    Args:
+        declared: The caller's ``major.minor``, already checked for membership
+            in :data:`SUPPORTED_CONTRACT_MINORS` by the caller of this
+            function. Anything unparseable is treated as *below* every
+            requirement, which fails closed.
+        required: The minor being demanded, from :data:`CAPABILITY_SINCE_MINOR`.
+
+    Returns:
+        ``True`` when *declared* is at least *required*.
+    """
+    try:
+        parsed = tuple(int(part) for part in declared.split("."))
+    except ValueError:
+        return False
+    return parsed >= tuple(int(part) for part in required.split("."))
 
 
 class CapabilitiesStatus(StrEnum):
@@ -229,11 +313,20 @@ class CapabilitiesStatus(StrEnum):
 
 
 class JournalAction(StrEnum):
-    """What an idempotent journal upsert actually did.
+    """What an idempotent write actually did — journal upsert or upload.
 
     ``UNCHANGED`` is a success, not an error: re-sending an unmodified entry is
     the steady state of a continuous sync, and a client must be able to tell it
     apart from a write without diffing content itself.
+
+    Shared by :class:`JournalUpsertResponse` and :class:`UploadResponse` rather
+    than duplicated under a second name. The three words are the same three
+    :func:`creek_mcp.tools.upload._action_of` collapses an ingest tally into,
+    and the ledger that decides them is one ledger. The name kept its
+    ``Journal`` prefix through contract 0.8 because it is a **published schema
+    component name**: Adepthood has vendored ``$defs/JournalAction`` since 0.2,
+    and renaming it would break every consumer's schema validation to buy
+    nothing a docstring cannot say.
 
     Attributes:
         CREATED: A new fragment was written.
@@ -290,7 +383,7 @@ class NoteKind(StrEnum):
 
 
 class ErrorCode(StrEnum):
-    """The nine wire error codes, closed at contract 0.3 and unchanged since 0.2.
+    """The ten wire error codes: nine from contract 0.2, one added at 0.8.
 
     There is deliberately **no** ``care_escalation`` member: an escalation is a
     successful, 200-shaped :class:`CareEscalationResponse`, because a person in
@@ -311,6 +404,12 @@ class ErrorCode(StrEnum):
             "not for you" is a corpus enumeration primitive.
         UNSUPPORTED_CAPABILITY: A published capability this server does not
             implement.
+        UNSUPPORTED_SOURCE: The uploaded file's **extension** names a format
+            Creek must not ingest as one document — a conversation export, an
+            archive, a legacy binary Office file (#1526). A statement about
+            the caller's own filename and nothing else, so it discloses
+            nothing about the vault. Added at contract 0.8 (#1524), and
+            reachable only on ``POST /v1/uploads``.
         UNAVAILABLE: The vault is absent or unreadable; a human must act.
         TEMPORARILY_UNAVAILABLE: A transient condition; backoff will clear it.
         INTERNAL_ERROR: An unexpected server fault.
@@ -322,6 +421,7 @@ class ErrorCode(StrEnum):
     PRIVACY_REFUSED = "privacy_refused"
     NOT_FOUND = "not_found"
     UNSUPPORTED_CAPABILITY = "unsupported_capability"
+    UNSUPPORTED_SOURCE = "unsupported_source"
     UNAVAILABLE = "unavailable"
     TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
     INTERNAL_ERROR = "internal_error"
@@ -354,6 +454,7 @@ ERROR_STATUS: Final[dict[ErrorCode, int]] = {
     ErrorCode.PRIVACY_REFUSED: 403,
     ErrorCode.NOT_FOUND: 404,
     ErrorCode.UNSUPPORTED_CAPABILITY: 501,
+    ErrorCode.UNSUPPORTED_SOURCE: 415,
     ErrorCode.UNAVAILABLE: 503,
     ErrorCode.TEMPORARILY_UNAVAILABLE: 503,
     ErrorCode.INTERNAL_ERROR: 500,
@@ -362,10 +463,17 @@ ERROR_STATUS: Final[dict[ErrorCode, int]] = {
 
 Total over :class:`ErrorCode`, so no dispatch path can ``KeyError`` while
 building a response. As prose: 401 Unauthorized, 422 Unprocessable Content, 409
-Conflict, 403 Forbidden, 404 Not Found, 501 Not Implemented, 503 Service
-Unavailable (twice — the two 503s differ only in retry disposition, which is
-the distinction that actually matters to a client) and 500 Internal Server
-Error.
+Conflict, 403 Forbidden, 404 Not Found, 501 Not Implemented, 415 Unsupported
+Media Type, 503 Service Unavailable (twice — the two 503s differ only in retry
+disposition, which is the distinction that actually matters to a client) and
+500 Internal Server Error.
+
+``415`` is the one status contract 0.8 added to the published set, and it is a
+status of its own rather than a second ``422`` on purpose: the OpenAPI document
+carries one response object per status, so a code sharing ``422`` with
+``INVALID_REQUEST`` could not be documented at all — and, more to the point, a
+client's generic "fix your JSON and retry" handling is exactly the wrong
+handling for "this file format is never going to work".
 
 ``PRIVACY_REFUSED`` is 403 rather than 404 on purpose. 404 would be the very
 oracle :attr:`ErrorCode.NOT_FOUND` is fenced off to avoid: a caller able to
@@ -384,6 +492,20 @@ ERROR_MESSAGES: Final[dict[ErrorCode, str]] = {
     # collapsed.
     ErrorCode.NOT_FOUND: "no such endpoint on this server",
     ErrorCode.UNSUPPORTED_CAPABILITY: "this capability is not implemented here",
+    # Phrased about the FORMAT, never about the file, and it carries the
+    # remedy rather than only the refusal — a refusal that does not say what
+    # to do instead is one the caller retries verbatim. It is one constant
+    # covering all three refused families (#1526's conversation exports,
+    # archives and legacy binary Office documents) precisely so that it can
+    # stay a constant: a per-extension message would have to be selected at
+    # render time, and the moment `error_response` can be handed a message it
+    # is a place caller — or vault — material eventually gets interpolated.
+    ErrorCode.UNSUPPORTED_SOURCE: (
+        "this file format cannot be ingested as one document: unpack a "
+        "conversation export or archive and run `creek ingest --type "
+        "<chatgpt|claude|discord|substack> --input <dir>`, or re-save a "
+        "legacy Office document as .docx, .xlsx or .pptx"
+    ),
     ErrorCode.UNAVAILABLE: "the vault is not available to serve this request",
     ErrorCode.TEMPORARILY_UNAVAILABLE: "the service is briefly unable to answer",
     ErrorCode.INTERNAL_ERROR: "the server failed to complete this request",
@@ -409,6 +531,7 @@ RETRY_POLICY: Final[dict[ErrorCode, RetryDisposition]] = {
     ErrorCode.PRIVACY_REFUSED: RetryDisposition.TERMINAL,
     ErrorCode.NOT_FOUND: RetryDisposition.TERMINAL,
     ErrorCode.UNSUPPORTED_CAPABILITY: RetryDisposition.TERMINAL,
+    ErrorCode.UNSUPPORTED_SOURCE: RetryDisposition.TERMINAL,
     ErrorCode.UNAVAILABLE: RetryDisposition.RETRY_AFTER_OPERATOR_ACTION,
     ErrorCode.TEMPORARILY_UNAVAILABLE: RetryDisposition.RETRY_WITH_BACKOFF,
     ErrorCode.INTERNAL_ERROR: RetryDisposition.RETRY_WITH_BACKOFF,
@@ -479,6 +602,35 @@ in a default.
 
 _MIN_CARE_RESOURCES: Final[int] = 1
 """A care signal with no resources would dead-end the person reading it."""
+
+MAX_EXTERNAL_ID_CHARS: Final[int] = 512
+"""Inclusive upper bound on a consumer-supplied ``external_id``.
+
+Generous enough for any namespaced consumer id — the published example is 38
+characters — and small enough that the id cannot become a payload.
+:func:`creek_mcp.staged_names.safe_stem` accepts literally any string and
+truncates only the *readable slug* to 80 characters before appending a digest
+of the whole raw id, so without a bound here an unbounded id would be accepted,
+stored and echoed back at full length.
+
+Declared in this framework-free module, and imported by
+:mod:`creek_mcp.httpapi.journal` rather than restated there, because both write
+surfaces have to mean the same thing by "an id that can serve as an idempotency
+key": the journal route takes it as a URL path segment and the upload route as
+a JSON field, and two bounds would let the same id be addressable through one
+and not the other.
+"""
+
+MAX_FILENAME_CHARS: Final[int] = 255
+"""Inclusive upper bound on the uploaded ``filename``.
+
+The classical POSIX single-component limit. Only the extension is ever trusted
+— :func:`creek_mcp.staged_names.safe_suffix` truncates that, and the staged
+name is built from the ``external_id``, never from this string — so the bound
+is not protecting a filesystem call. It is protecting the audit log and the
+wire from a caller who discovers that "filename" is an unbounded free-text
+field nobody reads.
+"""
 
 
 # --------------------------------------------------------------------------
@@ -677,6 +829,146 @@ class JournalUpsertResponse(_WireModel):
         default=None,
         description=(
             "Content-free operator advisories this write produced; absent when none."
+        ),
+    )
+
+
+class UploadRequest(_WireModel):
+    """One document's bytes, handed to the vault under a stable id (#1524).
+
+    The wire half of :func:`creek_mcp.tools.upload.upload_tool`, and
+    deliberately its *subset*: it carries no ``source_type``. The tool refuses
+    that override because the ``chatgpt`` / ``claude`` / ``discord`` /
+    ``substack`` ingestors are directory-only and would discover nothing from a
+    single staged file, reporting a silent no-op as a success. Dispatch is by
+    the filename's extension, through
+    :func:`creek.ingest.route_to_ingestor`, and nothing else. Uploading a whole
+    export archive is tracked separately, in #1525.
+
+    **JSON and base64, never multipart.** The consumer's HTTP client is JSON
+    and its CI bans ``python-multipart``, so a multipart route would be one
+    neither end could use. The cost is the ~33% base64 expansion, which is what
+    :data:`creek_mcp.api.routes.UPLOAD_MAX_BODY_BYTES` is sized around.
+
+    Attributes:
+        filename: The caller's original filename. Only its **extension** is
+            trusted, and only to choose an ingestor; the staged file's name is
+            derived from *external_id*, so nothing here reaches a path.
+        content_base64: The document's bytes, base64-encoded. Refused when
+            blank; refused by the tool when it is not valid base64, and — via
+            the encoded-length guard — before an oversize payload is ever
+            turned into memory.
+        external_id: The consumer-side stable id, and the idempotency key. The
+            same id updates in place; a new id creates a new fragment.
+        timestamp: Optional ISO-8601 upload time, accepted for symmetry with
+            :class:`JournalUpsertRequest` and echoed nowhere on disk — a binary
+            document has no frontmatter to put it in, so the fragment's
+            timestamp comes from the ingestor.
+        tier: The tier to file the document at. **Required, and typed
+            :class:`WireTierCeiling`,** so ``intimate`` is not expressible and
+            omission is not defaultable. Both halves matter: #1494 removed this
+            field's ``open`` default from ``creek.upload`` precisely because
+            only the caller knows what the document holds, and a default filed
+            intimate-derived bytes in the clear.
+    """
+
+    filename: str = Field(
+        max_length=MAX_FILENAME_CHARS,
+        description="Original filename; only its extension is trusted.",
+    )
+    content_base64: str = Field(description="The document's bytes, base64.")
+    external_id: str = Field(
+        max_length=MAX_EXTERNAL_ID_CHARS,
+        description="Consumer-side stable id; the idempotency key.",
+    )
+    timestamp: str | None = Field(
+        default=None,
+        description="Optional client-supplied upload time.",
+    )
+    tier: WireTierCeiling = Field(description="Tier to file the document at.")
+
+    @field_validator("filename", "content_base64", "external_id")
+    @classmethod
+    def _reject_blank(cls, value: str) -> str:
+        """Refuse a whitespace-only value on any of the three required strings.
+
+        One validator over three fields rather than three validators: they
+        share a rule, and a rule stated three times is one that gets relaxed
+        twice.
+
+        Args:
+            value: The submitted field value.
+
+        Returns:
+            *value* unchanged when it carries a non-space character.
+
+        Raises:
+            ValueError: When *value* is empty or whitespace-only.
+        """
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
+class UploadResponse(_WireModel):
+    """The result of an idempotent document upload.
+
+    **There is deliberately no ``tier`` field**, and its absence is the whole
+    of this model's privacy argument. ``creek classify`` is escalate-only and
+    :meth:`creek.vault.writer.VaultWriter.update_fragment` re-derives a
+    fragment's tier the same way, so an uploaded ``.md`` whose own frontmatter
+    declares ``intimate`` is filed at ``intimate`` however modest a tier the
+    caller declared. A ``tier`` field here would have exactly two possible
+    values and both are wrong: echo the declared tier and the response asserts
+    something about the file on disk that is false — the #1491 defect, where a
+    response claimed a tier the bytes did not carry — or report the resolved
+    tier and the response becomes a tier oracle, spelled in a vocabulary
+    (:class:`WireTierCeiling`) that cannot even express the answer. So the
+    response says only what it can say truthfully: which ceiling the call ran
+    at, and which fragments now exist.
+
+    Attributes:
+        status: Always ``"ok"``. Failure is an :class:`ErrorEnvelope`.
+        tier_ceiling: The ceiling the call was served under — the caller's own
+            declared value, echoed for correlation and carrying no bit of the
+            vault's state.
+        external_id: The consumer-side identity of the document, unchanged.
+        fragment_id: The vault-side identity now backing it. For the
+            one-fragment-per-file majority this is simply *the* fragment; for a
+            document that splits (a multi-sheet workbook) it is the first of
+            :attr:`affected_fragment_ids` in ledger-key order, which is
+            deterministic across runs.
+        affected_fragment_ids: **Every** fragment this document produced, in
+            that same order. Published rather than left implicit because a
+            right-to-be-forgotten request answered from ``fragment_id`` alone
+            would miss the other sheets of a workbook (#1305).
+        action: Whether the upload created, updated, or changed nothing.
+        source_type: The ingestor the extension dispatched to (``markdown``,
+            ``document``, ``spreadsheet``, …). Derived from the caller's own
+            filename, so it discloses nothing, and worth publishing because
+            "which reader interpreted my bytes" is otherwise unknowable.
+        warnings: Content-free operator advisories this ingest produced, absent
+            entirely when there were none — the same optional-and-omitted shape
+            :class:`JournalUpsertResponse` uses, and for the same reason. This
+            is the surface that most needs it: the collapsed-unit advisory
+            reports actual data loss on the multi-sheet workbook path. Every
+            entry is proven ceiling-safe at the producer (see
+            :attr:`creek.ingest.pipeline.IngestRunResult.ceiling_safe_warnings`).
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    external_id: str = Field(description="Consumer-side document identity.")
+    fragment_id: str = Field(description="Vault-side fragment identity.")
+    affected_fragment_ids: list[str] = Field(
+        description="Every fragment this document produced, in ledger order.",
+    )
+    action: JournalAction = Field(description="Created, updated, or unchanged.")
+    source_type: str = Field(description="Ingestor the extension dispatched to.")
+    warnings: list[str] | None = Field(
+        default=None,
+        description=(
+            "Content-free operator advisories this upload produced; absent when none."
         ),
     )
 
@@ -960,9 +1252,9 @@ class WheelResponse(_WireModel):
 class NotApplicableExample(_WireModel):
     """Marks a fixture-matrix cell that has no response shape to document.
 
-    The published example matrix is 4 capabilities x 7 states. Three of those
-    cells — care escalation for ``capabilities``, ``journal-upsert`` and
-    ``wheel`` — are *structurally* unreachable: the acute-distress guard runs
+    The published example matrix is 5 capabilities x 7 states. Four of those
+    cells — care escalation for ``capabilities``, ``journal-upsert``, ``wheel``
+    and ``upload`` — are *structurally* unreachable: the acute-distress guard runs
     only inside :func:`creek_mcp.tools.reflect.reflect_tool`, so no other
     capability can ever escalate.
 
@@ -1001,6 +1293,8 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "ReflectionRequest": ReflectionRequest,
     "ReflectionResponse": ReflectionResponse,
     "TierModel": TierModel,
+    "UploadRequest": UploadRequest,
+    "UploadResponse": UploadResponse,
     "VaultState": VaultState,
     "WheelFrequencies": WheelFrequencies,
     "WheelFrequency": WheelFrequency,

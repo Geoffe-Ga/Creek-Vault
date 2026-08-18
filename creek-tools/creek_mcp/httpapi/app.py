@@ -60,8 +60,14 @@ from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
 from starlette.routing import Route
 
-from creek_mcp.api.models import ERROR_STATUS, SUPPORTED_CONTRACT_MINORS, ErrorCode
-from creek_mcp.api.routes import CONTRACT_VERSION_HEADER, ROUTES
+from creek_mcp.api.models import (
+    CAPABILITY_SINCE_MINOR,
+    ERROR_STATUS,
+    SUPPORTED_CONTRACT_MINORS,
+    ErrorCode,
+    minor_at_least,
+)
+from creek_mcp.api.routes import CONTRACT_VERSION_HEADER, ROUTE_BODY_CAPS, ROUTES
 from creek_mcp.httpapi import handlers
 from creek_mcp.httpapi.auth import BearerAuthMiddleware, build_verifier
 from creek_mcp.httpapi.context import context_of
@@ -124,6 +130,46 @@ def _speaks_a_served_minor(request: Request) -> bool:
     return request.headers.get(CONTRACT_VERSION_HEADER) in SUPPORTED_CONTRACT_MINORS
 
 
+def _predates_the_capability(request: Request, spec: RouteSpec) -> bool:
+    """Return whether the caller's declared minor is older than *spec*'s capability.
+
+    The mirror image of the filter
+    :func:`creek_mcp.httpapi.capabilities.advertised_capabilities` applies, off
+    the same :data:`~creek_mcp.api.models.CAPABILITY_SINCE_MINOR` table: a
+    client that was told a capability does not exist must not find that it
+    quietly does. Serving it anyway would hand a consumer a route whose
+    response model, error codes and status set are all absent from the contract
+    version it vendored — which is the same "integrates against it, discovers
+    it in production" failure the ``501`` honesty stub exists to prevent, one
+    layer up.
+
+    Consulted only from behind ``spec.requires_contract_version``, which is what
+    keeps ``GET /v1/capabilities`` out of it entirely. That endpoint must answer
+    ``200`` for *every* server and caller state, including a minor it cannot
+    speak — a client that cannot read a version off a server has no way to learn
+    what is wrong with it — so it reports incompatibility in its body and must
+    never be handed a ``409`` by a gate above it.
+
+    Returns ``False`` for a route with no capability (health), and for a request
+    that declared no minor at all: silence is already refused, one line earlier,
+    by :func:`_speaks_a_served_minor` on every route that reaches here.
+
+    Args:
+        request: The request in flight.
+        spec: The route being dispatched to.
+
+    Returns:
+        ``True`` when this caller is pinned below the minor that published this
+        route's capability.
+    """
+    if spec.capability is None:
+        return False
+    declared = request.headers.get(CONTRACT_VERSION_HEADER)
+    if declared is None:
+        return False
+    return not minor_at_least(declared, CAPABILITY_SINCE_MINOR[spec.capability])
+
+
 def _endpoint_for(spec: RouteSpec, handler: Handler) -> Handler:
     """Wrap *handler* with the two things every ``/v1`` endpoint owes.
 
@@ -141,7 +187,13 @@ def _endpoint_for(spec: RouteSpec, handler: Handler) -> Handler:
     """
 
     async def endpoint(request: Request) -> Response:
-        """Record the route template, apply the version gate, then dispatch.
+        """Record the route template, apply the two version gates, then dispatch.
+
+        Both gates render the same ``incompatible_version``, and deliberately:
+        "you speak a minor this server retired" and "you speak a minor that
+        predates this route" are the same instruction to a client — renegotiate
+        — and two distinguishable codes would only tell a caller which of the
+        two facts to probe for.
 
         Args:
             request: The request in flight.
@@ -151,7 +203,10 @@ def _endpoint_for(spec: RouteSpec, handler: Handler) -> Handler:
         """
         context = context_of(request.scope)
         context.route = spec.path
-        if spec.requires_contract_version and not _speaks_a_served_minor(request):
+        if spec.requires_contract_version and (
+            not _speaks_a_served_minor(request)
+            or _predates_the_capability(request, spec)
+        ):
             return error_response(ErrorCode.INCOMPATIBLE_VERSION, context)
         return await handler(request)
 
@@ -261,7 +316,9 @@ def _middleware(
 
     Args:
         verifier: The shared consumer-token verifier.
-        max_body_bytes: Inclusive request-body cap.
+        max_body_bytes: Inclusive request-body cap, for every path that does
+            not declare its own in
+            :data:`~creek_mcp.api.routes.ROUTE_BODY_CAPS`.
         timeout_seconds: Per-request deadline.
         max_concurrency: In-flight request limit, process-wide.
 
@@ -274,7 +331,11 @@ def _middleware(
         Middleware(ConcurrencyLimitMiddleware, max_concurrency=max_concurrency),
         Middleware(RequestTimeoutMiddleware, timeout_seconds=timeout_seconds),
         Middleware(BearerAuthMiddleware, verifier=verifier),
-        Middleware(BodySizeLimitMiddleware, max_body_bytes=max_body_bytes),
+        Middleware(
+            BodySizeLimitMiddleware,
+            max_body_bytes=max_body_bytes,
+            route_caps=ROUTE_BODY_CAPS,
+        ),
         Middleware(CeilingAdmissionMiddleware),
     ]
 
@@ -298,7 +359,10 @@ def create_app(
         verifier: The consumer-token verifier, or ``None`` to build one from
             the environment. There is no third option: an app with no verifier
             would be an unauthenticated vault surface.
-        max_body_bytes: Inclusive request-body cap.
+        max_body_bytes: Inclusive request-body cap, for every path that does
+            not declare its own in
+            :data:`~creek_mcp.api.routes.ROUTE_BODY_CAPS`. ``POST /v1/uploads``
+            does, so lowering this does not lower that route.
         timeout_seconds: Per-request deadline.
         max_concurrency: In-flight request limit, process-wide.
         reflect_llm_factory: Thunk returning the tier-keyed LLM factory

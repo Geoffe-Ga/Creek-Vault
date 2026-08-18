@@ -104,7 +104,7 @@ class _Refuse:
     guidance: str
 
 
-_STRUCTURED_EXPORT_GUIDANCE: Final[str] = (
+STRUCTURED_EXPORT_GUIDANCE: Final[str] = (
     "A conversation export holds many conversations, not one document, and "
     "the generic fallback would file the whole file as a single "
     "undifferentiated blob. Unpack the export and run `creek ingest --type "
@@ -112,14 +112,14 @@ _STRUCTURED_EXPORT_GUIDANCE: Final[str] = (
     "export directly is tracked by issue #1525."
 )
 
-_ARCHIVE_GUIDANCE: Final[str] = (
+ARCHIVE_GUIDANCE: Final[str] = (
     "An export archive is a container of many files, not one document. "
     "Unpack it and run `creek ingest --type "
     "<chatgpt|claude|discord|substack> --input <unpacked-dir>`. Uploading an "
     "archive directly is tracked by issue #1525."
 )
 
-_LEGACY_OFFICE_GUIDANCE: Final[str] = (
+LEGACY_OFFICE_GUIDANCE: Final[str] = (
     "Creek reads the Office Open XML formats. Re-save this document as "
     ".docx, .xlsx or .pptx and send that instead."
 )
@@ -146,20 +146,20 @@ _EXTENSION_ROUTES: dict[str, str | _Refuse] = {
     ".tiff": "image",
     ".webp": "image",
     # --- refused: structured formats `generic` would silently ruin -----
-    ".json": _Refuse(_STRUCTURED_EXPORT_GUIDANCE),
-    ".jsonl": _Refuse(_STRUCTURED_EXPORT_GUIDANCE),
-    ".ndjson": _Refuse(_STRUCTURED_EXPORT_GUIDANCE),
-    ".zip": _Refuse(_ARCHIVE_GUIDANCE),
-    ".tar": _Refuse(_ARCHIVE_GUIDANCE),
-    ".tgz": _Refuse(_ARCHIVE_GUIDANCE),
-    ".gz": _Refuse(_ARCHIVE_GUIDANCE),
-    ".bz2": _Refuse(_ARCHIVE_GUIDANCE),
-    ".xz": _Refuse(_ARCHIVE_GUIDANCE),
-    ".7z": _Refuse(_ARCHIVE_GUIDANCE),
-    ".rar": _Refuse(_ARCHIVE_GUIDANCE),
-    ".doc": _Refuse(_LEGACY_OFFICE_GUIDANCE),
-    ".xls": _Refuse(_LEGACY_OFFICE_GUIDANCE),
-    ".ppt": _Refuse(_LEGACY_OFFICE_GUIDANCE),
+    ".json": _Refuse(STRUCTURED_EXPORT_GUIDANCE),
+    ".jsonl": _Refuse(STRUCTURED_EXPORT_GUIDANCE),
+    ".ndjson": _Refuse(STRUCTURED_EXPORT_GUIDANCE),
+    ".zip": _Refuse(ARCHIVE_GUIDANCE),
+    ".tar": _Refuse(ARCHIVE_GUIDANCE),
+    ".tgz": _Refuse(ARCHIVE_GUIDANCE),
+    ".gz": _Refuse(ARCHIVE_GUIDANCE),
+    ".bz2": _Refuse(ARCHIVE_GUIDANCE),
+    ".xz": _Refuse(ARCHIVE_GUIDANCE),
+    ".7z": _Refuse(ARCHIVE_GUIDANCE),
+    ".rar": _Refuse(ARCHIVE_GUIDANCE),
+    ".doc": _Refuse(LEGACY_OFFICE_GUIDANCE),
+    ".xls": _Refuse(LEGACY_OFFICE_GUIDANCE),
+    ".ppt": _Refuse(LEGACY_OFFICE_GUIDANCE),
 }
 """The single declaration of extension dispatch (#1526).
 
@@ -1419,9 +1419,12 @@ def build_drive_connector(
 
 
 __all__ = [
+    "ARCHIVE_GUIDANCE",
     "GOOGLE_DOCS_MIME",
     "GOOGLE_SHEETS_MIME",
     "GOOGLE_SLIDES_MIME",
+    "LEGACY_OFFICE_GUIDANCE",
+    "STRUCTURED_EXPORT_GUIDANCE",
     "DownloadResult",
     "DriveClient",
     "DriveFile",
