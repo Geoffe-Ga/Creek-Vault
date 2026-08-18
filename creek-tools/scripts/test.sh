@@ -144,6 +144,11 @@ done
 
 cd "$PROJECT_ROOT"
 
+# Stale bytecode in local test runs can cause false greens when mtime and size
+# are preserved (issue #1187). Setting PYTHONDONTWRITEBYTECODE=1 ensures pytest
+# always executes live sources directly, matching CI's clean-tree behaviour.
+export PYTHONDONTWRITEBYTECODE=1
+
 # Fail fast with an actionable message if the Python toolchain is missing
 # (fresh checkout, never ran dev-setup) rather than an opaque ImportError.
 creek_require_python_toolchain || exit 2
