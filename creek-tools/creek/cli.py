@@ -5493,6 +5493,13 @@ def _run_seeded_draft(
             vault_path=vault_path,
             current_phase=current_phase,
         )
+    except typer.Exit:
+        # `typer.Exit` subclasses `RuntimeError` (see
+        # `click.exceptions.Exit.__mro__`), so without this the handler below
+        # would swallow an exit raised *inside* the generator — the #1031
+        # tier refusal is one — print `str(Exit(1))`, which is the empty
+        # string, as a blank red line, and rewrite the exit code to 1.
+        raise
     except (SeedResolutionError, PluralitySourceError, RuntimeError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
@@ -5587,6 +5594,13 @@ def _run_outline_draft(
     except OutlineParseError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=2) from exc
+    except typer.Exit:
+        # `typer.Exit` subclasses `RuntimeError` (see
+        # `click.exceptions.Exit.__mro__`), so without this the handler below
+        # would swallow an exit raised *inside* the generator — the #1031
+        # tier refusal is one — print `str(Exit(1))`, which is the empty
+        # string, as a blank red line, and rewrite the exit code to 1.
+        raise
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc

@@ -767,12 +767,14 @@ def test_a_prebuilt_llm_skips_the_tier_survey(
     """
     from creek.generate.mining import IdeaSeed, MiningStrategy
 
-    def _explode(*_args: object, **_kwargs: object) -> list[PrivacyTier]:
+    def _explode(*_args: object, **_kwargs: object) -> dict[str, PrivacyTier]:
         """Fail loudly if the survey runs for a pre-built client."""
-        msg = "source_tiers must not run when a built llm was supplied"
+        msg = "resolved_source_tiers must not run when a built llm was supplied"
         raise AssertionError(msg)
 
-    monkeypatch.setattr("creek.generate.drafts.source_tiers", _explode)
+    # ``setattr`` on a string target raises if the name is absent, so this
+    # also pins that the module still imports the survey it is meant to skip.
+    monkeypatch.setattr("creek.generate.drafts.resolved_source_tiers", _explode)
     vault = tmp_path / "vault"
     (vault / "01-Fragments" / "Notes").mkdir(parents=True)
     write_raw_fragment_file(
@@ -842,3 +844,361 @@ def test_generator_requires_exactly_one_client_seam(
     """
     with pytest.raises(ValueError, match="llm"):
         DraftGenerator(skills_root=tmp_path / "skills", **kwargs)
+
+
+_FILTER_MODES: list[tuple[str, list[str], str, str, bool]] = [
+    ("default-filter", [], "anthropic", _VAULT_CLOUD_MODEL, False),
+    ("include-tier-all", ["--include-tier", "all"], "ollama", _VAULT_LOCAL_MODEL, True),
+]
+"""``(id, argv, provider, model, body_in_prompt)`` per ``--include-tier`` mode."""
+
+
+@pytest.mark.parametrize(
+    ("extra_argv", "expected_provider", "expected_model", "body_in_prompt"),
+    [row[1:] for row in _FILTER_MODES],
+    ids=[row[0] for row in _FILTER_MODES],
+)
+def test_cli_draft_routes_by_what_the_filter_admitted_not_by_what_was_named(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recorder: type[_RecordingClassifier],
+    extra_argv: list[str],
+    expected_provider: str,
+    expected_model: str,
+    body_in_prompt: bool,
+) -> None:
+    """The survey follows the prompt, not the seed's id list.
+
+    Both rows draft from the *same* seed over the *same* intimate fragment;
+    only ``--include-tier`` differs. Under the default filter that fragment is
+    excluded before the prompt is composed — a mined seed names ids off
+    threads and resonances, which are tier-blind — so the prompt carries no
+    intimate text and must still reach the stage the operator configured.
+    Surveying the named ids instead refuses a draft on a leak that is not
+    happening, and the default filter is the *common* invocation.
+
+    The ``include-tier all`` row is the other half of the same pair: the one
+    argument that changed admits the body, and the routing changes with it.
+
+    Args:
+        tmp_path: Pytest tmp dir.
+        monkeypatch: Pytest's patcher.
+        recorder: The classifier recorder fixture.
+        extra_argv: The ``--include-tier`` flag (or none) under test.
+        expected_provider: Provider the built client must carry.
+        expected_model: Model the built client must carry.
+        body_in_prompt: Whether the intimate body reaches the prompt at all.
+    """
+    vault = _seed_vault(tmp_path)
+    _stub_miner(monkeypatch, _INTIMATE_ID, _INTIMATE_TITLE)
+
+    # ANTI-VACUITY: with no tier, this config resolves to the CLOUD.
+    _assert_unrouted_resolution_is_cloud(vault)
+
+    result = runner.invoke(app, ["draft", "--vault", str(vault), *extra_argv])
+
+    assert result.exit_code == 0, result.output
+    assert recorder.providers() == [expected_provider]
+    assert recorder.models() == [expected_model]
+    prompts = recorder.all_prompts()
+    assert prompts, "the draft never reached a provider at all"
+    # The routing above is only defensible because of what the prompt holds:
+    # the cloud row is cloud *because* the filter took the body out.
+    assert any(_INTIMATE_BODY in prompt for prompt in prompts) is body_in_prompt
+
+
+def test_cli_draft_does_not_refuse_when_the_filter_removed_the_intimate_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recorder: type[_RecordingClassifier],
+) -> None:
+    """An all-cloud config plus a *filtered-out* intimate source still drafts.
+
+    The sharp edge of the same defect: on a config with no local stage, a
+    survey of the named ids turns "the filter already removed that fragment"
+    into ``IntimateRoutingError`` and exit 1 — a refusal citing an egress that
+    the privacy filter had prevented three steps earlier, on the default
+    invocation. Refusing a draft that leaks nothing is not a safe direction to
+    fail in; it is a broken command.
+
+    Contrast ``test_cli_draft_refuses_intimate_when_no_local_backend_exists``,
+    which is the same vault and the same config with ``--include-tier all``:
+    there the body really is in the prompt and the refusal is correct. The
+    pair is the whole distinction.
+
+    Args:
+        tmp_path: Pytest tmp dir.
+        monkeypatch: Pytest's patcher.
+        recorder: The classifier recorder fixture.
+    """
+    vault = _seed_vault(tmp_path)
+    (vault / "00-Creek-Meta" / "creek_config.yaml").write_text(
+        "llm:\n"
+        "  default:\n    provider: anthropic\n    model: cloud-default\n"
+        "  classification:\n    provider: anthropic\n    model: cloud-stage\n",
+        encoding="utf-8",
+    )
+    _stub_miner(monkeypatch, _INTIMATE_ID, _INTIMATE_TITLE)
+
+    result = runner.invoke(app, ["draft", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert "no local backend to fall back to" not in _flatten(result.output)
+    assert recorder.models() == ["cloud-stage"]
+    assert not any(_INTIMATE_BODY in prompt for prompt in recorder.all_prompts())
+
+
+_ABSENT_ID = "frag-that-is-not-there"
+
+_DEFAULT_FILTER_ROWS: list[
+    tuple[str, tuple[tuple[str, str | None], ...], tuple[str, ...], PrivacyTier]
+] = [
+    (
+        "filtered-out-only",
+        (("frag-int", "intimate"),),
+        ("frag-int",),
+        PrivacyTier.OPEN,
+    ),
+    (
+        "filtered-out-plus-absent",
+        (("frag-int", "intimate"),),
+        ("frag-int", _ABSENT_ID),
+        PrivacyTier.INTIMATE,
+    ),
+    (
+        "filtered-out-plus-admitted-open",
+        (("frag-int", "intimate"), ("frag-op", "open")),
+        ("frag-int", "frag-op"),
+        PrivacyTier.OPEN,
+    ),
+    (
+        "admitted-personal-summary",
+        (("frag-per", "personal"),),
+        ("frag-per",),
+        PrivacyTier.PERSONAL,
+    ),
+    (
+        "admitted-untiered-fails-closed",
+        (("frag-untiered", None),),
+        ("frag-untiered",),
+        PrivacyTier.INTIMATE,
+    ),
+]
+"""``(id, seeded fragments, ids the seed names, expected tier)`` per row."""
+
+
+@pytest.mark.parametrize(
+    ("seeded", "named", "expected"),
+    [row[1:] for row in _DEFAULT_FILTER_ROWS],
+    ids=[row[0] for row in _DEFAULT_FILTER_ROWS],
+)
+def test_generator_surveys_only_what_the_default_filter_admitted(
+    tmp_path: Path,
+    seeded: tuple[tuple[str, str | None], ...],
+    named: tuple[str, ...],
+    expected: PrivacyTier,
+) -> None:
+    """Under the default filter the survey follows the prompt, id by id.
+
+    The three cases a named id falls into must stay three answers:
+
+    * **filtered out** — resolves, but the privacy filter dropped it before
+      the prompt was composed, so it contributes nothing (rows 1 and 3);
+    * **absent** — resolves to nothing, so nothing is known and it fails
+      closed (row 2, which is row 1 plus one unresolvable id and flips the
+      whole answer — that is the "do not collapse these two" assertion);
+    * **admitted** — its text is in the prompt, so it contributes its own
+      tier, whether that is a personal fragment's title-only summary (row 4)
+      or an untiered fragment (row 5).
+
+    Row 5 is why the tiers are read from the raw-frontmatter survey and not
+    off the admitted map: :class:`~creek.models.Fragment` defaults a *missing*
+    ``privacy_tier`` to ``unclassified``, which the filter admits as personal,
+    while :func:`~creek.classify.privacy_filter.fragment_tier` calls a missing
+    key ``INTIMATE``. Reading ``tier_of`` off the admitted fragment would
+    route that body to the cloud.
+
+    Args:
+        tmp_path: Pytest tmp dir.
+        seeded: ``(fragment_id, privacy_tier or None)`` pairs to write.
+        named: The ids the seed declares as sources.
+        expected: The tier the factory must be keyed with.
+    """
+    from creek.generate.mining import IdeaSeed, MiningStrategy
+
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments" / "Notes").mkdir(parents=True)
+    for frag_id, tier in seeded:
+        write_raw_fragment_file(
+            vault,
+            "01-Fragments/Notes",
+            frag_id,
+            f"Title of {frag_id}",
+            body=f"body of {frag_id}",
+            privacy_tier=tier,
+        )
+    factory = _TierRecordingFactory()
+    generator = DraftGenerator(
+        llm_factory=factory,
+        skills_root=tmp_path / "skills",
+    )
+    idea = IdeaSeed(
+        strategy=MiningStrategy.RESONANCE_CHAIN,
+        title="A draft",
+        source_fragments=named,
+        threads=(),
+        eddies=(),
+        frequency_affinity=(),
+        brief_description="Sources the default filter treats differently.",
+        score=0.5,
+    )
+
+    generator.generate_draft(idea, vault_path=vault)
+
+    assert factory.tiers == [expected]
+
+
+_MARKUP_RE = re.compile(r"\[/?[a-z ]+\]")
+
+_REFUSAL_PATHS: list[tuple[str, list[str]]] = [
+    ("seeded", ["--seed-fragment", _INTIMATE_ID]),
+    ("outline", ["--seed-outline-text", _OUTLINE_TEXT]),
+]
+
+
+@pytest.mark.parametrize(
+    "extra_argv",
+    [row[1] for row in _REFUSAL_PATHS],
+    ids=[row[0] for row in _REFUSAL_PATHS],
+)
+def test_cli_draft_refusal_prints_no_blank_line_before_exiting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recorder: type[_RecordingClassifier],
+    extra_argv: list[str],
+) -> None:
+    """The routing refusal exits through the handlers, not into them.
+
+    ``typer.Exit`` subclasses :class:`RuntimeError` — check
+    ``click.exceptions.Exit.__mro__`` — and both ``_run_seeded_draft`` and
+    ``_run_outline_draft`` catch ``RuntimeError`` to turn an empty LLM body
+    into a legible exit. So the exit raised *inside* the generator, by the
+    tier refusal this PR introduces, was caught by those handlers and
+    re-printed as ``console.print(f"[red]{exc}[/red]")`` — and
+    ``str(typer.Exit(code=1))`` is the empty string. The operator got a blank
+    red line stapled to the refusal, and any future exit raised down there
+    would have its code rewritten to 1 on the way out.
+
+    Recording ``console.print`` rather than scraping the rendered output is
+    deliberate: Rich hard-wraps, so a blank line in the capture could just be
+    a wrap artefact, while a print call whose whole payload is markup cannot.
+
+    Args:
+        tmp_path: Pytest tmp dir.
+        monkeypatch: Pytest's patcher.
+        recorder: The classifier recorder fixture (nothing may be built).
+        extra_argv: The flags selecting the entry path under test.
+    """
+    from creek import cli as cli_module
+
+    vault = _seed_vault(tmp_path)
+    (vault / "00-Creek-Meta" / "creek_config.yaml").write_text(
+        "llm:\n"
+        "  default:\n    provider: anthropic\n    model: cloud-default\n"
+        "  classification:\n    provider: anthropic\n    model: cloud-stage\n",
+        encoding="utf-8",
+    )
+    _stub_ontology_detector(monkeypatch)
+    printed: list[str] = []
+    real_print = cli_module.console.print
+
+    def _record(*args: Any, **kwargs: Any) -> None:
+        """Forward to Rich after recording the first positional argument."""
+        printed.append(str(args[0]) if args else "")
+        real_print(*args, **kwargs)
+
+    monkeypatch.setattr(cli_module.console, "print", _record)
+
+    result = runner.invoke(
+        app,
+        ["draft", "--vault", str(vault), "--include-tier", "all", *extra_argv],
+    )
+
+    assert result.exit_code == 1, result.output
+    stripped = [_MARKUP_RE.sub("", message).strip() for message in printed]
+    assert stripped, "the command printed nothing at all"
+    assert any("no local backend to fall back to" in line for line in stripped)
+    assert "" not in stripped
+    assert recorder.built == []
+
+
+def _unavailable_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every built ``LLMClassifier`` report its backend unreachable.
+
+    Args:
+        monkeypatch: Pytest's patcher.
+    """
+    from creek.classify.llm import LLMClassifier
+
+    monkeypatch.setattr(LLMClassifier, "available", property(lambda _self: False))
+
+
+def test_cli_draft_with_nothing_to_draft_never_touches_the_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run that composes no prompt now exits 0 on an unreachable provider.
+
+    A deliberate behaviour change, pinned rather than left to be discovered:
+    the availability check moved from build time into the first prompt, so a
+    vault with nothing to surface no longer fails on a backend it was never
+    going to call. ``creek_mcp.tools.draft`` made the same choice in #958.
+    The cost is that ``creek draft`` no longer doubles as a provider probe.
+
+    Args:
+        tmp_path: Pytest tmp dir.
+        monkeypatch: Pytest's patcher.
+    """
+    _unavailable_provider(monkeypatch)
+    vault = tmp_path / "vault"
+    for sub in ("01-Fragments/Notes", "02-Threads", "03-Eddies", "07-Voice/Drafts"):
+        (vault / sub).mkdir(parents=True, exist_ok=True)
+    _write_routing_config(
+        vault / "00-Creek-Meta" / "creek_config.yaml",
+        default_model=_VAULT_LOCAL_MODEL,
+        classification_model=_VAULT_CLOUD_MODEL,
+    )
+
+    result = runner.invoke(app, ["draft", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert "nothing to draft" in _flatten(result.output)
+    assert "LLM provider unavailable" not in _flatten(result.output)
+
+
+def test_cli_draft_reports_an_unreachable_provider_only_after_the_mine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unreachable-provider refusal now lands *after* the vault work.
+
+    The other face of the same move: when there *is* something to draft, the
+    operator pays the whole mine before being told the backend is down, where
+    the pre-#1031 build-time check refused immediately. Exit code and message
+    are unchanged; the ordering is the tell, so it is what this asserts.
+
+    Args:
+        tmp_path: Pytest tmp dir.
+        monkeypatch: Pytest's patcher.
+    """
+    _unavailable_provider(monkeypatch)
+    vault = _seed_vault(tmp_path, tier="open")
+    _stub_miner(monkeypatch, _OPEN_ID, _OPEN_TITLE)
+
+    result = runner.invoke(app, ["draft", "--vault", str(vault)])
+
+    assert result.exit_code == 1, result.output
+    flat = _flatten(result.output)
+    assert "LLM provider unavailable" in flat
+    assert _OPEN_TITLE in flat, "the mine's idea was never presented"
+    assert flat.index(_OPEN_TITLE) < flat.index("LLM provider unavailable")
