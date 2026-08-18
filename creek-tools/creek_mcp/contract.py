@@ -6,8 +6,8 @@ These constants are the runtime source of the version strings published in
 negotiate compatibility before any read or write.
 
 Bump :data:`CONTRACT_VERSION` when the tool surface or its semantics change;
-bump :data:`ONTOLOGY_VERSION` when the shared APTITUDE-frequency / Wavelength-phase
-vocabulary changes (it is dated to the last canonical change — the frequency
+bump :data:`ONTOLOGY_VERSION` when the shared APTITUDE-frequency vocabulary
+changes (it is dated to the last canonical change — the frequency
 naming decision, ``docs/decisions/2026-05-23-frequency-naming.md``).
 """
 

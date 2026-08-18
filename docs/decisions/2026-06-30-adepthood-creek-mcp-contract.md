@@ -195,7 +195,7 @@ strings become `{"len": N}`), tagged with the `consumer`, tamper-evident via a
 ## Ontology version
 
 The shared vocabulary — **Adepthood Aspects = Creek APTITUDE frequencies =
-Archetypal Wavelength Modes = Adepthood Stages** — is defined canonically in
+Adepthood Stages**, ten members keyed by colour — is defined canonically in
 [`docs/Ontology/creek_ontology_agent_prompt.md`](../Ontology/creek_ontology_agent_prompt.md)
 (frequencies §6.1, Wavelength §7) and implemented as the single source of truth in
 `creek-tools/creek/generate/ontology_glossary.py`, `…/indexes.py`, and
@@ -231,13 +231,33 @@ sides MUST treat a mismatch in this string as "renegotiate the contract".
 (plus `unclassified`). A six-phase rise-and-fall cycle; an entry sits at one
 phase.
 
-**Phases are not Modes.** This is the one confusion worth guarding against, and
-it has already produced wrong text in both repos. A *Mode* is one of the ten
-colour-keyed positions above — the functional stance named in §7.2 (Inhabit,
-Express, Collaborate, Integrate, Absorb, and Clear Light's Be), so Beige's Mode
-is Inhabit (Do) and Clear Light's is Be (Both/Neither). A *phase* is where in
-the six-part cycle something sits. Ten of one, six of the other, different
-axes; only the Modes belong in the `Aspects = frequencies = Stages` identity.
+**Neither Wavelength axis belongs in that identity.** This is the confusion
+worth guarding against, and it has already produced wrong text in both repos —
+first as *"= Wavelength phases"*, then as *"= Wavelength Modes"*. The identity
+above has ten members, one per colour. The Archetypal Wavelength contributes
+two *other* axes, and neither has ten:
+
+- **Modes** — the five functional stances §7.2 names (Inhabit, Express,
+  Collaborate, Integrate, Absorb), each paired with a Do/Feel orientation.
+  §7.2 scopes itself to the nine frequencies Beige through Ultraviolet and
+  assigns Clear Light (F10) no Mode at all; `creek.models.Mode` implements the
+  same five (plus `unclassified`). A Mode *groups* frequencies — Beige and
+  Purple are both Inhabit — so it cannot be one of them.
+- **Phases** — the six-part rise-and-fall cycle above. A phase is where in that
+  cycle an entry sits, not which frequency it is.
+
+Ten, five, six: three axes, three cardinalities. Only the ten-member frequency
+axis is the `Aspects = frequencies = Stages` identity.
+
+**Join on the colour, not the name.** Names are per-repo editorial labels —
+each side names its own axis, and this repo's own labels have already drifted
+away from the canon once
+([`2026-05-23-frequency-naming.md`](./2026-05-23-frequency-naming.md),
+ONTOLOGY-001: canonical names won, the drifted artefacts were re-pinned). The
+colour designation is a single machine-checked 1:1 map (`FREQUENCY_COLORS` in
+`creek-tools/creek/generate/indexes.py`). A name join can therefore mismatch
+silently wherever the two sides' labels differ, while still looking correct; a
+colour join cannot.
 
 ## Open questions (resolve before `Accepted`)
 
