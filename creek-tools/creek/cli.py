@@ -2560,6 +2560,16 @@ def classify(
         "--force",
         help="Overwrite fragments classified as method: manual.",
     ),
+    retier: bool = typer.Option(
+        False,
+        "--retier",
+        help=(
+            "Re-derive the privacy tier of fragments that already carry one, "
+            "and keep the result only when it is MORE restrictive. Free (no "
+            "provider call) and raise-only; classification provenance and "
+            "manual curation are left untouched."
+        ),
+    ),
     calibrate: bool = typer.Option(
         False,
         "--calibrate",
@@ -2614,6 +2624,17 @@ def classify(
     ``classification.confidence_threshold``. Fragments with
     ``classification.method: manual`` are preserved unless ``--force``
     is supplied.
+
+    ``--retier`` re-opens a case neither of the above covers (#1106): a
+    fragment stamped with a *concrete but too weak* tier by a pre-#974
+    pipeline. Nothing revisits such a tier — ``privacy_tier`` is a one-way
+    ratchet — so it stays admissible to a PERSONAL-ceiling caller and keeps
+    feeding voice-proxy generation. ``--retier`` re-runs the free local
+    heuristic over every already-tiered fragment and persists the verdict
+    only where it is *stricter*, through the same narrow tier-only writer
+    the resume short-circuit uses. Unlike ``--force`` it costs no tokens,
+    re-stamps no ``classification_method``, and overrides no manual
+    curation beyond the tier itself.
 
     ``--calibrate`` flips this into calibration mode: instead of touching
     the vault, the classifier runs against the calibration fixture and
@@ -2681,6 +2702,7 @@ def classify(
             config=config,
             method=method,
             force=force,
+            retier=retier,
         )
     except LLMProviderUnavailableError as exc:
         # The engine refused to iterate because the configured LLM
@@ -2714,7 +2736,12 @@ def classify(
         # Issue #878: and again for hashtag tags. Counts fragments gained,
         # not tags written, so a second run over an unchanged vault reports
         # zero rather than re-reporting the whole vault.
-        f"{summary.tags_extracted} tagged"
+        f"{summary.tags_extracted} tagged, "
+        # Issue #1106: reported even at zero, and separately from the
+        # tier-assignment count above, so "my vault has no pre-#974
+        # mis-stamps" is an answer the operator can actually read rather
+        # than an absence they have to infer.
+        f"{summary.retiered} re-tiered"
         ").[/bold green]",
     )
     if summary.errors:
@@ -3247,11 +3274,20 @@ class _FillGapCounts:
             (#877).
         tags_backfillable: Fragments whose body carries a hashtag the
             frontmatter does not record (#878).
+        retierable: Fragments carrying a *concrete* privacy tier that the
+            free heuristic would now derive **more restrictively** — the
+            pre-#974 mis-stamp (#1106). Deliberately disjoint from
+            :attr:`untiered`: an untiered fragment satisfies the bare
+            escalate predicate too, and since ``needs_tier`` is ``True``
+            for an explicit ``unclassified``, ``untiered`` already reads
+            35,330 on the 35k-fragment demo vault. A retier count folded
+            into that number could not be seen at all.
     """
 
     untiered: int
     praxis_backfillable: int
     tags_backfillable: int
+    retierable: int
 
 
 def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
@@ -3281,6 +3317,18 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
     what keeps it free — it rides the walk the other two already pay for,
     and must never become a second pass over 35k files.
 
+    The retier detector (#1106) is the fourth of the same shape and the
+    one with the sharpest edge. Its proof is "the heuristic would derive a
+    *stricter* tier than the one on disk", which
+    :func:`~creek.classify.privacy_pass.needs_retier` answers through the
+    two tier readers that already exist — no sixth opinion about what a
+    fragment's tier is (#1079) — and which, because
+    :func:`~creek.classify.privacy_pass.escalate` ranks by restrictiveness,
+    can only ever fire upwards. It excludes untiered fragments on purpose:
+    they satisfy the same predicate, they are ``untiered``'s population,
+    and merging the two would bury this count inside a number that already
+    reads 35,330 on the demo vault.
+
     The imports are function-local (like the rest of this module's) so a
     bare ``creek --help`` never pays to import the classification stack.
 
@@ -3292,13 +3340,18 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
         is no ``01-Fragments`` directory at all.
     """
     from creek.classify.praxis_pass import detect
-    from creek.classify.privacy_pass import needs_tier
+    from creek.classify.privacy import PrivacyClassifier
+    from creek.classify.privacy_pass import needs_retier, needs_tier
     from creek.classify.tags_pass import has_unrecorded_tags
     from creek.vault.reader import iter_vault_fragments
 
+    # Stateless and read-only, so one instance serves the whole walk rather
+    # than 35k constructions.
+    privacy = PrivacyClassifier()
     untiered = 0
     backfillable = 0
     untagged = 0
+    retierable = 0
     for _path, fragment, body, raw in iter_vault_fragments(
         vault_path / "01-Fragments",
     ):
@@ -3309,10 +3362,13 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
             backfillable += 1
         if has_unrecorded_tags(fragment.tags, body):
             untagged += 1
+        if needs_retier(fragment, body, raw=raw, classifier=privacy):
+            retierable += 1
     return _FillGapCounts(
         untiered=untiered,
         praxis_backfillable=backfillable,
         tags_backfillable=untagged,
+        retierable=retierable,
     )
 
 
@@ -3410,6 +3466,33 @@ def _count_tags_backfillable_fragments(
     if scan is None:
         scan = _scan_fill_gaps(vault_path)
     return scan.tags_backfillable
+
+
+def _count_retierable_fragments(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> int:
+    """Count fragments whose recorded tier is weaker than today's verdict.
+
+    The #1106 population: fragments a pre-#974 ``creek process`` stamped
+    ``privacy_tier: personal`` (with ``voice_proxy_eligible: true``) that
+    the current heuristic reads as ``intimate``. See
+    :func:`_scan_fill_gaps` for why untiered fragments are excluded, and
+    :func:`~creek.classify.privacy_pass.needs_retier` for why the
+    predicate can only ever fire upwards.
+
+    Args:
+        vault_path: Vault root.
+        scan: An already-completed :func:`_scan_fill_gaps` result to read
+            the answer out of. Omit it to walk the vault here.
+
+    Returns:
+        The number of re-tierable fragments; ``0`` when the vault has no
+        ``01-Fragments`` directory at all.
+    """
+    if scan is None:
+        scan = _scan_fill_gaps(vault_path)
+    return scan.retierable
 
 
 def _hint_untiered_fragments(
@@ -3529,6 +3612,56 @@ def _hint_tags_backfill(
     )
 
 
+def _hint_retier(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> None:
+    """Print the ``creek classify --retier`` nudge for mis-stamped tiers.
+
+    Its **own** line and its own guard, not a clause bolted onto the
+    untiered hint. ``needs_tier`` counts an explicit ``unclassified`` as
+    untiered, so that hint already reports 35,330 on the demo vault; a
+    handful of mis-stamped fragments folded into it would be invisible,
+    which is precisely the visibility failure #1106 was filed about. The
+    separate ``try`` is the same reasoning the praxis and tags hints
+    already follow — one failing scan must not silence a sibling.
+
+    Silent at zero, so a vault the operator has already re-tiered never
+    nags, and the pass is escalate-only so it goes quiet after one run.
+
+    Reports a **count only** — never a fragment id or a body excerpt.
+    Naming either would turn an advisory line into an unaudited
+    disclosure of vault content through stdout (the config-oracle rule,
+    #846 / #848), and these are by definition the vault's most sensitive
+    fragments.
+
+    The named remedy is ``creek classify --retier`` rather than
+    ``--force``. Both would move the tier; only ``--retier`` leaves
+    ``classification_method`` — and therefore manual operator curation —
+    intact, and only ``--retier`` touches nothing but the fragments whose
+    tier actually moves.
+
+    Args:
+        vault_path: Vault root.
+        scan: The shared vault walk, when one already succeeded.
+    """
+    try:
+        retierable = _count_retierable_fragments(vault_path, scan)
+    except Exception as exc:
+        logger.warning("fill: skipping retier hint: %s", exc)
+        return
+    if retierable == 0:
+        return
+    console.print(
+        f"[dim][fill] {retierable} fragment(s) carry a privacy tier that is "
+        "weaker than the one Creek would derive for them today (classified "
+        "before #974 tightened self-authored confessional content). Run "
+        "`creek classify --retier` to raise just those — it is free, it "
+        "only ever raises a tier, and it leaves classification provenance "
+        "and manual curation untouched.[/dim]",
+    )
+
+
 def _run_classify_upgrade(vault_path: Path, config: CreekConfig) -> None:
     """Re-classify ``rules`` fragments via the LLM, preserving manual/llm.
 
@@ -3554,8 +3687,9 @@ def _maybe_upgrade_classification(
     silently egresses): it only prints a hint. ``--upgrade`` applies the upgrade
     without a prompt; an interactive TTY prompts ``[y/N]`` (default No).
 
-    The #876 untiered-fragment hint, the #877 praxis-backfill hint and the
-    #878 tags-backfill hint all fire first, ahead of every early return: the
+    The #876 untiered-fragment hint, the #877 praxis-backfill hint, the
+    #878 tags-backfill hint and the #1106 retier hint all fire first,
+    ahead of every early return: the
     vault that most needs them (rules-classified, no LLM reachable, every
     fragment untiered) is exactly the one where there is no upgrade to offer.
     All three read one shared vault walk so ``creek fill`` parses every
@@ -3565,6 +3699,7 @@ def _maybe_upgrade_classification(
     _hint_untiered_fragments(vault_path, gaps)
     _hint_praxis_backfill(vault_path, gaps)
     _hint_tags_backfill(vault_path, gaps)
+    _hint_retier(vault_path, gaps)
     try:
         offer = _detect_classify_upgrade(vault_path, config)
     except Exception as exc:
