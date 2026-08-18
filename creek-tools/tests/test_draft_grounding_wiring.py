@@ -123,8 +123,8 @@ def _run_cli_draft(
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _prompt: body,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _prompt: body,
     )
     _stub_miner(monkeypatch, "creek.generate.mining.IdeaMiner.mine_all")
     argv = ["draft", "--vault", str(vault)]

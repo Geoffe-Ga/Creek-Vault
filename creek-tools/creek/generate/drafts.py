@@ -17,6 +17,15 @@ frontmatter so a reader can trace every sentence back to its roots:
 The LLM client is injected as a :data:`DraftLLM` callable so the module
 stays deterministic and test-friendly; no network calls live in this
 module.
+
+A caller that cannot know the routing tier when it builds the generator
+injects a :data:`DraftLLMFactory` instead (#1031). ``creek draft`` picks
+its source fragments *here*, several layers below the CLI, so a client
+built up there could only ever be tier-less — and a tier-less client is a
+:meth:`creek.classify.llm.router.ModelRouter.resolve` with the
+``Intimate``-never-cloud gate (#647) switched off. The generator surveys
+the tiers of the fragments each prompt renders and calls the factory with
+their maximum; see :meth:`DraftGenerator._bind_routing_tier`.
 """
 
 from __future__ import annotations
@@ -39,6 +48,8 @@ from creek.care.guardrail import CARE_POLICY
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     filter_fragments_by_tier,
+    max_source_tier,
+    resolved_source_tiers,
 )
 from creek.generate.ai_style.guard import (
     VOICE_GUARD_STATUS_KEY,
@@ -92,10 +103,12 @@ from creek.models import (
     Frequency,
     Mode,
     Phase,
+    PrivacyTier,
     Thread,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
 
     from creek.classify.prompt import PromptOntology
@@ -204,6 +217,26 @@ callers keep working; the CLI adapter returns the richer object so a
 """
 
 
+DraftLLMFactory = Callable[[PrivacyTier], DraftLLM]
+"""Signature for tier-keyed draft LLM factories (#1031).
+
+Takes the privacy tier of the fragments a prompt will carry and returns
+the :data:`DraftLLM` client that tier may be sent to. It is the draft
+twin of ``creek.compile.engine.CompileLLMFactory``, and it exists for the
+same reason: the ``Intimate``-never-cloud chokepoint (#647) is
+:meth:`creek.classify.llm.router.ModelRouter.resolve`'s ``tier``
+argument, and only the layer that has seen the source fragments can
+supply it. ``creek draft`` picks its sources *inside* this module — long
+after the CLI built a client — so a pre-built client can only ever be a
+tier-less one, which is exactly how intimate bodies came to be routable
+to a cloud provider under ``--include-tier intimate|all``.
+
+The factory may be called more than once per draft (the outline path
+composes one prompt per section plus a stitch, and the tiers can differ),
+so a production factory should cache per tier rather than re-handshake.
+"""
+
+
 OntologyDetector = Callable[[str], "PromptOntology"]
 """Signature for prompt-ontology detectors.
 
@@ -227,6 +260,33 @@ _TRUNCATION_WARNING: str = (
 
 _TRUNCATION_FOOTER: str = "\n\n---\n*(truncated — see frontmatter)*"
 """Footer appended to a truncated draft body so the file is self-describing."""
+
+
+def _fixed_llm_factory(llm: DraftLLM) -> DraftLLMFactory:
+    """Adapt a pre-built *llm* to the :data:`DraftLLMFactory` shape.
+
+    Lets :class:`DraftGenerator` hold exactly one client seam while both
+    constructions stay supported: ``llm=`` for a caller that already keyed
+    its client by tier (``creek_mcp.tools.draft`` derives the tier before
+    the generator exists) or that injects a test double, and
+    ``llm_factory=`` for a caller that cannot know the tier yet (the
+    ``creek draft`` CLI).
+
+    Args:
+        llm: The already-built draft client.
+
+    Returns:
+        A factory returning *llm* for every tier. The tier is discarded
+        deliberately — a caller passing a built client has taken the
+        routing decision itself, and re-deciding it here would silently
+        override it.
+    """
+
+    def _factory(_tier: PrivacyTier) -> DraftLLM:
+        """Return the pre-built client, whatever the tier."""
+        return llm
+
+    return _factory
 
 
 def _normalise_llm_response(raw: str | DraftLLMResponse) -> DraftLLMResponse:
@@ -764,7 +824,8 @@ class DraftGenerator:
     def __init__(
         self,
         *,
-        llm: DraftLLM,
+        llm: DraftLLM | None = None,
+        llm_factory: DraftLLMFactory | None = None,
         skills_root: Path,
         voice_core: str = "",
         style_preamble: str = "",
@@ -778,10 +839,22 @@ class DraftGenerator:
         voice_guard_no_llm: bool = False,
         cohesion: bool = False,
     ) -> None:
-        """Initialise with an LLM client and skill tree root.
+        """Initialise with an LLM client (or tier-keyed factory) and skill tree root.
+
+        Exactly one of *llm* and *llm_factory* must be supplied.
 
         Args:
             llm: Callable ``(prompt) -> response`` for draft generation.
+                Use this when the caller has already decided which provider
+                the prompt may reach — ``creek_mcp.tools.draft`` derives its
+                routing tier from the seed's sources *before* building the
+                generator, and every test double comes in this way.
+            llm_factory: Tier-keyed :data:`DraftLLMFactory` for callers that
+                cannot know the tier yet (#1031). ``creek draft`` chooses its
+                source fragments inside this class, so the CLI has nothing to
+                key a client with at build time; passing the factory instead
+                lets the generator call it once its sources are resolved and
+                keep intimate bodies off a cloud provider.
             skills_root: Directory containing the SKILL.md subtree
                 (``frequencies/``, ``phases/``, ``modes/``, ``registers/``).
             voice_core: Optional voice-core description the prompt will
@@ -837,8 +910,33 @@ class DraftGenerator:
                 by the deterministic entity-preservation guard and a
                 biographical-grounding re-check; any violation falls back to
                 the pre-cohesion body.
+
+        Raises:
+            ValueError: When neither or both of *llm* and *llm_factory* are
+                supplied. Defaulting either way would be worse than failing:
+                with no client the generator cannot draft at all, and
+                honouring one of two supplied seams would silently discard
+                the caller's routing decision.
         """
-        self._llm = llm
+        if llm is not None and llm_factory is not None:
+            msg = "DraftGenerator takes llm or llm_factory, not both."
+            raise ValueError(msg)
+        if llm_factory is not None:
+            self._llm_factory: DraftLLMFactory = llm_factory
+            # Only a tier-keyed factory needs a tier, and deriving one costs a
+            # vault survey per composition — so the survey is skipped entirely
+            # for a pre-built client, whose caller already routed it.
+            self._tier_keyed = True
+        elif llm is not None:
+            self._llm_factory = _fixed_llm_factory(llm)
+            self._tier_keyed = False
+        else:
+            msg = "DraftGenerator requires one of llm or llm_factory."
+            raise ValueError(msg)
+        # Fail closed until sources are resolved (#1031): an unbound
+        # generator routes as if its prompt carried intimate content, so a
+        # path that forgets to bind cannot egress by omission.
+        self._routing_tier = PrivacyTier.INTIMATE
         self.skills_root = skills_root
         self.voice_core = voice_core
         self.style_preamble = style_preamble
@@ -1320,6 +1418,11 @@ class DraftGenerator:
             compiled_pages=compiled_pages,
         )
         prompt = self._compose_prompt(idea, skill_stack, source_material)
+        # Before the first call that could reach a provider, and after the
+        # sources are known (#1031). The cohesion and voice-guard hops below
+        # inherit this tier — their inputs are distilled from the same
+        # fragments.
+        self._bind_routing_tier(vault_path, idea.source_fragments, fragments)
         body, truncated = self._invoke_draft_llm(
             prompt,
             empty_message="LLM returned an empty draft body",
@@ -1377,12 +1480,113 @@ class DraftGenerator:
         Raises:
             RuntimeError: When the LLM returns an empty body.
         """
-        response = _normalise_llm_response(self._llm(prompt))
+        response = _normalise_llm_response(
+            self._llm_factory(self._routing_tier)(prompt)
+        )
         body = response.text.strip()
         if not body:
             raise RuntimeError(empty_message)
         truncated = _warn_if_truncated(response.stop_reason)
         return body, truncated
+
+    def _bind_routing_tier(
+        self,
+        vault_path: Path,
+        source_ids: Sequence[str],
+        admitted: Mapping[str, tuple[Fragment, str]],
+    ) -> PrivacyTier:
+        """Key subsequent LLM calls to the tier *source_ids* carry (#1031).
+
+        The draft twin of ``creek.compile.engine._routing_tier_for``, and it
+        lives here for the same reason: the fragments a draft prompt renders
+        are chosen inside this class, so this is the only layer that can name
+        the tier the ``Intimate``-never-cloud chokepoint (#647) needs.
+
+        The tier is derived from the sources this prompt actually renders —
+        never from the whole admitted corpus. Under ``--include-tier all`` the
+        loaded corpus contains every intimate fragment in the vault, so
+        reducing over *that* would pin every such draft to the local model
+        regardless of what the prompt says. (It is the same trap
+        ``creek_mcp.tier_ceiling``'s ``ALL -> INTIMATE`` mapping sets for
+        anyone tempted to reconcile a CLI "ceiling" here; the CLI operator is
+        the vault owner and has no ceiling to reconcile.)
+
+        **The survey is over what the prompt renders, which is the named ids
+        intersected with what the privacy filter admitted.** *admitted* is the
+        already-filtered ``{id: (fragment, body)}`` map the prompt is composed
+        from, and the three cases a named id can fall into route differently
+        on purpose — collapsing any two of them is a bug, and collapsing the
+        last two was a live regression on the *default* invocation:
+
+        * **Named and admitted.** Its text is in the prompt; it contributes
+          its tier. (A ``personal`` fragment admitted under the default
+          filter contributes a title-only summary — still its own text, so
+          still its own tier.)
+        * **Named but absent from the vault.** Nothing resolves, so nothing
+          is known; contributes ``INTIMATE``. Mirrors
+          ``creek_mcp.tools.draft._source_routing_tier``: with no evidence
+          about what a prompt carries, assume the worst.
+        * **Named, resolves, but filtered out.** The privacy filter removed
+          it *before* the prompt was composed —
+          :func:`_render_fragment_section` never sees it — so it contributes
+          no text and must contribute no tier either. Surveying it anyway
+          made ``creek draft`` (default filter, all-cloud config) exit 1
+          citing an intimate egress the filter had already prevented: a
+          refusal over a leak that is not happening, on the common path. A
+          mined seed names ids off threads and resonances, which are
+          tier-blind, so this case is *ordinary*, not exotic.
+
+        Distinguishing the last two is why the survey is
+        :func:`~creek.classify.privacy_filter.resolved_source_tiers` and not
+        its list-returning sibling: a bare list of tiers cannot say which
+        requested id it came from.
+
+        *No* ids named is a fourth statement: that prompt renders no vault
+        fragment at all (an ontology-only seed, or an outline section that
+        retrieved nothing), and failing it closed would force those drafts
+        local for no privacy gain, so it routes as ``OPEN`` — as does a
+        prompt every one of whose named sources the filter removed, which
+        renders exactly as much vault content: none.
+
+        **Known gap, tracked separately.** The ``## Threads`` / ``## Eddies``
+        blocks render *compiled-page* bodies, whose own sources are not
+        surveyed here; the MCP twin closed that channel in #1013 via
+        :func:`creek_mcp.tools.draft._compiled_source_ids`, and the CLI twin
+        of that fix is issue #1538 rather than a widening of this one — the
+        two surveys want to become one, which is a change to the shared
+        privacy module, not to this call site.
+
+        Cost: one vault survey per composition, and the outline path composes
+        once per section. It is skipped entirely for a pre-built ``llm``,
+        whose caller already routed it.
+
+        Args:
+            vault_path: Vault root; the survey reads ``01-Fragments``.
+            source_ids: Ids this prompt names as sources.
+            admitted: The tier-filtered fragment map the prompt is composed
+                from — membership, not tier, is what is read from it, so a
+                fragment whose frontmatter omits ``privacy_tier`` still
+                fails closed through the raw-frontmatter survey.
+
+        Returns:
+            The tier now bound — also stored for the calls that follow.
+        """
+        if not self._tier_keyed:
+            return self._routing_tier
+        named = list(dict.fromkeys(source_ids))
+        resolved = resolved_source_tiers(vault_path, named) if named else {}
+        rendered: list[PrivacyTier] = []
+        for source_id in named:
+            tier = resolved.get(source_id)
+            if tier is None:
+                # Named but unresolved: no evidence, so the worst case. Also
+                # covers an id the *admitted* map somehow holds and the
+                # survey does not — fail closed on any disagreement.
+                rendered.append(PrivacyTier.INTIMATE)
+            elif source_id in admitted:
+                rendered.append(tier)
+        self._routing_tier = max_source_tier(rendered) if rendered else PrivacyTier.OPEN
+        return self._routing_tier
 
     def _cohesion_grounding_check(
         self,
@@ -1429,8 +1633,9 @@ class DraftGenerator:
     def _cohesion_llm(self, prompt: str) -> str:
         """Call the shared draft LLM for the cohesion hop, returning the body.
 
-        Reuses :attr:`_llm` so the cohesion pass shares the same provider seam
-        (and the same test stubs) as composition. The
+        Reuses the same client seam — and therefore the same routing tier
+        (#1031) — so the cohesion pass cannot send a body distilled from
+        intimate sources somewhere the composition prompt could not go. The
         :class:`DraftLLMResponse` wrapper is unwrapped to the plain body string
         the cohesion guard expects; a truncated stop reason is irrelevant here
         because the pass only adds transitions.
@@ -1441,7 +1646,9 @@ class DraftGenerator:
         Returns:
             The smoothed body text the LLM returned.
         """
-        return _normalise_llm_response(self._llm(prompt)).text
+        return _normalise_llm_response(
+            self._llm_factory(self._routing_tier)(prompt),
+        ).text
 
     def _apply_cohesion(
         self,
@@ -1756,6 +1963,13 @@ class DraftGenerator:
             twist_directive=twist_payload.directive,
             twist_active=bool(twist_payload.dimensions),
         )
+        # The per-dimension blocks render fragments the seed itself never
+        # named, so the survey spans both sets (#1031).
+        self._bind_routing_tier(
+            vault_path,
+            [*idea.source_fragments, *union_fragment_ids(slices)],
+            fragments,
+        )
         body, truncated = self._invoke_draft_llm(
             prompt,
             empty_message="LLM returned an empty draft body",
@@ -1862,16 +2076,28 @@ class DraftGenerator:
             vault_path / _FRAGMENTS_SUBDIR,
             privacy_override=self.privacy_override,
         )
-        sections = tuple(
-            self._compose_section(
-                section,
-                vault_path=vault_path,
-                detect_ontology=detect_ontology,
-                current_phase=current_phase,
-                fragments=fragments,
+        composed: list[SectionComposition] = []
+        section_tiers: list[PrivacyTier] = []
+        for section in parsed:
+            composed.append(
+                self._compose_section(
+                    section,
+                    vault_path=vault_path,
+                    detect_ontology=detect_ontology,
+                    current_phase=current_phase,
+                    fragments=fragments,
+                ),
             )
-            for section in parsed
-        )
+            # Each section binds its own tier as it composes; collecting them
+            # here is what lets the stitch below be keyed by the whole essay
+            # rather than by whichever section happened to compose last.
+            section_tiers.append(self._routing_tier)
+        sections = tuple(composed)
+        if self._tier_keyed:
+            # The stitch prompt carries every section's body, so it routes at
+            # the most sensitive tier any of them drew on (#1031). Guarded like
+            # every other binding: a pre-built client was routed by its caller.
+            self._routing_tier = max_source_tier(section_tiers)
         stitch_prompt = build_stitch_prompt(
             [(section.heading, section.body) for section in sections],
             voice_core=self.voice_core,
@@ -1916,6 +2142,9 @@ class DraftGenerator:
         try:
             idea = self.resolve_seed(spec, vault_path=vault_path, fragments=fragments)
         except SeedResolutionError:
+            # A bare section renders no vault fragment at all — only the
+            # operator's own outline text and the skill files (#1031).
+            self._bind_routing_tier(vault_path, (), fragments)
             body, truncated = self._compose_bare_section(section, current_phase)
             return SectionComposition(
                 heading=section.heading,
@@ -2058,6 +2287,12 @@ class DraftGenerator:
             per_dimension_material=per_dimension_material,
             twist_directive=twist.directive,
             twist_active=bool(twist.dimensions),
+        )
+        # Per section, over exactly what this section's prompt renders (#1031).
+        self._bind_routing_tier(
+            vault_path,
+            [*idea.source_fragments, *union_fragment_ids(slices)],
+            fragments,
         )
         return self._invoke_section_llm(prompt)
 

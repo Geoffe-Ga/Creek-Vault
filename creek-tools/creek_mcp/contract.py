@@ -6,9 +6,14 @@ These constants are the runtime source of the version strings published in
 negotiate compatibility before any read or write.
 
 Bump :data:`CONTRACT_VERSION` when the tool surface or its semantics change;
-bump :data:`ONTOLOGY_VERSION` when the shared APTITUDE-frequency / Wavelength-phase
-vocabulary changes (it is dated to the last canonical change — the frequency
-naming decision, ``docs/decisions/2026-05-23-frequency-naming.md``).
+bump :data:`ONTOLOGY_VERSION` when the shared classification vocabulary changes
+on **either** of its two axes — the ten APTITUDE frequencies (ontology prompt
+§6.1) or the Archetypal Wavelength phases and Modes (§7). They are separate
+axes classified independently, not three names for one list, and the version
+string covers both: a client that renegotiated only on a frequency change would
+miss a Mode or phase revision it also has to interpret. It is dated to the last
+canonical change — the frequency naming decision,
+``docs/decisions/2026-05-23-frequency-naming.md``.
 """
 
 from __future__ import annotations
@@ -73,7 +78,9 @@ same change or every client still sending it is refused.
 """
 
 ONTOLOGY_VERSION: Final[str] = "aptitude-wavelength/2026-05-23"
-"""Pinned version of the shared frequency/phase vocabulary.
+"""Pinned version of the shared APTITUDE-frequency and Archetypal-Wavelength
+vocabularies — the same two axes the module docstring names, versioned
+together, which is why the string reads ``aptitude-wavelength/…``.
 
 Dated to the canonical frequency-naming decision. A mismatch in this string
 between client and server means "renegotiate the contract".
