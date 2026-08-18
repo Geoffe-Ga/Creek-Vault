@@ -8,12 +8,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 VERBOSE=false
+COLD=false
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --verbose)
             VERBOSE=true
+            shift
+            ;;
+        --cold|--ci|--no-cache)
+            COLD=true
             shift
             ;;
         --help)
@@ -24,6 +29,9 @@ Run type checking on the project using MyPy.
 
 OPTIONS:
     --verbose   Show detailed output
+    --cold      Run cold typecheck with incremental cache disabled (--no-incremental)
+    --ci        Alias for --cold
+    --no-cache  Alias for --cold
     --help      Display this help message
 
 EXIT CODES:
@@ -69,7 +77,12 @@ if command -v mypy &> /dev/null; then
     # ungated one would be no fix at all, so the dead-code policy module
     # is type-checked (and, via pyproject's coverage source, covered)
     # exactly like product code.
-    python -m mypy creek/ creek_mcp/ scripts/ || {
+    MYPY_FLAGS=()
+    if [[ "${CI:-}" == "true" ]] || $COLD; then
+        MYPY_FLAGS+=(--no-incremental --cache-dir=/dev/null)
+    fi
+
+    python -m mypy "${MYPY_FLAGS[@]}" creek/ creek_mcp/ scripts/ || {
         echo "✗ Type checking failed" >&2
         exit 1
     }
