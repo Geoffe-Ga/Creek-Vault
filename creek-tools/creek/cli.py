@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from creek.generate.drafts import (
         DraftGenerator,
         DraftLLM,
+        DraftLLMFactory,
         OntologyDetector,
         SeedSpec,
     )
@@ -5368,67 +5369,103 @@ def _build_seed_spec(
     )
 
 
-def _build_draft_llm(max_tokens: int | None = None) -> DraftLLM:
-    """Construct a :data:`DraftLLM` callable from the configured LLM provider.
+def _build_draft_llm_factory(
+    config: CreekConfig,
+    max_tokens: int | None = None,
+) -> DraftLLMFactory:
+    """Build the tier-keyed draft LLM factory for ``creek draft`` (#1031).
 
-    Uses the Ollama/Anthropic adapter already wired up for classification.
-    Reads the vault-resolved config via :func:`load_config` so the helper
-    keeps a stable signature; the ``draft`` command pre-warms
-    ``CREEK_CONFIG`` resolution by calling :func:`_load_config_for_vault`
-    upstream.
+    Returns a factory rather than a client because the tier this call must
+    be keyed with is not known here. ``creek draft`` resolves its source
+    fragments inside :class:`~creek.generate.drafts.DraftGenerator` — mined
+    seed, ``--seed-*`` spec, or per outline section — so the CLI has nothing
+    to hand :meth:`~creek.classify.llm.router.ModelRouter.resolve` at build
+    time, and the tier-less ``resolve`` it used to call switched off the
+    ``Intimate``-never-cloud gate (#647) on the one draft path that puts
+    whole fragment *bodies* in a prompt. The generator calls this back once
+    it knows what a prompt carries; see
+    :meth:`~creek.generate.drafts.DraftGenerator._bind_routing_tier`.
 
-    The returned callable yields a
-    :class:`~creek.generate.drafts.DraftLLMResponse` so the draft
-    generator can detect a ``max_tokens`` truncation via the provider's
-    stop reason instead of saving a silently cut-off essay.
+    The content tier alone, with no ceiling term — the CLI operator *is* the
+    vault owner, so unlike ``creek_mcp.tools.draft`` there is no caller
+    declaration to reconcile against. Modelling ``--include-tier all`` as a
+    ceiling would be actively wrong: ``creek_mcp.tier_ceiling``'s
+    ``CEILING_ROUTING_TIER[ALL]`` is ``INTIMATE``, which would pin every
+    such draft to the local model no matter what the prompt actually holds.
+
+    *config* is the **vault's** config, resolved by
+    :func:`_load_config_for_vault`. The bare ``load_config()`` this used to
+    call read the process's own config instead, so ``creek draft --vault
+    <v>`` routed on whatever config the current working directory happened
+    to expose and ignored the vault's routing policy entirely.
 
     Args:
+        config: The vault-resolved configuration supplying both the router
+            and the ``draft.max_tokens`` default, so the two cannot diverge.
         max_tokens: Explicit per-invocation token ceiling (the
             ``--max-tokens`` flag). ``None`` falls back to the loaded
             ``draft.max_tokens`` config, then to the provider's built-in
             default. The Ollama path ignores it.
 
     Returns:
-        A callable ``(prompt) -> DraftLLMResponse`` ready to feed to
-        :class:`DraftGenerator`.
-
-    Raises:
-        typer.Exit: If the configured LLM provider is not reachable.
+        A ``(tier) -> (prompt) -> DraftLLMResponse`` factory ready to feed
+        to :class:`DraftGenerator` as ``llm_factory``. Clients are cached
+        per tier so a multi-section draft pays one provider handshake per
+        distinct tier, not one per prompt. The
+        :class:`~creek.generate.drafts.DraftLLMResponse` return lets the
+        generator detect a ``max_tokens`` truncation via the provider's stop
+        reason instead of saving a silently cut-off essay.
     """
     from creek.classify.llm import LLMClassifier
+    from creek.classify.llm.router import IntimateRoutingError
     from creek.generate.drafts import DraftLLMResponse
 
-    config = load_config()
     # The explicit flag wins; otherwise honour the config default. Both
     # the provider settings and this ceiling come from the same loaded
     # config so they cannot diverge.
     effective_max_tokens = (
         max_tokens if max_tokens is not None else config.draft.max_tokens
     )
-    # Issue #1031: a real, unfixed tier leak — unlike the deliberate no-tier
-    # sites in this file, this client is fed vault fragment *bodies*, and
-    # `--include-tier intimate|all` lets intimate ones through untouched. Not a
-    # considered decision; tracked separately because the fix shape differs
-    # (the tier is per-fragment here, not per-call as in `creek compile` #962).
-    classifier = LLMClassifier(config.model_router.resolve("classification"))
-    if not classifier.available:
-        console.print(
-            "[red]LLM provider unavailable; cannot generate draft. "
-            "Check Ollama or ANTHROPIC_API_KEY configuration.[/red]",
-        )
-        raise typer.Exit(code=1)
+    clients: dict[PrivacyTier, DraftLLM] = {}
 
-    def _invoke(prompt: str) -> DraftLLMResponse:
-        completion = classifier.invoke_prompt_with_metadata(
-            prompt,
-            max_tokens=effective_max_tokens,
-        )
-        return DraftLLMResponse(
-            text=completion.text,
-            stop_reason=completion.stop_reason,
-        )
+    def _client_for(tier: PrivacyTier) -> DraftLLM:
+        """Return the draft client this *tier* may be sent to."""
+        cached = clients.get(tier)
+        if cached is not None:
+            return cached
+        try:
+            resolved = config.model_router.resolve("classification", tier)
+        except IntimateRoutingError as exc:
+            # The one refusal that must be legible, exactly as on ``creek
+            # compile`` (#962): keying the call by tier *introduces* this
+            # failure mode (all-cloud config + intimate sources), and a stack
+            # trace would read as a crash rather than as the privacy
+            # guarantee doing its job.
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        classifier = LLMClassifier(resolved)
+        if not classifier.available:
+            console.print(
+                "[red]LLM provider unavailable; cannot generate draft. "
+                "Check Ollama or ANTHROPIC_API_KEY configuration.[/red]",
+            )
+            raise typer.Exit(code=1)
 
-    return _invoke
+        def _invoke(prompt: str) -> DraftLLMResponse:
+            """Send *prompt* to the tier-routed provider."""
+            completion = classifier.invoke_prompt_with_metadata(
+                prompt,
+                max_tokens=effective_max_tokens,
+            )
+            return DraftLLMResponse(
+                text=completion.text,
+                stop_reason=completion.stop_reason,
+            )
+
+        clients[tier] = _invoke
+        return _invoke
+
+    return _client_for
 
 
 def _run_seeded_draft(
@@ -5513,7 +5550,8 @@ def _build_ontology_detector(vault: Path | None) -> OntologyDetector:
         # `OutlineSection.seed_text`, i.e. operator-supplied `--seed-outline` /
         # `--seed-outline-text` copy. No fragment content reaches this provider,
         # so there is no classified tier for the router to enforce. Contrast
-        # `_build_draft_llm` above, which does see fragment bodies (#1031).
+        # `_build_draft_llm_factory` above, which does see fragment bodies and
+        # is therefore keyed by their tier (#1031).
         return detect_ontology(prompt, config.model_router.resolve("classification"))
 
     return _detect
@@ -5796,12 +5834,14 @@ def draft(
         seed_spec=seed_spec,
         ontology_twist=ontology_twist,
     )
-    llm = _build_draft_llm(max_tokens)
+    llm_factory = _build_draft_llm_factory(vault_config, max_tokens)
     if bypass_compiled:
         _warn_bypass_compiled("draft")
 
     generator = DraftGenerator(
-        llm=llm,
+        # A factory, not a client: only the generator knows which fragments
+        # a prompt will carry, so only it can key the router by tier (#1031).
+        llm_factory=llm_factory,
         skills_root=skills_dir,
         voice_core=voice_text,
         style_preamble=style_preamble,
