@@ -40,6 +40,7 @@ from crawdad.consent import (
     format_type_question,
 )
 from crawdad.history import ConversationHistory
+from crawdad.intents import CEILING_RANK, PrivacyTierCeiling
 from crawdad.loop import run_one_turn
 from crawdad.mcp_client import MCPUnavailableError
 from crawdad.slash_commands import register as register_slash_commands
@@ -210,7 +211,12 @@ class _AuthorLike(Protocol):
 
 
 class _ChannelLike(Protocol):
-    """Subset of ``discord.abc.Messageable`` used by the handler."""
+    """Subset of ``discord.abc.Messageable`` used by the handler.
+
+    ``parent_id`` is deliberately absent: only ``discord.Thread`` carries
+    one, so :func:`_parent_channel_id` reads it structurally rather than
+    forcing every channel type (and every test fake) to declare it.
+    """
 
     @property
     def id(self) -> int: ...  # pragma: no cover - protocol stub
@@ -373,7 +379,7 @@ def _capture_allowed(
     """
     if not _passes_allowlist(message, config=config, bot_user_id=bot_user_id):
         return False
-    tier = _channel_tier(channel_id=message.channel.id, config=config)
+    tier = _channel_tier(channel=message.channel, config=config)
     return tier in CAPTURE_ADMITTED_TIERS
 
 
@@ -470,7 +476,7 @@ async def _handle_attachments(
         config=config,
         mcp_client=mcp_client,
         known_tools=known_tools,
-        channel_id=channel_id,
+        channel=message.channel,
     )
 
     # Hold the per-channel consent lock during the record so a racing
@@ -482,7 +488,7 @@ async def _handle_attachments(
             _record_pending_batch(
                 pending_batches=pending_batches,
                 processed=processed,
-                channel_id=channel_id,
+                channel=message.channel,
                 config=config,
                 scanned=outcome.scanned,
             )
@@ -505,7 +511,7 @@ def _record_pending_batch(
     *,
     pending_batches: PendingBatchStore | None,
     processed: ProcessedAttachments,
-    channel_id: int,
+    channel: _ChannelLike,
     config: CrawDadConfig,
     scanned: bool,
 ) -> None:
@@ -517,7 +523,10 @@ def _record_pending_batch(
     Args:
         pending_batches: Store to record on; ``None`` is a no-op.
         processed: Result of the attachment download/staging pass.
-        channel_id: Discord channel the batch belongs to.
+        channel: Discord channel the batch belongs to. Passed whole
+            rather than as a bare id so :func:`_channel_tier` can see a
+            thread's parent (#1265); the batch is still keyed on
+            ``channel.id``, which is the thread's own id.
         config: Bot config, consulted for the channel's tier ceiling.
         scanned: :attr:`_ScanOutcome.scanned` from this turn's safety
             pass, persisted on the batch so the dispatch boundary can
@@ -536,10 +545,10 @@ def _record_pending_batch(
         for a in processed.accepted
     )
     batch = build_pending_batch(
-        channel_id=channel_id,
+        channel_id=channel.id,
         staging_dir=processed.staging_dir,
         accepted_files=files,
-        privacy_tier_ceiling=_channel_tier(channel_id=channel_id, config=config),
+        privacy_tier_ceiling=_channel_tier(channel=channel, config=config),
         now=pending_batches.now(),
         scanned=scanned,
     )
@@ -815,7 +824,7 @@ async def _run_safety_scan(
     config: CrawDadConfig,
     mcp_client: MCPClient | None,
     known_tools: tuple[str, ...],
-    channel_id: int,
+    channel: _ChannelLike,
 ) -> _ScanOutcome:
     """Invoke ``creek.redact.scan`` on the staging dir; report what happened.
 
@@ -849,7 +858,7 @@ async def _run_safety_scan(
                 {
                     "input_path": str(rel_staging),
                     "privacy_tier_ceiling": _channel_tier(
-                        channel_id=channel_id, config=config
+                        channel=channel, config=config
                     ),
                 },
             )
@@ -948,18 +957,77 @@ def _format_scan_section(*, body: str, parsed: dict[str, Any] | None) -> str:
     return f"**Safety scan**\n```\n{body}\n```"
 
 
-def _channel_tier(*, channel_id: int, config: CrawDadConfig) -> str:
-    """Return the privacy tier ceiling for *channel_id*.
+def _parent_channel_id(channel: _ChannelLike) -> int | None:
+    """Return *channel*'s parent channel id, or ``None`` when it has none.
+
+    ``discord.Thread`` is the only channel type that carries a
+    ``parent_id``; every other ``discord.abc.Messageable`` the bot sees
+    is its own top-level channel. Read structurally rather than via
+    ``isinstance(channel, discord.Thread)`` so the handler stays
+    drivable with the plain fakes the test suite uses — the same reason
+    :class:`_ChannelLike` is a Protocol.
+
+    Fails closed: anything that is not an ``int`` (missing attribute,
+    ``None`` on a partially-hydrated thread) yields ``None``, which
+    :func:`_channel_tier` reads as "no parent tier to inherit" and so
+    never widens the ceiling.
+    """
+    parent_id = getattr(channel, "parent_id", None)
+    if isinstance(parent_id, int) and not isinstance(parent_id, bool):
+        return parent_id
+    return None
+
+
+def _channel_tier(*, channel: _ChannelLike, config: CrawDadConfig) -> str:
+    """Return the privacy tier ceiling governing *channel*.
+
+    Looks up :attr:`AttachmentConfig.channel_privacy_tiers` for the
+    channel's own id **and**, when *channel* is a thread, its parent
+    channel's id (#1265). ``message.channel.id`` inside a thread is the
+    *thread's* id, so keying on it alone silently dropped a ceiling the
+    operator had declared on the parent — a de-escalation of an explicit
+    operator declaration.
+
+    Of the tiers found, the most restrictive wins, ranked by
+    :data:`~crawdad.intents.CEILING_RANK` — the codebase's single tier
+    ordering table, reused here rather than copied so no second ordering
+    can drift from it. "Most restrictive" is the *highest*-ranked tier
+    (``open`` < ``personal`` < ``intimate`` < ``all``), because a
+    channel tier declares how sensitive that channel's material is: a
+    higher tier means the operator asked for *more* protection, and the
+    resolved value only ever moves up. The three call sites read that
+    monotonically:
+
+    * :func:`_capture_allowed` admits only
+      :data:`~crawdad.config.CAPTURE_ADMITTED_TIERS`, which is exactly
+      the two lowest ranks — so raising the tier can only ever refuse a
+      capture that used to be written, never admit a new one.
+    * :func:`_record_pending_batch` stamps the value on the staged
+      batch, so a raised tier marks the ingested material as more
+      private downstream (``privacy_tier`` is a one-way ratchet).
+    * :func:`_run_safety_scan` passes it as the scan's ceiling, so a
+      raised tier lets the scan see the parent channel's declared
+      sensitivity instead of assuming the ``personal`` default — the
+      point of the fix.
+
+    So the rule is a ratchet in both directions it can move: a thread
+    may tighten itself inside an ``open`` parent, and an ``intimate``
+    parent still binds a thread that declares itself ``open``.
 
     Falls back to :data:`~crawdad.config.DEFAULT_CHANNEL_TIER`
-    (``personal``) when the channel is absent from
-    :attr:`AttachmentConfig.channel_privacy_tiers` — ingest writes
-    default to personal per FEAT-011, so a missing entry never
-    silently relaxes the ceiling.
+    (``personal``) only when *neither* id is declared — ingest writes
+    default to personal per FEAT-011, so a missing entry never silently
+    relaxes the ceiling. An undeclared parent contributes nothing rather
+    than contributing the default, so a channel the operator explicitly
+    declared ``open`` keeps resolving to ``open``.
     """
-    return config.attachments.channel_privacy_tiers.get(
-        channel_id, DEFAULT_CHANNEL_TIER
-    )
+    tiers = config.attachments.channel_privacy_tiers
+    parent_id = _parent_channel_id(channel)
+    candidate_ids = (channel.id,) if parent_id is None else (channel.id, parent_id)
+    declared = [tiers[cid] for cid in candidate_ids if cid in tiers]
+    if not declared:
+        return DEFAULT_CHANNEL_TIER
+    return max(declared, key=lambda tier: CEILING_RANK[PrivacyTierCeiling(tier)])
 
 
 def _resolve_skills(

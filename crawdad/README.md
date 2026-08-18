@@ -91,6 +91,11 @@ vault, because a captured message currently can't carry its channel's
 privacy tier with it. #1262 tracks carrying that tier end-to-end so
 `intimate` channels can be captured faithfully instead of refused.
 
+A **thread inherits its parent channel's declared tier** (#1265):
+declaring channel `555` as `intimate` covers every thread inside it,
+even threads you never listed. A thread may declare itself *stricter*
+than its parent, never looser.
+
 #### Upgrading from a pre-#1052 build — audit your capture tree
 
 #1052 stopped future bad writes; it did nothing about what an older build
