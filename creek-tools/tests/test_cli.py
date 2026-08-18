@@ -2632,18 +2632,48 @@ def test_report_rhetorical_patterns_no_exemplars_is_friendly(tmp_path: Path) -> 
     assert "No rhetorical patterns written" in result.output
 
 
-def test_report_rhetorical_patterns_generates(tmp_path: Path) -> None:
-    """``report --type rhetorical-patterns`` writes a per-register note (#582)."""
-    vault = tmp_path / "vault"
-    (vault / "00-Creek-Meta").mkdir(parents=True)
+def _seed_rhetorical_patterns_vault(vault: Path, *, tier_line: str) -> Path:
+    """Seed *vault* with one exemplar-qualifying fragment for the patterns report.
+
+    *tier_line* is spliced into the frontmatter verbatim, so a caller passes
+    either ``"privacy_tier: open\\n"`` or ``""`` — the empty string being the
+    only way to produce a file that never declared a tier at all, which is the
+    state #1212 is about and which no model-serialising helper can express.
+
+    Args:
+        vault: Vault root to create.
+        tier_line: The ``privacy_tier`` frontmatter line, or ``""`` to omit it.
+
+    Returns:
+        *vault*, for chaining.
+    """
+    (vault / "00-Creek-Meta").mkdir(parents=True, exist_ok=True)
     frags = vault / "01-Fragments" / "Journal"
-    frags.mkdir(parents=True)
+    frags.mkdir(parents=True, exist_ok=True)
     (frags / "ex-1.md").write_text(
         '---\ntype: fragment\nid: ex-1\ntitle: "T"\n'
+        f"{tier_line}"
         "source:\n  platform: journal\n  author: self\n"
         "voice:\n  voice_register: confessional\n  confidence: conviction\n"
         "---\nThe truth is we rise; as I said before, we rise.\n",
         encoding="utf-8",
+    )
+    return vault
+
+
+def test_report_rhetorical_patterns_generates(tmp_path: Path) -> None:
+    """``report --type rhetorical-patterns`` writes a per-register note (#582).
+
+    The fixture states ``privacy_tier: open`` explicitly (#1212). It used to
+    omit the key, which made this test depend on the very defect #1212 fixes:
+    an untiered fragment reaching the voice corpus at the CLI's default
+    ``ALL`` ceiling. Stating the tier keeps the test about *rhetorical-pattern
+    generation* rather than about tier admission, which
+    ``test_report_rhetorical_patterns_refuses_an_untiered_fragment`` owns.
+    """
+    vault = _seed_rhetorical_patterns_vault(
+        tmp_path / "vault",
+        tier_line="privacy_tier: open\n",
     )
 
     result = runner.invoke(
@@ -2654,6 +2684,56 @@ def test_report_rhetorical_patterns_generates(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "Rhetorical patterns written" in result.output
     assert (vault / "07-Voice" / "Rhetorical-Patterns" / "confessional.md").exists()
+
+
+def test_report_rhetorical_patterns_refuses_an_untiered_fragment(
+    tmp_path: Path,
+) -> None:
+    """A fragment with no ``privacy_tier`` key produces no patterns (#1212 AC1).
+
+    AC1 names ``rhetorical-patterns`` explicitly, and this is the surface as
+    the operator meets it: a bare ``creek report --type rhetorical-patterns``,
+    with no ``--include-tier``, which the CLI resolves to
+    ``PrivacyTierOverride.ALL``. At that ceiling the raw-frontmatter gate
+    short-circuits to "admit", leaving only the model-reading consent gate —
+    which sees Pydantic's ``unclassified`` default and cannot tell that the
+    file said nothing at all.
+
+    Both arms run, over two vaults identical but for that one frontmatter
+    line, because the negative arm alone is worthless: ``No rhetorical
+    patterns written`` is also what a vault the walk never reached would
+    print, and what a mis-typed fixture, a bad body, or an unqualifying
+    confidence would print. The positive arm is what proves the refusal is
+    about the tier.
+    """
+    untiered = _seed_rhetorical_patterns_vault(
+        tmp_path / "untiered-vault",
+        tier_line="",
+    )
+    tiered = _seed_rhetorical_patterns_vault(
+        tmp_path / "tiered-vault",
+        tier_line="privacy_tier: open\n",
+    )
+
+    refused = runner.invoke(
+        app,
+        ["report", "--type", "rhetorical-patterns", "--vault", str(untiered)],
+    )
+    admitted = runner.invoke(
+        app,
+        ["report", "--type", "rhetorical-patterns", "--vault", str(tiered)],
+    )
+
+    assert admitted.exit_code == 0, admitted.output
+    assert "Rhetorical patterns written" in admitted.output, (
+        "the tiered arm wrote nothing, so the untiered arm's silence says "
+        f"nothing about the tier. output={admitted.output!r}"
+    )
+    assert (tiered / "07-Voice" / "Rhetorical-Patterns" / "confessional.md").is_file()
+
+    assert refused.exit_code == 0, refused.output
+    assert "No rhetorical patterns written" in refused.output
+    assert not (untiered / "07-Voice" / "Rhetorical-Patterns").exists()
 
 
 def test_report_mode_profiles_no_data_is_friendly(tmp_path: Path) -> None:
