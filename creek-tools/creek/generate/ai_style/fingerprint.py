@@ -40,11 +40,11 @@ import re
 from typing import TYPE_CHECKING
 
 import frontmatter
-import yaml
 
 from creek.generate.ai_style.features import FINGERPRINT_FEATURES
 from creek.generate.ai_style.model import FeatureStat, VoiceFingerprint
 from creek.ingest.turns import CONVERSATION_PLATFORMS, split_conversation_body
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -252,7 +252,13 @@ def _eligible_texts(
     for md_file in sorted(fragments_root.rglob("*.md")):
         try:
             post = frontmatter.load(str(md_file))
-        except (OSError, yaml.YAMLError):
+        except FRONTMATTER_LOAD_ERRORS:
+            # Widened from ``(OSError, yaml.YAMLError)`` (#924): this walk
+            # visits every fragment in the vault, and a hand-edited note with
+            # a non-string frontmatter key raised the bare ``TypeError`` from
+            # ``frontmatter.load``'s ``**metadata`` splat straight through
+            # here, costing the whole fingerprint its run rather than costing
+            # itself its sample (#1475).
             logger.warning("Skipping unreadable fragment: %s", md_file)
             continue
         source = post.metadata.get("source", {})

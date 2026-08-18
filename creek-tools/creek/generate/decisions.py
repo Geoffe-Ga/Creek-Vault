@@ -497,6 +497,17 @@ class DecisionDetector:
             decision_id: The decision ID to find.
             decisions_dir: The 08-Decisions directory path.
 
+        An unreadable neighbour costs itself, not the search: ``08-Decisions``
+        is an operator-editable folder, and this load was unguarded, so one
+        hand-edited note there — a non-string frontmatter key raises
+        ``TypeError`` out of ``frontmatter.load``'s ``**metadata`` splat —
+        aborted every lookup in the folder rather than being stepped over
+        (#924, #1475). Skipping is the same policy the module's other loader,
+        :func:`_load_post`, already applies, and it is safe here because the
+        skipped file could not have answered the query anyway: its ``id`` is
+        exactly what could not be read. The cost is the one #926 tracks — the
+        note is invisible, so a subsequent write may duplicate it.
+
         Returns:
             Path to the matching note, or None if not found.
         """
@@ -505,7 +516,11 @@ class DecisionDetector:
             if not search_dir.exists():
                 continue
             for md_file in search_dir.glob("*.md"):
-                post = frontmatter.load(str(md_file))
+                try:
+                    post = frontmatter.load(str(md_file))
+                except FRONTMATTER_LOAD_ERRORS:
+                    logger.debug("Skipping unreadable decision note: %s", md_file)
+                    continue
                 if post.get("id") == decision_id:
                     return md_file
         return None

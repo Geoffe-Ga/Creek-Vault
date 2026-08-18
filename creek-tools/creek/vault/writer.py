@@ -416,7 +416,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 
 def _load_post_or_report(path: Path) -> frontmatter.Post:
-    """Load *path*, re-raising an unreadable header as a ``ValueError`` naming it.
+    """Load *path*, re-raising an unreadable header with *path* in the message.
 
     The three fragment-lifecycle write paths — :meth:`VaultWriter.update_fragment`,
     :meth:`VaultWriter.tomb_fragment`, and :meth:`VaultWriter.restore_fragment` —
@@ -443,6 +443,23 @@ def _load_post_or_report(path: Path) -> frontmatter.Post:
     verifier for, and leaving the load bare would report it as an unpathed
     ``TypeError``.
 
+    **The OS-level failures keep their ``OSError`` identity**, and that split
+    is the whole reason this is two ``except`` clauses rather than one over
+    :data:`~creek.vault.reader.FRONTMATTER_LOAD_ERRORS` (which contains
+    ``OSError``). All three callers are reached from the per-unit loop in
+    :mod:`creek.ingest.pipeline`, whose handlers are ``except (OSError,
+    KeyError)``: an unreadable file is reported against *that unit* and the
+    batch continues. Re-raising the race described above — a vanished or
+    half-rewritten file, i.e. an ``OSError`` — as a ``ValueError`` would walk
+    straight past that handler and out through ``_run_ingest``, which catches
+    only ``FileNotFoundError``/``EscapingSymlinkError``, ending the whole
+    ``creek ingest`` run on one file an editor happened to be touching. That
+    is strictly narrower than the bare ``frontmatter.load`` this replaced. So
+    ``ValueError`` is reserved for the parse-shaped failures — the non-string
+    key (``TypeError``), malformed YAML, undecodable bytes — which were never
+    catchable per-unit anyway, and which no concurrent editor can conjure out
+    of a file that was fine a moment ago.
+
     Args:
         path: The live vault file to parse.
 
@@ -450,11 +467,20 @@ def _load_post_or_report(path: Path) -> frontmatter.Post:
         The parsed document, body included.
 
     Raises:
-        ValueError: When the frontmatter cannot be read, naming *path* and
-            quoting the underlying error.
+        OSError: When the file itself could not be read — vanished, replaced,
+            permission-denied. Re-raised as an ``OSError`` so the ingest
+            loop's per-unit handler still catches it, with *path* named.
+        ValueError: When the bytes were read but the frontmatter will not
+            parse, naming *path* and quoting the underlying error.
     """
     try:
         return frontmatter.load(str(path))
+    except OSError as exc:
+        # Deliberately ahead of the wider tuple below, which also contains
+        # ``OSError``: the family must stay an ``OSError`` for the ingest
+        # loop's ``except (OSError, KeyError)`` per-unit handler. See above.
+        msg = f"Unreadable frontmatter in {path}: {exc}"
+        raise OSError(msg) from exc
     except FRONTMATTER_LOAD_ERRORS as exc:
         msg = f"Unreadable frontmatter in {path}: {exc}"
         raise ValueError(msg) from exc
@@ -913,8 +939,12 @@ class VaultWriter:
             frontmatter will not parse at all (#1543).
 
         Raises:
-            ValueError: If the located file's frontmatter cannot be parsed;
-                the message names the path (see :func:`_load_post_or_report`).
+            OSError: If the located file cannot be read — the vanished or
+                half-rewritten file of the verify-then-load race. Kept in the
+                ``OSError`` family so the ingest loop's per-unit handler still
+                catches it (see :func:`_load_post_or_report`).
+            ValueError: If the located file was read but its frontmatter will
+                not parse; the message names the path (same function).
         """
         target_dir = self._fragment_target_dir(fragment)
         with self._lock:
@@ -1186,10 +1216,14 @@ class VaultWriter:
             RuntimeError: If a unique filename cannot be allocated in the
                 orphan directory within
                 :data:`_MAX_FILENAME_COLLISION_RETRIES` attempts.
-            OSError: If the tombstone cannot be created, or its index entry
-                cannot be appended.
-            ValueError: If the located file's frontmatter cannot be parsed;
-                the message names the path (see :func:`_load_post_or_report`).
+            OSError: If the located file cannot be read (the verify-then-load
+                race), if the tombstone cannot be created, or if its index
+                entry cannot be appended.
+            ValueError: If the located file was read but its frontmatter will
+                not parse; the message names the path (see
+                :func:`_load_post_or_report`). A file that cannot be *read* at
+                all raises ``OSError`` above instead, so the ingest loop's
+                per-unit handler still catches it.
 
         The ``RuntimeError`` and ``OSError`` propagate from
         :meth:`_relocate_fragment_locked`.
@@ -1244,10 +1278,14 @@ class VaultWriter:
             RuntimeError: If a unique filename cannot be allocated in the
                 target directory within
                 :data:`_MAX_FILENAME_COLLISION_RETRIES` attempts.
-            OSError: If the restored file cannot be created, or its index
+            OSError: If the located file cannot be read (the verify-then-load
+                race), if the restored file cannot be created, or if its index
                 entry cannot be appended.
-            ValueError: If the located file's frontmatter cannot be parsed;
-                the message names the path (see :func:`_load_post_or_report`).
+            ValueError: If the located file was read but its frontmatter will
+                not parse; the message names the path (see
+                :func:`_load_post_or_report`). A file that cannot be *read* at
+                all raises ``OSError`` above instead, so the ingest loop's
+                per-unit handler still catches it.
 
         The ``RuntimeError`` and ``OSError`` propagate from
         :meth:`_relocate_fragment_locked`.

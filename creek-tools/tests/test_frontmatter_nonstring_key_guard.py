@@ -33,6 +33,8 @@ from typing import TYPE_CHECKING, Final
 import frontmatter
 import pytest
 
+from creek.cli import _run_ingest
+from creek.ingest import INGESTOR_REGISTRY
 from creek.models import (
     Fragment,
     FragmentSource,
@@ -238,15 +240,215 @@ def test_corrupt_fragment_goes_invisible_rather_than_crashing(
     writer = VaultWriter(vault_path=writer_vault)
     fragment = _good_fragment(0)
     written = writer.write_fragment(fragment, body="hello")
-    _write_note(
-        written,
-        f"id: {fragment.id}\ntype: fragment\n" + NONSTRING_KEY_HEADERS[header_name],
+    corrupt_header = (
+        f"id: {fragment.id}\ntype: fragment\n" + NONSTRING_KEY_HEADERS[header_name]
+    )
+    _write_note(written, corrupt_header)
+    # The restore arm needs a tombstone that *exists and declares this id*, or
+    # it passes for the unrelated reason that ``10-Liminal/Orphaned/`` is
+    # empty — which is what made it vacuous before. Written corrupt, so the
+    # only thing standing between the id and its tombstone is the header.
+    orphan = _write_note(
+        writer_vault / "10-Liminal" / "Orphaned" / f"tomb-{fragment.id}.md",
+        corrupt_header,
     )
 
     assert writer.find_fragment(fragment.id) is None
     assert writer.update_fragment(fragment, body="new") is None
     assert writer.tomb_fragment(fragment.id) is None
     assert writer.restore_fragment(fragment) is None
+    # ...and the tombstone really is sitting there, declaring the id in text.
+    assert fragment.id in orphan.read_text(encoding="utf-8")
+
+
+def test_restore_fragment_finds_a_readable_tombstone(writer_vault: Path) -> None:
+    """Positive control for the restore arm above.
+
+    Proves the ``None`` there is caused by the unreadable header and not by a
+    restore path that can never find anything: same writer, same orphan
+    directory, a tombstone whose only difference is that its frontmatter
+    parses.
+    """
+    writer = VaultWriter(vault_path=writer_vault)
+    fragment = _good_fragment(1)
+    writer.write_fragment(fragment, body="hello")
+    assert writer.tomb_fragment(fragment.id) is not None
+
+    restored = writer.restore_fragment(fragment)
+
+    assert restored is not None
+    assert restored.parent.name != "Orphaned"
+
+
+# ---- The verify-then-load race must stay in the OSError family (#1475) ------
+
+
+def test_load_post_or_report_keeps_an_oserror_an_oserror(tmp_path: Path) -> None:
+    """A file that vanished mid-run raises ``OSError``, never ``ValueError``.
+
+    The three write paths are all reached from the per-unit loop in
+    :mod:`creek.ingest.pipeline`, whose handlers are ``except (OSError,
+    KeyError)``. Before the guard existed these loads were bare, so the
+    ``FileNotFoundError`` of a file an editor or sync client removed mid-run
+    was reported against that one unit and the batch carried on. Re-raising it
+    as a ``ValueError`` would walk past that handler and end the whole run, so
+    the wrapper splits: ``OSError`` stays an ``OSError`` (with the path named),
+    and ``ValueError`` is reserved for the parse-shaped failures.
+    """
+    from creek.vault.writer import _load_post_or_report
+
+    missing = tmp_path / "vanished.md"
+
+    with pytest.raises(OSError) as excinfo:
+        _load_post_or_report(missing)
+
+    assert not isinstance(excinfo.value, ValueError)
+    assert str(missing) in str(excinfo.value)
+
+
+def _race_vault(tmp_path: Path) -> Path:
+    """Scaffold the minimal vault a markdown ingest run needs."""
+    vault = tmp_path / "vault"
+    for relative in (
+        "00-Creek-Meta/Processing-Log",
+        "01-Fragments/Journal",
+        "01-Fragments/Notes",
+        "10-Liminal/Orphaned",
+        "personal/journal",
+    ):
+        (vault / relative).mkdir(parents=True, exist_ok=True)
+    return vault
+
+
+def _ingest_markdown(vault: Path, target: Path) -> tuple[int, list[str], int]:
+    """Run one markdown ingest pass over *target* (a directory = full source)."""
+    return _run_ingest(
+        ingestor_cls=INGESTOR_REGISTRY["markdown"],
+        source_type="markdown",
+        input_path=target,
+        vault_path=vault,
+    )
+
+
+def _arm_vanishing_file(
+    monkeypatch: pytest.MonkeyPatch,
+    doomed_id: str,
+) -> dict[str, bool]:
+    """Delete the located file for *doomed_id* the instant it is located.
+
+    A genuine race, not a mocked exception: the file is really unlinked
+    between the id verifier proving it and the write path loading it, so
+    ``frontmatter.load`` raises a real ``FileNotFoundError`` out of ``open``.
+    That is the window :func:`creek.vault.writer._load_post_or_report`'s
+    docstring describes — an editor or sync client rewriting a live Obsidian
+    vault under a running ingest.
+    """
+    real = VaultWriter._find_existing_locked
+    state = {"fired": False}
+
+    def racing(
+        self: VaultWriter,
+        model_id: str,
+        target_dir: Path,
+    ) -> Path | None:
+        found = real(self, model_id, target_dir)
+        if found is not None and model_id == doomed_id and not state["fired"]:
+            state["fired"] = True
+            found.unlink()
+        return found
+
+    monkeypatch.setattr(VaultWriter, "_find_existing_locked", racing)
+    return state
+
+
+def _fragment_ids_by_path(vault: Path) -> dict[Path, str]:
+    """Map every live fragment file to the id its frontmatter declares."""
+    return {
+        path: str(frontmatter.load(str(path))["id"])
+        for path in sorted((vault / "01-Fragments").rglob("*.md"))
+    }
+
+
+def test_vanished_file_mid_update_costs_one_fragment_not_the_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``update_fragment`` losing its file is reported per unit; the batch runs on."""
+    vault = _race_vault(tmp_path)
+    journal = vault / "personal" / "journal"
+    (journal / "one.md").write_text(
+        "---\ndate: 2026-06-01\n---\nfirst body\n", encoding="utf-8"
+    )
+    (journal / "two.md").write_text(
+        "---\ndate: 2026-06-02\n---\nsecond body\n", encoding="utf-8"
+    )
+    _, errors, _ = _ingest_markdown(vault, journal)
+    assert errors == []
+    by_path = _fragment_ids_by_path(vault)
+    assert len(by_path) == 2  # positive control: two real fragments to race.
+    doomed_path, doomed_id = next(iter(by_path.items()))
+    survivor_path = next(path for path in by_path if path != doomed_path)
+
+    # Edit both source units so both take the update path.
+    (journal / "one.md").write_text(
+        "---\ndate: 2026-06-01\n---\nfirst body REWRITTEN\n", encoding="utf-8"
+    )
+    (journal / "two.md").write_text(
+        "---\ndate: 2026-06-02\n---\nsecond body REWRITTEN\n", encoding="utf-8"
+    )
+    state = _arm_vanishing_file(monkeypatch, doomed_id)
+
+    written, errors, _ = _ingest_markdown(vault, journal)
+
+    assert state["fired"], "the race never fired; the test proves nothing"
+    assert len(errors) == 1, errors
+    assert doomed_id in errors[0]
+    assert "Unreadable frontmatter" in errors[0]
+    assert str(doomed_path) in errors[0]
+    # The batch continued: the other unit was written, not abandoned.
+    assert written == 1
+    assert "REWRITTEN" in survivor_path.read_text(encoding="utf-8")
+
+
+def test_vanished_file_mid_tomb_costs_one_fragment_not_the_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``tomb_fragment`` losing its file is reported per unit; the batch runs on."""
+    vault = _race_vault(tmp_path)
+    journal = vault / "personal" / "journal"
+    # Ingested one at a time, so the doomed fragment's source unit is known by
+    # construction rather than guessed back from a derived filename.
+    (journal / "one.md").write_text(
+        "---\ndate: 2026-06-01\n---\nfirst body\n", encoding="utf-8"
+    )
+    _, errors, _ = _ingest_markdown(vault, journal)
+    assert errors == []
+    first = _fragment_ids_by_path(vault)
+    assert len(first) == 1  # positive control.
+    doomed_path, doomed_id = next(iter(first.items()))
+    (journal / "two.md").write_text(
+        "---\ndate: 2026-06-02\n---\nsecond body\n", encoding="utf-8"
+    )
+    _, errors, _ = _ingest_markdown(vault, journal)
+    assert errors == []
+    assert len(_fragment_ids_by_path(vault)) == 2  # positive control.
+
+    # ``one.md`` is gone, so its fragment is tombed — and the tomb path loses
+    # the file between locating it and loading it.
+    (journal / "one.md").unlink()
+    state = _arm_vanishing_file(monkeypatch, doomed_id)
+
+    _, errors, _ = _ingest_markdown(vault, journal)
+
+    assert state["fired"], "the race never fired; the test proves nothing"
+    assert len(errors) == 1, errors
+    assert "Unreadable frontmatter" in errors[0]
+    assert str(doomed_path) in errors[0]
+    # The surviving unit was still processed: it is live and unchanged.
+    survivors = _fragment_ids_by_path(vault)
+    assert len(survivors) == 1
+    assert doomed_id not in survivors.values()
 
 
 @pytest.mark.parametrize("header_name", _HEADER_IDS)
@@ -344,12 +546,27 @@ def test_post_loaders_skip_nonstring_key_notes(
 
 
 def test_post_loaders_positive_control(tmp_path: Path) -> None:
-    """The same loaders still return something for a well-formed note.
+    """Every loader in the battery above still returns something readable.
 
     Without this, a loader that returned ``None`` unconditionally would pass
-    the skip test above and the whole battery would be vacuous.
+    the skip test and the whole battery would be vacuous. All ten are covered,
+    not the four whose sentinel is cheapest to disprove: each of the remaining
+    six needs a note shaped for *it* — a valid fragment record, a provenance
+    list, an over-ceiling voice distance — and skipping them is exactly how a
+    vacuous arm hides.
     """
-    from creek.generate import compost_scan, mining, state, wavelength
+    from creek.compile import engine as compile_engine
+    from creek.generate import (
+        compost_scan,
+        decisions,
+        mining,
+        skills,
+        state,
+        wavelength,
+    )
+    from creek.generate import unnamed as unnamed_mod
+    from creek.generate import voice as voice_mod
+    from creek.lint.checks import voice_fidelity
 
     note = _write_note(tmp_path / "good.md", "type: fragment\ntitle: Fine\n")
     for label, loader in (
@@ -357,8 +574,211 @@ def test_post_loaders_positive_control(tmp_path: Path) -> None:
         ("mining._safe_post", mining._safe_post),
         ("compost_scan._safe_post", compost_scan._safe_post),
         ("wavelength._safe_post", wavelength._safe_post),
+        ("decisions._load_post", decisions._load_post),
+        (
+            "skills._safe_load_post",
+            lambda path: skills._safe_load_post(path, label="skill"),
+        ),
     ):
         assert loader(note) is not None, f"{label} lost a readable note"
+
+    # The two fragment-record loaders need a real fragment, not any old post.
+    vault = tmp_path / "vault"
+    fragment_file = write_fragment_file(
+        vault=vault,
+        fragment=_good_fragment(9),
+        body="a readable body",
+    )
+    assert unnamed_mod._load_fragment(fragment_file) is not None
+    assert voice_mod._load_fragment_with_body(fragment_file) is not None
+
+    # ``_load_existing_provenance`` returns ``[]`` for *both* "unreadable" and
+    # "no provenance", so its control must assert a non-empty list.
+    page = _write_note(
+        tmp_path / "page.md",
+        "provenance:\n"
+        "  - claim_id: claim-001\n"
+        "    claim_excerpt: A claim worth tracing\n"
+        "    fragment_ids: [frag-nonstr000009]\n"
+        "    compiled_at: 2026-01-01T00:00:00+00:00\n"
+        "    compile_method: rules\n",
+    )
+    assert compile_engine._load_existing_provenance(page) != []
+
+    # ``voice_fidelity._scan_draft`` returns ``None`` for "unreadable" *and*
+    # for "on voice", so its control needs a draft that must be reported.
+    off_voice = _write_note(tmp_path / "draft.md", "voice_distance: 99.0\n")
+    assert _scan_voice_fidelity_draft(voice_fidelity, off_voice) is not None
+
+
+# ---- The two sites #924 named that this PR reaches (#1475 blockers B/C) -----
+
+
+def _tagged_vault(tmp_path: Path, header_name: str) -> Path:
+    """Build a vault holding one tagged fragment and one unreadable note."""
+    vault = tmp_path / "vault"
+    write_fragment_file(
+        vault=vault,
+        fragment=_good_fragment(3),
+        body="a readable body",
+        extras={"tags": ["alpha"]},
+    )
+    _scatter_bad_notes(vault / "01-Fragments" / "Notes")
+    _write_note(
+        vault / "01-Fragments" / "Notes" / "bad-only.md",
+        NONSTRING_KEY_HEADERS[header_name],
+    )
+    return vault
+
+
+@pytest.mark.parametrize("header_name", _HEADER_IDS)
+def test_tag_scan_survives_nonstring_key_note(
+    tmp_path: Path,
+    header_name: str,
+) -> None:
+    """The tag garden's scan skips the unreadable note and keeps its tally.
+
+    This load was the last unguarded one of the four ``#924`` named, and it
+    is the one that made this PR's headline claim untrue: ``creek lint`` calls
+    it through :func:`creek.lint.checks.tags.run`.
+    """
+    from creek.generate.tags import TagGardenGenerator
+
+    vault = _tagged_vault(tmp_path, header_name)
+
+    scan = TagGardenGenerator(vault_path=vault).scan_tags()
+
+    # Positive control: the readable fragment's tag is still counted.
+    assert scan.tag_counts.get("alpha") == 1
+
+
+def test_lint_run_survives_a_nonstring_key_note(tmp_path: Path) -> None:
+    """``creek lint`` completes over a vault holding an unreadable note.
+
+    The headline claim, proven at the surface that carries it.
+    :mod:`creek.lint.runner` has no per-check ``except`` — every check it
+    calls runs bare — so any check that raises ends the whole command. Run
+    here through the real runner with its default deterministic set, so a
+    future check that reintroduces an unguarded load fails this test.
+    """
+    from creek.lint.runner import LintRunner
+
+    vault = _tagged_vault(tmp_path, "date_key")
+    _scatter_bad_notes(vault / "10-Liminal" / "Compost", prefix="compost-bad")
+    _scatter_bad_notes(vault / "07-Voice" / "Drafts", prefix="draft-bad")
+
+    report = LintRunner(vault_path=vault).run()
+
+    # Positive control: real checks really ran, and the tag survived.
+    results = {result.name: result for result in report.results}
+    assert results, "no checks ran"
+    assert "1 tag(s) tracked" in results["tags"].summary
+
+
+@pytest.mark.parametrize("header_name", _HEADER_IDS)
+def test_find_decision_by_id_steps_over_unreadable_note(
+    tmp_path: Path,
+    header_name: str,
+) -> None:
+    """One hand-edited decision note must not hide every other decision."""
+    from creek.generate.decisions import DecisionDetector
+
+    decisions_dir = tmp_path / "08-Decisions"
+    active = decisions_dir / "Active"
+    active.mkdir(parents=True)
+    # Sorted before the target, so an unguarded load aborts before reaching it.
+    _write_note(active / "aaa-bad.md", NONSTRING_KEY_HEADERS[header_name])
+    wanted = _write_note(active / "zzz-good.md", "id: dec-000001\ntype: decision\n")
+
+    found = DecisionDetector._find_decision_by_id("dec-000001", decisions_dir)
+
+    assert found == wanted
+
+
+@pytest.mark.parametrize("header_name", _HEADER_IDS)
+def test_fingerprint_corpus_survives_nonstring_key_note(
+    tmp_path: Path,
+    header_name: str,
+) -> None:
+    """The voice fingerprint's corpus walk keeps its samples (#924).
+
+    Its guard was the narrow ``(OSError, yaml.YAMLError)``, so the splat's
+    ``TypeError`` went straight through and cost the whole fingerprint its
+    run rather than costing one note its sample.
+    """
+    from creek.config import AIStyleConfig
+    from creek.generate.ai_style.fingerprint import _eligible_texts
+
+    vault = tmp_path / "vault"
+    write_fragment_file(
+        vault=vault,
+        fragment=_good_fragment(4),
+        body="a readable body of prose that the fingerprint can measure",
+    )
+    _write_note(
+        vault / "01-Fragments" / "Notes" / f"bad-{header_name}.md",
+        NONSTRING_KEY_HEADERS[header_name],
+    )
+
+    texts = _eligible_texts(vault, AIStyleConfig(), include_intimate=True)
+
+    # Positive control: the readable fragment is still in the corpus.
+    assert len(texts) == 1
+
+
+# ---- The accepted cost of header-only reading (#1416) -----------------------
+
+
+def test_header_only_readers_require_the_fence_on_line_one(tmp_path: Path) -> None:
+    """Pin the one narrowing the ``read_header_meta`` conversions accept.
+
+    ``frontmatter.loads`` tolerates blank lines above the opening ``---``;
+    :func:`creek.vault.links.read_header_meta` does not (#1416), and two of
+    the five converted sites read operator-editable folders. The narrowing is
+    accepted rather than reverted for three reasons: **Obsidian itself** only
+    recognises frontmatter whose fence opens line 1, so such a note has no
+    properties in the editor the vault lives in either; the consequence at
+    both sites is a skip, not a loss — the compost note goes unlisted, the
+    paradox pair is not recognised as recorded and may be re-proposed as a
+    duplicate (the case #1320's advisory already reports); and #1416 made
+    exactly this trade for the sibling ``10-Liminal/Synchronicities/`` folder,
+    so reverting these two would split the rule across three sibling folders.
+
+    Pinned here so the cost is a decision on the record, not a surprise.
+    """
+    from creek.generate.paradox import _recorded_pair
+    from creek.lint.checks import compost as compost_check
+
+    vault = tmp_path / "vault"
+    compost_dir = vault / "10-Liminal" / "Compost"
+    compost_dir.mkdir(parents=True)
+    good_compost = compost_dir / "kept.md"
+    good_compost.write_text(
+        "---\ntype: compost\ntitle: Kept\n---\nbody\n", encoding="utf-8"
+    )
+    (compost_dir / "shifted.md").write_text(
+        "\n---\ntype: compost\ntitle: Shifted\n---\nbody\n", encoding="utf-8"
+    )
+
+    result = compost_check.run(vault)
+
+    # Positive control first: the fence-on-line-1 note is still listed.
+    assert any("Kept" in finding for finding in result.findings)
+    assert not any("Shifted" in finding for finding in result.findings)
+
+    paradox_dir = vault / "10-Liminal" / "Paradoxes"
+    paradox_dir.mkdir(parents=True)
+    good_pair = paradox_dir / "pair.md"
+    good_pair.write_text(
+        "---\nfragments: [frag-a, frag-b]\n---\nbody\n", encoding="utf-8"
+    )
+    shifted_pair = paradox_dir / "shifted.md"
+    shifted_pair.write_text(
+        "\n---\nfragments: [frag-a, frag-b]\n---\nbody\n", encoding="utf-8"
+    )
+
+    assert _recorded_pair(good_pair) == frozenset({"frag-a", "frag-b"})
+    assert _recorded_pair(shifted_pair) is None
 
 
 # ---- Metadata-only readers now on read_header_meta --------------------------

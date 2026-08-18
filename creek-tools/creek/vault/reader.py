@@ -65,8 +65,23 @@ before its (possibly byte-clean ASCII) frontmatter is ever parsed.
 **Wrap the load statement, nothing else.** ``TypeError`` is the most common
 symptom of a genuine programming error, so a tuple this wide around a loop body
 — or around a ``model_validate`` call — would swallow real bugs and turn them
-into silent skips. Every use in this package brackets exactly one
-``frontmatter.load``/``loads`` call.
+into silent skips.
+
+Sixteen of this package's twenty uses bracket a bare
+``frontmatter.load``/``loads`` call and nothing else. The remaining four —
+:func:`iter_vault_fragments` below,
+:func:`creek.classify.review_runner._read_entry`,
+:func:`creek.author.checks._scan_subtree_for_cited`, and
+:func:`creek.classify.classify_engine._load_classifiable_fragment` — bracket a
+single call to :func:`try_load_fragment` (or to
+``classify_engine._read_fragment``, a thin alias for it) instead, because that
+helper *is* their load. The extra surface
+that buys is bounded and stated here rather than papered over: on top of the
+load, ``try_load_fragment`` runs ``post.metadata.copy()``, one ``dict.get``,
+and ``Fragment.model_validate``, whose own failure mode — ``ValidationError``,
+a ``ValueError`` subclass — is already caught *inside* the helper and logged.
+Nothing else in there can raise a member of this tuple without it being a real
+bug, and no caller may widen the bracket further.
 
 A reader that needs only the *metadata* should prefer
 :func:`creek.vault.links.read_header_meta` over catching this at all: it parses
