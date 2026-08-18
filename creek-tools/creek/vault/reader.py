@@ -67,15 +67,22 @@ symptom of a genuine programming error, so a tuple this wide around a loop body
 — or around a ``model_validate`` call — would swallow real bugs and turn them
 into silent skips.
 
-Sixteen of this package's twenty uses bracket a bare
-``frontmatter.load``/``loads`` call and nothing else. The remaining four —
-:func:`iter_vault_fragments` below,
+Nearly every use in this package brackets a bare
+``frontmatter.load``/``loads`` call and nothing else. The exceptions are
+enumerated exhaustively here — :func:`iter_vault_fragments` below,
 :func:`creek.classify.review_runner._read_entry`,
 :func:`creek.author.checks._scan_subtree_for_cited`, and
-:func:`creek.classify.classify_engine._load_classifiable_fragment` — bracket a
-single call to :func:`try_load_fragment` (or to
+:func:`creek.classify.classify_engine._load_classifiable_fragment` — and they
+bracket a single call to :func:`try_load_fragment` (or to
 ``classify_engine._read_fragment``, a thin alias for it) instead, because that
-helper *is* their load. The extra surface
+helper *is* their load. No tally of the remaining sites is written here on
+purpose: a hand-counted number goes stale the moment a site moves (#1548 will
+move several), and this paragraph carried a wrong one until #1546. Both
+claims are instead checked mechanically by
+``test_every_frontmatter_guard_brackets_exactly_one_load`` in
+``tests/test_frontmatter_nonstring_key_guard.py``, which walks this package's
+AST and fails if any guard brackets more than its load, or if a site outside
+the four named above starts bracketing the helper. The extra surface
 that buys is bounded and stated here rather than papered over: on top of the
 load, ``try_load_fragment`` runs ``post.metadata.copy()``, one ``dict.get``,
 and ``Fragment.model_validate``, whose own failure mode — ``ValidationError``,

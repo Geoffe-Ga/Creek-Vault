@@ -26,9 +26,12 @@ it" vacuously.
 
 from __future__ import annotations
 
+import ast
+import json
 import re
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Final
+from pathlib import Path
+from typing import Final
 
 import frontmatter
 import pytest
@@ -43,9 +46,6 @@ from creek.models import (
 )
 from creek.vault.writer import VaultWriter
 from tests.helpers import write_fragment_file
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 # The three headers that crash ``frontmatter.load``. Each is a *whole*
 # frontmatter block so a fixture can be written verbatim.
@@ -150,6 +150,134 @@ def test_frontmatter_load_errors_covers_the_four_unreadable_shapes() -> None:
         ValueError,
         yaml.YAMLError,
     }
+
+
+# ---- The guard's shape, checked mechanically rather than counted ------------
+
+_BARE_LOAD_CALLEES: Final[frozenset[str]] = frozenset(
+    {"frontmatter.load", "frontmatter.loads"},
+)
+"""Callees that *are* the load: bracketing one of these is the house shape."""
+
+_HELPER_CALLEES: Final[frozenset[str]] = frozenset(
+    {"try_load_fragment", "_read_fragment"},
+)
+"""Callees whose own body holds the load (``_read_fragment`` aliases the first)."""
+
+_HELPER_BRACKETING_SITES: Final[frozenset[tuple[str, str]]] = frozenset(
+    {
+        ("vault/reader.py", "iter_vault_fragments"),
+        ("classify/review_runner.py", "_read_entry"),
+        ("classify/classify_engine.py", "_load_classifiable_fragment"),
+        ("author/checks.py", "_scan_subtree_for_cited"),
+    },
+)
+"""Every site that brackets :func:`creek.vault.reader.try_load_fragment`.
+
+:data:`creek.vault.reader.FRONTMATTER_LOAD_ERRORS` enumerates exactly these in
+prose, and used to pair the list with a hand-counted tally of the remaining
+sites — a tally that was wrong. Pinned here instead, where it is checked.
+"""
+
+
+def _catches_load_errors(node: ast.Try) -> bool:
+    """Report whether *node* has a handler naming ``FRONTMATTER_LOAD_ERRORS``."""
+    return any(
+        isinstance(name, ast.Name) and name.id == "FRONTMATTER_LOAD_ERRORS"
+        for handler in node.handlers
+        if handler.type is not None
+        for name in ast.walk(handler.type)
+    )
+
+
+def _callee_name(node: ast.expr) -> str:
+    """Return the dotted name of *node*, or its node type when it is not a name."""
+    if isinstance(node, ast.Attribute):
+        return f"{_callee_name(node.value)}.{node.attr}"
+    if isinstance(node, ast.Name):
+        return node.id
+    return type(node).__name__
+
+
+def _bracketed_callee(body: list[ast.stmt]) -> str | None:
+    """Return the callee of a ``try`` *body* that is one single call statement.
+
+    ``None`` means the bracket holds something other than one bare call — the
+    shape the guard's docstring forbids, because a wider bracket would swallow
+    a genuine programming-error ``TypeError``.
+    """
+    if len(body) != 1:
+        return None
+    statement = body[0]
+    if not isinstance(statement, (ast.Assign, ast.Return)):
+        return None
+    if not isinstance(statement.value, ast.Call):
+        return None
+    return _callee_name(statement.value.func)
+
+
+def _collect_guards(
+    node: ast.AST,
+    module: str,
+    function: str,
+    found: list[tuple[str, str, str | None]],
+) -> None:
+    """Append ``(module, function, bracketed callee)`` for each guard under *node*."""
+    for child in ast.iter_child_nodes(node):
+        name = function
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = child.name
+        elif isinstance(child, ast.Try) and _catches_load_errors(child):
+            found.append((module, function, _bracketed_callee(child.body)))
+        _collect_guards(child, module, name, found)
+
+
+def _frontmatter_guard_sites() -> list[tuple[str, str, str | None]]:
+    """Walk the ``creek`` package for every ``FRONTMATTER_LOAD_ERRORS`` guard."""
+    import creek
+
+    package_root = Path(creek.__file__).parent
+    found: list[tuple[str, str, str | None]] = []
+    for path in sorted(package_root.rglob("*.py")):
+        module = path.relative_to(package_root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        _collect_guards(tree, module, "<module>", found)
+    return found
+
+
+def test_every_frontmatter_guard_brackets_exactly_one_load() -> None:
+    """Every guard wraps its load statement and nothing else (#1546).
+
+    :data:`creek.vault.reader.FRONTMATTER_LOAD_ERRORS` documents two rules:
+    the bracket holds the load statement alone, and the only sites that
+    bracket :func:`~creek.vault.reader.try_load_fragment` instead of a bare
+    ``frontmatter.load`` are the ones it names. Both were prose, and the
+    paragraph stating them also carried a hand-counted tally of the package's
+    uses that was simply wrong. A count nobody can check becomes false
+    silently; this test checks the claims instead, so a guard that widens its
+    bracket — or a fifth caller that starts bracketing the helper — fails here
+    rather than quietly outdating the docstring (#1548 will move sites).
+    """
+    sites = _frontmatter_guard_sites()
+
+    # Positive control: the walk really parsed the package and found guards.
+    assert len(sites) > len(_HELPER_BRACKETING_SITES)
+    bare_load_sites = [site for site in sites if site[2] in _BARE_LOAD_CALLEES]
+    assert bare_load_sites, "no bare-load guard found — the walk missed the tree"
+
+    over_wide = [
+        (module, function, callee)
+        for module, function, callee in sites
+        if callee not in _BARE_LOAD_CALLEES | _HELPER_CALLEES
+    ]
+    assert over_wide == [], f"guard brackets more than its load: {over_wide}"
+
+    helper_sites = {
+        (module, function)
+        for module, function, callee in sites
+        if callee in _HELPER_CALLEES
+    }
+    assert helper_sites == set(_HELPER_BRACKETING_SITES)
 
 
 # ---- Vault writer -----------------------------------------------------------
@@ -614,8 +742,41 @@ def test_post_loaders_positive_control(tmp_path: Path) -> None:
 # ---- The two sites #924 named that this PR reaches (#1475 blockers B/C) -----
 
 
+def _write_voice_fingerprint(vault: Path, *, fragment_count: int = 12) -> Path:
+    """Write a non-empty voice fingerprint under *vault* and return its path.
+
+    :func:`creek.lint.checks.voice_fidelity.run` returns early when the loaded
+    fingerprint's ``fragment_count`` is zero — *before* it reaches
+    :func:`~creek.lint.checks.voice_fidelity._scan_draft`, the one remaining
+    direct ``frontmatter.load`` on the lint runner's path. Without this file
+    the runner-level test below walks *past* that site rather than through it,
+    and would keep passing if its guard were removed.
+    """
+    from creek.generate.ai_style.fingerprint import FINGERPRINT_VERSION
+
+    path = vault / "00-Creek-Meta" / "voice-fingerprint.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": FINGERPRINT_VERSION,
+                "fragment_count": fragment_count,
+                "features": {
+                    "em_dash_density": {"rate": 0.01, "support": fragment_count},
+                },
+            },
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def _tagged_vault(tmp_path: Path, header_name: str) -> Path:
-    """Build a vault holding one tagged fragment and one unreadable note."""
+    """Build a vault holding one tagged fragment, a fingerprint, and bad notes.
+
+    The fingerprint is what makes the voice-fidelity check *run* rather than
+    bail on "no profile yet"; see :func:`_write_voice_fingerprint`.
+    """
     vault = tmp_path / "vault"
     write_fragment_file(
         vault=vault,
@@ -623,6 +784,7 @@ def _tagged_vault(tmp_path: Path, header_name: str) -> Path:
         body="a readable body",
         extras={"tags": ["alpha"]},
     )
+    _write_voice_fingerprint(vault)
     _scatter_bad_notes(vault / "01-Fragments" / "Notes")
     _write_note(
         vault / "01-Fragments" / "Notes" / "bad-only.md",
@@ -660,12 +822,21 @@ def test_lint_run_survives_a_nonstring_key_note(tmp_path: Path) -> None:
     calls runs bare — so any check that raises ends the whole command. Run
     here through the real runner with its default deterministic set, so a
     future check that reintroduces an unguarded load fails this test.
+
+    The vault carries a voice fingerprint deliberately: without one the
+    voice-fidelity check short-circuits on "no profile yet" and this test
+    never reaches ``_scan_draft``'s load at all, so the assertions below name
+    that check's own tally as a second positive control.
     """
     from creek.lint.runner import LintRunner
 
     vault = _tagged_vault(tmp_path, "date_key")
     _scatter_bad_notes(vault / "10-Liminal" / "Compost", prefix="compost-bad")
     _scatter_bad_notes(vault / "07-Voice" / "Drafts", prefix="draft-bad")
+    _write_note(
+        vault / "07-Voice" / "Drafts" / "off-voice.md",
+        "voice_distance: 99.0\n",
+    )
 
     report = LintRunner(vault_path=vault).run()
 
@@ -673,6 +844,9 @@ def test_lint_run_survives_a_nonstring_key_note(tmp_path: Path) -> None:
     results = {result.name: result for result in report.results}
     assert results, "no checks ran"
     assert "1 tag(s) tracked" in results["tags"].summary
+    # Positive control: voice-fidelity got past its "no fingerprint" exit and
+    # read every draft, so the unreadable three went through its guard.
+    assert "4 draft(s) scanned; 1 above" in results["voice-fidelity"].summary
 
 
 @pytest.mark.parametrize("header_name", _HEADER_IDS)
