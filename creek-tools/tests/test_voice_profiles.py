@@ -8,6 +8,7 @@ register-specific anti-patterns.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -56,12 +57,18 @@ def _make_fragment(
     register: VoiceRegister = VoiceRegister.CONFESSIONAL,
     confidence: Confidence = Confidence.CONVICTION,
     author: Authorship = Authorship.SELF,
+    privacy: PrivacyTier = PrivacyTier.PERSONAL,
 ) -> Fragment:
     """Build a fully classified fragment for exemplar use.
 
     No ``voice_weight`` is passed, so the model default of ``1.0`` applies —
     the shape ``DocumentIngestor`` produces for a DOCX/PDF carrying an
     ``author`` in its file metadata (#1213).
+
+    ``privacy`` defaults to ``PERSONAL``, the value every pre-#1212 caller
+    here was getting implicitly, so adding the parameter changes nothing for
+    them; it exists so the tier-materialisation tests can seed a declared
+    ``intimate`` or ``open`` fragment through the same helper.
     """
     return Fragment(
         id=frag_id,
@@ -78,7 +85,7 @@ def _make_fragment(
             voice_register=register,
             confidence=confidence,
         ),
-        privacy_tier=PrivacyTier.PERSONAL,
+        privacy_tier=privacy,
     )
 
 
@@ -188,6 +195,96 @@ def _write_fragment_file(
     target = fragments_dir / f"{fragment.id}.md"
     target.write_text(frontmatter.dumps(post), encoding="utf-8")
     return target
+
+
+def _write_untiered_fragment_file(
+    vault_path: Path,
+    fragment: Fragment,
+    body: str,
+    *,
+    subfolder: str = "Journal",
+) -> Path:
+    """Persist *fragment* with the ``privacy_tier`` key **absent** from disk.
+
+    The sibling of :func:`_write_fragment_file` for #1212, mirroring
+    ``tests/test_voice_exemplars.py``'s ``_write_untiered_fragment``.
+    ``_write_fragment_file`` serialises ``model_dump(mode="json")`` and
+    ``privacy_tier`` is a declared field with a default, so that dump always
+    carries the key and cannot express "nobody ever wrote a tier down".
+
+    Self-proving in both directions, so it cannot go quietly vacuous: the key
+    must have been present before it is popped (a rename or a model change
+    fails here rather than writing an ordinary tiered file), and the written
+    file is re-read to confirm the key is gone and ``type: fragment`` is still
+    there — ``_load_fragment_with_body`` skips anything else, and a walk over
+    files it skips proves nothing.
+
+    Args:
+        vault_path: Vault root, already scaffolded by the ``vault`` fixture.
+        fragment: The fragment to write; its own tier is discarded.
+        body: Markdown body to write beneath the frontmatter.
+        subfolder: Folder beneath ``01-Fragments/`` to write into.
+
+    Returns:
+        The path written.
+    """
+    fragments_dir = vault_path / "01-Fragments" / subfolder
+    fragments_dir.mkdir(parents=True, exist_ok=True)
+    data = fragment.model_dump(mode="json")
+    assert "privacy_tier" in data, (
+        "the serialised fragment carries no 'privacy_tier' key, so this helper "
+        "can no longer produce the untiered case #1212 is about"
+    )
+    del data["privacy_tier"]
+    post = frontmatter.Post(content=body, **data)
+    target = fragments_dir / f"{fragment.id}.md"
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    written = frontmatter.load(str(target))
+    assert "privacy_tier" not in written.metadata, (
+        f"{target} was written with a privacy_tier after all: "
+        f"{written.metadata.get('privacy_tier')!r}"
+    )
+    assert written.metadata.get("type") == "fragment", (
+        f"{target} is not typed 'fragment', so the streaming walk skips it and "
+        "every assertion about the spool it feeds is vacuous"
+    )
+    return target
+
+
+def _streamed_fragment_payloads(
+    profile_generator: VoiceProfileGenerator,
+    vault_path: Path,
+) -> dict[str, dict[str, object]]:
+    """Return every fragment payload ``_stream_into`` spooled, keyed by id.
+
+    Reads the accumulator's JSONL files *inside* the context manager, because
+    the temp directory holding them is deleted on exit. This is the only way
+    to observe the third walk's output directly: everything downstream of it
+    is aggregated into patterns and counts, where an admitted fragment can
+    hide.
+
+    Args:
+        profile_generator: The generator whose collector supplies the ceiling
+            and the ``allow_intimate`` consent setting for the walk.
+        vault_path: Vault root.
+
+    Returns:
+        Mapping of fragment id to the ``fragment`` object of its spooled JSONL
+        line, as it was serialised — not re-validated, so a serialisation
+        regression is visible rather than repaired on the way through.
+    """
+    payloads: dict[str, dict[str, object]] = {}
+    with profile_generator._streaming_accumulator(vault_path) as register_paths:
+        for _register, jsonl_path in sorted(register_paths.items()):
+            for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                fragment_payload = record["fragment"]
+                assert isinstance(fragment_payload, dict)
+                payloads[str(fragment_payload["id"])] = fragment_payload
+    return payloads
 
 
 # ---- Fixtures ----
@@ -341,6 +438,97 @@ def test_generate_rhetorical_patterns_excludes_non_self_authors(
     assert "- Self-deprecation before insight: 0." in text
     assert "- Paradox constructions: 0." in text
     assert "- Callbacks to earlier points: 0." in text
+
+
+# ---- Tier materialisation on the streaming walk (Issue #1212) ----
+
+
+_PROF_OPEN_CONTROL_ID = "prof-tier-open-control"
+"""Positive control: identical to the canary but for one frontmatter line."""
+
+_PROF_KEYLESS_CANARY_ID = "prof-tier-keyless-canary"
+"""The fragment whose ``privacy_tier`` key is absent from the file on disk."""
+
+_PROF_DECLARED_INTIMATE_ID = "prof-tier-declared-intimate"
+"""A fragment that says ``intimate`` out loud, for the serialisation contract."""
+
+
+def test_stream_into_refuses_a_file_with_no_privacy_tier_key(vault: Path) -> None:
+    """The streaming walk keeps an untiered fragment out of the spool (#1212 AC1).
+
+    ``_stream_into`` is the third walk over ``01-Fragments/``, independent of
+    both collector walks, and it is the one feeding ``report --type voice``
+    profiles and ``report --type rhetorical-patterns``. Asserting the gate on
+    the collector's two walks would leave it entirely uncovered.
+
+    The assertion is on the JSONL spool rather than on a rendered note because
+    the notes downstream are aggregates — averages, counts, a handful of quoted
+    passages — and an admitted fragment can contribute to them without leaving
+    a string anyone can grep for. The open control is asserted by **equality**
+    so a vault the walk never reached cannot pass this vacuously.
+    """
+    _write_fragment_file(
+        vault,
+        _make_fragment(_PROF_OPEN_CONTROL_ID, "Control", privacy=PrivacyTier.OPEN),
+        "The tide turns and I turn with it. I said what I meant to say.",
+    )
+    _write_untiered_fragment_file(
+        vault,
+        _make_fragment(_PROF_KEYLESS_CANARY_ID, "Canary", privacy=PrivacyTier.OPEN),
+        "Zarquon vitrifies the perambulating quotidian. Zarquon persists.",
+    )
+
+    payloads = _streamed_fragment_payloads(VoiceProfileGenerator(), vault)
+
+    assert sorted(payloads) == [_PROF_OPEN_CONTROL_ID]
+
+
+def test_streamed_payload_serialises_the_tier_as_its_value(vault: Path) -> None:
+    """The spooled JSONL carries tier *values*, not enum reprs (#1212).
+
+    The serialisation contract the fix depends on. Materialising the declared
+    tier means ``fragment.model_copy(update={"privacy_tier": ...})``, and
+    ``model_copy`` bypasses validation — so it stores a genuine
+    :class:`~creek.models.PrivacyTier` member on a model whose config is
+    ``use_enum_values=True`` and whose every other tier is a plain ``str``.
+    ``_stream_into`` then writes ``model_dump(mode="json")`` into the spool,
+    and ``_iter_exemplars_from_jsonl`` re-validates what it finds there. A
+    payload reading ``"PrivacyTier.INTIMATE"`` would fail that validation and
+    the exemplar would vanish silently — the register's whole cohort quietly
+    thinner, with no error anywhere.
+
+    Asserting it makes the enum-member store *safe* rather than *lucky*. The
+    control's ``open`` is asserted alongside so the test also fails if the
+    loader mangles the tiers it was never supposed to touch.
+    """
+    from creek.generate.voice import VoiceExemplarCollector
+
+    _write_fragment_file(
+        vault,
+        _make_fragment(_PROF_OPEN_CONTROL_ID, "Control", privacy=PrivacyTier.OPEN),
+        "The tide turns and I turn with it. I said what I meant to say.",
+    )
+    _write_fragment_file(
+        vault,
+        _make_fragment(
+            _PROF_DECLARED_INTIMATE_ID,
+            "Declared intimate",
+            privacy=PrivacyTier.INTIMATE,
+        ),
+        "I have never told anyone this, and I am telling it now.",
+    )
+
+    payloads = _streamed_fragment_payloads(
+        VoiceProfileGenerator(collector=VoiceExemplarCollector(allow_intimate=True)),
+        vault,
+    )
+
+    assert sorted(payloads) == [
+        _PROF_DECLARED_INTIMATE_ID,
+        _PROF_OPEN_CONTROL_ID,
+    ]
+    assert payloads[_PROF_DECLARED_INTIMATE_ID]["privacy_tier"] == "intimate"
+    assert payloads[_PROF_OPEN_CONTROL_ID]["privacy_tier"] == "open"
 
 
 # ---- Module surface ----

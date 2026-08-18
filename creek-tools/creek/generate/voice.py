@@ -32,10 +32,20 @@ voice proxy is opt-in even at ``--include-tier intimate``
 note's raw frontmatter via
 :func:`~creek.classify.privacy_filter.within_ceiling`. They are additive by
 design — admission is ``allow_intimate`` *and* ``within_ceiling`` — and must
-not be "simplified" into one. Saved exemplars include a per-register summary
-note recording the breakdown of confidence levels and the manifest of the
-copies the run wrote (:func:`_sample_digest`), which is what entitles the
-next run to delete one.
+not be "simplified" into one.
+
+Both gates read the same tier because :func:`_load_fragment_with_body`
+materialises the **declared** tier onto every model it returns (#1212): a
+note with no ``privacy_tier`` key resolves to ``intimate`` rather than to
+the model's ``unclassified`` default, so it is refused wherever a
+declared-intimate note is. Without that, the consent gate — which sees only
+the model — admitted unvouched-for content whenever the ceiling gate was at
+:attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL` and therefore
+short-circuiting.
+
+Saved exemplars include a per-register summary note recording the breakdown
+of confidence levels and the manifest of the copies the run wrote
+(:func:`_sample_digest`), which is what entitles the next run to delete one.
 """
 
 from __future__ import annotations
@@ -59,7 +69,11 @@ import frontmatter
 import yaml
 from pydantic import ValidationError
 
-from creek.classify.privacy_filter import PrivacyTierOverride, within_ceiling
+from creek.classify.privacy_filter import (
+    PrivacyTierOverride,
+    raw_privacy_tier,
+    within_ceiling,
+)
 from creek.config import VoiceAudienceWeightingConfig
 from creek.models import (
     Authorship,
@@ -214,6 +228,16 @@ def audience_authority(
     and endorsed material outranks aspirational and borrowed material). The
     result multiplies a fragment's ranking score so higher-authority fragments
     win ties and dominate the exemplars that feed each voice profile.
+
+    A fragment whose file declared no ``privacy_tier`` reaches here as
+    ``intimate`` — :func:`_load_fragment_with_body` materialises the declared
+    tier (#1212) — and therefore scores ``0.0`` rather than ``unclassified``'s
+    ``0.75``. That is deliberate and accepted: keyless content behaves exactly
+    like declared-intimate content at every reader in this module, and on the
+    ``allow_intimate=True`` path where it is still admitted a ``0.0`` only
+    de-ranks it (:meth:`VoiceExemplarCollector.rank_exemplars` truncates by
+    position, not by score). Do not carve an exception out here — a second
+    tier opinion inside one module is the bug #1079 and #1212 both were.
 
     Args:
         fragment: The candidate exemplar fragment.
@@ -436,18 +460,48 @@ def _load_fragment_with_body(
 ) -> tuple[Fragment, str, dict[str, object]] | None:
     """Parse *md_file* into a Fragment and return it with body and raw frontmatter.
 
-    The raw frontmatter is returned alongside the validated model because the
-    ceiling gate (#968) must read the tier *before* Pydantic applies its
-    ``unclassified`` default: a missing key and an explicit ``unclassified``
-    are indistinguishable on the model, and they must rank differently.
+    The returned model carries the **declared** tier: this loader overwrites
+    ``privacy_tier`` with
+    :func:`~creek.classify.privacy_filter.raw_privacy_tier` of the raw
+    frontmatter, so a file with no ``privacy_tier`` key resolves to
+    ``INTIMATE`` (``creek/classify/privacy_filter.py:409-415``) instead of
+    reaching the consent gate as Pydantic's ``unclassified`` default (#1212).
+    That doctrine is not new here — "the tier field is missing → ``intimate``"
+    is already published to every vault at
+    ``creek/templates/skills/privacy-tier.SKILL.md:27`` — and the shape is
+    copied verbatim from :func:`creek.generate.mining._admitted_liminal_entry`
+    (``creek/generate/mining.py:441``), which closed the identical hole in
+    #1079. Doing it once, at the single loader every walk in this module goes
+    through, is what makes all three walks see one tier per file.
+
+    The substitution is **one-way**: it can only ever refuse more. Whenever the
+    key is present the two readers agree — both read the same dict, and an
+    unparseable value already failed ``model_validate`` above — so the only
+    fragment whose tier moves is the keyless one, and it moves towards
+    ``intimate``.
+
+    The raw frontmatter is still returned alongside the model because the
+    ceiling gate (#968) runs *before* the consent gate at each walk and takes
+    raw: :func:`~creek.classify.privacy_filter.within_ceiling` must keep
+    reading frontmatter rather than a model, since the tier it needs precedes
+    validation.
+
+    One subtlety the callers depend on: ``Fragment``'s config is
+    ``use_enum_values=True`` (``creek/models.py:766``), so ``privacy_tier`` is
+    normally a plain ``str`` at runtime, and ``model_copy(update=...)``
+    bypasses validation — after this substitution that one field holds a
+    genuine :class:`~creek.models.PrivacyTier` member. Every reader survives
+    because ``PrivacyTier`` is a ``StrEnum`` (``creek/models.py:333``):
+    ``str(member)`` is the value, ``model_dump(mode="json")`` emits the value,
+    and ``!=`` against another tier compares by value.
 
     Args:
         md_file: Markdown file to read.
 
     Returns:
-        A ``(fragment, body, raw)`` triple, or ``None`` when the file is not a
-        valid fragment record (unreadable, wrong type, or invalid
-        frontmatter).
+        A ``(fragment, body, raw)`` triple whose fragment carries the declared
+        tier, or ``None`` when the file is not a valid fragment record
+        (unreadable, wrong type, or invalid frontmatter).
     """
     try:
         post = frontmatter.load(str(md_file))
@@ -462,7 +516,14 @@ def _load_fragment_with_body(
     except ValidationError:
         logger.debug("Skipping invalid fragment frontmatter: %s", md_file)
         return None
-    return fragment, post.content, metadata
+    # Materialised unconditionally: for a file that reaches this line the key
+    # is either absent (the one case that changes) or a valid tier string that
+    # ``raw_privacy_tier`` reads back identically off the same dict. A guard
+    # would only add an arm that can never be taken.
+    declared = fragment.model_copy(
+        update={"privacy_tier": raw_privacy_tier(metadata)},
+    )
+    return declared, post.content, metadata
 
 
 def _sample_digest(stem: str) -> str:
@@ -631,7 +692,9 @@ class VoiceExemplarCollector:
         ``voice.confidence`` is ``settled`` or ``conviction``, their
         ``voice_weight`` is positive, and their ``voice.register`` is set.
         Intimate privacy tier fragments are filtered out unless
-        :attr:`allow_intimate` is ``True``, and every fragment must
+        :attr:`allow_intimate` is ``True``, and so are untiered ones — a file
+        with no ``privacy_tier`` key reads as ``intimate`` at every gate
+        (#1212; see :func:`_load_fragment_with_body`). Every fragment must
         additionally sit within :attr:`override` (#968). Each register key
         in the returned dict is always present; empty registers map to
         ``[]``.
@@ -683,9 +746,10 @@ class VoiceExemplarCollector:
 
         Shares the eligibility gate with :meth:`collect_exemplars`
         (self-authored, ``settled`` or ``conviction`` confidence, positive
-        ``voice_weight``, a set register, intimate filtered unless
-        :attr:`allow_intimate`, within :attr:`override`, ``11-Other-Authors``
-        excluded) but returns a flat :class:`Exemplar` list — fragment paired
+        ``voice_weight``, a set register, intimate — and, since #1212,
+        untiered — filtered unless :attr:`allow_intimate`, within
+        :attr:`override`, ``11-Other-Authors`` excluded) but returns a flat
+        :class:`Exemplar` list — fragment paired
         with its on-disk body — rather than per-register ``Fragment`` buckets.
         Consumers that need the whole voice corpus as one unit (e.g. the
         lexicon) use this so they share a single source of truth for *which*
@@ -729,6 +793,14 @@ class VoiceExemplarCollector:
         collapse the two: one is the operator's opt-in to voice-proxy
         training, the other is the caller's declared ceiling, and a fragment
         needs both.
+
+        The tier this method reads off the model *is* the declared one, even
+        though it never sees frontmatter, because
+        :func:`_load_fragment_with_body` materialised it there first (#1212).
+        The model still cannot distinguish "no key on disk" from an explicit
+        ``unclassified`` — it does not have to: the loader has already
+        resolved the keyless case to ``intimate``, and the model value
+        ``UNCLASSIFIED`` keeps its #876 standing here.
         """
         return _eligible_register(fragment, allow_intimate=self.allow_intimate)
 
