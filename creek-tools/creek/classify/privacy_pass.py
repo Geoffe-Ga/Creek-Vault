@@ -10,6 +10,8 @@ close that hole:
 
 * :func:`needs_tier` — does this raw frontmatter still owe us a tier?
 * :func:`escalate` — merge two candidate tiers, never lowering.
+* :func:`needs_retier` — is a tier already on record *less* restrictive
+  than the heuristic would derive today? (#1106)
 * :func:`apply_tier` — stamp a tier, honouring a manual override.
 * :func:`reassess` — re-run the check after classification hardened the
   fragment's voice signals; escalate-only, and only on new evidence.
@@ -123,6 +125,87 @@ def escalate(current: PrivacyTier, candidate: PrivacyTier) -> PrivacyTier:
     if _ESCALATION_RANK[candidate] > _ESCALATION_RANK[current]:
         return candidate
     return current
+
+
+def needs_retier(
+    fragment: Fragment,
+    body: str,
+    *,
+    raw: dict[str, object],
+    classifier: PrivacyClassifier,
+) -> bool:
+    """Return whether *fragment*'s recorded tier is weaker than today's verdict.
+
+    The detector predicate for issue #1106. #974 stopped the pipeline
+    stamping self-authored confessional fragments ``personal``, but a
+    vault processed before it still carries them, and nothing revisits a
+    tier that is already concrete. This is the shape that *proves* such a
+    fragment is outstanding::
+
+        escalate(tier_of(f), classify_tier(f, body)) is not tier_of(f)
+
+    **It can only ever fire upwards.** :func:`escalate` picks the higher
+    :data:`_ESCALATION_RANK` of the two, so the merge differs from what is
+    on disk exactly when the recomputed tier is *more* restrictive. A
+    fragment whose heuristic verdict got weaker — a self-authored essay
+    recorded ``intimate`` — returns ``False`` and is never handed to a
+    writer. That is what makes both the detector and the remediation
+    built on it safe against a one-way ratchet: ``privacy_tier`` has no
+    way back, so a predicate that could fire downwards would bury content
+    permanently.
+
+    **Untiered fragments are deliberately excluded**, and the exclusion is
+    load-bearing rather than tidy. ``tier_of`` reports ``unclassified``
+    for them, which :data:`_ESCALATION_RANK` puts *below* ``open``, so the
+    bare escalate above is ``True`` for every untiered fragment in the
+    vault. Those are :func:`needs_tier`'s population (#876) and are
+    already counted and already remediated by a plain ``creek classify``;
+    folding them in here would make this count a near-copy of that one —
+    35,330 of 35,330 on the demo vault — and hide the population this
+    predicate exists to surface.
+
+    No I/O, no LLM, no network: :meth:`PrivacyClassifier.classify_tier` is
+    keyword and metadata work, so this is free to run on every fragment of
+    a 35k-fragment vault.
+
+    Args:
+        fragment: The fragment as loaded from disk.
+        body: Its markdown body — the classifier scans it for recovery
+            keywords, a body-only signal the model does not carry.
+        raw: Its frontmatter exactly as read, used to tell "no decision
+            yet" from "a decision that is now too weak".
+        classifier: The shared :class:`PrivacyClassifier`.
+
+    Returns:
+        ``True`` when a re-tier would strictly raise the recorded tier.
+    """
+    if needs_tier(raw):
+        return False
+    current = tier_of(fragment)
+    candidate = classifier.classify_tier(fragment, content=body)
+    return escalate(current, candidate) is not current
+
+
+def outranks_recorded_tier(fragment: Fragment, candidate: PrivacyTier) -> bool:
+    """Return whether *candidate* is strictly more restrictive than *fragment*'s tier.
+
+    The half of :func:`needs_retier` that a caller which has *already*
+    computed the heuristic's verdict can reuse, so the engine does not
+    classify the same fragment twice per run. It carries no
+    :func:`needs_tier` exclusion of its own — the caller applies that,
+    because on the engine's path the untiered case is handled by
+    :func:`apply_tier` a line later and must not be double-counted.
+
+    Args:
+        fragment: The fragment as loaded from disk.
+        candidate: The tier
+            :meth:`PrivacyClassifier.classify_tier` derived for it.
+
+    Returns:
+        ``True`` when merging *candidate* in would raise the recorded tier.
+    """
+    current = tier_of(fragment)
+    return escalate(current, candidate) is not current
 
 
 def apply_tier(

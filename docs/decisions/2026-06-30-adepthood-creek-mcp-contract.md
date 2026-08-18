@@ -194,12 +194,29 @@ strings become `{"len": N}`), tagged with the `consumer`, tamper-evident via a
 
 ## Ontology version
 
-The shared vocabulary — **Adepthood Aspects = Creek APTITUDE frequencies =
-Archetypal Wavelength phases** — is defined canonically in
+The shared vocabulary is Creek's **APTITUDE frequency** axis, defined
+canonically in
 [`docs/Ontology/creek_ontology_agent_prompt.md`](../Ontology/creek_ontology_agent_prompt.md)
-(frequencies §6.1, Wavelength §7) and implemented as the single source of truth in
+§6.1 and implemented as the single source of truth in
 `creek-tools/creek/generate/ontology_glossary.py`, `…/indexes.py`, and
-`…/models.py`.
+`…/models.py`. Adepthood addresses its counterpart axis as **Aspects** and its
+curriculum axis as **Stages**, so the three names are expected to line up
+member-for-member — but **that alignment is at the naming layer only; it is
+not a semantic identity.** That hedge is not optional here: it is the ruling
+of the Accepted sibling ADR
+[`2026-07-31-adepthood-http-application-api.md`](./2026-07-31-adepthood-http-application-api.md)
+(*"the F1–F10 ↔ ten-stage numeric coincidence is not a semantic identity"*),
+which this draft does not reopen. Concretely, a Creek frequency `share` and an
+Adepthood per-stage `fullness` are different quantities under matching names,
+and nothing may be projected from one onto the other on the strength of the
+name alone.
+
+> **Unverified from this repo.** Nothing in this repository records
+> Adepthood's Aspect or Stage definitions, names, or ordering. The
+> member-for-member alignment above is asserted by the Adepthood side
+> (`adepthood#950`) and mirrored here; it is not something Creek's own
+> sources can show. Only the Creek half — the frequency axis of §6.1 and its
+> implementation — is verifiable in-tree.
 
 There is **no ontology version constant in code today.** This contract pins the
 agreed vocabulary to the version string **`aptitude-wavelength/2026-05-23`**,
@@ -231,6 +248,32 @@ sides MUST treat a mismatch in this string as "renegotiate the contract".
 (plus `unclassified`). A six-phase rise-and-fall cycle; an entry sits at one
 phase.
 
+**Neither Wavelength axis is that shared vocabulary.** This is the confusion
+worth guarding against, and it has already produced wrong text in both repos —
+first as *"= Wavelength phases"*, then as *"= Wavelength Modes"*. §7 of the
+ontology prompt defines the Archetypal Wavelength, and it is a *different*
+subject from §6.1: §7.1 gives the phases, §7.2 the Modes. Both are axes the
+frequency vocabulary is classified *along*, not other names for it:
+
+- **Modes** — the five functional stances §7.2 names (Inhabit, Express,
+  Collaborate, Integrate, Absorb), each paired with a Do/Feel orientation.
+  §7.2 scopes itself to the nine frequencies Beige through Ultraviolet and
+  assigns Clear Light (F10) no Mode at all; `creek.models.Mode` implements the
+  same five (plus `unclassified`). A Mode *groups* frequencies — Beige and
+  Purple are both Inhabit — so it cannot be one of them.
+- **Phases** — the six-part rise-and-fall cycle above. A phase is where in that
+  cycle an entry sits, not which frequency it is.
+
+Ten, five, six: three axes, three cardinalities. Cardinality is used here in
+one direction only. A *differing* count is enough to rule an axis out — a
+ten-member list is not a five- or six-member one, which is what disqualifies
+both Wavelength axes. A *matching* count proves nothing: **shared cardinality
+is not evidence of identity.** That is the reasoning error that put the wrong
+axis into these ADRs in the first place, and it is the same error the sibling
+ADR names when it refuses to read the F1–F10 ↔ ten-stage coincidence as a
+semantic identity — which is why the frequency/Aspect/Stage alignment above
+stays a naming-layer claim rather than being argued from ten-ness.
+
 ## Open questions (resolve before `Accepted`)
 
 1. **Ontology version string** — is the `aptitude-wavelength/2026-05-23` scheme
@@ -243,6 +286,27 @@ phase.
    assumes co-located stdio until then.
 4. **Reflect / wheel return shapes** — pinned here only loosely; finalise the
    field-level schemas when #751/#752 are implemented.
+5. **Join key: colour or name?** — unresolved, and stated as a question rather
+   than as guidance because neither answer is currently implementable. The
+   *case* for colour is in-repo: this repo's own frequency labels drifted from
+   the canon once already
+   ([`2026-05-23-frequency-naming.md`](./2026-05-23-frequency-naming.md),
+   ONTOLOGY-001 — canonical names won and the drifted artefacts were
+   re-pinned), so a name join can mismatch silently wherever two sides' labels
+   differ, while a colour designation is a 1:1 map this repo machine-checks
+   (`FREQUENCY_COLORS` in `creek-tools/creek/generate/indexes.py`, sourced from
+   §6.1 of the ontology prompt — **the only in-repo source for the colour
+   designations**). Two limits keep this an open question:
+   - **Colour is on neither side's wire.** No `/v1` response model and no
+     schema under `docs/contracts/adepthood-v1/schemas/` publishes a colour
+     field; `FREQUENCY_COLORS` is an internal map that renders vault indexes
+     and classifier prompts. Adopting a colour join therefore means publishing
+     the designation on both surfaces first — a coordinated contract change,
+     not a documentation preference.
+   - **Only Creek's half of the map is knowable here.** Whether Adepthood
+     designates its Aspects or Stages by the same colours is **not recorded
+     anywhere in this repo** and is unverified from it. Until it is, "join on
+     the colour" is advice about a key one side may not have.
 
 ## Change log
 

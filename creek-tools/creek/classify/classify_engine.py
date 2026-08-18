@@ -66,6 +66,23 @@ call it:
   some tier was already on record. A fragment the resume short-circuit
   preserves is not reassessed at all: this run produced no evidence
   about it.
+* **``--retier``: the one case the two rules above leave stranded**
+  (#1106). A vault processed before #974 holds fragments whose tier is
+  *concrete but too weak* — self-authored confessional content stamped
+  ``personal``. ``needs_tier`` is ``False`` for them, so no assignment
+  happens; the reassess gate is ``False`` for them too, because the voice
+  signal that would justify raising the tier is already on disk, so this
+  run learns nothing new (correctly — that is what gives the operator a
+  durable override). ``--retier`` is the explicit, opt-in third door:
+  :func:`_should_retier` re-reads
+  :attr:`_PreparedFragment.tier_baseline` — already computed, so free —
+  and hands the fragment to the *same* narrow
+  :func:`_write_tier_only` path the bullet two up describes. It is not
+  ``--force``: it does not enter the short-circuit's condition, so
+  ``classification_method`` is never re-stamped and no cloud call is
+  re-paid. And because it selects through
+  :func:`~creek.classify.privacy_pass.escalate`, it is raise-only like
+  everything else here.
 
 Praxis pass (issue #877)
 ------------------------
@@ -216,6 +233,7 @@ from creek.classify.privacy_pass import (
     PRIVACY_TIER_KEY,
     apply_tier,
     needs_tier,
+    outranks_recorded_tier,
     reassess,
 )
 from creek.classify.reatomize import (
@@ -338,8 +356,10 @@ class ClassifySummary:
         privacy_tiers_assigned: Fragments whose privacy tier this run
             owned and (re-)derived — i.e. the frontmatter carried no
             tier (or an explicit ``unclassified``), or ``--force`` was
-            passed (issue #876). A fragment carrying a deliberate
-            operator tier that the run left alone is **not** counted.
+            passed (issue #876), or ``--retier`` found the recorded tier
+            weaker than today's verdict (issue #1106, also counted on
+            :attr:`retiered`). A fragment carrying a deliberate operator
+            tier that the run left alone is **not** counted.
             This counts the decision, not the bytes: a fragment whose
             subsequent write fails is counted here *and* reported on
             :attr:`errors`.
@@ -366,6 +386,16 @@ class ClassifySummary:
             :attr:`privacy_tiers_assigned` this counts the decision, not
             the bytes — a fragment whose write then fails is counted here
             *and* reported on :attr:`errors`.
+        retiered: Fragments this run raised to a **stricter** privacy tier
+            because the recorded one was weaker than the heuristic's
+            verdict today (issue #1106) — the pre-#974 mis-stamp. Only
+            ``--retier`` produces a non-zero value here, and only for
+            fragments that already carried a concrete tier: an untiered
+            fragment is :attr:`privacy_tiers_assigned`'s population, and
+            counting it twice would hide the one this exists to surface.
+            Escalate-only, so a second run over an unchanged vault reports
+            ``0``. Like :attr:`privacy_tiers_assigned` this counts the
+            decision, not the bytes.
     """
 
     total: int
@@ -380,6 +410,7 @@ class ClassifySummary:
     privacy_tiers_assigned: int = 0
     praxis_marked: int = 0
     tags_extracted: int = 0
+    retiered: int = 0
 
 
 @dataclass
@@ -398,6 +429,7 @@ class _RunCounts:
     privacy_tiers_assigned: int = 0
     praxis_marked: int = 0
     tags_extracted: int = 0
+    retiered: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -496,6 +528,7 @@ def run_classify(
     config: CreekConfig,
     method: str,
     force: bool,
+    retier: bool = False,
 ) -> ClassifySummary:
     """Classify every fragment in *vault_path* using the chosen method.
 
@@ -505,6 +538,15 @@ def run_classify(
         method: ``"rules"`` or ``"llm"``.
         force: When ``True``, overwrite ``classification_method:
             manual`` decisions.
+        retier: When ``True``, also re-derive the privacy tier of
+            fragments that already carry a concrete one, and persist it
+            when — and only when — the new verdict is *stricter* (issue
+            #1106). Deliberately opt-in and deliberately not ``--force``:
+            it rides the preserved short-circuit's narrow tier-only
+            writer, so ``classification_method`` provenance and manual
+            curation survive and no LLM call is made. It is not the
+            default because re-deriving a tier the operator settled by
+            hand is a decision only the operator can take.
 
     Returns:
         A :class:`ClassifySummary` reporting per-method counts.
@@ -569,6 +611,7 @@ def run_classify(
         _process_file,
         method=method,
         force=force,
+        retier=retier,
         rules=rules,
         audience=audience,
         # Issue #876: stateless and read-only for the duration of the
@@ -598,6 +641,7 @@ def run_classify(
         privacy_tiers_assigned=counts.privacy_tiers_assigned,
         praxis_marked=counts.praxis_marked,
         tags_extracted=counts.tags_extracted,
+        retiered=counts.retiered,
     )
 
 
@@ -835,10 +879,63 @@ class _PreparedFragment:
     tier_baseline: PrivacyTier
 
 
+def _should_retier(
+    fragment: Fragment,
+    *,
+    raw: dict[str, object],
+    retier: bool,
+    baseline: PrivacyTier,
+) -> bool:
+    """Decide whether ``--retier`` owns this fragment's tier (issue #1106).
+
+    Three conditions, and each one is load-bearing.
+
+    *The flag.* Re-deriving a tier that is already concrete is opt-in.
+    A tier on disk may be an operator's deliberate call — the frontmatter
+    records no provenance, so the engine cannot tell — and overruling one
+    silently on every run would destroy the durable override #1105 was
+    careful to preserve.
+
+    *Not untiered.* An untiered fragment is :func:`needs_tier`'s
+    population (#876): ``apply_tier`` assigns it a tier on the very next
+    line and :attr:`_RunCounts.privacy_tiers_assigned` already reports it.
+    Since ``tier_of`` reads ``unclassified`` for those and
+    ``_ESCALATION_RANK`` puts that below ``open``, they would *all*
+    satisfy the escalate check, so omitting this clause would make
+    ``retiered`` a second, louder copy of a count that already exists —
+    35,330 of 35,330 on the demo vault — and hide the population this
+    exists to surface.
+
+    *Strictly stricter.* :func:`~creek.classify.privacy_pass.outranks_recorded_tier`
+    merges through ``escalate``, which ranks by restrictiveness, so it is
+    ``True`` only when the recomputed tier is **higher** than the recorded
+    one. A fragment whose verdict got *weaker* is never selected, and
+    ``privacy_tier`` therefore keeps its one-way-ratchet guarantee.
+
+    *baseline* is the verdict on the fragment **as loaded**, captured
+    before any mutation this run makes, so the decision is free (no second
+    classify call) and cannot be contaminated by this run's own output.
+
+    Args:
+        fragment: The fragment as loaded from disk.
+        raw: Its frontmatter exactly as read.
+        retier: The ``--retier`` flag for this run.
+        baseline: :attr:`_PreparedFragment.tier_baseline` — the
+            heuristic's verdict on the fragment as loaded.
+
+    Returns:
+        ``True`` when this run should raise the fragment's recorded tier.
+    """
+    if not retier or needs_tier(raw):
+        return False
+    return outranks_recorded_tier(fragment, baseline)
+
+
 def _prepare_fragment(
     *,
     md_file: Path,
     force: bool,
+    retier: bool,
     privacy: PrivacyClassifier,
     tier_classifiers: TierClassifiers | None,
     counts: _RunCounts,
@@ -866,6 +963,15 @@ def _prepare_fragment(
     Args:
         md_file: The file to consider.
         force: Whether to re-derive settled classifications and tiers.
+        retier: Whether to re-derive an already-concrete tier and keep the
+            result when it is stricter (issue #1106). Unlike *force* it
+            widens nothing else — it does not enter the preserved
+            short-circuit's condition below — so a ``manual``/``llm``
+            fragment still short-circuits and reaches only the narrow
+            tier-only writer, keeping its provenance and costing no
+            provider call. A fragment the short-circuit does not preserve
+            takes the ordinary classification path it would have taken
+            anyway, carrying the raised tier with it.
         privacy: Shared :class:`PrivacyClassifier`.
         tier_classifiers: Per-tier :class:`LLMClassifier` set, or ``None``
             on the rules path.
@@ -898,10 +1004,27 @@ def _prepare_fragment(
     # longer gates the post-classification reassess — ``tier_baseline`` does
     # that — because "a tier is already on record" turned out to say nothing
     # about whether a *person* put it there.
-    owns_tier = needs_tier(raw) or force
-    fragment = apply_tier(fragment, body, raw=raw, force=force, classifier=privacy)
+    # #1106: a fragment mis-stamped by the pre-#974 pipeline carries a tier
+    # that is *concrete but too weak*, so neither ``needs_tier`` nor the #1105
+    # reassess will ever revisit it. ``--retier`` re-opens exactly that case,
+    # reading the baseline captured above rather than re-classifying.
+    retierable = _should_retier(
+        fragment, raw=raw, retier=retier, baseline=tier_baseline
+    )
+    owns_tier = needs_tier(raw) or force or retierable
+    # ``force=`` here is the *merge* switch inside ``apply_tier``, not the CLI
+    # flag: with a concrete tier on disk it takes ``escalate(tier_of(fragment),
+    # candidate)``, which by construction can only raise. Nothing about the
+    # preserved short-circuit below is affected — that still tests the real
+    # ``force`` — so a re-tiered fragment keeps its ``classification_method``
+    # and costs no provider call.
+    fragment = apply_tier(
+        fragment, body, raw=raw, force=force or retierable, classifier=privacy
+    )
     if owns_tier:
         counts.privacy_tiers_assigned += 1
+    if retierable:
+        counts.retiered += 1
 
     # Per-tier routing (#666): pick the classifier for this fragment's
     # privacy tier. ``tier_of`` fails closed to INTIMATE for an unrecognised
@@ -943,6 +1066,7 @@ def _process_file(
     *,
     method: str,
     force: bool,
+    retier: bool,
     rules: RuleClassifier,
     audience: AudienceClassifier,
     privacy: PrivacyClassifier,
@@ -961,6 +1085,8 @@ def _process_file(
         md_file: The file to consider.
         method: ``"rules"`` or ``"llm"``.
         force: Whether to overwrite previously-classified fragments.
+        retier: Whether to re-derive an already-concrete privacy tier and
+            persist it when the new verdict is stricter (issue #1106).
         rules: Shared :class:`RuleClassifier` instance.
         audience: Shared :class:`AudienceClassifier`; stamps the #634
             audience axis on every (re)classified fragment, deterministically,
@@ -1005,6 +1131,7 @@ def _process_file(
         prepared = _prepare_fragment(
             md_file=md_file,
             force=force,
+            retier=retier,
             privacy=privacy,
             tier_classifiers=tier_classifiers,
             counts=counts,
