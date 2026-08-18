@@ -194,7 +194,6 @@ from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
 from typing import TYPE_CHECKING
 
 import frontmatter
-import yaml
 
 from creek.classify.audience import AudienceClassifier
 from creek.classify.constants import (
@@ -232,7 +231,7 @@ from creek.classify.weighted import classify_weighted
 from creek.ingest.base import IngestedFragment
 from creek.models import Fragment, Frequency, PrivacyTier
 from creek.time import now_la
-from creek.vault.reader import try_load_fragment
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, try_load_fragment
 from creek.vault.writer import VaultWriter
 
 LLM_PROGRESS_FILENAME = "llm-progress.jsonl"
@@ -1141,7 +1140,7 @@ def _load_classifiable_fragment(
     """
     try:
         record = _read_fragment(md_file)
-    except (OSError, ValueError, yaml.YAMLError) as exc:
+    except FRONTMATTER_LOAD_ERRORS as exc:
         counts.errors.append(f"unreadable fragment {md_file}: {exc}")
         return None
     if record is None:

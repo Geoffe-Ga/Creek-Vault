@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 import typer
-import yaml
 
 from creek.classify.constants import (
     CLASSIFICATION_METHOD_KEY,
@@ -30,7 +29,7 @@ from creek.classify.constants import (
 from creek.classify.review import ReviewQueueGenerator
 from creek.models import Fragment, Frequency, FrequencyClassification
 from creek.time import LA_TZ
-from creek.vault.reader import try_load_fragment
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, try_load_fragment
 
 if TYPE_CHECKING:
     from rich.console import Console
@@ -299,7 +298,7 @@ def _read_entry(md_file: Path) -> ReviewEntry | None:
     """
     try:
         record = try_load_fragment(md_file)
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         logger.debug("Skipping unreadable markdown file: %s", md_file)
         return None
     if record is None:

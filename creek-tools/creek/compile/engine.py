@@ -45,7 +45,7 @@ from creek.hierarchy import (
     structural_path_context,
 )
 from creek.models import CompiledPage, CompileTargetKind, Fragment, PrivacyTier
-from creek.vault.reader import iter_vault_fragments
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, iter_vault_fragments
 
 if TYPE_CHECKING:
     from creek.config import LLMConfig
@@ -717,7 +717,7 @@ def _load_existing_provenance(target_path: Path) -> list[ProvenanceEntry]:
         return []
     try:
         post = frontmatter.load(str(target_path))
-    except (OSError, ValueError):
+    except FRONTMATTER_LOAD_ERRORS:
         return []
     raw = post.metadata.get("provenance") or []
     if not isinstance(raw, list):

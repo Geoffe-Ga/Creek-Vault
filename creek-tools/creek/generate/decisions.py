@@ -18,7 +18,6 @@ from datetime import date
 from typing import TYPE_CHECKING
 
 import frontmatter
-import yaml
 
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
@@ -35,7 +34,7 @@ from creek.models import (
     PrivacyTier,
     _generate_decision_id,
 )
-from creek.vault.reader import iter_vault_fragments
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, iter_vault_fragments
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -674,7 +673,7 @@ def _load_post(path: Path) -> frontmatter.Post | None:
     """
     try:
         return frontmatter.load(str(path))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         return None
 
 

@@ -41,7 +41,6 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, TypeVar
 
 import frontmatter
-import yaml
 from pydantic import BaseModel, ValidationError
 
 from creek.classify.privacy_filter import (
@@ -71,6 +70,7 @@ from creek.models import (
     Thread,
     VoiceRegister,
 )
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -533,7 +533,7 @@ def _safe_load_post(md_file: Path, *, label: str) -> frontmatter.Post | None:
     """Load a frontmatter ``Post`` from *md_file*, logging on failure."""
     try:
         return frontmatter.load(str(md_file))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         logger.debug("Skipping unreadable %s: %s", label, md_file)
         return None
 

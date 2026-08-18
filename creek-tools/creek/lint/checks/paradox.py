@@ -16,30 +16,51 @@ from __future__ import annotations
 from datetime import datetime  # noqa: TC003  # used at runtime as a parameter type
 from pathlib import Path  # noqa: TC003  # plain stdlib import; no lazy benefit
 
-import frontmatter
-import yaml
 from pydantic import ValidationError
 
 from creek.config import load_config
 from creek.generate.paradox import ParadoxDetector
 from creek.lint._result import CheckResult
 from creek.models import Fragment
+from creek.vault.links import read_header_meta
 
 _FRAGMENT_DIRS: tuple[str, ...] = ("01-Fragments", "10-Liminal")
 
 
 def _load_fragments(vault_path: Path) -> list[Fragment]:
-    """Best-effort load of every parseable Fragment in the fragment dirs."""
+    """Best-effort load of every parseable Fragment in the fragment dirs.
+
+    Reads each header with :func:`~creek.vault.links.read_header_meta` rather
+    than ``frontmatter.load``. Two reasons, both load-bearing:
+
+    * this check only ever validates the *header*, and a header-only read does
+      not pull 35k bodies through memory to count paradox candidates; and
+    * ``frontmatter.load`` ends in ``Post(content, handler, **metadata)``, so a
+      note with a non-string frontmatter key (``2024-05-01:``) raised a bare
+      ``TypeError`` that aborted the whole check (#1475). ``read_header_meta``
+      parses with ``yaml.safe_load`` and never splats, so the crash is
+      structurally impossible here rather than caught.
+
+    Validation is now its own ``try``. Sharing one with the load would put a
+    guard tuple around ``model_validate``, where a ``TypeError`` means a real
+    bug in :class:`~creek.models.Fragment` and must not be swallowed.
+
+    Header-only reading carries the same three deliberate consequences #1416
+    accepted and documents in full at
+    :func:`creek.generate.synchronicity._existing_synchronicity_pairs`: the
+    ``---`` fence must open line 1, the 200-line / 64 KB header caps apply, and
+    a note carrying a stray non-string key is tolerated rather than rejected.
+    """
     fragments: list[Fragment] = []
     for sub in _FRAGMENT_DIRS:
         root = vault_path / sub
         if not root.is_dir():
             continue
         for md_file in root.rglob("*.md"):
+            meta = read_header_meta(md_file)
             try:
-                post = frontmatter.load(str(md_file))
-                fragments.append(Fragment.model_validate(post.metadata))
-            except (OSError, ValueError, ValidationError, yaml.YAMLError):
+                fragments.append(Fragment.model_validate(meta))
+            except ValidationError:
                 continue
     return fragments
 
