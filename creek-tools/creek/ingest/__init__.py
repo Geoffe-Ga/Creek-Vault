@@ -41,6 +41,7 @@ from creek.ingest.gdrive import (
     DriveFile,
     GoogleApiUnavailableError,
     GoogleDriveDownloader,
+    UnsupportedSourceError,
     route_to_ingestor,
 )
 from creek.ingest.generic import GenericIngestor
@@ -89,6 +90,7 @@ __all__ = [
     "RawDocument",
     "SpreadsheetIngestor",
     "SubstackIngestor",
+    "UnsupportedSourceError",
     "assemble_ingested_fragment",
     "route_to_ingestor",
 ]
