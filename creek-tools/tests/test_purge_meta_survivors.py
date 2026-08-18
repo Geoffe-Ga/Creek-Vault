@@ -37,7 +37,7 @@ from creek.purge.engine import VAULT_PURGE_CONFIRMATION
 from creek.purge.meta import META_PURGE_KEEP, SWEEP_EXEMPT, MetaKeep
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 DOC_PATH: Final[Path] = (
     Path(__file__).resolve().parents[1] / "docs" / "cleaning-and-purge.md"
@@ -284,6 +284,14 @@ def test_the_keep_list_validator_rejects_a_reasonless_entry() -> None:
         _validate_keep_list(
             (MetaKeep(PurePosixPath("00-Creek-Meta/x.json"), "a"),),
         )
+
+    # The meta root itself, spelled as the empty relative path. Under
+    # equality matching it shelters nothing, and under any future
+    # containment mode it would shelter the whole directory this module
+    # exists to sweep — so it is rejected outright rather than left to
+    # mean whichever of those two the matcher happens to implement.
+    with pytest.raises(ValueError, match="names no file"):
+        _validate_keep_list((MetaKeep(PurePosixPath("."), "a"),))
 
 
 # ---------------------------------------------------------------------------
@@ -854,3 +862,257 @@ def test_the_documented_policy_block_states_both_sweep_decisions() -> None:
     assert "directory" in block
     assert "dangling" in block
     assert "symlink" in block
+
+
+# ---------------------------------------------------------------------------
+# The documented edge dispositions are executed, not merely spelled (#1545)
+# ---------------------------------------------------------------------------
+
+_EDGE_ROW: Final[re.Pattern[str]] = re.compile(
+    r"^\|\s*`([a-z-]+)`[^|]*\|\s*(swept|unlinked|left alone)\s*\|$"
+)
+"""One row of the policy block's edge table: a slug and a disposition."""
+
+_DESTROYED: Final[frozenset[str]] = frozenset({"swept", "unlinked"})
+"""The dispositions that mean "gone from disk after `purge vault`"."""
+
+
+def _parse_policy_edges() -> tuple[tuple[str, str], ...]:
+    """Parse the edge-case table out of the ``META-SURVIVOR-POLICY`` block.
+
+    Returns:
+        ``(slug, disposition)`` pairs, in document order.
+
+    Raises:
+        AssertionError: If the block or its table is missing.
+    """
+    text = DOC_PATH.read_text(encoding="utf-8")
+    assert _POLICY_BEGIN in text, f"{DOC_PATH} lost its sweep-policy marker"
+    block = text.split(_POLICY_BEGIN, 1)[1].split(_POLICY_END, 1)[0]
+    edges = [
+        (match.group(1), match.group(2))
+        for line in block.splitlines()
+        if (match := _EDGE_ROW.match(line.strip())) is not None
+    ]
+    assert edges, "the sweep-policy block states no edge dispositions at all"
+    return tuple(edges)
+
+
+POLICY_EDGES: Final[tuple[tuple[str, str], ...]] = _parse_policy_edges()
+"""The documented edge dispositions, parsed once at import."""
+
+
+def _present(path: Path) -> bool:
+    """Report whether *path* is still on disk, dangling links included.
+
+    ``Path.exists()`` follows a symlink and therefore answers ``False``
+    for a link that is very much still there, which would make every
+    "destroyed" assertion below pass vacuously.
+
+    Args:
+        path: The probe path.
+
+    Returns:
+        ``True`` when anything at all occupies *path*.
+    """
+    return path.is_symlink() or path.exists()
+
+
+def _build_directory_at_a_shelter(root: Path) -> tuple[Path, Path]:
+    """Seed a vault with a directory standing at the ``audit/redact.jsonl`` keep.
+
+    Args:
+        root: A private directory to build the vault under.
+
+    Returns:
+        The vault root and the probe whose fate is the disposition.
+    """
+    vault = _minimal_vault(root)
+    probe = vault / "00-Creek-Meta" / "audit" / "redact.jsonl" / "leak.md"
+    probe.parent.mkdir(parents=True)
+    probe.write_text(f"{_PRIVATE}\n", encoding="utf-8")
+    return vault, probe
+
+
+def _build_link_the_purge_breaks(root: Path) -> tuple[Path, Path]:
+    """Seed a vault with a meta link to a *directory* inside a content folder.
+
+    The cell the rest of the suite misses. Every other symlink test
+    either calls ``sweep_unkept_meta`` directly — where nothing has
+    wiped the content folders, so the link still resolves to a live
+    directory — or goes through ``purge_vault`` with a *file* target,
+    which ``is_file()`` catches on both sides. Only a directory target
+    behind a real ``purge_vault`` is classified as a live directory by
+    the preview and as a dangling link by the apply run.
+
+    Args:
+        root: A private directory to build the vault under.
+
+    Returns:
+        The vault root and the link whose fate is the disposition.
+    """
+    vault = _minimal_vault(root)
+    journal = vault / "01-Fragments" / "Journal"
+    journal.mkdir(parents=True)
+    (journal / f"{_PRIVATE}.md").write_text(
+        "---\nid: frag-x\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    probe = vault / "00-Creek-Meta" / "latest-thread"
+    probe.symlink_to(journal, target_is_directory=True)
+    return vault, probe
+
+
+def _build_link_to_a_surviving_directory(root: Path) -> tuple[Path, Path]:
+    """Seed a vault with a meta link to an out-of-vault directory.
+
+    Args:
+        root: A private directory to build the vault under.
+
+    Returns:
+        The vault root and the link whose fate is the disposition.
+    """
+    vault = _minimal_vault(root)
+    outside = root / "elsewhere" / "notes"
+    outside.mkdir(parents=True)
+    (outside / "keep-me.md").write_text("untouched\n", encoding="utf-8")
+    probe = vault / "00-Creek-Meta" / "external"
+    probe.symlink_to(outside, target_is_directory=True)
+    return vault, probe
+
+
+_EDGE_BUILDERS: Final[dict[str, Callable[[Path], tuple[Path, Path]]]] = {
+    "directory-at-a-shelter": _build_directory_at_a_shelter,
+    "link-the-purge-breaks": _build_link_the_purge_breaks,
+    "link-to-a-surviving-directory": _build_link_to_a_surviving_directory,
+}
+"""One executable vault per documented edge case, keyed by its doc slug."""
+
+
+def test_the_policy_block_states_one_disposition_per_executable_edge() -> None:
+    """Positive control on the doc-driven parametrisation below.
+
+    Without this, deleting a table row (or renaming a slug) would empty
+    the parametrisation and the disposition pin would pass by testing
+    nothing at all.
+    """
+    assert len(POLICY_EDGES) == len(_EDGE_BUILDERS) > 0
+    assert {slug for slug, _ in POLICY_EDGES} == set(_EDGE_BUILDERS)
+    assert {disposition for _, disposition in POLICY_EDGES} == {
+        "swept",
+        "unlinked",
+        "left alone",
+    }, "the three edges must not collapse onto one disposition"
+
+
+@pytest.mark.parametrize(("slug", "disposition"), POLICY_EDGES)
+def test_each_documented_edge_gets_exactly_the_disposition_the_doc_states(
+    slug: str,
+    disposition: str,
+    tmp_path: Path,
+) -> None:
+    """Execute the documented policy instead of grepping it for vocabulary.
+
+    The previous pin asserted that the words ``directory``, ``dangling``
+    and ``symlink`` appeared in the block, which the *opposite* policy
+    also satisfies — the block could be rewritten to promise that a
+    directory at a keep path is sheltered and nothing would go red. This
+    one builds the vault each row describes, runs a real
+    ``purge vault``, and holds the code's disposition against the word
+    the documentation uses.
+
+    The dry-run half is asserted in the same test on purpose: the
+    documented parity claim ("``Meta artifacts removed`` in a
+    ``--dry-run`` preview is the number the apply run really performs")
+    is exactly what the ``link-the-purge-breaks`` row used to violate.
+    """
+    build = _EDGE_BUILDERS[slug]
+
+    previewed_vault, previewed_probe = build(tmp_path / "preview")
+    preview = PurgeEngine(previewed_vault, dry_run=True).purge_vault(
+        VAULT_PURGE_CONFIRMATION
+    )
+    assert _present(previewed_probe), "a dry run destroyed something"
+
+    applied_vault, applied_probe = build(tmp_path / "apply")
+    applied = PurgeEngine(applied_vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    destroyed = disposition in _DESTROYED
+    assert _present(applied_probe) is not destroyed, (
+        f"{slug} is documented as {disposition!r} but the purge disagreed"
+    )
+    assert applied.meta_artifacts_removed == int(destroyed)
+    assert preview.meta_artifacts_removed == applied.meta_artifacts_removed, (
+        f"{slug}: the preview promised "
+        f"{preview.meta_artifacts_removed} and the apply run performed "
+        f"{applied.meta_artifacts_removed}"
+    )
+
+
+def test_a_meta_link_to_a_content_directory_previews_the_removal_it_performs(
+    tmp_path: Path,
+) -> None:
+    """The mirrored #1485 divergence, pinned end to end (#1545 review).
+
+    ``00-Creek-Meta/latest-thread -> 01-Fragments/Journal/`` is a link to
+    a *directory*, and the sweep's directory exemption was written to
+    consult the filesystem: ``entry.is_file() or not entry.exists()``.
+    In an apply run the content wipe has already removed the target, so
+    the link dangles and is unlinked. In a dry run nothing has been
+    wiped, so the same link still resolves to a live directory and was
+    left alone — **preview 0, apply 1**, the exact dry-run/apply
+    divergence this PR exists to close, read in a mirror.
+
+    The link's own name is innocuous; its *target string* is not, and
+    that is the residue the RTBF request is about.
+    """
+    previewed_vault, previewed_link = _build_link_the_purge_breaks(tmp_path / "preview")
+    preview = PurgeEngine(previewed_vault, dry_run=True).purge_vault(
+        VAULT_PURGE_CONFIRMATION
+    )
+
+    assert previewed_link.is_symlink(), "a dry run unlinked something"
+    assert preview.meta_artifacts_removed == 1
+
+    applied_vault, applied_link = _build_link_the_purge_breaks(tmp_path / "apply")
+    applied = PurgeEngine(applied_vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert not applied_link.is_symlink(), "the broken directory link survived"
+    assert applied.meta_artifacts_removed == 1
+    assert _last_outcome(applied_vault)["meta_artifacts_removed"] == 1
+    assert _PRIVATE not in _residue(applied_vault)
+
+
+def test_a_meta_link_to_a_content_folder_itself_is_left_alone(
+    tmp_path: Path,
+) -> None:
+    """The wipe empties the ten content folders; it does not remove them.
+
+    So ``00-Creek-Meta/all-fragments -> 01-Fragments`` still resolves to
+    a live directory after the purge, and it is a
+    ``link-to-a-surviving-directory`` rather than a
+    ``link-the-purge-breaks``. The distinction is the ``!=`` in the
+    engine's "is this target about to be destroyed" predicate:
+    containment alone answers ``True`` for the folder root as well as
+    for everything inside it, and would unlink an alias whose target is
+    still standing — widening a right-to-be-forgotten sweep past what
+    this document says it does. Unlike the divergence this test's
+    neighbours pin, the widened form is *consistent* between preview and
+    apply, so only an explicit assertion on the disposition catches it.
+    """
+    vault = _minimal_vault(tmp_path)
+    (vault / "01-Fragments" / f"{_PRIVATE}.md").write_text(
+        "---\nid: frag-x\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    link = vault / "00-Creek-Meta" / "all-fragments"
+    link.symlink_to(vault / "01-Fragments", target_is_directory=True)
+
+    preview = PurgeEngine(vault, dry_run=True).purge_vault(VAULT_PURGE_CONFIRMATION)
+    applied = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert link.is_symlink(), "a link to a surviving directory was unlinked"
+    assert (vault / "01-Fragments").is_dir()
+    assert applied.meta_artifacts_removed == 0
+    assert preview.meta_artifacts_removed == applied.meta_artifacts_removed
+    assert _PRIVATE not in _residue(vault)
