@@ -43,7 +43,11 @@ Gate ordering, all of it load-bearing and asserted from outside:
 3. the encoded-length cap, then the decode, then the decoded-size cap;
 4. the #970 overwrite gate on the tier of the *resolved existing* fragment —
    audited, then refused;
-5. **only then** :func:`_stage_upload` writes anything.
+5. the unsupported-format gate — a ``.json`` conversation export or a ``.zip``
+   archive is refused *with a remedy* rather than routed to ``generic``
+   (#1526), and it sits here, above the write, so the refused bytes never
+   reach the staging directory at all;
+6. **only then** :func:`_stage_upload` writes anything.
 
 Gate 2 sitting above gate 3 is the sharp edge: an ``intimate`` upload at
 ``ceiling=open`` must never decode a byte, and a refused overwrite must leave
@@ -59,7 +63,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from creek.classify.privacy_filter import max_source_tier, source_tiers
-from creek.ingest import INGESTOR_REGISTRY, route_to_ingestor
+from creek.ingest import (
+    INGESTOR_REGISTRY,
+    UnsupportedSourceError,
+    route_to_ingestor,
+)
 from creek.ingest.journal_staging import UPLOAD_LEDGER_SOURCE, UPLOAD_STAGING_RELDIR
 from creek.ingest.ledger import SourceLedger
 from creek.ingest.pipeline import derive_source_key, run_ingest
@@ -592,12 +600,18 @@ def _ingest_outcome(
     """Run the ingest for the staged file, or return the refusal it earned.
 
     ``written == 0`` is a refusal, not a success. ``GenericIngestor`` returns
-    no fragments for content its binary heuristic flags, and discovers
-    nothing at all for an extension claimed by another ingestor (``.json``);
-    ``run_ingest`` then reports ``written=0, errors=[]``, which is
-    indistinguishable from success unless ``written`` is inspected. Reporting
-    ``ok`` there would tell a caller its document is in the vault when the
-    pipeline silently dropped it.
+    no fragments for content its binary heuristic flags, and ``run_ingest``
+    then reports ``written=0, errors=[]``, which is indistinguishable from
+    success unless ``written`` is inspected. Reporting ``ok`` there would tell
+    a caller its document is in the vault when the pipeline silently dropped
+    it.
+
+    It is a *backstop*, not the format gate. Since #1526 the extensions whose
+    ``written=0`` was really a routing mistake — ``.json``, ``.zip`` and the
+    rest of :data:`creek.ingest.gdrive._EXTENSION_ROUTES`' refusals — never
+    reach here: they are refused above the staging write, with guidance, in
+    place of the format-blind ``produced no fragment`` reason this branch
+    can only offer.
 
     Args:
         vault_path: Vault root.
@@ -658,6 +672,55 @@ def _action_of(result: IngestRunResult) -> str:
     return "unchanged"
 
 
+def _routed_source_type(
+    *,
+    vault_path: Path,
+    audit_args: dict[str, Any],
+    external_id: str,
+    filename: str,
+    upload_tier: PrivacyTier,
+    ceiling: TierCeiling,
+    consumer: str,
+) -> str | dict[str, Any]:
+    """Return the ingestor key for this upload, or the refusal it earned.
+
+    Routes on the *derived* staged path rather than an already-written one,
+    because :func:`_upload_staged_path` is pure: a refused ``.json`` must
+    leave no staged bytes behind, and the surest way to guarantee that is to
+    decide before :func:`_stage_upload` runs. The suffix is identical either
+    way — ``_stage_upload`` derives its path from the same helper.
+
+    Args:
+        vault_path: Vault root holding the MCP audit log.
+        audit_args: The sanitised argument summary for the audit trail.
+        external_id: The caller's idempotency key.
+        filename: The caller's original filename, whose extension decides
+            the ingestor.
+        upload_tier: The tier declared for this content, recorded on the
+            refusal's audit entry.
+        ceiling: The caller's admission ceiling.
+        consumer: Free-form consumer id for the audit log.
+
+    Returns:
+        The :data:`creek.ingest.INGESTOR_REGISTRY` key on success, or the
+        structured refusal carrying
+        :class:`~creek.ingest.UnsupportedSourceError`'s guidance verbatim —
+        the whole point of the gate is that the caller is told what to do
+        instead.
+    """
+    try:
+        return route_to_ingestor(_upload_staged_path(vault_path, external_id, filename))
+    except UnsupportedSourceError as exc:
+        return _refuse_with_audit(
+            vault_path=vault_path,
+            audit_args=audit_args,
+            ceiling=ceiling,
+            consumer=consumer,
+            reason=str(exc),
+            created_tier=upload_tier.value,
+        )
+
+
 def upload_tool(
     *,
     vault_path: Path,
@@ -677,7 +740,10 @@ def upload_tool(
     each bails on a non-directory input — so an override would let a caller
     name an ingestor that discovers nothing from a single staged file and
     reports it as a silent no-op. Dispatch is by extension, through
-    :func:`creek.ingest.route_to_ingestor`, and nothing else.
+    :func:`creek.ingest.route_to_ingestor`, and nothing else — and an
+    extension that function refuses (``.json``, ``.zip``, …) is refused here
+    too, with its guidance, rather than flattened into one ``generic``
+    fragment (#1526).
 
     Args:
         vault_path: Vault root.
@@ -800,8 +866,26 @@ def upload_tool(
         )
         return conflict
 
+    # The unsupported-format gate (#1526), above the staging write: an
+    # extension the ``generic`` fallback would flatten into one blob is
+    # refused with a remedy, and refused before its bytes touch disk. It is
+    # decidable from the caller's own filename, so it discloses nothing
+    # about the vault; it sits below the #970 gate anyway, so it cannot
+    # answer for an id whose content the ceiling may not read.
+    routed = _routed_source_type(
+        vault_path=vault_path,
+        audit_args=audit_args,
+        external_id=external_id,
+        filename=filename,
+        upload_tier=upload_tier,
+        ceiling=privacy_tier_ceiling,
+        consumer=consumer,
+    )
+    if not isinstance(routed, str):
+        return routed
+    source_type = routed
+
     staged = _stage_upload(vault_path, external_id, filename, raw)
-    source_type = route_to_ingestor(staged)
     result = _ingest_outcome(
         vault_path=vault_path,
         audit_args=audit_args,

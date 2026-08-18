@@ -20,8 +20,10 @@ runtime, never pasted as an opaque literal.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import shutil
+import zipfile
 from typing import TYPE_CHECKING, Any
 
 import frontmatter
@@ -455,7 +457,7 @@ def test_overwriting_an_intimate_upload_is_refused_at_ceiling_open(
     ("filename", "payload"),
     [
         ("mystery.bin", b"\x00\x01binary\x00payload\x00"),
-        ("export.json", b'{"claimed": "by the chat ingestors"}'),
+        ("notes.yaml", b"\x00\x01not really yaml\x00at all\x00"),
     ],
 )
 def test_a_file_that_produces_no_fragment_is_refused_not_reported_ok(
@@ -464,8 +466,19 @@ def test_a_file_that_produces_no_fragment_is_refused_not_reported_ok(
     """``written == 0`` is a refusal, not a success.
 
     Both cases route to ``generic`` and yield ``written=0, errors=[]`` — the
-    binary heuristic drops one and the claimed-``.json`` guard drops the
-    other — so only inspecting ``written`` tells them apart from success.
+    binary heuristic drops the content whatever the extension claims — so
+    only inspecting ``written`` tells them apart from success.
+
+    The ``.json`` case that used to sit here has moved: since #1526 a
+    ``.json`` never reaches ``run_ingest`` at all, because
+    ``route_to_ingestor`` refuses it above the staging write with a remedy
+    rather than letting the claimed-extension guard turn it into this
+    format-blind ``produced no fragment`` reason. That path is covered by
+    ``test_uploading_a_structured_export_refuses_with_guidance_and_writes_nothing``.
+    The second case is deliberately kept — an unmapped extension carrying
+    binary bytes is the backstop's one remaining live trigger, and dropping
+    to a single parameter would leave it looking like a special case of
+    ``.bin``.
     """
     vault = _vault(tmp_path)
 
@@ -1405,3 +1418,122 @@ def test_a_same_named_key_outside_the_staging_dir_does_not_block_an_upload(
     assert result["action"] == "created"
     assert len(_fragments(vault)) == 1
     assert "frag-decoy" not in result["affected_fragment_ids"]
+
+
+# ---- #1526: unrecognised structured formats refuse instead of blobbing ----
+
+
+def _chatgpt_export_bytes() -> bytes:
+    """Return a miniature ChatGPT ``conversations.json`` export, built at runtime."""
+    return json.dumps(
+        [
+            {
+                "title": "A conversation that must not become one blob",
+                "create_time": 1_700_000_000.0,
+                "mapping": {},
+            }
+        ]
+    ).encode("utf-8")
+
+
+def _export_archive_bytes() -> bytes:
+    """Return a genuine ZIP archive wrapping the export above, built in-process."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("conversations.json", _chatgpt_export_bytes())
+    return buffer.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload", "phrases"),
+    [
+        pytest.param(
+            "conversations.json",
+            _chatgpt_export_bytes(),
+            [
+                "'.json'",
+                "single undifferentiated blob",
+                "creek ingest --type",
+                "#1525",
+            ],
+            id="chatgpt-conversations-json",
+        ),
+        pytest.param(
+            "chatgpt-export.zip",
+            _export_archive_bytes(),
+            ["'.zip'", "Unpack it", "creek ingest --type", "#1525"],
+            id="export-archive-zip",
+        ),
+    ],
+)
+def test_uploading_a_structured_export_refuses_with_guidance_and_writes_nothing(
+    tmp_path: Path, filename: str, payload: bytes, phrases: list[str]
+) -> None:
+    """#1526 AC5: the refusal reaches the caller and nothing lands on disk.
+
+    The response alone is not the assertion that matters. Before #1526 a
+    ``.json`` routed to ``generic`` and, for anything the binary heuristic
+    let through, produced a fragment holding the whole export as one body —
+    a silent wrong result, the corpus quietly seeded from garbage. So this
+    checks the *disk*: no fragment, and no staged bytes either, because the
+    format gate sits above :func:`_stage_upload` rather than cleaning up
+    after it.
+
+    The reason text is asserted because a refusal that does not name the
+    remedy leaves the user exactly as stuck as the blob did.
+    """
+    vault = _vault(tmp_path)
+
+    result = upload_tool(
+        vault_path=vault,
+        filename=filename,
+        content_base64=_b64(payload),
+        external_id="u-export",
+        timestamp=_TS,
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert set(result) == _REFUSAL_KEYS
+    for phrase in phrases:
+        assert phrase in result["reason"], (filename, phrase, result["reason"])
+    # The pre-#1526 refusal this must not regress to: format-blind, and
+    # silent about what the caller should do next.
+    assert "produced no fragment" not in result["reason"]
+
+    assert _fragments(vault) == []
+    assert _staged(vault) == []
+    # The bytes never reached the vault at all, under any name.
+    assert _leaking_files(vault, b"must not become one blob") == []
+
+    entries = _audit(vault)
+    assert len(entries) == 1
+    assert entries[0]["tool"] == TOOL_NAME
+
+
+def test_a_plain_text_upload_still_takes_the_generic_fallback(
+    tmp_path: Path,
+) -> None:
+    """The #1526 gate is scoped to structured formats, asserted end to end.
+
+    Positive control for the boundary stated in ``_EXTENSION_ROUTES``: a
+    ``.yaml`` file is text under an extension no ingestor claims, and it must
+    still become a fragment. Without this, tightening the refusal set until
+    ordinary text was rejected would pass every other test in this suite.
+    """
+    vault = _vault(tmp_path)
+
+    result = upload_tool(
+        vault_path=vault,
+        filename="settings.yaml",
+        content_base64=_b64(b"theme: creek\nnotes: an ordinary text file\n"),
+        external_id="u-yaml",
+        timestamp=_TS,
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "ok"
+    assert result["source_type"] == "generic"
+    assert len(_fragments(vault)) == 1
