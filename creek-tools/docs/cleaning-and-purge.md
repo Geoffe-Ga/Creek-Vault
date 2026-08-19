@@ -197,6 +197,26 @@ Inverting the default is the point. An enumerated wipe-list stops being correct 
 
 <!-- META-SURVIVOR-TABLE:END -->
 
+##### What a row in that table does *not* promise
+
+<!-- META-SURVIVOR-POLICY:BEGIN -->
+
+A `keep` or `exempt` row shelters **exactly one regular file, at exactly that path**. That is a constraint on the list itself, not just an observation about today's entries: a row added with a *directory* in mind would silently shelter nothing, because the match is path equality. Three edges follow, and the first two were real defects (#1484, #1485):
+
+| Edge case | Disposition |
+| --- | --- |
+| `directory-at-a-shelter` — a directory standing where a `keep` or `exempt` row names a file, e.g. `00-Creek-Meta/audit/redact.jsonl/` | swept |
+| `link-the-purge-breaks` — a symlink under `00-Creek-Meta/` whose target this purge itself destroys, e.g. one pointing into `01-Fragments/` | unlinked |
+| `link-to-a-surviving-directory` — a symlink to a directory this purge does not destroy | left alone |
+
+- **A directory standing where a keep names a file is swept.** If `00-Creek-Meta/audit/redact.jsonl` or `00-Creek-Meta/embeddings.parquet` exists as a *directory*, the sweep walks into it and destroys everything inside, recursively, exactly as it would under any other name. The alternative — sheltering the subtree — turns one documented survivor into an unbounded number of undocumented ones on a right-to-be-forgotten path, while this table goes on claiming the vault is clean. Only a directory defeats a shelter; a symlink standing at a keep path is still sheltered, because a link is a single alias and cannot hide a subtree behind it.
+- **A symlink this purge breaks is unlinked, never followed — whatever it once pointed at.** `purge vault` wipes the ten content folders *before* it sweeps `00-Creek-Meta/`, so a link there that pointed into one of them is broken by the time the sweep meets it. That is true of a link to a fragment *file* and equally of a link to a *directory of fragments*: once the wipe has run, both are dangling, and a dangling link is destroyed regardless of what it used to resolve to. The residue that matters is not the body the link no longer reaches but the **target string** it carries, and this vault's paths are title-derived — `01-Fragments/Journal/2026-03-11 therapy session.md` is itself private text. Unlinking removes the alias and nothing else, so a link out of the vault is taken without its target being touched.
+- **A symlink to a directory that outlives the purge is left alone**, matching the content wipe: the tree behind it is not this purge's to claim. That exemption is narrower than it looks. It holds for a target the purge does not destroy — an out-of-vault tree, or something under `00-Creek-Meta/` itself. A link *into* a content folder is not a surviving directory link; it is a link about to dangle, and it is unlinked.
+
+`Meta artifacts removed` in a `--dry-run` preview is the number the apply run really performs, that last edge included. The two runs meet different filesystems — a preview does not wipe the content folders, so a link into them is still resolvable at the moment the sweep classifies it — so the sweep asks whether this purge is *about to* destroy the link's target, not merely whether it already has. Getting that wrong is not a cosmetic mismatch: a preview that reports `0` before an apply that removes `1` is the same class of defect as #1485 itself, read in a mirror.
+
+<!-- META-SURVIVOR-POLICY:END -->
+
 Two consequences an operator will notice:
 
 - **The scaffold must be redeployed.** Run `creek init --vault <path>` (or `creek skills sync` for the skill tree alone) after a vault purge. Any skill file you authored yourself is gone, deliberately.

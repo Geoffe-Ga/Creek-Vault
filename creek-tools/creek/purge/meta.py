@@ -43,10 +43,16 @@ class MetaKeep:
     """One path under ``00-Creek-Meta/`` that outlives a whole-vault purge.
 
     Attributes:
-        relpath: Path relative to ``00-Creek-Meta/``. A directory keeps
-            its entire subtree. Matched with ``PurePosixPath`` semantics
-            — never a string prefix, so ``Ontology-drafts/`` is not
-            sheltered by the ``Ontology/`` entry.
+        relpath: Path relative to ``00-Creek-Meta/``, naming exactly
+            one **regular file**. Matched with ``PurePosixPath``
+            equality — never a string prefix, so ``Ontology-drafts/``
+            is not sheltered by an ``Ontology/`` entry, and never a
+            containment prefix, so a *directory* standing at this path
+            shelters nothing beneath it (#1484). The "one regular file"
+            part is a requirement on whoever adds a row, not a promise
+            the type can keep: an entry written with a directory in
+            mind shelters *nothing*, silently, because no file inside
+            it equals the entry's path. See :func:`_validate_keep_list`.
         reason: Why this artifact survives an erasure request. Non-empty
             by construction (:func:`_validate_keep_list`): "we always
             kept it" is not a reason, and an entry that cannot state one
@@ -146,13 +152,35 @@ owns destroying this", not "this survives".
 def _validate_keep_list(keeps: tuple[MetaKeep, ...]) -> None:
     """Reject a keep-list that cannot mean what it says.
 
+    **Every entry must name exactly one regular file**, and that is a
+    constraint this function can only partly enforce. Since #1484
+    :func:`is_kept` matches by path *equality*, so an entry added with
+    a *directory* in mind shelters nothing at all: the walk descends
+    into the directory and each file inside is compared against the
+    entry's own path, which none of them equals. The failure is silent
+    — no error, no warning, just an intended survivor swept — so the
+    constraint is stated here, in :class:`MetaKeep` and in
+    ``docs/cleaning-and-purge.md`` rather than discovered during an
+    erasure. A directory-shaped keep needs :func:`is_kept` to grow a
+    deliberate second matching mode, with the unbounded-subtree
+    argument in that function's docstring answered first.
+
+    What *is* enforced statically: no duplicates, a stated reason, a
+    path that is relative to ``00-Creek-Meta/`` without restating it,
+    and a path that actually names something. The last of those is the
+    meta root itself sneaking in as ``PurePosixPath(".")``, which under
+    equality semantics shelters nothing and under any future
+    containment mode would shelter the entire directory this module
+    exists to sweep.
+
     Args:
         keeps: The keep-list to check.
 
     Raises:
-        ValueError: On a duplicate relpath, an empty reason, or an entry
+        ValueError: On a duplicate relpath, an empty reason, an entry
             that is absolute or re-states the ``00-Creek-Meta`` prefix
-            it is already relative to.
+            it is already relative to, or an entry that names no path
+            beneath that prefix.
     """
     seen: set[PurePosixPath] = set()
     for keep in keeps:
@@ -169,28 +197,41 @@ def _validate_keep_list(keeps: tuple[MetaKeep, ...]) -> None:
                 f"{META_RELDIR}/, without restating it"
             )
             raise ValueError(msg)
+        if not keep.relpath.parts:
+            msg = f"Keep-list entry {keep.relpath!s} names no file under {META_RELDIR}/"
+            raise ValueError(msg)
 
 
 _validate_keep_list(META_PURGE_KEEP)
 
 
 def is_kept(relpath: PurePosixPath) -> bool:
-    """Report whether *relpath* is sheltered by :data:`META_PURGE_KEEP`.
+    """Report whether *relpath* is exactly a :data:`META_PURGE_KEEP` entry.
 
-    Uses ``is_relative_to`` rather than a string prefix, so a keep of
-    ``audit/purge.jsonl`` cannot be made to shelter
-    ``audit/purge.jsonl.bak``. Every current entry happens to name a
-    single file, but the containment semantics are the ones to have: a
-    prefix keep that ever *is* added shelters its subtree and nothing
-    that merely starts with the same characters.
+    ``PurePosixPath`` **equality**, so a keep of ``audit/purge.jsonl``
+    shelters neither ``audit/purge.jsonl.bak`` (a string prefix) nor
+    ``audit/purge.jsonl/leak.md`` (a containment prefix).
+
+    Containment matching was the original spelling and it was the wrong
+    call (#1484). Every entry names a single file, but nothing stops a
+    *directory* appearing at one of those paths — a hand-edited vault,
+    a botched restore, an attacker with local write access — and under
+    containment the entire subtree beneath it was then sheltered. One
+    documented survivor would have become an unbounded number of
+    undocumented ones on a right-to-be-forgotten path, while the
+    survivor table in ``docs/cleaning-and-purge.md`` still claimed the
+    vault was clean. A keep shelters one file; a directory standing
+    where it names a file is swept like anything else, which is the
+    restrictive direction and the same default the whole module is
+    built on.
 
     Args:
         relpath: A path relative to ``00-Creek-Meta/``.
 
     Returns:
-        ``True`` when the path is a keep-list entry or lies beneath one.
+        ``True`` only when the path *is* a keep-list entry.
     """
-    return any(relpath.is_relative_to(keep.relpath) for keep in META_PURGE_KEEP)
+    return any(relpath == keep.relpath for keep in META_PURGE_KEEP)
 
 
 def _relpath_of(path: Path, meta_root: Path) -> PurePosixPath:
@@ -206,8 +247,103 @@ def _relpath_of(path: Path, meta_root: Path) -> PurePosixPath:
     return PurePosixPath(path.relative_to(meta_root).as_posix())
 
 
-def _sweep_candidates(meta_root: Path, current: Path) -> Iterator[Path]:
-    """Yield the regular files under *current* that the sweep may destroy.
+def _is_sheltered(relpath: PurePosixPath) -> bool:
+    """Report whether the sweep steps over *relpath* rather than destroying it.
+
+    The two dispositions differ in meaning and not in effect here: a
+    keep survives the erasure, an exempt path is destroyed by another
+    pass that reports what it removed. Neither is this walk's to take.
+
+    Args:
+        relpath: A path relative to ``00-Creek-Meta/``.
+
+    Returns:
+        ``True`` when *relpath* is on the keep-list or the exempt tuple.
+    """
+    return is_kept(relpath) or relpath in SWEEP_EXEMPT
+
+
+def _breaks_no_link(_entry: Path) -> bool:
+    """Answer that the caller destroys nothing a meta symlink points at.
+
+    The default *breaks_link* for :func:`sweep_unkept_meta`, and the
+    only correct answer for a caller that is not itself deleting the
+    link's target. ``purge_vault`` overrides it, because it is.
+
+    Args:
+        _entry: The symlink being classified; deliberately unused.
+
+    Returns:
+        ``False``, always.
+    """
+    return False
+
+
+def _sweep_destroys_link(entry: Path, *, breaks_link: Callable[[Path], bool]) -> bool:
+    """Report whether the sweep unlinks the symlink *entry*.
+
+    ``Path.is_file()`` **follows** the link, which is why the second
+    clause is needed rather than redundant: a *dangling* link answers
+    ``False`` to ``is_file()``, so asking that question alone dropped it
+    on the floor (#1485). ``purge_vault`` creates dangling links itself
+    — it wipes the content folders before this sweep runs — and the
+    residue a survivor leaves is not a body but its **target string**,
+    which in this vault is routinely title-derived.
+
+    So a dangling link is unlinked **regardless of what it once pointed
+    at**, a directory target included. The directory exemption below
+    therefore holds only for a target that *outlives* the purge, and
+    *breaks_link* is what makes a dry run say so. Without it the two
+    runs met different filesystems and disagreed: a preview does not
+    wipe the content folders, so ``00-Creek-Meta/latest-thread ->
+    01-Fragments/Journal/`` still resolved to a live directory and was
+    left alone, while the apply run met the same link dangling and
+    unlinked it. Preview 0, apply 1 — the #1485 divergence in a mirror,
+    which is why the caller is asked whether it is *about to* destroy
+    the target rather than only whether it already has.
+
+    A link to a directory the purge does not touch is the one case that
+    stays: unlinking it would be safe, but it is the content wipe's
+    pinned policy that a surviving directory link is neither followed
+    nor claimed, and the two walks must not disagree about what such a
+    link stands for.
+
+    ``engine._regular_files_under`` answers ``[]`` for a broken link and
+    that is not a disagreement: it builds the *record* of destroyed
+    content, and a broken link destroys none — the wipe's ``rmtree``
+    removes it regardless. This function decides what gets destroyed at
+    all, so the same link has to be named here or nothing removes it.
+
+    On Python 3.11 to 3.13 ``exists()`` and ``is_file()`` re-raise
+    ``PermissionError`` on an unreadable parent, so an ``EACCES`` mid
+    sweep aborts the purge into ``status="partial"`` rather than
+    silently widening this predicate. Python 3.14 changed that: both
+    swallow ``OSError`` and answer ``False``, which would turn an
+    unreadable link into "dangling, unlink it". That is the restrictive
+    direction, so it is safe — but it is a silent behaviour change, and
+    the abort it removes is one this module's callers rely on for the
+    *count* to be honest. Revisit when 3.14 enters the support matrix.
+
+    Args:
+        entry: A path already known to be a symlink.
+        breaks_link: Reports whether the caller's own operation destroys
+            what *entry* points at, so a dry run classifies the link the
+            way the apply run will.
+
+    Returns:
+        ``True`` for a link to a regular file, for a broken link, and
+        for a link whose target this operation is about to destroy.
+    """
+    return entry.is_file() or not entry.exists() or breaks_link(entry)
+
+
+def _sweep_candidates(
+    meta_root: Path,
+    current: Path,
+    *,
+    breaks_link: Callable[[Path], bool],
+) -> Iterator[Path]:
+    """Yield the files and symlinks under *current* the sweep may destroy.
 
     Symlink policy is copied from ``engine._regular_files_under`` so the
     meta sweep and the content wipe cannot disagree about what a link
@@ -215,21 +351,37 @@ def _sweep_candidates(meta_root: Path, current: Path) -> Iterator[Path]:
     destroy that alias), a symlink to a directory is never walked
     through (the files behind it are not this purge's to claim, and
     naming out-of-vault paths in a record that survives the purge is its
-    own leak).
+    own leak). It parts from that helper on exactly one case: a
+    **dangling** symlink is yielded here (#1485), because this walk
+    decides what is destroyed while that one only records what already
+    was.
+
+    Ordering is the load-bearing part. The shelter check runs **after**
+    the ``is_dir()`` branch, never before (#1484): asked first, it
+    short-circuited a directory standing at a keep or exempt path, and
+    the walk then never descended into it at all — sheltering an
+    unbounded subtree on the strength of one documented file. A
+    directory is walked no matter what its name is; only what the walk
+    finds *inside* gets a disposition.
 
     Args:
         meta_root: The ``00-Creek-Meta/`` directory, for relative paths.
         current: The directory being walked.
+        breaks_link: Passed to :func:`_sweep_destroys_link`; reports
+            whether the caller's own operation destroys a link's target.
 
     Yields:
-        Files that are neither kept nor exempt.
+        Files and links that are neither kept nor exempt.
     """
     for entry in sorted(current.iterdir()):
         relpath = _relpath_of(entry, meta_root)
-        if is_kept(relpath) or relpath in SWEEP_EXEMPT:
-            continue
         if entry.is_symlink():
-            if entry.is_file():
+            # Asked before ``is_dir()``, which follows the link: a link
+            # is an alias, never a directory this walk may descend.
+            if not _is_sheltered(relpath) and _sweep_destroys_link(
+                entry,
+                breaks_link=breaks_link,
+            ):
                 yield entry
             continue
         if entry.is_dir():
@@ -237,8 +389,9 @@ def _sweep_candidates(meta_root: Path, current: Path) -> Iterator[Path]:
             # when only a descendant is: `audit/` is not a keep-list
             # entry, but four files inside it are, so the directory has
             # to be entered and decided file by file.
-            yield from _sweep_candidates(meta_root, entry)
-        elif entry.is_file():
+            yield from _sweep_candidates(meta_root, entry, breaks_link=breaks_link)
+            continue
+        if entry.is_file() and not _is_sheltered(relpath):
             yield entry
 
 
@@ -247,6 +400,7 @@ def sweep_unkept_meta(
     *,
     skip: Callable[[Path], bool],
     remove: Callable[[Path], None],
+    breaks_link: Callable[[Path], bool] = _breaks_no_link,
 ) -> int:
     """Destroy every unkept regular file under *meta_root*, and count them.
 
@@ -260,6 +414,12 @@ def sweep_unkept_meta(
             skipped so a preview does not count it twice.
         remove: Destroys one file. Called with a file the sweep has
             decided against; in a dry run the caller makes this a no-op.
+        breaks_link: Reports whether the caller's own operation destroys
+            what a ``00-Creek-Meta/`` symlink points at. Defaults to
+            "nothing", which is right for every caller that is not also
+            deleting vault content; ``purge_vault`` is, and passing this
+            is what keeps its preview and its apply run agreeing about a
+            link into a content folder.
 
     Returns:
         The number of files removed, incremented only **after** *remove*
@@ -272,7 +432,7 @@ def sweep_unkept_meta(
     if not meta_root.is_dir():
         return 0
     removed = 0
-    for path in _sweep_candidates(meta_root, meta_root):
+    for path in _sweep_candidates(meta_root, meta_root, breaks_link=breaks_link):
         if skip(path):
             continue
         remove(path)

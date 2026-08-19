@@ -117,7 +117,7 @@ from most to least likely:
   own parent, and admitted — with the resolved target used as the
   root everywhere thereafter — when the target stays under that
   parent, so `~/vault -> ~/Dropbox/vault` is still admitted and
-  still redacts under `~/Dropbox/vault`. Three residuals remain.
+  still redacts under `~/Dropbox/vault`. Two residuals remain.
   First, a named path reached through an escaping *ancestor*
   component (e.g. `<root>/linkdir/a.md`, where the leaf is a real
   file but `linkdir` is the escaping link) is still admitted and
@@ -128,15 +128,40 @@ from most to least likely:
   `source_path.rglob("*")` and `:484` `scan_batch`) still traverses
   a directly-named symlinked directory; it is read-only there and
   escalates to a hard refusal via the skip counter rather than
-  writing. Third, `--scan`'s own `--vault` is not contained. It is
-  used only to locate `creek_config.yaml`, and `--scan` writes
-  nothing, so this is a read-escape rather than a write: an
-  out-of-tree `creek_config.yaml` is opened, parsed, and used to
-  configure the pass (confirmed by pointing it at malformed YAML,
-  which surfaces as a parse error from outside the named tree). It
-  is deliberately not refused here, because a refusing `--scan` is
-  the denial of service the skip-and-count contract exists to
-  avoid; tracked separately in #1359. #1294 closed the last of the
+  writing. `--scan`'s own `--vault` **was** a third residual and is
+  now closed (#1359): it is contained, and an escaping one is
+  refused outright, like `--apply`'s and `--review`'s. #1293 left it
+  open on the reading that the escape was an inert read — `--vault`
+  only locates `creek_config.yaml` and `--scan` writes nothing — and
+  that refusing would be the denial of service the skip-and-count
+  contract exists to avoid. Execution refuted the first half. An
+  out-of-tree `creek_config.yaml` is not merely read: it is a
+  complete off switch on the pass. A scan of a file with one `email`
+  and one `api_key` reports **zero** findings under any of
+  `supported_extensions` (drop the source's extension),
+  `exclude_patterns` (name the source directory), or
+  `false_positive_allowlist` (the exact matched strings — the
+  original probe missed this only because the check is exact-string
+  membership, so a near-miss entry changes nothing). `enabled: false`
+  is the one inert setting, because the explicit CLI mode does not
+  consult it — which fails safe, scanning more rather than less. So
+  the choice was between a loud, correctable error and a silent "no
+  findings" on the one command an operator runs because they are
+  worried, and the refusal wins. The skip-and-count contract is
+  untouched: it is about the **source** — the tree being examined —
+  and `--scan --source <tree containing an escaping link>` still
+  declines that file, scans the rest, exits 0, and names the skip in
+  the statistics. A `--vault` symlink that stays inside its own
+  parent is still admitted. Separately, `--apply` no longer rewrites
+  `<vault>/00-Creek-Meta/creek_config.yaml` (#1398): `.yaml` is in
+  the default `supported_extensions`, so a vault-wide apply was
+  replacing `exclude_patterns` tokens and custom `patterns` with
+  `[REDACTED:…]` markers — and losing an exclusion *widens* what the
+  next run walks, so running redaction reconfigured redaction. The
+  config joins `00-Creek-Meta/audit/` and the legacy purge log in
+  `PROTECTED_AUDIT_RELPATHS`, excluded from the APPLY set only;
+  detection is unchanged, so `--scan` and `--review` still report
+  matches inside it. #1294 closed the last of the
   gaps: the ingestor walks had no containment check of any kind, so
   the pipeline refusal was a backstop that a vault with
   `redaction.enabled: false` never reached — and that a caller

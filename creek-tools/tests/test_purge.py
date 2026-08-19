@@ -5390,8 +5390,10 @@ def test_a_keep_is_matched_by_path_and_never_by_string_prefix(
     A ``startswith`` keep-test shelters anything whose path merely
     begins with a kept one, which is the cheapest way to smuggle content
     past a deny-by-default sweep: name the file after something on the
-    list. ``is_relative_to`` compares path components and cannot be
-    fooled that way.
+    list. ``is_kept`` compares whole ``PurePosixPath`` values for
+    equality and cannot be fooled that way. (It used ``is_relative_to``
+    until #1484; that also defeated the string prefix, but sheltered
+    ``audit/purge.jsonl/leak.md`` by containment instead.)
     """
     vault = _make_vault(tmp_path)
     audit = vault / "00-Creek-Meta" / "audit"
