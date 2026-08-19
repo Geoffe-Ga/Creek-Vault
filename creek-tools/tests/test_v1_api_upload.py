@@ -1116,3 +1116,61 @@ def test_the_upload_route_is_mounted_for_post_only(vault: Path) -> None:
                 method, UPLOAD_PATH, headers=headers(ceiling="open")
             )
             assert response.status_code == ERROR_STATUS[ErrorCode.NOT_FOUND], method
+
+
+# --------------------------------------------------------------------------- #
+# One bound, both write surfaces
+# --------------------------------------------------------------------------- #
+
+
+def test_both_write_surfaces_bound_the_external_id_by_the_same_object() -> None:
+    """The journal route and the upload model share one ``MAX_EXTERNAL_ID_CHARS``.
+
+    ``external_id`` reaches the vault two ways — as a URL path segment on
+    ``PUT /v1/journal-entries/{external_id}`` and as a JSON field on
+    ``POST /v1/uploads`` — and both mint a staged name through the same
+    ``safe_stem``. Two independently-declared bounds that happen to agree today
+    would let one surface accept an id the other refuses, so the same id would
+    be addressable through one write path and not the other.
+    """
+    from creek_mcp.api import models
+    from creek_mcp.httpapi import journal
+
+    assert journal.MAX_EXTERNAL_ID_CHARS is models.MAX_EXTERNAL_ID_CHARS
+
+
+def test_the_journal_route_imports_the_bound_rather_than_restating_it() -> None:
+    """``journal.py`` declares no literal of its own, as its docstring claims.
+
+    Equality alone would still pass if somebody re-declared the literal in
+    ``journal.py`` at the same value, which is precisely the drift this pins:
+    the module's binding must come from an import of
+    :mod:`creek_mcp.api.models`, so a later edit to the canonical bound cannot
+    leave a second copy behind.
+    """
+    import ast
+    import inspect
+
+    from creek_mcp.api import models
+    from creek_mcp.httpapi import journal
+
+    tree = ast.parse(inspect.getsource(journal))
+    assigned = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AnnAssign | ast.Assign)
+        for target in (
+            [node.target] if isinstance(node, ast.AnnAssign) else node.targets
+        )
+        if isinstance(target, ast.Name)
+    }
+    assert "MAX_EXTERNAL_ID_CHARS" not in assigned
+
+    imported_from = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+        if alias.name == "MAX_EXTERNAL_ID_CHARS"
+    }
+    assert imported_from == {models.__name__}
