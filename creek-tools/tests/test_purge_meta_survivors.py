@@ -34,7 +34,13 @@ import pytest
 
 from creek.purge import PurgeAuditEntry, PurgeAuditLog, PurgeEngine
 from creek.purge.engine import VAULT_PURGE_CONFIRMATION
-from creek.purge.meta import META_PURGE_KEEP, SWEEP_EXEMPT, MetaKeep
+from creek.purge.meta import (
+    MAX_LINK_HOPS,
+    META_PURGE_KEEP,
+    SWEEP_EXEMPT,
+    MetaKeep,
+    chain_enters,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -599,6 +605,24 @@ _POLICY_BEGIN: Final[str] = "<!-- META-SURVIVOR-POLICY:BEGIN -->"
 _POLICY_END: Final[str] = "<!-- META-SURVIVOR-POLICY:END -->"
 
 
+def _policy_block() -> str:
+    """Return the delimited ``META-SURVIVOR-POLICY`` block of the doc.
+
+    Returns:
+        The block body, without its markers.
+
+    Raises:
+        AssertionError: If either marker is missing, or the block is
+            empty — both of which would make every pin below vacuous.
+    """
+    text = DOC_PATH.read_text(encoding="utf-8")
+    assert _POLICY_BEGIN in text, f"{DOC_PATH} lost its sweep-policy marker"
+    assert _POLICY_END in text, f"{DOC_PATH} lost its sweep-policy end marker"
+    block = text.split(_POLICY_BEGIN, 1)[1].split(_POLICY_END, 1)[0]
+    assert block.strip(), "the sweep-policy block is empty"
+    return block
+
+
 def _minimal_vault(tmp_path: Path) -> Path:
     """Build the smallest directory ``purge_vault`` accepts as a vault.
 
@@ -853,12 +877,8 @@ def test_the_documented_policy_block_states_both_sweep_decisions() -> None:
     and pinning it means the code cannot change its mind without the
     documentation changing with it.
     """
-    text = DOC_PATH.read_text(encoding="utf-8")
+    block = _policy_block()
 
-    assert _POLICY_BEGIN in text, f"{DOC_PATH} lost its sweep-policy marker"
-    block = text.split(_POLICY_BEGIN, 1)[1].split(_POLICY_END, 1)[0].strip()
-
-    assert block, "the sweep-policy block is empty"
     assert "directory" in block
     assert "dangling" in block
     assert "symlink" in block
@@ -886,9 +906,7 @@ def _parse_policy_edges() -> tuple[tuple[str, str], ...]:
     Raises:
         AssertionError: If the block or its table is missing.
     """
-    text = DOC_PATH.read_text(encoding="utf-8")
-    assert _POLICY_BEGIN in text, f"{DOC_PATH} lost its sweep-policy marker"
-    block = text.split(_POLICY_BEGIN, 1)[1].split(_POLICY_END, 1)[0]
+    block = _policy_block()
     edges = [
         (match.group(1), match.group(2))
         for line in block.splitlines()
@@ -981,9 +999,103 @@ def _build_link_to_a_surviving_directory(root: Path) -> tuple[Path, Path]:
     return vault, probe
 
 
+def _build_link_through_a_wiped_alias(root: Path) -> tuple[Path, Path]:
+    """Seed a meta link that reaches an out-of-vault tree *through* a wiped alias.
+
+    ``00-Creek-Meta/latest-thread -> 01-Fragments/Journal/alias-… ->
+    <outside>``. Resolving the whole chain collapses past the middle
+    hop and lands outside the vault, so a predicate that classifies
+    ``link.resolve()`` answers "not broken" — while the wipe removes
+    the middle hop and leaves the meta link dangling. Preview ``0``,
+    apply ``1``.
+
+    The middle hop is *nested* one level down: a symlink to a directory
+    sitting directly in a content folder makes ``_wipe_folder_contents``
+    call ``shutil.rmtree`` on a link and abort the purge, which is a
+    different (pre-existing) defect and not this row's subject.
+
+    Args:
+        root: A private directory to build the vault under.
+
+    Returns:
+        The vault root and the link whose fate is the disposition.
+    """
+    vault = _minimal_vault(root)
+    outside = root / "elsewhere" / "notes"
+    outside.mkdir(parents=True)
+    (outside / "keep-me.md").write_text("untouched\n", encoding="utf-8")
+    journal = vault / "01-Fragments" / "Journal"
+    journal.mkdir(parents=True)
+    hop = journal / f"alias-{_PRIVATE}"
+    hop.symlink_to(outside, target_is_directory=True)
+    probe = vault / "00-Creek-Meta" / "latest-thread"
+    probe.symlink_to(hop, target_is_directory=True)
+    return vault, probe
+
+
+def _build_link_traversing_a_wiped_directory(root: Path) -> tuple[Path, Path]:
+    """Seed a relative meta link that walks through a wiped directory.
+
+    ``00-Creek-Meta/vault-root -> ../01-Fragments/Journal/../..`` names
+    the vault root, which outlives the purge — but it can only be
+    reached by traversing ``01-Fragments/Journal``, which does not.
+    ``resolve()`` reports the surviving destination and nothing else, so
+    the link reads as "not broken" until the apply run finds it
+    dangling.
+
+    Args:
+        root: A private directory to build the vault under.
+
+    Returns:
+        The vault root and the link whose fate is the disposition.
+    """
+    vault = _minimal_vault(root)
+    journal = vault / "01-Fragments" / "Journal"
+    journal.mkdir(parents=True)
+    (journal / f"{_PRIVATE}.md").write_text(
+        "---\nid: frag-x\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    probe = vault / "00-Creek-Meta" / "vault-root"
+    probe.symlink_to(Path("../01-Fragments/Journal/../.."), target_is_directory=True)
+    return vault, probe
+
+
+def _build_link_named_in_another_case(root: Path) -> tuple[Path, Path]:
+    """Seed a meta link naming ``01-fragments`` where the folder is ``01-Fragments``.
+
+    On the operator's own machine — macOS, case-insensitive by default —
+    those two spellings name the *same* directory, so the wipe breaks
+    this link while a pure-path, case-sensitive comparison says it is
+    untouched. On a case-sensitive filesystem the link is dangling from
+    the moment it is created, which the sweep already unlinks on both
+    sides: the documented disposition is ``unlinked`` either way, which
+    is why this row is portable.
+
+    Args:
+        root: A private directory to build the vault under.
+
+    Returns:
+        The vault root and the link whose fate is the disposition.
+    """
+    vault = _minimal_vault(root)
+    journal = vault / "01-Fragments" / "Journal"
+    journal.mkdir(parents=True)
+    (journal / f"{_PRIVATE}.md").write_text(
+        "---\nid: frag-x\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    probe = vault / "00-Creek-Meta" / "cased-thread"
+    probe.symlink_to(vault / "01-fragments" / "Journal", target_is_directory=True)
+    return vault, probe
+
+
 _EDGE_BUILDERS: Final[dict[str, Callable[[Path], tuple[Path, Path]]]] = {
     "directory-at-a-shelter": _build_directory_at_a_shelter,
     "link-the-purge-breaks": _build_link_the_purge_breaks,
+    "link-through-a-wiped-alias": _build_link_through_a_wiped_alias,
+    "link-traversing-a-wiped-directory": _build_link_traversing_a_wiped_directory,
+    "link-named-in-another-case": _build_link_named_in_another_case,
     "link-to-a-surviving-directory": _build_link_to_a_surviving_directory,
 }
 """One executable vault per documented edge case, keyed by its doc slug."""
@@ -1116,3 +1228,122 @@ def test_a_meta_link_to_a_content_folder_itself_is_left_alone(
     assert applied.meta_artifacts_removed == 0
     assert preview.meta_artifacts_removed == applied.meta_artifacts_removed
     assert _PRIVATE not in _residue(vault)
+
+
+# ---------------------------------------------------------------------------
+# The chain walk's own boundaries (#1484)
+# ---------------------------------------------------------------------------
+
+
+def _alias_chain(meta_root: Path, name: str, length: int, final: Path) -> Path:
+    """Build ``name-0 -> name-1 -> … -> name-(length-1) -> final``.
+
+    Args:
+        meta_root: Directory to create the links in.
+        name: Filename prefix shared by every link in the chain.
+        length: How many symlinks to chain; at least one.
+        final: What the last link points at.
+
+    Returns:
+        The head of the chain.
+    """
+    for index in reversed(range(length)):
+        target = final if index == length - 1 else meta_root / f"{name}-{index + 1}"
+        (meta_root / f"{name}-{index}").symlink_to(target)
+    return meta_root / f"{name}-0"
+
+
+def test_the_chain_walk_follows_an_alias_chain_into_a_content_folder(
+    tmp_path: Path,
+) -> None:
+    """The permissive half of the hop-ceiling boundary.
+
+    Without this, a ceiling of *zero* — a walk that gives up before it
+    starts — would satisfy the test below and answer "nothing is ever
+    broken", which is exactly the pre-#1484 behaviour written a second
+    way.
+    """
+    vault = _minimal_vault(tmp_path)
+    journal = vault / "01-Fragments" / "Journal"
+    journal.mkdir(parents=True)
+    head = _alias_chain(vault / "00-Creek-Meta", "short", 5, journal)
+
+    assert chain_enters(head, [vault / "01-Fragments"]) is True
+
+
+def test_the_chain_walk_gives_up_past_the_documented_hop_ceiling(
+    tmp_path: Path,
+) -> None:
+    """A chain longer than the ceiling answers "not broken", deliberately.
+
+    The permissive direction, and the one the documentation has to state
+    rather than imply: a link buried under more than
+    :data:`MAX_LINK_HOPS` aliases that really does end inside a content
+    folder is left alone by the sweep. What matters is that *both* runs
+    are left alone identically — the parity claim survives even where
+    the classification is generous.
+    """
+    vault = _minimal_vault(tmp_path)
+    journal = vault / "01-Fragments" / "Journal"
+    journal.mkdir(parents=True)
+    head = _alias_chain(
+        vault / "00-Creek-Meta",
+        "long",
+        MAX_LINK_HOPS + 5,
+        journal,
+    )
+
+    assert chain_enters(head, [vault / "01-Fragments"]) is False
+
+
+def test_the_documented_hop_ceiling_is_the_number_the_code_enforces() -> None:
+    """The doc names a specific ceiling; it must be the code's own.
+
+    A prose "gives up after a while" would be unfalsifiable, and a
+    number that drifted from the constant would be worse than none.
+    """
+    assert f"{MAX_LINK_HOPS} hops" in _policy_block()
+
+
+def test_a_meta_symlink_loop_is_unlinked_identically_in_both_runs(
+    tmp_path: Path,
+) -> None:
+    """The chain walk abandons a loop, and the dangling clause still takes it.
+
+    ``chain_enters`` answers ``False`` — a loop reaches no content
+    folder, and the ceiling stops the walk regardless. That is not a
+    hole: the kernel cannot resolve a loop either, so ``exists()``
+    answers ``False`` on both sides and :func:`_sweep_destroys_link`
+    unlinks the pair as dangling. Preview and apply still agree, which
+    is the property under test.
+    """
+
+    def build(root: Path) -> tuple[Path, Path]:
+        """Seed a vault whose meta folder holds a two-link symlink loop.
+
+        Args:
+            root: A private directory to build the vault under.
+
+        Returns:
+            The vault root and the head of the loop.
+        """
+        vault = _minimal_vault(root)
+        meta = vault / "00-Creek-Meta"
+        (meta / "loop-a").symlink_to(meta / "loop-b")
+        (meta / "loop-b").symlink_to(meta / "loop-a")
+        return vault, meta / "loop-a"
+
+    previewed_vault, previewed_head = build(tmp_path / "preview")
+    assert chain_enters(previewed_head, [previewed_vault / "01-Fragments"]) is False
+
+    preview = PurgeEngine(previewed_vault, dry_run=True).purge_vault(
+        VAULT_PURGE_CONFIRMATION
+    )
+    assert previewed_head.is_symlink(), "a dry run unlinked something"
+
+    applied_vault, applied_head = build(tmp_path / "apply")
+    applied = PurgeEngine(applied_vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert not applied_head.is_symlink(), "the looping link survived"
+    assert applied.meta_artifacts_removed == 2
+    assert preview.meta_artifacts_removed == applied.meta_artifacts_removed

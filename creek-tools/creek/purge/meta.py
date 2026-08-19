@@ -26,13 +26,14 @@ that module is already 2400 lines and sits at the ``xenon
 
 from __future__ import annotations
 
+import os
+from collections import deque
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
-    from pathlib import Path
+    from collections.abc import Callable, Iterator, Sequence
 
 META_RELDIR: Final[str] = "00-Creek-Meta"
 """The vault folder this module sweeps."""
@@ -261,6 +262,155 @@ def _is_sheltered(relpath: PurePosixPath) -> bool:
         ``True`` when *relpath* is on the keep-list or the exempt tuple.
     """
     return is_kept(relpath) or relpath in SWEEP_EXEMPT
+
+
+MAX_LINK_HOPS: Final[int] = 40
+"""Symlink hops :func:`chain_enters` follows before it gives up.
+
+Bounds the walk against a symlink *loop*, which has no natural end. The
+number is the conventional ``SYMLOOP_MAX`` — the kernel's own ceiling on
+Linux and macOS — so a chain this walk abandons is one the filesystem
+would refuse to resolve anyway.
+
+Giving up answers "the purge does not break this link", which is the
+*permissive* direction and therefore the one that needs saying out loud:
+a link buried under 40 hops of aliasing that really does end inside a
+content folder is left alone by the sweep. It is left alone identically
+in a preview and in an apply run, which is the property this predicate
+exists to hold; and a loop is unlinked anyway, by the dangling clause of
+:func:`_sweep_destroys_link`, because the kernel cannot resolve it
+either.
+"""
+
+
+def _follow_one_hop(link: Path, pending: deque[str]) -> Path:
+    """Splice a symlink's raw target into the pending component queue.
+
+    The raw target is read with ``os.readlink`` rather than ``resolve()``
+    on purpose: this walk exists to *see* the intermediate hops that
+    full resolution collapses away.
+
+    Args:
+        link: A path already known to be a symlink.
+        pending: Components still to be walked; the target's own
+            components are pushed in front of them, exactly as the
+            kernel splices a link's target into a lookup in progress.
+
+    Returns:
+        The directory the spliced components are walked from — the
+        filesystem root for an absolute target, the link's own parent
+        for a relative one.
+    """
+    raw = Path(os.readlink(link))
+    if raw.is_absolute():
+        pending.extendleft(reversed(raw.parts[1:]))
+        return Path(raw.anchor)
+    pending.extendleft(reversed(raw.parts))
+    return link.parent
+
+
+def _resolution_visits(link: Path) -> Iterator[Path]:
+    """Yield every path the kernel touches while resolving *link*.
+
+    ``Path.resolve()`` answers with the single path a chain finally
+    names, and that is not enough to tell whether this purge breaks the
+    link: the destination can outlive the purge while the *route* to it
+    does not. Three shapes make the two disagree — a link whose middle
+    hop lives in a content folder, a relative target that walks through
+    one before climbing back out (``../01-Fragments/Journal/../..``),
+    and a spelling that differs from the real folder only in case. All
+    three resolve to something that survives and all three dangle after
+    the wipe.
+
+    So the components are walked one at a time, links spliced in where
+    they are met, in the same order the kernel would take them. ``..``
+    pops the current directory *after* it has been visited, which is
+    what makes the traversing case observable.
+
+    Args:
+        link: The symlink to resolve. Interpreted against the process
+            working directory if it is relative, exactly as the kernel
+            would; an absolute *link* makes the join a no-op.
+
+    Yields:
+        Each path reached along the way, in visit order, whether or not
+        it exists — the tail of a dangling chain is still a path the
+        lookup names.
+    """
+    start = Path.cwd() / link
+    pending: deque[str] = deque(start.parts[1:])
+    current = Path(start.anchor)
+    hops = 0
+    while pending:
+        part = pending.popleft()
+        # No ``.`` case: ``PurePath`` drops those components, so neither
+        # ``start.parts`` nor a spliced ``os.readlink`` result can yield
+        # one, and a branch for it would never be taken.
+        if part == "..":
+            current = current.parent
+            continue
+        current = current / part
+        yield current
+        if not current.is_symlink():
+            continue
+        hops += 1
+        if hops > MAX_LINK_HOPS:
+            return
+        current = _follow_one_hop(current, pending)
+
+
+def _is_same_dir(left: Path, right: Path) -> bool:
+    """Report whether two paths are the *same* directory, not the same spelling.
+
+    ``samefile`` compares device and inode, so it sees through a case
+    difference on a case-insensitive filesystem (macOS by default) and
+    through an alias that names the directory by another route. String
+    comparison sees neither, which is how a link to ``01-fragments``
+    read as untouched while the wipe emptied ``01-Fragments``.
+
+    Args:
+        left: One path.
+        right: The other.
+
+    Returns:
+        ``True`` when both exist and are the same directory entry;
+        ``False`` when either is missing or unreadable — a path that is
+        not there cannot be the folder about to be wiped.
+    """
+    try:
+        return left.samefile(right)
+    except OSError:
+        return False
+
+
+def chain_enters(link: Path, roots: Sequence[Path]) -> bool:
+    """Report whether resolving *link* ever descends *inside* one of *roots*.
+
+    "Inside" is strict: a chain that stops *at* a root has not entered
+    it. That is the distinction between a link to ``01-Fragments``,
+    which survives a vault purge because the wipe empties those folders
+    without removing them, and a link to ``01-Fragments/Journal``, which
+    does not.
+
+    The test is applied to the visit sequence rather than to the final
+    destination, and it needs only one question per visit: is this
+    path's parent one of the roots? The first step that descends inside
+    a root has that root as its parent by construction, so a single
+    ``samefile`` per visit catches every depth.
+
+    Args:
+        link: A symlink whose fate is being decided.
+        roots: Directories whose *contents* the caller is about to
+            destroy.
+
+    Returns:
+        ``True`` when some path along the resolution passes strictly
+        inside a root.
+    """
+    return any(
+        any(_is_same_dir(visit.parent, root) for root in roots)
+        for visit in _resolution_visits(link)
+    )
 
 
 def _breaks_no_link(_entry: Path) -> bool:

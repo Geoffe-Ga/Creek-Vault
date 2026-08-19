@@ -46,7 +46,7 @@ from creek.ingest.ledger import forget_fragment_ids
 from creek.ingest.source_unit import split_source_unit
 from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog, PurgeOutcomeStatus
 from creek.purge.dryrun import DryRunLedger
-from creek.purge.meta import META_RELDIR, sweep_unkept_meta
+from creek.purge.meta import META_RELDIR, chain_enters, sweep_unkept_meta
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -1043,29 +1043,51 @@ class PurgeEngine:
         folders without removing them — so the comparison excludes the
         folder root.
 
-        ``resolve()`` is non-strict and answers for a dangling link too,
-        which matters because it is consulted on both sides. An
-        ``OSError`` (a symlink loop, an unreadable parent) answers
-        ``False``: this predicate can only ever *widen* what the sweep
-        destroys, so failing it closed would destroy a link on the
-        strength of an error rather than a fact.
+        The question is asked of the whole resolution **chain**, not of
+        the one path ``resolve()`` finally names (#1484). Those two
+        differ whenever the route into the vault is not the destination:
+        a meta link through an alias that itself lives in
+        ``01-Fragments/`` and points back out of the vault, a relative
+        target like ``../01-Fragments/Journal/../..`` that walks through
+        a wiped directory before climbing back to the surviving vault
+        root, or a spelling that differs from the real folder only in
+        case — which on the operator's own macOS filesystem is the same
+        directory. Every one of them resolves to something that outlives
+        the purge, so ``resolve()`` alone answered "not broken" in the
+        preview while the apply run met a dangling link and unlinked it:
+        preview ``0``, apply ``1``, three more copies of #1485 in a
+        mirror. :func:`~creek.purge.meta.chain_enters` walks the chain a
+        hop at a time and compares directories by identity rather than
+        by spelling, so both runs classify all three identically.
+
+        It errs toward *unlinking*: a chain that merely passes through a
+        content folder is taken even when the path it finally names
+        survives. That is the restrictive direction on a
+        right-to-be-forgotten path, and the residue at stake is the
+        link's target *string* — title-derived in this vault — not the
+        body behind it.
+
+        An ``OSError`` (an unreadable parent) answers ``False``: this
+        predicate can only ever *widen* what the sweep destroys, so
+        failing it closed would destroy a link on the strength of an
+        error rather than a fact. A symlink *loop* needs no such
+        handling — the walk abandons the chain after
+        ``MAX_LINK_HOPS`` — and is unlinked anyway as dangling, on both
+        sides, because the kernel cannot resolve it either.
 
         Args:
             link: A symlink under ``00-Creek-Meta/``.
 
         Returns:
-            ``True`` when *link* resolves to something strictly inside a
-            vault content folder, which this purge is about to wipe.
+            ``True`` when resolving *link* passes strictly inside a
+            vault content folder, whose contents this purge is about to
+            wipe.
         """
         try:
-            target = link.resolve()
-            roots = [
-                (self.vault_path / folder).resolve()
-                for folder in _VAULT_CONTENT_FOLDERS
-            ]
+            roots = [self.vault_path / folder for folder in _VAULT_CONTENT_FOLDERS]
+            return chain_enters(link, roots)
         except OSError:
             return False
-        return any(target != root and target.is_relative_to(root) for root in roots)
 
     def _remove_meta_artifact(self, path: Path) -> None:
         """Destroy one swept ``00-Creek-Meta/`` file, or pretend to.

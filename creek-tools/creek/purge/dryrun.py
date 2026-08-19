@@ -80,16 +80,28 @@ def _key_for(path: Path) -> str:
     """
     try:
         return str(path.resolve())
-    except (OSError, ValueError):
-        # The same two failures ``PurgeEngine._resolve_pointer_in_vault``
-        # already tolerates, spelled the same way: an embedded NUL raises
-        # ``ValueError`` and a resolution loop or unreadable component
-        # raises ``OSError``. Frontmatter pointers are operator-authored
-        # text, so both are real inputs — and neither may abort the
-        # preview of an erasure. Falling back to the literal spelling is
-        # the safe direction: writer and reader fall back identically, so
-        # such a path still matches itself, and the worst case is a
-        # preview that over-counts rather than one that does not happen.
+    except (OSError, RuntimeError, ValueError):
+        # The failures ``PurgeEngine._resolve_pointer_in_vault`` already
+        # tolerates: an embedded NUL raises ``ValueError`` and an
+        # unreadable component raises ``OSError``. Frontmatter pointers
+        # are operator-authored text, so both are real inputs — and
+        # neither may abort the preview of an erasure.
+        #
+        # ``RuntimeError`` is the symlink **loop** (#1484). This clause
+        # always meant to cover one — it is the textbook unresolvable
+        # path — but ``Path.resolve()`` does not report it as an
+        # ``OSError``: ``pathlib`` catches the underlying ``ELOOP`` and
+        # re-raises ``RuntimeError("Symlink loop from …")``, which sailed
+        # straight through a tuple naming only the other two. So a dry
+        # run over a vault holding ``00-Creek-Meta/a -> b -> a`` crashed
+        # where the apply run succeeded: the operator could not preview
+        # the erasure they were about to perform, on the one path where
+        # previewing it matters most.
+        #
+        # Falling back to the literal spelling is the safe direction:
+        # writer and reader fall back identically, so such a path still
+        # matches itself, and the worst case is a preview that
+        # over-counts rather than one that does not happen.
         return str(path)
 
 
