@@ -101,12 +101,18 @@ def test_a_failed_unlink_does_not_count_a_staged_file_as_erased(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A scoped purge counts a staged source file only once it is really gone.
+    """A refused unlink leaves the staged file on disk, body intact.
 
-    The #1481 defect in one assertion: with the increment ahead of the
-    ``unlink``, the ``OSError`` propagated out of a result that already
-    read ``journal_staged_removed == 1`` — an audit line certifying the
-    destruction of a file whose full plaintext body was still on disk.
+    This pins the *precondition* for #1481, not the defect itself: that the
+    file really does survive the refused unlink, so the count asserted by
+    :func:`test_a_failed_unlink_leaves_the_audit_count_at_zero` is being
+    compared against a file that is still there holding its plaintext body.
+
+    Deliberately NOT claiming to be "#1481 in one assertion" — the monkeypatch
+    guarantees the unlink fails, so ``staged.is_file()`` would hold whether the
+    counter were fixed or not. The counter is pinned in the sibling test, and
+    against the audit record rather than the in-memory result, because the
+    record is what a compliance auditor reads back.
     """
     vault = _make_vault(tmp_path)
     staged = _stage_journal_entry(vault)
@@ -507,3 +513,57 @@ def test_a_dry_run_prunes_no_directory_and_moves_no_count(tmp_path: Path) -> Non
     assert channel.is_dir(), "a dry run removes no directory"
     assert preview.meta_artifacts_removed == applied.meta_artifacts_removed
     assert preview.fragments_affected == applied.fragments_affected
+
+
+def test_a_cache_that_vanishes_before_the_unlink_does_not_veto(
+    tmp_path: Path,
+) -> None:
+    """#1480 must hold in the exact race its own comment advertises.
+
+    The read_metadata handler tolerates a file that disappeared between the
+    ``exists()`` check and the parse. A bare ``unlink()`` then raised
+    ``FileNotFoundError`` — an ``OSError`` — straight back out of
+    ``purge_vault``, reinstating the veto the fix exists to remove. Caught by
+    adversarial review of the first cut of this very PR.
+    """
+    import pathlib as _pathlib
+
+    from creek.link.embeddings import delete_embeddings_cache
+
+    missing = tmp_path / "embeddings.parquet"
+    missing.write_bytes(b"not parquet")
+
+    real_exists = _pathlib.Path.exists
+
+    def vanish_after_check(self: Path, *a: object, **k: object) -> bool:
+        """Report the cache present, then remove it — the real race."""
+        present = real_exists(self, *a, **k)  # type: ignore[arg-type]  # Issue #1480: Path.exists is untyped for *args
+        if self == missing and present:
+            missing.unlink()
+        return present
+
+    import pytest as _pytest
+
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setattr("pathlib.Path.exists", vanish_after_check)
+        # Must not raise: this is the whole contract of #1480.
+        assert delete_embeddings_cache(missing) == 0
+
+
+def test_a_directory_standing_at_the_cache_path_does_not_veto(
+    tmp_path: Path,
+) -> None:
+    """A directory at ``embeddings.parquet`` is a shortfall, not a veto.
+
+    ``unlink()`` on a directory raises ``IsADirectoryError`` — also an
+    ``OSError``, also straight out of ``purge_vault``. The erasure must
+    continue and say loudly that this artifact was left behind, rather than
+    aborting the whole right-to-be-forgotten run.
+    """
+    from creek.link.embeddings import delete_embeddings_cache
+
+    as_dir = tmp_path / "embeddings.parquet"
+    as_dir.mkdir()
+
+    assert delete_embeddings_cache(as_dir) == 0
+    assert as_dir.is_dir(), "the shortfall is reported, not silently 'handled'"

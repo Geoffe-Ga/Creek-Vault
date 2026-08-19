@@ -274,7 +274,30 @@ def delete_embeddings_cache(cache_path: Path, *, dry_run: bool = False) -> int:
         )
         row_count = 0
     if not dry_run:
-        cache_path.unlink()
+        try:
+            cache_path.unlink(missing_ok=True)
+        except OSError as exc:
+            # The whole point of #1480 is that a bad embeddings cache must not
+            # veto an erasure — and a bare unlink() reinstated exactly that.
+            # The handler above deliberately tolerates a file that vanished or
+            # turned unreadable between exists() and the parse; unlink() would
+            # then raise FileNotFoundError straight back out of purge_vault.
+            # A directory standing at this path raises IsADirectoryError the
+            # same way. Both are OSError, both are the veto again.
+            #
+            # missing_ok=True covers the vanished case outright. Anything else
+            # is a real erasure SHORTFALL, so it is loud rather than silent:
+            # the cache may still hold vectors derived from purged content.
+            # Type only, never the message — a parquet error can quote a column
+            # name derived from vault content.
+            logger.warning(
+                "Embeddings cache %s could NOT be deleted (%s): this erasure "
+                "is PARTIAL and the cache may still hold vectors derived from "
+                "the purged content. Remove it by hand.",
+                cache_path,
+                type(exc).__name__,
+            )
+            return 0
         logger.info(
             "Deleted embeddings cache %s (%d row(s) removed)",
             cache_path,
