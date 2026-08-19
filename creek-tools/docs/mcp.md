@@ -702,8 +702,14 @@ With both flags set, the server serves the Starlette app directly under
 `uvicorn` with `ssl_certfile`/`ssl_keyfile` — no reverse proxy is required, and
 with `access_log=False` so uvicorn's own request logger, which is on by default
 and writes the client address of every request, is suppressed here exactly as it
-is on `creek-tools-api` (#1125). The two adapters share one logging posture
-rather than drifting apart.
+is on `creek-tools-api` (#1125).
+
+That applies to **this TLS path only**. The loopback path below goes through the
+MCP SDK's own uvicorn bootstrap (`server.run(transport="streamable-http")`),
+which this repo does not configure, so uvicorn's access log is still on by
+default there. The two adapters therefore share one logging posture when TLS is
+terminated here, and not when it is terminated in a reverse proxy — worth
+knowing if you are relying on the absence of client addresses in the logs.
 Alternatively, keep the server bound to `127.0.0.1` (or `localhost`) and
 terminate TLS in a reverse proxy in front of it; either path keeps bearer
 tokens off the wire in cleartext. A non-loopback bind without TLS exits

@@ -32,9 +32,15 @@ same answer an unrouted path already gets.
 :func:`_outermost_fault` is registered against ``Exception`` so Starlette's
 ``ServerErrorMiddleware`` — which is installed unconditionally, above every
 Creek layer — renders the contract envelope instead of its default
-``text/plain`` page. It is reachable only from the one line above
-:class:`~creek_mcp.httpapi.middleware.boundary.ErrorBoundaryMiddleware`; every
-other fault is enveloped one layer down and never gets here.
+``text/plain`` page. It is reachable only from
+:class:`~creek_mcp.httpapi.middleware.access_log.AccessLogMiddleware`, the one
+layer above
+:class:`~creek_mcp.httpapi.middleware.boundary.ErrorBoundaryMiddleware` — from
+either of its two raising lines: ``bind_context(scope)`` before the call, and
+``_record(...)`` in its ``finally`` afterwards. The second is the path that can
+arrive with a context already bound and a response already started, which is
+why :func:`_outermost_fault` handles that case rather than assuming a fresh
+context. Every other fault is enveloped one layer down and never gets here.
 
 **A method miss renders as a routing miss.** ``405`` is not in the contract's
 published status set ``{200, 401, 403, 404, 409, 422, 500, 501, 503}``, and a

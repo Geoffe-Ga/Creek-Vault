@@ -581,17 +581,32 @@ def test_the_document_requires_that_scheme_globally() -> None:
     assert build_openapi()["security"] == [{SECURITY_SCHEME_NAME: []}]
 
 
-def test_no_operation_opts_out_of_the_bearer_requirement() -> None:
-    """No route may publish itself as anonymous, because none of them is.
+def test_no_operation_publishes_its_own_security_override() -> None:
+    """No operation carries an operation-level ``security`` key at all.
 
     An operation-level ``security: []`` is how OpenAPI spells "this one is
     open". ``GET /v1/health`` is the route somebody would eventually be tempted
     to spell that way, and it is still behind the gate — a probe with no bearer
     is a ``401``, which the suite pins elsewhere.
+
+    Asserted as *absence of the key*, not as ``get(..., default) != []``. The
+    earlier form could not fail: with no operation publishing ``security``, the
+    default was returned every time and the comparison was always true — a
+    forward guard wearing the clothes of evidence. Absence is falsifiable: any
+    override, permissive or not, fails here and forces the decision to be made
+    deliberately rather than inherited.
     """
-    assert all(
-        operation.get("security", [{SECURITY_SCHEME_NAME: []}]) != []
-        for _path, _method, operation in _operations()
+    ops = list(_operations())
+    assert ops, "no operations found — the walk missed the document"
+
+    overrides = [
+        f"{method.upper()} {path}"
+        for path, method, operation in ops
+        if "security" in operation
+    ]
+    assert overrides == [], (
+        "these operations override the document-level bearer requirement; "
+        f"decide each one deliberately: {overrides}"
     )
 
 
