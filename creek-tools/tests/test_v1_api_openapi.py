@@ -71,6 +71,7 @@ from tests.v1_api_support import (
     HEALTH_PATH,
     JOURNAL_TEMPLATE,
     REFLECTIONS_PATH,
+    UPLOAD_PATH,
     WHEEL_PATH,
     build_app,
     mounted_method_paths,
@@ -395,12 +396,13 @@ def test_documented_paths_equal_the_mounted_routes(vault: Path) -> None:
 
 
 def test_every_published_route_is_documented() -> None:
-    """All five paths appear, named explicitly so a silent drop is visible."""
+    """All six paths appear, named explicitly so a silent drop is visible."""
     assert set(_paths()) == {
         CAPABILITIES_PATH,
         JOURNAL_TEMPLATE,
         REFLECTIONS_PATH,
         WHEEL_PATH,
+        UPLOAD_PATH,
         HEALTH_PATH,
     }
 

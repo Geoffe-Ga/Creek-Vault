@@ -2,7 +2,7 @@
 
 :func:`build_bundle` renders the whole of ``docs/contracts/adepthood-v1/`` from
 the code in :mod:`creek_mcp.api.models`: one JSON Schema per published model, a
-4x7 matrix of worked example responses, the retry table, and a manifest that
+5x7 matrix of worked example responses, the retry table, and a manifest that
 hashes every one of them. :func:`write_bundle` materialises it.
 
 **Why generate it instead of hand-writing it.** A hand-written fixture bundle
@@ -30,7 +30,7 @@ its whole error-handling surface against fixtures:
 - ``refusal`` — an :class:`~creek_mcp.api.models.ErrorEnvelope` carrying
   ``privacy_refused``. **These are the intimate examples, and every one of them
   is a refusal rather than a success** — that is the point of publishing them.
-- ``care-escalation`` — ``reflections`` only; the other three cells are
+- ``care-escalation`` — ``reflections`` only; the other four cells are
   :class:`~creek_mcp.api.models.NotApplicableExample`, because the
   acute-distress guard runs only inside ``reflect_tool``.
 - ``malformed-input`` / ``incompatible-version`` / ``unavailable-service`` —
@@ -164,8 +164,9 @@ UNREACHABLE_CELLS: Final[frozenset[tuple[str, str]]] = frozenset(
 Derived from the axes rather than listed, so it cannot fall out of step with
 the matrix it describes. The acute-distress guard runs only inside
 :func:`creek_mcp.tools.reflect.reflect_tool`, so ``capabilities``,
-``journal-upsert`` and ``wheel`` can never escalate. Those three cells are
-filled with a :class:`~creek_mcp.api.models.NotApplicableExample` that says so.
+``journal-upsert``, ``wheel`` and ``upload`` can never escalate. Those four
+cells are filled with a :class:`~creek_mcp.api.models.NotApplicableExample`
+that says so.
 """
 
 _ERROR_STATE_CODES: Final[dict[str, ErrorCode]] = {
@@ -198,7 +199,7 @@ _CAPABILITIES_SUCCESS: Final[dict[str, Any]] = {
     "tier_model": _TIER_MODEL_PAYLOAD,
     "capabilities": list(CAPABILITIES),
 }
-"""A ready server: vault present, all four capabilities served."""
+"""A ready server: vault present, all five capabilities served."""
 
 _CAPABILITIES_EMPTY: Final[dict[str, Any]] = {
     **_CAPABILITIES_SUCCESS,
@@ -243,6 +244,50 @@ _JOURNAL_EMPTY: Final[dict[str, Any]] = {
     "action": JournalAction.UNCHANGED.value,
 }
 """A re-sync that changed nothing: a success, not an error."""
+
+_EXAMPLE_UPLOAD_EXTERNAL_ID: Final[str] = "adepthood:doc:2026-08-18T09:30:00Z"
+"""A synthetic consumer-side document id, in the shape Adepthood mints."""
+
+_EXAMPLE_UPLOAD_FRAGMENT_ID: Final[str] = "frag-8c41d0be59a7"
+"""A second synthetic fragment id, opaque for the same reason as the first."""
+
+_UPLOAD_SOURCE_TYPE: Final[str] = "document"
+"""The ingestor a ``.pdf`` / ``.docx`` upload dispatches to.
+
+A :data:`creek.ingest.INGESTOR_REGISTRY` key, spelled here as the literal it is
+on the wire: the fixture documents the *response*, and a consumer reading this
+cell needs to know the field carries a short registry name rather than a MIME
+type or a filename.
+"""
+
+_UPLOAD_SUCCESS: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "tier_ceiling": WireTierCeiling.PERSONAL.value,
+    "external_id": _EXAMPLE_UPLOAD_EXTERNAL_ID,
+    "fragment_id": _EXAMPLE_UPLOAD_FRAGMENT_ID,
+    "affected_fragment_ids": [_EXAMPLE_UPLOAD_FRAGMENT_ID],
+    "action": JournalAction.CREATED.value,
+    "source_type": _UPLOAD_SOURCE_TYPE,
+}
+"""A first upload.
+
+The fixture is the *response*, so no document bytes are published — and no
+``tier`` either, because :class:`~creek_mcp.api.models.UploadResponse` has none:
+a document's own frontmatter can escalate the fragment above the declared tier,
+so any tier field here would be either a false claim or an oracle.
+"""
+
+_UPLOAD_EMPTY: Final[dict[str, Any]] = {
+    **_UPLOAD_SUCCESS,
+    "action": JournalAction.UNCHANGED.value,
+}
+"""A re-send of identical bytes under the same id: a success, not an error.
+
+This is the cell that documents idempotency. The ledger recognised the content,
+nothing was written, and the *same* ``fragment_id`` comes back — which is why
+the payload is spread from the success cell rather than written out with a new
+id.
+"""
 
 _EXAMPLE_NOTE: Final[dict[str, Any]] = {
     "quote": "I keep saying yes to things I do not want",
@@ -347,7 +392,7 @@ _WHEEL_EMPTY: Final[dict[str, Any]] = {
 
 
 # --------------------------------------------------------------------------
-# The 4 x 7 matrix
+# The 5 x 7 matrix
 # --------------------------------------------------------------------------
 
 _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
@@ -366,6 +411,10 @@ _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
     Capability.WHEEL.value: _Example(
         model="WheelResponse",
         payload=_WHEEL_SUCCESS,
+    ),
+    Capability.UPLOAD.value: _Example(
+        model="UploadResponse",
+        payload=_UPLOAD_SUCCESS,
     ),
 }
 """The ``success`` column: one canonical happy response per capability."""
@@ -386,6 +435,10 @@ _EMPTY_EXAMPLES: Final[dict[str, _Example]] = {
     Capability.WHEEL.value: _Example(
         model="WheelResponse",
         payload=_WHEEL_EMPTY,
+    ),
+    Capability.UPLOAD.value: _Example(
+        model="UploadResponse",
+        payload=_UPLOAD_EMPTY,
     ),
 }
 """The ``empty`` column. Every cell is a success envelope, not an error."""

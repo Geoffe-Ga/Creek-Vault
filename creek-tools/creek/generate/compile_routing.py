@@ -27,12 +27,16 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path  # runtime use in dataclass / type hints
+from typing import TYPE_CHECKING, Final
 
 import frontmatter
-import yaml
 from pydantic import ValidationError
 
 from creek.models import CompiledPage
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +112,106 @@ def empty_index(*, bypassed: bool = False) -> CompiledPageIndex:
     return CompiledPageIndex(bypassed=bypassed)
 
 
+@dataclass(frozen=True)
+class CompiledSources:
+    """What a prompt's compiled thread/eddy sections were synthesised from.
+
+    Attributes:
+        fragment_ids: Every fragment id the named pages' provenance records,
+            de-duplicated, in page-then-entry order.
+        opaque: ``True`` when at least one named thread or eddy contributes
+            prompt text whose sources cannot be enumerated. **Opaque is not
+            empty**: the caller must fail closed on it rather than reduce over
+            the ids it did manage to collect.
+    """
+
+    fragment_ids: tuple[str, ...]
+    opaque: bool
+
+
+NO_COMPILED_SOURCES: Final[CompiledSources] = CompiledSources(
+    fragment_ids=(),
+    opaque=False,
+)
+"""The survey of a prompt that renders no compiled section at all.
+
+Distinct from an opaque survey, and the distinction is the whole point: a
+prompt naming no thread and no eddy carries no unaccountable compiled text, so
+it must not be pushed onto the local model for no privacy gain.
+"""
+
+
+def compiled_source_ids(
+    index: CompiledPageIndex,
+    *,
+    thread_ids: Iterable[str],
+    eddy_ids: Iterable[str],
+) -> CompiledSources:
+    """Return the fragment ids behind a prompt's compiled sections (#1013, #1538).
+
+    The ``## Threads`` and ``## Eddies`` blocks of a draft prompt render
+    compiled-page *bodies*, and neither :class:`~creek.models.Thread` nor
+    :class:`~creek.models.Eddy` carries a ``privacy_tier`` — so those sections
+    cannot be tier-*filtered*, only tier-*accounted*. What they do carry is
+    :attr:`~creek.models.CompiledPage.provenance`, the fragment ids each claim
+    was synthesised from, which is exactly the evidence a source-tier survey
+    needs in order to see them.
+
+    This is the **one** survey behind both draft surfaces:
+    :meth:`creek.generate.drafts.DraftGenerator._bind_routing_tier` (the
+    ``creek draft`` CLI) and :func:`creek_mcp.tools.draft._compiled_source_ids`
+    (the MCP tool). It lives here rather than beside
+    :func:`creek.classify.privacy_filter.source_tiers` — where the rest of the
+    tier survey lives — for one mechanical reason: ``privacy_filter`` is
+    imported by :mod:`creek.generate.drafts`, which
+    :mod:`creek.generate`'s package ``__init__`` imports, so a module-level
+    import of the compiled layer *from* ``privacy_filter`` would close an
+    import cycle. This module is already the single read-side surface for the
+    compiled layer and already owns
+    :meth:`CompiledPageIndex.fragment_ids_for`, so the survey belongs here and
+    the tier reduction stays in ``privacy_filter``.
+
+    **A page that cannot be enumerated is opaque, not empty.** A missing page
+    and a page recording no provenance are reported identically, and callers
+    must fail closed to :attr:`~creek.models.PrivacyTier.INTIMATE` on either.
+    Reading "no provenance" as "no sources" would reopen the laundering hole
+    for every page compiled before provenance was recorded. Equally, a caller
+    must not skip an unresolvable id and reduce over the rest, which would
+    clear a prompt on the strength of its safe half.
+
+    A *bypassed* index (``creek draft --bypass-compiled``) reports every lookup
+    as a miss, so every named thread or eddy comes back opaque. That is the
+    correct answer rather than an accident: bypass makes the prompt render the
+    thread's or eddy's frontmatter *description* instead, text with no
+    provenance record anywhere.
+
+    Args:
+        index: The compiled-page index the prompt was (or will be) rendered
+            from — the same one, so the survey and the render cannot disagree
+            about which pages exist.
+        thread_ids: Thread ids the seed names.
+        eddy_ids: Eddy ids the seed names.
+
+    Returns:
+        A :class:`CompiledSources` carrying the de-duplicated provenance ids
+        and the ``opaque`` flag.
+    """
+    ids: list[str] = []
+    opaque = False
+    for lookup, target_ids in (
+        (index.thread, thread_ids),
+        (index.eddy, eddy_ids),
+    ):
+        for target_id in target_ids:
+            page = lookup(target_id)
+            page_ids = index.fragment_ids_for(page) if page is not None else ()
+            if not page_ids:
+                opaque = True
+                continue
+            ids.extend(page_ids)
+    return CompiledSources(fragment_ids=tuple(dict.fromkeys(ids)), opaque=opaque)
+
+
 def load_compiled_pages(vault_path: Path) -> CompiledPageIndex:
     """Scan *vault_path* and return every compiled-layer page.
 
@@ -138,7 +242,7 @@ def _load_pages(root: Path, target_kind: str) -> dict[str, CompiledPage]:
     for md_file in sorted(root.rglob("*.md")):
         try:
             post = frontmatter.load(str(md_file))
-        except (OSError, ValueError, yaml.YAMLError):
+        except FRONTMATTER_LOAD_ERRORS:
             logger.debug("Skipping unreadable compiled page: %s", md_file)
             continue
         metadata = post.metadata.copy()

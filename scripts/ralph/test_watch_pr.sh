@@ -393,6 +393,52 @@ else
   bad "pr-ready.sh hardcodes a CI job name: $hits"
 fi
 
+# --- long holds are polled materially less often (#1197) -------------------
+# `review-quota-exhausted` (#1160) held a lane for SEVEN DAYS on PR #1158, and
+# `main-not-green` (#1159) for ~20 minutes. Nothing the orchestrator does
+# shortens either. Each pr-ready.sh poll costs ~8-10 gh calls, so one held lane
+# at 30s is ~1,000 calls/hour against a 5,000/hour REST budget — burning the
+# API budget hardest exactly when nothing can merge.
+#
+# The back-off is a MULTIPLIER of the caller's interval, not an absolute floor
+# in seconds: this suite drives the watcher at fractional intervals to stay
+# fast, and a "back off to 5 minutes" floor would hang every case below.
+#
+# Asserted by stubbing `sleep` and reading the interval the watcher actually
+# CHOSE, rather than by counting polls in wall-clock. Poll counts are dominated
+# by subprocess overhead (~0.2s per iteration against a 0.05s interval), which
+# makes a count-ratio assertion flaky in exactly the direction that hides a
+# regression. The chosen interval is the thing under test; measure that.
+cat > "$BIN/sleep" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$STATE_DIR/sleeps"
+exec /bin/sleep 0.01
+STUB
+chmod +x "$BIN/sleep"
+
+slept() { sort -u "$STATE/case-$1/sleeps" 2>/dev/null | tr '\n' ' ' | sed 's/ $//'; }
+
+TOKENS="pending" run_watch 130 0.5 1 >/dev/null
+TOKENS="review-quota-exhausted" run_watch 131 0.5 1 >/dev/null
+TOKENS="main-not-green" run_watch 132 0.5 1 >/dev/null
+TOKENS="awaiting-review" run_watch 134 0.5 1 >/dev/null
+
+# Positive control: without it, a watcher that never slept at all would make
+# every "backed off" assertion below vacuously true.
+check "a CI-speed wait sleeps exactly the interval it was given" "0.5" "$(slept 130)"
+check "awaiting-review is a CI-speed wait too" "0.5" "$(slept 134)"
+
+check "review-quota-exhausted sleeps 10x the interval" "5" "$(slept 131)"
+check "main-not-green sleeps 10x the interval" "5" "$(slept 132)"
+
+rm -f "$BIN/sleep"
+
+# The back-off must change only HOW OFTEN the question is asked, never which
+# token wakes the orchestrator (the issue's second acceptance criterion).
+out="$(TOKENS="review-quota-exhausted,ready" run_watch 133 0.05 30)"
+check "a backed-off lane still wakes on the next actionable token" \
+  "WATCH 133 ready" "$out"
+
 # --- summary ---------------------------------------------------------------
 echo
 echo "watch-pr tests: $PASS passed, $FAIL failed"

@@ -24,8 +24,10 @@ its source fragments *here*, several layers below the CLI, so a client
 built up there could only ever be tier-less — and a tier-less client is a
 :meth:`creek.classify.llm.router.ModelRouter.resolve` with the
 ``Intimate``-never-cloud gate (#647) switched off. The generator surveys
-the tiers of the fragments each prompt renders and calls the factory with
-their maximum; see :meth:`DraftGenerator._bind_routing_tier`.
+the tiers of the fragments each prompt renders — the ids the seed names
+*and*, since #1538, the provenance behind the compiled thread/eddy pages
+whose bodies the prompt carries — and calls the factory with their
+maximum; see :meth:`DraftGenerator._bind_routing_tier`.
 """
 
 from __future__ import annotations
@@ -57,7 +59,10 @@ from creek.generate.ai_style.guard import (
 )
 from creek.generate.cohesion import run_cohesion_pass
 from creek.generate.compile_routing import (
+    NO_COMPILED_SOURCES,
     CompiledPageIndex,
+    CompiledSources,
+    compiled_source_ids,
     empty_index,
     load_compiled_pages,
     log_compile_gap,
@@ -701,6 +706,71 @@ def _load_eddies_by_id(root: Path) -> dict[str, Eddy]:
             continue
         collected[eddy.id] = eddy
     return collected
+
+
+def _rendered_source_tiers(
+    named: Sequence[str],
+    admitted: Mapping[str, tuple[Fragment, str]],
+    resolved: Mapping[str, PrivacyTier],
+) -> list[PrivacyTier]:
+    """Return the tiers the *named* source fragments contribute to a prompt.
+
+    Split out of :meth:`DraftGenerator._bind_routing_tier` so the named-source
+    rule and the compiled-section rule (:func:`_compiled_section_tiers`) each
+    read as one thing; the two differ on whether *admitted* applies, and that
+    difference is easiest to keep straight when neither is nested inside the
+    other. The three-case reasoning lives on ``_bind_routing_tier``.
+
+    Args:
+        named: The de-duplicated ids this prompt names as sources.
+        admitted: The tier-filtered fragment map the prompt was composed from.
+        resolved: ``{id: tier}`` from the shared vault survey.
+
+    Returns:
+        One tier per named id whose text actually reaches the prompt, plus
+        ``INTIMATE`` for each named id nothing is known about. An id the filter
+        removed contributes nothing.
+    """
+    tiers: list[PrivacyTier] = []
+    for source_id in named:
+        tier = resolved.get(source_id)
+        if tier is None:
+            # Named but unresolved: no evidence, so the worst case. Also
+            # covers an id the *admitted* map somehow holds and the survey
+            # does not — fail closed on any disagreement.
+            tiers.append(PrivacyTier.INTIMATE)
+        elif source_id in admitted:
+            tiers.append(tier)
+    return tiers
+
+
+def _compiled_section_tiers(
+    compiled: CompiledSources,
+    resolved: Mapping[str, PrivacyTier],
+) -> list[PrivacyTier]:
+    """Return the tiers this prompt's compiled thread/eddy sections contribute.
+
+    Unlike :func:`_rendered_source_tiers` this consults no ``admitted`` map:
+    the privacy filter governs the ``## Source fragments`` block only, and a
+    compiled page renders whatever it was synthesised from no matter what the
+    filter did to the underlying fragments (#1538).
+
+    Args:
+        compiled: The survey from
+            :func:`~creek.generate.compile_routing.compiled_source_ids`.
+        resolved: ``{id: tier}`` from the shared vault survey.
+
+    Returns:
+        One tier per provenance id — ``INTIMATE`` for any that no longer
+        resolves — plus a single ``INTIMATE`` when the survey was opaque.
+    """
+    tiers = [
+        resolved.get(fragment_id, PrivacyTier.INTIMATE)
+        for fragment_id in compiled.fragment_ids
+    ]
+    if compiled.opaque:
+        tiers.append(PrivacyTier.INTIMATE)
+    return tiers
 
 
 def _fragment_matches_dimensions(
@@ -1422,7 +1492,16 @@ class DraftGenerator:
         # sources are known (#1031). The cohesion and voice-guard hops below
         # inherit this tier — their inputs are distilled from the same
         # fragments.
-        self._bind_routing_tier(vault_path, idea.source_fragments, fragments)
+        self._bind_routing_tier(
+            vault_path,
+            idea.source_fragments,
+            fragments,
+            compiled=compiled_source_ids(
+                compiled_pages,
+                thread_ids=idea.threads,
+                eddy_ids=idea.eddies,
+            ),
+        )
         body, truncated = self._invoke_draft_llm(
             prompt,
             empty_message="LLM returned an empty draft body",
@@ -1494,8 +1573,10 @@ class DraftGenerator:
         vault_path: Path,
         source_ids: Sequence[str],
         admitted: Mapping[str, tuple[Fragment, str]],
+        *,
+        compiled: CompiledSources,
     ) -> PrivacyTier:
-        """Key subsequent LLM calls to the tier *source_ids* carry (#1031).
+        """Key subsequent LLM calls to the tier this prompt carries (#1031, #1538).
 
         The draft twin of ``creek.compile.engine._routing_tier_for``, and it
         lives here for the same reason: the fragments a draft prompt renders
@@ -1548,13 +1629,31 @@ class DraftGenerator:
         prompt every one of whose named sources the filter removed, which
         renders exactly as much vault content: none.
 
-        **Known gap, tracked separately.** The ``## Threads`` / ``## Eddies``
-        blocks render *compiled-page* bodies, whose own sources are not
-        surveyed here; the MCP twin closed that channel in #1013 via
-        :func:`creek_mcp.tools.draft._compiled_source_ids`, and the CLI twin
-        of that fix is issue #1538 rather than a widening of this one — the
-        two surveys want to become one, which is a change to the shared
-        privacy module, not to this call site.
+        **The compiled sections are accounted, not filtered** (#1538). The
+        ``## Threads`` / ``## Eddies`` blocks render *compiled-page bodies* —
+        text synthesised from fragments the seed never names — and neither
+        :class:`~creek.models.Thread` nor :class:`~creek.models.Eddy` carries a
+        ``privacy_tier`` to filter on. Until this issue that let an ``open``
+        source fragment plus a thread whose page distilled ``intimate``
+        fragments route the whole prompt to a cloud stage: the #931 laundering
+        shape again. *compiled* is
+        :func:`~creek.generate.compile_routing.compiled_source_ids`'s answer —
+        the same survey ``creek_mcp.tools.draft`` reduces over, so the two
+        surfaces cannot drift — and its ids are folded in here on terms that
+        differ from a named source's in exactly one way, deliberately:
+
+        * They are **not** gated on *admitted*. The privacy filter governs the
+          ``## Source fragments`` block; it has no reach into a compiled body,
+          which renders whatever it was synthesised from regardless. Gating
+          them would drop precisely the ids this fix exists to count.
+        * An id that does not resolve contributes ``INTIMATE``, for the same
+          "no evidence, assume the worst" reason a named-but-absent source
+          does.
+        * ``compiled.opaque`` — a named thread or eddy whose sources cannot be
+          enumerated at all, because the page is missing or records no
+          provenance — contributes ``INTIMATE`` on its own. Opaque is *not*
+          empty; reading "no provenance" as "no sources" would reopen this
+          hole for every page compiled before provenance existed.
 
         Cost: one vault survey per composition, and the outline path composes
         once per section. It is skipped entirely for a pre-built ``llm``,
@@ -1567,6 +1666,12 @@ class DraftGenerator:
                 from — membership, not tier, is what is read from it, so a
                 fragment whose frontmatter omits ``privacy_tier`` still
                 fails closed through the raw-frontmatter survey.
+            compiled: The compiled-section survey for this prompt. Required
+                rather than defaulted: a call site that renders compiled
+                sections and forgets to say so is the exact defect #1538 fixed,
+                and a default would let the next one land silently. Pass
+                :data:`~creek.generate.compile_routing.NO_COMPILED_SOURCES`
+                when the prompt genuinely renders no compiled section.
 
         Returns:
             The tier now bound — also stored for the calls that follow.
@@ -1574,17 +1679,10 @@ class DraftGenerator:
         if not self._tier_keyed:
             return self._routing_tier
         named = list(dict.fromkeys(source_ids))
-        resolved = resolved_source_tiers(vault_path, named) if named else {}
-        rendered: list[PrivacyTier] = []
-        for source_id in named:
-            tier = resolved.get(source_id)
-            if tier is None:
-                # Named but unresolved: no evidence, so the worst case. Also
-                # covers an id the *admitted* map somehow holds and the
-                # survey does not — fail closed on any disagreement.
-                rendered.append(PrivacyTier.INTIMATE)
-            elif source_id in admitted:
-                rendered.append(tier)
+        requested = [*named, *compiled.fragment_ids]
+        resolved = resolved_source_tiers(vault_path, requested) if requested else {}
+        rendered = _rendered_source_tiers(named, admitted, resolved)
+        rendered.extend(_compiled_section_tiers(compiled, resolved))
         self._routing_tier = max_source_tier(rendered) if rendered else PrivacyTier.OPEN
         return self._routing_tier
 
@@ -1964,11 +2062,18 @@ class DraftGenerator:
             twist_active=bool(twist_payload.dimensions),
         )
         # The per-dimension blocks render fragments the seed itself never
-        # named, so the survey spans both sets (#1031).
+        # named, so the survey spans both sets (#1031) — and the compiled
+        # thread/eddy blocks render text distilled from fragments nothing here
+        # names at all, which the compiled survey accounts for (#1538).
         self._bind_routing_tier(
             vault_path,
             [*idea.source_fragments, *union_fragment_ids(slices)],
             fragments,
+            compiled=compiled_source_ids(
+                compiled_pages,
+                thread_ids=idea.threads,
+                eddy_ids=idea.eddies,
+            ),
         )
         body, truncated = self._invoke_draft_llm(
             prompt,
@@ -2143,8 +2248,15 @@ class DraftGenerator:
             idea = self.resolve_seed(spec, vault_path=vault_path, fragments=fragments)
         except SeedResolutionError:
             # A bare section renders no vault fragment at all — only the
-            # operator's own outline text and the skill files (#1031).
-            self._bind_routing_tier(vault_path, (), fragments)
+            # operator's own outline text and the skill files (#1031) — and no
+            # compiled thread or eddy block either, so there is nothing for the
+            # compiled survey to account for (#1538).
+            self._bind_routing_tier(
+                vault_path,
+                (),
+                fragments,
+                compiled=NO_COMPILED_SOURCES,
+            )
             body, truncated = self._compose_bare_section(section, current_phase)
             return SectionComposition(
                 heading=section.heading,
@@ -2274,10 +2386,15 @@ class DraftGenerator:
             confidence_threshold=spec.ontology_confidence_threshold,
         )
         per_dimension_material = _render_per_dimension_sections(slices, fragments)
+        # Resolved once and shared with the survey below, so the pages the
+        # prompt renders and the pages the routing tier accounts for are the
+        # same set by construction (#1538).
+        compiled_pages = self._resolve_compiled_pages(vault_path, None)
         source_material = self.gather_source_material(
             idea,
             vault_path=vault_path,
             fragments=fragments,
+            compiled_pages=compiled_pages,
             include_fragments=not slices,
         )
         prompt = self._compose_prompt(
@@ -2288,11 +2405,17 @@ class DraftGenerator:
             twist_directive=twist.directive,
             twist_active=bool(twist.dimensions),
         )
-        # Per section, over exactly what this section's prompt renders (#1031).
+        # Per section, over exactly what this section's prompt renders (#1031),
+        # compiled thread/eddy blocks included (#1538).
         self._bind_routing_tier(
             vault_path,
             [*idea.source_fragments, *union_fragment_ids(slices)],
             fragments,
+            compiled=compiled_source_ids(
+                compiled_pages,
+                thread_ids=idea.threads,
+                eddy_ids=idea.eddies,
+            ),
         )
         return self._invoke_section_llm(prompt)
 

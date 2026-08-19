@@ -36,6 +36,7 @@ from creek_mcp.api.models import (
     CONTRACT_MODELS,
     ERROR_MESSAGES,
     ERROR_STATUS,
+    Capability,
     ErrorCode,
 )
 from creek_mcp.api.routes import (
@@ -124,6 +125,25 @@ carry one documented response, and the transient one is the one every route can
 actually produce.
 """
 
+_CAPABILITY_ERROR_CODES: Final[dict[Capability, tuple[ErrorCode, ...]]] = {
+    Capability.UPLOAD: (ErrorCode.UNSUPPORTED_SOURCE,),
+}
+"""Refusals only one capability can produce, keyed by that capability.
+
+A table rather than an ``if spec.capability is Capability.UPLOAD`` in
+:func:`_error_codes`, because the question "which refusals does this route
+document" is data about the route, and the *next* capability-specific code
+should be one line here rather than a second branch.
+
+Only ``upload`` has an entry today.
+:attr:`~creek_mcp.api.models.ErrorCode.UNSUPPORTED_SOURCE` is emitted by
+:func:`creek_mcp.httpapi.upload.upload_refusal_code` and nowhere else, so
+documenting it on every route would advertise a ``415`` five endpoints cannot
+return — and omitting it from the one that can leaves a generated client with
+no branch for the refusal it will meet the first time somebody uploads a
+``conversations.json``.
+"""
+
 _HEALTH_RESPONSE_SCHEMA: Final[dict[str, Any]] = {
     "type": "object",
     "additionalProperties": False,
@@ -190,13 +210,16 @@ def _error_codes(spec: RouteSpec) -> tuple[ErrorCode, ...]:
 
     Returns:
         The universal refusals, plus ``409``/``403`` for the routes that
-        negotiate a contract minor and resolve vault objects, plus ``501`` for
-        the routes that are published but not yet built. Ordered by status so
-        the document is byte-stable across runs.
+        negotiate a contract minor and resolve vault objects, plus whatever
+        :data:`_CAPABILITY_ERROR_CODES` reserves for this route's capability,
+        plus ``501`` for the routes that are published but not yet built.
+        Ordered by status so the document is byte-stable across runs.
     """
     codes = list(_UNIVERSAL_ERROR_CODES)
     if spec.requires_contract_version:
         codes += [ErrorCode.INCOMPATIBLE_VERSION, ErrorCode.PRIVACY_REFUSED]
+    if spec.capability is not None:
+        codes += _CAPABILITY_ERROR_CODES.get(spec.capability, ())
     if _is_unbuilt(spec):
         codes.append(ErrorCode.UNSUPPORTED_CAPABILITY)
     return tuple(sorted(codes, key=lambda code: ERROR_STATUS[code]))

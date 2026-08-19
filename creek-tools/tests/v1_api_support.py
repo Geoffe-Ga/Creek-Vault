@@ -22,6 +22,7 @@ glob is ``test_*.py``, so it is imported, never collected.
 
 from __future__ import annotations
 
+import base64
 import re
 from typing import TYPE_CHECKING, Any, Final
 
@@ -95,7 +96,7 @@ OTHER_TOKEN: Final[str] = "unit-test-other-token-" + "b" * 20
 UNKNOWN_TOKEN: Final[str] = "unit-test-unknown-token-" + "c" * 20
 
 # --------------------------------------------------------------------------- #
-# The five published routes
+# The six published routes
 # --------------------------------------------------------------------------- #
 
 CAPABILITIES_PATH: Final[str] = "/v1/capabilities"
@@ -113,6 +114,9 @@ REFLECTIONS_PATH: Final[str] = "/v1/reflections"
 WHEEL_PATH: Final[str] = "/v1/wheel"
 """The wheel endpoint."""
 
+UPLOAD_PATH: Final[str] = "/v1/uploads"
+"""The document-upload endpoint (contract 0.8, #1524)."""
+
 HEALTH_PATH: Final[str] = "/v1/health"
 """The liveness probe."""
 
@@ -128,6 +132,9 @@ OP_REFLECTIONS: Final[str] = "createReflection"
 OP_WHEEL: Final[str] = "getWheel"
 """``operation_id`` of ``GET /v1/wheel``."""
 
+OP_UPLOAD: Final[str] = "uploadDocument"
+"""``operation_id`` of ``POST /v1/uploads``."""
+
 OP_HEALTH: Final[str] = "getHealth"
 """``operation_id`` of ``GET /v1/health``."""
 
@@ -136,6 +143,7 @@ MOUNTED: Final[tuple[tuple[str, str], ...]] = (
     ("PUT", JOURNAL_PATH),
     ("POST", REFLECTIONS_PATH),
     ("GET", WHEEL_PATH),
+    ("POST", UPLOAD_PATH),
     ("GET", HEALTH_PATH),
 )
 """Every ``(method, concrete path)`` pair a client can actually reach."""
@@ -145,6 +153,7 @@ MOUNTED_IDS: Final[tuple[str, ...]] = (
     "journal-upsert",
     "reflections",
     "wheel",
+    "upload",
     "health",
 )
 """Stable parametrize ids for :data:`MOUNTED`, in the same order."""
@@ -153,10 +162,16 @@ VERSIONED: Final[tuple[tuple[str, str], ...]] = (
     ("PUT", JOURNAL_PATH),
     ("POST", REFLECTIONS_PATH),
     ("GET", WHEEL_PATH),
+    ("POST", UPLOAD_PATH),
 )
-"""The three routes the contract-version gate applies to."""
+"""The four routes the contract-version gate applies to."""
 
-VERSIONED_IDS: Final[tuple[str, ...]] = ("journal-upsert", "reflections", "wheel")
+VERSIONED_IDS: Final[tuple[str, ...]] = (
+    "journal-upsert",
+    "reflections",
+    "wheel",
+    "upload",
+)
 """Stable parametrize ids for :data:`VERSIONED`."""
 
 STUB_METHOD: Final[str] = "POST"
@@ -211,6 +226,19 @@ VALID_REFLECTION_BODY: Final[dict[str, Any]] = {
     "max_notes": 2,
 }
 """A body that validates against ``ReflectionRequest``."""
+
+VALID_UPLOAD_BODY: Final[dict[str, Any]] = {
+    "filename": "note.md",
+    # base64 of b"a sentence the server must never echo\n", derived at import
+    # rather than pasted, so the fixture cannot drift from the plaintext the
+    # leak sweeps look for.
+    "content_base64": base64.b64encode(
+        b"a sentence the server must never echo\n"
+    ).decode("ascii"),
+    "external_id": "adepthood:doc:support",
+    "tier": "open",
+}
+"""A body that validates against ``UploadRequest``."""
 
 
 # --------------------------------------------------------------------------- #

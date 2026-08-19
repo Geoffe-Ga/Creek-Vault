@@ -34,6 +34,71 @@ from creek.models import Fragment
 
 logger = logging.getLogger(__name__)
 
+FRONTMATTER_LOAD_ERRORS: Final[tuple[type[Exception], ...]] = (
+    OSError,
+    TypeError,
+    ValueError,
+    yaml.YAMLError,
+)
+"""What a hand-edited or corrupt vault file raises out of ``frontmatter.load``.
+
+The one definition of "this file's frontmatter is unreadable", shared by every
+loader in the package. A second, drifting copy of that answer is the bug this
+constant exists to end: the tree carried three different tuples —
+``(OSError, ValueError)``, ``(OSError, ValueError, yaml.YAMLError)``, and
+:func:`creek.vault.links.read_header_meta`'s wider set — and a note that
+crashed one walk was skipped by another.
+
+Widens the house ``(OSError, ValueError, yaml.YAMLError)`` tuple with
+``TypeError``, which is load-bearing and must never be dropped:
+``frontmatter.load`` ends in ``Post(content, handler, **metadata)``, so a
+header carrying a **non-string key** — a bare YAML date (``2024-05-01:``), a
+bool (``true:``), or an int (``1:``), all three valid ``SafeLoader`` output and
+all three plausible in a hand-authored Obsidian note — raises a plain
+``TypeError: keywords must be strings`` that no other tuple in the tree caught
+(#1475, #924; precedent PR #927 / issue #847).
+
+``UnicodeDecodeError`` is a ``ValueError`` subclass and is therefore covered
+deliberately: a file whose *body* carries non-UTF-8 bytes fails at read time,
+before its (possibly byte-clean ASCII) frontmatter is ever parsed.
+
+**Wrap the load statement, nothing else.** ``TypeError`` is the most common
+symptom of a genuine programming error, so a tuple this wide around a loop body
+— or around a ``model_validate`` call — would swallow real bugs and turn them
+into silent skips.
+
+Nearly every use in this package brackets a bare
+``frontmatter.load``/``loads`` call and nothing else. The exceptions are
+enumerated exhaustively here — :func:`iter_vault_fragments` below,
+:func:`creek.classify.review_runner._read_entry`,
+:func:`creek.author.checks._scan_subtree_for_cited`, and
+:func:`creek.classify.classify_engine._load_classifiable_fragment` — and they
+bracket a single call to :func:`try_load_fragment` (or to
+``classify_engine._read_fragment``, a thin alias for it) instead, because that
+helper *is* their load. No tally of the remaining sites is written here on
+purpose: a hand-counted number goes stale the moment a site moves (#1548 will
+move several), and this paragraph carried a wrong one until #1546. Both
+claims are instead checked mechanically by
+``test_every_frontmatter_guard_brackets_exactly_one_load`` in
+``tests/test_frontmatter_nonstring_key_guard.py``, which walks this package's
+AST and fails if any guard brackets more than its load, or if a site outside
+the four named above starts bracketing the helper. The extra surface
+that buys is bounded and stated here rather than papered over: on top of the
+load, ``try_load_fragment`` runs ``post.metadata.copy()``, one ``dict.get``,
+and ``Fragment.model_validate``, whose own failure mode — ``ValidationError``,
+a ``ValueError`` subclass — is already caught *inside* the helper and logged.
+Nothing else in there can raise a member of this tuple without it being a real
+bug, and no caller may widen the bracket further.
+
+A reader that needs only the *metadata* should prefer
+:func:`creek.vault.links.read_header_meta` over catching this at all: it parses
+the header with ``yaml.safe_load`` and never splats, so the crash is
+structurally impossible rather than merely handled.
+
+Note that widening a guard converts a crash into a silent skip. #926 tracks
+surfacing those skips to the operator, and must land after this.
+"""
+
 CORPUS_SUBDIRS: Final[tuple[str, ...]] = (
     "01-Fragments",
     "09-Reference",
@@ -85,8 +150,19 @@ def try_load_fragment(
         or ``None`` when the file is well-formed YAML but not a
         fragment.
 
+    This loader deliberately does **not** catch
+    :data:`FRONTMATTER_LOAD_ERRORS` itself. It needs ``post.content``, so it
+    cannot use the splat-free :func:`creek.vault.links.read_header_meta`, and
+    each caller's tolerance for an unreadable file differs: a lint walk skips
+    it, ``creek classify`` records it on ``errors``, and the HARD leak gate in
+    :mod:`creek.author.checks` logs a warning because a fragment it cannot read
+    is a fragment it cannot police. Swallowing here would impose the lint
+    walk's policy on all three.
+
     Raises:
         OSError: When the file cannot be read.
+        TypeError: When the frontmatter carries a non-string key, which
+            ``frontmatter.load``'s ``**metadata`` splat rejects (#1475).
         ValueError: When the YAML cannot be parsed.
         yaml.YAMLError: When the YAML parser rejects the document.
     """
@@ -128,7 +204,7 @@ def iter_vault_fragments(
     for md_file in sorted(fragments_root.rglob("*.md")):
         try:
             record = try_load_fragment(md_file)
-        except (OSError, ValueError, yaml.YAMLError):
+        except FRONTMATTER_LOAD_ERRORS:
             logger.debug("Skipping unreadable markdown file: %s", md_file)
             continue
         if record is None:
