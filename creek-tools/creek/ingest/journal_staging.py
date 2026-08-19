@@ -78,10 +78,30 @@ directory would mint a fresh id for every turn on every re-upload and
 duplicate the whole export. Determinism here is what makes re-uploading the
 same archive a no-op.
 
-Residue is bounded on both sides: the extraction root is removed however the
-upload ends, and the **whole** of this root is removed before any archive is
-unpacked, so even a hard kill mid-ingest leaves nothing past the next archive
-upload.
+Residue after a hard kill (SIGKILL, OOM, power loss) between extraction and
+the ``finally`` is reached by ``purge vault``, but **not** by a scoped purge:
+
+* ``purge vault`` sweeps ``00-Creek-Meta/`` deny-by-default
+  (:func:`creek.purge.meta.sweep_unkept_meta` destroys every unkept regular
+  file, and nothing keeps ``adepthood/``), so an abandoned unpack tree is
+  destroyed there. Pinned by
+  ``test_purge_vault_destroys_abandoned_archive_residue``.
+* ``purge_fragment`` and the other scoped entries run only
+  ``_purge_scoped_tail`` and no meta sweep, so a per-person RTBF request does
+  not reach an abandoned tree. Tracked as a follow-up rather than widened here.
+
+An earlier version of this note claimed the residue was bounded because "the
+whole of this root is removed before any archive is unpacked". That was true
+and was itself the bug: clearing the shared parent destroyed a *concurrently
+running* upload's extraction tree, since ``/v1/uploads`` runs the tool in a
+threadpool. Cleanup is now scoped to this upload's own directory, which is
+correct for concurrency and is exactly why the bound above had to be restated
+in terms of what the purge actually reaches.
+
+Adding this root to :data:`ADEPTHOOD_STAGING_RELDIRS` would not close the
+scoped gap: that sweep walks each root with a non-recursive
+:meth:`~pathlib.Path.iterdir` and skips anything that is not a file, so it
+would count nothing here while implying coverage.
 """
 
 ADEPTHOOD_STAGING_RELDIRS: Final[tuple[Path, ...]] = (

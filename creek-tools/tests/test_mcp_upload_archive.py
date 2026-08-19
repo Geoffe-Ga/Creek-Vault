@@ -48,6 +48,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import shutil
 import zipfile
 from typing import TYPE_CHECKING, Any, Final
 
@@ -540,6 +541,20 @@ def test_an_unrecognised_archive_is_refused_with_a_remedy(tmp_path: Path) -> Non
 # --------------------------------------------------------------------------- #
 
 
+def test_the_tier_battery_covers_every_export_family() -> None:
+    """``_ARCHIVES`` still names all four families.
+
+    ``test_every_fragment_carries_the_declared_tier_on_disk`` is parametrized
+    solely over ``_ARCHIVES`` and is the only assertion in this suite that
+    reads ``privacy_tier`` out of written frontmatter. Emptying or shrinking
+    that dict would delete the entire on-disk tier check and still report a
+    green run — the same vacuity this PR guards against for the refused-
+    extension sweep, which would otherwise be guarded in one place and not the
+    other.
+    """
+    assert set(_ARCHIVES) == {"chatgpt", "claude", "discord", "substack"}
+
+
 @pytest.mark.parametrize("declared", ["open", "personal", "intimate"])
 @pytest.mark.parametrize("source_type", sorted(_ARCHIVES))
 def test_every_fragment_carries_the_declared_tier_on_disk(
@@ -761,3 +776,77 @@ def test_a_successful_archive_upload_is_audited_with_every_fragment_id(
     assert entries[0]["tool"] == TOOL_NAME
     assert entries[0]["affected_fragment_ids"] == result["affected_fragment_ids"]
     assert entries[0]["created_tier"] == PrivacyTier.PERSONAL.value
+
+
+def test_a_concurrent_upload_does_not_destroy_another_extraction(
+    tmp_path: Path,
+) -> None:
+    """Two overlapping archive uploads must not delete each other's tree.
+
+    ``/v1/uploads`` runs ``upload_tool`` in a threadpool, and the cleanup used
+    to clear the shared unpack ROOT rather than this upload's own directory.
+    A second upload landing mid-extraction therefore destroyed the first one's
+    tree, and the first came back either as ``UNRECOGNISED_EXPORT`` with an
+    inapplicable remedy or — when the wipe landed after discovery — as
+    ``status=ok`` with a smaller ``written`` and **no advisory**: silent
+    truncation reported as success, on the seeding path.
+
+    Asserted on the filesystem rather than through two live uploads, because a
+    thread race is not a deterministic test. The invariant is the one that
+    makes the race impossible: unpacking under one ``external_id`` leaves a
+    sibling's directory untouched.
+    """
+    vault = _vault(tmp_path)
+    unpack_root = vault / ARCHIVE_UNPACK_RELDIR
+
+    # A sibling upload's tree, mid-extraction.
+    sibling = unpack_root / "victim-id"
+    sibling.mkdir(parents=True)
+    (sibling / "conversations.json").write_text("[]", encoding="utf-8")
+
+    _upload(vault, chatgpt_archive(), external_id="attacker-id")
+
+    assert sibling.is_dir(), "a concurrent upload deleted a sibling's extraction tree"
+    assert (sibling / "conversations.json").is_file(), (
+        "a concurrent upload truncated a sibling's extraction tree"
+    )
+
+
+def test_a_directory_already_at_this_ids_unpack_path_is_adopted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``mkdir`` must tolerate the directory already existing.
+
+    The unpack directory is deterministic per ``external_id``, so two
+    overlapping uploads of the SAME id interleave as A.rmtree, B.rmtree,
+    A.mkdir, B.mkdir — and the second ``mkdir`` raised ``FileExistsError``
+    out of ``upload_tool``, landing as a 500 for a caller's own well-formed
+    archive, because it sat above the ``try``.
+
+    The interleaving itself is not deterministically reproducible, so the
+    losing side is simulated directly: the cleanup is neutered so the
+    directory is still present when ``mkdir`` runs, which is exactly the state
+    B finds itself in. Without ``exist_ok`` this raises.
+    """
+    from creek_mcp.staged_names import safe_stem
+
+    vault = _vault(tmp_path)
+    contested = vault / ARCHIVE_UNPACK_RELDIR / safe_stem("adepthood:export:1525")
+    contested.mkdir(parents=True)
+
+    import pathlib as _pathlib
+
+    real_rmtree = shutil.rmtree
+
+    def skip_contested(path: object, *a: object, **k: object) -> None:
+        """Leave the contested directory standing, as the loser's race does."""
+        if _pathlib.Path(str(path)) == contested:
+            return
+        real_rmtree(path, *a, **k)  # type: ignore[arg-type]  # Issue #1525: shutil.rmtree is untyped for *args
+
+    monkeypatch.setattr("creek_mcp.tools.upload.shutil.rmtree", skip_contested)
+
+    payload = _upload(vault, chatgpt_archive(), external_id="adepthood:export:1525")
+
+    assert payload.get("status") == "ok", payload

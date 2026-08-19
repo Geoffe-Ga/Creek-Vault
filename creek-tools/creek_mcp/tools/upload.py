@@ -998,10 +998,23 @@ def _archive_outcome(
     Returns:
         The success payload, or a structured four-key refusal.
     """
+    # Scoped to THIS upload's own directory, never the shared parent.
+    # Clearing the whole unpack root here destroyed a concurrently-running
+    # upload's extraction tree: /v1/uploads runs this in a threadpool, so two
+    # overlapping archive POSTs raced. The victim's valid export came back
+    # either as UNRECOGNISED_EXPORT with an inapplicable remedy, or — when the
+    # wipe landed after discovery — as status=ok with a smaller `written` and
+    # NO advisory. Silent truncation reported as success, on the seeding path.
+    #
+    # exist_ok because the directory is deterministic per external_id: two
+    # concurrent uploads of the SAME id previously interleaved as
+    # A.rmtree, B.rmtree, A.mkdir, B.mkdir and the second raised
+    # FileExistsError out of upload_tool, landing as a 500 for a caller's own
+    # well-formed archive.
     unpack_root = vault_path / ARCHIVE_UNPACK_RELDIR
-    shutil.rmtree(unpack_root, ignore_errors=True)
     root = unpack_root / safe_stem(external_id)
-    root.mkdir(parents=True)
+    shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
     try:
         detected = _unpacked_export(raw, root)
         if isinstance(detected, str):
@@ -1029,7 +1042,9 @@ def _archive_outcome(
             )
         action = "created" if _fragment_count(vault_path) > before else "unchanged"
     finally:
-        shutil.rmtree(unpack_root, ignore_errors=True)
+        # This upload's tree only — see the entry comment. A sibling upload
+        # may be mid-extraction under the same parent.
+        shutil.rmtree(root, ignore_errors=True)
 
     # ``written == 0`` is a refusal here for the same reason it is on the
     # single-file path: a response of ``ok`` over an empty run tells the
