@@ -1016,7 +1016,56 @@ class PurgeEngine:
             self.vault_path / META_RELDIR,
             skip=self._skip_as_removed,
             remove=self._remove_meta_artifact,
+            breaks_link=self._vault_wipe_breaks_link,
         )
+
+    def _vault_wipe_breaks_link(self, link: Path) -> bool:
+        """Report whether this vault purge destroys what *link* points at.
+
+        The meta sweep leaves a symlink to a *directory* alone, and that
+        exemption has to mean "a directory that outlives the purge" or
+        the preview and the apply run classify the same link
+        differently. ``purge_vault`` wipes the ten content folders
+        before it sweeps ``00-Creek-Meta/``, so
+        ``00-Creek-Meta/latest-thread -> 01-Fragments/Journal/`` is a
+        live directory link when a dry run meets it and a dangling one
+        when an apply run does: preview ``0``, apply ``1``. Answering
+        from the *folder list* rather than from the filesystem makes
+        both runs agree.
+
+        Only the ten content folders are consulted, and that is the
+        whole set of directory-destroying work that precedes the sweep.
+        ``_wipe_adepthood_staging`` removes staged **files**, which
+        ``is_file()`` already classifies identically on both sides, and
+        leaves its staging roots standing; ``_delete_cache_file`` runs
+        *after* the sweep. A link to a content folder itself (rather
+        than into one) is not broken either — the wipe empties those
+        folders without removing them — so the comparison excludes the
+        folder root.
+
+        ``resolve()`` is non-strict and answers for a dangling link too,
+        which matters because it is consulted on both sides. An
+        ``OSError`` (a symlink loop, an unreadable parent) answers
+        ``False``: this predicate can only ever *widen* what the sweep
+        destroys, so failing it closed would destroy a link on the
+        strength of an error rather than a fact.
+
+        Args:
+            link: A symlink under ``00-Creek-Meta/``.
+
+        Returns:
+            ``True`` when *link* resolves to something strictly inside a
+            vault content folder, which this purge is about to wipe.
+        """
+        try:
+            target = link.resolve()
+            roots = [
+                (self.vault_path / folder).resolve()
+                for folder in _VAULT_CONTENT_FOLDERS
+            ]
+        except OSError:
+            return False
+        return any(target != root and target.is_relative_to(root) for root in roots)
 
     def _remove_meta_artifact(self, path: Path) -> None:
         """Destroy one swept ``00-Creek-Meta/`` file, or pretend to.
