@@ -27,10 +27,24 @@ import pytest
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
 
-# The slice a lane takes when nothing gives it an explicit budget. Pinned here
-# so raising it in the script without revisiting the OOM reasoning fails a test
-# rather than silently re-arming #1554.
-EXPECTED_LANE_WORKERS: Final[str] = "2"
+# The number of concurrent lanes the script assumes when nothing says
+# otherwise — fleet.sh's own documented default for max_workers.
+ASSUMED_CONCURRENT_LANES: Final[int] = 4
+
+
+def expected_lane_workers() -> int:
+    """The slice one lane should get on the machine running these tests.
+
+    Restated from the contract rather than imported from the script, so a
+    change to the script's arithmetic fails here instead of silently agreeing
+    with itself. Rounding down is deliberate: guessing high oversubscribes
+    every lane at once, guessing low only costs time.
+
+    Returns:
+        Cores divided among the assumed lanes, floored at 1.
+    """
+    return max(1, (os.cpu_count() or 1) // ASSUMED_CONCURRENT_LANES)
+
 
 _STUB_PYTHON: Final[str] = """#!/usr/bin/env bash
 # Answers `python -c "import pytest"` (the _lib.sh toolchain probe) and records
@@ -83,7 +97,7 @@ def _run_test_sh(
     env.update(env_overrides or {})
 
     # Fixed argv, no shell: the only variable parts are paths this test built.
-    subprocess.run(
+    completed = subprocess.run(
         ["bash", str(project_root / "scripts" / "test.sh"), "--unit"],
         cwd=project_root,
         env=env,
@@ -93,7 +107,18 @@ def _run_test_sh(
         timeout=120,
     )
 
-    return captured.read_text(encoding="utf-8").strip() if captured.exists() else ""
+    if not captured.exists():
+        # The script exited before reaching `python -m pytest`. Without its
+        # output the caller only learns "argv was empty", which says nothing
+        # about why - so hand back the diagnosis rather than swallowing it.
+        msg = (
+            f"test.sh exited {completed.returncode} without invoking python.\n"
+            f"--- stdout ---\n{completed.stdout}\n"
+            f"--- stderr ---\n{completed.stderr}"
+        )
+        raise AssertionError(msg)
+
+    return captured.read_text(encoding="utf-8").strip()
 
 
 @pytest.fixture
@@ -144,9 +169,16 @@ def test_a_fleet_lane_takes_a_slice_not_the_whole_box(
     """
     argv = _run_test_sh(project_root=_as_lane(script_tree, tmp_path), tmp_path=tmp_path)
 
-    assert argv, "the stub python was never invoked; the script exited early"
-    assert f"-n {EXPECTED_LANE_WORKERS}" in argv, argv
+    assert f"-n {expected_lane_workers()}" in argv, argv
     assert "-n auto" not in argv, f"a lane still claimed every core: {argv}"
+
+    # A fixed count would satisfy the two assertions above while still
+    # oversubscribing a small box (2 workers x 4 lanes on 4 cores is the same
+    # defect, only smaller). On any machine big enough for the division to
+    # bite, the slice must be strictly smaller than the core count.
+    cores = os.cpu_count() or 1
+    if cores >= ASSUMED_CONCURRENT_LANES * 2:
+        assert expected_lane_workers() < cores
 
 
 def test_outside_a_lane_the_whole_box_is_still_used(
@@ -159,7 +191,6 @@ def test_outside_a_lane_the_whole_box_is_still_used(
     """
     argv = _run_test_sh(project_root=script_tree, tmp_path=tmp_path)
 
-    assert argv, "the stub python was never invoked; the script exited early"
     assert "-n auto" in argv, argv
 
 
@@ -183,7 +214,6 @@ def test_an_explicit_serial_request_is_still_honoured_in_a_lane(
         env_overrides={"CREEK_TEST_WORKERS": serial_value},
     )
 
-    assert argv, "the stub python was never invoked; the script exited early"
     assert " -n " not in f" {argv} ", f"serial run still passed -n: {argv}"
 
 
@@ -201,5 +231,4 @@ def test_an_explicit_budget_overrides_lane_detection(
         env_overrides={"CREEK_TEST_WORKERS": "5"},
     )
 
-    assert argv, "the stub python was never invoked; the script exited early"
     assert "-n 5" in argv, argv

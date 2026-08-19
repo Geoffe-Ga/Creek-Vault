@@ -8,12 +8,27 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-# Workers a single fleet lane may claim when it has not been given an explicit
-# budget. Deliberately small and fixed: the lane cannot know how many siblings
-# are running, and the failure mode of guessing high is an OOM that kills every
-# lane at once, while the cost of guessing low is a slower run. See #1554 and
-# the CREEK_TEST_WORKERS block below.
-readonly FLEET_LANE_WORKERS=2
+# How many lanes to assume are running when nothing says otherwise. This is
+# `fleet.sh`'s own documented default for `max_workers`, restated rather than
+# read, because `scripts/ralph/` is repo-root tooling and this script must keep
+# working in a checkout that has none. An explicit CREEK_TEST_WORKERS is the
+# override for a fleet configured differently.
+readonly ASSUMED_CONCURRENT_LANES=4
+
+# Workers one lane may claim when it has not been given an explicit budget:
+# the machine's cores divided among the lanes assumed to be sharing it, floored
+# at 1. Deriving it rather than hardcoding is the point — a fixed 2 still
+# oversubscribes a 4-core box 2x at four lanes, which is the same defect #1554
+# was filed to remove, only smaller. Guessing high OOMs every lane at once;
+# guessing low only costs time, so this rounds down.
+creek_lane_workers() {
+    local cores
+    cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    [[ "$cores" =~ ^[0-9]+$ ]] && (( cores > 0 )) || cores=1
+    local slice=$(( cores / ASSUMED_CONCURRENT_LANES ))
+    (( slice < 1 )) && slice=1
+    printf '%s' "$slice"
+}
 
 # shellcheck source=scripts/_lib.sh
 source "$SCRIPT_DIR/_lib.sh"
@@ -174,7 +189,7 @@ case "$TEST_TYPE" in
         WORKERS="${CREEK_TEST_WORKERS:-}"
         if [[ -z "$WORKERS" ]]; then
             if [[ "$PROJECT_ROOT" == *"/.ralph/worktrees/"* ]]; then
-                WORKERS="$FLEET_LANE_WORKERS"
+                WORKERS="$(creek_lane_workers)"
                 echo "NOTE: fleet lane detected; using -n $WORKERS instead of" \
                      "'auto' so concurrent lanes do not exhaust memory (#1554)." \
                      "Set CREEK_TEST_WORKERS to override." >&2
