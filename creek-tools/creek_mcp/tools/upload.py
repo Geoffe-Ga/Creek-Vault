@@ -43,11 +43,18 @@ Gate ordering, all of it load-bearing and asserted from outside:
 3. the encoded-length cap, then the decode, then the decoded-size cap;
 4. the #970 overwrite gate on the tier of the *resolved existing* fragment —
    audited, then refused;
-5. the unsupported-format gate — a ``.json`` conversation export or a ``.zip``
-   archive is refused *with a remedy* rather than routed to ``generic``
-   (#1526), and it sits here, above the write, so the refused bytes never
-   reach the staging directory at all;
-6. **only then** :func:`_stage_upload` writes anything.
+5. the archive fork (#1525) — a ``.zip`` leaves the single-document path
+   here for :func:`_archive_outcome`, which unpacks it under containment and
+   size bounds, identifies the export from its **contents**, and erases every
+   extracted byte before returning. It sits below all four gates above it, so
+   an archive is admitted by exactly what a document is, and above the
+   format gate below it, since that gate's only answer for a ``.zip`` was the
+   refusal this fork replaces;
+6. the unsupported-format gate — a ``.json`` conversation export, a ``.tar``
+   or a legacy ``.doc`` is refused *with a remedy* rather than routed to
+   ``generic`` (#1526), and it sits here, above the write, so the refused
+   bytes never reach the staging directory at all;
+7. **only then** :func:`_stage_upload` writes anything.
 
 Gate 2 sitting above gate 3 is the sharp edge: an ``intimate`` upload at
 ``ceiling=open`` must never decode a byte, and a refused overwrite must leave
@@ -59,6 +66,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -68,7 +76,18 @@ from creek.ingest import (
     UnsupportedSourceError,
     route_to_ingestor,
 )
-from creek.ingest.journal_staging import UPLOAD_LEDGER_SOURCE, UPLOAD_STAGING_RELDIR
+from creek.ingest.archive import (
+    UNRECOGNISED_EXPORT_REASON,
+    ArchiveRefusedError,
+    detect_export_type,
+    extract_archive,
+    is_supported_archive,
+)
+from creek.ingest.journal_staging import (
+    ARCHIVE_UNPACK_RELDIR,
+    UPLOAD_LEDGER_SOURCE,
+    UPLOAD_STAGING_RELDIR,
+)
 from creek.ingest.ledger import SourceLedger
 from creek.ingest.pipeline import derive_source_key, run_ingest
 from creek.ingest.source_unit import split_source_unit
@@ -112,6 +131,35 @@ upload was too big.
 # per-platform: a per-platform table here would duplicate and drift from
 # ``creek/vault/writer.py``'s own routing map.
 _FRAGMENT_ROUTING_DIR = Path("01-Fragments")
+
+
+ARCHIVE_NO_FRAGMENTS_REASON: Final[str] = (
+    "the archive was recognised as an export but produced no fragments"
+)
+"""Refusal for an archive Creek identified but could read no content from.
+
+The archive twin of the single-file ``produced no fragment`` backstop, and a
+*constant* rather than an f-string so the HTTP adapter can recognise it: it is
+a caller-fixable outcome (an export that was emptied, or truncated before it
+was zipped), not the server fault the single-file backstop's fall-through
+treats it as.
+"""
+
+_ARCHIVE_PARTIAL_TEMPLATE: Final[str] = (
+    "This archive's {source_type} export held {discovered} source document(s); "
+    "{failed} of them could not be read and were skipped. {written} "
+    "fragment(s) were written from the rest."
+)
+"""The partial-failure advisory, in counts and a source type and nothing else.
+
+Requirement 6 of #1525 is that a partial ingest *says so* — 900 of 1000
+conversations landing must not be reported as a plain success. It is stated in
+tallies because this string crosses a tier ceiling: the pipeline's own
+``errors`` name the file that failed to parse, and an archive member's name is
+the caller's content. So the count travels and the names do not, which is the
+same trade :attr:`creek.ingest.pipeline.IngestRunResult.ceiling_safe_warnings`
+already makes.
+"""
 
 
 def _upload_staged_path(vault_path: Path, external_id: str, filename: str) -> Path:
@@ -721,6 +769,304 @@ def _routed_source_type(
         )
 
 
+def _fragment_count(vault_path: Path) -> int:
+    """Return how many fragment files the vault currently holds.
+
+    Used only to decide an archive upload's ``action`` word. An archive runs
+    ledger-free (see :func:`_archive_outcome`), so there is no per-unit record
+    to compare against and ``write_fragment_idempotent`` reports ``created``
+    for every fragment on every run — including a re-upload that wrote nothing
+    new, because the writer's id dedup absorbed it silently. Counting the
+    corpus on both sides of the run is what makes the reported word true.
+
+    Args:
+        vault_path: Vault root.
+
+    Returns:
+        The number of ``.md`` files under ``01-Fragments``, or ``0`` when that
+        directory does not exist yet.
+    """
+    fragments = vault_path / _FRAGMENT_ROUTING_DIR
+    if not fragments.is_dir():
+        return 0
+    return sum(1 for _path in fragments.rglob("*.md"))
+
+
+def _unpacked_export(raw: bytes, root: Path) -> tuple[str, Path] | str:
+    """Unpack *raw* under *root* and name the export it holds, or refuse.
+
+    Args:
+        raw: The archive's decoded bytes.
+        root: The per-upload extraction directory, already created and empty.
+
+    Returns:
+        ``(source_type, ingest_root)`` on success, or the content-free refusal
+        reason — one of :mod:`creek.ingest.archive`'s constants — as a plain
+        string. A string return is the refusal; the tuple is the success. The
+        two are told apart by type at the one call site rather than by an
+        error-code convention, matching how every other helper in this module
+        returns "value or refusal".
+    """
+    try:
+        extract_archive(raw, root)
+    except ArchiveRefusedError as refusal:
+        return refusal.reason
+    detected = detect_export_type(root)
+    if detected is None:
+        return UNRECOGNISED_EXPORT_REASON
+    return detected
+
+
+def _archive_run(
+    *,
+    vault_path: Path,
+    ingest_root: Path,
+    source_type: str,
+    upload_tier: PrivacyTier,
+    run: _Runner | None,
+) -> IngestRunResult:
+    """Run the detected directory ingestor over the unpacked export.
+
+    **Deliberately ledger-free** — no ``ledger_source``, which is the single
+    most consequential decision in the archive path and the one a reviewer
+    should check first. Borrowing ``UPLOAD_LEDGER_SOURCE`` here, as the
+    single-file path does, is *destructive*: none of the four export ingestors
+    emits a ``source_unit``, so every turn parsed out of one
+    ``conversations.json`` composes the same ``origin_key``, and
+    :func:`creek.ingest.pipeline.write_fragment_idempotent` then assigns each
+    successive turn the first turn's id and overwrites it. Measured on a
+    six-turn conversation: ``written=6`` reported, **one** file on disk. That
+    is the #1305 collapse, reached by a different road.
+
+    Ledger-free is also exactly what ``creek ingest --type chatgpt`` does —
+    :func:`creek.ingest.pipeline.ledger_for_source` ledgers only ``markdown``
+    — so the archive path produces the same corpus the CLI does. Identity
+    comes from :func:`creek.ingest.base.generate_fragment_id`, which hashes
+    the source path, timestamp and content; the extraction directory is
+    derived from the ``external_id`` and is therefore stable across
+    re-uploads, so the same archive sent twice derives the same ids and the
+    writer's dedup makes the second send a no-op.
+
+    Args:
+        vault_path: Vault root.
+        ingest_root: The directory :func:`detect_export_type` chose.
+        source_type: The detected :data:`creek.ingest.INGESTOR_REGISTRY` key.
+        upload_tier: The caller's declared tier, merged escalate-only onto
+            every fragment by :func:`creek.ingest.pipeline.stamp_declared_tier`
+            exactly as on the single-file path.
+        run: Ingest-runner seam; ``None`` selects
+            :func:`creek.ingest.pipeline.run_ingest`.
+
+    Returns:
+        The run's result.
+    """
+    runner = run if run is not None else run_ingest
+    return runner(
+        ingestor_cls=INGESTOR_REGISTRY[source_type],
+        source_type=source_type,
+        input_path=ingest_root,
+        vault_path=vault_path,
+        privacy_tier=upload_tier,
+    )
+
+
+def _archive_warnings(result: IngestRunResult, source_type: str) -> list[str]:
+    """Return the ceiling-safe advisories an archive ingest earned.
+
+    The run's own content-free advisories, plus the partial-failure line when
+    documents inside the archive failed to parse. Requirement 6: a run that
+    read 900 of 1000 conversations must say so rather than answer ``ok`` and
+    let the caller believe it got everything.
+
+    Args:
+        result: The completed run.
+        source_type: The detected export type, named in the advisory.
+
+    Returns:
+        Advisory strings, none of which names an archive member or a path.
+    """
+    advisories = list(result.ceiling_safe_warnings)
+    if result.errors:
+        advisories.append(
+            _ARCHIVE_PARTIAL_TEMPLATE.format(
+                source_type=source_type,
+                discovered=result.discovered,
+                failed=len(result.errors),
+                written=result.written,
+            )
+        )
+    return advisories
+
+
+def _archive_response(
+    *,
+    external_id: str,
+    filename: str,
+    timestamp: str | None,
+    source_type: str,
+    result: IngestRunResult,
+    upload_tier: PrivacyTier,
+    ceiling: TierCeiling,
+    size_bytes: int,
+    action: str,
+) -> dict[str, Any]:
+    """Assemble the success payload for an archive upload.
+
+    Every key the single-file path publishes, so the HTTP projection needs no
+    branch, plus three tallies an archive needs and one document does not:
+    ``discovered`` / ``written`` / ``failed_documents``. They are counts, never
+    the pipeline's ``errors`` strings, which interpolate the failing member's
+    path.
+
+    Args:
+        external_id: The caller's idempotency key.
+        filename: The caller's original filename.
+        timestamp: Echoed back unchanged.
+        source_type: The detected export type.
+        result: The completed run.
+        upload_tier: The declared tier.
+        ceiling: The caller's admission ceiling.
+        size_bytes: The archive's decoded size.
+        action: ``created`` or ``unchanged`` for the corpus as a whole.
+
+    Returns:
+        The success payload.
+    """
+    return {
+        "status": "ok",
+        "tool": TOOL_NAME,
+        "tier_ceiling": ceiling.value,
+        "external_id": external_id,
+        "filename": filename,
+        "timestamp": timestamp,
+        "source_type": source_type,
+        "fragment_id": result.fragment_ids[0] if result.fragment_ids else None,
+        "affected_fragment_ids": list(result.fragment_ids),
+        "action": action,
+        "tier": upload_tier.value,
+        "size_bytes": size_bytes,
+        "discovered": result.discovered,
+        "written": result.written,
+        "failed_documents": len(result.errors),
+        "warnings": _archive_warnings(result, source_type),
+    }
+
+
+def _archive_outcome(
+    *,
+    vault_path: Path,
+    audit_args: dict[str, Any],
+    external_id: str,
+    filename: str,
+    raw: bytes,
+    upload_tier: PrivacyTier,
+    ceiling: TierCeiling,
+    consumer: str,
+    timestamp: str | None,
+    run: _Runner | None,
+) -> dict[str, Any]:
+    """Unpack an export archive, ingest it, and delete every extracted byte.
+
+    The archive's own bytes are **never staged**. The single-file path writes
+    the upload verbatim under ``uploads/<stem><suffix>`` so the RTBF sweep can
+    reach it through each fragment's ``origin_key``; an archive cannot take
+    that shape, because the staging directory is documented flat precisely so
+    the sweep's non-recursive walk can see everything in it, and an unpacked
+    export is a tree. Rather than widen the sweep to a layout it was designed
+    to exclude, this path leaves nothing behind to sweep: the extraction root
+    is removed however the upload ends, success or refusal or exception.
+
+    The whole unpack root — not merely this ``external_id``'s directory — is
+    cleared on the way in as well, so a previous run killed between its
+    extraction and its ``finally`` cannot leave another caller's export
+    readable in the vault indefinitely.
+
+    Args:
+        vault_path: Vault root.
+        audit_args: The sanitised argument summary for the audit trail.
+        external_id: The caller's idempotency key, which names the extraction
+            directory (via :func:`~creek_mcp.staged_names.safe_stem`) and so
+            keeps derived fragment ids stable across re-uploads.
+        filename: The caller's original filename, echoed in the response.
+        raw: The archive's decoded bytes.
+        upload_tier: The declared tier.
+        ceiling: The caller's admission ceiling.
+        consumer: Free-form consumer id for the audit log.
+        timestamp: Echoed back unchanged.
+        run: Ingest-runner seam.
+
+    Returns:
+        The success payload, or a structured four-key refusal.
+    """
+    unpack_root = vault_path / ARCHIVE_UNPACK_RELDIR
+    shutil.rmtree(unpack_root, ignore_errors=True)
+    root = unpack_root / safe_stem(external_id)
+    root.mkdir(parents=True)
+    try:
+        detected = _unpacked_export(raw, root)
+        if isinstance(detected, str):
+            return _refuse_with_audit(
+                vault_path=vault_path,
+                audit_args=audit_args,
+                ceiling=ceiling,
+                consumer=consumer,
+                reason=detected,
+                created_tier=upload_tier.value,
+            )
+        source_type, ingest_root = detected
+        before = _fragment_count(vault_path)
+        try:
+            result = _archive_run(
+                vault_path=vault_path,
+                ingest_root=ingest_root,
+                source_type=source_type,
+                upload_tier=upload_tier,
+                run=run,
+            )
+        except FileNotFoundError:
+            return refusal_response(
+                tool=TOOL_NAME, ceiling=ceiling, reason="vault unavailable"
+            )
+        action = "created" if _fragment_count(vault_path) > before else "unchanged"
+    finally:
+        shutil.rmtree(unpack_root, ignore_errors=True)
+
+    # ``written == 0`` is a refusal here for the same reason it is on the
+    # single-file path: a response of ``ok`` over an empty run tells the
+    # caller its export is in the vault when nothing was read. Unlike that
+    # path, a *partial* run is NOT a refusal — the fragments that landed are
+    # real, and the shortfall travels as an advisory instead (#1525 req. 6).
+    if result.written == 0:
+        return _refuse_with_audit(
+            vault_path=vault_path,
+            audit_args=audit_args,
+            ceiling=ceiling,
+            consumer=consumer,
+            reason=ARCHIVE_NO_FRAGMENTS_REASON,
+            created_tier=upload_tier.value,
+        )
+    MCPAuditLog(vault_path).append(
+        tool=TOOL_NAME,
+        args=audit_args,
+        tier_ceiling=ceiling,
+        consumer=consumer,
+        created_path=str(_FRAGMENT_ROUTING_DIR),
+        created_tier=upload_tier.value,
+        affected_fragment_ids=list(result.fragment_ids),
+    )
+    return _archive_response(
+        external_id=external_id,
+        filename=filename,
+        timestamp=timestamp,
+        source_type=source_type,
+        result=result,
+        upload_tier=upload_tier,
+        ceiling=ceiling,
+        size_bytes=len(raw),
+        action=action,
+    )
+
+
 def upload_tool(
     *,
     vault_path: Path,
@@ -733,17 +1079,31 @@ def upload_tool(
     consumer: str = "unknown",
     run: _Runner | None = None,
 ) -> dict[str, Any]:
-    """Ingest one uploaded document as a vault fragment (idempotently).
+    """Ingest one uploaded document — or one export ARCHIVE — as fragments.
 
-    There is deliberately **no** ``source_type`` override. The ``chatgpt``,
+    There is still deliberately **no** ``source_type`` override, and #1525 is
+    what made that rule affordable rather than merely strict. The ``chatgpt``,
     ``claude``, ``discord`` and ``substack`` ingestors are directory-only —
     each bails on a non-directory input — so an override would let a caller
-    name an ingestor that discovers nothing from a single staged file and
-    reports it as a silent no-op. Dispatch is by extension, through
-    :func:`creek.ingest.route_to_ingestor`, and nothing else — and an
-    extension that function refuses (``.json``, ``.zip``, …) is refused here
-    too, with its guidance, rather than flattened into one ``generic``
-    fragment (#1526).
+    name an ingestor that discovers nothing and have the silent no-op reported
+    as a success. Until archives were accepted, honouring that rule also meant
+    the four richest sources a person owns had no upload path at all; now a
+    caller sends the platform's own ``.zip`` and the export type is decided
+    from the archive's **contents**, by
+    :func:`creek.ingest.archive.detect_export_type`, which is the same
+    guarantee the missing override was protecting.
+
+    Two dispatch paths, then, chosen from the caller's filename alone:
+
+    * a ``.zip`` goes to :func:`_archive_outcome` — unpacked containment-first
+      and under entry/byte bounds, identified from its contents, ingested by
+      the matching directory ingestor, and erased from the vault before the
+      call returns;
+    * anything else keeps the single-document path: dispatch by extension
+      through :func:`creek.ingest.route_to_ingestor`, and an extension that
+      function refuses (``.json``, ``.tar``, ``.doc``, …) refused here too,
+      with its guidance, rather than flattened into one ``generic``
+      fragment (#1526).
 
     Args:
         vault_path: Vault root.
@@ -776,6 +1136,10 @@ def upload_tool(
             :func:`creek.ingest.pipeline.run_ingest`.
 
     Returns:
+        For an archive, the same keys plus ``discovered`` / ``written`` /
+        ``failed_documents``, and a ``warnings`` list that names the shortfall
+        in counts when only part of the export could be read.
+
         ``{status, tool, tier_ceiling, external_id, filename, timestamp,
         source_type, fragment_id, affected_fragment_ids, action, tier,
         size_bytes, warnings}`` on
@@ -865,6 +1229,28 @@ def upload_tool(
             consumer=consumer,
         )
         return conflict
+
+    # The archive fork (#1525), below every privacy gate above it and above
+    # the single-document format gate below it. Placed here, not earlier, so
+    # an archive is admitted by exactly the gates a document is: the write
+    # ceiling, the #970 overwrite gate on whatever this id already owns, and
+    # the one-id-one-extension rule. Placed here, not later, so it is reached
+    # before `route_to_ingestor` — which still refuses ``.zip``, correctly, as
+    # a *single document*, and whose refusal was the only answer this surface
+    # had until now.
+    if is_supported_archive(filename):
+        return _archive_outcome(
+            vault_path=vault_path,
+            audit_args=audit_args,
+            external_id=external_id,
+            filename=filename,
+            raw=raw,
+            upload_tier=upload_tier,
+            ceiling=privacy_tier_ceiling,
+            consumer=consumer,
+            timestamp=timestamp,
+            run=run,
+        )
 
     # The unsupported-format gate (#1526), above the staging write: an
     # extension the ``generic`` fallback would flatten into one blob is

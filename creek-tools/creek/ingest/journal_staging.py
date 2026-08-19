@@ -54,6 +54,36 @@ deliberate: for an upload it is ``route_to_ingestor``, dispatching on the
 file's extension, that chooses the ingestor — not the staging path.
 """
 
+ARCHIVE_UNPACK_RELDIR: Final[Path] = Path("00-Creek-Meta/adepthood/archive-unpack")
+"""Vault-relative scratch root an uploaded export ARCHIVE is unpacked into (#1525).
+
+Deliberately **not** in :data:`ADEPTHOOD_STAGING_RELDIRS`, and the reason is
+the opposite of an oversight: nothing here is staged content. An archive
+upload extracts under ``<this>/<safe_stem(external_id)>/``, runs the directory
+ingestor over that tree, and deletes the tree in a ``finally`` — the archive's
+own bytes are never written to the vault at all, and no fragment's
+``source.origin_key`` ever points inside. There is therefore no staged
+plaintext for the RTBF sweep to find, which is the strongest form of the
+guarantee that sweep exists to provide, not a gap in it.
+
+Adding it to the staging tuple would in fact make things *worse*: that sweep
+walks each root with a non-recursive :meth:`~pathlib.Path.iterdir` and skips
+anything that is not a file, so it would count nothing here while implying
+coverage.
+
+The path is per-``external_id`` and deterministic rather than randomised
+because a ledger-free ingest derives each fragment's id from its source path
+(:func:`creek.ingest.base.generate_fragment_id`), so a randomised unpack
+directory would mint a fresh id for every turn on every re-upload and
+duplicate the whole export. Determinism here is what makes re-uploading the
+same archive a no-op.
+
+Residue is bounded on both sides: the extraction root is removed however the
+upload ends, and the **whole** of this root is removed before any archive is
+unpacked, so even a hard kill mid-ingest leaves nothing past the next archive
+upload.
+"""
+
 ADEPTHOOD_STAGING_RELDIRS: Final[tuple[Path, ...]] = (
     JOURNAL_STAGING_RELDIR,
     UPLOAD_STAGING_RELDIR,

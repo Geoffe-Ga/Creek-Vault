@@ -21,7 +21,11 @@ exists to prevent. What was missing was never the behaviour; it was a door.
 deliberately — the ``chatgpt`` / ``claude`` / ``discord`` / ``substack``
 ingestors are directory-only, so naming one for a single staged file yields a
 silent no-op reported as success — and this route does not reintroduce it.
-Uploading an export archive is #1525.
+Since #1525 an export **archive** is uploadable through this same route with
+no new field: send the platform's ``.zip`` as ``content_base64``, and the tool
+decides the export type from the archive's contents. That is why the override
+is still absent — content-based detection is the guarantee the missing
+override was standing in for.
 
 **The unsupported-format refusal, and why it is translated rather than echoed.**
 Since #1526 :func:`creek.ingest.route_to_ingestor` raises
@@ -57,6 +61,13 @@ from creek.ingest import (
     LEGACY_OFFICE_GUIDANCE,
     STRUCTURED_EXPORT_GUIDANCE,
 )
+from creek.ingest.archive import (
+    TOO_LARGE_REASON,
+    TOO_MANY_ENTRIES_REASON,
+    UNREADABLE_ARCHIVE_REASON,
+    UNRECOGNISED_EXPORT_REASON,
+    UNSAFE_ENTRY_REASON,
+)
 from creek_mcp.api.models import (
     OK_STATUS,
     ErrorCode,
@@ -71,7 +82,7 @@ from creek_mcp.httpapi.journal import admissible_external_id
 from creek_mcp.httpapi.vault import configured_vault
 from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
 from creek_mcp.tier_ceiling import TIER_REQUIRED_REASON
-from creek_mcp.tools.upload import upload_tool
+from creek_mcp.tools.upload import ARCHIVE_NO_FRAGMENTS_REASON, upload_tool
 
 if TYPE_CHECKING:
     from starlette.requests import Request
@@ -131,6 +142,42 @@ the recognition is total rather than merely plausible.
 """
 
 
+_MALFORMED_ARCHIVE_REASONS: Final[frozenset[str]] = frozenset(
+    {
+        UNREADABLE_ARCHIVE_REASON,
+        TOO_MANY_ENTRIES_REASON,
+        TOO_LARGE_REASON,
+        UNSAFE_ENTRY_REASON,
+    }
+)
+"""The #1525 archive refusals that are the CALLER's to fix, so ``400``.
+
+Every one of them is decided from the caller's own bytes and names nothing
+about the vault: bytes that are not a readable ZIP, an archive over the entry
+or extraction-byte bound, and a member that would be written outside the
+staging root. ``invalid_request`` rather than ``privacy_refused`` because none
+of them is a tier decision, and rather than ``internal_error`` because a
+caller that is told "server fault" retries the same crafted archive forever.
+
+**Imported, never restated.** These are the exact strings
+:mod:`creek.ingest.archive` raises, and a copied spelling here would silently
+turn a zip-slip refusal into a ``500`` — the one refusal on this surface where
+the caller most needs a definite answer.
+"""
+
+_UNSUPPORTED_ARCHIVE_REASONS: Final[frozenset[str]] = frozenset(
+    {UNRECOGNISED_EXPORT_REASON, ARCHIVE_NO_FRAGMENTS_REASON}
+)
+"""The #1525 archive refusals that mean "readable, but not an export I know".
+
+``415`` with the published remedy, joining the #1526 family: the archive
+unpacked safely and Creek still could not name it as a chatgpt / claude /
+discord / substack export, or named it and read no content out of it. Both are
+answered by the same advice — unpack it and run ``creek ingest`` — which is
+what :attr:`~creek_mcp.api.models.ErrorCode.UNSUPPORTED_SOURCE`'s body says.
+"""
+
+
 def upload_refusal_code(reason: str) -> ErrorCode:
     """Return the wire code for one of the upload tool's refusal reasons.
 
@@ -152,8 +199,13 @@ def upload_refusal_code(reason: str) -> ErrorCode:
     Returns:
         The published :class:`~creek_mcp.api.models.ErrorCode`.
     """
-    if any(reason.endswith(guidance) for guidance in _UNSUPPORTED_SOURCE_GUIDANCE):
+    if (
+        any(reason.endswith(guidance) for guidance in _UNSUPPORTED_SOURCE_GUIDANCE)
+        or reason in _UNSUPPORTED_ARCHIVE_REASONS
+    ):
         return ErrorCode.UNSUPPORTED_SOURCE
+    if reason in _MALFORMED_ARCHIVE_REASONS:
+        return ErrorCode.INVALID_REQUEST
     if (
         reason in (_BLANK_CALL_REASON, TIER_REQUIRED_REASON, _NOT_BASE64_REASON)
         or reason.startswith((_UNKNOWN_TIER_PREFIX, _EXTENSION_CONFLICT_PREFIX))

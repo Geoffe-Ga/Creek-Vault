@@ -53,6 +53,16 @@ class IngestRunResult:
             operator at a terminal, so an advisory here may name real vault
             fragments: this channel is **not** safe to hand to a caller whose
             tier ceiling has not admitted them.
+        fragment_ids: The vault id of every fragment this run wrote, in write
+            order (#1525). Populated for *every* run, but load-bearing only
+            where the ledger is not: an upload of a whole export archive runs
+            **ledger-free** — the four export ingestors emit no
+            ``source_unit``, so under a borrowed ledger every turn of one
+            conversation file shares one key and overwrites its predecessor —
+            and the ledger is therefore no longer available to answer "which
+            fragments did this call produce". A response that could not answer
+            that would leave a right-to-be-forgotten request with nothing to
+            act on.
         ceiling_safe_warnings: The subset of *warnings* proven free of vault
             content — the only advisory channel that may cross an MCP tier
             ceiling (#1372). Proven at the producer, which is the one place
@@ -71,6 +81,7 @@ class IngestRunResult:
     unchanged: int
     tombed: int
     skipped: int
+    fragment_ids: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     ceiling_safe_warnings: list[str] = field(default_factory=list)
 
@@ -1013,6 +1024,7 @@ def run_ingest(
         warn(advisory.message, ceiling_safe=advisory.ceiling_safe)
 
     errors: list[str] = [f"[{source_type}] {err}" for err in ingest_result.errors]
+    fragment_ids: list[str] = []
     written = 0
     skipped = 0
     counts: dict[str, int] = {}
@@ -1058,6 +1070,11 @@ def run_ingest(
             continue
         record_in_ledger(ledger, parsed, assembled.fragment)
         written += 1
+        # Read AFTER ``write_fragment_idempotent``, never before: that call
+        # reassigns ``fragment.id`` to the ledger's recorded id on every
+        # branch, so an id captured earlier would name the id this run
+        # derived rather than the one the vault now holds (#1329).
+        fragment_ids.append(assembled.fragment.id)
         counts[action] = counts.get(action, 0) + 1
 
     tombed = tomb_missing_units(
@@ -1078,6 +1095,7 @@ def run_ingest(
         unchanged=counts.get("unchanged", 0),
         tombed=tombed,
         skipped=skipped,
+        fragment_ids=fragment_ids,
         warnings=warnings,
         ceiling_safe_warnings=ceiling_safe_warnings,
     )
