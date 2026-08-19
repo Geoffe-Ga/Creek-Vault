@@ -121,8 +121,11 @@ Four gates, each must pass before the next:
     (#1088). See [§5.3](#53-redaction-scan-gate-feat-027-1054).
   - `attachments.channel_privacy_tiers` — per-channel declared ceiling
     (`open` / `personal` / `intimate` / `all`), validated at
-    config-parse time. See [§5.2](#52-bot-capture-boundary) for how
-    bot-capture reads it.
+    config-parse time. A **thread** inherits its parent channel's entry:
+    `_channel_tier` resolves the most restrictive of the thread's own
+    entry and its `parent_id`'s, so declaring the parent is enough
+    (#1265). See [§5.2](#52-bot-capture-boundary) for how bot-capture
+    reads it.
 
 Both allowlists must be non-empty — an empty list is a configuration
 error, not "open to everyone".
@@ -163,9 +166,19 @@ later Tier-A ingest. A message is captured only when **both** hold:
    |---|---|
    | `open` | yes (narrower than needed once landed) |
    | `personal` | yes (exact match) |
-   | unset (no `channel_privacy_tiers` entry) | yes — `_channel_tier` falls back to `personal` |
+   | unset (no `channel_privacy_tiers` entry, and no parent with one) | yes — `_channel_tier` falls back to `personal` |
    | `intimate` | **no** |
    | `all` | **no** — admits intimate content by definition |
+
+   "Declared tier" is the **resolved** tier, not the raw entry for
+   `message.channel.id`. Inside a thread, `message.channel.id` is the
+   *thread's* id, so `_channel_tier` also looks up
+   `discord.Thread.parent_id` and takes the most restrictive of the two
+   by `crawdad.intents.CEILING_RANK` — the one tier-ordering table
+   (#1265). A thread in an `intimate` parent is therefore refused even
+   when the thread itself is unlisted, and a thread may declare itself
+   stricter than an `open` parent. A parent that cannot be determined
+   contributes nothing, so the fail-closed `personal` default stands.
 
    A capture record carries no tier field, and the creek-tools side
    that stages the capture dir drops channel metadata, so a captured
