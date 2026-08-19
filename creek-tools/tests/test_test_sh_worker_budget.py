@@ -247,3 +247,22 @@ def test_an_explicit_budget_overrides_lane_detection(
     )
 
     assert "-n 5" in argv, argv
+
+
+def test_the_help_text_describes_the_formula_the_script_uses() -> None:
+    """``--help`` states the derived slice, not a number that drifts from it.
+
+    The first cut of this change hardcoded 2 and said "drops to 2"; the
+    follow-up derived the slice and left the sentence behind, so the help was
+    wrong on both machine shapes this issue exists to handle — 4-core CI and a
+    12-core box. Restating a value is what let it drift, so the restatement is
+    pinned to the constant the script actually uses.
+    """
+    script = (REPO_ROOT / "scripts" / "test.sh").read_text(encoding="utf-8")
+    help_block = script.split("CREEK_TEST_WORKERS", 1)[1].split("WHICH LANE", 1)[0]
+
+    assert f"nproc / {ASSUMED_CONCURRENT_LANES}" in help_block, help_block
+    assert "drops to 2" not in help_block, "the pre-derivation wording is back"
+    # A slice of 1 is spelled as "no -n at all"; the help must say so, because
+    # that is the branch a 4-core CI runner actually takes.
+    assert "serial" in help_block.lower(), help_block

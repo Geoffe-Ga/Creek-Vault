@@ -105,12 +105,16 @@ ENVIRONMENT:
                         Default 'auto' (one per core) for a normal checkout
                         and for CI, which own the machine. Inside a Ralph
                         fleet lane (a checkout under .ralph/worktrees/) the
-                        default drops to 2, because every concurrent lane
-                        runs this script and 'auto' would claim every core
-                        in each of them — 'lanes x ncpu' workers, which
-                        exhausts memory (#1554). Set it explicitly to give a
-                        lane an exact budget; set 1 (or 0) to run serially,
-                        needed for pdb, which xdist swallows.
+                        default is instead the machine's cores divided among
+                        the lanes assumed to share it — max(1, nproc / 4),
+                        so 1 on a 4-core box and 3 on a 12-core one. A slice
+                        of 1 means serial, i.e. no -n at all. Every
+                        concurrent lane runs this script, so 'auto' there
+                        would claim every core in each of them — 'lanes x
+                        ncpu' workers, which exhausts memory (#1554). Set it
+                        explicitly to give a lane an exact budget; set 1 (or
+                        0) to run serially, needed for pdb, which xdist
+                        swallows.
 
 WHICH LANE BLOCKS A MERGE:
     --unit, --integration and --e2e all gate the Quality Gate in
@@ -182,8 +186,8 @@ case "$TEST_TYPE" in
         # and it OOM'd the machine (#1554).
         #
         # So a lane — detected by its worktree path, since fleet.sh injects no
-        # environment — gets a small fixed slice instead of the whole box, and
-        # says so on stderr. An explicit CREEK_TEST_WORKERS always wins, which
+        # environment — takes a derived slice of the box rather than all of it,
+        # and says so on stderr. An explicit CREEK_TEST_WORKERS always wins, which
         # is how an orchestrator that knows the real lane count sets an exact
         # budget.
         WORKERS="${CREEK_TEST_WORKERS:-}"
