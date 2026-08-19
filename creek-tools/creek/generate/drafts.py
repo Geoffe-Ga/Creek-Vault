@@ -43,7 +43,6 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import frontmatter
-import yaml
 from pydantic import ValidationError
 
 from creek.care.guardrail import CARE_POLICY
@@ -111,6 +110,7 @@ from creek.models import (
     PrivacyTier,
     Thread,
 )
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -629,7 +629,7 @@ def _safe_post(md_file: Path) -> frontmatter.Post | None:
     """Load a frontmatter post, returning ``None`` on parse errors."""
     try:
         return frontmatter.load(str(md_file))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         logger.debug("Skipping unreadable markdown: %s", md_file)
         return None
 

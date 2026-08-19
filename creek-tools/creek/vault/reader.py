@@ -212,3 +212,74 @@ def iter_vault_fragments(
         fragment, body, raw = record
         out.append((md_file, fragment, body, raw))
     return out
+
+
+def load_post_or_raise(path: Path) -> frontmatter.Post:
+    """Load *path*, re-raising an unreadable header with *path* in the message.
+
+    The three fragment-lifecycle write paths — :meth:`VaultWriter.update_fragment`,
+    :meth:`VaultWriter.tomb_fragment`, and :meth:`VaultWriter.restore_fragment` —
+    each need the file's *body* as well as its header, so none of them can use
+    the splat-free :func:`creek.vault.links.read_header_meta`. They also must
+    not adopt the read paths' skip-and-continue policy: silently declining to
+    update, tomb, or restore a fragment loses an operator's edit and reports
+    success (#926 is the general form of that hazard).
+
+    So this fails, as it did before — but it says *which* file. Previously
+    these three loads were unguarded, and a hand-edited note with a bare-date
+    frontmatter key surfaced as a bare ``TypeError: keywords must be strings``
+    with no path anywhere in the traceback, leaving the operator to find the
+    offending file by hand across a 35k-note vault (#1475).
+
+    The window this actually covers is verify-then-load. :func:`_file_declares_id`
+    now screens the same exception set, so a file already unreadable when the
+    id was resolved never reaches here — it resolves to "not found" instead,
+    which is its own defect and is tracked as #1543. What remains is the gap
+    between that verification and this load: the writer holds ``self._lock``,
+    which is a lock over *this process*, and a Creek vault is a live Obsidian
+    folder. An editor, a sync client, or a sibling ``creek`` run can rewrite
+    the file in between. That is exactly the class of race #1083 built the
+    verifier for, and leaving the load bare would report it as an unpathed
+    ``TypeError``.
+
+    **The OS-level failures keep their ``OSError`` identity**, and that split
+    is the whole reason this is two ``except`` clauses rather than one over
+    :data:`~creek.vault.reader.FRONTMATTER_LOAD_ERRORS` (which contains
+    ``OSError``). All three callers are reached from the per-unit loop in
+    :mod:`creek.ingest.pipeline`, whose handlers are ``except (OSError,
+    KeyError)``: an unreadable file is reported against *that unit* and the
+    batch continues. Re-raising the race described above — a vanished or
+    half-rewritten file, i.e. an ``OSError`` — as a ``ValueError`` would walk
+    straight past that handler and out through ``_run_ingest``, which catches
+    only ``FileNotFoundError``/``EscapingSymlinkError``, ending the whole
+    ``creek ingest`` run on one file an editor happened to be touching. That
+    is strictly narrower than the bare ``frontmatter.load`` this replaced. So
+    ``ValueError`` is reserved for the parse-shaped failures — the non-string
+    key (``TypeError``), malformed YAML, undecodable bytes — which were never
+    catchable per-unit anyway, and which no concurrent editor can conjure out
+    of a file that was fine a moment ago.
+
+    Args:
+        path: The live vault file to parse.
+
+    Returns:
+        The parsed document, body included.
+
+    Raises:
+        OSError: When the file itself could not be read — vanished, replaced,
+            permission-denied. Re-raised as an ``OSError`` so the ingest
+            loop's per-unit handler still catches it, with *path* named.
+        ValueError: When the bytes were read but the frontmatter will not
+            parse, naming *path* and quoting the underlying error.
+    """
+    try:
+        return frontmatter.load(str(path))
+    except OSError as exc:
+        # Deliberately ahead of the wider tuple below, which also contains
+        # ``OSError``: the family must stay an ``OSError`` for the ingest
+        # loop's ``except (OSError, KeyError)`` per-unit handler. See above.
+        msg = f"Unreadable frontmatter in {path}: {exc}"
+        raise OSError(msg) from exc
+    except FRONTMATTER_LOAD_ERRORS as exc:
+        msg = f"Unreadable frontmatter in {path}: {exc}"
+        raise ValueError(msg) from exc

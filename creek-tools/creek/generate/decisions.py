@@ -34,7 +34,11 @@ from creek.models import (
     PrivacyTier,
     _generate_decision_id,
 )
-from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, iter_vault_fragments
+from creek.vault.reader import (
+    FRONTMATTER_LOAD_ERRORS,
+    iter_vault_fragments,
+    load_post_or_raise,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -426,7 +430,7 @@ class DecisionDetector:
             raise ValueError(msg)
 
         # Update frontmatter
-        post = frontmatter.load(str(source_path))
+        post = load_post_or_raise(source_path)
         post["status"] = new_phase
         source_path.write_text(frontmatter.dumps(post), encoding="utf-8")
 
@@ -864,7 +868,7 @@ class DecisionContextGatherer:
         Returns:
             The path that was updated.
         """
-        post = frontmatter.load(str(decision_path))
+        post = load_post_or_raise(decision_path)
         body = post.content
         existing = re.search(r"\n## Context\b.*", body, flags=re.DOTALL)
         new_section = context_section.rstrip() + "\n"
@@ -1180,7 +1184,7 @@ def decision_from_note(note_path: Path) -> Decision:
         A :class:`~creek.models.Decision` built from the note's
         frontmatter. Missing fields fall back to the model defaults.
     """
-    post = frontmatter.load(str(note_path))
+    post = load_post_or_raise(note_path)
     metadata = post.metadata.copy()
     metadata["title"] = metadata.get("title") or note_path.stem
     metadata["id"] = metadata.get("id") or _generate_decision_id()
