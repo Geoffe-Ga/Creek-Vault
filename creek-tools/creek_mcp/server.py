@@ -73,8 +73,10 @@ from creek_mcp.transport_posture import is_loopback, require_transport_confident
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    import uvicorn
     from mcp.server.auth.provider import AccessToken, TokenVerifier
     from mcp.types import ContentBlock
+    from starlette.types import ASGIApp
 
     from creek.author.client import AuthorLLMClient
     from creek.compile.engine import CompileLLM
@@ -894,6 +896,57 @@ _is_loopback = is_loopback
 _require_transport_confidentiality = require_transport_confidentiality
 
 
+def build_network_uvicorn_config(
+    app: ASGIApp, args: argparse.Namespace, *, log_level: str
+) -> uvicorn.Config:
+    """Build the uvicorn configuration the MCP network transport serves under.
+
+    Extracted from :func:`_serve_network` for the same reason
+    :func:`creek_mcp.httpapi.cli.build_uvicorn_config` was extracted from its
+    own serve seam: the one decision in it that is a security promise —
+    ``access_log=False`` — is then reachable by a test without binding a socket.
+
+    **Why uvicorn's own access log is switched off here too (#1125).** uvicorn
+    ships an access logger that is on by default and writes one line per
+    request in the form ``client_addr - "METHOD /concrete/path?query
+    HTTP/1.1" status``. ``/v1`` has suppressed it since #1117; this call site
+    built its own :class:`uvicorn.Config` and kept the default, so one server
+    logged the **client address** of every request on one adapter and not on
+    the other. The MCP surface publishes no identifier-bearing path parameters,
+    so the exposure is narrower than the ``external_id`` republication that
+    motivated #1117 — but the two adapters are one process with one operator,
+    and a logging posture that differs between them is one nobody can reason
+    about. Suppression rather than filtering, again: a
+    :class:`logging.Filter` would be a second redaction rule free to drift from
+    the first.
+
+    Args:
+        app: The ASGI application to serve — the SDK's
+            ``streamable_http_app()``.
+        args: The parsed arguments, carrying host, port and TLS material. TLS
+            is required here: this factory is reached only from the branch that
+            has both a certificate and a key.
+        log_level: uvicorn's own log level, taken from the built server's
+            settings so the two do not drift.
+
+    Returns:
+        The configuration, carrying the bind address, the TLS material, and no
+        access log of uvicorn's own.
+    """
+    # Lazy import, matching FastMCP's own transport bootstrap pattern.
+    import uvicorn
+
+    return uvicorn.Config(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=log_level,
+        ssl_certfile=str(args.tls_cert),
+        ssl_keyfile=str(args.tls_key),
+        access_log=False,
+    )
+
+
 def _serve_network(server: FastMCP, args: argparse.Namespace) -> None:
     """Serve the streamable-http transport, with TLS when cert + key are given.
 
@@ -912,13 +965,10 @@ def _serve_network(server: FastMCP, args: argparse.Namespace) -> None:
         # Lazy import, matching FastMCP's own transport bootstrap pattern.
         import uvicorn
 
-        config = uvicorn.Config(
+        config = build_network_uvicorn_config(
             server.streamable_http_app(),
-            host=args.host,
-            port=args.port,
+            args,
             log_level=server.settings.log_level.lower(),
-            ssl_certfile=str(args.tls_cert),
-            ssl_keyfile=str(args.tls_key),
         )
         uvicorn.Server(config).run()
     else:
