@@ -172,11 +172,12 @@ def _seed_documented_vault(tmp_path: Path) -> Path:
 def _seed_real_parquet(vault: Path) -> None:
     """Write a genuine embeddings cache, not a text file with that name.
 
-    The exempt row has to be seeded through the real writer. Seeding it
-    with placeholder text makes ``_delete_cache_file`` raise an
-    unhandled ``ArrowInvalid`` out of ``pq.read_metadata`` and abort the
-    whole purge — a separate defect, tracked as #1480, which this fixture
-    must not trip over while testing something else.
+    The exempt row has to be seeded through the real writer. Placeholder
+    text there would make ``_delete_cache_file`` meet an unparseable
+    parquet, which since #1480 no longer aborts the purge but *does*
+    report zero rows removed — so the fixture would quietly stop
+    exercising the exempt path's whole reason for existing (that another
+    pass destroys the file and reports its size).
 
     Args:
         vault: Vault root.
@@ -677,10 +678,16 @@ def test_a_directory_at_the_exempt_path_is_swept_not_sheltered(
     whole-vault erasure while the survivor table still claimed the vault
     was clean.
 
-    The purge then aborts — after the sweep, inside ``_delete_cache_file``,
-    because ``pq.read_metadata`` cannot open a directory. That is #1480,
-    and the ordering it forced (sweep first, cache delete second) is
-    exactly why the erasure still happens here.
+    The purge used to *abort* here on the way out — after the sweep,
+    inside ``_delete_cache_file``, because ``pq.read_metadata`` cannot
+    open a directory — and this test pinned that abort while asserting
+    the erasure survived it. Both halves of that have since been closed:
+    #1480 made an unreadable cache a warning rather than a veto, and
+    #1547 prunes the directory the sweep has just emptied, so by the time
+    ``_delete_cache_file`` looks there is nothing at that path at all.
+    The contract this test exists for is unchanged and still asserted —
+    the subtree is swept and the private string is gone — and the shape
+    of the exit is now "returns" rather than "raises".
     """
     vault = _minimal_vault(tmp_path)
     leak = vault / "00-Creek-Meta" / "embeddings.parquet" / "State" / "ingest.jsonl"
@@ -688,8 +695,7 @@ def test_a_directory_at_the_exempt_path_is_swept_not_sheltered(
     leak.write_text(f"{_PRIVATE}\n", encoding="utf-8")
     assert _PRIVATE in _residue(vault)
 
-    with pytest.raises(OSError, match="directory"):
-        PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+    PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
 
     assert not leak.exists()
     assert _PRIVATE not in _residue(vault)
@@ -1115,4 +1121,87 @@ def test_a_meta_link_to_a_content_folder_itself_is_left_alone(
     assert (vault / "01-Fragments").is_dir()
     assert applied.meta_artifacts_removed == 0
     assert preview.meta_artifacts_removed == applied.meta_artifacts_removed
+    assert _PRIVATE not in _residue(vault)
+
+
+# ---------------------------------------------------------------------------
+# The documented DIRECTORY policy is executed, not merely spelled (#1547)
+# ---------------------------------------------------------------------------
+
+_DIR_BEGIN: Final[str] = "<!-- META-DIR-POLICY:BEGIN -->"
+_DIR_END: Final[str] = "<!-- META-DIR-POLICY:END -->"
+
+_DIR_DISPOSITIONS: Final[frozenset[str]] = frozenset(
+    {"survives", "removed when empty"},
+)
+"""The two verdicts the directory table is allowed to hand out."""
+
+
+def _parse_directory_policy() -> tuple[str, ...]:
+    """Return the dispositions stated by the directory table, in document order.
+
+    Returns:
+        One disposition string per row.
+
+    Raises:
+        AssertionError: If the delimited block or its table is missing.
+    """
+    text = DOC_PATH.read_text(encoding="utf-8")
+    assert _DIR_BEGIN in text, f"{DOC_PATH} lost its directory-policy marker"
+    block = text.split(_DIR_BEGIN, 1)[1].split(_DIR_END, 1)[0]
+    row = re.compile(r"^\|[^|]+\|\s*(survives|removed when empty)\s*\|[^|]+\|$")
+    stated = [
+        match.group(1)
+        for line in block.splitlines()
+        if (match := row.match(line.strip())) is not None
+    ]
+    assert stated, "the directory-policy block states no dispositions at all"
+    return tuple(stated)
+
+
+DIRECTORY_DISPOSITIONS: Final[tuple[str, ...]] = _parse_directory_policy()
+"""The documented directory verdicts, parsed once at import."""
+
+
+def test_the_directory_policy_states_both_verdicts_and_names_its_tool() -> None:
+    """Positive control on the directory pin, and on its safety claim.
+
+    A block that only ever said ``survives`` would describe the very
+    defect #1547 was filed for while looking like a policy, and the
+    behavioural test below would go on passing against it. The ``rmdir``
+    claim is pinned in the same breath because it is the reason this
+    pass cannot destroy content on a wrong turn: swap it for ``rmtree``
+    and the documentation would be a lie about a right-to-be-forgotten
+    path.
+    """
+    text = DOC_PATH.read_text(encoding="utf-8")
+    block = text.split(_DIR_BEGIN, 1)[1].split(_DIR_END, 1)[0]
+
+    assert set(DIRECTORY_DISPOSITIONS) == _DIR_DISPOSITIONS
+    assert "rmdir" in block
+    assert "never `rmtree`" in block
+
+
+def test_the_documented_directory_verdicts_are_the_ones_the_purge_reaches(
+    tmp_path: Path,
+) -> None:
+    """Execute the directory table instead of grepping it for vocabulary.
+
+    One vault carrying both documented cases at once: a ``creek init``
+    scaffold root that the sweep empties (``removed when empty``) and
+    the ``audit/`` directory holding the erasure record (``survives``,
+    by being non-empty rather than by being named anywhere). Asserting
+    them together is what stops a fix for either from silently taking
+    the other with it.
+    """
+    vault = _minimal_vault(tmp_path)
+    scaffold = vault / "00-Creek-Meta" / "State" / "ingest"
+    scaffold.mkdir(parents=True)
+    (scaffold / "markdown.jsonl").write_text(f"{_PRIVATE}\n", encoding="utf-8")
+
+    PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert not (vault / "00-Creek-Meta" / "State").exists(), "removed when empty"
+    assert (vault / "00-Creek-Meta" / "audit" / "purge.jsonl").is_file(), "survives"
+    assert (vault / "00-Creek-Meta").is_dir(), "the meta root is never removed"
     assert _PRIVATE not in _residue(vault)

@@ -438,3 +438,105 @@ def sweep_unkept_meta(
         remove(path)
         removed += 1
     return removed
+
+
+def prune_empty_meta_dirs(meta_root: Path) -> None:
+    """Remove every directory left empty under *meta_root*, bottom-up (#1547).
+
+    :func:`sweep_unkept_meta` destroys files and symlinks and never a
+    directory, so a right-to-be-forgotten purge left identifying
+    directory *names* standing —
+    ``State/discord/capture-staging/messages/<channel>/`` is an empty
+    folder afterwards, and a Discord channel name is routinely
+    identifying. That is the same residue #1485 argued about for a
+    dangling symlink's target string, on a directory entry instead: the
+    body is gone and the name is not.
+
+    **No directory under ``00-Creek-Meta/`` is protected.** The
+    survivors are exactly the directories that still hold something —
+    ``audit/`` because four compliance logs are on
+    :data:`META_PURGE_KEEP`, ``Processing-Log/`` when the legacy
+    ``purge-log.json`` is present — and they survive by being non-empty,
+    not by being named anywhere. The ``creek init`` scaffold roots
+    (``State/``, ``Ontology/``, ``Scripts/``, ``Templates/``,
+    ``Skills/``) are pruned along with everything else, on exactly the
+    argument this module already makes for their *contents*: ``creek
+    init --vault <path>`` redeploys all of them and ``creek skills
+    sync`` redeploys the skill tree alone, so nothing is lost that the
+    tool cannot restore, and an operator who is told to re-run
+    ``creek init`` after a vault purge is being told that already. A
+    keep-list for directories would have to carry the same "one
+    documented survivor, unbounded undocumented subtree" hazard #1484
+    closed, for no gain.
+
+    ``rmdir``, never ``rmtree``: it refuses a directory that is not
+    empty, so the walk **cannot** destroy content on a wrong turn — the
+    worst a bug here can do is leave a directory standing. A symlink is
+    never descended (``is_dir()`` follows one), so a link pointing out
+    of the vault cannot steer the prune at a tree this purge does not
+    own; it counts as an occupant of its parent instead, which keeps
+    that parent standing.
+
+    *meta_root* itself is never removed. It holds ``creek_config.yaml``
+    — the vault marker the *next* purge's ``_require_vault_marker``
+    check looks for — so it is non-empty in any real vault; the walk
+    ignores its emptiness regardless rather than depending on that.
+
+    Runs strictly **after** :func:`sweep_unkept_meta`, and that ordering
+    keeps a ``--dry-run`` preview honest: the sweep classifies a symlink
+    to a *surviving* directory as one to leave alone, and it must reach
+    that verdict from the same facts on both runs. One residue is left
+    standing and is worth naming rather than discovering: a surviving
+    link that pointed at a directory this pass then prunes is left
+    dangling, carrying its target string. That is the pre-existing shape
+    of the surviving-directory-link exemption (such a link survives with
+    the same string today, pruned target or not), not something this
+    pass introduces — but it is the one case where a name outlives the
+    prune.
+
+    Nothing is counted. A removed empty directory destroyed no content,
+    so it is not a ``meta_artifacts_removed`` artifact, and every number
+    a purge reports is unchanged by this pass — which is what keeps a
+    ``--dry-run`` preview and its apply twin agreeing. A dry run does
+    not call this at all: it removes nothing, so there is nothing to
+    simulate.
+
+    Args:
+        meta_root: The vault's ``00-Creek-Meta/`` directory. A missing
+            directory prunes nothing.
+    """
+    if not meta_root.is_dir():
+        return
+    _prune_empty_dirs_below(meta_root)
+
+
+def _prune_empty_dirs_below(current: Path) -> bool:
+    """Prune *current*'s empty descendants and report whether it is now empty.
+
+    Depth-first, so a directory is only judged after the pass has had a
+    chance to empty it: the ``messages/<channel>/`` leaf goes first, then
+    ``messages/``, then ``capture-staging/``. A single top-down pass
+    would remove none of them.
+
+    Args:
+        current: A real directory (never a symlink to one).
+
+    Returns:
+        ``True`` when nothing is left inside *current*. The caller
+        ``rmdir``s it on that answer; the top-level caller ignores it,
+        because the meta root itself is not this pass's to remove.
+    """
+    occupied = False
+    for entry in sorted(current.iterdir()):
+        # ``is_dir()`` follows a symlink, so the link test comes first —
+        # otherwise a link to a directory is descended and pruned, which
+        # would reach outside ``00-Creek-Meta/`` and possibly outside the
+        # vault. A link is an occupant of this directory, nothing more.
+        if entry.is_symlink() or not entry.is_dir():
+            occupied = True
+            continue
+        if _prune_empty_dirs_below(entry):
+            entry.rmdir()
+        else:
+            occupied = True
+    return not occupied

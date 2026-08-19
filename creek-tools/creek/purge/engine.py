@@ -45,7 +45,7 @@ from creek.ingest.ledger import forget_fragment_ids
 from creek.ingest.source_unit import split_source_unit
 from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog, PurgeOutcomeStatus
 from creek.purge.dryrun import DryRunLedger
-from creek.purge.meta import META_RELDIR, sweep_unkept_meta
+from creek.purge.meta import META_RELDIR, prune_empty_meta_dirs, sweep_unkept_meta
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
@@ -96,6 +96,45 @@ _VOICE_BODY_UNDECODABLE = "UnicodeDecodeError"
 
 The exception **type name**, matching :meth:`PurgeEngine._run_audited`'s
 rule that an audit line carries the type and never the message.
+"""
+
+_FRONTMATTER_RESOURCE_ERRORS: tuple[type[Exception], ...] = (
+    RecursionError,
+    MemoryError,
+)
+"""Parser resource exhaustion the purge's *delete-decision* loaders tolerate.
+
+:data:`~creek.vault.reader.FRONTMATTER_LOAD_ERRORS` — ``OSError``,
+``TypeError``, ``ValueError``, ``yaml.YAMLError`` — covers the
+hand-edited-vault cases and is shared by a dozen call sites across the
+tree. It does **not** cover what PyYAML raises when the document itself
+is the attack: ``RecursionError`` from deeply nested flow collections
+(``[[[[…``, and ``RecursionError`` is a ``RuntimeError``, so nothing in
+that tuple catches it), and ``MemoryError`` from alias expansion, since
+``SafeLoader`` honours anchors and aliases and a billion-laughs
+frontmatter is therefore live.
+
+Both escaped the purge path and aborted the whole operation (#1455).
+That is a **denial-of-erasure primitive**: one corrupt or hostile file
+in ``01-Fragments/`` permanently blocked ``creek purge vault``, which is
+the operator's fallback when everything else has failed — and a vault
+that ingests other people's exports does not author all of its own
+frontmatter.
+
+Deliberately a *separate, local* tuple rather than a widening of the
+shared one. Everywhere else in the tree a ``RecursionError`` or a
+``MemoryError`` is a genuine resource failure that must keep
+propagating — swallowing it in ``creek classify`` or the lint walk would
+turn an exhausted interpreter into a silently short result. Only the
+loaders that exist to answer "does this file match, so that it can be
+``unlink``-ed" may treat it as "matches nothing", and only because that
+answer is the *restrictive* one: the file is left on disk, exactly as
+for every other unparseable file, and the passes that key off ids
+rather than content still run.
+
+The write-safe :meth:`PurgeEngine._load_frontmatter` is deliberately
+**not** widened. There a parse failure protects the operator's bytes
+from a lossy rewrite, and there is no erasure for it to veto.
 """
 
 VAULT_MARKER_RELPATH = ("00-Creek-Meta", "creek_config.yaml")
@@ -157,6 +196,37 @@ regression test ``test_purged_marker_reparses_as_nested_list_in_yaml``
 pins this trade-off so a future marker swap has to update the test and
 this docstring together.
 """
+
+
+def _warn_frontmatter_defeated_the_parser(path: Path, exc: BaseException) -> None:
+    """Report a file whose frontmatter exhausted the YAML parser (#1455).
+
+    Louder than the ordinary unparseable-file warning, and deliberately
+    so: an ``OSError`` or a ``yaml.YAMLError`` is a hand-edited vault,
+    while a ``RecursionError`` or a ``MemoryError`` means the *document*
+    beat the parser — a nesting bomb or an alias bomb — which in a vault
+    that ingests other people's exports is a thing somebody may have
+    authored on purpose. The purge continues past it (the alternative
+    was aborting the entire erasure), so the operator has to be told
+    which file to go and look at.
+
+    The path is named, matching the two sibling warnings in this module's
+    match loaders; the exception **type** is named and its message is
+    not, matching :meth:`PurgeEngine._run_audited` — a parser message
+    quotes the offending source, which here is vault content.
+
+    Args:
+        path: The markdown file whose frontmatter would not parse.
+        exc: The exhaustion that was caught, for its type name.
+    """
+    logger.warning(
+        "Frontmatter of %s exhausted the YAML parser (%s) — a nesting or "
+        "alias bomb, not an ordinary malformed file. It matches no purge "
+        "criteria and is left untouched; the rest of the purge continues. "
+        "Inspect the file by hand.",
+        path,
+        type(exc).__name__,
+    )
 
 
 def _str_list(value: object) -> list[str]:
@@ -968,10 +1038,14 @@ class PurgeEngine:
         :mod:`creek.purge.meta`; this method is only the engine's half
         of the wiring.
 
-        Called strictly **before** :meth:`_delete_cache_file`, which
-        raises an unhandled ``ArrowInvalid`` on a corrupt parquet (#1480)
-        — a sweep sequenced after it would inherit that abort and the
-        erasure would not happen at all.
+        Called strictly **before** :meth:`_delete_cache_file`. That
+        ordering was originally a defence: the cache delete raised an
+        unhandled ``ArrowInvalid`` on a corrupt parquet, so a sweep
+        sequenced after it inherited the abort and the erasure did not
+        happen at all. #1480 closed the crash — an unreadable cache is
+        now destroyed anyway and reported as zero rows — but the order
+        stays, because "the erasure that matters runs before anything
+        derived" is the rule, not a workaround for one exception.
 
         Swept paths are counted but deliberately **not** appended to
         ``deleted_files``, following the ``journal_staged_removed``
@@ -984,17 +1058,33 @@ class PurgeEngine:
         the one file the erasure preserves would re-create a smaller
         version of the leak being closed.
 
+        The file sweep is followed by
+        :func:`~creek.purge.meta.prune_empty_meta_dirs`, which removes the
+        directories that sweep left empty (#1547). Without it a whole-vault
+        erasure kept identifying directory *names* —
+        ``State/discord/capture-staging/messages/<channel>/`` survived as an
+        empty but named folder — the same residue #1485 closed for a dangling
+        symlink's target string. The prune destroys no content (``rmdir``
+        refuses a non-empty directory) and is counted nowhere, so it moves no
+        number a dry run reports; a dry run therefore skips it outright rather
+        than simulating it, exactly as it removes no files.
+
         Args:
             result: Result accumulator; ``meta_artifacts_removed`` is
                 set to the number of files destroyed (counted-only in a
-                dry run).
+                dry run). Directories pruned afterwards are deliberately
+                not counted there: an empty directory is a name, not a
+                destroyed artifact.
         """
+        meta_root = self.vault_path / META_RELDIR
         result.meta_artifacts_removed = sweep_unkept_meta(
-            self.vault_path / META_RELDIR,
+            meta_root,
             skip=self._skip_as_removed,
             remove=self._remove_meta_artifact,
             breaks_link=self._vault_wipe_breaks_link,
         )
+        if not self.dry_run:
+            prune_empty_meta_dirs(meta_root)
 
     def _vault_wipe_breaks_link(self, link: Path) -> bool:
         """Report whether this vault purge destroys what *link* points at.
@@ -1319,7 +1409,8 @@ class PurgeEngine:
             post: Frontmatter of the fragment being purged.
             result: Result accumulator; ``journal_staged_removed`` is
                 incremented for each staged file actually removed (or
-                that would be removed in a dry run).
+                that would be removed in a dry run) — **after** the
+                unlink returns, never before (#1481).
         """
         origin_key = _extract_source_origin_key(post)
         if not origin_key:
@@ -1332,11 +1423,19 @@ class PurgeEngine:
         # split out of one staged document share an origin_key.
         if self._skip_as_removed(staged_path):
             return
-        result.journal_staged_removed += 1
         if self.dry_run:
             self._ledger.mark_removed(staged_path)
         else:
             staged_path.unlink(missing_ok=True)
+        # Counted strictly *after* the unlink returns (#1481). Incrementing
+        # first meant an ``OSError`` from the unlink — a read-only mount, a
+        # permission change, an NFS blip — propagated to ``_run_audited``,
+        # which wrote a ``status="partial"`` outcome line whose
+        # ``journal_staged_removed`` already included a staged file still
+        # sitting on disk with the entry's full plaintext body in it. An
+        # erasure record that over-claims a destruction is the one error
+        # this subsystem must never make (#1340).
+        result.journal_staged_removed += 1
 
     def _resolve_staged_source(self, origin_key: str) -> Path | None:
         """Resolve *origin_key* to the staged file to delete, or ``None``.
@@ -1602,13 +1701,19 @@ class PurgeEngine:
 
         try:
             post = frontmatter.loads(text)
-        except FRONTMATTER_LOAD_ERRORS:
+        except (*FRONTMATTER_LOAD_ERRORS, *_FRONTMATTER_RESOURCE_ERRORS):
             # Same shortfall, same fail-safe answer. Raising would let one
             # hostile or hand-broken file VETO an entire right-to-be-forgotten
             # purge (#1455); returning the body anyway would be worse, because
             # the content-keyed comparison could not match and an incomplete
             # erasure would report success. Recording it downgrades the audit
             # outcome to `partial`, which is the honest answer.
+            #
+            # `_FRONTMATTER_RESOURCE_ERRORS` joins the tuple here for exactly
+            # that reason: a nesting bomb or an alias bomb defeats the parser
+            # just as a hand-broken document does, the id-keyed passes are
+            # equally unaffected, and the shortfall the operator must be told
+            # about is identical.
             #
             # Id only - no path, no parser message. This subsystem logs ids and
             # constants, and the tier is unknown precisely because it would not
@@ -1781,7 +1886,8 @@ class PurgeEngine:
         Args:
             result: Result accumulator; ``journal_staged_removed`` is
                 incremented per staged file removed (or counted-only in
-                a dry run).
+                a dry run), and only once the unlink has returned
+                (#1481).
         """
         for reldir in ADEPTHOOD_STAGING_RELDIRS:
             staging_dir = self.vault_path / reldir
@@ -1790,7 +1896,6 @@ class PurgeEngine:
             for staged_file in sorted(staging_dir.iterdir()):
                 if not staged_file.is_file():
                     continue
-                result.journal_staged_removed += 1
                 if self.dry_run:
                     # The meta sweep walks this same directory a moment
                     # later. Without the mark it meets a file this pass
@@ -1801,6 +1906,9 @@ class PurgeEngine:
                     self._ledger.mark_removed(staged_file)
                 else:
                     staged_file.unlink(missing_ok=True)
+                # After the unlink, never before — see the twin site in
+                # :meth:`_purge_staged_source_entry` (#1481).
+                result.journal_staged_removed += 1
 
     def _find_fragment_by_id(
         self,
@@ -1970,6 +2078,9 @@ class PurgeEngine:
                 type(exc).__name__,
             )
             return None
+        except _FRONTMATTER_RESOURCE_ERRORS as exc:
+            _warn_frontmatter_defeated_the_parser(path, exc)
+            return None
 
     def _load_frontmatter_lossily(self, path: Path) -> frontmatter.Post | None:
         """Re-read an undecodable file, replacing its bad bytes with U+FFFD.
@@ -2001,6 +2112,9 @@ class PurgeEngine:
                 path,
                 type(exc).__name__,
             )
+            return None
+        except _FRONTMATTER_RESOURCE_ERRORS as exc:
+            _warn_frontmatter_defeated_the_parser(path, exc)
             return None
 
     def _scrub_references(
