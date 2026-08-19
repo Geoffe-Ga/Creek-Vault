@@ -52,7 +52,7 @@ from creek.generate.ai_style.guard import (
     VOICE_GUARD_STATUS_KEY,
 )
 from creek.models import Authorship, Fragment, PrivacyTier, SourcePlatform
-from creek.vault.reader import iter_vault_fragments
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, iter_vault_fragments
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -302,7 +302,21 @@ def _probe_deslop(draft_path: Path) -> DeslopStatus:
     Returns:
         The de-slop sub-score for *draft_path*.
     """
-    post = frontmatter.load(str(draft_path))
+    try:
+        post = frontmatter.load(str(draft_path))
+    except FRONTMATTER_LOAD_ERRORS as exc:
+        # Fail closed: a draft whose frontmatter will not parse carries no
+        # attestation this function can trust, which is exactly what
+        # `attested=False` already means everywhere else here. The class name
+        # only - the parser's message is not a stable contract and this file's
+        # tier is unknown precisely because it would not parse (#926).
+        return DeslopStatus(
+            draft=str(draft_path),
+            attested=False,
+            voice_distance=None,
+            residual_findings=0,
+            status=f"draft frontmatter is unreadable ({type(exc).__name__})",
+        )
     raw_distance = post.metadata.get(VOICE_DISTANCE_KEY)
     guard_status = post.metadata.get(VOICE_GUARD_STATUS_KEY)
     findings = post.metadata.get(VOICE_FINDINGS_KEY, [])

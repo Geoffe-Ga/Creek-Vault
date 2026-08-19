@@ -68,7 +68,7 @@ from creek.ingest.pipeline import (
     resolve_recorded_source,
 )
 from creek.vault.authors import OTHER_AUTHORS_DIR
-from creek.vault.reader import iter_vault_fragments
+from creek.vault.reader import iter_vault_fragments, load_post_or_raise
 
 # Importing these three from the writer rather than retyping them is
 # deliberate. ``_atomic_write_text`` is the vault's one crash-safe rewrite
@@ -420,7 +420,7 @@ def _stamp_origin_key(md_file: Path, source_key: str) -> None:
         md_file: The fragment file to stamp.
         source_key: The ledger key to record on ``source.origin_key``.
     """
-    post = frontmatter.load(str(md_file))
+    post = load_post_or_raise(md_file)
     existing = post.metadata.get("source")
     # A validated fragment always carries a mapping here; the guard keeps the
     # helper total for a hand-edited file rather than raising mid-migration.

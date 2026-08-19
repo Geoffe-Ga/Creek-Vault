@@ -209,6 +209,15 @@ def _bracketed_callee(body: list[ast.stmt]) -> str | None:
     if len(body) != 1:
         return None
     statement = body[0]
+    # A `with` whose body is the single load counts as the load. The rule
+    # exists so a wide bracket cannot swallow a genuine programming-error
+    # TypeError; opening a file raises OSError, never that. Two sites need
+    # the file object rather than a decoded string — `frontmatter.load` is
+    # itself `open(...)` + `loads(text)`, so going through the handle keeps
+    # one parse entry point and preserves universal-newline handling, which
+    # is what keeps a CRLF vault file identical on both paths.
+    if isinstance(statement, ast.With) and len(statement.body) == 1:
+        statement = statement.body[0]
     if not isinstance(statement, (ast.Assign, ast.Return)):
         return None
     if not isinstance(statement.value, ast.Call):
@@ -243,6 +252,124 @@ def _frontmatter_guard_sites() -> list[tuple[str, str, str | None]]:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         _collect_guards(tree, module, "<module>", found)
     return found
+
+
+# Sites that call ``frontmatter.load`` with NO guard on purpose, because
+# raising IS their contract. Each entry is (module, function).
+#
+# There is exactly one, and its docstring says so in a ``Raises:`` section:
+# ``try_load_fragment`` deliberately propagates, so each of its callers picks
+# its own tolerance — the lint walk reports, ``classify`` collects, and the
+# HARD privacy gate refuses. Swallowing there would force one policy on all
+# three.
+#
+# The completeness assertion below is the point of storing this as data: an
+# allowlist with no check that its entries still exist is how a fixed site
+# keeps a permanent exemption (#1413).
+_DELIBERATE_RAISE_SITES: Final[frozenset[tuple[str, str]]] = frozenset(
+    {("vault/reader.py", "try_load_fragment")}
+)
+
+
+def _unguarded_frontmatter_loads() -> list[tuple[str, str, int, str]]:
+    """Find every ``frontmatter.load``/``loads`` call the canonical tuple misses.
+
+    The mirror image of :func:`_frontmatter_guard_sites`, which walks from the
+    guard down. Walking from the *load* up is what catches a site that has no
+    guard at all — a guard-first walk cannot see an absence.
+
+    Returns:
+        ``(module, function, lineno, guard)`` per unguarded or narrowly-guarded
+        call, where *guard* names the exception set actually caught.
+    """
+    import creek
+
+    package_root = Path(creek.__file__).parent
+    found: list[tuple[str, str, int, str]] = []
+
+    for path in sorted(package_root.rglob("*.py")):
+        module = path.relative_to(package_root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+
+        parents: dict[ast.AST, ast.AST] = {}
+        enclosing_fn: dict[ast.AST, str] = {}
+        for node in ast.walk(tree):
+            fn_name = (
+                getattr(node, "name", None)
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                else None
+            )
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+                enclosing_fn[child] = fn_name or enclosing_fn.get(node, "<module>")
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute) or func.attr not in {
+                "load",
+                "loads",
+            }:
+                continue
+            if getattr(func.value, "id", None) != "frontmatter":
+                continue
+
+            caught: set[str] | None = None
+            cursor: ast.AST = node
+            while cursor in parents:
+                cursor = parents[cursor]
+                if isinstance(cursor, ast.Try):
+                    caught = set()
+                    for handler in cursor.handlers:
+                        if handler.type is None:
+                            caught.add("<bare>")
+                            continue
+                        for inner in ast.walk(handler.type):
+                            if isinstance(inner, ast.Name):
+                                caught.add(inner.id)
+                            elif isinstance(inner, ast.Attribute):
+                                caught.add(inner.attr)
+                    break
+
+            ok = caught is not None and (
+                "FRONTMATTER_LOAD_ERRORS" in caught
+                or "<bare>" in caught
+                or "Exception" in caught
+            )
+            if not ok:
+                found.append(
+                    (
+                        module,
+                        enclosing_fn.get(node, "<module>"),
+                        node.lineno,
+                        "UNGUARDED" if caught is None else ",".join(sorted(caught)),
+                    )
+                )
+    return found
+
+
+def test_no_frontmatter_load_is_guarded_by_anything_narrower() -> None:
+    unguarded = _unguarded_frontmatter_loads()
+
+    # Positive control: the walk really parsed the package. Without it an
+    # import failure or a renamed attribute would empty the list and pass.
+    assert _frontmatter_guard_sites(), "the AST walk found no guards at all"
+
+    offenders = [
+        (module, function, lineno, guard)
+        for module, function, lineno, guard in unguarded
+        if (module, function) not in _DELIBERATE_RAISE_SITES
+    ]
+    assert offenders == [], (
+        "these frontmatter loads are unguarded or narrower than "
+        f"FRONTMATTER_LOAD_ERRORS: {offenders}"
+    )
+
+    # The allowlist may not outlive the sites it exempts.
+    still_unguarded = {(module, function) for module, function, _, _ in unguarded}
+    stale = _DELIBERATE_RAISE_SITES - still_unguarded
+    assert stale == set(), f"allowlist entries no longer exist: {stale}"
 
 
 def test_every_frontmatter_guard_brackets_exactly_one_load() -> None:
@@ -312,7 +439,7 @@ def test_rebuild_index_survives_nonstring_key_sibling(writer_vault: Path) -> Non
 
 
 @pytest.mark.parametrize("header_name", _HEADER_IDS)
-def test_load_post_or_report_names_the_unreadable_file(
+def testload_post_or_raise_names_the_unreadable_file(
     tmp_path: Path,
     header_name: str,
 ) -> None:
@@ -325,21 +452,21 @@ def test_load_post_or_report_names_the_unreadable_file(
     ``TypeError: keywords must be strings`` with no path becomes a
     ``ValueError`` naming the file.
     """
-    from creek.vault.writer import _load_post_or_report
+    from creek.vault.reader import load_post_or_raise
 
     note = _write_note(tmp_path / "bad.md", NONSTRING_KEY_HEADERS[header_name])
 
     with pytest.raises(ValueError, match=re.escape(str(note))):
-        _load_post_or_report(note)
+        load_post_or_raise(note)
 
 
-def test_load_post_or_report_returns_the_document(tmp_path: Path) -> None:
+def testload_post_or_raise_returns_the_document(tmp_path: Path) -> None:
     """Positive control: the same loader still returns header *and* body."""
-    from creek.vault.writer import _load_post_or_report
+    from creek.vault.reader import load_post_or_raise
 
     note = _write_note(tmp_path / "good.md", "id: frag-x\n", body="the body\n")
 
-    post = _load_post_or_report(note)
+    post = load_post_or_raise(note)
 
     assert post["id"] == "frag-x"
     assert post.content.strip() == "the body"
@@ -411,7 +538,7 @@ def test_restore_fragment_finds_a_readable_tombstone(writer_vault: Path) -> None
 # ---- The verify-then-load race must stay in the OSError family (#1475) ------
 
 
-def test_load_post_or_report_keeps_an_oserror_an_oserror(tmp_path: Path) -> None:
+def testload_post_or_raise_keeps_an_oserror_an_oserror(tmp_path: Path) -> None:
     """A file that vanished mid-run raises ``OSError``, never ``ValueError``.
 
     The three write paths are all reached from the per-unit loop in
@@ -423,12 +550,12 @@ def test_load_post_or_report_keeps_an_oserror_an_oserror(tmp_path: Path) -> None
     the wrapper splits: ``OSError`` stays an ``OSError`` (with the path named),
     and ``ValueError`` is reserved for the parse-shaped failures.
     """
-    from creek.vault.writer import _load_post_or_report
+    from creek.vault.reader import load_post_or_raise
 
     missing = tmp_path / "vanished.md"
 
     with pytest.raises(OSError) as excinfo:
-        _load_post_or_report(missing)
+        load_post_or_raise(missing)
 
     assert not isinstance(excinfo.value, ValueError)
     assert str(missing) in str(excinfo.value)
@@ -467,7 +594,7 @@ def _arm_vanishing_file(
     A genuine race, not a mocked exception: the file is really unlinked
     between the id verifier proving it and the write path loading it, so
     ``frontmatter.load`` raises a real ``FileNotFoundError`` out of ``open``.
-    That is the window :func:`creek.vault.writer._load_post_or_report`'s
+    That is the window :func:`creek.vault.writer.load_post_or_raise`'s
     docstring describes — an editor or sync client rewriting a live Obsidian
     vault under a running ingest.
     """

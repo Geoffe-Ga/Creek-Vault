@@ -38,7 +38,6 @@ from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 
 import frontmatter
-import yaml
 from pydantic import BaseModel, Field
 
 from creek.ingest.journal_staging import ADEPTHOOD_STAGING_RELDIRS
@@ -47,6 +46,7 @@ from creek.ingest.source_unit import split_source_unit
 from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog, PurgeOutcomeStatus
 from creek.purge.dryrun import DryRunLedger
 from creek.purge.meta import META_RELDIR, sweep_unkept_meta
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -156,29 +156,6 @@ must tolerate nested-list entries (or skip purged drafts). The
 regression test ``test_purged_marker_reparses_as_nested_list_in_yaml``
 pins this trade-off so a future marker swap has to update the test and
 this docstring together.
-"""
-
-_FRONTMATTER_LOAD_ERRORS: tuple[type[Exception], ...] = (
-    OSError,
-    TypeError,
-    ValueError,
-    yaml.YAMLError,
-)
-"""Exceptions a hand-edited or corrupt vault file raises out of ``frontmatter.load``.
-
-Widens the house ``(OSError, ValueError, yaml.YAMLError)`` tuple with
-``TypeError``, which is load-bearing here and must never be dropped:
-``frontmatter.load`` splats the parsed metadata as
-``Post(content, handler, **metadata)``, so frontmatter carrying a
-non-string key — a bare YAML date like ``2024-05-01: note``, a realistic
-hand-edited-vault case — parses to a ``datetime.date`` key and raises a
-plain ``TypeError: keywords must be strings`` that the house tuple
-misses (precedent: PR #927 / issue #847).
-
-``UnicodeDecodeError`` is a ``ValueError`` subclass and is therefore
-covered deliberately: a file whose *body* carries non-UTF-8 bytes fails
-at read time, before its (possibly byte-clean ASCII) frontmatter block
-is ever parsed.
 """
 
 
@@ -1546,6 +1523,42 @@ class PurgeEngine:
             return None
         return resolved
 
+    def _decode_body_or_report(
+        self,
+        frag_file: Path,
+        fragment_id: str,
+        result: PurgeResult,
+    ) -> str | None:
+        """Read *frag_file* under strict UTF-8, or record the shortfall.
+
+        Split out of :meth:`_voice_match_body` so each function holds one
+        ``try``: an undecodable body and unparseable frontmatter are different
+        shortfalls with different messages, and merging their brackets would
+        both blur that and widen the guard past the house shape.
+
+        Args:
+            frag_file: The fragment file being purged.
+            fragment_id: Its id, used only to name it in the warning and on
+                ``voice_body_undecodable``.
+            result: Result accumulator to record the shortfall on.
+
+        Returns:
+            The strictly-decoded text, or ``None`` when the bytes are not
+            valid UTF-8 and the content-keyed pass must be skipped.
+        """
+        try:
+            return frag_file.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            result.voice_body_undecodable.append(fragment_id or _UNNAMED_FRAGMENT)
+            logger.warning(
+                "Body of fragment %s is not valid UTF-8, so the voice-profile "
+                "sweep cannot match it: this erasure is PARTIAL and a "
+                "07-Voice/<register>-profile.md may still quote the fragment. "
+                "Regenerate 07-Voice with `creek report --type voice`.",
+                fragment_id or _UNNAMED_FRAGMENT,
+            )
+            return None
+
     def _voice_match_body(
         self,
         frag_file: Path,
@@ -1583,19 +1596,34 @@ class PurgeEngine:
             The strictly-decoded body, or ``None`` when the file is not
             valid UTF-8 and the content-keyed pass must be skipped.
         """
+        text = self._decode_body_or_report(frag_file, fragment_id, result)
+        if text is None:
+            return None
+
         try:
-            with frag_file.open(encoding="utf-8") as handle:
-                return frontmatter.load(handle).content
-        except UnicodeDecodeError:
+            post = frontmatter.loads(text)
+        except FRONTMATTER_LOAD_ERRORS:
+            # Same shortfall, same fail-safe answer. Raising would let one
+            # hostile or hand-broken file VETO an entire right-to-be-forgotten
+            # purge (#1455); returning the body anyway would be worse, because
+            # the content-keyed comparison could not match and an incomplete
+            # erasure would report success. Recording it downgrades the audit
+            # outcome to `partial`, which is the honest answer.
+            #
+            # Id only - no path, no parser message. This subsystem logs ids and
+            # constants, and the tier is unknown precisely because it would not
+            # parse.
             result.voice_body_undecodable.append(fragment_id or _UNNAMED_FRAGMENT)
             logger.warning(
-                "Body of fragment %s is not valid UTF-8, so the voice-profile "
-                "sweep cannot match it: this erasure is PARTIAL and a "
-                "07-Voice/<register>-profile.md may still quote the fragment. "
-                "Regenerate 07-Voice with `creek report --type voice`.",
+                "Frontmatter of fragment %s will not parse, so the "
+                "voice-profile sweep cannot match it: this erasure is PARTIAL "
+                "and a 07-Voice/<register>-profile.md may still quote the "
+                "fragment. Regenerate 07-Voice with `creek report --type voice`.",
                 fragment_id or _UNNAMED_FRAGMENT,
             )
             return None
+
+        return post.content
 
     def _iter_voice_artifacts(
         self,
@@ -1884,7 +1912,7 @@ class PurgeEngine:
         """
         try:
             return frontmatter.load(str(path))
-        except _FRONTMATTER_LOAD_ERRORS as exc:
+        except FRONTMATTER_LOAD_ERRORS as exc:
             # Log the exception *type* only: yaml.MarkedYAMLError
             # stringifies with the offending source snippet, which would
             # copy vault content into the log.
@@ -1934,7 +1962,7 @@ class PurgeEngine:
                 path,
             )
             return self._load_frontmatter_lossily(path)
-        except _FRONTMATTER_LOAD_ERRORS as exc:
+        except FRONTMATTER_LOAD_ERRORS as exc:
             # Type name only — never str(exc); see _load_frontmatter.
             logger.warning(
                 "Unable to parse frontmatter in %s (%s); leaving it untouched",
@@ -1966,7 +1994,7 @@ class PurgeEngine:
             # leaving a CRLF vault file identical on both paths.
             with path.open(encoding="utf-8", errors="replace") as handle:
                 return frontmatter.load(handle)
-        except _FRONTMATTER_LOAD_ERRORS as exc:
+        except FRONTMATTER_LOAD_ERRORS as exc:
             # Both undecodable *and* unparseable: no criteria can match.
             logger.warning(
                 "Unable to parse frontmatter in %s (%s); leaving it untouched",
