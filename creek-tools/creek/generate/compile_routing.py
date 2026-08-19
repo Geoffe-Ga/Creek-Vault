@@ -29,10 +29,10 @@ from datetime import UTC, datetime
 from pathlib import Path  # runtime use in dataclass / type hints
 
 import frontmatter
-import yaml
 from pydantic import ValidationError
 
 from creek.models import CompiledPage
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +138,7 @@ def _load_pages(root: Path, target_kind: str) -> dict[str, CompiledPage]:
     for md_file in sorted(root.rglob("*.md")):
         try:
             post = frontmatter.load(str(md_file))
-        except (OSError, ValueError, yaml.YAMLError):
+        except FRONTMATTER_LOAD_ERRORS:
             logger.debug("Skipping unreadable compiled page: %s", md_file)
             continue
         metadata = post.metadata.copy()

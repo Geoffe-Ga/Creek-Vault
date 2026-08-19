@@ -66,7 +66,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import frontmatter
-import yaml
 from pydantic import ValidationError
 
 from creek.classify.privacy_filter import (
@@ -85,6 +84,8 @@ from creek.models import (
     PrivacyTier,
     VoiceRegister,
 )
+from creek.vault.links import read_header_meta
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -505,7 +506,7 @@ def _load_fragment_with_body(
     """
     try:
         post = frontmatter.load(str(md_file))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         logger.debug("Skipping unreadable markdown file: %s", md_file)
         return None
     metadata = post.metadata
@@ -570,6 +571,19 @@ def _read_sample_manifest(register_dir: Path) -> frozenset[str]:
     collector deletes only what it can prove it wrote, so a lost record
     costs a stale copy rather than an operator's file.
 
+    The header is read with :func:`~creek.vault.links.read_header_meta`, which
+    folds every unreadable shape into that empty mapping — and, unlike
+    ``frontmatter.load``, never splats the parsed header into keyword
+    arguments, so a non-string frontmatter key no longer raises ``TypeError``
+    out of a prune (#1475). Only :data:`_MANIFEST_KEY` is read; the summary's
+    body is not consulted.
+
+    Header-only reading carries the same three deliberate consequences #1416
+    accepted and documents in full at
+    :func:`creek.generate.synchronicity._existing_synchronicity_pairs`: the
+    ``---`` fence must open line 1, the 200-line / 64 KB header caps apply, and
+    a note carrying a stray non-string key is tolerated rather than rejected.
+
     Args:
         register_dir: The register's samples folder, which may not exist.
 
@@ -581,12 +595,7 @@ def _read_sample_manifest(register_dir: Path) -> frozenset[str]:
     summary_path = register_dir / _SUMMARY_FILENAME
     if not summary_path.is_file():
         return frozenset()
-    try:
-        post = frontmatter.load(str(summary_path))
-    except (OSError, ValueError, yaml.YAMLError):
-        logger.debug("Unreadable register summary, pruning nothing: %s", summary_path)
-        return frozenset()
-    recorded = post.metadata.get(_MANIFEST_KEY)
+    recorded = read_header_meta(summary_path).get(_MANIFEST_KEY)
     if not isinstance(recorded, list):
         return frozenset()
     return frozenset(str(entry) for entry in recorded)

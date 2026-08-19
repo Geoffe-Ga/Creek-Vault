@@ -41,6 +41,7 @@ from pydantic import ValidationError
 
 from creek.models import Fragment
 from creek.time import effective_authored_at, effective_authored_date
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -540,7 +541,7 @@ def _load_fragment(md_file: Path) -> tuple[Fragment, str] | None:
     """
     try:
         post = frontmatter.load(str(md_file))
-    except (OSError, ValueError):
+    except FRONTMATTER_LOAD_ERRORS:
         logger.debug("Skipping unreadable markdown file: %s", md_file)
         return None
     metadata = post.metadata

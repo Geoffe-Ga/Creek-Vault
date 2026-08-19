@@ -56,7 +56,6 @@ from pathlib import Path  # plain stdlib import; no lazy benefit
 from typing import TYPE_CHECKING, TypeVar
 
 import frontmatter
-import yaml
 from pydantic import ValidationError
 
 from creek.classify.privacy_filter import (
@@ -91,6 +90,7 @@ from creek.generate.wavelength import (
 from creek.hierarchy import select_by_policy
 from creek.models import Eddy, Fragment, Frequency, Praxis, PrivacyTier, Thread
 from creek.vault.links import read_header_meta
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -322,7 +322,7 @@ def _safe_post(md_file: Path) -> frontmatter.Post | None:
     """Load a frontmatter post, returning ``None`` on parse errors."""
     try:
         return frontmatter.load(str(md_file))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         logger.debug("Skipping unreadable markdown: %s", md_file)
         return None
 
