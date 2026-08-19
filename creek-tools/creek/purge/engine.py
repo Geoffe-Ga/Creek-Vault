@@ -433,6 +433,13 @@ class PurgeResult(BaseModel):
             that it need not understand a future artifact to refuse to
             let it survive an erasure. Zero for every scoped purge,
             which sweeps nothing.
+        embeddings_cache_undeleted: ``True`` when the embeddings cache was
+            still on disk after the erasure tried to remove it — a real
+            shortfall, because the cache holds vectors this file's own module
+            docstring calls partially invertible back to the purged content.
+            Distinct from "the cache could not be *parsed*", which is not a
+            shortfall: an unreadable cache that is then deleted took its rows
+            with it.
         voice_body_undecodable: Ids of the purged fragments whose body
             could not be decoded as strict UTF-8, so the content-keyed
             ``<register>-profile.md`` pass could not run for them
@@ -462,6 +469,7 @@ class PurgeResult(BaseModel):
     ledger_rows_removed: int = 0
     meta_artifacts_removed: int = 0
     voice_body_undecodable: list[str] = Field(default_factory=list)
+    embeddings_cache_undeleted: bool = False
 
     @property
     def outcome_status(self) -> PurgeOutcomeStatus:
@@ -490,9 +498,24 @@ class PurgeResult(BaseModel):
 
         Returns:
             ``"partial"`` when any fragment is named in
-            :attr:`voice_body_undecodable`, otherwise ``"complete"``.
+            :attr:`voice_body_undecodable`, or when
+            :attr:`embeddings_cache_undeleted` is set; otherwise
+            ``"complete"``.
         """
-        return "partial" if self.voice_body_undecodable else "complete"
+        # Two shortfalls, one verdict. The embeddings arm was missed when
+        # #1480 stopped a corrupt cache vetoing the purge: the handler logged
+        # "this erasure is PARTIAL" while this property still answered
+        # "complete", so the audit line and the MCP payload both certified an
+        # erasure that had provably left an artifact on disk — the same
+        # over-claim #1481 fixed for staged files, in the sibling artifact.
+        #
+        # Note the contrast with the unparseable-frontmatter arm, which is
+        # deliberately NOT a shortfall: there the fragment file is destroyed
+        # whether or not its frontmatter could be read, so "complete" is true.
+        # Here the file is still there.
+        if self.voice_body_undecodable or self.embeddings_cache_undeleted:
+            return "partial"
+        return "complete"
 
 
 class PurgeEngine:
@@ -841,6 +864,7 @@ class PurgeEngine:
             result.fragments_affected = census.file_count
             result.affected_fragment_ids.extend(census.fragment_ids)
             result.embeddings_removed = self._delete_cache_file()
+            result.embeddings_cache_undeleted = self._cache_survived_deletion()
 
         return self._run_audited(result, body)
 
@@ -995,6 +1019,27 @@ class PurgeEngine:
             embeddings_cache_path(self.vault_path),
             dry_run=self.dry_run,
         )
+
+    def _cache_survived_deletion(self) -> bool:
+        """Report whether the embeddings cache is still on disk after deletion.
+
+        Asked of the filesystem rather than inferred from a return value:
+        :func:`~creek.link.embeddings.delete_embeddings_cache` reports a *row
+        count*, and it deliberately answers ``0`` both when the cache was
+        removed empty and when it could not be removed at all (#1480 — it must
+        never veto an erasure by raising). Those two are indistinguishable from
+        the count, and only one of them is a shortfall.
+
+        Returns:
+            ``True`` when the cache path still exists on a real run. Always
+            ``False`` under ``dry_run``, where nothing was deleted by design
+            and a surviving file is the expected state, not a shortfall.
+        """
+        if self.dry_run:
+            return False
+        from creek.link.embeddings import embeddings_cache_path
+
+        return embeddings_cache_path(self.vault_path).exists()
 
     def _purge_scoped_tail(self, result: PurgeResult) -> None:
         """Run the erasure passes every *scoped* purge owes (#1453).

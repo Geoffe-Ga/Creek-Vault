@@ -567,3 +567,74 @@ def test_a_directory_standing_at_the_cache_path_does_not_veto(
 
     assert delete_embeddings_cache(as_dir) == 0
     assert as_dir.is_dir(), "the shortfall is reported, not silently 'handled'"
+
+
+def test_an_undeletable_cache_degrades_the_whole_purge_to_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache left on disk makes the AUDIT LINE say partial, not complete.
+
+    The end-to-end half of #1480, and the half that matters for compliance.
+    Stopping a corrupt cache from vetoing the purge is only part of the job:
+    if the cache then cannot be deleted, the erasure really is incomplete, and
+    a record certifying ``complete`` is the same over-claim #1481 fixed for
+    staged files.
+
+    Asserted through ``purge_vault`` and against the written audit entry —
+    what a compliance auditor reads back — rather than against
+    ``delete_embeddings_cache``'s return value, which reports ``0`` both for
+    "removed, and it was empty" and for "could not remove it at all".
+
+    The shortfall is provoked by refusing the unlink, the way a read-only
+    mount or a permissions change does. A *directory* standing at the cache
+    path is NOT usable here: this PR's own #1547 prune sweeps its contents and
+    then removes the emptied directory, so the cache does not survive — which
+    is the correct outcome, and worth knowing.
+    """
+    from creek.purge import PurgeAuditLog
+
+    vault = _make_vault(tmp_path)
+    cache = vault / "00-Creek-Meta" / "embeddings.parquet"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_bytes(b"not a real parquet")
+
+    real_unlink = type(cache).unlink
+
+    def refuse_cache(self: Path, *args: object, **kwargs: object) -> None:
+        """Refuse only the embeddings cache, as a read-only mount would."""
+        if self == cache:
+            msg = "Read-only file system"
+            raise OSError(msg)
+        real_unlink(self, *args, **kwargs)  # type: ignore[arg-type]  # Issue #1480: pathlib.Path.unlink is untyped for *args
+
+    monkeypatch.setattr("pathlib.Path.unlink", refuse_cache)
+
+    engine = PurgeEngine(vault)
+    result = engine.purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert cache.is_file(), "positive control: the cache really did survive"
+    assert result.embeddings_cache_undeleted is True
+    assert result.outcome_status == "partial"
+
+    outcomes = [e for e in PurgeAuditLog(vault).read() if e.phase == "outcome"]
+    assert outcomes, "the purge wrote an outcome line"
+    assert outcomes[-1].status == "partial", (
+        "the record certified a complete erasure while the cache was still on disk"
+    )
+
+
+def test_a_clean_purge_still_reports_complete(tmp_path: Path) -> None:
+    """Negative control: nothing left behind still verdicts ``complete``.
+
+    Without this, a change that hard-coded ``partial`` would satisfy the test
+    above and quietly mark every clean erasure incomplete — which would train
+    an auditor to ignore the field.
+    """
+    vault = _make_vault(tmp_path)
+
+    engine = PurgeEngine(vault)
+    result = engine.purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert result.embeddings_cache_undeleted is False
+    assert result.outcome_status == "complete"
