@@ -8,6 +8,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
+# Workers a single fleet lane may claim when it has not been given an explicit
+# budget. Deliberately small and fixed: the lane cannot know how many siblings
+# are running, and the failure mode of guessing high is an OOM that kills every
+# lane at once, while the cost of guessing low is a slower run. See #1554 and
+# the CREEK_TEST_WORKERS block below.
+readonly FLEET_LANE_WORKERS=2
+
 # shellcheck source=scripts/_lib.sh
 source "$SCRIPT_DIR/_lib.sh"
 
@@ -80,8 +87,15 @@ OPTIONS:
 
 ENVIRONMENT:
     CREEK_TEST_WORKERS  pytest-xdist worker count for the unit lane.
-                        Default 'auto' (one per core). Set to 1 to run
-                        serially — needed for pdb, which xdist swallows.
+                        Default 'auto' (one per core) for a normal checkout
+                        and for CI, which own the machine. Inside a Ralph
+                        fleet lane (a checkout under .ralph/worktrees/) the
+                        default drops to 2, because every concurrent lane
+                        runs this script and 'auto' would claim every core
+                        in each of them — 'lanes x ncpu' workers, which
+                        exhausts memory (#1554). Set it explicitly to give a
+                        lane an exact budget; set 1 (or 0) to run serially,
+                        needed for pdb, which xdist swallows.
 
 WHICH LANE BLOCKS A MERGE:
     --unit, --integration and --e2e all gate the Quality Gate in
@@ -143,7 +157,31 @@ case "$TEST_TYPE" in
         #
         # CREEK_TEST_WORKERS=1 (or 0) forces serial for an interactive
         # debugging session — xdist swallows pdb and interleaves output.
-        WORKERS="${CREEK_TEST_WORKERS:-auto}"
+        #
+        # `auto` means one worker per core, which assumes THIS RUN OWNS THE
+        # MACHINE. That holds for CI (one job per runner) and for a developer
+        # running the suite once. It does NOT hold inside a Ralph fleet lane:
+        # check-all.sh runs this script, and the fleet runs up to `max_workers`
+        # lanes at once, so the real worker count is `lanes x ncpu` rather than
+        # `ncpu`. On a 10-core box that was ~60 pytest processes at ~1 GB each
+        # and it OOM'd the machine (#1554).
+        #
+        # So a lane — detected by its worktree path, since fleet.sh injects no
+        # environment — gets a small fixed slice instead of the whole box, and
+        # says so on stderr. An explicit CREEK_TEST_WORKERS always wins, which
+        # is how an orchestrator that knows the real lane count sets an exact
+        # budget.
+        WORKERS="${CREEK_TEST_WORKERS:-}"
+        if [[ -z "$WORKERS" ]]; then
+            if [[ "$PROJECT_ROOT" == *"/.ralph/worktrees/"* ]]; then
+                WORKERS="$FLEET_LANE_WORKERS"
+                echo "NOTE: fleet lane detected; using -n $WORKERS instead of" \
+                     "'auto' so concurrent lanes do not exhaust memory (#1554)." \
+                     "Set CREEK_TEST_WORKERS to override." >&2
+            else
+                WORKERS="auto"
+            fi
+        fi
         if [[ "$WORKERS" != "0" && "$WORKERS" != "1" ]]; then
             PYTEST_ARGS+=(-n "$WORKERS")
         fi
