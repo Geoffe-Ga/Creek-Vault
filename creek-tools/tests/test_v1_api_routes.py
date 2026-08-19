@@ -44,9 +44,18 @@ from creek_mcp.api.models import (
     JournalUpsertResponse,
     ReflectionRequest,
     ReflectionResponse,
+    UploadRequest,
+    UploadResponse,
     WheelResponse,
 )
-from creek_mcp.api.routes import IMPLEMENTED_CAPABILITIES, ROUTES, RouteSpec
+from creek_mcp.api.routes import (
+    IMPLEMENTED_CAPABILITIES,
+    ROUTE_BODY_CAPS,
+    ROUTES,
+    UPLOAD_MAX_BODY_BYTES,
+    RouteSpec,
+)
+from creek_mcp.tools.upload import MAX_UPLOAD_BYTES
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
@@ -99,6 +108,15 @@ _EXPECTED: Final[
         True,
     ),
     (
+        "/v1/uploads",
+        "POST",
+        "uploadDocument",
+        Capability.UPLOAD,
+        UploadRequest,
+        UploadResponse,
+        True,
+    ),
+    (
         "/v1/health",
         "GET",
         "getHealth",
@@ -114,10 +132,11 @@ _EXPECTED_IDS: Final[tuple[str, ...]] = (
     "journal-upsert",
     "reflections",
     "wheel",
+    "upload",
     "health",
 )
 
-_EXPECTED_ROUTE_COUNT: Final[int] = 5
+_EXPECTED_ROUTE_COUNT: Final[int] = 6
 
 
 def _by_path(path: str) -> RouteSpec:
@@ -145,10 +164,10 @@ def _by_path(path: str) -> RouteSpec:
 # --------------------------------------------------------------------------- #
 
 
-def test_routes_declares_exactly_five_specs() -> None:
-    """``/v1`` publishes five endpoints and no sixth.
+def test_routes_declares_exactly_six_specs() -> None:
+    """``/v1`` publishes six endpoints and no seventh.
 
-    A sixth would be an endpoint no fixture, no OpenAPI response set and no
+    A seventh would be an endpoint no fixture, no OpenAPI response set and no
     capability entry describes — reachable, undocumented surface.
     """
     assert len(ROUTES) == _EXPECTED_ROUTE_COUNT
@@ -163,7 +182,7 @@ def test_routes_is_a_tuple() -> None:
     assert isinstance(ROUTES, tuple)
 
 
-def test_route_paths_and_methods_are_the_published_five() -> None:
+def test_route_paths_and_methods_are_the_published_six() -> None:
     """Every ``(path, method)`` pair matches the ADR, in order."""
     assert [(spec.path, spec.method) for spec in ROUTES] == [
         (path, method) for path, method, *_rest in _EXPECTED
@@ -225,6 +244,7 @@ def test_health_requires_no_contract_version() -> None:
         "/v1/journal-entries/{external_id}",
         "/v1/reflections",
         "/v1/wheel",
+        "/v1/uploads",
     ],
 )
 def test_content_routes_require_the_contract_version(path: str) -> None:
@@ -280,11 +300,11 @@ def test_exactly_one_route_declares_no_capability() -> None:
     assert uncapable == ["/v1/health"]
 
 
-def test_implemented_capabilities_is_exactly_the_published_four() -> None:
-    """At #1077 every published capability answers for real.
+def test_implemented_capabilities_is_exactly_the_published_five() -> None:
+    """Every published capability answers for real, ``upload`` included (#1524).
 
     An exhaustive literal, not a containment check, and still named one by
-    one: a fifth capability added to ``Capability`` has to change this line
+    one: a sixth capability added to ``Capability`` has to change this line
     before it can be advertised, which is what keeps a new endpoint's landing a
     visible edit rather than a silent widening.
     """
@@ -295,6 +315,7 @@ def test_implemented_capabilities_is_exactly_the_published_four() -> None:
                 Capability.JOURNAL_UPSERT,
                 Capability.REFLECTIONS,
                 Capability.WHEEL,
+                Capability.UPLOAD,
             }
         )
         == IMPLEMENTED_CAPABILITIES
@@ -312,13 +333,13 @@ def test_every_published_capability_is_implemented() -> None:
     failure mode the old assertion guarded against was reaching equality by
     *shrinking* ``Capability`` instead — quietly dropping endpoints Adepthood
     already codes against — and that is now guarded by
-    :func:`test_implemented_capabilities_is_exactly_the_published_four` above,
-    which names all four and would go red on a removal.
+    :func:`test_implemented_capabilities_is_exactly_the_published_five` above,
+    which names all five and would go red on a removal.
 
     **What must not happen is this assertion being relaxed in the other
     direction.** ``>=`` here would let a capability be advertised with no
     handler behind it, which is the dishonesty the whole constant exists to
-    prevent. If a fifth capability is published before its handler exists, this
+    prevent. If a sixth capability is published before its handler exists, this
     test is supposed to go red, and the fix is to restore the strict-superset
     form for the interim — not to weaken the operator.
     """
@@ -381,7 +402,7 @@ def test_every_route_model_is_a_published_contract_model() -> None:
 
 
 def test_route_spec_declares_the_published_fields() -> None:
-    """``RouteSpec`` carries exactly the eight fields the adapter consumes."""
+    """``RouteSpec`` carries exactly the nine fields the adapter consumes."""
     assert {field.name for field in fields(RouteSpec)} == {
         "path",
         "method",
@@ -391,7 +412,57 @@ def test_route_spec_declares_the_published_fields() -> None:
         "response_model",
         "requires_contract_version",
         "summary",
+        "max_body_bytes",
     }
+
+
+# --------------------------------------------------------------------------- #
+# Per-route body caps (#1524)
+# --------------------------------------------------------------------------- #
+
+
+def test_only_the_upload_route_declares_its_own_body_cap() -> None:
+    """One route overrides the process-wide cap, and the map names only it.
+
+    Derived from the table rather than listed beside the middleware, so a cap
+    declared on a route cannot fail to be applied to it.
+    """
+    assert ROUTE_BODY_CAPS == {"/v1/uploads": UPLOAD_MAX_BODY_BYTES}
+
+
+def test_the_upload_body_cap_carries_the_tools_whole_document_cap() -> None:
+    """The wire cap admits a document of exactly ``MAX_UPLOAD_BYTES``.
+
+    The sharp direction is the one this asserts: base64 expands by 4/3, so a
+    body cap set to the *decoded* limit would refuse a legal 10 MiB document
+    as malformed — a limit the caller can neither see nor satisfy. Recomputed
+    here from ``MAX_UPLOAD_BYTES`` rather than read off the constant, because
+    the two live in different packages precisely so the framework-free half
+    need not import the ingest stack, and this test is what stands in for the
+    import.
+    """
+    encoded = 4 * ((MAX_UPLOAD_BYTES + 2) // 3)
+    assert encoded < UPLOAD_MAX_BODY_BYTES
+
+
+def test_a_templated_path_may_not_declare_a_body_cap() -> None:
+    """The cap is matched on the literal path, so a template could never find it.
+
+    Refused at construction rather than left to be discovered as a limit that
+    looks configured and silently is not.
+    """
+    with pytest.raises(ValueError, match="templated path"):
+        RouteSpec(
+            path="/v1/things/{thing_id}",
+            method="POST",
+            operation_id="createThing",
+            capability=None,
+            request_model=None,
+            response_model=None,
+            requires_contract_version=True,
+            summary="A route that could never have its cap applied.",
+            max_body_bytes=1,
+        )
 
 
 def test_route_spec_is_frozen() -> None:

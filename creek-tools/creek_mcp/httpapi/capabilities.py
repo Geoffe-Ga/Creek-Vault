@@ -28,10 +28,17 @@ stays as the cheaper path and as defence in depth for a contract state that must
 survive polling, but it is no longer the only thing standing between this
 endpoint and a lie.
 
-**Advertised equals implemented.** The ``capabilities`` list is
-:data:`creek_mcp.api.routes.IMPLEMENTED_CAPABILITIES`, not ``set(Capability)``.
-Advertising an endpoint that answers ``501`` is a lie a client cannot detect
-until it has already written the integration.
+**Advertised equals implemented, intersected with what the caller negotiated.**
+The ``capabilities`` list is :data:`creek_mcp.api.routes.IMPLEMENTED_CAPABILITIES`,
+not ``set(Capability)`` — advertising an endpoint that answers ``501`` is a lie
+a client cannot detect until it has already written the integration — and since
+contract 0.8 it is filtered again by
+:data:`creek_mcp.api.models.CAPABILITY_SINCE_MINOR`, so a client pinned to an
+older minor is not offered a capability its own vendored contract has no
+vocabulary for (#1524). The second filter has a matching enforcement in
+:func:`creek_mcp.httpapi.app._predates_the_capability`: what is withheld here
+is refused there, off the same table, so this endpoint's answer stays the truth
+about what that caller can actually reach.
 """
 
 from __future__ import annotations
@@ -41,6 +48,7 @@ from typing import TYPE_CHECKING
 from starlette.concurrency import run_in_threadpool
 
 from creek_mcp.api.models import (
+    CAPABILITY_SINCE_MINOR,
     CONTRACT_MINOR,
     SUPPORTED_CONTRACT_MINORS,
     CapabilitiesResponse,
@@ -49,6 +57,7 @@ from creek_mcp.api.models import (
     TierModel,
     VaultState,
     WireTierCeiling,
+    minor_at_least,
 )
 from creek_mcp.api.routes import (
     CONTRACT_VERSION_HEADER,
@@ -70,24 +79,48 @@ if TYPE_CHECKING:
     from creek_mcp.httpapi.context import RequestContext
 
 
-def _implemented_capabilities() -> list[Capability]:
-    """Return the capabilities this server actually answers for.
+def advertised_capabilities(declared_minor: str | None) -> list[Capability]:
+    """Return what a caller at *declared_minor* is told this server can do.
+
+    Two filters, and they answer different questions.
+    :data:`~creek_mcp.api.routes.IMPLEMENTED_CAPABILITIES` answers "does a
+    handler exist" — advertising an endpoint that answers ``501`` is a lie a
+    client cannot detect until it has written the integration.
+    :data:`~creek_mcp.api.models.CAPABILITY_SINCE_MINOR` answers "does this
+    caller's contract describe it" — advertising a capability to a client
+    pinned below the minor that published it offers a route whose response
+    model and error codes are simply absent from the document that client
+    vendored (#1524).
 
     In :class:`~creek_mcp.api.models.Capability` declaration order rather than
     set order, so the wire is deterministic and two servers at the same commit
     emit the same bytes.
 
+    Args:
+        declared_minor: The caller's ``X-Creek-Contract-Version``, or ``None``
+            when it sent none. Silence is answered with the server's own full
+            list: a client that has pinned nothing has vendored nothing that
+            the newest capability could contradict, and it is exactly the
+            client — a first-time integrator, an operator with ``curl`` —
+            that most needs to see what is here. It is also not a way in: the
+            content routes refuse a request that declares no minor, so nothing
+            is *reachable* on the strength of having been listed here.
+
     Returns:
-        The implemented capabilities, in declaration order.
+        The capabilities to advertise, in declaration order.
     """
     return [
         capability
         for capability in Capability
         if capability in IMPLEMENTED_CAPABILITIES
+        and (
+            declared_minor is None
+            or minor_at_least(declared_minor, CAPABILITY_SINCE_MINOR[capability])
+        )
     ]
 
 
-def _negotiate(vault: Path, context: RequestContext) -> bool:
+def _negotiate(vault: Path, context: RequestContext, advertised: list[str]) -> bool:
     """Enter the handshake tool for a vault already known to exist.
 
     Reached only after :func:`~creek_mcp.tools.handshake.vault_available` has
@@ -99,6 +132,10 @@ def _negotiate(vault: Path, context: RequestContext) -> bool:
         vault: The vault root, already probed.
         context: The request's context, supplying the audited consumer and the
             ceiling the caller was admitted at.
+        advertised: The capability names this caller is being told about,
+            already filtered. The handshake the audit trail records is
+            therefore the handshake the caller actually received, rather than
+            the server's private maximum.
 
     Returns:
         The tool's own readiness verdict, or ``False`` when the vault turns out
@@ -108,9 +145,7 @@ def _negotiate(vault: Path, context: RequestContext) -> bool:
     try:
         negotiated = handshake_tool(
             vault_path=vault,
-            capabilities=[
-                capability.value for capability in _implemented_capabilities()
-            ],
+            capabilities=advertised,
             server_name=SERVER_NAME,
             privacy_tier_ceiling=context.ceiling,
             consumer=context.consumer,
@@ -120,7 +155,9 @@ def _negotiate(vault: Path, context: RequestContext) -> bool:
     return bool(negotiated["available"])
 
 
-def _vault_is_usable(request: Request, context: RequestContext) -> bool:
+def _vault_is_usable(
+    request: Request, context: RequestContext, advertised: list[str]
+) -> bool:
     """Return whether a scaffolded, readable vault stands behind this server.
 
     Synchronous on purpose, and *the* sync seam of this module: every blocking
@@ -139,6 +176,7 @@ def _vault_is_usable(request: Request, context: RequestContext) -> bool:
     Args:
         request: The request in flight.
         context: The request's context.
+        advertised: The capability names this caller is being told about.
 
     Returns:
         ``True`` only when the marker directory exists *and* the handshake tool
@@ -147,7 +185,7 @@ def _vault_is_usable(request: Request, context: RequestContext) -> bool:
     vault = configured_vault(request)
     if vault is None or not vault_available(vault):
         return False
-    return _negotiate(vault, context)
+    return _negotiate(vault, context, advertised)
 
 
 def _minor_is_negotiable(request: Request) -> bool:
@@ -204,7 +242,12 @@ def _tier_model() -> TierModel:
     )
 
 
-def _render(status: CapabilitiesStatus, *, available: bool) -> Response:
+def _render(
+    status: CapabilitiesStatus,
+    advertised: list[Capability],
+    *,
+    available: bool,
+) -> Response:
     """Return the handshake body for *status*.
 
     Both version strings are present whatever the status, so a client can
@@ -213,6 +256,7 @@ def _render(status: CapabilitiesStatus, *, available: bool) -> Response:
 
     Args:
         status: The readiness being reported.
+        advertised: The capabilities this caller is entitled to be told about.
         available: Whether a usable vault stands behind this server.
 
     Returns:
@@ -226,9 +270,7 @@ def _render(status: CapabilitiesStatus, *, available: bool) -> Response:
         ontology_version=ONTOLOGY_VERSION,
         vault=VaultState(available=available),
         tier_model=_tier_model(),
-        capabilities=(
-            _implemented_capabilities() if status is CapabilitiesStatus.OK else []
-        ),
+        capabilities=(advertised if status is CapabilitiesStatus.OK else []),
     )
     return json_response(payload.model_dump(mode="json"), HTTP_OK)
 
@@ -287,5 +329,15 @@ async def handle_capabilities(request: Request) -> Response:
         The handshake response.
     """
     context = context_of(request.scope)
-    available = await run_in_threadpool(_vault_is_usable, request, context)
-    return _render(_status_for(request, available=available), available=available)
+    advertised = advertised_capabilities(request.headers.get(CONTRACT_VERSION_HEADER))
+    available = await run_in_threadpool(
+        _vault_is_usable,
+        request,
+        context,
+        [capability.value for capability in advertised],
+    )
+    return _render(
+        _status_for(request, available=available),
+        advertised,
+        available=available,
+    )

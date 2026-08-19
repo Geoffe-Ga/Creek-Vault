@@ -23,6 +23,7 @@ does and does not yet do.
 | `GET /v1/health` | **Implemented.** Readiness only. Not part of the published contract. |
 | `PUT /v1/journal-entries/{external_id}` | **Implemented.** Idempotent journal write over the shared `creek.journal` tool — same tier gates, same audit records, same fragment identity as MCP (#1075). |
 | `POST /v1/reflections` | **Implemented.** Anchored margin notes over the shared `creek.reflect` tool. `ok` / `empty` / `escalate` / every refusal are distinguishable from a closed `status` or `code` enum — **no client needs to parse prose to branch**. `notes[].quote` is the only verbatim-guaranteed field: each is validated as a whitespace-normalised span of the submitted or referenced entry, and a span that is not is dropped rather than returned. `essay` is free model prose and is **never** grounding-checked, which is what `essay_grounded: false` (always present, always `false`) tells you — a client must not present it as the writer's own words. A care-flagged entry returns `status: "escalate"` at HTTP **200** with the full `care_signal`, and the model is never called; an escalation is not an error, because a person in acute distress must not land in a client's error path. An `entry_ref` that is above your ceiling and one that does not resolve are **deliberately indistinguishable** — both are `403 privacy_refused` with the same message, because a caller who could tell them apart could enumerate the corpus (#1077). |
+| `POST /v1/uploads` | **Implemented.** Idempotent **document** upload over the shared `creek.upload` tool — JSON + base64, never multipart. Body is `{filename, content_base64, external_id, timestamp?, tier}`; the extension of `filename` picks the ingestor and there is deliberately **no `source_type` override** (naming a directory-only ingestor for one file is a silent no-op; whole-archive upload is #1525). `external_id` is the idempotency key: re-sending it updates in place and never mints a second fragment. The response publishes **no `tier`**, on purpose — classification is escalate-only, so a `.md` declaring `intimate` in its own frontmatter lands at `intimate` however modest a tier you declared, and a field claiming the resulting tier could only be false or an oracle. A format Creek must not flatten into one blob (`.json`, `.zip`, `.doc`, …) is `415 unsupported_source` carrying the remedy, never a `500` and never a fragment (#1526). Published at contract `0.8.0` (#1524). |
 | `GET /v1/wheel` | **Implemented.** The **frequency distribution over the classified corpus** — how many ceiling-admitted fragments sit at each APTITUDE frequency F1–F10, and each frequency's share of the classified total. **This is not a curriculum-progress or fullness measure.** Adepthood's Map validates a ten-member `{aspects: [{stage_number, aspect, fullness}]}` shape from its own 36-week curriculum; that projection is Adepthood's and is owned there (Geoffe-Ga/adepthood#1937). Ten members on both sides is a coincidence of cardinality, not a shared meaning — reading one as the other renders confidently wrong numbers. An empty or missing corpus is `200` with all ten entries at `count: 0`, never `404` and never an error (#1076). |
 
 **Every published route is now built, and none of them was ever allowed to
@@ -202,7 +203,7 @@ the other: drop the directive and a compliant cache is free to store, drop the
 tokens and a non-compliant one is free to mismatch.
 
 **These are unconditional, not "on authenticated responses".** Bearer
-authentication sits above the router, so all five routes are authenticated
+authentication sits above the router, so all six routes are authenticated
 anyway; and refusals need the treatment as much as successes. A stored `404`
 is the concrete case — it is the one status this surface returns that both is
 reachable on any unrouted path and is *heuristically cacheable* under RFC 9110
@@ -249,15 +250,15 @@ could put on any wire position that names it.
 `/v1` is the HTTP major. Below it, one `contract_version` covers both this
 surface and MCP.
 
-The three capability routes — `PUT /v1/journal-entries/{external_id}`,
-`POST /v1/reflections` and `GET /v1/wheel` — require
-`X-Creek-Contract-Version: <major.minor>`, for example `0.6`. The comparison is
+The four capability routes — `PUT /v1/journal-entries/{external_id}`,
+`POST /v1/reflections`, `GET /v1/wheel` and `POST /v1/uploads` — require
+`X-Creek-Contract-Version: <major.minor>`, for example `0.8`. The comparison is
 strict membership against the server's `supported_contract_minors`: a missing
 header, a full patch version like `0.2.0`, or anything unrecognised is `409
 incompatible_version`, refused before any vault read.
 
 That set is a **window, and it widens before it narrows**. It currently holds
-`0.6`, `0.5`, `0.4`, `0.3` and `0.2`. The `0.3.0`, `0.4.0` and `0.6.0` moves all
+`0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and `0.2`. The `0.3.0`, `0.4.0` and `0.6.0` moves all
 came from the MCP surface and changed no `/v1` shape — `0.3.0` added
 `creek.upload` (#1023), `0.4.0` gave `creek.purge.*` its `partial` status
 (#1246), and `0.6.0` gave `creek.purge.*` the `ledger_rows_removed` and
@@ -266,6 +267,18 @@ one that moved a `/v1` shape: `JournalUpsertResponse` gained an *optional*
 `warnings` field, omitted from the payload entirely when the write produced no
 advisory. Every client still sending `0.5`, `0.4`, `0.3` or `0.2` is served
 exactly as before.
+
+`0.8.0` (#1524) is the first bump since `0.2.0` that **adds a route**:
+`POST /v1/uploads` and the `upload` capability. It still costs an older client
+nothing, and that is enforced rather than asserted — `CAPABILITY_SINCE_MINOR`
+drives both what `GET /v1/capabilities` lists for a given caller and which
+callers `POST /v1/uploads` will answer, so a client pinned below `0.8` is not
+told the capability exists and is refused `409 incompatible_version` if it
+tries the path anyway. Every shape such a client already knows is
+byte-identical. The same bump brings `415` into the published status set, with
+the `unsupported_source` code; a client pinned below `0.8` cannot meet it,
+because the only route that emits it is the one it cannot reach.
+
 Read the window off `GET /v1/capabilities` rather than assuming the newest
 minor is the only one accepted.
 
@@ -336,12 +349,23 @@ existence-and-rank oracle. Clients must branch on `code`, never parse prose.
 | `privacy_refused` | 403 | terminal |
 | `not_found` | 404 | terminal |
 | `unsupported_capability` | 501 | terminal |
+| `unsupported_source` | 415 | terminal |
 | `unavailable` | 503 | retry after operator action |
 | `temporarily_unavailable` | 503 | retry with backoff |
 | `internal_error` | 500 | retry with backoff |
 
 Retry policy is the static published table (`retry-policy.json`), a pure
 function of `code`. There is no `retryable` field on the wire, ever.
+
+**`unsupported_source` is about the caller's own filename, never the vault.**
+It is the only code added since contract `0.2.0` (it arrived at `0.8.0`,
+#1524) and the only one that can be emitted by exactly one route,
+`POST /v1/uploads`. It means the extension names a structured format Creek
+must not flatten into one document — a conversation export, an archive, a
+legacy binary Office file — and its message is the one place on this surface
+where a refusal carries a *remedy*, because a refusal that does not say what to
+do instead is one the caller retries verbatim. It is `terminal`: the same bytes
+under the same name will never succeed.
 
 **`not_found` is a routing code, never a content code.** It means "no such
 endpoint on this server". It is never emitted for a vault object: a caller who
@@ -366,7 +390,7 @@ false, and would have hidden the fault from the operator as well as the client.
 
 | Limit | Default | Behaviour when exceeded |
 |---|---|---|
-| Request body size | 1 MiB | `422 invalid_request`. Enforced on `Content-Length` *and* on streamed bytes, so a chunked request cannot bypass it, and the body is never buffered past the cap. |
+| Request body size | 1 MiB, except `POST /v1/uploads` at ~13.4 MiB | `422 invalid_request`. Enforced on `Content-Length` *and* on streamed bytes, so a chunked request cannot bypass it, and the body is never buffered past the cap. The upload route declares its own cap (`ROUTE_BODY_CAPS`, keyed on the literal path) because base64 of the tool's 10 MiB document limit does not fit in a limit sized for a journal entry — matching the 10 MiB cap Adepthood already enforces. Raising the *global* cap instead would let every route commit that memory; lowering `max_body_bytes` therefore does **not** lower the upload route, whose cap is published contract. |
 | Per-request timeout | 30 s | `503 temporarily_unavailable`. |
 | Concurrent requests | 32 | `503 temporarily_unavailable`. |
 

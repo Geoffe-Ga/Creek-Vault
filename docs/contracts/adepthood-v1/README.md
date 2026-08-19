@@ -36,15 +36,22 @@ adepthood-v1/
 │   └── <ModelName>.schema.json        # one JSON Schema per CONTRACT_MODELS entry (16 files)
 └── examples/
     └── <capability>/
-        └── <state>.json               # one fixture per (capability, state) cell (4 × 7 = 28 files)
+        └── <state>.json               # one fixture per (capability, state) cell (5 × 7 = 35 files)
 ```
 
 ## The two axes of the example matrix
 
-**Capabilities** (four): `capabilities`, `journal-upsert`, `reflections`,
-`wheel` — read directly off the `Capability` enum, so this directory's
-subdirectory names can never name a different set of capabilities than the
-server actually advertises through `GET /v1/capabilities`.
+**Capabilities** (five): `capabilities`, `journal-upsert`, `reflections`,
+`wheel`, `upload` — read directly off the `Capability` enum, so this
+directory's subdirectory names can never name a different set of capabilities
+than the server actually advertises through `GET /v1/capabilities`.
+
+`upload` is published at contract `0.8.0` (#1524) and is the one capability
+whose advertisement depends on the caller: a client declaring a minor below
+`0.8` is not shown it and is refused `POST /v1/uploads` with
+`incompatible_version`. Both halves read `CAPABILITY_SINCE_MINOR`. The fixtures
+here document the *current* contract, so this directory is present for every
+consumer regardless of what it pins.
 
 **States** (seven), in the order a consumer meets them:
 
@@ -67,16 +74,16 @@ server actually advertises through `GET /v1/capabilities`.
    `schemas/<model>.schema.json`.
 4. If you land on `capabilities/care-escalation.json`,
    `journal-upsert/care-escalation.json`, or `wheel/care-escalation.json`,
-   you have found one of the three `NotApplicableExample` cells — see
+   you have found one of the four `NotApplicableExample` cells — see
    below. Do not write a handler for a care-escalation response on any
    capability except `reflections`; the server can never emit one.
 
-## Why three cells are `NotApplicableExample`
+## Why four cells are `NotApplicableExample`
 
 The acute-distress care guard runs only inside `reflect_tool`. `capabilities`,
-`journal-upsert`, and `wheel` therefore have **no reachable
+`journal-upsert`, `wheel` and `upload` therefore have **no reachable
 care-escalation response shape at all** — not "rare," structurally
-impossible. Those three cells hold an explicit, schema-validated
+impossible. Those four cells hold an explicit, schema-validated
 `NotApplicableExample` (`{"unreachable": true, "reason": "..."}`) rather than
 either a fabricated response (which would document a shape the server can
 never send) or an absent file (which would read as "undocumented" rather

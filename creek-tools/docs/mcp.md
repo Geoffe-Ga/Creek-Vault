@@ -314,6 +314,15 @@ every field of `PurgeResult`, so both appear on the wire automatically —
 which is why the contract minor moved. `SUPPORTED_CONTRACT_MINORS` keeps
 serving `0.5`, `0.4`, `0.3` and `0.2`.
 
+Contract `0.8.0` (#1524) is the first bump that moves the **HTTP** surface by
+addition rather than the MCP one: `creek.upload` — MCP-only since `0.3.0`, so
+no HTTP client could seed a vault with a document — is now also published as
+`POST /v1/uploads`. The tool itself is unchanged; the route delegates to it and
+reimplements nothing. See [`docs/api.md`](./api.md) for the wire shape and for
+how a client pinned below `0.8` is neither told about the capability nor served
+it. `SUPPORTED_CONTRACT_MINORS` widens again rather than shifting, so every
+minor back to `0.2` is still served.
+
 Every tool requires a `privacy_tier_ceiling` parameter
 (`open` | `personal` | `intimate` | `all`); default is `open`. Note
 that `open` is the *most restrictive* setting — it restricts the

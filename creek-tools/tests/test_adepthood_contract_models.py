@@ -47,6 +47,7 @@ the artifact it checks would catch nothing.
 from __future__ import annotations
 
 import ast
+import base64
 import hashlib
 import json
 import re
@@ -95,6 +96,8 @@ from creek_mcp.api.models import (
     ReflectionStatus,
     RetryDisposition,
     TierModel,
+    UploadRequest,
+    UploadResponse,
     VaultState,
     WheelFrequencies,
     WheelFrequency,
@@ -158,7 +161,13 @@ CAPABILITIES_RESPONSE_PAYLOAD: dict[str, Any] = {
     "ontology_version": ONTOLOGY_VERSION,
     "vault": VAULT_STATE_PAYLOAD,
     "tier_model": TIER_MODEL_PAYLOAD,
-    "capabilities": ["capabilities", "journal-upsert", "reflections", "wheel"],
+    "capabilities": [
+        "capabilities",
+        "journal-upsert",
+        "reflections",
+        "wheel",
+        "upload",
+    ],
 }
 
 JOURNAL_UPSERT_REQUEST_PAYLOAD: dict[str, Any] = {
@@ -174,6 +183,28 @@ JOURNAL_UPSERT_RESPONSE_PAYLOAD: dict[str, Any] = {
     "fragment_id": "frag-2026-07-31-ridge-fog",
     "action": "created",
     "tier": "personal",
+}
+
+UPLOAD_REQUEST_PAYLOAD: dict[str, Any] = {
+    "filename": "Ridge Notes.md",
+    # Derived, never a pasted literal: a hand-typed base64 blob is a fixture
+    # nobody can read and nobody notices going stale.
+    "content_base64": base64.b64encode(
+        b"Woke before the alarm and walked the ridge.\n"
+    ).decode("ascii"),
+    "external_id": "adepthood:doc:2026-07-31T06:12:00Z",
+    "timestamp": "2026-07-31T06:12:00Z",
+    "tier": "personal",
+}
+
+UPLOAD_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "ok",
+    "tier_ceiling": "personal",
+    "external_id": "adepthood:doc:2026-07-31T06:12:00Z",
+    "fragment_id": "frag-2026-07-31-ridge-notes",
+    "affected_fragment_ids": ["frag-2026-07-31-ridge-notes"],
+    "action": "created",
+    "source_type": "markdown",
 }
 
 REFLECTION_REQUEST_PAYLOAD: dict[str, Any] = {
@@ -255,6 +286,8 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     ReflectionRequest.__name__: REFLECTION_REQUEST_PAYLOAD,
     ReflectionResponse.__name__: REFLECTION_RESPONSE_PAYLOAD,
     TierModel.__name__: TIER_MODEL_PAYLOAD,
+    UploadRequest.__name__: UPLOAD_REQUEST_PAYLOAD,
+    UploadResponse.__name__: UPLOAD_RESPONSE_PAYLOAD,
     VaultState.__name__: VAULT_STATE_PAYLOAD,
     WheelFrequencies.__name__: WHEEL_FREQUENCIES_PAYLOAD,
     WheelFrequency.__name__: WHEEL_FREQUENCY_PAYLOAD,
@@ -275,6 +308,7 @@ EXPECTED_ERROR_CODES: frozenset[str] = frozenset(
         "privacy_refused",
         "not_found",
         "unsupported_capability",
+        "unsupported_source",
         "unavailable",
         "temporarily_unavailable",
         "internal_error",
@@ -288,13 +322,14 @@ EXPECTED_ERROR_STATUS: tuple[tuple[str, int], ...] = (
     ("privacy_refused", 403),
     ("not_found", 404),
     ("unsupported_capability", 501),
+    ("unsupported_source", 415),
     ("unavailable", 503),
     ("temporarily_unavailable", 503),
     ("internal_error", 500),
 )
 
 ALLOWED_HTTP_STATUSES: frozenset[int] = frozenset(
-    {401, 403, 404, 409, 422, 500, 501, 503}
+    {401, 403, 404, 409, 415, 422, 500, 501, 503}
 )
 
 EXPECTED_RETRY_POLICY: tuple[tuple[str, str], ...] = (
@@ -304,6 +339,7 @@ EXPECTED_RETRY_POLICY: tuple[tuple[str, str], ...] = (
     ("privacy_refused", "terminal"),
     ("not_found", "terminal"),
     ("unsupported_capability", "terminal"),
+    ("unsupported_source", "terminal"),
     ("unavailable", "retry_after_operator_action"),
     ("temporarily_unavailable", "retry_with_backoff"),
     ("internal_error", "retry_with_backoff"),
@@ -333,6 +369,7 @@ EXPECTED_UNREACHABLE_CELLS: frozenset[tuple[str, str]] = frozenset(
         ("capabilities", "care-escalation"),
         ("journal-upsert", "care-escalation"),
         ("wheel", "care-escalation"),
+        ("upload", "care-escalation"),
     }
 )
 
@@ -539,9 +576,13 @@ def test_contract_model_rejects_an_unknown_key(model_name: str) -> None:
 
 
 def test_error_code_membership_is_frozen() -> None:
-    """``ErrorCode`` carries exactly the nine agreed wire codes."""
+    """``ErrorCode`` carries exactly the ten agreed wire codes.
+
+    Nine since contract 0.2; ``unsupported_source`` joined at 0.8 (#1524),
+    which is also what brought ``415`` into the published status set.
+    """
     assert {code.value for code in ErrorCode} == EXPECTED_ERROR_CODES
-    assert len(ErrorCode) == 9
+    assert len(ErrorCode) == 10
 
 
 def test_error_code_has_no_care_escalation_member() -> None:
@@ -698,7 +739,7 @@ def test_error_status_is_pinned(code_value: str, status: int) -> None:
 
 
 def test_every_error_status_is_an_agreed_http_code() -> None:
-    """No error maps to a status outside the eight the contract publishes."""
+    """No error maps to a status outside the nine the contract publishes."""
     assert set(ERROR_STATUS.values()) <= ALLOWED_HTTP_STATUSES
 
 
@@ -783,8 +824,14 @@ def test_bundle_root_name_matches_the_declared_dir_name() -> None:
 
 
 def test_capability_and_state_axes_are_pinned() -> None:
-    """The fixture matrix is 4 capabilities x 7 states = 28 cells."""
-    assert CAPABILITIES == ("capabilities", "journal-upsert", "reflections", "wheel")
+    """The fixture matrix is 5 capabilities x 7 states = 35 cells."""
+    assert CAPABILITIES == (
+        "capabilities",
+        "journal-upsert",
+        "reflections",
+        "wheel",
+        "upload",
+    )
     assert EXAMPLE_STATES == (
         "success",
         "empty",
@@ -794,7 +841,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "incompatible-version",
         "unavailable-service",
     )
-    assert len(_matrix()) == 28
+    assert len(_matrix()) == 35
 
 
 @pytest.mark.parametrize(("capability", "state"), _matrix())
@@ -882,7 +929,7 @@ def test_retry_policy_json_mirrors_the_runtime_table() -> None:
     }
 
 
-def test_unreachable_cells_are_the_three_non_reflection_care_escalations() -> None:
+def test_unreachable_cells_are_the_four_non_reflection_care_escalations() -> None:
     """Only ``reflections`` can escalate; the other three cells are N/A."""
     assert UNREACHABLE_CELLS == EXPECTED_UNREACHABLE_CELLS
 

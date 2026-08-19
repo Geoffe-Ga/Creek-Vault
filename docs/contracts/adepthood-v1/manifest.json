@@ -1,6 +1,6 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.7.0",
+  "contract_version": "0.8.0",
   "files": [
     {
       "capability": "capabilities",
@@ -13,7 +13,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "92d128fc82853ba61e807f2d206e1e1847f0c9909b2c30ac08006c94979b6cd8",
+      "sha256": "a06b35198c4386b9e5722959fa59370d7224ae8841fd4fd3b77fbedfc5869ea2",
       "state": "empty"
     },
     {
@@ -41,7 +41,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "519cd5d8495bfaf4eb4ba26267f7116975e1e5cbb2b7d1559715fc09bd0204dd",
+      "sha256": "128ce2b8b0fd4c5c4f1fde36189291d405a67f4c55770f3422ebead4490727dc",
       "state": "success"
     },
     {
@@ -150,6 +150,55 @@
       "state": "unavailable-service"
     },
     {
+      "capability": "upload",
+      "model": "NotApplicableExample",
+      "path": "examples/upload/care-escalation.json",
+      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "state": "care-escalation"
+    },
+    {
+      "capability": "upload",
+      "model": "UploadResponse",
+      "path": "examples/upload/empty.json",
+      "sha256": "8405a1597da91b2b1c57570110ac302d52dec3b360862eddb3d6a5b98da7b159",
+      "state": "empty"
+    },
+    {
+      "capability": "upload",
+      "model": "ErrorEnvelope",
+      "path": "examples/upload/incompatible-version.json",
+      "sha256": "07bf423851cdaf6cf721ab0be7a1614253ddb54d8957d2567664a8897472d833",
+      "state": "incompatible-version"
+    },
+    {
+      "capability": "upload",
+      "model": "ErrorEnvelope",
+      "path": "examples/upload/malformed-input.json",
+      "sha256": "e67de3e48344f9b4d5b984d2817d46ece909e0381c3f6a0cfbb8e8773db8627f",
+      "state": "malformed-input"
+    },
+    {
+      "capability": "upload",
+      "model": "ErrorEnvelope",
+      "path": "examples/upload/refusal.json",
+      "sha256": "63c4668a4cb759863a2d5778c3175591385f2aeff1839b95bf4718bc4893a2b7",
+      "state": "refusal"
+    },
+    {
+      "capability": "upload",
+      "model": "UploadResponse",
+      "path": "examples/upload/success.json",
+      "sha256": "b0a907041d41ce5f2b918afbe1612903d05b3701f95052594b53194df2d76dde",
+      "state": "success"
+    },
+    {
+      "capability": "upload",
+      "model": "ErrorEnvelope",
+      "path": "examples/upload/unavailable-service.json",
+      "sha256": "c557c982eca814d9bfe391009cd5803f61261cfeb163edcc0e0ac4e67bfcd28e",
+      "state": "unavailable-service"
+    },
+    {
       "capability": "wheel",
       "model": "NotApplicableExample",
       "path": "examples/wheel/care-escalation.json",
@@ -202,14 +251,14 @@
       "capability": null,
       "model": null,
       "path": "retry-policy.json",
-      "sha256": "62f9e85767f6a0a1c23577ef076b7f731b9078d6284306e7c5803118a6e72b6a",
+      "sha256": "8e6d5be69156f8934c5a7ab523e115e0053017107e53ef31a4be83147d0657fb",
       "state": null
     },
     {
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "schemas/CapabilitiesResponse.schema.json",
-      "sha256": "7eebce0435939cfe6a00f1687aa98edd3d666ac43aa258d9e0973edfc90a5a46",
+      "sha256": "380b2b009dc319887f6b3df650cb577b9dea62b9ba5785332839eac5fd6daa0b",
       "state": null
     },
     {
@@ -237,7 +286,7 @@
       "capability": null,
       "model": "ErrorEnvelope",
       "path": "schemas/ErrorEnvelope.schema.json",
-      "sha256": "28bca19dc4baf715b676906d291cb8d1155f435baee950a3e1a31656d9f2df31",
+      "sha256": "6f9d0a3288cdf9f207cd28da3742f90ae686e12da6b21f28f82743895e0a634e",
       "state": null
     },
     {
@@ -251,14 +300,14 @@
       "capability": null,
       "model": "JournalUpsertResponse",
       "path": "schemas/JournalUpsertResponse.schema.json",
-      "sha256": "8cb954012d4b4bf49c679386900f1e3b5ef6a8bb0375bed10d9f2d10105e4796",
+      "sha256": "3ee3856e89c4739327d96c5ea035150912891a4ec3e0be344aeb1eaf2bbd912c",
       "state": null
     },
     {
       "capability": null,
       "model": "NotApplicableExample",
       "path": "schemas/NotApplicableExample.schema.json",
-      "sha256": "b85a807991582faa458995db5c56ff3c6810f89d2bf345aa79d180be8ab508ae",
+      "sha256": "4e69aa485c3297cd037885a6a8aeadf4d862eac27619bccef3aee4f66702f421",
       "state": null
     },
     {
@@ -287,6 +336,20 @@
       "model": "TierModel",
       "path": "schemas/TierModel.schema.json",
       "sha256": "2936160c5beb8595c47f61c9f1b4dea94f4dbf6074cd2f7805ee496c6359ff9d",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "UploadRequest",
+      "path": "schemas/UploadRequest.schema.json",
+      "sha256": "fe5b52dc44f8de0bf940dda6520494073d808630b2a2beea3a1ec3630eb233e4",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "UploadResponse",
+      "path": "schemas/UploadResponse.schema.json",
+      "sha256": "2818591a664cf6bae6a6ad108bbc82c5f547d3f3417f111cb3c90dcc77c61e38",
       "state": null
     },
     {

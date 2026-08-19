@@ -330,7 +330,7 @@ def test_inadmissible_ceiling_refuses_without_touching_the_vault(
 ) -> None:
     """An over-ceiling request is ``422`` and leaves the vault byte-for-byte.
 
-    Thirty cells: five routes times six inadmissible ceilings, each with a
+    Thirty-six cells: six routes times six inadmissible ceilings, each with a
     valid bearer and a valid contract minor, so the only thing wrong with the
     request is the ceiling it declares.
 
@@ -419,11 +419,11 @@ def test_inadmissible_ceiling_never_reaches_any_handler(
     and only one route could ever carry it: the other four answer ``501``
     without reaching a tool, so there is no tool call to intercept there. This
     one moves the probe up a layer, to the handler the router would dispatch
-    to, which every route has. Thirty cells — five routes times six
+    to, which every route has. Thirty-six cells — six routes times six
     inadmissible ceilings — and none of them may reach a handler.
 
-    That completes the pair. The filesystem snapshot covers all five routes
-    and would miss a handler that read nothing; this covers all five routes
+    That completes the pair. The filesystem snapshot covers all six routes
+    and would miss a handler that read nothing; this covers all six routes
     and would miss nothing that ran.
 
     Args:
@@ -446,7 +446,7 @@ def test_the_handler_probe_is_live_on_every_route(
     """The non-vacuity twin: an *admissible* request does reach the probe.
 
     Without this, the sweep above would be equally green against a substitution
-    that silently failed to take — five routes' worth of "no handler ran"
+    that silently failed to take — six routes' worth of "no handler ran"
     proving only that no handler was ever installed.
 
     Args:

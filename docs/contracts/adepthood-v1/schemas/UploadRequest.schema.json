@@ -1,0 +1,59 @@
+{
+  "$defs": {
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:func:`creek_mcp.policy.admitted_ceiling` refuses any remote call declaring\na ceiling outside :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` *before\ndispatch*. Since #1073 that decision is transport-neutral, so every adapter\nis meant to reach it the same way; the MCP surface does so today through\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool`, and #1074 mounts the\n``/v1`` handlers that will. This enum mirrors that frozenset, so\n``intimate`` and ``all`` are not merely refused at runtime \u2014 they cannot be\nconstructed at all, which is the half of the guarantee that does not depend\non a handler remembering to ask.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One document's bytes, handed to the vault under a stable id (#1524).\n\nThe wire half of :func:`creek_mcp.tools.upload.upload_tool`, and\ndeliberately its *subset*: it carries no ``source_type``. The tool refuses\nthat override because the ``chatgpt`` / ``claude`` / ``discord`` /\n``substack`` ingestors are directory-only and would discover nothing from a\nsingle staged file, reporting a silent no-op as a success. Dispatch is by\nthe filename's extension, through\n:func:`creek.ingest.route_to_ingestor`, and nothing else. Uploading a whole\nexport archive is tracked separately, in #1525.\n\n**JSON and base64, never multipart.** The consumer's HTTP client is JSON\nand its CI bans ``python-multipart``, so a multipart route would be one\nneither end could use. The cost is the ~33% base64 expansion, which is what\n:data:`creek_mcp.api.routes.UPLOAD_MAX_BODY_BYTES` is sized around.\n\nAttributes:\n    filename: The caller's original filename. Only its **extension** is\n        trusted, and only to choose an ingestor; the staged file's name is\n        derived from *external_id*, so nothing here reaches a path.\n    content_base64: The document's bytes, base64-encoded. Refused when\n        blank; refused by the tool when it is not valid base64, and \u2014 via\n        the encoded-length guard \u2014 before an oversize payload is ever\n        turned into memory.\n    external_id: The consumer-side stable id, and the idempotency key. The\n        same id updates in place; a new id creates a new fragment.\n    timestamp: Optional ISO-8601 upload time, accepted for symmetry with\n        :class:`JournalUpsertRequest` and echoed nowhere on disk \u2014 a binary\n        document has no frontmatter to put it in, so the fragment's\n        timestamp comes from the ingestor.\n    tier: The tier to file the document at. **Required, and typed\n        :class:`WireTierCeiling`,** so ``intimate`` is not expressible and\n        omission is not defaultable. Both halves matter: #1494 removed this\n        field's ``open`` default from ``creek.upload`` precisely because\n        only the caller knows what the document holds, and a default filed\n        intimate-derived bytes in the clear.",
+  "properties": {
+    "content_base64": {
+      "description": "The document's bytes, base64.",
+      "title": "Content Base64",
+      "type": "string"
+    },
+    "external_id": {
+      "description": "Consumer-side stable id; the idempotency key.",
+      "maxLength": 512,
+      "title": "External Id",
+      "type": "string"
+    },
+    "filename": {
+      "description": "Original filename; only its extension is trusted.",
+      "maxLength": 255,
+      "title": "Filename",
+      "type": "string"
+    },
+    "tier": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Tier to file the document at."
+    },
+    "timestamp": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional client-supplied upload time.",
+      "title": "Timestamp"
+    }
+  },
+  "required": [
+    "filename",
+    "content_base64",
+    "external_id",
+    "tier"
+  ],
+  "title": "UploadRequest",
+  "type": "object"
+}
