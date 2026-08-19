@@ -439,7 +439,7 @@ def test_rebuild_index_survives_nonstring_key_sibling(writer_vault: Path) -> Non
 
 
 @pytest.mark.parametrize("header_name", _HEADER_IDS)
-def testload_post_or_raise_names_the_unreadable_file(
+def test_load_post_or_raise_names_the_unreadable_file(
     tmp_path: Path,
     header_name: str,
 ) -> None:
@@ -460,7 +460,7 @@ def testload_post_or_raise_names_the_unreadable_file(
         load_post_or_raise(note)
 
 
-def testload_post_or_raise_returns_the_document(tmp_path: Path) -> None:
+def test_load_post_or_raise_returns_the_document(tmp_path: Path) -> None:
     """Positive control: the same loader still returns header *and* body."""
     from creek.vault.reader import load_post_or_raise
 
@@ -538,7 +538,7 @@ def test_restore_fragment_finds_a_readable_tombstone(writer_vault: Path) -> None
 # ---- The verify-then-load race must stay in the OSError family (#1475) ------
 
 
-def testload_post_or_raise_keeps_an_oserror_an_oserror(tmp_path: Path) -> None:
+def test_load_post_or_raise_keeps_an_oserror_an_oserror(tmp_path: Path) -> None:
     """A file that vanished mid-run raises ``OSError``, never ``ValueError``.
 
     The three write paths are all reached from the per-unit loop in

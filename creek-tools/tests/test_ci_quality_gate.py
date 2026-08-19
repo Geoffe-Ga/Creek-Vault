@@ -29,6 +29,7 @@ pinned by name. Moving a check is fine; losing one is not.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from tests.shell_command_support import CI_WORKFLOW, load_yaml
 
@@ -232,3 +233,35 @@ def _matrix_versions(job: dict[str, object]) -> list[object]:
         return []
     versions = matrix.get("python-version")
     return versions if isinstance(versions, list) else []
+
+
+def test_no_test_function_is_silently_uncollected() -> None:
+    """No ``tests/`` function starts with ``test`` but not ``test_``.
+
+    ``pyproject.toml``'s ``python_functions = ["test_*"]`` matches on the
+    literal ``test_`` prefix, so ``testfoo`` is not collected — pytest drops
+    it without a warning and the gate reports green having run one fewer
+    test than it claims. That is the same failure family as an emptied
+    ``parametrize`` list: coverage disappears behind a passing gate.
+
+    This is not hypothetical. A bulk rename of ``_load_post_or_report`` to
+    ``load_post_or_raise`` (#1548) ate the underscore in
+    ``test_load_post_or_report_x`` — the old name begins at index 4, so the
+    result was ``testload_post_or_raise_x`` — and silently voided the only
+    three direct tests of that helper's contract. Local and CI runs both
+    stayed green.
+    """
+    import re
+
+    tests_dir = Path(__file__).parent
+    pattern = re.compile(r"^\s*(?:async\s+)?def (test[^_(\s][\w]*)", re.MULTILINE)
+
+    offenders: list[str] = []
+    for path in sorted(tests_dir.rglob("test_*.py")):
+        for name in pattern.findall(path.read_text(encoding="utf-8")):
+            offenders.append(f"{path.name}::{name}")
+
+    assert offenders == [], (
+        "these functions look like tests but pytest will not collect them "
+        f"(need a `test_` prefix): {offenders}"
+    )
