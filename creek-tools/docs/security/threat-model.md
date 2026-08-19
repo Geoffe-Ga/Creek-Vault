@@ -124,8 +124,9 @@ from most to least likely:
   rewritten in place — the same resolve-the-root/lstat-the-leaf
   asymmetry the scanner already documents and relies on to keep a
   `/tmp` -> `/private/tmp` root scannable. Second,
-  `Pipeline._run_redaction` (`creek/pipeline.py:478`
-  `source_path.rglob("*")` and `:484` `scan_batch`) still traverses
+  `Pipeline._run_redaction` (its `source_path.rglob("*")` file
+  count, then `self.scanner.scan_batch(source_path)` — cited by
+  symbol because the line numbers drift) still traverses
   a directly-named symlinked directory; it is read-only there and
   escalates to a hard refusal via the skip counter rather than
   writing. `--scan`'s own `--vault` **was** a third residual and is
@@ -161,7 +162,20 @@ from most to least likely:
   config joins `00-Creek-Meta/audit/` and the legacy purge log in
   `PROTECTED_AUDIT_RELPATHS`, excluded from the APPLY set only;
   detection is unchanged, so `--scan` and `--review` still report
-  matches inside it. #1294 closed the last of the
+  matches inside it. The near-miss worth recording: that exclusion is
+  anchored on a vault **root**, and the first cut anchored it on
+  `--vault`, falling back to `config.vault_path` — which defaults to
+  `Path()`, the *current directory*. Measured, that left
+  `creek redact --apply --source <vault> --yes` run from anywhere
+  outside the vault rewriting the config exactly as before, which is
+  the invocation every workflow example in `docs/redaction.md` uses.
+  The roots are now derived from `--source` as well
+  (`_reachable_vault_roots`: every directory at or above the walked
+  tree that carries a `00-Creek-Meta/`), so the protection does not
+  depend on a flag the documentation never tells anyone to pass, and
+  it also covers `--source <vault>/00-Creek-Meta`. Both arms —
+  `--vault` supplied and omitted — are pinned by a parametrized
+  test. #1294 closed the last of the
   gaps: the ingestor walks had no containment check of any kind, so
   the pipeline refusal was a backstop that a vault with
   `redaction.enabled: false` never reached — and that a caller
@@ -258,7 +272,12 @@ from most to least likely:
   `purge.jsonl`, which would have chain-*signed* redacted records as
   authentic. Detection is deliberately unchanged: `--scan` and
   `--review` still report matches inside `00-Creek-Meta/audit/`; only
-  in-place destruction narrows.
+  in-place destruction narrows. `<vault>/00-Creek-Meta/creek_config.yaml`
+  joined the same set in #1398. "Unconditionally" is a claim about
+  *roots* as much as about settings: the protected paths are anchored
+  on the vault roots the walk can reach, derived from `--source`, so
+  the exclusion holds whether or not `--vault` is passed and whatever
+  directory the operator is standing in.
 - **A destructive redaction cannot outrun its own record.** The
   per-file audit entry is appended immediately after that file's
   atomic write, and the `intent` entry naming every candidate is

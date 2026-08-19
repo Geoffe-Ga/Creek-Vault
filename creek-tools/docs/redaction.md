@@ -108,6 +108,9 @@ It rewrites more than fragment bodies. Every file whose extension is in
 quietly change its meaning. Three paths are excluded unconditionally —
 `00-Creek-Meta/audit/`, the legacy purge log, and
 `<vault>/00-Creek-Meta/creek_config.yaml` (#1398) — and nothing else is.
+That exclusion does **not** require `--vault`: the roots it is anchored
+on are derived from the tree `--source` names as well, so the workflow
+above (which never passes `--vault`) is protected.
 Your own structured files are still in scope, so point `--source` at the
 narrowest tree that needs cleaning rather than at a whole vault.
 
@@ -267,6 +270,16 @@ independent of `supported_extensions` and `exclude_patterns`:
 - the whole of `00-Creek-Meta/audit/`
 - the legacy `00-Creek-Meta/Processing-Log/purge-log.json`
 - `00-Creek-Meta/creek_config.yaml`
+
+"Unconditionally" covers the *root* the paths are anchored on, not just
+the settings. The first cut anchored them on `--vault`, falling back to
+`config.vault_path` — which defaults to the **current directory** — so
+`creek redact --apply --source <vault> --yes` from outside the vault got
+no protection at all, and that is the shape every example in this
+document uses. The roots are now taken from `--source` too: every
+directory at or above the walked tree that carries a `00-Creek-Meta/`.
+Standing anywhere, with or without `--vault`, and including
+`--source <vault>/00-Creek-Meta`, the three paths are excluded.
 
 Detection is unaffected: `--scan` and `--review` still report matches there.
 

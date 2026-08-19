@@ -914,11 +914,51 @@ restated here, so a future relocation cannot silently unprotect them.
 """
 
 
+def _reachable_vault_roots(source: Path) -> tuple[Path, ...]:
+    """Vault roots whose compliance artifacts a walk of *source* can reach.
+
+    The protected set is anchored on a root, and ``run_apply``'s root was
+    ``config.vault_path`` — a ``CreekConfig`` field that defaults to
+    ``Path()``, the process's *current directory*. So the exclusion only
+    held when the operator passed ``--vault``, or happened to be standing
+    in the vault. Every workflow example in ``docs/redaction.md`` is
+    ``--apply --source <tree>`` with no ``--vault``, which is exactly the
+    invocation that missed (#1398).
+
+    Anchoring on *source* as well closes it. A protected artifact can
+    only be in the rewrite set if it is under the walked tree, and
+    ``<root>/00-Creek-Meta/...`` is under the walk only when *root* is
+    *source* itself or one of its ancestors — so those are the
+    candidates, filtered to the ones that actually carry a
+    ``00-Creek-Meta`` directory. That also covers
+    ``--source <vault>/00-Creek-Meta``, which anchoring on the walk root
+    alone would miss.
+
+    A single-file *source* needs no special case: it cannot itself carry
+    a ``00-Creek-Meta`` child, so it is filtered out, and
+    ``source.parents`` already begins at its containing directory.
+
+    Args:
+        source: The file or directory ``--apply`` was pointed at.
+
+    Returns:
+        Every directory at or above *source* that looks like a vault
+        root, outermost-last.
+    """
+    meta_dirname = VAULT_CONFIG_RELPATH.parent
+    return tuple(
+        candidate
+        for candidate in (source, *source.parents)
+        if (candidate / meta_dirname).is_dir()
+    )
+
+
 def _exclude_audit_artifacts(
     files: list[Path],
     vault_path: Path,
     *,
     console: Console,
+    extra_vault_roots: tuple[Path, ...] = (),
 ) -> list[Path]:
     """Drop candidates the vault must never have rewritten under it.
 
@@ -935,7 +975,11 @@ def _exclude_audit_artifacts(
 
     So the exclusion is unconditional — independent of both
     ``supported_extensions`` and ``exclude_patterns`` — and covers every
-    path in :data:`PROTECTED_AUDIT_RELPATHS`.
+    path in :data:`PROTECTED_AUDIT_RELPATHS`, under every root it is
+    given. "Unconditional" is a claim about *roots* as much as about
+    settings: anchoring on ``config.vault_path`` alone made it hold only
+    when ``--vault`` was passed, because that field defaults to the
+    current directory (see :func:`_reachable_vault_roots`).
 
     Applied to the APPLY file list only, never to ``scan_batch``:
     detection must stay exactly as wide as it is today for ``--scan``,
@@ -944,15 +988,23 @@ def _exclude_audit_artifacts(
 
     Args:
         files: Candidate files the apply would rewrite.
-        vault_path: Vault root owning the compliance artifacts.
+        vault_path: Vault root owning the audit log this run writes.
         console: Rich console sink for the one-line notice.
+        extra_vault_roots: Further roots whose artifacts must also be
+            protected — the vault roots the walk can actually reach
+            (:func:`_reachable_vault_roots`). Supplied separately from
+            *vault_path* because that one is where the audit log lands,
+            which is not necessarily the tree being rewritten.
 
     Returns:
         *files* minus every protected compliance artifact.
     """
+    roots = tuple(dict.fromkeys((vault_path, *extra_vault_roots)))
     try:
         protected = tuple(
-            (vault_path / relpath).resolve() for relpath in PROTECTED_AUDIT_RELPATHS
+            (root / relpath).resolve()
+            for root in roots
+            for relpath in PROTECTED_AUDIT_RELPATHS
         )
     except (OSError, RuntimeError) as exc:
         # The candidate side of the comparison fails closed (see
@@ -962,7 +1014,8 @@ def _exclude_audit_artifacts(
         # traceback. Nothing has been rewritten at this point.
         console.print(
             f"[red]Cannot resolve the vault's compliance artifacts under "
-            f"{vault_path / '00-Creek-Meta'}: {_safe_error_detail(exc)}. "
+            f"{', '.join(str(root / VAULT_CONFIG_RELPATH.parent) for root in roots)}"
+            f": {_safe_error_detail(exc)}. "
             f"Refusing to redact anything, because the audit trail cannot "
             f"be reliably excluded. No files were modified.[/red]"
         )
@@ -977,9 +1030,9 @@ def _exclude_audit_artifacts(
     if dropped:
         console.print(
             f"[yellow]Skipped {dropped} protected file(s) under "
-            f"{vault_path / '00-Creek-Meta'}: the audit trail, the legacy "
-            f"purge log and the config that governs redaction are never "
-            f"rewritten in place.[/yellow]"
+            f"00-Creek-Meta: the audit trail, the legacy purge log and the "
+            f"config that governs redaction are never rewritten in "
+            f"place.[/yellow]"
         )
     return kept
 
@@ -1215,9 +1268,15 @@ def run_apply(
     log, or of :func:`_atomic_write`'s ``os.replace``. Both residuals
     fail safe — intent present, rewrite lost.
 
-    The vault's own ``00-Creek-Meta/audit/`` directory is excluded from
-    the rewrite set unconditionally (:func:`_exclude_audit_artifacts`),
-    so a run can never redact its own history.
+    ``00-Creek-Meta/audit/``, the legacy purge log and
+    ``creek_config.yaml`` are excluded from the rewrite set
+    unconditionally (:func:`_exclude_audit_artifacts`), so a run can
+    never redact its own history or the config that steers the next run.
+    The exclusion is anchored on the vault roots the *walk* reaches
+    (:func:`_reachable_vault_roots`) as well as on *vault*, so it does
+    not depend on ``--vault`` being passed — ``config.vault_path``
+    defaults to the current directory, which would otherwise make the
+    guarantee true only for operators standing in their vault (#1398).
 
     Args:
         source: File or directory to scan and redact.
@@ -1265,6 +1324,7 @@ def run_apply(
         _files_from_summary(summary),
         vault_path,
         console=console,
+        extra_vault_roots=_reachable_vault_roots(source),
     )
     if not files:
         console.print(_nothing_to_redact_message(summary))

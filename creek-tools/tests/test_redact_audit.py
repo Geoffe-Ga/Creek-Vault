@@ -1142,3 +1142,222 @@ def test_the_protected_set_covers_the_vault_config_by_its_owning_constant(
         "the exclusion kept the vault config in the rewrite set (or dropped "
         f"the ordinary file with it).\n\nkept={kept}"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1398, second half: the protection must not depend on ``--vault``
+#
+# The exclusion is anchored on a vault ROOT, and ``run_apply``'s root was
+# ``vault if vault is not None else config.vault_path``. That config field
+# defaults to ``Path()`` — the process's current directory — so
+# ``creek redact --apply --source <vault> --yes`` from anywhere outside the
+# vault anchored the protected set on the wrong tree and rewrote the config
+# anyway. That is the invocation every ``--apply`` example in
+# ``docs/redaction.md`` uses.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "pass_vault",
+    [True, False],
+    ids=["vault-flag-supplied", "vault-flag-omitted"],
+)
+def test_apply_protects_the_config_with_and_without_an_explicit_vault(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    pass_vault: bool,
+) -> None:
+    """``creek_config.yaml`` survives an apply in BOTH invocations.
+
+    The ``vault-flag-omitted`` arm is the documented one, and it is the arm
+    that was red: with the current directory outside the vault,
+    ``config.vault_path`` falls back to ``Path()`` and the protected roots
+    are computed under the *cwd*, so nothing under the real vault matches.
+
+    The cwd is moved to ``tmp_path`` — a directory that is emphatically NOT
+    the vault root — because standing in the vault makes ``Path()`` happen to
+    be correct and the test would pass against the unfixed code.
+
+    Non-vacuity: an ordinary in-vault fragment must have been redacted. A run
+    that refused, crashed, or found nothing satisfies byte-identity perfectly.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        monkeypatch: Pytest monkeypatch fixture, used to move the cwd.
+        pass_vault: Whether the invocation supplies ``--vault``.
+    """
+    vault = _make_vault(tmp_path)
+    config_path = vault / "00-Creek-Meta" / "creek_config.yaml"
+    config_path.write_text(_CONFIG_WITH_SECRET_SHAPED_TOKEN, encoding="utf-8")
+    original_bytes = config_path.read_bytes()
+    fragment = vault / "notes.md"
+    _write_secret_file(fragment)
+    monkeypatch.chdir(tmp_path)
+
+    argv = ["redact", "--apply", "--source", str(vault)]
+    if pass_vault:
+        argv += ["--vault", str(vault)]
+    argv.append("--yes")
+    result = runner.invoke(app, argv)
+
+    assert result.exit_code == 0, result.output
+    assert fragment.read_text(encoding="utf-8") != f"contact: {SECRET_SSN}\n", (
+        "the ordinary in-vault fragment was not redacted, so this run "
+        "rewrote nothing and the byte-identity assertion below is "
+        f"vacuous.\n\n{result.output}"
+    )
+    assert config_path.read_bytes() == original_bytes, (
+        "creek_config.yaml was rewritten. The protection is anchored on a "
+        "vault root; without --vault that root defaulted to the current "
+        "directory, so the documented invocation "
+        "`creek redact --apply --source <vault> --yes` got no protection at "
+        f"all.\n\n{config_path.read_text(encoding='utf-8')}"
+    )
+
+
+def test_apply_protects_the_config_when_the_meta_dir_is_the_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pointing ``--source`` at ``00-Creek-Meta`` itself still protects it.
+
+    Anchoring on the walk root alone would compute
+    ``<vault>/00-Creek-Meta/00-Creek-Meta/creek_config.yaml`` and match
+    nothing, so the roots are taken from the walk root *and its ancestors*
+    that carry a ``00-Creek-Meta`` directory.
+
+    ``--vault`` is deliberately omitted, so the vault root is recovered from
+    the source ancestry or not at all.
+
+    Non-vacuity: an ordinary file inside ``00-Creek-Meta`` IS redacted, so
+    the run demonstrably walked and rewrote that directory.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        monkeypatch: Pytest monkeypatch fixture, used to move the cwd.
+    """
+    vault = _make_vault(tmp_path)
+    meta = vault / "00-Creek-Meta"
+    config_path = meta / "creek_config.yaml"
+    config_path.write_text(_CONFIG_WITH_SECRET_SHAPED_TOKEN, encoding="utf-8")
+    original_bytes = config_path.read_bytes()
+    ordinary = meta / "notes.md"
+    _write_secret_file(ordinary)
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--apply", "--source", str(meta), "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert ordinary.read_text(encoding="utf-8") != f"contact: {SECRET_SSN}\n", (
+        "the ordinary file inside 00-Creek-Meta was not redacted, so the "
+        f"run never walked the directory under test.\n\n{result.output}"
+    )
+    assert config_path.read_bytes() == original_bytes, (
+        "creek_config.yaml was rewritten when --source named its own "
+        f"parent directory.\n\n{config_path.read_text(encoding='utf-8')}"
+    )
+
+
+def test_reachable_vault_roots_finds_the_vault_from_the_source_alone(
+    tmp_path: Path,
+) -> None:
+    """The roots come from *source*, and only from directories that qualify.
+
+    Pins both arms: a directory carrying ``00-Creek-Meta`` is a root at any
+    depth at or above the walk root, and one that does not carry it is not a
+    root at all — otherwise every ancestor up to ``/`` would be treated as a
+    vault and the protection would be untargeted.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    import creek.redact.cli_commands as cli_commands
+
+    vault = _make_vault(tmp_path)
+    nested = vault / "Fragments" / "2024"
+    nested.mkdir(parents=True)
+
+    assert cli_commands._reachable_vault_roots(nested) == (vault,), (
+        "the vault root was not recovered from a nested source, so an "
+        "--apply without --vault gets no protection."
+    )
+    assert cli_commands._reachable_vault_roots(tmp_path) == (), (
+        "a directory with no 00-Creek-Meta was treated as a vault root."
+    )
+    file_inside = nested / "note.md"
+    file_inside.write_text("hello\n", encoding="utf-8")
+    assert cli_commands._reachable_vault_roots(file_inside) == (vault,), (
+        "a single-file source did not resolve to its owning vault root."
+    )
+
+
+def test_the_protected_skip_messages_name_all_three_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator-facing strings are pinned, not just their behaviour.
+
+    ``_nothing_to_redact_message``'s docstring carries a contract about what
+    the message must NOT say — it must not name only the audit trail when
+    the config is equally capable of being the sole reason (#1398) — and a
+    contract stated only in a docstring is not enforced. Three strings are
+    pinned here: the skip notice, the "every match is in a protected file"
+    message, and the resolve-failure refusal.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        monkeypatch: Pytest monkeypatch fixture, used to move the cwd.
+    """
+    import io
+    from pathlib import Path as RealPath
+
+    import typer
+    from rich.console import Console
+
+    import creek.redact.cli_commands as cli_commands
+
+    vault = _make_vault(tmp_path)
+    meta = vault / "00-Creek-Meta"
+    config_path = meta / "creek_config.yaml"
+    config_path.write_text(_CONFIG_WITH_SECRET_SHAPED_TOKEN, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--apply", "--source", str(meta), "--vault", str(vault), "--yes"],
+    )
+    flattened = " ".join(result.output.split())
+    assert "Skipped 1 protected file(s) under 00-Creek-Meta" in flattened, flattened
+    assert (
+        "the audit trail, the legacy purge log and the config that "
+        "governs redaction are never rewritten in place" in flattened
+    ), flattened
+    assert (
+        "Nothing to redact - every match is in a protected file"
+        in flattened.replace("\u2014", "-").replace("—", "-")
+    ), flattened
+
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=200)
+    real_resolve = RealPath.resolve
+
+    def looping_resolve(self: RealPath, strict: bool = False) -> RealPath:
+        if "00-Creek-Meta" in str(self):
+            msg = "Symlink loop"
+            raise RuntimeError(msg)
+        return real_resolve(self, strict=strict)
+
+    monkeypatch.setattr(RealPath, "resolve", looping_resolve)
+    with pytest.raises(typer.Exit):
+        cli_commands._exclude_audit_artifacts(
+            [tmp_path / "fine.md"],
+            vault,
+            console=console,
+        )
+    refusal = " ".join(buffer.getvalue().split())
+    assert "Cannot resolve the vault's compliance artifacts under" in refusal, refusal
+    assert "No files were modified." in refusal, refusal
