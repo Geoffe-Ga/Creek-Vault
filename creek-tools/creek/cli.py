@@ -4762,9 +4762,14 @@ def lint(
         None,
         "--check",
         help=(
+            # Kept in step with creek.lint.ALL_CHECKS by
+            # test_lint.py::test_the_check_help_string_lists_every_check.
+            # Restated rather than rendered because `creek.lint` is imported
+            # lazily inside the command bodies to keep CLI startup fast, and
+            # a module-level import here would undo that.
             "Run only this check (repeatable). Names: paradox, unnamed, "
             "synchronicity, compost, tags, broken-links, orphan-compiled, "
-            "skill-size."
+            "skill-size, draft-grounding, voice-fidelity, unparseable."
         ),
     ),
     since: str | None = typer.Option(

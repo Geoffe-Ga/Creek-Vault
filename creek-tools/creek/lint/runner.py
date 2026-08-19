@@ -37,6 +37,9 @@ from creek.lint.checks import (
     unnamed as unnamed_check,
 )
 from creek.lint.checks import (
+    unparseable as unparseable_check,
+)
+from creek.lint.checks import (
     voice_fidelity as voice_fidelity_check,
 )
 
@@ -70,6 +73,7 @@ DETERMINISTIC_CHECKS: tuple[str, ...] = (
     "compost",
     "draft-grounding",
     "voice-fidelity",
+    "unparseable",
 )
 """Cheap checks that always run by default (link graph + frontmatter only)."""
 
@@ -93,6 +97,7 @@ _REGISTRY: dict[str, _CheckCallable] = {
     "paradox": paradox_check.run,
     "synchronicity": synchronicity_check.run,
     "unnamed": unnamed_check.run,
+    "unparseable": unparseable_check.run,
 }
 
 
