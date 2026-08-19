@@ -166,19 +166,34 @@ def test_a_fleet_lane_takes_a_slice_not_the_whole_box(
 
     This is the #1554 regression itself: every lane's Gate 2 reaches this code
     path, and each one previously claimed one worker per core.
+
+    The assertion is written around the *contract* — "a lane never claims every
+    core" — rather than around a specific number, because the number depends on
+    the machine. On a box with fewer cores than assumed lanes the slice floors
+    at 1, and the script's pre-existing rule is that 1 means *serial*: it omits
+    ``-n`` entirely rather than passing ``-n 1``. An earlier version of this
+    test asserted ``-n {slice}`` unconditionally; it passed on a 10-core
+    developer machine (slice 2) and failed on CI's 4-core runner (slice 1),
+    which is precisely the machine-dependence this whole issue is about.
     """
     argv = _run_test_sh(project_root=_as_lane(script_tree, tmp_path), tmp_path=tmp_path)
 
-    assert f"-n {expected_lane_workers()}" in argv, argv
     assert "-n auto" not in argv, f"a lane still claimed every core: {argv}"
 
-    # A fixed count would satisfy the two assertions above while still
+    slice_size = expected_lane_workers()
+    if slice_size > 1:
+        assert f"-n {slice_size}" in argv, argv
+    else:
+        # Floored to one worker, which this script spells as "no xdist".
+        assert " -n " not in f" {argv} ", f"expected serial, got: {argv}"
+
+    # A fixed count would satisfy the assertions above while still
     # oversubscribing a small box (2 workers x 4 lanes on 4 cores is the same
     # defect, only smaller). On any machine big enough for the division to
     # bite, the slice must be strictly smaller than the core count.
     cores = os.cpu_count() or 1
     if cores >= ASSUMED_CONCURRENT_LANES * 2:
-        assert expected_lane_workers() < cores
+        assert slice_size < cores
 
 
 def test_outside_a_lane_the_whole_box_is_still_used(
