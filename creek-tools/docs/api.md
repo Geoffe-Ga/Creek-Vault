@@ -210,13 +210,14 @@ reachable on any unrouted path and is *heuristically cacheable* under RFC 9110
 §15.1, so a conforming shared cache may store and reuse it with no freshness
 information at all.
 
-**Scope.** This is a promise about responses the application builds. Two paths
-answer a client without passing through that builder: a trailing slash is
-answered by the router's own `307`
-([#1369](https://github.com/Geoffe-Ga/Creek-Vault/issues/1369)), and a fault in
-the outermost middleware escapes as a bare `text/plain` `500`
-([#1370](https://github.com/Geoffe-Ga/Creek-Vault/issues/1370)). Neither
-carries these headers.
+**Scope.** This is a promise about responses the application builds — and since
+[#1369](https://github.com/Geoffe-Ga/Creek-Vault/issues/1369) and
+[#1370](https://github.com/Geoffe-Ga/Creek-Vault/issues/1370) that is every
+response the application emits. The two paths that used to escape it both now
+enter the builder: a trailing slash is `404 not_found` rather than the router's
+own `307`, and a fault in the outermost middleware is the published
+`500 internal_error` rather than a bare `text/plain` page. Both therefore carry
+these headers.
 
 **If you front this server with a reverse proxy, do not enable caching on
 `/v1`.** The [access-log scope note](#request-logging) applies here too: a proxy
@@ -375,6 +376,14 @@ vault-object non-answer collapses to `403 privacy_refused` with one fixed
 reason. A method mismatch (`PUT /v1/wheel`) also renders `404`, because `405` is
 not in the contract's published status set.
 
+**A trailing slash is `404`, not a redirect (#1369).** `GET /v1/health/` is not
+a path this server serves, and it is answered as one. The router's default
+`307` was wrong twice over: `307` is outside the published status set, so a
+conforming client reads it as "unreachable" the same way it would a `405`; and
+the redirect is issued *above* the contract-version gate, so a client speaking a
+minor this server does not serve was handed a URL to retry instead of
+`409 incompatible_version`. Send the canonical path.
+
 **`404` is keyed on the routing statuses, not on the exception class.** The two
 answers the router can reach — `404` for a path it does not serve and `405` for
 a verb it does not serve on a path it does — are the only ones that become
@@ -487,6 +496,23 @@ silently rewrite a document a consumer has pinned. Generating from our own
 models makes it a function of our models alone. It is also why `/v1` uses
 Starlette rather than FastAPI (see the ADR's "HTTP framework" section for all
 four reasons).
+
+**The document declares the bearer requirement it has always enforced (#1371).**
+`components.securitySchemes.bearerAuth` is an OpenAPI `http`/`bearer` scheme —
+the `Authorization` header, by RFC 7235 — and a document-level `security`
+requirement applies it to every operation, including `GET /v1/health`. No
+operation opts out, because none of them is anonymous: the bearer check sits
+above the router. A client generated from this document therefore ships with a
+place to put the credential.
+
+**Path parameters are published with their bounds (#1132).** `{external_id}`
+carries `minLength`, `maxLength` (the same `MAX_EXTERNAL_ID_CHARS` both write
+surfaces enforce) and a `pattern` excluding ASCII control characters, `DEL` and
+`/`. The pattern is deliberately looser than the server's own
+`admissible_external_id` — which also refuses whitespace-only ids and
+non-printable characters outside ASCII — because a published constraint tighter
+than the server would make a generated client refuse, client-side, an id the
+vault already holds.
 
 **The document is generated on demand and is not committed.** Its agreement with
 the published bundle is pinned by tests rather than by a second stored artifact:

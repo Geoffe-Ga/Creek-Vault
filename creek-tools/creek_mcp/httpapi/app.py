@@ -16,6 +16,26 @@ Matching is strict ``major.minor`` membership — ``0.2.0`` is a patch version,
 not a minor, and is refused rather than liberally parsed, because a parser that
 accepts both spellings is a parser two implementations will disagree about.
 
+**A trailing slash renders as a routing miss too (#1369).** Starlette's router
+redirects ``/v1/health/`` to ``/v1/health`` by default, and
+:data:`REDIRECT_SLASHES` turns that off. ``307`` is outside the published status
+set for the same reason ``405`` is, so a stray slash cost a conforming client
+the whole vault — but the serious half is *where* the redirect is issued. The
+router sits **above** the contract-version gate in :func:`_endpoint_for`, so a
+client speaking a minor this server does not serve was answered with a URL to
+retry rather than with ``409 incompatible_version``: the redirect could land a
+request on a handler without the negotiation the gate exists to perform. With
+the redirect off, both become ``404 not_found`` — in the published set, and the
+same answer an unrouted path already gets.
+
+**A fault above the error boundary renders as the published ``500`` (#1370).**
+:func:`_outermost_fault` is registered against ``Exception`` so Starlette's
+``ServerErrorMiddleware`` — which is installed unconditionally, above every
+Creek layer — renders the contract envelope instead of its default
+``text/plain`` page. It is reachable only from the one line above
+:class:`~creek_mcp.httpapi.middleware.boundary.ErrorBoundaryMiddleware`; every
+other fault is enveloped one layer down and never gets here.
+
 **A method miss renders as a routing miss.** ``405`` is not in the contract's
 published status set ``{200, 401, 403, 404, 409, 422, 500, 501, 503}``, and a
 conforming client maps an out-of-set status to "unreachable" — losing the vault
@@ -70,10 +90,13 @@ from creek_mcp.api.models import (
 from creek_mcp.api.routes import CONTRACT_VERSION_HEADER, ROUTE_BODY_CAPS, ROUTES
 from creek_mcp.httpapi import handlers
 from creek_mcp.httpapi.auth import BearerAuthMiddleware, build_verifier
-from creek_mcp.httpapi.context import context_of
+from creek_mcp.httpapi.context import SCOPE_KEY, bind_context, context_of
 from creek_mcp.httpapi.errors import error_response
 from creek_mcp.httpapi.middleware.access_log import AccessLogMiddleware
-from creek_mcp.httpapi.middleware.boundary import ErrorBoundaryMiddleware
+from creek_mcp.httpapi.middleware.boundary import (
+    ErrorBoundaryMiddleware,
+    log_unhandled_fault,
+)
 from creek_mcp.httpapi.middleware.ceiling import CeilingAdmissionMiddleware
 from creek_mcp.httpapi.middleware.limits import (
     DEFAULT_MAX_BODY_BYTES,
@@ -92,9 +115,22 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
     from creek_mcp.api.routes import RouteSpec
+    from creek_mcp.httpapi.context import RequestContext
     from creek_mcp.httpapi.handlers import Handler
     from creek_mcp.remote_auth import ConsumerTokenVerifier
     from creek_mcp.tools.reflect import _LLMFactory
+
+REDIRECT_SLASHES: Final[bool] = False
+"""Whether the router answers a trailing slash with a redirect. It does not.
+
+Set on ``app.router`` after construction rather than passed to
+:class:`~starlette.applications.Starlette`, because that constructor exposes no
+``redirect_slashes`` argument and builds the
+:class:`~starlette.routing.Router` itself; the router's own flag is read on each
+request, and the middleware stack is assembled lazily on the first call, so the
+assignment lands before anything can be served. Named rather than written as a
+bare ``False`` so the reason for it has somewhere to live.
+"""
 
 METHOD_NOT_ALLOWED: Final[int] = 405
 """The status Starlette's router raises on a verb mismatch.
@@ -303,6 +339,58 @@ async def _not_a_routing_miss(_request: Request, exc: Exception) -> NoReturn:
     raise exc
 
 
+async def _outermost_fault(request: Request, _exc: Exception) -> Response:
+    """Render a fault from *above* the error boundary as the published ``500`` (#1370).
+
+    :class:`~creek_mcp.httpapi.middleware.boundary.ErrorBoundaryMiddleware` is
+    the second layer and envelopes everything below it. It cannot envelope the
+    layer above it, and there is one reachable line up there:
+    :class:`~creek_mcp.httpapi.middleware.access_log.AccessLogMiddleware` calls
+    :func:`~creek_mcp.httpapi.context.bind_context` before and outside its own
+    ``try``. A fault there escaped the whole Creek stack into Starlette's
+    ``ServerErrorMiddleware``, which — with no handler registered — answered
+    ``PlainTextResponse("Internal Server Error", 500)``: the wrong envelope,
+    ``text/plain`` where the contract speaks only JSON, an author-written string
+    on the wire where the contract guarantees only constants from
+    :data:`~creek_mcp.api.models.ERROR_MESSAGES`, no standing headers, and no
+    correlation id.
+
+    Registering this handler is what makes ``ServerErrorMiddleware`` render the
+    published envelope instead. The alternative repair — moving ``bind_context``
+    inside the access log's ``try`` — was declined: the context is then the very
+    thing that failed, and :func:`~creek_mcp.httpapi.context.context_of` is
+    deliberately intolerant of a missing entry precisely so a reordering cannot
+    be papered over.
+
+    **The context, and why minting one here is not that papering-over.** The
+    ``scope`` is read directly rather than through ``context_of`` because the
+    binding is exactly what may not have happened. When it did not, a fresh
+    context is minted *and the fault is logged under its id*, so the id the
+    caller is handed names a real log line rather than correlating to nothing.
+    When a context is already present and its response has begun, the fault is
+    unwinding past bytes already on the wire — the boundary declines to log that
+    case for the same reason, and ``ServerErrorMiddleware`` re-raises so the
+    ASGI server records it once.
+
+    Args:
+        request: The request in flight, read only for its ``scope``.
+        _exc: The fault. Deliberately unread: its message, its class and its
+            traceback are the three things that must not reach a remote caller,
+            and :func:`log_unhandled_fault` takes it from the live ``except``
+            block for the operator instead.
+
+    Returns:
+        The published ``500 internal_error`` envelope, built by the single
+        response builder like every other refusal.
+    """
+    context: RequestContext | None = request.scope.get(SCOPE_KEY)
+    if context is None:
+        context = bind_context(request.scope)
+    if not context.started:
+        log_unhandled_fault(context.request_id)
+    return error_response(ErrorCode.INTERNAL_ERROR, context)
+
+
 def _middleware(
     verifier: ConsumerTokenVerifier,
     max_body_bytes: int,
@@ -396,8 +484,10 @@ def create_app(
             ERROR_STATUS[ErrorCode.NOT_FOUND]: _routing_miss,
             METHOD_NOT_ALLOWED: _routing_miss,
             HTTPException: _not_a_routing_miss,
+            Exception: _outermost_fault,
         },
     )
+    app.router.redirect_slashes = REDIRECT_SLASHES
     app.state.vault_path = vault_path
     app.state.reflect_llm_factory = reflect_llm_factory
     return app

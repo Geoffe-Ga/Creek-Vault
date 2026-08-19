@@ -699,7 +699,11 @@ creek-tools-mcp --transport network --host 0.0.0.0 --port 8443 \
 ```
 
 With both flags set, the server serves the Starlette app directly under
-`uvicorn` with `ssl_certfile`/`ssl_keyfile` — no reverse proxy is required.
+`uvicorn` with `ssl_certfile`/`ssl_keyfile` — no reverse proxy is required, and
+with `access_log=False` so uvicorn's own request logger, which is on by default
+and writes the client address of every request, is suppressed here exactly as it
+is on `creek-tools-api` (#1125). The two adapters share one logging posture
+rather than drifting apart.
 Alternatively, keep the server bound to `127.0.0.1` (or `localhost`) and
 terminate TLS in a reverse proxy in front of it; either path keeps bearer
 tokens off the wire in cleartext. A non-loopback bind without TLS exits

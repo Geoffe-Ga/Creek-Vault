@@ -57,14 +57,27 @@ actually holds the line — it is the one a dangling ref fails.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 
-from creek_mcp.api.models import CONTRACT_MODELS, ERROR_STATUS
-from creek_mcp.api.openapi import build_openapi
+from creek_mcp.api.models import (
+    CONTRACT_MODELS,
+    ERROR_STATUS,
+    MAX_EXTERNAL_ID_CHARS,
+)
+from creek_mcp.api.openapi import (
+    BEARER_SCHEME_DESCRIPTION,
+    EXTERNAL_ID_PARAM,
+    EXTERNAL_ID_PATTERN,
+    SECURITY_SCHEME_NAME,
+    build_openapi,
+)
+from creek_mcp.api.routes import AUTHORIZATION_HEADER
 from creek_mcp.contract import CONTRACT_VERSION
+from creek_mcp.httpapi.journal import admissible_external_id
 from tests.v1_api_support import (
     CAPABILITIES_PATH,
     CONTRACT_VERSION_HEADER,
@@ -521,3 +534,191 @@ def test_the_content_routes_declare_the_contract_version_parameter(
 def test_the_versioned_operations_list_is_not_vacuous() -> None:
     """The parametrize above covers three routes, not zero."""
     assert len(VERSIONED_OPERATIONS) == 3
+
+
+# --------------------------------------------------------------------------- #
+# The bearer requirement (#1371)
+# --------------------------------------------------------------------------- #
+
+
+def _security_schemes() -> dict[str, Any]:
+    """Return the document's ``components/securitySchemes`` mapping.
+
+    Returns:
+        The declared schemes, keyed by name. Empty when the document declares
+        none at all — which is the state #1371 was filed about, and which this
+        helper renders as an assertion failure rather than a ``KeyError``.
+    """
+    schemes: dict[str, Any] = build_openapi()["components"].get("securitySchemes", {})
+    return schemes
+
+
+def test_the_document_declares_the_bearer_scheme_every_route_enforces() -> None:
+    """THE INVARIANT — the published document names the credential the server demands.
+
+    :class:`~creek_mcp.httpapi.auth.BearerAuthMiddleware` sits above the router,
+    so all six published routes are unreachable without a token and
+    :func:`~creek_mcp.httpapi.auth.build_verifier` refuses to construct a server
+    with no consumers configured. A document that declares no scheme therefore
+    says the surface is open while the server refuses everything, and a client
+    generated from it has no way to present a credential at all.
+    """
+    assert _security_schemes()[SECURITY_SCHEME_NAME] == {
+        "type": "http",
+        "scheme": "bearer",
+        "description": BEARER_SCHEME_DESCRIPTION,
+    }
+
+
+def test_the_document_requires_that_scheme_globally() -> None:
+    """The requirement is document-level, so it reaches every operation.
+
+    Declared once rather than repeated per operation: five copies of a
+    requirement are five places for one of them to be dropped, and OpenAPI
+    already resolves an absent operation-level ``security`` against the
+    document-level default.
+    """
+    assert build_openapi()["security"] == [{SECURITY_SCHEME_NAME: []}]
+
+
+def test_no_operation_opts_out_of_the_bearer_requirement() -> None:
+    """No route may publish itself as anonymous, because none of them is.
+
+    An operation-level ``security: []`` is how OpenAPI spells "this one is
+    open". ``GET /v1/health`` is the route somebody would eventually be tempted
+    to spell that way, and it is still behind the gate — a probe with no bearer
+    is a ``401``, which the suite pins elsewhere.
+    """
+    assert all(
+        operation.get("security", [{SECURITY_SCHEME_NAME: []}]) != []
+        for _path, _method, operation in _operations()
+    )
+
+
+def test_the_bearer_scheme_is_truthful_about_the_header_the_server_reads() -> None:
+    """THE NON-VACUITY TWIN — ``http``/``bearer`` names ``Authorization``, implicitly.
+
+    OpenAPI's ``type: http`` scheme has no place to name a header: it *means*
+    the ``Authorization`` header, by RFC 7235. So the declaration above is only
+    a true statement about this server while
+    :data:`~creek_mcp.api.routes.AUTHORIZATION_HEADER` — the constant
+    :mod:`creek_mcp.httpapi.auth` reads and :mod:`creek_mcp.httpapi.errors`
+    names in every ``Vary`` — is that header. Move the constant and this scheme
+    becomes a lie no other test in this module could see.
+    """
+    assert AUTHORIZATION_HEADER == "Authorization"
+
+
+def test_the_bearer_requirement_added_no_component_schema() -> None:
+    """Publishing the scheme must not disturb the byte-pinned schema bundle.
+
+    ``components/securitySchemes`` is a different namespace from
+    ``components/schemas``; the sixteen committed schema files are what a
+    consumer vendors, and a security declaration must not move one of them.
+    """
+    assert SECURITY_SCHEME_NAME not in _components()
+    assert "securitySchemes" not in _components()
+
+
+# --------------------------------------------------------------------------- #
+# The external_id path parameter (#1132)
+# --------------------------------------------------------------------------- #
+
+
+def _path_parameters() -> list[tuple[str, str, dict[str, Any]]]:
+    """Return every ``(path, method, parameter)`` triple for an ``in: path`` parameter.
+
+    Returns:
+        One entry per declared path parameter across the whole document.
+    """
+    return [
+        (path, method, parameter)
+        for path, method, operation in _operations()
+        for parameter in operation.get("parameters", [])
+        if parameter["in"] == "path"
+    ]
+
+
+def test_every_published_path_parameter_is_bounded() -> None:
+    """THE INVARIANT — no path parameter is published as an unbounded string.
+
+    Starlette's default converter is ``[^/]+``, which admits a NUL byte, a
+    control character and an id of any length straight through to the handler.
+    The server already refuses those —
+    :func:`~creek_mcp.httpapi.journal.admissible_external_id` bounds the length
+    and demands printable characters — so an unconstrained
+    declaration understates the contract, and a consumer that pins this schema
+    bundle pins the understatement.
+    """
+    declared = _path_parameters()
+    assert declared, "the document declares no path parameters at all"
+    for path, method, parameter in declared:
+        schema = parameter["schema"]
+        assert "maxLength" in schema, f"{method} {path}: {parameter['name']}"
+        assert "pattern" in schema, f"{method} {path}: {parameter['name']}"
+
+
+def test_the_external_id_bound_is_the_one_both_write_surfaces_share() -> None:
+    """The published maximum is :data:`MAX_EXTERNAL_ID_CHARS` itself, not a restatement.
+
+    #1524 made that constant the single canonical bound imported by the journal
+    route and the upload model alike. A literal here would be a fourth spelling
+    of it, free to drift the day the bound moves.
+    """
+    (_path, _method, parameter) = next(
+        entry for entry in _path_parameters() if entry[2]["name"] == EXTERNAL_ID_PARAM
+    )
+    assert parameter["schema"]["maxLength"] == MAX_EXTERNAL_ID_CHARS
+    assert parameter["schema"]["minLength"] == 1
+
+
+@pytest.mark.parametrize(
+    "external_id",
+    [
+        "adepthood:doc:2026-08-19",
+        "abc",
+        "a" * MAX_EXTERNAL_ID_CHARS,
+        "..",
+        "an id with spaces",
+        "émoji-ok-\N{SNOWMAN}",
+    ],
+    ids=["namespaced", "short", "at-the-bound", "dot-dot", "spaces", "unicode"],
+)
+def test_the_published_pattern_admits_every_id_the_server_admits(
+    external_id: str,
+) -> None:
+    """THE NON-VACUITY TWIN — the published constraint refuses nothing the server takes.
+
+    A pattern *tighter* than the server is the more dangerous error of the two:
+    it makes a generated client refuse, client-side, an id the vault would have
+    accepted and already holds — so a consumer's own sync silently stops
+    addressing entries it wrote. ``..`` is in the list deliberately: the server
+    accepts it (``safe_stem`` digests the raw id rather than pathing on it), so
+    the document must not pretend otherwise.
+
+    Args:
+        external_id: An id :func:`admissible_external_id` accepts.
+    """
+    assert admissible_external_id(external_id)
+    assert re.fullmatch(EXTERNAL_ID_PATTERN, external_id) is not None
+
+
+@pytest.mark.parametrize(
+    "external_id",
+    ["with\x00nul", "with\nnewline", "with\x7fdelete", "with/slash"],
+    ids=["nul", "newline", "delete", "slash"],
+)
+def test_the_published_pattern_refuses_what_it_claims_to_refuse(
+    external_id: str,
+) -> None:
+    """The pattern is not the identity: it rejects the bytes #1132 named.
+
+    Without this, a pattern of ``.*`` would satisfy every assertion above.
+    ``/`` is included because Starlette's converter already excludes it, so a
+    published pattern that admitted it would document a path the router cannot
+    match.
+
+    Args:
+        external_id: An id the published pattern must refuse.
+    """
+    assert re.fullmatch(EXTERNAL_ID_PATTERN, external_id) is None
