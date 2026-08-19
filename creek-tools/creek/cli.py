@@ -6882,6 +6882,33 @@ carry ``deleted_files``, so there is no log to defer the operator to.
 """
 
 
+def _render_embeddings_purge_shortfall(result: PurgeResult) -> None:
+    """Say so, on screen, when the embeddings cache outlived the erasure.
+
+    The sibling shortfall — an undecodable body — already prints here, and an
+    erasure that fell short must say so where the operator is already looking.
+    Without this the only signals are a WARNING log line and the audit JSONL,
+    neither of which an operator running ``creek purge vault`` interactively
+    is reading, so a partial erasure would look complete on screen.
+
+    The cache matters specifically because its vectors are partially
+    invertible back to the purged content, so a surviving cache is a surviving
+    derivative, not merely untidy.
+
+    Args:
+        result: The completed purge result.
+    """
+    if not result.embeddings_cache_undeleted:
+        return
+    console.print(
+        "[red]The embeddings cache could not be deleted, so this erasure is "
+        "PARTIAL.[/red] It may still hold vectors derived from the purged "
+        "content. Remove "
+        "[bold]00-Creek-Meta/embeddings.parquet[/bold] by hand, then re-run "
+        "[bold]creek purge vault[/bold] to confirm."
+    )
+
+
 def _render_voice_purge_notes(result: PurgeResult) -> None:
     """Render the ``07-Voice`` sweep's count, follow-up, and any shortfall.
 
@@ -6948,6 +6975,7 @@ def _render_purge_result(result: PurgeResult) -> None:
             f"Meta artifacts removed: {result.meta_artifacts_removed}",
         )
     _render_voice_purge_notes(result)
+    _render_embeddings_purge_shortfall(result)
     _render_deleted_files(result.deleted_files)
 
 

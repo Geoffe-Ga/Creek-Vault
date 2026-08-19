@@ -26,6 +26,7 @@ that module is already 2400 lines and sits at the ``xenon
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Final
@@ -33,6 +34,8 @@ from typing import TYPE_CHECKING, Final
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 META_RELDIR: Final[str] = "00-Creek-Meta"
 """The vault folder this module sweeps."""
@@ -527,16 +530,54 @@ def _prune_empty_dirs_below(current: Path) -> bool:
         because the meta root itself is not this pass's to remove.
     """
     occupied = False
-    for entry in sorted(current.iterdir()):
+    try:
+        entries = sorted(current.iterdir())
+    except OSError as exc:
+        # A directory this pass cannot even list is an occupant, not a veto.
+        # Raising here would escape purge_vault() — and cli.py's purge
+        # command catches only ValueError, so the operator would get a raw
+        # traceback for an erasure that had already completed.
+        logger.warning(
+            "Could not list %s while pruning empty directories (%s); "
+            "leaving it standing",
+            current.name,
+            type(exc).__name__,
+        )
+        return False
+
+    for entry in entries:
         # ``is_dir()`` follows a symlink, so the link test comes first —
         # otherwise a link to a directory is descended and pruned, which
         # would reach outside ``00-Creek-Meta/`` and possibly outside the
         # vault. A link is an occupant of this directory, nothing more.
-        if entry.is_symlink() or not entry.is_dir():
+        try:
+            is_link_or_file = entry.is_symlink() or not entry.is_dir()
+        except OSError:
+            occupied = True
+            continue
+        if is_link_or_file:
             occupied = True
             continue
         if _prune_empty_dirs_below(entry):
-            entry.rmdir()
+            try:
+                entry.rmdir()
+            except OSError as exc:
+                # rmdir raises for more than "not empty": PermissionError on
+                # an immutable or read-only directory, EBUSY on a mount
+                # point, and the genuine race where a concurrent writer —
+                # Discord capture staging is a live one in this system — puts
+                # a file back into a directory this pass just judged empty.
+                #
+                # A tidiness pass must never veto an erasure. This is the same
+                # failure class delete_embeddings_cache's unlink() closes; it
+                # was left open here, in the newest code path.
+                logger.warning(
+                    "Could not remove the emptied directory %s (%s); leaving "
+                    "it standing. The files beneath it were still erased.",
+                    entry.name,
+                    type(exc).__name__,
+                )
+                occupied = True
         else:
             occupied = True
     return not occupied

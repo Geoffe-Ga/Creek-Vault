@@ -638,3 +638,47 @@ def test_a_clean_purge_still_reports_complete(tmp_path: Path) -> None:
 
     assert result.embeddings_cache_undeleted is False
     assert result.outcome_status == "complete"
+
+
+def test_an_unremovable_directory_does_not_veto_the_purge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused ``rmdir`` leaves the directory standing, not a traceback.
+
+    ``rmdir`` raises for more than "not empty": ``PermissionError`` on a
+    read-only directory, ``EBUSY`` on a mount point, and the genuine race
+    where a concurrent writer — Discord capture staging is a live one here —
+    puts a file back into a directory this pass has just judged empty.
+
+    Escaping would land as a raw traceback: it propagates out of
+    ``purge_vault`` and ``creek purge vault`` catches only ``ValueError``, so
+    the operator would see a crash for an erasure whose content deletion had
+    already completed. The same failure class ``delete_embeddings_cache``
+    closes for ``unlink``, left open in the newest code path until review
+    caught it.
+    """
+    vault = _make_vault(tmp_path)
+    doomed = vault / "00-Creek-Meta" / "State" / "discord" / "channel-x"
+    doomed.mkdir(parents=True)
+    (doomed / "messages.json").write_text("[]", encoding="utf-8")
+
+    real_rmdir = type(doomed).rmdir
+
+    def refuse(self: Path, *args: object, **kwargs: object) -> None:
+        """Refuse the emptied leaf, as a read-only mount would."""
+        if self == doomed:
+            msg = "Read-only file system"
+            raise OSError(msg)
+        real_rmdir(self, *args, **kwargs)  # type: ignore[arg-type]  # Issue #1547: pathlib.Path.rmdir is untyped for *args
+
+    monkeypatch.setattr("pathlib.Path.rmdir", refuse)
+
+    # Must not raise: a tidiness pass may never veto an erasure.
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert doomed.is_dir(), "positive control: the directory really did survive"
+    assert not (doomed / "messages.json").exists(), (
+        "the content beneath it must still have been erased"
+    )
+    assert result.meta_artifacts_removed >= 1
