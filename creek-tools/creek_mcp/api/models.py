@@ -1106,6 +1106,12 @@ class DriveSyncResponse(_WireModel):
             count is published because a caller told only about successes
             would believe an incomplete sync was complete. The *reasons* stay
             in the server log: they interpolate Drive file names.
+        fragments_failed: Files that downloaded cleanly and then failed to
+            become fragments — a per-unit assemble or write error. Published
+            separately from ``files_failed`` because the two are different
+            shortfalls: one never landed, the other landed and was lost.
+            Without it a sync whose content half-failed reports ``ok`` with
+            silently fewer fragments and no signal anywhere.
         files_unsupported: Files that downloaded cleanly and were **not**
             ingested, because their extension names a format Creek must not
             read as one document (#1526) — a conversation export, an archive,
@@ -1128,6 +1134,14 @@ class DriveSyncResponse(_WireModel):
     files_unsupported: int = Field(
         ge=0,
         description="Files fetched but of a format Creek must not ingest.",
+    )
+    fragments_failed: int = Field(
+        ge=0,
+        description=(
+            "Files that downloaded cleanly and then failed to become "
+            "fragments. Distinct from files_failed, which is a download that "
+            "never landed."
+        ),
     )
     fragments_created: int = Field(ge=0, description="Fragments newly written.")
     fragments_updated: int = Field(ge=0, description="Fragments rewritten.")

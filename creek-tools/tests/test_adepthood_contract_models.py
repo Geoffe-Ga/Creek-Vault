@@ -225,6 +225,7 @@ DRIVE_SYNC_RESPONSE_PAYLOAD: dict[str, Any] = {
     "files_unchanged": 11,
     "files_failed": 0,
     "files_unsupported": 1,
+    "fragments_failed": 0,
     "fragments_created": 2,
     "fragments_updated": 1,
     "fragments_unchanged": 0,

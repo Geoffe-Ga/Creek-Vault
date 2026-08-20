@@ -741,6 +741,7 @@ def test_the_published_schema_has_no_field_a_credential_could_sit_in(
             "files_unchanged",
             "files_failed",
             "files_unsupported",
+            "fragments_failed",
             "fragments_created",
             "fragments_updated",
             "fragments_unchanged",
@@ -1630,3 +1631,62 @@ def test_no_connector_verb_does_its_blocking_work_on_the_event_loop(
     # and its answer consumed, rather than the request short-circuiting above it.
     assert response.status_code == _OK_STATUS
     assert seen == [False]
+
+
+def test_a_file_that_downloads_but_fails_to_ingest_is_reported(
+    vault: Path,
+    configured: Path,
+    token_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sync whose content half-failed must not answer a clean ``ok``.
+
+    ``run_ingest`` reports a per-unit failure in ``errors`` and never logs it
+    itself. Discarding that list put a file which downloaded cleanly but whose
+    fragment failed to assemble — or whose write raised ``OSError`` — into
+    NONE of the published counts: ``files_failed`` covers only a download that
+    never landed, and ``files_unsupported`` is decided before the ingest even
+    starts. The response was a 200 with silently fewer fragments and no signal
+    anywhere, which is the exact shortfall this connector exists to avoid.
+
+    Caught by adversarial review of this PR.
+
+    Args:
+        vault: A seeded vault.
+        configured: The staging directory.
+        token_path: Where the cached credential lives.
+        monkeypatch: The active monkeypatch fixture.
+    """
+    del configured
+    from creek.ingest.pipeline import IngestRunResult
+
+    def _failing_ingest(**_kwargs: object) -> IngestRunResult:
+        """One unit in, zero fragments out, one error recorded."""
+        return IngestRunResult(
+            written=0,
+            discovered=1,
+            created=0,
+            updated=0,
+            unchanged=0,
+            tombed=0,
+            skipped=0,
+            errors=["[gdrive] failed to write frag-x: disk full"],
+        )
+
+    stub = _StubDrive([_drive_file("id-1", "ridge.md")], {"id-1": _PLAIN_BODY})
+    _stubbed(monkeypatch, stub)
+    monkeypatch.setattr(drive_tools, "run_ingest", _failing_ingest)
+    _connect(token_path)
+
+    with client(vault_path=vault) as test_client:
+        response = _sync(test_client)
+
+    assert response.status_code == _OK_STATUS, response.text
+    body = envelope(response)
+    assert body["fragments_failed"] >= 1, body
+    assert body["fragments_created"] == 0, body
+
+    # The count is published; the error STRING is not. It carries a source
+    # path, and a Drive file name is user content this response must not echo.
+    assert "disk full" not in response.text
+    assert "frag-x" not in response.text

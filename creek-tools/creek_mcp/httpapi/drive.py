@@ -251,6 +251,7 @@ def _sync_model(result: dict[str, Any]) -> DriveSyncResponse:
         files_unchanged=int(result["files_unchanged"]),
         files_failed=int(result["files_failed"]),
         files_unsupported=int(result["files_unsupported"]),
+        fragments_failed=int(result["fragments_failed"]),
         fragments_created=int(result["fragments_created"]),
         fragments_updated=int(result["fragments_updated"]),
         fragments_unchanged=int(result["fragments_unchanged"]),

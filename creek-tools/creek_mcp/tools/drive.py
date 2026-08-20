@@ -327,7 +327,7 @@ def _ingest_downloaded(
     Returns:
         The four tallies, or ``None`` when the vault vanished mid-run.
     """
-    tally = {"created": 0, "updated": 0, "unchanged": 0, "unsupported": 0}
+    tally = {"created": 0, "updated": 0, "unchanged": 0, "unsupported": 0, "failed": 0}
     for path in downloaded:
         try:
             source_type = route_to_ingestor(path)
@@ -357,6 +357,22 @@ def _ingest_downloaded(
         tally["created"] += result.created
         tally["updated"] += result.updated
         tally["unchanged"] += result.unchanged
+        # run_ingest reports a per-unit failure in `errors` and never logs it
+        # itself. Dropping that list made a file which downloaded cleanly but
+        # whose fragment failed to assemble — or whose write raised OSError —
+        # land in NONE of the three counts above: a 200 with silently fewer
+        # fragments and no signal anywhere. `files_unsupported` does not cover
+        # it; that is decided before the ingest even starts.
+        #
+        # Counted, never quoted: an error string carries the source path, and
+        # a Drive file name is user content this response must not echo.
+        tally["failed"] += len(result.errors)
+        if result.errors:
+            logger.warning(
+                "%d file(s) downloaded from Drive but did not become "
+                "fragments; this sync is INCOMPLETE",
+                len(result.errors),
+            )
     return tally
 
 
@@ -378,7 +394,12 @@ def _sync_payload(
         tally: The ingest tallies from :func:`_ingest_downloaded`.
 
     Returns:
-        The seven counts, and nothing derived from a file name or an id.
+        The eight counts, and nothing derived from a file name or an id.
+
+    ``files_failed`` and ``fragments_failed`` are different shortfalls and are
+    published separately: the first is a download that never landed, the second
+    a file that landed and then failed to become a fragment. Collapsing them
+    would tell an operator a sync was clean when half its content is missing.
     """
     return {
         "status": "ok",
@@ -387,6 +408,7 @@ def _sync_payload(
         "files_unchanged": skipped,
         "files_failed": failed,
         "files_unsupported": tally["unsupported"],
+        "fragments_failed": tally["failed"],
         "fragments_created": tally["created"],
         "fragments_updated": tally["updated"],
         "fragments_unchanged": tally["unchanged"],

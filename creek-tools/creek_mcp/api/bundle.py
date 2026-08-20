@@ -313,18 +313,6 @@ of what a consumer learns about the credential is that one exists and that it
 was granted read-only.
 """
 
-_DRIVE_STATUS_EMPTY: Final[dict[str, Any]] = {
-    **_DRIVE_STATUS_SUCCESS,
-    "connection": DriveConnectionState.NOT_CONNECTED.value,
-    "can_sync": False,
-}
-"""A server nobody has authorised yet: a legitimate state, never an error.
-
-This is the cell a client renders its "Connect Google Drive" button from — and
-the reason that button points at the operator's own machine rather than at a
-``/v1`` route, because there is no route that can mint a credential.
-"""
-
 _DRIVE_SYNC_EMPTY: Final[dict[str, Any]] = {
     "status": OK_STATUS,
     "tier_ceiling": WireTierCeiling.OPEN.value,
@@ -332,6 +320,7 @@ _DRIVE_SYNC_EMPTY: Final[dict[str, Any]] = {
     "files_unchanged": 0,
     "files_failed": 0,
     "files_unsupported": 0,
+    "fragments_failed": 0,
     "fragments_created": 0,
     "fragments_updated": 0,
     "fragments_unchanged": 0,

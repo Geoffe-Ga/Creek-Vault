@@ -62,7 +62,7 @@
       "capability": "drive-connector",
       "model": "DriveSyncResponse",
       "path": "examples/drive-connector/empty.json",
-      "sha256": "5af5f319c5820cea00c9c3d240fac4a78a1c79b70bac178ea711cbd338cc16fc",
+      "sha256": "54f3f1431e62c7ea9f51cc54663149f80eb0f2acabb5eb3a7fca061d4860feb9",
       "state": "empty"
     },
     {
@@ -349,7 +349,7 @@
       "capability": null,
       "model": "DriveSyncResponse",
       "path": "schemas/DriveSyncResponse.schema.json",
-      "sha256": "092cfa15240ba039a8a99cdbe6d59ee64d875fb6649c570ff54d2801c9defac4",
+      "sha256": "8fa0ddc2b9143f3962ceede733fede60695e250e5ec728509123ea8d1c150ea8",
       "state": null
     },
     {
