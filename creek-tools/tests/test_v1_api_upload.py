@@ -39,13 +39,16 @@ implementation would have gone wrong.
 from __future__ import annotations
 
 import base64
+import io
 import json
+import zipfile
 from typing import TYPE_CHECKING, Any, Final
 
 import frontmatter
 import pytest
 
 from creek.ingest import INGESTOR_REGISTRY
+from creek.ingest.archive import ARCHIVE_SUFFIXES
 from creek.ingest.gdrive import _EXTENSION_ROUTES, _Refuse
 from creek.ingest.pipeline import run_ingest
 from creek.models import PrivacyTier
@@ -63,6 +66,11 @@ from creek_mcp.httpapi.upload import upload_refusal_code
 from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
 from creek_mcp.tier_ceiling import TIER_REQUIRED_REASON
 from creek_mcp.tools.upload import MAX_UPLOAD_BYTES
+from tests.archive_export_support import (
+    CHATGPT_KEPT_ANSWER,
+    chatgpt_archive,
+    zip_slip_archive,
+)
 from tests.v1_api_support import (
     CAPABILITIES_PATH,
     UPLOAD_PATH,
@@ -184,13 +192,25 @@ def _fragments(vault: Path) -> list[Path]:
 
 
 def _refused_extensions() -> tuple[str, ...]:
-    """Return every extension :func:`route_to_ingestor` refuses, sorted.
+    """Return every extension **this route** refuses, sorted.
 
     Read off :data:`creek.ingest.gdrive._EXTENSION_ROUTES` rather than listed,
     so an extension added to the refusal table is swept by this module without
     anyone remembering to add it. Reaching for the private name is deliberate:
     a public restatement would be a second list, and a second list is what this
     derivation exists to avoid.
+
+    :data:`~creek.ingest.archive.ARCHIVE_SUFFIXES` is subtracted, and the
+    subtraction is the #1525 seam. ``route_to_ingestor`` still refuses
+    ``.zip`` — correctly, since there is no ingestor that reads an archive as
+    one *document* — but ``upload_tool`` no longer reaches that refusal for
+    one: it forks above it and unpacks the archive. Sweeping ``.zip`` through
+    here as a ``415`` would therefore be asserting a behaviour this surface
+    deliberately no longer has. What replaces it is stronger, not weaker: the
+    ``.zip`` cases below assert a real archive lands as ``200`` **and** a
+    malformed one as ``400``, and the non-vacuity test below pins the
+    subtraction to exactly the archive suffixes so a future extension cannot
+    fall out of the sweep unnoticed.
 
     Returns:
         The refused suffixes, in a stable order.
@@ -199,7 +219,7 @@ def _refused_extensions() -> tuple[str, ...]:
         sorted(
             suffix
             for suffix, route in _EXTENSION_ROUTES.items()
-            if isinstance(route, _Refuse)
+            if isinstance(route, _Refuse) and suffix not in ARCHIVE_SUFFIXES
         )
     )
 
@@ -587,15 +607,113 @@ def test_every_refused_extension_lands_as_415_with_the_remedy(
     assert _fragments(vault) == []
 
 
+def test_an_export_archive_crosses_the_route_and_becomes_many_fragments(
+    vault: Path,
+) -> None:
+    """#1525 over HTTP: one ``.zip`` in, a whole conversation history out.
+
+    The route needed no new field for this and gets none — the archive arrives
+    as ``content_base64`` under a ``.zip`` filename, and the export type is
+    decided from the archive's contents by the tool. Asserted here rather than
+    only at the tool because the response projection is this module's subject:
+    an archive produces *many* fragments, so ``affected_fragment_ids`` carries
+    more than one entry and ``fragment_id`` must be the first of them rather
+    than the only one.
+
+    Args:
+        vault: A seeded vault.
+    """
+    response = _post(
+        vault,
+        _body(filename="chatgpt-export.zip", content=chatgpt_archive()),
+    )
+
+    assert response.status_code == _OK_STATUS
+    parsed = UploadResponse.model_validate(envelope(response))
+    assert parsed.source_type == "chatgpt"
+    assert len(parsed.affected_fragment_ids) > 1
+    assert parsed.fragment_id == parsed.affected_fragment_ids[0]
+    assert len(_fragments(vault)) == len(parsed.affected_fragment_ids)
+    assert CHATGPT_KEPT_ANSWER in "\n".join(
+        path.read_text(encoding="utf-8") for path in _fragments(vault)
+    )
+
+
+@pytest.mark.parametrize(
+    ("content", "case"),
+    [
+        (b'{"conversations": []}', "not-a-zip"),
+        (zip_slip_archive("../../etc/x", b"escaped-1525"), "zip-slip"),
+    ],
+)
+def test_a_malformed_archive_lands_as_400_and_writes_nothing(
+    vault: Path, content: bytes, case: str
+) -> None:
+    """An unusable ``.zip`` is the caller's to fix, so ``400``, never ``500``.
+
+    Both cases are decided entirely from the caller's own bytes, so neither may
+    fall through to ``internal_error`` — a caller told "server fault" retries
+    the same crafted archive indefinitely. The filesystem assertion is the
+    other half: the zip-slip case must leave no fragment and no escaped file.
+
+    Args:
+        vault: A seeded vault.
+        content: The archive bytes to send.
+        case: The shape's name, for the failure message.
+    """
+    response = _post(vault, _body(filename="export.zip", content=content))
+
+    assert response.status_code == _INVALID_REQUEST_STATUS, case
+    assert envelope(response)["code"] == ErrorCode.INVALID_REQUEST.value, case
+    assert _fragments(vault) == [], case
+    escaped = [
+        path
+        for path in sorted(vault.parent.rglob("*"))
+        if path.is_file() and b"escaped-1525" in path.read_bytes()
+    ]
+    assert escaped == [], case
+
+
+def test_an_unrecognised_archive_lands_as_415_with_the_remedy(vault: Path) -> None:
+    """A readable archive Creek cannot name joins the #1526 ``415`` family.
+
+    Args:
+        vault: A seeded vault.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("holiday/readme.txt", b"nothing Creek knows about")
+
+    response = _post(vault, _body(filename="export.zip", content=buffer.getvalue()))
+
+    assert response.status_code == _UNSUPPORTED_SOURCE_STATUS
+    body = envelope(response)
+    assert body["code"] == ErrorCode.UNSUPPORTED_SOURCE.value
+    assert "creek ingest" in body["message"]
+    assert _fragments(vault) == []
+
+
 def test_the_refused_extension_sweep_is_not_vacuous() -> None:
     """The sweep above really does cover all three refused families.
 
     An emptied parametrize list is a test that vanishes behind a green gate, so
     the count is asserted and the three family representatives are named.
+
+    ``.tar`` stands for the archive family now that ``.zip`` is unpacked
+    (#1525), and the subtraction is pinned to *exactly* the archive suffixes:
+    a future change that dropped, say, ``.doc`` out of the sweep by widening
+    the exclusion would fail here rather than quietly shrink the sweep.
     """
     refused = _refused_extensions()
     assert len(refused) >= 3
-    assert {".json", ".zip", ".doc"} <= set(refused)
+    assert {".json", ".tar", ".doc"} <= set(refused)
+    all_refused = {
+        suffix
+        for suffix, route in _EXTENSION_ROUTES.items()
+        if isinstance(route, _Refuse)
+    }
+    assert all_refused - set(refused) == set(ARCHIVE_SUFFIXES)
+    assert ".zip" in ARCHIVE_SUFFIXES
 
 
 def test_an_unsupported_upload_leaves_no_staged_bytes(vault: Path) -> None:

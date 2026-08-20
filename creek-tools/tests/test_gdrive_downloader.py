@@ -407,13 +407,13 @@ class TestRouteToIngestor:
                     "single undifferentiated blob",
                     "creek ingest --type",
                     "--input <export-dir>",
-                    "#1525",
+                    ".zip",
                 ],
             ),
             (
                 "messages.JSONL",
                 ".jsonl",
-                ["'.jsonl'", "creek ingest --type", "#1525"],
+                ["'.jsonl'", "creek ingest --type", ".zip"],
             ),
             (
                 "chatgpt-export.zip",
@@ -423,7 +423,6 @@ class TestRouteToIngestor:
                     "container of many files",
                     "Unpack it",
                     "creek ingest --type",
-                    "#1525",
                 ],
             ),
             (

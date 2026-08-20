@@ -23,7 +23,7 @@ import base64
 import io
 import json
 import shutil
-import zipfile
+import tarfile
 from typing import TYPE_CHECKING, Any
 
 import frontmatter
@@ -1436,11 +1436,25 @@ def _chatgpt_export_bytes() -> bytes:
     ).encode("utf-8")
 
 
-def _export_archive_bytes() -> bytes:
-    """Return a genuine ZIP archive wrapping the export above, built in-process."""
+def _tar_archive_bytes() -> bytes:
+    """Return a genuine TAR archive wrapping the export above, built in-process.
+
+    A ``.tar`` rather than the ``.zip`` this case used before #1525. The
+    contract under test is unchanged — *a container format this surface cannot
+    unpack is refused with a remedy, and its bytes never reach the staging
+    directory* — but ``.zip`` is no longer such a format: it is unpacked,
+    identified and ingested by :func:`creek_mcp.tools.upload._archive_outcome`,
+    and is covered end to end by ``tests/test_mcp_upload_archive.py``. Moving
+    the case to the container family Creek still refuses keeps the assertion
+    exactly as strong; deleting it would have retired the refusal for the four
+    formats that still earn it.
+    """
     buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("conversations.json", _chatgpt_export_bytes())
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        payload = _chatgpt_export_bytes()
+        info = tarfile.TarInfo("conversations.json")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
     return buffer.getvalue()
 
 
@@ -1454,15 +1468,15 @@ def _export_archive_bytes() -> bytes:
                 "'.json'",
                 "single undifferentiated blob",
                 "creek ingest --type",
-                "#1525",
+                ".zip",
             ],
             id="chatgpt-conversations-json",
         ),
         pytest.param(
-            "chatgpt-export.zip",
-            _export_archive_bytes(),
-            ["'.zip'", "Unpack it", "creek ingest --type", "#1525"],
-            id="export-archive-zip",
+            "chatgpt-export.tar",
+            _tar_archive_bytes(),
+            ["'.tar'", "Unpack it", "creek ingest --type", ".zip"],
+            id="export-archive-tar",
         ),
     ],
 )

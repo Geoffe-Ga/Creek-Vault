@@ -107,16 +107,18 @@ class _Refuse:
 STRUCTURED_EXPORT_GUIDANCE: Final[str] = (
     "A conversation export holds many conversations, not one document, and "
     "the generic fallback would file the whole file as a single "
-    "undifferentiated blob. Unpack the export and run `creek ingest --type "
-    "<chatgpt|claude|discord|substack> --input <export-dir>`. Uploading an "
-    "export directly is tracked by issue #1525."
+    "undifferentiated blob. Send the whole export as a .zip archive, which "
+    "Creek unpacks and reads with the matching ingestor, or run `creek "
+    "ingest --type <chatgpt|claude|discord|substack> --input <export-dir>` "
+    "against the unpacked directory."
 )
 
 ARCHIVE_GUIDANCE: Final[str] = (
-    "An export archive is a container of many files, not one document. "
+    "An export archive is a container of many files, not one document. Creek "
+    "unpacks .zip export archives, so re-pack this one as .zip and send that. "
     "Unpack it and run `creek ingest --type "
-    "<chatgpt|claude|discord|substack> --input <unpacked-dir>`. Uploading an "
-    "archive directly is tracked by issue #1525."
+    "<chatgpt|claude|discord|substack> --input <unpacked-dir>` to ingest it "
+    "locally instead."
 )
 
 LEGACY_OFFICE_GUIDANCE: Final[str] = (
