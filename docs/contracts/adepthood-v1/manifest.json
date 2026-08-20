@@ -1,6 +1,6 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.8.0",
+  "contract_version": "0.9.0",
   "files": [
     {
       "capability": "capabilities",
@@ -13,7 +13,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "a06b35198c4386b9e5722959fa59370d7224ae8841fd4fd3b77fbedfc5869ea2",
+      "sha256": "0b351a098f4086f3a6dea530ebf90790009658b95f6eb6216e9fd635dc37b3be",
       "state": "empty"
     },
     {
@@ -41,7 +41,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "128ce2b8b0fd4c5c4f1fde36189291d405a67f4c55770f3422ebead4490727dc",
+      "sha256": "273b92f29b1f17c723b7891f0a0d4b73972f9339dc912a48483cc79d391f9975",
       "state": "success"
     },
     {
@@ -139,7 +139,7 @@
       "capability": "reflections",
       "model": "ReflectionResponse",
       "path": "examples/reflections/success.json",
-      "sha256": "250fd9c41d702ffcae5e2e29ba38147785a1eb74b6d9ec96b38b834b44812deb",
+      "sha256": "ecb5b753260dcba1a5612b502e0ef3a6580cb0e9bbd856b9fc777d88396daca9",
       "state": "success"
     },
     {
@@ -328,7 +328,21 @@
       "capability": null,
       "model": "ReflectionResponse",
       "path": "schemas/ReflectionResponse.schema.json",
-      "sha256": "678194d72f6384f60985eedbc92d71342ac1213ce2cd17dfc09edf00526ea1a1",
+      "sha256": "048a0db1587133ea96111d9293f0e08afcb15ac8cf29a9164dc063523a09ed9c",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "RelatedEddy",
+      "path": "schemas/RelatedEddy.schema.json",
+      "sha256": "d69d4fde0fea05a60333a9d4949a15488360f3600ca3da002a428d6b5c2d6c6d",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "RelatedPraxis",
+      "path": "schemas/RelatedPraxis.schema.json",
+      "sha256": "0561d2a8538e894969c4ec062e8234b5150477b07f137c10c3a65cc80138f85d",
       "state": null
     },
     {

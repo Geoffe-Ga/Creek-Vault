@@ -12,7 +12,7 @@ schema in ``docs/contracts/adepthood-v1/schemas/`` carries the definitions it
 references inline under its own ``$defs``, which is what makes each file
 independently resolvable. An OpenAPI document has one shared
 ``components/schemas`` namespace instead, so those definitions are hoisted out
-and become siblings. Hoisting is not optional: publishing only the sixteen
+and become siblings. Hoisting is not optional: publishing only the
 registered models while rewriting ``#/$defs/X`` to ``#/components/schemas/X``
 would emit a document whose references point at names it never defines, which
 every standard validator and code generator rejects.
@@ -178,7 +178,7 @@ _SECURITY_SCHEMES: Final[dict[str, Any]] = {
 }
 """``components/securitySchemes``: the one way in.
 
-Declared beside ``components/schemas`` and **not** inside it. The sixteen
+Declared beside ``components/schemas`` and **not** inside it. The committed
 schema files under ``docs/contracts/adepthood-v1/schemas/`` are byte-pinned by
 ``tests/test_v1_api_openapi.py`` and are what a consumer vendors; a security
 scheme is a different namespace, so publishing one moves none of them and the

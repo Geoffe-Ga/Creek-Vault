@@ -20,8 +20,36 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.8.0"
+CONTRACT_VERSION: Final[str] = "0.9.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.9.0 (#873): ``creek.reflect`` and ``POST /v1/reflections`` may now carry two
+**optional** fields — ``related_praxis`` and ``related_eddies`` — naming the
+compiled-layer structures the reflected entry belongs to. Shape-wise this is a
+0.5.0-shaped bump: two optional response fields on one published ``/v1``
+response, plus two new wire models (``RelatedPraxis`` / ``RelatedEddy``) and the
+schemas for them. No route, no capability, no error code, and no *required*
+field moves, so ``SUPPORTED_CONTRACT_MINORS`` widens rather than shifts and a
+``0.8`` client keeps being served.
+
+Be precise about what it costs that client, because "nothing" is not the honest
+answer: the route drops both keys when nothing qualified, so the common case is
+byte-identical — but a reflection that *does* find an admitted eddy or praxis
+carries two extra keys regardless of the minor the caller negotiated, and a
+``0.8`` consumer validating closed sees them in exactly that case. Retained on
+the 0.5.0 reasoning: refusing every ``0.8`` request outright is strictly worse
+than serving one that occasionally carries a field the client can ignore, and
+the window is published on ``GET /v1/capabilities`` for a client that wants to
+move.
+
+The bump is what makes the addition *detectable* rather than silent, and that
+matters more here than for ``warnings`` at 0.5.0, because these fields are
+compiled artifacts: a consumer needs to know the field exists in order to know
+that its absence means "nothing qualified or nothing was admitted" rather than
+"this server is too old to answer". Admission itself is unchanged — a compiled
+page reaches the wire only when every fragment it was compiled from is within
+the caller's ceiling, and the remote cap still stops any network consumer
+declaring more than ``personal``.
 
 0.8.0 (#1524): ``/v1`` publishes a **fifth capability**, ``upload``, served by
 ``POST /v1/uploads``. This is the first bump since 0.2.0 that adds a route

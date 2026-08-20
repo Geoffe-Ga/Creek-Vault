@@ -148,6 +148,45 @@ bound to spans of the entry. This is the capability that most needs the **care
 gate** ([#753](https://github.com/Geoffe-Ga/Creek-Vault/issues/753)): it must not
 emit medical advice and must route crisis content to a human.
 
+#### The compiled layer on the reflection surface (contract `0.9.0`, #873)
+
+Since contract `0.9.0`, an `ok`/`empty` reflection may additionally carry two
+**optional** fields naming the compiled structures the reflected entry belongs
+to:
+
+| Field | Shape | Bound |
+|---|---|---|
+| `related_praxis` | `{title, praxis_type, status, excerpt}` | ≤ 3 |
+| `related_eddies` | `{title, description, fragment_count, formed}` | ≤ 2 |
+
+Both are **absent** — not present-and-empty — whenever nothing qualifies, so a
+consumer written against `0.8` parses an unchanged response in the ordinary
+case. `praxis_type` and `status` are closed enums mirroring the vault's own
+`PraxisType` / `PraxisStatus` vocabularies.
+
+**These are compiled artifacts, and the tier rule for them is stricter than
+for a fragment.** An eddy page's `description` and `fragment_count` are
+synthesised *from its members*, and a praxis page is distilled *from* the
+fragments its `derived_from` names; neither page carries a `privacy_tier` of
+its own, so there is nothing on the page itself to rank. The rule Creek
+applies, in `creek_mcp/compiled_pages.py`, is therefore:
+
+> **Provenance authorizes; seeds only select.**
+
+A page is published only when **every** fragment it was compiled from resolves
+on disk *and* ranks within the caller's `privacy_tier_ceiling`. A page whose
+provenance cannot be enumerated in full — an eddy whose `fragment_count`
+exceeds the members that can be found, a praxis naming an id that no longer
+resolves, a page declaring no sources at all — is treated as **opaque** and
+withheld. "No provenance" is never read as "no sources". The consequence a
+consumer should rely on: a remote caller capped at `personal` can never be
+handed an eddy compiled from an `intimate` fragment, and cannot distinguish
+"no such eddy" from "that eddy was withheld".
+
+Selection reuses the fragment ids the grounding retrieval pass already
+resolved, so there is no second embedding sweep and **no new egress path** —
+the lookup reads vault markdown and nothing else (ADR-0004).
+
 ### Wheel — *Planned* (#752)
 
 `creek.wheel` returns a per-frequency **balance read** (F1–F10) for the Adepthood
@@ -312,6 +351,7 @@ stays a naming-layer claim rather than being argued from ten-ness.
 
 | Contract version | Date | Change |
 |---|---|---|
+| `0.9.0` | 2026-08-19 | `creek.reflect` and `POST /v1/reflections` may carry two **optional** fields, `related_praxis` and `related_eddies`, naming the compiled-layer structures the reflected entry belongs to (#873). Two wire models (`RelatedPraxis` / `RelatedEddy`) and their schemas join the published bundle. No route, capability, error code, or *required* field moves, so `SUPPORTED_CONTRACT_MINORS` widens rather than shifts and a `0.8` client keeps being served — byte-identically whenever nothing qualified, since the route omits both keys when they are absent. Admission is stricter than for a fragment: a compiled page is published only when every fragment it was compiled from is within the caller's ceiling, and a page whose provenance cannot be enumerated in full is withheld. See [The compiled layer on the reflection surface](#the-compiled-layer-on-the-reflection-surface-contract-090-873). |
 | `0.4.0` | 2026-08-08 | `creek.purge.*` gains a third status, `partial` (#1246). An erasure that finished but fell short — a fragment whose body is not valid UTF-8 skips the content-keyed `07-Voice` sweep, so a profile may still quote it — used to be reported over MCP as unqualified `ok`, while `purge.jsonl` recorded `status="partial"` and the CLI said so in red. The payload is now derived from `PurgeResult` rather than a hand-picked subset, so all six previously-dropped fields reach the caller (`embeddings_removed`, `provenance_scrubbed`, `intimate_stubs_removed`, `journal_staged_removed`, `voice_artifacts_removed`, `voice_body_undecodable` — the last names the fragments the sweep could not reach). A tool's return shape moved, so the contract minor moves. `refused` and `ok` keep their spellings; a client that does not know `partial` falls through its branches rather than reading an incomplete erasure as a clean one. No `/v1` shape changed — `creek.purge.*` is elevated-token-gated and out of the Adepthood surface — so the HTTP adapter keeps serving `0.3` and `0.2` alongside `0.4` (`SUPPORTED_CONTRACT_MINORS`). |
 | `0.3.0` | 2026-08-08 | `creek.upload` joins the tool surface (#1023): one document's base64 bytes are staged under `00-Creek-Meta/adepthood/uploads/`, routed to an ingestor by extension, and ingested through the `upload` ledger so the staged bytes carry an `origin_key` and fall inside the RTBF purge sweep. A capability was added, so the contract minor moves. Nothing existing changed shape: the `/v1` HTTP adapter keeps serving contract minor `0.2` alongside `0.3` (`SUPPORTED_CONTRACT_MINORS`), and no existing tool's arguments or return shape were touched. |
 | `0.2.0` | 2026-07-30 | `unclassified` (untiered) content now ranks with `personal`, not `open`, on the MCP ceiling — matching `creek.classify.privacy_filter` since #876 (#961). `open`-ceiling consumers no longer read untiered content; remedy is `creek classify`. See the amendment note under [Tier ceiling semantics](#tier-ceiling-semantics). |

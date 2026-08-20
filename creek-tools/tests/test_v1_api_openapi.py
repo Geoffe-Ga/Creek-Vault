@@ -29,7 +29,7 @@ document and the expectation would come from the same table, and a route the
 adapter failed to *mount* would still appear documented.
 
 **Why the component set is wider than ``CONTRACT_MODELS``.** The registry holds
-the sixteen wire *models*. Each committed schema carries the definitions it
+every registered wire *model*. Each committed schema carries the definitions it
 references — the six enums (``Capability``, ``WireTierCeiling``,
 ``CapabilitiesStatus``, ``JournalAction``, ``NoteKind``, ``ReflectionStatus``)
 and the nested models — inline under its own ``$defs``, which is what makes each
@@ -38,7 +38,7 @@ schema file independently resolvable. An OpenAPI document has one shared
 and become siblings.
 
 Hoisting is not optional: dropping ``$defs`` while rewriting ``#/$defs/X`` to
-``#/components/schemas/X`` and publishing only the sixteen models would emit a
+``#/components/schemas/X`` and publishing only the registered models would emit a
 document whose references point at names it never defines. Every standard
 validator and code generator rejects that, so "OpenAPI generation succeeds"
 would be true only in the sense that a broken file was produced. The component
@@ -47,7 +47,7 @@ schemas' own ``$defs`` keys — derived from the bundle at test time, never
 hard-coded, so a definition added to a model shows up here without anybody
 remembering to update a list.
 
-This changes nothing about what the bundle publishes. The sixteen schema files
+This changes nothing about what the bundle publishes. The committed schema files
 and the manifest hashes are untouched; hoisting happens only in the OpenAPI
 projection, and every hoisted definition is itself checked against the committed
 bytes it came from. :func:`test_every_reference_resolves` is the assertion that
@@ -285,7 +285,7 @@ def test_components_are_exactly_the_models_plus_their_committed_definitions() ->
     publishes nothing for, so a consumer generating code from the document
     would get a type the fixtures never validate.
 
-    The expectation is the sixteen registered models plus every name the
+    The expectation is every registered model plus every name the
     committed schemas hoist out of their own ``$defs`` — read from the bundle,
     not restated — so this cannot be satisfied by inventing a component or by
     quietly dropping one.
@@ -628,7 +628,7 @@ def test_the_bearer_requirement_added_no_component_schema() -> None:
     """Publishing the scheme must not disturb the byte-pinned schema bundle.
 
     ``components/securitySchemes`` is a different namespace from
-    ``components/schemas``; the sixteen committed schema files are what a
+    ``components/schemas``; the committed schema files are what a
     consumer vendors, and a security declaration must not move one of them.
     """
     assert SECURITY_SCHEME_NAME not in _components()

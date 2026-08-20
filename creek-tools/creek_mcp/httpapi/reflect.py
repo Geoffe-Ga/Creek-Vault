@@ -277,10 +277,40 @@ def _render_notes(result: dict[str, Any], context: RequestContext) -> Response:
             ],
             essay=result.get("essay"),
             essay_grounded=False,
+            # Absent from the tool's result when nothing qualified, and the
+            # ``.get`` keeps that absence as ``None`` rather than manufacturing
+            # an empty list — see ``_dumped``. The admission decision was made
+            # inside ``reflect_tool``; this adapter inherits it and adds none.
+            related_praxis=result.get("related_praxis"),
+            related_eddies=result.get("related_eddies"),
         )
     except (ValidationError, ValueError, KeyError, TypeError):
         return error_response(ErrorCode.INTERNAL_ERROR, context)
-    return json_response(payload.model_dump(mode="json"), HTTP_OK)
+    return json_response(_dumped(payload), HTTP_OK)
+
+
+def _dumped(payload: ReflectionResponse) -> dict[str, Any]:
+    """Serialise *payload*, omitting the two 0.9 fields when they are absent.
+
+    Deliberately **not** ``model_dump(exclude_none=True)``. That would also
+    drop ``essay: null``, which every consumer since contract 0.2 has been
+    reading as an explicit key — silently narrowing a shape three published
+    minors document while claiming to be an additive change. So exactly the two
+    fields #873 added are dropped when ``None``, and nothing else is touched:
+    a reflection with no admitted compiled neighbours serialises byte-for-byte
+    as it did at 0.8.
+
+    Args:
+        payload: The validated response.
+
+    Returns:
+        The JSON-ready mapping.
+    """
+    data: dict[str, Any] = payload.model_dump(mode="json")
+    for key in ("related_praxis", "related_eddies"):
+        if data.get(key) is None:
+            del data[key]
+    return data
 
 
 def _render(result: dict[str, Any], context: RequestContext) -> Response:

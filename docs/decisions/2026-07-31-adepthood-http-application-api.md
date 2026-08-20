@@ -637,8 +637,9 @@ network MCP call. It is out of scope for #1117 and is tracked as follow-up
 
 [`docs/contracts/adepthood-v1/`](../contracts/adepthood-v1/) is the source of
 truth for the wire shapes in this repository:
-`manifest.json`, `retry-policy.json`, eighteen `schemas/*.schema.json` files
-(one per `CONTRACT_MODELS` entry), and thirty-five
+`manifest.json`, `retry-policy.json`, one `schemas/*.schema.json` file per
+`CONTRACT_MODELS` entry (twenty at contract `0.9.0`, after #873 added
+`RelatedPraxis` and `RelatedEddy`), and thirty-five
 `examples/<capability>/<state>.json` fixtures (five capabilities × seven
 states). Everything in the directory except its own `README.md` is
 **generated** by `build_bundle()`
