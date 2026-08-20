@@ -31,6 +31,8 @@ from creek_mcp.compiled_pages import (
     MAX_RELATED_EDDIES,
     MAX_RELATED_PRAXIS,
     RelatedCompiled,
+    _body_of,
+    _excerpt,
     _praxis_page,
     related_compiled,
 )
@@ -610,3 +612,42 @@ def test_untiered_fragments_are_not_silently_open(tmp_path: Path) -> None:
     assert (
         related_compiled([_UNTIERED_FRAGMENT], vault, TierCeiling.INTIMATE).praxis != []
     )
+
+
+# ---------------------------------------------------------------------------
+# The body reader, driven directly
+# ---------------------------------------------------------------------------
+#
+# ``_excerpt`` is only ever *reached* through ``_praxis_page``, which has
+# already parsed a well-formed header -- so these two branches are unreachable
+# from ``related_compiled`` and are exercised here instead of being left as
+# untested defensive code. Both are real: a Creek vault is a live Obsidian
+# folder, so a page can vanish or be rewritten between the header read and the
+# body read, which is the same verify-then-load race #1083 built its verifier
+# for.
+
+
+def test_an_excerpt_of_a_vanished_page_is_empty_not_an_exception(
+    tmp_path: Path,
+) -> None:
+    """A page deleted between the header read and the body read costs itself."""
+    assert _excerpt(tmp_path / "gone.md") == ""
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("no header here", "no header here"),
+        ("---\ntype: praxis\nbody never reached", ""),
+        ("---\na: 1\n---\nThe body.", "The body."),
+    ],
+    ids=["no-fence", "unterminated", "well-formed"],
+)
+def test_the_body_reader_never_returns_front_matter(text: str, expected: str) -> None:
+    """An unterminated header yields nothing rather than its own front matter.
+
+    The ``unterminated`` row is the one that matters: returning the remainder
+    would put raw front matter -- including a ``privacy_tier`` line -- into a
+    published excerpt.
+    """
+    assert _body_of(text) == expected

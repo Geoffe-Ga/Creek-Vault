@@ -642,6 +642,11 @@ def test_wire_tier_ceiling_rejects_non_remote_values(value: str) -> None:
             RetryDisposition,
             {"terminal", "retry_after_operator_action", "retry_with_backoff"},
         ),
+        (
+            PraxisKind,
+            {"commitment", "framework", "habit", "insight", "practice"},
+        ),
+        (PraxisLifecycle, {"active", "integrated", "proposed", "released"}),
     ],
     ids=[
         "WireTierCeiling",
@@ -649,6 +654,8 @@ def test_wire_tier_ceiling_rejects_non_remote_values(value: str) -> None:
         "JournalAction",
         "ReflectionStatus",
         "RetryDisposition",
+        "PraxisKind",
+        "PraxisLifecycle",
     ],
 )
 def test_enum_membership_is_pinned(
