@@ -60,7 +60,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from creek.care.guardrail import CARE_SIGNAL
 from creek.generate.indexes import CANONICAL_FREQUENCY_NAMES
-from creek.models import PrivacyTier
+from creek.models import PraxisStatus, PraxisType, PrivacyTier
 from creek_mcp import policy, read_gate
 from creek_mcp.api import models as api_models
 from creek_mcp.api.bundle import (
@@ -90,10 +90,14 @@ from creek_mcp.api.models import (
     JournalUpsertResponse,
     NotApplicableExample,
     NoteKind,
+    PraxisKind,
+    PraxisLifecycle,
     ReflectionNote,
     ReflectionRequest,
     ReflectionResponse,
     ReflectionStatus,
+    RelatedEddy,
+    RelatedPraxis,
     RetryDisposition,
     TierModel,
     UploadRequest,
@@ -104,6 +108,7 @@ from creek_mcp.api.models import (
     WheelResponse,
     WireTierCeiling,
 )
+from creek_mcp.compiled_pages import MAX_RELATED_EDDIES, MAX_RELATED_PRAXIS
 from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
 from creek_mcp.tier_ceiling import CEILING_ROUTING_TIER, routing_tier, tier_allowed
 from creek_mcp.tools import reflect
@@ -223,6 +228,20 @@ CARE_RESOURCE_PAYLOAD: dict[str, Any] = {
     "contact": "Call or text 988",
 }
 
+RELATED_PRAXIS_PAYLOAD: dict[str, Any] = {
+    "title": "Rest before the collapse",
+    "praxis_type": "practice",
+    "status": "active",
+    "excerpt": "Synthetic example prose.",
+}
+
+RELATED_EDDY_PAYLOAD: dict[str, Any] = {
+    "title": "Rest and Ruin",
+    "description": "Synthetic example description.",
+    "fragment_count": 12,
+    "formed": "2026-03-04",
+}
+
 REFLECTION_RESPONSE_PAYLOAD: dict[str, Any] = {
     "status": "ok",
     "tier_ceiling": "personal",
@@ -285,6 +304,8 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     ReflectionNote.__name__: REFLECTION_NOTE_PAYLOAD,
     ReflectionRequest.__name__: REFLECTION_REQUEST_PAYLOAD,
     ReflectionResponse.__name__: REFLECTION_RESPONSE_PAYLOAD,
+    RelatedEddy.__name__: RELATED_EDDY_PAYLOAD,
+    RelatedPraxis.__name__: RELATED_PRAXIS_PAYLOAD,
     TierModel.__name__: TIER_MODEL_PAYLOAD,
     UploadRequest.__name__: UPLOAD_REQUEST_PAYLOAD,
     UploadResponse.__name__: UPLOAD_RESPONSE_PAYLOAD,
@@ -621,6 +642,11 @@ def test_wire_tier_ceiling_rejects_non_remote_values(value: str) -> None:
             RetryDisposition,
             {"terminal", "retry_after_operator_action", "retry_with_backoff"},
         ),
+        (
+            PraxisKind,
+            {"commitment", "framework", "habit", "insight", "practice"},
+        ),
+        (PraxisLifecycle, {"active", "integrated", "proposed", "released"}),
     ],
     ids=[
         "WireTierCeiling",
@@ -628,6 +654,8 @@ def test_wire_tier_ceiling_rejects_non_remote_values(value: str) -> None:
         "JournalAction",
         "ReflectionStatus",
         "RetryDisposition",
+        "PraxisKind",
+        "PraxisLifecycle",
     ],
 )
 def test_enum_membership_is_pinned(
@@ -1445,3 +1473,154 @@ def test_the_compatibility_window_only_ever_widens() -> None:
     """
     for retired_minor in ("0.2", "0.3", "0.4", "0.5", "0.6"):
         assert retired_minor in SUPPORTED_CONTRACT_MINORS
+
+
+# ---------------------------------------------------------------------------
+# Group 12 -- the compiled layer on the reflection surface (contract 0.9, #873)
+# ---------------------------------------------------------------------------
+
+
+def test_praxis_kind_mirrors_the_vaults_own_vocabulary() -> None:
+    """``PraxisKind`` tracks :class:`creek.models.PraxisType` instead of copying it.
+
+    A wire enum that drifted would either refuse a legitimate page on the way
+    out, or admit a value the vault never sanctioned.
+    """
+    assert {kind.value for kind in PraxisKind} == {kind.value for kind in PraxisType}
+
+
+def test_praxis_lifecycle_mirrors_the_vaults_own_statuses() -> None:
+    """``PraxisLifecycle`` tracks :class:`creek.models.PraxisStatus`."""
+    assert {status.value for status in PraxisLifecycle} == {
+        status.value for status in PraxisStatus
+    }
+
+
+def test_the_published_related_bounds_match_the_producer() -> None:
+    """The schema's ``maxItems`` is the bound the producer actually keeps.
+
+    ``creek_mcp/api/models.py`` restates the two bounds rather than importing
+    them, because it must stay free of vault readers (#1079). This is what
+    stops the restatement drifting into a published schema that promises a
+    ceiling the producer does not enforce -- which would be a contract that
+    lies rather than one that merely differs.
+    """
+    schema = ReflectionResponse.model_json_schema()
+    praxis = schema["properties"]["related_praxis"]["anyOf"][0]
+    eddies = schema["properties"]["related_eddies"]["anyOf"][0]
+    assert praxis["maxItems"] == MAX_RELATED_PRAXIS
+    assert eddies["maxItems"] == MAX_RELATED_EDDIES
+
+
+def test_the_related_fields_are_optional_and_default_absent() -> None:
+    """A 0.8-shaped payload still validates, and the fields read as absent.
+
+    The whole compatibility claim of contract 0.9, asserted on the model that
+    the published schema is generated from.
+    """
+    response = ReflectionResponse.model_validate(REFLECTION_RESPONSE_PAYLOAD)
+
+    assert response.related_praxis is None
+    assert response.related_eddies is None
+    assert "related_praxis" not in REFLECTION_RESPONSE_PAYLOAD
+
+
+def test_the_related_fields_round_trip_when_present() -> None:
+    """The populated shape validates and keeps its closed enums."""
+    response = ReflectionResponse.model_validate(
+        {
+            **REFLECTION_RESPONSE_PAYLOAD,
+            "related_praxis": [RELATED_PRAXIS_PAYLOAD],
+            "related_eddies": [RELATED_EDDY_PAYLOAD],
+        }
+    )
+
+    assert response.related_praxis is not None
+    assert response.related_praxis[0].praxis_type is PraxisKind.PRACTICE
+    assert response.related_praxis[0].status is PraxisLifecycle.ACTIVE
+    assert response.related_eddies is not None
+    assert (
+        response.related_eddies[0].fragment_count
+        == RELATED_EDDY_PAYLOAD["fragment_count"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "payload"),
+    [
+        ("related_praxis", [RELATED_PRAXIS_PAYLOAD] * (MAX_RELATED_PRAXIS + 1)),
+        ("related_eddies", [RELATED_EDDY_PAYLOAD] * (MAX_RELATED_EDDIES + 1)),
+    ],
+    ids=["praxis", "eddies"],
+)
+def test_the_related_fields_refuse_more_than_their_bound(
+    field: str, payload: list[dict[str, Any]]
+) -> None:
+    """The bound is enforced by the model, not merely documented by it."""
+    with pytest.raises(ValidationError):
+        ReflectionResponse.model_validate(
+            {**REFLECTION_RESPONSE_PAYLOAD, field: payload}
+        )
+
+
+def test_a_related_praxis_outside_the_vocabulary_is_refused() -> None:
+    """A hand-edited ``praxis_type`` cannot be laundered onto the wire."""
+    with pytest.raises(ValidationError):
+        ReflectionResponse.model_validate(
+            {
+                **REFLECTION_RESPONSE_PAYLOAD,
+                "related_praxis": [
+                    {**RELATED_PRAXIS_PAYLOAD, "praxis_type": "aspiration"}
+                ],
+            }
+        )
+
+
+def test_a_related_eddy_cannot_report_a_negative_fragment_count() -> None:
+    """``fragment_count`` is a tally, so the schema refuses a negative one."""
+    with pytest.raises(ValidationError):
+        ReflectionResponse.model_validate(
+            {
+                **REFLECTION_RESPONSE_PAYLOAD,
+                "related_eddies": [{**RELATED_EDDY_PAYLOAD, "fragment_count": -1}],
+            }
+        )
+
+
+def test_the_committed_empty_reflection_fixture_omits_the_related_fields() -> None:
+    """The published ``empty`` fixture is the pre-0.9 shape, byte-for-byte.
+
+    Read off the committed file rather than the builder, because it is the
+    committed file a cross-repo consumer vendors. If the route ever starts
+    emitting ``related_praxis: []``, this and the byte-identical fixture both
+    go red -- which is the point: "absent, not empty" is the compatibility
+    promise, and a promise nothing checks is prose.
+    """
+    fixture = json.loads(
+        (BUNDLE_ROOT / "examples" / "reflections" / "empty.json").read_text()
+    )
+
+    assert "related_praxis" not in fixture
+    assert "related_eddies" not in fixture
+    assert fixture["essay"] is None, "essay must keep its explicit null"
+
+
+def test_the_committed_success_reflection_fixture_shows_the_populated_shape() -> None:
+    """A consumer can write its parser against a fixture that actually has them."""
+    fixture = json.loads(
+        (BUNDLE_ROOT / "examples" / "reflections" / "success.json").read_text()
+    )
+
+    assert len(fixture["related_praxis"]) <= MAX_RELATED_PRAXIS
+    assert len(fixture["related_eddies"]) <= MAX_RELATED_EDDIES
+    ReflectionResponse.model_validate(fixture)
+
+
+def test_the_previous_minor_is_still_served() -> None:
+    """0.9 widened the compatibility window rather than shifting it.
+
+    A ``0.8`` client's ``/v1`` traffic is unaffected by an optional response
+    field, so refusing it outright would be a break invented by the bump.
+    """
+    assert "0.8" in SUPPORTED_CONTRACT_MINORS
+    assert CONTRACT_MINOR == "0.9"

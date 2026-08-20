@@ -53,6 +53,21 @@ whose advertisement depends on the caller: a client declaring a minor below
 here document the *current* contract, so this directory is present for every
 consumer regardless of what it pins.
 
+### Optional fields, and why `success` and `empty` differ in shape
+
+`examples/reflections/success.json` carries `related_praxis` and
+`related_eddies`; `examples/reflections/empty.json` does not. That is not an
+oversight in the fixtures — it is the contract. Both fields are **optional** at
+`0.9.0` (#873), and the route omits the key entirely rather than emitting an
+empty list, so a consumer written against `0.8` sees an unchanged response
+whenever nothing qualified. Write your parser against the `success` shape and
+your default against the `empty` one.
+
+The absence is also deliberately *ambiguous*: "this vault has no eddies" and
+"the eddies this entry belongs to were compiled from fragments above your
+ceiling and were withheld" are indistinguishable to a caller, because telling
+them apart would be a one-bit oracle over the compiled layer.
+
 **States** (seven), in the order a consumer meets them:
 
 | State | Meaning | Response is |

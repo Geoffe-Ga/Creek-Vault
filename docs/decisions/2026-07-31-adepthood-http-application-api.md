@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (Creek side)
 - **Date**: 2026-07-31
-- **Contract version**: `0.8.0`
+- **Contract version**: `0.9.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23`
 - **Driving issues**: [#1072](https://github.com/Geoffe-Ga/Creek-Vault/issues/1072) (this decision), epic [#1071](https://github.com/Geoffe-Ga/Creek-Vault/issues/1071)
 - **Mirrors**: [`Geoffe-Ga/adepthood#2044`](https://github.com/Geoffe-Ga/adepthood/issues/2044)
@@ -637,8 +637,9 @@ network MCP call. It is out of scope for #1117 and is tracked as follow-up
 
 [`docs/contracts/adepthood-v1/`](../contracts/adepthood-v1/) is the source of
 truth for the wire shapes in this repository:
-`manifest.json`, `retry-policy.json`, eighteen `schemas/*.schema.json` files
-(one per `CONTRACT_MODELS` entry), and thirty-five
+`manifest.json`, `retry-policy.json`, one `schemas/*.schema.json` file per
+`CONTRACT_MODELS` entry (twenty at contract `0.9.0`, after #873 added
+`RelatedPraxis` and `RelatedEddy`), and thirty-five
 `examples/<capability>/<state>.json` fixtures (five capabilities × seven
 states). Everything in the directory except its own `README.md` is
 **generated** by `build_bundle()`
@@ -720,6 +721,7 @@ restating the other.
 
 | Contract version | Date | Change |
 |---|---|---|
+| `0.9.0` | 2026-08-19 | #873 adds two **optional** fields to `ReflectionResponse`, `related_praxis` and `related_eddies`, naming the compiled-layer structures the reflected entry belongs to — bounded at 3 and 2 respectively, with two new wire models (`RelatedPraxis`, `RelatedEddy`) and their schemas joining the bundle. No route, no capability, no error code and no *required* field moves, so this is a `0.5.0`-shaped bump and `SUPPORTED_CONTRACT_MINORS` widens rather than shifts. **What it costs a `0.8` client, precisely:** nothing in the ordinary case — the route drops both keys when nothing qualified, so `examples/reflections/empty.json` is byte-identical and so is every reflection over a vault with no admitted compiled neighbours. A reflection that *does* find one carries two extra keys regardless of the negotiated minor, which a closed-validating `0.8` consumer will see; retained anyway on the `0.5.0` reasoning, because refusing every `0.8` request outright is strictly worse than occasionally serving a key it can ignore. The drop is deliberately narrow — exactly these two fields, never a blanket `exclude_none`, which would also have removed the explicit `essay: null` three published minors document. **Admission is stricter than for a fragment**, and that is the substance of the bump: a compiled page carries no `privacy_tier` of its own and is synthesised from fragments the caller may not be entitled to, so `creek_mcp/compiled_pages.py` publishes one only when *every* fragment it was compiled from resolves on disk and ranks within the caller's ceiling, and withholds as **opaque** any page whose provenance it cannot enumerate in full. A remote caller capped at `personal` therefore cannot be handed an eddy compiled from an `intimate` fragment, and cannot distinguish "no such eddy" from "that eddy was withheld". |
 | `0.2.0` | 2026-07-31 | This ADR: publishes `/v1`, the Adepthood HTTP application API, alongside the existing MCP agent adapter. No wire-shape change to the existing contract version — `creek_mcp.api.models` and the fixture bundle under `docs/contracts/adepthood-v1/` are the first publication of a new surface, not a revision of the MCP one (#1072, epic #1071). |
 | `0.2.0` | 2026-07-31 | #1074 mounts the routes: the tracer serves a real `GET /v1/capabilities` and answers `501 unsupported_capability` on journal, reflection and wheel. No wire shape changes, so no version moves. Two clarifications recorded above rather than left implicit: the advertised capability list tracks what is actually implemented during the epic's build-out, and the issue's provisional `not_implemented` spelling is superseded by `unsupported_capability` — the `ErrorCode` member this ADR already publishes for exactly that meaning at exactly that status. |
 | `0.2.0` | 2026-08-01 | #1117 review fixes: `creek-tools-api` now starts uvicorn with `access_log=False` (its own access logger was republishing the caller's address and the concrete request path alongside the audited middleware), and `GET /v1/capabilities`'s readiness probe now runs in a worker thread rather than on the event loop. Neither changes a wire shape, so no version moves. See [Serving: uvicorn's own logging and the readiness probe](#serving-uvicorns-own-logging-and-the-readiness-probe). |

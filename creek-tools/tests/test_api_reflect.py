@@ -38,6 +38,7 @@ from creek_mcp.tools.reflect import reflect_tool
 from tests.adapter_parity import assert_parity, http_outcome, mcp_outcome
 from tests.v1_api_support import (
     CONSUMER,
+    CONTRACT_MINOR,
     REFLECTIONS_PATH,
     build_app,
     contains_a_path,
@@ -212,6 +213,7 @@ def _post(
     body: dict[str, Any] | None = None,
     ceiling: str | None = None,
     factory: _FactorySpy | None = None,
+    minor: str | None = CONTRACT_MINOR,
 ) -> httpx.Response:
     """Send one reflection request and return the raw response.
 
@@ -220,6 +222,7 @@ def _post(
         body: The JSON body, or ``None`` for a canonical inline-content one.
         ceiling: The declared tier ceiling, or ``None`` to send no header.
         factory: The stub LLM factory, or ``None`` for a silent one.
+        minor: The declared contract minor, or ``None`` to send none.
 
     Returns:
         The response.
@@ -230,7 +233,7 @@ def _post(
         return test_client.post(
             REFLECTIONS_PATH,
             json={"content": _ENTRY} if body is None else body,
-            headers=headers(ceiling=ceiling),
+            headers=headers(ceiling=ceiling, minor=minor),
         )
 
 
@@ -755,3 +758,165 @@ def test_http_and_mcp_agree_on_every_scenario(
             ),
         ),
     )
+
+
+# --------------------------------------------------------------------------- #
+# The compiled layer on the wire (contract 0.9, #873)
+# --------------------------------------------------------------------------- #
+
+
+def _write_compiled_layer(vault_path: Path, *, member_tier: str) -> str:
+    """Seed an eddy + praxis compiled from one ``open`` and one *member_tier* fragment.
+
+    Args:
+        vault_path: The vault root.
+        member_tier: The tier of the *second* contributor. The entry the caller
+            reflects on is always the ``open`` one, so this is the only thing
+            that varies between the admitted and the withheld case.
+
+    Returns:
+        The ``entry_ref`` of the ``open`` fragment.
+    """
+    entry_ref = "frag-873http0001"
+    other = "frag-873httpoth1"
+    _write_fragment(vault_path, frag_id=entry_ref, body=_ENTRY, privacy_tier="open")
+    _write_fragment(vault_path, frag_id=other, body=_ENTRY, privacy_tier=member_tier)
+    link = "[[Rest and Ruin]]"
+    for frag_id in (entry_ref, other):
+        path = vault_path / "01-Fragments" / "Notes" / f"{frag_id}.md"
+        post = frontmatter.loads(path.read_text(encoding="utf-8"))
+        post["eddies"] = [link]
+        path.write_text(frontmatter.dumps(post), encoding="utf-8")
+    eddies = vault_path / "03-Eddies"
+    eddies.mkdir(parents=True, exist_ok=True)
+    (eddies / "eddy.md").write_text(
+        "---\ntype: eddy\nid: eddy-0000000001\ntitle: Rest and Ruin\n"
+        "formed: 2026-03-04\nfragment_count: 2\n"
+        "description: Where rest and ruin keep meeting.\n---\n\nSummary.\n",
+        encoding="utf-8",
+    )
+    praxis = vault_path / "04-Praxis" / "Daily"
+    praxis.mkdir(parents=True, exist_ok=True)
+    (praxis / "praxis.md").write_text(
+        "---\ntype: praxis\nid: prax-0000000001\n"
+        "title: Rest before the collapse\npraxis_type: practice\nstatus: active\n"
+        f"derived_from:\n  - {entry_ref}\n  - {other}\n---\n\nRest is the practice.\n",
+        encoding="utf-8",
+    )
+    return entry_ref
+
+
+def test_the_compiled_layer_reaches_a_caller_admitted_to_every_contributor(
+    vault: Path,
+) -> None:
+    """The control: an all-``open`` eddy and praxis are published at ``open``.
+
+    Without this, the withholding assertion below could be explained by the
+    feature never firing on this surface at all.
+    """
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+
+    response = _post(vault, body={"entry_ref": entry_ref}, ceiling="open")
+
+    assert response.status_code == _OK
+    payload = response.json()
+    assert [row["title"] for row in payload["related_eddies"]] == ["Rest and Ruin"]
+    assert [row["title"] for row in payload["related_praxis"]] == [
+        "Rest before the collapse"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("ceiling", "member_tier"),
+    [("open", "personal"), ("open", "intimate"), ("personal", "intimate")],
+    ids=["personal@open", "intimate@open", "intimate@personal"],
+)
+def test_a_page_compiled_above_the_ceiling_never_crosses_the_wire(
+    vault: Path, ceiling: str, member_tier: str
+) -> None:
+    """One above-ceiling contributor withholds the whole compiled page.
+
+    Asserted at the **narrowest** ceiling that can fail. These two ceilings are
+    also the only ones ``/v1`` can express at all
+    (:class:`~creek_mcp.api.models.WireTierCeiling`), so this is the whole
+    reachable surface for a remote consumer — the case that actually matters,
+    since a compiled page is the one artifact that can summarise content the
+    caller is not admitted to without quoting a byte of it.
+    """
+    entry_ref = _write_compiled_layer(vault, member_tier=member_tier)
+
+    response = _post(vault, body={"entry_ref": entry_ref}, ceiling=ceiling)
+
+    assert response.status_code == _OK
+    payload = response.json()
+    assert "related_eddies" not in payload
+    assert "related_praxis" not in payload
+    # The whole body, not just those two keys: a leak that renamed the field
+    # or folded the description elsewhere would still be a leak.
+    assert "Where rest and ruin keep meeting" not in response.text
+    assert "Rest before the collapse" not in response.text
+
+
+def test_the_related_keys_are_omitted_not_nulled_when_nothing_qualifies(
+    vault: Path,
+) -> None:
+    """A 0.8 consumer's parse is unchanged, and ``essay`` keeps its null.
+
+    Both halves matter. Dropping the two new keys is the additive-change
+    promise; keeping ``essay: null`` is what stops that promise being kept by
+    quietly narrowing a shape three published minors already document — which
+    is exactly what a blanket ``exclude_none`` would have done.
+    """
+    response = _post(vault, ceiling="open")
+
+    assert response.status_code == _OK
+    payload = response.json()
+    assert "related_praxis" not in payload
+    assert "related_eddies" not in payload
+    assert "essay" in payload
+    assert payload["essay"] is None
+
+
+def test_a_prior_minor_is_not_served_the_compiled_layer(
+    vault: Path,
+) -> None:
+    """A ``0.8`` caller gets the ``0.8`` shape, even when a neighbour qualified.
+
+    Every published response schema sets ``additionalProperties: false``, so a
+    consumer validating against the minor it vendored does **not** ignore an
+    unknown key — it rejects the entire response. Emitting the #873 fields to a
+    caller that declared ``0.8`` would therefore break exactly the consumer
+    #873 exists to unblock, and only on the reflections that found a compiled
+    neighbour: the worst distribution a break could have.
+
+    The fixture is the one that DOES qualify, so this cannot pass by the
+    fields simply being absent — the sibling test below asserts they are served
+    at ``0.9`` from the same vault.
+    """
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+
+    response = _post(vault, body={"entry_ref": entry_ref}, ceiling="open", minor="0.8")
+
+    assert response.status_code == _OK, response.text
+    payload = response.json()
+    assert "related_praxis" not in payload
+    assert "related_eddies" not in payload
+
+
+def test_the_current_minor_is_served_the_compiled_layer(
+    vault: Path,
+) -> None:
+    """Positive control for the gate above: at ``0.9`` the fields do ship.
+
+    Without this, dropping the fields unconditionally would satisfy the
+    withholding test and silently delete the whole feature.
+    """
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+
+    response = _post(vault, body={"entry_ref": entry_ref}, ceiling="open", minor="0.9")
+
+    assert response.status_code == _OK, response.text
+    payload = response.json()
+    assert [row["title"] for row in payload["related_praxis"]] == [
+        "Rest before the collapse"
+    ]

@@ -167,6 +167,30 @@ to locate the originating commit for any reference below.
 
 ### Added
 
+- **`creek.reflect` returns the compiled layer nearest the entry — contract
+  `0.9.0` (#873).** An `ok`/`empty` reflection may now carry two **optional**,
+  bounded fields: `related_praxis` (≤3 `{title, praxis_type, status, excerpt}`)
+  and `related_eddies` (≤2 `{title, description, fragment_count, formed}`).
+  Published on both surfaces — the MCP tool and `POST /v1/reflections`, whose
+  `ReflectionResponse` schema and success fixture move with it. Both keys are
+  **absent**, never present-and-empty, when nothing qualifies, so a `0.8`
+  consumer's ordinary reflection is byte-identical and `SUPPORTED_CONTRACT_MINORS`
+  widens rather than shifts.
+
+  The admission rule is stricter than for a fragment, and it is the point of the
+  change rather than a caveat on it. An eddy page's `description` and
+  `fragment_count` are synthesised *from its members*, and a praxis page is
+  distilled from the fragments its `derived_from` names; neither carries a
+  `privacy_tier` of its own, so there is nothing on the page to rank. The new
+  `creek_mcp/compiled_pages.py` therefore publishes a page only when **every**
+  fragment it was compiled from resolves on disk *and* is within the caller's
+  `privacy_tier_ceiling` — and withholds any page whose provenance it cannot
+  enumerate in full (an eddy whose `fragment_count` exceeds its findable
+  members, a praxis naming a vanished id, a page declaring no sources at all).
+  "No provenance" is never read as "no sources". Selection reuses the fragment
+  ids the grounding pass already resolved, so there is no second embedding sweep
+  and no new egress path.
+
 - `creek init --refresh` re-copies canonical templates (ontology spec,
   AGENTS.md, schema-skill tree, folder scaffold) into an existing vault
   without touching user data or `creek_config.yaml`.
