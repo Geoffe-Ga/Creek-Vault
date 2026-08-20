@@ -228,6 +228,22 @@ def delete_embeddings_cache(cache_path: Path, *, dry_run: bool = False) -> int:
     survives a full-vault purge — including the embedding vectors,
     which are partially invertible.
 
+    An unreadable cache is deleted anyway and reported as zero rows
+    (#1480). ``pq.read_metadata`` raises ``ArrowInvalid`` — a
+    ``ValueError`` subclass — on a truncated or corrupt parquet, and
+    this function is the last statement of ``purge_vault``'s body, so
+    letting that escape allowed a **derived** file to veto a
+    right-to-be-forgotten erasure. This cache is also the likeliest file
+    in a vault to be half-written, because it is the only one produced
+    by a bulk binary writer that a killed ``creek link`` can leave
+    truncated. Failing to *count* the rows must never stop them being
+    *removed*: the file is destroyed either way, so the erasure is
+    complete and only the size of the record degrades — under-claiming,
+    which is the safe direction (#1340). The count is not recoverable by
+    any other means once the bytes are gone, so zero is the honest
+    answer and the ``WARNING`` is what tells the operator it is a floor
+    rather than a fact.
+
     Args:
         cache_path: Embeddings parquet path.
         dry_run: When ``True``, count rows but leave the file alone.
@@ -235,16 +251,53 @@ def delete_embeddings_cache(cache_path: Path, *, dry_run: bool = False) -> int:
     Returns:
         Number of rows that were in the file when it was deleted
         (or that would be deleted in a dry run). Zero when the file
-        does not exist.
+        does not exist, and zero when it could not be parsed.
     """
     if not cache_path.exists():
         return 0
 
     import pyarrow.parquet as pq  # lazy: pyarrow lives in the [embeddings] extra
 
-    row_count = int(pq.read_metadata(cache_path).num_rows)
+    try:
+        row_count = int(pq.read_metadata(cache_path).num_rows)
+    except (OSError, ValueError) as exc:
+        # ``ArrowInvalid`` subclasses ``ValueError``; ``OSError`` covers a
+        # file that vanished or turned unreadable between the exists()
+        # check and the parse. Log the exception *type* only — the same
+        # rule the purge audit follows, since a parquet error message can
+        # quote a column name derived from vault content.
+        logger.warning(
+            "Embeddings cache %s could not be read (%s); deleting it anyway "
+            "and reporting 0 row(s) removed",
+            cache_path,
+            type(exc).__name__,
+        )
+        row_count = 0
     if not dry_run:
-        cache_path.unlink()
+        try:
+            cache_path.unlink(missing_ok=True)
+        except OSError as exc:
+            # The whole point of #1480 is that a bad embeddings cache must not
+            # veto an erasure — and a bare unlink() reinstated exactly that.
+            # The handler above deliberately tolerates a file that vanished or
+            # turned unreadable between exists() and the parse; unlink() would
+            # then raise FileNotFoundError straight back out of purge_vault.
+            # A directory standing at this path raises IsADirectoryError the
+            # same way. Both are OSError, both are the veto again.
+            #
+            # missing_ok=True covers the vanished case outright. Anything else
+            # is a real erasure SHORTFALL, so it is loud rather than silent:
+            # the cache may still hold vectors derived from purged content.
+            # Type only, never the message — a parquet error can quote a column
+            # name derived from vault content.
+            logger.warning(
+                "Embeddings cache %s could NOT be deleted (%s): this erasure "
+                "is PARTIAL and the cache may still hold vectors derived from "
+                "the purged content. Remove it by hand.",
+                cache_path,
+                type(exc).__name__,
+            )
+            return 0
         logger.info(
             "Deleted embeddings cache %s (%d row(s) removed)",
             cache_path,
