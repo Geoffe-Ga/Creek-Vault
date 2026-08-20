@@ -501,7 +501,7 @@ def test_no_unrouted_request_produces_a_status_outside_the_set(vault: Path) -> N
 
 def test_the_method_sweep_is_not_vacuous() -> None:
     """The sweep above really does try every verb on every route."""
-    assert len(MOUNTED) * len(_ALL_METHODS) == 36
+    assert len(MOUNTED) * len(_ALL_METHODS) == 54
     assert "PATCH" in _ALL_METHODS
 
 

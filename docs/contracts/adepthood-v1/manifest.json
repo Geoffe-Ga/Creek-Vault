@@ -1,6 +1,6 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.8.0",
+  "contract_version": "0.9.0",
   "files": [
     {
       "capability": "capabilities",
@@ -13,7 +13,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "a06b35198c4386b9e5722959fa59370d7224ae8841fd4fd3b77fbedfc5869ea2",
+      "sha256": "0b351a098f4086f3a6dea530ebf90790009658b95f6eb6216e9fd635dc37b3be",
       "state": "empty"
     },
     {
@@ -41,7 +41,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "128ce2b8b0fd4c5c4f1fde36189291d405a67f4c55770f3422ebead4490727dc",
+      "sha256": "8ee29fa6be1483af5392419697962b38a75bfd36a0cd0a7dc0fc28639748c835",
       "state": "success"
     },
     {
@@ -49,6 +49,55 @@
       "model": "ErrorEnvelope",
       "path": "examples/capabilities/unavailable-service.json",
       "sha256": "89a0b5295b63a7c84f76da28bc556abf281afefa7993a3b5701ddd01baf9294d",
+      "state": "unavailable-service"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "NotApplicableExample",
+      "path": "examples/drive-connector/care-escalation.json",
+      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "state": "care-escalation"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "DriveSyncResponse",
+      "path": "examples/drive-connector/empty.json",
+      "sha256": "5af5f319c5820cea00c9c3d240fac4a78a1c79b70bac178ea711cbd338cc16fc",
+      "state": "empty"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "ErrorEnvelope",
+      "path": "examples/drive-connector/incompatible-version.json",
+      "sha256": "c30b8a6f89e5574f7393a9876aa65205ac52212da85eb3a45f886b8d0ed1b6f6",
+      "state": "incompatible-version"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "ErrorEnvelope",
+      "path": "examples/drive-connector/malformed-input.json",
+      "sha256": "4943689ec156ebd288dcb6e6f888e2284d43527de156a5b1b8e9f3649730aade",
+      "state": "malformed-input"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "ErrorEnvelope",
+      "path": "examples/drive-connector/refusal.json",
+      "sha256": "3dbec5a3c1e03cb60cdc213a9786d9cea6918d8cb136244d19eb5995ee1c0631",
+      "state": "refusal"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "DriveConnectorStatusResponse",
+      "path": "examples/drive-connector/success.json",
+      "sha256": "2029edc1fd756fb865226d72928915f463e75fcbe1bcd54645b1abc7829ad60c",
+      "state": "success"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "ErrorEnvelope",
+      "path": "examples/drive-connector/unavailable-service.json",
+      "sha256": "bd64368c2cf504b3fc6c7619e4eb0f4c3eff52c31a839d3da4d24f8d00e9f68c",
       "state": "unavailable-service"
     },
     {
@@ -258,7 +307,7 @@
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "schemas/CapabilitiesResponse.schema.json",
-      "sha256": "380b2b009dc319887f6b3df650cb577b9dea62b9ba5785332839eac5fd6daa0b",
+      "sha256": "c8dd894861567422befb5037d2fe5afb43b3b64c1c06927271b58ee60f8f044e",
       "state": null
     },
     {
@@ -280,6 +329,27 @@
       "model": "CareSignal",
       "path": "schemas/CareSignal.schema.json",
       "sha256": "fc09e8583eca62438b9a4b4074da5fcb1f31c694a059d11e7efca5db9b60ce90",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "DriveConnectorStatusResponse",
+      "path": "schemas/DriveConnectorStatusResponse.schema.json",
+      "sha256": "9878918c1f8a1091a155f20a69fae343b3229f03cce54b784525d51ae09d9c1f",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "DriveDisconnectResponse",
+      "path": "schemas/DriveDisconnectResponse.schema.json",
+      "sha256": "0809789ee2628bb14545eb4ed87cff172dbbbe502972dc1d8f0d32f18e181502",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "DriveSyncResponse",
+      "path": "schemas/DriveSyncResponse.schema.json",
+      "sha256": "092cfa15240ba039a8a99cdbe6d59ee64d875fb6649c570ff54d2801c9defac4",
       "state": null
     },
     {

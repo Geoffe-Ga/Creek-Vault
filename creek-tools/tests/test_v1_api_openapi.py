@@ -81,6 +81,8 @@ from creek_mcp.httpapi.journal import admissible_external_id
 from tests.v1_api_support import (
     CAPABILITIES_PATH,
     CONTRACT_VERSION_HEADER,
+    DRIVE_CONNECTOR_PATH,
+    DRIVE_SYNC_PATH,
     HEALTH_PATH,
     JOURNAL_TEMPLATE,
     REFLECTIONS_PATH,
@@ -409,13 +411,21 @@ def test_documented_paths_equal_the_mounted_routes(vault: Path) -> None:
 
 
 def test_every_published_route_is_documented() -> None:
-    """All six paths appear, named explicitly so a silent drop is visible."""
+    """All eight paths appear, named explicitly so a silent drop is visible.
+
+    Eight paths over nine operations since #1527: ``/v1/connectors/drive``
+    serves both ``GET`` and ``DELETE``, which is why this is a set of paths
+    while ``test_documented_routes_are_the_mounted_ones`` above compares
+    ``(method, path)`` pairs.
+    """
     assert set(_paths()) == {
         CAPABILITIES_PATH,
         JOURNAL_TEMPLATE,
         REFLECTIONS_PATH,
         WHEEL_PATH,
         UPLOAD_PATH,
+        DRIVE_CONNECTOR_PATH,
+        DRIVE_SYNC_PATH,
         HEALTH_PATH,
     }
 

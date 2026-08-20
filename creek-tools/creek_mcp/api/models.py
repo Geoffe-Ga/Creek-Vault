@@ -78,6 +78,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.8",
     "0.7",
     "0.6",
     "0.5",
@@ -198,7 +199,7 @@ class WireTierCeiling(StrEnum):
 
 
 class Capability(StrEnum):
-    """The five capabilities ``/v1`` publishes.
+    """The six capabilities ``/v1`` publishes.
 
     The list was identical for every minor in
     :data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3
@@ -220,6 +221,17 @@ class Capability(StrEnum):
         WHEEL: Aggregate APTITUDE frequency distribution.
         UPLOAD: Idempotent document upload — base64 bytes plus a filename,
             dispatched to an ingestor by extension. Since contract 0.8.
+        DRIVE_CONNECTOR: The read-only Google Drive connector's *state* and
+            its two verbs — one incremental sync, and disconnection. Since
+            contract 0.9 (#1527). Three routes rather than one, and one
+            capability rather than three, because a client cannot usefully
+            negotiate "may I read the connector's state" separately from "may
+            I sync it": they are one feature, and splitting them would let a
+            server advertise half a connector.
+
+            **It does not include authorisation.** No route begins, completes
+            or carries an OAuth flow; the credential is minted locally by
+            ``creek gdrive --download`` and never leaves the host.
     """
 
     CAPABILITIES = "capabilities"
@@ -227,6 +239,7 @@ class Capability(StrEnum):
     REFLECTIONS = "reflections"
     WHEEL = "wheel"
     UPLOAD = "upload"
+    DRIVE_CONNECTOR = "drive-connector"
 
 
 _FOUNDING_MINOR: Final[str] = "0.2"
@@ -241,12 +254,22 @@ every client pinned to 0.8 — the very clients this table exists to serve — w
 stop being told about a capability they negotiated correctly for.
 """
 
+_DRIVE_CONNECTOR_MINOR: Final[str] = "0.9"
+"""The minor ``drive-connector`` was published at (#1527).
+
+A literal for the same reason :data:`_UPLOAD_MINOR` is one: written as
+:data:`CONTRACT_MINOR` it would follow the next bump forward and stop
+advertising the capability to the very clients pinned to the minor that
+introduced it.
+"""
+
 CAPABILITY_SINCE_MINOR: Final[dict[Capability, str]] = {
     Capability.CAPABILITIES: _FOUNDING_MINOR,
     Capability.JOURNAL_UPSERT: _FOUNDING_MINOR,
     Capability.REFLECTIONS: _FOUNDING_MINOR,
     Capability.WHEEL: _FOUNDING_MINOR,
     Capability.UPLOAD: _UPLOAD_MINOR,
+    Capability.DRIVE_CONNECTOR: _DRIVE_CONNECTOR_MINOR,
 }
 """The contract minor each capability was first published at.
 
@@ -973,6 +996,176 @@ class UploadResponse(_WireModel):
     )
 
 
+class DriveConnectionState(StrEnum):
+    """The four states the read-only Drive connector can be in (#1527).
+
+    A closed enum rather than a boolean, because the three unusable states are
+    answered by three different operator actions and a client that could only
+    see ``connected: false`` would have to guess which to prompt for.
+
+    **Every member is a fact about this server's own configuration**, never
+    about the user's Drive: no file, folder, id or count is expressible here.
+
+    Attributes:
+        CONNECTED: A cached credential exists and is usable, so a sync will
+            run without a human present.
+        NOT_CONNECTED: No cached credential. The operator authorises with
+            ``creek gdrive --download`` on the host; there is no ``/v1`` route
+            that can do it for them.
+        EXPIRED: A credential exists but has lapsed and carries no refresh
+            token, so it cannot be renewed non-interactively. The same
+            operator action clears it.
+        UNSUPPORTED: The optional Google client libraries are not installed on
+            this server, so no credential could be used even if one existed.
+            Distinguished from :attr:`NOT_CONNECTED` because the remedy is an
+            install rather than an authorisation, and a client that conflated
+            them would send the operator round a loop that cannot terminate.
+    """
+
+    CONNECTED = "connected"
+    NOT_CONNECTED = "not_connected"
+    EXPIRED = "expired"
+    UNSUPPORTED = "unsupported"
+
+
+class DriveConnectorStatusResponse(_WireModel):
+    """What ``GET /v1/connectors/drive`` reports about the connector (#1527).
+
+    **The one thing this model must never carry is the credential**, and its
+    closed field list is what enforces that: ``_WireModel`` forbids extras, so
+    a token cannot be bolted on without editing this class and the schema it
+    publishes. What a caller gets is the *state* of the connection and the
+    *scope set* it was granted under — never the token, the refresh token, the
+    client secret, or the path any of them live at.
+
+    Publishing connection state deliberately is not in tension with the
+    no-oracle rule the refusals follow. This route **is** the negotiated
+    disclosure — a client that cannot tell "connected" from "not connected"
+    cannot render a connect button — and it is reachable only by an
+    authenticated consumer. The rule the refusals keep is the complementary
+    one: because this route answers the question honestly, no *other* route
+    has any reason to leak the answer sideways.
+
+    Attributes:
+        status: Always ``"ok"``. An unreadable vault or config is an
+            :class:`ErrorEnvelope`, not a state.
+        tier_ceiling: The ceiling the call ran at — the caller's own declared
+            value, echoed for correlation.
+        connection: The connector's state.
+        scopes: The OAuth scope set the cached credential was requested
+            under, verbatim. Published because a client showing a user "Creek
+            can read your Drive" should be able to *check* that claim rather
+            than repeat it;
+            :meth:`creek.config.GoogleDriveConfig.validate_readonly_scopes`
+            refuses to construct a config carrying anything else, so a widened
+            scope cannot reach this field without failing validation first.
+        can_sync: Whether ``POST /v1/connectors/drive/syncs`` would run rather
+            than refuse. Derived from :attr:`connection` and published
+            separately so a client need not encode this server's state
+            algebra to know whether its button is live.
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    connection: DriveConnectionState = Field(description="Connector state.")
+    scopes: list[str] = Field(
+        description="Read-only OAuth scopes the credential was granted under.",
+    )
+    can_sync: bool = Field(description="True when a sync would run, not refuse.")
+
+
+class DriveSyncResponse(_WireModel):
+    """The tally of one incremental Drive sync (#1527).
+
+    **Counts, and nothing but counts.** Not a file name, not a folder name,
+    not a Drive id, not a fragment id, not a tier. Every one of those is the
+    user's own content or a handle onto it, and this response is the only
+    thing a remote caller learns from a run that may have touched material far
+    above its ceiling — a sync ingests whatever the user's own Drive holds,
+    because the tier of that content is derived from the content, never
+    declared by the caller.
+
+    That is also why there is no ``affected_fragment_ids`` here, despite
+    :class:`UploadResponse` publishing one for the #1305 right-to-be-forgotten
+    argument. An upload's fragments are the caller's own bytes, handed over a
+    moment earlier; a sync's are the vault owner's, and a list of them handed
+    to an ``open``-ceiling consumer is a corpus enumeration primitive dressed
+    as a receipt. The vault-side record of what a sync wrote is the ingest
+    ledger, which RTBF already reads.
+
+    Attributes:
+        status: Always ``"ok"``. Failure is an :class:`ErrorEnvelope`.
+        tier_ceiling: The ceiling the call ran at.
+        files_fetched: Files Drive reported as newer than the local copy and
+            this run downloaded.
+        files_unchanged: Files the incremental skip passed over. This is the
+            number that makes a second sync of an untouched Drive visibly a
+            no-op rather than an invisible one.
+        files_failed: Files whose download raised. The run continues past
+            each, so a quota blip mid-sync does not abandon the rest — and the
+            count is published because a caller told only about successes
+            would believe an incomplete sync was complete. The *reasons* stay
+            in the server log: they interpolate Drive file names.
+        files_unsupported: Files that downloaded cleanly and were **not**
+            ingested, because their extension names a format Creek must not
+            read as one document (#1526) — a conversation export, an archive,
+            a legacy binary Office file. Published rather than folded into
+            :attr:`files_failed`, which would be untrue, and rather than left
+            out, which would be worse: a fetched-but-undigested file is
+            precisely the silent no-op this whole surface exists to prevent.
+            The bytes are in the staging mirror and ``creek ingest`` can read
+            them; nothing is lost, but nothing happened either.
+        fragments_created: Fragments this run's ingest newly wrote.
+        fragments_updated: Fragments it rewrote in place.
+        fragments_unchanged: Fragments the ledger recognised as identical.
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    files_fetched: int = Field(ge=0, description="Files downloaded this run.")
+    files_unchanged: int = Field(ge=0, description="Files the skip passed over.")
+    files_failed: int = Field(ge=0, description="Files whose download raised.")
+    files_unsupported: int = Field(
+        ge=0,
+        description="Files fetched but of a format Creek must not ingest.",
+    )
+    fragments_created: int = Field(ge=0, description="Fragments newly written.")
+    fragments_updated: int = Field(ge=0, description="Fragments rewritten.")
+    fragments_unchanged: int = Field(ge=0, description="Fragments left as they were.")
+
+
+class DriveDisconnectResponse(_WireModel):
+    """The outcome of ``DELETE /v1/connectors/drive`` (#1527).
+
+    Idempotent, and constant-shaped: disconnecting an already-disconnected
+    connector is a success, and reports the same
+    :attr:`~DriveConnectionState.NOT_CONNECTED` as disconnecting a live one.
+    That is why :attr:`connection` is published rather than a
+    ``token_erased`` boolean — the latter would answer "was there a
+    credential a moment ago", which is a question about the past that this
+    verb has no reason to answer.
+
+    Attributes:
+        status: Always ``"ok"``.
+        tier_ceiling: The ceiling the call ran at.
+        connection: The state afterwards. Always
+            :attr:`~DriveConnectionState.NOT_CONNECTED` on a ``200``: the
+            local credential is erased before the response is built, and a
+            failure to erase it is an :class:`ErrorEnvelope` rather than a
+            success reporting that nothing happened.
+        remote_revoked: Whether Google's revocation endpoint confirmed the
+            credential is dead on their side too. ``False`` does **not** mean
+            the local erase failed — it means the operator should finish the
+            job at Google's account page, which is the one piece of advice a
+            client can act on and cannot derive.
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    connection: DriveConnectionState = Field(description="State after the call.")
+    remote_revoked: bool = Field(description="Google confirmed the revocation.")
+
+
 class ReflectionRequest(_WireModel):
     """A request for margin notes on exactly one source.
 
@@ -1285,6 +1478,9 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "CareEscalationResponse": CareEscalationResponse,
     "CareResource": CareResource,
     "CareSignal": CareSignal,
+    "DriveConnectorStatusResponse": DriveConnectorStatusResponse,
+    "DriveDisconnectResponse": DriveDisconnectResponse,
+    "DriveSyncResponse": DriveSyncResponse,
     "ErrorEnvelope": ErrorEnvelope,
     "JournalUpsertRequest": JournalUpsertRequest,
     "JournalUpsertResponse": JournalUpsertResponse,

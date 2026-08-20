@@ -24,6 +24,9 @@ does and does not yet do.
 | `PUT /v1/journal-entries/{external_id}` | **Implemented.** Idempotent journal write over the shared `creek.journal` tool — same tier gates, same audit records, same fragment identity as MCP (#1075). |
 | `POST /v1/reflections` | **Implemented.** Anchored margin notes over the shared `creek.reflect` tool. `ok` / `empty` / `escalate` / every refusal are distinguishable from a closed `status` or `code` enum — **no client needs to parse prose to branch**. `notes[].quote` is the only verbatim-guaranteed field: each is validated as a whitespace-normalised span of the submitted or referenced entry, and a span that is not is dropped rather than returned. `essay` is free model prose and is **never** grounding-checked, which is what `essay_grounded: false` (always present, always `false`) tells you — a client must not present it as the writer's own words. A care-flagged entry returns `status: "escalate"` at HTTP **200** with the full `care_signal`, and the model is never called; an escalation is not an error, because a person in acute distress must not land in a client's error path. An `entry_ref` that is above your ceiling and one that does not resolve are **deliberately indistinguishable** — both are `403 privacy_refused` with the same message, because a caller who could tell them apart could enumerate the corpus (#1077). |
 | `POST /v1/uploads` | **Implemented.** Idempotent **document** upload over the shared `creek.upload` tool — JSON + base64, never multipart. Body is `{filename, content_base64, external_id, timestamp?, tier}`; the extension of `filename` picks the ingestor and there is deliberately **no `source_type` override** (naming a directory-only ingestor for one file is a silent no-op; whole-archive upload is #1525). `external_id` is the idempotency key: re-sending it updates in place and never mints a second fragment. The response publishes **no `tier`**, on purpose — classification is escalate-only, so a `.md` declaring `intimate` in its own frontmatter lands at `intimate` however modest a tier you declared, and a field claiming the resulting tier could only be false or an oracle. A format Creek must not flatten into one blob (`.json`, `.zip`, `.doc`, …) is `415 unsupported_source` carrying the remedy, never a `500` and never a fragment (#1526). Published at contract `0.8.0` (#1524). |
+| `GET /v1/connectors/drive` | **Implemented.** The read-only Google Drive connector's *state*: `connected` / `not_connected` / `expired` / `unsupported`, the granted OAuth scopes (always `.readonly` — the config refuses anything else), and `can_sync`. **No credential is published and none is accepted**: the response has no field a token could sit in, and the model forbids extras. This is the one route that discloses connection state deliberately — a client cannot render a connect button without it — which is exactly why the other two verbs' refusals disclose nothing. Published at contract `0.9.0` (#1527). |
+| `POST /v1/connectors/drive/syncs` | **Implemented.** One **incremental** Drive sync over the existing downloader, followed by an ordinary ledger-backed ingest of whatever it fetched. Takes **no request body** — there is no parameter you could usefully set, and a caller-supplied path or file id would be a way to steer the server at part of the owner's Drive they never asked it to touch. The response is **counts only**: no Drive file name, folder name or id, and no `affected_fragment_ids` — a sync's fragments are the vault owner's content, and a list of them would be a corpus enumeration primitive. Files land at the tier `creek ingest` would give them; the route passes **no** `privacy_tier`, so it cannot make any tier less restrictive. A second sync over an unchanged Drive fetches nothing and writes nothing. Refuses with `503 unavailable` when there is no usable credential, rather than falling through to an OAuth flow that would try to open a browser on the server. Published at contract `0.9.0` (#1527). |
+| `DELETE /v1/connectors/drive` | **Implemented.** Revoke and erase: posts the refresh token to Google's revocation endpoint (the one journey the credential makes, and it is back to its issuer), then overwrites and unlinks the local token file. Idempotent — disconnecting an already-disconnected connector is a `200` reporting the same state. `remote_revoked: false` means finish the job at Google's account page; it does **not** mean the local erase failed, which is a refusal rather than a success. After this, a sync refuses. Published at contract `0.9.0` (#1527). |
 | `GET /v1/wheel` | **Implemented.** The **frequency distribution over the classified corpus** — how many ceiling-admitted fragments sit at each APTITUDE frequency F1–F10, and each frequency's share of the classified total. **This is not a curriculum-progress or fullness measure.** Adepthood's Map validates a ten-member `{aspects: [{stage_number, aspect, fullness}]}` shape from its own 36-week curriculum; that projection is Adepthood's and is owned there (Geoffe-Ga/adepthood#1937). Ten members on both sides is a coincidence of cardinality, not a shared meaning — reading one as the other renders confidently wrong numbers. An empty or missing corpus is `200` with all ten entries at `count: 0`, never `404` and never an error (#1076). |
 
 **Every published route is now built, and none of them was ever allowed to
@@ -251,15 +254,16 @@ could put on any wire position that names it.
 `/v1` is the HTTP major. Below it, one `contract_version` covers both this
 surface and MCP.
 
-The four capability routes — `PUT /v1/journal-entries/{external_id}`,
-`POST /v1/reflections`, `GET /v1/wheel` and `POST /v1/uploads` — require
-`X-Creek-Contract-Version: <major.minor>`, for example `0.8`. The comparison is
+The seven capability routes — `PUT /v1/journal-entries/{external_id}`,
+`POST /v1/reflections`, `GET /v1/wheel`, `POST /v1/uploads` and the three
+`/v1/connectors/drive` verbs — require
+`X-Creek-Contract-Version: <major.minor>`, for example `0.9`. The comparison is
 strict membership against the server's `supported_contract_minors`: a missing
 header, a full patch version like `0.2.0`, or anything unrecognised is `409
 incompatible_version`, refused before any vault read.
 
 That set is a **window, and it widens before it narrows**. It currently holds
-`0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and `0.2`. The `0.3.0`, `0.4.0` and `0.6.0` moves all
+`0.9`, `0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and `0.2`. The `0.3.0`, `0.4.0` and `0.6.0` moves all
 came from the MCP surface and changed no `/v1` shape — `0.3.0` added
 `creek.upload` (#1023), `0.4.0` gave `creek.purge.*` its `partial` status
 (#1246), and `0.6.0` gave `creek.purge.*` the `ledger_rows_removed` and
@@ -279,6 +283,15 @@ tries the path anyway. Every shape such a client already knows is
 byte-identical. The same bump brings `415` into the published status set, with
 the `unsupported_source` code; a client pinned below `0.8` cannot meet it,
 because the only route that emits it is the one it cannot reach.
+
+`0.9.0` (#1527) is the second such bump, and the first to publish a capability
+served by **three** routes: `drive-connector`, over `GET`/`DELETE
+/v1/connectors/drive` and `POST /v1/connectors/drive/syncs`. It is additive in
+the same enforced sense — one `CAPABILITY_SINCE_MINOR` entry drives both the
+advertised list and the route refusal — and it adds **no error code and no new
+status**, so a `0.8` client meets nothing new on any route it already calls. It
+is also the first template serving two methods; `GET` and `DELETE` on
+`/v1/connectors/drive` are separate published operations.
 
 Read the window off `GET /v1/capabilities` rather than assuming the newest
 minor is the only one accepted.

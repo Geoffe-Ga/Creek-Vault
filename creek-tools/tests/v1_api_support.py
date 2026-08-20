@@ -1,6 +1,6 @@
 """Shared scaffolding for the Adepthood ``/v1`` HTTP API suite (#1074).
 
-Eight ``tests/test_v1_api_*.py`` modules drive the same adapter, and every one
+Nine ``tests/test_v1_api_*.py`` modules drive the same adapter, and every one
 of them needs the same four things: a seeded vault, a bearer token that clears
 :data:`creek_mcp.token_policy.MIN_TOKEN_LEN`, a verifier over two consumers,
 and a :class:`~starlette.testclient.TestClient` over
@@ -117,6 +117,16 @@ WHEEL_PATH: Final[str] = "/v1/wheel"
 UPLOAD_PATH: Final[str] = "/v1/uploads"
 """The document-upload endpoint (contract 0.8, #1524)."""
 
+DRIVE_CONNECTOR_PATH: Final[str] = "/v1/connectors/drive"
+"""The Drive connector resource: ``GET`` reads its state, ``DELETE`` clears it.
+
+The first published template serving two methods (contract 0.9, #1527), which
+is why :data:`MOUNTED` below carries it twice.
+"""
+
+DRIVE_SYNC_PATH: Final[str] = "/v1/connectors/drive/syncs"
+"""The Drive incremental-sync endpoint (contract 0.9, #1527)."""
+
 HEALTH_PATH: Final[str] = "/v1/health"
 """The liveness probe."""
 
@@ -135,6 +145,15 @@ OP_WHEEL: Final[str] = "getWheel"
 OP_UPLOAD: Final[str] = "uploadDocument"
 """``operation_id`` of ``POST /v1/uploads``."""
 
+OP_DRIVE_STATUS: Final[str] = "getDriveConnector"
+"""``operation_id`` of ``GET /v1/connectors/drive``."""
+
+OP_DRIVE_SYNC: Final[str] = "syncDriveConnector"
+"""``operation_id`` of ``POST /v1/connectors/drive/syncs``."""
+
+OP_DRIVE_DISCONNECT: Final[str] = "disconnectDriveConnector"
+"""``operation_id`` of ``DELETE /v1/connectors/drive``."""
+
 OP_HEALTH: Final[str] = "getHealth"
 """``operation_id`` of ``GET /v1/health``."""
 
@@ -144,6 +163,9 @@ MOUNTED: Final[tuple[tuple[str, str], ...]] = (
     ("POST", REFLECTIONS_PATH),
     ("GET", WHEEL_PATH),
     ("POST", UPLOAD_PATH),
+    ("GET", DRIVE_CONNECTOR_PATH),
+    ("POST", DRIVE_SYNC_PATH),
+    ("DELETE", DRIVE_CONNECTOR_PATH),
     ("GET", HEALTH_PATH),
 )
 """Every ``(method, concrete path)`` pair a client can actually reach."""
@@ -154,6 +176,9 @@ MOUNTED_IDS: Final[tuple[str, ...]] = (
     "reflections",
     "wheel",
     "upload",
+    "drive-status",
+    "drive-sync",
+    "drive-disconnect",
     "health",
 )
 """Stable parametrize ids for :data:`MOUNTED`, in the same order."""
@@ -163,14 +188,20 @@ VERSIONED: Final[tuple[tuple[str, str], ...]] = (
     ("POST", REFLECTIONS_PATH),
     ("GET", WHEEL_PATH),
     ("POST", UPLOAD_PATH),
+    ("GET", DRIVE_CONNECTOR_PATH),
+    ("POST", DRIVE_SYNC_PATH),
+    ("DELETE", DRIVE_CONNECTOR_PATH),
 )
-"""The four routes the contract-version gate applies to."""
+"""The seven routes the contract-version gate applies to."""
 
 VERSIONED_IDS: Final[tuple[str, ...]] = (
     "journal-upsert",
     "reflections",
     "wheel",
     "upload",
+    "drive-status",
+    "drive-sync",
+    "drive-disconnect",
 )
 """Stable parametrize ids for :data:`VERSIONED`."""
 

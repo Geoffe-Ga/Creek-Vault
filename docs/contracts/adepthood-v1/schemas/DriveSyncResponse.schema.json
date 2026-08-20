@@ -1,0 +1,82 @@
+{
+  "$defs": {
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:func:`creek_mcp.policy.admitted_ceiling` refuses any remote call declaring\na ceiling outside :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` *before\ndispatch*. Since #1073 that decision is transport-neutral, so every adapter\nis meant to reach it the same way; the MCP surface does so today through\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool`, and #1074 mounts the\n``/v1`` handlers that will. This enum mirrors that frozenset, so\n``intimate`` and ``all`` are not merely refused at runtime \u2014 they cannot be\nconstructed at all, which is the half of the guarantee that does not depend\non a handler remembering to ask.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The tally of one incremental Drive sync (#1527).\n\n**Counts, and nothing but counts.** Not a file name, not a folder name,\nnot a Drive id, not a fragment id, not a tier. Every one of those is the\nuser's own content or a handle onto it, and this response is the only\nthing a remote caller learns from a run that may have touched material far\nabove its ceiling \u2014 a sync ingests whatever the user's own Drive holds,\nbecause the tier of that content is derived from the content, never\ndeclared by the caller.\n\nThat is also why there is no ``affected_fragment_ids`` here, despite\n:class:`UploadResponse` publishing one for the #1305 right-to-be-forgotten\nargument. An upload's fragments are the caller's own bytes, handed over a\nmoment earlier; a sync's are the vault owner's, and a list of them handed\nto an ``open``-ceiling consumer is a corpus enumeration primitive dressed\nas a receipt. The vault-side record of what a sync wrote is the ingest\nledger, which RTBF already reads.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call ran at.\n    files_fetched: Files Drive reported as newer than the local copy and\n        this run downloaded.\n    files_unchanged: Files the incremental skip passed over. This is the\n        number that makes a second sync of an untouched Drive visibly a\n        no-op rather than an invisible one.\n    files_failed: Files whose download raised. The run continues past\n        each, so a quota blip mid-sync does not abandon the rest \u2014 and the\n        count is published because a caller told only about successes\n        would believe an incomplete sync was complete. The *reasons* stay\n        in the server log: they interpolate Drive file names.\n    files_unsupported: Files that downloaded cleanly and were **not**\n        ingested, because their extension names a format Creek must not\n        read as one document (#1526) \u2014 a conversation export, an archive,\n        a legacy binary Office file. Published rather than folded into\n        :attr:`files_failed`, which would be untrue, and rather than left\n        out, which would be worse: a fetched-but-undigested file is\n        precisely the silent no-op this whole surface exists to prevent.\n        The bytes are in the staging mirror and ``creek ingest`` can read\n        them; nothing is lost, but nothing happened either.\n    fragments_created: Fragments this run's ingest newly wrote.\n    fragments_updated: Fragments it rewrote in place.\n    fragments_unchanged: Fragments the ledger recognised as identical.",
+  "properties": {
+    "files_failed": {
+      "description": "Files whose download raised.",
+      "minimum": 0,
+      "title": "Files Failed",
+      "type": "integer"
+    },
+    "files_fetched": {
+      "description": "Files downloaded this run.",
+      "minimum": 0,
+      "title": "Files Fetched",
+      "type": "integer"
+    },
+    "files_unchanged": {
+      "description": "Files the skip passed over.",
+      "minimum": 0,
+      "title": "Files Unchanged",
+      "type": "integer"
+    },
+    "files_unsupported": {
+      "description": "Files fetched but of a format Creek must not ingest.",
+      "minimum": 0,
+      "title": "Files Unsupported",
+      "type": "integer"
+    },
+    "fragments_created": {
+      "description": "Fragments newly written.",
+      "minimum": 0,
+      "title": "Fragments Created",
+      "type": "integer"
+    },
+    "fragments_unchanged": {
+      "description": "Fragments left as they were.",
+      "minimum": 0,
+      "title": "Fragments Unchanged",
+      "type": "integer"
+    },
+    "fragments_updated": {
+      "description": "Fragments rewritten.",
+      "minimum": 0,
+      "title": "Fragments Updated",
+      "type": "integer"
+    },
+    "status": {
+      "const": "ok",
+      "description": "Always ok; failure is an error.",
+      "title": "Status",
+      "type": "string"
+    },
+    "tier_ceiling": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Ceiling the call ran at."
+    }
+  },
+  "required": [
+    "status",
+    "tier_ceiling",
+    "files_fetched",
+    "files_unchanged",
+    "files_failed",
+    "files_unsupported",
+    "fragments_created",
+    "fragments_updated",
+    "fragments_unchanged"
+  ],
+  "title": "DriveSyncResponse",
+  "type": "object"
+}

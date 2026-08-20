@@ -2,7 +2,7 @@
 
 :func:`build_bundle` renders the whole of ``docs/contracts/adepthood-v1/`` from
 the code in :mod:`creek_mcp.api.models`: one JSON Schema per published model, a
-5x7 matrix of worked example responses, the retry table, and a manifest that
+6x7 matrix of worked example responses, the retry table, and a manifest that
 hashes every one of them. :func:`write_bundle` materialises it.
 
 **Why generate it instead of hand-writing it.** A hand-written fixture bundle
@@ -30,7 +30,7 @@ its whole error-handling surface against fixtures:
 - ``refusal`` — an :class:`~creek_mcp.api.models.ErrorEnvelope` carrying
   ``privacy_refused``. **These are the intimate examples, and every one of them
   is a refusal rather than a success** — that is the point of publishing them.
-- ``care-escalation`` — ``reflections`` only; the other four cells are
+- ``care-escalation`` — ``reflections`` only; the other five cells are
   :class:`~creek_mcp.api.models.NotApplicableExample`, because the
   acute-distress guard runs only inside ``reflect_tool``.
 - ``malformed-input`` / ``incompatible-version`` / ``unavailable-service`` —
@@ -71,6 +71,7 @@ from creek_mcp.api.models import (
     SUPPORTED_CONTRACT_MINORS,
     CapabilitiesStatus,
     Capability,
+    DriveConnectionState,
     ErrorCode,
     JournalAction,
     NoteKind,
@@ -164,9 +165,9 @@ UNREACHABLE_CELLS: Final[frozenset[tuple[str, str]]] = frozenset(
 Derived from the axes rather than listed, so it cannot fall out of step with
 the matrix it describes. The acute-distress guard runs only inside
 :func:`creek_mcp.tools.reflect.reflect_tool`, so ``capabilities``,
-``journal-upsert``, ``wheel`` and ``upload`` can never escalate. Those four
-cells are filled with a :class:`~creek_mcp.api.models.NotApplicableExample`
-that says so.
+``journal-upsert``, ``wheel``, ``upload`` and ``drive-connector`` can never
+escalate. Those five cells are filled with a
+:class:`~creek_mcp.api.models.NotApplicableExample` that says so.
 """
 
 _ERROR_STATE_CODES: Final[dict[str, ErrorCode]] = {
@@ -199,7 +200,7 @@ _CAPABILITIES_SUCCESS: Final[dict[str, Any]] = {
     "tier_model": _TIER_MODEL_PAYLOAD,
     "capabilities": list(CAPABILITIES),
 }
-"""A ready server: vault present, all five capabilities served."""
+"""A ready server: vault present, all six capabilities served."""
 
 _CAPABILITIES_EMPTY: Final[dict[str, Any]] = {
     **_CAPABILITIES_SUCCESS,
@@ -287,6 +288,59 @@ This is the cell that documents idempotency. The ledger recognised the content,
 nothing was written, and the *same* ``fragment_id`` comes back — which is why
 the payload is spread from the success cell rather than written out with a new
 id.
+"""
+
+_DRIVE_READONLY_SCOPE: Final[str] = "https://www.googleapis.com/auth/drive.readonly"
+"""The single scope the connector may hold, spelled as it appears on the wire.
+
+Written out rather than imported from
+:data:`creek.config._READONLY_SCOPES`, because the fixture documents what a
+*consumer* will be shown and a set has no published order. The two are pinned
+equal by a test, which is the half of the trade that catches a widened scope.
+"""
+
+_DRIVE_STATUS_SUCCESS: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "tier_ceiling": WireTierCeiling.OPEN.value,
+    "connection": DriveConnectionState.CONNECTED.value,
+    "scopes": [_DRIVE_READONLY_SCOPE],
+    "can_sync": True,
+}
+"""A connected, syncable connector.
+
+No token, no refresh token, no expiry and no path to any of them — the whole
+of what a consumer learns about the credential is that one exists and that it
+was granted read-only.
+"""
+
+_DRIVE_STATUS_EMPTY: Final[dict[str, Any]] = {
+    **_DRIVE_STATUS_SUCCESS,
+    "connection": DriveConnectionState.NOT_CONNECTED.value,
+    "can_sync": False,
+}
+"""A server nobody has authorised yet: a legitimate state, never an error.
+
+This is the cell a client renders its "Connect Google Drive" button from — and
+the reason that button points at the operator's own machine rather than at a
+``/v1`` route, because there is no route that can mint a credential.
+"""
+
+_DRIVE_SYNC_EMPTY: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "tier_ceiling": WireTierCeiling.OPEN.value,
+    "files_fetched": 0,
+    "files_unchanged": 0,
+    "files_failed": 0,
+    "files_unsupported": 0,
+    "fragments_created": 0,
+    "fragments_updated": 0,
+    "fragments_unchanged": 0,
+}
+"""A sync of an unchanged Drive: all zeroes, and emphatically a success.
+
+Published as its own fixture because "nothing happened" is the answer a client
+integrating against this route will see most often, and a client that treated
+an all-zero tally as a failure would retry a working connector forever.
 """
 
 _EXAMPLE_NOTE: Final[dict[str, Any]] = {
@@ -392,7 +446,7 @@ _WHEEL_EMPTY: Final[dict[str, Any]] = {
 
 
 # --------------------------------------------------------------------------
-# The 5 x 7 matrix
+# The 6 x 7 matrix
 # --------------------------------------------------------------------------
 
 _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
@@ -416,8 +470,18 @@ _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
         model="UploadResponse",
         payload=_UPLOAD_SUCCESS,
     ),
+    Capability.DRIVE_CONNECTOR.value: _Example(
+        model="DriveConnectorStatusResponse",
+        payload=_DRIVE_STATUS_SUCCESS,
+    ),
 }
-"""The ``success`` column: one canonical happy response per capability."""
+"""The ``success`` column: one canonical happy response per capability.
+
+``drive-connector`` is the one capability whose column spans three response
+models, because it is one capability over three verbs. Its two success-ish
+cells are chosen to be the two a client meets first: the connected *state*
+here, and an unchanged *sync* in the ``empty`` column below.
+"""
 
 _EMPTY_EXAMPLES: Final[dict[str, _Example]] = {
     Capability.CAPABILITIES.value: _Example(
@@ -440,6 +504,10 @@ _EMPTY_EXAMPLES: Final[dict[str, _Example]] = {
         model="UploadResponse",
         payload=_UPLOAD_EMPTY,
     ),
+    Capability.DRIVE_CONNECTOR.value: _Example(
+        model="DriveSyncResponse",
+        payload=_DRIVE_SYNC_EMPTY,
+    ),
 }
 """The ``empty`` column. Every cell is a success envelope, not an error."""
 
@@ -452,7 +520,7 @@ def _care_example(capability: str) -> _Example:
 
     Returns:
         The real escalation envelope for ``reflections``; an explicit
-        unreachability marker for the three capabilities that cannot escalate.
+        unreachability marker for the five capabilities that cannot escalate.
     """
     if (capability, _STATE_CARE_ESCALATION) in UNREACHABLE_CELLS:
         return _Example(model="NotApplicableExample", payload=_UNREACHABLE_PAYLOAD)
