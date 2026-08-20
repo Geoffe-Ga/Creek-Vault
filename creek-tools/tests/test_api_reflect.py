@@ -38,6 +38,7 @@ from creek_mcp.tools.reflect import reflect_tool
 from tests.adapter_parity import assert_parity, http_outcome, mcp_outcome
 from tests.v1_api_support import (
     CONSUMER,
+    CONTRACT_MINOR,
     REFLECTIONS_PATH,
     build_app,
     contains_a_path,
@@ -212,6 +213,7 @@ def _post(
     body: dict[str, Any] | None = None,
     ceiling: str | None = None,
     factory: _FactorySpy | None = None,
+    minor: str | None = CONTRACT_MINOR,
 ) -> httpx.Response:
     """Send one reflection request and return the raw response.
 
@@ -220,6 +222,7 @@ def _post(
         body: The JSON body, or ``None`` for a canonical inline-content one.
         ceiling: The declared tier ceiling, or ``None`` to send no header.
         factory: The stub LLM factory, or ``None`` for a silent one.
+        minor: The declared contract minor, or ``None`` to send none.
 
     Returns:
         The response.
@@ -230,7 +233,7 @@ def _post(
         return test_client.post(
             REFLECTIONS_PATH,
             json={"content": _ENTRY} if body is None else body,
-            headers=headers(ceiling=ceiling),
+            headers=headers(ceiling=ceiling, minor=minor),
         )
 
 
@@ -872,3 +875,48 @@ def test_the_related_keys_are_omitted_not_nulled_when_nothing_qualifies(
     assert "related_eddies" not in payload
     assert "essay" in payload
     assert payload["essay"] is None
+
+
+def test_a_prior_minor_is_not_served_the_compiled_layer(
+    vault: Path,
+) -> None:
+    """A ``0.8`` caller gets the ``0.8`` shape, even when a neighbour qualified.
+
+    Every published response schema sets ``additionalProperties: false``, so a
+    consumer validating against the minor it vendored does **not** ignore an
+    unknown key — it rejects the entire response. Emitting the #873 fields to a
+    caller that declared ``0.8`` would therefore break exactly the consumer
+    #873 exists to unblock, and only on the reflections that found a compiled
+    neighbour: the worst distribution a break could have.
+
+    The fixture is the one that DOES qualify, so this cannot pass by the
+    fields simply being absent — the sibling test below asserts they are served
+    at ``0.9`` from the same vault.
+    """
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+
+    response = _post(vault, body={"entry_ref": entry_ref}, ceiling="open", minor="0.8")
+
+    assert response.status_code == _OK, response.text
+    payload = response.json()
+    assert "related_praxis" not in payload
+    assert "related_eddies" not in payload
+
+
+def test_the_current_minor_is_served_the_compiled_layer(
+    vault: Path,
+) -> None:
+    """Positive control for the gate above: at ``0.9`` the fields do ship.
+
+    Without this, dropping the fields unconditionally would satisfy the
+    withholding test and silently delete the whole feature.
+    """
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+
+    response = _post(vault, body={"entry_ref": entry_ref}, ceiling="open", minor="0.9")
+
+    assert response.status_code == _OK, response.text
+    payload = response.json()
+    assert [row["title"] for row in payload["related_praxis"]] == [
+        "Rest before the collapse"
+    ]

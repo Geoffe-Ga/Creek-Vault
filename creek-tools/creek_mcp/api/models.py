@@ -140,11 +140,14 @@ and cannot reach. That last clause is enforced, not hoped for: see
 Contract 0.9 (#873) is a 0.5-shaped move: two **optional** fields —
 ``related_praxis`` and ``related_eddies`` — on :class:`ReflectionResponse`, and
 the two wire models they are made of. The route omits both keys when nothing
-qualified, so a ``0.8`` client's ordinary reflection is byte-identical; one
-that finds an admitted compiled neighbour carries two extra keys, which a
-closed-validating ``0.8`` consumer will see. ``0.8`` is retained anyway, for
-the same reason ``0.4`` was retained at 0.5: refusing it outright is strictly
-worse than occasionally serving a key it can ignore.
+qualified, so a ``0.8`` client's ordinary reflection is byte-identical; and one
+that finds an admitted compiled neighbour carries two extra keys — which a
+``0.8`` consumer validating against its vendored, closed schema would reject
+outright, not ignore. So the fields are gated on the declared minor via
+:data:`RELATED_FIELDS_SINCE_MINOR`: a ``0.8`` caller is served the ``0.8``
+shape, byte-for-byte, whether or not a neighbour qualified. ``0.8`` is retained
+for the same reason ``0.4`` was retained at 0.5 — refusing it outright is
+strictly worse — but retention alone was not enough here.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
@@ -249,6 +252,22 @@ A literal, deliberately, and **not** :data:`CONTRACT_MINOR`. Written as the
 derived constant it would silently follow the next bump forward, at which point
 every client pinned to 0.8 — the very clients this table exists to serve — would
 stop being told about a capability they negotiated correctly for.
+"""
+
+RELATED_FIELDS_SINCE_MINOR: Final[str] = "0.9"
+"""First contract minor whose ``ReflectionResponse`` carries the #873 fields.
+
+The same two-sided rule :data:`CAPABILITY_SINCE_MINOR` enforces for routes,
+applied to *fields*: a client is served only what the minor it declared can
+describe.
+
+It is load-bearing rather than decorative because every published response
+schema sets ``additionalProperties: false``. A ``0.8`` consumer that vendored
+the ``0.8`` ``ReflectionResponse`` and validates closed does **not** "ignore" an
+unknown key — it rejects the entire response. Emitting ``related_praxis`` to a
+caller that declared ``0.8`` would therefore break exactly the consumer #873
+exists to unblock, and only on the reflections that found a compiled neighbour,
+which is the worst possible distribution of a failure.
 """
 
 CAPABILITY_SINCE_MINOR: Final[dict[Capability, str]] = {

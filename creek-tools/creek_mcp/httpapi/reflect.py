@@ -42,6 +42,7 @@ from starlette.concurrency import run_in_threadpool
 
 from creek.care.guardrail import acute_distress_guard
 from creek_mcp.api.models import (
+    RELATED_FIELDS_SINCE_MINOR,
     CareEscalationResponse,
     CareSignal,
     ErrorCode,
@@ -51,6 +52,7 @@ from creek_mcp.api.models import (
     ReflectionStatus,
     WireTierCeiling,
 )
+from creek_mcp.api.routes import CONTRACT_VERSION_HEADER
 from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
 from creek_mcp.httpapi.vault import configured_vault
@@ -253,7 +255,12 @@ def _render_escalation(
     return json_response(payload.model_dump(mode="json"), HTTP_OK)
 
 
-def _render_notes(result: dict[str, Any], context: RequestContext) -> Response:
+def _render_notes(
+    result: dict[str, Any],
+    context: RequestContext,
+    *,
+    serve_related: bool,
+) -> Response:
     """Return the note-bearing response for an ``ok`` or ``empty`` result.
 
     Args:
@@ -286,11 +293,14 @@ def _render_notes(result: dict[str, Any], context: RequestContext) -> Response:
         )
     except (ValidationError, ValueError, KeyError, TypeError):
         return error_response(ErrorCode.INTERNAL_ERROR, context)
-    return json_response(_dumped(payload), HTTP_OK)
+    return json_response(_dumped(payload, serve_related=serve_related), HTTP_OK)
 
 
-def _dumped(payload: ReflectionResponse) -> dict[str, Any]:
-    """Serialise *payload*, omitting the two 0.9 fields when they are absent.
+def _dumped(payload: ReflectionResponse, *, serve_related: bool) -> dict[str, Any]:
+    """Serialise *payload*, omitting the two 0.9 fields when they must not ship.
+
+    Two independent reasons to drop a field, and they are not the same reason:
+    nothing qualified, or the caller declared a minor that predates it.
 
     Deliberately **not** ``model_dump(exclude_none=True)``. That would also
     drop ``essay: null``, which every consumer since contract 0.2 has been
@@ -300,25 +310,71 @@ def _dumped(payload: ReflectionResponse) -> dict[str, Any]:
     a reflection with no admitted compiled neighbours serialises byte-for-byte
     as it did at 0.8.
 
+    The minor gate is what keeps this additive in practice rather than only on
+    paper. Every published response schema sets ``additionalProperties: false``,
+    so a ``0.8`` consumer validating against its vendored schema rejects the
+    whole response on an unknown key rather than ignoring it — and it would do
+    so only on the reflections that found a compiled neighbour, which is the
+    worst distribution a break could have.
+
     Args:
         payload: The validated response.
+        serve_related: Whether the caller's declared minor is at least
+            :data:`~creek_mcp.api.models.RELATED_FIELDS_SINCE_MINOR`.
 
     Returns:
         The JSON-ready mapping.
     """
     data: dict[str, Any] = payload.model_dump(mode="json")
     for key in ("related_praxis", "related_eddies"):
-        if data.get(key) is None:
-            del data[key]
+        if not serve_related or data.get(key) is None:
+            data.pop(key, None)
     return data
 
 
-def _render(result: dict[str, Any], context: RequestContext) -> Response:
+def _serves_related(request: Request) -> bool:
+    """Whether this caller's declared minor can describe the two 0.9 fields.
+
+    The field-level twin of ``_predates_the_capability``'s route-level rule,
+    and needed for the same reason: every published response schema sets
+    ``additionalProperties: false``, so a consumer validating against the minor
+    it vendored rejects an unknown key rather than ignoring it.
+
+    A caller that declared no minor, or one this server does not serve, is
+    already refused upstream by the version gate; answering ``False`` here as
+    well keeps the decision fail-closed rather than relying on that ordering.
+
+    Args:
+        request: The request in flight.
+
+    Returns:
+        ``True`` only when the declared minor is at or past
+        :data:`~creek_mcp.api.models.RELATED_FIELDS_SINCE_MINOR`.
+    """
+    declared = request.headers.get(CONTRACT_VERSION_HEADER)
+    if declared is None:
+        return False
+    try:
+        return tuple(int(part) for part in declared.split(".")) >= tuple(
+            int(part) for part in RELATED_FIELDS_SINCE_MINOR.split(".")
+        )
+    except ValueError:
+        return False
+
+
+def _render(
+    result: dict[str, Any],
+    context: RequestContext,
+    *,
+    serve_related: bool,
+) -> Response:
     """Project the tool's result onto the published response, or a refusal.
 
     Args:
         result: The tool's return dict.
         context: The request's context.
+        serve_related: Whether the caller declared a minor that can describe
+            the two #873 fields.
 
     Returns:
         The published response.
@@ -327,7 +383,7 @@ def _render(result: dict[str, Any], context: RequestContext) -> Response:
     if escalation is not None:
         return escalation
     if result.get("status") in _NOTE_STATUSES:
-        return _render_notes(result, context)
+        return _render_notes(result, context, serve_related=serve_related)
     return error_response(reflect_refusal_code(str(result.get("reason", ""))), context)
 
 
@@ -361,4 +417,4 @@ async def handle_reflection(request: Request) -> Response:
     result = await run_in_threadpool(_reflect, request, parsed, context, build_factory)
     if result is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
-    return _render(result, context)
+    return _render(result, context, serve_related=_serves_related(request))

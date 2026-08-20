@@ -2323,3 +2323,48 @@ def test_the_default_grounder_carries_its_fragment_provenance(
 
     assert grounding.lines == ["A title"]
     assert grounding.source_ids == ["frag-a", "frag-b"]
+
+
+def test_a_retrieval_seed_alone_selects_the_compiled_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A page reachable only through retrieval is still selected.
+
+    ``seeds = from_entry + retrieved_ids`` composes two independent sources,
+    and until this test only the ``entry_ref`` half was observed: every other
+    test that asserts ``related_*`` injects ``retrieve=``, and an injected
+    grounder contributes no ids by design. Mutating the line to
+    ``seeds = from_entry`` therefore left the whole suite green — the
+    retrieval-seeded half of selection was never exercised.
+
+    Here the request carries inline ``content`` and **no** ``entry_ref``, so
+    ``from_entry`` is empty by construction and the only way the eddy and
+    praxis can be found is through the ids the grounding pass resolved.
+    """
+    from creek.author.models import EvidenceBundle as _Bundle
+    from creek.author.models import EvidenceClaim as _Claim
+
+    vault = _vault(tmp_path)
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+
+    def _fake_gather(
+        _self: object, _query: str, _vault: Path, *, override: object
+    ) -> EvidenceBundle:
+        """Ground on the fragment the compiled pages were built from."""
+        del override
+        return _Bundle(claims=[_Claim(claim="A title", source_fragments=[entry_ref])])
+
+    monkeypatch.setattr(RetrievalSpecialist, "gather", _fake_gather)
+
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    result = reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        llm_factory=factory,
+    )
+
+    assert result.get("status") != "refused", result
+    assert [row["title"] for row in result["related_praxis"]] == [_PRAXIS_873], result
