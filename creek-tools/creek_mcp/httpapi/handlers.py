@@ -1,10 +1,14 @@
 """What each ``/v1`` operation actually does, keyed by ``operation_id`` (#1074).
 
 Every published route is built: the handshake and health from #1074, the journal
-upsert from #1075, the wheel from #1076, the reflection from #1077 and the
-document upload from #1524. :data:`HANDLERS` is derived from the route table
-rather than listed, so a route added to :data:`~creek_mcp.api.routes.ROUTES`
-without a handler fails at *import* instead of being mounted to nothing.
+upsert from #1075, the wheel from #1076, the reflection from #1077, the
+document upload from #1524 and the three Drive-connector verbs from #1527 —
+which are the first three operations to share one capability, and the reason
+this map is keyed on ``operation_id`` rather than on
+:class:`~creek_mcp.api.models.Capability`. :data:`HANDLERS` is derived from the
+route table rather than listed, so a route added to
+:data:`~creek_mcp.api.routes.ROUTES` without a handler fails at *import*
+instead of being mounted to nothing.
 
 **The honesty stub stays, and stays exercised.** While a route was unbuilt it
 answered ``501 unsupported_capability`` rather than a *plausible* success — an
@@ -53,6 +57,9 @@ from creek_mcp.api.models import ErrorCode
 from creek_mcp.api.routes import (
     IMPLEMENTED_CAPABILITIES,
     OP_CAPABILITIES,
+    OP_DRIVE_DISCONNECT,
+    OP_DRIVE_STATUS,
+    OP_DRIVE_SYNC,
     OP_HEALTH,
     OP_JOURNAL_UPSERT,
     OP_REFLECTIONS,
@@ -62,6 +69,11 @@ from creek_mcp.api.routes import (
 )
 from creek_mcp.httpapi.capabilities import handle_capabilities
 from creek_mcp.httpapi.context import context_of
+from creek_mcp.httpapi.drive import (
+    handle_drive_disconnect,
+    handle_drive_status,
+    handle_drive_sync,
+)
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
 from creek_mcp.httpapi.journal import handle_journal_upsert
 from creek_mcp.httpapi.reflect import handle_reflection
@@ -167,6 +179,9 @@ async def handle_health(_request: Request) -> Response:
 
 _IMPLEMENTED_HANDLERS: Final[dict[str, Handler]] = {
     OP_CAPABILITIES: handle_capabilities,
+    OP_DRIVE_DISCONNECT: handle_drive_disconnect,
+    OP_DRIVE_STATUS: handle_drive_status,
+    OP_DRIVE_SYNC: handle_drive_sync,
     OP_HEALTH: handle_health,
     OP_JOURNAL_UPSERT: handle_journal_upsert,
     OP_REFLECTIONS: handle_reflection,

@@ -179,7 +179,7 @@ def test_the_tier_model_is_the_standing_promise(vault: Path) -> None:
 def test_a_present_vault_advertises_only_the_built_capabilities(
     vault: Path,
 ) -> None:
-    """At #1524 that is every published capability, ``upload`` included.
+    """At #1527 that is every published capability, ``drive-connector`` too.
 
     Spelled as a literal rather than derived from
     ``IMPLEMENTED_CAPABILITIES`` — that derivation already has its own test
@@ -189,7 +189,7 @@ def test_a_present_vault_advertises_only_the_built_capabilities(
 
     The request carries the current minor (``headers()`` defaults to it), so
     this is the *newest*-client view. The older-client view — where ``upload``
-    is withheld — is asserted separately below.
+    and ``drive-connector`` are withheld — is asserted separately below.
 
     Args:
         vault: A seeded vault.
@@ -200,6 +200,7 @@ def test_a_present_vault_advertises_only_the_built_capabilities(
         "reflections",
         "wheel",
         "upload",
+        "drive-connector",
     ]
 
 
@@ -472,7 +473,7 @@ def test_the_stub_still_answers_501_for_an_unbuilt_capability(vault: Path) -> No
 
 
 def test_capabilities_fixture_documents_the_completed_steady_state() -> None:
-    """The committed fixture shows all five capabilities. That is deliberate.
+    """The committed fixture shows all six capabilities. That is deliberate.
 
     ``docs/contracts/adepthood-v1/examples/capabilities/success.json`` is the
     shape a consumer vendors and codes against once the epic is finished — the

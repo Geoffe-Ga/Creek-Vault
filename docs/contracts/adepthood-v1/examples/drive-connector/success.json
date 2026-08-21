@@ -1,0 +1,9 @@
+{
+  "can_sync": true,
+  "connection": "connected",
+  "scopes": [
+    "https://www.googleapis.com/auth/drive.readonly"
+  ],
+  "status": "ok",
+  "tier_ceiling": "open"
+}

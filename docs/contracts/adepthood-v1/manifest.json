@@ -41,7 +41,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "273b92f29b1f17c723b7891f0a0d4b73972f9339dc912a48483cc79d391f9975",
+      "sha256": "8ee29fa6be1483af5392419697962b38a75bfd36a0cd0a7dc0fc28639748c835",
       "state": "success"
     },
     {
@@ -49,6 +49,55 @@
       "model": "ErrorEnvelope",
       "path": "examples/capabilities/unavailable-service.json",
       "sha256": "89a0b5295b63a7c84f76da28bc556abf281afefa7993a3b5701ddd01baf9294d",
+      "state": "unavailable-service"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "NotApplicableExample",
+      "path": "examples/drive-connector/care-escalation.json",
+      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "state": "care-escalation"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "DriveSyncResponse",
+      "path": "examples/drive-connector/empty.json",
+      "sha256": "54f3f1431e62c7ea9f51cc54663149f80eb0f2acabb5eb3a7fca061d4860feb9",
+      "state": "empty"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "ErrorEnvelope",
+      "path": "examples/drive-connector/incompatible-version.json",
+      "sha256": "c30b8a6f89e5574f7393a9876aa65205ac52212da85eb3a45f886b8d0ed1b6f6",
+      "state": "incompatible-version"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "ErrorEnvelope",
+      "path": "examples/drive-connector/malformed-input.json",
+      "sha256": "4943689ec156ebd288dcb6e6f888e2284d43527de156a5b1b8e9f3649730aade",
+      "state": "malformed-input"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "ErrorEnvelope",
+      "path": "examples/drive-connector/refusal.json",
+      "sha256": "3dbec5a3c1e03cb60cdc213a9786d9cea6918d8cb136244d19eb5995ee1c0631",
+      "state": "refusal"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "DriveConnectorStatusResponse",
+      "path": "examples/drive-connector/success.json",
+      "sha256": "2029edc1fd756fb865226d72928915f463e75fcbe1bcd54645b1abc7829ad60c",
+      "state": "success"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "ErrorEnvelope",
+      "path": "examples/drive-connector/unavailable-service.json",
+      "sha256": "bd64368c2cf504b3fc6c7619e4eb0f4c3eff52c31a839d3da4d24f8d00e9f68c",
       "state": "unavailable-service"
     },
     {
@@ -258,7 +307,7 @@
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "schemas/CapabilitiesResponse.schema.json",
-      "sha256": "380b2b009dc319887f6b3df650cb577b9dea62b9ba5785332839eac5fd6daa0b",
+      "sha256": "c8dd894861567422befb5037d2fe5afb43b3b64c1c06927271b58ee60f8f044e",
       "state": null
     },
     {
@@ -280,6 +329,27 @@
       "model": "CareSignal",
       "path": "schemas/CareSignal.schema.json",
       "sha256": "fc09e8583eca62438b9a4b4074da5fcb1f31c694a059d11e7efca5db9b60ce90",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "DriveConnectorStatusResponse",
+      "path": "schemas/DriveConnectorStatusResponse.schema.json",
+      "sha256": "9878918c1f8a1091a155f20a69fae343b3229f03cce54b784525d51ae09d9c1f",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "DriveDisconnectResponse",
+      "path": "schemas/DriveDisconnectResponse.schema.json",
+      "sha256": "0809789ee2628bb14545eb4ed87cff172dbbbe502972dc1d8f0d32f18e181502",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "DriveSyncResponse",
+      "path": "schemas/DriveSyncResponse.schema.json",
+      "sha256": "8fa0ddc2b9143f3962ceede733fede60695e250e5ec728509123ea8d1c150ea8",
       "state": null
     },
     {

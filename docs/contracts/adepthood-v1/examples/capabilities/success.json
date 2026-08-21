@@ -4,7 +4,8 @@
     "journal-upsert",
     "reflections",
     "wheel",
-    "upload"
+    "upload",
+    "drive-connector"
   ],
   "contract_minor": "0.9",
   "contract_version": "0.9.0",

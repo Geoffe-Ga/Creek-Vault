@@ -83,6 +83,9 @@ from creek_mcp.api.models import (
     CareEscalationResponse,
     CareResource,
     CareSignal,
+    DriveConnectorStatusResponse,
+    DriveDisconnectResponse,
+    DriveSyncResponse,
     ErrorCode,
     ErrorEnvelope,
     JournalAction,
@@ -212,6 +215,34 @@ UPLOAD_RESPONSE_PAYLOAD: dict[str, Any] = {
     "source_type": "markdown",
 }
 
+DRIVE_STATUS_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "ok",
+    "tier_ceiling": "open",
+    "connection": "connected",
+    "scopes": ["https://www.googleapis.com/auth/drive.readonly"],
+    "can_sync": True,
+}
+
+DRIVE_SYNC_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "ok",
+    "tier_ceiling": "open",
+    "files_fetched": 3,
+    "files_unchanged": 11,
+    "files_failed": 0,
+    "files_unsupported": 1,
+    "fragments_failed": 0,
+    "fragments_created": 2,
+    "fragments_updated": 1,
+    "fragments_unchanged": 0,
+}
+
+DRIVE_DISCONNECT_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "ok",
+    "tier_ceiling": "open",
+    "connection": "not_connected",
+    "remote_revoked": True,
+}
+
 REFLECTION_REQUEST_PAYLOAD: dict[str, Any] = {
     "content": "I keep saying yes to things I do not want.",
     "max_notes": 3,
@@ -297,6 +328,9 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     CareEscalationResponse.__name__: CARE_ESCALATION_RESPONSE_PAYLOAD,
     CareResource.__name__: CARE_RESOURCE_PAYLOAD,
     CareSignal.__name__: CARE_SIGNAL,
+    DriveConnectorStatusResponse.__name__: DRIVE_STATUS_RESPONSE_PAYLOAD,
+    DriveDisconnectResponse.__name__: DRIVE_DISCONNECT_RESPONSE_PAYLOAD,
+    DriveSyncResponse.__name__: DRIVE_SYNC_RESPONSE_PAYLOAD,
     ErrorEnvelope.__name__: ERROR_ENVELOPE_PAYLOAD,
     JournalUpsertRequest.__name__: JOURNAL_UPSERT_REQUEST_PAYLOAD,
     JournalUpsertResponse.__name__: JOURNAL_UPSERT_RESPONSE_PAYLOAD,
@@ -391,6 +425,7 @@ EXPECTED_UNREACHABLE_CELLS: frozenset[tuple[str, str]] = frozenset(
         ("journal-upsert", "care-escalation"),
         ("wheel", "care-escalation"),
         ("upload", "care-escalation"),
+        ("drive-connector", "care-escalation"),
     }
 )
 
@@ -852,13 +887,14 @@ def test_bundle_root_name_matches_the_declared_dir_name() -> None:
 
 
 def test_capability_and_state_axes_are_pinned() -> None:
-    """The fixture matrix is 5 capabilities x 7 states = 35 cells."""
+    """The fixture matrix is 6 capabilities x 7 states = 42 cells."""
     assert CAPABILITIES == (
         "capabilities",
         "journal-upsert",
         "reflections",
         "wheel",
         "upload",
+        "drive-connector",
     )
     assert EXAMPLE_STATES == (
         "success",
@@ -869,7 +905,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "incompatible-version",
         "unavailable-service",
     )
-    assert len(_matrix()) == 35
+    assert len(_matrix()) == 42
 
 
 @pytest.mark.parametrize(("capability", "state"), _matrix())
@@ -957,8 +993,8 @@ def test_retry_policy_json_mirrors_the_runtime_table() -> None:
     }
 
 
-def test_unreachable_cells_are_the_four_non_reflection_care_escalations() -> None:
-    """Only ``reflections`` can escalate; the other three cells are N/A."""
+def test_unreachable_cells_are_the_five_non_reflection_care_escalations() -> None:
+    """Only ``reflections`` can escalate; the other five cells are N/A."""
     assert UNREACHABLE_CELLS == EXPECTED_UNREACHABLE_CELLS
 
 

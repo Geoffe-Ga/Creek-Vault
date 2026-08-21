@@ -16,10 +16,11 @@ what lets the published OpenAPI document outlive whatever serves it.
 **Exposed versus implemented.** :data:`ROUTES` says which endpoints exist;
 :data:`IMPLEMENTED_CAPABILITIES` says which of them actually answer. #1075—#1077
 moved the last three capabilities from the first set into the second, and #1524
-added ``upload`` already built, so the two still coincide. The distinction is
+(``upload``) and #1527 (``drive-connector``) both arrived already built, so the
+two still coincide. The distinction is
 not obsolete: while a capability was unbuilt it was wired to an honest ``501``
 rather than to a fabricated ``200``, because a stub that looks like success is
-one a consumer integrates against and only discovers in production. A sixth
+one a consumer integrates against and only discovers in production. A seventh
 capability published before its handler exists gets exactly that treatment,
 from the same constant, with no code change.
 """
@@ -32,6 +33,9 @@ from typing import TYPE_CHECKING, Final
 from creek_mcp.api.models import (
     CapabilitiesResponse,
     Capability,
+    DriveConnectorStatusResponse,
+    DriveDisconnectResponse,
+    DriveSyncResponse,
     JournalUpsertRequest,
     JournalUpsertResponse,
     ReflectionRequest,
@@ -94,10 +98,19 @@ OP_WHEEL: Final[str] = "getWheel"
 OP_UPLOAD: Final[str] = "uploadDocument"
 """``operation_id`` of ``POST /v1/uploads``."""
 
+OP_DRIVE_STATUS: Final[str] = "getDriveConnector"
+"""``operation_id`` of ``GET /v1/connectors/drive``."""
+
+OP_DRIVE_SYNC: Final[str] = "syncDriveConnector"
+"""``operation_id`` of ``POST /v1/connectors/drive/syncs``."""
+
+OP_DRIVE_DISCONNECT: Final[str] = "disconnectDriveConnector"
+"""``operation_id`` of ``DELETE /v1/connectors/drive``."""
+
 OP_HEALTH: Final[str] = "getHealth"
 """``operation_id`` of ``GET /v1/health``.
 
-The six are named constants rather than bare literals in the table below
+The nine are named constants rather than bare literals in the table below
 because the adapter's handler map is keyed on them: a client generator's method
 name and a server's dispatch key have to be the same string, and two spellings
 of it are one rename away from a route mounted to nothing.
@@ -280,6 +293,36 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         max_body_bytes=UPLOAD_MAX_BODY_BYTES,
     ),
     RouteSpec(
+        path="/v1/connectors/drive",
+        method="GET",
+        operation_id=OP_DRIVE_STATUS,
+        capability=Capability.DRIVE_CONNECTOR,
+        request_model=None,
+        response_model=DriveConnectorStatusResponse,
+        requires_contract_version=True,
+        summary="Report the read-only Google Drive connector's state.",
+    ),
+    RouteSpec(
+        path="/v1/connectors/drive/syncs",
+        method="POST",
+        operation_id=OP_DRIVE_SYNC,
+        capability=Capability.DRIVE_CONNECTOR,
+        request_model=None,
+        response_model=DriveSyncResponse,
+        requires_contract_version=True,
+        summary="Run one incremental Google Drive sync and ingest what it fetched.",
+    ),
+    RouteSpec(
+        path="/v1/connectors/drive",
+        method="DELETE",
+        operation_id=OP_DRIVE_DISCONNECT,
+        capability=Capability.DRIVE_CONNECTOR,
+        request_model=None,
+        response_model=DriveDisconnectResponse,
+        requires_contract_version=True,
+        summary="Revoke the cached Drive credential and erase it from disk.",
+    ),
+    RouteSpec(
         path="/v1/health",
         method="GET",
         operation_id=OP_HEALTH,
@@ -295,6 +338,15 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
 A tuple rather than a list so the table is immutable at the container level as
 well as per entry: a list would let any import-time hook append a route after
 the document and the handshake had already been read off it.
+
+**Three entries share one capability**, and that is the first time the table
+has done so. ``drive-connector`` is one feature — a client that may read the
+connector's state may sync and disconnect it, and there is nothing useful it
+could negotiate in between — so it is published as one name over three verbs
+rather than as three names a server could half-implement. Nothing downstream
+assumed the mapping was injective: :data:`~creek_mcp.httpapi.handlers.HANDLERS`
+is keyed on ``operation_id``, the OpenAPI ``paths`` mapping is built with
+``setdefault`` per path, and the handshake advertises a *set*.
 
 ``/v1/health`` is the one entry with no capability. Liveness is infrastructure,
 not something a client negotiates, and it is exempt from the contract-version

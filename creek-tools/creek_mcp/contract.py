@@ -23,8 +23,34 @@ from typing import Final
 CONTRACT_VERSION: Final[str] = "0.9.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
 
-0.9.0 (#873): ``creek.reflect`` and ``POST /v1/reflections`` may now carry two
-**optional** fields — ``related_praxis`` and ``related_eddies`` — naming the
+0.9.0 (#1527 / #873): two additive changes ship at this minor. Both widen
+``SUPPORTED_CONTRACT_MINORS`` rather than shift it, and neither takes anything
+away from a client pinned below 0.9.
+
+**#1527 — a sixth capability.** ``/v1`` publishes ``drive-connector``,
+served by three routes on the existing read-only Google Drive OAuth connector:
+``GET /v1/connectors/drive`` (connection state), ``POST
+/v1/connectors/drive/syncs`` (one incremental sync) and ``DELETE
+/v1/connectors/drive`` (revoke and erase the cached token). Shaped exactly like
+0.8.0 and additive for the same reason: a client below 0.9 is neither told the
+capability exists nor served it, because both halves read
+:data:`creek_mcp.api.models.CAPABILITY_SINCE_MINOR`. Three wire models ride
+along (``DriveConnectorStatusResponse``, ``DriveSyncResponse``,
+``DriveDisconnectResponse``) and **no new error code** — the connector's
+refusals are the published ``unavailable`` and ``temporarily_unavailable``,
+which is deliberate: a code minted for "Drive is not connected" would be a
+Drive-specific fact on a shared error table.
+
+**What this bump does not add is the authorisation step.** Granting Drive
+access still happens locally, through ``creek gdrive --download``: the cached
+credential is an installed-app loopback flow, which needs a browser on the
+machine holding the client secret, and no ``/v1`` route begins, completes or
+carries one. The token stays server-side and never crosses the wire in either
+direction.
+
+**#873 — two optional reflection fields.** ``creek.reflect`` and ``POST
+/v1/reflections`` may now carry two **optional** fields — ``related_praxis``
+and ``related_eddies`` — naming the
 compiled-layer structures the reflected entry belongs to. Shape-wise this is a
 0.5.0-shaped bump: two optional response fields on one published ``/v1``
 response, plus two new wire models (``RelatedPraxis`` / ``RelatedEddy``) and the

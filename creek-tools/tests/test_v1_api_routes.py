@@ -40,6 +40,9 @@ from creek_mcp.api.models import (
     CONTRACT_MODELS,
     CapabilitiesResponse,
     Capability,
+    DriveConnectorStatusResponse,
+    DriveDisconnectResponse,
+    DriveSyncResponse,
     JournalUpsertRequest,
     JournalUpsertResponse,
     ReflectionRequest,
@@ -117,6 +120,33 @@ _EXPECTED: Final[
         True,
     ),
     (
+        "/v1/connectors/drive",
+        "GET",
+        "getDriveConnector",
+        Capability.DRIVE_CONNECTOR,
+        None,
+        DriveConnectorStatusResponse,
+        True,
+    ),
+    (
+        "/v1/connectors/drive/syncs",
+        "POST",
+        "syncDriveConnector",
+        Capability.DRIVE_CONNECTOR,
+        None,
+        DriveSyncResponse,
+        True,
+    ),
+    (
+        "/v1/connectors/drive",
+        "DELETE",
+        "disconnectDriveConnector",
+        Capability.DRIVE_CONNECTOR,
+        None,
+        DriveDisconnectResponse,
+        True,
+    ),
+    (
         "/v1/health",
         "GET",
         "getHealth",
@@ -133,29 +163,39 @@ _EXPECTED_IDS: Final[tuple[str, ...]] = (
     "reflections",
     "wheel",
     "upload",
+    "drive-status",
+    "drive-sync",
+    "drive-disconnect",
     "health",
 )
 
-_EXPECTED_ROUTE_COUNT: Final[int] = 6
+_EXPECTED_ROUTE_COUNT: Final[int] = 9
 
 
-def _by_path(path: str) -> RouteSpec:
-    """Return the single :class:`RouteSpec` declared for *path*.
+def _by_operation(operation_id: str) -> RouteSpec:
+    """Return the :class:`RouteSpec` declared for *operation_id*.
+
+    Keyed on the operation rather than on the path since #1527, when
+    ``/v1/connectors/drive`` became the first template serving two methods: a
+    path lookup would have returned whichever of the two was declared first
+    and silently stopped asserting anything about the other. ``operation_id``
+    is unique by construction — ``test_operation_ids_are_unique`` pins it — so
+    this lookup is total.
 
     Args:
-        path: The route template.
+        operation_id: The published operation name.
 
     Returns:
         The matching spec.
 
     Raises:
-        LookupError: When the table declares no such path, which is a clearer
-            failure than an ``IndexError`` three assertions later.
+        LookupError: When the table declares no such operation, which is a
+            clearer failure than an ``IndexError`` three assertions later.
     """
     for spec in ROUTES:
-        if spec.path == path:
+        if spec.operation_id == operation_id:
             return spec
-    msg = f"no RouteSpec declared for {path}"
+    msg = f"no RouteSpec declared for {operation_id}"
     raise LookupError(msg)
 
 
@@ -164,10 +204,10 @@ def _by_path(path: str) -> RouteSpec:
 # --------------------------------------------------------------------------- #
 
 
-def test_routes_declares_exactly_six_specs() -> None:
-    """``/v1`` publishes six endpoints and no seventh.
+def test_routes_declares_exactly_nine_specs() -> None:
+    """``/v1`` publishes nine endpoints and no tenth.
 
-    A seventh would be an endpoint no fixture, no OpenAPI response set and no
+    A tenth would be an endpoint no fixture, no OpenAPI response set and no
     capability entry describes — reachable, undocumented surface.
     """
     assert len(ROUTES) == _EXPECTED_ROUTE_COUNT
@@ -182,7 +222,7 @@ def test_routes_is_a_tuple() -> None:
     assert isinstance(ROUTES, tuple)
 
 
-def test_route_paths_and_methods_are_the_published_six() -> None:
+def test_route_paths_and_methods_are_the_published_nine() -> None:
     """Every ``(path, method)`` pair matches the ADR, in order."""
     assert [(spec.path, spec.method) for spec in ROUTES] == [
         (path, method) for path, method, *_rest in _EXPECTED
@@ -223,7 +263,7 @@ def test_capabilities_requires_no_contract_version() -> None:
     ``contract_version`` off *some* endpoint, or "upgrade required" collapses
     into "vault unavailable" — the exact collapse epic #1071 exists to stop.
     """
-    assert _by_path("/v1/capabilities").requires_contract_version is False
+    assert _by_operation("getCapabilities").requires_contract_version is False
 
 
 def test_health_requires_no_contract_version() -> None:
@@ -235,29 +275,42 @@ def test_health_requires_no_contract_version() -> None:
     debugging a version mismatch would see the probe go red too and learn
     nothing from it. Pinned rather than left implicit.
     """
-    assert _by_path("/v1/health").requires_contract_version is False
+    assert _by_operation("getHealth").requires_contract_version is False
 
 
-@pytest.mark.parametrize(
-    "path",
-    [
-        "/v1/journal-entries/{external_id}",
-        "/v1/reflections",
-        "/v1/wheel",
-        "/v1/uploads",
-    ],
+_VERSION_GATED_OPERATIONS: Final[tuple[str, ...]] = (
+    "upsertJournalEntry",
+    "createReflection",
+    "getWheel",
+    "uploadDocument",
+    "getDriveConnector",
+    "syncDriveConnector",
+    "disconnectDriveConnector",
 )
-def test_content_routes_require_the_contract_version(path: str) -> None:
+"""Every operation the contract-version gate applies to, restated from the ADR.
+
+A tuple rather than a comprehension over ``ROUTES``: derived from the table it
+is asserting against, this test could not fail. Emptying it is caught by
+``test_exactly_two_routes_are_version_exempt``, which counts from the other
+end.
+"""
+
+
+@pytest.mark.parametrize("operation_id", _VERSION_GATED_OPERATIONS)
+def test_content_routes_require_the_contract_version(operation_id: str) -> None:
     """Every route that touches the vault is gated on the declared minor.
 
-    These three are the routes whose *shape* a minor bump can change, so a
-    client speaking the wrong one must be refused ``409`` before any read
-    rather than served a body it will misparse.
+    These are the routes whose *shape* a minor bump can change, so a client
+    speaking the wrong one must be refused ``409`` before any read rather than
+    served a body it will misparse. The three Drive-connector verbs are gated
+    for the sharper reason that their capability did not exist before 0.9: an
+    ungated one would answer a client whose vendored contract cannot describe
+    the response it is about to receive.
 
     Args:
-        path: The route template under test.
+        operation_id: The published operation under test.
     """
-    assert _by_path(path).requires_contract_version is True
+    assert _by_operation(operation_id).requires_contract_version is True
 
 
 def test_exactly_two_routes_are_version_exempt() -> None:
@@ -283,7 +336,7 @@ def test_every_declared_capability_is_a_capability_member() -> None:
 
 
 def test_route_capabilities_cover_every_published_capability() -> None:
-    """The four published capabilities are exactly the ones routed.
+    """The six published capabilities are exactly the ones routed.
 
     Equality, not containment. A capability advertised in the handshake with
     no route is an endpoint a client will call and get ``404`` from; a route
@@ -300,11 +353,11 @@ def test_exactly_one_route_declares_no_capability() -> None:
     assert uncapable == ["/v1/health"]
 
 
-def test_implemented_capabilities_is_exactly_the_published_five() -> None:
-    """Every published capability answers for real, ``upload`` included (#1524).
+def test_implemented_capabilities_is_exactly_the_published_six() -> None:
+    """Every published capability answers for real, Drive included (#1527).
 
     An exhaustive literal, not a containment check, and still named one by
-    one: a sixth capability added to ``Capability`` has to change this line
+    one: a seventh capability added to ``Capability`` has to change this line
     before it can be advertised, which is what keeps a new endpoint's landing a
     visible edit rather than a silent widening.
     """
@@ -316,6 +369,7 @@ def test_implemented_capabilities_is_exactly_the_published_five() -> None:
                 Capability.REFLECTIONS,
                 Capability.WHEEL,
                 Capability.UPLOAD,
+                Capability.DRIVE_CONNECTOR,
             }
         )
         == IMPLEMENTED_CAPABILITIES
@@ -357,23 +411,23 @@ def test_implemented_capabilities_is_a_frozenset() -> None:
 
 
 @pytest.mark.parametrize(
-    ("path", "request_model", "response_model"),
-    [(entry[0], entry[4], entry[5]) for entry in _EXPECTED],
+    ("operation_id", "request_model", "response_model"),
+    [(entry[2], entry[4], entry[5]) for entry in _EXPECTED],
     ids=_EXPECTED_IDS,
 )
 def test_route_models_are_the_published_ones(
-    path: str,
+    operation_id: str,
     request_model: type[BaseModel] | None,
     response_model: type[BaseModel] | None,
 ) -> None:
     """Each route names the wire models the ADR assigns it.
 
     Args:
-        path: The route template under test.
+        operation_id: The published operation under test.
         request_model: The expected request model, or ``None``.
         response_model: The expected response model, or ``None``.
     """
-    spec = _by_path(path)
+    spec = _by_operation(operation_id)
     assert spec.request_model is request_model
     assert spec.response_model is response_model
 

@@ -53,6 +53,45 @@ SUBSTACK_BODY: Final[str] = "The channel remembers what the water forgets."
 _EPOCH: Final[float] = 1_700_000_000.0
 """Fixed ``create_time`` base, so nothing in these fixtures reads the clock."""
 
+_ZIP_MEMBER_DATE_TIME: Final[tuple[int, int, int, int, int, int]] = (
+    1980,
+    1,
+    1,
+    0,
+    0,
+    0,
+)
+"""Fixed DOS timestamp stamped into every member these helpers write.
+
+The other half of the promise :data:`_EPOCH` makes. ``ZipFile.writestr`` given
+a plain ``str`` name synthesises a ``ZipInfo`` from ``time.localtime()``, so
+two calls a second apart return archives that differ in four header bytes.
+That is invisible until an archive's bytes become a **pytest parameter id**:
+``pytest-xdist`` collects independently on every worker, compares the id lists
+and aborts the whole run with "Different tests were collected between gw0 and
+gw1" whenever collection straddles a second boundary — a flake that reddens CI
+on a diff that touched nothing near it.
+
+1980-01-01 is the DOS epoch, the earliest a ZIP can encode.
+"""
+
+
+def _member(name: str, compress_type: int = zipfile.ZIP_STORED) -> zipfile.ZipInfo:
+    """Return a clock-free :class:`zipfile.ZipInfo` for *name*.
+
+    Args:
+        name: The archive-relative member name.
+        compress_type: The member's compression, matching what the enclosing
+            :class:`zipfile.ZipFile` was opened with — ``writestr`` takes it
+            from the ``ZipInfo`` rather than the file when handed one.
+
+    Returns:
+        A ``ZipInfo`` stamped with :data:`_ZIP_MEMBER_DATE_TIME`.
+    """
+    info = zipfile.ZipInfo(name, date_time=_ZIP_MEMBER_DATE_TIME)
+    info.compress_type = compress_type
+    return info
+
 
 def _node(
     node_id: str,
@@ -268,7 +307,7 @@ def _zip(members: dict[str, bytes]) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for name, payload in members.items():
-            archive.writestr(name, payload)
+            archive.writestr(_member(name, zipfile.ZIP_DEFLATED), payload)
     return buffer.getvalue()
 
 
@@ -284,7 +323,7 @@ def zip_slip_archive(escape_name: str, payload: bytes) -> bytes:
     """
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr(escape_name, payload)
+        archive.writestr(_member(escape_name), payload)
     return buffer.getvalue()
 
 
@@ -370,7 +409,7 @@ def _one_member_zip(payload: bytes) -> bytes:
     """
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("conversations.json", payload)
+        archive.writestr(_member("conversations.json", zipfile.ZIP_DEFLATED), payload)
     return buffer.getvalue()
 
 
