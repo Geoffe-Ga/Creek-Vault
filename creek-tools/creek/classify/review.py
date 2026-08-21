@@ -8,12 +8,21 @@ mandatory human review.
 
 import logging
 from pathlib import Path
+from typing import Final
 
 from creek.config import ClassificationConfig
 from creek.models import Confidence, Fragment, Frequency, PrivacyTier
 from creek.time import now_la
 
 logger = logging.getLogger(__name__)
+
+_REVIEW_QUEUE_RELPARTS: Final[tuple[str, ...]] = ("00-Creek-Meta", "Processing-Log")
+"""Vault-relative directory the review queue is written to (#883).
+
+Beside the compile-gap log and the lint reports — machine-written material
+that belongs out of the operator's daily field of view. Path *components*
+rather than a joined string so the join stays platform-correct.
+"""
 
 # Confidence levels considered "low" — fragments with these need review.
 _LOW_CONFIDENCE_LEVELS: frozenset[str] = frozenset(
@@ -81,12 +90,27 @@ class ReviewQueueGenerator:
         """Write a review queue markdown file for fragments needing review.
 
         Filters the given fragments to those needing review, then writes
-        a markdown file with checkboxes for each one. The file is placed
-        in the vault_path directory.
+        a markdown file with checkboxes for each one, under
+        :data:`_REVIEW_QUEUE_RELPARTS` beside Creek's other machine-written
+        logs. It used to land in the vault root — the folder an operator
+        opens in Obsidian every day — and was the only root-level
+        bare-filename write in ``creek/`` or ``creek_mcp/`` (#883).
+
+        The ``review-queue-<timestamp>.md`` name is unchanged, and that is an
+        interface rather than a detail:
+        :class:`creek.clean.hygiene.StaleReviewScanner` finds queues by
+        ``rglob("review-queue-*.md")`` and ages them by ``strptime`` on the
+        stem. Renaming while relocating would silently stop
+        ``creek clean stale-reviews`` from ever expiring a queue again — and
+        would look like it worked, because the scan would simply find nothing.
+        ``rglob`` also still reaches queues left in the root by earlier
+        versions, so nothing already written becomes invisible.
 
         Args:
             fragments: List of fragments to evaluate.
-            vault_path: Path to the vault directory where the file is written.
+            vault_path: Path to the vault; the queue is written to the
+                processing-log subdirectory beneath it, which is created if
+                absent.
 
         Returns:
             Path to the generated review queue markdown file.
@@ -99,8 +123,9 @@ class ReviewQueueGenerator:
         )
 
         timestamp = now_la().strftime("%Y-%m-%d_%H%M%S")
-        filename = f"review-queue-{timestamp}.md"
-        output_path = vault_path / filename
+        output_dir = vault_path.joinpath(*_REVIEW_QUEUE_RELPARTS)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"review-queue-{timestamp}.md"
 
         lines = self._build_markdown(needs_review)
         output_path.write_text("\n".join(lines) + "\n")

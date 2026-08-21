@@ -14,8 +14,10 @@ from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Protocol
 
 from creek.lint.checks import (
+    ancestry,
     broken_links,
     orphan_compiled,
+    root_hygiene,
     skill_size_budget,
 )
 from creek.lint.checks import (
@@ -93,6 +95,8 @@ DETERMINISTIC_CHECKS: tuple[str, ...] = (
     "draft-grounding",
     "voice-fidelity",
     "unparseable",
+    "ancestry",
+    "root-hygiene",
 )
 """Cheap checks that always run by default (link graph + frontmatter only)."""
 
@@ -117,6 +121,8 @@ _REGISTRY: dict[str, _CheckCallable] = {
     "synchronicity": synchronicity_check.run,
     "unnamed": unnamed_check.run,
     "unparseable": unparseable_check.run,
+    "ancestry": ancestry.run,
+    "root-hygiene": root_hygiene.run,
 }
 
 _INDEX_AWARE: dict[str, _IndexAwareCheck] = {
