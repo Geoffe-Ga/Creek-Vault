@@ -29,8 +29,9 @@ from creek.classify.privacy_filter import (
 from creek.config import (
     AIStyleConfig,
     ClassificationConfig,
+    VoiceAudienceWeightingConfig,
     load_config,
-    resolve_config_path,
+    load_vault_config,
 )
 from creek.consent import ConsentLogUnavailableError, ConsentManager
 from creek.models import PraxisPotential, PrivacyTier
@@ -4275,6 +4276,8 @@ def _report_fingerprint(vault_path: Path, override: PrivacyTierOverride) -> None
 def _resolve_voice_fingerprint(
     vault_path: Path,
     ai_style: AIStyleConfig,
+    *,
+    audience_weighting: VoiceAudienceWeightingConfig,
 ) -> VoiceFingerprint:
     """Return the vault's voice fingerprint, persisted-first then built.
 
@@ -4286,10 +4289,21 @@ def _resolve_voice_fingerprint(
     Args:
         vault_path: Vault root.
         ai_style: AI-style configuration (fingerprint path + weights).
+        audience_weighting: The vault's audience weighting, forwarded to
+            ``build_fingerprint`` on the fallback branch. Keyword-only and
+            **required, with no default**, because #1410 was precisely a
+            default going unnoticed: ``build_fingerprint``'s own parameter
+            defaults to ``None``, which means *disabled*, so this one caller
+            silently built the fallback fingerprint from the flat platform
+            average while every sibling honoured the vault's weighting. A
+            default here would let the next caller repeat that.
 
     Returns:
         A :class:`VoiceFingerprint`; its ``fragment_count`` is ``0`` when
-        neither a persisted artefact nor eligible fragments exist.
+        neither a persisted artefact nor eligible fragments exist — which
+        includes the case where *audience_weighting* zeroes the authority of
+        every tier the vault holds, since a zero weight drops a fragment from
+        the corpus rather than merely down-ranking it.
     """
     from creek.generate.ai_style.fingerprint import (
         build_fingerprint,
@@ -4299,7 +4313,11 @@ def _resolve_voice_fingerprint(
     fingerprint = load_fingerprint(vault_path, ai_style)
     if fingerprint.fragment_count > 0:
         return fingerprint
-    return build_fingerprint(vault_path, ai_style)
+    return build_fingerprint(
+        vault_path,
+        ai_style,
+        audience_weighting=audience_weighting,
+    )
 
 
 def _print_voice_check_summary(
@@ -4418,13 +4436,23 @@ def voice_check(
         raise typer.Exit(code=2)
 
     vault_path = _resolve_vault(vault)
-    ai_style = _load_config_for_vault(vault).ai_style
+    # From the RESOLVED root, not the raw ``--vault`` argument. With ``--vault``
+    # omitted, ``_load_config_for_vault(vault)`` falls through to the cwd while
+    # ``_resolve_vault`` has already named the vault the corpus comes from — so
+    # the config and the fragments would come from two different vaults. Same
+    # hazard ``_report_voice`` documents and re-resolves against.
+    config = _load_config_for_vault(vault_path)
+    ai_style = config.ai_style
     # Resolve the ceiling from THIS vault's config at call time so a per-vault
     # voice_distance_upper override is honoured; an explicit flag still wins.
     effective_max_distance = (
         max_distance if max_distance is not None else ai_style.voice_distance_upper
     )
-    fingerprint = _resolve_voice_fingerprint(vault_path, ai_style)
+    fingerprint = _resolve_voice_fingerprint(
+        vault_path,
+        ai_style,
+        audience_weighting=config.voice_audience_weighting,
+    )
 
     if fingerprint.fragment_count == 0:
         console.print(
@@ -4769,7 +4797,8 @@ def lint(
             # a module-level import here would undo that.
             "Run only this check (repeatable). Names: paradox, unnamed, "
             "synchronicity, compost, tags, broken-links, orphan-compiled, "
-            "skill-size, draft-grounding, voice-fidelity, unparseable."
+            "skill-size, draft-grounding, voice-fidelity, unparseable, "
+            "ancestry, root-hygiene."
         ),
     ),
     since: str | None = typer.Option(
@@ -6689,12 +6718,18 @@ def _load_config_for_vault(
 ) -> CreekConfig:
     """Load :class:`CreekConfig`, auto-discovering ``--vault``'s config (issue #322).
 
-    Wraps :func:`creek.config.resolve_config_path` + :func:`load_config`
-    so every CLI command that accepts ``--vault <path>`` automatically
-    picks up ``<path>/00-Creek-Meta/creek_config.yaml`` when neither
-    ``--config`` nor ``CREEK_CONFIG`` is set. Explicit overrides still
-    take precedence; the helper is otherwise transparent to existing
-    callers.
+    The CLI's adapter over :func:`creek.config.load_vault_config`, which
+    #1409 made the single spelling of "resolve this vault's config". Every
+    command that accepts ``--vault <path>`` automatically picks up
+    ``<path>/00-Creek-Meta/creek_config.yaml`` when neither ``--config`` nor
+    ``CREEK_CONFIG`` is set. Explicit overrides still take precedence; the
+    helper is otherwise transparent to its callers.
+
+    It survives the convergence rather than being replaced at all thirty-odd
+    call sites because it flips the shared resolver's ``warn_on_missing``
+    default to ``True``: the CLI has an operator console to warn at, and most
+    of the resolver's other callers (MCP tools, the Writing Desk's agents) do
+    not.
 
     Args:
         vault: Vault root from the command's ``--vault`` flag, or
@@ -6708,8 +6743,7 @@ def _load_config_for_vault(
     Returns:
         A fully-validated :class:`CreekConfig`.
     """
-    config_path = resolve_config_path(vault, None)
-    return load_config(config_path, warn_on_missing=warn_on_missing)
+    return load_vault_config(vault, warn_on_missing=warn_on_missing)
 
 
 def _resolve_vault(vault: Path | None) -> Path:

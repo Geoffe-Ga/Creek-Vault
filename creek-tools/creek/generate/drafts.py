@@ -64,7 +64,7 @@ from creek.generate.compile_routing import (
     compiled_source_ids,
     empty_index,
     load_compiled_pages,
-    log_compile_gap,
+    record_compile_gap,
 )
 from creek.generate.dimensional_retrieval import (
     AllDimensionsEmptyError,
@@ -1217,12 +1217,12 @@ class DraftGenerator:
                 entries.append(_render_compiled_entry(tid, page))
                 continue
             if not compiled.bypassed:
-                log_compile_gap(
+                record_compile_gap(
                     vault_path,
+                    compiled,
                     target_kind="thread",
                     target_id=tid,
                     surfaced_by="draft",
-                    reason="missing",
                 )
             if threads is None:
                 threads = _load_threads_by_id(vault_path / _THREADS_SUBDIR)
@@ -1256,12 +1256,12 @@ class DraftGenerator:
                 entries.append(_render_compiled_entry(eid, page))
                 continue
             if not compiled.bypassed:
-                log_compile_gap(
+                record_compile_gap(
                     vault_path,
+                    compiled,
                     target_kind="eddy",
                     target_id=eid,
                     surfaced_by="draft",
-                    reason="missing",
                 )
             if eddies is None:
                 eddies = _load_eddies_by_id(vault_path / _EDDIES_SUBDIR)

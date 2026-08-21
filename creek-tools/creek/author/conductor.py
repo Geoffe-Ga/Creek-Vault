@@ -335,13 +335,11 @@ class Conductor:
         """
         from pydantic import ValidationError
 
-        from creek.config import load_config, resolve_config_path
+        from creek.config import load_vault_config
         from creek.generate.ai_style import load_fingerprint
 
         try:
-            config = load_config(
-                resolve_config_path(vault, None), warn_on_missing=False
-            )
+            config = load_vault_config(vault)
         except (OSError, ValueError, ValidationError):
             # A malformed config must not crash the desk: voice-fidelity simply
             # stays dormant. ``ValidationError`` is not a ``ValueError`` subclass
@@ -487,9 +485,8 @@ def _resolve_max_rounds(vault: Path, max_rounds: int | None) -> int:
     none, the bound comes from *vault*'s ``author.max_author_rounds``
     (``AuthorConfig``'s built-in 3 when no config is reachable).
     ``CREEK_CONFIG``/vault precedence is whatever
-    :func:`creek.config.resolve_config_path` says — the same idiom the desk
-    already uses at ``agents.py:96``, ``checks.py:554`` and
-    ``conductor.py:342``.
+    :func:`creek.config.load_vault_config` says — the one shared resolver every
+    vault-scoped consumer went through in #1409.
 
     A malformed or unreachable config is deliberately left to raise. The
     specialists load the same config unguarded ten lines later
@@ -507,11 +504,9 @@ def _resolve_max_rounds(vault: Path, max_rounds: int | None) -> int:
     """
     if max_rounds is not None:
         return max_rounds
-    from creek.config import load_config, resolve_config_path
+    from creek.config import load_vault_config
 
-    return load_config(
-        resolve_config_path(vault, None), warn_on_missing=False
-    ).author.max_author_rounds
+    return load_vault_config(vault).author.max_author_rounds
 
 
 def run_author(

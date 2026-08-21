@@ -54,10 +54,14 @@ the vault owner's rather than the caller's. The tier is therefore whatever the
 content and the classifier derive, which is the only arrangement under which
 this path cannot make a tier less restrictive than the ordinary one would.
 
-One file at a time is also load-bearing rather than stylistic:
-:func:`~creek.ingest.pipeline.run_ingest` arms ``tomb_missing_units`` when a
-forced ``ledger_source`` meets a *directory* input, which over a partial Drive
-listing would soft-tomb every fragment the pass did not happen to see.
+One file at a time is also load-bearing rather than stylistic. A *directory*
+input is what makes :func:`~creek.ingest.pipeline.tomb_missing_units`
+computable at all, and over a partial Drive listing a gone set is not a gone
+set: every fragment the pass did not happen to see would look deleted. (This
+note used to attribute the hazard to a forced ``ledger_source``. That is now
+backwards — :func:`~creek.ingest.pipeline.tombing_is_authorised` requires
+``ledger_source is None``, so a borrowed ledger *disarms* the sweep. The
+single-file input is what this path actually relies on.)
 """
 
 from __future__ import annotations
@@ -68,7 +72,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 from yaml import YAMLError
 
-from creek.config import load_config
+from creek.config import load_vault_config
 from creek.ingest import INGESTOR_REGISTRY, UnsupportedSourceError, route_to_ingestor
 from creek.ingest.gdrive import (
     GoogleApiDriveClient,
@@ -209,13 +213,19 @@ def connection_state(token: TokenInspection, *, libs_available: bool) -> str:
     return STATE_EXPIRED
 
 
-def _loaded_config() -> CreekConfig | None:
-    """Return the resolved Creek configuration, or ``None`` when unreadable.
+def _loaded_config(vault_path: Path) -> CreekConfig | None:
+    """Return *vault_path*'s Creek configuration, or ``None`` when unreadable.
 
-    Resolved the same way ``creek gdrive`` resolves it — ``CREEK_CONFIG`` or
-    ``creek_config.yaml`` in the working directory — so the connector a remote
-    caller drives is the connector the operator configured, not a second one
-    with its own defaults.
+    Until #1409 this resolved from the process's working directory, on the
+    stated grounds that it matched how ``creek gdrive`` resolves. The parallel
+    did not hold: the CLI's ``gdrive`` command declares no ``--vault`` flag and
+    so is cwd-scoped by construction, whereas all three MCP drive tools take
+    ``vault_path`` as a parameter. A remote caller naming vault A was therefore
+    driving the Google Drive connector — staging directory included — that
+    whichever vault the server was started in had declared.
+
+    Args:
+        vault_path: The vault the calling tool was asked to act on.
 
     Returns:
         The validated configuration, or ``None`` when it cannot be read. The
@@ -225,7 +235,7 @@ def _loaded_config() -> CreekConfig | None:
         depend on the HTTP adapter.
     """
     try:
-        return load_config()
+        return load_vault_config(vault_path)
     except (OSError, ValueError, YAMLError):
         return None
 
@@ -281,7 +291,7 @@ def drive_status_tool(
         The state payload, or a structured refusal when the configuration
         cannot be read.
     """
-    config = _loaded_config()
+    config = _loaded_config(vault_path)
     if config is None:
         return refusal_response(
             tool=STATUS_TOOL_NAME,
@@ -475,7 +485,7 @@ def drive_sync_tool(
     Returns:
         The seven counts, or a structured refusal.
     """
-    config = _loaded_config()
+    config = _loaded_config(vault_path)
     if config is None:
         return refusal_response(
             tool=SYNC_TOOL_NAME,
@@ -552,7 +562,7 @@ def drive_disconnect_tool(
         The disconnect payload, or a structured refusal when the configuration
         cannot be read or the local credential survived the erase.
     """
-    config = _loaded_config()
+    config = _loaded_config(vault_path)
     if config is None:
         return refusal_response(
             tool=DISCONNECT_TOOL_NAME,
