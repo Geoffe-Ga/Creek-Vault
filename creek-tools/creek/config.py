@@ -2084,6 +2084,59 @@ def load_config(
     return CreekConfig()
 
 
+def load_vault_config(
+    vault: Path | None,
+    *,
+    explicit: Path | None = None,
+    warn_on_missing: bool = False,
+) -> CreekConfig:
+    """Load the configuration belonging to *vault* (#1409).
+
+    The single spelling of "resolve this vault's config". Every consumer that
+    acts *on a named vault* must use it, because the alternative —
+    ``load_config()`` with no argument — silently reads
+    ``creek_config.yaml`` relative to the **process's current working
+    directory** and never opens ``<vault>/00-Creek-Meta/creek_config.yaml``.
+    Nothing raises and nothing logs when that happens: the caller simply
+    proceeds with built-in defaults while reporting success, which is how the
+    defect in #1409 spread to eleven call sites unnoticed.
+
+    Precedence is :func:`resolve_config_path`'s, unchanged and deliberate:
+    ``explicit`` beats ``CREEK_CONFIG`` beats the vault's own file. In
+    particular ``CREEK_CONFIG`` still wins over the vault (#1313 examined that
+    ordering and left it alone), so a subprocess handed the variable keeps
+    behaving as its parent intended.
+
+    Neither a stale nor a malformed vault config is swallowed here. A key the
+    schema forbids raises ``pydantic.ValidationError`` and a dangling
+    ``CREEK_CONFIG`` raises ``FileNotFoundError``; callers that have a reason
+    to continue anyway catch them at their own level. Silent fallback is the
+    exact failure class this function exists to end.
+
+    The one thing it cannot fix is a vault with no config file at all: that
+    still falls through to :func:`load_config`'s cwd default and then to
+    built-in defaults. ``warn_on_missing`` defaults to ``False`` because most
+    callers are library surfaces (MCP tools, agents) with no operator console
+    to warn at; the CLI wrappers that do have one keep passing ``True``.
+
+    Args:
+        vault: Vault root to resolve against, or ``None`` when the caller
+            genuinely has no vault (several CLI commands take no ``--vault``).
+        explicit: Operator-supplied config path, e.g. a ``--config`` flag.
+        warn_on_missing: Log a WARNING when no config file is found anywhere.
+
+    Returns:
+        The vault's fully-validated ``CreekConfig``.
+
+    Raises:
+        FileNotFoundError: When ``CREEK_CONFIG`` names a missing path.
+    """
+    return load_config(
+        resolve_config_path(vault, explicit),
+        warn_on_missing=warn_on_missing,
+    )
+
+
 _ANTHROPIC_CONSENT_NOTE: str = """\
 # -----------------------------------------------------------------------------
 # Anthropic cloud classification (opt-in) -- issue #320

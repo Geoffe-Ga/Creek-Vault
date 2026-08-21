@@ -133,8 +133,8 @@ def vault(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     (tmp_path / "00-Creek-Meta" / "Inbound").mkdir(parents=True)
 
     monkeypatch.setattr(
-        "creek_mcp.tools.redact.load_config",
-        lambda: CreekConfig(),
+        "creek_mcp.tools.redact.load_vault_config",
+        lambda _vault_path, **_kwargs: CreekConfig(),
     )
     yield tmp_path
 

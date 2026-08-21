@@ -154,7 +154,16 @@ _PRODUCTION_ROOTS: Final[tuple[Path, ...]] = (
 _EXCLUDED_SOURCES: Final[frozenset[Path]] = frozenset(
     {_CREEK_TOOLS_ROOT / "creek" / "config.py"},
 )
-_CONFIG_LOADERS: Final[frozenset[str]] = frozenset({"load_config"})
+_CONFIG_LOADERS: Final[frozenset[str]] = frozenset(
+    {
+        "load_config",
+        # #1409's shared vault-scoped resolver. It returns the same
+        # ``CreekConfig`` and is now what almost every consumer calls, so
+        # omitting it would blind the scan to nearly every real config read and
+        # report live fields as dormant.
+        "load_vault_config",
+    },
+)
 
 
 # --------------------------------------------------------------------------

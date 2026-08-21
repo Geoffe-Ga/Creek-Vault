@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import UTC, datetime
+from functools import partial
 from typing import TYPE_CHECKING
 
 import frontmatter
@@ -2499,8 +2500,11 @@ def test_compile_routes_intimate_sources_to_the_local_provider(
     _patch_build_provider(monkeypatch, spy)
     monkeypatch.setattr(
         server_mod,
-        "load_config",
-        lambda: _RoutingConfigStub(default="ollama", generation="anthropic"),
+        "load_vault_config",
+        lambda _vault, **_kwargs: _RoutingConfigStub(
+            default="ollama",
+            generation="anthropic",
+        ),
     )
 
     result = compile_tool(
@@ -2509,7 +2513,7 @@ def test_compile_routes_intimate_sources_to_the_local_provider(
         target_kind="thread",
         target_id="thread-x",
         target_title="Thread X",
-        llm_factory=server_mod._build_compile_llm,
+        llm_factory=partial(server_mod._build_compile_llm, vault),
         privacy_tier_ceiling=TierCeiling.INTIMATE,
     )
 
@@ -2711,8 +2715,11 @@ def test_compile_refuses_when_intimate_has_no_local_backend(
     _patch_build_provider(monkeypatch, spy)
     monkeypatch.setattr(
         server_mod,
-        "load_config",
-        lambda: _RoutingConfigStub(default="anthropic", generation="anthropic"),
+        "load_vault_config",
+        lambda _vault, **_kwargs: _RoutingConfigStub(
+            default="anthropic",
+            generation="anthropic",
+        ),
     )
 
     result = compile_tool(
@@ -2721,7 +2728,7 @@ def test_compile_refuses_when_intimate_has_no_local_backend(
         target_kind="thread",
         target_id="thread-x",
         target_title="Thread X",
-        llm_factory=server_mod._build_compile_llm,
+        llm_factory=partial(server_mod._build_compile_llm, vault),
         privacy_tier_ceiling=TierCeiling.ALL,
     )
 
@@ -2773,8 +2780,11 @@ def test_compile_not_found_refusal_no_longer_depends_on_model_config(
     _patch_build_provider(monkeypatch, spy)
     monkeypatch.setattr(
         server_mod,
-        "load_config",
-        lambda: _RoutingConfigStub(default="anthropic", generation="anthropic"),
+        "load_vault_config",
+        lambda _vault, **_kwargs: _RoutingConfigStub(
+            default="anthropic",
+            generation="anthropic",
+        ),
     )
 
     result = compile_tool(
@@ -2783,7 +2793,7 @@ def test_compile_not_found_refusal_no_longer_depends_on_model_config(
         target_kind="thread",
         target_id="thread-x",
         target_title="Thread X",
-        llm_factory=server_mod._build_compile_llm,
+        llm_factory=partial(server_mod._build_compile_llm, vault),
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
 
@@ -2804,8 +2814,11 @@ def test_compile_not_found_refusal_no_longer_depends_on_model_config(
     # turns on the vault's contents, not on the operator's model choice.
     monkeypatch.setattr(
         server_mod,
-        "load_config",
-        lambda: _RoutingConfigStub(default="ollama", generation="anthropic"),
+        "load_vault_config",
+        lambda _vault, **_kwargs: _RoutingConfigStub(
+            default="ollama",
+            generation="anthropic",
+        ),
     )
     with_local_default = compile_tool(
         vault_path=vault,
@@ -2813,7 +2826,7 @@ def test_compile_not_found_refusal_no_longer_depends_on_model_config(
         target_kind="thread",
         target_id="thread-x",
         target_title="Thread X",
-        llm_factory=server_mod._build_compile_llm,
+        llm_factory=partial(server_mod._build_compile_llm, vault),
         privacy_tier_ceiling=TierCeiling.OPEN,
     )
 
