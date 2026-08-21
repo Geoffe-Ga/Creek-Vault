@@ -107,12 +107,25 @@ ocr:
   min_confidence: 0.6
 ```
 
-| Field            | Default        | Notes |
+**Every field in this block is dormant.** All four are on
+`DORMANT_CONFIG_FIELDS` in `tests/test_config_contract.py` — "declared
+dormant: OCR wire-in tracked by #1041" — and that allowlist is a ratchet
+which fails the moment a listed field *is* read, so their being on it is
+proof no production path consults them. `creek init` still writes the
+block, and it still loads, but **editing these values changes nothing
+today**: setting `enabled: false` does not stop `creek ingest --type
+image` from attempting OCR, and `languages` does not reach Tesseract.
+
+Read "dormant" precisely: it means *this key is not consulted*, **not**
+that the behaviour behind it is absent. The confidence threshold in
+particular is live — see the `min_confidence` row.
+
+| Field            | Default        | Status |
 |------------------|----------------|-------|
-| `enabled`        | `true`         | If `false`, `creek ingest --type images` will skip OCR. |
-| `engine`         | `pytesseract`  | Engine name. (Custom engines are injected at the API level — see `creek.ingest.images.OcrEngine`.) |
-| `languages`      | `[eng]`        | Tesseract language codes. |
-| `min_confidence` | `0.6`          | Per-page OCR confidence below which the resulting fragment is tagged `review: pending_review` in frontmatter, as a marker for a human — no command currently filters on this key. Range `[0.0, 1.0]`. |
+| `enabled`        | `true`         | Dormant. Intended as the master switch for the OCR pass. |
+| `engine`         | `pytesseract`  | Dormant. Custom engines are injected at the API level today — see `creek.ingest.images.OcrEngine`. |
+| `languages`      | `[eng]`        | Dormant. Intended for Tesseract language codes. |
+| `min_confidence` | `0.6`          | **The key is dormant; the behaviour is not.** A page below the threshold really *is* tagged `review: pending_review` today — executed by running `ImageIngestor` with an injected `OcrEngine` returning confidence `0.42`, whose frontmatter came back `review: pending_review`. What the key cannot do is change the number: the threshold in force is `_DEFAULT_MIN_CONFIDENCE` in `creek/ingest/images.py`, not this value. Range `[0.0, 1.0]`. No command filters on the resulting key. |
 
 ## `linking` — resonance / thread / eddy thresholds
 
@@ -360,6 +373,39 @@ sources:
 ```
 
 These are **relative to `source_drive`**. `creek process` walks them in order. Override on the CLI with `--input` for one-off runs.
+
+## Seeding: what is and is not configurable
+
+Getting source material into a vault is documented end to end in
+[seeding.md](./seeding.md). This section is the config-side companion, and it
+is deliberately short: **the seeding epic ([#1523](https://github.com/Geoffe-Ga/Creek-Vault/issues/1523))
+added no new `creek_config.yaml` fields.** What it added is a network surface
+whose controls are environment variables and request headers. Listing knobs
+that do nothing is the failure mode this repository tracks as
+[#1041](https://github.com/Geoffe-Ga/Creek-Vault/issues/1041), so nothing
+below is listed unless it was observed changing behaviour.
+
+### Controls that work
+
+| Control | Kind | Observed effect |
+|---------|------|-----------------|
+| `CREEK_MCP_CONSUMER_TOKENS` | Environment variable | **Required.** With it unset, `create_app()` raises `ValueError: CREEK_MCP_CONSUMER_TOKENS is not set (consumer=token pairs). /v1 has no anonymous access, so it refuses to serve without authentication configured.` A token under 32 characters is refused at startup too, naming the length and the rotation recipe. An unauthenticated request gets `401 unauthenticated`. Format and rotation: [api.md](./api.md). |
+| `X-Creek-Tier-Ceiling` | Request header | Sets the tier ceiling for one `/v1` request; absent, it is `open`. A `tier: personal` upload at the default ceiling is refused `403 privacy_refused`; the identical upload with `X-Creek-Tier-Ceiling: personal` returns `200` and the fragment lands `privacy_tier: personal`. `intimate` is not an accepted value — `GET /v1/capabilities` advertises `ceilings: ["open", "personal"]` with `intimate_never_egresses: true`. |
+| `tier` (per upload) | Request field | Required on every `POST /v1/uploads` and every `creek.upload` call, never defaulted, and checked **before any byte is decoded**. |
+| [`google_drive`](#google_drive) | YAML block | The Drive connector's credential, token, scope and staging paths. Unchanged by this epic. Note `creek gdrive` has **no `--vault` flag**: without `CREEK_CONFIG` or `--config` it runs on built-in defaults and prints `Config file creek_config.yaml not found; running with built-in defaults.` |
+| [`sources`](#sources--default-input-directories) | YAML block | Default input directories for `creek process`, relative to `source_drive`. |
+
+### Deliberately not configurable
+
+These come up as "where do I set this?" and the answer is that you cannot —
+stated here so nobody goes looking for a field that does not exist.
+
+| Not configurable | Where it is fixed | Why it matters |
+|------------------|-------------------|----------------|
+| The **10 MiB** upload cap | `MAX_UPLOAD_BYTES` in `creek_mcp/tools/upload.py` | Checked on the encoded length, then the decoded length, before anything is written. |
+| The **tier a CLI-seeded fragment gets** | `creek ingest` has no tier or privacy option at all — grepping its `--help` for `tier` or `privacy` returns nothing, and no config key supplies a default | Every fragment `creek ingest` writes is `privacy_tier: unclassified`. See [seeding.md § Privacy of seeded content](./seeding.md#privacy-of-seeded-content). |
+| **Which ingestor an uploaded extension routes to** | `_EXTENSION_ROUTES` in `creek/ingest/gdrive.py`, pinned by `tests/test_seeding_docs_capability_set.py` | There is deliberately no `source_type` override on the upload surface. |
+| Whether an export **archive** is unpacked | `ARCHIVE_SUFFIXES` in `creek/ingest/archive.py` — `.zip` only | `.tar` and friends are refused. **The refusal text differs by surface**: the `creek.upload` MCP tool names the remedy — *"Creek unpacks .zip export archives, so re-pack this one as .zip and send that"* — while the identical bytes to `POST /v1/uploads` come back as a `415` carrying the generic `unsupported_source` message, the same one a `.json` gets, with no repack remedy. Both executed. |
 
 ## `voice_audience_weighting` — graduated voice authority
 
