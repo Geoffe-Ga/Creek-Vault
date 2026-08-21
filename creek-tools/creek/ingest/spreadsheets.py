@@ -110,9 +110,11 @@ def _sheet_unit_keys(sheets: Sequence[SheetData]) -> list[str | None]:
     every CSV and every one-sheet XLSX derives byte-identical identity
     before and after #1305, so nothing already in an operator's vault is
     re-minted and duplicated on its next ingest. There is no ledger to pin
-    spreadsheets into — ``ledger_for_source`` returns ``None`` for every
-    source type but markdown — so a #1329-style migration is unavailable
-    here, and this carve-out is what replaces it.
+    spreadsheets into — ``spreadsheet`` is deliberately absent from
+    :data:`creek.ingest.pipeline.LEDGERED_SOURCES`, because per-sheet
+    sub-unit identity needs its own idempotency proof before it can be
+    ledger-backed (#1363) — so a #1329-style migration is unavailable here,
+    and this carve-out is what replaces it.
 
     **Otherwise the discriminator is the sheet's name**, passed through
     :func:`~creek.ingest.source_unit.sanitize_unit`, with a blank name

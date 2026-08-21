@@ -54,10 +54,14 @@ the vault owner's rather than the caller's. The tier is therefore whatever the
 content and the classifier derive, which is the only arrangement under which
 this path cannot make a tier less restrictive than the ordinary one would.
 
-One file at a time is also load-bearing rather than stylistic:
-:func:`~creek.ingest.pipeline.run_ingest` arms ``tomb_missing_units`` when a
-forced ``ledger_source`` meets a *directory* input, which over a partial Drive
-listing would soft-tomb every fragment the pass did not happen to see.
+One file at a time is also load-bearing rather than stylistic. A *directory*
+input is what makes :func:`~creek.ingest.pipeline.tomb_missing_units`
+computable at all, and over a partial Drive listing a gone set is not a gone
+set: every fragment the pass did not happen to see would look deleted. (This
+note used to attribute the hazard to a forced ``ledger_source``. That is now
+backwards — :func:`~creek.ingest.pipeline.tombing_is_authorised` requires
+``ledger_source is None``, so a borrowed ledger *disarms* the sweep. The
+single-file input is what this path actually relies on.)
 """
 
 from __future__ import annotations

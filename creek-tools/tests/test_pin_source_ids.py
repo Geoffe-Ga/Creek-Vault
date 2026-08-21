@@ -36,6 +36,7 @@ from creek.ingest.markdown import MarkdownIngestor
 from creek.ingest.pin_ids import pin_source_ids
 from creek.ingest.pipeline import (
     IngestRunResult,
+    derive_source_key,
     run_ingest,
     unpinned_vault_warning,
 )
@@ -835,14 +836,21 @@ def test_a_relative_source_resolving_where_it_stands_still_wins(
     vault. Here the recorded path resolves *both* ways: the real source is
     outside the vault under the working directory, and a decoy of the same
     vault-relative name sits inside. The working directory wins, so the key is
-    the outside-the-vault bare-name form.
+    the outside-the-vault form.
+
+    The *spelling* of that form moved in #953 — a bare filename collided
+    across directories and destroyed content, so an out-of-vault source is now
+    keyed under the ``external/<digest of its parent>/`` namespace. The
+    subject of this test did not move: it is still that the working directory
+    wins over the vault anchor, which is why the discriminating assertion is
+    against the decoy's key rather than for a literal.
 
     Args:
         tmp_path: Pytest temp directory.
         monkeypatch: Used to run the migration from the ingest's directory.
     """
     vault = _make_vault(tmp_path)
-    _make_in_vault_source(vault)  # the decoy, same vault-relative name
+    decoy = _make_in_vault_source(vault)  # same vault-relative name
     work = tmp_path / "work"
     real = work / "00-Inbox" / "note.md"
     real.parent.mkdir(parents=True, exist_ok=True)
@@ -853,7 +861,14 @@ def test_a_relative_source_resolving_where_it_stands_still_wins(
     result = pin_source_ids(vault)
 
     assert result.pinned == 1
-    assert _origin_key(md_file) == "note.md"
+    key = _origin_key(md_file)
+    assert key != derive_source_key(str(decoy), vault), (
+        "the in-vault decoy won: the record was re-pointed at a same-named "
+        "file the original ingest never read."
+    )
+    assert key == derive_source_key(str(real), vault)
+    assert key is not None
+    assert key.endswith("/note.md")
 
 
 def test_a_relative_source_that_exists_nowhere_is_still_unpinnable(
