@@ -91,9 +91,9 @@ class Specialist(Protocol):
 
 def _load_config(vault: Path) -> CreekConfig:
     """Load the vault's config (defaults when no file is present)."""
-    from creek.config import load_config, resolve_config_path
+    from creek.config import load_vault_config
 
-    return load_config(resolve_config_path(vault, None), warn_on_missing=False)
+    return load_vault_config(vault)
 
 
 def _load_corpus(
