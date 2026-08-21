@@ -14,8 +14,10 @@ from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Protocol
 
 from creek.lint.checks import (
+    ancestry,
     broken_links,
     orphan_compiled,
+    root_hygiene,
     skill_size_budget,
 )
 from creek.lint.checks import (
@@ -42,11 +44,13 @@ from creek.lint.checks import (
 from creek.lint.checks import (
     voice_fidelity as voice_fidelity_check,
 )
+from creek.vault.links import build_link_index
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.lint._result import CheckResult
+    from creek.vault.links import LinkIndex
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +69,23 @@ class _CheckCallable(Protocol):
     ) -> CheckResult: ...
 
 
+class _IndexAwareCheck(Protocol):
+    """Signature of a check that can reuse a pre-built :class:`LinkIndex`.
+
+    A strict extension of :class:`_CheckCallable`: the extra parameter is
+    keyword-only and defaulted, so an index-aware check remains a valid
+    ``_CheckCallable`` and ``_REGISTRY`` needs no widening.
+    """
+
+    def __call__(
+        self,
+        vault_path: Path,
+        *,
+        since: datetime | None = None,
+        link_index: LinkIndex | None = None,
+    ) -> CheckResult: ...
+
+
 DETERMINISTIC_CHECKS: tuple[str, ...] = (
     "broken-links",
     "orphan-compiled",
@@ -74,6 +95,8 @@ DETERMINISTIC_CHECKS: tuple[str, ...] = (
     "draft-grounding",
     "voice-fidelity",
     "unparseable",
+    "ancestry",
+    "root-hygiene",
 )
 """Cheap checks that always run by default (link graph + frontmatter only)."""
 
@@ -98,7 +121,26 @@ _REGISTRY: dict[str, _CheckCallable] = {
     "synchronicity": synchronicity_check.run,
     "unnamed": unnamed_check.run,
     "unparseable": unparseable_check.run,
+    "ancestry": ancestry.run,
+    "root-hygiene": root_hygiene.run,
 }
+
+_INDEX_AWARE: dict[str, _IndexAwareCheck] = {
+    "broken-links": broken_links.run,
+    "orphan-compiled": orphan_compiled.run,
+}
+"""Checks that resolve wiki-links, and so can share one vault-wide index.
+
+Both used to build their own — ``broken-links`` via
+:class:`creek.clean.hygiene.BrokenLinkScanner` and ``orphan-compiled``
+directly — so a default ``creek lint`` run header-parsed every ``*.md`` in
+the vault twice (#1223).
+
+Every entry must be the *same object* as its ``_REGISTRY`` entry, not merely
+an equal-looking one; ``tests/test_lint_single_index.py`` asserts that by
+identity. Two callables registered under one name is how half a runner ends
+up silently calling a stale check.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +265,12 @@ class LintRunner:
     def run(self, checks: list[str] | None = None) -> LintReport:
         """Execute the requested checks and return a :class:`LintReport`.
 
+        The vault-wide :class:`~creek.vault.links.LinkIndex` is built here,
+        **lazily and at most once**, and handed to every check in
+        :data:`_INDEX_AWARE`. Lazily matters: ``creek lint --check tags``
+        selects no index-aware check and must not pay to walk the vault for an
+        index nothing reads.
+
         Args:
             checks: Explicit list of check names, or ``None`` to use the
                 default set. The default runs all deterministic checks
@@ -235,9 +283,18 @@ class LintRunner:
             ValueError: If *checks* contains an unknown name.
         """
         selected = self._resolve_checks(checks)
-        results = [
-            _REGISTRY[name](self.vault_path, since=self.since) for name in selected
-        ]
+        index: LinkIndex | None = None
+        results: list[CheckResult] = []
+        for name in selected:
+            aware = _INDEX_AWARE.get(name)
+            if aware is None:
+                results.append(_REGISTRY[name](self.vault_path, since=self.since))
+                continue
+            if index is None:
+                index = build_link_index(self.vault_path)
+            results.append(
+                aware(self.vault_path, since=self.since, link_index=index),
+            )
         return LintReport(results=results, since=self.since_text, today=self.today)
 
     def write(self, report: LintReport) -> Path:

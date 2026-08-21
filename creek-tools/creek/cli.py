@@ -4797,7 +4797,8 @@ def lint(
             # a module-level import here would undo that.
             "Run only this check (repeatable). Names: paradox, unnamed, "
             "synchronicity, compost, tags, broken-links, orphan-compiled, "
-            "skill-size, draft-grounding, voice-fidelity, unparseable."
+            "skill-size, draft-grounding, voice-fidelity, unparseable, "
+            "ancestry, root-hygiene."
         ),
     ),
     since: str | None = typer.Option(
