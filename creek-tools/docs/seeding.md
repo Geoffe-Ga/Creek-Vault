@@ -26,6 +26,7 @@ confidently.
 - [Which shape is my source?](#which-shape-is-my-source)
 - [Seeding from the CLI](#seeding-from-the-cli)
 - [Seeding over the network](#seeding-over-the-network)
+  - [Ingests, but does not classify or link](#seeding-over-the-network-ingests-but-does-not-classify-or-link)
 - [Google Drive](#google-drive)
 - [Four traps that silently cost you fragments](#four-traps-that-silently-cost-you-fragments)
 - [Privacy of seeded content](#privacy-of-seeded-content)
@@ -470,6 +471,52 @@ the published schema:
 
 The MCP tool `creek.upload` is the same surface over stdio, and its gates are
 documented row-by-row in [mcp.md](./mcp.md).
+
+### Seeding over the network ingests, but does not classify or link
+
+**This is the most important limitation on this page.** Everything above gets
+your bytes into the vault as fragments. It does not make them *usable*.
+
+`/v1` publishes nine routes across six capabilities, and **none of them
+classifies or links**:
+
+```console
+$ grep -ic "classify\|link" creek_mcp/api/routes.py
+0
+```
+
+`POST /v1/uploads` calls `run_ingest` and stops there. `creek.classify` and
+`creek.link` exist only as **MCP tools** — there is no HTTP route for either.
+
+So a vault seeded entirely over the network contains fragments with:
+
+- no APTITUDE frequency,
+- no Archetypal Wavelength phase,
+- no resonances, and
+- `privacy_tier: unclassified` (see
+  [Privacy of seeded content](#privacy-of-seeded-content) — `unclassified`
+  ranks *with* `personal`, so a fresh vault is fail-closed rather than open).
+
+Nothing errors. The upload returns `200`, the fragments are genuinely on disk,
+and the vault is simply **inert** — the Higher Self Resonance runs over an
+unclassified corpus.
+
+**Until this closes, a network-only seeding flow is incomplete.** Someone with
+shell access on the vault host has to run:
+
+```console
+$ creek classify --vault <vault>
+$ creek link --vault <vault>
+```
+
+Tracked as
+[#1570](https://github.com/Geoffe-Ga/Creek-Vault/issues/1570). Unlike the Drive
+OAuth gap ([#1568](https://github.com/Geoffe-Ga/Creek-Vault/issues/1568)),
+which was a deliberate cut, this one was not filed until the seeding epic's
+Definition of Done was re-read against the shipped routes — the DoD promises
+fragments land *"correctly-typed, correctly-tiered — over the network, with no
+CLI and no shell access,"* and typing and tiering are exactly what `classify`
+and `link` produce.
 
 ## Google Drive
 
