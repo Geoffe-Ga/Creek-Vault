@@ -22,7 +22,7 @@ pinned against silent truncation.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -366,3 +366,135 @@ def short_write(monkeypatch: pytest.MonkeyPatch) -> ShortWriteController:
     monkeypatch.setattr(os, "write", controller)
     monkeypatch.setattr(os, "close", _tracking_close)
     return controller
+
+
+if TYPE_CHECKING:  # pragma: no cover - typing-only, kept beside its consumers
+    from pathlib import Path
+
+
+# ---- Unreadable / schema-invalid notes (issues #1450, #1451, #996, #871, #1448)
+
+CORRUPT_NOTE_SHAPES: Final[tuple[str, ...]] = (
+    "malformed-yaml",
+    "undecodable",
+    "nonstring-key",
+)
+"""The three ways a vault note defeats ``frontmatter.load``.
+
+Each shape lands on a *different* limb of
+:data:`creek.vault.reader.FRONTMATTER_LOAD_ERRORS`, which is why one shape
+is not enough to exercise a guard:
+
+``malformed-yaml``
+    Unparseable header -> :class:`yaml.YAMLError`.
+``undecodable``
+    Bytes that are not UTF-8 -> :class:`UnicodeDecodeError` (a
+    :class:`ValueError`), raised while *reading*, before any parse.
+``nonstring-key``
+    A header mapping with a non-string key -> a builtin
+    :class:`TypeError` out of ``Post(content, handler, **metadata)``.
+    This limb is absent from the older ``(OSError, ValueError,
+    yaml.YAMLError)`` tuple, so a fixture set that omits it silently
+    under-tests every guard that widened to catch it (#1475, #924).
+"""
+
+
+def _corrupt_note_bytes(shape: str) -> bytes:
+    """Return the raw bytes of an unreadable note of the given *shape*.
+
+    Args:
+        shape: One of :data:`CORRUPT_NOTE_SHAPES`.
+
+    Returns:
+        Bytes to write verbatim; deliberately not ``str`` because the
+        ``undecodable`` shape has no valid UTF-8 spelling.
+
+    Raises:
+        ValueError: If *shape* is not a known shape. Guarding here turns a
+            typo in a ``parametrize`` list into a loud error instead of a
+            note that quietly loads fine and makes the test vacuous.
+    """
+    if shape == "malformed-yaml":
+        return b"---\n:\n  - [unclosed\n---\ncorrupt body\n"
+    if shape == "undecodable":
+        return b"---\ntitle: caf\xff\xfe\n---\ncorrupt body\n"
+    if shape == "nonstring-key":
+        # Reuse the single definition of this poison rather than minting a
+        # fourth copy of it; the bool/int key variants live beside it and
+        # are swept by that module's own loader battery.
+        from tests.test_frontmatter_nonstring_key_guard import (
+            NONSTRING_KEY_HEADERS,
+        )
+
+        header = NONSTRING_KEY_HEADERS["date_key"]
+        return f"---\n{header}---\ncorrupt body\n".encode()
+    msg = f"Unknown corrupt-note shape: {shape!r}"
+    raise ValueError(msg)
+
+
+@pytest.fixture
+def corrupt_note() -> Callable[[Path, str], Path]:
+    """Return a factory writing one *unreadable* note at a caller-chosen path.
+
+    The factory emits **only the poison**: it never writes the valid
+    sibling note a non-vacuous test needs beside it. That is deliberate.
+    A valid record's frontmatter is schema-specific (a Fragment's
+    ``source`` must be a mapping carrying ``platform``, its
+    ``frequency.primary`` an ``F1``..``F10`` value), so baking one into
+    this shared file would couple it to the models and duplicate the
+    per-suite builders that already exist. Each test supplies its own
+    good note and takes only the poison from here.
+
+    Returns:
+        ``factory(path, shape) -> path``, where *shape* is one of
+        :data:`CORRUPT_NOTE_SHAPES`. Parent directories are created.
+    """
+
+    def _write(path: Path, shape: str) -> Path:
+        """Write the *shape* poison to *path* and return *path*."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(_corrupt_note_bytes(shape))
+        return path
+
+    return _write
+
+
+@pytest.fixture
+def pydantic_invalid_note() -> Callable[[Path], Path]:
+    """Return a factory writing a *readable* note that fails model validation.
+
+    The distinction matters: this note's YAML parses, and it carries
+    ``type: fragment`` so it passes the type gate and actually reaches
+    ``Fragment.model_validate``. Exactly one field is broken
+    (``created``), so the note exercises a caller's
+    ``except ValidationError`` arm — a different arm from the load
+    guards :func:`corrupt_note` targets, and one a corrupt note can
+    never reach.
+
+    Returns:
+        ``factory(path) -> path``. Parent directories are created.
+    """
+
+    def _write(path: Path) -> Path:
+        """Write the schema-invalid fragment note to *path*."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "---\n"
+            "type: fragment\n"
+            "id: frag-schema-invalid\n"
+            "title: Schema-invalid fragment\n"
+            "privacy_tier: open\n"
+            "source:\n"
+            "  platform: journal\n"
+            # Valid in every other field; only `created` is unparseable,
+            # so the ValidationError is about the schema and not about a
+            # half-written stub.
+            "created: not-a-timestamp\n"
+            "ingested: '2026-01-15T12:00:00+00:00'\n"
+            "---\n"
+            "schema-invalid body\n",
+            encoding="utf-8",
+        )
+        return path
+
+    return _write

@@ -730,6 +730,7 @@ def _post_loaders() -> list[tuple[str, _PostLoader]]:
     from creek.generate import (
         compost_scan,
         decisions,
+        drafts,
         mining,
         skills,
         state,
@@ -742,6 +743,11 @@ def _post_loaders() -> list[tuple[str, _PostLoader]]:
     return [
         ("state._safe_post", state._safe_post),
         ("mining._safe_post", mining._safe_post),
+        # ``drafts._safe_post`` is the fifth of this package's near-identical
+        # per-note loaders and was the only one absent from this battery, so
+        # its guard was the one nobody had ever driven a non-string key
+        # through (#996).
+        ("drafts._safe_post", drafts._safe_post),
         ("compost_scan._safe_post", compost_scan._safe_post),
         ("wavelength._safe_post", wavelength._safe_post),
         ("decisions._load_post", decisions._load_post),
@@ -804,16 +810,17 @@ def test_post_loaders_positive_control(tmp_path: Path) -> None:
     """Every loader in the battery above still returns something readable.
 
     Without this, a loader that returned ``None`` unconditionally would pass
-    the skip test and the whole battery would be vacuous. All ten are covered,
-    not the four whose sentinel is cheapest to disprove: each of the remaining
-    six needs a note shaped for *it* — a valid fragment record, a provenance
-    list, an over-ceiling voice distance — and skipping them is exactly how a
-    vacuous arm hides.
+    the skip test and the whole battery would be vacuous. All eleven are
+    covered, not the handful whose sentinel is cheapest to disprove: each of
+    the rest needs a note shaped for *it* — a valid fragment record, a
+    provenance list, an over-ceiling voice distance — and skipping them is
+    exactly how a vacuous arm hides.
     """
     from creek.compile import engine as compile_engine
     from creek.generate import (
         compost_scan,
         decisions,
+        drafts,
         mining,
         skills,
         state,
@@ -827,6 +834,7 @@ def test_post_loaders_positive_control(tmp_path: Path) -> None:
     for label, loader in (
         ("state._safe_post", state._safe_post),
         ("mining._safe_post", mining._safe_post),
+        ("drafts._safe_post", drafts._safe_post),
         ("compost_scan._safe_post", compost_scan._safe_post),
         ("wavelength._safe_post", wavelength._safe_post),
         ("decisions._load_post", decisions._load_post),
