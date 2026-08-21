@@ -15,6 +15,7 @@ any surface can drive it.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path  # runtime use: resolving recorded source paths
@@ -128,12 +129,61 @@ def resolve_recorded_source(source_path: str, vault_path: Path) -> Path:
     return candidate
 
 
+_OUT_OF_VAULT_PREFIX: Final[str] = "external"
+"""Namespace every out-of-vault ``source_key`` is written under (#953).
+
+A fixed first segment keeps the two halves of the key space visibly apart in
+a ledger file and in a fragment's frontmatter, so an operator reading either
+can tell at a glance whether a key names something inside their vault. It is
+*not* a reservation the in-vault arm defers to: that arm is tried first and
+wins outright, so a vault directory literally named ``external/<hex>/`` still
+keys as its own plain vault-relative path.
+"""
+
+_PATH_DIGEST_CHARS: Final[int] = 16
+"""How much of the parent directory's SHA-256 goes into an out-of-vault key.
+
+16 hex characters is 64 bits. The digest only has to separate the directories
+one operator ingests from, so the birthday bound over even a million distinct
+source directories is on the order of 1e-8 — while a full 64-character digest
+would make every key unreadable for no additional safety.
+"""
+
+
 def derive_source_key(source_path: str, vault_path: Path) -> str:
-    """Return a stable vault-relative ``source_key`` for a source file (#672).
+    """Return a stable ``source_key`` for a source file (#672, #953).
 
     Prefers the path relative to the vault root (the stable identity a
-    re-ingested edit is matched on); falls back to the bare filename when the
-    source lives outside the vault.
+    re-ingested edit is matched on). A source that lives *outside* the vault
+    is keyed ``external/<digest of its parent>/<filename>``.
+
+    **The in-vault arm below is byte-identical to the one every already-synced
+    vault was keyed with, and must stay that way.** A fragment's identity is
+    ledger-backed on exactly this string: change how an in-vault key is spelled
+    and the next ingest matches nothing already on disk, mints fresh ids and
+    leaves every predecessor behind as an orphan — the #1304/#1329/#1384 scar.
+    ``tests/test_ingest_source_key_identity.py`` pins the exact literals.
+
+    **Why the out-of-vault arm had to move.** It returned ``candidate.name``,
+    a bare filename, so ``~/a/report.pdf`` and ``~/b/report.pdf`` shared one
+    key. That is not a duplicate, it is content destruction:
+    :func:`write_fragment_idempotent` hoists ``fragment.id =
+    record.fragment_id`` above every branch, so the second file adopts the
+    first's id and rewrites its body. It is live for every ``creek sync``,
+    which ingests the ``journal`` source as source type ``markdown`` from an
+    external drive path, recursively, enabled by default.
+
+    **Why the digest covers the parent and the filename stays literal.**
+    Identity is bijective on ``(parent, name)``, which *is* the resolved path,
+    so this is exactly as collision-free as digesting the whole path — while
+    every file from one source directory groups under one digest and the key
+    stays recognisable to an operator reading a ledger. The digest is also
+    hex, so it can never contain :data:`~creek.ingest.source_unit.
+    SOURCE_UNIT_SEPARATOR` and the base half of a composed key stays
+    unambiguous.
+
+    ``.resolve()`` runs first so a symlink and its target yield one key: they
+    are one file, and keying them apart would ingest it twice.
 
     The recorded string is interpreted by :func:`resolve_recorded_source`
     rather than being anchored to the current directory, so a relative record
@@ -142,12 +192,57 @@ def derive_source_key(source_path: str, vault_path: Path) -> str:
     disagreeing about where the same recorded path points is how the migration
     came to call a live in-vault source deleted while this function happily
     derived a key for it.
+
+    Args:
+        source_path: The recorded ``source.original_file``, verbatim.
+        vault_path: Vault root.
+
+    Returns:
+        The vault-relative POSIX path, or the namespaced out-of-vault key.
     """
     candidate = resolve_recorded_source(source_path, vault_path)
     try:
         return candidate.resolve().relative_to(vault_path.resolve()).as_posix()
     except ValueError:
+        resolved = candidate.resolve()
+        digest = hashlib.sha256(
+            resolved.parent.as_posix().encode("utf-8"),
+        ).hexdigest()[:_PATH_DIGEST_CHARS]
+        return f"{_OUT_OF_VAULT_PREFIX}/{digest}/{resolved.name}"
+
+
+def legacy_source_key(source_path: str, vault_path: Path) -> str | None:
+    """Return the pre-#953 bare-filename key for an out-of-vault source (#953).
+
+    The single source of truth for "what did this used to be called", so the
+    adoption path in :func:`adopt_legacy_ledger_key` and the seen-key widening
+    in :func:`establish_source_identity` cannot disagree about it.
+
+    **It answers ``None`` for anything in-vault**, and that is the load-bearing
+    half: an in-vault key never had a legacy spelling, so every piece of
+    migration machinery downstream is structurally unable to reach the in-vault
+    corpus even by accident. The guard is the same ``relative_to`` the key
+    derivation itself uses, not a second predicate that could drift from it.
+
+    ``candidate.name`` — the *unresolved* candidate's basename — is returned
+    verbatim, because that is the exact string the old code wrote into the
+    ledger. Resolving first would produce the target's name for a symlinked
+    source and miss the record that is actually there.
+
+    Args:
+        source_path: The recorded ``source.original_file``, verbatim.
+        vault_path: Vault root.
+
+    Returns:
+        The bare filename this source used to key as, or ``None`` when it
+        lives inside the vault and therefore never had one.
+    """
+    candidate = resolve_recorded_source(source_path, vault_path)
+    try:
+        candidate.resolve().relative_to(vault_path.resolve())
+    except ValueError:
         return candidate.name
+    return None
 
 
 LEDGERED_SOURCE_TYPE: Final[str] = "markdown"
@@ -279,6 +374,189 @@ def attach_origin_key(
         return
     base_key = derive_source_key(parsed.source_path, vault_path)
     fragment.source.origin_key = compose_source_unit(base_key, parsed.source_unit)
+
+
+def _recorded_source_of(fragment_path: Path) -> str:
+    """Return the ``source.original_file`` a fragment file records, verbatim.
+
+    Read straight off disk rather than from any in-memory model: the string on
+    disk is the one the fragment was minted from, and it is the evidence
+    :func:`adopt_legacy_ledger_key` demands before it lets one source inherit
+    another's identity.
+
+    Args:
+        fragment_path: Path to the fragment file.
+
+    Returns:
+        The recorded source string, or ``""`` when the file records none or
+        cannot be parsed as a fragment.
+    """
+    # Deferred import: creek.vault.reader pulls the model stack; keep it out
+    # of this module's import time, which creek_mcp pays on every tool call.
+    from creek.vault.reader import load_post_or_raise
+
+    try:
+        post = load_post_or_raise(fragment_path)
+    except (OSError, ValueError):
+        return ""
+    source = post.metadata.get("source")
+    if not isinstance(source, dict):
+        return ""
+    recorded = source.get("original_file")
+    return recorded if isinstance(recorded, str) else ""
+
+
+def _record_names_this_source(
+    writer: VaultWriter,
+    record: LedgerRecord,
+    parsed: ParsedFragment,
+    vault_path: Path,
+) -> bool:
+    """Return whether *record*'s fragment was minted from *parsed*'s source.
+
+    The proof adoption runs on, and it is **exact, not heuristic**: the
+    fragment on disk names its own source verbatim, so the two paths are
+    resolved through the same :func:`resolve_recorded_source` the key
+    derivation uses and compared. Nothing here guesses, which is what stops a
+    second file that merely shares a basename from inheriting the first's
+    history.
+
+    The tombstone is consulted as well as the live fragment: a unit that
+    vanished and came back is exactly the case whose id must survive, and
+    :meth:`~creek.vault.writer.VaultWriter.find_fragment` is scoped to
+    ``01-Fragments/`` only.
+
+    Args:
+        writer: Vault writer, consulted read-only.
+        record: The legacy ledger record being considered for adoption.
+        parsed: The unit this run is about to write.
+        vault_path: Vault root, used to anchor a relative recorded path.
+
+    Returns:
+        ``True`` only when a fragment for ``record.fragment_id`` exists and
+        records a source resolving to the same file as *parsed*.
+    """
+    fragment_path = writer.find_fragment(record.fragment_id) or (
+        writer.find_tombed_fragment(record.fragment_id)
+    )
+    if fragment_path is None:
+        return False
+    recorded = _recorded_source_of(fragment_path)
+    if not recorded:
+        return False
+    return (
+        resolve_recorded_source(recorded, vault_path).resolve()
+        == resolve_recorded_source(parsed.source_path, vault_path).resolve()
+    )
+
+
+def adopt_legacy_ledger_key(
+    ledger: SourceLedger,
+    writer: VaultWriter,
+    parsed: ParsedFragment,
+    vault_path: Path,
+    origin_key: str,
+    legacy_key: str,
+) -> bool:
+    """Re-record a pre-#953 bare-filename ledger entry under its new key.
+
+    #953 re-spells the key of every source that lives outside the vault, and
+    ``creek sync``'s ``journal`` pass — source type ``markdown``, an external
+    drive path, on by default — has been writing exactly those keys since
+    #672. Without this, the first run after the upgrade would miss on the new
+    key, take :func:`write_fragment_idempotent`'s ``record is None`` branch,
+    mint a fresh id and orphan every journal fragment in the vault at once.
+
+    Adoption is refused unless **all** of these hold, so it can only ever
+    preserve an identity and never invent one:
+
+    * the new key is absent from the ledger — a key that already has a record
+      is already migrated, and re-adopting would overwrite it;
+    * the legacy key is present — otherwise there is no predecessor at all;
+    * the recorded fragment still exists and its own ``source.original_file``
+      resolves to *this* source (:func:`_record_names_this_source`).
+
+    The stale legacy record is deliberately left in place rather than
+    rewritten: the ledger is append-only, and :func:`establish_source_identity`
+    keeps that key in the run's seen-set so it can never be read as a vanished
+    unit. It stops mattering as soon as the new record exists.
+
+    Cost is one vault read per *miss* on the new key, i.e. once per unit on
+    the first post-upgrade run and never again — the pass is self-clearing.
+
+    Args:
+        ledger: The resolved ledger for this run.
+        writer: Vault writer, consulted read-only.
+        parsed: The unit this run is about to write.
+        vault_path: Vault root.
+        origin_key: The key this run derived, composed with any sub-unit.
+        legacy_key: The pre-#953 spelling of the same unit's key.
+
+    Returns:
+        ``True`` when a record was adopted under *origin_key*.
+    """
+    if origin_key in ledger or legacy_key not in ledger:
+        return False
+    record = ledger.get(legacy_key)
+    if record is None or not _record_names_this_source(
+        writer, record, parsed, vault_path
+    ):
+        return False
+    ledger.record(
+        origin_key,
+        record.fragment_id,
+        record.content_hash,
+        last_seen=record.last_seen,
+        tombed=record.tombed,
+    )
+    return True
+
+
+def establish_source_identity(
+    ledger: SourceLedger | None,
+    writer: VaultWriter,
+    parsed: ParsedFragment,
+    fragment: Fragment,
+    vault_path: Path,
+) -> set[str]:
+    """Stamp the fragment's key, migrate it if needed, and report keys seen.
+
+    One call so :func:`run_ingest`'s loop gains no branch — and so the three
+    things that must happen together cannot be done apart. Stamping without
+    adopting re-mints an out-of-vault corpus; adopting without reporting the
+    legacy key **soft-tombs that whole corpus on the same run**, because the
+    stale record stays in :meth:`~creek.ingest.ledger.SourceLedger.live_keys`
+    and a ``creek sync`` journal pass is a directory ingest with tombing armed.
+
+    The legacy key is reported as seen whether or not anything was adopted.
+    The set is only ever *subtracted* from the gone set, so reporting a key no
+    record uses costs nothing, while omitting one that a record does use
+    relocates a live fragment. The one imprecision this admits is an in-vault
+    source at the vault root whose basename matches an out-of-vault source's:
+    its key is shielded from tombing for that run. That is a missed
+    soft-delete, never a destroyed fragment.
+
+    Args:
+        ledger: The resolved ledger, or ``None`` for an unledgered run.
+        writer: Vault writer, consulted read-only.
+        parsed: The unit about to be written.
+        fragment: The assembled fragment, before it is written.
+        vault_path: Vault root.
+
+    Returns:
+        Every ledger key this unit answers for, to be marked seen. Empty for
+        an unledgered run, which has no keys and never tombs.
+    """
+    attach_origin_key(ledger, parsed, fragment, vault_path)
+    origin_key = fragment.source.origin_key
+    if ledger is None or origin_key is None:
+        return set()
+    legacy = legacy_source_key(parsed.source_path, vault_path)
+    if legacy is None:
+        return {origin_key}
+    legacy_key = compose_source_unit(legacy, parsed.source_unit)
+    adopt_legacy_ledger_key(ledger, writer, parsed, vault_path, origin_key, legacy_key)
+    return {origin_key, legacy_key}
 
 
 def record_in_ledger(
@@ -1039,12 +1317,13 @@ def run_ingest(
             )
             continue
         stamp_declared_tier(assembled.fragment, privacy_tier)
-        attach_origin_key(ledger, parsed, assembled.fragment, vault_path)
-        origin_key = assembled.fragment.source.origin_key
-        # Record the key as seen BEFORE any incremental skip, so an unchanged
-        # unit is never mistaken for a deleted one and tombed (#674/#677).
-        if origin_key is not None:
-            seen_keys.add(origin_key)
+        # Record every key as seen BEFORE any incremental skip, so an
+        # unchanged unit is never mistaken for a deleted one and tombed
+        # (#674/#677) — and so a unit's pre-#953 key is never read as one
+        # either (#953).
+        seen_keys |= establish_source_identity(
+            ledger, writer, parsed, assembled.fragment, vault_path
+        )
         if should_skip_unit(
             filtering=filtering,
             ledger=ledger,
