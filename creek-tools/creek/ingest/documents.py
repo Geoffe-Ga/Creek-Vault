@@ -826,14 +826,16 @@ class DocumentIngestor(Ingestor):
         ``datetime.fromtimestamp(mtime)``, which renders the epoch in the
         host's local zone and so mints one id per timezone.
 
-        Documents are more exposed to this than markdown, not less:
-        :func:`creek.ingest.pipeline.ledger_for_source` leaves them
-        unledgered, so there is no recorded id to fall back on and a
-        drifting derivation is an unconditional second write rather than a
-        merely possible one. Widening the ledger to documents is blocked on
-        a bare-filename collision in ``derive_source_key`` and is tracked by
-        #1363; this fix removes the timezone-driven churn, not the
-        mtime-driven churn.
+        Documents used to be more exposed to this than markdown, not less:
+        :func:`creek.ingest.pipeline.ledger_for_source` left them
+        unledgered, so there was no recorded id to fall back on and a
+        drifting derivation was an unconditional second write rather than a
+        merely possible one. #1363 closed that — ``document`` is now in
+        :data:`creek.ingest.pipeline.LEDGERED_SOURCES`, once #953 had made
+        ``derive_source_key`` collision-free for out-of-vault sources, which
+        was the blocker. A ledgered document's id comes from the record, so
+        the derivation below is only how a *new* document gets its first
+        one; keeping it host-independent still matters for exactly that.
 
         Args:
             metadata: Fragment metadata dict.

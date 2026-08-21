@@ -61,7 +61,7 @@ from typing import TYPE_CHECKING
 import frontmatter
 
 from creek.ingest.base import generate_fragment_id
-from creek.ingest.ledger import SourceLedger
+from creek.ingest.ledger import SourceLedger, store_unpinned_sources
 from creek.ingest.pipeline import (
     LEDGERED_SOURCE_TYPE,
     derive_source_key,
@@ -501,15 +501,25 @@ def pin_source_ids(vault_path: Path, *, dry_run: bool = False) -> PinResult:
     A ``source_key`` claimed by more than one live fragment is pinned for
     neither and reported as a conflict; see :func:`_index_by_source_key`.
 
+    **Those refusals are also persisted** (#1367), via
+    :func:`~creek.ingest.ledger.store_unpinned_sources`. Returning them only
+    in memory made the realistic migration outcome — clean sources pinned,
+    duplicated ones skipped — indistinguishable from a fully migrated vault
+    the moment the process exited: the ledger was now non-empty, so
+    :func:`creek.ingest.pipeline.unpinned_vault_warning` went permanently
+    silent about exactly the fragments still at risk of being re-minted. The
+    state is rewritten in full on every run, and *removed* when nothing is
+    outstanding, so it converges to silence rather than accumulating.
+
     Idempotent: a key already present in the ledger is counted as
     ``already_pinned`` and left alone, so a second run reports ``pinned == 0``
-    and writes nothing.
+    and writes no ledger record.
 
     Args:
         vault_path: Vault root (the directory containing ``01-Fragments/``).
-        dry_run: When ``True``, nothing is written — no ledger append and no
-            frontmatter stamp — but the returned result is fully populated so
-            a caller can print the plan.
+        dry_run: When ``True``, nothing is written — no ledger append, no
+            frontmatter stamp and no conflict state — but the returned result
+            is fully populated so a caller can print the plan.
 
     Returns:
         A :class:`PinResult` summarising what was (or would be) pinned.
@@ -518,12 +528,14 @@ def pin_source_ids(vault_path: Path, *, dry_run: bool = False) -> PinResult:
     ledger = SourceLedger.load(vault_path, source=_LEDGER_SOURCE)
 
     conflicts: list[str] = []
+    contested: list[str] = []
     pinned = 0
     already_pinned = 0
     repaired = 0
     for source_key, claimants in _index_by_source_key(candidates).items():
         if len(claimants) > 1:
             conflicts.append(_conflict_line(source_key, claimants))
+            contested.append(source_key)
             continue
         was_pinned, was_repaired = _pin_one(claimants[0], ledger, dry_run=dry_run)
         if was_pinned:
@@ -531,6 +543,9 @@ def pin_source_ids(vault_path: Path, *, dry_run: bool = False) -> PinResult:
         else:
             already_pinned += 1
             repaired += int(was_repaired)
+
+    if not dry_run:
+        store_unpinned_sources(vault_path, contested)
 
     return PinResult(
         pinned=pinned,

@@ -15,6 +15,7 @@ any surface can drive it.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path  # runtime use: resolving recorded source paths
@@ -128,12 +129,61 @@ def resolve_recorded_source(source_path: str, vault_path: Path) -> Path:
     return candidate
 
 
+_OUT_OF_VAULT_PREFIX: Final[str] = "external"
+"""Namespace every out-of-vault ``source_key`` is written under (#953).
+
+A fixed first segment keeps the two halves of the key space visibly apart in
+a ledger file and in a fragment's frontmatter, so an operator reading either
+can tell at a glance whether a key names something inside their vault. It is
+*not* a reservation the in-vault arm defers to: that arm is tried first and
+wins outright, so a vault directory literally named ``external/<hex>/`` still
+keys as its own plain vault-relative path.
+"""
+
+_PATH_DIGEST_CHARS: Final[int] = 16
+"""How much of the parent directory's SHA-256 goes into an out-of-vault key.
+
+16 hex characters is 64 bits. The digest only has to separate the directories
+one operator ingests from, so the birthday bound over even a million distinct
+source directories is on the order of 1e-8 — while a full 64-character digest
+would make every key unreadable for no additional safety.
+"""
+
+
 def derive_source_key(source_path: str, vault_path: Path) -> str:
-    """Return a stable vault-relative ``source_key`` for a source file (#672).
+    """Return a stable ``source_key`` for a source file (#672, #953).
 
     Prefers the path relative to the vault root (the stable identity a
-    re-ingested edit is matched on); falls back to the bare filename when the
-    source lives outside the vault.
+    re-ingested edit is matched on). A source that lives *outside* the vault
+    is keyed ``external/<digest of its parent>/<filename>``.
+
+    **The in-vault arm below is byte-identical to the one every already-synced
+    vault was keyed with, and must stay that way.** A fragment's identity is
+    ledger-backed on exactly this string: change how an in-vault key is spelled
+    and the next ingest matches nothing already on disk, mints fresh ids and
+    leaves every predecessor behind as an orphan — the #1304/#1329/#1384 scar.
+    ``tests/test_ingest_source_key_identity.py`` pins the exact literals.
+
+    **Why the out-of-vault arm had to move.** It returned ``candidate.name``,
+    a bare filename, so ``~/a/report.pdf`` and ``~/b/report.pdf`` shared one
+    key. That is not a duplicate, it is content destruction:
+    :func:`write_fragment_idempotent` hoists ``fragment.id =
+    record.fragment_id`` above every branch, so the second file adopts the
+    first's id and rewrites its body. It is live for every ``creek sync``,
+    which ingests the ``journal`` source as source type ``markdown`` from an
+    external drive path, recursively, enabled by default.
+
+    **Why the digest covers the parent and the filename stays literal.**
+    Identity is bijective on ``(parent, name)``, which *is* the resolved path,
+    so this is exactly as collision-free as digesting the whole path — while
+    every file from one source directory groups under one digest and the key
+    stays recognisable to an operator reading a ledger. The digest is also
+    hex, so it can never contain :data:`~creek.ingest.source_unit.
+    SOURCE_UNIT_SEPARATOR` and the base half of a composed key stays
+    unambiguous.
+
+    ``.resolve()`` runs first so a symlink and its target yield one key: they
+    are one file, and keying them apart would ingest it twice.
 
     The recorded string is interpreted by :func:`resolve_recorded_source`
     rather than being anchored to the current directory, so a relative record
@@ -142,12 +192,57 @@ def derive_source_key(source_path: str, vault_path: Path) -> str:
     disagreeing about where the same recorded path points is how the migration
     came to call a live in-vault source deleted while this function happily
     derived a key for it.
+
+    Args:
+        source_path: The recorded ``source.original_file``, verbatim.
+        vault_path: Vault root.
+
+    Returns:
+        The vault-relative POSIX path, or the namespaced out-of-vault key.
     """
     candidate = resolve_recorded_source(source_path, vault_path)
     try:
         return candidate.resolve().relative_to(vault_path.resolve()).as_posix()
     except ValueError:
+        resolved = candidate.resolve()
+        digest = hashlib.sha256(
+            resolved.parent.as_posix().encode("utf-8"),
+        ).hexdigest()[:_PATH_DIGEST_CHARS]
+        return f"{_OUT_OF_VAULT_PREFIX}/{digest}/{resolved.name}"
+
+
+def legacy_source_key(source_path: str, vault_path: Path) -> str | None:
+    """Return the pre-#953 bare-filename key for an out-of-vault source (#953).
+
+    The single source of truth for "what did this used to be called", so the
+    adoption path in :func:`adopt_legacy_ledger_key` and the seen-key widening
+    in :func:`establish_source_identity` cannot disagree about it.
+
+    **It answers ``None`` for anything in-vault**, and that is the load-bearing
+    half: an in-vault key never had a legacy spelling, so every piece of
+    migration machinery downstream is structurally unable to reach the in-vault
+    corpus even by accident. The guard is the same ``relative_to`` the key
+    derivation itself uses, not a second predicate that could drift from it.
+
+    ``candidate.name`` — the *unresolved* candidate's basename — is returned
+    verbatim, because that is the exact string the old code wrote into the
+    ledger. Resolving first would produce the target's name for a symlinked
+    source and miss the record that is actually there.
+
+    Args:
+        source_path: The recorded ``source.original_file``, verbatim.
+        vault_path: Vault root.
+
+    Returns:
+        The bare filename this source used to key as, or ``None`` when it
+        lives inside the vault and therefore never had one.
+    """
+    candidate = resolve_recorded_source(source_path, vault_path)
+    try:
+        candidate.resolve().relative_to(vault_path.resolve())
+    except ValueError:
         return candidate.name
+    return None
 
 
 LEDGERED_SOURCE_TYPE: Final[str] = "markdown"
@@ -162,27 +257,82 @@ an enforcement, and the review that produced this constant found the
 advisory already consulting a different ledger than the migration wrote.
 """
 
+LEDGERED_SOURCES: frozenset[str] = frozenset(
+    {LEDGERED_SOURCE_TYPE, "generic", "document"},
+)
+"""Source types whose fragment identity is ledger-backed by default (#1363).
+
+Holding a ledger buys a source type three things and **no others**: an
+idempotent re-ingest (an edited unit updates in place under its existing id
+instead of orphaning it), a ``source.origin_key`` on every fragment — which is
+the only field the RTBF purge sweep resolves a target from — and a content
+hash to tell an edit from a touch.
+
+It buys **no deletion authority**. That is :data:`TOMBING_SOURCES`, a
+separate set consulted by a separate gate, and the two are deliberately kept
+as two names rather than one: a set that meant both would make "let this
+source type keep its ids" and "let this source type delete vault content"
+the same decision, which is the coupling #1329 was filed to remove.
+
+``generic`` and ``document`` joined in #1363. Both derive an id from the
+source's mtime, so before this a ``touch`` alone minted a duplicate, an edit
+orphaned its predecessor, and neither ever received an ``origin_key`` — which
+means content ingested through them was unreachable by an erasure request.
+The registry spells them singular: ``document``, not ``documents``.
+
+Deliberately **not** widened: ``image``, ``code``, ``spreadsheet``,
+``presentation`` and the four append-only export ingestors. Each needs its own
+idempotency proof, ``spreadsheet`` interacts with the #1305 sub-unit path, and
+the export ingestors emit no ``source_unit`` at all — under a ledger every
+turn of one conversation file would share a key and overwrite its
+predecessor. Widening them is a follow-up, not a line in this set.
+
+**Why widening cannot import the collision defect.** Turning the ledger on for
+a source type whose key is a bare filename is strictly worse than leaving it
+off: two same-named documents would then resolve to one record and one would
+overwrite the other. Measured, before the fix. That is why #953's key change
+lands first in this branch and why
+``tests/test_ingest_out_of_vault_identity.py`` asserts both halves in a single
+test — they are only safe together.
+"""
+
 TOMBING_SOURCES: frozenset[str] = frozenset({LEDGERED_SOURCE_TYPE})
 """Source types whose directory ingest may soft-tomb units it no longer sees.
 
-Deliberately *narrower* than "has a ledger", and separate from it (#1329).
-:func:`resolve_ledger` lets a caller opt a non-markdown source type into
-ledger-backed *identity* via ``ledger_source``, and until this split that same
-opt-in silently armed :func:`tomb_missing_units` as well — so a directory
+Deliberately *narrower* than :data:`LEDGERED_SOURCES`, and separate from it
+(#1329). :func:`resolve_ledger` lets a caller opt a non-markdown source type
+into ledger-backed *identity* via ``ledger_source``, and until this split that
+same opt-in silently armed :func:`tomb_missing_units` as well — so a directory
 ingest under a borrowed ledger would tomb every previously-recorded unit it
 did not happen to see. Identity and tombing are different questions; only a
 source whose directory listing is genuinely the full, authoritative set of
 live units belongs here.
+
+The markdown journal qualifies because its whole corpus lives under the
+directory being walked. A document or a generic file does not: an operator
+moving a PDF out of a staging folder is not asking for its fragment to be
+soft-deleted.
 """
 
 
 def ledger_for_source(source_type: str, vault_path: Path) -> SourceLedger | None:
-    """Load the source ledger for mutable sources, else ``None`` (#672).
+    """Load the source ledger for a ledger-backed source, else ``None`` (#672).
 
-    Only the markdown (journal) source is ledger-wired; append-only event
-    sources keep their content-hashed ids untouched.
+    Membership of :data:`LEDGERED_SOURCES` is the whole question; append-only
+    event sources keep their content-hashed ids and never consult a ledger.
+
+    Each source type loads **its own** ledger file, named for the type, so a
+    newly ledgered type starts from an empty file rather than inheriting
+    another type's key space.
+
+    Args:
+        source_type: Registry key of the ingestor being run.
+        vault_path: Vault root holding ``00-Creek-Meta/State/ingest/``.
+
+    Returns:
+        That source type's ledger, or ``None`` when it is unledgered.
     """
-    if source_type != LEDGERED_SOURCE_TYPE:
+    if source_type not in LEDGERED_SOURCES:
         return None
     from creek.ingest.ledger import SourceLedger
 
@@ -279,6 +429,189 @@ def attach_origin_key(
         return
     base_key = derive_source_key(parsed.source_path, vault_path)
     fragment.source.origin_key = compose_source_unit(base_key, parsed.source_unit)
+
+
+def _recorded_source_of(fragment_path: Path) -> str:
+    """Return the ``source.original_file`` a fragment file records, verbatim.
+
+    Read straight off disk rather than from any in-memory model: the string on
+    disk is the one the fragment was minted from, and it is the evidence
+    :func:`adopt_legacy_ledger_key` demands before it lets one source inherit
+    another's identity.
+
+    Args:
+        fragment_path: Path to the fragment file.
+
+    Returns:
+        The recorded source string, or ``""`` when the file records none or
+        cannot be parsed as a fragment.
+    """
+    # Deferred import: creek.vault.reader pulls the model stack; keep it out
+    # of this module's import time, which creek_mcp pays on every tool call.
+    from creek.vault.reader import load_post_or_raise
+
+    try:
+        post = load_post_or_raise(fragment_path)
+    except (OSError, ValueError):
+        return ""
+    source = post.metadata.get("source")
+    if not isinstance(source, dict):
+        return ""
+    recorded = source.get("original_file")
+    return recorded if isinstance(recorded, str) else ""
+
+
+def _record_names_this_source(
+    writer: VaultWriter,
+    record: LedgerRecord,
+    parsed: ParsedFragment,
+    vault_path: Path,
+) -> bool:
+    """Return whether *record*'s fragment was minted from *parsed*'s source.
+
+    The proof adoption runs on, and it is **exact, not heuristic**: the
+    fragment on disk names its own source verbatim, so the two paths are
+    resolved through the same :func:`resolve_recorded_source` the key
+    derivation uses and compared. Nothing here guesses, which is what stops a
+    second file that merely shares a basename from inheriting the first's
+    history.
+
+    The tombstone is consulted as well as the live fragment: a unit that
+    vanished and came back is exactly the case whose id must survive, and
+    :meth:`~creek.vault.writer.VaultWriter.find_fragment` is scoped to
+    ``01-Fragments/`` only.
+
+    Args:
+        writer: Vault writer, consulted read-only.
+        record: The legacy ledger record being considered for adoption.
+        parsed: The unit this run is about to write.
+        vault_path: Vault root, used to anchor a relative recorded path.
+
+    Returns:
+        ``True`` only when a fragment for ``record.fragment_id`` exists and
+        records a source resolving to the same file as *parsed*.
+    """
+    fragment_path = writer.find_fragment(record.fragment_id) or (
+        writer.find_tombed_fragment(record.fragment_id)
+    )
+    if fragment_path is None:
+        return False
+    recorded = _recorded_source_of(fragment_path)
+    if not recorded:
+        return False
+    return (
+        resolve_recorded_source(recorded, vault_path).resolve()
+        == resolve_recorded_source(parsed.source_path, vault_path).resolve()
+    )
+
+
+def adopt_legacy_ledger_key(
+    ledger: SourceLedger,
+    writer: VaultWriter,
+    parsed: ParsedFragment,
+    vault_path: Path,
+    origin_key: str,
+    legacy_key: str,
+) -> bool:
+    """Re-record a pre-#953 bare-filename ledger entry under its new key.
+
+    #953 re-spells the key of every source that lives outside the vault, and
+    ``creek sync``'s ``journal`` pass — source type ``markdown``, an external
+    drive path, on by default — has been writing exactly those keys since
+    #672. Without this, the first run after the upgrade would miss on the new
+    key, take :func:`write_fragment_idempotent`'s ``record is None`` branch,
+    mint a fresh id and orphan every journal fragment in the vault at once.
+
+    Adoption is refused unless **all** of these hold, so it can only ever
+    preserve an identity and never invent one:
+
+    * the new key is absent from the ledger — a key that already has a record
+      is already migrated, and re-adopting would overwrite it;
+    * the legacy key is present — otherwise there is no predecessor at all;
+    * the recorded fragment still exists and its own ``source.original_file``
+      resolves to *this* source (:func:`_record_names_this_source`).
+
+    The stale legacy record is deliberately left in place rather than
+    rewritten: the ledger is append-only, and :func:`establish_source_identity`
+    keeps that key in the run's seen-set so it can never be read as a vanished
+    unit. It stops mattering as soon as the new record exists.
+
+    Cost is one vault read per *miss* on the new key, i.e. once per unit on
+    the first post-upgrade run and never again — the pass is self-clearing.
+
+    Args:
+        ledger: The resolved ledger for this run.
+        writer: Vault writer, consulted read-only.
+        parsed: The unit this run is about to write.
+        vault_path: Vault root.
+        origin_key: The key this run derived, composed with any sub-unit.
+        legacy_key: The pre-#953 spelling of the same unit's key.
+
+    Returns:
+        ``True`` when a record was adopted under *origin_key*.
+    """
+    if origin_key in ledger or legacy_key not in ledger:
+        return False
+    record = ledger.get(legacy_key)
+    if record is None or not _record_names_this_source(
+        writer, record, parsed, vault_path
+    ):
+        return False
+    ledger.record(
+        origin_key,
+        record.fragment_id,
+        record.content_hash,
+        last_seen=record.last_seen,
+        tombed=record.tombed,
+    )
+    return True
+
+
+def establish_source_identity(
+    ledger: SourceLedger | None,
+    writer: VaultWriter,
+    parsed: ParsedFragment,
+    fragment: Fragment,
+    vault_path: Path,
+) -> set[str]:
+    """Stamp the fragment's key, migrate it if needed, and report keys seen.
+
+    One call so :func:`run_ingest`'s loop gains no branch — and so the three
+    things that must happen together cannot be done apart. Stamping without
+    adopting re-mints an out-of-vault corpus; adopting without reporting the
+    legacy key **soft-tombs that whole corpus on the same run**, because the
+    stale record stays in :meth:`~creek.ingest.ledger.SourceLedger.live_keys`
+    and a ``creek sync`` journal pass is a directory ingest with tombing armed.
+
+    The legacy key is reported as seen whether or not anything was adopted.
+    The set is only ever *subtracted* from the gone set, so reporting a key no
+    record uses costs nothing, while omitting one that a record does use
+    relocates a live fragment. The one imprecision this admits is an in-vault
+    source at the vault root whose basename matches an out-of-vault source's:
+    its key is shielded from tombing for that run. That is a missed
+    soft-delete, never a destroyed fragment.
+
+    Args:
+        ledger: The resolved ledger, or ``None`` for an unledgered run.
+        writer: Vault writer, consulted read-only.
+        parsed: The unit about to be written.
+        fragment: The assembled fragment, before it is written.
+        vault_path: Vault root.
+
+    Returns:
+        Every ledger key this unit answers for, to be marked seen. Empty for
+        an unledgered run, which has no keys and never tombs.
+    """
+    attach_origin_key(ledger, parsed, fragment, vault_path)
+    origin_key = fragment.source.origin_key
+    if ledger is None or origin_key is None:
+        return set()
+    legacy = legacy_source_key(parsed.source_path, vault_path)
+    if legacy is None:
+        return {origin_key}
+    legacy_key = compose_source_unit(legacy, parsed.source_unit)
+    adopt_legacy_ledger_key(ledger, writer, parsed, vault_path, origin_key, legacy_key)
+    return {origin_key, legacy_key}
 
 
 def record_in_ledger(
@@ -399,6 +732,72 @@ def write_fragment_idempotent(
     return "unchanged"
 
 
+def tombing_is_authorised(
+    ledger: SourceLedger | None,
+    input_path: Path,
+    source_type: str,
+    ledger_source: str | None,
+    *,
+    discovery_complete: bool,
+    may_tomb: bool,
+) -> bool:
+    """Return whether this pass may compute a gone set at all (#674/#1329).
+
+    Five independent conjuncts, each closing a different way a pass can lack
+    the authority to soft-delete. They are gathered here, rather than left as
+    a run of early returns inside :func:`tomb_missing_units`, so the whole
+    authority question is answerable by reading one function — and so adding a
+    sixth cannot quietly push the sweep over the complexity ceiling and get
+    "simplified" back into a disjunction.
+
+    * **Discovery was complete.** Checked first, and first for a reason.
+      Tombing is driven by *absence*, and absence means nothing when the walk
+      that failed to see a key could not read part of the tree: the key's
+      source may be sitting in exactly the part that could not be listed. The
+      gone set is not computable, not merely inadvisable (#1444).
+    * **A ledger exists.** Nothing to sweep without one.
+    * **The input is a directory.** Only a full-source pass enumerates the
+      authoritative set; a single-file input never tombs, which is what keeps
+      the incremental epic from tombing every other unit when one file is
+      re-ingested.
+    * **The source type may tomb** — membership of :data:`TOMBING_SOURCES`,
+      which is deliberately narrower than :data:`LEDGERED_SOURCES` (#1329).
+      Holding a ledger is identity, not deletion authority.
+    * **The ledger is this source type's own.** A borrowed ledger
+      (``ledger_source``) belongs to units this pass never enumerated, so its
+      ``live_keys`` minus this pass's ``seen_keys`` is not a gone set, it is
+      simply the other source's whole corpus. No caller does this today; it is
+      closed by construction rather than by a comment saying not to.
+    * **The caller permits it.** See ``may_tomb`` on :func:`run_ingest`.
+
+    *discovery_complete* and *may_tomb* are keyword-only with **no default**,
+    copying the ``warn(..., *, ceiling_safe)`` precedent in
+    :func:`run_ingest`. mypy strict covers ``creek/``, so a future caller that
+    has not thought about whether its pass had the authority to delete cannot
+    compile; a default of ``True`` would be fail-open, which is the defect
+    rather than its fix.
+
+    Args:
+        ledger: The resolved ledger for this run, or ``None``.
+        input_path: The source the operator named, verbatim.
+        source_type: Registry key of the ingestor being run.
+        ledger_source: The ledger name the caller forced, or ``None``.
+        discovery_complete: Whether discovery enumerated the whole source.
+        may_tomb: Whether the calling surface permits soft-deletion.
+
+    Returns:
+        ``True`` only when every conjunct holds.
+    """
+    return (
+        discovery_complete
+        and ledger is not None
+        and input_path.is_dir()
+        and source_type in TOMBING_SOURCES
+        and ledger_source is None
+        and may_tomb
+    )
+
+
 def tomb_missing_units(
     ledger: SourceLedger | None,
     writer: VaultWriter,
@@ -406,28 +805,16 @@ def tomb_missing_units(
     seen_keys: set[str],
     errors: list[str],
     source_type: str,
+    ledger_source: str | None,
     *,
     discovery_complete: bool,
+    may_tomb: bool,
 ) -> int:
     """Soft-tomb ledgered units absent from a full-source pass (#674).
 
-    Only a directory (full-source) input computes a gone set; a single-file
-    input never tombs — that guards the incremental epic from tombing every
-    other unit when re-ingesting one file.
-
-    **The pass must first have been able to see the whole source.** Tombing
-    is a soft-delete driven by *absence*, and absence means nothing when the
-    walk that failed to see a key could not read part of the tree: the key's
-    source may be sitting in exactly the part that could not be listed. So
-    ``discovery_complete=False`` returns 0 before anything else is
-    considered — the gone set is not computable, not merely inadvisable
-    (#1444).
-
-    *discovery_complete* is keyword-only with **no default**, copying the
-    ``warn(..., *, ceiling_safe)`` precedent in :func:`run_ingest`. mypy
-    strict covers ``creek/``, so a future caller that has not thought about
-    whether its pass had the authority to delete cannot compile; a default of
-    ``True`` would be fail-open, which is the defect rather than its fix.
+    Whether this pass is allowed to compute a gone set at all is
+    :func:`tombing_is_authorised`; every guard and its reason lives there.
+    This function is only the sweep.
 
     **Why an incomplete pass only warns and still exits 0.** ``creek.cli``'s
     ``_warn_if_discovered_but_empty`` returns early on ``written > 0 or
@@ -438,16 +825,23 @@ def tomb_missing_units(
     ``--strict`` flag is therefore left for its own issue; nothing is
     destroyed either way, which is the property that had to hold.
 
-    Tombing is additionally gated on *source_type* being in
-    :data:`TOMBING_SOURCES` (#1329). Holding a ledger is not sufficient: a
-    caller can borrow one via ``ledger_source`` purely to pin identity, and
-    that must not arm the tomb sweep for a source type whose directory
-    listing is not the authoritative set of live units.
-
     A tomb that fails on I/O is collected into *errors* and the unit is left
     live in the ledger so the next full-source pass retries it, rather than
     crashing the whole run. A tomb that finds nothing to move is treated the
     same way (#1332) — see :func:`_tomb_one_unit`.
+
+    Args:
+        ledger: The resolved ledger for this run, or ``None``.
+        writer: Vault writer performing the relocations.
+        input_path: The source the operator named, verbatim.
+        seen_keys: Every ledger key this pass answered for, including the
+            pre-#953 spelling of an out-of-vault unit's key (#953). A key
+            missing from this set is read as a deleted source.
+        errors: Collector for ``[<source_type>] …`` operator messages.
+        source_type: Registry key of the ingestor being run.
+        ledger_source: The ledger name the caller forced, or ``None``.
+        discovery_complete: Whether discovery enumerated the whole source.
+        may_tomb: Whether the calling surface permits soft-deletion.
 
     Returns:
         The number of fragments this call actually relocated into
@@ -457,18 +851,17 @@ def tomb_missing_units(
         does not count. The figure is printed to the operator verbatim, so
         it may only ever name work that happened.
     """
-    # First, above every other guard. An incomplete enumeration cannot tell
-    # "the operator deleted this unit" from "the walk could not read the
-    # directory it lives in", so there is no gone set to compute. Being first
-    # is also what covers the ``ledger_source`` hazard documented on
-    # :func:`run_ingest`: a borrowed ledger plus a directory input is exactly
-    # the shape that arms this sweep for a source type whose listing was
-    # never authoritative to begin with.
-    if not discovery_complete:
-        return 0
-    if ledger is None or not input_path.is_dir():
-        return 0
-    if source_type not in TOMBING_SOURCES:
+    authorised = tombing_is_authorised(
+        ledger,
+        input_path,
+        source_type,
+        ledger_source,
+        discovery_complete=discovery_complete,
+        may_tomb=may_tomb,
+    )
+    # ``authorised`` already established that the ledger is not ``None``; the
+    # explicit clause is what narrows the type for mypy, not a second gate.
+    if not authorised or ledger is None:
         return 0
     tombed = 0
     for source_key in sorted(ledger.live_keys() - seen_keys):
@@ -631,6 +1024,97 @@ def unpinned_vault_warning(
     if not any(fragments_root.rglob("*.md")):
         return None
     return _UNPINNED_VAULT_WARNING
+
+
+_PARTIAL_PIN_TEMPLATE = (
+    "This vault has {count} markdown source(s) that `creek ingest "
+    "--pin-source-ids` refused to pin, because more than one live fragment "
+    "claims each one. Their fragment ids are still unpinned, so re-ingesting "
+    "those sources mints new ids and leaves the existing fragments behind as "
+    "duplicates: {sample}. Run `creek clean duplicates`, resolve them, then "
+    "re-run `creek ingest --pin-source-ids`."
+)
+"""Advisory for a vault the pin migration could only partly complete (#1367).
+
+The console rendering. ``{sample}`` interpolates real vault-relative source
+paths, which is why it must not leave this process for a caller whose ceiling
+has not admitted them — see :data:`_PARTIAL_PIN_SAFE_TEMPLATE`.
+"""
+
+_PARTIAL_PIN_SAFE_TEMPLATE = (
+    "This vault has {count} markdown source(s) that `creek ingest "
+    "--pin-source-ids` refused to pin, because more than one live fragment "
+    "claims each one. Their fragment ids are still unpinned, so re-ingesting "
+    "those sources mints new ids and leaves the existing fragments behind as "
+    "duplicates. Run the same ingest at a terminal to see which sources. Run "
+    "`creek clean duplicates`, resolve them, then re-run `creek ingest "
+    "--pin-source-ids`."
+)
+"""The content-free twin of :data:`_PARTIAL_PIN_TEMPLATE` (#1372).
+
+Interpolates ``{count}`` and nothing else. The count stays because an advisory
+that withholds the number as well as the paths reports no problem at all; what
+is withheld is the ``{sample}`` clause, replaced by the instruction that
+recovers it through a surface where the operator is entitled to see every path
+in their own vault.
+"""
+
+_PARTIAL_PIN_SAMPLE = 3
+"""How many contested source keys the advisory names before it stops listing."""
+
+
+def partially_pinned_warning(
+    source_type: str,
+    vault_path: Path,
+) -> Advisory | None:
+    """Return the partially-pinned-vault advisory, or ``None`` (#1367).
+
+    :func:`unpinned_vault_warning` derives its whole signal from the markdown
+    ledger being *empty*, which makes it blind to the migration's most likely
+    real outcome: the clean sources get pinned, the duplicated ones are
+    refused, and the now-non-empty ledger silences the advisory forever —
+    about exactly the fragments still at risk of being re-minted.
+
+    So this asks a different question of different state. The refusals are
+    persisted by :func:`creek.ingest.pin_ids.pin_source_ids` and read back
+    here, which is what lets a finding computed in one process be reported by
+    the next one. Reading a recorded list is also what keeps this off the hot
+    path: no vault walk, no frontmatter parsing, and a cost that does not grow
+    with the size of the vault.
+
+    Self-clearing in both directions. The migration rewrites the state in full
+    and removes it when nothing is outstanding, so resolving the duplicates
+    and re-pinning restores silence — and an advisory that cannot go quiet is
+    one operators learn to ignore.
+
+    Gated on *source_type* for the same reason :func:`unpinned_vault_warning`
+    is: the migration and its refusals concern markdown identity only, and an
+    advisory delivered on a run it does not apply to is trained-away noise.
+
+    Args:
+        source_type: Registry key of the ingestor being run, verbatim.
+        vault_path: Vault root.
+
+    Returns:
+        The advisory in both disclosure forms, or ``None`` when this run
+        writes under another source type's identity or the vault has no
+        recorded refusals.
+    """
+    if source_type != LEDGERED_SOURCE_TYPE:
+        return None
+    from creek.ingest.ledger import load_unpinned_sources
+
+    contested = load_unpinned_sources(vault_path)
+    if not contested:
+        return None
+    sample = ", ".join(contested[:_PARTIAL_PIN_SAMPLE])
+    if len(contested) > _PARTIAL_PIN_SAMPLE:
+        sample = f"{sample}, …"
+    count = len(contested)
+    return Advisory(
+        message=_PARTIAL_PIN_TEMPLATE.format(count=count, sample=sample),
+        ceiling_safe=_PARTIAL_PIN_SAFE_TEMPLATE.format(count=count),
+    )
 
 
 _COLLAPSED_UNIT_WARNING_TEMPLATE = (
@@ -873,6 +1357,9 @@ def pre_write_advisories(
     * **Un-pinned vault.** Once the loop has recorded its first ledger entry
       the vault no longer *looks* un-pinned, so an advisory raised afterwards
       would never fire for the very run it needed to warn about (#1329).
+    * **Partially pinned vault.** Same reason, one step later in the
+      migration: this run is about to mint new ids for sources the migration
+      refused to pin, so saying so afterwards would be a post-mortem (#1367).
     * **Collapsed pre-#1305 units.** The operator is told which fragments
       this run supersedes before the run that supersedes them finishes,
       rather than after (#1305).
@@ -903,6 +1390,9 @@ def pre_write_advisories(
         # interpolation, so it names a command rather than a fragment, and
         # withholding it from an MCP caller would be caution with no subject.
         advisories.append(Advisory(message=unpinned, ceiling_safe=unpinned))
+    partial = partially_pinned_warning(source_type, vault_path)
+    if partial is not None:
+        advisories.append(partial)
     collapsed = collapsed_unit_warning(writer, ingest_result.fragments)
     if collapsed is not None:
         advisories.append(collapsed)
@@ -920,6 +1410,7 @@ def run_ingest(
     incremental: bool = False,
     ledger_source: str | None = None,
     privacy_tier: PrivacyTier | None = None,
+    may_tomb: bool = True,
     on_warning: Callable[[str], None] | None = None,
 ) -> IngestRunResult:
     """Run one ingestor and persist its output idempotently to the vault.
@@ -930,8 +1421,8 @@ def run_ingest(
 
     Args:
         ingestor_cls: Concrete :class:`Ingestor` subclass to run.
-        source_type: Registry key, used to prefix error messages (and to select
-            the ledger — only ``"markdown"`` is ledger-backed).
+        source_type: Registry key, used to prefix error messages and to select
+            the ledger (see :data:`LEDGERED_SOURCES`).
         input_path: Source directory or file to ingest.
         vault_path: Vault root for :class:`VaultWriter`.
         reclassify_threshold: Body-similarity floor below which a materially
@@ -939,16 +1430,31 @@ def run_ingest(
         since: Incremental cutoff (#677) — only units newer than this are kept.
         incremental: Ledger-driven incremental mode (#677).
         ledger_source: Force a specific ledger name instead of the one
-            :func:`ledger_for_source` would pick, opting a non-markdown
-            source type into ledger-backed identity (#1023). **Hazard:**
-            combining this with a *directory* ``input_path`` arms
-            :func:`tomb_missing_units` for that ledger, soft-tombing every
-            previously-ledgered unit the pass does not see; ``creek.upload``
-            always passes a single file, which can never tomb.
+            :func:`ledger_for_source` would pick, opting an unledgered source
+            type into ledger-backed identity (#1023). A borrowed ledger can
+            never be swept: :func:`tombing_is_authorised` requires
+            ``ledger_source is None``, because the units in someone else's
+            ledger are precisely the units this pass did not enumerate. (An
+            earlier version of this note claimed the opposite — that a
+            ``ledger_source`` plus a directory input *armed* the sweep. #1329
+            had already moved that gate onto the ingestor's registry key, and
+            this parameter now subtracts authority rather than granting it.)
         privacy_tier: Tier the caller declares for this content (#1023).
             Merged onto each fragment with
             :func:`creek.classify.privacy_pass.escalate`, so it can only
             raise the tier, never lower one the source already declared.
+        may_tomb: Whether this surface permits soft-deletion at all. A
+            restrictive conjunct: it can only ever *subtract* from the
+            authority :func:`tombing_is_authorised` already computes, never
+            add to it, so passing ``True`` grants nothing on its own.
+            ``creek_mcp.tools.ingest`` passes ``False`` — a remote caller has
+            never held vault-mutating deletion authority on that surface and
+            must not acquire it as a side effect of the tool gaining a ledger
+            (#1467). It carries a default, unlike the keyword-only no-default
+            arguments it feeds, purely for compatibility: a required argument
+            here would mean editing every existing call site, and every one of
+            those surfaces (the CLI, ``creek.upload``, ``creek.drive``) keeps
+            exactly its present behaviour under ``True``.
         on_warning: Called with each operator advisory **at the moment it is
             detected**, which for the un-pinned-vault advisory is before the
             first fragment is written (#1329). Surfaces still get every warning
@@ -1039,12 +1545,13 @@ def run_ingest(
             )
             continue
         stamp_declared_tier(assembled.fragment, privacy_tier)
-        attach_origin_key(ledger, parsed, assembled.fragment, vault_path)
-        origin_key = assembled.fragment.source.origin_key
-        # Record the key as seen BEFORE any incremental skip, so an unchanged
-        # unit is never mistaken for a deleted one and tombed (#674/#677).
-        if origin_key is not None:
-            seen_keys.add(origin_key)
+        # Record every key as seen BEFORE any incremental skip, so an
+        # unchanged unit is never mistaken for a deleted one and tombed
+        # (#674/#677) — and so a unit's pre-#953 key is never read as one
+        # either (#953).
+        seen_keys |= establish_source_identity(
+            ledger, writer, parsed, assembled.fragment, vault_path
+        )
         if should_skip_unit(
             filtering=filtering,
             ledger=ledger,
@@ -1084,7 +1591,9 @@ def run_ingest(
         seen_keys,
         errors,
         source_type,
+        ledger_source,
         discovery_complete=ingest_result.discovery_complete,
+        may_tomb=may_tomb,
     )
     return IngestRunResult(
         written=written,
