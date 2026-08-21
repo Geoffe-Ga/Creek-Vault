@@ -35,6 +35,7 @@ distinct reasons are a documented accepted residual oracle.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from pydantic import ValidationError
@@ -60,6 +61,7 @@ from creek_mcp.tools.reflect import reflect_tool
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     from starlette.requests import Request
     from starlette.responses import Response
@@ -151,8 +153,8 @@ async def _parsed_body(request: Request) -> ReflectionRequest | None:
         return None
 
 
-def _default_llm_factory() -> _LLMFactory:
-    """Return the production tier-keyed LLM factory.
+def _default_llm_factory(vault: Path) -> _LLMFactory:
+    """Return the production tier-keyed LLM factory for *vault*.
 
     Imported inside the function rather than at module scope: the builder lives
     beside the MCP server, which pulls in the MCP framework, and the HTTP
@@ -161,19 +163,28 @@ def _default_llm_factory() -> _LLMFactory:
     :class:`~creek.classify.llm.router.ModelRouter` it resolves through, and a
     parallel factory here would be a second routing policy.
 
+    Since #1409 that builder takes the vault whose routing it must honour, which
+    is why this default can only be bound inside :func:`_reflect`: the vault is
+    not resolved until then. Binding it at request entry, where the type is a
+    bare thunk, is what would have left this surface routing every vault's
+    reflection through whichever config the server's working directory named.
+
+    Args:
+        vault: The vault being reflected against.
+
     Returns:
-        The tier-keyed factory.
+        The tier-keyed factory, bound to *vault*'s routing.
     """
     from creek_mcp.server import _build_reflect_llm_factory
 
-    return _build_reflect_llm_factory()
+    return _build_reflect_llm_factory(vault)
 
 
 def _reflect(
     request: Request,
     parsed: ReflectionRequest,
     context: RequestContext,
-    build_factory: Callable[[], _LLMFactory],
+    build_factory: Callable[[], _LLMFactory] | None,
 ) -> dict[str, Any] | None:
     """Resolve the vault and run the reflect tool, both off the event loop.
 
@@ -189,11 +200,13 @@ def _reflect(
         parsed: The validated request body.
         context: The request's context, supplying the *admitted* ceiling and
             the authenticated consumer.
-        build_factory: A zero-argument thunk returning the tier-keyed LLM
-            factory. Invoked here rather than at request entry so a provider
-            that cannot be built costs nothing on the event loop, and so the
-            failure lands in the same structured vocabulary as every other
-            provider failure.
+        build_factory: An injected zero-argument thunk returning the tier-keyed
+            LLM factory, or ``None`` to use the production builder bound to the
+            resolved vault. Invoked here rather than at request entry so a
+            provider that cannot be built costs nothing on the event loop, so
+            the failure lands in the same structured vocabulary as every other
+            provider failure, and — since #1409 — so the production default can
+            see the vault it must route for.
 
     Returns:
         The tool's return dict, a synthetic refusal when the factory itself
@@ -205,7 +218,7 @@ def _reflect(
     if vault is None:
         return None
     try:
-        factory = build_factory()
+        factory = (build_factory or partial(_default_llm_factory, vault))()
     except (RuntimeError, OSError, ValueError) as exc:
         return {
             "status": "refused",
@@ -413,8 +426,13 @@ async def handle_reflection(request: Request) -> Response:
     parsed = await _parsed_body(request)
     if parsed is None:
         return error_response(ErrorCode.INVALID_REQUEST, context)
-    build_factory = request.app.state.reflect_llm_factory or _default_llm_factory
-    result = await run_in_threadpool(_reflect, request, parsed, context, build_factory)
+    result = await run_in_threadpool(
+        _reflect,
+        request,
+        parsed,
+        context,
+        request.app.state.reflect_llm_factory,
+    )
     if result is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
     return _render(result, context, serve_related=_serves_related(request))
