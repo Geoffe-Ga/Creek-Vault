@@ -2838,12 +2838,12 @@ def test_redact_scan_probe_refuses_and_is_not_vacuous(
         half of #972, where ``report_markdown`` rendered absolute paths and
         leaked the operator's home directory alongside the filename.
 
-    ``load_config`` is stubbed for the admitted calls; the refused one returns
-    above it.
+    ``load_vault_config`` is stubbed for the admitted calls; the refused one
+    returns above it.
     """
     monkeypatch.setattr(
-        "creek_mcp.tools.redact.load_config",
-        lambda: CreekConfig(),
+        "creek_mcp.tools.redact.load_vault_config",
+        lambda _vault_path, **_kwargs: CreekConfig(),
     )
     vault_root = str(canary_vault.resolve())
 

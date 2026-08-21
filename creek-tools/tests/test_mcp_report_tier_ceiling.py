@@ -34,12 +34,15 @@ import inspect
 import json
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Final
 
 import frontmatter
 import pytest
 from typer.testing import CliRunner
 
+import creek
+import creek_mcp
 from creek.cli import app
 from creek.models import PrivacyTier
 from creek_mcp.tier_ceiling import TierCeiling
@@ -47,7 +50,6 @@ from creek_mcp.tools.report import report_tool
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
-    from pathlib import Path
     from types import ModuleType
 
     from creek.classify.privacy_filter import PrivacyTierOverride
@@ -1531,12 +1533,6 @@ _OVERRIDE_CALL_NAMES = frozenset(
 )
 """Callables whose new privacy parameter must never be left at its default."""
 
-_OVERRIDE_CALLER_MODULES = [
-    "creek_mcp.tools.report",
-    "creek.cli",
-]
-"""The two production surfaces that fan out to the six report generators."""
-
 
 def _call_name(node: ast.Call) -> str | None:
     """Resolve a call's callee to a bare symbol name.
@@ -1619,6 +1615,105 @@ def _guarded_calls(
     return found
 
 
+def _modules_calling(names: frozenset[str]) -> set[str]:
+    """Return every module under ``creek/`` or ``creek_mcp/`` that calls *names*.
+
+    This replaces the two hand-maintained module allowlists that used to sit
+    here. Those lists asserted only one direction — that every guarded *name*
+    was called by some listed module — and nothing asserted the converse, that
+    every module calling a guarded name was on the list. A new surface could
+    therefore construct a privacy-filtered generator with the keyword omitted
+    and the guard would stay green, because the module simply was not being
+    looked at. Discovery closes that: the parametrize list *is* the set of real
+    callers, so it cannot drift from the tree.
+
+    The walk parses file *text* rather than importing every module. Importing
+    the whole of ``creek/`` would pull in optional heavy extras (pyarrow,
+    sentence-transformers, the MCP SDK), can fail on any import-time side
+    effect, and would make a structural guard the slowest test in the suite.
+
+    Args:
+        names: The guarded callee names to search for.
+
+    Returns:
+        Dotted module names, one per module containing at least one such call.
+    """
+    found: set[str] = set()
+    for package in (creek, creek_mcp):
+        pkg_root = Path(str(package.__file__)).parent
+        root = pkg_root.parent
+        for source in sorted(pkg_root.rglob("*.py")):
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            if not any(
+                isinstance(node, ast.Call) and _call_name(node) in names
+                for node in ast.walk(tree)
+            ):
+                continue
+            parts = list(source.relative_to(root).with_suffix("").parts)
+            if parts[-1] == "__init__":
+                parts.pop()
+            found.add(".".join(parts))
+    return found
+
+
+_OVERRIDE_CALLER_MODULES: Final = sorted(_modules_calling(_OVERRIDE_CALL_NAMES))
+"""Every production module that fans out to a privacy-filtered generator.
+
+Discovered, not listed. The literal this replaces named ``creek_mcp.tools.report``
+and ``creek.cli`` and had already fallen behind the tree:
+``creek.lint.checks.tags`` constructs a ``TagGardenGenerator`` and was invisible
+to the guard.
+"""
+
+
+_DISCOVERY_ONLY_CALLER: Final = "creek.lint.checks.tags"
+"""A guarded caller the two retired hardcoded lists never named.
+
+The witness for #1413's "the sweep catches a caller absent from the old lists".
+``creek.lint.checks.tags`` constructs a ``TagGardenGenerator`` and sits under
+neither ``creek_mcp.tools.report`` nor ``creek.cli``, so it is invisible to a
+literal list and visible only to a real walk of the tree.
+"""
+
+
+def test_override_caller_discovery_is_non_empty() -> None:
+    """The discovered caller list must not be empty, or every case below vanishes.
+
+    A computed parametrize list that comes back empty does not fail — it
+    *silently runs nothing* and reports green. That is precisely the failure
+    mode replacing a literal with discovery introduces, so it gets its own
+    assertion rather than a comment.
+    """
+    assert len(_OVERRIDE_CALLER_MODULES) >= 2, (
+        f"Discovered only {_OVERRIDE_CALLER_MODULES} as callers of "
+        f"{sorted(_OVERRIDE_CALL_NAMES)}. The report fan-out spans at least two "
+        "surfaces, so this is a broken walk, not a clean tree — and an empty "
+        "list would skip every parametrized case below without failing."
+    )
+
+
+def test_override_caller_discovery_reaches_beyond_the_retired_literal() -> None:
+    """The sweep must find a caller neither hardcoded list ever named (#1413).
+
+    ``test_override_caller_discovery_is_non_empty`` above is guarded only by
+    ``>= 2``, which the two retired literals ``creek_mcp.tools.report`` and
+    ``creek.cli`` satisfy on their own. So a walk that silently narrowed back
+    to exactly those two would keep it green while the discovery it replaced
+    them with had stopped happening.
+
+    Naming :data:`_DISCOVERY_ONLY_CALLER` closes that: it is a real guarded
+    caller in a package neither literal covered, so it is reachable only by
+    actually walking the tree.
+    """
+    assert _DISCOVERY_ONLY_CALLER in _OVERRIDE_CALLER_MODULES, (
+        f"The sweep discovered {_OVERRIDE_CALLER_MODULES}, which omits "
+        f"{_DISCOVERY_ONLY_CALLER} — a module that calls "
+        f"{sorted(_OVERRIDE_CALL_NAMES)} and that the retired hardcoded lists "
+        "never named. Either the walk narrowed back to the old two surfaces, "
+        "or that caller moved and this witness needs re-pointing at a live one."
+    )
+
+
 @pytest.mark.parametrize("dotted", _OVERRIDE_CALLER_MODULES)
 def test_production_report_callers_always_state_an_override(dotted: str) -> None:
     """Neither production surface may fall back to the unfiltered default.
@@ -1694,6 +1789,14 @@ _AUDIENCE_WEIGHTING_CALL_NAMES = frozenset(
         # persisted verbatim, so a weighting dropped here is a privacy-visible
         # change, not merely a ranking one.
         "generate_register_samples",
+        # #1410. ``build_fingerprint``'s ``audience_weighting`` defaults to
+        # ``None``, which means *off* for this function — the flat texting
+        # average the #632/#633 epic exists to replace. The function's own
+        # docstring records that no guard covered it, and that one production
+        # caller still relied on the default: ``creek.cli``'s
+        # ``_resolve_voice_fingerprint``, the fallback ``creek voice-check``
+        # takes when a vault has no persisted voice-fingerprint.json.
+        "build_fingerprint",
     },
 )
 """Callables whose ``audience_weighting`` must never be left at its default.
@@ -1712,16 +1815,61 @@ instead is the behavioural invariance tripwire
 exclusion — goes red the day the lexicon starts consuming a weighted metric.
 """
 
-_AUDIENCE_WEIGHTING_CALLER_MODULES = [
-    "creek_mcp.tools.report",
-    "creek.cli",
-    # Required, not decorative. ``VoiceExemplarCollector`` is constructed only
-    # here, so without this entry a deleted ``audience_weighting=`` forward
-    # inside ``generate_register_samples`` leaves the guard green while the
-    # config stops reaching the ranking.
-    "creek.generate.voice",
-]
-"""Every module that constructs an audience-weighted voice generator."""
+_AUDIENCE_WEIGHTING_EXEMPT_MODULES: Final[dict[str, str]] = {
+    "creek.generate.lexicon": (
+        "generate_lexicon constructs a VoiceExemplarCollector but is provably "
+        "invariant to the weighting: collect_all_exemplars does no ranking, "
+        "extract_patterns is called with no weights=, and build_lexicon reads "
+        "patterns only for metaphor families. Passing audience_weighting=None "
+        "here would *game* this guard while changing nothing — None selects "
+        "the enabled default for that class. What guards the path instead is "
+        "the behavioural tripwire "
+        "test_lexicon_output_is_invariant_to_the_audience_weighting in "
+        "tests/test_voice_audience_weighting_wiring.py, which goes red the day "
+        "the lexicon starts consuming a weighted metric."
+    ),
+}
+"""Modules that call a guarded name but must not be required to state it.
+
+A *named, reasoned* exemption rather than a wider allowlist. The distinction
+matters: an allowlist entry is invisible once written, whereas an exemption
+carries the argument for itself and is checked below for still being live.
+"""
+
+_AUDIENCE_WEIGHTING_CALLER_MODULES: Final = sorted(
+    _modules_calling(_AUDIENCE_WEIGHTING_CALL_NAMES)
+    - set(_AUDIENCE_WEIGHTING_EXEMPT_MODULES),
+)
+"""Every module constructing an audience-weighted voice generator, discovered."""
+
+
+def test_audience_weighting_caller_discovery_is_non_empty() -> None:
+    """The discovered caller list must not be empty, or every case below vanishes.
+
+    Same reasoning as :func:`test_override_caller_discovery_is_non_empty`: an
+    empty computed parametrize list reports green having asserted nothing.
+    """
+    assert len(_AUDIENCE_WEIGHTING_CALLER_MODULES) >= 2, (
+        f"Discovered only {_AUDIENCE_WEIGHTING_CALLER_MODULES} as callers of "
+        f"{sorted(_AUDIENCE_WEIGHTING_CALL_NAMES)}. That is a broken walk, not "
+        "a clean tree."
+    )
+
+
+def test_every_audience_weighting_exemption_is_still_live() -> None:
+    """A module may only be exempt while it still calls a guarded name.
+
+    Without this, an exemption outlives the code that earned it and silently
+    excuses whatever that module does next. The exemption must fail loudly when
+    it goes stale rather than quietly widening the guard.
+    """
+    discovered = _modules_calling(_AUDIENCE_WEIGHTING_CALL_NAMES)
+    stale = sorted(set(_AUDIENCE_WEIGHTING_EXEMPT_MODULES) - discovered)
+    assert not stale, (
+        f"_AUDIENCE_WEIGHTING_EXEMPT_MODULES excuses {stale}, which no longer "
+        f"calls any of {sorted(_AUDIENCE_WEIGHTING_CALL_NAMES)}. Delete the "
+        "entry: a stale exemption excuses code that never earned it."
+    )
 
 
 @pytest.mark.parametrize("dotted", _AUDIENCE_WEIGHTING_CALLER_MODULES)

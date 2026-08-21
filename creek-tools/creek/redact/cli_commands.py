@@ -27,7 +27,7 @@ from rich.table import Table
 from rich.text import Text
 
 from creek._containment import find_escaping_symlink, named_path_escapes
-from creek.config import VAULT_CONFIG_RELPATH, load_config, resolve_config_path
+from creek.config import VAULT_CONFIG_RELPATH, load_vault_config
 from creek.purge.audit import LEGACY_PURGE_LOG_RELPATH
 from creek.redact.audit import (
     REDACT_AUDIT_RELPATH,
@@ -516,7 +516,7 @@ def run_scan(
     # skip-and-count contract (#1087).
     if vault is not None:
         _assert_named_path_contained(vault, console=console, label="vault")
-    config = load_config(resolve_config_path(vault, None))
+    config = load_vault_config(vault, warn_on_missing=True)
     scanner, summary = _scan_source(
         source,
         config,
@@ -1248,7 +1248,7 @@ def run_apply(
         _assert_named_path_contained(vault, console=console, label="vault")
     if source.is_dir():
         _assert_no_escaping_symlinks(source, console=console, label="source")
-    config = load_config(resolve_config_path(vault, None))
+    config = load_vault_config(vault, warn_on_missing=True)
     vault_path = vault if vault is not None else config.vault_path
     scanner, summary = _scan_source(
         source,
@@ -1316,7 +1316,7 @@ def run_review(
     _assert_named_path_contained(vault, console=console, label="vault")
     if vault.is_dir():
         _assert_no_escaping_symlinks(vault, console=console, label="vault")
-    config = load_config(resolve_config_path(vault, None))
+    config = load_vault_config(vault, warn_on_missing=True)
     scanner, summary = _scan_source(
         vault,
         config,
