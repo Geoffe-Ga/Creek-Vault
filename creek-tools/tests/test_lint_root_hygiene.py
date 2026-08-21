@@ -33,7 +33,7 @@ operator's own note filed there on purpose.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -41,8 +41,8 @@ from creek.classify.review import ReviewQueueGenerator
 from creek.clean.hygiene import StaleReviewScanner
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
-    from types import ModuleType
 
     from creek.lint._result import CheckResult
 
@@ -74,20 +74,23 @@ REVIEW_QUEUE_RELPARTS: tuple[str, ...] = ("00-Creek-Meta", "Processing-Log")
 """Where review queues belong after #883."""
 
 
-def _root_hygiene() -> ModuleType:
-    """Import the root-hygiene check module (added by the fix for #883).
+def _root_hygiene() -> Callable[[Path], CheckResult]:
+    """Return the root-hygiene check entry point (added by the fix for #883).
 
     Imported per-test so a missing module fails each behaviour separately
-    rather than collapsing the file into one collection error.
+    rather than collapsing the file into one collection error. The return
+    type is the callable itself rather than the module: a ``ModuleType``
+    attribute is ``Any``, which would silently erase every ``CheckResult``
+    assertion in this file from type checking.
     """
-    from creek.lint.checks import root_hygiene
+    from creek.lint.checks.root_hygiene import run
 
-    return root_hygiene
+    return run
 
 
 def _run(vault: Path) -> CheckResult:
     """Run the root-hygiene check against *vault*."""
-    return _root_hygiene().run(vault)
+    return _root_hygiene()(vault)
 
 
 def _findings_for(result: CheckResult, rule: str) -> list[str]:
@@ -335,9 +338,9 @@ class TestZeroByteDetection:
         opened: list[str] = []
         real_read = type(big).read_text
 
-        def _spy(self: Path, *args: object, **kwargs: object) -> str:
+        def _spy(self: Path, *args: Any, **kwargs: Any) -> str:
             opened.append(str(self))
-            return real_read(self, *args, **kwargs)  # type: ignore[arg-type]
+            return real_read(self, *args, **kwargs)
 
         monkeypatch.setattr(type(big), "read_text", _spy)
 

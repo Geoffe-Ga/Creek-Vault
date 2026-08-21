@@ -62,8 +62,8 @@ from creek.vault.reader import iter_vault_fragments
 from tests.helpers import write_fragment_file
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
-    from types import ModuleType
 
     from creek.lint._result import CheckResult
 
@@ -86,21 +86,24 @@ ALL_RULES: tuple[str, ...] = (
 )
 
 
-def _ancestry() -> ModuleType:
-    """Import the ancestry check module (added by the fix for #1277).
+def _ancestry() -> Callable[[Path], CheckResult]:
+    """Return the ancestry check entry point (added by the fix for #1277).
 
     Imported inside the tests rather than at module scope so a missing module
     fails each test individually, instead of collapsing the file into one
-    collection error that hides how many behaviours are unimplemented.
+    collection error that hides how many behaviours are unimplemented. The
+    return type names the callable rather than the module: a ``ModuleType``
+    attribute types as ``Any``, which would erase every ``CheckResult``
+    assertion in this file from type checking.
     """
-    from creek.lint.checks import ancestry
+    from creek.lint.checks.ancestry import run
 
-    return ancestry
+    return run
 
 
 def _run(vault: Path) -> CheckResult:
     """Run the ancestry check against *vault*."""
-    return _ancestry().run(vault)
+    return _ancestry()(vault)
 
 
 def _write(

@@ -62,8 +62,8 @@ from creek.models import (
 from tests.helpers import write_fragment_file
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
-    from types import ModuleType
 
     from creek.lint._result import CheckResult
 
@@ -88,24 +88,27 @@ vacuously true.
 """
 
 
-def _check_module(name: str) -> ModuleType:
-    """Import one of the new check modules by registry name.
+def _check_entry_point(name: str) -> Callable[[Path], CheckResult]:
+    """Return one of the new checks' entry points, by registry name.
 
     Imported per-test so a missing module fails each behaviour individually
-    instead of collapsing this file into a single collection error.
+    instead of collapsing this file into a single collection error. The
+    return type names the callable rather than the module: a ``ModuleType``
+    attribute types as ``Any``, which would erase from type checking exactly
+    the ``CheckResult`` assertions that pin the no-body-text guarantee.
     """
     if name == "ancestry":
-        from creek.lint.checks import ancestry
+        from creek.lint.checks.ancestry import run as ancestry_run
 
-        return ancestry
-    from creek.lint.checks import root_hygiene
+        return ancestry_run
+    from creek.lint.checks.root_hygiene import run as root_hygiene_run
 
-    return root_hygiene
+    return root_hygiene_run
 
 
 def _run(name: str, vault: Path) -> CheckResult:
     """Run the named new check against *vault*."""
-    return _check_module(name).run(vault)
+    return _check_entry_point(name)(vault)
 
 
 def _write_fragment(

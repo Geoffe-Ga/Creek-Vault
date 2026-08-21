@@ -48,9 +48,9 @@ def _seed(
         strategy=MiningStrategy.LIMINAL_CROSS_EDDY,
         title="Naming what orbits",
         source_fragments=("frag-001",),
-        threads=list(threads),
-        eddies=list(eddies),
-        frequency_affinity=[Frequency.F1],
+        threads=threads,
+        eddies=eddies,
+        frequency_affinity=(Frequency.F1,),
         brief_description="An essay waits here.",
         score=0.8,
     )
