@@ -44,6 +44,8 @@ from typing import TYPE_CHECKING
 import frontmatter
 
 from creek.ingest.ledger import SourceLedger
+from creek.ingest.pin_ids import pin_source_ids
+from creek.ingest.pipeline import partially_pinned_warning
 from creek.models import Fragment, FragmentSource, SourcePlatform
 from creek.vault.writer import VaultWriter
 from creek_mcp.tier_ceiling import TierCeiling
@@ -54,6 +56,8 @@ if TYPE_CHECKING:
 
 _SECRET_TITLE = "SECRET-TITLE-DONOTLEAK"
 _SECRET_BODY = "SECRET-BODY-EXCERPT-DONOTLEAK"
+_SECRET_SOURCE_NAME = "SECRET-SOURCE-DONOTLEAK.md"
+_SECRET_SOURCE_KEY = f"00-Inbox/{_SECRET_SOURCE_NAME}"
 _VANISHED_KEY = "00-Inbox/vanished.md"
 _VANISHED_ID = "frag-vanished001"
 
@@ -228,10 +232,20 @@ def test_the_response_carries_advisories_with_no_vault_content(
 ) -> None:
     """Advisories reach the caller through the ceiling-safe channel only.
 
-    The vault is seeded un-pinned — markdown fragments on disk, empty ledger —
-    which is the #1329 advisory's trigger. The seeded fragment's title and body
-    are distinctive strings, so a leak of either is detectable rather than
-    argued about.
+    **The vault must produce an advisory whose two renderings differ**, or this
+    test cannot see which channel the response used. The un-pinned-vault
+    advisory alone is not enough: its text is a fixed constant with no
+    interpolation, so its operator and ceiling-safe forms are byte-identical
+    and swapping ``result.ceiling_safe_warnings`` for ``result.warnings``
+    survives. That survivor is what this seeding exists to kill.
+
+    So the vault is seeded *both* un-pinned and **partially pinned** (#1367):
+    two live fragments claim one source, ``pin_source_ids`` refuses to pin it
+    and records the refusal, and the resulting advisory interpolates that
+    source path — a real piece of the operator's vault layout, and one this
+    test names distinctively so a leak is detectable rather than argued about.
+    The positive control below asserts the operator rendering really does
+    carry it, so the absence asserted in the payload means something.
 
     RED at HEAD: the response has no ``warnings`` key at all, because the
     inline loop never calls ``run_ingest`` and therefore never computes an
@@ -239,16 +253,23 @@ def test_the_response_carries_advisories_with_no_vault_content(
     why ``open`` cannot carry this test.
     """
     vault = _make_vault(tmp_path)
-    VaultWriter(vault_path=vault).write_fragment(
-        Fragment(
-            id="frag-preexist001",
-            title=_SECRET_TITLE,
-            source=FragmentSource(
-                platform=SourcePlatform.JOURNAL,
-                original_file="00-Inbox/preexisting.md",
+    writer = VaultWriter(vault_path=vault)
+    _write_entry(vault, _SECRET_SOURCE_NAME, _ORIGINAL)
+    for index, title in enumerate((_SECRET_TITLE, f"{_SECRET_TITLE}-2")):
+        writer.write_fragment(
+            Fragment(
+                id=f"frag-preexist00{index}",
+                title=title,
+                source=FragmentSource(
+                    platform=SourcePlatform.JOURNAL,
+                    original_file=_SECRET_SOURCE_KEY,
+                ),
             ),
-        ),
-        body=f"{_SECRET_BODY} and more prose.\n",
+            body=f"{_SECRET_BODY} and more prose.\n",
+        )
+    refused = pin_source_ids(vault)
+    assert len(refused.conflicts) == 1, (
+        f"setup failed: the contested source was not refused: {refused}"
     )
     _write_entry(vault, "2024-01-05.md", _ORIGINAL)
 
@@ -258,10 +279,20 @@ def test_the_response_carries_advisories_with_no_vault_content(
     warnings = response["warnings"]
     assert isinstance(warnings, list)
     assert warnings, (
-        "an un-pinned vault produced no advisory on the MCP surface; the tool "
-        "is mute rather than merely lossy."
+        "an un-pinned, partially-pinned vault produced no advisory on the MCP "
+        "surface; the tool is mute rather than merely lossy."
+    )
+    control = partially_pinned_warning("markdown", vault)
+    assert control is not None, "positive control failed: no advisory to compare"
+    assert _SECRET_SOURCE_KEY in control.message, (
+        "positive control failed: the operator rendering does not name the "
+        "contested source, so its absence from the payload proves nothing."
     )
     payload = json.dumps(response)
+    assert _SECRET_SOURCE_KEY not in payload, (
+        "a vault source path reached the payload, so the response carried the "
+        "operator rendering rather than the ceiling-safe one."
+    )
     assert _SECRET_TITLE not in payload, "a vault fragment title reached the payload."
     assert _SECRET_BODY not in payload, "a vault body excerpt reached the payload."
     for warning in warnings:

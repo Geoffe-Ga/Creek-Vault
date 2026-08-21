@@ -33,10 +33,12 @@ import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+import frontmatter
+
 from creek.ingest import INGESTOR_REGISTRY
 from creek.ingest.ledger import SourceLedger, ledger_dir
 from creek.ingest.pin_ids import pin_source_ids
-from creek.ingest.pipeline import IngestRunResult, run_ingest
+from creek.ingest.pipeline import IngestRunResult, derive_source_key, run_ingest
 from creek.models import Fragment, FragmentSource, SourcePlatform
 from creek.vault.writer import VaultWriter
 
@@ -207,13 +209,54 @@ def test_the_travelling_rendering_names_no_vault_path_or_fragment_id(
     )
 
 
+def _claimants_by_source_key(vault: Path) -> dict[str, list[Path]]:
+    """Group every live fragment by the ``source_key`` its source resolves to.
+
+    The same grouping ``pin_source_ids`` does, computed independently here so
+    the resolution step below can be checked against it rather than assumed.
+    """
+    groups: dict[str, list[Path]] = {}
+    for path in sorted((vault / "01-Fragments").rglob("*.md")):
+        source = frontmatter.load(path).get("source")
+        recorded = source.get("original_file") if isinstance(source, dict) else None
+        key = derive_source_key(str(recorded or ""), vault)
+        groups.setdefault(key, []).append(path)
+    return groups
+
+
+def _resolve_every_duplicate(vault: Path) -> None:
+    """Reduce every contested ``source_key`` to a single claimant.
+
+    This is what the advisory actually instructs — ``creek clean duplicates``,
+    resolve them, re-run — and doing less than it is why the first version of
+    the test below could not pass. Unlinking only the seeded duplicate left
+    ``00-Inbox/dup.md`` still claimed by two fragments, because the
+    positive-control ingest **had itself added a third**: a source the
+    migration refused to pin is a source the next ingest re-mints, which is
+    the entire finding this advisory exists to report. Measured before this
+    helper was written::
+
+        seeded       {'…/clean.md': [frag-clean00001],
+                      '…/dup.md':   [frag-dupfirst01, frag-dupsecond1]}
+        after ingest {'…/clean.md': [frag-clean00001, frag-clean00001],
+                      '…/dup.md':   [frag-dupfirst01, frag-dupsecond1,
+                                     frag-9bae27a1e415]}
+
+    Nothing about the assertions was relaxed to accommodate that; the
+    resolution step was made to actually resolve.
+    """
+    for claimants in _claimants_by_source_key(vault).values():
+        for extra in claimants[1:]:
+            extra.unlink()
+
+
 def test_resolving_the_duplicate_and_re_pinning_restores_silence(
     tmp_path: Path,
 ) -> None:
     """The advisory clears itself, and clears the state that produced it.
 
     The positive control comes first: the advisory must be firing *before* the
-    duplicate is resolved, or the silence afterwards proves nothing. That
+    duplicates are resolved, or the silence afterwards proves nothing. That
     control is what makes this test red at HEAD.
     """
     vault = _seed_partially_pinnable_vault(tmp_path)
@@ -223,13 +266,12 @@ def test_resolving_the_duplicate_and_re_pinning_restores_silence(
         "positive control failed: the advisory was already silent, so the "
         "silence asserted below would be meaningless."
     )
+    assert len(_claimants_by_source_key(vault)[_CONFLICTED_KEY]) > 1
 
-    duplicate = next(
-        path
-        for path in (vault / "01-Fragments").rglob("*.md")
-        if "frag-dupsecond1" in path.read_text(encoding="utf-8")
-    )
-    duplicate.unlink()
+    _resolve_every_duplicate(vault)
+    assert all(
+        len(claimants) == 1 for claimants in _claimants_by_source_key(vault).values()
+    ), "the resolution step left a contested key, so the re-pin below cannot clear"
     repin = pin_source_ids(vault)
     assert repin.conflicts == []
 

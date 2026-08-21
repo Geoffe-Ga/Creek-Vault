@@ -677,68 +677,39 @@ def test_ingest_writes_fragments_and_audit(
     vault: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Success path: written count + ``affected_fragment_ids`` recorded."""
-    from creek.ingest.base import IngestedFragment
+    """Success path: written count + ``affected_fragment_ids`` recorded.
 
-    class _StubResult:
-        def __init__(self) -> None:
-            self.fragments: list[object] = ["stub-parsed"]
-            self.errors: list[str] = []
+    Driven against the **real** markdown ingestor and the real vault writer.
+    It used to stub the ingestor, ``assemble_ingested_fragment`` and
+    ``VaultWriter`` at module attributes of the tool, which stopped existing
+    when #1467 moved the write loop into
+    :func:`creek.ingest.pipeline.run_ingest`. Re-pointing the stubs at the new
+    seam would have re-created a test that passes whatever the pipeline does;
+    a real source file is both simpler and stronger, and the id can still be
+    asserted exactly because it is read back off the fragment on disk.
+    """
+    source = vault / "input.md"
+    source.write_text("# stub\n\nA body.\n", encoding="utf-8")
 
-    class _StubIngestor:
-        def ingest(self, _input: object) -> object:
-            return _StubResult()
-
-    stub_fragment = IngestedFragment.__new__(IngestedFragment)
-    fragment_holder: dict[str, object] = {}
-
-    def _stub_assemble(_parsed: object) -> object:
-        return type(
-            "_A",
-            (),
-            {
-                "fragment": type("_F", (), {"id": "frag-stub-1"})(),
-                "body": "stub body",
-            },
-        )()
-
-    class _StubWriter:
-        def __init__(self, *, vault_path: object) -> None:
-            fragment_holder["vault"] = vault_path
-
-        def write_fragment(self, fragment: object, *, body: str) -> None:
-            fragment_holder["fragment"] = fragment
-            fragment_holder["body"] = body
-
-    monkeypatch.setattr(
-        "creek_mcp.tools.ingest.INGESTOR_REGISTRY",
-        {"markdown": _StubIngestor},
-    )
-    monkeypatch.setattr(
-        "creek_mcp.tools.ingest.assemble_ingested_fragment",
-        _stub_assemble,
-    )
-    monkeypatch.setattr("creek_mcp.tools.ingest.VaultWriter", _StubWriter)
-
-    fake_input = vault / "input.md"
-    fake_input.write_text("# stub\n", encoding="utf-8")
     result = ingest_tool(
         vault_path=vault,
         source_type="markdown",
-        input_path=str(fake_input),
+        input_path=str(source),
         privacy_tier_ceiling=TierCeiling.PERSONAL,
         consumer="crawdad",
     )
+
     assert result["status"] == "ok"
     assert result["written"] == 1
-    assert result["affected_fragment_ids"] == ["frag-stub-1"]
+    written = sorted((vault / "01-Fragments").rglob("*.md"))
+    assert len(written) == 1
+    on_disk = str(frontmatter.load(written[0])["id"])
+    assert result["affected_fragment_ids"] == [on_disk]
     entries = _read_audit(vault)
     last = entries[-1]
     assert last["tool"] == "creek.ingest"
     assert last["created_tier"] == "personal"
-    assert last["affected_fragment_ids"] == ["frag-stub-1"]
-    # Ensure the unused IngestedFragment alias does not cause import warnings.
-    assert stub_fragment is not None
+    assert last["affected_fragment_ids"] == [on_disk]
 
 
 # ---------------------------------------------------------------------------
@@ -832,53 +803,27 @@ def test_ingest_relative_input_path_resolves_against_vault(
     vault: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A relative ``input_path`` is resolved against the vault root, not cwd."""
+    """A relative ``input_path`` is resolved against the vault root, not cwd.
 
-    class _StubResult:
-        def __init__(self) -> None:
-            self.fragments: list[object] = ["stub-parsed"]
-            self.errors: list[str] = []
+    Run from a foreign working directory, so a resolution against the cwd
+    could not find the file at all. Real ingestor, real writer — see
+    :func:`test_ingest_writes_fragments_and_audit` for why the stubs went.
+    """
+    (vault / "input.md").write_text("# stub\n\nA body.\n", encoding="utf-8")
+    elsewhere = vault.parent / "elsewhere"
+    elsewhere.mkdir(exist_ok=True)
+    monkeypatch.chdir(elsewhere)
 
-    class _StubIngestor:
-        def ingest(self, _input: object) -> object:
-            return _StubResult()
-
-    def _stub_assemble(_parsed: object) -> object:
-        return type(
-            "_A",
-            (),
-            {
-                "fragment": type("_F", (), {"id": "frag-stub-rel"})(),
-                "body": "stub body",
-            },
-        )()
-
-    class _StubWriter:
-        def __init__(self, *, vault_path: object) -> None:
-            self.vault_path = vault_path
-
-        def write_fragment(self, fragment: object, *, body: str) -> None:
-            del fragment, body
-
-    monkeypatch.setattr(
-        "creek_mcp.tools.ingest.INGESTOR_REGISTRY",
-        {"markdown": _StubIngestor},
-    )
-    monkeypatch.setattr(
-        "creek_mcp.tools.ingest.assemble_ingested_fragment",
-        _stub_assemble,
-    )
-    monkeypatch.setattr("creek_mcp.tools.ingest.VaultWriter", _StubWriter)
-
-    (vault / "input.md").write_text("# stub\n", encoding="utf-8")
     result = ingest_tool(
         vault_path=vault,
         source_type="markdown",
         input_path="input.md",
         privacy_tier_ceiling=TierCeiling.PERSONAL,
     )
+
     assert result["status"] == "ok"
     assert result["written"] == 1
+    assert len(sorted((vault / "01-Fragments").rglob("*.md"))) == 1
 
 
 def test_ingest_tier_ceiling_checked_before_confinement(vault: Path) -> None:

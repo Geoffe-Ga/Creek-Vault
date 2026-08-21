@@ -5,24 +5,30 @@ The ingestor's default tier is ``personal`` (matches the CLI), so
 ``affected_fragment_ids`` records what the run produced; the ingestor
 errors flow back in the response without entering the audit body.
 
-**Deliberately excluded from the #1372 advisory work, and not because it is
-already covered.** #1372 gave ``creek.journal``, ``creek.upload`` and
-``creek.link`` the operator advisories they were computing and dropping. This
-tool has none to drop: it never calls
-:func:`creek.ingest.pipeline.run_ingest`, which is where advisories are
-produced. It re-implements the write loop inline (below) and writes no ledger,
-so it is structurally *mute* rather than lossy — an un-pinned vault or a
-pre-#1305 collapsed fragment goes unreported here whatever a caller's ceiling
-admits. A blanket claim that "no MCP surface drops an advisory" is therefore
-**not** satisfied by leaving this tool as it is.
+**This tool runs the shared pipeline** —
+:func:`creek.ingest.pipeline.run_ingest` — exactly as ``creek ingest`` and
+``creek.journal`` do (#1467). It used to re-implement the write loop inline
+with a bare ``writer.write_fragment``, which cost it three things at once: a
+repeat ingest of an *edited* in-vault ``.md`` minted a new id and orphaned its
+predecessor; nothing it wrote carried ``source.origin_key``, so the RTBF purge
+sweep — which resolves its targets from exactly that field — could not see it;
+and it was structurally *mute*, computing no advisories to drop or deliver.
 
-Converting it is a write-semantics change, not an observability one, which is
-why it was not folded in: ``run_ingest`` with a ``ledger_source`` plus a
-*directory* ``input_path`` arms :func:`creek.ingest.pipeline.tomb_missing_units`
-for that ledger (see the ``ledger_source`` hazard note in ``run_ingest``'s
-docstring), which can soft-tomb every previously-ledgered unit the pass does
-not see. That is a vault-mutating decision this tool has never made and cannot
-acquire as a side effect of adding a response field. (#1467.)
+The stated reason for keeping it separate had gone stale. It read: ``run_ingest``
+with a ``ledger_source`` plus a *directory* ``input_path`` arms
+:func:`creek.ingest.pipeline.tomb_missing_units` for that ledger. #1329 had
+already moved that gate onto the ingestor's registry key rather than onto
+holding a ledger, and this tool needs no ``ledger_source`` at all. The
+collision hazard #953 fixes is likewise unreachable here:
+:func:`~creek_mcp.path_confinement.resolve_within_vault` refuses anything
+outside the vault, so every path this tool ingests takes the in-vault arm of
+``derive_source_key``.
+
+What *was* real is narrower: ``source_type="markdown"`` plus a directory input
+does arm the tomb sweep, and soft-deleting vault content is authority this
+surface has never held. That is closed by passing ``may_tomb=False`` — a
+restrictive conjunct that can only subtract authority — rather than by
+declining to run the pipeline and keeping the three defects above.
 """
 
 from __future__ import annotations
@@ -31,9 +37,9 @@ from pathlib import Path
 from typing import Any
 
 from creek._containment import EscapingSymlinkError
-from creek.ingest import INGESTOR_REGISTRY, assemble_ingested_fragment
+from creek.ingest import INGESTOR_REGISTRY
+from creek.ingest.pipeline import run_ingest
 from creek.models import PrivacyTier
-from creek.vault.writer import VaultWriter
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.path_confinement import resolve_within_vault
 from creek_mcp.tier_ceiling import (
@@ -116,30 +122,29 @@ def ingest_tool(
             reason=f"input path not found: {input_path}",
         )
 
-    writer = VaultWriter(vault_path=vault_path)
     try:
-        ingest_result = ingestor_cls().ingest(resolved)
+        result = run_ingest(
+            ingestor_cls=ingestor_cls,
+            source_type=source_type,
+            input_path=resolved,
+            vault_path=vault_path,
+            privacy_tier=DEFAULT_INGEST_TIER,
+            may_tomb=False,
+        )
     except EscapingSymlinkError as exc:
         # ``resolve_within_vault`` above confines the path the caller NAMED;
         # it says nothing about a link *underneath* a legitimately in-vault
-        # source. Refusals on this surface are structured responses, so the
-        # containment error must not surface as a transport crash (#1294).
-        # ``exc.path`` names the link as walked, never its resolved target.
+        # source. ``run_ingest`` drives the ingestor's own walk, so the
+        # containment refusal still raises through it. Refusals on this
+        # surface are structured responses, so it must not surface as a
+        # transport crash (#1294). ``exc.path`` names the link as walked,
+        # never its resolved target.
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
             reason=(f"source tree contains a symlink that escapes it: {exc.path}"),
         )
-    written_ids: list[str] = []
-    errors: list[str] = list(ingest_result.errors)
-    for parsed in ingest_result.fragments:
-        try:
-            assembled = assemble_ingested_fragment(parsed)
-            writer.write_fragment(assembled.fragment, body=assembled.body)
-        except (KeyError, ValueError, OSError) as exc:
-            errors.append(f"[{source_type}] {exc}")
-            continue
-        written_ids.append(assembled.fragment.id)
+    written_ids = result.fragment_ids
 
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
@@ -155,7 +160,12 @@ def ingest_tool(
         "tool": TOOL_NAME,
         "tier_ceiling": privacy_tier_ceiling.value,
         "written": len(written_ids),
-        "errors": errors,
+        "errors": result.errors,
         "affected_fragment_ids": written_ids,
         "created_tier": DEFAULT_INGEST_TIER.value,
+        # ``ceiling_safe_warnings``, never ``warnings``: the operator
+        # rendering may name real vault fragments, and this caller's ceiling
+        # has not admitted them (#1372). The choice is the producer's, made in
+        # ``run_ingest``; this surface only picks the channel.
+        "warnings": result.ceiling_safe_warnings,
     }

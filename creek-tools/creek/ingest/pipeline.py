@@ -257,8 +257,10 @@ an enforcement, and the review that produced this constant found the
 advisory already consulting a different ledger than the migration wrote.
 """
 
-LEDGERED_SOURCES: frozenset[str] = frozenset({LEDGERED_SOURCE_TYPE})
-"""Source types whose fragment identity is ledger-backed by default.
+LEDGERED_SOURCES: frozenset[str] = frozenset(
+    {LEDGERED_SOURCE_TYPE, "generic", "document"},
+)
+"""Source types whose fragment identity is ledger-backed by default (#1363).
 
 Holding a ledger buys a source type three things and **no others**: an
 idempotent re-ingest (an edited unit updates in place under its existing id
@@ -271,6 +273,27 @@ separate set consulted by a separate gate, and the two are deliberately kept
 as two names rather than one: a set that meant both would make "let this
 source type keep its ids" and "let this source type delete vault content"
 the same decision, which is the coupling #1329 was filed to remove.
+
+``generic`` and ``document`` joined in #1363. Both derive an id from the
+source's mtime, so before this a ``touch`` alone minted a duplicate, an edit
+orphaned its predecessor, and neither ever received an ``origin_key`` — which
+means content ingested through them was unreachable by an erasure request.
+The registry spells them singular: ``document``, not ``documents``.
+
+Deliberately **not** widened: ``image``, ``code``, ``spreadsheet``,
+``presentation`` and the four append-only export ingestors. Each needs its own
+idempotency proof, ``spreadsheet`` interacts with the #1305 sub-unit path, and
+the export ingestors emit no ``source_unit`` at all — under a ledger every
+turn of one conversation file would share a key and overwrite its
+predecessor. Widening them is a follow-up, not a line in this set.
+
+**Why widening cannot import the collision defect.** Turning the ledger on for
+a source type whose key is a bare filename is strictly worse than leaving it
+off: two same-named documents would then resolve to one record and one would
+overwrite the other. Measured, before the fix. That is why #953's key change
+lands first in this branch and why
+``tests/test_ingest_out_of_vault_identity.py`` asserts both halves in a single
+test — they are only safe together.
 """
 
 TOMBING_SOURCES: frozenset[str] = frozenset({LEDGERED_SOURCE_TYPE})
@@ -1003,6 +1026,97 @@ def unpinned_vault_warning(
     return _UNPINNED_VAULT_WARNING
 
 
+_PARTIAL_PIN_TEMPLATE = (
+    "This vault has {count} markdown source(s) that `creek ingest "
+    "--pin-source-ids` refused to pin, because more than one live fragment "
+    "claims each one. Their fragment ids are still unpinned, so re-ingesting "
+    "those sources mints new ids and leaves the existing fragments behind as "
+    "duplicates: {sample}. Run `creek clean duplicates`, resolve them, then "
+    "re-run `creek ingest --pin-source-ids`."
+)
+"""Advisory for a vault the pin migration could only partly complete (#1367).
+
+The console rendering. ``{sample}`` interpolates real vault-relative source
+paths, which is why it must not leave this process for a caller whose ceiling
+has not admitted them — see :data:`_PARTIAL_PIN_SAFE_TEMPLATE`.
+"""
+
+_PARTIAL_PIN_SAFE_TEMPLATE = (
+    "This vault has {count} markdown source(s) that `creek ingest "
+    "--pin-source-ids` refused to pin, because more than one live fragment "
+    "claims each one. Their fragment ids are still unpinned, so re-ingesting "
+    "those sources mints new ids and leaves the existing fragments behind as "
+    "duplicates. Run the same ingest at a terminal to see which sources. Run "
+    "`creek clean duplicates`, resolve them, then re-run `creek ingest "
+    "--pin-source-ids`."
+)
+"""The content-free twin of :data:`_PARTIAL_PIN_TEMPLATE` (#1372).
+
+Interpolates ``{count}`` and nothing else. The count stays because an advisory
+that withholds the number as well as the paths reports no problem at all; what
+is withheld is the ``{sample}`` clause, replaced by the instruction that
+recovers it through a surface where the operator is entitled to see every path
+in their own vault.
+"""
+
+_PARTIAL_PIN_SAMPLE = 3
+"""How many contested source keys the advisory names before it stops listing."""
+
+
+def partially_pinned_warning(
+    source_type: str,
+    vault_path: Path,
+) -> Advisory | None:
+    """Return the partially-pinned-vault advisory, or ``None`` (#1367).
+
+    :func:`unpinned_vault_warning` derives its whole signal from the markdown
+    ledger being *empty*, which makes it blind to the migration's most likely
+    real outcome: the clean sources get pinned, the duplicated ones are
+    refused, and the now-non-empty ledger silences the advisory forever —
+    about exactly the fragments still at risk of being re-minted.
+
+    So this asks a different question of different state. The refusals are
+    persisted by :func:`creek.ingest.pin_ids.pin_source_ids` and read back
+    here, which is what lets a finding computed in one process be reported by
+    the next one. Reading a recorded list is also what keeps this off the hot
+    path: no vault walk, no frontmatter parsing, and a cost that does not grow
+    with the size of the vault.
+
+    Self-clearing in both directions. The migration rewrites the state in full
+    and removes it when nothing is outstanding, so resolving the duplicates
+    and re-pinning restores silence — and an advisory that cannot go quiet is
+    one operators learn to ignore.
+
+    Gated on *source_type* for the same reason :func:`unpinned_vault_warning`
+    is: the migration and its refusals concern markdown identity only, and an
+    advisory delivered on a run it does not apply to is trained-away noise.
+
+    Args:
+        source_type: Registry key of the ingestor being run, verbatim.
+        vault_path: Vault root.
+
+    Returns:
+        The advisory in both disclosure forms, or ``None`` when this run
+        writes under another source type's identity or the vault has no
+        recorded refusals.
+    """
+    if source_type != LEDGERED_SOURCE_TYPE:
+        return None
+    from creek.ingest.ledger import load_unpinned_sources
+
+    contested = load_unpinned_sources(vault_path)
+    if not contested:
+        return None
+    sample = ", ".join(contested[:_PARTIAL_PIN_SAMPLE])
+    if len(contested) > _PARTIAL_PIN_SAMPLE:
+        sample = f"{sample}, …"
+    count = len(contested)
+    return Advisory(
+        message=_PARTIAL_PIN_TEMPLATE.format(count=count, sample=sample),
+        ceiling_safe=_PARTIAL_PIN_SAFE_TEMPLATE.format(count=count),
+    )
+
+
 _COLLAPSED_UNIT_WARNING_TEMPLATE = (
     "This vault holds {count} fragment(s) written before #1305, when every "
     "sheet of a multi-sheet workbook shared one fragment id and only the "
@@ -1243,6 +1357,9 @@ def pre_write_advisories(
     * **Un-pinned vault.** Once the loop has recorded its first ledger entry
       the vault no longer *looks* un-pinned, so an advisory raised afterwards
       would never fire for the very run it needed to warn about (#1329).
+    * **Partially pinned vault.** Same reason, one step later in the
+      migration: this run is about to mint new ids for sources the migration
+      refused to pin, so saying so afterwards would be a post-mortem (#1367).
     * **Collapsed pre-#1305 units.** The operator is told which fragments
       this run supersedes before the run that supersedes them finishes,
       rather than after (#1305).
@@ -1273,6 +1390,9 @@ def pre_write_advisories(
         # interpolation, so it names a command rather than a fragment, and
         # withholding it from an MCP caller would be caution with no subject.
         advisories.append(Advisory(message=unpinned, ceiling_safe=unpinned))
+    partial = partially_pinned_warning(source_type, vault_path)
+    if partial is not None:
+        advisories.append(partial)
     collapsed = collapsed_unit_warning(writer, ingest_result.fragments)
     if collapsed is not None:
         advisories.append(collapsed)
