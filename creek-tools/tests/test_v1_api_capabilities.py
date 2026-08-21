@@ -473,7 +473,7 @@ def test_the_stub_still_answers_501_for_an_unbuilt_capability(vault: Path) -> No
 
 
 def test_capabilities_fixture_documents_the_completed_steady_state() -> None:
-    """The committed fixture shows all five capabilities. That is deliberate.
+    """The committed fixture shows all six capabilities. That is deliberate.
 
     ``docs/contracts/adepthood-v1/examples/capabilities/success.json`` is the
     shape a consumer vendors and codes against once the epic is finished — the

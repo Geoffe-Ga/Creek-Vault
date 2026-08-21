@@ -23,10 +23,13 @@ Two distinct questions are answered here, both off the same ranking:
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from creek.classify.privacy_filter import PrivacyTierOverride
 from creek.models import PrivacyTier
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 class TierCeiling(StrEnum):
@@ -145,6 +148,45 @@ def tier_sensitivity(tier: PrivacyTier) -> int:
         provider.
     """
     return _TIER_RANK.get(tier, _TIER_RANK[PrivacyTier.INTIMATE])
+
+
+def frontmatter_tier(metadata: Mapping[str, object]) -> PrivacyTier:
+    """Return a vault page's classified ``privacy_tier``, failing closed.
+
+    Mirrors :func:`creek.classify.privacy_filter.tier_of`: a recognised value
+    (including ``unclassified``) is honoured; anything unrecognised — or a
+    missing key — is treated as the most-restrictive tier, so a hand-edited or
+    legacy page nobody has vouched for is never admitted below ``intimate``
+    and never routed to a cloud provider.
+
+    It reads the **raw front-matter mapping** rather than a parsed
+    :class:`~creek.models.Fragment`, and that is the whole point of it living
+    here rather than being replaced by the model's field. ``Fragment``'s
+    ``privacy_tier`` defaults to ``unclassified``, which ranks with
+    ``personal`` (#961) and is therefore *admitted* from ``ceiling=personal``;
+    a file with the key missing entirely is a different thing from one that
+    explicitly declares ``unclassified``, and this reader is what keeps the
+    two distinguishable at the MCP boundary. The asymmetry with the
+    model-default view taken by ``creek.author.agents._load_corpus`` is
+    deliberate and tracked by #1033.
+
+    Args:
+        metadata: A page's front-matter mapping, as returned by
+            :func:`creek.vault.links.read_header_meta` or the raw-metadata
+            element of :func:`creek.vault.reader.iter_vault_fragments`.
+
+    Returns:
+        The declared :class:`~creek.models.PrivacyTier`, or
+        :attr:`~creek.models.PrivacyTier.INTIMATE` when the declaration is
+        missing or unrecognised.
+    """
+    raw = metadata.get("privacy_tier")
+    if raw is None:
+        return PrivacyTier.INTIMATE
+    try:
+        return PrivacyTier(str(raw))
+    except ValueError:
+        return PrivacyTier.INTIMATE
 
 
 def _routable_tier(content_tier: PrivacyTier) -> PrivacyTier:

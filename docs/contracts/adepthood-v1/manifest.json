@@ -188,7 +188,7 @@
       "capability": "reflections",
       "model": "ReflectionResponse",
       "path": "examples/reflections/success.json",
-      "sha256": "250fd9c41d702ffcae5e2e29ba38147785a1eb74b6d9ec96b38b834b44812deb",
+      "sha256": "ecb5b753260dcba1a5612b502e0ef3a6580cb0e9bbd856b9fc777d88396daca9",
       "state": "success"
     },
     {
@@ -398,7 +398,21 @@
       "capability": null,
       "model": "ReflectionResponse",
       "path": "schemas/ReflectionResponse.schema.json",
-      "sha256": "678194d72f6384f60985eedbc92d71342ac1213ce2cd17dfc09edf00526ea1a1",
+      "sha256": "048a0db1587133ea96111d9293f0e08afcb15ac8cf29a9164dc063523a09ed9c",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "RelatedEddy",
+      "path": "schemas/RelatedEddy.schema.json",
+      "sha256": "d69d4fde0fea05a60333a9d4949a15488360f3600ca3da002a428d6b5c2d6c6d",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "RelatedPraxis",
+      "path": "schemas/RelatedPraxis.schema.json",
+      "sha256": "0561d2a8538e894969c4ec062e8234b5150477b07f137c10c3a65cc80138f85d",
       "state": null
     },
     {

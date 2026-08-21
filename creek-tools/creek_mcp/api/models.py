@@ -137,6 +137,18 @@ and cannot reach. That last clause is enforced, not hoped for: see
 ``GET /v1/capabilities`` advertises to a given caller and which callers
 ``POST /v1/uploads`` will answer.
 
+Contract 0.9 (#873) is a 0.5-shaped move: two **optional** fields —
+``related_praxis`` and ``related_eddies`` — on :class:`ReflectionResponse`, and
+the two wire models they are made of. The route omits both keys when nothing
+qualified, so a ``0.8`` client's ordinary reflection is byte-identical; and one
+that finds an admitted compiled neighbour carries two extra keys — which a
+``0.8`` consumer validating against its vendored, closed schema would reject
+outright, not ignore. So the fields are gated on the declared minor via
+:data:`RELATED_FIELDS_SINCE_MINOR`: a ``0.8`` caller is served the ``0.8``
+shape, byte-for-byte, whether or not a neighbour qualified. ``0.8`` is retained
+for the same reason ``0.4`` was retained at 0.5 — refusing it outright is
+strictly worse — but retention alone was not enough here.
+
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
 version alone silently drops the outgoing current minor out of this window and
@@ -261,6 +273,22 @@ A literal for the same reason :data:`_UPLOAD_MINOR` is one: written as
 :data:`CONTRACT_MINOR` it would follow the next bump forward and stop
 advertising the capability to the very clients pinned to the minor that
 introduced it.
+"""
+
+RELATED_FIELDS_SINCE_MINOR: Final[str] = "0.9"
+"""First contract minor whose ``ReflectionResponse`` carries the #873 fields.
+
+The same two-sided rule :data:`CAPABILITY_SINCE_MINOR` enforces for routes,
+applied to *fields*: a client is served only what the minor it declared can
+describe.
+
+It is load-bearing rather than decorative because every published response
+schema sets ``additionalProperties: false``. A ``0.8`` consumer that vendored
+the ``0.8`` ``ReflectionResponse`` and validates closed does **not** "ignore" an
+unknown key — it rejects the entire response. Emitting ``related_praxis`` to a
+caller that declared ``0.8`` would therefore break exactly the consumer #873
+exists to unblock, and only on the reflections that found a compiled neighbour,
+which is the worst possible distribution of a failure.
 """
 
 CAPABILITY_SINCE_MINOR: Final[dict[Capability, str]] = {
@@ -403,6 +431,47 @@ class NoteKind(StrEnum):
     REFRAME = "reframe"
     TENSION = "tension"
     VALUE = "value"
+
+
+class PraxisKind(StrEnum):
+    """The five praxis types, mirroring the vault's own vocabulary.
+
+    Kept in lock-step with :class:`creek.models.PraxisType`, which is what a
+    ``04-Praxis/`` page's ``praxis_type`` is actually constrained to;
+    :mod:`creek_mcp.compiled_pages` withholds any page naming something outside
+    it, so a wire enum that drifted would refuse a legitimate page on the way
+    out — or, worse, admit a hand-edited value the vault never sanctioned.
+    ``tests/test_adepthood_contract_models.py`` pins the two lists equal.
+
+    Attributes:
+        COMMITMENT: A promise the writer has made.
+        FRAMEWORK: A way of seeing they reuse.
+        HABIT: Something done repeatedly, near-automatically.
+        INSIGHT: A distilled realisation.
+        PRACTICE: Something done deliberately and returned to.
+    """
+
+    COMMITMENT = "commitment"
+    FRAMEWORK = "framework"
+    HABIT = "habit"
+    INSIGHT = "insight"
+    PRACTICE = "practice"
+
+
+class PraxisLifecycle(StrEnum):
+    """The four praxis lifecycle statuses, mirroring :class:`creek.models.PraxisStatus`.
+
+    Attributes:
+        ACTIVE: Currently being practised.
+        INTEGRATED: Absorbed; no longer needs deliberate attention.
+        PROPOSED: Named but not yet taken up.
+        RELEASED: Deliberately let go.
+    """
+
+    ACTIVE = "active"
+    INTEGRATED = "integrated"
+    PROPOSED = "proposed"
+    RELEASED = "released"
 
 
 class ErrorCode(StrEnum):
@@ -625,6 +694,21 @@ in a default.
 
 _MIN_CARE_RESOURCES: Final[int] = 1
 """A care signal with no resources would dead-end the person reading it."""
+
+_MAX_RELATED_PRAXIS: Final[int] = 3
+"""Published ceiling on :attr:`ReflectionResponse.related_praxis` (#873)."""
+
+_MAX_RELATED_EDDIES: Final[int] = 2
+"""Published ceiling on :attr:`ReflectionResponse.related_eddies` (#873).
+
+Restated here rather than imported from
+:mod:`creek_mcp.compiled_pages`, because this module is deliberately
+declarative — it opens no file and imports no vault reader (#1079) — and that
+producer module reaches the filesystem. The two are pinned equal by
+``test_the_published_related_bounds_match_the_producer`` in
+``tests/test_adepthood_contract_models.py``, so the restatement cannot drift
+into a schema that promises a bound the producer does not keep.
+"""
 
 MAX_EXTERNAL_ID_CHARS: Final[int] = 512
 """Inclusive upper bound on a consumer-supplied ``external_id``.
@@ -1286,6 +1370,60 @@ class CareSignal(_WireModel):
     )
 
 
+class RelatedPraxis(_WireModel):
+    """One praxis page the reflected entry contributed to (contract 0.9, #873).
+
+    **Compiled, not raw.** A praxis page is distilled *from* fragments, so it
+    is published only when every id in its ``derived_from`` resolves to a
+    fragment within the caller's ceiling — and withheld outright when its
+    provenance cannot be enumerated in full. That rule lives in
+    :mod:`creek_mcp.compiled_pages`; nothing on this model re-derives it, and
+    no field here carries a tier, because a page that reached the wire is one
+    whose whole provenance was already admitted.
+
+    Attributes:
+        title: The praxis page's title.
+        praxis_type: Which of the five :class:`PraxisKind` values it is.
+        status: Where it sits in the :class:`PraxisLifecycle`.
+        excerpt: The page's own opening prose, whitespace-collapsed and capped
+            at :data:`creek_mcp.compiled_pages.EXCERPT_CHARS`. Not a model
+            summary and not grounding-checked — it is the page as written.
+    """
+
+    title: str = Field(description="The praxis page's title.")
+    praxis_type: PraxisKind = Field(description="Which kind of praxis this is.")
+    status: PraxisLifecycle = Field(description="Where it sits in its lifecycle.")
+    excerpt: str = Field(description="The page's own opening prose, capped.")
+
+
+class RelatedEddy(_WireModel):
+    """One eddy the reflected entry belongs to (contract 0.9, #873).
+
+    Carries the same compiled-page caveat as :class:`RelatedPraxis`, and one
+    more that is specific to it: ``description`` and ``fragment_count`` are
+    *synthesised from the eddy's members*, so publishing the page to a caller
+    admitted to only some of them would hand over a summary of content they
+    cannot read. :mod:`creek_mcp.compiled_pages` therefore admits an eddy only
+    when the members it can enumerate account for ``fragment_count`` exactly
+    **and** every one of them is within the ceiling.
+
+    Attributes:
+        title: The eddy page's title.
+        description: The eddy's own one-line description; ``""`` when the page
+            declares none.
+        fragment_count: How many fragments the eddy clusters. A tally, so never
+            negative.
+        formed: The ``YYYY-MM-DD`` the eddy was first detected.
+    """
+
+    title: str = Field(description="The eddy page's title.")
+    description: str = Field(description="The eddy's own description; may be empty.")
+    fragment_count: int = Field(
+        ge=_MIN_COUNT, description="How many fragments the eddy clusters."
+    )
+    formed: str = Field(description="ISO date the eddy was first detected.")
+
+
 class ReflectionResponse(_WireModel):
     """Margin notes for one entry.
 
@@ -1339,6 +1477,28 @@ class ReflectionResponse(_WireModel):
     # can detect, so it needs a contract minor bump — not a quiet relaxation.
     essay_grounded: Literal[False] = Field(
         description="Required; only False is admissible at contract 0.2.",
+    )
+    # Contract 0.9 (#873). Optional and bounded. The route drops these two
+    # keys when they are ``None`` -- and only these two, never ``essay``, whose
+    # explicit ``null`` a 0.2 consumer has been reading since the contract
+    # opened -- so a reflection with no admitted compiled neighbours is
+    # byte-identical to what a 0.8 client already receives. Present only when
+    # something qualified — which is the whole compatibility claim, and the
+    # reason these are ``| None`` rather than defaulting to ``[]``: an empty
+    # list is a *statement* that nothing qualified, and this contract does not
+    # make that statement, because a vault that has never run ``creek link``
+    # and one whose neighbours were all withheld above the ceiling must be
+    # indistinguishable to the caller. Telling them apart would be a one-bit
+    # oracle over the compiled layer.
+    related_praxis: list[RelatedPraxis] | None = Field(
+        default=None,
+        max_length=_MAX_RELATED_PRAXIS,
+        description="Praxis pages the entry contributed to; absent when none.",
+    )
+    related_eddies: list[RelatedEddy] | None = Field(
+        default=None,
+        max_length=_MAX_RELATED_EDDIES,
+        description="Eddies the entry belongs to; absent when none.",
     )
 
 
@@ -1502,6 +1662,8 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "ReflectionNote": ReflectionNote,
     "ReflectionRequest": ReflectionRequest,
     "ReflectionResponse": ReflectionResponse,
+    "RelatedEddy": RelatedEddy,
+    "RelatedPraxis": RelatedPraxis,
     "TierModel": TierModel,
     "UploadRequest": UploadRequest,
     "UploadResponse": UploadResponse,

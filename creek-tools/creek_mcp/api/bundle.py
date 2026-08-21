@@ -75,6 +75,8 @@ from creek_mcp.api.models import (
     ErrorCode,
     JournalAction,
     NoteKind,
+    PraxisKind,
+    PraxisLifecycle,
     ReflectionStatus,
     WireTierCeiling,
 )
@@ -342,6 +344,37 @@ _EXAMPLE_NOTE: Final[dict[str, Any]] = {
 }
 """One margin note. Deliberately invented, and labelled as such in the note."""
 
+_EXAMPLE_PRAXIS: Final[dict[str, Any]] = {
+    "title": "Rest before the collapse",
+    "praxis_type": PraxisKind.PRACTICE.value,
+    "status": PraxisLifecycle.ACTIVE.value,
+    "excerpt": (
+        "Synthetic example prose. A real excerpt is the praxis page's own "
+        "opening lines, taken verbatim and capped."
+    ),
+}
+"""The ``related_praxis`` cell of the success fixture (contract 0.9, #873).
+
+Synthetic, like the note beside it: no fixture in this bundle carries real
+vault prose. What it documents is the *shape*, and one property a consumer
+cannot see from the shape — a praxis page reaches the wire only when every
+fragment its ``derived_from`` names is within the caller's ceiling.
+"""
+
+_EXAMPLE_EDDY: Final[dict[str, Any]] = {
+    "title": "Rest and Ruin",
+    "description": "Synthetic example description of a topic cluster.",
+    "fragment_count": 12,
+    "formed": "2026-03-04",
+}
+"""The ``related_eddies`` cell of the success fixture (contract 0.9, #873).
+
+``description`` and ``fragment_count`` are *compiled from* the eddy's members,
+which is why the page is published only when the members that can be
+enumerated account for ``fragment_count`` exactly and every one of them is
+admitted. An eddy whose provenance is partial is withheld, not summarised.
+"""
+
 _REFLECTIONS_SUCCESS: Final[dict[str, Any]] = {
     "status": ReflectionStatus.OK.value,
     "tier_ceiling": WireTierCeiling.PERSONAL.value,
@@ -349,19 +382,38 @@ _REFLECTIONS_SUCCESS: Final[dict[str, Any]] = {
     "notes": [_EXAMPLE_NOTE],
     "essay": None,
     "essay_grounded": False,
+    "related_praxis": [_EXAMPLE_PRAXIS],
+    "related_eddies": [_EXAMPLE_EDDY],
 }
 """A reflection that found something.
 
 ``routed_tier`` equals ``tier_ceiling`` here, and always will: it is a constant
 function of the declared ceiling, which is why publishing it discloses nothing.
+
+The two ``related_*`` fields are optional at 0.9 and are shown *present* here
+on purpose: a consumer needs the populated shape to write its parser against,
+and :data:`_REFLECTIONS_EMPTY` next door shows the absent case, which is what
+the route actually emits whenever nothing qualified.
 """
 
 _REFLECTIONS_EMPTY: Final[dict[str, Any]] = {
-    **_REFLECTIONS_SUCCESS,
+    **{
+        key: value
+        for key, value in _REFLECTIONS_SUCCESS.items()
+        if key not in {"related_praxis", "related_eddies"}
+    },
     "status": ReflectionStatus.EMPTY.value,
     "notes": [],
 }
-"""A reflection with nothing to say. Still a 200."""
+"""A reflection with nothing to say. Still a 200.
+
+Also the published example of the ``related_*`` fields being **absent** rather
+than present-and-empty — the shape a pre-0.9 consumer keeps seeing, and the
+one the route emits when the vault has no compiled neighbours the caller is
+admitted to. The two cases are indistinguishable here by design: telling "no
+eddies exist" from "the eddies that exist were withheld" would be a one-bit
+oracle over the compiled layer.
+"""
 
 _CARE_PAYLOAD: Final[dict[str, Any]] = {
     "status": ReflectionStatus.ESCALATE.value,

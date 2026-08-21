@@ -6,7 +6,7 @@ and nothing else. Two modules:
 - :mod:`creek_mcp.api.models` — the Pydantic v2 wire models, enums and the
   three error tables (status / message / retry disposition).
 - :mod:`creek_mcp.api.bundle` — the deterministic, byte-reproducible fixture
-  bundle (JSON Schemas + a 5x7 example matrix + a manifest) published under
+  bundle (JSON Schemas + a 6x7 example matrix + a manifest) published under
   ``docs/contracts/adepthood-v1/`` for the cross-repo consumer.
 
 **No web framework may be imported anywhere under this package.** #1074 picks

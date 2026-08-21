@@ -67,11 +67,15 @@ provider, before any envelope exists. So a tool can paste an intimate fragment
 into a prompt, ship it to a cloud endpoint, and return an envelope (f)
 certifies as canary-free: the disclosure already happened, off-envelope, where
 nothing above was looking. ``creek.reflect`` is the concrete case rather than
-the hypothetical one. The manifest records two gates for it, and (f) can only
+the hypothetical one. The manifest records three gates for it, and (f) can only
 ever reach the first: ``_probe_reflect`` passes ``entry_ref=<intimate id>``,
 which the #846 gate refuses *before* the grounding walk, so
 ``creek_mcp.tools.reflect._default_retrieve`` — the second corpus read, live
-since #964 — is never exercised by that probe at all.
+since #964 — is never exercised by that probe at all. The same is true of the
+third corpus read, ``creek_mcp.compiled_pages`` (#873), which sits below the
+same #846 gate; its own admission rule is exercised directly by
+``tests/test_mcp_compiled_pages.py`` and end-to-end through ``reflect_tool``
+by ``tests/test_mcp_reflect.py``.
 
 Within (g), the **personal** canary is the assertion that matters. Excluding
 ``intimate`` is close to free: every path in this repo drops it. ``personal``
