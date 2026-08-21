@@ -154,12 +154,40 @@ ingestor's own `generate_frontmatter` — is the real thing in both cases.
 Three rows in that table are worth knowing about *before* you seed, because
 each one puts a fragment somewhere you did not ask for:
 
-- **`--type markdown` decides `journal` / `essay` / `code` for you, from the
-  folder name.** A file under `daily/`, `journal/` or `diary/` is stamped
-  `platform: journal`; one under a folder starting `essay` or under
-  `writing/` is stamped `platform: essay`; a note whose body reads as
-  technical prose is stamped `platform: code`. Nothing you pass on the
-  command line overrides this. Verified in one run over a parent folder:
+- **`--type markdown` decides `journal` / `essay` / `code` for you — from the
+  file's *body first*, and only then its folder.** Nothing you pass on the
+  command line overrides either.
+
+  The order matters and is easy to get backwards. `_infer_platform`
+  (`creek/ingest/markdown.py:134`) maps the **detected document type** first,
+  and consults the path *only* when that type comes back `notes`:
+
+  ```python
+  if document_type in type_map:      # journal / essay / technical
+      return type_map[document_type]
+  return _infer_platform_from_path(file_path)
+  ```
+
+  The document type comes from `_detect_document_type(content)`, which scores
+  the **body** against journal patterns (ISO dates, "dear diary", "today i",
+  "reflecting") and essay patterns ("introduction"/"conclusion" headings,
+  "thesis", "in this essay"). So a note in a completely unrelated folder whose
+  prose happens to read like a diary entry is stamped `journal` anyway.
+  Executed, all three cases:
+
+  ```console
+  $ python -c '...'   # _detect_document_type + _infer_platform, verbatim
+  neutral folder, diary-ish body   path=/vault/99-Misc   document_type=journal -> journal
+  neutral folder, plain body       path=/vault/99-Misc   document_type=notes   -> markdown
+  journal folder, plain body       path=/vault/journal   document_type=notes   -> journal
+  ```
+
+  Read that middle row carefully: the folder wins **only** when the content is
+  unremarkable. A dated line or the word "reflecting" is enough to override it.
+
+  The folder rules apply to that fallback: `daily/`, `journal/` or `diary/`
+  gives `platform: journal`; a folder starting `essay`, or `writing/`, gives
+  `platform: essay`. Verified in one run over a parent folder:
 
   ```console
   $ creek ingest --type markdown --input ./src --vault ~/Creek-Vault --yes
