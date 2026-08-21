@@ -257,27 +257,59 @@ an enforcement, and the review that produced this constant found the
 advisory already consulting a different ledger than the migration wrote.
 """
 
+LEDGERED_SOURCES: frozenset[str] = frozenset({LEDGERED_SOURCE_TYPE})
+"""Source types whose fragment identity is ledger-backed by default.
+
+Holding a ledger buys a source type three things and **no others**: an
+idempotent re-ingest (an edited unit updates in place under its existing id
+instead of orphaning it), a ``source.origin_key`` on every fragment — which is
+the only field the RTBF purge sweep resolves a target from — and a content
+hash to tell an edit from a touch.
+
+It buys **no deletion authority**. That is :data:`TOMBING_SOURCES`, a
+separate set consulted by a separate gate, and the two are deliberately kept
+as two names rather than one: a set that meant both would make "let this
+source type keep its ids" and "let this source type delete vault content"
+the same decision, which is the coupling #1329 was filed to remove.
+"""
+
 TOMBING_SOURCES: frozenset[str] = frozenset({LEDGERED_SOURCE_TYPE})
 """Source types whose directory ingest may soft-tomb units it no longer sees.
 
-Deliberately *narrower* than "has a ledger", and separate from it (#1329).
-:func:`resolve_ledger` lets a caller opt a non-markdown source type into
-ledger-backed *identity* via ``ledger_source``, and until this split that same
-opt-in silently armed :func:`tomb_missing_units` as well — so a directory
+Deliberately *narrower* than :data:`LEDGERED_SOURCES`, and separate from it
+(#1329). :func:`resolve_ledger` lets a caller opt a non-markdown source type
+into ledger-backed *identity* via ``ledger_source``, and until this split that
+same opt-in silently armed :func:`tomb_missing_units` as well — so a directory
 ingest under a borrowed ledger would tomb every previously-recorded unit it
 did not happen to see. Identity and tombing are different questions; only a
 source whose directory listing is genuinely the full, authoritative set of
 live units belongs here.
+
+The markdown journal qualifies because its whole corpus lives under the
+directory being walked. A document or a generic file does not: an operator
+moving a PDF out of a staging folder is not asking for its fragment to be
+soft-deleted.
 """
 
 
 def ledger_for_source(source_type: str, vault_path: Path) -> SourceLedger | None:
-    """Load the source ledger for mutable sources, else ``None`` (#672).
+    """Load the source ledger for a ledger-backed source, else ``None`` (#672).
 
-    Only the markdown (journal) source is ledger-wired; append-only event
-    sources keep their content-hashed ids untouched.
+    Membership of :data:`LEDGERED_SOURCES` is the whole question; append-only
+    event sources keep their content-hashed ids and never consult a ledger.
+
+    Each source type loads **its own** ledger file, named for the type, so a
+    newly ledgered type starts from an empty file rather than inheriting
+    another type's key space.
+
+    Args:
+        source_type: Registry key of the ingestor being run.
+        vault_path: Vault root holding ``00-Creek-Meta/State/ingest/``.
+
+    Returns:
+        That source type's ledger, or ``None`` when it is unledgered.
     """
-    if source_type != LEDGERED_SOURCE_TYPE:
+    if source_type not in LEDGERED_SOURCES:
         return None
     from creek.ingest.ledger import SourceLedger
 
@@ -677,6 +709,72 @@ def write_fragment_idempotent(
     return "unchanged"
 
 
+def tombing_is_authorised(
+    ledger: SourceLedger | None,
+    input_path: Path,
+    source_type: str,
+    ledger_source: str | None,
+    *,
+    discovery_complete: bool,
+    may_tomb: bool,
+) -> bool:
+    """Return whether this pass may compute a gone set at all (#674/#1329).
+
+    Five independent conjuncts, each closing a different way a pass can lack
+    the authority to soft-delete. They are gathered here, rather than left as
+    a run of early returns inside :func:`tomb_missing_units`, so the whole
+    authority question is answerable by reading one function — and so adding a
+    sixth cannot quietly push the sweep over the complexity ceiling and get
+    "simplified" back into a disjunction.
+
+    * **Discovery was complete.** Checked first, and first for a reason.
+      Tombing is driven by *absence*, and absence means nothing when the walk
+      that failed to see a key could not read part of the tree: the key's
+      source may be sitting in exactly the part that could not be listed. The
+      gone set is not computable, not merely inadvisable (#1444).
+    * **A ledger exists.** Nothing to sweep without one.
+    * **The input is a directory.** Only a full-source pass enumerates the
+      authoritative set; a single-file input never tombs, which is what keeps
+      the incremental epic from tombing every other unit when one file is
+      re-ingested.
+    * **The source type may tomb** — membership of :data:`TOMBING_SOURCES`,
+      which is deliberately narrower than :data:`LEDGERED_SOURCES` (#1329).
+      Holding a ledger is identity, not deletion authority.
+    * **The ledger is this source type's own.** A borrowed ledger
+      (``ledger_source``) belongs to units this pass never enumerated, so its
+      ``live_keys`` minus this pass's ``seen_keys`` is not a gone set, it is
+      simply the other source's whole corpus. No caller does this today; it is
+      closed by construction rather than by a comment saying not to.
+    * **The caller permits it.** See ``may_tomb`` on :func:`run_ingest`.
+
+    *discovery_complete* and *may_tomb* are keyword-only with **no default**,
+    copying the ``warn(..., *, ceiling_safe)`` precedent in
+    :func:`run_ingest`. mypy strict covers ``creek/``, so a future caller that
+    has not thought about whether its pass had the authority to delete cannot
+    compile; a default of ``True`` would be fail-open, which is the defect
+    rather than its fix.
+
+    Args:
+        ledger: The resolved ledger for this run, or ``None``.
+        input_path: The source the operator named, verbatim.
+        source_type: Registry key of the ingestor being run.
+        ledger_source: The ledger name the caller forced, or ``None``.
+        discovery_complete: Whether discovery enumerated the whole source.
+        may_tomb: Whether the calling surface permits soft-deletion.
+
+    Returns:
+        ``True`` only when every conjunct holds.
+    """
+    return (
+        discovery_complete
+        and ledger is not None
+        and input_path.is_dir()
+        and source_type in TOMBING_SOURCES
+        and ledger_source is None
+        and may_tomb
+    )
+
+
 def tomb_missing_units(
     ledger: SourceLedger | None,
     writer: VaultWriter,
@@ -684,28 +782,16 @@ def tomb_missing_units(
     seen_keys: set[str],
     errors: list[str],
     source_type: str,
+    ledger_source: str | None,
     *,
     discovery_complete: bool,
+    may_tomb: bool,
 ) -> int:
     """Soft-tomb ledgered units absent from a full-source pass (#674).
 
-    Only a directory (full-source) input computes a gone set; a single-file
-    input never tombs — that guards the incremental epic from tombing every
-    other unit when re-ingesting one file.
-
-    **The pass must first have been able to see the whole source.** Tombing
-    is a soft-delete driven by *absence*, and absence means nothing when the
-    walk that failed to see a key could not read part of the tree: the key's
-    source may be sitting in exactly the part that could not be listed. So
-    ``discovery_complete=False`` returns 0 before anything else is
-    considered — the gone set is not computable, not merely inadvisable
-    (#1444).
-
-    *discovery_complete* is keyword-only with **no default**, copying the
-    ``warn(..., *, ceiling_safe)`` precedent in :func:`run_ingest`. mypy
-    strict covers ``creek/``, so a future caller that has not thought about
-    whether its pass had the authority to delete cannot compile; a default of
-    ``True`` would be fail-open, which is the defect rather than its fix.
+    Whether this pass is allowed to compute a gone set at all is
+    :func:`tombing_is_authorised`; every guard and its reason lives there.
+    This function is only the sweep.
 
     **Why an incomplete pass only warns and still exits 0.** ``creek.cli``'s
     ``_warn_if_discovered_but_empty`` returns early on ``written > 0 or
@@ -716,16 +802,23 @@ def tomb_missing_units(
     ``--strict`` flag is therefore left for its own issue; nothing is
     destroyed either way, which is the property that had to hold.
 
-    Tombing is additionally gated on *source_type* being in
-    :data:`TOMBING_SOURCES` (#1329). Holding a ledger is not sufficient: a
-    caller can borrow one via ``ledger_source`` purely to pin identity, and
-    that must not arm the tomb sweep for a source type whose directory
-    listing is not the authoritative set of live units.
-
     A tomb that fails on I/O is collected into *errors* and the unit is left
     live in the ledger so the next full-source pass retries it, rather than
     crashing the whole run. A tomb that finds nothing to move is treated the
     same way (#1332) — see :func:`_tomb_one_unit`.
+
+    Args:
+        ledger: The resolved ledger for this run, or ``None``.
+        writer: Vault writer performing the relocations.
+        input_path: The source the operator named, verbatim.
+        seen_keys: Every ledger key this pass answered for, including the
+            pre-#953 spelling of an out-of-vault unit's key (#953). A key
+            missing from this set is read as a deleted source.
+        errors: Collector for ``[<source_type>] …`` operator messages.
+        source_type: Registry key of the ingestor being run.
+        ledger_source: The ledger name the caller forced, or ``None``.
+        discovery_complete: Whether discovery enumerated the whole source.
+        may_tomb: Whether the calling surface permits soft-deletion.
 
     Returns:
         The number of fragments this call actually relocated into
@@ -735,18 +828,17 @@ def tomb_missing_units(
         does not count. The figure is printed to the operator verbatim, so
         it may only ever name work that happened.
     """
-    # First, above every other guard. An incomplete enumeration cannot tell
-    # "the operator deleted this unit" from "the walk could not read the
-    # directory it lives in", so there is no gone set to compute. Being first
-    # is also what covers the ``ledger_source`` hazard documented on
-    # :func:`run_ingest`: a borrowed ledger plus a directory input is exactly
-    # the shape that arms this sweep for a source type whose listing was
-    # never authoritative to begin with.
-    if not discovery_complete:
-        return 0
-    if ledger is None or not input_path.is_dir():
-        return 0
-    if source_type not in TOMBING_SOURCES:
+    authorised = tombing_is_authorised(
+        ledger,
+        input_path,
+        source_type,
+        ledger_source,
+        discovery_complete=discovery_complete,
+        may_tomb=may_tomb,
+    )
+    # ``authorised`` already established that the ledger is not ``None``; the
+    # explicit clause is what narrows the type for mypy, not a second gate.
+    if not authorised or ledger is None:
         return 0
     tombed = 0
     for source_key in sorted(ledger.live_keys() - seen_keys):
@@ -1198,6 +1290,7 @@ def run_ingest(
     incremental: bool = False,
     ledger_source: str | None = None,
     privacy_tier: PrivacyTier | None = None,
+    may_tomb: bool = True,
     on_warning: Callable[[str], None] | None = None,
 ) -> IngestRunResult:
     """Run one ingestor and persist its output idempotently to the vault.
@@ -1208,8 +1301,8 @@ def run_ingest(
 
     Args:
         ingestor_cls: Concrete :class:`Ingestor` subclass to run.
-        source_type: Registry key, used to prefix error messages (and to select
-            the ledger — only ``"markdown"`` is ledger-backed).
+        source_type: Registry key, used to prefix error messages and to select
+            the ledger (see :data:`LEDGERED_SOURCES`).
         input_path: Source directory or file to ingest.
         vault_path: Vault root for :class:`VaultWriter`.
         reclassify_threshold: Body-similarity floor below which a materially
@@ -1217,16 +1310,31 @@ def run_ingest(
         since: Incremental cutoff (#677) — only units newer than this are kept.
         incremental: Ledger-driven incremental mode (#677).
         ledger_source: Force a specific ledger name instead of the one
-            :func:`ledger_for_source` would pick, opting a non-markdown
-            source type into ledger-backed identity (#1023). **Hazard:**
-            combining this with a *directory* ``input_path`` arms
-            :func:`tomb_missing_units` for that ledger, soft-tombing every
-            previously-ledgered unit the pass does not see; ``creek.upload``
-            always passes a single file, which can never tomb.
+            :func:`ledger_for_source` would pick, opting an unledgered source
+            type into ledger-backed identity (#1023). A borrowed ledger can
+            never be swept: :func:`tombing_is_authorised` requires
+            ``ledger_source is None``, because the units in someone else's
+            ledger are precisely the units this pass did not enumerate. (An
+            earlier version of this note claimed the opposite — that a
+            ``ledger_source`` plus a directory input *armed* the sweep. #1329
+            had already moved that gate onto the ingestor's registry key, and
+            this parameter now subtracts authority rather than granting it.)
         privacy_tier: Tier the caller declares for this content (#1023).
             Merged onto each fragment with
             :func:`creek.classify.privacy_pass.escalate`, so it can only
             raise the tier, never lower one the source already declared.
+        may_tomb: Whether this surface permits soft-deletion at all. A
+            restrictive conjunct: it can only ever *subtract* from the
+            authority :func:`tombing_is_authorised` already computes, never
+            add to it, so passing ``True`` grants nothing on its own.
+            ``creek_mcp.tools.ingest`` passes ``False`` — a remote caller has
+            never held vault-mutating deletion authority on that surface and
+            must not acquire it as a side effect of the tool gaining a ledger
+            (#1467). It carries a default, unlike the keyword-only no-default
+            arguments it feeds, purely for compatibility: a required argument
+            here would mean editing every existing call site, and every one of
+            those surfaces (the CLI, ``creek.upload``, ``creek.drive``) keeps
+            exactly its present behaviour under ``True``.
         on_warning: Called with each operator advisory **at the moment it is
             detected**, which for the un-pinned-vault advisory is before the
             first fragment is written (#1329). Surfaces still get every warning
@@ -1363,7 +1471,9 @@ def run_ingest(
         seen_keys,
         errors,
         source_type,
+        ledger_source,
         discovery_complete=ingest_result.discovery_complete,
+        may_tomb=may_tomb,
     )
     return IngestRunResult(
         written=written,
