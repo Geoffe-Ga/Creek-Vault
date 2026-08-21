@@ -122,10 +122,10 @@ particular is live — see the `min_confidence` row.
 
 | Field            | Default        | Status |
 |------------------|----------------|-------|
-| `enabled`        | `true`         | Dormant. Intended as the master switch for the OCR pass. |
-| `engine`         | `pytesseract`  | Dormant. Custom engines are injected at the API level today — see `creek.ingest.images.OcrEngine`. |
-| `languages`      | `[eng]`        | Dormant. Intended for Tesseract language codes. |
-| `min_confidence` | `0.6`          | **The key is dormant; the behaviour is not.** A page below the threshold really *is* tagged `review: pending_review` today — executed by running `ImageIngestor` with an injected `OcrEngine` returning confidence `0.42`, whose frontmatter came back `review: pending_review`. What the key cannot do is change the number: the threshold in force is `_DEFAULT_MIN_CONFIDENCE` in `creek/ingest/images.py`, not this value. Range `[0.0, 1.0]`. No command filters on the resulting key. |
+| `enabled`        | `true`         | **Dormant.** Intended as the master switch for the OCR pass. |
+| `engine`         | `pytesseract`  | **Dormant.** Custom engines are injected at the API level today — see `creek.ingest.images.OcrEngine`. |
+| `languages`      | `[eng]`        | **Dormant.** Intended for Tesseract language codes. |
+| `min_confidence` | `0.6`          | **Dormant — but the behaviour it names is live.** Editing this number changes nothing; the threshold in force is `_DEFAULT_MIN_CONFIDENCE` (`creek/ingest/images.py`). A low-confidence page really *is* tagged `review: pending_review` today — executed with an injected `OcrEngine` returning `0.42`, whose frontmatter came back `review: pending_review`. Range `[0.0, 1.0]`. No command filters on the resulting key. |
 
 ## `linking` — resonance / thread / eddy thresholds
 
