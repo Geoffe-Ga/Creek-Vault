@@ -43,6 +43,7 @@ about what that caller can actually reach.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING
 
 from starlette.concurrency import run_in_threadpool
@@ -128,6 +129,17 @@ def _negotiate(vault: Path, context: RequestContext, advertised: list[str]) -> b
     its own, so this ordering is no longer load-bearing for correctness; it is
     kept because there is nothing to negotiate about a vault that is not there.
 
+    This is the *audited* half of the readiness probe, and since #1148 that is
+    all it is. It used to end ``return bool(negotiated["available"])``, which
+    could only ever be ``True``: the caller had already established the marker
+    directory exists, and the tool derives its own ``available`` from that same
+    :func:`~creek_mcp.tools.handshake.vault_available` predicate. Returning the
+    tool's echo of the caller's own precondition made the audit append look
+    like part of the verdict, which is why it could not be skipped for a caller
+    the server cannot speak to. The ``UNREADABLE_CONFIG`` catch is *not* part
+    of that tautology and stays: a vault whose config cannot be parsed is a
+    genuine ``uninitialized``, discovered here and nowhere earlier.
+
     Args:
         vault: The vault root, already probed.
         context: The request's context, supplying the audited consumer and the
@@ -138,12 +150,11 @@ def _negotiate(vault: Path, context: RequestContext, advertised: list[str]) -> b
             the server's private maximum.
 
     Returns:
-        The tool's own readiness verdict, or ``False`` when the vault turns out
-        to be unreadable after all — which is a legitimate ``uninitialized``,
-        not a server fault.
+        ``True``, or ``False`` when the vault turns out to be unreadable after
+        all — which is a legitimate ``uninitialized``, not a server fault.
     """
     try:
-        negotiated = handshake_tool(
+        handshake_tool(
             vault_path=vault,
             capabilities=advertised,
             server_name=SERVER_NAME,
@@ -152,11 +163,15 @@ def _negotiate(vault: Path, context: RequestContext, advertised: list[str]) -> b
         )
     except UNREADABLE_CONFIG:
         return False
-    return bool(negotiated["available"])
+    return True
 
 
 def _vault_is_usable(
-    request: Request, context: RequestContext, advertised: list[str]
+    request: Request,
+    context: RequestContext,
+    advertised: list[str],
+    *,
+    audited: bool,
 ) -> bool:
     """Return whether a scaffolded, readable vault stands behind this server.
 
@@ -173,18 +188,33 @@ def _vault_is_usable(
     some of those on the loop for no benefit and buy an extra context switch
     for the privilege.
 
+    *audited* splits the probe rather than replacing it, and the distinction is
+    the whole of #1148's fix. The cheap two seams answer the question; the
+    third only records it. A caller declaring a contract minor this server does
+    not serve gets ``status: incompatible`` and an empty capability list — but
+    ``vault.available`` is still on the wire for it, so the question must still
+    be answered or a stale client is told its vault is down when the only thing
+    wrong is its version. What that caller does *not* get is a record in the
+    vault's data-access log, because it accessed no data.
+
     Args:
         request: The request in flight.
         context: The request's context.
         advertised: The capability names this caller is being told about.
+        audited: Whether to enter the handshake tool and append to the vault's
+            audit log. Keyword-only: at the one call site the flag is the
+            subject of the decision, and a bare positional ``False`` there
+            would read as data rather than as policy.
 
     Returns:
-        ``True`` only when the marker directory exists *and* the handshake tool
-        confirms it.
+        ``True`` only when the marker directory exists — and, when *audited*,
+        when the handshake tool confirms the config is readable too.
     """
     vault = configured_vault(request)
     if vault is None or not vault_available(vault):
         return False
+    if not audited:
+        return True
     return _negotiate(vault, context, advertised)
 
 
@@ -210,18 +240,25 @@ def _minor_is_negotiable(request: Request) -> bool:
     return declared is None or declared in SUPPORTED_CONTRACT_MINORS
 
 
-def _status_for(request: Request, *, available: bool) -> CapabilitiesStatus:
+def _status_for(*, available: bool, negotiable: bool) -> CapabilitiesStatus:
     """Return the readiness this response reports.
 
+    Takes *negotiable* rather than re-deriving it from the request: since #1148
+    the same predicate also decides whether the audited half of the readiness
+    probe runs at all, and a rule that decides two things has to be evaluated
+    once. Two calls to :func:`_minor_is_negotiable` could disagree only if the
+    headers mutated mid-request, which is not a failure worth being able to
+    have.
+
     Args:
-        request: The request in flight.
         available: Whether a usable vault stands behind this server.
+        negotiable: Whether this caller declared a minor the server serves.
 
     Returns:
         ``incompatible`` when the caller speaks a minor this server does not,
         else ``ok`` or ``uninitialized`` by vault readiness.
     """
-    if not _minor_is_negotiable(request):
+    if not negotiable:
         return CapabilitiesStatus.INCOMPATIBLE
     return CapabilitiesStatus.OK if available else CapabilitiesStatus.UNINITIALIZED
 
@@ -296,6 +333,25 @@ async def handle_capabilities(request: Request) -> Response:
     ``200``, and ``invalid_request`` is a distinct code it can tell apart from
     every server-side state.
 
+    **A caller the server cannot speak to does not get audited (#1148).** The
+    contract-minor check is a dict lookup on a header; the readiness probe is
+    filesystem I/O ending in an ``fsync`` under two locks. Deciding the cheap
+    one first lets the expensive *record* be skipped for a caller that is being
+    handed ``capabilities: []`` and reads nothing — otherwise any authenticated
+    consumer could drive one locked, fsync'd append per request, unboundedly,
+    by polling the endpoint every client calls first with a version header this
+    server cannot speak.
+
+    What is skipped is the audit half only, never the answer. ``vault.available``
+    is rendered at every status, so the cheap seams still run and a stale client
+    is still told the truth about its vault; skipping the probe outright would
+    report ``available: false`` against a perfectly healthy vault and turn "you
+    are on an old contract" into "your vault is down". The cost is stated where
+    it lands: a poll at an unserved minor no longer appears in the vault's
+    data-access log. It accessed no data, and
+    :class:`~creek_mcp.httpapi.middleware.access_log.AccessLogMiddleware` still
+    records the call itself.
+
     **The readiness probe runs in a worker thread.** :func:`_vault_is_usable` is
     entirely blocking filesystem I/O — config read and YAML parse, a stat, and
     an audit append that holds a thread lock and an ``fcntl`` exclusive lock
@@ -330,14 +386,18 @@ async def handle_capabilities(request: Request) -> Response:
     """
     context = context_of(request.scope)
     advertised = advertised_capabilities(request.headers.get(CONTRACT_VERSION_HEADER))
+    negotiable = _minor_is_negotiable(request)
     available = await run_in_threadpool(
-        _vault_is_usable,
-        request,
-        context,
-        [capability.value for capability in advertised],
+        partial(
+            _vault_is_usable,
+            request,
+            context,
+            [capability.value for capability in advertised],
+            audited=negotiable,
+        )
     )
     return _render(
-        _status_for(request, available=available),
+        _status_for(available=available, negotiable=negotiable),
         advertised,
         available=available,
     )

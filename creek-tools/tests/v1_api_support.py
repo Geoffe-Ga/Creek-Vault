@@ -535,8 +535,12 @@ def mounted_routes(app: Starlette) -> list[Route]:
 def mounted_method_paths(app: Starlette) -> set[tuple[str, str]]:
     """Return the ``(method, path template)`` pairs *app* actually serves.
 
-    ``HEAD`` is dropped: Starlette adds it implicitly alongside ``GET`` and it
-    is not a published operation.
+    Unfiltered on purpose. This helper used to drop ``HEAD`` on the grounds
+    that Starlette adds it implicitly alongside ``GET`` and it "is not a
+    published operation" — but a verb the server answers *is* served whether or
+    not anyone published it, and the filter is what let four undeclared ``HEAD``
+    operations accumulate behind a green suite (#1143). What the helper reports
+    is now the wire truth, and it is the route table's job to match it.
 
     Args:
         app: The application under test.
@@ -548,7 +552,6 @@ def mounted_method_paths(app: Starlette) -> set[tuple[str, str]]:
         (method, route.path)
         for route in mounted_routes(app)
         for method in (route.methods or set())
-        if method != "HEAD"
     }
 
 
