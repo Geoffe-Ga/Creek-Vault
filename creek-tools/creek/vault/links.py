@@ -153,8 +153,13 @@ def _read_header_block(path: Path) -> str | None:
     return None
 
 
-def _declared_names(meta: dict[str, object]) -> list[str]:
+def declared_names(meta: dict[str, object]) -> list[str]:
     """Extract the linkable names a frontmatter mapping declares.
+
+    Public because the compiled-layer name index in
+    :mod:`creek.generate.compile_routing` resolves the *same* declared names
+    against the *same* header-only read. Two copies of "what counts as a name
+    a page declares" is exactly how the two resolvers drift apart.
 
     ``title`` contributes one name; ``aliases`` contributes each entry, and
     is accepted as either a scalar or a list because Obsidian permits both.
@@ -228,7 +233,7 @@ def _header_names(path: Path) -> list[str]:
     mapping — yields no names rather than raising. Lint walks every file in
     the vault, so one bad header must not cost the whole run its index.
     """
-    return _declared_names(read_header_meta(path))
+    return declared_names(read_header_meta(path))
 
 
 def _is_unsurveyed(relative: Path) -> bool:

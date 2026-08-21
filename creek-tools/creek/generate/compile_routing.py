@@ -33,6 +33,7 @@ import frontmatter
 from pydantic import ValidationError
 
 from creek.models import CompiledPage
+from creek.vault.links import declared_names, read_header_meta
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
@@ -48,10 +49,92 @@ _THREAD_DIR: Path = Path("02-Threads")
 _EDDY_DIR: Path = Path("03-Eddies")
 _FREQ_DIR: Path = Path("06-Frequencies")
 
+_LINKER_TYPES: Final[dict[str, str]] = {"thread": "thread", "eddy": "eddy"}
+"""``target_kind`` → the ``type:`` a *linker*-written page of that kind carries.
+
+``creek link`` writes ``02-Threads/`` and ``03-Eddies/`` pages from the
+:class:`~creek.models.Thread` / :class:`~creek.models.Eddy` models, whose
+``type`` defaults are the literals ``"thread"`` and ``"eddy"``. Those pages
+carry no provenance, so they are *known* to this module without ever being
+*returned* by it. ``frequency_index`` has no linker-written form and is
+deliberately absent.
+"""
+
+
+def _normalise_target(raw: str) -> str:
+    """Reduce a compiled-layer reference to the bare name it points at.
+
+    The reference reaching :meth:`CompiledPageIndex.thread` and
+    :meth:`~CompiledPageIndex.eddy` is frequently a **wiki-link, not an id**:
+    ``creek/link/eddies.py`` builds ``f"[[{eddy.title}]]"`` and merges that
+    string into every member fragment's ``eddies``, from where
+    :class:`~creek.generate.mining.IdeaSeed` copies it verbatim. A plain
+    ``dict.get`` keyed by ``target_id`` therefore missed on every such
+    reference, and a **fully compiled vault logged a ``missing`` compile gap
+    for every eddy its fragments named** (#881).
+
+    Args:
+        raw: A reference in any of the forms that reach this module —
+            ``eddy-abc123``, ``[[Messages]]``, ``[[eddy-abc123|Display]]``,
+            ``[[eddy-abc123#Section]]``, or any of those with padding.
+
+    Returns:
+        The reference with surrounding whitespace, one level of ``[[ ]]``, and
+        any ``|display`` / ``#heading`` suffix removed.
+    """
+    target = raw.strip()
+    if target.startswith("[[") and target.endswith("]]"):
+        target = target[2:-2]
+    target = target.split("|", 1)[0].split("#", 1)[0]
+    return target.strip()
+
+
+@dataclass(frozen=True)
+class _NameIndex:
+    """Every name a compiled-layer surface of one kind can be referenced by.
+
+    Names are mapped to a **canonical id**, never to a page: whether that id
+    has a compiled page is a separate question, and conflating the two is what
+    would break mining's provenance fallback.
+
+    Precedence mirrors :func:`creek.vault.links.build_link_index` exactly — a
+    four-level ladder of exact id, exact declared name, folded id, folded
+    declared name, with the first page in sorted path order winning inside a
+    level. The two resolvers must not be able to disagree about which page a
+    name means.
+
+    Attributes:
+        by_name: Exact-case name → canonical id.
+        by_folded: Case-folded name → canonical id.
+    """
+
+    by_name: dict[str, str] = field(default_factory=dict)
+    by_folded: dict[str, str] = field(default_factory=dict)
+
+    def canonical(self, name: str) -> str | None:
+        """Return the id *name* refers to, or ``None`` if no page claims it."""
+        exact = self.by_name.get(name)
+        if exact is not None:
+            return exact
+        return self.by_folded.get(name.casefold())
+
 
 @dataclass(frozen=True)
 class CompiledPageIndex:
     """Compiled-layer pages keyed by ``(target_kind, target_id)``.
+
+    Two questions this index answers, and they are deliberately distinct:
+
+    * :meth:`thread` / :meth:`eddy` / :meth:`frequency_index` return a page
+      **only** when a provenance-bearing ``type: compiled_page`` exists for
+      the target. Admitting a linker-written page here would silently break
+      :mod:`creek.generate.mining`, which switches to
+      :meth:`fragment_ids_for` the moment a lookup returns non-``None`` — and
+      a linker page records no provenance, so ``IdeaSeed.source_fragments``
+      would collapse to empty.
+    * :meth:`page_exists` reports whether a page of that kind exists *at all*,
+      compiled or merely linked. That is what separates a gap that is
+      ``missing`` from one that is ``uncompiled``.
 
     Attributes:
         threads: ``{thread_id: CompiledPage}`` for every page under
@@ -60,6 +143,9 @@ class CompiledPageIndex:
             ``03-Eddies/``.
         frequency_indexes: ``{frequency_id: CompiledPage}`` for every
             page under ``06-Frequencies/``.
+        names: ``target_kind`` → the :class:`_NameIndex` resolving that
+            kind's titles and aliases to canonical ids. An unknown kind is
+            simply absent, so it resolves to nothing.
         bypassed: ``True`` when the index was constructed in bypass
             mode — every lookup returns a miss and miss-logging is
             suppressed (the ``--bypass-compiled`` escape hatch).
@@ -68,25 +154,58 @@ class CompiledPageIndex:
     threads: dict[str, CompiledPage] = field(default_factory=dict)
     eddies: dict[str, CompiledPage] = field(default_factory=dict)
     frequency_indexes: dict[str, CompiledPage] = field(default_factory=dict)
+    names: dict[str, _NameIndex] = field(default_factory=dict)
     bypassed: bool = False
+
+    def _canonical(self, target_kind: str, target: str) -> str | None:
+        """Return the canonical id *target* names for *target_kind*."""
+        name_index = self.names.get(target_kind)
+        if name_index is None:
+            return None
+        return name_index.canonical(_normalise_target(target))
+
+    def _lookup(
+        self,
+        store: dict[str, CompiledPage],
+        target_kind: str,
+        target: str,
+    ) -> CompiledPage | None:
+        """Return the compiled page *target* names in *store*, or ``None``."""
+        if self.bypassed:
+            return None
+        page = store.get(_normalise_target(target))
+        if page is not None:
+            return page
+        canonical = self._canonical(target_kind, target)
+        return None if canonical is None else store.get(canonical)
 
     def thread(self, target_id: str) -> CompiledPage | None:
         """Return the compiled thread page for *target_id*, or ``None``."""
-        if self.bypassed:
-            return None
-        return self.threads.get(target_id)
+        return self._lookup(self.threads, "thread", target_id)
 
     def eddy(self, target_id: str) -> CompiledPage | None:
         """Return the compiled eddy page for *target_id*, or ``None``."""
-        if self.bypassed:
-            return None
-        return self.eddies.get(target_id)
+        return self._lookup(self.eddies, "eddy", target_id)
 
     def frequency_index(self, target_id: str) -> CompiledPage | None:
         """Return the compiled frequency-index page, or ``None``."""
+        return self._lookup(self.frequency_indexes, "frequency_index", target_id)
+
+    def page_exists(self, target_kind: str, target: str) -> bool:
+        """Return whether *target* names a page of *target_kind* at all.
+
+        True for a provenance-bearing compiled page **and** for the
+        ``type: thread`` / ``type: eddy`` page ``creek link`` writes. False
+        for an unknown kind, for a bypassed index, and for a reference no page
+        claims by id, title, or alias.
+
+        Args:
+            target_kind: ``"thread"``, ``"eddy"``, or ``"frequency_index"``.
+            target: A reference in any form :func:`_normalise_target` accepts.
+        """
         if self.bypassed:
-            return None
-        return self.frequency_indexes.get(target_id)
+            return False
+        return self._canonical(target_kind, target) is not None
 
     def fragment_ids_for(self, page: CompiledPage) -> tuple[str, ...]:
         """Return the unique fragment IDs traced by *page*'s provenance.
@@ -227,11 +346,73 @@ def load_compiled_pages(vault_path: Path) -> CompiledPageIndex:
         directories do not exist the index is empty (``bypassed=False``
         so misses are still logged downstream).
     """
+    roots = {
+        "thread": vault_path / _THREAD_DIR,
+        "eddy": vault_path / _EDDY_DIR,
+        "frequency_index": vault_path / _FREQ_DIR,
+    }
     return CompiledPageIndex(
-        threads=_load_pages(vault_path / _THREAD_DIR, "thread"),
-        eddies=_load_pages(vault_path / _EDDY_DIR, "eddy"),
-        frequency_indexes=_load_pages(vault_path / _FREQ_DIR, "frequency_index"),
+        threads=_load_pages(roots["thread"], "thread"),
+        eddies=_load_pages(roots["eddy"], "eddy"),
+        frequency_indexes=_load_pages(roots["frequency_index"], "frequency_index"),
+        names={kind: _load_names(root, kind) for kind, root in roots.items()},
     )
+
+
+def _page_identity(meta: dict[str, object], target_kind: str) -> str | None:
+    """Return the canonical id *meta* claims for *target_kind*, or ``None``.
+
+    A ``type: compiled_page`` header contributes its ``target_id`` (and only
+    when its ``target_kind`` matches). The linker-written ``type: thread`` /
+    ``type: eddy`` headers contribute their ``id``. Anything else — a
+    fragment, a hand-written note, a header with no ``type`` — contributes
+    nothing.
+    """
+    declared_type = meta.get("type")
+    linker_type = _LINKER_TYPES.get(target_kind)
+    if declared_type == "compiled_page":
+        if meta.get("target_kind") != target_kind:
+            return None
+        raw = meta.get("target_id")
+    elif linker_type is not None and declared_type == linker_type:
+        raw = meta.get("id")
+    else:
+        return None
+    return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+
+def _load_names(root: Path, target_kind: str) -> _NameIndex:
+    """Build the name → canonical-id index for *target_kind* under *root*.
+
+    Header-only (:func:`creek.vault.links.read_header_meta`), so a vault with
+    35k pages does not pay to parse a body just to learn a page's aliases.
+    Both compiled and linker-written pages are indexed here — knowing that
+    ``[[Messages]]`` names a real eddy is what lets a gap be reported as
+    ``uncompiled`` rather than falsely as ``missing``.
+    """
+    if not root.exists():
+        return _NameIndex()
+    pages = [
+        (page_id, declared_names(meta))
+        for md_file in sorted(root.rglob("*.md"))
+        for meta in (read_header_meta(md_file),)
+        for page_id in (_page_identity(meta, target_kind),)
+        if page_id is not None
+    ]
+    by_name: dict[str, str] = {}
+    by_folded: dict[str, str] = {}
+
+    def _register(name: str, page_id: str) -> None:
+        """Claim *name* for *page_id* unless an earlier page already holds it."""
+        by_name.setdefault(name, page_id)
+        by_folded.setdefault(name.casefold(), page_id)
+
+    for page_id, _ in pages:
+        _register(page_id, page_id)
+    for page_id, names in pages:
+        for name in names:
+            _register(name, page_id)
+    return _NameIndex(by_name=by_name, by_folded=by_folded)
 
 
 def _load_pages(root: Path, target_kind: str) -> dict[str, CompiledPage]:
@@ -293,3 +474,45 @@ def log_compile_gap(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def record_compile_gap(
+    vault_path: Path,
+    index: CompiledPageIndex,
+    *,
+    target_kind: str,
+    target_id: str,
+    surfaced_by: str,
+) -> None:
+    """Append a compile gap, naming the reason *index* can actually justify.
+
+    Every routing miss still reaches the backlog — that is not negotiable, and
+    the guard suite ``tests/test_compile_gap_signal.py`` exists to keep it
+    that way. #881 was never "log less"; it was "stop lying about what is
+    absent". So the reason is now derived rather than hard-coded:
+
+    * ``"uncompiled"`` — a page of this kind exists (a ``creek link``-written
+      thread/eddy, say) but has never been through ``creek compile``. A real
+      operator task, honestly named.
+    * ``"missing"`` — nothing in the vault claims this target by id, title, or
+      alias. Byte-identical to what was logged before #881.
+
+    Args:
+        vault_path: Vault root.
+        index: The index the miss came from, so the reason and the lookup
+            cannot disagree about which pages exist.
+        target_kind: ``"thread"``, ``"eddy"``, ``"frequency_index"``, or any
+            other surface the caller names — an unrecognised kind simply has
+            no page index and reports ``"missing"``.
+        target_id: The reference as the caller holds it, logged verbatim so
+            the operator sees the spelling their vault actually contains.
+        surfaced_by: Verb that hit the gap, plus an optional strategy tag.
+    """
+    reason = "uncompiled" if index.page_exists(target_kind, target_id) else "missing"
+    log_compile_gap(
+        vault_path,
+        target_kind=target_kind,
+        target_id=target_id,
+        surfaced_by=surfaced_by,
+        reason=reason,
+    )
