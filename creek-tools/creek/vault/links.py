@@ -295,9 +295,34 @@ def iter_link_sources(vault_path: Path) -> list[Path]:
 def build_link_index(vault_path: Path) -> LinkIndex:
     """Build the name → page index for every markdown file under *vault_path*.
 
-    Each page is registered under its filename stem plus every name its
-    frontmatter declares. Ties go to the first page in sorted path order, so
-    the index is deterministic across runs regardless of filesystem ordering.
+    Resolution follows a strict four-level ladder; the first level with a hit
+    wins, and within a level the first page in sorted path order wins:
+
+    1. exact-case filename stem
+    2. exact-case declared name (frontmatter ``title`` or an ``aliases`` entry)
+    3. case-folded filename stem
+    4. case-folded declared name
+
+    In one sentence: a page's own filename stem outranks any *other* page's
+    declared name at the same case-match quality; an exact-case match still
+    outranks a folded one regardless of provenance; ties inside a level go to
+    the first page in sorted path order.
+
+    The ladder falls out of two registration passes over one pre-sorted list
+    (stems first, then declared names) combined with the exact-before-folded
+    lookup in :meth:`LinkIndex.resolve` — no provenance is stored.
+
+    Why (#1224): a page's stem is a fact about that page's identity, the name
+    the operator sees in the Obsidian sidebar and the one Obsidian itself
+    resolves first. An alias is a courtesy name some *different* page
+    volunteered. Before this change the winner was whichever page happened to
+    sort first, so a fragment aliasing ``Messages`` beat the eddy page
+    literally named ``Messages.md``.
+
+    The one case where a foreign alias still shadows a stem is level 2 over
+    level 3 — an exact-case alias beats a folded stem. That is deliberate:
+    Obsidian's exact-before-folded rule is preserved, and the ladder only
+    reorders *within* a case-match quality.
 
     Args:
         vault_path: Root of the Obsidian vault.
@@ -305,10 +330,21 @@ def build_link_index(vault_path: Path) -> LinkIndex:
     Returns:
         A :class:`LinkIndex` covering the whole vault.
     """
+    pages = [
+        (md_file, md_file.stem, _header_names(md_file))
+        for md_file in sorted(vault_path.rglob("*.md"))
+    ]
     by_name: dict[str, Path] = {}
     by_folded: dict[str, Path] = {}
-    for md_file in sorted(vault_path.rglob("*.md")):
-        for name in (md_file.stem, *_header_names(md_file)):
-            by_name.setdefault(name, md_file)
-            by_folded.setdefault(name.casefold(), md_file)
+
+    def _register(name: str, md_file: Path) -> None:
+        """Claim *name* for *md_file* unless an earlier page already holds it."""
+        by_name.setdefault(name, md_file)
+        by_folded.setdefault(name.casefold(), md_file)
+
+    for md_file, stem, _ in pages:
+        _register(stem, md_file)
+    for md_file, _, declared in pages:
+        for name in declared:
+            _register(name, md_file)
     return LinkIndex(by_name=by_name, by_folded=by_folded)
