@@ -345,19 +345,17 @@ def build_fingerprint(
             #632/#633/#634 epic, and flipping this one is a behaviour change
             for library callers with no issue behind it.
 
-            Be careful what you conclude from that. On the *exemplar* side the
-            default is unreachable in production, because
+            The default is nonetheless unreachable from production on both
+            sides. ``build_fingerprint`` joined
+            ``_AUDIENCE_WEIGHTING_CALL_NAMES`` in #1410, so
             ``test_production_voice_callers_always_state_an_audience_weighting``
-            requires every construction there to state the value. **No such
-            guard covers this function.** ``build_fingerprint`` is deliberately
-            absent from ``_AUDIENCE_WEIGHTING_CALL_NAMES``, and one production
-            caller does still rely on the ``None`` default:
-            ``creek/cli.py``'s ``_resolve_voice_fingerprint``, the fallback
-            ``creek voice-check`` takes when a vault has no persisted
-            ``voice-fingerprint.json``. So that command can score against an
-            unweighted fingerprint while ``report --type fingerprint``
-            persists a weighted one. Tracked in #1410; not fixed here because
-            it is pre-existing and outside #1313's inventory.
+            now requires every in-tree construction to state the value —
+            including ``creek/cli.py``'s ``_resolve_voice_fingerprint``, the
+            fallback ``creek voice-check`` takes when a vault has no persisted
+            ``voice-fingerprint.json``, which was the last caller relying on
+            it and could score against an unweighted fingerprint while
+            ``report --type fingerprint`` persisted a weighted one. ``None``
+            survives for library callers outside the tree.
 
             The load-bearing difference between the two paths is not the
             default but the semantics — see :func:`_eligible_texts` on why a

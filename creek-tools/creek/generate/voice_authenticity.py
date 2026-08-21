@@ -43,8 +43,7 @@ import frontmatter
 
 from creek.config import (
     VoiceAudienceWeightingConfig,
-    load_config,
-    resolve_config_path,
+    load_vault_config,
 )
 from creek.generate.ai_style.guard import (
     VOICE_DISTANCE_KEY,
@@ -374,7 +373,7 @@ def build_voice_authenticity_report(
     # Vault-scoped, not the bare process-wide ``load_config()``: that resolves
     # ``creek_config.yaml`` against the cwd and never reads the vault's own
     # file. Same precedent as ``creek_mcp/tools/draft.py`` (#1313).
-    config = load_config(resolve_config_path(vault_path, None), warn_on_missing=False)
+    config = load_vault_config(vault_path)
     return VoiceAuthenticityReport(
         audience_mix=_probe_audience_mix(
             eligible,

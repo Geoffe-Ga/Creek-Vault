@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -25,7 +26,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
 
 from creek.care.guardrail import acute_distress_guard
-from creek.config import CONFIG_PATH_ENV_VAR, load_config
+from creek.config import CONFIG_PATH_ENV_VAR, load_config, load_vault_config
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
 from creek_mcp.policy import (
     Admission,
@@ -206,7 +207,16 @@ class _BoundedFastMCP(FastMCP):
 
 
 def _resolve_vault(vault_path: Path | None) -> Path:
-    """Return the supplied path or fall back to ``load_config().vault_path``."""
+    """Return the supplied path or fall back to ``load_config().vault_path``.
+
+    The bare :func:`~creek.config.load_config` here is deliberate and is one of
+    the two sites #1409 left alone. This function is the bootstrap that
+    *answers* "which vault?"; it runs before any vault is known, so resolving
+    it through :func:`~creek.config.load_vault_config` would be circular. Every
+    consumer downstream of it has a vault and must use the shared resolver
+    instead — ``tests/test_vault_config_resolver.py`` enforces exactly that
+    split, and lists this function by name as an allowed exception.
+    """
     if vault_path is not None:
         return vault_path
     return load_config().vault_path
@@ -217,7 +227,7 @@ def _consumer_from_env() -> str:
     return os.environ.get("CREEK_MCP_CONSUMER", "unknown")
 
 
-def _build_draft_llm(tier: PrivacyTier) -> Callable[[str], str]:
+def _build_draft_llm(vault: Path, tier: PrivacyTier) -> Callable[[str], str]:
     """Return the draft-side LLM callable, routed for *tier* (#958).
 
     Mirrors :func:`_build_compile_llm`: the ``generation`` stage is resolved
@@ -235,6 +245,11 @@ def _build_draft_llm(tier: PrivacyTier) -> Callable[[str], str]:
     Anthropic key nor a running Ollama.
 
     Args:
+        vault: The served vault, whose own ``creek_config.yaml`` owns the
+            routing. Bound by ``build_server`` at construction time (#1409):
+            reading it from the process cwd instead let the operator's
+            per-vault routing — including which provider a stage egresses to —
+            be decided by wherever the server happened to be started.
         tier: The routing tier ``draft_tool`` computed from the caller's
             ceiling and the seed's source fragments' own classifications.
 
@@ -249,7 +264,7 @@ def _build_draft_llm(tier: PrivacyTier) -> Callable[[str], str]:
     """
     from creek.classify.llm.providers import build_provider
 
-    cfg = load_config().model_router.resolve("generation", tier)
+    cfg = load_vault_config(vault).model_router.resolve("generation", tier)
     provider = build_provider(cfg)
     if not provider.available:
         msg = (
@@ -260,7 +275,7 @@ def _build_draft_llm(tier: PrivacyTier) -> Callable[[str], str]:
     return lambda prompt: provider.complete(prompt).text
 
 
-def _build_compile_llm(tier: PrivacyTier) -> CompileLLM:
+def _build_compile_llm(vault: Path, tier: PrivacyTier) -> CompileLLM:
     """Return the compile-side LLM callable, routed for *tier* (#928/#929).
 
     Mirrors :func:`_build_reflect_llm_factory`'s inner factory: the
@@ -276,6 +291,11 @@ def _build_compile_llm(tier: PrivacyTier) -> CompileLLM:
     ``creek.compile`` call then fails, and it fails as a structured refusal.
 
     Args:
+        vault: The served vault, whose own ``creek_config.yaml`` owns the
+            routing. Bound by ``build_server`` at construction time (#1409):
+            reading it from the process cwd instead let the operator's
+            per-vault routing — including which provider a stage egresses to —
+            be decided by wherever the server happened to be started.
         tier: The routing tier, reconciled from two signals: since #962
             ``creek.compile.engine`` derives the source fragments' own
             classification (it is the layer that loaded them) and
@@ -293,7 +313,7 @@ def _build_compile_llm(tier: PrivacyTier) -> CompileLLM:
     """
     from creek.classify.llm.providers import build_provider
 
-    cfg = load_config().model_router.resolve("generation", tier)
+    cfg = load_vault_config(vault).model_router.resolve("generation", tier)
     provider = build_provider(cfg)
     if not provider.available:
         msg = (
@@ -304,7 +324,7 @@ def _build_compile_llm(tier: PrivacyTier) -> CompileLLM:
     return lambda prompt: provider.complete(prompt).text
 
 
-def _build_reflect_llm_factory() -> _LLMFactory:
+def _build_reflect_llm_factory(vault: Path) -> _LLMFactory:
     """Return a tier-keyed LLM factory for ``creek.reflect``.
 
     The returned ``factory(tier)`` resolves the ``generation`` stage through the
@@ -313,10 +333,17 @@ def _build_reflect_llm_factory() -> _LLMFactory:
     raises ``IntimateRoutingError`` rather than egressing). Lazy imports keep the
     server bootable without a provider — only a ``creek.reflect`` call then fails,
     surfacing as a structured refusal.
+
+    Args:
+        vault: The served vault, whose own config owns the routing (#1409).
+            Bound once here; the tier arrives per call.
+
+    Returns:
+        A tier → LLM-callable factory bound to *vault*'s router.
     """
     from creek.classify.llm.providers import build_provider
 
-    router = load_config().model_router
+    router = load_vault_config(vault).model_router
 
     def _factory(tier: PrivacyTier) -> _LLM:
         cfg = router.resolve("generation", tier)
@@ -332,7 +359,7 @@ def _build_reflect_llm_factory() -> _LLMFactory:
     return _factory
 
 
-def _build_author_llm(tier: PrivacyTier | None) -> AuthorLLMClient | None:
+def _build_author_llm(vault: Path, tier: PrivacyTier | None) -> AuthorLLMClient | None:
     """Return the Writing Desk's voice client, routed for *tier* (#658/#661).
 
     The author-side sibling of :func:`_build_draft_llm`, extracted from
@@ -349,6 +376,10 @@ def _build_author_llm(tier: PrivacyTier | None) -> AuthorLLMClient | None:
     failure, and the caller is told so in prose rather than by an exception.
 
     Args:
+        vault: The served vault. The one builder reading *two* config sections
+            — ``model_router`` and ``author`` — so resolving it from the
+            process cwd took both the routing and the desk's persona from
+            whichever vault the server's directory happened to name (#1409).
         tier: The run's content tier, or ``None`` when the evidence carries no
             classification to route on.
 
@@ -362,7 +393,7 @@ def _build_author_llm(tier: PrivacyTier | None) -> AuthorLLMClient | None:
     """
     from creek.author.client import AuthorLLMClient
 
-    config = load_config()
+    config = load_vault_config(vault)
     return AuthorLLMClient.for_voice_or_none(
         config.model_router,
         author=config.author,
@@ -417,10 +448,13 @@ def build_server(
     )
     vault = _resolve_vault(vault_path)
     consumer = _consumer_from_env()
-    factory = draft_llm_factory or _build_draft_llm
-    author_factory = author_llm_factory or _build_author_llm
-    compile_factory = compile_llm_factory or _build_compile_llm
-    reflect_factory = reflect_llm_factory or _build_reflect_llm_factory
+    # Each default builder is bound to the vault this server serves (#1409).
+    # They used to resolve their config from the process cwd, which silently
+    # routed one vault's text with another vault's model routing.
+    factory = draft_llm_factory or partial(_build_draft_llm, vault)
+    author_factory = author_llm_factory or partial(_build_author_llm, vault)
+    compile_factory = compile_llm_factory or partial(_build_compile_llm, vault)
+    reflect_factory = reflect_llm_factory or partial(_build_reflect_llm_factory, vault)
 
     @server.tool(name="creek.handshake")
     async def _handshake(
