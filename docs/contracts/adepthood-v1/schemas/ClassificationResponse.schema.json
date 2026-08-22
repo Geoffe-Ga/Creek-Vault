@@ -1,0 +1,108 @@
+{
+  "$defs": {
+    "ClassificationMethod": {
+      "description": "The classification methods ``POST /v1/classifications`` serves.\n\nOne member, and the single member is the point. ``creek classify`` also\naccepts ``llm``, and it is **deliberately absent here** rather than\naccepted-and-refused:\n\n* **Time.** :data:`creek_mcp.httpapi.middleware.limits.DEFAULT_TIMEOUT_SECONDS`\n  is thirty seconds, and the timeout middleware uses ``anyio.fail_after``,\n  which cannot cancel a call already inside ``run_in_threadpool``. An LLM\n  pass over a seeded corpus is minutes to hours: the caller would be handed\n  a ``503`` while the work carried on with no handle on it.\n* **Egress.** With no ``llm`` member there is no value a producer or a\n  consumer can put on the wire that reaches a provider at all, so \"no byte\n  of the vault leaves the host on this route\" is a property of the type\n  rather than of a runtime check somebody can forget to call.\n\nReaching ``llm`` classification over the network needs an asynchronous job\nsurface \u2014 ``202``, a job id, a status route \u2014 which this contract does not\nhave. Until then it stays an operator step on the host.\n\nAttributes:\n    RULES: Keyword classification. No model, no key, no consent, no egress.",
+      "enum": [
+        "rules"
+      ],
+      "title": "ClassificationMethod",
+      "type": "string"
+    },
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:func:`creek_mcp.policy.admitted_ceiling` refuses any remote call declaring\na ceiling outside :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` *before\ndispatch*. Since #1073 that decision is transport-neutral, so every adapter\nis meant to reach it the same way; the MCP surface does so today through\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool`, and #1074 mounts the\n``/v1`` handlers that will. This enum mirrors that frozenset, so\n``intimate`` and ``all`` are not merely refused at runtime \u2014 they cannot be\nconstructed at all, which is the half of the guarantee that does not depend\non a handler remembering to ask.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "What one classification pass did, in counts alone (#1570).\n\n**Nothing here names a fragment.** No id, no path, no title, no excerpt,\nnot even an error string \u2014 the engine's per-fragment errors interpolate\nfile paths, so they are collapsed into :attr:`complete`. That is what makes\nit safe for this route to run over the *whole* vault while serving a caller\ncapped at ``personal``: the pass reads material above the ceiling on the\nhost, and reports nothing whatsoever about it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call ran at.\n    method: The classifier that ran, echoed so a client that sent an empty\n        body learns which default it got.\n    total: Creek fragments visited.\n    classified: Fragments whose frontmatter this run rewrote.\n    preserved_manual: Fragments left alone because an operator had stamped\n        them by hand.\n    preserved_llm: Fragments left alone by the resume short-circuit.\n    privacy_tiers_assigned: Fragments whose privacy tier this run derived.\n        **Zero is the expected answer for a network-seeded corpus**, and it\n        is not a failure: ``POST /v1/uploads`` requires an explicit tier\n        (#1497), so an uploaded fragment already carries the caller's\n        declared one and the tier pass does not own it. Only ``retier``\n        re-opens that case.\n    retiered: Subset of the above where an already-recorded tier was\n        replaced by a stricter one. Non-zero only under ``retier``.\n    praxis_marked: Fragments raised to a stronger praxis potential.\n    tags_extracted: Fragments that gained a hashtag ``tags`` entry.\n    complete: Whether every visited fragment was processed without error.\n        ``False`` means some were skipped, and \u2014 because the pass is\n        resumable \u2014 that the honest next step is to call again rather than\n        to treat the corpus as done. The *reasons* stay in the server log:\n        each one names the file it failed on.",
+  "properties": {
+    "classified": {
+      "description": "Fragments rewritten this run.",
+      "minimum": 0,
+      "title": "Classified",
+      "type": "integer"
+    },
+    "complete": {
+      "description": "Every visited fragment processed cleanly.",
+      "title": "Complete",
+      "type": "boolean"
+    },
+    "method": {
+      "$ref": "#/$defs/ClassificationMethod",
+      "description": "The classifier that ran."
+    },
+    "praxis_marked": {
+      "description": "Fragments raised to praxis.",
+      "minimum": 0,
+      "title": "Praxis Marked",
+      "type": "integer"
+    },
+    "preserved_llm": {
+      "description": "Left alone: resume stamp.",
+      "minimum": 0,
+      "title": "Preserved Llm",
+      "type": "integer"
+    },
+    "preserved_manual": {
+      "description": "Left alone: operator stamp.",
+      "minimum": 0,
+      "title": "Preserved Manual",
+      "type": "integer"
+    },
+    "privacy_tiers_assigned": {
+      "description": "Tiers derived this run.",
+      "minimum": 0,
+      "title": "Privacy Tiers Assigned",
+      "type": "integer"
+    },
+    "retiered": {
+      "description": "Recorded tiers replaced by stricter.",
+      "minimum": 0,
+      "title": "Retiered",
+      "type": "integer"
+    },
+    "status": {
+      "const": "ok",
+      "description": "Always ok; failure is an error.",
+      "title": "Status",
+      "type": "string"
+    },
+    "tags_extracted": {
+      "description": "Fragments that gained tags.",
+      "minimum": 0,
+      "title": "Tags Extracted",
+      "type": "integer"
+    },
+    "tier_ceiling": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Ceiling the call ran at."
+    },
+    "total": {
+      "description": "Creek fragments visited.",
+      "minimum": 0,
+      "title": "Total",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "status",
+    "tier_ceiling",
+    "method",
+    "total",
+    "classified",
+    "preserved_manual",
+    "preserved_llm",
+    "privacy_tiers_assigned",
+    "retiered",
+    "praxis_marked",
+    "tags_extracted",
+    "complete"
+  ],
+  "title": "ClassificationResponse",
+  "type": "object"
+}

@@ -20,8 +20,40 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.9.0"
+CONTRACT_VERSION: Final[str] = "0.10.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.10.0 (#1570): a seventh capability, ``pipeline``, served by two routes —
+``POST /v1/classifications`` and ``POST /v1/links``. Additive in exactly the
+0.8.0 / 0.9.0 shape: ``SUPPORTED_CONTRACT_MINORS`` widens to keep ``0.9`` and
+everything below it served, and a client pinned under 0.10 is neither told the
+capability exists nor served it, because both halves read
+:data:`creek_mcp.api.models.CAPABILITY_SINCE_MINOR`. No existing response
+shape, field, status or error code moves.
+
+**What it closes.** Until now ``/v1`` could ingest and nothing else:
+``creek.classify`` and ``creek.link`` existed only as MCP tools, so a vault
+seeded entirely over the network held fragments with no APTITUDE frequency, no
+Archetypal Wavelength phase and no resonances — inert, with nothing erroring.
+The seeding epic's Definition of Done promises fragments land
+*"correctly-typed, correctly-tiered — over the network, with no CLI and no
+shell access"*, and typing and tiering are what these two passes produce.
+
+**What it deliberately does not add.** ``classify --method llm`` and ``link
+--method embeddings`` are absent from the wire enums, so they are unreachable
+in the *type* rather than refused at runtime. Both are minutes-to-hours of work
+behind a thirty-second request deadline the timeout middleware cannot cancel
+once the call is in a worker thread. Reaching them over the network needs an
+asynchronous job surface this contract does not have; until then they remain an
+operator step on the host. That is **not** a promise that the served members
+all finish inside the deadline: ``eddies`` and ``threads`` cluster over
+embeddings and so fill the parquet cache with a *local* model pass on a cold
+vault, which a first call can outrun. They ship anyway because the cache keeps
+the timed-out work, so a retry converges (#1605).
+
+**This is the first double-digit minor.**
+:func:`creek_mcp.api.models.minor_at_least` compares componentwise as integers
+precisely for this day: read as text, ``"0.10"`` sorts *below* ``"0.8"``.
 
 0.9.0 (#1527 / #873): two additive changes ship at this minor. Both widen
 ``SUPPORTED_CONTRACT_MINORS`` rather than shift it, and neither takes anything

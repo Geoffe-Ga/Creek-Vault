@@ -184,17 +184,18 @@ def test_the_tier_model_is_the_standing_promise(vault: Path) -> None:
 def test_a_present_vault_advertises_only_the_built_capabilities(
     vault: Path,
 ) -> None:
-    """At #1527 that is every published capability, ``drive-connector`` too.
+    """At #1570 that is every published capability, ``pipeline`` too.
 
     Spelled as a literal rather than derived from
     ``IMPLEMENTED_CAPABILITIES`` — that derivation already has its own test
     below. This one is the pin that makes a capability's landing *visible* in
-    a diff: a sixth capability has to add its name here, and a handler wired
+    a diff: a seventh capability has to add its name here, and a handler wired
     without the constant (or vice versa) cannot slip past both.
 
     The request carries the current minor (``headers()`` defaults to it), so
-    this is the *newest*-client view. The older-client view — where ``upload``
-    and ``drive-connector`` are withheld — is asserted separately below.
+    this is the *newest*-client view. The older-client view — where ``upload``,
+    ``drive-connector`` and ``pipeline`` are withheld — is asserted separately
+    below.
 
     Args:
         vault: A seeded vault.
@@ -206,6 +207,7 @@ def test_a_present_vault_advertises_only_the_built_capabilities(
         "wheel",
         "upload",
         "drive-connector",
+        "pipeline",
     ]
 
 

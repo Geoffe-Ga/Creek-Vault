@@ -27,6 +27,8 @@ does and does not yet do.
 | `GET /v1/connectors/drive` | **Implemented.** The read-only Google Drive connector's *state*: `connected` / `not_connected` / `expired` / `unsupported`, the granted OAuth scopes (always `.readonly` — the config refuses anything else), and `can_sync`. **No credential is published and none is accepted**: the response has no field a token could sit in, and the model forbids extras. This is the one route that discloses connection state deliberately — a client cannot render a connect button without it — which is exactly why the other two verbs' refusals disclose nothing. Published at contract `0.9.0` (#1527). |
 | `POST /v1/connectors/drive/syncs` | **Implemented.** One **incremental** Drive sync over the existing downloader, followed by an ordinary ledger-backed ingest of whatever it fetched. Takes **no request body** — there is no parameter you could usefully set, and a caller-supplied path or file id would be a way to steer the server at part of the owner's Drive they never asked it to touch. The response is **counts only**: no Drive file name, folder name or id, and no `affected_fragment_ids` — a sync's fragments are the vault owner's content, and a list of them would be a corpus enumeration primitive. Files land at the tier `creek ingest` would give them; the route passes **no** `privacy_tier`, so it cannot make any tier less restrictive. A second sync over an unchanged Drive fetches nothing and writes nothing. Refuses with `503 unavailable` when there is no usable credential, rather than falling through to an OAuth flow that would try to open a browser on the server. Published at contract `0.9.0` (#1527). |
 | `DELETE /v1/connectors/drive` | **Implemented.** Revoke and erase: posts the refresh token to Google's revocation endpoint (the one journey the credential makes, and it is back to its issuer), then overwrites and unlinks the local token file. Idempotent — disconnecting an already-disconnected connector is a `200` reporting the same state. `remote_revoked: false` means finish the job at Google's account page; it does **not** mean the local erase failed, which is a refusal rather than a success. After this, a sync refuses. Published at contract `0.9.0` (#1527). |
+| `POST /v1/classifications` | **Implemented.** One **whole-vault** classification pass over the shared `creek.classify` tool. Body is `{method?, retier?}`; `method` defaults to `rules`, which is the **only** served value — `llm` is absent from the wire enum, so it is a `422`, not a runtime refusal. That exclusion is about time, not capability: an LLM pass is minutes-to-hours behind a 30-second request deadline the server cannot cancel once the work is in a thread, and it stays an operator step (`creek classify --method llm`). There is deliberately **no fragment selector** — the pass is idempotent, so "classify everything" converges on retry, whereas a caller-supplied id list would let a consumer enumerate a corpus it cannot read. The response is **counts only**: no fragment id, no path, no prose, and not even the engine's per-fragment error strings (they name files), which collapse into `complete`. `privacy_tiers_assigned: 0` is the expected answer for a network-seeded vault and is not a failure — `POST /v1/uploads` requires an explicit `tier`, so the fragment already carries one; only `retier: true` re-opens that, and it is **escalate-only**, so nothing here can make a fragment less private. Published at contract `0.10.0` (#1570). |
+| `POST /v1/links` | **Implemented.** One linker stage over the whole vault, via the shared `creek.link` tool. Body is `{method}`, required and undefaulted — `temporal`, `eddies` and `threads` write different artefacts, so a default would silently run a pass you did not choose. `embeddings` is absent from the enum for the same reason `llm` is absent above: it is the unbounded O(n²) pairwise-similarity stage, and it stays an operator step (`creek link --method embeddings`). **Excluding it does not make the served three uniformly cheap, and do not read the schema as promising that**: `temporal` needs no vectors, but `eddies` and `threads` both fill the embeddings parquet on a cold cache — a *local* sentence-transformer pass over every uncached fragment, minutes of work on a large vault, which can outrun the 30-second deadline on a first call. They are served anyway because the parquet is a cache: the work a timed-out call performs still lands, so a retry converges rather than starting over, and nothing about it reaches a network provider. Counts only, for the same disclosure reason. `oversized_discarded` is published rather than folded away because a discarded fragment carries no link at all — that is data loss, and a caller who cannot see it reads a lossy pass as a clean one. Published at contract `0.10.0` (#1570). |
 | `GET /v1/wheel` | **Implemented.** The **frequency distribution over the classified corpus** — how many ceiling-admitted fragments sit at each APTITUDE frequency F1–F10, and each frequency's share of the classified total. **This is not a curriculum-progress or fullness measure.** Adepthood's Map validates a ten-member `{aspects: [{stage_number, aspect, fullness}]}` shape from its own 36-week curriculum; that projection is Adepthood's and is owned there (Geoffe-Ga/adepthood#1937). Ten members on both sides is a coincidence of cardinality, not a shared meaning — reading one as the other renders confidently wrong numbers. An empty or missing corpus is `200` with all ten entries at `count: 0`, never `404` and never an error (#1076). |
 
 **Every published route is now built, and none of them was ever allowed to
@@ -59,13 +61,14 @@ list of names:
 | `wheel` | `0.2` |
 | `upload` | `0.8` |
 | `drive-connector` | `0.9` |
+| `pipeline` | `0.10` |
 <!-- /capability-set -->
 
 **The advertised list is caller-dependent, and the count above is the ceiling,
 not the answer.** What a given caller is shown is the intersection of that set
 with what its *declared* contract minor published, off `CAPABILITY_SINCE_MINOR`
 in `creek_mcp/api/models.py`: a caller declaring `0.2` is shown the first four,
-one declaring `0.9` — or declaring no minor at all — is shown all six. The
+one declaring `0.10` — or declaring no minor at all — is shown all seven. The
 route that serves a withheld capability refuses the same caller off the same
 table, so what is hidden here is unreachable there.
 
@@ -241,7 +244,7 @@ the other: drop the directive and a compliant cache is free to store, drop the
 tokens and a non-compliant one is free to mismatch.
 
 **These are unconditional, not "on authenticated responses".** Bearer
-authentication sits above the router, so all nine operations are authenticated
+authentication sits above the router, so all eleven operations are authenticated
 anyway; and refusals need the treatment as much as successes. A stored `404`
 is the concrete case — it is the one status this surface returns that both is
 reachable on any unrouted path and is *heuristically cacheable* under RFC 9110
@@ -289,16 +292,16 @@ could put on any wire position that names it.
 `/v1` is the HTTP major. Below it, one `contract_version` covers both this
 surface and MCP.
 
-The seven capability routes — `PUT /v1/journal-entries/{external_id}`,
-`POST /v1/reflections`, `GET /v1/wheel`, `POST /v1/uploads` and the three
-`/v1/connectors/drive` verbs — require
-`X-Creek-Contract-Version: <major.minor>`, for example `0.9`. The comparison is
+The nine capability routes — `PUT /v1/journal-entries/{external_id}`,
+`POST /v1/reflections`, `GET /v1/wheel`, `POST /v1/uploads`, the three
+`/v1/connectors/drive` verbs, `POST /v1/classifications` and `POST /v1/links` —
+require `X-Creek-Contract-Version: <major.minor>`, for example `0.10`. The comparison is
 strict membership against the server's `supported_contract_minors`: a missing
 header, a full patch version like `0.2.0`, or anything unrecognised is `409
 incompatible_version`, refused before any vault read.
 
 That set is a **window, and it widens before it narrows**. It currently holds
-`0.9`, `0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and `0.2`. The `0.3.0`, `0.4.0` and `0.6.0` moves all
+`0.10`, `0.9`, `0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and `0.2`. The `0.3.0`, `0.4.0` and `0.6.0` moves all
 came from the MCP surface and changed no `/v1` shape — `0.3.0` added
 `creek.upload` (#1023), `0.4.0` gave `creek.purge.*` its `partial` status
 (#1246), and `0.6.0` gave `creek.purge.*` the `ledger_rows_removed` and
@@ -327,6 +330,15 @@ advertised list and the route refusal — and it adds **no error code and no new
 status**, so a `0.8` client meets nothing new on any route it already calls. It
 is also the first template serving two methods; `GET` and `DELETE` on
 `/v1/connectors/drive` are separate published operations.
+
+`0.10.0` (#1570) is the third such bump: `pipeline`, over `POST
+/v1/classifications` and `POST /v1/links`. Additive in the same enforced sense,
+with **no new error code and no new status**, so a `0.9` client meets nothing
+new on any route it already calls. It closes the seeding gap — until it, `/v1`
+could ingest and nothing else, so a vault seeded entirely over the network held
+fragments with no frequency, no phase and no resonances. It is also the first
+**double-digit** minor: compare minors componentwise as integers, never as
+text, or `0.10` sorts below `0.8`.
 
 Read the window off `GET /v1/capabilities` rather than assuming the newest
 minor is the only one accepted.
@@ -639,7 +651,8 @@ is not hash-pinned the way the fixture bundle is; only its schema content is
 pinned, by the tests above.
 
 **The revisit trigger, because "at the next contract minor" already came and
-went twice.** Minors `0.8.0` (#1524) and `0.9.0` (#1527/#873) have each
+went twice.** Minors `0.8.0` (#1524), `0.9.0` (#1527/#873) and `0.10.0`
+(#1570) have each
 re-published the bundle since #1111 was filed, so waiting for a free moment is
 not a plan. The trigger is recorded in
 [`docs/decisions/2026-07-31-adepthood-http-application-api.md`](../../docs/decisions/2026-07-31-adepthood-http-application-api.md)

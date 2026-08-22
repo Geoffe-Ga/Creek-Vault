@@ -71,9 +71,11 @@ from creek_mcp.api.models import (
     SUPPORTED_CONTRACT_MINORS,
     CapabilitiesStatus,
     Capability,
+    ClassificationMethod,
     DriveConnectionState,
     ErrorCode,
     JournalAction,
+    LinkMethod,
     NoteKind,
     PraxisKind,
     PraxisLifecycle,
@@ -167,8 +169,8 @@ UNREACHABLE_CELLS: Final[frozenset[tuple[str, str]]] = frozenset(
 Derived from the axes rather than listed, so it cannot fall out of step with
 the matrix it describes. The acute-distress guard runs only inside
 :func:`creek_mcp.tools.reflect.reflect_tool`, so ``capabilities``,
-``journal-upsert``, ``wheel``, ``upload`` and ``drive-connector`` can never
-escalate. Those five cells are filled with a
+``journal-upsert``, ``wheel``, ``upload``, ``drive-connector`` and
+``pipeline`` can never escalate. Those six cells are filled with a
 :class:`~creek_mcp.api.models.NotApplicableExample` that says so.
 """
 
@@ -332,6 +334,64 @@ _DRIVE_SYNC_EMPTY: Final[dict[str, Any]] = {
 Published as its own fixture because "nothing happened" is the answer a client
 integrating against this route will see most often, and a client that treated
 an all-zero tally as a failure would retry a working connector forever.
+"""
+
+_PIPELINE_TOTAL: Final[int] = 12
+"""Fragments visited by the worked classification example."""
+
+_PIPELINE_PRESERVED: Final[int] = 2
+"""Of those, the ones an operator had already stamped by hand."""
+
+_PIPELINE_CLASSIFIED: Final[int] = _PIPELINE_TOTAL - _PIPELINE_PRESERVED
+"""The rest, which this run rewrote. Derived, so the three cannot disagree."""
+
+_PIPELINE_TAGGED: Final[int] = 5
+"""How many of the classified fragments gained a hashtag ``tags`` entry."""
+
+_CLASSIFICATION_SUCCESS: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "tier_ceiling": WireTierCeiling.PERSONAL.value,
+    "method": ClassificationMethod.RULES.value,
+    "total": _PIPELINE_TOTAL,
+    "classified": _PIPELINE_CLASSIFIED,
+    "preserved_manual": _PIPELINE_PRESERVED,
+    "preserved_llm": 0,
+    "privacy_tiers_assigned": 0,
+    "retiered": 0,
+    "praxis_marked": 0,
+    "tags_extracted": _PIPELINE_TAGGED,
+    "complete": True,
+}
+"""A worked classification pass over a network-seeded vault.
+
+``privacy_tiers_assigned`` is **zero on purpose**, and it is the cell a
+consumer is most likely to misread as a failure. ``POST /v1/uploads`` requires
+an explicit tier (#1497), so every fragment a network-seeded corpus holds
+already carries the caller's declared one and the tier pass does not own it.
+Only a request with ``retier`` set re-opens that case.
+
+No fragment id, no path and no prose appear here, because the response model
+has nowhere to put any: the fixture documents the *response*, and the response
+is the whole of what a remote consumer learns from a pass that read the entire
+vault.
+"""
+
+_LINK_EMPTY: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "tier_ceiling": WireTierCeiling.PERSONAL.value,
+    "method": LinkMethod.TEMPORAL.value,
+    "fragment_count": 0,
+    "link_count": 0,
+    "largest_cluster_fragments": 0,
+    "clusters_split": 0,
+    "oversized_discarded": 0,
+}
+"""A linker stage over a vault with nothing in it: all zeroes, and a success.
+
+Published as the ``empty`` cell for the same reason the Drive connector's
+unchanged sync is: "nothing happened" is an answer a client integrating
+against this route will meet often, and one that treated an all-zero tally as
+a failure would retry a working server forever.
 """
 
 _EXAMPLE_NOTE: Final[dict[str, Any]] = {
@@ -515,13 +575,19 @@ _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
         model="DriveConnectorStatusResponse",
         payload=_DRIVE_STATUS_SUCCESS,
     ),
+    Capability.PIPELINE.value: _Example(
+        model="ClassificationResponse",
+        payload=_CLASSIFICATION_SUCCESS,
+    ),
 }
 """The ``success`` column: one canonical happy response per capability.
 
 ``drive-connector`` is the one capability whose column spans three response
 models, because it is one capability over three verbs. Its two success-ish
 cells are chosen to be the two a client meets first: the connected *state*
-here, and an unchanged *sync* in the ``empty`` column below.
+here, and an unchanged *sync* in the ``empty`` column below. ``pipeline``
+splits the same way over its two verbs — a worked classification here, an
+empty link below — so both of its response models are shown somewhere.
 """
 
 _EMPTY_EXAMPLES: Final[dict[str, _Example]] = {
@@ -548,6 +614,10 @@ _EMPTY_EXAMPLES: Final[dict[str, _Example]] = {
     Capability.DRIVE_CONNECTOR.value: _Example(
         model="DriveSyncResponse",
         payload=_DRIVE_SYNC_EMPTY,
+    ),
+    Capability.PIPELINE.value: _Example(
+        model="LinkResponse",
+        payload=_LINK_EMPTY,
     ),
 }
 """The ``empty`` column. Every cell is a success envelope, not an error."""

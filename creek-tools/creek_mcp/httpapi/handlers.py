@@ -2,8 +2,9 @@
 
 Every published route is built: the handshake and health from #1074, the journal
 upsert from #1075, the wheel from #1076, the reflection from #1077, the
-document upload from #1524 and the three Drive-connector verbs from #1527 —
-which are the first three operations to share one capability, and the reason
+document upload from #1524, the three Drive-connector verbs from #1527 and the
+two pipeline passes from #1570 — the connector's three being the first
+operations to share one capability, and the reason
 this map is keyed on ``operation_id`` rather than on
 :class:`~creek_mcp.api.models.Capability`. :data:`HANDLERS` is derived from the
 route table rather than listed, so a route added to
@@ -57,11 +58,13 @@ from creek_mcp.api.models import ErrorCode
 from creek_mcp.api.routes import (
     IMPLEMENTED_CAPABILITIES,
     OP_CAPABILITIES,
+    OP_CLASSIFY,
     OP_DRIVE_DISCONNECT,
     OP_DRIVE_STATUS,
     OP_DRIVE_SYNC,
     OP_HEALTH,
     OP_JOURNAL_UPSERT,
+    OP_LINK,
     OP_REFLECTIONS,
     OP_UPLOAD,
     OP_WHEEL,
@@ -76,6 +79,7 @@ from creek_mcp.httpapi.drive import (
 )
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
 from creek_mcp.httpapi.journal import handle_journal_upsert
+from creek_mcp.httpapi.pipeline import handle_classification, handle_link
 from creek_mcp.httpapi.reflect import handle_reflection
 from creek_mcp.httpapi.upload import handle_upload
 from creek_mcp.httpapi.wheel import handle_wheel
@@ -179,11 +183,13 @@ async def handle_health(_request: Request) -> Response:
 
 _IMPLEMENTED_HANDLERS: Final[dict[str, Handler]] = {
     OP_CAPABILITIES: handle_capabilities,
+    OP_CLASSIFY: handle_classification,
     OP_DRIVE_DISCONNECT: handle_drive_disconnect,
     OP_DRIVE_STATUS: handle_drive_status,
     OP_DRIVE_SYNC: handle_drive_sync,
     OP_HEALTH: handle_health,
     OP_JOURNAL_UPSERT: handle_journal_upsert,
+    OP_LINK: handle_link,
     OP_REFLECTIONS: handle_reflection,
     OP_UPLOAD: handle_upload,
     OP_WHEEL: handle_wheel,

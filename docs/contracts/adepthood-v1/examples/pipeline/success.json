@@ -1,0 +1,14 @@
+{
+  "classified": 10,
+  "complete": true,
+  "method": "rules",
+  "praxis_marked": 0,
+  "preserved_llm": 0,
+  "preserved_manual": 2,
+  "privacy_tiers_assigned": 0,
+  "retiered": 0,
+  "status": "ok",
+  "tags_extracted": 5,
+  "tier_ceiling": "personal",
+  "total": 12
+}

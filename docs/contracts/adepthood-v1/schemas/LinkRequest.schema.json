@@ -1,0 +1,27 @@
+{
+  "$defs": {
+    "LinkMethod": {
+      "description": "The linker stages ``POST /v1/links`` serves.\n\nThree of :data:`creek.surface_modes.LINK_METHODS`. ``embeddings`` is the\nfourth and is excluded for the same shape of reason ``llm`` is excluded\nfrom :class:`ClassificationMethod`, with a different cause: it is the\nO(n\u00b2) pairwise-similarity stage, which has been observed being abandoned\nat 35k fragments and is unbounded in a way no cache repairs.\n\n**Excluding it does not make every served member cheap, and the schema\nshould not be read as promising that.** ``eddies`` and ``threads`` both\nneed vectors, so both fill the embeddings parquet on a cold cache \u2014 a\nlocal sentence-transformer pass over every uncached fragment, which is\nminutes of work on a large vault and can outrun the request deadline.\nThey are served anyway because the parquet is a *cache*: the work a\ntimed-out first call performs still lands, so a retry converges instead of\nstarting over. Nothing about that reaches a network provider; the model is\nlocal (ADR-0004). Budget for the first call on a cold vault, and prefer\n``temporal`` when you only need the corpus navigable.\n\nAttributes:\n    TEMPORAL: Same-window adjacency links. The one genuinely cheap stage \u2014\n        no vectors, no model \u2014 and the one that makes a freshly-seeded\n        corpus navigable at all.\n    EDDIES: Topic clusters, materialised under ``03-Eddies/``. Embeds on a\n        cold cache.\n    THREADS: Narrative currents, materialised under ``02-Threads/``. Embeds\n        on a cold cache, and reads the APTITUDE labels a classification\n        pass writes, so run classification first.",
+      "enum": [
+        "temporal",
+        "eddies",
+        "threads"
+      ],
+      "title": "LinkMethod",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One linker stage over the whole vault (#1570).\n\n``method`` is required and has no default, unlike\n:class:`ClassificationRequest`'s. The three stages are not\ninterchangeable \u2014 one writes adjacency into fragment frontmatter, one\nmaterialises ``03-Eddies/``, one materialises ``02-Threads/`` \u2014 so a\ndefault would silently run a pass the caller did not choose and report it\nas the one they asked for.\n\nAttributes:\n    method: The linker stage to run.",
+  "properties": {
+    "method": {
+      "$ref": "#/$defs/LinkMethod",
+      "description": "Linker stage to run."
+    }
+  },
+  "required": [
+    "method"
+  ],
+  "title": "LinkRequest",
+  "type": "object"
+}
