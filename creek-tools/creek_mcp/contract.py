@@ -41,15 +41,18 @@ shell access"*, and typing and tiering are what these two passes produce.
 
 **What it deliberately does not add.** ``classify --method llm`` and ``link
 --method embeddings`` are absent from the wire enums, so they are unreachable
-in the *type* rather than refused at runtime. Both are minutes-to-hours of work
-behind a thirty-second request deadline the timeout middleware cannot cancel
-once the call is in a worker thread. Reaching them over the network needs an
-asynchronous job surface this contract does not have; until then they remain an
-operator step on the host. That is **not** a promise that the served members
-all finish inside the deadline: ``eddies`` and ``threads`` cluster over
-embeddings and so fill the parquet cache with a *local* model pass on a cold
-vault, which a first call can outrun. They ship anyway because the cache keeps
-the timed-out work, so a retry converges (#1605).
+in the *type* rather than refused at runtime. Both are minutes-to-hours of work, and
+these are **write** routes, which since #1109 deliberately run to completion
+rather than being shed at the thirty-second deadline — abandoning a vault
+mutation to meet a deadline would report a failure for work that landed. So the
+caller would simply wait minutes to hours with no refusal to act on. Reaching
+them over the network needs an asynchronous job surface this contract does not
+have; until then they remain an operator step on the host. That is **not** a
+promise that the served members all finish inside the deadline either:
+``eddies`` and ``threads`` cluster over embeddings and so fill the parquet
+cache with a *local* model pass on a cold vault, which a first call can far
+outrun. They ship anyway because the pass is idempotent and the cache keeps
+what it computed, so a client that hangs up and retries converges (#1605).
 
 **This is the first double-digit minor.**
 :func:`creek_mcp.api.models.minor_at_least` compares componentwise as integers

@@ -48,7 +48,7 @@ unit-tested as a pure function of its arguments. The cheap alternative —
 stamping in :func:`error_response` alone — covers every refusal and no ``200``,
 the exact inverse of what was asked. And the condition would have nothing to
 decide: :class:`~creek_mcp.httpapi.auth.BearerAuthMiddleware` is item 5 of the
-seven-layer stack, *above* the router, so all five routes are authenticated by
+eight-layer stack, *above* the router, so every route is authenticated by
 construction. Where it *would* have an effect is on a route that does not exist
 yet — one mounted above the gate would silently stop being stamped, because
 such a condition is keyed on the stack's order rather than on anything the

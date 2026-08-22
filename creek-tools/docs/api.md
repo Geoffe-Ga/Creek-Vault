@@ -493,24 +493,62 @@ false, and would have hidden the fault from the operator as well as the client.
 | Limit | Default | Behaviour when exceeded |
 |---|---|---|
 | Request body size | 1 MiB, except `POST /v1/uploads` at ~13.4 MiB | `422 invalid_request`. Enforced on `Content-Length` *and* on streamed bytes, so a chunked request cannot bypass it, and the body is never buffered past the cap. The upload route declares its own cap (`ROUTE_BODY_CAPS`, keyed on the literal path) because base64 of the tool's 10 MiB document limit does not fit in a limit sized for a journal entry — matching the 10 MiB cap Adepthood already enforces. Raising the *global* cap instead would let every route commit that memory; lowering `max_body_bytes` therefore does **not** lower the upload route, whose cap is published contract. |
-| Per-request timeout | 30 s | `503 temporarily_unavailable`. |
+| Request body message count | cap &divide; 256 B, floor 64 | `422 invalid_request`, the same code and the same retry disposition as an oversize body. Bytes alone do not bound the buffer: it is a list of ASGI messages, each costing its own dict, keys and values, so a body arriving in enough small chunks commits far more memory than its size suggests. The ceiling is derived from the byte cap rather than fixed, so a route that raises its own cap raises this with it and an ordinary chunked upload never approaches it. |
+| Per-request timeout, **read routes** | 30 s | `503 temporarily_unavailable`. `GET /v1/capabilities`, `GET /v1/wheel`, `GET /v1/connectors/drive`, `GET /v1/health` and `POST /v1/reflections` mutate no vault state, so the deadline is enforced: the caller is answered on time and the abandoned worker thread has nothing to tear. |
+| Per-request timeout, **write routes** | **not enforced** | The caller waits for the real answer. `PUT /v1/journal-entries/{external_id}`, `POST /v1/uploads`, `POST /v1/connectors/drive/syncs`, `DELETE /v1/connectors/drive`, `POST /v1/classifications` and `POST /v1/links` mutate the vault, and a Python thread cannot be cancelled — only detached. Shedding one mid-mutation would hand the client a `503` about a write that in fact landed, which is worse than a late `200`. Budget accordingly: `POST /v1/links` on a cold embedding cache is minutes of work on a large vault. |
 | Concurrent requests | 32 | `503 temporarily_unavailable`. |
 
-The concurrency limit is process-global, not per-consumer, so one consumer can
-in principle starve the others; per-consumer rate limiting is a tracked
-follow-up.
+There are two concurrency ceilings, and they answer different questions. The
+process-global one sits **above** authentication, so a flood of unauthenticated
+requests is shed before the server pays for a single token comparison. The
+per-consumer one sits immediately **below** authentication and bounds what any
+one configured consumer can hold in flight, so a loud consumer can no longer
+take the last slot from a quiet one. Keep the process ceiling at or above the
+sum of the per-consumer ones and both properties hold at once.
+
+Both refusals are byte-identical `503 temporarily_unavailable` but for the
+`request_id`. There is deliberately no "you specifically are over quota" code:
+the retry disposition is the same either way, and a distinguishable refusal
+would tell a caller something about the other consumers' traffic.
+
+The identity a quota is keyed on is never client-supplied. `consumer` is the
+verified token's `client_id`, which is a key of the operator-configured token
+map — so one issued credential buys exactly one bucket, and a name that map
+does not hold is shed rather than granted one of its own.
+
+Note what a per-consumer ceiling does **not** bound: how long a slot is held.
+A write route runs to completion past the deadline (see above), and
+`POST /v1/links` on a cold embedding cache is minutes of work.
 
 **The per-request timeout is a cancel scope evaluated on the event loop**,
 so it can only fire while the loop is free to run it. That is why
 `GET /v1/capabilities`'s readiness probe is dispatched to a worker thread
 rather than awaited inline — otherwise a blocked loop would mean the
 deadline could never be reached, let alone enforced, on the one endpoint
-every client calls first. Be precise about what that buys: anyio cannot
-cancel a worker thread, so on timeout the request is abandoned at the HTTP
-layer while the filesystem work it kicked off keeps running to completion in
-the background. That is strictly better than a deadline that cannot fire at
-all — but it is not cancellation, and no code here should be read as
-promising that it is.
+every client calls first.
+
+Dispatching to a worker is necessary but not sufficient, and this document
+previously claimed more than the code delivered. `anyio.to_thread.run_sync`
+defers cancellation until the worker returns unless it is told otherwise, so
+until #1109 the deadline fired on **no** route at all: measured on this stack,
+a 0.25 s deadline against a 1.2 s tool returned `200` in 1.223 s — the real
+answer, late, with no `503` anywhere. What each route now declares, at its
+dispatch site, is which of the two answers it wants
+(`creek_mcp.httpapi.deadline`):
+
+* A **read** takes the enforced deadline. The caller gets its `503` on time.
+  The worker keeps running to completion in the background — nothing can
+  cancel a Python thread — but a half-finished read has nothing to tear, so
+  abandoning it costs only the thread.
+* A **write** does not. Abandoning a detached write thread while answering
+  `503` would report a failure for a mutation that in fact landed, and a
+  client that retried on that `503` would be retrying against a vault it had
+  been told was untouched. Consistency beats boundedness here, so the row
+  above says "not enforced" rather than publishing a bound these routes cannot
+  keep.
+
+Neither case is cancellation, and no code here should be read as promising
+that it is.
 
 ### Request logging
 

@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 HTTP_SCOPE: Final[str] = "http"
 """The ASGI scope type every ``/v1`` middleware acts on.
 
-Stated once and imported by all seven. Anything else goes to
+Stated once and imported by all eight. Anything else goes to
 :func:`pass_through`, which is where the *allowlist* lives.
 """
 
@@ -58,7 +58,7 @@ that is not ``http``".
 
 The difference is not cosmetic. Denying by omission means the allowlist is
 implicit, and the first ``websocket`` route anyone mounts inherits a path
-through all seven layers that is unauthenticated, unceilinged and unlogged —
+through all eight layers that is unauthenticated, unceilinged and unlogged —
 answered by the router rather than refused, because ``websocket`` is a type
 Starlette already serves. There is no live exposure today, which is precisely
 why it is closed now rather than after there is one.

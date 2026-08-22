@@ -24,7 +24,7 @@ Four issues meet here because they are four faces of the same question.
   behind the route table, and the work done for an answer that is thrown away.
 
 The scope tests here are deliberately narrower than the parametrized sweep in
-``test_v1_api_hardening.py``: that sweep proves all seven layers refuse, and
+``test_v1_api_hardening.py``: that sweep proves all eight layers refuse, and
 this one names the two whose refusal is a *security* property rather than a
 consistency one, and asserts the refusal message rather than only its type.
 """

@@ -46,8 +46,6 @@ from __future__ import annotations
 from functools import partial
 from typing import TYPE_CHECKING
 
-from starlette.concurrency import run_in_threadpool
-
 from creek_mcp.api.models import (
     CAPABILITY_SINCE_MINOR,
     CONTRACT_MINOR,
@@ -67,6 +65,7 @@ from creek_mcp.api.routes import (
 from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
 from creek_mcp.httpapi import SERVER_NAME
 from creek_mcp.httpapi.context import context_of
+from creek_mcp.httpapi.deadline import read_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, json_response
 from creek_mcp.httpapi.vault import UNREADABLE_CONFIG, configured_vault
 from creek_mcp.policy import Transport
@@ -183,7 +182,7 @@ def _vault_is_usable(
     Synchronous on purpose, and *the* sync seam of this module: every blocking
     syscall the handshake makes is reachable from here and nowhere else, so
     :func:`handle_capabilities` can hoist the lot off the event loop with a
-    single :func:`~starlette.concurrency.run_in_threadpool` call. The three
+    single :func:`~creek_mcp.httpapi.deadline.read_off_loop` call. The three
     seams underneath are all filesystem I/O —
     :func:`~creek_mcp.httpapi.vault.configured_vault` reads
     and parses ``creek_config.yaml``, ``vault_available`` stats the marker, and
@@ -375,13 +374,14 @@ async def handle_capabilities(request: Request) -> Response:
     to completion in the background. That is strictly better than a deadline
     that cannot fire, not a cancellation.
 
-    :func:`starlette.concurrency.run_in_threadpool` rather than
-    :func:`anyio.to_thread.run_sync`: the two are the same call — the former
-    wraps the latter — and this is a Starlette endpoint, so it uses the
-    framework's own helper and inherits whatever thread-limiter policy
-    Starlette applies to the rest of the app. The undeclared-dependency
-    argument this comment used to make no longer holds: anyio has been a
-    declared dependency since #1123.
+    :func:`~creek_mcp.httpapi.deadline.read_off_loop` rather than
+    ``run_in_threadpool``, and the difference is the whole of #1109. Starlette's
+    helper takes anyio's ``abandon_on_cancel=False`` default, which *defers*
+    cancellation until the worker returns — so the paragraph above was false as
+    written: the request was not abandoned, the caller was made to wait the full
+    duration and handed the real answer. The handshake reads no vault state it
+    could tear, so it takes the abandonable dispatch and the deadline becomes
+    what this docstring always claimed it was.
 
     Args:
         request: The request in flight.
@@ -392,7 +392,7 @@ async def handle_capabilities(request: Request) -> Response:
     context = context_of(request.scope)
     advertised = advertised_capabilities(request.headers.get(CONTRACT_VERSION_HEADER))
     negotiable = _minor_is_negotiable(request)
-    available = await run_in_threadpool(
+    available = await read_off_loop(
         partial(
             _vault_is_usable,
             request,

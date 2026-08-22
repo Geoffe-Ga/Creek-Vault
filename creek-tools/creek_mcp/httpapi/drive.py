@@ -34,7 +34,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Final, TypeVar
 
 from pydantic import BaseModel, ValidationError
-from starlette.concurrency import run_in_threadpool
 
 from creek_mcp.api.models import (
     OK_STATUS,
@@ -46,6 +45,7 @@ from creek_mcp.api.models import (
     WireTierCeiling,
 )
 from creek_mcp.httpapi.context import context_of
+from creek_mcp.httpapi.deadline import read_off_loop, write_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
 from creek_mcp.httpapi.vault import configured_vault
 from creek_mcp.tools.drive import (
@@ -289,7 +289,7 @@ async def handle_drive_status(request: Request) -> Response:
         The published response or refusal.
     """
     context = context_of(request.scope)
-    result = await run_in_threadpool(_run, drive_status_tool, request, context)
+    result = await read_off_loop(_run, drive_status_tool, request, context)
     return _rendered(result, context, _status_model)
 
 
@@ -309,7 +309,7 @@ async def handle_drive_sync(request: Request) -> Response:
         The published response or refusal.
     """
     context = context_of(request.scope)
-    result = await run_in_threadpool(_run, drive_sync_tool, request, context)
+    result = await write_off_loop(_run, drive_sync_tool, request, context)
     return _rendered(result, context, _sync_model)
 
 
@@ -323,5 +323,5 @@ async def handle_drive_disconnect(request: Request) -> Response:
         The published response or refusal.
     """
     context = context_of(request.scope)
-    result = await run_in_threadpool(_run, drive_disconnect_tool, request, context)
+    result = await write_off_loop(_run, drive_disconnect_tool, request, context)
     return _rendered(result, context, _disconnect_model)

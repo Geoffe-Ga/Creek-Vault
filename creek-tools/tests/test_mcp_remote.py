@@ -48,7 +48,7 @@ from typing import TYPE_CHECKING, Final
 
 import pytest
 import uvicorn
-from mcp.server.auth.provider import AccessToken
+from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.testclient import TestClient
 
@@ -950,6 +950,193 @@ def test_rotation_notice_carries_no_token_value() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# A credential that names nobody (#1100)
+# --------------------------------------------------------------------------- #
+
+_UNNAMED_CONSUMERS: Final[tuple[str, ...]] = ("", " ", "   ", "\t", "\n", " \t\n ")
+"""Every spelling of "this credential identifies nobody"."""
+
+_UNNAMED_IDS: Final[tuple[str, ...]] = (
+    "empty",
+    "one-space",
+    "three-spaces",
+    "tab",
+    "newline",
+    "mixed-whitespace",
+)
+
+
+@pytest.mark.parametrize("consumer", _UNNAMED_CONSUMERS, ids=_UNNAMED_IDS)
+def test_verifier_refuses_a_consumer_name_that_identifies_nobody(
+    consumer: str,
+) -> None:
+    """A blank or whitespace-only consumer key is refused at construction (#1100).
+
+    ``_normalized_token_sets`` is the narrowest shared ceiling: both
+    ``load_consumer_tokens`` and this constructor funnel through it, and the
+    constructor is reachable *without* the environment parser — from
+    ``tests/v1_api_support.py``, from the wire tests, and from
+    ``creek_mcp.httpapi.app.create_app(verifier=...)``. A consumer whose name
+    strips to nothing would be admitted as a real identity there and stamped
+    on every audit line, access line and ceiling decision below as ``''``.
+
+    Args:
+        consumer: One spelling of "no name at all".
+    """
+    with pytest.raises(ValueError, match="names no consumer") as excinfo:
+        ConsumerTokenVerifier({consumer: (_STRONG_TOKEN,)})
+    message = str(excinfo.value)
+    assert _STRONG_TOKEN not in message  # NEVER echo the token value
+
+
+def test_unnamed_consumers_are_refused_rather_than_admitted_as_distinct_ones() -> None:
+    """Three whitespace names are three *distinct* map keys, and one non-identity.
+
+    This is the blast radius the issue understates. ``''``, ``'   '`` and
+    ``'\\t'`` do not collapse: they are three separate keys, three separate
+    verified identities, and — once per-consumer accounting exists — three
+    separate quota buckets for a caller with no name at all. The refusal has
+    to land before any of that, which means at construction.
+    """
+    unnamed = {"": (_OLD_TOKEN,), "   ": (_NEW_TOKEN,), "\t": (_THIRD_TOKEN,)}
+    assert len(unnamed) == 3, "three distinct keys, all of them nobody"
+    with pytest.raises(ValueError, match="names no consumer"):
+        ConsumerTokenVerifier(unnamed)
+
+
+def test_load_consumer_tokens_still_drops_a_blank_name_rather_than_failing_boot() -> (
+    None
+):
+    """The env parser keeps *skipping* nameless entries; it does not now refuse.
+
+    The new guard sits in ``_normalized_token_sets``, which
+    ``load_consumer_tokens`` calls last — so a guard written carelessly would
+    turn an operator's stray ``;`` or ``=orphan`` into a boot failure. It does
+    not, because ``_parsed_entry`` has already dropped those before the
+    normaliser ever sees them.
+    """
+    env = {CONSUMER_TOKENS_ENV: f" = {_OLD_TOKEN} ; adepthood={_STRONG_TOKEN} ; ="}
+    assert load_consumer_tokens(env) == {"adepthood": (_STRONG_TOKEN,)}
+
+
+class _UnnamedTokenVerifier(TokenVerifier):
+    """A custom verifier that authenticates a bearer but names no consumer.
+
+    The case the constructor guard cannot see: an arbitrary
+    :class:`~mcp.server.auth.provider.TokenVerifier` handed to
+    :func:`creek_mcp.server.build_server` never runs
+    ``_normalized_token_sets`` at all.
+    """
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        """Return an access token whose ``client_id`` names nobody.
+
+        Args:
+            token: The presented bearer.
+
+        Returns:
+            An :class:`AccessToken` with a blank ``client_id``.
+        """
+        return AccessToken(
+            token=token, client_id="", scopes=[REMOTE_SCOPE], expires_at=None
+        )
+
+
+class _NamedTokenVerifier(TokenVerifier):
+    """The non-vacuity twin: a custom verifier that does name its consumer."""
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        """Return an access token naming ``adepthood``.
+
+        Args:
+            token: The presented bearer.
+
+        Returns:
+            An :class:`AccessToken` with a usable ``client_id``.
+        """
+        return AccessToken(
+            token=token, client_id="adepthood", scopes=[REMOTE_SCOPE], expires_at=None
+        )
+
+
+def test_the_verifier_publishes_its_configured_consumer_names() -> None:
+    """``consumers`` is the public read a per-consumer limiter must build from (#1110).
+
+    Eagerly, and from *this* — never lazily from whatever name arrives on a
+    request. A bucket map that grew on first sight would hand a bucket to every
+    distinct identity any future verifier let through, which turns a limit into
+    an amplifier. Configured order is preserved so an operator reading a
+    diagnostic sees their own configuration back.
+    """
+    configured = ConsumerTokenVerifier(
+        {"adepthood": (_OLD_TOKEN, _NEW_TOKEN), "crawdad": (_THIRD_TOKEN,)}
+    )
+    assert configured.consumers == ("adepthood", "crawdad")
+
+
+def test_the_published_consumer_names_carry_no_token_value() -> None:
+    """The accessor exposes names only, so it cannot leak a secret by construction.
+
+    A limiter, a diagnostic or a log line reading this must not be able to
+    reach a credential through it.
+    """
+    configured = ConsumerTokenVerifier(
+        {"adepthood": (_OLD_TOKEN, _NEW_TOKEN), "crawdad": (_THIRD_TOKEN,)}
+    )
+    rendered = repr(configured.consumers)
+    for token in _ALL_TEST_TOKENS:
+        assert token not in rendered
+
+
+def test_build_server_refuses_a_token_verifier_that_names_no_consumer(
+    vault: Path,
+) -> None:
+    """A custom verifier's blank ``client_id`` authenticates nobody, before dispatch.
+
+    The SDK's ``RequireAuthMiddleware`` answers ``401`` for a verifier that
+    returns ``None``, so mapping "authenticated but unnamed" onto ``None`` at
+    the boundary is the 401-equivalent refusal AC#1 asks for — and it lands
+    before any tool runs, before ``_effective_consumer`` is consulted and
+    before an audit entry is written under an empty name.
+
+    Args:
+        vault: Seeded vault root.
+    """
+    server = build_server(
+        transport=Transport.NETWORK,
+        vault_path=vault,
+        token_verifier=_UnnamedTokenVerifier(),
+    )
+    installed = server._token_verifier
+    assert installed is not None
+    assert asyncio.run(installed.verify_token(_STRONG_TOKEN)) is None
+
+
+def test_build_server_still_admits_a_token_verifier_that_names_a_consumer(
+    vault: Path,
+) -> None:
+    """The guard refuses *unnamed* credentials only, and passes the identity through.
+
+    Without this twin, a guard that refused every custom verifier outright
+    would satisfy the test above and break the network transport.
+
+    Args:
+        vault: Seeded vault root.
+    """
+    server = build_server(
+        transport=Transport.NETWORK,
+        vault_path=vault,
+        token_verifier=_NamedTokenVerifier(),
+    )
+    installed = server._token_verifier
+    assert installed is not None
+    access = asyncio.run(installed.verify_token(_STRONG_TOKEN))
+    assert access is not None
+    assert access.client_id == "adepthood"
+    assert access.scopes == [REMOTE_SCOPE]
+
+
+# --------------------------------------------------------------------------- #
 # Cross-cutting: no refusal on ANY of the new paths ever echoes a token
 # --------------------------------------------------------------------------- #
 
@@ -966,6 +1153,8 @@ _RAISING_CONFIGURATIONS: list[Callable[[], object]] = [
     lambda: load_consumer_tokens(
         {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN},{_OLD_TOKEN}"}
     ),
+    lambda: ConsumerTokenVerifier({"": (_OLD_TOKEN,)}),
+    lambda: ConsumerTokenVerifier({"   ": (_OLD_TOKEN,)}),
     lambda: ConsumerTokenVerifier({"adepthood": _OLD_TOKEN}),
     lambda: ConsumerTokenVerifier({"adepthood": ()}),
     lambda: ConsumerTokenVerifier(
@@ -978,6 +1167,8 @@ _RAISING_IDS = [
     "parser-repeated-consumer-name",
     "parser-value-shared-across-consumers",
     "parser-value-repeated-within-one-set",
+    "verifier-empty-consumer-name",
+    "verifier-whitespace-consumer-name",
     "verifier-bare-string-value",
     "verifier-empty-token-set",
     "verifier-value-shared-across-consumers",

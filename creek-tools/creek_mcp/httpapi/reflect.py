@@ -39,7 +39,6 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from pydantic import ValidationError
-from starlette.concurrency import run_in_threadpool
 
 from creek.care.guardrail import acute_distress_guard
 from creek_mcp.api.models import (
@@ -55,6 +54,7 @@ from creek_mcp.api.models import (
 )
 from creek_mcp.api.routes import CONTRACT_VERSION_HEADER
 from creek_mcp.httpapi.context import context_of
+from creek_mcp.httpapi.deadline import read_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
 from creek_mcp.httpapi.vault import configured_vault
 from creek_mcp.tools.reflect import reflect_tool
@@ -426,7 +426,7 @@ async def handle_reflection(request: Request) -> Response:
     parsed = await _parsed_body(request)
     if parsed is None:
         return error_response(ErrorCode.INVALID_REQUEST, context)
-    result = await run_in_threadpool(
+    result = await read_off_loop(
         _reflect,
         request,
         parsed,

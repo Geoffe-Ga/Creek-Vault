@@ -627,6 +627,29 @@ def test_effective_consumer_never_falls_back_to_the_default_when_remote() -> Non
     assert _LOCAL_DEFAULT not in outcomes
 
 
+def test_effective_consumer_still_raises_only_on_a_missing_consumer() -> None:
+    """The blank-name refusal stays at the verifier boundary, not here (#1100).
+
+    ``effective_consumer`` is called from inside the tool wrapper, at every
+    ``consumer=_effective_consumer(...)`` site, so raising here escapes into
+    the FastMCP tool surface and *skips the audit entry the call was going to
+    write* — losing the trail for precisely the call whose attribution is
+    suspect. #1100 therefore refuses a nameless credential where it is issued
+    (``creek_mcp.remote_auth``) and where it is presented
+    (``creek_mcp.httpapi.auth``), and leaves this function's contract exactly
+    as it was: ``None`` raises, ``""`` does not.
+
+    Pinned as a test because the tempting one-line "fix" is to widen the
+    ``is None`` here, and that would be a regression dressed as a hardening.
+    """
+    with pytest.raises(ValueError, match="must name the consumer"):
+        effective_consumer(
+            CallerIdentity(consumer=None, is_remote=True), _LOCAL_DEFAULT
+        )
+    unnamed = CallerIdentity(consumer="", is_remote=True)
+    assert effective_consumer(unnamed, _LOCAL_DEFAULT) == ""
+
+
 # --------------------------------------------------------------------------- #
 # Group 8 -- the transport-neutrality guards (and their negative cases)
 # --------------------------------------------------------------------------- #

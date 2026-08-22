@@ -1067,7 +1067,7 @@ async def _vary_overriding_health(_request: Request) -> Response:
 def test_a_handler_cannot_override_the_standing_vary_through_the_stack(
     vault: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The guarantee survives a real handler and all seven middleware layers.
+    """The guarantee survives a real handler and all eight middleware layers.
 
     The unit tests above read a response object the moment it is built; this one
     reads what an HTTP client is handed after the whole stack has run, which is
@@ -1328,7 +1328,7 @@ async def _cache_control_overriding_health(_request: Request) -> Response:
 def test_a_handler_cannot_override_the_standing_cache_control_through_the_stack(
     vault: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The directive survives a real handler and all seven middleware layers.
+    """The directive survives a real handler and all eight middleware layers.
 
     The twin of the ``Vary`` override test above, and health is the right probe
     for the same reason: it is exempt from the contract-version gate and its

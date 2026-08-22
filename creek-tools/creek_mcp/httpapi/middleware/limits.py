@@ -8,9 +8,31 @@ these cases, since ``retry-policy.json`` keys on the code alone.
 **Shedding beats queueing.** A queued request holds a connection, a worker slot
 and whatever it has buffered, so a slow vault turns into an unbounded memory
 commitment. ``temporarily_unavailable`` tells the client to back off, which is
-something it can act on. The limit is process-global rather than per-consumer,
-so one consumer can in principle starve the others; per-consumer rate limiting
-is a tracked follow-up.
+something it can act on.
+
+**Two concurrency limits, not one (#1110).**
+:class:`ConcurrencyLimitMiddleware` is process-global and sits *above*
+authentication, so a flood of unauthenticated requests is shed before anything
+pays for a token comparison — it has no consumer to key on, and that is the
+point. :class:`ConsumerConcurrencyLimitMiddleware` sits immediately *below*
+authentication and bounds what any single configured consumer can hold, so one
+loud consumer can no longer take the last slot from a quiet one. The second is
+an addition, never a replacement: keep the process ceiling at or above the sum
+of the per-consumer ones and both properties hold at once.
+
+Keying a limit on an identity is only safe when the identity is not
+attacker-chosen, or it becomes a way to get N buckets instead of one. It is
+safe here: ``context.consumer`` is the verifier's ``client_id``, which is a key
+of the operator-configured token map and never a byte off the request, and the
+bucket map is built **eagerly** from
+:attr:`creek_mcp.remote_auth.ConsumerTokenVerifier.consumers` at construction.
+A name the map does not hold is shed rather than granted a bucket of its own.
+
+**A bucket can be held for a long time, and that is a consequence of #1109.**
+The slot is released after the stack below returns, and a write route
+deliberately runs to completion past the deadline — so a per-consumer ceiling
+bounds how many slots one consumer holds, not for how long. ``POST /v1/links``
+on a cold embedding cache is minutes of work.
 
 **The semaphore is released in a ``finally``.** A semaphore acquired without one
 turns a single bad request into a permanently dead server — a denial of service
@@ -29,6 +51,16 @@ header is a limit with a published bypass. The body is therefore read here,
 counted, and refused the moment it exceeds the cap — which means it is never
 buffered past the cap either, and the refusal costs the server one cap's worth
 of memory rather than however much the client felt like sending.
+
+**And it is capped on the message count as well as the byte count (#1142).**
+The buffer is a list of ASGI messages, each carrying its own dict, keys and
+values, so the bytes it holds are only part of what it costs. Counting bytes
+alone left the sentence above false: 200,000 one-byte chunks totalling a fifth
+of the default cap buffered 200,001 messages — roughly 54 MB of objects — and
+were accepted. :func:`message_ceiling` derives the second cap from the first,
+so a route that raises its byte cap raises its message ceiling with it, and
+both breaches land on the same ``422`` with the same retry disposition rather
+than inventing new wire vocabulary for the caller to learn.
 """
 
 from __future__ import annotations
@@ -43,7 +75,7 @@ from creek_mcp.httpapi.context import HTTP_SCOPE, context_of, pass_through
 from creek_mcp.httpapi.errors import error_response
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -56,6 +88,16 @@ DEFAULT_TIMEOUT_SECONDS: Final[float] = 30.0
 DEFAULT_MAX_CONCURRENCY: Final[int] = 32
 """How many requests may be in flight at once, process-wide."""
 
+DEFAULT_MAX_PER_CONSUMER: Final[int] = 8
+"""How many requests one configured consumer may have in flight at once.
+
+A quarter of :data:`DEFAULT_MAX_CONCURRENCY`, so the process ceiling stays at
+or above the sum for the four consumers a deployment is likely to have, and
+above the *individual* ceiling for any number of them. No consumer can take
+more than an eighth of the process's capacity, and the global limit still sheds
+an unauthenticated flood before any of this is reached.
+"""
+
 _CONTENT_LENGTH: Final[str] = "content-length"
 """The header a client declares its body size in, if it declares one at all."""
 
@@ -64,6 +106,47 @@ _REQUEST_MESSAGE: Final[str] = "http.request"
 
 _DISCONNECT_MESSAGE_TYPE: Final[str] = "http.disconnect"
 """What a replayed receive channel answers once the buffer is exhausted."""
+
+
+MIN_CHUNK_BYTES: Final[int] = 256
+"""The smallest body chunk that carries more payload than bookkeeping.
+
+A buffered ASGI message costs roughly this much in dict, key and value
+overhead before a single byte of its body is counted, so a stream of chunks
+smaller than this commits more memory to *describing* the body than to holding
+it. Measured on the amplification #1142 reports: 200,000 one-byte chunks —
+200 KB, a fifth of the default cap — held about 54 MB of Python objects, and
+were accepted, because only the bytes were being counted.
+"""
+
+_MIN_MESSAGE_CEILING: Final[int] = 64
+"""The floor under the derived ceiling.
+
+A cap of a few dozen bytes (the suite uses one) would otherwise derive a
+ceiling of zero and refuse *every* chunked request, including the ordinary
+one-message unchunked ones. The floor keeps the rule a limit on amplification
+rather than a ban on streaming.
+"""
+
+
+def message_ceiling(limit: int) -> int:
+    """Return how many body messages a request capped at *limit* bytes may send.
+
+    Derived from the byte cap rather than fixed, so a route that declares its
+    own cap in :data:`creek_mcp.api.routes.ROUTE_BODY_CAPS` raises its message
+    ceiling along with it. A flat constant cannot serve both ends: one sized
+    for a journal entry would refuse a legitimate thirteen-megabyte upload
+    streamed in ordinary chunks, and one sized for that upload would leave
+    every other route amplifiable.
+
+    Args:
+        limit: The inclusive byte cap governing this request.
+
+    Returns:
+        The inclusive message ceiling, never below
+        :data:`_MIN_MESSAGE_CEILING`.
+    """
+    return max(_MIN_MESSAGE_CEILING, limit // MIN_CHUNK_BYTES)
 
 
 def _declared_length(scope: Scope) -> int | None:
@@ -89,22 +172,37 @@ def _declared_length(scope: Scope) -> int | None:
 
 
 async def _buffer_within(receive: Receive, limit: int) -> list[Message] | None:
-    """Read the request body, stopping the instant it exceeds *limit*.
+    """Read the request body, stopping the instant it exceeds either cap.
+
+    **Two caps, because bytes alone do not bound memory (#1142).** The buffer
+    is a list of ASGI messages, and each message costs its own dict, keys and
+    values regardless of how little body it carries. Counting only bytes let
+    200,000 one-byte chunks — 200 KB against a one-mebibyte cap — buffer
+    200,001 messages holding roughly 54 MB of Python objects, and be
+    *accepted*. So the message count is capped too, at
+    :func:`message_ceiling` of the byte cap, which is what makes this module's
+    "one cap's worth of memory" promise true rather than aspirational.
+
+    The count is checked on the message just appended, before its body is
+    read, so the breach costs one message beyond the ceiling and no more.
 
     Args:
         receive: The upstream ASGI receive channel.
         limit: The inclusive byte cap.
 
     Returns:
-        The buffered messages when the body fits, or ``None`` when it does not
-        — at which point nothing further is read, so an oversize upload is
-        abandoned rather than absorbed.
+        The buffered messages when the body fits both caps, or ``None`` when
+        it breaches either — at which point nothing further is read, so an
+        oversize or over-fragmented upload is abandoned rather than absorbed.
     """
+    ceiling = message_ceiling(limit)
     messages: list[Message] = []
     total = 0
     while True:
         message = await receive()
         messages.append(message)
+        if len(messages) > ceiling:
+            return None
         if message["type"] != _REQUEST_MESSAGE:
             return messages
         total += len(message.get("body", b""))
@@ -151,6 +249,24 @@ async def _refuse_oversize(scope: Scope, receive: Receive, send: Send) -> None:
     await refusal(scope, receive, send)
 
 
+async def _shed(scope: Scope, receive: Receive, send: Send) -> None:
+    """Answer ``503 temporarily_unavailable`` for a request there is no room for.
+
+    One helper for both concurrency limits, so the process-wide refusal and the
+    per-consumer one are the *same* answer rather than two that happen to agree
+    today. A caller must not be able to tell which limit refused it: the retry
+    disposition is identical, and a distinguishable refusal would disclose
+    something about the other consumers' traffic.
+
+    Args:
+        scope: The ASGI scope.
+        receive: The ASGI receive channel.
+        send: The ASGI send channel.
+    """
+    refusal = error_response(ErrorCode.TEMPORARILY_UNAVAILABLE, context_of(scope))
+    await refusal(scope, receive, send)
+
+
 class ConcurrencyLimitMiddleware:
     """Shed a request when every in-flight slot is already taken."""
 
@@ -178,10 +294,7 @@ class ConcurrencyLimitMiddleware:
         try:
             self._slots.acquire_nowait()
         except WouldBlock:
-            refusal = error_response(
-                ErrorCode.TEMPORARILY_UNAVAILABLE, context_of(scope)
-            )
-            await refusal(scope, receive, send)
+            await _shed(scope, receive, send)
             return
         try:
             await self.app(scope, receive, send)
@@ -189,8 +302,89 @@ class ConcurrencyLimitMiddleware:
             self._slots.release()
 
 
+class ConsumerConcurrencyLimitMiddleware:
+    """Shed a request when the *calling consumer* has taken its own quota.
+
+    Below authentication, because it cannot bucket a caller that has no
+    identity yet; above the body-size limit, so an over-quota consumer is shed
+    before the server buffers its body. The process-wide limit above
+    authentication stays exactly where it is — this is a second ceiling, not a
+    replacement for the first.
+
+    The bucket map is fixed at construction from the verifier's configured
+    consumer set. That is the property that makes keying on identity safe: an
+    attacker holding one issued credential gets one bucket, and a name the map
+    does not hold is shed rather than growing the map. A lazily-grown dict
+    would turn this limit into an amplifier the first time any verifier change
+    widened the identity space.
+    """
+
+    def __init__(
+        self, app: ASGIApp, *, consumers: Sequence[str], max_per_consumer: int
+    ) -> None:
+        """Wrap *app* behind one semaphore per configured consumer.
+
+        Args:
+            app: The next application in the stack.
+            consumers: The configured consumer names, from
+                :attr:`creek_mcp.remote_auth.ConsumerTokenVerifier.consumers`.
+            max_per_consumer: How many requests one consumer may run at once.
+        """
+        self.app = app
+        self._slots = {consumer: Semaphore(max_per_consumer) for consumer in consumers}
+
+    @property
+    def consumers(self) -> tuple[str, ...]:
+        """Return the consumer names this limiter holds a bucket for.
+
+        Returns:
+            The fixed key set, in configured order. A test asserts it equals
+            the verifier's, which is what pins the map as eager rather than
+            grown on demand.
+        """
+        return tuple(self._slots)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Take the caller's own slot or shed, and always give the slot back.
+
+        Args:
+            scope: The ASGI scope.
+            receive: The ASGI receive channel.
+            send: The ASGI send channel.
+        """
+        if scope["type"] != HTTP_SCOPE:
+            await pass_through(self.app, scope, receive, send)
+            return
+        slots = self._slots.get(context_of(scope).consumer)
+        if slots is None:
+            # An identity this limiter was not built for. Fail closed: minting
+            # a bucket here is the one change that would make per-consumer
+            # accounting worse than no accounting at all.
+            await _shed(scope, receive, send)
+            return
+        try:
+            slots.acquire_nowait()
+        except WouldBlock:
+            await _shed(scope, receive, send)
+            return
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            slots.release()
+
+
 class RequestTimeoutMiddleware:
-    """Stop waiting on a request that has taken too long, and say so."""
+    """Stop waiting on a request that has taken too long, and say so.
+
+    **What this can and cannot bind (#1109).** The scope is evaluated on the
+    event loop, and every route does its work in a worker thread, so whether
+    the deadline fires at all is decided at the dispatch site rather than here:
+    :mod:`creek_mcp.httpapi.deadline` gives reads an abandonable dispatch and
+    writes a deferred one, on purpose. Against a write this middleware is inert
+    by design — the ``TimeoutError`` is not raised until the worker returns, at
+    which point the response is already going out — and ``docs/api.md``
+    publishes that split rather than a bound the write routes cannot keep.
+    """
 
     def __init__(self, app: ASGIApp, *, timeout_seconds: float) -> None:
         """Wrap *app* with a per-request deadline.

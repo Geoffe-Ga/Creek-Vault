@@ -37,7 +37,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Final
 
 from pydantic import ValidationError
-from starlette.concurrency import run_in_threadpool
 
 from creek_mcp.api.models import (
     MAX_EXTERNAL_ID_CHARS,
@@ -49,6 +48,7 @@ from creek_mcp.api.models import (
     WireTierCeiling,
 )
 from creek_mcp.httpapi.context import context_of
+from creek_mcp.httpapi.deadline import write_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
 from creek_mcp.httpapi.vault import configured_vault
 from creek_mcp.read_gate import GENERIC_ABOVE_CEILING_REASON
@@ -321,7 +321,7 @@ async def handle_journal_upsert(request: Request) -> Response:
     parsed = await _parsed_body(request)
     if parsed is None:
         return error_response(ErrorCode.INVALID_REQUEST, context)
-    result = await run_in_threadpool(_upsert, request, external_id, parsed, context)
+    result = await write_off_loop(_upsert, request, external_id, parsed, context)
     if result is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
     return _render(result, context)
