@@ -28,11 +28,17 @@ ADR published, and it must keep passing however readiness comes to be decided.
 **Advertised equals implemented.** The response's ``capabilities`` list must
 equal :data:`creek_mcp.api.routes.IMPLEMENTED_CAPABILITIES`, not
 ``set(Capability)``. Advertising an endpoint that answers ``501`` is a lie a
-client cannot detect until it has already written the integration. That makes
-this module the thing that turns #1075/#1076/#1077 red until each wires a real
-handler — and the committed ``examples/capabilities/success.json`` fixture,
-which documents the *completed* steady state with all four, is pinned
-separately so the divergence is recorded rather than latent.
+client cannot detect until it has already written the integration. That is what
+turned #1075/#1076/#1077 red until each wired a real handler.
+
+Those are closed now, and with them the deliberate gap this module used to
+record: the committed ``examples/capabilities/success.json`` fixture documented
+the finished steady state while the running server advertised only what it had
+built. :func:`test_the_fixture_the_live_server_and_the_enum_all_agree` replaced
+that record with a four-way equality — fixture, enum, implemented set, live
+response — so the closed divergence cannot quietly reopen (#1112). The constant
+stays a constant regardless: it is what makes "a route exists but is unbuilt"
+expressible at all.
 """
 
 from __future__ import annotations
@@ -286,6 +292,15 @@ def test_an_incompatible_minor_is_a_200_incompatible_body(vault: Path) -> None:
     ``contract_version`` off *some* endpoint so it can render "upgrade
     required" instead of "vault unavailable".
 
+    ``vault.available`` is asserted ``True`` here, and ``False`` over a bare
+    directory in the sibling below. Together they prove the field is a real
+    probe result at ``incompatible`` and not a constant — which is what both
+    capability-state tables now document, after they spent several minors
+    rendering that cell as ``—`` (#1150). ``—`` reads as absent or
+    unspecified, and it is neither: ``_render`` emits
+    ``VaultState(available=…)`` at every status and only ``capabilities`` is
+    emptied for a non-OK one.
+
     Args:
         vault: A seeded vault.
     """
@@ -295,6 +310,24 @@ def test_an_incompatible_minor_is_a_200_incompatible_body(vault: Path) -> None:
     assert parsed.capabilities == []
     assert parsed.contract_version == CONTRACT_VERSION
     assert parsed.ontology_version == ONTOLOGY_VERSION
+    assert parsed.vault.available is True
+
+
+def test_an_incompatible_minor_still_reports_an_absent_vault(bare: Path) -> None:
+    """``incompatible`` over a bare directory reports ``available: false``.
+
+    The mirror of the assertion above. A stale client is told the truth about
+    its vault either way, which is the reason #1148 skipped only the *audit*
+    half at an unserved minor and deliberately kept the probe: dropping it
+    would report ``available: false`` against a healthy vault and turn "you are
+    on an old contract" into "your vault is down".
+
+    Args:
+        bare: A directory that has never been ``creek init``-ed.
+    """
+    parsed = CapabilitiesResponse.model_validate(_get(bare, minor="0.1"))
+    assert parsed.status is CapabilitiesStatus.INCOMPATIBLE
+    assert parsed.vault.available is False
 
 
 def test_a_missing_version_header_is_not_an_error(vault: Path) -> None:
@@ -471,24 +504,47 @@ def test_the_stub_still_answers_501_for_an_unbuilt_capability(vault: Path) -> No
     assert envelope(response)["code"] == ErrorCode.UNSUPPORTED_CAPABILITY.value
 
 
-def test_capabilities_fixture_documents_the_completed_steady_state() -> None:
-    """The committed fixture shows all six capabilities. That is deliberate.
+def test_the_fixture_the_live_server_and_the_enum_all_agree(vault: Path) -> None:
+    """One four-way equality: fixture == enum == implemented == live response.
 
-    ``docs/contracts/adepthood-v1/examples/capabilities/success.json`` is the
-    shape a consumer vendors and codes against once the epic is finished — the
-    *completed* steady state, not today's partial one. It therefore diverges
-    from the live response asserted by
-    ``test_advertised_capabilities_equal_implemented_capabilities`` for as long
-    as #1075—#1077 are open.
+    This test used to be
+    ``test_capabilities_fixture_documents_the_completed_steady_state``, and its
+    docstring recorded a *deliberate divergence*: while epic #1071 was being
+    built out, the committed fixture documented the finished steady state while
+    the running server advertised only what it had actually implemented, so the
+    two were knowingly unequal "for as long as #1075—#1077 are open".
 
-    Recording the divergence in a test is the point: an undocumented gap
-    between a published fixture and a running server is exactly the kind of
-    drift the bundle exists to prevent, and "we know, here is why" is a
-    different thing from "nobody noticed".
+    **#1077 and #1071 are both closed, so there is no divergence left to
+    record** (#1112). The assertion body had already become the steady-state
+    equality; only the name and the docstring still sold the gap. Rather than
+    delete the test — which would drop the fixture from the gate entirely —
+    it now asserts every side of the agreement at once:
+
+    * the committed ``examples/capabilities/success.json`` fixture,
+    * ``[c.value for c in Capability]`` in declaration order,
+    * :data:`creek_mcp.api.routes.IMPLEMENTED_CAPABILITIES`, and
+    * a live ``GET /v1/capabilities`` over a seeded vault declaring the
+      current minor.
+
+    A seventh capability added to the enum therefore fails here, at the
+    fixture, and at ``test_advertised_capabilities_equal_implemented_capabilities``
+    together, rather than passing because one of the four was left behind.
+
+    The live call declares ``CONTRACT_MINOR`` explicitly: the advertised list
+    is filtered per caller by ``CAPABILITY_SINCE_MINOR``, so a caller at an
+    older minor is legitimately shown fewer, and pinning the full set means
+    pinning it at the minor that publishes all of them.
+
+    Args:
+        vault: A seeded vault.
     """
+    declared = [capability.value for capability in Capability]
     payload = json.loads(SUCCESS_FIXTURE.read_text(encoding="utf-8"))
-    assert payload["capabilities"] == [capability.value for capability in Capability]
     assert payload["status"] == CapabilitiesStatus.OK.value
+    assert payload["capabilities"] == declared
+    implemented = sorted(capability.value for capability in IMPLEMENTED_CAPABILITIES)
+    assert implemented == sorted(declared)
+    assert _get(vault, minor=CONTRACT_MINOR)["capabilities"] == declared
 
 
 # --------------------------------------------------------------------------- #

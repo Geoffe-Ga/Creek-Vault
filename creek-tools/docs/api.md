@@ -38,17 +38,44 @@ admits it is unbuilt: the whole reason epic #1071 exists is that every failure
 used to collapse into "vault unavailable", indistinguishable from "no vault
 configured", and two repositories shipped a contract neither implemented.
 
-The machinery that enforced it is still in place and still tested. A fifth
+The machinery that enforced it is still in place and still tested. **The next**
 capability added to `Capability` before its handler exists is mounted to the
 same honest `501` and is left out of the advertised list, because both are
-driven by the one `IMPLEMENTED_CAPABILITIES` constant.
+driven by the one `IMPLEMENTED_CAPABILITIES` constant. (This sentence used to
+say "a fifth". An ordinal baked into prose is exactly what rots — there are six
+capabilities now, and the mechanism never depended on the count.)
 
-`GET /v1/capabilities` advertises only the capabilities actually implemented —
-today, all four: `["capabilities", "journal-upsert", "reflections", "wheel"]`.
-The advertised list and the
-set of routes that answer `501` are driven by a single constant,
-`IMPLEMENTED_CAPABILITIES` in `creek_mcp/api/routes.py`, so they cannot
-disagree.
+`GET /v1/capabilities` advertises only the capabilities actually implemented.
+Every member of `Capability` is implemented today, so
+`IMPLEMENTED_CAPABILITIES` is spelled `frozenset(Capability)` rather than as a
+list of names:
+
+<!-- capability-set: v1-capabilities -->
+| Capability | Published since contract minor |
+|---|---|
+| `capabilities` | `0.2` |
+| `journal-upsert` | `0.2` |
+| `reflections` | `0.2` |
+| `wheel` | `0.2` |
+| `upload` | `0.8` |
+| `drive-connector` | `0.9` |
+<!-- /capability-set -->
+
+**The advertised list is caller-dependent, and the count above is the ceiling,
+not the answer.** What a given caller is shown is the intersection of that set
+with what its *declared* contract minor published, off `CAPABILITY_SINCE_MINOR`
+in `creek_mcp/api/models.py`: a caller declaring `0.2` is shown the first four,
+one declaring `0.9` — or declaring no minor at all — is shown all six. The
+route that serves a withheld capability refuses the same caller off the same
+table, so what is hidden here is unreachable there.
+
+The advertised list and the set of routes that answer `501` are driven by that
+single constant, `IMPLEMENTED_CAPABILITIES` in `creek_mcp/api/routes.py`, so
+they cannot disagree. The table above is machine-checked against the enum by
+`tests/test_v1_api_capabilities.py`, along with the committed
+`docs/contracts/adepthood-v1/examples/capabilities/success.json` fixture and a
+live response — one four-way equality, so a seventh capability cannot be added
+without this page moving with it.
 
 > **On the issue's `not_implemented` spelling.** Issue #1074 was written before
 > the contract was ratified and asked for `code: "not_implemented"`. `ErrorCode`
@@ -340,12 +367,31 @@ refused separately: it would repair a bad value instead of leaving it refused,
 breaking the standing rule that an absent ceiling fails closed while a bad one
 is never coerced into meaning something.
 
+<!-- capability-set: capabilities-states -->
 | `status` | `vault.available` | `capabilities` | Meaning |
 |---|---|---|---|
-| `ok` | `true` | implemented set | Vault present and usable. |
+| `ok` | `true` | advertised set | Vault present and usable. |
 | `uninitialized` | `false` | `[]` | Reachable; no vault scaffolded. Both version strings still present. |
-| `incompatible` | — | `[]` | The requested contract minor is not served here. |
+| `incompatible` | `true` or `false` — a real probe result | `[]` | The requested contract minor is not served here. |
 | *no body at all* | — | — | Unreachable. A client must map this to its own distinct state and must **not** fold it into `uninitialized`. |
+<!-- /capability-set -->
+
+**Row (c)'s `vault.available` used to read `—` in this table and in the ADR's
+copy of it. That was wrong (#1150).** `_render` emits `VaultState(available=…)`
+at *every* status, and `handle_capabilities` computes `available` from the
+readiness probe unconditionally, so an `incompatible` body always carries a
+concrete boolean — `—` reads as absent-or-unspecified and it is neither. Only
+`capabilities` is emptied for a non-`ok` status. What #1148 changed is the
+*audit* half alone: at an unserved minor the probe runs with `audited=False`,
+so the poll no longer drives a locked, fsync'd append. The probe itself is kept
+deliberately, and the handler's own docstring says why — skipping it would
+report `available: false` against a perfectly healthy vault and turn "you are
+on an old contract" into "your vault is down". Whether the probe *should* be
+reordered away at that status is held open as a design question in
+[the MCP ADR's open questions](../../docs/decisions/2026-06-30-adepthood-creek-mcp-contract.md#open-questions-resolve-before-accepted)
+— #1150 asked for this table, and #1148, which owned the reordering, is closed
+— so the question lives in a document rather than on an issue. What this table
+now states is what the code emits.
 
 **A capabilities call against an absent vault is not audited.** There is nowhere
 honest to audit it to: `MCPAuditLog.append` creates its own directory tree, so
@@ -558,11 +604,48 @@ rewrite that the two formats require. The document's `(path, method)` set is
 checked against the routes actually mounted on the app, so a route added without
 a `RouteSpec` turns the test red.
 
-Whether the OpenAPI document should itself join `build_bundle()` and the
-published fixture bundle at the next contract minor is a tracked follow-up. It
-does not today, so — stated plainly — the *file* an operator generates is not
-hash-pinned the way the fixture bundle is; only its schema content is pinned, by
-the tests above.
+**Decision (2026-08-21, #1111): the document stays generated-on-demand.** It
+does not join `build_bundle()`, and no `openapi.json` is committed. Four
+reasons, in the order that decided it:
+
+1. **Committing it is a consumer-visible contract event, not a docs change.**
+   Every file under `docs/contracts/adepthood-v1/` is generated by
+   `build_bundle()`, and `manifest.json` carries a per-file sha256. Adding
+   `openapi.json` adds a manifest row and therefore rewrites the manifest's own
+   bytes and hash — and the manifest is the artifact Adepthood pins. That is a
+   coordinated re-pin on the consumer side, which is a different kind of change
+   from publishing a document.
+2. **The residual gap is narrow.** `tests/test_v1_api_openapi.py` already pins
+   five properties of the generated document: schema-by-schema equality with
+   the committed `schemas/<Model>.schema.json` (modulo the mechanical `$defs` →
+   `components/schemas` rewrite), the same for hoisted definitions, that every
+   `$ref` resolves, that the `(path, method)` set equals the routes mounted on
+   the app, and that every documented status is in the published closed set.
+   What is unpinned is only the *file* an operator vendors after running
+   `--print-openapi`.
+3. **Determinism is not the blocker, and that is worth recording as a fact
+   rather than a worry.** `creek_mcp/httpapi/cli.py` prints
+   `json.dumps(build_openapi(), indent=2, sort_keys=True)` — the same canonical
+   form `creek_mcp/api/bundle.py`'s `_serialise` uses, plus a trailing newline.
+   So committing it remains cheap whenever it is taken up; it is declined on
+   contract-event grounds, not on flappiness grounds.
+4. **A zero-manifest-cost middle option stays available.** Publishing
+   `openapi.json` as an asset on a rolling GitHub Release would give an
+   operator something to diff a vendored copy against without touching the
+   pinned bundle at all.
+
+Stated plainly, and unchanged by the decision: the *file* an operator generates
+is not hash-pinned the way the fixture bundle is; only its schema content is
+pinned, by the tests above.
+
+**The revisit trigger, because "at the next contract minor" already came and
+went twice.** Minors `0.8.0` (#1524) and `0.9.0` (#1527/#873) have each
+re-published the bundle since #1111 was filed, so waiting for a free moment is
+not a plan. The trigger is recorded in
+[`docs/decisions/2026-07-31-adepthood-http-application-api.md`](../../docs/decisions/2026-07-31-adepthood-http-application-api.md)
+— a document consulted at every bump, unlike an issue — and reads: *at the next
+minor that re-publishes the bundle, either add `openapi.json` to
+`build_bundle()` or restate this decision in that minor's change-log row.*
 
 ## Why the adapter is not in `creek_mcp/api/`
 
