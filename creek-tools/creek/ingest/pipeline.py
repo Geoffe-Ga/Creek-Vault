@@ -614,18 +614,71 @@ def establish_source_identity(
     return {origin_key, legacy_key}
 
 
+def ledger_body_hash(body: str) -> str:
+    """Return the ledger's content hash for the body the vault will hold (#1393).
+
+    **The ledger's content hash is a hash of the WRITTEN body, never of
+    ``ParsedFragment.content``.** Several ingestors leave ``content`` empty or
+    partial and build the real body in ``convert_to_markdown``:
+    ``SpreadsheetIngestor`` and ``PresentationIngestor`` return
+    ``ParsedFragment(content="")`` outright, and the generic and image
+    ingestors wrap or prefix theirs. Hashing ``content`` therefore recorded
+    ``sha256("")`` for every workbook and every deck, forever — so an edited
+    re-upload compared equal to its own predecessor, took the ``unchanged``
+    branch, and the operator's edit was silently never written.
+
+    This is deliberately the **only** place in this module that computes a
+    ledger content hash. All three call sites — the row that is written
+    (:func:`record_in_ledger`), the changed/unchanged compare
+    (:func:`write_fragment_idempotent`) and the ``--since``/``--incremental``
+    filter (:func:`should_skip_unit`) — route through it, because they must
+    agree on the hashed string or the ledger becomes actively harmful. Fixing
+    the record site while leaving the incremental filter hashing ``content``
+    would make every workbook compare *changed* on every run and rewrite the
+    whole corpus; fixing only the filter would leave the edit lost. One
+    chokepoint is what stops the three from drifting apart again.
+
+    Note that ``generate_fragment_id`` still hashes ``ParsedFragment.content``
+    (``base.py``). That is a different namespace — *identity*, not *change
+    detection* — and it is untouched here on purpose: moving it would remint
+    every fragment id in every existing vault.
+
+    Args:
+        body: The Markdown body that will be written below the frontmatter.
+
+    Returns:
+        The SHA-256 hex digest the ledger records for that body.
+    """
+    # Deferred import: this module keeps ledger imports local (see
+    # `ledger_for_source`), and `content_hash` is a staticmethod, so the
+    # digest definition still lives in exactly one place.
+    from creek.ingest.ledger import SourceLedger
+
+    return SourceLedger.content_hash(body)
+
+
 def record_in_ledger(
     ledger: SourceLedger | None,
-    parsed: ParsedFragment,
     fragment: Fragment,
+    body: str,
 ) -> None:
-    """Record the written fragment in the source ledger (#672)."""
+    """Record the written fragment in the source ledger (#672).
+
+    Hashes *body* — the bytes the vault now holds — rather than the parsed
+    source content, so the recorded digest describes the file that exists
+    (#1393). See :func:`ledger_body_hash`.
+
+    Args:
+        ledger: The source ledger, or ``None`` for an unledgered run.
+        fragment: The fragment that was just written.
+        body: The Markdown body written below its frontmatter.
+    """
     if ledger is None or fragment.source.origin_key is None:
         return
     ledger.record(
         fragment.source.origin_key,
         fragment.id,
-        ledger.content_hash(parsed.content),
+        ledger_body_hash(body),
     )
 
 
@@ -673,10 +726,10 @@ def restore_tombed(
 def write_fragment_idempotent(
     ledger: SourceLedger | None,
     writer: VaultWriter,
-    parsed: ParsedFragment,
     fragment: Fragment,
     body: str,
     reclassify_threshold: float,
+    extra_frontmatter: dict[str, object] | None = None,
 ) -> str:
     """Write or update the fragment; return ``"created"``/``"updated"``/``"unchanged"``.
 
@@ -696,24 +749,49 @@ def write_fragment_idempotent(
     per *reclassify_threshold*); unchanged content falls through to a write
     the id makes a no-op; a new unit with no prior record is written fresh
     and reported as created.
+
+    The change compare hashes *body* — the bytes about to be written — not
+    the parsed source content (#1393). Because ``body`` is also the string
+    handed to every ``write_fragment``/``update_fragment`` branch below, the
+    hash and the write cannot describe different content.
+
+    Args:
+        ledger: The source ledger, or ``None`` for an unledgered run.
+        writer: The vault writer.
+        fragment: The fragment to write; its ``id`` may be reassigned to the
+            ledger's recorded id.
+        body: The Markdown body to write below the frontmatter.
+        reclassify_threshold: Similarity below which a rewrite flags the
+            fragment for re-classification.
+        extra_frontmatter: Unmodelled frontmatter keys to write alongside the
+            model fields (#1392). Only the ``write_fragment`` branches need
+            it; the ``update_fragment`` branches rewrite the body of a file
+            whose frontmatter already carries these keys and preserves them.
+
+    Returns:
+        ``"created"``, ``"updated"`` or ``"unchanged"``.
     """
     record = ledger_record(ledger, fragment)
     # `record is not None` guarantees `ledger is not None` (ledger_record
-    # returns None for a missing ledger); the explicit guard narrows for mypy.
-    if record is None or ledger is None:
-        writer.write_fragment(fragment, body=body)
+    # returns None for a missing ledger). No narrowing of `ledger` is needed
+    # below: the hash now comes from `ledger_body_hash(body)`, which is a
+    # free function precisely so all three sites share one definition (#1393).
+    if record is None:
+        writer.write_fragment(fragment, body=body, extra_frontmatter=extra_frontmatter)
         return "created"
     # The ledger is the authority on this unit's identity, on every branch
     # below. Do not push this back down into the branches (#1329).
     fragment.id = record.fragment_id
-    new_hash = ledger.content_hash(parsed.content)
+    new_hash = ledger_body_hash(body)
     if record.tombed:
         restored = restore_tombed(
             writer, fragment, record, body, new_hash, reclassify_threshold
         )
         if restored is None:
             # Tombstone lost out of band: recreate under the preserved id.
-            writer.write_fragment(fragment, body=body)
+            writer.write_fragment(
+                fragment, body=body, extra_frontmatter=extra_frontmatter
+            )
         return "updated"
     if record.content_hash != new_hash:
         updated = writer.update_fragment(
@@ -721,14 +799,16 @@ def write_fragment_idempotent(
         )
         if updated is None:
             # File gone out of band: recreate under the preserved id.
-            writer.write_fragment(fragment, body=body)
+            writer.write_fragment(
+                fragment, body=body, extra_frontmatter=extra_frontmatter
+            )
         return "updated"
     # Known unit, content unchanged: idempotent no-op. The write resolves to
     # the existing file because `fragment.id` is now the *ledgered* id and the
     # writer's per-directory id index matches on it — the guarantee comes from
     # the ledger, not from trusting the derivation to reproduce (#1329).
     # Reported as unchanged so it never inflates the updated counter.
-    writer.write_fragment(fragment, body=body)
+    writer.write_fragment(fragment, body=body, extra_frontmatter=extra_frontmatter)
     return "unchanged"
 
 
@@ -950,17 +1030,42 @@ def should_skip_unit(
     ledger: SourceLedger | None,
     parsed: ParsedFragment,
     fragment: Fragment,
+    body: str,
     since: datetime | None,
 ) -> bool:
-    """Return whether incremental mode should skip this unchanged unit (#677)."""
+    """Return whether incremental mode should skip this unchanged unit (#677).
+
+    The third of the three ledger-hash sites, and the one it is worst to
+    miss: this filter compares against the hash :func:`record_in_ledger`
+    wrote, so if it hashes a different string than that function did, no
+    unit ever compares equal and ``creek ingest --incremental`` rewrites the
+    entire corpus on every run. It hashes *body* for that reason (#1393).
+
+    Args:
+        filtering: Whether an incremental mode is active at all.
+        ledger: The source ledger, or ``None`` for an unledgered run.
+        parsed: The parsed unit; read only for its ``timestamp``, which is
+            the cursor the ``--since`` mode compares.
+        fragment: The assembled fragment, used to find the prior record.
+        body: The Markdown body this run would write.
+        since: Explicit ``--since`` cutoff, or ``None`` for ledger-driven
+            ``--incremental``.
+
+    Returns:
+        ``True`` to skip the unit as unchanged.
+    """
     if not filtering:
         return False
     # Deferred import: creek.pipeline pulls heavy stage deps; keep import light.
     from creek.pipeline import unit_is_changed
 
     record = ledger_record(ledger, fragment)
-    content_hash = ledger.content_hash(parsed.content) if ledger is not None else ""
-    return not unit_is_changed(parsed.timestamp, content_hash, record, since)
+    # Hashed unconditionally: `unit_is_changed` consults the hash only when
+    # *record* is not None, which cannot happen without a ledger, so the old
+    # `if ledger is not None else ""` guard chose between two values that
+    # were never read. Computing it plainly keeps this site textually
+    # identical to the other two.
+    return not unit_is_changed(parsed.timestamp, ledger_body_hash(body), record, since)
 
 
 _UNPINNED_VAULT_WARNING = (
@@ -1233,6 +1338,11 @@ def collapsed_unit_warning(
     for parsed in fragments:
         if parsed.source_unit is None:
             continue
+        # NOT a ledger hash — do not sweep this to the rendered body (#1393).
+        # This deliberately reproduces the PRE-#1305 legacy id, which hashed
+        # `parsed.content`, in order to find fragments minted under the old
+        # rule. Feed it anything else and it computes an id no vault ever
+        # held, the advisory matches nothing, and it goes permanently silent.
         legacy_id = generate_fragment_id(
             parsed.source_path, parsed.timestamp, parsed.content
         )
@@ -1557,6 +1667,7 @@ def run_ingest(
             ledger=ledger,
             parsed=parsed,
             fragment=assembled.fragment,
+            body=assembled.body,
             since=since,
         ):
             skipped += 1
@@ -1565,17 +1676,17 @@ def run_ingest(
             action = write_fragment_idempotent(
                 ledger,
                 writer,
-                parsed,
                 assembled.fragment,
                 assembled.body,
                 reclassify_threshold,
+                assembled.extra_frontmatter,
             )
         except (OSError, KeyError) as exc:
             errors.append(
                 f"[{source_type}] failed to write {assembled.fragment.id}: {exc}",
             )
             continue
-        record_in_ledger(ledger, parsed, assembled.fragment)
+        record_in_ledger(ledger, assembled.fragment, assembled.body)
         written += 1
         # Read AFTER ``write_fragment_idempotent``, never before: that call
         # reassigns ``fragment.id`` to the ledger's recorded id on every

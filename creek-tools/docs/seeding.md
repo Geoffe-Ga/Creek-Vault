@@ -191,7 +191,7 @@ each one puts a fragment somewhere you did not ask for:
 
   ```console
   $ creek ingest --type markdown --input ./src --vault ~/Creek-Vault --yes
-  Ingest summary: 2 created, 0 updated, 0 tombed, 0 skipped
+  Ingest summary: 2 created, 0 updated, 0 unchanged, 0 tombed, 0 skipped
 
   $ grep -r 'platform:' ~/Creek-Vault/01-Fragments
   01-Fragments/Journal/2026-08-21-Morning.md:  platform: journal
@@ -212,7 +212,7 @@ each one puts a fragment somewhere you did not ask for:
   $ creek ingest --type document --input ./src/docs --vault ~/Creek-Vault --yes --strict
   Found: 4 file(s), 0.0 MB.
   Sample: memo.rtf, page.html, plain.txt, report.docx
-  Ingest summary: 4 created, 0 updated, 0 tombed, 0 skipped
+  Ingest summary: 4 created, 0 updated, 0 unchanged, 0 tombed, 0 skipped
   Ingested 4 fragment(s).
 
   $ grep -r 'platform:' ~/Creek-Vault/01-Fragments
@@ -263,7 +263,7 @@ First time processing /…/src/md.
 Found: 1 file(s), 0.0 MB.
 Sample: note.md
 Consent auto-granted via --yes; recorded in consent log.
-Ingest summary: 1 created, 0 updated, 0 tombed, 0 skipped
+Ingest summary: 1 created, 0 updated, 0 unchanged, 0 tombed, 0 skipped
 Ingested 1 fragment(s).
 ```
 
@@ -282,7 +282,7 @@ Same shape, different `--type`. A `.csv` lands under `01-Fragments/Data/`; a
 ```console
 $ creek ingest --type code --input ./src/code --vault ~/Creek-Vault --yes --strict
 Consent auto-granted via --yes; recorded in consent log.
-Ingest summary: 1 created, 0 updated, 0 tombed, 0 skipped
+Ingest summary: 1 created, 0 updated, 0 unchanged, 0 tombed, 0 skipped
 Ingested 1 fragment(s).
 ```
 
@@ -305,15 +305,15 @@ at the unpacked folder.
 
 ```console
 $ creek ingest --type claude --input ./src/claude --vault ~/Creek-Vault --yes --strict
-Ingest summary: 2 created, 0 updated, 0 tombed, 0 skipped
+Ingest summary: 2 created, 0 updated, 0 unchanged, 0 tombed, 0 skipped
 Ingested 2 fragment(s).
 
 $ creek ingest --type chatgpt --input ./src/chatgpt --vault ~/Creek-Vault --yes --strict
-Ingest summary: 2 created, 0 updated, 0 tombed, 0 skipped
+Ingest summary: 2 created, 0 updated, 0 unchanged, 0 tombed, 0 skipped
 Ingested 2 fragment(s).
 
 $ creek ingest --type discord --input ./src/discord --vault ~/Creek-Vault --yes --strict
-Ingest summary: 1 created, 0 updated, 0 tombed, 0 skipped
+Ingest summary: 1 created, 0 updated, 0 unchanged, 0 tombed, 0 skipped
 Ingested 1 fragment(s).
 ```
 
@@ -625,7 +625,7 @@ the consent preflight counted your files with a different scanner:
 $ creek ingest --type substack --input ./src/sub --vault ~/Creek-Vault --yes --strict
 Found: 1 file(s), 0.0 MB.
 Sample: on-silt.html
-Ingest summary: 0 created, 0 updated, 0 tombed, 0 skipped
+Ingest summary: 0 created, 0 updated, 0 unchanged, 0 tombed, 0 skipped
 Ingested 0 fragment(s).
 # exit status 0
 ```
@@ -645,7 +645,7 @@ about to be written:
 $ creek ingest --type markdown --input ./src/solo/solo.md --vault ~/Creek-Vault --yes
 Found: 0 file(s), 0.0 MB.
 Consent auto-granted via --yes; recorded in consent log.
-Ingest summary: 1 created, 0 updated, 0 tombed, 0 skipped
+Ingest summary: 1 created, 0 updated, 0 unchanged, 0 tombed, 0 skipped
 Ingested 1 fragment(s).
 ```
 
