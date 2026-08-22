@@ -1,0 +1,16 @@
+{
+  "additionalProperties": false,
+  "description": "Whether a vault exists behind this server.\n\nDeliberately one boolean. Anything richer \u2014 fragment counts, last-write\ntimestamps, initialisation progress \u2014 is a measurement of the corpus, and\nthe handshake is reachable before any tier gate has run.\n\nAttributes:\n    available: ``True`` when a scaffolded vault is readable.",
+  "properties": {
+    "available": {
+      "description": "True when a scaffolded vault is readable.",
+      "title": "Available",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "available"
+  ],
+  "title": "VaultState",
+  "type": "object"
+}

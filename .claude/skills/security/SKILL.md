@@ -5,8 +5,7 @@ description: >-
   Use when handling user input, file paths, subprocess calls, SQL queries,
   API keys, or building web endpoints. Covers input validation, injection
   prevention, secret management, and XSS/CSRF protection across Python,
-  TypeScript, Go, and Rust. Do NOT use for general error handling
-  (use error-handling skill).
+  TypeScript, Go, and Rust.
 metadata:
   author: Geoff
   version: 1.0.0

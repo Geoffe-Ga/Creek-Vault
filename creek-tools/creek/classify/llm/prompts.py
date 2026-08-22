@@ -76,6 +76,73 @@ _COLOR_BLOCK: str = _build_color_block()
 """Pre-rendered Spiral Dynamics color vocabulary for the prompt."""
 
 
+EMOTIONAL_TEXTURE_VOCABULARY: tuple[str, ...] = (
+    "grief",
+    "wonder",
+    "frustration",
+    "flow",
+    "paradox",
+    "joy",
+    "longing",
+    "anger",
+    "fear",
+    "shame",
+    "tenderness",
+    "resolve",
+    "exhaustion",
+    "relief",
+    "curiosity",
+    "restlessness",
+)
+"""Seed vocabulary for the ``emotional_texture`` axis (issue #878).
+
+**This list is the highest-leverage decision in the #878 LLM half.** The
+field is free-form by design — §5.1 of the ontology spec
+(``docs/Ontology/creek_ontology_agent_prompt.md:309``) describes it as
+"free-form tags" — but free-form output from a per-fragment call is
+*per-fragment vocabulary*. The one consumer that pays for this axis,
+:func:`creek.link.temporal`, scores exact string set-intersection
+(``creek/link/temporal.py:107-112``: ``+0.1`` for each tag two fragments
+literally share). Let the model invent a fresh poetic phrase for each of
+35,330 fragments and nothing ever co-occurs: the field is populated, the
+bonus never fires, and the axis is exactly as dead as the empty list
+#878 is fixing — only harder to notice.
+
+Seeding a small shared vocabulary is what makes co-occurrence possible.
+It is advertised as a *preference*, never as an enum: the prompt tells
+the model free-form tags are allowed when none of these fit, and the
+parser (:func:`creek.classify.llm.parsing._parse_emotional_texture`)
+accepts any string. Constraining it to an enum would throw away the
+liminal, uncategorisable content the ontology explicitly values.
+
+The first four entries are the spec's own canonical examples (line 309);
+``paradox`` is *mandated* by line 715 — "Do not resolve paradoxes or
+contradictions — tag them with ``paradox`` in emotional_texture" — which
+makes it the one entry that is a contract rather than a suggestion. The
+remaining eleven span the affective range the corpus actually contains
+so that the seed does not bias every fragment toward mourning.
+"""
+
+
+def _build_texture_block() -> str:
+    """Render the emotional-texture seed vocabulary for the prompt.
+
+    Sourced from :data:`EMOTIONAL_TEXTURE_VOCABULARY` rather than typed
+    into the template so the prompt and the documented vocabulary cannot
+    drift apart — the same discipline
+    :func:`_build_color_block` applies to the Spiral Dynamics colors.
+
+    Returns:
+        A single comma-joined list of the seed tags, suitable for
+        embedding mid-sentence in :data:`CLASSIFICATION_PROMPT`.
+    """
+    return ", ".join(EMOTIONAL_TEXTURE_VOCABULARY)
+
+
+_TEXTURE_BLOCK: str = _build_texture_block()
+"""Pre-rendered emotional-texture seed vocabulary for the prompt."""
+
+
 def _build_frequency_color_block() -> str:
     """Render the Frequency-to-Color mapping for the prompt.
 
@@ -131,6 +198,19 @@ instructional, raw, conversational
 
 9. **Confidence**: musing, exploring, forming, settled, conviction
 
+10. **Praxis Potential**: explicit, latent, none — does this fragment state an
+    actionable insight, a practice, or a decision-in-progress? Use ``explicit``
+    when the fragment names something to *do*; ``latent`` when a practice is
+    implied but never stated outright; ``none`` otherwise.
+
+11. **Emotional Texture**: up to three short tags naming how this fragment
+    *feels*, not what it is about. Prefer this seed vocabulary, so that tags
+    recur across fragments instead of being unique to each one: \
+__TEXTURE_BLOCK__. A free-form tag is allowed when none of these fit, but
+    reach for the seed list first. Where the fragment holds an unresolved
+    contradiction, do NOT resolve it — tag it ``paradox``. Emit an empty
+    list rather than inventing a tag for a fragment with no clear texture.
+
 A few labelled examples (do not include these in your YAML output):
 
 {examples}
@@ -139,8 +219,9 @@ Two-step protocol (FEAT-017):
 
 Step 1 — Reason briefly. Walk through which frequency this most resonates
 with and why, then which phase, then which mode, orientation, and dosage,
-which color and descriptor follow from those, and finally the voice
-register. Two to four short sentences total.
+which color and descriptor follow from those, then the voice register,
+then whether the fragment carries any praxis potential, and finally how
+it feels — its emotional texture. Two to four short sentences total.
 
 Step 2 — Emit your classification as valid YAML inside a fenced
 ```yaml ... ``` block. **You MUST emit the full ``wavelength:`` block
@@ -169,6 +250,10 @@ confidence_scores:
   mode: 0.7
   orientation: 0.7
   dosage: 0.7
+praxis:
+  potential: none
+texture:
+  emotional: [grief, resolve]
 ```
 
 If a dimension is genuinely unclear, set ``unclassified`` rather than
@@ -185,6 +270,7 @@ Fragment content:
         _COLOR_BLOCK,
     )
     .replace("__FREQUENCY_COLOR_BLOCK__", _FREQUENCY_COLOR_BLOCK)
+    .replace("__TEXTURE_BLOCK__", _TEXTURE_BLOCK)
 )
 """Prompt template for two-step LLM-based fragment classification (FEAT-017).
 
@@ -203,6 +289,22 @@ because models follow the explicit YAML far more reliably than the
 bullet-point list above it. Drop a field from the schema and the
 classifier silently regresses to the pre-fix state where every
 fragment had ``wavelength.color: unclassified``.
+
+Issue #877: the ``praxis`` section is listed **last** in the schema, and
+:data:`creek.classify.llm.parsing._YAML_HEAD_RE` is deliberately not
+widened to recognise it — a key that can never lead a payload does not
+belong in the unfenced-payload head pattern. Every literal ``{``/``}``
+added to this template must be doubled: it is consumed by ``str.format``
+in :func:`build_classification_prompt`.
+
+Issue #878: the ``texture`` section now takes that last slot, on the same
+terms — ``_YAML_HEAD_RE`` stays unwidened for it too. The section is
+named ``texture`` rather than ``emotional_texture`` because
+:data:`creek.classify.llm.parsing._ALLOWED_TOP_LEVEL_KEYS` is the SEC-004
+injection boundary and is never widened to a
+:class:`~creek.models.Fragment` field name. The doubled-brace rule above
+applies to anything added here, section 11 and its schema block
+included.
 """
 
 

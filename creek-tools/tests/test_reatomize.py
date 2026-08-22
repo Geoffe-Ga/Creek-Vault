@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import get_args
 
 import pytest
 
-from creek.atomize.aggregate import AggregationConfig
 from creek.classify.reatomize import (
     ClassificationTree,
     Classifier,
+    Direction,
+    DirectionOverride,
     ReatomizeConfig,
+    StopReason,
     choose_direction,
     classify_reatomize,
-    classify_reatomize_stream,
 )
 from creek.config import ClassificationConfig
 from creek.ingest.base import IngestedFragment
@@ -132,15 +134,42 @@ class TestReatomizeConfig:
         cfg = ReatomizeConfig.from_classification_config(cls_cfg)
         assert cfg.threshold == pytest.approx(0.4)
 
-    def test_from_classification_config_accepts_aggregation_override(self) -> None:
-        """Callers can wire a tuned AggregationConfig for burst runs."""
-        agg = AggregationConfig(burst_similarity_threshold=0.9)
-        cls_cfg = ClassificationConfig()
-        cfg = ReatomizeConfig.from_classification_config(
-            cls_cfg,
-            aggregation_config=agg,
-        )
-        assert cfg.aggregation_config is agg
+
+# ---- Re-atomization vocabulary ---------------------------------------------
+
+
+class TestReatomizeVocabulary:
+    """The ``Direction`` / ``StopReason`` token sets are a public contract."""
+
+    def test_stop_reason_tokens_are_exactly_the_seven_live_reasons(self) -> None:
+        """Every ``StopReason`` token must have a producer in the orchestrator.
+
+        The vocabulary is pinned literally, not derived, because a stray
+        token is precisely how ``aggregated_weak`` outlived its producer:
+        the FEAT-022 zoom-out aggregator was retired (ADR-0011, issue
+        #1342) but its stop reasons stayed in the ``Literal``, where no
+        type checker, linter or coverage gate could notice that nothing
+        emits them any more. Downstream consumers gate dashboards and
+        export queues on this string, so a phantom token is a live
+        promise the pipeline cannot keep.
+        """
+        assert set(get_args(StopReason)) == {
+            "accepted",
+            "terminal",
+            "max_depth",
+            "disabled",
+            "no_decomposition",
+            "no_operator",
+            "split",
+        }
+
+    def test_direction_offers_only_split_and_none(self) -> None:
+        """``choose_direction`` may route to the splitter or to nothing at all."""
+        assert set(get_args(Direction)) == {"split", "none"}
+
+    def test_direction_override_offers_only_auto_and_split(self) -> None:
+        """The only operator-selectable direction left is the zoom-in splitter."""
+        assert set(get_args(DirectionOverride)) == {"auto", "split"}
 
 
 # ---- Direction heuristic ---------------------------------------------------
@@ -152,10 +181,13 @@ class TestChooseDirection:
     @pytest.mark.parametrize(
         ("platform", "level", "expected"),
         [
-            # Chat sources at chat-level: zoom out.
-            (SourcePlatform.DISCORD, "document", "aggregate"),
-            (SourcePlatform.CLAUDE, "document", "aggregate"),
-            (SourcePlatform.CHATGPT, "exchange", "aggregate"),
+            # Chat sources at chat-level: no operator applies. Zoom-out
+            # was retired with FEAT-022 (ADR-0011, issue #1342) and
+            # splitting a lone chat message is not what the heuristic
+            # ever meant, so the honest answer is "none".
+            (SourcePlatform.DISCORD, "document", "none"),
+            (SourcePlatform.CLAUDE, "document", "none"),
+            (SourcePlatform.CHATGPT, "exchange", "none"),
             # Document sources at top-level: zoom in.
             (SourcePlatform.MARKDOWN, "document", "split"),
             (SourcePlatform.ESSAY, "section", "split"),
@@ -173,21 +205,34 @@ class TestChooseDirection:
         level: FragmentLevel,
         expected: str,
     ) -> None:
+        """The (platform, level) pair alone decides the direction.
+
+        Args:
+            platform: Source platform stamped on the fragment.
+            level: Structural level stamped on the fragment.
+            expected: Direction the heuristic must return.
+        """
         ingested = _make_ingested(platform=platform, level=level)
         assert choose_direction(ingested.fragment) == expected
 
     @pytest.mark.parametrize(
         ("override", "platform"),
-        [("split", SourcePlatform.DISCORD), ("aggregate", SourcePlatform.MARKDOWN)],
+        [("split", SourcePlatform.DISCORD)],
     )
     def test_explicit_override_wins(
         self,
-        override: str,
+        override: DirectionOverride,
         platform: SourcePlatform,
     ) -> None:
-        """Non-``auto`` overrides bypass the heuristic entirely."""
+        """Non-``auto`` overrides bypass the heuristic entirely.
+
+        Args:
+            override: Explicit direction the caller forces.
+            platform: A platform whose heuristic answer differs from
+                ``override``, so a pass proves the override was honoured.
+        """
         ingested = _make_ingested(platform=platform, level="document")
-        assert choose_direction(ingested.fragment, override) == override  # type: ignore[arg-type]
+        assert choose_direction(ingested.fragment, override) == override
 
 
 # ---- Disabled path ---------------------------------------------------------
@@ -217,26 +262,6 @@ class TestDisabled:
         )
         assert tree.stop_reason == "disabled"
         assert tree.children == ()
-
-    def test_stream_disabled_returns_per_input_leaves(self) -> None:
-        ingested = [
-            _make_ingested(
-                frag_id="frag-a",
-                body="hi",
-                platform=SourcePlatform.DISCORD,
-            ),
-            _make_ingested(
-                frag_id="frag-b",
-                body="ok",
-                platform=SourcePlatform.DISCORD,
-            ),
-        ]
-        trees = classify_reatomize_stream(
-            ingested,
-            _accepting_classifier(),
-            config=ReatomizeConfig(enabled=False),
-        )
-        assert [t.stop_reason for t in trees] == ["disabled", "disabled"]
 
 
 # ---- Acceptance path -------------------------------------------------------
@@ -336,22 +361,35 @@ class TestNoDecomposition:
         assert tree.children == ()
 
 
-class TestAggregateNoSiblings:
-    """Single-fragment API can't aggregate; records that fact and stops."""
+class TestNoOperator:
+    """A chat message at chat level has no operator left; it stops honestly."""
 
-    def test_lone_chat_message_records_aggregate_no_siblings(self) -> None:
+    def test_lone_chat_message_records_no_operator(self) -> None:
+        """A weak Discord ``document`` becomes a ``no_operator`` leaf.
+
+        Zoom-out was the only operator this branch ever had, and FEAT-022
+        was retired by ADR-0011 (issue #1342). The orchestrator must
+        therefore say so in one word — ``no_operator`` — rather than
+        borrowing a reason that implies work was attempted. The whole
+        leaf contract is pinned (reason, no children, root depth, and
+        that the returned fragment is the classified *input*, not a
+        substitute), because a downstream export queue reads all four.
+        """
         ingested = _make_ingested(
             body="hi",
             level="document",
             platform=SourcePlatform.DISCORD,
+            frag_id="frag-lonechat001",
         )
         tree = classify_reatomize(
             ingested,
             _rejecting_classifier(),
             config=ReatomizeConfig(enabled=True, threshold=0.9),
         )
-        assert tree.stop_reason == "aggregate_no_siblings"
+        assert tree.stop_reason == "no_operator"
         assert tree.children == ()
+        assert tree.depth == 0
+        assert tree.fragment.fragment.id == "frag-lonechat001"
 
 
 # ---- Zoom-in integration ---------------------------------------------------
@@ -436,303 +474,6 @@ class TestZoomInIntegration:
         second = classify_reatomize(self._polyphonic_doc(), classifier, config=cfg)
         assert _shape_signature(first) == _shape_signature(second)
         assert _ids(first) == _ids(second)
-
-
-# ---- Zoom-out integration --------------------------------------------------
-
-
-class TestZoomOutIntegration:
-    """Stream of short chat messages → confidently-classified exchange parents."""
-
-    @staticmethod
-    def _short_chat_messages() -> list[IngestedFragment]:
-        return [
-            _make_ingested(
-                frag_id=f"frag-msg{idx:08}",
-                body=body,
-                title=body,
-                level="document",
-                platform=SourcePlatform.DISCORD,
-                minute=idx,
-                interlocutor="alice",
-                author=Authorship.SELF if idx % 2 == 0 else Authorship.OTHER,
-            )
-            for idx, body in enumerate(["hi", "hey", "ok", "thanks"])
-        ]
-
-    @staticmethod
-    def _aggregating_classifier() -> Classifier:
-        """LLM mock: messages stay unclassified, exchange parents classify."""
-
-        def _classify(ig: IngestedFragment) -> tuple[IngestedFragment, float]:
-            if ig.fragment.level == "exchange":
-                return (
-                    IngestedFragment(
-                        fragment=_classified(
-                            ig.fragment,
-                            frequency=Frequency.F2,
-                            phase=Phase.RESTORATION,
-                        ),
-                        body=ig.body,
-                    ),
-                    0.9,
-                )
-            return ig, 0.2
-
-        return _classify
-
-    def test_stream_zooms_out_into_exchange_parents(self) -> None:
-        trees = classify_reatomize_stream(
-            self._short_chat_messages(),
-            self._aggregating_classifier(),
-            config=ReatomizeConfig(enabled=True, threshold=0.7),
-        )
-        assert len(trees) == 1
-        parent_tree = trees[0]
-        assert parent_tree.stop_reason == "aggregated"
-        assert parent_tree.fragment.fragment.level == "exchange"
-        assert parent_tree.fragment.fragment.frequency.primary == Frequency.F2.value
-        # All four messages live under the single exchange parent.
-        assert len(parent_tree.children) == 4
-
-    def test_stream_idempotent_under_rerun(self) -> None:
-        classifier = self._aggregating_classifier()
-        cfg = ReatomizeConfig(enabled=True, threshold=0.7)
-        first = classify_reatomize_stream(
-            self._short_chat_messages(),
-            classifier,
-            config=cfg,
-        )
-        second = classify_reatomize_stream(
-            self._short_chat_messages(),
-            classifier,
-            config=cfg,
-        )
-        assert [_shape_signature(t) for t in first] == [
-            _shape_signature(t) for t in second
-        ]
-        assert [_ids(t) for t in first] == [_ids(t) for t in second]
-
-    def test_stream_returns_empty_for_empty_input(self) -> None:
-        trees = classify_reatomize_stream(
-            [],
-            _accepting_classifier(),
-            config=ReatomizeConfig(enabled=True),
-        )
-        assert trees == []
-
-    def test_stream_skips_aggregation_when_all_accepted(self) -> None:
-        messages = self._short_chat_messages()
-        trees = classify_reatomize_stream(
-            messages,
-            _accepting_classifier(0.95),
-            config=ReatomizeConfig(enabled=True, threshold=0.7),
-        )
-        assert len(trees) == len(messages)
-        assert all(t.stop_reason == "accepted" for t in trees)
-
-    def test_stream_falls_through_to_split_for_document_sources(self) -> None:
-        """Document-source weak fragments use the single-fragment splitter."""
-        body = "# H1\n\npara one.\n\npara two."
-        docs = [
-            _make_ingested(
-                frag_id="frag-doc-a",
-                body=body,
-                level="document",
-                platform=SourcePlatform.MARKDOWN,
-            ),
-        ]
-        trees = classify_reatomize_stream(
-            docs,
-            _rejecting_classifier(),
-            config=ReatomizeConfig(enabled=True, threshold=0.9),
-        )
-        assert len(trees) == 1
-        assert trees[0].stop_reason == "split"
-
-    def test_stream_passthrough_weak_fragment_marked_passthrough(self) -> None:
-        """A weak pass-through fragment is labeled ``passthrough``, not ``accepted``.
-
-        Mixing a ``document``-level message with a ``burst``-level fragment
-        forces the aggregator's eligibility partition to emit the burst as
-        pass-through. When that pass-through fragment failed the threshold
-        on its own, ``stop_reason`` must NOT be ``accepted`` — downstream
-        consumers gate dashboards and export queues on that field.
-        """
-
-        def _mixed_classifier(
-            ig: IngestedFragment,
-        ) -> tuple[IngestedFragment, float]:
-            if ig.fragment.level == "exchange":
-                return (
-                    IngestedFragment(
-                        fragment=_classified(
-                            ig.fragment,
-                            frequency=Frequency.F2,
-                            phase=Phase.RISING,
-                        ),
-                        body=ig.body,
-                    ),
-                    0.9,
-                )
-            return ig, 0.2
-
-        mixed = [
-            _make_ingested(
-                frag_id="frag-msg00000001",
-                body="hi",
-                level="document",
-                platform=SourcePlatform.DISCORD,
-                minute=0,
-            ),
-            _make_ingested(
-                frag_id="frag-burst00001",
-                body="burst body",
-                level="burst",
-                platform=SourcePlatform.DISCORD,
-                minute=5,
-            ),
-        ]
-        trees = classify_reatomize_stream(
-            mixed,
-            _mixed_classifier,
-            config=ReatomizeConfig(
-                enabled=True,
-                threshold=0.7,
-                direction="aggregate",
-            ),
-        )
-        # The aggregator emits one exchange parent and one burst pass-through.
-        stops = {t.stop_reason for t in trees}
-        assert "aggregated" in stops
-        # The weak burst pass-through must be flagged honestly, NOT "accepted":
-        # confidence was 0.2 against a threshold of 0.7.
-        assert "passthrough" in stops
-        assert "accepted" not in stops
-
-    def test_stream_passthrough_strong_fragment_marked_accepted(self) -> None:
-        """A pass-through fragment that *does* pass the threshold stays ``accepted``."""
-
-        def _strong_passthrough_classifier(
-            ig: IngestedFragment,
-        ) -> tuple[IngestedFragment, float]:
-            if ig.fragment.level == "exchange":
-                return (
-                    IngestedFragment(
-                        fragment=_classified(
-                            ig.fragment,
-                            frequency=Frequency.F2,
-                            phase=Phase.RISING,
-                        ),
-                        body=ig.body,
-                    ),
-                    0.9,
-                )
-            if ig.fragment.level == "burst":
-                # Confident pass-through — must keep its "accepted" label.
-                return (
-                    IngestedFragment(
-                        fragment=_classified(
-                            ig.fragment,
-                            frequency=Frequency.F5,
-                            phase=Phase.PEAKING,
-                        ),
-                        body=ig.body,
-                    ),
-                    0.95,
-                )
-            # The document-level message stays weak so aggregation fires.
-            return ig, 0.2
-
-        mixed = [
-            _make_ingested(
-                frag_id="frag-msg00000002",
-                body="hi",
-                level="document",
-                platform=SourcePlatform.DISCORD,
-                minute=0,
-            ),
-            _make_ingested(
-                frag_id="frag-burst00002",
-                body="burst body",
-                level="burst",
-                platform=SourcePlatform.DISCORD,
-                minute=5,
-            ),
-        ]
-        trees = classify_reatomize_stream(
-            mixed,
-            _strong_passthrough_classifier,
-            config=ReatomizeConfig(
-                enabled=True,
-                threshold=0.7,
-                direction="aggregate",
-            ),
-        )
-        stops = {t.stop_reason for t in trees}
-        assert "aggregated" in stops
-        assert "accepted" in stops  # confident pass-through keeps "accepted"
-        assert "passthrough" not in stops  # confident burst is NOT a weak passthrough
-
-    def test_stream_aggregated_weak_parent_marked_aggregated_weak(self) -> None:
-        """An aggregated parent that still fails the threshold gets ``aggregated_weak``.
-
-        ``no_decomposition`` is reserved for "operator returned no children";
-        a parent with non-empty children must not borrow that label.
-        """
-
-        def _weak_parent_classifier(
-            _ig: IngestedFragment,
-        ) -> tuple[IngestedFragment, float]:
-            # Every fragment — leaf or aggregated parent — scores below threshold.
-            return _ig, 0.2
-
-        messages = [
-            _make_ingested(
-                frag_id=f"frag-weak{idx:08}",
-                body=body,
-                title=body,
-                level="document",
-                platform=SourcePlatform.DISCORD,
-                minute=idx,
-            )
-            for idx, body in enumerate(["a", "b", "c"])
-        ]
-        trees = classify_reatomize_stream(
-            messages,
-            _weak_parent_classifier,
-            config=ReatomizeConfig(enabled=True, threshold=0.7),
-        )
-        assert len(trees) == 1
-        parent = trees[0]
-        # Children were produced, so "no_decomposition" would be a lie.
-        assert parent.children
-        assert parent.stop_reason == "aggregated_weak"
-
-    def test_stream_returns_terminal_when_base_level_is_session(self) -> None:
-        """A stream already at the terminal level can't aggregate further."""
-        sessions = [
-            _make_ingested(
-                frag_id=f"frag-sess{idx:08}",
-                body="x",
-                level="session",
-                platform=SourcePlatform.DISCORD,
-                minute=idx,
-            )
-            for idx in range(2)
-        ]
-        # Force aggregate direction so the stream takes the zoom-out branch.
-        trees = classify_reatomize_stream(
-            sessions,
-            _rejecting_classifier(),
-            config=ReatomizeConfig(
-                enabled=True,
-                threshold=0.9,
-                direction="aggregate",
-            ),
-        )
-        # Sessions hit the terminal guard in the zoom-out branch.
-        assert all(t.stop_reason == "terminal" for t in trees)
 
 
 # ---- Walk helpers ----------------------------------------------------------

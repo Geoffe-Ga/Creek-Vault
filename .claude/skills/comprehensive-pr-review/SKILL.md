@@ -5,8 +5,9 @@ description: >-
   and documentation. Use when reviewing pull requests, evaluating code
   changes, or doing code review. Produces verdicts with specific references.
   Do NOT use for backlog grooming or issue triage (use backlog-grooming),
-  reviewing your own changes before PR creation (use self-review), or
-  iterating on a review's feedback as the PR author (use address-feedback).
+  reviewing your own changes before PR creation (use the
+  code-review-orchestrator agent), or iterating on a review's feedback as
+  the PR author (use address-feedback).
 metadata:
   author: Geoff
   version: 1.0.0

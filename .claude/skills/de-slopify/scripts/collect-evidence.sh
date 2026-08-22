@@ -81,7 +81,14 @@ run() {
 # ----------------------------------------------------------------------------
 if [[ ${#PY_DIRS[@]} -gt 0 ]]; then
   run ruff.json            ruff check "${PY_DIRS[@]}" --config="$PY_CONFIG" --output-format=json
-  run vulture.txt          vulture "${PY_DIRS[@]}" --min-confidence 80
+  # 60, not 80. Vulture scores an unused function/method/class/property/
+  # attribute at 60%, so a floor of 80 excludes the entire dead-symbol
+  # tier — the defect fixed in issue #1395. This is evidence collection,
+  # not a gate, so the extra noise is the right trade: a human or agent
+  # triages the output, and a missing finding cannot be triaged at all.
+  # The actual gate lives in creek-tools/scripts/lint-vulture.sh, which
+  # applies per-type floors; its verdict will not match this raw sweep.
+  run vulture.txt          vulture "${PY_DIRS[@]}" --min-confidence 60
   run radon-cc.txt         radon cc "${PY_DIRS[@]}" -s -n C
   run radon-mi.txt         radon mi "${PY_DIRS[@]}" -s
   run mypy.txt             mypy "${PY_DIRS[@]}" --config-file="$PY_CONFIG"

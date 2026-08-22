@@ -46,6 +46,8 @@ Four detection rules; a fragment pair matching any one becomes a paradox:
 
 Output: a note in `10-Liminal/Paradoxes/` linking both fragments, a neutral description of the tension, and the `#paradox` tag plus relevant frequency tags. CLI: `creek report --type paradox`.
 
+Re-running is idempotent (#1320) — a fragment pair already captured by an existing note is skipped, never rewritten, so a note you have annotated survives every later run. The key is the note's `fragments:` frontmatter, not its filename: the filename embeds the detection date, so before #1320 a weekly run left one copy of every paradox per calendar day. Vaults that already hold those copies are told so, by count and by path, on the next run — and nothing is deleted for you, because which copy carries your reflection is not a judgement the generator gets to make.
+
 ---
 
 ## §10.3 — Synchronicity Detection
@@ -94,7 +96,13 @@ The compost note records:
 - **Links to referencing fragments** — wiki-links so the compost stays reachable.
 - **Verifier metadata** — `embedding_similarity` and `verifier_reasoning` round-trip into frontmatter so the operator can audit decisions later.
 
-Output: `10-Liminal/Compost/<id>.md` (canonical) or `10-Liminal/Compost/Review/<id>.md` (ambiguous, awaiting triage). CLI: `creek report --type compost`.
+Output: `10-Liminal/Compost/<date>-<sanitised-title>[-N].md` (canonical) or the same filename under `10-Liminal/Compost/Review/` (ambiguous, awaiting triage). `[-N]` is a collision ordinal, present only on the second and later notes that want the same name; a title is not an identity, so the path is resolved by ownership — `-1`, `-2`, … are probed until one is free or already records this candidate's source — and a note recording a different source is never overwritten. The ordinal is a bare integer on purpose: a project candidate's source id *is* its tag, which can be intimate-derived, and no identity-derived string belongs on the filesystem.
+
+Detection (#882): `creek compost scan [--vault PATH] [--no-llm] [--dry-run] [--embedding-threshold 0.7]`. The production entry point — runs the embedding gate over the vault, prints the candidate counts and the resulting LLM-call estimate *before* verifying so the cost is refusable, then files confirmed candidates canonically and ambiguous ones to the review queue. `--no-llm` runs the gate alone and files every hit to the review queue: an embedding match on its own is a suspicion, not a finding, so it is never asserted as canonical compost. Without `--no-llm` an unavailable provider is a hard refusal rather than a silent downgrade, because this command writes to the vault. Intimate-tier fragments are dropped before the gate and never reach a provider. Re-scanning is idempotent — sources already carrying a compost note are skipped and reported, spending no LLM calls.
+
+Config: `compost.llm_verification: false` is the standing form of `--no-llm`, and `compost.exemplars_relpath` (vault-relative, like `compost.review_queue_relpath`) points the gate at a custom exemplar set — override it only after `creek compost calibrate` shows the packaged defaults under-recall on your corpus.
+
+`creek fill --with-compost` then regenerates `10-Liminal/Compost/_Compost-Report.md`, the Dataview overview across whatever the scan filed.
 
 Calibration (FEAT-028): `creek compost calibrate [--fixture FIXTURE.yaml] [--json PATH] [--floor-recall 0.8] [--floor-precision 0.85] [--no-verifier]`. Runs the two-stage detector against a hand-labelled fixture (default: `tests/fixtures/compost-calibration.yaml`, 20+ positives × 20+ false-positive-risk negatives) and reports recall, precision, F1, false-positive rate, and per-stage hit counts (embedding-passed / verifier-yes / verifier-no / routed-to-review). `--floor-recall` and `--floor-precision` exit non-zero on a regression so a CI job can gate on detector quality. `--no-verifier` runs embedding-only for offline calibration.
 

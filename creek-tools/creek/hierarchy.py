@@ -38,10 +38,13 @@ LevelPolicy = Literal["leaves", "documents", "all"]
 _DOCUMENT_LEVELS: frozenset[str] = frozenset({"document", "session"})
 """Structural levels treated as "whole-source"-grained.
 
-``document`` is the default for any flat ingestion; ``session`` is the
-coarsest level the FEAT-022 zoom-out aggregator produces. Anything
-finer (sentence, paragraph, subsection, section, exchange, burst) is
-explicitly *not* a document for wavelength-read purposes.
+``document`` is the default for any flat ingestion; ``session`` was the
+coarsest level the FEAT-022 zoom-out aggregator produced before issue
+#1342 (ADR-0011) retired it — no production path mints a ``session``
+fragment now, though the value remains valid for a legacy or
+hand-authored one. Anything finer (sentence, paragraph, subsection,
+section, exchange, burst) is explicitly *not* a document for
+wavelength-read purposes.
 """
 
 
@@ -102,6 +105,19 @@ def structural_path_context(
     field is empty because the writer that produced this fragment
     pre-dated FEAT-020.
 
+    **Tier contract: this function ranks nothing.** Both branches return
+    strings derived from *ancestors*, and the persisted branch does so
+    without the ancestor fragments being present at all — which is how an
+    above-ceiling parent's heading reached the compile prompt through an
+    admitted child (#931). Rendering the breadcrumb is therefore only safe
+    where the ancestry has already been *ranked*:
+    :func:`creek.classify.privacy_filter.ancestry_tiers` (and its pure
+    sibling :func:`~creek.classify.privacy_filter.build_ancestor_index`) is
+    the survey that does it. ``creek.compile.engine`` is the only production
+    caller, pinned by
+    ``tests/test_hierarchy.py::test_structural_path_context_has_exactly_one_production_caller``;
+    a second renderer must add its tier gate first.
+
     Args:
         leaf: The fragment whose ancestry to render.
         by_id: Mapping of fragment ID → :class:`Fragment` for every
@@ -109,15 +125,28 @@ def structural_path_context(
             the first missing parent rather than raising.
 
     Returns:
-        Breadcrumb from root to immediate parent, in display order.
-        Empty when *leaf* has no ancestry to surface.
+        Breadcrumb from root to immediate parent, in display order, with
+        each ancestor appearing at most once. Empty when *leaf* has no
+        ancestry to surface.
     """
     if leaf.structural_path:
         return leaf.structural_path.copy()
     path: list[str] = []
+    # A ``parent_id`` cycle inside ``by_id`` (a↔b, or a self-parent) used to
+    # spin forever: the loop's only exit was a parent *missing* from the
+    # mapping, and in a cycle every parent is present. Seeded with the leaf
+    # so a fragment never appears in its own breadcrumb. Kept deliberately
+    # in step with the vault-backed walk in
+    # ``creek.classify.privacy_filter.AncestorIndex._ascend`` (#931) —
+    # two ancestry walks with different cycle semantics is the
+    # two-readers-can-disagree drift that module's docstring exists to stop.
+    visited: set[str] = {leaf.id}
     current = leaf
-    while current.parent_id is not None and current.parent_id in by_id:
-        parent = by_id[current.parent_id]
+    while current.parent_id is not None and current.parent_id not in visited:
+        parent = by_id.get(current.parent_id)
+        if parent is None:
+            break
+        visited.add(parent.id)
         path.append(parent.title or parent.id)
         current = parent
     path.reverse()

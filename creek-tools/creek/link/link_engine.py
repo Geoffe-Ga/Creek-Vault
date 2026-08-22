@@ -65,10 +65,11 @@ class LinkSummary:
 
     The structured fields make the contract per-method explicit so the
     CLI can phrase what actually happened — pairwise similarity edges
-    cached in a parquet are *not* per-fragment frontmatter links, and an
+    computed in memory are *not* per-fragment frontmatter links, and an
     eddy cluster *detected* in memory is not the same as an eddy file
     *written* to disk. ``link_count`` is preserved as a back-compat
-    mirror of the method-specific count.
+    mirror of the method-specific count; it is the field that must never
+    be used as an operator-facing "how much was persisted" number.
 
     Attributes:
         method: Linker that was run (``embeddings`` / ``temporal`` /
@@ -77,9 +78,11 @@ class LinkSummary:
         link_count: Generic count for back-compat; mirrors the
             method-specific count (resonance edges, temporal links, or
             eddies detected).
-        similarity_edges: Pairwise cosine-similarity edges cached in the
-            embeddings parquet. Only populated for ``method ==
-            "embeddings"`` (zero elsewhere).
+        similarity_edges: Pairwise cosine-similarity edges discovered in
+            memory. **Not persisted** — the parquet caches the embedding
+            *vectors*, not the edges between them, and there is no
+            resonance writer to persist them to (#1303). Only populated
+            for ``method == "embeddings"`` (zero elsewhere).
         eddies_detected: Eddy clusters returned by the detector. Only
             populated for ``method == "eddies"``.
         eddies_written: Eddy markdown files persisted under
@@ -96,6 +99,31 @@ class LinkSummary:
             ``02-Threads/{status}/`` by the materialisation step. Equal to
             ``threads_detected`` when every write succeeds; smaller when a
             write fails. Only populated for ``method == "threads"``.
+        largest_cluster_fragments: Member count of the biggest eddy or
+            thread emitted. The operator-visible proof that no cluster
+            swallowed the vault (issue #880); ``0`` when nothing was
+            detected.
+        clusters_split: Clusters that exceeded the configured ceiling and
+            were re-clustered at a tighter parameter.
+        oversized_discarded: Fragments dropped to noise because their
+            cluster stayed above the ceiling even after the split budget
+            was spent. Those fragments carry no ``eddies:``/``threads:``
+            link at all, so a non-zero value is worth an operator's
+            attention.
+        fragments_embedded: Vectors this run actually computed — cache
+            misses only. A run whose parquet is warm reports ``0`` here
+            even though every fragment had an embedding available, which
+            is what lets ``creek process`` attribute local-model work to
+            the run that paid for it instead of re-counting the corpus
+            (#1303).
+        vectors_persisted: Rows present in
+            ``00-Creek-Meta/embeddings.parquet`` as written by *this* run.
+            Deliberately distinct from ``fragments_embedded``: the cache is
+            rewritten whole from fresh cache hits plus new vectors, so a
+            fully warm run persists the entire corpus while computing none
+            of it. ``0`` means nothing reached disk — an empty vault, or a
+            swallowed ``OSError`` from the cache write. The CLI reports
+            this rather than asserting that vectors were cached (#1337).
     """
 
     method: str
@@ -107,6 +135,39 @@ class LinkSummary:
     member_fragments_updated: int = 0
     threads_detected: int = 0
     threads_written: int = 0
+    largest_cluster_fragments: int = 0
+    clusters_split: int = 0
+    oversized_discarded: int = 0
+    fragments_embedded: int = 0
+    vectors_persisted: int = 0
+
+
+@dataclass(frozen=True)
+class EmbeddingPass:
+    """Embedding vectors for one linker stage, plus how they were obtained.
+
+    :func:`_load_or_compute_embeddings` used to return the vector map
+    alone, which made "how many fragments did this run actually embed?"
+    unanswerable — callers could only fall back to ``len(fragments)``,
+    counting every cache hit as fresh local-model work (#1303).
+
+    Attributes:
+        vectors: Fragment ID to embedding vector, covering every fragment
+            handed to the pass.
+        computed: Vectors computed by the model on this pass (cache
+            misses).
+        reused: Vectors served verbatim from the on-disk parquet cache.
+        persisted: Rows this pass actually wrote to the parquet — ``0``
+            when the write failed or never happened. Required, with no
+            default: the number has to be *measured* by the write, and a
+            default would let a future pass silently under-report the one
+            thing the field exists to make honest (#1337).
+    """
+
+    vectors: dict[str, list[float]]
+    computed: int
+    reused: int
+    persisted: int
 
 
 def run_link(
@@ -145,7 +206,7 @@ def run_link(
         return LinkSummary(method=method, fragment_count=0, link_count=0)
 
     if method == "embeddings":
-        link_count = _run_embeddings(
+        link_count, embedding_pass = _run_embeddings(
             fragments=fragments,
             config=config,
             cache_path=cache_path,
@@ -155,6 +216,8 @@ def run_link(
             fragment_count=len(fragments),
             link_count=link_count,
             similarity_edges=link_count,
+            fragments_embedded=embedding_pass.computed,
+            vectors_persisted=embedding_pass.persisted,
         )
     if method == "temporal":
         temporal = TemporalLinker()
@@ -216,12 +279,15 @@ def _run_threads(
     Returns:
         A populated :class:`LinkSummary` for the threads method.
     """
-    embeddings = _load_or_compute_embeddings(
+    embedding_pass = _load_or_compute_embeddings(
         fragments=fragments,
         config=config,
         cache_path=cache_path,
     )
-    detector = ThreadDetector(embeddings=embeddings)
+    detector = ThreadDetector.from_linking_config(
+        embedding_pass.vectors,
+        config.linking,
+    )
     threads = detector.detect_threads(
         fragments,
         min_fragments=config.linking.thread_min_fragments,
@@ -232,6 +298,10 @@ def _run_threads(
             method="threads",
             fragment_count=len(fragments),
             link_count=0,
+            clusters_split=detector.clusters_split,
+            oversized_discarded=detector.oversized_discarded,
+            fragments_embedded=embedding_pass.computed,
+            vectors_persisted=embedding_pass.persisted,
         )
 
     updated_fragments = detector.assign_fragments_to_threads(fragments, threads)
@@ -255,6 +325,11 @@ def _run_threads(
         threads_detected=len(threads),
         threads_written=len(written_paths),
         member_fragments_updated=fragments_updated,
+        largest_cluster_fragments=_largest_cluster(detector.thread_members),
+        clusters_split=detector.clusters_split,
+        oversized_discarded=detector.oversized_discarded,
+        fragments_embedded=embedding_pass.computed,
+        vectors_persisted=embedding_pass.persisted,
     )
 
 
@@ -298,12 +373,15 @@ def _run_eddies(
     Returns:
         A populated :class:`LinkSummary` for the eddies method.
     """
-    embeddings = _load_or_compute_embeddings(
+    embedding_pass = _load_or_compute_embeddings(
         fragments=fragments,
         config=config,
         cache_path=cache_path,
     )
-    detector = EddyDetector(embeddings=embeddings)
+    detector = EddyDetector.from_linking_config(
+        embedding_pass.vectors,
+        config.linking,
+    )
     eddies = detector.detect_eddies(
         fragments,
         min_fragments=config.linking.eddy_min_fragments,
@@ -314,6 +392,10 @@ def _run_eddies(
             method="eddies",
             fragment_count=len(fragments),
             link_count=0,
+            clusters_split=detector.clusters_split,
+            oversized_discarded=detector.oversized_discarded,
+            fragments_embedded=embedding_pass.computed,
+            vectors_persisted=embedding_pass.persisted,
         )
 
     updated_fragments = detector.assign_fragments_to_eddies(fragments, eddies)
@@ -337,7 +419,26 @@ def _run_eddies(
         eddies_detected=len(eddies),
         eddies_written=len(written_paths),
         member_fragments_updated=fragments_updated,
+        largest_cluster_fragments=_largest_cluster(detector.eddy_members),
+        clusters_split=detector.clusters_split,
+        oversized_discarded=detector.oversized_discarded,
+        fragments_embedded=embedding_pass.computed,
+        vectors_persisted=embedding_pass.persisted,
     )
+
+
+def _largest_cluster(members_by_id: dict[str, list[str]]) -> int:
+    """Return the member count of the biggest cluster in a membership map.
+
+    Args:
+        members_by_id: Cluster ID to member fragment IDs, as exposed by
+            :attr:`EddyDetector.eddy_members` /
+            :attr:`ThreadDetector.thread_members`.
+
+    Returns:
+        The largest membership size, or ``0`` when nothing was detected.
+    """
+    return max((len(members) for members in members_by_id.values()), default=0)
 
 
 def _materialise_link_models(
@@ -473,7 +574,7 @@ def _run_embeddings(
     fragments: list[Fragment],
     config: CreekConfig,
     cache_path: Path,
-) -> int:
+) -> tuple[int, EmbeddingPass]:
     """Compute embeddings, optionally re-using the on-disk cache.
 
     Args:
@@ -482,9 +583,17 @@ def _run_embeddings(
         cache_path: Where to read/write the cached embeddings parquet.
 
     Returns:
-        Number of resonance edges discovered.
+        ``(resonance_edges_discovered, embedding_pass)``. The edge count is
+        obtained from :meth:`~EmbeddingLinker.count_resonances`, which walks
+        the same traversal as ``find_resonances`` without materialising a
+        ``Resonance`` per pair — the objects were only ever built to call
+        ``len`` on them, at a measured ~1KB of heap each (#1337). Nothing
+        about the edges reaches the vault: there is no ``Resonance`` writer
+        anywhere in the codebase and :class:`~creek.models.Fragment` has no
+        ``resonances`` field (#1303). Only the vectors are persisted, in
+        the parquet cache, and the pass reports how many rows landed there.
     """
-    embeddings = _load_or_compute_embeddings(
+    embedding_pass = _load_or_compute_embeddings(
         fragments=fragments,
         config=config,
         cache_path=cache_path,
@@ -493,12 +602,12 @@ def _run_embeddings(
     # FEAT-024: hierarchy-aware filtering needs both the fragment map
     # (parent/child relations) and the configured sibling skip window.
     fragments_by_id = {f.id: f for f in fragments}
-    resonances = EmbeddingLinker(config=config.embeddings).find_resonances(
-        embeddings,
+    edges = EmbeddingLinker(config=config.embeddings).count_resonances(
+        embedding_pass.vectors,
         fragments_by_id,
         sibling_skip_window=config.linking.hierarchy_sibling_skip_window,
     )
-    return len(resonances)
+    return edges, embedding_pass
 
 
 def _load_or_compute_embeddings(
@@ -506,7 +615,7 @@ def _load_or_compute_embeddings(
     fragments: list[Fragment],
     config: CreekConfig,
     cache_path: Path,
-) -> dict[str, list[float]]:
+) -> EmbeddingPass:
     """Return embeddings for *fragments*, hitting the cache when fresh.
 
     The cache is consulted per-fragment: rows whose ``content_hash``
@@ -522,7 +631,9 @@ def _load_or_compute_embeddings(
         cache_path: Embedding cache path.
 
     Returns:
-        Mapping of fragment ID to embedding vector.
+        An :class:`EmbeddingPass` carrying the vectors, the split between
+        freshly computed and cache-served entries, and the row count the
+        cache write actually landed on disk.
     """
     linker = EmbeddingLinker(config=config.embeddings)
 
@@ -536,8 +647,20 @@ def _load_or_compute_embeddings(
     }
     embeddings.update(new_vectors)
 
-    _persist_cache(linker, fragments, cached, new_vectors, fresh_ids, cache_path)
-    return embeddings
+    persisted = _persist_cache(
+        linker,
+        fragments,
+        cached,
+        new_vectors,
+        fresh_ids,
+        cache_path,
+    )
+    return EmbeddingPass(
+        vectors=embeddings,
+        computed=len(new_vectors),
+        reused=len(fresh_ids),
+        persisted=persisted,
+    )
 
 
 def _safe_load_cache(
@@ -596,7 +719,7 @@ def _persist_cache(
     new_vectors: dict[str, list[float]],
     fresh_ids: set[str],
     cache_path: Path,
-) -> None:
+) -> int:
     """Write the merged cache back to disk, degrading gracefully on IO errors.
 
     Args:
@@ -606,6 +729,12 @@ def _persist_cache(
         new_vectors: Vectors produced this run.
         fresh_ids: Fragment IDs whose cached entry is still valid.
         cache_path: Cache parquet path.
+
+    Returns:
+        Rows actually written to *cache_path* — the whole merged entry set
+        on success, ``0`` when the write raised. The cache is rewritten
+        whole, so on a fully warm run this is the corpus size even though
+        no vector was computed (#1337).
     """
     new_entries = linker.build_cache_entries(fragments, new_vectors)
     entries = {frag.id: cached[frag.id] for frag in fragments if frag.id in fresh_ids}
@@ -617,11 +746,15 @@ def _persist_cache(
         # Disk full / permission denied / read-only volume. Linking
         # itself succeeded — losing the cache only costs a recompute on
         # the next run, so we degrade gracefully instead of crashing.
+        # The operator still learns about it: the zero returned here is
+        # what the CLI prints instead of claiming vectors were cached.
         logger.warning(
             "Failed to persist embeddings cache to %s: %s",
             cache_path,
             exc,
         )
+        return 0
+    return len(entries)
 
 
 def _load_fragments(vault_path: Path) -> list[Fragment]:

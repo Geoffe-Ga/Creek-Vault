@@ -33,6 +33,9 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from pathlib import Path
 
+from rich.console import Console
+
+from creek._containment import EscapingSymlinkError
 from creek.clean.filters.discord import DiscordFilter, DiscordFilterConfig
 from creek.ingest.base import (
     Ingestor,
@@ -52,36 +55,6 @@ TIME_PROXIMITY_MINUTES = 5
 
 _SPOILER_PATTERN = re.compile(r"\|\|(.+?)\|\|")
 """Regex pattern matching Discord spoiler tags ``||content||``."""
-
-
-# ---- Helper data structures ----
-
-
-class _MessageGroup:
-    """A group of temporally or reply-linked Discord messages.
-
-    Attributes:
-        channel_name: The name of the source Discord channel.
-        messages: Ordered list of message dicts in this group.
-        channel_id: The Discord channel ID string.
-    """
-
-    def __init__(
-        self,
-        channel_name: str,
-        messages: list[dict[str, Any]],
-        channel_id: str,
-    ) -> None:
-        """Initialise a message group.
-
-        Args:
-            channel_name: The display name of the channel.
-            messages: The list of message dicts in this group.
-            channel_id: The Discord channel ID string.
-        """
-        self.channel_name = channel_name
-        self.messages = messages
-        self.channel_id = channel_id
 
 
 # ---- Discord formatting helpers ----
@@ -665,7 +638,8 @@ class DiscordIngestor(Ingestor):
             ts_str: The ISO 8601 timestamp string.
 
         Returns:
-            A timezone-aware datetime in the configured timezone.
+            A timezone-aware datetime in America/Los_Angeles, the anchor
+            every normalized Creek timestamp uses (:data:`creek.time.LA_TZ`).
         """
         if not ts_str:
             return normalize_timestamp("1970-01-01T00:00:00Z", None)
@@ -711,10 +685,24 @@ class DiscordIngestor(Ingestor):
     def generate_frontmatter(self, fragment: ParsedFragment) -> dict[str, Any]:
         """Generate YAML frontmatter metadata for a Discord fragment.
 
-        Produces frontmatter with source platform, channel, timestamps,
-        and participant information. FEAT-031: the message's source-side
-        ``timestamp`` (preserved with its native offset) lands on
-        ``authored_at``.
+        Produces frontmatter with a title, source platform, channel,
+        timestamps, and participant information. FEAT-031: the message's
+        source-side ``timestamp`` (preserved with its native offset) lands
+        on ``authored_at``.
+
+        Issue #880: the ``title`` key is emitted here rather than left to
+        :func:`creek.ingest.base.assemble_ingested_fragment`'s filename-stem
+        fallback. :meth:`discover` only ever reads
+        ``<channel_dir>/messages.json``, so that fallback gave *every*
+        Discord fragment in every vault the title ``messages`` — and since
+        :class:`~creek.models.Fragment` carries no body, a fragment's title
+        is the only text the linker ever sees. 30,795 identical titles are
+        what named a mega-eddy ``Messages``. Naming the channel and the day
+        gives the linker something that actually distinguishes one
+        conversation from another.
+
+        No fragment id churns: :func:`creek.ingest.base.generate_fragment_id`
+        hashes source path, timestamp and content, never the title.
 
         Args:
             fragment: The parsed fragment.
@@ -722,17 +710,23 @@ class DiscordIngestor(Ingestor):
         Returns:
             A dict of frontmatter key-value pairs.
         """
+        channel = fragment.metadata.get("channel_name", "unknown")
+        authored_at: datetime | None = fragment.metadata.get("authored_at")
+        # The source-side day when the export carried one, so the title
+        # agrees with ``authored_at`` rather than with the LA-anchored
+        # ingest timestamp (FEAT-031).
+        titled_on = (authored_at or fragment.timestamp).date()
         frontmatter_dict: dict[str, Any] = {
+            "title": f"{channel} {titled_on.isoformat()}",
             "source": {
                 "platform": "discord",
-                "channel": fragment.metadata.get("channel_name", "unknown"),
+                "channel": channel,
                 "channel_id": fragment.metadata.get("channel_id", "unknown"),
             },
             "created": fragment.timestamp.isoformat(),
             "authors": fragment.metadata.get("authors", []),
             "message_count": fragment.metadata.get("message_count", 0),
         }
-        authored_at: datetime | None = fragment.metadata.get("authored_at")
         if authored_at is not None:
             frontmatter_dict["authored_at"] = authored_at.isoformat()
         return frontmatter_dict
@@ -837,8 +831,63 @@ def write_fragments(result: IngestResult, vault: Path) -> list[Path]:
     paths: list[Path] = []
     for parsed in result.fragments:
         assembled = assemble_ingested_fragment(parsed)
-        paths.append(writer.write_fragment(assembled.fragment, body=assembled.body))
+        # Forwarded even though this ingestor emits no passthrough keys today
+        # (#1392): every assemble->write chain carries the same contract, so
+        # Discord capture cannot silently diverge from `creek ingest`.
+        paths.append(
+            writer.write_fragment(
+                assembled.fragment,
+                body=assembled.body,
+                extra_frontmatter=assembled.extra_frontmatter,
+            )
+        )
     return paths
+
+
+_REFUSAL_CONSOLE = Console(stderr=True)
+"""stderr sink for a containment refusal (#1377).
+
+stderr, not stdout: two of the three Discord entry points return a *count* on
+stdout that a caller may be parsing, and a refusal is not a result.
+"""
+
+
+def _print_containment_refusal(exc: EscapingSymlinkError) -> None:
+    """Show a containment refusal as a message rather than a traceback (#1377).
+
+    The three Discord ingest entry points call ``DiscordIngestor().ingest``
+    directly, and their CLI parents catch only unrelated exceptions
+    (``TokenMissingError`` / ``CalledProcessError``, or nothing at all), so
+    before #1377 an :class:`~creek._containment.EscapingSymlinkError` reached
+    the operator as a raw traceback — from the one path whose operator is
+    least equipped to read one, since a Discord Data Package is a ZIP someone
+    unzipped wherever they happened to unzip it.
+
+    **The caller must re-raise, and every caller here does.** Collecting this
+    error into an ``IngestResult.errors`` list and continuing is not a
+    degraded pass, it is mass data loss: a swallowed refusal leaves
+    ``run_ingest``'s ``seen_keys`` empty and ``tomb_missing_units`` then
+    soft-tombs every live ledger key. This function therefore only *prints*;
+    it deliberately does not raise ``typer.Exit`` either, because
+    :func:`ingest_capture_dir` also runs behind the bot with no typer context,
+    where ``typer.Exit`` would surface as an unhandled click error.
+
+    ``markup=False`` so a path containing square brackets cannot be eaten as
+    Rich markup, and ``soft_wrap=True`` so the link's name is never split
+    across a wrap point — the operator has to be able to copy it.
+
+    Args:
+        exc: The refusal to render. Its message names the link exactly as
+            walked and never its resolved target, per #1087; nothing is added
+            here that could reintroduce that oracle.
+    """
+    _REFUSAL_CONSOLE.print(
+        f"Symlink containment: {exc}",
+        style="red",
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
+    )
 
 
 def ingest_capture_dir(capture_dir: Path, vault: Path) -> int:
@@ -866,7 +915,12 @@ def ingest_capture_dir(capture_dir: Path, vault: Path) -> int:
         shutil.rmtree(staging)
     staging.mkdir(parents=True, exist_ok=True)
     stage_capture_as_data_package(capture_dir, staging)
-    return len(write_fragments(DiscordIngestor().ingest(staging), vault))
+    try:
+        documents = DiscordIngestor().ingest(staging)
+    except EscapingSymlinkError as exc:
+        _print_containment_refusal(exc)
+        raise
+    return len(write_fragments(documents, vault))
 
 
 def run_discord_data_package(vault: Path, package: Path) -> int:
@@ -891,7 +945,12 @@ def run_discord_data_package(vault: Path, package: Path) -> int:
     """
     fragments_root = vault / "01-Fragments"
     before = set(fragments_root.rglob("*.md")) if fragments_root.is_dir() else set()
-    written = write_fragments(DiscordIngestor().ingest(package), vault)
+    try:
+        documents = DiscordIngestor().ingest(package)
+    except EscapingSymlinkError as exc:
+        _print_containment_refusal(exc)
+        raise
+    written = write_fragments(documents, vault)
     # New = distinct written paths that did not pre-exist. `set(written)` also
     # collapses any duplicate path emitted within a single run, so a fragment is
     # counted at most once.

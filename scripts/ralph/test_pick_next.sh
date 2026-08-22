@@ -87,6 +87,12 @@ set_labels() { printf '%s' "$2" > "$STUBDIR/labels/$1"; }                    # <
 pr_closes()  { printf 'Closes #%s\n' "$1" >> "$STUBDIR/pr_bodies"; }
 worktree()   { mkdir -p "$REPO/.ralph/worktrees/issue-$1"; }
 run_pick()   { (cd "$REPO" && PATH="$BIN:$PATH" "$PICK"); }
+# stderr only — stdout is discarded so a scenario can assert on the diagnostic
+# channel without the issue number bleeding into the comparison (#1011). Braced
+# rather than `2>&1 >/dev/null` so the ordering is explicit (shellcheck SC2069).
+run_pick_err() {
+  (cd "$REPO" && { PATH="$BIN:$PATH" "$PICK" >/dev/null; } 2>&1)
+}
 
 # JSON-mode helpers: build the fixture the stub feeds to pick-next's REAL --jq
 # filter (mirrors `gh issue list --json number,labels`), so require/exclude
@@ -252,6 +258,44 @@ check "mixed P0/priority-critical share tier 0 (oldest wins)" "40" "$(run_pick)"
 new_scenario prio_high_beats_medium
 ij_add 5 "priority-medium"; ij_add 9 "priority-high"; ij_finalize
 check "priority-high (tier 1) beats priority-medium (tier 2)" "9" "$(run_pick)"
+
+# --- untriaged issues are ranked by default, but never silently (#1011) -------
+#
+# An issue with no priority label sorts at RALPH_DEFAULT_PRIORITY_RANK. Two
+# consecutive groom gates found ten such issues, whose eventual triage ranged
+# P1..P3 — so no fixed default is right more often than it is wrong. The rank
+# stays at P1 (burying a genuinely urgent finding is the worse failure), and the
+# picker announces the assumption instead of making it silently.
+
+# 20) Picking an unlabeled issue warns on stderr, naming the issue and the tier.
+new_scenario default_rank_warns
+ij_add 300 ""; ij_finalize
+check "unlabeled pick warns on stderr" "1" \
+  "$(run_pick_err | grep -c 'no priority label' || true)"
+check "the warning names the issue number" "1" \
+  "$(run_pick_err | grep -c '#300' || true)"
+
+# 21) The warning goes to stderr ONLY. The orchestrator parses stdout for a bare
+# issue number; a warning leaking there would break every caller.
+new_scenario default_rank_stdout_clean
+ij_add 301 ""; ij_finalize
+check "stdout stays a bare issue number while warning" "301" "$(run_pick)"
+
+# 22) A triaged issue is silent — the warning must mean something when it fires.
+new_scenario labeled_pick_is_silent
+ij_add 302 "P2"; ij_finalize
+check "labeled pick emits no warning" "" "$(run_pick_err)"
+
+# 23) Both label vocabularies count as triaged, matching the tiering block.
+new_scenario named_priority_is_silent
+ij_add 303 "priority-low"; ij_finalize
+check "priority-* labels also count as triaged" "" "$(run_pick_err)"
+
+# 24) The label must be a whole token: a `P1x`-style near-miss is not triage.
+new_scenario near_miss_label_still_warns
+ij_add 304 "P1x,bug"; ij_finalize
+check "a near-miss label does not count as triaged" "1" \
+  "$(run_pick_err | grep -c 'no priority label' || true)"
 
 echo
 echo "pick-next tests: $PASS passed, $FAIL failed"

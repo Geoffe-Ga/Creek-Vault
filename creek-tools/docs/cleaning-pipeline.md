@@ -105,7 +105,7 @@ Drives the `creek clean *` CLI commands:
 
 - `OrphanScanner` — fragments with zero links after `cleaning.hygiene.orphan_age_days`.
 - `StaleReviewScanner` — review-queue items older than `cleaning.hygiene.stale_review_days`.
-- `BrokenLinkScanner` — wiki-links pointing at nonexistent files.
+- `BrokenLinkScanner` — wiki-links pointing at nonexistent files, surveyed vault-wide except Creek's own report folders; see [`lint.md`](lint.md#check-names) for the withheld set and why.
 - `DuplicateScanner` — runs normalised + semantic dedup against the saved vault.
 - `HygieneReporter` — aggregate report of vault health.
 

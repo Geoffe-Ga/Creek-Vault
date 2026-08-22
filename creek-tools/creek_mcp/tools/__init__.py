@@ -24,6 +24,7 @@ from creek_mcp.tools.save import save_tool
 from creek_mcp.tools.skills import skills_refresh_tool
 from creek_mcp.tools.state import state_render_tool
 from creek_mcp.tools.state_read import state_read_tool
+from creek_mcp.tools.upload import upload_tool
 from creek_mcp.tools.wheel import wheel_tool
 
 __all__ = [
@@ -49,5 +50,6 @@ __all__ = [
     "skills_refresh_tool",
     "state_read_tool",
     "state_render_tool",
+    "upload_tool",
     "wheel_tool",
 ]

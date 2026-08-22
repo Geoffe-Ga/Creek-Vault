@@ -1,0 +1,46 @@
+{
+  "$defs": {
+    "ErrorCode": {
+      "description": "The ten wire error codes: nine from contract 0.2, one added at 0.8.\n\nThere is deliberately **no** ``care_escalation`` member: an escalation is a\nsuccessful, 200-shaped :class:`CareEscalationResponse`, because a person in\nacute distress must not have their response swallowed by a client's error\npath.\n\nAttributes:\n    UNAUTHENTICATED: No valid consumer credential accompanied the request.\n    INVALID_REQUEST: The body does not satisfy the published schema.\n    INCOMPATIBLE_VERSION: The requested contract minor is not served here.\n    PRIVACY_REFUSED: The single answer for every vault-object non-answer.\n        Above the ceiling, purged, orphaned, schema-invalid and deleted out\n        of band all collapse to this one code with this one message.\n    NOT_FOUND: A **routing** code only \u2014 no such endpoint or path on this\n        server. Never emitted for a vault object. Emitting it for a\n        fragment would reintroduce the existence oracle that #846 / #970 /\n        #972 / #1090 collapsed: the difference between \"no such id\" and\n        \"not for you\" is a corpus enumeration primitive.\n    UNSUPPORTED_CAPABILITY: A published capability this server does not\n        implement.\n    UNSUPPORTED_SOURCE: The uploaded file's **extension** names a format\n        Creek must not ingest as one document \u2014 a conversation export, an\n        archive, a legacy binary Office file (#1526). A statement about\n        the caller's own filename and nothing else, so it discloses\n        nothing about the vault. Added at contract 0.8 (#1524), and\n        reachable only on ``POST /v1/uploads``.\n    UNAVAILABLE: The vault is absent or unreadable; a human must act.\n    TEMPORARILY_UNAVAILABLE: A transient condition; backoff will clear it.\n    INTERNAL_ERROR: An unexpected server fault.",
+      "enum": [
+        "unauthenticated",
+        "invalid_request",
+        "incompatible_version",
+        "privacy_refused",
+        "not_found",
+        "unsupported_capability",
+        "unsupported_source",
+        "unavailable",
+        "temporarily_unavailable",
+        "internal_error"
+      ],
+      "title": "ErrorCode",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The one error shape on ``/v1``: three fields, and never a fourth.\n\nIt echoes nothing. Not the request body, not the resolved tier, not the\nidentifier that was probed. Everything a caller needs in order to act is in\n:data:`ERROR_STATUS` and :data:`RETRY_POLICY`, both keyed on :attr:`code`\nalone; everything else they might want is something this server must not\ntell them.\n\nAttributes:\n    code: The closed wire code. Look up HTTP status, human message and\n        retry disposition from it.\n    message: A constant drawn from :data:`ERROR_MESSAGES`. Never composed\n        from request or vault material.\n    request_id: A server-generated correlation id for the operator's logs.\n        Opaque to the client, and derived from nothing the caller sent.",
+  "properties": {
+    "code": {
+      "$ref": "#/$defs/ErrorCode",
+      "description": "Closed wire error code."
+    },
+    "message": {
+      "description": "Constant message from ERROR_MESSAGES.",
+      "title": "Message",
+      "type": "string"
+    },
+    "request_id": {
+      "description": "Server-generated correlation id.",
+      "title": "Request Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "code",
+    "message",
+    "request_id"
+  ],
+  "title": "ErrorEnvelope",
+  "type": "object"
+}

@@ -4,6 +4,8 @@ Tests cover:
 - StagedFile model (path, filename, content, modified, authors, owner)
 - GoogleDriveFilterResult model (action, reasons, duplicate_of)
 - Duplicate detection: "Copy of..." prefix removal and version suffixes
+- Year vs counter disambiguation: 4-digit year suffixes like (2021) are
+  distinct documents, not Drive copy counters (issue #834)
 - Empty document filtering: no extractable text
 - Multi-author flagging: collaborator contributions exceed threshold
 - Staleness detection: files not modified within configurable timeframe
@@ -254,6 +256,154 @@ class TestVersionSuffixDetection:
             for r in results[1].reasons
             if results[1].action == "skip"
         )
+
+    def test_two_digit_counter_still_deduped(self) -> None:
+        """Two-digit Drive copy counters like (10) should still dedupe."""
+        base = _make_file(
+            filename="report.docx",
+            modified=_NOW - timedelta(days=2),
+        )
+        v10 = _make_file(
+            filename="report (10).docx",
+            modified=_NOW,
+        )
+        gdf = GoogleDriveFilter(now=_NOW)
+
+        results = gdf.filter_batch([base, v10])
+
+        assert results[0].action == "skip"
+        assert any("version" in r.lower() for r in results[0].reasons)
+        assert results[0].duplicate_of == str(v10.path)
+        assert results[1].action == "keep"
+
+    def test_three_digit_number_not_treated_as_version(self) -> None:
+        """Parenthesised 3-digit numbers are not Drive copy counters.
+
+        Drive only generates 1-2 digit copy counters, so ``(100)`` and
+        ``(2021)`` are part of the document title and must not be
+        stripped into a shared version group (issue #834 boundary).
+        """
+        ledger_100 = _make_file(
+            filename="Ledger (100).pdf",
+            content="Ledger covering the first one hundred transactions.",
+            modified=_NOW - timedelta(days=1),
+        )
+        ledger_2021 = _make_file(
+            filename="Ledger (2021).pdf",
+            content="Ledger covering the 2021 fiscal year in full.",
+            modified=_NOW,
+        )
+        gdf = GoogleDriveFilter(now=_NOW)
+
+        results = gdf.filter_batch([ledger_100, ledger_2021])
+
+        assert results[0].action == "keep"
+        assert results[1].action == "keep"
+        for result in results:
+            assert not any("version" in r.lower() for r in result.reasons)
+
+    def test_version_counter_no_extension_still_deduped(self) -> None:
+        """Version counters on extension-less filenames should still dedupe."""
+        base = _make_file(
+            filename="photo",
+            modified=_NOW - timedelta(days=1),
+        )
+        v1 = _make_file(
+            filename="photo (1)",
+            modified=_NOW,
+        )
+        gdf = GoogleDriveFilter(now=_NOW)
+
+        results = gdf.filter_batch([base, v1])
+
+        assert results[0].action == "skip"
+        assert any("version" in r.lower() for r in results[0].reasons)
+        assert results[0].duplicate_of == str(v1.path)
+        assert results[1].action == "keep"
+
+
+# ---------------------------------------------------------------------------
+# Year vs counter disambiguation (issue #834)
+# ---------------------------------------------------------------------------
+
+
+class TestYearVsCounterDisambiguation:
+    """Tests that 4-digit year suffixes are not treated as copy counters.
+
+    Regression tests for issue #834: ``Taxes (2021).pdf`` and
+    ``Taxes (2022).pdf`` are distinct annual documents, not versions of
+    ``Taxes.pdf``, and must never be deduplicated against each other.
+    Genuine 1-2 digit Drive copy counters must keep deduplicating.
+    """
+
+    def test_year_suffix_not_treated_as_version_duplicate(self) -> None:
+        """Distinct annual documents like (2021)/(2022) must both be kept."""
+        taxes_2021 = _make_file(
+            filename="Taxes (2021).pdf",
+            content="Tax return for fiscal year 2021 with unique figures.",
+            modified=_NOW - timedelta(days=30),
+        )
+        taxes_2022 = _make_file(
+            filename="Taxes (2022).pdf",
+            content="Tax return for fiscal year 2022 with different figures.",
+            modified=_NOW,
+        )
+        gdf = GoogleDriveFilter(now=_NOW)
+
+        results = gdf.filter_batch([taxes_2021, taxes_2022])
+
+        assert results[0].action == "keep"
+        assert results[1].action == "keep"
+        for result in results:
+            assert not any("version" in r.lower() for r in result.reasons)
+
+    def test_year_suffix_documents_both_kept(self) -> None:
+        """Neither year-suffixed document may be silently dropped."""
+        taxes_2021 = _make_file(
+            filename="Taxes (2021).pdf",
+            content="Tax return for fiscal year 2021 with unique figures.",
+            modified=_NOW - timedelta(days=30),
+        )
+        taxes_2022 = _make_file(
+            filename="Taxes (2022).pdf",
+            content="Tax return for fiscal year 2022 with different figures.",
+            modified=_NOW,
+        )
+        gdf = GoogleDriveFilter(now=_NOW)
+
+        results = gdf.filter_batch([taxes_2021, taxes_2022])
+
+        not_skipped = [r for r in results if r.action != "skip"]
+        assert len(not_skipped) == 2
+        assert results[0].duplicate_of is None
+        assert results[1].duplicate_of is None
+
+    def test_counter_after_year_strips_only_counter(self) -> None:
+        """A copy counter after a year dedups against the year-bearing base.
+
+        ``Taxes (2021) (1).pdf`` is a Drive copy of ``Taxes (2021).pdf``:
+        only the trailing ``(1)`` counter is stripped, the year stays part
+        of the base name, and the older year-bearing original is skipped
+        in favour of the newer copy.
+        """
+        base = _make_file(
+            filename="Taxes (2021).pdf",
+            content="Tax return for fiscal year 2021, original upload.",
+            modified=_NOW - timedelta(days=5),
+        )
+        copy = _make_file(
+            filename="Taxes (2021) (1).pdf",
+            content="Tax return for fiscal year 2021, re-uploaded copy.",
+            modified=_NOW,
+        )
+        gdf = GoogleDriveFilter(now=_NOW)
+
+        results = gdf.filter_batch([base, copy])
+
+        assert results[0].action == "skip"
+        assert any("version" in r.lower() for r in results[0].reasons)
+        assert results[0].duplicate_of == str(copy.path)
+        assert results[1].action == "keep"
 
 
 # ---------------------------------------------------------------------------

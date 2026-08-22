@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import shutil
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -38,6 +38,7 @@ from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
     RawDocument,
+    file_modified_time,
     parse_authored_at,
 )
 from creek.models import SourcePlatform
@@ -403,8 +404,11 @@ class ImageIngestor(Ingestor):
                 can reconcile per-fragment language with the engine
                 that produced them.
             min_confidence: OCR-confidence threshold below which a
-                produced fragment is tagged for the review queue. Mirrors
-                :pyattr:`creek.config.OCRConfig.min_confidence`.
+                produced fragment is tagged ``review: pending_review`` in
+                its frontmatter. The tag is a marker for a human reader;
+                no command filters on it — in particular ``creek redact
+                --review`` selects by findings, not by this key (#1338).
+                Mirrors :pyattr:`creek.config.OCRConfig.min_confidence`.
         """
         self.engine = engine if engine is not None else PytesseractOcrEngine(language)
         self.language = language
@@ -603,8 +607,13 @@ class ImageIngestor(Ingestor):
 
 
 def _modified_time(path: Path) -> datetime:
-    """Return the file's mtime as a timezone-aware UTC datetime."""
-    return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+    """Return the file's mtime as a timezone-aware UTC datetime.
+
+    Delegates to :func:`creek.ingest.base.file_modified_time` so the
+    id-anchoring conversion rule lives in exactly one place (#1329); the
+    semantics are byte-identical to the expression this replaced.
+    """
+    return file_modified_time(path)
 
 
 # EXIF tag IDs — magic numbers chosen by the standard, not by us. Hard-coded

@@ -45,6 +45,25 @@ class PatternInfo:
             raise ValueError(msg)
 
 
+HIGH_ENTROPY_MIN_RUN: int = 20
+"""Shortest base64url-ish run the generic secret detector considers at all.
+
+Single source of truth for two things that must never drift apart:
+
+* the repetition floor of the ``high_entropy_string`` candidate regex
+  below, which interpolates this constant rather than repeating the number;
+* the width of the sub-run window
+  :func:`creek.redact.scanner.has_high_entropy_region` slides across a
+  candidate run (Issue #942).
+
+They are the same number by design. The invariant it buys: a substring the
+detector would flag standing alone must not become undetectable merely by
+being concatenated to a low-entropy neighbour. A window narrower than the
+candidate floor would flag fragments too short to be candidates; a wider
+one would leave the shortest candidates unmeasurable.
+"""
+
+
 PATTERN_METADATA: dict[str, PatternInfo] = {
     "api_key": PatternInfo(
         pattern=re.compile(
@@ -257,16 +276,25 @@ PATTERN_METADATA: dict[str, PatternInfo] = {
         ),
     ),
     "high_entropy_string": PatternInfo(
-        pattern=re.compile(r"[A-Za-z0-9+/=_\-]{20,}"),
+        pattern=re.compile(rf"[A-Za-z0-9+/=_\-]{{{HIGH_ENTROPY_MIN_RUN},}}"),
         description=(
-            "Generic high-entropy substrings (≥20 base64url-ish chars) "
-            "above the configured RedactionConfig.min_confidence threshold."
+            f"Generic high-entropy substrings (≥{HIGH_ENTROPY_MIN_RUN} "
+            "base64url-ish chars) against the configured "
+            "RedactionConfig.min_confidence threshold. A run is flagged "
+            "when the whole run clears that threshold OR when any "
+            f"contiguous {HIGH_ENTROPY_MIN_RUN}-character window of it "
+            "does, so a secret cannot be hidden by gluing predictable "
+            "filler alongside it (Issue #942)."
         ),
         severity="medium",
         false_positive_notes=(
             "Long random-looking identifiers, hashes, and content-addressed "
-            "filenames will match. Tune via RedactionConfig.min_confidence "
-            "or add specific substrings to false_positive_allowlist."
+            "filenames will match. The sub-run window also flags a "
+            "mostly-predictable run that contains one dense "
+            f"{HIGH_ENTROPY_MIN_RUN}-character stretch. Tune via "
+            "RedactionConfig.min_confidence (raising it narrows both gates) "
+            "or add specific substrings to false_positive_allowlist, which "
+            "is checked before either gate."
         ),
     ),
     "ipv6": PatternInfo(

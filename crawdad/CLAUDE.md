@@ -21,7 +21,11 @@ These mirror `creek-tools/CLAUDE.md` at a smaller scale:
    - Cyclomatic complexity ≤ 10 per function (Xenon `--max-absolute B`)
    - MyPy strict mode, zero violations
    - Ruff lint + format, zero violations
+   - Vulture, zero dead-code findings (shared policy, no allowlist)
    - Bandit, zero medium-or-above findings
+   - pip-audit, zero known vulnerabilities across both the installed
+     environment and the exported `uv.lock` — no suppression without
+     a tracked issue
 
 ## 2. Project overview
 
@@ -105,6 +109,24 @@ Four gates, each must pass before the next:
   - `allowed_channel_ids` — channels the bot will respond in.
   - `max_loop_rounds` — optional FEAT-036 override for the agent-loop
     round cap (default `MAX_LOOP_ROUNDS = 5`, bounded `[1, 50]`).
+  - `capture_enabled` — bot-capture toggle (#687), default `False`.
+    Opt-in per deployment; see [§5.2](#52-bot-capture-boundary).
+  - `capture_subpath` — vault-relative dir the capture writer appends
+    to, default `discord-capture`. Must stay inside the vault — the same
+    absolute/`..` validation `attachments.staging_subpath` gets, but not
+    its canonical-root arm (#1088): nothing scans the capture dir.
+  - `attachments.staging_subpath` — vault-relative attachment staging
+    dir, default `00-Creek-Meta/Inbound`, and it must stay under that
+    root: it is the only subtree `creek.redact.scan` admits at a
+    channel's ceiling, so anywhere else the safety pass never runs
+    (#1088). See [§5.3](#53-redaction-scan-gate-feat-027-1054).
+  - `attachments.channel_privacy_tiers` — per-channel declared ceiling
+    (`open` / `personal` / `intimate` / `all`), validated at
+    config-parse time. A **thread** inherits its parent channel's entry:
+    `_channel_tier` resolves the most restrictive of the thread's own
+    entry and its `parent_id`'s, so declaring the parent is enough
+    (#1265). See [§5.2](#52-bot-capture-boundary) for how bot-capture
+    reads it.
 
 Both allowlists must be non-empty — an empty list is a configuration
 error, not "open to everyone".
@@ -122,6 +144,186 @@ it means:
 - Do *not* feed user-controlled content into `crawdad.yaml`.
 - Multi-user / shared deployments are out of scope for v1.0; revisit
   this assumption before broadening access.
+
+See also [§5.2 Bot-capture boundary](#52-bot-capture-boundary) for the
+narrower trust boundary bot-capture applies on top of this one.
+
+### 5.2 Bot-capture boundary
+
+Bot-capture (#687) writes messages to `<vault>/<capture_subpath>/` for
+later Tier-A ingest. A message is captured only when **both** hold:
+
+1. It passes `_passes_allowlist` — the same gate the command path
+   uses: not the bot's own message, not `author.bot`, and both
+   `allowed_user_ids` and `allowed_channel_ids` admit it. **The
+   capture boundary is the command boundary** (#1052) — before this
+   fix, capture ran ahead of the allowlist gate and logged strangers,
+   other bots, and channels the operator never allowlisted.
+2. The channel's declared privacy tier (`_channel_tier`, reading
+   `attachments.channel_privacy_tiers`) is in `CAPTURE_ADMITTED_TIERS`
+   = `{"open", "personal"}`:
+
+   | Declared tier | Captured? |
+   |---|---|
+   | `open` | yes (narrower than needed once landed) |
+   | `personal` | yes (exact match) |
+   | unset (no `channel_privacy_tiers` entry, and no parent with one) | yes — `_channel_tier` falls back to `personal` |
+   | `intimate` | **no** |
+   | `all` | **no** — admits intimate content by definition |
+
+   "Declared tier" is the **resolved** tier, not the raw entry for
+   `message.channel.id`. Inside a thread, `message.channel.id` is the
+   *thread's* id, so `_channel_tier` also looks up
+   `discord.Thread.parent_id` and takes the most restrictive of the two
+   by `crawdad.intents.CEILING_RANK` — the one tier-ordering table
+   (#1265). A thread in an `intimate` parent is therefore refused even
+   when the thread itself is unlisted, and a thread may declare itself
+   stricter than an `open` parent. A parent that cannot be determined
+   contributes nothing, so the fail-closed `personal` default stands.
+
+   A capture record carries no tier field, and the creek-tools side
+   that stages the capture dir drops channel metadata, so a captured
+   message lands downstream as `unclassified`, which ranks *with*
+   `personal` (`creek_mcp/tier_ceiling.py`, #961). Writing an
+   `intimate` channel into capture would be a silent privacy
+   de-escalation — capture must not carry content whose ceiling it
+   cannot represent.
+
+The tier gate is **capture-scoped only**. `channel_privacy_tiers` has
+never gated whether the bot *replies* in a channel and still does not
+— an `intimate` channel still gets `/crawdad` and free-text replies;
+it is just never written to the capture log.
+
+The gate (`_capture_allowed`) is evaluated *inside*
+`CrawDadClient._capture_message`'s `try`, so a gate that raises (a
+malformed message, an attribute that errors) fails closed to "not
+captured" while the command path keeps running unaffected — capture
+is best-effort and must never take a command turn down with it.
+
+**Standing constraint for future work:** `MessageCapture.backfill` has
+no production caller today. If it is ever wired in (#1057), it MUST
+evaluate `_capture_allowed` **per message inside the history loop**,
+not once per channel — a channel's history contains messages from
+non-allowlisted users and other bots that a channel-level check would
+wave through.
+
+`CAPTURE_ADMITTED_TIERS` may only widen once #1262 lands: carrying the
+tier end-to-end from the capture record through staging into fragment
+frontmatter, so an `intimate` channel can be captured faithfully
+instead of refused outright.
+
+**Remediating a pre-#1052 tree (#1264).** The gate above is
+write-time-only; it never re-examines what an older build already
+wrote, and the creek-tools read side
+(`stage_capture_as_data_package`) applies no allowlist or tier filter
+of its own. `crawdad/crawdad/capture_audit.py` plus
+`crawdad capture audit|purge` is the offline remediation helper —
+audit read-only by default, purge dry-run unless `--apply`. It
+re-derives the gate's verdict from `crawdad.yaml`, so it must never
+grow a second copy of the gate's rules: `_verdict_for` reads
+`allowed_channel_ids` and `CAPTURE_ADMITTED_TIERS` directly, in the
+same order `_capture_allowed` does.
+
+Two limits are structural, not provisional. **Only channel-level
+conditions are re-derivable**: `_record_for` writes no user id and no
+channel id, so `allowed_user_ids` cannot be re-evaluated from disk and
+purge therefore operates on whole channel directories, never on
+individual records. **Only id-labelled directories get a verdict**:
+`_channel_label` prefers the channel *name*, and a name cannot be
+mapped back to an id offline, so name-labelled dirs are reported
+`UNRESOLVED` and left alone until the operator names one with
+`--channel`. Note the trap `_resolve_channel_id` exists to avoid:
+digit-only channel *names* are ordinary (`2024`, `420`, `911`), so
+"all digits" alone must never mean "is an id" — a short numeric name
+read as an id misses the allowlist, becomes `REFUSED`, and is deleted
+by a default `--apply` with no confirmation. Hence the
+`_MIN_SNOWFLAKE_DIGITS` floor. Do not relax it; the failure it
+prevents is silent, irreversible data loss, while its cost when it
+over-triggers is one `--channel` flag. A gate-`ADMITTED` directory is refused even when named
+explicitly — that refusal is what makes "never deletes what the gate
+would admit" a property of the tool rather than of how carefully it
+was invoked. Both limits are stated in the tool's own output; do not
+remove them from the report to tidy it up.
+
+### 5.3 Redaction-scan gate (FEAT-027, #1054)
+
+**Policy: record the batch, refuse at dispatch.** An attachment turn
+whose `creek.redact.scan` could not run still stages the files and
+still records a `PendingBatch` — so the user can see what landed and
+`cancel` it — but that batch can never be dispatched to `creek.ingest`.
+
+Rejected alternatives: *withholding the consent prompt* (relies on the
+user never typing `ingest` unprompted — prompt suppression is not
+enforcement), and *a distinct opt-in token* (a documented override is
+a fail-open path, and this is the one gate standing between unscanned
+content and the vault).
+
+**Mechanism.** `PendingBatch.scanned` is a **required field with no
+default**, placed ahead of the defaulted fields. There is deliberately
+no permissive default and no `ConsentConfig` knob: either would let a
+construction site — or an operator — silently reopen the hole.
+`_run_safety_scan` returns a `_ScanOutcome(scanned, text)` rather than
+a bare string, so the caller reads a status instead of string-matching
+the reply text against `_MCP_UNAVAILABLE_REPLY` (shared with the ingest
+and state paths). All four failure modes — no MCP client, the tool
+unadvertised, `MCPUnavailableError`, and any other exception — yield
+`scanned=False`.
+
+Enforcement is **one branch in `_dispatch_ingest_for_batch`**, the sole
+convergence point of the consent flow. Both `_apply_consent_reply` and
+`_apply_disambiguation_reply` reach ingest through it, so one guard
+closes the `ingest` route, the `ingest` → type-question → type-word
+route, and any future caller. Do not add a second guard at a caller: two
+gates drift, one cannot. `with_resolved_types` / `with_state` /
+`with_ingested` are all `dataclasses.replace` copies, so `scanned`
+survives every transition and cannot be laundered.
+
+**Explicit non-goal.** The gate enforces *"the scan could not run"* —
+**not** *"the scan found nothing"*. `creek_mcp/tools/redact.py` computes
+`status = "empty" if not scanned.matches else "ok"`, so there is no
+failing status to read: a scan that runs and reports secrets still
+clears the gate. User-facing copy must claim only what is enforced —
+`_SCAN_BLOCKED_REPLY` says "I couldn't run the redaction scan", never
+"these files are clean". Substituting a new false claim for the old one
+would miss the point of the fix.
+
+Related, explicitly **not** covered here: #1087 (`scan_batch` follows
+symlinks out of the scan root — a scan that *runs* but under-reports,
+and this gate marks such a batch `scanned=True`).
+
+#1088 (`attachments.staging_subpath` outside the scan's canonical
+scope) was the fifth way the scan fails to run, and it has now landed
+in two layers. **Config gate:** `AttachmentConfig` refuses at
+config-parse time any `staging_subpath` outside
+`CANONICAL_STAGING_ROOT` (`00-Creek-Meta/Inbound`, mirrored from
+`creek_mcp/tools/redact.py`), with `validate_default=True` on the model
+so a drifted *default* is caught too. That check is lexical — the real
+confinement boundary is still creek-tools' `resolve_within_vault` plus
+its resolved `is_relative_to`. **Runtime arm:** `_run_safety_scan`
+gained the fifth `_ScanOutcome(scanned=False, …)` arm, for a response
+body that is a JSON object whose `status` is exactly `"refused"` —
+creek-tools' `refusal_response()` envelope. Every other body keeps
+`scanned=True`, deliberately: fail-open on unparseable, non-object, or
+status-less responses means the change can only ever *remove*
+admissions.
+
+This does **not** disturb the non-goal above. `ok` and `empty` both
+still clear the gate, so a scan that runs and reports secrets still
+ingests. Only `refused` — a scan that was *declined*, never a scan that
+found something — flips `scanned`, and the user-facing copy
+(`_SCAN_REFUSED_REPLY`) claims only that no scan ran.
+
+That copy is pinned by test, not just by review: `status="refused"`
+covers every refusal reason creek-tools has (out-of-scope root, but
+also `input_path not found`), so the fixed text hedges about the cause
+and `_scan_refusal_text` echoes creek-tools' own `reason` verbatim.
+`_assert_claims_no_cleanliness` asserts no delivered refusal message
+contains a cleanliness claim — if a future edit reintroduces one, a
+test goes red rather than a reviewer having to notice.
+
+**Revisit predicate:** when `creek.redact.scan` gains a failing status
+for non-empty findings, revisit whether `scanned` should become a
+three-state outcome and whether findings should block ingest.
 
 ## 6. MCP subprocess resilience
 
@@ -145,3 +347,33 @@ The bot does **not** exit on MCP subprocess failure. The pattern is:
 | Type checking | strict, zero | `mypy --strict` |
 | Lint + format | zero | `ruff check` + `ruff format` |
 | Security | zero medium+ | `bandit -r crawdad/ -ll` |
+| Dead code | zero findings | `./scripts/lint-vulture.sh` (creek-tools' shared policy, `--scope crawdad`) |
+| Dependency vulnerabilities | zero known | `pip-audit` (installed env + exported `uv.lock` — `./scripts/security.sh`) |
+
+`scripts/security.sh` runs `pip-audit` twice because crawdad has two
+distinct dependency surfaces and each answers a different question.
+Since #1501, CI provisions the installed environment FROM the exported
+lock (`uv export --locked --all-extras --no-emit-project --no-hashes`
+piped into `uv pip install --system -r ...`, then `uv pip install
+--system --no-deps -e .`), so the first `pip-audit` call no longer
+audits a live PyPI resolve. It still audits a genuinely different
+artifact than the lock export below: the editable install layers the
+local `crawdad` package itself on top, and whatever the interpreter's
+own ensurepip seeded, or a PEP 517 build backend left behind, is
+present in the environment and invisible to a plain lock export. This
+pass also doubles as the regression detector for #1501 itself — pip
+honours neither `uv.lock` nor `[tool.uv].constraint-dependencies`, so
+if a future edit ever reintroduces a live resolve (reverting to `pip
+install -e ".[dev]"`, say), the lock pass below would stay clean while
+this pass alone would report the drift. The second run exports
+`uv.lock` (`uv export --quiet --locked --all-extras --no-emit-project`)
+and audits that instead, since `uv.lock` is the reproducibility
+contract `uv sync` users install and is where all eight advisories of
+#979 lived; an environment-only audit would have reported clean while
+the lock carried eight. `--locked` doubles as a lock-freshness gate —
+if `pyproject.toml` and `uv.lock` have drifted, the export fails with
+"The lockfile at `uv.lock` needs to be updated" and the fix is `uv
+lock`, never dropping `--locked`. Do not add `--strict` to either
+`pip-audit` call: the local `crawdad` package isn't published to PyPI,
+so pip-audit always reports it as a benign SKIP, and `--strict` would
+turn that permanent skip into a permanent false failure.

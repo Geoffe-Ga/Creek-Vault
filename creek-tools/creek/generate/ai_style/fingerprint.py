@@ -4,12 +4,38 @@ Builds a :class:`~creek.generate.ai_style.model.VoiceFingerprint` from
 genuinely user-authored vault content — the false-positive authority and
 distance baseline every detector consults. The single most important
 property is the **authorship filter**: only self-authored text feeds the
-fingerprint, and for conversation platforms (ChatGPT / Claude) only the
-*user-turn* portion is used, never the assistant's reply — otherwise the
-baseline would be poisoned with the very AI accent we are trying to detect.
+fingerprint, and never the assistant's reply — otherwise the baseline
+would be poisoned with the very AI accent we are trying to detect.
 
-Pure and deterministic; reads fragment bodies only (never frontmatter
-values), and writes a single JSON artifact under the vault.
+For a conversation platform (ChatGPT / Claude) the filter is not "keep
+the user-turn portion" but a decision per body *shape*, made by
+:func:`creek.ingest.turns.split_conversation_body` (#1426):
+
+* a **per-turn split** human fragment — the shape both ingestors have
+  written since #1333/#553, a plain blockquote with no ``**User**:``
+  marker — contributes **in full**;
+* a **merged** pre-split body contributes **only its human half**;
+* an **assistant-only** body, where no human half can be identified,
+  contributes **nothing**.
+
+Reading only the marker, as this module did until #1426, silently
+excluded the first of those three — every chat turn the operator has
+written since per-turn attribution shipped.
+
+The catalogue of on-disk body shapes, the reachability of each, and the
+reasoning behind each verdict are **not** restated here.
+:mod:`creek.ingest.turns` is their single source; the three bullets
+above are a summary of it, kept short deliberately, and if they ever
+disagree with it the parser's own docstring is the one that is right.
+
+Pure and deterministic. Every *measured* feature is computed from
+fragment bodies alone; frontmatter is read only to decide eligibility and
+weight (``source.author``/``source.platform``, ``privacy_tier``,
+``audience``, ``representativeness``), never as a feature value. The tier
+read among those goes through
+:func:`creek.classify.privacy_filter.raw_privacy_tier` so this module has
+no tier opinion of its own (#1529). Writes a single JSON artifact under
+the vault.
 """
 
 from __future__ import annotations
@@ -20,10 +46,13 @@ import re
 from typing import TYPE_CHECKING
 
 import frontmatter
-import yaml
 
+from creek.classify.privacy_filter import raw_privacy_tier
 from creek.generate.ai_style.features import FINGERPRINT_FEATURES
 from creek.generate.ai_style.model import FeatureStat, VoiceFingerprint
+from creek.ingest.turns import CONVERSATION_PLATFORMS, split_conversation_body
+from creek.models import PrivacyTier
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -32,16 +61,25 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-FINGERPRINT_VERSION = 1
-"""Schema version stamped into the persisted fingerprint JSON."""
+FINGERPRINT_VERSION = 2
+"""Schema version stamped into the persisted fingerprint JSON.
+
+v2 is #1426: the *corpus* changed, not the JSON layout. Split-era human
+chat turns now contribute where they were previously dropped, so every
+rate in a v1 artifact was measured over a strictly smaller sample and is
+no longer comparable with a freshly built one. Bumping the version makes
+:func:`load_fingerprint` ignore a persisted v1 file and log that
+``creek report --type fingerprint`` should rebuild it, rather than let a
+stale baseline keep scoring drafts.
+"""
 
 _FRAGMENTS_SUBDIR = "01-Fragments"
-_CONVERSATION_PLATFORMS = frozenset({"chatgpt", "claude"})
 _SELF = "self"
-_INTIMATE = "intimate"
 
-# Conversation bodies render turns as blockquotes:
+# The *merged* pre-split rendering marked its turns inside the blockquote:
 #   > **User**: ...        > **Assistant**: ...
+# These two patterns serve `extract_user_turns` alone, which is off the
+# fingerprint path since #1426; a split-era body carries neither marker.
 _USER_MARKER = re.compile(r"^\**user\**\s*:\s*(.*)$", re.IGNORECASE)
 _ASSISTANT_MARKER = re.compile(r"^\**assistant\**\s*:", re.IGNORECASE)
 
@@ -52,19 +90,35 @@ def _strip_quote(line: str) -> str:
 
 
 def extract_user_turns(body: str) -> str | None:
-    """Return only the user-turn text from a conversation *body*.
+    """Return only the user-turn text from a marker-delimited *body*.
 
     Walks the ``> **User**:`` / ``> **Assistant**:`` blockquote structure,
     accumulating text under user turns and dropping everything under
     assistant turns.
 
+    **This is the legacy marker parser and it is no longer on the
+    fingerprint path** (#1426). It is retained as public API — it is
+    exported from :mod:`creek.generate.ai_style` — but
+    :func:`_user_text` now dispatches on body shape via
+    :func:`creek.ingest.turns.split_conversation_body` instead, for two
+    reasons this function cannot be fixed into:
+
+    * It treats any line's *contents* as a speaker cue. A bare ``user:``
+      inside the operator's own prose — a pasted log line, say — is read
+      as the start of a turn, silently deleting everything written
+      before it. The loss is invisible: the body is still non-``None``
+      and the fragment still counts.
+    * It cannot see the split-era shapes at all. A per-turn human
+      fragment carries no ``**User**:`` marker, so it returns ``None``
+      for the shape that is now the common case.
+
     Args:
         body: A conversation fragment body.
 
     Returns:
-        The joined user-turn text, or ``None`` when no ``**User**:`` marker
-        is present (the body cannot be split cleanly, so it is excluded
-        rather than risk fingerprinting AI text).
+        The joined user-turn text, or ``None`` when no ``**User**:``
+        marker is present. That ``None`` no longer means "excluded from
+        the fingerprint" — nothing on the fingerprint path consults it.
     """
     parts: list[str] = []
     speaker: str | None = None
@@ -90,8 +144,23 @@ def extract_user_turns(body: str) -> str | None:
 def _user_text(platform: str, body: str) -> str | None:
     """Return the fingerprint-eligible text for a fragment body.
 
-    Conversation platforms yield only their user-turn; everything else
-    yields the whole body.
+    A conversation platform yields the human half its body *shape*
+    identifies — the whole turn when the body is already per-turn split,
+    the operator's half alone when it is merged, and nothing at all when
+    only the model's words can be found. Every other platform yields the
+    whole body. The discriminator is the shape, not the presence of a
+    ``**User**:`` marker.
+
+    The rejected alternative was the one the issue proposed: fall back to
+    the whole body when no ``**Assistant**:`` marker is present. It was
+    measured and it fails on the bodies it was meant to protect, because
+    a *merged pre-split Claude* body never carried an ``Assistant``
+    marker either — the human turn was blockquoted and the reply followed
+    as plain prose. Under that fallback such a body measures **173.9
+    AI-vocabulary hits per 1000 words**, and the legacy ``"> \\n\\n{AI
+    reply}"`` shape (an image-only or tool-only human send, whose human
+    half is ``""``) measures **217.4**. Keep the human half whatever the
+    shape, or keep nothing.
 
     Args:
         platform: The fragment's source platform.
@@ -99,11 +168,11 @@ def _user_text(platform: str, body: str) -> str | None:
 
     Returns:
         The user-authored text, or ``None`` when a conversation body has no
-        recoverable user turn.
+        recoverable human half (and when a body is empty once stripped).
     """
-    if platform in _CONVERSATION_PLATFORMS:
-        return extract_user_turns(body)
-    return body.strip() or None
+    if platform not in CONVERSATION_PLATFORMS:
+        return body.strip() or None
+    return split_conversation_body(platform, body).human or None
 
 
 def _audience_factor(
@@ -123,6 +192,18 @@ def _audience_factor(
     is preserved. Missing values fall back to ``1.0`` so a new enum member never
     silently zeroes a fragment.
 
+    ``privacy_tier`` is the one axis exempt from that fall-back, because on
+    this path a zero is a **membership gate** (see :func:`_eligible_texts`)
+    and the tier is a one-way ratchet. It is resolved through
+    :func:`creek.classify.privacy_filter.raw_privacy_tier`, the repo's single
+    fail-closed raw-frontmatter reader, so an *absent*, empty, or unparseable
+    key weighs exactly as a declared ``intimate`` rather than as the
+    ``unclassified`` this defaulted to until #1529. The point is that the
+    multiplier cannot disagree with the admission gate above it about the same
+    file: two tier opinions inside one module is the bug class #1529 is, not a
+    style question. An explicit ``unclassified`` is untouched — it says out
+    loud what it is, and ranks with ``personal`` (#876/#961).
+
     Args:
         metadata: The fragment's frontmatter mapping.
         platform: The fragment's ``source.platform``.
@@ -139,7 +220,7 @@ def _audience_factor(
         1.0,
     )
     privacy = weighting.privacy_tier_authority.get(
-        str(metadata.get("privacy_tier", "unclassified")),
+        raw_privacy_tier(metadata).value,
         1.0,
     )
     representativeness = weighting.representativeness_authority.get(
@@ -159,11 +240,16 @@ def _eligible_texts(
 ) -> list[tuple[float, str]]:
     """Collect ``(weight, user_text)`` pairs for self-authored fragments.
 
-    Applies the authorship filter (self-authored only; conversation
-    user-turn only) and the privacy policy (intimate excluded unless
-    *include_intimate*). When *audience_weighting* is supplied, each fragment's
-    weight is additionally multiplied by its audience-authority factor so
-    audience-facing documents dominate the fingerprint (#633).
+    Applies the authorship filter (self-authored only; for a conversation
+    platform, the human half its body shape identifies — see
+    :func:`_user_text`) and the privacy policy (intimate excluded unless
+    *include_intimate*, where "intimate" is whatever
+    :func:`creek.classify.privacy_filter.raw_privacy_tier` says — so a
+    fragment with no ``privacy_tier`` key, an empty one, or an unparseable
+    one is excluded too, #1529). When *audience_weighting* is supplied,
+    each fragment's weight is additionally multiplied by its
+    audience-authority factor so audience-facing documents dominate the
+    fingerprint (#633).
 
     Args:
         vault_path: Vault root.
@@ -171,6 +257,13 @@ def _eligible_texts(
         include_intimate: When ``True``, intimate-tier fragments are kept.
         audience_weighting: When supplied and enabled, scope the fingerprint to
             audience-facing documents; ``None`` keeps the flat-average path.
+            Note the semantics below: ``if weight > 0.0`` makes a zero
+            authority a **membership gate** on this path — a fragment weighted
+            to zero is dropped from the corpus outright. On the exemplar path
+            (:meth:`creek.generate.voice.VoiceExemplarCollector.rank_exemplars`)
+            the same zero only de-ranks, because that method returns
+            ``scored[:max]`` whatever the scores are. That difference is
+            semantic, not a defaulting accident (#1313).
 
     Returns:
         One ``(weight, text)`` pair per eligible fragment.
@@ -182,13 +275,32 @@ def _eligible_texts(
     for md_file in sorted(fragments_root.rglob("*.md")):
         try:
             post = frontmatter.load(str(md_file))
-        except (OSError, yaml.YAMLError):
+        except FRONTMATTER_LOAD_ERRORS:
+            # Widened from ``(OSError, yaml.YAMLError)`` (#924): this walk
+            # visits every fragment in the vault, and a hand-edited note with
+            # a non-string frontmatter key raised the bare ``TypeError`` from
+            # ``frontmatter.load``'s ``**metadata`` splat straight through
+            # here, costing the whole fingerprint its run rather than costing
+            # itself its sample (#1475).
             logger.warning("Skipping unreadable fragment: %s", md_file)
             continue
         source = post.metadata.get("source", {})
+        # This gate is the *only* thing keeping a ChatGPT AI turn out. Once a
+        # conversation is split per-turn, ChatGPT's renderer blockquotes both
+        # roles with no heading and no marker, so an AI turn's body is
+        # shape-indistinguishable from a human one — `_user_text` would hand
+        # back the model's prose in full. There is no body-shape backstop for
+        # it; only `source.author != self`.
         if not isinstance(source, dict) or source.get("author") != _SELF:
             continue
-        if not include_intimate and post.metadata.get("privacy_tier") == _INTIMATE:
+        # Fail closed on the tier, through the one shared raw reader. This walk
+        # never builds a `Fragment`, so it cannot use `fragment_tier`; asking
+        # the frontmatter directly (`.get("privacy_tier") == "intimate"`, as
+        # this did until #1529) answers `False` for a file with no key at all
+        # and *admits* it — a raw read that fails open. `raw_privacy_tier`
+        # resolves absent/empty/unparseable to INTIMATE, which is refusal here.
+        tier = raw_privacy_tier(post.metadata)
+        if not include_intimate and tier is PrivacyTier.INTIMATE:
             continue
         platform = str(source.get("platform", "other"))
         text = _user_text(platform, post.content)
@@ -225,7 +337,29 @@ def build_fingerprint(
         config: AI-style configuration.
         include_intimate: When ``True``, include intimate-tier fragments.
         audience_weighting: When supplied and enabled, scope the fingerprint to
-            audience-facing documents; ``None`` keeps the flat-average path.
+            audience-facing documents; ``None`` keeps the flat-average path —
+            that is, ``None`` means **off** here, the opposite of
+            :class:`~creek.generate.voice.VoiceExemplarCollector`, whose
+            ``None`` selects the enabled default. Neither default moved in
+            #1313: flipping the collector's would silently disable the shipped
+            #632/#633/#634 epic, and flipping this one is a behaviour change
+            for library callers with no issue behind it.
+
+            The default is nonetheless unreachable from production on both
+            sides. ``build_fingerprint`` joined
+            ``_AUDIENCE_WEIGHTING_CALL_NAMES`` in #1410, so
+            ``test_production_voice_callers_always_state_an_audience_weighting``
+            now requires every in-tree construction to state the value —
+            including ``creek/cli.py``'s ``_resolve_voice_fingerprint``, the
+            fallback ``creek voice-check`` takes when a vault has no persisted
+            ``voice-fingerprint.json``, which was the last caller relying on
+            it and could score against an unweighted fingerprint while
+            ``report --type fingerprint`` persisted a weighted one. ``None``
+            survives for library callers outside the tree.
+
+            The load-bearing difference between the two paths is not the
+            default but the semantics — see :func:`_eligible_texts` on why a
+            ``0.0`` authority excludes here and merely de-ranks there.
 
     Returns:
         A fingerprint whose ``fragment_count`` is the number of eligible

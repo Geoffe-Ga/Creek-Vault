@@ -5,15 +5,20 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import frontmatter
 import pytest
 from typer.testing import CliRunner
 
-from creek.cli import app
+from creek.cli import app, console
 from creek.ingest.base import IngestResult
+from creek.ingest.gdrive import DownloadResult, DriveFile
 
 runner = CliRunner()
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+# Must match ``_TEST_TERMINAL_COLUMNS`` in ``tests/conftest.py``.
+_PINNED_TERMINAL_COLUMNS = 200
 
 
 def _strip_ansi(text: str) -> str:
@@ -26,6 +31,25 @@ def _strip_ansi(text: str) -> str:
     keeps the tests environment-independent.
     """
     return _ANSI_ESCAPE_RE.sub("", text)
+
+
+def test_cli_console_width_is_pinned_at_import_time() -> None:
+    """creek's console must not freeze at 80 columns in an xdist worker (#1141).
+
+    Rich caches ``COLUMNS`` into ``Console._width`` at construction and then
+    returns that cached value from every ``size`` lookup, so a console built
+    while ``COLUMNS=80`` stays 80 columns wide no matter what a fixture sets
+    afterwards. :mod:`creek.cli` builds its console at import — i.e. during
+    collection — and on Linux every pytest-xdist worker inherits
+    ``COLUMNS=80`` from readline's C-level ``putenv``. The result was Rich
+    hard-wrapping CLI output mid-phrase and splitting the substrings the CLI
+    tests assert on.
+
+    ``tests/conftest.py`` closes the window by pinning the width in
+    ``pytest_configure``, which runs before collection. This asserts that the
+    pin actually reached the console, rather than trusting the ordering.
+    """
+    assert console.width == _PINNED_TERMINAL_COLUMNS
 
 
 def test_help() -> None:
@@ -60,6 +84,124 @@ def test_process_command(tmp_path: Path) -> None:
         ["process", "--source", str(source), "--vault", str(vault), "--yes"],
     )
     assert result.exit_code == 0, result.output
+
+
+def _process_argv(source: Path, vault: Path) -> list[str]:
+    """Return the ``creek process`` argv the #1303 tests share.
+
+    Args:
+        source: Source directory to ingest.
+        vault: Vault root to write into.
+
+    Returns:
+        Argv for ``CliRunner.invoke``.
+    """
+    return [
+        "process",
+        "--source",
+        str(source),
+        "--vault",
+        str(vault),
+        "--yes",
+        "--no-llm",
+    ]
+
+
+def test_process_summary_reports_persistence_not_a_bare_link_count(
+    tmp_path: Path,
+) -> None:
+    """``creek process`` must not print an undifferentiated ``Links found``.
+
+    That line was the operator-facing face of #1303: it summed four
+    in-memory counts over a link graph the pipeline then discarded, two
+    of which (resonance and temporal edges) nothing in this codebase can
+    persist. It is replaced by the same per-stage phrasing ``creek link``
+    uses, plus a total that counts pages written to disk.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "note.md").write_text("# A note\n\nBody.\n", encoding="utf-8")
+    vault = tmp_path / "vault"
+    for name in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / name).mkdir(parents=True, exist_ok=True)
+
+    result = runner.invoke(
+        app,
+        _process_argv(source, vault),
+    )
+    assert result.exit_code == 0, result.output
+    normalized = " ".join(_strip_ansi(result.output).split())
+    assert "Links found:" not in normalized
+    assert "Eddies linker:" in normalized
+    assert "Threads linker:" in normalized
+    assert "Link artefacts persisted: 0" in normalized, (
+        "a corpus too small to cluster must report zero persisted artefacts, "
+        "not a non-zero in-memory count"
+    )
+
+
+def test_process_into_unscaffolded_vault_reports_honest_zero(
+    tmp_path: Path,
+) -> None:
+    """A half-set-up vault must degrade to zero, not crash (#1303).
+
+    Stage 5 now writes to the vault, so it inherits ``VaultWriter``'s
+    scaffold requirement and a new way to fail. Verified by execution
+    rather than assumed: on a bare vault the fragment write earlier in
+    the run lands nothing under ``01-Fragments/``, so ``_load_fragments``
+    returns empty and ``run_link`` short-circuits before it ever reaches
+    ``_materialise_link_models`` (whose own ``FileNotFoundError`` swallow
+    is covered directly in ``tests/test_link_engine.py``). What this test
+    pins is the end-to-end guarantee: exit 0, and an honest zero rather
+    than a traceback or an invented count.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "note.md").write_text("# A note\n\nBody.\n", encoding="utf-8")
+    vault = tmp_path / "bare-vault"
+    vault.mkdir()
+
+    result = runner.invoke(
+        app,
+        _process_argv(source, vault),
+    )
+    assert result.exit_code == 0, result.output
+    normalized = " ".join(_strip_ansi(result.output).split())
+    assert "Link artefacts persisted: 0" in normalized
+
+
+def test_process_embedding_model_unavailable_exits_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A model-load failure aborts ``creek process`` with the remediation.
+
+    ``creek link`` has always handled this; ``creek process`` did not need
+    to, because its link stage never loaded the model for real work. Since
+    #1303 it does, so the same typed error is reachable here — and must
+    print the remediation rather than a traceback.
+    """
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "note.md").write_text("# A note\n\nBody.\n", encoding="utf-8")
+    vault = tmp_path / "vault"
+    for name in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / name).mkdir(parents=True, exist_ok=True)
+
+    def _raise(_model_name: str, _cache_folder: str | None) -> object:
+        msg = "boom"
+        raise OSError(msg)
+
+    monkeypatch.setattr("creek.link.embeddings._load_sentence_transformer", _raise)
+
+    result = runner.invoke(
+        app,
+        _process_argv(source, vault),
+    )
+    assert result.exit_code != 0
+    normalized = " ".join(_strip_ansi(result.output).split())
+    assert "Embedding linker aborted" in normalized
+    assert "network access" in normalized
 
 
 def test_ingest_help() -> None:
@@ -163,6 +305,58 @@ def test_ingest_command_writes_fragments(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     written = list((vault / "01-Fragments").rglob("*.md"))
     assert len(written) >= 1
+
+
+def test_ingest_command_extracts_hashtags_into_frontmatter_tags(
+    tmp_path: Path,
+) -> None:
+    """``creek ingest`` writes body hashtags to ``tags`` (AC-1, issue #878).
+
+    The bug: ``Fragment.tags`` defaulted to ``[]`` and *no* pipeline
+    stage ever set it, so 2000/2000 sampled fragments of the operator's
+    35,330-fragment vault read ``tags: []`` and
+    ``00-Creek-Meta/Tag-Garden.md`` read ``*No tags found in vault.*``.
+    Three consumers — the Tag Garden (``creek/generate/tags.py``), the
+    orphan-tag lint (``creek/lint/checks/tags.py``) and the tag-driven
+    branches of ``creek/generate/compost.py`` — were structurally
+    unreachable.
+
+    This is the acceptance criterion end to end: a real ``creek ingest``
+    invocation over a real source note, asserted against the file that
+    lands in the vault rather than against any in-process object. The
+    expected value is an exact list, in body order, so the test cannot
+    false-green on "some tags exist".
+    """
+    vault = tmp_path / "vault"
+    for d in ["00-Creek-Meta", "01-Fragments/Notes"]:
+        (vault / d).mkdir(parents=True)
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text(
+        "# Hello\n\nFirst note about systems.\n\n#recovery #writing\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "--type",
+            "markdown",
+            "--input",
+            str(src),
+            "--vault",
+            str(vault),
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    written = list((vault / "01-Fragments").rglob("*.md"))
+    assert len(written) == 1, written
+    post = frontmatter.load(str(written[0]))
+    assert post["tags"] == ["recovery", "writing"]
 
 
 def test_ingest_command_idempotent(tmp_path: Path) -> None:
@@ -405,6 +599,39 @@ def test_classify_rejects_unknown_reatomize_direction(tmp_path: Path) -> None:
     )
     assert result.exit_code == 2
     assert "reatomize-direction" in result.output
+
+
+def test_classify_rejects_retired_aggregate_direction(tmp_path: Path) -> None:
+    """``--reatomize-direction aggregate`` is refused, and says why (#1342).
+
+    FEAT-022's zoom-out aggregator had zero production callers, so
+    ``aggregate`` was a silent no-op: the flag was accepted, the run
+    proceeded, and nothing aggregated. ADR-0011 retires the operator, and
+    a retired value must fail loudly rather than keep pretending. The
+    message has to name the retirement and the issue so an operator whose
+    script still passes the flag learns where the decision lives instead
+    of just seeing "unknown value".
+    """
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+    result = runner.invoke(
+        app,
+        [
+            "classify",
+            "--vault",
+            str(vault),
+            "--reatomize",
+            "--reatomize-direction",
+            "aggregate",
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    # Rich styles and hard-wraps console output, so strip ANSI and collapse
+    # whitespace before substring-asserting (same idiom as the help tests
+    # above). Assert on wrapping-robust single tokens, never a phrase.
+    normalised = re.sub(r"\s+", " ", _strip_ansi(result.output)).lower()
+    assert "retired" in normalised
+    assert "1342" in normalised
 
 
 def test_classify_reatomize_help_lists_flag() -> None:
@@ -1106,26 +1333,281 @@ def test_link_rebuild_clears_embeddings_cache(tmp_path: Path) -> None:
     assert not cache_path.exists()
 
 
+# ----- Issue #1337: the embeddings sentence must match the parquet -----------
+
+_SEEDED_FRAGMENTS = 4
+"""Fragment count for the #1337 seeded-vault fixtures.
+
+Every expected number below is derived from this constant or read back off
+the parquet, so growing the fixture can never turn a test vacuous.
+"""
+
+_CACHED_VECTORS_RE = re.compile(
+    r"(\d+) vector\(s\) cached in 00-Creek-Meta/embeddings\.parquet",
+)
+"""Recovers the operator-facing cached-vector count from the CLI sentence."""
+
+_EMBEDDING_CACHE_COLUMNS = {
+    "fragment_id",
+    "content_hash",
+    "model_name",
+    "embedding",
+    "computed_at",
+}
+"""The parquet's entire schema — vectors and their freshness keys, no edges."""
+
+
+class _FlatEncoder:
+    """Deterministic stand-in for the sentence-transformer model.
+
+    Row ``i`` is ``[1.0, 0.001 * i]``, so every pair of fragments sits well
+    above the default 0.75 cosine threshold and the similarity-edge count is
+    a stable ``C(n, 2)``. The shared conftest mock returns random
+    384-dimension vectors instead, which are near-orthogonal — under it "0
+    edges" is the usual answer, which is useless for a test about the edge
+    clause. ``EmbeddingLinker.generate_embeddings`` wraps whatever ``encode``
+    returns in ``numpy.asarray``, so a nested list is an exact stand-in for
+    the real model's ndarray.
+    """
+
+    def encode(
+        self,
+        texts: str | list[str],
+        **_kwargs: object,
+    ) -> list[list[float]]:
+        """Return one deterministic vector per entry in *texts*.
+
+        Args:
+            texts: A single text, or the batch the linker passes.
+            **_kwargs: ``show_progress_bar`` / ``batch_size``; ignored.
+
+        Returns:
+            One ``[1.0, 0.001 * i]`` row per input text.
+        """
+        batch = [texts] if isinstance(texts, str) else list(texts)
+        return [[1.0, 0.001 * index] for index, _text in enumerate(batch)]
+
+
+def _seed_embeddings_vault(vault: Path, *, count: int) -> Path:
+    """Seed *vault* with *count* fragments plus the meta directory.
+
+    Args:
+        vault: Vault root to create.
+        count: Number of fragment files to write under ``01-Fragments/``.
+
+    Returns:
+        The embeddings parquet path — which does not exist yet, so a test
+        can assert on its absence as well as its contents.
+    """
+    from creek.link.embeddings import embeddings_cache_path
+    from creek.models import Fragment, FragmentSource, SourcePlatform
+    from tests.helpers import write_fragment_file
+
+    (vault / "00-Creek-Meta").mkdir(parents=True, exist_ok=True)
+    for index in range(count):
+        write_fragment_file(
+            vault=vault,
+            fragment=Fragment(
+                id=f"frag-1337vector{index:02d}",
+                title=f"Vector fragment {index}",
+                source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+            ),
+            body=f"Body of vector fragment {index}.",
+        )
+    return embeddings_cache_path(vault)
+
+
+def _run_link_embeddings(vault: Path) -> tuple[int, str]:
+    """Run ``creek link --method embeddings`` under the deterministic encoder.
+
+    Args:
+        vault: Vault root to link.
+
+    Returns:
+        ``(exit_code, output)``, the output ANSI-stripped and
+        whitespace-collapsed: the honest sentence is longer than the pinned
+        200-column test terminal, so Rich wraps it mid-clause and raw
+        substring assertions would fail for the wrong reason.
+    """
+    from unittest.mock import patch
+
+    with patch(
+        "creek.link.embeddings.EmbeddingLinker.load_model",
+        return_value=_FlatEncoder(),
+    ):
+        result = runner.invoke(
+            app,
+            ["link", "--vault", str(vault), "--method", "embeddings"],
+        )
+    return result.exit_code, " ".join(_strip_ansi(result.output).split())
+
+
 def test_link_embeddings_output_phrases_similarity_edges(tmp_path: Path) -> None:
     """Embeddings CLI output explicitly says "similarity edges", not "links".
 
     Issue #338 Problem B: the pre-fix output used "link(s)" for pairwise
-    similarity edges stored only in the parquet cache. That implied a
-    user-visible side effect in fragment frontmatter that did not exist.
-    The fix is to phrase the count accurately as similarity edges
-    cached in the parquet so operators know what they're being shown.
+    similarity edges that never reached fragment frontmatter. That
+    implied a user-visible side effect that did not exist.
+
+    Issue #1303 finished the job: the #338 wording said the *edges* were
+    cached in the parquet, when in fact only the *vectors* are — the
+    edges are computed and dropped, because no resonance writer exists.
+    The output must therefore name both halves. The three vocabulary
+    assertions below are unchanged from #338/#1303 on purpose: the
+    accurate vocabulary has to survive the rewording, not be replaced by
+    it. They read the whitespace-normalised output because the honest
+    sentence no longer fits the pinned terminal width.
+
+    Issue #1337 ties the sentence to the artifact, and the tie runs both
+    ways. The vault is *seeded*, so a parquet genuinely exists (the
+    pre-#1337 version of this test ran against an empty vault where no
+    parquet was ever written, and still asserted the word
+    "embeddings.parquet" appeared — it would have passed with the cache
+    deleted from the codebase). The cached count printed to the operator
+    is compared against ``num_rows`` on disk, derived not hardcoded, and
+    the column set is asserted exactly. Add an edge column to the cache
+    later and the schema assertion fires; claim cached edges in the
+    sentence without adding that column and the wording assertion fires.
+    Neither half can move without the other.
     """
+    import pyarrow.parquet as pq
+
+    vault = tmp_path / "vault"
+    cache_path = _seed_embeddings_vault(vault, count=_SEEDED_FRAGMENTS)
+
+    exit_code, output = _run_link_embeddings(vault)
+
+    assert exit_code == 0, output
+    # #338 phrasing — accurate to what the embeddings method does.
+    assert "similarity edge" in output.lower()
+    assert "embeddings.parquet" in output
+    # #1303: and it must not claim the edges themselves were persisted.
+    assert "not persisted" in output.lower()
+
+    # #1337 tie, half one: the number the operator reads is the number of
+    # rows the artifact actually holds.
+    assert cache_path.exists(), output
+    table = pq.read_table(cache_path)
+    match = _CACHED_VECTORS_RE.search(output)
+    assert match is not None, f"no cached-vector count in output: {output}"
+    assert int(match.group(1)) == table.num_rows
+
+    # #1337 tie, half two: the cache stores vectors and freshness keys and
+    # nothing else. An added edge column fires here.
+    assert set(table.column_names) == _EMBEDDING_CACHE_COLUMNS
+
+    # Because there is no edge column, the sentence may not claim the edges
+    # were cached — only the vectors were.
+    assert "edge(s) cached" not in output
+    assert "edges cached" not in output
+
+
+def test_link_embeddings_warm_run_reports_zero_vectors_computed(
+    tmp_path: Path,
+) -> None:
+    """A second identical run must report the vectors it did *not* compute.
+
+    Issue #1337, lie one: the sentence read ``{fragment_count} fragment(s)
+    embedded``, so a fully warm cache still claimed the whole corpus had
+    been embedded even though ``LinkSummary.fragments_embedded`` was ``0``
+    and the local model was never invoked. ``N fragment(s) embedded`` is
+    the exact substring the defect printed, so its absence is asserted
+    directly rather than inferred from the replacement wording.
+
+    The cached count is still tied to ``num_rows``: a warm run rewrites the
+    same rows, so the parquet must hold the whole corpus even though this
+    run computed none of it.
+    """
+    import pyarrow.parquet as pq
+
+    vault = tmp_path / "vault"
+    cache_path = _seed_embeddings_vault(vault, count=_SEEDED_FRAGMENTS)
+
+    cold_code, cold_output = _run_link_embeddings(vault)
+    assert cold_code == 0, cold_output
+    expected_cold = (
+        f"{_SEEDED_FRAGMENTS} fragment(s) scanned, "
+        f"{_SEEDED_FRAGMENTS} vector(s) computed,"
+    )
+    assert expected_cold in cold_output
+
+    warm_code, warm_output = _run_link_embeddings(vault)
+    assert warm_code == 0, warm_output
+    expected_warm = f"{_SEEDED_FRAGMENTS} fragment(s) scanned, 0 vector(s) computed,"
+    assert expected_warm in warm_output
+    assert f"{_SEEDED_FRAGMENTS} fragment(s) embedded" not in warm_output
+
+    table = pq.read_table(cache_path)
+    assert table.num_rows == _SEEDED_FRAGMENTS
+    match = _CACHED_VECTORS_RE.search(warm_output)
+    assert match is not None, f"no cached-vector count in output: {warm_output}"
+    assert int(match.group(1)) == table.num_rows
+
+
+def test_link_embeddings_empty_vault_admits_nothing_was_cached(
+    tmp_path: Path,
+) -> None:
+    """An empty vault must not claim vectors reached the parquet.
+
+    Issue #1337, lie two: ``run_link`` returns early for a fragmentless
+    vault, so ``_persist_cache`` never runs and no parquet is created — yet
+    the sentence still ended "vectors cached in
+    00-Creek-Meta/embeddings.parquet". The disk assertion and the wording
+    assertion live in the same test on purpose: separated, one could be
+    weakened without the other noticing, which is exactly how the claim
+    and the artifact drifted apart in the first place.
+    """
+    from creek.link.embeddings import embeddings_cache_path
+
     vault = tmp_path / "vault"
     (vault / "01-Fragments").mkdir(parents=True)
+    cache_path = embeddings_cache_path(vault)
 
-    result = runner.invoke(
-        app,
-        ["link", "--vault", str(vault), "--method", "embeddings"],
+    exit_code, output = _run_link_embeddings(vault)
+
+    assert exit_code == 0, output
+    assert not cache_path.exists()
+    assert "no vectors written to 00-Creek-Meta/embeddings.parquet" in output
+    assert "vector(s) cached in" not in output
+    assert "0 fragment(s) scanned, 0 vector(s) computed," in output
+
+
+def test_link_embeddings_cache_write_failure_is_admitted(tmp_path: Path) -> None:
+    """A swallowed cache-write error must reach the operator as a zero count.
+
+    Issue #1337, lie three: ``_persist_cache`` catches ``OSError`` (disk
+    full, read-only volume) and logs a warning, so linking exits 0 with no
+    parquet on disk while the sentence claimed the vectors were cached.
+    Graceful degradation is deliberate and stays — losing the cache only
+    costs a recompute — so the exit code is pinned at 0. The fix is not to
+    fail the run but to stop lying about it: the honest count *is* the
+    remedy for the swallowed error, making it visible to the operator
+    instead of only to the log.
+
+    The run's real work is asserted too, so an implementation that reported
+    ``0 vector(s) computed`` alongside the failed write — conflating
+    "computed" with "persisted" — would fail here.
+    """
+    from unittest.mock import patch
+
+    vault = tmp_path / "vault"
+    cache_path = _seed_embeddings_vault(vault, count=_SEEDED_FRAGMENTS)
+
+    with patch(
+        "creek.link.embeddings.EmbeddingLinker.save_cache",
+        side_effect=OSError("disk full"),
+    ):
+        exit_code, output = _run_link_embeddings(vault)
+
+    assert exit_code == 0, output
+    assert not cache_path.exists()
+    assert "no vectors written to 00-Creek-Meta/embeddings.parquet" in output
+    assert "vector(s) cached in" not in output
+    expected_work = (
+        f"{_SEEDED_FRAGMENTS} fragment(s) scanned, "
+        f"{_SEEDED_FRAGMENTS} vector(s) computed,"
     )
-    assert result.exit_code == 0, result.output
-    # New phrasing — accurate to what the embeddings method does.
-    assert "similarity edge" in result.output.lower()
-    assert "embeddings.parquet" in result.output
+    assert expected_work in output
 
 
 def test_link_embeddings_model_unavailable_exits_nonzero(
@@ -1197,6 +1679,56 @@ def test_link_eddies_output_phrases_eddies_written(tmp_path: Path) -> None:
     assert "detected" in output_lower
     assert "written" in output_lower
     assert "03-eddies" in output_lower
+
+
+def test_link_summary_reports_cluster_health() -> None:
+    """Issue #880: the largest cluster, splits and discards are operator-visible.
+
+    A single eddy holding 87% of the vault used to be invisible from the
+    CLI — the summary reported how many eddies were detected but never how
+    big any of them was. Discarded fragments carry no wiki-link at all, so
+    that count is named explicitly rather than folded into a total.
+    """
+    from creek.cli import _format_link_summary
+    from creek.link.link_engine import LinkSummary
+
+    rendered = _format_link_summary(
+        LinkSummary(
+            method="eddies",
+            fragment_count=700,
+            link_count=3,
+            eddies_detected=3,
+            eddies_written=3,
+            member_fragments_updated=36,
+            largest_cluster_fragments=12,
+            clusters_split=6,
+            oversized_discarded=521,
+        ),
+    )
+    assert "largest cluster: 12 fragment(s)" in rendered
+    assert "6 oversized cluster(s) re-clustered" in rendered
+    assert "521 fragment(s) discarded as unsplittable" in rendered
+
+
+def test_link_summary_stays_terse_for_a_healthy_run() -> None:
+    """No splits and no discards means no extra clauses beyond the largest."""
+    from creek.cli import _format_link_summary
+    from creek.link.link_engine import LinkSummary
+
+    rendered = _format_link_summary(
+        LinkSummary(
+            method="threads",
+            fragment_count=40,
+            link_count=2,
+            threads_detected=2,
+            threads_written=2,
+            member_fragments_updated=8,
+            largest_cluster_fragments=5,
+        ),
+    )
+    assert "largest cluster: 5 fragment(s)" in rendered
+    assert "re-clustered" not in rendered
+    assert "discarded" not in rendered
 
 
 def test_report_help() -> None:
@@ -1323,6 +1855,85 @@ def test_report_paradox_writes_notes(tmp_path: Path) -> None:
     assert sorted((vault / "10-Liminal" / "Paradoxes").glob("*.md"))
 
 
+def _seed_paradox_pair(vault: Path) -> None:
+    """Write two fragments whose opposite confidence on one thread is a paradox."""
+    from creek.models import (
+        Confidence,
+        Fragment,
+        FragmentSource,
+        SourcePlatform,
+        VoiceClassification,
+    )
+    from tests.helpers import write_fragment_file
+
+    for fid, conf in (
+        ("frag-cli-dupe-aa", Confidence.MUSING),
+        ("frag-cli-dupe-bb", Confidence.SETTLED),
+    ):
+        write_fragment_file(
+            vault=vault,
+            fragment=Fragment(
+                id=fid,
+                title="career ambitions",
+                source=FragmentSource(platform=SourcePlatform.JOURNAL),
+                voice=VoiceClassification(confidence=conf),
+                threads=["thread-career"],
+            ),
+            body="a contradiction worth holding",
+        )
+
+
+def test_report_paradox_rerun_writes_no_second_copy(tmp_path: Path) -> None:
+    """A second `report --type paradox` run records nothing new (#1320).
+
+    The CLI-level pin on the fix: the empty-result line must not claim no
+    contradictory pair was found when one was found and already recorded.
+    """
+    vault = _report_vault(tmp_path)
+    _seed_paradox_pair(vault)
+    runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+
+    result = runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert "already recorded" in result.output
+    assert len(list((vault / "10-Liminal" / "Paradoxes").glob("*.md"))) == 1
+
+
+def test_report_paradox_reports_pre_existing_duplicates(tmp_path: Path) -> None:
+    """Pre-#1320 duplicate copies are named on the console and left on disk."""
+    import frontmatter
+
+    vault = _report_vault(tmp_path)
+    _seed_paradox_pair(vault)
+    runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+    (original,) = (vault / "10-Liminal" / "Paradoxes").glob("*.md")
+    stray = original.with_name("2020-01-01-frag-cli-dupe-aa-frag-cli-dupe-bb.md")
+    post = frontmatter.loads(original.read_text(encoding="utf-8"))
+    post["detected_date"] = "2020-01-01"
+    stray.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    result = runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert "#1320" in result.output
+    assert "Nothing is deleted automatically" in result.output
+    assert stray.exists()
+    assert original.exists()
+
+
+def test_report_paradox_is_quiet_when_no_duplicates(tmp_path: Path) -> None:
+    """An operator must not be accused of duplicates on every clean run."""
+    vault = _report_vault(tmp_path)
+    _seed_paradox_pair(vault)
+    runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+
+    result = runner.invoke(app, ["report", "--type", "paradox", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert "#1320" not in result.output
+
+
 def test_report_synchronicity_writes_notes(tmp_path: Path) -> None:
     """`report --type synchronicity` writes notes + reports success (#711, #726).
 
@@ -1387,6 +1998,14 @@ def test_report_decisions_no_candidates_is_friendly(tmp_path: Path) -> None:
     The handler is now real (not the #579 stub): an empty corpus prints the
     "no new decision candidates" message, writes nothing, and never emits the
     old "Would generate" stub text.
+
+    This is also the ``withheld == 0`` arm of #1487, and the two assertions
+    added for it are what keep the withheld notice *conditional*. The notice
+    must not appear — on stdout or stderr — for a vault where nothing was
+    refused, and the empty-vault tail must keep saying "no new decision
+    candidates found" rather than being flattened into the ``withheld > 0``
+    wording. ``result.output`` is deliberate for the negative: it folds stderr
+    in under click 8.4, so it also proves no spurious ``logger.warning`` fired.
     """
     vault = tmp_path / "vault"
     (vault / "00-Creek-Meta").mkdir(parents=True)
@@ -1400,6 +2019,14 @@ def test_report_decisions_no_candidates_is_friendly(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "No decision notes generated" in result.output
     assert "Would generate" not in result.output
+    assert "withheld" not in result.output, (
+        "#1487: nothing was refused on this vault, so the withheld notice "
+        f"must not print at all. output={result.output!r}"
+    )
+    assert "nonewdecisioncandidatesfound." in _squashed(result.stdout), (
+        "#1487: the withheld == 0 tail must stay byte-identical; only the "
+        f"withheld > 0 arm gets new wording. stdout={result.stdout!r}"
+    )
 
 
 def test_report_decisions_generates_note(tmp_path: Path) -> None:
@@ -1408,8 +2035,18 @@ def test_report_decisions_generates_note(tmp_path: Path) -> None:
     (vault / "00-Creek-Meta").mkdir(parents=True)
     frags = vault / "01-Fragments" / "Conversations"
     frags.mkdir(parents=True)
+    # ``privacy_tier: open`` is stated rather than omitted (#1431). The screen
+    # ``generate_decisions`` now applies reads the *raw* front matter and fails
+    # closed, so a note with no ``privacy_tier:`` key ranks intimate and is
+    # withheld. Omitting the key here was never realistic vault state:
+    # ``VaultWriter._write_model`` (creek/vault/writer.py:1385) serialises
+    # ``model.model_dump(mode="json")``, so every pipeline-written fragment
+    # carries the key explicitly. The keyless case is not swept under the rug —
+    # ``test_report_decisions_withholds_a_fragment_with_no_privacy_tier_key``
+    # below pins it.
     (frags / "frag-decide99.md").write_text(
         '---\ntype: fragment\nid: frag-decide99\ntitle: "Should I move to the coast"\n'
+        "privacy_tier: open\n"
         "source:\n  platform: journal\n  author: self\n---\nbody\n",
         encoding="utf-8",
     )
@@ -1422,6 +2059,540 @@ def test_report_decisions_generates_note(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "Decision notes generated" in result.output
     assert any((vault / "08-Decisions" / "Active").glob("*.md"))
+
+
+def test_report_decisions_withholds_a_fragment_with_no_privacy_tier_key(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A keyless fragment is withheld, and the withholding is announced (#1431).
+
+    The decisions screen reads
+    :func:`creek.classify.privacy_filter.raw_privacy_tier`, which fails closed:
+    a note whose front matter has no ``privacy_tier:`` key ranks ``intimate``
+    rather than the model's ``unclassified``. That is the same answer
+    ``tests/test_mcp_report_tier_ceiling.py``'s
+    ``test_fragment_with_no_privacy_tier_key_fails_closed_to_intimate`` already
+    pins for report artifacts, and picking the model reader instead would leave
+    the #1431 filename leak reproducible for exactly this fragment shape.
+
+    The consequence is deliberately made loud rather than silent. ``creek
+    report`` otherwise prints "no new decision candidates found", which for a
+    hand-written or legacy vault would be a false statement produced by the
+    fix; the withheld count is what distinguishes "nothing to report" from
+    "something was refused". Only the count is disclosed — never an id and
+    never a title, since the title is the leaking value.
+
+    Since #1487 that count reaches the operator on **stdout** as well as the
+    log, and the two strings come from one
+    :func:`creek.generate.decisions.withheld_notice` so they cannot drift.
+    This test keeps pinning the log half — ``creek`` is a library as well as a
+    CLI, and the warning is what a non-CLI embedder sees. The stdout half is
+    pinned by
+    ``test_report_decisions_announces_the_withheld_count_on_stdout`` below.
+    """
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    frags = vault / "01-Fragments" / "Conversations"
+    frags.mkdir(parents=True)
+    (frags / "frag-notier.md").write_text(
+        '---\ntype: fragment\nid: frag-notier\ntitle: "Should I move to the coast"\n'
+        "source:\n  platform: journal\n  author: self\n---\nbody\n",
+        encoding="utf-8",
+    )
+
+    with caplog.at_level("WARNING", logger="creek.generate.decisions"):
+        result = runner.invoke(
+            app,
+            ["report", "--type", "decisions", "--vault", str(vault)],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "No decision notes generated" in result.output
+    assert not list((vault / "08-Decisions").rglob("*.md"))
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("withheld" in r.getMessage() for r in warnings), (
+        "the fail-closed screen dropped the only candidate without saying so; "
+        f"records={[r.getMessage() for r in caplog.records]}"
+    )
+    assert any("1" in r.getMessage() for r in warnings), (
+        "the warning must carry the withheld count so an operator can tell "
+        "'nothing to report' from 'something was refused'."
+    )
+    assert not any("coast" in r.getMessage() for r in caplog.records), (
+        "the warning must carry a count only — logging the title would move "
+        "the leak from the filename to the log."
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1431 — the intimate title must not reach stdout either
+# ---------------------------------------------------------------------------
+
+_INTIMATE_DECISION_CANARY = "Jane-Doe-of-Springfield-Illinois"
+"""Sentinel carried in an intimate fragment's title.
+
+Restricted to ``[A-Za-z0-9-]`` because
+``creek.generate.decisions._sanitize_title`` strips everything else out of the
+filename it derives from the title, and the filename is the surface under test.
+"""
+
+
+def _seed_intimate_decision_vault(tmp_path: Path, *, with_open: bool = True) -> Path:
+    """Build a vault whose only decision candidate is an ``intimate`` fragment.
+
+    A second, ``open`` fragment rides along as the positive control: without it
+    a "the canary is absent" assertion is satisfied by a command that printed
+    nothing at all. ``with_open=False`` drops that control deliberately, for
+    the #1487 tests that need a vault where *every* fragment is refused and the
+    report therefore takes its empty branch — the arm where the headline says
+    "no new candidates among the fragments this report could read".
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        with_open: Write the ``open`` positive-control fragment. Keyword-only
+            and defaulting to ``True`` so the #1431 callers are unchanged.
+
+    Returns:
+        The vault root.
+    """
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    frags = vault / "01-Fragments" / "Conversations"
+    frags.mkdir(parents=True)
+    (frags / "frag-intimate.md").write_text(
+        "---\ntype: fragment\nid: frag-intimate\n"
+        f'title: "Should I leave my marriage with {_INTIMATE_DECISION_CANARY}"\n'
+        "privacy_tier: intimate\n"
+        "source:\n  platform: journal\n  author: self\n---\nbody\n",
+        encoding="utf-8",
+    )
+    if with_open:
+        (frags / "frag-open.md").write_text(
+            "---\ntype: fragment\nid: frag-open\n"
+            'title: "Should I buy a bicycle"\n'
+            "privacy_tier: open\n"
+            "source:\n  platform: journal\n  author: self\n---\nbody\n",
+            encoding="utf-8",
+        )
+    return vault
+
+
+def _write_keyless_decision_fragment(vault: Path, frag_id: str, title: str) -> Path:
+    """Write a hand-authored decision fragment with **no** ``privacy_tier:`` key.
+
+    This shape cannot be produced by dumping a :class:`~creek.models.Fragment`
+    — ``VaultWriter._write_model`` serialises ``model_dump(mode="json")`` and
+    therefore always states the key — so it is written literally. It is the
+    fragment shape the #1487 report actually meets in a hand-written or legacy
+    vault: ``raw_privacy_tier`` fails closed to ``intimate``, the fragment is
+    withheld, and before the fix the operator was told "no new decision
+    candidates found".
+
+    Args:
+        vault: Vault root (must already exist).
+        frag_id: Fragment id, also the filename stem.
+        title: Fragment title. Must open with "Should I" or the detector never
+            flags it.
+
+    Returns:
+        The path written.
+    """
+    frags = vault / "01-Fragments" / "Conversations"
+    frags.mkdir(parents=True, exist_ok=True)
+    path = frags / f"{frag_id}.md"
+    path.write_text(
+        f"---\ntype: fragment\nid: {frag_id}\n"
+        f'title: "{title}"\n'
+        "source:\n  platform: journal\n  author: self\n---\nbody\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _squashed(text: str) -> str:
+    """Return *text* with ANSI escapes removed and every whitespace run deleted.
+
+    Whitespace is *deleted*, not collapsed to single spaces, and that is the
+    whole point. Rich hard-wraps the ``Decision notes generated (N): <path>``
+    line at the console width, and it wraps mid-token: at 80 columns the
+    pre-fix output is
+    ``'…with-Jane-Doe-of-Sprin\\ngfield-Illinois.md'``. A plain
+    ``canary not in result.output`` therefore passes while the title is printed
+    in full — a vacuous assertion that would have declared #1431 fixed.
+
+    Args:
+        text: Captured CLI output.
+
+    Returns:
+        The output with ANSI stripped and all whitespace removed.
+    """
+    return "".join(_strip_ansi(text).split())
+
+
+def test_report_decisions_never_echoes_an_intimate_title_to_stdout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``creek report --type decisions`` must not print an intimate title (#1431).
+
+    ``_report_decisions`` joins ``str(p.relative_to(vault_path))`` for every
+    written path into a Rich message, so suppressing only the *file* while
+    still echoing its name is not a fix — the title would reach the terminal,
+    the scrollback and any captured build log regardless.
+
+    With no ``--include-tier`` the report runs unfiltered
+    (``PrivacyTierOverride.ALL``), which is the ceiling the defect lives at.
+
+    The console width is pinned to 80 for the duration so the wrap hazard
+    :func:`_squashed` guards against is actually exercised rather than merely
+    described; ``tests/conftest.py`` otherwise pins it wide enough that the
+    line fits and the guard would never be tested.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    vault = _seed_intimate_decision_vault(tmp_path)
+    monkeypatch.setattr(console, "width", 80)
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "decisions", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    squashed = _squashed(result.output)
+    assert "Should-I-buy-a-bicycle" in squashed, (
+        "the open fragment's note was not announced, so the exclusion "
+        f"assertion below is vacuous. output={result.output!r}"
+    )
+    assert _INTIMATE_DECISION_CANARY not in squashed, (
+        "an intimate fragment's title was echoed to stdout by `creek report "
+        f"--type decisions`. output={result.output!r}"
+    )
+    leaked = [
+        str(p.relative_to(vault))
+        for p in (vault / "08-Decisions").rglob("*")
+        if _INTIMATE_DECISION_CANARY in str(p.relative_to(vault))
+    ]
+    assert not leaked, f"intimate title in an 08-Decisions filename: {leaked}"
+
+
+def test_fill_report_decisions_step_never_echoes_an_intimate_title(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``creek fill`` ``report/decisions`` step is gated too (#1431).
+
+    ``fill`` is the surface the issue was reported against, and it is the
+    strictest one: ``_build_fill_steps`` states ``PrivacyTierOverride.ALL`` for
+    every step because ``fill`` has no ``--include-tier`` of its own, so the
+    ceiling gate admits everything and only the unconditional screen stands
+    between an intimate title and the vault tree.
+
+    The production ``_build_fill_steps`` plan is built and its real
+    ``report/decisions`` lambda invoked, rather than driving the whole command:
+    ``fill``'s first step instantiates a ``SentenceTransformer`` and reaches
+    for model weights over the network. Nothing is stubbed in exchange — the
+    callable invoked here is the production lambda with the production
+    arguments.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    from creek.cli import _build_fill_steps, _load_config_for_vault
+
+    vault = _seed_intimate_decision_vault(tmp_path)
+    monkeypatch.setattr(console, "width", 80)
+
+    steps = dict(
+        _build_fill_steps(vault, _load_config_for_vault(vault), with_compost=False),
+    )
+    assert "report/decisions" in steps
+    with console.capture() as captured:
+        steps["report/decisions"]()
+
+    squashed = _squashed(captured.get())
+    assert "Should-I-buy-a-bicycle" in squashed, (
+        "the open fragment's note was not announced by the fill step, so the "
+        f"exclusion assertion below is vacuous. output={captured.get()!r}"
+    )
+    assert _INTIMATE_DECISION_CANARY not in squashed, (
+        "the `creek fill` report/decisions step echoed an intimate fragment's "
+        f"title. output={captured.get()!r}"
+    )
+    leaked = [
+        str(p.relative_to(vault))
+        for p in (vault / "08-Decisions").rglob("*")
+        if _INTIMATE_DECISION_CANARY in str(p.relative_to(vault))
+    ]
+    assert not leaked, f"intimate title in an 08-Decisions filename: {leaked}"
+
+
+# ---------------------------------------------------------------------------
+# #1487 — the withheld count must reach the operator on stdout, in both branches
+#
+# Every positive assertion below targets ``result.stdout`` (or
+# ``console.capture()``), never ``result.output``. Under click 8.4
+# ``Result.output`` folds stderr in, so ``"withheld" in result.output`` is
+# already True at HEAD purely from the ``logger.warning`` — a vacuous assertion
+# that would declare #1487 fixed while the operator's terminal still says "no
+# new decision candidates found". The negatives use ``result.output``, where
+# folding stderr in makes the guard strictly stronger.
+# ---------------------------------------------------------------------------
+
+_WITHHELD_HEADLINE = (
+    "No decision notes generated: no new candidates among the fragments "
+    "this report could read."
+)
+"""Headline for the empty branch when something *was* refused (#1487).
+
+The ``No decision notes generated`` prefix is byte-identical to the
+``withheld == 0`` headline pinned above; only the tail differs, because saying
+"no new decision candidates found" over a vault the report could not fully read
+is the false statement this issue exists to remove.
+"""
+
+_WITHHELD_NOTICE_TAIL = "A tier already recorded as intimate is never lowered."
+"""Closing sentence of the withheld notice (#1487).
+
+Asserted alongside the count-bearing head so that a truncated or reworded
+notice cannot satisfy the tests by printing its first clause alone. The exact
+full wording is pinned once, in
+``tests/test_decisions.py::test_withheld_notice_states_the_exact_remedy``.
+"""
+
+
+def _withheld_notice_head(count: int) -> str:
+    """Return the count-bearing opening clause of the #1487 withheld notice.
+
+    Args:
+        count: The number of withheld fragments the notice must state.
+
+    Returns:
+        The literal (unsquashed) opening clause.
+    """
+    return f"{count} fragment(s) withheld from the decisions report"
+
+
+def test_report_decisions_announces_the_withheld_count_on_stdout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A keyless-only vault says so on stdout, not just in the log (#1487).
+
+    The reported defect, exactly: one hand-authored fragment with no
+    ``privacy_tier:`` key, the fail-closed screen refuses it, and stdout says
+    "no new decision candidates found" — a false statement, because there *was*
+    a candidate and the report simply could not read it. The count reached
+    ``logger.warning`` and died there.
+
+    Kills three mutants:
+
+    * deleting the ``console.print`` while leaving the ``logger.warning`` —
+      the assertions read ``result.stdout``, which excludes the log;
+    * ``if (notice := …) is not None:`` degraded to ``if False:``;
+    * keeping the ``withheld == 0`` tail on the ``withheld > 0`` branch.
+
+    Only the *count* may be disclosed: the canary assertion pins that the
+    withheld fragment's title never appears, in the sanitiser-proof
+    ``[A-Za-z0-9-]`` shape and through :func:`_squashed`, so an 80-column
+    mid-token wrap cannot hide a leak.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    _write_keyless_decision_fragment(
+        vault,
+        "frag-notier",
+        f"Should I leave my marriage with {_INTIMATE_DECISION_CANARY}",
+    )
+    monkeypatch.setattr(console, "width", 80)
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "decisions", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    squashed = _squashed(result.stdout)
+    assert _squashed(_withheld_notice_head(1)) in squashed, (
+        "#1487: the withheld count never reached stdout; the operator was "
+        f"told nothing was found. stdout={result.stdout!r}"
+    )
+    assert _squashed(_WITHHELD_NOTICE_TAIL) in squashed, (
+        "#1487: the notice was truncated — the operator got a count with no "
+        f"remedy and no ratchet caveat. stdout={result.stdout!r}"
+    )
+    assert _squashed(_WITHHELD_HEADLINE) in squashed, (
+        "#1487: the empty-branch headline must stop claiming 'no new decision "
+        f"candidates found' when a fragment was refused. stdout={result.stdout!r}"
+    )
+    assert _INTIMATE_DECISION_CANARY not in _squashed(result.output), (
+        "#1487: the notice must disclose a count and nothing else — naming "
+        f"the fragment moves the leak, it does not fix it. output={result.output!r}"
+    )
+    assert not list((vault / "08-Decisions").rglob("*.md"))
+
+
+def test_report_decisions_announces_the_withheld_count_alongside_written_notes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The notice prints in the *non-empty* branch too (#1487).
+
+    This is the half of the defect that survives a literal reading of AC1. On a
+    mixed vault the report writes ``Should-I-buy-a-bicycle`` and, before the
+    fix, says nothing whatsoever about the fragment it refused: the operator
+    sees a green success line and has no way to know the report was partial.
+    Fixing only the empty branch leaves this exactly as it was.
+
+    Kills the mutant that prints the notice from inside the ``if not
+    notes:`` early return — one exit path, two branches, one notice.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    vault = _seed_intimate_decision_vault(tmp_path)
+    monkeypatch.setattr(console, "width", 80)
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "decisions", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    squashed = _squashed(result.stdout)
+    assert "Decisionnotesgenerated" in squashed, (
+        "the open fragment's note was not announced, so the withheld "
+        "assertion below proves nothing about the success branch. "
+        f"stdout={result.stdout!r}"
+    )
+    assert "Should-I-buy-a-bicycle" in squashed, (
+        f"the admitted note was not named on stdout. stdout={result.stdout!r}"
+    )
+    assert _squashed(_withheld_notice_head(1)) in squashed, (
+        "#1487: a partial report announced its successes and stayed silent "
+        f"about its refusal. stdout={result.stdout!r}"
+    )
+    assert _squashed(_WITHHELD_NOTICE_TAIL) in squashed, (
+        f"#1487: the notice was truncated. stdout={result.stdout!r}"
+    )
+    assert _INTIMATE_DECISION_CANARY not in _squashed(result.output), (
+        "#1431/#1487: the withheld fragment's title reached the terminal. "
+        f"output={result.output!r}"
+    )
+
+
+def test_report_decisions_withheld_notice_states_the_real_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two withheld fragments are reported as two, not as one (#1487).
+
+    The count is interpolated, never spelled. This is the killer for a notice
+    that hardcodes ``1`` — or that reports ``len(something_else)`` — and it is
+    why the negative half matters as much as the positive: ``"2 fragment(s)"``
+    present is satisfied by a notice printed twice, once per fragment, each
+    claiming ``1``.
+
+    The two withheld fragments are deliberately different shapes — one
+    explicitly ``privacy_tier: intimate``, one keyless and failing closed —
+    because the count must span both refusal reasons the notice names.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    vault = _seed_intimate_decision_vault(tmp_path, with_open=False)
+    _write_keyless_decision_fragment(
+        vault,
+        "frag-notier",
+        "Should I sell the house",
+    )
+    monkeypatch.setattr(console, "width", 80)
+
+    result = runner.invoke(
+        app,
+        ["report", "--type", "decisions", "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, result.output
+    squashed = _squashed(result.stdout)
+    assert _squashed(_withheld_notice_head(2)) in squashed, (
+        "#1487: two fragments were refused and the notice did not say two. "
+        f"stdout={result.stdout!r}"
+    )
+    assert _squashed(_withheld_notice_head(1)) not in _squashed(result.output), (
+        "#1487: the withheld count is hardcoded or per-fragment — the notice "
+        f"claimed one refusal on a vault with two. output={result.output!r}"
+    )
+    assert _squashed(_WITHHELD_HEADLINE) in squashed, (
+        "#1487: nothing could be read, so the headline must not claim there "
+        f"were no candidates. stdout={result.stdout!r}"
+    )
+    assert not list((vault / "08-Decisions").rglob("*.md"))
+
+
+def test_fill_report_decisions_step_announces_the_withheld_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``creek fill`` ``report/decisions`` step announces refusals too (#1487).
+
+    ``fill`` is the unattended surface, and the one that states
+    ``PrivacyTierOverride.ALL`` for every step because it has no
+    ``--include-tier`` of its own — so it is the run most likely to refuse
+    something and the run least likely to have anybody watching a log. The
+    notice must reach the same console the step's other output goes to.
+
+    Kills the mutant that puts the ``console.print`` in the ``creek report``
+    command body rather than in the shared ``_report_decisions`` helper both
+    surfaces call.
+
+    The production ``_build_fill_steps`` plan is built and its real
+    ``report/decisions`` lambda invoked, rather than driving the whole command:
+    ``fill``'s first step instantiates a ``SentenceTransformer`` and reaches
+    for model weights over the network.
+
+    Args:
+        tmp_path: Pytest temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    from creek.cli import _build_fill_steps, _load_config_for_vault
+
+    vault = _seed_intimate_decision_vault(tmp_path)
+    monkeypatch.setattr(console, "width", 80)
+
+    steps = dict(
+        _build_fill_steps(vault, _load_config_for_vault(vault), with_compost=False),
+    )
+    assert "report/decisions" in steps
+    with console.capture() as captured:
+        steps["report/decisions"]()
+
+    squashed = _squashed(captured.get())
+    assert "Should-I-buy-a-bicycle" in squashed, (
+        "the open fragment's note was not announced by the fill step, so the "
+        f"assertions below prove nothing. output={captured.get()!r}"
+    )
+    assert _squashed(_withheld_notice_head(1)) in squashed, (
+        "#1487: the fill step refused a fragment without telling the console. "
+        f"output={captured.get()!r}"
+    )
+    assert _squashed(_WITHHELD_NOTICE_TAIL) in squashed, (
+        f"#1487: the notice was truncated. output={captured.get()!r}"
+    )
+    assert _INTIMATE_DECISION_CANARY not in squashed, (
+        "#1431/#1487: the withheld fragment's title reached the console. "
+        f"output={captured.get()!r}"
+    )
 
 
 def test_report_lexicon_no_exemplars_is_friendly(tmp_path: Path) -> None:
@@ -1461,18 +2632,48 @@ def test_report_rhetorical_patterns_no_exemplars_is_friendly(tmp_path: Path) -> 
     assert "No rhetorical patterns written" in result.output
 
 
-def test_report_rhetorical_patterns_generates(tmp_path: Path) -> None:
-    """``report --type rhetorical-patterns`` writes a per-register note (#582)."""
-    vault = tmp_path / "vault"
-    (vault / "00-Creek-Meta").mkdir(parents=True)
+def _seed_rhetorical_patterns_vault(vault: Path, *, tier_line: str) -> Path:
+    """Seed *vault* with one exemplar-qualifying fragment for the patterns report.
+
+    *tier_line* is spliced into the frontmatter verbatim, so a caller passes
+    either ``"privacy_tier: open\\n"`` or ``""`` — the empty string being the
+    only way to produce a file that never declared a tier at all, which is the
+    state #1212 is about and which no model-serialising helper can express.
+
+    Args:
+        vault: Vault root to create.
+        tier_line: The ``privacy_tier`` frontmatter line, or ``""`` to omit it.
+
+    Returns:
+        *vault*, for chaining.
+    """
+    (vault / "00-Creek-Meta").mkdir(parents=True, exist_ok=True)
     frags = vault / "01-Fragments" / "Journal"
-    frags.mkdir(parents=True)
+    frags.mkdir(parents=True, exist_ok=True)
     (frags / "ex-1.md").write_text(
         '---\ntype: fragment\nid: ex-1\ntitle: "T"\n'
+        f"{tier_line}"
         "source:\n  platform: journal\n  author: self\n"
         "voice:\n  voice_register: confessional\n  confidence: conviction\n"
         "---\nThe truth is we rise; as I said before, we rise.\n",
         encoding="utf-8",
+    )
+    return vault
+
+
+def test_report_rhetorical_patterns_generates(tmp_path: Path) -> None:
+    """``report --type rhetorical-patterns`` writes a per-register note (#582).
+
+    The fixture states ``privacy_tier: open`` explicitly (#1212). It used to
+    omit the key, which made this test depend on the very defect #1212 fixes:
+    an untiered fragment reaching the voice corpus at the CLI's default
+    ``ALL`` ceiling. Stating the tier keeps the test about *rhetorical-pattern
+    generation* rather than about tier admission, which
+    ``test_report_rhetorical_patterns_refuses_an_untiered_fragment`` owns.
+    """
+    vault = _seed_rhetorical_patterns_vault(
+        tmp_path / "vault",
+        tier_line="privacy_tier: open\n",
     )
 
     result = runner.invoke(
@@ -1483,6 +2684,56 @@ def test_report_rhetorical_patterns_generates(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "Rhetorical patterns written" in result.output
     assert (vault / "07-Voice" / "Rhetorical-Patterns" / "confessional.md").exists()
+
+
+def test_report_rhetorical_patterns_refuses_an_untiered_fragment(
+    tmp_path: Path,
+) -> None:
+    """A fragment with no ``privacy_tier`` key produces no patterns (#1212 AC1).
+
+    AC1 names ``rhetorical-patterns`` explicitly, and this is the surface as
+    the operator meets it: a bare ``creek report --type rhetorical-patterns``,
+    with no ``--include-tier``, which the CLI resolves to
+    ``PrivacyTierOverride.ALL``. At that ceiling the raw-frontmatter gate
+    short-circuits to "admit", leaving only the model-reading consent gate —
+    which sees Pydantic's ``unclassified`` default and cannot tell that the
+    file said nothing at all.
+
+    Both arms run, over two vaults identical but for that one frontmatter
+    line, because the negative arm alone is worthless: ``No rhetorical
+    patterns written`` is also what a vault the walk never reached would
+    print, and what a mis-typed fixture, a bad body, or an unqualifying
+    confidence would print. The positive arm is what proves the refusal is
+    about the tier.
+    """
+    untiered = _seed_rhetorical_patterns_vault(
+        tmp_path / "untiered-vault",
+        tier_line="",
+    )
+    tiered = _seed_rhetorical_patterns_vault(
+        tmp_path / "tiered-vault",
+        tier_line="privacy_tier: open\n",
+    )
+
+    refused = runner.invoke(
+        app,
+        ["report", "--type", "rhetorical-patterns", "--vault", str(untiered)],
+    )
+    admitted = runner.invoke(
+        app,
+        ["report", "--type", "rhetorical-patterns", "--vault", str(tiered)],
+    )
+
+    assert admitted.exit_code == 0, admitted.output
+    assert "Rhetorical patterns written" in admitted.output, (
+        "the tiered arm wrote nothing, so the untiered arm's silence says "
+        f"nothing about the tier. output={admitted.output!r}"
+    )
+    assert (tiered / "07-Voice" / "Rhetorical-Patterns" / "confessional.md").is_file()
+
+    assert refused.exit_code == 0, refused.output
+    assert "No rhetorical patterns written" in refused.output
+    assert not (untiered / "07-Voice" / "Rhetorical-Patterns").exists()
 
 
 def test_report_mode_profiles_no_data_is_friendly(tmp_path: Path) -> None:
@@ -1580,6 +2831,670 @@ def test_report_voice_command(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "Voice profile" in result.output or "voice profile" in result.output
     assert (vault / "07-Voice" / "confessional-profile.md").is_file()
+
+
+# ---- Issue #879: report --type voice must populate Register-Samples -------
+#
+# ``VoiceExemplarCollector.save_exemplars`` had no production caller, so
+# ``07-Voice/Register-Samples/`` was only ever written by tests: a real
+# vault got ``<register>-profile.md`` and an empty samples tree. These
+# tests pin the CLI wiring end to end — the copies exist, they carry the
+# source body rather than an empty one, both privacy gates still hold,
+# and a re-run neither duplicates nor orphans.
+
+_SAMPLES_SUBPATH = ("07-Voice", "Register-Samples")
+"""Vault-relative location of the persisted register samples."""
+
+
+def _voice_body(marker: str) -> str:
+    """Return a distinctive multi-sentence exemplar body carrying *marker*."""
+    return (
+        f"{marker} the creek of thought flows gently downstream. "
+        "It gathers what it passes and it carries the sediment on. "
+    ) * 20
+
+
+def _write_voice_fragment(
+    vault: Path,
+    frag_id: str,
+    *,
+    tier: str | None = "personal",
+    register: str = "confessional",
+    confidence: str = "conviction",
+    body: str | None = None,
+    title: str | None = None,
+    file_stem: str | None = None,
+) -> Path:
+    """Write one exemplar-eligible fragment with hand-built frontmatter.
+
+    Built from a literal template rather than ``Fragment.model_dump``
+    (which always emits a ``privacy_tier``) so ``tier=None`` produces a
+    file with the key genuinely **absent** — the legacy / hand-edited
+    shape that ``raw_privacy_tier`` fails closed to ``intimate``, and the
+    only shape that can tell a raw-frontmatter ceiling read apart from a
+    model-defaulted one. Same reasoning as
+    ``tests/test_cli_fill.py::_seed_fragment``.
+
+    Args:
+        vault: Vault root.
+        frag_id: Fragment id (also the file stem, unless *file_stem* says
+            otherwise).
+        tier: ``privacy_tier`` value, or ``None`` to omit the key entirely.
+        register: ``voice.voice_register`` value.
+        confidence: ``voice.confidence`` value.
+        body: Markdown body; defaults to a marked exemplar body.
+        title: ``title`` value. Defaults to ``f"Fragment {frag_id}"``, which
+            *contains* the id — so a test asserting that a title has been
+            scrubbed must pass a title that shares no substring with the id,
+            or it proves nothing the id assertion did not already prove.
+        file_stem: Filename stem to write under, when it must differ from
+            *frag_id*. The two diverge only for ids that cannot themselves
+            be filenames (an over-long id would raise ``OSError`` here,
+            before the code under test ever saw it).
+
+    Returns:
+        Path of the written fragment file.
+    """
+    folder = vault / "01-Fragments" / "Journal"
+    folder.mkdir(parents=True, exist_ok=True)
+    tier_line = f"privacy_tier: {tier}\n" if tier is not None else ""
+    resolved_title = f"Fragment {frag_id}" if title is None else title
+    target = folder / f"{file_stem or frag_id}.md"
+    target.write_text(
+        f'---\ntype: fragment\nid: {frag_id}\ntitle: "{resolved_title}"\n'
+        f"source:\n  platform: journal\n  author: self\n"
+        f"frequency:\n  primary: F5\n"
+        f"wavelength:\n  phase: rising\n  mode: express\n"
+        f"voice:\n  voice_register: {register}\n  confidence: {confidence}\n"
+        f"{tier_line}---\n{body if body is not None else _voice_body(frag_id)}\n",
+        encoding="utf-8",
+    )
+    return target
+
+
+def _samples_root(vault: Path) -> Path:
+    """Return the ``07-Voice/Register-Samples`` root for *vault*."""
+    return vault.joinpath(*_SAMPLES_SUBPATH)
+
+
+def _sample_relpaths(vault: Path) -> list[str]:
+    """Return every file under ``Register-Samples`` as sorted relative paths."""
+    root = _samples_root(vault)
+    if not root.is_dir():
+        return []
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+
+
+def _copied_names(vault: Path, register: str = "confessional") -> list[str]:
+    """Return the sorted exemplar filenames in *register*, minus the summary."""
+    register_dir = _samples_root(vault) / register
+    if not register_dir.is_dir():
+        return []
+    return sorted(p.name for p in register_dir.glob("*.md") if p.name != "_Summary.md")
+
+
+def _run_report_voice(vault: Path, *args: str) -> None:
+    """Invoke ``creek report --type voice`` on *vault* and assert it exits 0."""
+    result = runner.invoke(
+        app,
+        ["report", "--type", "voice", "--vault", str(vault), *args],
+    )
+    assert result.exit_code == 0, result.output
+
+
+def _voice_vault(tmp_path: Path) -> Path:
+    """Return a scaffolded, empty vault root ready for voice fragments."""
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    (vault / "01-Fragments").mkdir(parents=True)
+    return vault
+
+
+def test_report_voice_writes_register_samples(tmp_path: Path) -> None:
+    """``report --type voice`` copies ranked exemplars into Register-Samples.
+
+    The headline defect of #879: the command wrote
+    ``07-Voice/confessional-profile.md`` and left
+    ``07-Voice/Register-Samples/`` completely empty, because
+    ``save_exemplars`` had no production caller at all.
+    """
+    vault = _voice_vault(tmp_path)
+    for index in range(6):
+        _write_voice_fragment(vault, f"frag-rs-{index}")
+
+    _run_report_voice(vault)
+
+    register_dir = _samples_root(vault) / "confessional"
+    assert (register_dir / "_Summary.md").is_file()
+    assert _copied_names(vault) == [f"frag-rs-{index}.md" for index in range(6)]
+
+
+def test_report_voice_register_samples_carry_the_source_body(
+    tmp_path: Path,
+) -> None:
+    """Each copied sample is the source file verbatim, never an empty body.
+
+    ``_persist_fragment`` only copies the source when
+    ``self._records[fragment.id]`` exists, and ``_records`` is populated
+    **only** by ``collect_exemplars``. An implementation that builds a
+    second collector for the save, or calls ``save_exemplars`` without a
+    prior ``collect_exemplars`` on the same instance, silently falls back
+    to ``frontmatter.Post(content="", ...)`` and writes body-less samples
+    that pass every other assertion in this module. Byte equality is the
+    assertion that catches it.
+    """
+    import frontmatter
+
+    vault = _voice_vault(tmp_path)
+    source = _write_voice_fragment(
+        vault,
+        "frag-body-1",
+        body=_voice_body("unmistakable-exemplar-marker"),
+    )
+
+    _run_report_voice(vault)
+
+    copy = _samples_root(vault) / "confessional" / "frag-body-1.md"
+    assert copy.is_file()
+    copied = frontmatter.load(str(copy))
+    assert copied.content == frontmatter.load(str(source)).content
+    assert copied.content.strip() != ""
+    assert "unmistakable-exemplar-marker" in copied.content
+    assert copy.read_bytes() == source.read_bytes()
+
+
+def test_report_voice_register_samples_exclude_intimate_by_default(
+    tmp_path: Path,
+) -> None:
+    """A bare run copies no intimate fragment, and names none in the summary.
+
+    ``allow_intimate`` is the voice proxy's own consent gate and is not
+    CLI-exposed, so ``intimate`` content must stay out of the samples tree
+    even on an otherwise unfiltered run. The ``open`` control fragment is
+    what stops this passing vacuously on an implementation that copies
+    nothing at all.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-open-ctl", tier="open")
+    _write_voice_fragment(vault, "frag-intimate", tier="intimate")
+
+    _run_report_voice(vault)
+
+    assert _copied_names(vault) == ["frag-open-ctl.md"]
+    written = "\n".join(
+        path.read_text(encoding="utf-8") for path in _samples_root(vault).rglob("*.md")
+    )
+    assert "frag-intimate" not in written
+
+
+def test_report_voice_register_samples_honour_the_tier_ceiling(
+    tmp_path: Path,
+) -> None:
+    """``--include-tier open`` admits only ``open`` fragments to the samples.
+
+    On ``report`` the flag NARROWS (an absent flag means unfiltered), so
+    the ``personal`` fragment sits one rank above the declared ceiling and
+    must not be copied — while the ``open`` control proves the run copied
+    anything at all.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-open", tier="open")
+    _write_voice_fragment(vault, "frag-personal", tier="personal")
+
+    _run_report_voice(vault, "--include-tier", "open")
+
+    assert _copied_names(vault) == ["frag-open.md"]
+
+
+def test_report_voice_register_samples_fail_closed_on_an_absent_tier(
+    tmp_path: Path,
+) -> None:
+    """A fragment with no ``privacy_tier`` key at all is never copied.
+
+    The ceiling is asked of the **raw** frontmatter
+    (``privacy_filter.within_ceiling`` → ``raw_privacy_tier``), which
+    fails closed to ``intimate`` when the key is absent — a hand-edited or
+    legacy note carries less assurance than a pipeline-written one that
+    says ``unclassified`` out loud.
+
+    ``personal`` is the ceiling that makes this discriminating, and it is
+    the only one that does. A raw read ranks the untiered file with
+    ``intimate`` (rank 2) and excludes it; reading the tier through the
+    validated ``Fragment`` instead would apply the model's
+    ``unclassified`` default, which ranks with ``personal`` (rank 1,
+    #876) and would let it straight through. At ``--include-tier open``
+    both readings exclude it, so that ceiling proves nothing here. The
+    file is therefore written with the key genuinely stripped rather than
+    via ``model_dump``, which always emits one.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-personal-ctl", tier="personal")
+    _write_voice_fragment(vault, "frag-untiered", tier=None)
+
+    _run_report_voice(vault, "--include-tier", "personal")
+
+    assert _copied_names(vault) == ["frag-personal-ctl.md"]
+
+
+def test_report_voice_register_samples_are_idempotent(tmp_path: Path) -> None:
+    """A second run writes the same set of files, and no more of them."""
+    vault = _voice_vault(tmp_path)
+    for index in range(3):
+        _write_voice_fragment(vault, f"frag-idem-{index}")
+
+    _run_report_voice(vault)
+    first = _sample_relpaths(vault)
+    assert first, "the first run wrote nothing into Register-Samples"
+
+    _run_report_voice(vault)
+
+    assert _sample_relpaths(vault) == first
+
+
+def test_report_voice_prunes_samples_whose_fragment_is_gone(
+    tmp_path: Path,
+) -> None:
+    """A sample whose source fragment left the corpus is removed on re-run.
+
+    ``save_exemplars`` only ever ``mkdir``s and writes, so a fragment that
+    drops out of the corpus leaves its copy behind forever — a deleted or
+    purged fragment keeps a full-bodied copy of itself in the voice
+    samples tree indefinitely.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-keep")
+    dropped = _write_voice_fragment(vault, "frag-drop")
+
+    _run_report_voice(vault)
+    assert _copied_names(vault) == ["frag-drop.md", "frag-keep.md"]
+
+    dropped.unlink()
+    _run_report_voice(vault)
+
+    assert _copied_names(vault) == ["frag-keep.md"]
+
+
+def test_report_voice_prunes_a_sample_that_becomes_intimate(
+    tmp_path: Path,
+) -> None:
+    """Re-tiering a fragment to ``intimate`` removes its existing sample.
+
+    The privacy face of the same stale-copy bug: without pruning, a
+    fragment reclassified upward keeps a verbatim copy of its body in
+    ``Register-Samples`` that no gate will ever look at again.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-keep", tier="open")
+    _write_voice_fragment(vault, "frag-secret", tier="open")
+
+    _run_report_voice(vault)
+    assert _copied_names(vault) == ["frag-keep.md", "frag-secret.md"]
+
+    _write_voice_fragment(vault, "frag-secret", tier="intimate")
+    _run_report_voice(vault)
+
+    assert _copied_names(vault) == ["frag-keep.md"]
+    written = "\n".join(
+        path.read_text(encoding="utf-8") for path in _samples_root(vault).rglob("*.md")
+    )
+    assert "frag-secret" not in written
+
+
+def test_report_voice_pruning_spares_operator_notes(tmp_path: Path) -> None:
+    """Pruning removes stale samples only — never the operator's own files.
+
+    ``Register-Samples/<register>/`` is a vault folder an operator can put
+    notes in. A prune that clears anything it did not write turns a
+    housekeeping pass into data loss, and one that clears ``_Summary.md``
+    deletes the note it is about to rewrite.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-a")
+    _write_voice_fragment(vault, "frag-b")
+
+    _run_report_voice(vault)
+    register_dir = _samples_root(vault) / "confessional"
+    notes = register_dir / "My-Notes.md"
+    notes.write_text("# My reading notes\n\nHand written.\n", encoding="utf-8")
+
+    _run_report_voice(vault)
+
+    assert notes.read_text(encoding="utf-8") == "# My reading notes\n\nHand written.\n"
+    assert (register_dir / "_Summary.md").is_file()
+    assert (register_dir / "frag-a.md").is_file()
+    assert (register_dir / "frag-b.md").is_file()
+
+
+# ---- Issue #879, second pass: security-review findings --------------------
+#
+# Five defects the first pass left behind. Three of them share a root
+# cause: ``_prune_stale_copies`` decides "is this file mine to delete?"
+# with ``_is_generated_sample`` — "parses as ``type: fragment`` and its
+# ``id`` equals its own stem" — which is a *shape* test, not a record of
+# authorship. It answers "no" for a file this tool wrote (once ``creek
+# purge`` scrubs the id) and "yes" for a file it did not (an operator's
+# curated fragment). The fix replaces the heuristic with a manifest kept
+# in ``_Summary.md``; these tests are written against the behaviour, not
+# the manifest's internals.
+
+
+def _samples_text(vault: Path) -> str:
+    """Return every byte of markdown currently under ``Register-Samples``.
+
+    The residue assertions need to search the *whole* samples tree, not
+    just the copies: the summary note is markdown too, and it is where
+    the ids and titles of departed fragments were found to survive.
+    """
+    return "\n".join(
+        path.read_text(encoding="utf-8") for path in _samples_root(vault).rglob("*.md")
+    )
+
+
+def _load_register_summary(
+    vault: Path,
+    register: str = "confessional",
+) -> frontmatter.Post:
+    """Load the ``_Summary.md`` note for *register*.
+
+    Args:
+        vault: Vault root.
+        register: Canonical voice register whose summary note to read.
+
+    Returns:
+        The parsed summary note.
+    """
+    return frontmatter.load(str(_samples_root(vault) / register / "_Summary.md"))
+
+
+def test_report_voice_rewrites_the_summary_of_an_emptied_register(
+    tmp_path: Path,
+) -> None:
+    """A register that loses every exemplar must stop naming them.
+
+    ``save_exemplars`` prunes and then ``continue``s on an empty bucket,
+    *before* ``_write_summary`` — so the summary an earlier run wrote
+    survives the emptying intact. It goes on claiming the old
+    ``exemplar_count`` and goes on wikilinking the departed fragment by
+    both id **and title**, which is the residue that matters: the body
+    copy is pruned correctly, and the title is the part of a fragment
+    most likely to be self-describing.
+
+    ``test_report_voice_prunes_a_sample_that_becomes_intimate`` cannot
+    catch this. Its register keeps another exemplar, so the summary is
+    rewritten as a side effect of the register still being non-empty.
+    Here the re-tiered fragment is the register's **sole** exemplar.
+
+    The fix is to rewrite the summary, not to invent a new rendering:
+    ``_render_summary_body`` already renders an empty cohort as
+    ``_No exemplars collected._`` (pinned by
+    ``tests/test_voice_exemplars.py::...::
+    test_summary_body_lists_zero_exemplars_when_empty``). Nor may the fix
+    start writing summaries for registers that never had one —
+    ``tests/test_voice_exemplars.py::TestSaveExemplars::
+    test_skips_empty_registers`` holds that line.
+    """
+    vault = _voice_vault(tmp_path)
+    # A second register keeps the run itself non-empty, so this test cannot
+    # pass by way of the command doing nothing at all.
+    _write_voice_fragment(vault, "frag-ctl", tier="open")
+    secret_title = "My affair with the neighbour"
+    _write_voice_fragment(
+        vault,
+        "frag-secret",
+        tier="open",
+        register="analytical",
+        title=secret_title,
+    )
+
+    _run_report_voice(vault)
+    assert _copied_names(vault, "analytical") == ["frag-secret.md"]
+    assert _load_register_summary(vault, "analytical")["exemplar_count"] == 1
+
+    _write_voice_fragment(
+        vault,
+        "frag-secret",
+        tier="intimate",
+        register="analytical",
+        title=secret_title,
+    )
+    _run_report_voice(vault)
+
+    assert _copied_names(vault, "analytical") == []
+    residue = _samples_text(vault)
+    assert "frag-secret" not in residue
+    assert secret_title not in residue
+    emptied = _load_register_summary(vault, "analytical")
+    assert emptied["exemplar_count"] == 0
+    assert emptied["conviction_count"] == 0
+    assert emptied["settled_count"] == 0
+    assert "_No exemplars collected._" in emptied.content
+    # The control register is untouched: the rewrite is scoped, not a wipe.
+    assert _copied_names(vault) == ["frag-ctl.md"]
+
+
+def test_report_voice_pruning_spares_a_curated_fragment_copy(
+    tmp_path: Path,
+) -> None:
+    """A fragment the operator curated into the folder must survive a re-run.
+
+    ``_is_generated_sample`` returns ``True`` for *any* fragment note whose
+    ``id`` equals its stem — which is exactly the shape of a fragment an
+    operator copies in to keep as a permanent stylistic exemplar. The
+    first ``creek report --type voice`` (or ``creek fill``) after that
+    deletes it, irrecoverably, with no prompt and no dry-run.
+
+    ``test_report_voice_pruning_spares_operator_notes`` covers only the
+    easy case: a note with no frontmatter at all, which no id-equals-stem
+    check could ever claim. This one is a *real fragment file*, byte for
+    byte, and the prune has no honest way to tell it from its own output
+    — unless it stops guessing and consults a record of what it actually
+    wrote.
+
+    ``exploring`` confidence keeps the curated fragment out of the corpus,
+    so it is never in ``keep_ids`` and the prune has to make a real
+    decision about it.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-a")
+    _write_voice_fragment(vault, "frag-b")
+
+    _run_report_voice(vault)
+    register_dir = _samples_root(vault) / "confessional"
+
+    curated_source = _write_voice_fragment(
+        vault,
+        "frag-curated",
+        confidence="exploring",
+    )
+    curated = register_dir / "frag-curated.md"
+    curated.write_bytes(curated_source.read_bytes())
+
+    _run_report_voice(vault)
+
+    assert curated.is_file(), "the prune deleted a fragment the operator curated"
+    assert curated.read_bytes() == curated_source.read_bytes()
+    assert _copied_names(vault) == ["frag-a.md", "frag-b.md", "frag-curated.md"]
+
+
+def test_report_voice_prunes_a_copy_whose_id_purge_has_scrubbed(
+    tmp_path: Path,
+) -> None:
+    """``creek purge``'s id-scrub must not make a stale copy immortal.
+
+    ``purge fragment`` deletes the source and then walks every ``.md`` in
+    the vault rewriting the fragment's id to ``[purged]``. That walk
+    reaches ``07-Voice/Register-Samples/<register>/<id>.md``, whose id is
+    now the YAML list ``["purged"]`` — so ``Fragment.model_validate``
+    rejects it, ``_is_generated_sample`` answers ``False``, and the prune
+    that exists precisely to remove this file refuses to touch it. The
+    verbatim body of a purged fragment then survives every subsequent
+    run, permanently.
+
+    Scope (do not widen): that ``purge`` does not itself reach
+    ``07-Voice/`` synchronously is a **pre-existing** gap, verified at
+    unmodified HEAD — ``purge`` already leaves a purged body in
+    ``07-Voice/<register>-profile.md`` — and is tracked as issue #1211.
+    This test pins only the part #879 owns: its own prune must not be
+    disarmed by the scrub.
+    """
+    vault = _voice_vault(tmp_path)
+    marker = "purge-residue-marker-9f2a"
+    _write_voice_fragment(vault, "frag-purge-keep", body=_voice_body("keeper"))
+    _write_voice_fragment(vault, "frag-purge-gone", body=_voice_body(marker))
+
+    _run_report_voice(vault)
+    assert _copied_names(vault) == ["frag-purge-gone.md", "frag-purge-keep.md"]
+
+    purged = runner.invoke(
+        app,
+        ["purge", "fragment", "frag-purge-gone", "--vault", str(vault), "--yes"],
+    )
+    assert purged.exit_code == 0, purged.output
+
+    _run_report_voice(vault)
+
+    assert _copied_names(vault) == ["frag-purge-keep.md"]
+    assert marker not in _samples_text(vault)
+
+
+def test_report_voice_survives_an_unwritably_long_fragment_id(
+    tmp_path: Path,
+) -> None:
+    """One unusable id costs one exemplar, not the whole command.
+
+    ``_is_safe_sample_stem`` bounds an id's *content* but not its
+    *length*, so a 300-character id passes the guard and reaches
+    ``shutil.copy2``, which raises ``OSError`` (``[Errno 63] File name
+    too long``; ``ENAMETOOLONG`` on every filesystem with a 255-byte
+    ``NAME_MAX``). Nothing catches it, so ``creek report --type voice``
+    dies with a traceback — defeating the guard's own stated intent, that
+    "one unusable id is one unusable exemplar rather than a malformed
+    call, so the collector skips it and goes on saving the rest".
+
+    The long id sorts before ``frag-ok`` and is therefore persisted
+    first, so the surviving copy is a real assertion rather than an
+    artefact of ordering.
+
+    The id lives in the frontmatter of a *short-named* file: a source
+    file named after a 300-character id could not be written to disk at
+    all, and the defect is about ids, not paths.
+    """
+    vault = _voice_vault(tmp_path)
+    over_long_id = "a" * 300
+    _write_voice_fragment(vault, "frag-ok")
+    _write_voice_fragment(vault, over_long_id, file_stem="over-long-id")
+
+    _run_report_voice(vault)
+
+    assert _copied_names(vault) == ["frag-ok.md"]
+    assert (_samples_root(vault) / "confessional" / "_Summary.md").is_file()
+
+
+def test_report_voice_summary_stamps_an_unfiltered_tier_ceiling(
+    tmp_path: Path,
+) -> None:
+    """A bare run records ``tier_ceiling: all`` in the summary.
+
+    Regression pin for existing-but-unasserted behaviour, not a RED test.
+    The stamp is the sole mitigation for a real caveat that
+    ``_write_summary`` documents: a narrower ``--include-tier`` run
+    surveys a smaller corpus *and* prunes samples a wider run produced,
+    so two summaries taken at two ceilings describe two different corpora
+    and their counts are not comparable. Without the stamp there is
+    nothing on disk that says which corpus a given count came from,
+    which makes it load-bearing rather than cosmetic.
+
+    ``report``'s ``--include-tier`` narrows rather than widens, so an
+    absent flag means unfiltered — ``PrivacyTierOverride.ALL``.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-ceiling-all", tier="personal")
+
+    _run_report_voice(vault)
+
+    assert _load_register_summary(vault)["tier_ceiling"] == "all"
+
+
+def test_report_voice_summary_stamps_a_narrowed_tier_ceiling(
+    tmp_path: Path,
+) -> None:
+    """``--include-tier open`` records ``tier_ceiling: open``.
+
+    The other half of the pin above: the stamp must track the declared
+    ceiling, not be a constant. Together the two tests kill the mutant
+    that hardcodes either value.
+    """
+    vault = _voice_vault(tmp_path)
+    _write_voice_fragment(vault, "frag-ceiling-open", tier="open")
+
+    _run_report_voice(vault, "--include-tier", "open")
+
+    assert _load_register_summary(vault)["tier_ceiling"] == "open"
+
+
+def test_report_voice_narrowed_rerun_retracts_a_wider_runs_sample(
+    tmp_path: Path,
+) -> None:
+    """A narrower ``--include-tier`` re-run deletes what a wider run wrote.
+
+    ``docs/generation.md`` states this as a privacy remedy, not a
+    convenience: "A narrower ``--include-tier`` prunes what a wider run
+    wrote. This is the only way to retract above-ceiling copies after a
+    broad run." Nothing else retracts a persisted sample — there is no
+    un-persist flag, and deleting the source fragment is precisely the
+    move that used to leave its verbatim body behind. If this does not
+    hold, the documented remedy for "I ran ``report --type voice``
+    unfiltered on a vault I meant to keep narrow" does not exist.
+
+    ``test_report_voice_register_samples_honour_the_tier_ceiling`` cannot
+    catch a regression here: it proves only that a narrow ceiling excludes
+    on **write**, starting from an empty folder. Retraction is a different
+    path. The copy is already on disk; this run never sees the fragment at
+    all, because the ceiling drops it during ``collect_exemplars`` and so
+    its id never reaches ``keep_ids``; and the only thing entitling the
+    prune to delete the file is the digest the *wider* run recorded in
+    ``_Summary.md``. Break that manifest round-trip — write it under
+    another key, record ids the next run cannot reproduce, skip it when
+    the ceiling changes — and the above-ceiling copy becomes permanent
+    while every write-side ceiling test stays green.
+
+    The ``open`` fragment is the control at both ends: it proves the wide
+    run wrote more than the sample under test, and that the narrow re-run
+    *retracted* rather than merely emptied the samples tree.
+    """
+    vault = _voice_vault(tmp_path)
+    # A title sharing no substring with the id, so the title assertion
+    # below proves something the id assertion does not: the summary
+    # wikilinks a departed exemplar by both, and the title is the half a
+    # deleted body copy does not take with it.
+    retracted_title = "Midnight at the cannery"
+    _write_voice_fragment(
+        vault,
+        "frag-wide-only",
+        tier="personal",
+        title=retracted_title,
+    )
+    _write_voice_fragment(vault, "frag-both-runs", tier="open")
+
+    _run_report_voice(vault)
+
+    assert _copied_names(vault) == ["frag-both-runs.md", "frag-wide-only.md"]
+    wide = _load_register_summary(vault)
+    assert wide["tier_ceiling"] == "all"
+    assert wide["exemplar_count"] == 2
+
+    _run_report_voice(vault, "--include-tier", "open")
+
+    assert _copied_names(vault) == ["frag-both-runs.md"]
+    residue = _samples_text(vault)
+    assert "frag-wide-only" not in residue
+    assert retracted_title not in residue
+    # The control is still named in the tree it survived, so the
+    # retraction cannot have been a wipe of the samples folder.
+    assert "frag-both-runs" in residue
+    narrowed = _load_register_summary(vault)
+    assert narrowed["tier_ceiling"] == "open"
+    assert narrowed["exemplar_count"] == 1
 
 
 def _write_wavelength_fragment(vault: Path, frag_id: str) -> None:
@@ -1873,6 +3788,145 @@ def test_process_consent_is_per_source(tmp_path: Path) -> None:
     )
     assert blocked.exit_code == 1
     assert "consent" in blocked.output.lower() or "Non-interactive" in blocked.output
+
+
+def test_process_exits_cleanly_when_the_consent_log_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """``creek process`` refuses, rather than tracebacking, on a broken log.
+
+    A directory where ``consent-log.json`` belongs makes every read of
+    the log fail. The gate must translate that into the CLI's refusal
+    idiom — exit 1, a message naming the log — and must NOT report the
+    source as newly consented, which would overwrite the log.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text("Body\n")
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / d).mkdir(parents=True)
+    (vault / "00-Creek-Meta" / "Processing-Log" / "consent-log.json").mkdir(
+        parents=True
+    )
+
+    result = runner.invoke(
+        app,
+        ["process", "--source", str(src), "--vault", str(vault), "--yes"],
+    )
+
+    assert result.exit_code == 1
+    # A clean ``typer.Exit`` reaches CliRunner as SystemExit; an unhandled
+    # IsADirectoryError would land here instead and also exit 1.
+    assert isinstance(result.exception, SystemExit)
+    output = _strip_ansi(result.output)
+    # Rich may soft-wrap the long log path, so rejoin lines before matching.
+    assert "consent-log.json" in output.replace("\n", "")
+    assert "Consent auto-granted" not in " ".join(output.split())
+
+
+def test_ingest_exits_cleanly_when_the_consent_log_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    """``creek ingest`` shares the gate, so it shares the refusal.
+
+    ``ingest`` never constructs a ``Pipeline``, so a handler wrapped
+    around ``pipeline.run`` cannot cover this call site — only one
+    inside ``_gate_consent`` does.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text("# Hello\n\nFirst note about systems.\n")
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / d).mkdir(parents=True)
+    (vault / "00-Creek-Meta" / "Processing-Log" / "consent-log.json").mkdir(
+        parents=True
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "ingest",
+            "--type",
+            "markdown",
+            "--input",
+            str(src),
+            "--vault",
+            str(vault),
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    output = _strip_ansi(result.output)
+    assert "consent-log.json" in output.replace("\n", "")
+    assert "Consent auto-granted" not in " ".join(output.split())
+
+
+def test_process_reports_a_consent_log_that_breaks_mid_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A log readable at the gate but not at Stage 0 is still a refusal.
+
+    ``creek process`` reads the consent log twice: once in the gate, and
+    again in the pipeline's Stage 0 consent check. A log that goes away
+    between the two — a disk unmounting, a permissions change — surfaces
+    from inside ``pipeline.run`` rather than from the gate, so a
+    different handler has to catch it. Without one it exits as a raw
+    traceback, which reads like a crash rather than a refusal.
+    """
+    from creek.consent import ConsentLogUnavailableError, ConsentManager
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "note.md").write_text("# Hello\n\nFirst note about systems.\n")
+    vault = tmp_path / "vault"
+    for d in ("00-Creek-Meta", "01-Fragments", "02-Threads", "03-Eddies"):
+        (vault / d).mkdir(parents=True)
+
+    calls = {"n": 0}
+    real_check = ConsentManager.check_consent
+
+    def _breaks_after_the_gate(
+        self: ConsentManager, source_type: str, source_path: str
+    ) -> bool:
+        """Answer the gate honestly, then fail every later read.
+
+        Args:
+            self: The consent manager under test.
+            source_type: Source identifier passed through to the real call.
+            source_path: Source path passed through to the real call.
+
+        Returns:
+            The real answer, on the first call only.
+
+        Raises:
+            ConsentLogUnavailableError: On every call after the first.
+        """
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise ConsentLogUnavailableError(
+                vault / "00-Creek-Meta" / "Processing-Log" / "consent-log.json",
+                OSError("disk went away"),
+            )
+        return real_check(self, source_type, source_path)
+
+    monkeypatch.setattr(ConsentManager, "check_consent", _breaks_after_the_gate)
+
+    result = runner.invoke(
+        app,
+        ["process", "--source", str(src), "--vault", str(vault), "--yes"],
+    )
+
+    assert calls["n"] > 1, "the pipeline never re-read the consent log"
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    output = _strip_ansi(result.output).replace("\n", "")
+    assert "Consent log unavailable" in output
+    assert "disk went away" in output
 
 
 def test_process_aborts_on_unresolved_redactions(tmp_path: Path) -> None:
@@ -2266,7 +4320,9 @@ def test_draft_command_no_seeds(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     vault.mkdir()
@@ -2302,8 +4358,8 @@ def test_draft_command_happy_path(
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _p: "Generated draft body.",
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "Generated draft body.",
     )
 
     def _stub_mine_all(
@@ -2377,8 +4433,8 @@ def test_draft_cohesion_flag_smooths_body(
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: _two_phase,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: _two_phase,
     )
 
     def _stub_mine_all(
@@ -2410,13 +4466,25 @@ def test_draft_command_errors_when_llm_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Test that draft fails fast with exit 1 when the LLM is unavailable."""
+    """Test that draft exits 1 with a message when the LLM is unavailable.
+
+    The client is built when the generator knows the tier of the fragments
+    its prompt will carry (#1031), so the vault here holds a fragment and the
+    draft is seeded from it — a run that composes no prompt at all now
+    reaches no provider, which is the same choice ``creek_mcp.tools.draft``
+    made in #958 and is why this test seeds rather than running on an empty
+    vault.
+    """
     from creek.classify.llm import LLMClassifier
 
     monkeypatch.setattr(LLMClassifier, "available", property(lambda _self: False))
     vault = tmp_path / "vault"
-    vault.mkdir()
-    result = runner.invoke(app, ["draft", "--vault", str(vault)])
+    _seed_test_vault(vault)
+    _write_seed_fragment(vault, frag_id="frag-unavailable")
+    result = runner.invoke(
+        app,
+        ["draft", "--vault", str(vault), "--seed-fragment", "frag-unavailable"],
+    )
     assert result.exit_code == 1
     assert "LLM provider unavailable" in result.output
 
@@ -2627,7 +4695,9 @@ def test_draft_seed_empty_topic_falls_back_to_mining(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -2670,8 +4740,8 @@ def _stub_outline_detector(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _p: "Stitched body.",
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "Stitched body.",
     )
     monkeypatch.setattr(
         cli_module,
@@ -2752,7 +4822,9 @@ def test_draft_seed_outline_mutually_exclusive_inline_and_file(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -2782,7 +4854,9 @@ def test_draft_seed_outline_mutually_exclusive_with_topic(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -2810,7 +4884,9 @@ def test_draft_seed_outline_file_read_error_exits_two(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -2836,7 +4912,9 @@ def test_draft_seed_fragment_mutually_exclusive_with_topic(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -2864,7 +4942,9 @@ def test_draft_seed_fragment_mutually_exclusive_with_frequency(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -2892,7 +4972,9 @@ def test_draft_seed_invalid_frequency_lists_options(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -2920,7 +5002,9 @@ def test_draft_seed_invalid_phase_lists_options(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -2946,7 +5030,9 @@ def test_draft_seed_invalid_mode_lists_options(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -2975,8 +5061,8 @@ def test_draft_seed_fragment_happy_path(
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _p: "Body composed from frag-keep.",
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "Body composed from frag-keep.",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -3006,7 +5092,9 @@ def test_draft_seed_unknown_fragment_errors_cleanly(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -3035,8 +5123,10 @@ def test_draft_seed_dimensional_filters_combine(
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _p: "Composed from the per-dimension blend.",
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: (
+            lambda _t: lambda _p: "Composed from the per-dimension blend."
+        ),
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -3100,7 +5190,9 @@ def test_draft_seed_zero_match_exits_with_honest_message(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -3130,7 +5222,9 @@ def test_draft_seed_topic_with_frequency_filters_candidates(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "Draft."
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "Draft.",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -3179,7 +5273,9 @@ def test_draft_without_seed_flags_keeps_mining_behaviour(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -3207,7 +5303,9 @@ def test_draft_ontology_twist_without_seed_exits_with_clear_message(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -3231,7 +5329,9 @@ def test_draft_ontology_twist_plurality_failure_exits_cleanly(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -3270,8 +5370,8 @@ def test_draft_ontology_twist_happy_path_writes_twist_frontmatter(
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _p: "Twisted draft body.",
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "Twisted draft body.",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -3327,8 +5427,8 @@ def test_draft_seed_empty_body_exits_cleanly(
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _p: "   ",
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "   ",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -3351,8 +5451,8 @@ def test_draft_outline_empty_section_body_exits_cleanly(
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _p: "   ",
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "   ",
     )
     monkeypatch.setattr(
         cli_module,
@@ -3387,11 +5487,12 @@ def test_draft_max_tokens_threaded_to_builder(
 
     captured: dict[str, object] = {}
 
-    def _fake_builder(max_tokens: int | None = None) -> object:
+    def _fake_builder(config: object, max_tokens: int | None = None) -> object:
         captured["max_tokens"] = max_tokens
-        return lambda _p: DraftLLMResponse(text="Generated draft body.")
+        captured["config"] = config
+        return lambda _tier: lambda _p: DraftLLMResponse(text="Generated draft body.")
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", _fake_builder)
+    monkeypatch.setattr(cli_module, "_build_draft_llm_factory", _fake_builder)
 
     def _stub_mine_all(
         _self: object,
@@ -3432,18 +5533,13 @@ def test_draft_max_tokens_threaded_to_builder(
 def test_build_draft_llm_falls_back_to_config_max_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no flag, _build_draft_llm uses the loaded config's draft.max_tokens."""
+    """With no flag, the factory uses the passed config's draft.max_tokens."""
     from creek import cli as cli_module
     from creek.classify.llm.providers import AnthropicCompletion
     from creek.config import CreekConfig, DraftConfig
+    from creek.models import PrivacyTier
 
     captured: dict[str, object] = {}
-
-    monkeypatch.setattr(
-        cli_module,
-        "load_config",
-        lambda *_a, **_k: CreekConfig(draft=DraftConfig(max_tokens=2048)),
-    )
 
     class _Classifier:
         available = True
@@ -3463,8 +5559,10 @@ def test_build_draft_llm_falls_back_to_config_max_tokens(
 
     monkeypatch.setattr("creek.classify.llm.LLMClassifier", _Classifier)
 
-    llm = cli_module._build_draft_llm()
-    llm("a prompt")
+    factory = cli_module._build_draft_llm_factory(
+        CreekConfig(draft=DraftConfig(max_tokens=2048)),
+    )
+    factory(PrivacyTier.OPEN)("a prompt")
     assert captured["max_tokens"] == 2048
 
 
@@ -3951,3 +6049,199 @@ def test_ingest_no_warning_when_no_inputs_discovered(
 
     assert result.exit_code == 0, result.output
     assert "WARNING" not in result.output
+
+
+# ---- gdrive --download accounting (#1372) ----
+
+
+def _flat_output(text: str) -> str:
+    """Return *text* ANSI-free with Rich's soft wrapping collapsed to spaces.
+
+    The accounting line the tests below assert on is a single sentence Rich
+    is free to wrap; rejoining it means the assertion is about what the
+    operator reads, not about where the terminal happened to break it.
+
+    Args:
+        text: Raw captured CLI output.
+
+    Returns:
+        The single-spaced, escape-free form of *text*.
+    """
+    return " ".join(_strip_ansi(text).split())
+
+
+def _listed_drive_file(name: str) -> DriveFile:
+    """Build a Drive listing entry named *name*.
+
+    :class:`~creek.ingest.gdrive.DriveFile` is a frozen dataclass with no
+    defaults, so every field is supplied; only ``name`` is load-bearing here,
+    because it is the one thing an operator can act on.
+
+    Args:
+        name: The file name as Drive reports it.
+
+    Returns:
+        A fully populated listing entry.
+    """
+    from datetime import UTC, datetime
+
+    return DriveFile(
+        id=f"id-{name}",
+        name=name,
+        mime_type="application/octet-stream",
+        modified_time=datetime(2026, 4, 1, tzinfo=UTC),
+        size=2048,
+        parent_path="",
+    )
+
+
+class _CannedConnector:
+    """A Drive connector stand-in whose ``fetch_to`` returns a fixed result."""
+
+    def __init__(self, result: DownloadResult) -> None:
+        """Store the result ``fetch_to`` will hand back."""
+        self.result = result
+
+    def fetch_to(self, _staging: Path) -> DownloadResult:
+        """Return the canned result without contacting Drive."""
+        return self.result
+
+
+def _install_canned_download(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    result: DownloadResult,
+) -> None:
+    """Point ``creek gdrive --download`` at a connector yielding *result*.
+
+    ``build_drive_connector`` is imported inside the command body
+    (cli.py:4641), so the seam is the attribute on :mod:`creek.ingest.gdrive`
+    rather than a name bound in :mod:`creek.cli`.
+
+    Args:
+        monkeypatch: The test's patcher.
+        tmp_path: Somewhere harmless for the config's vault/source roots.
+        result: The outcome the download should report.
+    """
+    from creek.config import CreekConfig
+    from creek.ingest.gdrive import GoogleApiDriveClient
+
+    monkeypatch.setattr(
+        "creek.cli.load_config",
+        lambda *_a, **_k: CreekConfig(vault_path=tmp_path, source_drive=tmp_path),
+    )
+    monkeypatch.setattr(GoogleApiDriveClient, "is_available", lambda _self: True)
+    monkeypatch.setattr(
+        "creek.ingest.gdrive.build_drive_connector",
+        lambda *_a, **_k: _CannedConnector(result),
+    )
+
+
+class TestGdriveDownloadAccounting:
+    """``creek gdrive --download`` must account for every file it listed (#1372).
+
+    The handler printed ``Downloaded N / Skipped M (unchanged) files`` and
+    never looked at ``result.errors``, so a three-file listing where two files
+    403'd rendered as "Downloaded 1 / Skipped 0" and exited 0 — arithmetic the
+    operator cannot check, against a folder only Google can enumerate.
+    """
+
+    def test_every_listed_file_is_accounted_for(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Downloaded + Skipped + Failed covers the listing, and names the failures.
+
+        Both filenames, not just the count: a partial download is only
+        actionable if the operator knows which documents did not arrive.
+        """
+        staging = tmp_path / "stg"
+        _install_canned_download(
+            monkeypatch,
+            tmp_path,
+            DownloadResult(
+                downloaded=(staging / "alpha.docx",),
+                skipped=(),
+                errors=(
+                    (_listed_drive_file("beta.docx"), RuntimeError("HTTP 403")),
+                    (_listed_drive_file("gamma.docx"), RuntimeError("HTTP 500")),
+                ),
+            ),
+        )
+
+        result = runner.invoke(app, ["gdrive", "--download", "--staging", str(staging)])
+
+        flat = _flat_output(result.stdout)
+        assert "Downloaded 1 / Skipped 0 (unchanged) / Failed 2" in flat, flat
+        assert "beta.docx" in flat, flat
+        assert "gamma.docx" in flat, flat
+        assert result.exit_code == 0, result.output
+
+    def test_total_failure_exits_nonzero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing fetched, nothing already current, and errors — that is a failure.
+
+        A run that produced no files at all exited 0, so a schedule that
+        chains ``creek gdrive --download && creek ingest ...`` marched
+        straight on to ingest an empty staging directory and reported success.
+        """
+        staging = tmp_path / "stg"
+        _install_canned_download(
+            monkeypatch,
+            tmp_path,
+            DownloadResult(
+                downloaded=(),
+                skipped=(),
+                errors=((_listed_drive_file("beta.docx"), RuntimeError("HTTP 401")),),
+            ),
+        )
+
+        result = runner.invoke(app, ["gdrive", "--download", "--staging", str(staging)])
+
+        assert result.exit_code == 1, result.output
+
+    def test_a_warm_incremental_tick_with_one_failure_exits_zero(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two files already up to date plus one failure is not a failed run.
+
+        ``errors and not downloaded`` is the predicate that looks natural and
+        is wrong: on a warm incremental tick *every* healthy file is skipped
+        rather than downloaded, so that test would declare total failure for
+        the ordinary steady state — the case that runs every thirty minutes.
+        The skip set has to count as work that succeeded.
+        """
+        staging = tmp_path / "stg"
+        _install_canned_download(
+            monkeypatch,
+            tmp_path,
+            DownloadResult(
+                downloaded=(),
+                skipped=(staging / "alpha.docx", staging / "delta.docx"),
+                errors=((_listed_drive_file("beta.docx"), RuntimeError("HTTP 500")),),
+            ),
+        )
+
+        result = runner.invoke(app, ["gdrive", "--download", "--staging", str(staging)])
+
+        assert result.exit_code == 0, result.output
+
+    def test_attempted_accounts_for_every_listed_file(self, tmp_path: Path) -> None:
+        """``attempted`` is downloaded + skipped + errors — the size of the listing.
+
+        The number the printed accounting line is measured against. Kept as a
+        property on the result rather than recomputed at each call site, so
+        the CLI and any future caller cannot disagree about what "every file"
+        means.
+        """
+        result = DownloadResult(
+            downloaded=(tmp_path / "a",),
+            skipped=(tmp_path / "b", tmp_path / "c"),
+            errors=(
+                (_listed_drive_file("d.docx"), RuntimeError("x")),
+                (_listed_drive_file("e.docx"), RuntimeError("y")),
+                (_listed_drive_file("f.docx"), RuntimeError("z")),
+            ),
+        )
+
+        assert result.attempted == 6

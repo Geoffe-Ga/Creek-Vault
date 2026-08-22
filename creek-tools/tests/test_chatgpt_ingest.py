@@ -1461,3 +1461,117 @@ class TestLinearizeTreeParentOnlyMapping:
 
         texts = [m["content"]["parts"][0] for m in ordered]
         assert texts == ["Q", "long", "follow"]
+
+
+def _chain_conversation(
+    turns: list[tuple[str, str]],
+    title: str = "Consecutive Chat",
+    create_time: float = 1700042400.0,
+) -> dict[str, Any]:
+    """Build a ChatGPT conversation whose mapping is one linear chain.
+
+    Mirrors the node shape of :func:`_minimal_conversation` (root -> ... ->
+    leaf, each node carrying an ``author.role`` and text ``parts``) but lets
+    a test state the exact role sequence it needs.
+
+    Args:
+        turns: Ordered ``(role, text)`` pairs, one message node each.
+        title: Conversation title.
+        create_time: Unix epoch for the conversation; each node is stamped
+            ten seconds after its predecessor.
+
+    Returns:
+        A dict representing one ChatGPT conversation.
+    """
+    mapping: dict[str, Any] = {
+        "root": {"id": "root", "message": None, "parent": None, "children": []},
+    }
+    parent = "root"
+    for idx, (role, text) in enumerate(turns):
+        node_id = f"n{idx}"
+        mapping[parent]["children"] = [node_id]
+        mapping[node_id] = {
+            "id": node_id,
+            "message": {
+                "id": node_id,
+                "author": {"role": role},
+                "content": {"content_type": "text", "parts": [text]},
+                "create_time": create_time + 10.0 * (idx + 1),
+            },
+            "parent": parent,
+            "children": [],
+        }
+        parent = node_id
+    return {
+        "title": title,
+        "create_time": create_time,
+        "update_time": create_time + 100.0,
+        "mapping": mapping,
+    }
+
+
+class TestChatGPTConsecutiveMessages:
+    """Runs of same-role messages must all reach a fragment (issue #1333).
+
+    The old index walk paired a user message only with a strictly adjacent
+    assistant message, so the first of two consecutive user messages was
+    skipped, the second of two consecutive assistant messages was dropped,
+    and a system node between the turns broke the pair entirely — even
+    though system messages are documented as skipped.
+    """
+
+    def test_consecutive_user_messages_merge_into_human_fragment(self) -> None:
+        """Both user messages of a run land in the human fragment."""
+        conv = _chain_conversation(
+            [
+                ("user", "Part one"),
+                ("user", "Part two"),
+                ("assistant", "Reply"),
+            ]
+        )
+        ingestor = ChatGPTIngestor()
+        fragments = ingestor.parse(_make_raw_doc([conv]))
+
+        assert len(fragments) == 2
+        assert fragments[0].metadata["author_role"] == "self"
+        # Both halves of the operator's question, separated by a blank line.
+        assert fragments[0].content == "Part one\n\nPart two"
+        assert fragments[1].content == "Reply"
+
+    def test_consecutive_assistant_messages_merge_into_ai_fragment(self) -> None:
+        """Both assistant messages of a run land in the AI fragment."""
+        conv = _chain_conversation(
+            [
+                ("user", "Question"),
+                ("assistant", "A one"),
+                ("assistant", "A two"),
+            ]
+        )
+        ingestor = ChatGPTIngestor()
+        fragments = ingestor.parse(_make_raw_doc([conv]))
+
+        assert len(fragments) == 2
+        assert fragments[0].content == "Question"
+        assert fragments[1].metadata["author_role"] == "ai"
+        assert fragments[1].content == "A one\n\nA two"
+
+    def test_system_message_between_turns_does_not_break_the_pair(self) -> None:
+        """A system node mid-conversation is skipped, not a pair divider."""
+        conv = _chain_conversation(
+            [
+                ("user", "Question"),
+                ("system", "System prompt."),
+                ("assistant", "Reply"),
+            ]
+        )
+        ingestor = ChatGPTIngestor()
+        fragments = ingestor.parse(_make_raw_doc([conv]))
+
+        # Before #1333 this yielded zero fragments: the system node broke
+        # strict adjacency and the whole exchange was dropped.
+        assert len(fragments) == 2
+        assert fragments[0].content == "Question"
+        assert fragments[1].content == "Reply"
+        assert "System prompt." not in fragments[0].content
+        assert "System prompt." not in fragments[1].content
+        assert [f.metadata["author_role"] for f in fragments] == ["self", "ai"]

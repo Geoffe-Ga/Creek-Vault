@@ -1,0 +1,2044 @@
+"""``creek.report`` must honour the caller's tier ceiling in what it *writes* (#968).
+
+``report_tool`` accepts a ``privacy_tier_ceiling``, audits it and echoes it, but
+at the time these tests were written it never converted it and never threaded
+it into any of the six generators it fans out to. The consequence is not a
+read-side leak — the tool returns only ``report_paths``, never content — it is
+**above-ceiling content distilled into an unlabelled vault artifact** that every
+later reader treats as ordinary vault material.
+
+That shapes every assertion here: *nothing* in this module asserts on
+``report_tool``'s return value as evidence of exclusion. A test that did would
+have passed against the unfixed code and proved nothing. The evidence is always
+the bytes of the file the call wrote.
+
+Two properties of the existing generators had to be designed around, and both
+are the difference between a real test and a vacuous one:
+
+1. ``voice``, ``lexicon`` and ``rhetorical-patterns`` already drop ``intimate``
+   fragments via ``creek.generate.voice._eligible_register(allow_intimate=False)``.
+   An *intimate* canary in those fixtures would have been excluded by the
+   pre-existing filter and the test would have gone green without the ceiling
+   being enforced at all. Their above-ceiling canary is therefore ``personal``.
+2. ``rhetorical-patterns`` writes **no fragment-derived text** — three integer
+   counts and nothing else — so a substring sweep over its artifact passes for
+   free. Its gate is pinned by file-set (the above-ceiling fragment's register
+   note must not exist) and by count identity across ceilings instead.
+"""
+
+from __future__ import annotations
+
+import ast
+import importlib
+import inspect
+import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Final
+
+import frontmatter
+import pytest
+from typer.testing import CliRunner
+
+import creek
+import creek_mcp
+from creek.cli import app
+from creek.models import PrivacyTier
+from creek_mcp.tier_ceiling import TierCeiling
+from creek_mcp.tools.report import report_tool
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+    from types import ModuleType
+
+    from creek.classify.privacy_filter import PrivacyTierOverride
+
+runner = CliRunner()
+
+
+# ---------------------------------------------------------------------------
+# Canaries
+#
+# Plain sentinels rather than realistic prose: a leak cannot then be excused as
+# "that phrase could have come from anywhere". Restricted to ``[A-Za-z0-9-]``
+# because ``creek.generate.decisions._sanitize_title`` strips everything else
+# out of the filename it derives from a fragment title.
+# ---------------------------------------------------------------------------
+
+_OPEN_CANARY = "CANARY-RPT-OPEN-3a71"
+"""Below every ceiling under test — the mandatory positive control."""
+
+_INTIMATE_CANARY = "CANARY-RPT-INTIMATE-8c4e"
+"""Above ``ceiling=open`` for ``tags`` / ``decisions`` / ``mode-profiles``."""
+
+_PERSONAL_CANARY = "CANARY-RPT-PERSONAL-1f95"
+"""Above ``ceiling=open`` for the three voice-corpus reports (see module doc).
+
+Also the above-ceiling canary for ``decisions`` since #1431 — see
+:func:`_build_decisions_vault`.
+"""
+
+_NOTIER_CANARY = "CANARY-RPT-NOTIER-6b02"
+"""Carried by a fragment whose front matter has no ``privacy_tier`` key at all."""
+
+
+# Bodies for the voice-corpus fixture. ``sangha`` and ``dharma`` are members of
+# ``creek.generate.lexicon.TRADITION_GLOSSARIES["buddhist"]``, and
+# ``LexiconGenerator._build_borrowed_terms`` records the *whole surrounding
+# sentence* verbatim with no occurrence threshold — the cheapest way to get a
+# fragment's own prose copied into ``glossary.md`` byte for byte.
+_OPEN_VOICE_BODY = (
+    f"The sangha of {_OPEN_CANARY} gathers, and yet the room stays quiet."
+)
+_PERSONAL_VOICE_BODY = (
+    f"The dharma of {_PERSONAL_CANARY} is quiet, but also loud. "
+    "As I mentioned, it returns."
+)
+
+# The exact rhetorical-move tally ``_OPEN_VOICE_BODY`` produces: one paradox
+# construction ("and yet") and nothing else. Pinned as values rather than as a
+# bare "the two files match" so a gate that silently emptied the analytical
+# register would fail here too.
+_EXPECTED_ANALYTICAL_MOVES = {
+    "Self-deprecation before insight": 0,
+    "Paradox constructions": 1,
+    "Callbacks to earlier points": 0,
+}
+
+_MOVE_LINE_RE = re.compile(r"^- (?P<label>[^:\n]+): (?P<count>\d+)\.$", re.MULTILINE)
+"""Matches one ``- <label>: <n>.`` line of ``_format_rhetorical_moves`` output."""
+
+
+# ---------------------------------------------------------------------------
+# Vault-building helpers
+#
+# Kept in this file rather than conftest.py: every fixture here is shaped around
+# one specific generator's admission conditions, and moving them to shared scope
+# would invite a later edit to "simplify" one of those conditions away.
+# ---------------------------------------------------------------------------
+
+
+def _new_vault(root: Path, name: str) -> Path:
+    """Create an empty vault skeleton under *root* and return its path.
+
+    ``TagGardenGenerator.generate_garden`` writes ``00-Creek-Meta/Tag-Garden.md``
+    without creating its parent directory, so the meta folder is part of the
+    skeleton rather than something each caller remembers.
+
+    Args:
+        root: Directory the vault is created inside (typically ``tmp_path``).
+        name: Vault directory name, so one test can build several vaults.
+
+    Returns:
+        The vault root.
+    """
+    vault = root / name
+    (vault / "00-Creek-Meta").mkdir(parents=True, exist_ok=True)
+    (vault / "01-Fragments" / "Notes").mkdir(parents=True, exist_ok=True)
+    return vault
+
+
+def _write_note(
+    vault: Path,
+    relpath: str,
+    metadata: dict[str, Any],
+    body: str,
+) -> Path:
+    """Write one markdown note with YAML front matter into the vault.
+
+    Args:
+        vault: Vault root.
+        relpath: Vault-relative destination path.
+        metadata: Front-matter mapping, written verbatim — a key omitted here
+            is a key genuinely absent from the file, which is the distinction
+            the fail-closed tier read depends on.
+        body: Markdown body.
+
+    Returns:
+        The path written.
+    """
+    target = vault / relpath
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        frontmatter.dumps(frontmatter.Post(content=body, **metadata)),
+        encoding="utf-8",
+    )
+    return target
+
+
+def _fragment_metadata(
+    *,
+    frag_id: str,
+    title: str,
+    privacy_tier: str | None,
+    tags: list[str] | None = None,
+    mode: str | None = None,
+    register: str | None = None,
+    confidence: str = "settled",
+) -> dict[str, Any]:
+    """Build fragment front matter, omitting keys the caller did not ask for.
+
+    Args:
+        frag_id: Fragment id.
+        title: Fragment title — the carrier for the ``decisions`` and
+            ``mode-profiles`` canaries.
+        privacy_tier: The declared tier, or ``None`` to omit the key entirely.
+            ``None`` is not the same as ``"unclassified"``: the model defaults a
+            missing key to ``unclassified``, and only the raw front matter can
+            still tell the two apart.
+        tags: Obsidian tags — the carrier for the ``tags`` canaries.
+        mode: Wavelength engagement mode; set to make the fragment visible to
+            ``mode-profiles``.
+        register: Voice register; set to make the fragment exemplar-eligible.
+        confidence: Voice confidence. Must be ``settled`` or ``conviction`` for
+            ``_eligible_register`` to admit the fragment.
+
+    Returns:
+        A front-matter mapping ready for :func:`_write_note`.
+    """
+    meta: dict[str, Any] = {
+        "type": "fragment",
+        "id": frag_id,
+        "title": title,
+        "source": {"platform": "journal", "author": "self"},
+        "frequency": {"primary": "F5", "secondary": []},
+    }
+    if privacy_tier is not None:
+        meta["privacy_tier"] = privacy_tier
+    if tags is not None:
+        meta["tags"] = tags
+    if mode is not None:
+        meta["wavelength"] = {"phase": "rising", "mode": mode}
+    if register is not None:
+        meta["voice"] = {"voice_register": register, "confidence": confidence}
+    return meta
+
+
+def _build_tags_vault(root: Path) -> Path:
+    """Seed one ``open`` and one ``intimate`` fragment, each with a tag canary.
+
+    Args:
+        root: Directory the vault is created inside.
+
+    Returns:
+        The vault root.
+    """
+    vault = _new_vault(root, "tags-vault")
+    _write_note(
+        vault,
+        "01-Fragments/Notes/frag-open.md",
+        _fragment_metadata(
+            frag_id="frag-open",
+            title="Open note",
+            privacy_tier="open",
+            tags=[_OPEN_CANARY],
+        ),
+        "Open body.",
+    )
+    _write_note(
+        vault,
+        "01-Fragments/Notes/frag-intimate.md",
+        _fragment_metadata(
+            frag_id="frag-intimate",
+            title="Intimate note",
+            privacy_tier="intimate",
+            tags=[_INTIMATE_CANARY],
+        ),
+        "Intimate body.",
+    )
+    return vault
+
+
+def _build_decisions_vault(root: Path) -> Path:
+    """Seed three decision-signalling fragments: ``open``, ``personal``, ``intimate``.
+
+    All three titles open with ``"Should I"`` so
+    ``DecisionDetector._detect_keywords`` flags them; the canary rides in the
+    title, which ends up verbatim in the generated note's filename *and* its
+    ``title:`` front matter. ``08-Decisions/Active/`` is deliberately left
+    absent so the idempotency skip in ``_existing_decision_fragment_ids``
+    cannot suppress any note.
+
+    The ``personal`` fragment exists because of #1431. ``generate_decisions``
+    now carries an unconditional intimate screen on top of the ceiling gate, so
+    the ``intimate`` fragment is written at *no* ceiling — which would make the
+    two permissive-direction proofs vacuous if they kept using it as their
+    above-ceiling canary. ``personal`` is the tier that is *above*
+    ``ceiling=open`` (so ``test_report_at_open_ceiling_excludes_above_ceiling_content``
+    and the inverted-gate obedience proof stay real) yet *below* the new screen
+    (so ``test_report_at_all_ceiling_admits_everything`` still proves that
+    ``ALL`` filters nothing it is not required to). The ``intimate`` fragment
+    stays exactly as it was: it is the subject of
+    :func:`test_decisions_never_names_an_intimate_fragment_at_any_ceiling`.
+
+    Args:
+        root: Directory the vault is created inside.
+
+    Returns:
+        The vault root.
+    """
+    vault = _new_vault(root, "decisions-vault")
+    _write_note(
+        vault,
+        "01-Fragments/Notes/frag-open.md",
+        _fragment_metadata(
+            frag_id="frag-open",
+            title=f"Should I keep {_OPEN_CANARY}",
+            privacy_tier="open",
+        ),
+        "Open body.",
+    )
+    _write_note(
+        vault,
+        "01-Fragments/Notes/frag-intimate.md",
+        _fragment_metadata(
+            frag_id="frag-intimate",
+            title=f"Should I keep {_INTIMATE_CANARY}",
+            privacy_tier="intimate",
+        ),
+        "Intimate body.",
+    )
+    _write_note(
+        vault,
+        "01-Fragments/Notes/frag-personal.md",
+        _fragment_metadata(
+            frag_id="frag-personal",
+            title=f"Should I keep {_PERSONAL_CANARY}",
+            privacy_tier="personal",
+        ),
+        "Personal body.",
+    )
+    return vault
+
+
+def _build_mode_profiles_vault(root: Path) -> Path:
+    """Seed two ``express``-mode fragments, one ``open`` and one ``intimate``.
+
+    Both share the same mode on purpose: ``05-Wavelength/Mode-Profiles/express.md``
+    is then written at *every* ceiling, so "the above-ceiling title is absent"
+    cannot be satisfied by the note simply not existing.
+
+    Args:
+        root: Directory the vault is created inside.
+
+    Returns:
+        The vault root.
+    """
+    vault = _new_vault(root, "mode-profiles-vault")
+    _write_note(
+        vault,
+        "01-Fragments/Notes/frag-open.md",
+        _fragment_metadata(
+            frag_id="frag-open",
+            title=f"Express note {_OPEN_CANARY}",
+            privacy_tier="open",
+            mode="express",
+        ),
+        "Open body.",
+    )
+    _write_note(
+        vault,
+        "01-Fragments/Notes/frag-intimate.md",
+        _fragment_metadata(
+            frag_id="frag-intimate",
+            title=f"Express note {_INTIMATE_CANARY}",
+            privacy_tier="intimate",
+            mode="express",
+        ),
+        "Intimate body.",
+    )
+    return vault
+
+
+def _build_voice_vault(root: Path) -> Path:
+    """Seed two exemplar-eligible fragments in *different* registers.
+
+    The above-ceiling fragment is ``personal``, not ``intimate``: the voice
+    corpus already excludes ``intimate`` regardless of the ceiling, so an
+    intimate canary here would prove nothing (see the module docstring).
+
+    The registers are segregated — ``open`` is ``analytical``, ``personal`` is
+    ``confessional`` — so ``rhetorical-patterns``, which writes no
+    fragment-derived text at all, can still be pinned by which per-register
+    files exist.
+
+    Args:
+        root: Directory the vault is created inside.
+
+    Returns:
+        The vault root.
+    """
+    vault = _new_vault(root, "voice-vault")
+    _write_note(
+        vault,
+        "01-Fragments/Notes/frag-open-voice.md",
+        _fragment_metadata(
+            frag_id="frag-open-voice",
+            title="Open exemplar",
+            privacy_tier="open",
+            register="analytical",
+        ),
+        _OPEN_VOICE_BODY,
+    )
+    _write_note(
+        vault,
+        "01-Fragments/Notes/frag-personal-voice.md",
+        _fragment_metadata(
+            frag_id="frag-personal-voice",
+            title="Personal exemplar",
+            privacy_tier="personal",
+            register="confessional",
+        ),
+        _PERSONAL_VOICE_BODY,
+    )
+    return vault
+
+
+def _build_eddy_vault(root: Path) -> Path:
+    """Seed an ``open`` fragment plus a tagged eddy note under ``03-Eddies``.
+
+    ``TagGardenGenerator`` scans five directories, not one. An eddy carries no
+    ``privacy_tier`` of its own but its tags are derived from its member
+    fragments, so it is a second, independent route for the same leak.
+
+    Args:
+        root: Directory the vault is created inside.
+
+    Returns:
+        The vault root.
+    """
+    vault = _new_vault(root, "eddy-vault")
+    _write_note(
+        vault,
+        "01-Fragments/Notes/frag-open.md",
+        _fragment_metadata(
+            frag_id="frag-open",
+            title="Open note",
+            privacy_tier="open",
+            tags=[_OPEN_CANARY],
+        ),
+        "Open body.",
+    )
+    _write_note(
+        vault,
+        "03-Eddies/eddy-canary.md",
+        {
+            "type": "eddy",
+            "id": "eddy-canary",
+            "title": "Canary eddy",
+            "tags": [_INTIMATE_CANARY],
+        },
+        "Eddy body.",
+    )
+    return vault
+
+
+def _build_untiered_vault(root: Path) -> Path:
+    """Seed a fragment with **no** ``privacy_tier`` key beside an ``open`` one.
+
+    Args:
+        root: Directory the vault is created inside.
+
+    Returns:
+        The vault root.
+    """
+    vault = _new_vault(root, "untiered-vault")
+    _write_note(
+        vault,
+        "01-Fragments/Notes/frag-open.md",
+        _fragment_metadata(
+            frag_id="frag-open",
+            title="Open note",
+            privacy_tier="open",
+            tags=[_OPEN_CANARY],
+        ),
+        "Open body.",
+    )
+    _write_note(
+        vault,
+        "01-Fragments/Notes/frag-notier.md",
+        _fragment_metadata(
+            frag_id="frag-notier",
+            title="Untiered note",
+            privacy_tier=None,
+            tags=[_NOTIER_CANARY],
+        ),
+        "Untiered body.",
+    )
+    return vault
+
+
+# ---------------------------------------------------------------------------
+# Artifact inspection helpers
+# ---------------------------------------------------------------------------
+
+
+def _artifact_files(vault: Path, roots: tuple[str, ...]) -> list[Path]:
+    """Return every file beneath the given vault-relative artifact *roots*.
+
+    Args:
+        vault: Vault root.
+        roots: Vault-relative directories (or files) the report writes into.
+
+    Returns:
+        Sorted list of existing files. Absent roots contribute nothing, so a
+        report that wrote no artifact yields an empty list rather than raising —
+        the positive-control assertions are what catch that case.
+    """
+    out: list[Path] = []
+    for root in roots:
+        base = vault / root
+        if not base.exists():
+            continue
+        if base.is_file():
+            out.append(base)
+            continue
+        out.extend(sorted(p for p in base.rglob("*") if p.is_file()))
+    return out
+
+
+def _artifact_blob(vault: Path, roots: tuple[str, ...]) -> str:
+    """Return every artifact's vault-relative path and text, concatenated.
+
+    Paths are included alongside contents because one of the six reports —
+    ``decisions`` — puts the fragment title verbatim into the *filename*. A
+    contents-only sweep would miss it entirely.
+
+    Args:
+        vault: Vault root.
+        roots: Vault-relative artifact roots.
+
+    Returns:
+        One string covering every artifact path and body.
+    """
+    parts: list[str] = []
+    for path in _artifact_files(vault, roots):
+        parts.append(str(path.relative_to(vault)))
+        parts.append(path.read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(parts)
+
+
+def _snapshot(vault: Path) -> dict[Path, bytes]:
+    """Return the full byte contents of every file in the vault.
+
+    Bytes rather than ``(mtime_ns, size)``: a report that rewrites a file with
+    same-length content inside one filesystem timestamp tick would look
+    unchanged to a stat-based snapshot, and "unchanged" is exactly the state
+    this snapshot is used to rule out.
+
+    Args:
+        vault: Vault root.
+
+    Returns:
+        Mapping of path to contents.
+    """
+    return {p: p.read_bytes() for p in vault.rglob("*") if p.is_file()}
+
+
+def _changed_files(vault: Path, before: dict[Path, bytes]) -> list[Path]:
+    """Return every file that is new or whose bytes differ from *before*.
+
+    Args:
+        vault: Vault root.
+        before: A :func:`_snapshot` taken before the call under test.
+
+    Returns:
+        Sorted list of new-or-modified files.
+    """
+    return sorted(
+        p for p in vault.rglob("*") if p.is_file() and before.get(p) != p.read_bytes()
+    )
+
+
+def _new_tags_section(garden: str) -> str:
+    """Return the ``### New Tags`` block of a rendered Tag Garden.
+
+    Args:
+        garden: The full ``Tag-Garden.md`` text.
+
+    Returns:
+        The text between ``### New Tags`` and the next ``## `` heading, or the
+        empty string when the section is absent.
+    """
+    marker = "### New Tags"
+    start = garden.find(marker)
+    if start == -1:
+        return ""
+    rest = garden[start + len(marker) :]
+    end = rest.find("\n## ")
+    return rest if end == -1 else rest[:end]
+
+
+def _move_counts(note: str) -> dict[str, int]:
+    """Parse the ``### Rhetorical Moves`` counts out of a register note.
+
+    Args:
+        note: The full text of a ``07-Voice/Rhetorical-Patterns/<register>.md``.
+
+    Returns:
+        Mapping of move label to its integer count.
+    """
+    return {
+        match.group("label"): int(match.group("count"))
+        for match in _MOVE_LINE_RE.finditer(note)
+    }
+
+
+# ---------------------------------------------------------------------------
+# The six report types, described once
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ReportCase:
+    """One report type plus everything needed to judge what it wrote.
+
+    Attributes:
+        report_type: The ``report_type`` argument to ``report_tool``.
+        build: Builds this report's fixture vault under a given root.
+        above_canary: The sentinel carried by the above-ceiling fragment.
+        below_canary: The sentinel carried by the below-ceiling fragment, or
+            ``None`` for ``rhetorical-patterns``, whose artifact contains no
+            fragment-derived text for a substring check to find.
+        artifact_roots: Vault-relative roots this report writes into.
+        positive_glob: A vault-relative glob that must match at least one file
+            at ``ceiling=open`` — the proof the generator ran at all.
+        forbidden_glob: A vault-relative glob that must match nothing at
+            ``ceiling=open`` and something at ``ceiling=all``, or ``None`` when
+            the report writes a single ceiling-independent file.
+    """
+
+    report_type: str
+    build: Callable[[Path], Path]
+    above_canary: str
+    below_canary: str | None
+    artifact_roots: tuple[str, ...]
+    positive_glob: str
+    forbidden_glob: str | None
+
+
+_CASES: tuple[_ReportCase, ...] = (
+    _ReportCase(
+        report_type="tags",
+        build=_build_tags_vault,
+        above_canary=_INTIMATE_CANARY,
+        below_canary=_OPEN_CANARY,
+        artifact_roots=("00-Creek-Meta",),
+        positive_glob="00-Creek-Meta/Tag-Garden.md",
+        forbidden_glob=None,
+    ),
+    _ReportCase(
+        report_type="decisions",
+        build=_build_decisions_vault,
+        # ``personal``, not ``intimate`` (#1431): ``generate_decisions`` screens
+        # intimate fragments unconditionally, so an intimate above-canary would
+        # be absent at *every* ceiling and the ALL-admits-everything and
+        # inverted-gate proofs would both pass without the gate doing anything.
+        above_canary=_PERSONAL_CANARY,
+        below_canary=_OPEN_CANARY,
+        artifact_roots=("08-Decisions",),
+        positive_glob="08-Decisions/Active/*.md",
+        forbidden_glob=None,
+    ),
+    _ReportCase(
+        report_type="mode-profiles",
+        build=_build_mode_profiles_vault,
+        above_canary=_INTIMATE_CANARY,
+        below_canary=_OPEN_CANARY,
+        artifact_roots=("05-Wavelength",),
+        positive_glob="05-Wavelength/Mode-Profiles/express.md",
+        forbidden_glob=None,
+    ),
+    _ReportCase(
+        report_type="voice",
+        build=_build_voice_vault,
+        above_canary=_PERSONAL_CANARY,
+        below_canary=_OPEN_CANARY,
+        artifact_roots=("07-Voice",),
+        positive_glob="07-Voice/analytical-profile.md",
+        forbidden_glob="07-Voice/confessional-profile.md",
+    ),
+    _ReportCase(
+        report_type="lexicon",
+        build=_build_voice_vault,
+        above_canary=_PERSONAL_CANARY,
+        below_canary=_OPEN_CANARY,
+        artifact_roots=("07-Voice/Lexicon",),
+        positive_glob="07-Voice/Lexicon/glossary.md",
+        forbidden_glob=None,
+    ),
+    _ReportCase(
+        report_type="rhetorical-patterns",
+        build=_build_voice_vault,
+        above_canary=_PERSONAL_CANARY,
+        below_canary=None,
+        artifact_roots=("07-Voice/Rhetorical-Patterns",),
+        positive_glob="07-Voice/Rhetorical-Patterns/analytical.md",
+        forbidden_glob="07-Voice/Rhetorical-Patterns/confessional.md",
+    ),
+)
+"""The ceiling-aware report types with a canary fixture, in dispatch order.
+
+Not the whole surface: ``creek.report`` routes all eleven of
+:data:`creek.surface_modes.REPORT_TYPES` (#1253), of which four are refused
+below ``ceiling=all`` precisely *because* their generators cannot be filtered,
+and ``decisions`` / ``mode-profiles`` / ``wavelength`` are ceiling-aware but
+have no canary vault here yet. Completeness of the surface itself is asserted
+by ``tests/test_mcp_write_tools.py``; this list is about leak evidence.
+"""
+
+_CASE_IDS = [case.report_type for case in _CASES]
+
+_CASE_BY_TYPE = {case.report_type: case for case in _CASES}
+
+
+# ---------------------------------------------------------------------------
+# T1 / T2 — exclusion in both directions, with positive controls
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("case", _CASES, ids=_CASE_IDS)
+def test_report_at_open_ceiling_excludes_above_ceiling_content(
+    case: _ReportCase,
+    tmp_path: Path,
+) -> None:
+    """No report writes above-ceiling content into its artifact at ``open``.
+
+    Asserted against the artifact bytes and the artifact *paths*, never against
+    ``report_tool``'s response. The response carries only ``report_paths``, so a
+    response-level assertion is satisfied by the unfixed code and proves
+    nothing; the leak has always been the file.
+
+    The below-ceiling canary is asserted *present* in the same test, and that is
+    not decoration: without it, a generator that filtered everything out — or
+    crashed into writing an empty file — would satisfy the exclusion assertion
+    perfectly while being an outage rather than a gate.
+
+    ``rhetorical-patterns`` has no below-ceiling substring to assert (its
+    artifact is three integers), so its positive control is the file-set: the
+    ``open`` fragment's register note must exist while the ``personal``
+    fragment's must not.
+
+    Args:
+        case: The report type under test and its fixture.
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = case.build(tmp_path)
+    result = report_tool(
+        vault_path=vault,
+        report_type=case.report_type,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "ok"
+
+    blob = _artifact_blob(vault, case.artifact_roots)
+    assert case.above_canary not in blob, (
+        f"report_type={case.report_type!r} at privacy_tier_ceiling=open wrote "
+        f"the above-ceiling sentinel {case.above_canary!r} into "
+        f"{case.artifact_roots}. The response was clean — it always is — so the "
+        f"only place this shows up is the artifact:\n\n{blob}"
+    )
+    assert list(vault.glob(case.positive_glob)), (
+        f"report_type={case.report_type!r} wrote nothing matching "
+        f"{case.positive_glob!r} at ceiling=open, so the exclusion assertion "
+        "above is vacuous. A gate that drops everything is an outage."
+    )
+    if case.below_canary is not None:
+        assert case.below_canary in blob, (
+            f"report_type={case.report_type!r} dropped the below-ceiling "
+            f"sentinel {case.below_canary!r} at ceiling=open. Admitted content "
+            "must still reach the artifact."
+        )
+    if case.forbidden_glob is not None:
+        assert not list(vault.glob(case.forbidden_glob)), (
+            f"report_type={case.report_type!r} wrote "
+            f"{case.forbidden_glob!r} at ceiling=open. That file exists only "
+            "because an above-ceiling fragment was admitted to the corpus, "
+            "even though the file's own contents name no fragment."
+        )
+
+
+@pytest.mark.parametrize("case", _CASES, ids=_CASE_IDS)
+def test_report_at_all_ceiling_admits_everything(
+    case: _ReportCase,
+    tmp_path: Path,
+) -> None:
+    """``ceiling=all`` is the explicit override: nothing is filtered out.
+
+    The permissive direction has to be pinned as hard as the restrictive one.
+    Every assertion in the test above is satisfied by a generator that writes an
+    empty artifact at every ceiling, so without this test "the ceiling is
+    enforced" and "the report is broken" are indistinguishable.
+
+    ``rhetorical-patterns`` is exempt from the substring half, and it has to be:
+    its artifact is three integer counts, so *neither* sentinel is findable in
+    it by a sweep — in either direction. A ``ceiling=all`` assertion that the
+    above-ceiling canary is present would be false by construction rather than
+    by regression. Its permissive-direction evidence is the ``forbidden_glob``
+    assertion at the end of this test (the above-ceiling fragment's register
+    note must exist at ``ceiling=all``) plus
+    :func:`test_rhetorical_pattern_counts_are_identical_across_ceilings`.
+    ``below_canary is None`` is the flag for that case — it marks the artifact,
+    not the tier, which is why it gates both sentinels here.
+
+    ``decisions`` carries one further rule this test deliberately does not
+    weaken (#1431): on top of the ceiling it applies an *unconditional*
+    ``intimate`` screen, because its artifact's filename is a source
+    fragment's title. Rather than soften the invariant above for that row, its
+    ``above_canary`` was moved onto a ``personal`` fragment — above
+    ``ceiling=open``, below the screen — so the assertion here still means
+    exactly what it says. The invariant itself, and its wording, stay verbatim
+    for all six report types; the intimate case is proved separately by
+    :func:`test_decisions_never_names_an_intimate_fragment_at_any_ceiling`.
+
+    Args:
+        case: The report type under test and its fixture.
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = case.build(tmp_path)
+    result = report_tool(
+        vault_path=vault,
+        report_type=case.report_type,
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    assert result["status"] == "ok"
+
+    blob = _artifact_blob(vault, case.artifact_roots)
+    if case.below_canary is not None:
+        assert case.above_canary in blob, (
+            f"report_type={case.report_type!r} at ceiling=all dropped "
+            f"{case.above_canary!r}. ALL is the operator's explicit override; "
+            "filtering under it is a regression, not caution."
+        )
+        assert case.below_canary in blob
+    assert list(vault.glob(case.positive_glob))
+    if case.forbidden_glob is not None:
+        assert list(vault.glob(case.forbidden_glob)), (
+            f"report_type={case.report_type!r} at ceiling=all did not write "
+            f"{case.forbidden_glob!r}, so the file-set assertion at ceiling=open "
+            "could be passing because the file is never written at all."
+        )
+
+
+def test_rhetorical_pattern_counts_are_identical_across_ceilings(
+    tmp_path: Path,
+) -> None:
+    """The admitted register's counts do not move when the ceiling widens.
+
+    ``rhetorical-patterns`` is the one report whose artifact contains no
+    fragment-derived string, so a canary sweep over it is structurally vacuous.
+    Two properties replace it: the file-set assertions in the two tests above,
+    and this one — the numbers in ``analytical.md`` must be byte-identical at
+    ``ceiling=open`` and ``ceiling=all``.
+
+    That is what rules out the subtler failure the file-set check cannot see: an
+    above-ceiling fragment being folded into an *admitted* register's corpus,
+    which would leave the file names unchanged and only shift the counts.
+
+    The expected tally is pinned by value as well as by equality, so a
+    generator that emptied the analytical corpus (making both files trivially
+    equal at zero) fails here.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    open_vault = _build_voice_vault(tmp_path / "open-ceiling")
+    all_vault = _build_voice_vault(tmp_path / "all-ceiling")
+    report_tool(
+        vault_path=open_vault,
+        report_type="rhetorical-patterns",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    report_tool(
+        vault_path=all_vault,
+        report_type="rhetorical-patterns",
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    relpath = "07-Voice/Rhetorical-Patterns/analytical.md"
+    at_open = (open_vault / relpath).read_text(encoding="utf-8")
+    at_all = (all_vault / relpath).read_text(encoding="utf-8")
+    assert _move_counts(at_open) == _EXPECTED_ANALYTICAL_MOVES
+    assert _move_counts(at_all) == _EXPECTED_ANALYTICAL_MOVES
+
+
+# ---------------------------------------------------------------------------
+# T3 — the second artifact the #968 reproduction named
+# ---------------------------------------------------------------------------
+
+
+def _read_history(vault: Path) -> tuple[str, list[dict[str, Any]]]:
+    """Return the raw text and parsed entries of ``tag-history.json``.
+
+    Args:
+        vault: Vault root.
+
+    Returns:
+        ``(raw_text, entries)``.
+    """
+    path = vault / "00-Creek-Meta" / "Processing-Log" / "tag-history.json"
+    raw = path.read_text(encoding="utf-8")
+    entries: list[dict[str, Any]] = json.loads(raw)
+    return raw, entries
+
+
+def test_tag_history_excludes_above_ceiling_tags_and_records_its_ceiling(
+    tmp_path: Path,
+) -> None:
+    """``tag-history.json`` is a second artifact and needs its own assertions.
+
+    The #968 reproduction found the intimate tag in *two* files. ``Tag-Garden.md``
+    is regenerated from scratch each run, but the history file is append-only —
+    an entry written at the wrong ceiling stays in the vault forever, and every
+    later run reads it back. Asserting on the garden alone would leave that
+    persistent copy unexamined.
+
+    Both the parsed counts and the raw file text are checked, because "absent
+    from ``tag_counts``" would still hold if the tag survived in some other key.
+    The recorded ``tier_ceiling`` is what makes the entry interpretable at all:
+    a count taken under one ceiling is not comparable to a count taken under
+    another.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _build_tags_vault(tmp_path)
+    report_tool(
+        vault_path=vault,
+        report_type="tags",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    raw, entries = _read_history(vault)
+    newest = entries[-1]
+    assert _INTIMATE_CANARY not in newest["tag_counts"]
+    assert newest["tag_counts"][_OPEN_CANARY] == 1
+    assert _INTIMATE_CANARY not in raw, (
+        "the intimate tag survives somewhere in tag-history.json:\n\n" + raw
+    )
+    assert newest["tier_ceiling"] == "open"
+
+
+def test_tag_history_does_not_compare_growth_across_ceilings(
+    tmp_path: Path,
+) -> None:
+    """Growth is only ever measured against an entry taken at the same ceiling.
+
+    Two runs at different ceilings survey two different corpora. Comparing one
+    against the other produces growth figures that are not merely imprecise but
+    meaningless — every tag the wider ceiling admits reads as brand new, and
+    every tag the narrower one dropped reads as a collapse.
+
+    The discriminating assertion is about the **open** canary, not the intimate
+    one. After a second run at ``ceiling=all``, the intimate tag is new under
+    either behaviour (nothing had ever counted it). The open tag is new *only*
+    if the ``open``-ceiling entry was correctly rejected as a comparison
+    baseline — had it been used, the open tag would have been seen before and
+    would not appear under "New Tags" at all.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _build_tags_vault(tmp_path)
+    report_tool(
+        vault_path=vault,
+        report_type="tags",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    report_tool(
+        vault_path=vault,
+        report_type="tags",
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    _raw, entries = _read_history(vault)
+    assert [entry["tier_ceiling"] for entry in entries] == ["open", "all"]
+
+    garden = (vault / "00-Creek-Meta" / "Tag-Garden.md").read_text(encoding="utf-8")
+    new_tags = _new_tags_section(garden)
+    assert _INTIMATE_CANARY in new_tags
+    assert _OPEN_CANARY in new_tags, (
+        "the ceiling=all run treated the earlier ceiling=open entry as its "
+        "growth baseline, so a tag that was only ever counted under a narrower "
+        "ceiling no longer reads as new. Growth across mixed ceilings is not a "
+        "comparison, it is a category error.\n\n" + garden
+    )
+
+
+# ---------------------------------------------------------------------------
+# T4 — a missing key is not an "unclassified" key
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("ceiling", "admitted"),
+    [
+        (TierCeiling.OPEN, False),
+        (TierCeiling.PERSONAL, False),
+        (TierCeiling.INTIMATE, True),
+    ],
+    ids=["open", "personal", "intimate"],
+)
+def test_fragment_with_no_privacy_tier_key_fails_closed_to_intimate(
+    tmp_path: Path,
+    ceiling: TierCeiling,
+    admitted: bool,
+) -> None:
+    """A fragment with no ``privacy_tier`` key at all ranks as ``intimate``.
+
+    **The ``personal`` row is the load-bearing one, and it is why this test
+    exists.** ``Fragment`` defaults a *missing* ``privacy_tier`` to
+    ``unclassified``, and ``unclassified`` ranks with ``personal`` (#876/#961) —
+    so an implementation that read the tier off the validated model instead of
+    the raw front matter would refuse this fragment at ``open`` and *admit* it at
+    ``personal``. Both implementations pass an ``open``-only assertion. Only the
+    ``personal`` row tells them apart.
+
+    A file with no key at all carries less assurance than a pipeline-written one
+    that at least says ``unclassified`` out loud, which is why the raw read has
+    to fail all the way closed rather than to ``personal``.
+
+    The ``open``-tier fragment is present at every ceiling as the positive
+    control, so "excluded" cannot be satisfied by an empty garden.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        ceiling: The ceiling the report is run at.
+        admitted: Whether the untiered fragment's tag should appear.
+    """
+    vault = _build_untiered_vault(tmp_path)
+    report_tool(
+        vault_path=vault,
+        report_type="tags",
+        privacy_tier_ceiling=ceiling,
+    )
+    garden = (vault / "00-Creek-Meta" / "Tag-Garden.md").read_text(encoding="utf-8")
+    assert _OPEN_CANARY in garden
+    assert (_NOTIER_CANARY in garden) is admitted, (
+        "a fragment with no privacy_tier key was "
+        f"{'excluded from' if admitted else 'admitted to'} the tag garden at "
+        f"ceiling={ceiling.value!r}. A missing key must fail closed to "
+        "intimate, not default to the model's 'unclassified'.\n\n" + garden
+    )
+
+
+# ---------------------------------------------------------------------------
+# T5 — the four non-fragment scan directories
+# ---------------------------------------------------------------------------
+
+
+def test_tag_garden_excludes_untiered_eddy_tags_at_the_open_ceiling(
+    tmp_path: Path,
+) -> None:
+    """``03-Eddies`` is scanned too, and an eddy has no tier of its own.
+
+    ``TagGardenGenerator`` walks five directories — ``01-Fragments``,
+    ``02-Threads``, ``03-Eddies``, ``04-Praxis``, ``08-Decisions`` — with a raw
+    ``frontmatter.load`` and no ``Fragment`` model in sight. Gating only the
+    fragment directory would leave four open routes to the same artifact, and an
+    eddy's tags are *derived from its member fragments*, so this is not a
+    hypothetical route: it is the same tags arriving by a different file.
+
+    Note what this pins: because those note types carry no ``privacy_tier``, the
+    fail-closed read ranks them ``intimate`` and they are dropped below
+    ``ceiling=intimate``. That is a real design choice with a real cost, and
+    asserting it here makes it checkable rather than a matter of taste.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _build_eddy_vault(tmp_path)
+    report_tool(
+        vault_path=vault,
+        report_type="tags",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    garden = (vault / "00-Creek-Meta" / "Tag-Garden.md").read_text(encoding="utf-8")
+    assert _OPEN_CANARY in garden
+    assert _INTIMATE_CANARY not in garden, (
+        "an eddy note under 03-Eddies carried an above-ceiling tag into "
+        "Tag-Garden.md at ceiling=open. Gating 01-Fragments alone leaves four "
+        f"other scan directories ungated.\n\n{garden}"
+    )
+
+
+def test_tag_garden_includes_untiered_eddy_tags_at_the_all_ceiling(
+    tmp_path: Path,
+) -> None:
+    """The eddy route is not simply severed — ``ceiling=all`` still sees it.
+
+    The companion to the test above. Dropping every non-fragment note
+    unconditionally would satisfy that assertion and quietly gut the tag garden
+    for the operator who explicitly asked for everything.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _build_eddy_vault(tmp_path)
+    report_tool(
+        vault_path=vault,
+        report_type="tags",
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    garden = (vault / "00-Creek-Meta" / "Tag-Garden.md").read_text(encoding="utf-8")
+    assert _OPEN_CANARY in garden
+    assert _INTIMATE_CANARY in garden
+
+
+# ---------------------------------------------------------------------------
+# T6 — mutation resistance: the gate's *return value* must decide something
+# ---------------------------------------------------------------------------
+
+
+class _InvertingGate:
+    """A ``within_ceiling`` stand-in that returns the opposite verdict.
+
+    Wraps the real predicate and negates it, counting calls. Two distinct
+    mutations die against it:
+
+    * a generator that *calls* the gate and discards its result is unaffected by
+      inversion, so its artifact still holds the below-ceiling content and the
+      inverted expectation fails;
+    * a generator that stopped calling the gate leaves ``call_count`` at zero.
+
+    Attributes:
+        call_count: How many times the gate was invoked.
+    """
+
+    def __init__(
+        self,
+        real: Callable[[Mapping[str, object], PrivacyTierOverride], bool],
+    ) -> None:
+        """Store the real gate and zero the counter.
+
+        Args:
+            real: The genuine ``within_ceiling`` implementation.
+        """
+        self._real = real
+        self.call_count = 0
+
+    def __call__(
+        self,
+        raw: Mapping[str, object],
+        override: PrivacyTierOverride,
+    ) -> bool:
+        """Return the negation of the real verdict.
+
+        Args:
+            raw: The file's raw front matter.
+            override: The admission ceiling.
+
+        Returns:
+            ``not within_ceiling(raw, override)``.
+        """
+        self.call_count += 1
+        return not self._real(raw, override)
+
+
+_GATE_CALL_SITES = [
+    pytest.param("tags", "creek.generate.tags", id="tags"),
+    pytest.param("voice", "creek.generate.voice", id="voice"),
+    pytest.param("lexicon", "creek.generate.voice", id="lexicon"),
+    pytest.param("decisions", "creek.generate.decisions", id="decisions"),
+    pytest.param("mode-profiles", "creek.generate.wavelength", id="wavelength"),
+]
+"""``report_type`` → the module whose ``within_ceiling`` the walk really calls.
+
+``lexicon`` is the odd row and deliberately so: ``generate_lexicon`` owns no
+vault walk of its own — it delegates to
+``creek.generate.voice.VoiceExemplarCollector.collect_all_exemplars`` — so the
+gate is patched in ``creek.generate.voice`` while the call is driven through
+``report_type="lexicon"``. Patching ``creek.generate.lexicon`` instead would
+patch a name nothing calls, and the test would pass while the walk stayed
+ungated. Between them the five rows cover all five generator modules.
+"""
+
+
+@pytest.mark.parametrize(("report_type", "module"), _GATE_CALL_SITES)
+def test_report_generators_act_on_the_gate_verdict_not_just_call_it(
+    report_type: str,
+    module: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inverting the gate must invert the artifact.
+
+    Everything else in this file can be satisfied by a generator that invokes
+    ``within_ceiling`` on the request path and then ignores what it said — the
+    call site exists, the import exists, an AST walk finds it, and the artifact
+    is whatever it always was. Only replacing the gate with one that answers
+    *backwards* can tell "consulted" from "obeyed".
+
+    Both halves are asserted. The inverted artifact must now carry the
+    above-ceiling sentinel and must have lost the below-ceiling one — which
+    fails for a generator that discards the verdict — and ``call_count`` must be
+    non-zero, which fails for a generator that stopped consulting the gate at
+    all.
+
+    Args:
+        report_type: The report driving the walk.
+        module: The module whose ``within_ceiling`` name is patched.
+        tmp_path: pytest's per-test temporary directory.
+        monkeypatch: pytest's patching fixture.
+    """
+    # Imported here rather than at module scope so the artifact-level tests
+    # above fail on the leak itself rather than on a collection-time ImportError
+    # while the new privacy_filter API is still absent.
+    from creek.classify.privacy_filter import within_ceiling
+
+    case = _CASE_BY_TYPE[report_type]
+    vault = case.build(tmp_path)
+    spy = _InvertingGate(within_ceiling)
+    monkeypatch.setattr(f"{module}.within_ceiling", spy)
+
+    report_tool(
+        vault_path=vault,
+        report_type=report_type,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    blob = _artifact_blob(vault, case.artifact_roots)
+
+    assert spy.call_count > 0, (
+        f"{module}.within_ceiling was never called while generating "
+        f"report_type={report_type!r}. A gate off the request path enforces "
+        "nothing."
+    )
+    assert case.above_canary in blob, (
+        f"inverting {module}.within_ceiling did not change what "
+        f"report_type={report_type!r} wrote: {case.above_canary!r} is still "
+        "absent. The generator calls the gate and discards its verdict.\n\n"
+        f"{blob}"
+    )
+    if case.below_canary is not None:
+        assert case.below_canary not in blob, (
+            f"inverting {module}.within_ceiling left {case.below_canary!r} in "
+            "the artifact, so the verdict is not what decides admission.\n\n"
+            f"{blob}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# T7 — mutation resistance: a parallel, ungated read
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("case", _CASES, ids=_CASE_IDS)
+def test_no_file_the_report_touches_carries_above_ceiling_content(
+    case: _ReportCase,
+    tmp_path: Path,
+) -> None:
+    """Every file the call created or modified is swept, not a named list.
+
+    The artifact-level tests above look where we already know to look. This one
+    derives its file list from the filesystem — everything whose bytes differ
+    from a pre-call snapshot — so it also covers an artifact nobody anticipated,
+    a debug dump, a cache, and a second ungated walk spliced into an existing
+    generator whose declared output looks unchanged.
+
+    Paths are checked as well as contents because ``decisions`` writes the
+    fragment title into the *filename*: a bytes-only sweep would walk straight
+    past it.
+
+    ``rhetorical-patterns`` writes no fragment-derived text, so its byte sweep
+    is vacuous by construction; the ``forbidden_glob`` assertion is what carries
+    that row, and it is stated here rather than left implied.
+
+    Args:
+        case: The report type under test and its fixture.
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = case.build(tmp_path)
+    before = _snapshot(vault)
+    report_tool(
+        vault_path=vault,
+        report_type=case.report_type,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    changed = _changed_files(vault, before)
+    assert list(vault.glob(case.positive_glob)), (
+        f"report_type={case.report_type!r} produced no artifact at "
+        "ceiling=open, so this sweep has nothing to sweep."
+    )
+    needle = case.above_canary.encode("utf-8")
+    for path in changed:
+        rel = str(path.relative_to(vault))
+        assert case.above_canary not in rel, (
+            f"report_type={case.report_type!r} created {rel!r} — the "
+            "above-ceiling sentinel is in the file name."
+        )
+        assert needle not in path.read_bytes(), (
+            f"report_type={case.report_type!r} wrote the above-ceiling "
+            f"sentinel {case.above_canary!r} into {rel!r}. This file was found "
+            "by diffing the vault, not from a list of expected artifacts, so a "
+            "second ungated read cannot hide behind an unchanged declared "
+            "output."
+        )
+    if case.forbidden_glob is not None:
+        assert not list(vault.glob(case.forbidden_glob)), (
+            f"report_type={case.report_type!r} created "
+            f"{case.forbidden_glob!r}, which exists only if an above-ceiling "
+            "fragment entered the corpus."
+        )
+
+
+# ---------------------------------------------------------------------------
+# T8 — the two tier readers must agree
+# ---------------------------------------------------------------------------
+
+
+def _build_every_tier_vault(root: Path) -> Path:
+    """Seed one fragment per :class:`PrivacyTier` plus one with no key.
+
+    Args:
+        root: Directory the vault is created inside.
+
+    Returns:
+        The vault root.
+    """
+    vault = _new_vault(root, "every-tier-vault")
+    for tier in PrivacyTier:
+        _write_note(
+            vault,
+            f"01-Fragments/Notes/frag-{tier.value}.md",
+            _fragment_metadata(
+                frag_id=f"frag-{tier.value}",
+                title=f"{tier.value} note",
+                privacy_tier=tier.value,
+            ),
+            f"{tier.value} body.",
+        )
+    _write_note(
+        vault,
+        "01-Fragments/Notes/frag-nokey.md",
+        _fragment_metadata(
+            frag_id="frag-nokey",
+            title="No key note",
+            privacy_tier=None,
+        ),
+        "No key body.",
+    )
+    return vault
+
+
+def test_raw_and_model_tier_readers_agree_on_every_fragment(
+    tmp_path: Path,
+) -> None:
+    """The new raw reader must not become a third, diverging tier opinion.
+
+    ``creek/classify/privacy_filter.py`` already carries two fail-closed tier
+    reads — ``tier_of`` (unrecognised value) and ``fragment_tier`` (absent key) —
+    and its own docstring names the failure mode a third one invites: "two tools
+    that disagree about the same file". ``raw_privacy_tier`` is that third
+    reader, so its agreement with ``fragment_tier`` is asserted rather than
+    assumed, fragment by fragment, over the shared vault loader both would
+    actually see.
+
+    The no-key fragment is checked separately and explicitly: it is the one case
+    where agreeing on ``INTIMATE`` is the whole point, and where a reader that
+    consulted the model would answer ``unclassified`` instead.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    from creek.classify.privacy_filter import fragment_tier, raw_privacy_tier
+    from creek.vault.reader import iter_vault_fragments
+
+    vault = _build_every_tier_vault(tmp_path)
+    loaded = iter_vault_fragments(vault / "01-Fragments")
+    by_id = {fragment.id: (fragment, raw) for _p, fragment, _b, raw in loaded}
+    assert set(by_id) == {
+        "frag-open",
+        "frag-personal",
+        "frag-intimate",
+        "frag-unclassified",
+        "frag-nokey",
+    }
+    for frag_id, (fragment, raw) in sorted(by_id.items()):
+        assert raw_privacy_tier(raw) == fragment_tier(fragment, raw), (
+            f"the two fail-closed tier readers disagree about {frag_id!r}: "
+            f"raw_privacy_tier says {raw_privacy_tier(raw)!r}, fragment_tier "
+            f"says {fragment_tier(fragment, raw)!r}"
+        )
+    nokey_fragment, nokey_raw = by_id["frag-nokey"]
+    assert raw_privacy_tier(nokey_raw) is PrivacyTier.INTIMATE
+    assert fragment_tier(nokey_fragment, nokey_raw) is PrivacyTier.INTIMATE
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param({}, PrivacyTier.INTIMATE, id="key-absent"),
+        pytest.param({"privacy_tier": None}, PrivacyTier.INTIMATE, id="none"),
+        pytest.param({"privacy_tier": ""}, PrivacyTier.INTIMATE, id="empty"),
+        pytest.param(
+            {"privacy_tier": "not-a-tier"},
+            PrivacyTier.INTIMATE,
+            id="unrecognised",
+        ),
+        # YAML front matter is operator-editable, so the value need not be a
+        # string at all. These rows exist because the implementation reaches
+        # the enum through ``PrivacyTier(str(value))``: dropping that ``str()``
+        # wrap would still raise for a list and a dict, but the row that really
+        # bites is ``["open"]`` — a one-character YAML slip (``privacy_tier:``
+        # followed by an indented ``- open``) which must fail closed rather
+        # than be talked into ``open`` by some future normalisation.
+        pytest.param({"privacy_tier": ["open"]}, PrivacyTier.INTIMATE, id="list"),
+        pytest.param(
+            {"privacy_tier": {"tier": "open"}},
+            PrivacyTier.INTIMATE,
+            id="mapping",
+        ),
+        pytest.param({"privacy_tier": 0}, PrivacyTier.INTIMATE, id="int"),
+        pytest.param({"privacy_tier": False}, PrivacyTier.INTIMATE, id="bool"),
+        # Casing and whitespace are not silently repaired. ``creek classify``
+        # writes the canonical lowercase value; anything else is a note nobody
+        # can vouch for, and guessing what an operator meant is how a gate
+        # becomes negotiable.
+        pytest.param({"privacy_tier": "OPEN"}, PrivacyTier.INTIMATE, id="uppercase"),
+        pytest.param({"privacy_tier": " open"}, PrivacyTier.INTIMATE, id="padded"),
+        pytest.param({"privacy_tier": "open"}, PrivacyTier.OPEN, id="open"),
+        pytest.param(
+            {"privacy_tier": "personal"},
+            PrivacyTier.PERSONAL,
+            id="personal",
+        ),
+        pytest.param(
+            {"privacy_tier": "intimate"},
+            PrivacyTier.INTIMATE,
+            id="intimate",
+        ),
+        pytest.param(
+            {"privacy_tier": "unclassified"},
+            PrivacyTier.UNCLASSIFIED,
+            id="unclassified",
+        ),
+    ],
+)
+def test_raw_privacy_tier_fails_closed_on_anything_it_cannot_read(
+    raw: dict[str, object],
+    expected: PrivacyTier,
+) -> None:
+    """Every unreadable ``privacy_tier`` resolves to ``intimate``, never ``open``.
+
+    Four distinct ways of saying nothing — the key absent, an explicit ``None``,
+    an empty string, and a value the enum has never heard of — must all land on
+    the most restrictive tier. They are listed separately because they arrive
+    from different places: a hand-edited note, a YAML ``privacy_tier:`` with no
+    value, a template that wrote an empty field, and a future schema this build
+    predates.
+
+    An explicit ``unclassified`` is deliberately *not* folded in with them: it
+    is what every pipeline-written, not-yet-classified fragment carries, and it
+    ranks with ``personal`` by policy (#876) rather than by failure.
+
+    Args:
+        raw: Raw front matter to read.
+        expected: The tier the reader must return.
+    """
+    from creek.classify.privacy_filter import raw_privacy_tier
+
+    assert raw_privacy_tier(raw) is expected
+
+
+# ---------------------------------------------------------------------------
+# T10 — the CLI surface
+# ---------------------------------------------------------------------------
+
+
+def test_cli_report_include_tier_open_excludes_above_ceiling_tags(
+    tmp_path: Path,
+) -> None:
+    """``creek report --type tags --include-tier open`` filters the garden.
+
+    ``report_tool`` is not the only production caller: the CLI reaches the same
+    six generators through ``_REPORT_DISPATCH``, and a fix threaded only through
+    MCP would leave ``--include-tier`` on ``report`` as a flag that is parsed,
+    audited, and then ignored.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _build_tags_vault(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--type",
+            "tags",
+            "--vault",
+            str(vault),
+            "--include-tier",
+            "open",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    garden = (vault / "00-Creek-Meta" / "Tag-Garden.md").read_text(encoding="utf-8")
+    assert _OPEN_CANARY in garden
+    assert _INTIMATE_CANARY not in garden, (
+        "creek report --include-tier open wrote an intimate fragment's tag "
+        f"into the Tag Garden:\n\n{garden}"
+    )
+
+
+def test_cli_report_without_include_tier_stays_unfiltered(tmp_path: Path) -> None:
+    """A bare ``creek report --type tags`` keeps its pre-#968 behaviour.
+
+    The new generator parameters default to ``PrivacyTierOverride.ALL``, i.e.
+    unfiltered, so that adding them is a genuine no-op for every existing
+    caller. That promise is worth asserting rather than assuming: an operator
+    who never passed ``--include-tier`` and suddenly finds half their tag garden
+    missing has been handed a silent data-loss bug wearing a privacy fix's
+    costume.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+    """
+    vault = _build_tags_vault(tmp_path)
+    result = runner.invoke(
+        app,
+        ["report", "--type", "tags", "--vault", str(vault)],
+    )
+    assert result.exit_code == 0, result.output
+    garden = (vault / "00-Creek-Meta" / "Tag-Garden.md").read_text(encoding="utf-8")
+    assert _OPEN_CANARY in garden
+    assert _INTIMATE_CANARY in garden, (
+        "creek report with no --include-tier flag now filters the tag garden. "
+        "The flag's absence must mean 'unchanged', not 'open'."
+    )
+
+
+# ---------------------------------------------------------------------------
+# T11 — the production call sites must state their intent
+# ---------------------------------------------------------------------------
+
+
+_OVERRIDE_CALL_NAMES = frozenset(
+    {
+        "TagGardenGenerator",
+        "generate_lexicon",
+        "generate_decisions",
+        "generate_mode_profiles",
+        "generate_all_profiles",
+        "generate_rhetorical_patterns",
+        "VoiceProfileGenerator",
+        # #879: the second half of the voice report. It walks the same
+        # corpus ``VoiceProfileGenerator`` does, but *copies fragment
+        # bodies into the vault* rather than rendering a profile, so a
+        # ceiling silently dropped at this call site is a verbatim
+        # above-ceiling body written to ``07-Voice/Register-Samples/``.
+        "generate_register_samples",
+        # #1253: the shared body of ``report --type wavelength`` on both
+        # surfaces. It loads the corpus itself, so a ceiling dropped here is a
+        # phase-map built from above-ceiling fragments.
+        "generate_phase_map",
+    },
+)
+"""Callables whose new privacy parameter must never be left at its default."""
+
+
+def _call_name(node: ast.Call) -> str | None:
+    """Resolve a call's callee to a bare symbol name.
+
+    Mirrors ``tests/test_mcp_read_gate.py``'s helper of the same name rather
+    than importing it: a private helper in another test module is not an API,
+    and duplicating six lines is cheaper than coupling two guardrails together.
+
+    Args:
+        node: The call node to inspect.
+
+    Returns:
+        ``func.id`` for a direct call, ``func.attr`` for a qualified one, or
+        ``None`` when the callee is a dynamic expression.
+    """
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
+def _states_keyword(node: ast.Call, keyword_name: str) -> bool:
+    """Return whether *node* names *keyword_name* at its own or its receiver's call.
+
+    Two shapes carry such a keyword, and both are legitimate:
+
+    * ``generate_decisions(vault, override=override)`` — the parameter is on the
+      function itself;
+    * ``VoiceProfileGenerator(override=override).generate_all_profiles(vault)`` —
+      the parameter is on the constructor, and the method that consumes the
+      corpus takes none. Requiring ``override=`` on ``generate_all_profiles``
+      itself would force an API the design does not have.
+
+    The receiver walk is what makes the constructor shape count, and it is
+    reused verbatim by the ``audience_weighting`` guard added for #1313.
+
+    Args:
+        node: The call node to inspect.
+        keyword_name: The keyword that must be stated.
+
+    Returns:
+        ``True`` when *keyword_name* is stated at this call or at the
+        constructor call the method is invoked on.
+    """
+    if any(keyword.arg == keyword_name for keyword in node.keywords):
+        return True
+    func = node.func
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Call):
+        return _states_keyword(func.value, keyword_name)
+    return False
+
+
+def _guarded_calls(
+    module: ModuleType,
+    names: frozenset[str] = _OVERRIDE_CALL_NAMES,
+    keyword_name: str = "override",
+) -> list[tuple[str, int, bool]]:
+    """Return ``(name, lineno, states_keyword)`` for every guarded call site.
+
+    Args:
+        module: The imported production module to scan.
+        names: The callee names to look for. Defaults to the privacy-ceiling
+            set; #1313's audience-weighting guard passes its own.
+        keyword_name: The keyword each matched call must state.
+
+    Returns:
+        One tuple per call to a name in *names*.
+    """
+    tree = ast.parse(inspect.getsource(module))
+    found: list[tuple[str, int, bool]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node)
+        if name in names:
+            assert name is not None
+            found.append((name, node.lineno, _states_keyword(node, keyword_name)))
+    return found
+
+
+def _modules_calling(names: frozenset[str]) -> set[str]:
+    """Return every module under ``creek/`` or ``creek_mcp/`` that calls *names*.
+
+    This replaces the two hand-maintained module allowlists that used to sit
+    here. Those lists asserted only one direction — that every guarded *name*
+    was called by some listed module — and nothing asserted the converse, that
+    every module calling a guarded name was on the list. A new surface could
+    therefore construct a privacy-filtered generator with the keyword omitted
+    and the guard would stay green, because the module simply was not being
+    looked at. Discovery closes that: the parametrize list *is* the set of real
+    callers, so it cannot drift from the tree.
+
+    The walk parses file *text* rather than importing every module. Importing
+    the whole of ``creek/`` would pull in optional heavy extras (pyarrow,
+    sentence-transformers, the MCP SDK), can fail on any import-time side
+    effect, and would make a structural guard the slowest test in the suite.
+
+    Args:
+        names: The guarded callee names to search for.
+
+    Returns:
+        Dotted module names, one per module containing at least one such call.
+    """
+    found: set[str] = set()
+    for package in (creek, creek_mcp):
+        pkg_root = Path(str(package.__file__)).parent
+        root = pkg_root.parent
+        for source in sorted(pkg_root.rglob("*.py")):
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            if not any(
+                isinstance(node, ast.Call) and _call_name(node) in names
+                for node in ast.walk(tree)
+            ):
+                continue
+            parts = list(source.relative_to(root).with_suffix("").parts)
+            if parts[-1] == "__init__":
+                parts.pop()
+            found.add(".".join(parts))
+    return found
+
+
+_OVERRIDE_CALLER_MODULES: Final = sorted(_modules_calling(_OVERRIDE_CALL_NAMES))
+"""Every production module that fans out to a privacy-filtered generator.
+
+Discovered, not listed. The literal this replaces named ``creek_mcp.tools.report``
+and ``creek.cli`` and had already fallen behind the tree:
+``creek.lint.checks.tags`` constructs a ``TagGardenGenerator`` and was invisible
+to the guard.
+"""
+
+
+_DISCOVERY_ONLY_CALLER: Final = "creek.lint.checks.tags"
+"""A guarded caller the two retired hardcoded lists never named.
+
+The witness for #1413's "the sweep catches a caller absent from the old lists".
+``creek.lint.checks.tags`` constructs a ``TagGardenGenerator`` and sits under
+neither ``creek_mcp.tools.report`` nor ``creek.cli``, so it is invisible to a
+literal list and visible only to a real walk of the tree.
+"""
+
+
+def test_override_caller_discovery_is_non_empty() -> None:
+    """The discovered caller list must not be empty, or every case below vanishes.
+
+    A computed parametrize list that comes back empty does not fail — it
+    *silently runs nothing* and reports green. That is precisely the failure
+    mode replacing a literal with discovery introduces, so it gets its own
+    assertion rather than a comment.
+    """
+    assert len(_OVERRIDE_CALLER_MODULES) >= 2, (
+        f"Discovered only {_OVERRIDE_CALLER_MODULES} as callers of "
+        f"{sorted(_OVERRIDE_CALL_NAMES)}. The report fan-out spans at least two "
+        "surfaces, so this is a broken walk, not a clean tree — and an empty "
+        "list would skip every parametrized case below without failing."
+    )
+
+
+def test_override_caller_discovery_reaches_beyond_the_retired_literal() -> None:
+    """The sweep must find a caller neither hardcoded list ever named (#1413).
+
+    ``test_override_caller_discovery_is_non_empty`` above is guarded only by
+    ``>= 2``, which the two retired literals ``creek_mcp.tools.report`` and
+    ``creek.cli`` satisfy on their own. So a walk that silently narrowed back
+    to exactly those two would keep it green while the discovery it replaced
+    them with had stopped happening.
+
+    Naming :data:`_DISCOVERY_ONLY_CALLER` closes that: it is a real guarded
+    caller in a package neither literal covered, so it is reachable only by
+    actually walking the tree.
+    """
+    assert _DISCOVERY_ONLY_CALLER in _OVERRIDE_CALLER_MODULES, (
+        f"The sweep discovered {_OVERRIDE_CALLER_MODULES}, which omits "
+        f"{_DISCOVERY_ONLY_CALLER} — a module that calls "
+        f"{sorted(_OVERRIDE_CALL_NAMES)} and that the retired hardcoded lists "
+        "never named. Either the walk narrowed back to the old two surfaces, "
+        "or that caller moved and this witness needs re-pointing at a live one."
+    )
+
+
+@pytest.mark.parametrize("dotted", _OVERRIDE_CALLER_MODULES)
+def test_production_report_callers_always_state_an_override(dotted: str) -> None:
+    """Neither production surface may fall back to the unfiltered default.
+
+    Every new parameter defaults to ``PrivacyTierOverride.ALL`` — unfiltered —
+    because that is the only default that keeps the change a no-op for the
+    library's existing callers and their existing tests. A defaulted privacy
+    parameter is safe exactly while every production caller states its intent
+    out loud, and *this* is the test that makes that true rather than hoped-for.
+    Without it, threading the ceiling through five of the six branches and
+    forgetting the sixth reads, at the call site, as ordinary working code.
+
+    The check is structural on purpose. It cannot tell whether the value passed
+    is the *right* one — the behavioural tests above do that — but it is the
+    only thing that catches a new branch added months from now that simply omits
+    the keyword.
+
+    Args:
+        dotted: The production module to parse.
+    """
+    module = importlib.import_module(dotted)
+    calls = _guarded_calls(module)
+    assert calls, (
+        f"{dotted} contains no call to any of {sorted(_OVERRIDE_CALL_NAMES)}, "
+        "so this guardrail is scanning for symbols nothing invokes. Either the "
+        "report fan-out moved, or the names in _OVERRIDE_CALL_NAMES are stale."
+    )
+    silent = [(name, lineno) for name, lineno, stated in calls if not stated]
+    assert not silent, (
+        f"{dotted} calls a report generator without stating an override: "
+        f"{silent}. The parameter defaults to PrivacyTierOverride.ALL "
+        "(unfiltered), so an omitted keyword is not a neutral omission — it is "
+        "the ceiling being silently discarded at that call site."
+    )
+
+
+def test_every_guarded_symbol_is_actually_called_somewhere() -> None:
+    """The guarded-name list describes real call sites, not aspirations.
+
+    The per-module test above is only as strong as its name list. A typo, a
+    rename, or a symbol that was never called by either surface would leave an
+    entry that can never fail — and the per-module assertion would still pass on
+    the strength of the other six. Asserting the union across both surfaces
+    covers every name closes that hole.
+    """
+    called: set[str] = set()
+    for dotted in _OVERRIDE_CALLER_MODULES:
+        module = importlib.import_module(dotted)
+        called.update(name for name, _lineno, _stated in _guarded_calls(module))
+    missing = _OVERRIDE_CALL_NAMES - called
+    assert not missing, (
+        f"_OVERRIDE_CALL_NAMES lists {sorted(missing)}, which neither "
+        f"{' nor '.join(_OVERRIDE_CALLER_MODULES)} calls. An entry no call site "
+        "matches is an assertion about nothing."
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1313 — the production call sites must state the vault's audience weighting
+# ---------------------------------------------------------------------------
+
+
+_AUDIENCE_WEIGHTING_CALL_NAMES = frozenset(
+    {
+        "VoiceProfileGenerator",
+        # Constructed only inside ``creek.generate.voice`` — at
+        # ``VoiceProfileGenerator.__init__``'s default collector and inside
+        # ``generate_register_samples``. Neither outer surface names it, which
+        # is exactly why ``creek.generate.voice`` is in the module list below.
+        "VoiceExemplarCollector",
+        # The half of the voice report that copies fragment bodies into the
+        # vault. Which fragments survive the top-N cut decides whose prose is
+        # persisted verbatim, so a weighting dropped here is a privacy-visible
+        # change, not merely a ranking one.
+        "generate_register_samples",
+        # #1410. ``build_fingerprint``'s ``audience_weighting`` defaults to
+        # ``None``, which means *off* for this function — the flat texting
+        # average the #632/#633 epic exists to replace. The function's own
+        # docstring records that no guard covered it, and that one production
+        # caller still relied on the default: ``creek.cli``'s
+        # ``_resolve_voice_fingerprint``, the fallback ``creek voice-check``
+        # takes when a vault has no persisted voice-fingerprint.json.
+        "build_fingerprint",
+    },
+)
+"""Callables whose ``audience_weighting`` must never be left at its default.
+
+Deliberately a *separate* set from :data:`_OVERRIDE_CALL_NAMES` rather than a
+reuse of it. That set contains ``generate_lexicon``, and requiring
+``audience_weighting=`` there would demand a keyword the function does not
+have and should not gain: the lexicon path is provably invariant to the
+weighting (``collect_all_exemplars`` does no ranking, ``extract_patterns`` is
+called with no ``weights=``, and ``build_lexicon`` reads ``patterns`` only for
+metaphor families), so the kwarg would be an untestable no-op. See the ``Note:``
+on :func:`creek.generate.lexicon.generate_lexicon`. What guards that path
+instead is the behavioural invariance tripwire
+``test_lexicon_output_is_invariant_to_the_audience_weighting`` in
+``tests/test_voice_audience_weighting_wiring.py``, which — unlike a guard
+exclusion — goes red the day the lexicon starts consuming a weighted metric.
+"""
+
+_AUDIENCE_WEIGHTING_EXEMPT_MODULES: Final[dict[str, str]] = {
+    "creek.generate.lexicon": (
+        "generate_lexicon constructs a VoiceExemplarCollector but is provably "
+        "invariant to the weighting: collect_all_exemplars does no ranking, "
+        "extract_patterns is called with no weights=, and build_lexicon reads "
+        "patterns only for metaphor families. Passing audience_weighting=None "
+        "here would *game* this guard while changing nothing — None selects "
+        "the enabled default for that class. What guards the path instead is "
+        "the behavioural tripwire "
+        "test_lexicon_output_is_invariant_to_the_audience_weighting in "
+        "tests/test_voice_audience_weighting_wiring.py, which goes red the day "
+        "the lexicon starts consuming a weighted metric."
+    ),
+}
+"""Modules that call a guarded name but must not be required to state it.
+
+A *named, reasoned* exemption rather than a wider allowlist. The distinction
+matters: an allowlist entry is invisible once written, whereas an exemption
+carries the argument for itself and is checked below for still being live.
+"""
+
+_AUDIENCE_WEIGHTING_CALLER_MODULES: Final = sorted(
+    _modules_calling(_AUDIENCE_WEIGHTING_CALL_NAMES)
+    - set(_AUDIENCE_WEIGHTING_EXEMPT_MODULES),
+)
+"""Every module constructing an audience-weighted voice generator, discovered."""
+
+
+def test_audience_weighting_caller_discovery_is_non_empty() -> None:
+    """The discovered caller list must not be empty, or every case below vanishes.
+
+    Same reasoning as :func:`test_override_caller_discovery_is_non_empty`: an
+    empty computed parametrize list reports green having asserted nothing.
+    """
+    assert len(_AUDIENCE_WEIGHTING_CALLER_MODULES) >= 2, (
+        f"Discovered only {_AUDIENCE_WEIGHTING_CALLER_MODULES} as callers of "
+        f"{sorted(_AUDIENCE_WEIGHTING_CALL_NAMES)}. That is a broken walk, not "
+        "a clean tree."
+    )
+
+
+def test_every_audience_weighting_exemption_is_still_live() -> None:
+    """A module may only be exempt while it still calls a guarded name.
+
+    Without this, an exemption outlives the code that earned it and silently
+    excuses whatever that module does next. The exemption must fail loudly when
+    it goes stale rather than quietly widening the guard.
+    """
+    discovered = _modules_calling(_AUDIENCE_WEIGHTING_CALL_NAMES)
+    stale = sorted(set(_AUDIENCE_WEIGHTING_EXEMPT_MODULES) - discovered)
+    assert not stale, (
+        f"_AUDIENCE_WEIGHTING_EXEMPT_MODULES excuses {stale}, which no longer "
+        f"calls any of {sorted(_AUDIENCE_WEIGHTING_CALL_NAMES)}. Delete the "
+        "entry: a stale exemption excuses code that never earned it."
+    )
+
+
+@pytest.mark.parametrize("dotted", _AUDIENCE_WEIGHTING_CALLER_MODULES)
+def test_production_voice_callers_always_state_an_audience_weighting(
+    dotted: str,
+) -> None:
+    """No production caller may fall back to the fabricated default weighting.
+
+    ``audience_weighting`` defaults to ``None``, which
+    :class:`VoiceExemplarCollector` turns into a fresh
+    :class:`~creek.config.VoiceAudienceWeightingConfig` — an *enabled* one. That
+    default is what made the vault's ``voice_audience_weighting`` section inert
+    for the whole exemplar path: every construction quietly substituted the
+    built-in values, so ``enabled: false`` on disk changed nothing and
+    ``creek voice-authenticity`` reported ``ON`` regardless (#1313).
+
+    Keeping the default is right — it keeps the library usable — but it is safe
+    only while every production caller states the vault's config out loud, and
+    this is the test that makes that structural rather than hoped-for. The
+    original defect was exactly the shape this catches: five call sites wired
+    and a sixth forgotten reads, at the call site, as ordinary working code.
+
+    Structural on purpose: it cannot tell whether the value passed came from the
+    *vault's* config rather than a bare ``load_config()`` — the behavioural
+    tests in ``tests/test_voice_audience_weighting_wiring.py`` do that, by
+    running from a config-less cwd — but it is the only thing that catches a new
+    call site added months from now that simply omits the keyword.
+
+    Args:
+        dotted: The production module to parse.
+    """
+    module = importlib.import_module(dotted)
+    calls = _guarded_calls(
+        module,
+        _AUDIENCE_WEIGHTING_CALL_NAMES,
+        "audience_weighting",
+    )
+    assert calls, (
+        f"{dotted} contains no call to any of "
+        f"{sorted(_AUDIENCE_WEIGHTING_CALL_NAMES)}, so this guardrail is "
+        "scanning for symbols nothing invokes. Either the voice fan-out moved, "
+        "or the names in _AUDIENCE_WEIGHTING_CALL_NAMES are stale."
+    )
+    silent = [(name, lineno) for name, lineno, stated in calls if not stated]
+    assert not silent, (
+        f"{dotted} constructs a voice generator without stating an "
+        f"audience_weighting: {silent}. The parameter defaults to the built-in "
+        "config, so an omitted keyword is not a neutral omission — it is the "
+        "vault's own voice_audience_weighting setting being silently discarded "
+        "at that call site (#1313)."
+    )
+
+
+def test_every_audience_weighted_symbol_is_actually_called_somewhere() -> None:
+    """The audience-weighting name list describes real call sites, not aspirations.
+
+    Same hole as :func:`test_every_guarded_symbol_is_actually_called_somewhere`
+    closes for the ceiling guard: a typo or a rename would leave an entry that
+    can never fail, and the per-module assertions would still pass on the
+    strength of the others. Asserting the union across all three surfaces covers
+    every name closes it.
+    """
+    called: set[str] = set()
+    for dotted in _AUDIENCE_WEIGHTING_CALLER_MODULES:
+        module = importlib.import_module(dotted)
+        called.update(
+            name
+            for name, _lineno, _stated in _guarded_calls(
+                module,
+                _AUDIENCE_WEIGHTING_CALL_NAMES,
+                "audience_weighting",
+            )
+        )
+    missing = _AUDIENCE_WEIGHTING_CALL_NAMES - called
+    assert not missing, (
+        f"_AUDIENCE_WEIGHTING_CALL_NAMES lists {sorted(missing)}, which none of "
+        f"{_AUDIENCE_WEIGHTING_CALLER_MODULES} calls. An entry no call site "
+        "matches is an assertion about nothing."
+    )
+
+
+# ---------------------------------------------------------------------------
+# T9 — decisions carries a second, non-defeasible screen (#1431)
+# ---------------------------------------------------------------------------
+
+
+_ALL_CEILINGS = [
+    pytest.param(TierCeiling.OPEN, id="open"),
+    pytest.param(TierCeiling.PERSONAL, id="personal"),
+    pytest.param(TierCeiling.INTIMATE, id="intimate"),
+    pytest.param(TierCeiling.ALL, id="all"),
+]
+"""Every :class:`TierCeiling` member, one parametrize row each.
+
+Spelled out rather than derived from ``list(TierCeiling)`` so the ids stay
+readable in a failure line; the length guard inside the test below is what
+stops a newly added ceiling from quietly skipping this proof.
+"""
+
+
+@pytest.mark.parametrize("ceiling", _ALL_CEILINGS)
+def test_decisions_never_names_an_intimate_fragment_at_any_ceiling(
+    ceiling: TierCeiling,
+    tmp_path: Path,
+) -> None:
+    """An ``intimate`` title never reaches an ``08-Decisions`` filename (#1431).
+
+    Unlike every other report gated by #968, ``decisions`` writes a source
+    fragment's title verbatim into a *filename* that then sits in the vault
+    tree, visible to Obsidian's file pane, to ``ls``, to Spotlight and to any
+    sync client — with no frontmatter to declare what tier it came from. The
+    ceiling is the operator's dial; this screen is not, which is why the
+    assertion is parametrized over *every* ceiling including ``ALL``.
+
+    The ceiling parametrization is the point. At ``ceiling=open`` the ordinary
+    rank cutoff already excludes the intimate fragment, and
+    ``test_report_at_open_ceiling_excludes_above_ceiling_content[decisions]``
+    was already green before this fix — a test pinned at the *narrowest*
+    ceiling would have proven nothing. The defect lives at ``intimate`` and
+    ``all``, the two widest ceilings, and those are the two rows that were red
+    before the screen existed.
+
+    The FILENAME assertion is written directly against ``rglob`` rather than
+    through :func:`_artifact_blob`, even though that helper happens to include
+    paths today. Path coverage there is one "simplify this to contents-only"
+    refactor away from disappearing, and the filename is this defect's primary
+    surface; the check must not be able to retire silently.
+
+    Args:
+        ceiling: The ceiling the report is driven at.
+        tmp_path: pytest's per-test temporary directory.
+    """
+    assert len(_ALL_CEILINGS) == len(list(TierCeiling)), (
+        "TierCeiling gained a member that this parametrization does not cover. "
+        "A ceiling with no row here is a ceiling at which the intimate screen "
+        "is unproven."
+    )
+
+    vault = _build_decisions_vault(tmp_path)
+    result = report_tool(
+        vault_path=vault,
+        report_type="decisions",
+        privacy_tier_ceiling=ceiling,
+    )
+    assert result["status"] == "ok"
+
+    leaked = [
+        str(path.relative_to(vault))
+        for path in (vault / "08-Decisions").rglob("*")
+        if _INTIMATE_CANARY in str(path.relative_to(vault))
+    ]
+    assert not leaked, (
+        f"at privacy_tier_ceiling={ceiling.value!r} an intimate fragment's "
+        f"title reached an 08-Decisions FILENAME: {leaked}. The note's own "
+        "front matter cannot label a path."
+    )
+
+    blob = _artifact_blob(vault, ("08-Decisions",))
+    assert _INTIMATE_CANARY not in blob, (
+        f"at privacy_tier_ceiling={ceiling.value!r} the intimate title reached "
+        f"08-Decisions content — the generated note's `title:` is the source "
+        f"fragment's title verbatim:\n\n{blob}"
+    )
+    assert _OPEN_CANARY in blob, (
+        f"at privacy_tier_ceiling={ceiling.value!r} the open fragment lost its "
+        "Decision note, so the exclusion assertions above are vacuous. A screen "
+        "that drops everything is an outage wearing a gate's costume."
+    )
+    assert list(vault.glob("08-Decisions/Active/*.md")), (
+        f"no Decision note at all was written at "
+        f"privacy_tier_ceiling={ceiling.value!r}."
+    )

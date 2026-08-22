@@ -72,7 +72,7 @@ These are non-negotiable:
 2. **Never edit the contributing fragments to align them.** Fragments are append-only after ingest; the Paradox note is the only place the contradiction is named.
 3. **Never auto-promote a Paradox to a Thread or Eddy.** A Thread tells a directional story; an Eddy is a topic cluster. A Paradox is neither — it is the system honoring §10.2 of the spec.
 4. **Never delete a Paradox note silently.** Deletion goes through `creek purge` with elevated auth; a paradox that "no longer feels true" is itself data about the human's wavelength position.
-5. **Never let a Paradox short-circuit privacy tiers.** If either contributing fragment is `intimate`, the Paradox note inherits `intimate` and the inclusion rules in `privacy-tier.SKILL.md` apply.
+5. **Never let a Paradox short-circuit privacy tiers.** Paradox honours `--tier` exactly like every other target: routing is the only thing `--target paradox` overrides. If either contributing fragment is `intimate`, pass `--tier intimate` — the note still lands in `10-Liminal/Paradoxes/`, but the body is diverted to the gitignored `10-Liminal/Compost/intimate-stubs/` directory and the vault note is reduced to a tier-redacted summary with `saved_from.intimate_body_pointer` naming the stub. A `personal` body is summarised the same way. **The fact of the contradiction is preserved by the note's location, title, tags and `saved_from` provenance — none of which needs the body in the clear.** So do not reach for a different target to get protection; name the tier the contributing fragments actually earned.
 
 ## When a paradox does get re-examined
 

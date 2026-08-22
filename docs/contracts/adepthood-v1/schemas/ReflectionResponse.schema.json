@@ -1,0 +1,235 @@
+{
+  "$defs": {
+    "NoteKind": {
+      "description": "The seven margin-note kinds, mirroring the reflect tool's vocabulary.\n\nKept in lock-step with :data:`creek_mcp.tools.reflect._ALLOWED_KINDS`,\nwhich is what the produced notes are actually constrained to; a wire enum\nthat drifted from it would let a legitimate note fail validation on the way\nout.\n\nAttributes:\n    FEAR: A named fear surfacing in the entry.\n    GIFT: Something the writer is giving or has been given.\n    LONGING: An unmet want the writing circles.\n    PATTERN: A recurrence the writer has not named yet.\n    REFRAME: The same material seen from another angle.\n    TENSION: Two things the entry holds at once.\n    VALUE: A commitment the entry reveals.",
+      "enum": [
+        "fear",
+        "gift",
+        "longing",
+        "pattern",
+        "reframe",
+        "tension",
+        "value"
+      ],
+      "title": "NoteKind",
+      "type": "string"
+    },
+    "PraxisKind": {
+      "description": "The five praxis types, mirroring the vault's own vocabulary.\n\nKept in lock-step with :class:`creek.models.PraxisType`, which is what a\n``04-Praxis/`` page's ``praxis_type`` is actually constrained to;\n:mod:`creek_mcp.compiled_pages` withholds any page naming something outside\nit, so a wire enum that drifted would refuse a legitimate page on the way\nout \u2014 or, worse, admit a hand-edited value the vault never sanctioned.\n``tests/test_adepthood_contract_models.py`` pins the two lists equal.\n\nAttributes:\n    COMMITMENT: A promise the writer has made.\n    FRAMEWORK: A way of seeing they reuse.\n    HABIT: Something done repeatedly, near-automatically.\n    INSIGHT: A distilled realisation.\n    PRACTICE: Something done deliberately and returned to.",
+      "enum": [
+        "commitment",
+        "framework",
+        "habit",
+        "insight",
+        "practice"
+      ],
+      "title": "PraxisKind",
+      "type": "string"
+    },
+    "PraxisLifecycle": {
+      "description": "The four praxis lifecycle statuses, mirroring :class:`creek.models.PraxisStatus`.\n\nAttributes:\n    ACTIVE: Currently being practised.\n    INTEGRATED: Absorbed; no longer needs deliberate attention.\n    PROPOSED: Named but not yet taken up.\n    RELEASED: Deliberately let go.",
+      "enum": [
+        "active",
+        "integrated",
+        "proposed",
+        "released"
+      ],
+      "title": "PraxisLifecycle",
+      "type": "string"
+    },
+    "ReflectionNote": {
+      "additionalProperties": false,
+      "description": "One margin note: a verbatim span, a kind, and the reflection itself.\n\nAttributes:\n    quote: A span copied verbatim from the entry. The producing tool\n        verifies this; a note whose quote is not verbatim is dropped rather\n        than returned.\n    kind: One of the seven :class:`NoteKind` values.\n    note: The reflection, addressed to the writer in second person.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/NoteKind",
+          "description": "Margin-note kind."
+        },
+        "note": {
+          "description": "The reflection itself.",
+          "title": "Note",
+          "type": "string"
+        },
+        "quote": {
+          "description": "Verbatim span copied from the entry.",
+          "title": "Quote",
+          "type": "string"
+        }
+      },
+      "required": [
+        "quote",
+        "kind",
+        "note"
+      ],
+      "title": "ReflectionNote",
+      "type": "object"
+    },
+    "RelatedEddy": {
+      "additionalProperties": false,
+      "description": "One eddy the reflected entry belongs to (contract 0.9, #873).\n\nCarries the same compiled-page caveat as :class:`RelatedPraxis`, and one\nmore that is specific to it: ``description`` and ``fragment_count`` are\n*synthesised from the eddy's members*, so publishing the page to a caller\nadmitted to only some of them would hand over a summary of content they\ncannot read. :mod:`creek_mcp.compiled_pages` therefore admits an eddy only\nwhen the members it can enumerate account for ``fragment_count`` exactly\n**and** every one of them is within the ceiling.\n\nAttributes:\n    title: The eddy page's title.\n    description: The eddy's own one-line description; ``\"\"`` when the page\n        declares none.\n    fragment_count: How many fragments the eddy clusters. A tally, so never\n        negative.\n    formed: The ``YYYY-MM-DD`` the eddy was first detected.",
+      "properties": {
+        "description": {
+          "description": "The eddy's own description; may be empty.",
+          "title": "Description",
+          "type": "string"
+        },
+        "formed": {
+          "description": "ISO date the eddy was first detected.",
+          "title": "Formed",
+          "type": "string"
+        },
+        "fragment_count": {
+          "description": "How many fragments the eddy clusters.",
+          "minimum": 0,
+          "title": "Fragment Count",
+          "type": "integer"
+        },
+        "title": {
+          "description": "The eddy page's title.",
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "description",
+        "fragment_count",
+        "formed"
+      ],
+      "title": "RelatedEddy",
+      "type": "object"
+    },
+    "RelatedPraxis": {
+      "additionalProperties": false,
+      "description": "One praxis page the reflected entry contributed to (contract 0.9, #873).\n\n**Compiled, not raw.** A praxis page is distilled *from* fragments, so it\nis published only when every id in its ``derived_from`` resolves to a\nfragment within the caller's ceiling \u2014 and withheld outright when its\nprovenance cannot be enumerated in full. That rule lives in\n:mod:`creek_mcp.compiled_pages`; nothing on this model re-derives it, and\nno field here carries a tier, because a page that reached the wire is one\nwhose whole provenance was already admitted.\n\nAttributes:\n    title: The praxis page's title.\n    praxis_type: Which of the five :class:`PraxisKind` values it is.\n    status: Where it sits in the :class:`PraxisLifecycle`.\n    excerpt: The page's own opening prose, whitespace-collapsed and capped\n        at :data:`creek_mcp.compiled_pages.EXCERPT_CHARS`. Not a model\n        summary and not grounding-checked \u2014 it is the page as written.",
+      "properties": {
+        "excerpt": {
+          "description": "The page's own opening prose, capped.",
+          "title": "Excerpt",
+          "type": "string"
+        },
+        "praxis_type": {
+          "$ref": "#/$defs/PraxisKind",
+          "description": "Which kind of praxis this is."
+        },
+        "status": {
+          "$ref": "#/$defs/PraxisLifecycle",
+          "description": "Where it sits in its lifecycle."
+        },
+        "title": {
+          "description": "The praxis page's title.",
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "praxis_type",
+        "status",
+        "excerpt"
+      ],
+      "title": "RelatedPraxis",
+      "type": "object"
+    },
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:func:`creek_mcp.policy.admitted_ceiling` refuses any remote call declaring\na ceiling outside :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` *before\ndispatch*. Since #1073 that decision is transport-neutral, so every adapter\nis meant to reach it the same way; the MCP surface does so today through\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool`, and #1074 mounts the\n``/v1`` handlers that will. This enum mirrors that frozenset, so\n``intimate`` and ``all`` are not merely refused at runtime \u2014 they cannot be\nconstructed at all, which is the half of the guarantee that does not depend\non a handler remembering to ask.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Margin notes for one entry.\n\nAttributes:\n    status: ``ok`` or ``empty``. ``escalate`` arrives as a\n        :class:`CareEscalationResponse` instead.\n    tier_ceiling: The caller's own declared ceiling, echoed.\n    routed_tier: The tier the model call was keyed with. **Safe to expose,\n        and provably so:** for every ceiling ``/v1`` permits and every\n        :class:`~creek.models.PrivacyTier` that ceiling admits,\n        ``routing_tier(ceiling, tier)`` equals\n        ``CEILING_ROUTING_TIER[ceiling]``. It is a constant function of the\n        caller's *own declared ceiling*, so it carries zero bits about the\n        content's tier \u2014 the caller learns only what they themselves\n        supplied. The invariant holds because ``routing_tier`` takes the\n        more sensitive of the ceiling-derived tier and the content tier,\n        and an admitted tier is by definition no more sensitive than its\n        ceiling. It is pinned by\n        ``test_routed_tier_is_a_constant_function_of_the_declared_ceiling``\n        in ``tests/test_adepthood_contract_models.py``. **If that test ever\n        fails, remove this field \u2014 do not relax the test.** A\n        ``routed_tier`` that varies with content is a one-bit tier oracle\n        over the whole corpus.\n    notes: The margin notes; empty when ``status`` is ``empty``.\n    essay: Optional free prose. Ungrounded by construction.\n    essay_grounded: Required, and only ``False`` is admissible at 0.2.",
+  "properties": {
+    "essay": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional free prose.",
+      "title": "Essay"
+    },
+    "essay_grounded": {
+      "const": false,
+      "description": "Required; only False is admissible at contract 0.2.",
+      "title": "Essay Grounded",
+      "type": "boolean"
+    },
+    "notes": {
+      "description": "Margin notes; may be empty.",
+      "items": {
+        "$ref": "#/$defs/ReflectionNote"
+      },
+      "title": "Notes",
+      "type": "array"
+    },
+    "related_eddies": {
+      "anyOf": [
+        {
+          "items": {
+            "$ref": "#/$defs/RelatedEddy"
+          },
+          "maxItems": 2,
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Eddies the entry belongs to; absent when none.",
+      "title": "Related Eddies"
+    },
+    "related_praxis": {
+      "anyOf": [
+        {
+          "items": {
+            "$ref": "#/$defs/RelatedPraxis"
+          },
+          "maxItems": 3,
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Praxis pages the entry contributed to; absent when none.",
+      "title": "Related Praxis"
+    },
+    "routed_tier": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Tier the call was keyed with; a function of tier_ceiling."
+    },
+    "status": {
+      "description": "ok or empty; escalate is CareEscalationResponse instead.",
+      "enum": [
+        "ok",
+        "empty"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "tier_ceiling": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Caller's declared ceiling."
+    }
+  },
+  "required": [
+    "status",
+    "tier_ceiling",
+    "routed_tier",
+    "notes",
+    "essay_grounded"
+  ],
+  "title": "ReflectionResponse",
+  "type": "object"
+}

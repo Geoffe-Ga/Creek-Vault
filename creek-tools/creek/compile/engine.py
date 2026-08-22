@@ -31,6 +31,12 @@ import frontmatter
 
 from creek.audit import AuditLog
 from creek.care.guardrail import CARE_POLICY
+from creek.classify.privacy_filter import (
+    AncestorIndex,
+    build_ancestor_index,
+    fragment_tier,
+    max_source_tier,
+)
 from creek.compile.provenance import ProvenanceEntry, merge_provenance
 from creek.hierarchy import (
     LevelPolicy,
@@ -39,7 +45,7 @@ from creek.hierarchy import (
     structural_path_context,
 )
 from creek.models import CompiledPage, CompileTargetKind, Fragment, PrivacyTier
-from creek.vault.reader import iter_vault_fragments
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, iter_vault_fragments
 
 if TYPE_CHECKING:
     from creek.config import LLMConfig
@@ -48,6 +54,28 @@ logger = logging.getLogger(__name__)
 
 CompileLLM = Callable[[str], str]
 """Signature for compile LLM clients: takes a prompt, returns JSON text."""
+
+CompileLLMFactory = Callable[[PrivacyTier], CompileLLM]
+"""Tier-keyed builder for a :data:`CompileLLM`.
+
+:func:`compile_to_vault` takes one of these rather than a ready-built
+client, and the key is the point: only the engine has seen the fragments,
+so only the engine can say how sensitive the call is. Its callers hold an
+id list and nothing more. A production factory closes over
+:class:`creek.classify.llm.router.ModelRouter` and resolves the
+``generation`` stage *with* the tier, which is what puts every compile
+through the ``Intimate``-never-cloud chokepoint (#647/#962); handed a
+pre-built client instead, the caller resolves with no tier and
+``ModelRouter._enforce_local_for_intimate`` degrades to a no-op — the
+invariant is then documented and unenforced, which is precisely the bug
+#962 fixes.
+
+The engine deliberately knows nothing about ``ModelRouter``, tier
+ceilings, or the MCP layer: it derives a :class:`~creek.models.PrivacyTier`
+and hands it over. Whatever the factory decides — including raising
+:class:`~creek.classify.llm.router.IntimateRoutingError` when there is no
+local backend to fall back to — propagates to the caller untouched.
+"""
 
 PARADOX_LOG_RELPATH = Path(
     "00-Creek-Meta/Processing-Log/paradoxes-during-compile.jsonl",
@@ -127,7 +155,8 @@ def compile_fragments(
 
     Raises:
         ValueError: If *target_kind* is not one of the supported
-            compiled-page surfaces.
+            compiled-page surfaces, or if the LLM payload's ``claims``
+            or ``paradoxes`` are not arrays of JSON objects.
     """
     _validate_target_kind(target_kind)
     pairs = list(fragments_with_bodies)
@@ -242,6 +271,85 @@ def _payload_to_paradox_entries(
     ]
 
 
+def _routing_tier_for(
+    loaded: list[tuple[Fragment, str, dict[str, object]]],
+    ancestry: list[PrivacyTier],
+) -> PrivacyTier:
+    """Return the tier this compile's LLM call must be keyed with.
+
+    The reduction spans **every loaded fragment**, and is taken *before*
+    any level policy is applied. That ordering is the trap a future
+    "optimisation" would fall into: :func:`compile_fragments` runs
+    :func:`_apply_level_policy`, which under the default ``"leaves"``
+    drops a parent whose child is also in the set — but the parent is not
+    thereby absent from the prompt. :func:`_build_prompt` passes a
+    ``by_id`` lookup spanning *all* pairs to
+    :func:`creek.hierarchy.structural_path_context`, which walks
+    ``parent_id`` and emits the dropped parents' **titles** as the
+    surviving child's ``structural_path:`` breadcrumb. Reducing over the
+    policy-selected subset would therefore under-route: an intimate
+    parent's title would egress on a call keyed by its open child.
+
+    **The *ancestry* term closes the other half of the same channel
+    (#931).** The walk above only reaches ancestors the caller *named*, so
+    it never saw the branch that fires when they did not:
+    ``structural_path_context`` prefers the leaf's own **persisted**
+    ``structural_path``, a list of ancestor headings the splitter baked in
+    at ingest, and that branch needs no ancestor fragment in memory at all.
+    Name one ``open`` child of an ``intimate`` document and pre-#931 the
+    call routed ``OPEN`` — a cloud client built with ``structural_path:
+    <the intimate document's heading>`` sitting in the prompt. Folding
+    :meth:`creek.classify.privacy_filter.AncestorIndex.chain_tiers` into the
+    reduction escalates the routing tier instead of redacting the
+    breadcrumb: the ``creek compile`` operator owns the vault, so the
+    orienting value of the ancestry is theirs to keep — it just may not
+    leave the machine. (The MCP wrapper makes the opposite and equally
+    correct choice for *its* caller, refusing the whole call; see
+    ``creek_mcp.tools.compile``.)
+
+    **Two accepted costs of ranking by walking ``parent_id``.** First it
+    *over-covers*: it ranks the root document, whose title the persisted
+    breadcrumb never carries (the splitter appends only headings). An
+    intimate root therefore forces its descendants' compiles local even
+    though the prompt shows only section headings — accepted, because the
+    fallback branch of ``structural_path_context`` *does* render the root's
+    title, and the two branches must be gated the same way. Second, an
+    ancestry link that cannot be surveyed — dangling (``creek
+    ingest``'s resplit unlinks a merged parent), cyclic, or a breadcrumb
+    deeper than the walk can reach — ranks ``INTIMATE``, so a whole subtree
+    becomes uncompilable at cloud tiers and the operator sees only
+    ``IntimateRoutingError``. That is the right privacy answer and a poor
+    diagnostic; ``creek lint`` surfacing those states is #1277.
+
+    Sensitivity is read fragment-by-fragment through
+    :func:`creek.classify.privacy_filter.fragment_tier`, which is why the
+    loader threads each file's *raw* frontmatter this far. A fragment with
+    no ``privacy_tier`` key at all is indistinguishable from an explicit
+    ``unclassified`` once :class:`~creek.models.Fragment` has applied its
+    default, and the two must route differently: nobody has vouched for
+    the former, so it fails closed to ``INTIMATE``.
+
+    Args:
+        loaded: Every ``(fragment, body, raw)`` triple the compile loaded,
+            pre-policy and in requested order.
+        ancestry: The tiers of the requested fragments' ancestors, from
+            :meth:`creek.classify.privacy_filter.AncestorIndex.chain_tiers`.
+            Empty when nothing requested resolved — which cannot narrow the
+            result, because the reduction below then has nothing to reduce
+            and fails closed anyway.
+
+    Returns:
+        The most sensitive tier among *loaded* and *ancestry*, or
+        :attr:`~creek.models.PrivacyTier.INTIMATE` when both are empty
+        — an empty compile carries no evidence about what it would send,
+        and :func:`creek.classify.privacy_filter.max_source_tier` owns
+        that fail-closed default so every caller of it agrees.
+    """
+    return max_source_tier(
+        [*(fragment_tier(f, raw) for f, _body, raw in loaded), *ancestry],
+    )
+
+
 def compile_to_vault(
     *,
     fragment_ids: list[str],
@@ -249,15 +357,23 @@ def compile_to_vault(
     target_kind: CompileTargetKind,
     target_id: str,
     target_title: str,
-    llm: CompileLLM,
+    llm_factory: CompileLLMFactory,
     level_policy: LevelPolicy = "leaves",
 ) -> Path:
     """Compile *fragment_ids* into a compiled-layer page on disk.
 
-    Loads the named fragments from ``<vault>/01-Fragments``, runs
+    Loads the named fragments from ``<vault>/01-Fragments``, builds the
+    LLM client for their combined privacy tier, runs
     :func:`compile_fragments`, persists the synthesis page to the
     ``target_kind``-specific directory, and appends any paradoxes to
     the side-channel JSONL log.
+
+    The step order is load-bearing, not incidental. The factory is invoked
+    **after** the load — so an unresolvable id gets the ``ValueError``
+    below rather than whatever the factory would have raised — and
+    **before** :func:`_resolve_target_path`, which unconditionally creates
+    the target directory. A compile refused on privacy grounds must leave
+    zero state on disk, not an empty ``02-Threads/Active``.
 
     Args:
         fragment_ids: IDs of source fragments to roll up.
@@ -265,22 +381,40 @@ def compile_to_vault(
         target_kind: ``"thread"``, ``"eddy"``, or ``"frequency_index"``.
         target_id: Stable ID of the synthesis target.
         target_title: Human-readable title for the page.
-        llm: Compile LLM callable returning JSON.
+        llm_factory: Tier-keyed builder for the compile LLM client. It is
+            called exactly once, with the tier :func:`_routing_tier_for`
+            derives from every loaded fragment — the engine is the only
+            layer that has seen them, so it is the only layer that can
+            supply it. See :data:`CompileLLMFactory`.
         level_policy: FEAT-025 level policy applied to the input
             fragments. Passed through to :func:`compile_fragments`;
-            defaults to ``"leaves"``.
+            defaults to ``"leaves"``. It deliberately does not narrow the
+            routing tier; see :func:`_routing_tier_for`.
 
     Returns:
         The path of the written compiled-layer page.
 
     Raises:
-        ValueError: If a requested fragment cannot be found in the vault.
+        ValueError: If a requested fragment cannot be found in the vault,
+            or if *target_id* escapes the compiled-layer directory.
+        creek.classify.llm.router.IntimateRoutingError: Raised by the
+            production *llm_factory* when the sources route ``INTIMATE``
+            and no local backend exists to fall back to. It subclasses
+            ``RuntimeError``, so ``creek_mcp.tools.compile``'s existing
+            ``except (ValueError, RuntimeError)`` keeps converting it into
+            a structured refusal; the CLI catches it by name so a privacy
+            refusal reads as a refusal rather than a traceback. Anything
+            else *llm_factory* raises — an unreachable provider, a missing
+            credential — propagates untouched for the same reason: the
+            engine takes no view on how a client is built.
     """
-    pairs = _load_fragments_for_compile(vault_path, fragment_ids)
+    pairs_with_raw, ancestors = _load_fragments_for_compile(vault_path, fragment_ids)
+    tier = _routing_tier_for(pairs_with_raw, ancestors.chain_tiers(fragment_ids))
+    llm = llm_factory(tier)
     target_path = _resolve_target_path(vault_path, target_kind, target_id)
     existing = _load_existing_provenance(target_path)
     result = compile_fragments(
-        pairs,
+        [(fragment, body) for fragment, body, _raw in pairs_with_raw],
         llm=llm,
         target_kind=target_kind,
         target_id=target_id,
@@ -455,6 +589,9 @@ def _parse_llm_payload(raw: str) -> dict[str, list[dict[str, object]]]:
     if not isinstance(claims, list) or not isinstance(paradoxes, list):
         msg = "Compile LLM payload claims/paradoxes must be arrays."
         raise ValueError(msg)  # noqa: TRY004  # ValueError unifies all LLM-payload schema errors with the JSONDecodeError branch above.
+    if any(not isinstance(item, dict) for item in (*claims, *paradoxes)):
+        msg = "Compile LLM payload claims/paradoxes must contain JSON objects."
+        raise ValueError(msg)
     return {"claims": list(claims), "paradoxes": list(paradoxes)}
 
 
@@ -473,20 +610,59 @@ def _render_body(title: str, claims: list[dict[str, object]]) -> str:
 def _load_fragments_for_compile(
     vault_path: Path,
     fragment_ids: list[str],
-) -> list[tuple[Fragment, str]]:
-    """Load the requested fragments from the vault and preserve order."""
+) -> tuple[list[tuple[Fragment, str, dict[str, object]]], AncestorIndex]:
+    """Load the requested fragments from the vault and preserve order.
+
+    Keeps the ``raw`` frontmatter :func:`creek.vault.reader.iter_vault_fragments`
+    already yields instead of discarding it. Within the compile engine this
+    is the only place a *missing* ``privacy_tier`` key is still
+    distinguishable from an explicit ``unclassified`` —
+    :class:`~creek.models.Fragment` has defaulted the two together by the
+    time the model is built — and :func:`_routing_tier_for` needs that
+    distinction to fail closed. Scoped to this engine deliberately:
+    :func:`creek_mcp.tools.reflect._fragment_tier` reaches the same
+    distinction independently, off its own raw ``post.metadata`` read, and
+    that duplication is pre-existing and unresolved (#847). The two must
+    keep agreeing; nothing but review currently makes them.
+
+    It also returns the whole-corpus
+    :class:`~creek.classify.privacy_filter.AncestorIndex` (#931), built from
+    the records of *this* walk rather than fetched by a second one. The
+    ancestors the prompt's ``structural_path:`` breadcrumb renders are
+    usually not among the requested ids, so ranking them needs the corpus —
+    but at the 35k-fragment bar a second ``rglob``-plus-parse pass doubles
+    the pre-LLM wall clock, and a privacy fix has no business shipping that
+    regression. ``tests/test_compile.py``'s
+    ``test_compile_to_vault_walks_the_vault_exactly_once`` pins the single
+    walk so a future lane cannot quietly reintroduce the second one.
+
+    Args:
+        vault_path: Vault root; fragments are read from ``01-Fragments``.
+        fragment_ids: The ids to load, in the order the caller wants them.
+
+    Returns:
+        A ``(triples, ancestor_index)`` pair: one ``(fragment, body, raw)``
+        triple per requested id in requested order, and the ancestry index
+        spanning every fragment in the corpus.
+
+    Raises:
+        ValueError: If any requested id has no matching fragment.
+    """
     requested = fragment_ids.copy()
-    by_id: dict[str, tuple[Fragment, str]] = {}
-    for _path, fragment, body, _raw in iter_vault_fragments(
-        vault_path / "01-Fragments",
-    ):
-        if fragment.id in requested:
-            by_id[fragment.id] = (fragment, body)
+    records = iter_vault_fragments(vault_path / "01-Fragments")
+    by_id: dict[str, tuple[Fragment, str, dict[str, object]]] = {
+        fragment.id: (fragment, body, raw)
+        for _path, fragment, body, raw in records
+        if fragment.id in requested
+    }
+    ancestors = build_ancestor_index(
+        (fragment, raw) for _path, fragment, _body, raw in records
+    )
     missing = [fid for fid in requested if fid not in by_id]
     if missing:
         msg = f"Fragment(s) not found in vault: {', '.join(missing)}"
         raise ValueError(msg)
-    return [by_id[fid] for fid in requested]
+    return [by_id[fid] for fid in requested], ancestors
 
 
 def _resolve_target_path(
@@ -541,7 +717,7 @@ def _load_existing_provenance(target_path: Path) -> list[ProvenanceEntry]:
         return []
     try:
         post = frontmatter.load(str(target_path))
-    except (OSError, ValueError):
+    except FRONTMATTER_LOAD_ERRORS:
         return []
     raw = post.metadata.get("provenance") or []
     if not isinstance(raw, list):

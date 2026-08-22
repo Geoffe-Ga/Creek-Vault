@@ -21,19 +21,31 @@ Plus the document-level integration tests: section ordering, ``write()``
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, date, datetime, timedelta
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import frontmatter
 import pytest
 from typer.testing import CliRunner
 
+from creek.classify.privacy_filter import PrivacyTierOverride
 from creek.cli import app
+from creek.generate.mining import IdeaSeed, MiningStrategy
 from creek.generate.state import (
     EMPTY_PLACEHOLDER,
     SECTION_ORDER,
     StateReportGenerator,
+    _admit_praxis,
+    _admitted_liminal_notes,
     _frequency_label,
+    _load_latest_yield,
+    _load_synchronicities,
+    _load_typed_models,
+    _read_fragment_files,
+    _refresh_latest,
+    _seed_as_prompt,
 )
 from creek.generate.state_budget import (
     SIZE_BUDGET_TOKENS,
@@ -42,9 +54,18 @@ from creek.generate.state_budget import (
     estimate_tokens,
 )
 from creek.generate.state_budget import main as state_budget_main
+from creek.models import (
+    Eddy,
+    Frequency,
+    Praxis,
+    PraxisStatus,
+    PraxisType,
+    PrivacyTier,
+)
+from tests.conftest import CORRUPT_NOTE_SHAPES
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Callable
 
 
 runner = CliRunner()
@@ -1014,7 +1035,15 @@ def _seed_rising_fixture(vault: Path) -> None:
 
 
 def _seed_bottoming_fixture(vault: Path) -> None:
-    """Populate a vault biased toward Bottoming-Out compost/synchronicity prompts."""
+    """Populate a vault biased toward Bottoming-Out compost/synchronicity prompts.
+
+    ``privacy_tier`` is explicit because ``section_suggested_questions``
+    routes through :func:`creek.generate.mining.phase_filtered_seeds`,
+    which tier-filters its corpus. Since #876 an untiered fragment ranks
+    as PERSONAL and arrives as a title-only summary, stripping the
+    ``composting``/``synchronicity`` body keywords this fixture exists to
+    surface. Tier policy is covered in the privacy-filter suite.
+    """
     base = datetime(2026, 5, 1, tzinfo=UTC)
     # Liminal "Unnamed" fragment plus matching eddy → liminal-cross-eddy seed.
     (vault / "10-Liminal" / "Unnamed").mkdir(parents=True, exist_ok=True)
@@ -1024,6 +1053,7 @@ def _seed_bottoming_fixture(vault: Path) -> None:
         "title": "Compost stirring",
         "created": base.isoformat(),
         "ingested": base.isoformat(),
+        "privacy_tier": "open",
         "source": {"platform": "journal", "author": "self"},
         "frequency": {"primary": "F4", "secondary": []},
     }
@@ -1643,3 +1673,505 @@ def test_cli_state_budget_fails_when_over_budget(populated_vault: Path) -> None:
 
     assert result.exit_code != 0
     assert "budget" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# #1344: the drift section stays fragment-scoped as the link survey widens
+# ---------------------------------------------------------------------------
+
+
+def test_section_drift_warnings_omits_non_fragment_sources(
+    empty_vault: Path,
+) -> None:
+    """A broken link on a thread page must not reach the drift section.
+
+    ``BrokenLinkScanner`` now surveys the whole vault minus Creek's own
+    report folders (#1344), but ``## Drift warnings`` renders only sources in
+    ``admitted_paths`` — which holds admitted *fragments*. #969 gates this
+    section by source precisely so an above-ceiling path never lands in a
+    committable artefact; widening the scanner must not widen the section.
+    """
+    base = datetime(2026, 4, 1, tzinfo=UTC)
+    _write_fragment(
+        empty_vault,
+        frag_id="frag-link",
+        title="Linker",
+        created=base,
+        body="See [[Missing Fragment Target]] for context.",
+    )
+    thread_meta = {
+        "type": "thread",
+        "id": "thread-link",
+        "title": "Thread Link",
+        "status": "active",
+        "first_seen": date(2026, 4, 1).isoformat(),
+        "last_seen": date(2026, 4, 15).isoformat(),
+        "fragment_count": 1,
+    }
+    thread = empty_vault / "02-Threads" / "Active" / "thread-link.md"
+    thread.write_text(
+        frontmatter.dumps(
+            frontmatter.Post(
+                content="See [[Nonexistent Thread Target]] for context.",
+                **thread_meta,
+            ),
+        ),
+        encoding="utf-8",
+    )
+
+    section = StateReportGenerator(
+        vault_path=empty_vault,
+    ).section_drift_warnings()
+
+    assert section.startswith("## Drift warnings")
+    assert "Missing Fragment Target" in section
+    assert "Nonexistent Thread Target" not in section
+    assert "thread-link" not in section
+
+
+# ---------------------------------------------------------------------------
+# Issue #1451: the state report's unwitnessed skip and fallback arms
+# ---------------------------------------------------------------------------
+
+
+class TestLoadTypedModelsStepsOverBadNotes:
+    """``_load_typed_models`` skips bad notes and keeps the good ones.
+
+    Every arm here is characterization — the loader already behaves
+    correctly — so these tests go green the moment they are written and
+    cannot be proved by watching them fail. They are therefore written to
+    be killed by mutation instead: each asserts the **exact surviving
+    ids** by list equality, with a positive control proving the loader
+    returns the good notes when no poison is present. A loader that
+    returned ``[]`` unconditionally passes every assertion weaker than
+    that.
+    """
+
+    @staticmethod
+    def _seed_good(vault: Path) -> list[str]:
+        """Write two readable eddies and return their ids."""
+        for eddy_id in ("eddy-good-a", "eddy-good-b"):
+            _write_eddy(vault, eddy_id=eddy_id, title=f"Title {eddy_id}")
+        return ["eddy-good-a", "eddy-good-b"]
+
+    @staticmethod
+    def _ids(vault: Path) -> list[str]:
+        """Return the eddy ids ``_load_typed_models`` recovers, in order."""
+        loaded = _load_typed_models(vault / "03-Eddies", type_tag="eddy", cls=Eddy)
+        return [model.id for model in loaded]
+
+    def test_positive_control_returns_both_eddies(self, empty_vault: Path) -> None:
+        """With no poison present the loader returns both good records."""
+        expected = self._seed_good(empty_vault)
+
+        assert self._ids(empty_vault) == expected
+
+    def test_absent_root_returns_empty(self, tmp_path: Path) -> None:
+        """A vault with no eddy folder yields nothing rather than raising."""
+        assert not (tmp_path / "03-Eddies").exists()
+
+        assert self._ids(tmp_path) == []
+
+    @pytest.mark.parametrize("shape", CORRUPT_NOTE_SHAPES)
+    def test_skips_each_corrupt_shape(
+        self,
+        empty_vault: Path,
+        shape: str,
+        corrupt_note: Callable[[Path, str], Path],
+    ) -> None:
+        """An unreadable note is stepped over; both good eddies survive.
+
+        The poison sorts between the two good notes, so a walk that
+        aborted on it returns one id and is caught by the equality.
+        """
+        expected = self._seed_good(empty_vault)
+        corrupt_note(empty_vault / "03-Eddies" / "eddy-good-aa.md", shape)
+
+        assert self._ids(empty_vault) == expected
+
+    def test_skips_foreign_type_note(self, empty_vault: Path) -> None:
+        """A well-formed note of another ``type`` is skipped by the gate.
+
+        The impostor is a *valid* thread record, so the ``type`` gate is
+        the only thing that can reject it — a malformed note here would
+        be caught one arm earlier and leave the gate untested.
+        """
+        expected = self._seed_good(empty_vault)
+        (empty_vault / "03-Eddies" / "eddy-good-aa.md").write_text(
+            "---\n"
+            "type: thread\n"
+            "id: thread-impostor\n"
+            "title: Not an eddy\n"
+            "status: active\n"
+            "first_seen: '2026-01-01'\n"
+            "last_seen: '2026-02-01'\n"
+            "---\n"
+            "impostor body\n",
+            encoding="utf-8",
+        )
+
+        assert self._ids(empty_vault) == expected
+
+    def test_skips_schema_invalid_note(self, empty_vault: Path) -> None:
+        """A note that parses but fails ``Eddy.model_validate`` is skipped.
+
+        Surgically invalid: the record carries ``type: eddy`` and every
+        required field, with only ``formed`` broken, so it reaches
+        ``model_validate`` and fails there rather than at some earlier
+        arm.
+        """
+        expected = self._seed_good(empty_vault)
+        (empty_vault / "03-Eddies" / "eddy-good-aa.md").write_text(
+            "---\n"
+            "type: eddy\n"
+            "id: eddy-broken\n"
+            "title: Unparseable formed date\n"
+            # The one broken field; everything else is a valid Eddy.
+            "formed: not-a-date\n"
+            "fragment_count: 1\n"
+            "threads: []\n"
+            "---\n"
+            "broken body\n",
+            encoding="utf-8",
+        )
+
+        assert self._ids(empty_vault) == expected
+
+
+class TestReadFragmentFilesSkipsSchemaInvalid:
+    """``_read_fragment_files`` drops a fragment whose schema will not validate.
+
+    The drop is fail-closed on purpose (a fragment nobody can load is a
+    fragment nobody can vouch for), so the assertion is on the surviving
+    ids rather than on the absence of a crash.
+    """
+
+    def test_positive_control_then_schema_invalid_is_dropped(
+        self,
+        empty_vault: Path,
+        pydantic_invalid_note: Callable[[Path], Path],
+    ) -> None:
+        """The good fragment survives; the schema-invalid one does not."""
+        _write_fragment(
+            empty_vault,
+            frag_id="frag-good",
+            title="Readable",
+            created=datetime(2026, 5, 1, tzinfo=UTC),
+        )
+        root = empty_vault / "01-Fragments"
+        before = [f.id for _p, f, _raw in _read_fragment_files(root)]
+        assert before == ["frag-good"]
+
+        pydantic_invalid_note(root / "Notes" / "broken.md")
+
+        after = [f.id for _p, f, _raw in _read_fragment_files(root)]
+        assert after == ["frag-good"]
+
+
+class TestAdmitPraxisRequiresEvidence:
+    """``_admit_praxis`` excludes a praxis that names no source fragments.
+
+    The empty-``derived_from`` case is not a corrupt-note arm at all: it
+    is a privacy rule. A praxis with no evidence has no source tier that
+    could vouch for its title, so admitting it would leak a title past a
+    ceiling that never cleared it. That is why it gets its own test and
+    its own assertion on *which* praxis survived.
+    """
+
+    def test_praxis_without_derived_from_is_excluded(self) -> None:
+        """Only the evidence-carrying praxis is admitted, by id."""
+        grounded = Praxis(
+            id="prx-grounded",
+            title="Grounded",
+            praxis_type=PraxisType.HABIT,
+            status=PraxisStatus.PROPOSED,
+            derived_from=["frag-001"],
+        )
+        ungrounded = Praxis(
+            id="prx-ungrounded",
+            title="Ungrounded",
+            praxis_type=PraxisType.HABIT,
+            status=PraxisStatus.PROPOSED,
+            derived_from=[],
+        )
+
+        admitted, tiers = _admit_praxis(
+            [grounded, ungrounded],
+            {"frag-001": PrivacyTier.OPEN},
+        )
+
+        assert [item.id for item in admitted] == ["prx-grounded"]
+        assert tiers == [PrivacyTier.OPEN]
+
+
+class TestAdmittedLiminalNotesStepsOverBadNotes:
+    """``_admitted_liminal_notes`` skips an unreadable note in the watch folder.
+
+    The liminal watch is the operator's hand-edited territory, so a
+    single malformed note there is the likeliest way to lose the whole
+    section. The assertion names the surviving stems.
+    """
+
+    @pytest.mark.parametrize("shape", CORRUPT_NOTE_SHAPES)
+    def test_skips_each_corrupt_shape(
+        self,
+        empty_vault: Path,
+        shape: str,
+        corrupt_note: Callable[[Path, str], Path],
+    ) -> None:
+        """Both readable notes survive an unreadable sibling."""
+        folder = empty_vault / "10-Liminal" / "Unnamed"
+        folder.mkdir(parents=True, exist_ok=True)
+        for name in ("note-a", "note-b"):
+            _write_liminal_unnamed(
+                empty_vault,
+                name,
+                created=datetime(2026, 5, 1, tzinfo=UTC),
+            )
+        corrupt_note(folder / "note-aa.md", shape)
+
+        admitted = _admitted_liminal_notes(folder, PrivacyTierOverride.ALL)
+
+        assert sorted(stem for stem, _tier in admitted) == ["note-a", "note-b"]
+
+    def test_positive_control_returns_the_readable_notes(
+        self,
+        empty_vault: Path,
+    ) -> None:
+        """With no poison present both readable notes are admitted.
+
+        Without this control the skip test above is vacuous: a loader
+        returning ``[]`` for everything would pass it.
+        """
+        folder = empty_vault / "10-Liminal" / "Unnamed"
+        folder.mkdir(parents=True, exist_ok=True)
+        for name in ("note-a", "note-b"):
+            _write_liminal_unnamed(
+                empty_vault,
+                name,
+                created=datetime(2026, 5, 1, tzinfo=UTC),
+            )
+
+        admitted = _admitted_liminal_notes(folder, PrivacyTierOverride.ALL)
+
+        assert sorted(stem for stem, _tier in admitted) == ["note-a", "note-b"]
+
+
+class TestLoadSynchronicitiesTypeGate:
+    """``_load_synchronicities`` ignores non-synchronicity notes in its folder.
+
+    Issue #1451 asked for the ``post is None`` arm of this loader. **That
+    arm is gone**: the loader now reads through
+    :func:`creek.vault.links.read_header_meta` rather than ``_safe_post``
+    (#1416), so an unreadable note yields an empty mapping and the crash
+    the issue described is structurally impossible rather than handled.
+    The genuinely uncovered arm the migration left behind is the ``type``
+    gate below, which is what this pins.
+    """
+
+    def test_foreign_type_note_is_ignored(self, empty_vault: Path) -> None:
+        """A non-synchronicity note in the folder does not become a row.
+
+        The impostor is deliberately **synchronicity-shaped**: it carries
+        a valid ``id``, both fragment ids, a float ``similarity`` and an
+        int ``time_gap_days``, so every isinstance guard downstream would
+        happily admit it. The ``type`` gate is therefore the only thing
+        that can reject it. An impostor missing those fields — a bare
+        paradox note, say — gets dropped by the isinstance guards instead
+        and leaves the gate untested while the coverage line still turns
+        green.
+        """
+        _write_synchronicity(
+            empty_vault,
+            sync_id="sync-good",
+            frag_a="frag-001",
+            frag_b="frag-002",
+        )
+        folder = empty_vault / "10-Liminal" / "Synchronicities"
+        (folder / "not-a-sync.md").write_text(
+            "---\n"
+            # Everything a synchronicity row needs, under the wrong type.
+            "type: resonance\n"
+            "id: res-001\n"
+            "fragment_a_id: frag-003\n"
+            "fragment_b_id: frag-004\n"
+            "similarity: 0.91\n"
+            "time_gap_days: 12\n"
+            "source_a: journal\n"
+            "source_b: essay\n"
+            "---\n"
+            "impostor body\n",
+            encoding="utf-8",
+        )
+
+        rows = _load_synchronicities(folder)
+
+        assert [row.sync_id for row in rows] == ["sync-good"]
+
+
+class TestLoadLatestYieldFailsSoft:
+    """``_load_latest_yield`` returns ``None`` for every unusable log.
+
+    Each arm returns the same ``None``, so the positive control is what
+    stops the battery being satisfied by a reader that returned ``None``
+    unconditionally.
+    """
+
+    def test_positive_control_returns_the_last_line(self, empty_vault: Path) -> None:
+        """The newest JSONL row is the one returned."""
+        log = _write_yield_jsonl(
+            empty_vault,
+            [{"run": "older", "n": 1}, {"run": "newest", "n": 2}],
+        )
+
+        assert _load_latest_yield(log) == {"run": "newest", "n": 2}
+
+    def test_unreadable_log_returns_none(
+        self,
+        empty_vault: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An ``OSError`` on read degrades to "no yield", not a crash.
+
+        The failure is injected by monkeypatching ``read_text`` rather
+        than by ``chmod``: a permission bit is root- and
+        filesystem-dependent and silently does nothing when the suite
+        runs as root in a container.
+        """
+        log = _write_yield_jsonl(empty_vault, [{"run": "newest"}])
+        real_read_text = Path.read_text
+
+        def _boom(self: Path, *args: Any, **kwargs: Any) -> str:
+            """Raise for the yield log only, delegating every other read."""
+            if self == log:
+                msg = "simulated IO failure"
+                raise OSError(msg)
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _boom)
+
+        assert _load_latest_yield(log) is None
+
+    @pytest.mark.parametrize("raw", ["", "   \n", "\n\n \t \n"])
+    def test_whitespace_only_log_returns_none(
+        self,
+        empty_vault: Path,
+        raw: str,
+    ) -> None:
+        """A log holding only blank lines yields no summary rather than raising.
+
+        Without the ``if not lines`` guard this indexes ``lines[-1]`` on
+        an empty list and raises ``IndexError``, which is a crash rather
+        than a missing section.
+        """
+        log = empty_vault / "00-Creek-Meta" / "Processing-Log" / "run-summary.jsonl"
+        log.write_text(raw, encoding="utf-8")
+
+        assert _load_latest_yield(log) is None
+
+
+class TestFrequencyLabelAcceptsEnumMembers:
+    """``_frequency_label`` accepts a real :class:`Frequency` member.
+
+    Scope stated honestly: the ``isinstance(freq_value, Frequency)``
+    short-circuit this drives is **defensive, not load-bearing today**.
+    Removing it falls through to ``Frequency(freq_value)``, and calling
+    an enum with one of its own members returns that member — so the
+    mutant is semantically identical and no behavioural test can kill it.
+    The branch earns its place against a future in which
+    :class:`Frequency` loses its :class:`enum.StrEnum` base, which is
+    what the module comment says. What these tests pin is the contract
+    (a member and its ``.value`` must label identically) and the
+    previously unexecuted branch; the redundancy is reported as a finding
+    rather than dressed up as a kill.
+    """
+
+    def test_enum_member_and_its_string_agree(self) -> None:
+        """A member and its ``.value`` produce the identical label."""
+        assert _frequency_label(Frequency.F1) == _frequency_label(Frequency.F1.value)
+
+    def test_enum_member_renders_code_and_name(self) -> None:
+        """The label carries both the code and the human-readable name."""
+        label = _frequency_label(Frequency.F1)
+
+        assert label.startswith("F1 (")
+        assert label.endswith(")")
+
+
+class TestSeedAsPrompt:
+    """``_seed_as_prompt`` renders a seed with and without a brief description."""
+
+    @staticmethod
+    def _seed(brief: str) -> IdeaSeed:
+        """Return an IdeaSeed carrying *brief* as its brief description."""
+        return IdeaSeed(
+            strategy=MiningStrategy.LIMINAL_CROSS_EDDY,
+            title="Naming what orbits",
+            source_fragments=("frag-001",),
+            threads=(),
+            eddies=(),
+            frequency_affinity=(Frequency.F1,),
+            brief_description=brief,
+            score=1.0,
+        )
+
+    def test_brief_description_is_appended(self) -> None:
+        """A seed with a brief renders ``title — brief``."""
+        assert _seed_as_prompt(self._seed("why now")) == "Naming what orbits — why now"
+
+    def test_missing_brief_description_renders_title_alone(self) -> None:
+        """A seed without a brief renders the bare title, with no dangling dash.
+
+        The dash is the tell: the naive single-branch implementation
+        emits ``"Naming what orbits — "`` and would pass any assertion
+        that only checked the title was present.
+        """
+        rendered = _seed_as_prompt(self._seed(""))
+
+        assert rendered == "Naming what orbits"
+        assert "—" not in rendered
+
+
+class TestRefreshLatestSurvivesUnlinkFailure:
+    """``_refresh_latest`` warns but still republishes when unlink fails.
+
+    The log level is the product here: the module comments say WARNING is
+    deliberate because an unlink failure can mask a permissions problem
+    and leave a dangling symlink. So the test asserts the level *and*
+    that the operator still got a usable ``latest.md`` — the degradation,
+    not just the message.
+    """
+
+    def test_unlink_oserror_warns_and_still_publishes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A failing unlink is reported at WARNING and does not abort."""
+        state_dir = tmp_path / "State"
+        state_dir.mkdir()
+        target = state_dir / "2026-W18.md"
+        target.write_text("# Week 18\n", encoding="utf-8")
+        latest = state_dir / "latest.md"
+        latest.write_text("stale\n", encoding="utf-8")
+        real_unlink = Path.unlink
+
+        def _boom(self: Path, *args: Any, **kwargs: Any) -> None:
+            """Fail for ``latest.md`` only, delegating every other unlink."""
+            if self == latest:
+                msg = "simulated unlink failure"
+                raise OSError(msg)
+            real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", _boom)
+
+        with caplog.at_level(logging.WARNING, logger="creek.generate.state"):
+            result = _refresh_latest(state_dir, target)
+
+        assert [r.message for r in caplog.records if r.levelno >= logging.WARNING] == [
+            "Could not unlink existing latest.md",
+        ]
+        assert result == latest
+        assert result.exists()
+        assert result.read_text(encoding="utf-8") == "# Week 18\n"

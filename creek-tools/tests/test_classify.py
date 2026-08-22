@@ -24,6 +24,7 @@ from creek.classify.llm import (
     _strip_code_fences,
 )
 from creek.classify.llm import LLMClassifier as LLMClassifierDirect
+from creek.classify.llm.parsing import _apply_praxis, _merge_textures
 from creek.classify.review import ReviewQueueGenerator as ReviewQueueGeneratorDirect
 from creek.classify.rules import (
     CONFIDENCE_SIGNALS,
@@ -45,6 +46,7 @@ from creek.models import (
     Mode,
     Orientation,
     Phase,
+    PraxisPotential,
     SourcePlatform,
     VoiceClassification,
     VoiceRegister,
@@ -70,6 +72,30 @@ def _make_fragment(
         id="frag-000000000003",
         title=title,
         source=FragmentSource(platform=platform),
+    )
+
+
+def _make_praxis_fragment(potential: PraxisPotential) -> Fragment:
+    """Create a Fragment that already carries a praxis verdict (issue #877).
+
+    :func:`_make_fragment` always yields the model default, ``none`` — the
+    *weakest* verdict on the monotone ``none < latent < explicit`` scale.
+    Any assertion built on it is therefore structurally blind to a
+    demotion, because there is no higher verdict left to lose.
+
+    ``.value`` is used because ``Fragment`` sets ``use_enum_values=True``
+    but ``model_copy`` bypasses that coercion, so passing the bare
+    StrEnum member would store something a plain-``str`` consumer (and
+    YAML's SafeDumper) does not see the same way.
+
+    Args:
+        potential: The praxis verdict already recorded on the fragment.
+
+    Returns:
+        A Fragment identical to :func:`_make_fragment`'s but at *potential*.
+    """
+    return _make_fragment().model_copy(
+        update={"praxis_potential": potential.value},
     )
 
 
@@ -671,15 +697,37 @@ class TestBuildPromptSanitisation:
 
     def test_caps_long_content_length(self) -> None:
         """Body longer than the cap is truncated before injection."""
+        from creek.classify import few_shot
+        from creek.classify.llm.prompts import _MAX_PROMPT_CONTENT_CHARS
+
         config = LLMConfig()
         classifier = LLMClassifier(config=config)
         huge = "x" * (32 * 1024)
         frag = _make_fragment(title="ok")
         prompt = classifier._build_prompt(frag, content=huge)
-        # FEAT-017: 8 KiB content cap + ~3 KiB CoT header + ~5 KiB
-        # rotated few-shot examples block (capped per fixture body too).
         assert len(prompt) < len(huge)
-        assert len(prompt) <= 8192 + 8192
+        # FEAT-017: the prompt is exactly three independently-bounded parts —
+        # the static template, the few-shot block (each example body capped at
+        # ``few_shot._BODY_CAP_CHARS``), and the content truncated to
+        # ``_MAX_PROMPT_CONTENT_CHARS``. Summing those pins the property that
+        # actually matters: nothing *unbounded* reaches the provider. It is a
+        # true ceiling by construction, since ``format`` substitutes each of
+        # ``{examples}``/``{content}`` exactly once and drops the placeholder
+        # text; the fixture's 2-char title and the rendered threshold fit
+        # inside the placeholders they replace, so they need no term here.
+        # The literal ``8192 + 8192`` this replaces pinned none of that. The
+        # few-shot block is sampled per fragment id (``sample_examples`` seeds
+        # its PRNG from a hash of the id), so a fixed total only ever spot
+        # checked the one rotation this fixture's id happens to draw, not the
+        # worst case across ids. Issue #878 — an 11th classification dimension
+        # — grew the template until that one rotation crossed the literal; it
+        # surfaced the gap rather than opened it.
+        expected_max = (
+            len(CLASSIFICATION_PROMPT)
+            + len(few_shot.render_block(few_shot.sample_examples(frag.id)))
+            + _MAX_PROMPT_CONTENT_CHARS
+        )
+        assert len(prompt) <= expected_max
 
 
 # ---- Apply Classification ----
@@ -1902,13 +1950,20 @@ class TestLLMClassifierAnthropicDispatch:
         mock_call.assert_called_once()
 
 
-# ---- Integration test (requires running Ollama) ----
+# ---- Live smoke (requires a running Ollama) ----
 
 
-class TestLLMClassifierIntegration:
-    """Integration tests for LLMClassifier with real Ollama."""
+class TestLLMClassifierLive:
+    """Live smoke for LLMClassifier against a real Ollama instance.
 
-    @pytest.mark.integration
+    ``live``, not ``integration``: ``LLMClassifier.available`` performs an
+    outbound HTTP probe of the Ollama endpoint, so this needs a reachable
+    service. The blocking ``integration`` lane is hermetic by definition, and
+    CI runs no Ollama. Every other LLMClassifier test in this module mocks
+    ``httpx.Client`` and stays in the unit lane.
+    """
+
+    @pytest.mark.live
     def test_classify_with_real_ollama(self) -> None:
         """classify should work with a real Ollama instance."""
         config = LLMConfig()
@@ -2813,3 +2868,1030 @@ class TestInvokePromptWithMetadata:
         completion = classifier.invoke_prompt_with_metadata("prompt", max_tokens=512)
         assert completion.text == "cut"
         assert completion.stop_reason == "max_tokens"
+
+
+# ---- Praxis potential: LLM schema + prompt (issue #877) ----
+
+
+_PRAXIS_YAML_RESPONSE: str = """\
+frequency:
+  primary: F3
+praxis:
+  potential: explicit
+"""
+"""A documented response carrying the new ``praxis`` section."""
+
+_LATENT_PRAXIS_RESPONSE: str = _VALID_YAML_RESPONSE + "praxis:\n  potential: latent\n"
+"""A full response whose praxis verdict is the *middle* one, ``latent``.
+
+Appended to :data:`_VALID_YAML_RESPONSE` so the other sections still land
+— an end-to-end praxis assertion is worthless if the call could have
+short-circuited before applying anything.
+"""
+
+_EXPLICIT_PRAXIS_RESPONSE: str = (
+    _VALID_YAML_RESPONSE + "praxis:\n  potential: explicit\n"
+)
+"""A full response whose praxis verdict is the strongest one."""
+
+
+class TestValidatePraxisSection:
+    """``praxis`` joins the documented top-level schema (issue #877)."""
+
+    def test_accepts_a_praxis_section(self) -> None:
+        """A response with ``praxis:`` validates rather than being rejected.
+
+        ``praxis`` has to join ``_ALLOWED_TOP_LEVEL_KEYS`` in lockstep with
+        the prompt: :func:`validate_response` rejects *any* undocumented
+        top-level key, so a model that obeys the new prompt would
+        otherwise have its entire response thrown away (and the fragment
+        left unclassified) on every call.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+
+        result = classifier.validate_response(_PRAXIS_YAML_RESPONSE)
+
+        assert result["praxis"] == {"potential": "explicit"}
+
+    def test_still_rejects_privacy_tier(self) -> None:
+        """SEC-004 regression: widening the schema must not widen it to privacy.
+
+        The allow-list exists so a successful prompt injection cannot
+        smuggle in a field like ``privacy_tier`` and talk the classifier
+        into re-tiering intimate content as ``open``. Adding ``praxis``
+        is a one-key change; this pins that the *rest* of the allow-list
+        is unchanged, including on a payload that also carries the
+        newly-legal ``praxis`` section.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        bogus = "praxis:\n  potential: explicit\nprivacy_tier: open\n"
+
+        with pytest.raises(ValueError, match="top-level"):
+            classifier.validate_response(bogus)
+
+    def test_still_rejects_other_undocumented_keys(self) -> None:
+        """An unrelated smuggled key is still refused after the widening."""
+        classifier = LLMClassifier(config=LLMConfig())
+        bogus = "praxis:\n  potential: explicit\nvoice_proxy_eligible: true\n"
+
+        with pytest.raises(ValueError, match="top-level"):
+            classifier.validate_response(bogus)
+
+
+class TestApplyPraxisSection:
+    """``_apply_praxis`` translates the LLM's verdict onto the fragment."""
+
+    def test_applies_explicit(self) -> None:
+        """``praxis.potential: explicit`` lands on the fragment."""
+        from creek.models import PraxisPotential
+
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"praxis": {"potential": "explicit"}}
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert str(result.praxis_potential) == PraxisPotential.EXPLICIT.value
+
+    def test_applies_latent(self) -> None:
+        """``latent`` is the LLM-only verdict — it must survive the parser.
+
+        The free keyword heuristic deliberately never emits ``latent``
+        ("there is a practice hiding in here that the author has not
+        named" is not something a regex can see), so this branch is the
+        *only* way a fragment can ever reach ``praxis_potential: latent``.
+        """
+        from creek.models import PraxisPotential
+
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"praxis": {"potential": "latent"}}
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert str(result.praxis_potential) == PraxisPotential.LATENT.value
+
+    def test_unknown_value_writes_nothing(self) -> None:
+        """A junk ``potential`` leaves the fragment object untouched.
+
+        Unknown values fall back to ``none``, and ``none`` writes no
+        update key at all — so a garbage response cannot demote a
+        fragment the heuristic already marked ``explicit``.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_fragment()
+        data: dict[str, object] = {"praxis": {"potential": "somewhat-maybe"}}
+
+        assert classifier._apply_classification(frag, data) is frag
+
+    def test_explicit_none_writes_nothing(self) -> None:
+        """``praxis.potential: none`` is a no-op, not a demotion.
+
+        The LLM can only ever *raise* this axis. The engine runs the free
+        heuristic before the LLM call, so a model answering ``none`` on a
+        fragment whose body carries a task checkbox must not undo the
+        heuristic's ``explicit``.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_fragment()
+        data: dict[str, object] = {"praxis": {"potential": "none"}}
+
+        assert classifier._apply_classification(frag, data) is frag
+
+    def test_non_dict_praxis_section_is_ignored(self) -> None:
+        """A scalar where the nested section belongs must not raise."""
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_fragment()
+        data: dict[str, object] = {"praxis": "explicit"}
+
+        assert classifier._apply_classification(frag, data) is frag
+
+    def test_absent_praxis_section_is_ignored(self) -> None:
+        """A response without ``praxis`` leaves the axis alone."""
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_fragment()
+        data: dict[str, object] = {"frequency": {"primary": "F3"}}
+
+        result = classifier._apply_classification(frag, data)
+
+        assert result.praxis_potential == frag.praxis_potential
+
+    def test_praxis_applies_alongside_the_other_sections(self) -> None:
+        """Praxis does not displace frequency / voice in the same response."""
+        from creek.models import PraxisPotential
+
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {
+            "frequency": {"primary": "F3", "secondary": ["F5"]},
+            "voice": {"voice_register": "analytical", "confidence": "forming"},
+            "praxis": {"potential": "explicit"},
+        }
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert result.frequency.primary == Frequency.F3
+        assert result.voice.confidence == Confidence.FORMING
+        assert str(result.praxis_potential) == PraxisPotential.EXPLICIT.value
+
+
+class TestApplyPraxisIsEscalateOnly:
+    """``_apply_praxis`` merges against the verdict the fragment already has.
+
+    The axis is monotone — ``none < latent < explicit``, and nothing may
+    lower it (see :mod:`creek.classify.praxis_pass`). That invariant is a
+    property of the *merge*, so the helper has to be told what the
+    fragment currently carries; refusing to write only when the parsed
+    value is ``none`` is not sufficient, because ``latent`` is also
+    weaker than ``explicit``.
+
+    Every case below drives ``_apply_praxis`` directly and asserts on the
+    ``updates`` dict rather than on a returned Fragment, because "writes
+    no key at all" is the contract: ``_apply_classification`` returns the
+    fragment untouched precisely when ``updates`` is empty, so writing
+    the merged value back unconditionally would be a behaviour change in
+    its own right.
+    """
+
+    def test_latent_never_demotes_an_explicit_fragment(self) -> None:
+        """``latent`` over a recorded ``explicit`` writes nothing.
+
+        The blocker's direct regression test. A model answering ``latent``
+        for a fragment already at ``explicit`` — from an earlier LLM run,
+        or from an operator's hand edit — is offering a *weaker* verdict.
+        The heuristic pass that runs afterwards cannot repair the damage:
+        it re-derives from the body and only ever proposes ``explicit`` or
+        ``none``, so a fragment whose ``explicit`` came from judgment
+        rather than keywords keeps the demotion all the way to disk.
+        """
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "latent"}},
+            updates,
+            PraxisPotential.EXPLICIT,
+        )
+
+        assert updates == {}
+
+    def test_explicit_raises_a_latent_fragment(self) -> None:
+        """``explicit`` over a recorded ``latent`` writes ``explicit``.
+
+        The escalating direction of the same merge: ``latent`` is the
+        weaker verdict, so the model's stronger answer wins.
+        """
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "explicit"}},
+            updates,
+            PraxisPotential.LATENT,
+        )
+
+        assert updates == {"praxis_potential": "explicit"}
+
+    def test_latent_raises_a_none_fragment(self) -> None:
+        """``latent`` over ``none`` still writes ``latent``.
+
+        Guards the fix against over-correcting into "never write anything
+        but ``explicit``". ``latent`` is the entire reason the LLM praxis
+        section exists — the free keyword heuristic can never emit it —
+        so a merge that dropped it would silently delete the feature.
+        """
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "latent"}},
+            updates,
+            PraxisPotential.NONE,
+        )
+
+        assert updates == {"praxis_potential": "latent"}
+
+    def test_an_unchanged_explicit_verdict_writes_no_key(self) -> None:
+        """Re-confirming ``explicit`` is a no-op, not a rewrite.
+
+        ``_apply_classification`` returns the input Fragment unchanged
+        only when ``updates`` is empty; writing the merged value back
+        whenever the model agrees would allocate a fresh model copy per
+        fragment and blur the "did this run change anything?" signal
+        callers read from object identity.
+        """
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "explicit"}},
+            updates,
+            PraxisPotential.EXPLICIT,
+        )
+
+        assert updates == {}
+
+    def test_an_unchanged_latent_verdict_writes_no_key(self) -> None:
+        """The same no-op contract holds at the middle rank."""
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "latent"}},
+            updates,
+            PraxisPotential.LATENT,
+        )
+
+        assert updates == {}
+
+    def test_none_from_the_model_never_demotes_explicit(self) -> None:
+        """``none`` over ``explicit`` writes nothing.
+
+        Pinned against a fragment that is actually at ``explicit`` — the
+        pre-existing coverage only ever started from the model default,
+        where ``none`` is a no-op for free.
+        """
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "none"}},
+            updates,
+            PraxisPotential.EXPLICIT,
+        )
+
+        assert updates == {}
+
+    def test_unparseable_garbage_never_demotes_explicit(self) -> None:
+        """An unrecognised value falls back to ``none`` and still writes nothing."""
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "somewhat-maybe"}},
+            updates,
+            PraxisPotential.EXPLICIT,
+        )
+
+        assert updates == {}
+
+    def test_the_written_value_is_a_plain_string(self) -> None:
+        """The update carries ``.value``, not the StrEnum member itself.
+
+        ``Fragment`` sets ``use_enum_values=True``, but ``model_copy``
+        bypasses that coercion — so a bare member would reach the vault
+        writer, where YAML's SafeDumper cannot represent it. ``type(...)
+        is str`` rather than ``isinstance`` / ``==`` on purpose: a
+        ``PraxisPotential`` member passes both of those.
+        """
+        updates: dict[str, object] = {}
+
+        _apply_praxis(
+            {"praxis": {"potential": "explicit"}},
+            updates,
+            PraxisPotential.NONE,
+        )
+
+        assert updates["praxis_potential"] == "explicit"
+        assert type(updates["praxis_potential"]) is str
+
+    def test_apply_classification_feeds_the_fragments_own_verdict(self) -> None:
+        """The orchestrator is the call site that must supply ``current``.
+
+        ``_apply_praxis`` can only refuse a demotion if it is told what
+        the fragment already carries, and ``_apply_classification`` is its
+        only production caller. ``Fragment.model_config`` sets
+        ``use_enum_values=True``, so ``fragment.praxis_potential`` is a
+        plain ``str`` at runtime and has to be coerced back to a
+        ``PraxisPotential`` on the way in — this pins that wiring, which
+        the direct-call tests above cannot see.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_praxis_fragment(PraxisPotential.EXPLICIT)
+        data: dict[str, object] = {"praxis": {"potential": "latent"}}
+
+        result = classifier._apply_classification(frag, data)
+
+        assert str(result.praxis_potential) == PraxisPotential.EXPLICIT.value
+        assert result is frag
+
+
+class TestClassifyPreservesAPriorPraxisVerdict:
+    """A whole ``classify`` call must never lower ``praxis_potential`` (#877).
+
+    The end-to-end counterpart to
+    :class:`TestApplyPraxisIsEscalateOnly`: prompt, stubbed provider,
+    response split, schema validation and application all run, and no
+    private helper is touched. This is the shape of test that would have
+    caught the demotion before review — the unit tests around
+    ``_apply_praxis`` all started from the model default and so had no
+    higher verdict to lose.
+    """
+
+    @patch.object(LLMClassifier, "_invoke_llm")
+    def test_a_latent_answer_leaves_an_explicit_fragment_explicit(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """The model's weaker verdict loses to the one already on record."""
+        mock_call.return_value = _LATENT_PRAXIS_RESPONSE
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+        frag = _make_praxis_fragment(PraxisPotential.EXPLICIT)
+
+        result = classifier.classify(frag)
+
+        assert str(result.praxis_potential) == PraxisPotential.EXPLICIT.value
+        # The rest of the same response *did* land, so the assertion above
+        # cannot be passing because the call short-circuited.
+        assert result.frequency.primary == Frequency.F3
+
+    @patch.object(LLMClassifier, "_invoke_llm")
+    def test_a_latent_answer_still_raises_a_none_fragment(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """A fragment at the default ``none`` still reaches ``latent``.
+
+        The LLM section exists to produce exactly this verdict, so the
+        escalate-only merge must not cost us the raise.
+        """
+        mock_call.return_value = _LATENT_PRAXIS_RESPONSE
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+
+        result = classifier.classify(_make_praxis_fragment(PraxisPotential.NONE))
+
+        assert str(result.praxis_potential) == PraxisPotential.LATENT.value
+
+    @patch.object(LLMClassifier, "_invoke_llm")
+    def test_an_explicit_answer_raises_a_latent_fragment(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """The escalating direction survives the full call too."""
+        mock_call.return_value = _EXPLICIT_PRAXIS_RESPONSE
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+
+        result = classifier.classify(_make_praxis_fragment(PraxisPotential.LATENT))
+
+        assert str(result.praxis_potential) == PraxisPotential.EXPLICIT.value
+
+
+class TestPraxisPrompt:
+    """The prompt must ask for the axis the parser now accepts."""
+
+    def test_prompt_renders_without_a_format_error(self) -> None:
+        """``CLASSIFICATION_PROMPT`` still survives ``str.format``.
+
+        The template is consumed by ``str.format`` (prompts.py:286), so a
+        single stray literal ``{`` or ``}`` added while editing the YAML
+        schema block raises ``KeyError`` / ``IndexError`` / ``ValueError``
+        on *every* classification call. That failure is invisible in a
+        static read of the diff, so it is pinned here.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+
+        prompt = classifier._build_prompt(_make_fragment(title="ok"), content="body")
+
+        assert "ok" in prompt
+        assert "body" in prompt
+
+    def test_prompt_names_the_praxis_dimension(self) -> None:
+        """The dimension list names praxis and its three legal values."""
+        prompt_lower = CLASSIFICATION_PROMPT.lower()
+
+        assert "praxis" in prompt_lower
+        assert "explicit" in prompt_lower
+        assert "latent" in prompt_lower
+
+    def test_prompt_yaml_example_includes_the_praxis_section(self) -> None:
+        """The YAML schema example must show the nested ``potential`` key.
+
+        Same lesson as issue #319: models follow the explicit YAML block
+        far more reliably than the prose above it. Without ``praxis:`` /
+        ``potential:`` in the example, the model never emits the section
+        and the LLM half of #877 silently regresses to never firing.
+        """
+        assert "praxis:" in CLASSIFICATION_PROMPT
+        assert "potential:" in CLASSIFICATION_PROMPT
+
+
+# ---- Emotional texture (issue #878) ----------------------------------------
+#
+# ``Fragment.emotional_texture`` shipped with a ``default_factory=list`` and
+# no producer: 2000/2000 sampled fragments of the operator's 35,330-fragment
+# vault carried ``emotional_texture: []``, which left the +0.1-per-shared-tag
+# term in ``creek/link/temporal.py`` dead and the wavelength report's texture
+# cloud permanently reading "_No emotional texture tags recorded._".
+#
+# The fix rides inside the EXISTING ``CLASSIFICATION_PROMPT`` response — zero
+# new LLM calls, zero new round trips. Two decisions are load-bearing and each
+# has its own test below:
+#
+#   1. The new top-level key is ``texture``, NOT ``emotional_texture``.
+#      ``_ALLOWED_TOP_LEVEL_KEYS`` is the SEC-004 injection boundary and its
+#      own docstring promises it is "never [widened] to a ``Fragment`` field
+#      name" — the rule that keeps ``privacy_tier`` rejected. A key named
+#      after the field it writes is exactly the shape that rule forbids.
+#   2. All caps live in ``creek/classify/llm/parsing.py``, never on the model
+#      (see ``tests/test_models.py``), so operator-hand-edited frontmatter is
+#      never silently rewritten on load.
+
+_TEXTURE_YAML_RESPONSE: str = (
+    _VALID_YAML_RESPONSE + "texture:\n  emotional: [grief, resolve]\n"
+)
+"""A full documented response carrying the new ``texture`` section.
+
+Appended to :data:`_VALID_YAML_RESPONSE` so the other sections still land
+— an end-to-end texture assertion is worthless if the call could have
+short-circuited before applying anything.
+"""
+
+
+def _make_texture_fragment(textures: list[str]) -> Fragment:
+    """Create a Fragment that already carries emotional textures (#878).
+
+    :func:`_make_fragment` always yields the model default, ``[]`` — the
+    empty case, against which a *union* and a *replace* are
+    indistinguishable. Any never-lose assertion has to start from a
+    fragment that has something to lose.
+
+    Args:
+        textures: The emotional textures already recorded on the fragment.
+
+    Returns:
+        A Fragment identical to :func:`_make_fragment`'s but carrying
+        *textures*.
+    """
+    return _make_fragment().model_copy(update={"emotional_texture": textures})
+
+
+class TestValidateTextureSection:
+    """``texture`` joins the documented top-level schema (issue #878)."""
+
+    def test_accepts_a_texture_section(self) -> None:
+        """A response with ``texture:`` validates rather than being rejected.
+
+        ``texture`` has to join ``_ALLOWED_TOP_LEVEL_KEYS`` in lockstep
+        with the prompt: :func:`validate_response` rejects *any*
+        undocumented top-level key, so a model that obeys the new prompt
+        would otherwise have its entire response thrown away (and the
+        fragment left unclassified) on every call.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+
+        result = classifier.validate_response(
+            "texture:\n  emotional: [grief, resolve]\n",
+        )
+
+        assert result["texture"] == {"emotional": ["grief", "resolve"]}
+
+    def test_rejects_a_bare_emotional_texture_top_level_key(self) -> None:
+        """The schema key is ``texture``; the *field* name stays rejected.
+
+        ``_ALLOWED_TOP_LEVEL_KEYS`` documents itself as the SEC-004
+        injection boundary, "widened one key at a time and never to a
+        :class:`~creek.models.Fragment` field name". Admitting
+        ``emotional_texture`` would break that invariant and turn the
+        allow-list into a list of writable frontmatter fields — the exact
+        posture that keeps ``privacy_tier`` out. Pinned so a future agent
+        cannot "simplify" the schema by renaming the section to match the
+        field.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+
+        with pytest.raises(ValueError, match="top-level"):
+            classifier.validate_response("emotional_texture: [grief]\n")
+
+    def test_still_rejects_privacy_tier(self) -> None:
+        """SEC-004 regression: widening the schema must not widen it to privacy.
+
+        The allow-list exists so a successful prompt injection cannot
+        smuggle in a field like ``privacy_tier`` and talk the classifier
+        into re-tiering intimate content as ``open``. Adding ``texture``
+        is a one-key change; this pins that the *rest* of the allow-list
+        is unchanged, on a payload that also carries the newly-legal
+        section.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        bogus = "texture:\n  emotional: [grief]\nprivacy_tier: open\n"
+
+        with pytest.raises(ValueError, match="top-level"):
+            classifier.validate_response(bogus)
+
+
+class TestApplyTextureSection:
+    """``_apply_texture`` translates the LLM's tags onto the fragment."""
+
+    def test_applies_a_valid_list(self) -> None:
+        """``texture.emotional`` lands on ``Fragment.emotional_texture``."""
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"texture": {"emotional": ["grief", "resolve"]}}
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert result.emotional_texture == ["grief", "resolve"]
+
+    def test_non_list_emotional_section_is_ignored(self) -> None:
+        """A scalar where the list belongs writes nothing and does not raise."""
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_fragment()
+        data: dict[str, object] = {"texture": {"emotional": "grief"}}
+
+        assert classifier._apply_classification(frag, data) is frag
+
+    def test_non_dict_texture_section_is_ignored(self) -> None:
+        """A scalar where the nested section belongs must not raise."""
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_fragment()
+        data: dict[str, object] = {"texture": "grief"}
+
+        assert classifier._apply_classification(frag, data) is frag
+
+    def test_absent_texture_section_is_ignored(self) -> None:
+        """A response without ``texture`` leaves the axis at its default.
+
+        This is the path that supplies the acceptance criterion's "falls
+        back to ``[]``": no key in ``updates`` means the
+        ``default_factory=list`` answer stands.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_fragment()
+        data: dict[str, object] = {"frequency": {"primary": "F3"}}
+
+        result = classifier._apply_classification(frag, data)
+
+        assert result.emotional_texture == []
+
+    def test_an_unchanged_value_writes_no_key(self) -> None:
+        """Re-confirming the recorded textures is a no-op, not a rewrite.
+
+        ``_apply_classification`` returns the input Fragment unchanged
+        only when ``updates`` is empty (``orchestrator.py:295``); writing
+        the merged value back whenever the model agrees would allocate a
+        fresh model copy per fragment and blur the "did this run change
+        anything?" signal callers read from object identity. Asserted with
+        ``is`` for exactly that reason.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_texture_fragment(["grief", "resolve"])
+        data: dict[str, object] = {"texture": {"emotional": ["grief", "resolve"]}}
+
+        assert classifier._apply_classification(frag, data) is frag
+
+    def test_union_never_drops_an_existing_texture(self) -> None:
+        """The merge is a union, existing-first — never a replacement.
+
+        A model that sees only part of a long fragment must not be able
+        to delete tags an earlier run (or the operator) put on record.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_texture_fragment(["resolve"])
+        data: dict[str, object] = {"texture": {"emotional": ["grief"]}}
+
+        result = classifier._apply_classification(frag, data)
+
+        assert result.emotional_texture == ["resolve", "grief"]
+
+    def test_texture_applies_alongside_the_other_sections(self) -> None:
+        """Texture does not displace frequency / voice in the same response."""
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {
+            "frequency": {"primary": "F3", "secondary": ["F5"]},
+            "voice": {"voice_register": "analytical", "confidence": "forming"},
+            "texture": {"emotional": ["grief"]},
+        }
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert result.frequency.primary == Frequency.F3
+        assert result.voice.confidence == Confidence.FORMING
+        assert result.emotional_texture == ["grief"]
+
+    def test_the_written_values_are_plain_strings(self) -> None:
+        """Every stored tag is a ``str``, ready for YAML's SafeDumper."""
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"texture": {"emotional": ["grief"]}}
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert [type(tag) for tag in result.emotional_texture] == [str]
+
+
+class TestTextureCaps:
+    """The bounds that keep a pathological response out of the frontmatter.
+
+    Both caps live in :mod:`creek.classify.llm.parsing` and nowhere else
+    — deliberately not on the model, so loading a fragment an operator
+    hand-edited to carry ten textures never silently rewrites it (see
+    ``tests/test_models.py``).
+    """
+
+    def test_documented_cap_values(self) -> None:
+        """``_MAX_TEXTURES`` is 5 and ``_MAX_TEXTURE_CHARS`` is 32.
+
+        Pinned explicitly rather than left implicit in the behavioural
+        tests below, so a change to either number is a visible, reviewed
+        edit rather than a silent drift.
+        """
+        from creek.classify.llm.parsing import _MAX_TEXTURE_CHARS, _MAX_TEXTURES
+
+        assert _MAX_TEXTURES == 5
+        assert _MAX_TEXTURE_CHARS == 32
+
+    def test_caps_the_number_of_tags(self) -> None:
+        """A 40-item list is truncated to the first ``_MAX_TEXTURES``.
+
+        Order is first-seen, so the truncation is deterministic across
+        re-runs; a set-based implementation would churn the same
+        fragment's frontmatter on every classify.
+        """
+        from creek.classify.llm.parsing import _MAX_TEXTURES
+
+        classifier = LLMClassifier(config=LLMConfig())
+        emitted = [f"mood{i:02d}" for i in range(40)]
+        data: dict[str, object] = {"texture": {"emotional": emitted}}
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert result.emotional_texture == emitted[:_MAX_TEXTURES]
+        assert len(result.emotional_texture) == 5
+
+    def test_truncates_a_runaway_tag(self) -> None:
+        """A 500-character "tag" is truncated, not dropped.
+
+        Same reasoning as the issue #319 descriptor cap: keep the signal
+        while bounding what a pathological response can write into every
+        fragment's YAML frontmatter on disk.
+        """
+        from creek.classify.llm.parsing import _MAX_TEXTURE_CHARS
+
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"texture": {"emotional": ["g" * 500]}}
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert result.emotional_texture == ["g" * _MAX_TEXTURE_CHARS]
+
+    def test_a_texture_tag_at_exactly_the_char_cap_survives_untouched(self) -> None:
+        """A 32-character tag is inside the bound and is not sliced.
+
+        :meth:`test_truncates_a_runaway_tag` computes its expectation
+        from the same constant the code slices with, so ``[:31]`` and
+        ``[:33]`` both satisfy it — a 500-character input cannot locate a
+        boundary. The literal 32 here, paired with the 33-character case
+        below, pins it from both sides.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"texture": {"emotional": ["g" * 32]}}
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert result.emotional_texture == ["g" * 32]
+        assert len(result.emotional_texture[0]) == 32
+
+    def test_a_texture_tag_one_char_over_the_cap_loses_exactly_one_char(self) -> None:
+        """A 33-character tag comes back at 32, losing exactly one character.
+
+        The far side of the same boundary. Together with the 32-character
+        case above this is the only pair that can distinguish the real
+        cap from an off-by-one, and both use literals for that reason.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"texture": {"emotional": ["g" * 33]}}
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert result.emotional_texture == ["g" * 32]
+        assert len(result.emotional_texture[0]) == 32
+
+    def test_junk_items_are_dropped_but_the_list_survives(self) -> None:
+        """A non-string item drops the ITEM, not the whole response.
+
+        Models emit ``[grief, 42, {mood: sad}]`` often enough that
+        throwing the list away would cost most of the signal. Dropping
+        only the offenders keeps the usable half.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {
+            "texture": {"emotional": [42, {"mood": "sad"}, "grief", None, "resolve"]},
+        }
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert result.emotional_texture == ["grief", "resolve"]
+
+    def test_an_all_junk_list_leaves_the_fragment_empty(self) -> None:
+        """When nothing survives sanitisation, no key is written at all.
+
+        ``is`` rather than ``== []``: writing an empty list would be a
+        rewrite of the fragment, and the AC's "falls back to ``[]``" is
+        supposed to come from the model's ``default_factory``, not from
+        the parser stamping an empty value over it.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_fragment()
+        data: dict[str, object] = {"texture": {"emotional": [42, None, "", "   "]}}
+
+        assert classifier._apply_classification(frag, data) is frag
+
+    def test_normalises_case_and_whitespace(self) -> None:
+        """Tags are lowercased and internal whitespace runs become dashes.
+
+        Without this, ``"Deep   Grief"`` and ``"deep-grief"`` are two
+        distinct entries in the wavelength texture cloud and two distinct
+        misses for the ``+0.1``-per-shared-tag temporal link term.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"texture": {"emotional": ["  Deep   Grief \n"]}}
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert result.emotional_texture == ["deep-grief"]
+
+    def test_deduplicates_after_normalisation(self) -> None:
+        """Two spellings of one tag are stored once."""
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"texture": {"emotional": ["Grief", "grief"]}}
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert result.emotional_texture == ["grief"]
+
+    def test_a_union_at_the_cap_adds_nothing(self) -> None:
+        """A fragment exactly at the ceiling keeps its tags and gains none.
+
+        Existing-first means the *new* candidates lose, so a re-classify
+        cannot evict tags already on disk. This is the equality case
+        only; :class:`TestTextureMergeNeverTruncatesTheRecord` sweeps
+        past the ceiling, where "gains none" and "loses the tail" stop
+        looking alike.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        recorded = ["a", "b", "c", "d", "e"]
+        frag = _make_texture_fragment(recorded)
+        data: dict[str, object] = {"texture": {"emotional": ["grief"]}}
+
+        assert classifier._apply_classification(frag, data) is frag
+
+
+class TestTextureMergeNeverTruncatesTheRecord:
+    """A recorded texture list past the cap is kept whole (issue #878).
+
+    ``_MAX_TEXTURES`` is a **growth ceiling**, not a length limit: it
+    bounds what an untrusted model response may *add* to a fragment and
+    says nothing about what an operator hand-wrote in Obsidian.
+    :class:`TestTextureCaps` only ever exercises the equality case, and
+    at ``len(current) == _MAX_TEXTURES`` a union that trims is
+    indistinguishable from one that does not.
+
+    Without this class the codebase contradicts itself. The model layer
+    deliberately carries no validator so that merely *reading* a
+    hand-edited fragment never rewrites it — pinned by
+    ``test_a_hand_authored_ten_item_texture_list_is_not_truncated`` in
+    ``tests/test_models.py`` — yet the parser would delete the same
+    operator's sixth through tenth tags the first time a classify pass
+    touched the fragment, which is the very write the model layer
+    refused to make.
+    """
+
+    def test_a_recorded_texture_list_over_the_cap_keeps_every_tag(self) -> None:
+        """Ten recorded textures stay ten, and nothing new is admitted.
+
+        The never-lose rule at the one input shape that can violate it.
+        Asserted against the whole list rather than its length, so a
+        union that held the count at ten by substituting the response's
+        tags for the evicted tail fails too.
+        """
+        recorded = [f"mood-{i}" for i in range(10)]
+
+        assert _merge_textures(recorded, ["grief"]) == recorded
+
+    def test_a_hand_authored_over_cap_texture_list_survives_a_classification(
+        self,
+    ) -> None:
+        """A ten-texture fragment comes back unchanged and uncopied.
+
+        This is the shape that reaches disk. ``_apply_classification``
+        returns the input fragment only when ``updates`` is empty, so a
+        union that trims does not merely compute a short list — it
+        writes the deletion back over the operator's frontmatter while
+        the run reports success. Identity and content are both asserted
+        because "same tags" and "no rewrite" are separate promises.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        recorded = [f"mood-{i}" for i in range(10)]
+        frag = _make_texture_fragment(recorded)
+        data: dict[str, object] = {"texture": {"emotional": ["grief"]}}
+
+        result = classifier._apply_classification(frag, data)
+
+        assert result.emotional_texture == recorded
+        assert result is frag
+
+    def test_a_hand_authored_over_length_texture_tag_is_preserved_verbatim(
+        self,
+    ) -> None:
+        """A 200-character recorded tag comes back byte-for-byte.
+
+        ``_MAX_TEXTURE_CHARS`` bounds what the *response* may write; the
+        recorded side is never length-checked, and unlike
+        :func:`creek.classify.tags_pass.merge` it is not normalised
+        either. Whatever the operator typed is what survives, however
+        long and however oddly cased.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        recorded = ["m" * 200]
+        frag = _make_texture_fragment(recorded)
+        data: dict[str, object] = {"texture": {"emotional": ["grief"]}}
+
+        result = classifier._apply_classification(frag, data)
+
+        assert result.emotional_texture == ["m" * 200, "grief"]
+        assert len(result.emotional_texture[0]) == 200
+
+    @pytest.mark.parametrize(
+        ("recorded_count", "expected_added"),
+        [(0, 5), (1, 4), (4, 1), (5, 0), (6, 0), (10, 0)],
+    )
+    def test_the_texture_union_admits_only_what_the_cap_leaves_room_for(
+        self,
+        recorded_count: int,
+        expected_added: int,
+    ) -> None:
+        """Room for new textures is ``max(0, 5 - len(current))``, exactly.
+
+        Swept across the boundary from both sides — 4, 5, 6 — because
+        the defect being pinned is a one-sided test, not a wrong
+        constant. Each case also asserts the recorded tags come back as a
+        prefix, which is what separates "admitted nothing" from "deleted
+        the tail": both leave the same *number* of new entries.
+        """
+        recorded = [f"kept-{i}" for i in range(recorded_count)]
+        candidate = [f"fresh-{i}" for i in range(40)]
+
+        result = _merge_textures(recorded, candidate)
+
+        assert len(set(result) - set(recorded)) == expected_added
+        assert result[: len(recorded)] == recorded
+
+    def test_the_texture_union_never_grows_past_five(self) -> None:
+        """Two recorded textures plus forty candidates yields exactly 5.
+
+        The ceiling still binds in the direction it was written for — a
+        model that emits a paragraph of moods cannot inflate the
+        frontmatter. The literal 5 is what makes this able to fail: an
+        expectation read off ``_MAX_TEXTURES`` moves with the constant
+        and so cannot catch an off-by-one in the room calculation.
+        """
+        recorded = ["kept-0", "kept-1"]
+        candidate = [f"fresh-{i}" for i in range(40)]
+
+        assert len(_merge_textures(recorded, candidate)) == 5
+
+
+class TestTexturePrompt:
+    """The prompt must ask for the axis the parser now accepts."""
+
+    def test_prompt_renders_without_a_format_error(self) -> None:
+        """``CLASSIFICATION_PROMPT`` still survives ``str.format``.
+
+        The template is consumed by ``str.format``, so a single stray
+        literal ``{`` or ``}`` added while editing the YAML schema block
+        raises ``KeyError`` / ``IndexError`` / ``ValueError`` on *every*
+        classification call. That failure is invisible in a static read
+        of the diff, so it is pinned here.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+
+        prompt = classifier._build_prompt(_make_fragment(title="ok"), content="body")
+
+        assert "ok" in prompt
+        assert "body" in prompt
+
+    def test_prompt_names_the_texture_dimension(self) -> None:
+        """The dimension list names emotional texture."""
+        prompt_lower = CLASSIFICATION_PROMPT.lower()
+
+        assert "emotional texture" in prompt_lower
+
+    def test_prompt_yaml_example_includes_the_texture_section(self) -> None:
+        """The YAML schema example must show ``texture:`` / ``emotional:``.
+
+        Same lesson as issues #319 and #877: models follow the explicit
+        YAML block far more reliably than the prose above it. Without the
+        section in the example the model never emits it and #878's LLM
+        half silently regresses to never firing.
+        """
+        assert "texture:" in CLASSIFICATION_PROMPT
+        assert "emotional:" in CLASSIFICATION_PROMPT
+
+    def test_prompt_carries_the_texture_vocabulary(self) -> None:
+        """A seed vocabulary is advertised, drawn from the ontology spec.
+
+        ``docs/Ontology/creek_ontology_agent_prompt.md:309`` names
+        ``grief`` / ``wonder`` / ``frustration`` / ``flow`` as the
+        canonical examples, and line 715 *mandates* that unresolved
+        contradictions be tagged ``paradox``. Free-form tags are still
+        allowed — this is a seed, not an enum — but without it the model
+        invents a fresh vocabulary per fragment and nothing ever
+        co-occurs, which would leave the +0.1-per-shared-tag temporal
+        term just as dead as an empty list did.
+        """
+        prompt_lower = CLASSIFICATION_PROMPT.lower()
+
+        for seed in ("grief", "wonder", "frustration", "flow", "paradox"):
+            assert seed in prompt_lower, seed
+
+
+class TestClassifyEmitsEmotionalTexture:
+    """A whole ``classify`` call carries the texture through (#878).
+
+    The end-to-end counterpart to :class:`TestApplyTextureSection`:
+    prompt, stubbed provider, response split, schema validation and
+    application all run, and no private helper is touched.
+    """
+
+    @patch.object(LLMClassifier, "_invoke_llm")
+    def test_a_texture_response_lands_on_the_fragment(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """The model's tags reach ``Fragment.emotional_texture``."""
+        mock_call.return_value = _TEXTURE_YAML_RESPONSE
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+
+        result = classifier.classify(_make_fragment())
+
+        assert result.emotional_texture == ["grief", "resolve"]
+        # The rest of the same response *did* land, so the assertion above
+        # cannot be passing because the call short-circuited.
+        assert result.frequency.primary == Frequency.F3
+
+    @patch.object(LLMClassifier, "_invoke_llm")
+    def test_a_texture_response_never_drops_a_recorded_tag(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """The union survives the full call, not just the unit helper."""
+        mock_call.return_value = _TEXTURE_YAML_RESPONSE
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+
+        result = classifier.classify(_make_texture_fragment(["wonder"]))
+
+        assert result.emotional_texture == ["wonder", "grief", "resolve"]
+
+    @patch.object(LLMClassifier, "_invoke_llm")
+    @patch("creek.classify.llm.time.sleep")
+    def test_classify_falls_back_on_a_bare_emotional_texture_key(
+        self,
+        mock_sleep: MagicMock,
+        mock_call: MagicMock,
+    ) -> None:
+        """SEC-004: the *field* name at top level still causes a fallback.
+
+        Matches ``test_classify_falls_back_on_unexpected_top_level_keys``:
+        an undocumented top-level key fails validation, the retries
+        exhaust, and the fragment is returned unchanged rather than
+        partially updated from a response the schema rejected.
+        """
+        mock_call.return_value = (
+            "frequency:\n  primary: F1\nemotional_texture: [grief]\n"
+        )
+        classifier = _make_classifier_available(LLMClassifier(config=LLMConfig()))
+        classifier.MAX_RETRIES = 2
+        frag = _make_fragment(title="ok")
+
+        result = classifier.classify(frag, content="hi")
+
+        assert result.frequency.primary == Frequency.UNCLASSIFIED
+        assert result.emotional_texture == []

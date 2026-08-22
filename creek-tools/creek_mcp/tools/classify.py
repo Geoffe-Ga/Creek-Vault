@@ -15,7 +15,7 @@ from creek.classify.classify_engine import (
     LLMProviderUnavailableError,
     run_classify,
 )
-from creek.config import load_config
+from creek.config import load_vault_config
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 
@@ -49,7 +49,9 @@ def classify_tool(
                 f"unknown method {method!r}; supported: {', '.join(_VALID_METHODS)}"
             ),
         )
-    config = load_config()
+    # This config selects llm.provider — i.e. which model is shown the
+    # vault's text — so it must be the classified vault's own file (#1409).
+    config = load_vault_config(vault_path)
     try:
         summary = run_classify(
             vault_path=vault_path,
@@ -90,5 +92,19 @@ def classify_tool(
         # consumers can present the two reasons distinctly.
         "preserved_llm": summary.preserved_llm,
         "skipped_high_confidence": summary.skipped_high_confidence,
+        # Issue #876: how many fragments this run gave a real privacy
+        # tier. Surfaced separately from ``classified`` because the tier
+        # pass also runs on fragments the resume short-circuit preserved.
+        "privacy_tiers_assigned": summary.privacy_tiers_assigned,
+        # Issue #877: how many fragments this run raised to a stronger
+        # praxis potential. Surfaced for the same reason as the tier count
+        # — the field previously had no producer at all, and a silent
+        # producer is how that bug survived.
+        "praxis_marked": summary.praxis_marked,
+        # Issue #878: how many fragments this run gained a hashtag ``tags``
+        # entry on. Same reasoning again — the field had no producer at all
+        # until #878, and an invisible producer is how that bug survived
+        # 35,330 fragments and an empty Tag Garden.
+        "tags_extracted": summary.tags_extracted,
         "errors": list(summary.errors),
     }

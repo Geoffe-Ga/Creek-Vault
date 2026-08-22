@@ -6,6 +6,41 @@ name: Iteration Trigger
 # app via MCP so it can continue iterating on feedback. Capped at 10 self-posts
 # per PR to avoid runaway loops.
 #
+# The "cleared to squash merge" line this job emits is a merge instruction, so it
+# must enforce the SAME invariants as scripts/ralph/pr-ready.sh or it becomes a
+# second code path that falsifies it. It therefore mirrors four of them, and
+# names the blocker instead of clearing when any fails:
+#   * no `do-not-auto-merge` hold on the PR;
+#   * the head is current with its base (compare API `behind_by == 0`);
+#   * the verdict carries the `<!-- creek-review pr=N -->` provenance marker for
+#     THIS PR (#1181) — the marker pr-ready.sh's MARKER_RE parses, read from the
+#     same comment the verdict came from;
+#   * the verdict was posted by an account the review pipeline can authenticate
+#     as (#1199) — the same two-member allowlist pr-ready.sh's
+#     VERDICT_AUTHORS_JQ holds, byte for byte, applied INSIDE the comment
+#     selector so a forged comment is skipped rather than picked and refused.
+#     Unlike the other three this one does not reach the blocker chain at all:
+#     an unaccepted author means no verdict was found, so the step takes the
+#     "No Claude review from an accepted author yet" early exit and no summary
+#     is ever composed. test_pr_ready.sh reads the allowlist out of THIS file's
+#     `CLAUDE=` assignment and compares it with pr-ready.sh's constant.
+# All four fail closed on an unreadable answer.
+#
+# AND EVERY ONE THAT REACHES THE CLEARANCE CHAIN REWRITES `VERDICT`, NOT JUST
+# `ACTION` (#1202) — the first three; the authorship one never gets that far,
+# because a thread with no accepted-author verdict produces no summary at all.
+# `VERDICT` is computed from the review comment ABOVE the chain, so a branch that
+# refuses while leaving it alone still posts `**VERDICT**: LGTM` + `**CI**: N/N
+# Green` — and those two fields are the ONLY ones the merge path reads
+# (`.claude/skills/await-claude-review/SKILL.md` Step 4a; its item 5 says in as
+# many words "Do not infer a verdict from the `Action:` prose"). `ACTION` is
+# diagnostic; `VERDICT` is the gate. The refusal values are chosen for their
+# BYTES — `HELD`, `NOT ATTESTED`, `NOT CURRENT` — none containing an `LGTM`
+# substring and none being one of the three verdicts SKILL.md recognises, so
+# Step 4a falls to item 5 and surfaces to a human instead of merging.
+# scripts/ralph/test_pr_ready.sh walks this chain and fails on any NOT-cleared
+# branch that leaves `VERDICT` alone, including ones added after this comment.
+#
 # Required secrets:
 #   GEOFFE_GA_PAT  - personal access token for the repo owner with `pull-requests: write`.
 #                    Without this the comment would post as github-actions[bot]
@@ -67,18 +102,98 @@ jobs:
           fi
 
           # Find the latest Claude review comment via the deterministic
-          # "## Verdict: <verdict>" line that code-review.yml appends.
-          CLAUDE=$(jq -c '[.[] | select(.body | test("(^|\\n)## Verdict:"))] | last // empty' comments.json)
+          # "## Verdict: <verdict>" line that code-review.yml appends — AND by
+          # its AUTHOR (#1199). The verdict line is a public, documented literal,
+          # so without the author filter this job cleared "You are cleared to
+          # squash merge" off whatever verdict-shaped comment posted last, from
+          # anybody who can comment. It is the path that WINS when it and
+          # pr-ready.sh disagree (await-claude-review Step 3 says this summary
+          # short-circuits per-event classification), so an author filter there
+          # alone would have moved the hole one file over instead of closing it.
+          #
+          # THE ALLOWLIST IS THE SAME SET, BYTE FOR BYTE, as pr-ready.sh's
+          # VERDICT_AUTHORS_JQ, and test_pr_ready.sh cuts THIS assignment out of
+          # this file and greps inside it — deliberately not the whole file, so
+          # the bytes cannot sit in a comment while the selector goes unguarded.
+          # Two members because code-review.yml's Post-review step sets its
+          # GH_TOKEN from the GEOFFE_GA_PAT secret with the GITHUB_TOKEN secret
+          # as fallback. That expression is described rather than quoted on
+          # purpose: an Actions dollar-double-brace expression is interpolated
+          # ANYWHERE inside a `run:` block, shell comments included, so writing
+          # it out here would splice a real token into the script the runner
+          # executes. Read the literal bytes in code-review.yml's `env:`, where
+          # they belong. `Geoffe-Ga` when the PAT exists, `github-actions[bot]`
+          # when it does not. Filtering happens INSIDE the select, so a forged
+          # comment is SKIPPED and a genuine earlier verdict still governs — not
+          # picked and then rejected, which would let anyone bury a real refusal
+          # under a later fake LGTM. Exact equality via `index` on the array,
+          # never `test()`: as a regex, `github-actions[bot]` is
+          # `github-actions` followed by the class `[bot]`, which matches the
+          # registrable login `github-actionsb`. Both sides are downcased:
+          # logins are unique case-insensitively, so folding admits no account
+          # that could not already match, and it hedges the fleet-wide unmark an
+          # unexpected casing from the API would otherwise cause.
+          #
+          # THE REST ENDPOINT DISAGREES WITH pr-ready.sh's PAYLOAD ABOUT BOTH THE
+          # FIELD NAME AND THE BOT'S LOGIN, so this expression is deliberately NOT
+          # a copy of that one and must never be made into one. Measured live
+          # against PR #943, the same account three ways:
+          #   gh pr view 943 --json author    -> .author.login           app/dependabot
+          #   gh pr view 943 --json comments  -> .comments[].author.login  dependabot
+          #   gh api repos/../issues/943/comments -> .[].user.login    dependabot[bot]
+          # This file reads the third, so it is `.user.login` (not
+          # `.author.login`) and the bot is `github-actions[bot]` (not the bare
+          # slug pr-ready.sh's GraphQL payload returns). Copying either half
+          # across breaks the file it lands in — silently, and on every lane at
+          # once, because a filter that matches nothing skips every verdict. The
+          # suite pins the field name and the per-payload spelling separately from
+          # the set. `?` and `// ""` because a deleted account leaves `user:
+          # null`: under this step's `set -euo pipefail` a jq error would abort
+          # the step, and an unattributable comment must simply not be selected.
+          CLAUDE=$(jq -c '(["Geoffe-Ga","github-actions[bot]"] | map(ascii_downcase)) as $authors
+                          | [.[] | select((.body | test("(^|\\n)## Verdict:"))
+                                          and (((.user.login? // "") | ascii_downcase) as $a
+                                               | $authors | index($a)))]
+                          | last // empty' comments.json)
           if [ -z "$CLAUDE" ]; then
-            echo "No Claude review yet - skipping"
+            # No verdict from an accepted author. Either none has been posted
+            # yet (the ordinary case) or the only verdict-shaped comments came
+            # from accounts this pipeline cannot post as, which is #1199's
+            # forgery reaching its dead end: no summary is composed, so nothing
+            # ever says "cleared to squash merge" on the strength of it.
+            echo "No Claude review from an accepted author yet - skipping"
             exit 0
           fi
           ID=$(jq -r '.id'   <<<"$CLAUDE")
           BODY=$(jq -r '.body' <<<"$CLAUDE")
 
+          # PROVENANCE (#1181), read from the SAME comment the verdict came from
+          # — the parity requirement in this file's header, and byte-for-byte the
+          # marker scripts/ralph/pr-ready.sh parses. code-review.yml prepends
+          # `<!-- creek-review pr=N -->` with N taken from
+          # `github.event.pull_request.number`, so a verdict without it came from
+          # the pipeline that reviewed PR #1179 and posted the LGTM onto #1117.
+          # Whole-LINE match: a marker quoted mid-sentence in review prose (a
+          # review of that change quotes one) attests to nothing. The trailing
+          # `[[:space:]]*` absorbs a carriage return, matching MARKER_RE in
+          # pr-ready.sh so the two clearance paths cannot disagree about bytes.
+          # `head -n 1` for the same reason: pr-ready.sh takes the FIRST marker in
+          # the body, so this must too.
+          #
+          # `|| true` on the whole pipeline because `set -euo pipefail` is on at
+          # the top of this step: grep exits 1 when there is no marker, which is
+          # the ordinary legacy case and not an error — and under `pipefail` that
+          # 1 would abort the step even though `tr` (the LAST command, whose
+          # status the pipeline would otherwise report) exits 0.
+          MARKER_PR=$(grep -oE '^<!-- creek-review pr=[0-9]+ -->[[:space:]]*$' <<<"$BODY" \
+                        | head -n 1 | tr -dc '0-9' || true)
+
           # Parse the verdict from that line only — grepping the whole body is
-          # unsafe (a COMMENTS rationale may itself mention "LGTM").
-          VLINE=$(grep -m1 -E '^## Verdict:' <<<"$BODY" || true)
+          # unsafe (a COMMENTS rationale may itself mention "LGTM"). When the
+          # body carries several verdict lines (the reviewer re-verdicted in
+          # one comment), the LAST is the final word — same contract as
+          # stats.py's normalize_verdict.
+          VLINE=$(grep -E '^## Verdict:' <<<"$BODY" | tail -n 1 || true)
           case "$VLINE" in
             *CHANGES_REQUESTED*) VERDICT='CHANGES REQUESTED' ;;
             *LGTM*)              VERDICT='LGTM' ;;
@@ -95,8 +210,91 @@ jobs:
           TOTAL=$(jq '[.check_runs[] | select(.conclusion != "skipped" and .conclusion != "neutral")] | length' runs.json)
           GREEN=$(jq '[.check_runs[] | select(.conclusion == "success")] | length'                             runs.json)
 
+          # Green + LGTM is NOT enough to clear a merge, and this job used to
+          # clear on those two alone. That made it a second code path able to
+          # falsify the invariant scripts/ralph/pr-ready.sh enforces: it would
+          # tell the loop to merge the very lanes that helper refuses — a branch
+          # behind its base (whose own green proves nothing about today's main)
+          # and one a human put on hold with `do-not-auto-merge`. Both checks
+          # below fail CLOSED: a missing/unreadable PR object yields no labels
+          # (HELD="unknown") and an empty BEHIND, neither of which clears.
+          PR_JSON=$(gh api "repos/$REPO/pulls/$PR" 2>/dev/null || echo '{}')
+          BASE=$(jq -r '.base.ref // empty' <<<"$PR_JSON")
+          HELD=$(jq -r 'if .labels == null then "unknown"
+                        elif ([.labels[].name] | index("do-not-auto-merge")) then "yes"
+                        else "no" end' <<<"$PR_JSON")
+          # behind_by counts base commits the head lacks. GitHub only reports
+          # mergeStateStatus BEHIND when the base enforces strict status checks,
+          # which this repo does not — so a branch many commits behind main reads
+          # CLEAN and only this compare call can see it. Anything but a literal
+          # "0", including the empty string a failed or malformed compare leaves,
+          # is "not current".
+          BEHIND=$(gh api "repos/$REPO/compare/$BASE...$SHA?per_page=1" --jq '.behind_by' 2>/dev/null || true)
+
           if [ "$GREEN" = "$TOTAL" ] && [ "$VERDICT" = "LGTM" ]; then
-            ACTION="You are cleared to squash merge, delete the branch, clean any worktrees, and unsubscribe from webhooks. Please proceed."
+            if [ "$HELD" != "no" ]; then
+              # THE ONE CONTROL A HUMAN RETAINS over an autonomous merge loop, so
+              # this branch is the most important place in the file to get right —
+              # and until #1202 it was the one that failed. Rewriting ACTION alone
+              # left the summary asserting `**VERDICT**: LGTM`, which is half of
+              # what Step 4a merges on, so a webhook-woken session merged the very
+              # PR a human had parked. `HELD` carries no `LGTM` substring and is
+              # not a verdict SKILL.md recognises; see the header for the full
+              # argument about why the VERDICT field, not ACTION, is the gate.
+              VERDICT='HELD'
+              ACTION="NOT cleared to merge: the do-not-auto-merge hold is set on this PR (or its labels could not be read). A human owns this one - leave it alone."
+            elif [ "$MARKER_PR" != "$PR" ]; then
+              # Fails CLOSED: an absent or unparseable marker leaves MARKER_PR
+              # empty, which never equals a PR number, so it does not clear.
+              #
+              # REWRITING `VERDICT` IS WHAT ACTUALLY STOPS THE MERGE; `ACTION` IS
+              # NOT LOAD-BEARING — THE RULE FOR EVERY BRANCH OF THIS CHAIN, argued
+              # here once and referenced from the other two.
+              # `.claude/skills/await-claude-review/SKILL.md`
+              # Step 4a parses `**VERDICT**:` and `**CI**: x/y Green` and nothing
+              # else — its item 3 returns LGTM to the caller on those two fields
+              # alone, and its item 5 says in as many words "Do not infer a
+              # verdict from the `Action:` prose". VERDICT is computed from the
+              # review comment ABOVE this clearance chain, and the chain only ever
+              # rewrote ACTION, so a marker-mismatched PR still posted
+              # `**VERDICT**: LGTM` + `**CI**: N/N Green` and a woken session
+              # merged on it — while Step 3 makes this summary SHORT-CIRCUIT
+              # per-event classification, so it is exactly the half that wins over
+              # pr-ready.sh's `awaiting-review`. A comment must not assert a
+              # merge-clearing verdict that the same comment then refuses.
+              #
+              # `NOT ATTESTED` is chosen for its BYTES: it contains no `LGTM`
+              # substring, so neither the `*LGTM*` glob above nor a downstream
+              # `test("LGTM")` can match it, and it is none of the three verdicts
+              # SKILL.md's recognition rule accepts — so Step 4a falls to item 5
+              # (marker present, verdict unparseable → surface to the user), which
+              # is the destination we want: a human looks, nobody merges.
+              # Assigning it here is safe because the enclosing
+              # `[ "$GREEN" = "$TOTAL" ] && [ "$VERDICT" = "LGTM" ]` has already
+              # been evaluated, and nothing reads VERDICT again before the BODY
+              # printf below.
+              #
+              # THE `HELD` AND `BEHIND` BRANCHES NOW DO THE SAME THING (#1202).
+              # They carried the identical hole for as long as this branch did
+              # not: rewriting ACTION alone, so `**VERDICT**: LGTM` stood and a
+              # `do-not-auto-merge` hold was defeated exactly the way an
+              # unattested verdict was. The asymmetry was scoped to #1181 on
+              # purpose and is now closed; the chain has ONE rule, and
+              # test_pr_ready.sh enforces it structurally rather than by naming
+              # these three branches, so a fourth refusal inherits it.
+              VERDICT='NOT ATTESTED'
+              ACTION="NOT cleared to merge: the latest verdict does not attest that the reviewer read THIS PR - its provenance marker names '${MARKER_PR}', not ${PR}. Run scripts/ralph/fleet.sh sync (or push any commit) so the marker-emitting review workflow runs on this branch and the re-review is attested; re-running the old review run will not help, it replays the workflow file from the commit that run was launched from. See #1181."
+            elif [ "$BEHIND" != "0" ]; then
+              # Same rule, same reason (#1202): this branch's own green proves
+              # nothing about today's base, and pr-ready.sh refuses the lane for
+              # it — so the summary must not hand the merge path an `LGTM` the
+              # sibling clearance path would reject. `NOT CURRENT` carries no
+              # `LGTM` substring and is not a verdict SKILL.md recognises.
+              VERDICT='NOT CURRENT'
+              ACTION="NOT cleared to merge: this head is not current with ${BASE:-its base} (behind_by='${BEHIND}'). Run scripts/ralph/fleet.sh sync and let CI re-run first."
+            else
+              ACTION="You are cleared to squash merge, delete the branch, clean any worktrees, and unsubscribe from webhooks. Please proceed."
+            fi
           else
             ACTION="pull comment ${ID} to see in-depth feedback and continue iterating"
           fi

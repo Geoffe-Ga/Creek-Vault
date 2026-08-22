@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek.ingest.base import ParsedFragment
+from creek.ingest.claude import ClaudeIngestor
 from creek.ingest.refresh import resplit_merged_ai_chat
 from creek.models import Authorship, Fragment, FragmentSource, SourcePlatform
 from creek.vault.reader import iter_vault_fragments
@@ -176,6 +178,49 @@ def test_already_split_human_fragment_is_skipped(tmp_path: Path) -> None:
 
     assert result.resplit == 0
     assert result.skipped == 1
+
+
+def test_merged_run_human_fragment_is_skipped(tmp_path: Path) -> None:
+    """A human fragment holding a merged message run is not re-split (#1333).
+
+    Consecutive human messages now merge into one turn separated by a blank
+    line, so a human fragment body is no longer a single paragraph — and
+    ``turns._split_claude`` reads any *non-blank* line that escapes the
+    blockquote as the assistant's prose. (A blank separator is safe whether
+    or not it carries the ``>``; the parser drops blank lines from that
+    bucket. A non-blank one is not.) So the guarantee this test pins is
+    that ``ClaudeIngestor.convert_to_markdown`` blockquotes **every** line
+    of a multi-paragraph human turn. The body is produced by that method
+    rather than hand-written, so a future change that lets any line through
+    unprefixed fails here instead of silently making the migration
+    destructive: it would otherwise split this fragment and re-attribute
+    the second half of the operator's own words to the AI.
+    """
+    vault = tmp_path / "vault"
+    merged_run_text = "First half of my thought\n\nSecond half of my thought"
+    body = ClaudeIngestor().convert_to_markdown(
+        ParsedFragment(
+            content=merged_run_text,
+            metadata={"turn_text": merged_run_text, "author_role": "self"},
+            source_path="/exports/claude.json",
+            timestamp=datetime(2024, 11, 15, 10, 0, tzinfo=UTC),
+        ),
+    )
+    # Guard the precondition the safety argument rests on.
+    assert all(line.startswith(">") for line in body.split("\n"))
+    target = _write_merged(
+        vault,
+        platform=SourcePlatform.CLAUDE,
+        body=body,
+        name="merged_run",
+    )
+
+    result = resplit_merged_ai_chat(vault)
+
+    assert result.resplit == 0
+    assert result.skipped == 1
+    assert target.exists()
+    assert target.read_text(encoding="utf-8").endswith(body)
 
 
 def test_empty_vault_is_unchanged(tmp_path: Path) -> None:

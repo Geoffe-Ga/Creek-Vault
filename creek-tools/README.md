@@ -60,7 +60,7 @@ creek init --vault ~/Obsidian/Creek-Vault
 # 1. Scan for secrets before anything else.
 creek redact --scan --source ~/exports --report
 
-# 2. Apply redactions (writes a queue under <source>/.creek-redactions/).
+# 2. Apply redactions (rewrites source files in place — no undo; back up first).
 creek redact --apply --source ~/exports --dry-run    # preview
 creek redact --apply --source ~/exports              # commit
 
@@ -94,8 +94,8 @@ Every command is also documented under [`docs/`](docs/) with end-to-end examples
 
 | Command | Purpose | Doc |
 |---------|---------|-----|
-| `creek redact --scan`   | Scan a source for secrets, API keys, and PII. Writes a structured report. | [redaction](docs/redaction.md) |
-| `creek redact --apply`  | Apply queued redactions to source files. Supports `--dry-run` and `--yes`. | [redaction](docs/redaction.md) |
+| `creek redact --scan`   | Scan a source for secrets, API keys, and PII. Prints a report; writes no files. | [redaction](docs/redaction.md) |
+| `creek redact --apply`  | Re-scan and rewrite matches in source files in place. No undo. Supports `--dry-run` and `--yes`. | [redaction](docs/redaction.md) |
 | `creek redact --review` | Render the review queue for a vault. | [redaction](docs/redaction.md) |
 | `creek purge fragment`  | Delete a fragment and scrub every reference (right-to-be-forgotten). | [cleaning-and-purge](docs/cleaning-and-purge.md) |
 | `creek purge source`    | Delete every fragment ingested from a given source. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
@@ -118,7 +118,7 @@ Every command is also documented under [`docs/`](docs/) with end-to-end examples
 | Command | Purpose | Doc |
 |---------|---------|-----|
 | `creek skills generate` | Generate the **Voice Skill Tree** under `<vault>/creek-skills/` (one `SKILL.md` per frequency, phase, mode, register, plus thread/eddy/meta skills). Previously `creek skills`; see [`CHANGELOG.md`](CHANGELOG.md) for the FEAT-019 rename. | [generation](docs/generation.md#voice-skill-tree) |
-| `creek skills sync` | Re-deploy the canonical schema-skill tree from `creek-tools/creek/templates/skills/` into `<vault>/00-Creek-Meta/Skills/`. Refuses to overwrite locally-modified skill files unless `--force` is passed. | [generation](docs/generation.md#voice-skill-tree) |
+| `creek skills sync` | Re-deploy the canonical schema-skill tree and medium contracts from `creek-tools/creek/templates/skills/` into `<vault>/00-Creek-Meta/Skills/` (including `mediums/*.MEDIUM.md`). Refuses to overwrite a locally-modified *canonical* file of either class unless `--force` is passed, in which case the local version is preserved alongside as `<name>.bak`. Files you authored yourself are never deployed over or reported as drift. | [generation](docs/generation.md#voice-skill-tree) |
 | `creek mine`     | Mine blog/essay seed ideas from the vault using four discovery strategies (liminal cross-eddy, thread terminus, resonance chain, wavelength-phase window). | [generation](docs/generation.md#mining) |
 | `creek draft`    | Draft an essay from a mined idea using the activated skill stack. Saves to `07-Voice/Drafts/` with full provenance. | [generation](docs/generation.md#drafting) |
 
@@ -128,7 +128,7 @@ Every command is also documented under [`docs/`](docs/) with end-to-end examples
 |---------|---------|-----|
 | `creek clean orphans`       | Identify fragments with zero links after N days. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
 | `creek clean stale-reviews` | Find review queue items older than N days. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
-| `creek clean broken-links`  | Scan fragments for wiki-links pointing to nonexistent files. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
+| `creek clean broken-links`  | Scan the vault for wiki-links pointing to nonexistent files. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
 | `creek clean duplicates`    | Run the dedup sweep and emit a review report. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
 | `creek clean report`        | Summary statistics on vault health. | [cleaning-and-purge](docs/cleaning-and-purge.md) |
 
@@ -161,7 +161,7 @@ read the threat model below before doing anything else.
 | `llm`            | `LLMRoutingConfig`     | Per-stage provider+model routing (`default` / `classification` / `generation` / `frontend` + a `writing_desk` role map), or a legacy flat `LLMConfig` block. See [LLM providers](#llm-providers). |
 | `embeddings`     | `EmbeddingsConfig`     | Sentence-transformer model, similarity thresholds. |
 | `ocr`            | `OCRConfig`            | Tesseract path, languages, PSM mode. |
-| `linking`        | `LinkingConfig`        | Embedding/temporal/eddy thresholds. |
+| `linking`        | `LinkingConfig`        | Embedding/temporal/thread/eddy thresholds, message-stream segmentation, and the cluster-size guardrail. See [ADR-0008](docs/architecture/ADR/0008-bounding-cluster-degeneration-in-message-streams.md). |
 | `classification` | `ClassificationConfig` | Auto-classify sources, confidence threshold, review-required sources. |
 | `context`        | `ContextConfig`        | How non-user content (others' messages, collaborative docs) is handled. |
 | `redaction`      | `RedactionConfig`      | Pattern enable list, exclusion globs, allow-list. |
@@ -228,11 +228,11 @@ For the Writing Desk voice roles (`voice_drafter` / `voice_line_editor`), an exp
 **Live smoke test (model onboarding).** Unit tests mock every vendor SDK, so a model id is only proven by a real call. With the provider's key (and consent) in the env, one command makes a single tiny live request and asserts the normalized round-trip:
 
 ```bash
-./scripts/test.sh --integration -k openai                                  # smoke the provider's default model
-CREEK_SMOKE_MODEL=some-new-model ./scripts/test.sh --integration -k gemini # smoke a candidate model id
+./scripts/test.sh --live -k openai                                  # smoke the provider's default model
+CREEK_SMOKE_MODEL=some-new-model ./scripts/test.sh --live -k gemini # smoke a candidate model id
 ```
 
-Each smoke skips cleanly when its key is absent, and the `integration` marker keeps them out of the default test selection and CI entirely.
+Each smoke skips cleanly when its key is absent, and the `live` marker keeps them out of the default test selection and CI entirely — CI holds no provider credentials, and a merge gate that depends on a paid third-party API is a flaky gate.
 
 ---
 
@@ -242,7 +242,7 @@ The ingestion pipeline currently ships **11** registered `Ingestor`s plus a read
 
 `claude`, `chatgpt`, `discord`, `code`, `document` (.docx / .pdf), `markdown`, `spreadsheet` (.xlsx / .csv), `presentation` (.pptx), `image` (with OCR), `substack` (newsletter exports), and `generic` (fallback for unknown text).
 
-`gdrive` is a downloader, not an ingestor — it stages files locally and dispatches each one to the appropriate ingestor by extension. The `other` enum value on `SourcePlatform` is reserved for downstream consumers (e.g. fragments synthesised from praxes) and has no parser.
+`gdrive` is a downloader, not an ingestor — it stages files locally and dispatches each one to the appropriate ingestor by extension. The `other` enum value on `SourcePlatform` is what the `generic` fallback ingestor writes, and it also covers downstream consumers (e.g. fragments synthesised from praxes).
 
 Each ingestor follows the same four-stage contract — `discover` → `parse` → `convert_to_markdown` → `generate_frontmatter` — and writes one fragment per logical unit (per chat thread, per sheet, per slide deck, per file). See [`docs/ingestion.md`](docs/ingestion.md) for which is right for which export.
 
@@ -258,7 +258,10 @@ All quality gates run from `creek-tools/` via the project scripts:
 ./scripts/check-all.sh          # Run all 7 gates (lint, format, typecheck, complexity, security, tests, coverage)
 ./scripts/fix-all.sh             # Auto-fix lint + format
 ./scripts/test.sh                # Unit tests (default)
-./scripts/test.sh --all          # Unit + integration + e2e
+./scripts/test.sh --integration  # Hermetic cross-component lane (blocking in CI)
+./scripts/test.sh --e2e          # Hermetic end-to-end lane (blocking in CI)
+./scripts/test.sh --live         # Live API/service smokes (needs keys; not in CI)
+./scripts/test.sh --all          # Every lane, live smokes included
 ./scripts/test.sh --coverage     # With coverage report
 ./scripts/lint.sh --fix          # Ruff lint with auto-fix
 ./scripts/format.sh --check      # Format check

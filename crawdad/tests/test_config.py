@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
 from crawdad.config import CrawDadConfig, load_config
 
@@ -140,6 +140,74 @@ def test_config_attachments_defaults_to_25_mib_and_inbound(tmp_path: Path) -> No
     assert ".exe" in config.attachments.denied_extensions
 
 
+def test_canonical_staging_root_mirrors_the_mcp_scan_scope() -> None:
+    """#1088: the mirrored constant must equal creek-tools' scan scope.
+
+    ``creek-tools/creek_mcp/tools/redact.py:98`` defines
+    ``_STAGING_SUBDIR = Path("00-Creek-Meta/Inbound")`` — the single
+    subtree ``creek.redact.scan`` admits at every ceiling, and therefore
+    the only staging root a ``personal``-tier CrawDad channel can ever get
+    a real scan for. CrawDad mirrors the value rather than importing it
+    (no Python-level dependency on creek-tools beyond the MCP contract),
+    so this assertion is the guard against the mirror drifting away from
+    its source.
+    """
+    from crawdad.config import CANONICAL_STAGING_ROOT
+
+    assert Path("00-Creek-Meta") / "Inbound" == CANONICAL_STAGING_ROOT
+
+
+def test_attachment_config_validates_a_drifted_default_staging_subpath() -> None:
+    """#1088: an out-of-scope *default* is refused, not only an explicit value.
+
+    Pydantic skips field validators for defaults unless validation of
+    defaults is switched on, so without it a subclass — or a future edit
+    to the field's own default — could reintroduce an unscannable staging
+    root that no test ever passes explicitly. Bare construction of this
+    subclass must raise.
+
+    Constraint this imposes on the implementation: pydantic (2.13.4) does
+    NOT inherit a per-field ``Field(..., validate_default=True)`` into a
+    subclass that re-declares the field, but it DOES inherit
+    ``model_config = ConfigDict(..., validate_default=True)``. This test
+    therefore requires the model-level form.
+    """
+    from crawdad.config import AttachmentConfig
+
+    class _DriftedDefault(AttachmentConfig):
+        """An ``AttachmentConfig`` whose only change is an out-of-scope default."""
+
+        staging_subpath: Path = Field(default=Path("01-Fragments"))
+
+    with pytest.raises(ValidationError, match="00-Creek-Meta/Inbound"):
+        _DriftedDefault()
+
+
+def test_load_config_refuses_out_of_scope_staging_subpath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1088: the refusal reaches the operator through the YAML load path.
+
+    ``crawdad.yaml`` is where an operator actually sets
+    ``attachments.staging_subpath``, so the gate has to fire on
+    :func:`load_config`, not only on direct model construction.
+    """
+    yaml_path = tmp_path / "crawdad.yaml"
+    yaml_path.write_text(
+        "vault_path: " + str(tmp_path) + "\n"
+        "allowed_user_ids: [1]\n"
+        "allowed_channel_ids: [2]\n"
+        "attachments:\n"
+        "  staging_subpath: 01-Fragments\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "t")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+
+    with pytest.raises(ValidationError, match="00-Creek-Meta/Inbound"):
+        load_config(yaml_path)
+
+
 def test_attachment_config_rejects_unknown_privacy_tier() -> None:
     """FEAT-027: bogus tier strings in ``channel_privacy_tiers`` are refused.
 
@@ -166,6 +234,74 @@ def test_attachment_config_accepts_all_four_tier_values() -> None:
         },
     )
     assert config.channel_privacy_tiers[2] == "personal"
+
+
+def test_capture_admitted_tiers_excludes_intimate_and_all() -> None:
+    """#1052: only ``open`` and ``personal`` channels may be bot-captured.
+
+    A capture record has no tier field, so a captured message arrives
+    downstream as ``unclassified``, which ranks with ``personal``
+    (``creek_mcp.tier_ceiling``, #961). Capturing an ``intimate`` channel
+    would therefore be a silent privacy de-escalation, and ``all`` admits
+    intimate content by definition. The equality (not a membership check) is
+    deliberate: adding a tier to this set must be an explicit, reviewed edit.
+    """
+    from crawdad.config import CAPTURE_ADMITTED_TIERS
+
+    assert frozenset({"open", "personal"}) == CAPTURE_ADMITTED_TIERS
+
+
+def test_capture_admitted_tiers_is_a_strict_subset_of_valid_tiers() -> None:
+    """#1052: the admitted set is a strict subset of the tier vocabulary.
+
+    Pins the escalate-only invariant against the two ways it can rot:
+    someone widening admission to the whole vocabulary, and a fifth tier
+    being added later and silently inheriting capture admission. A new tier
+    must fail this test until a human decides its admission explicitly.
+
+    The round-trip through ``AttachmentConfig`` keeps the constant honest —
+    it must be the same vocabulary the config validator enforces, not a
+    decorative duplicate that drifts.
+    """
+    from crawdad.config import (
+        _VALID_CHANNEL_TIERS,
+        CAPTURE_ADMITTED_TIERS,
+        AttachmentConfig,
+    )
+
+    assert CAPTURE_ADMITTED_TIERS < _VALID_CHANNEL_TIERS
+    assert (
+        frozenset({"intimate", "all"}) == _VALID_CHANNEL_TIERS - CAPTURE_ADMITTED_TIERS
+    )
+    for tier in sorted(_VALID_CHANNEL_TIERS):
+        parsed = AttachmentConfig(channel_privacy_tiers={1: tier})
+        assert parsed.channel_privacy_tiers[1] == tier
+
+
+def test_default_channel_tier_is_capture_admitted() -> None:
+    """#1052: a channel with no declared tier keeps bot-capture.
+
+    ``_channel_tier`` falls back to ``DEFAULT_CHANNEL_TIER`` for a channel the
+    operator never listed in ``channel_privacy_tiers``, and ``_capture_allowed``
+    then tests that value for membership in ``CAPTURE_ADMITTED_TIERS``. So the
+    #687 capture feature keeps working for the common "no tier block at all"
+    deployment *only* while these two constants agree. They are declared
+    independently, so pin the link here rather than leaving it to coincidence:
+    dropping ``personal`` from the admitted set would otherwise silently
+    disable capture for every un-tiered channel.
+
+    ``DEFAULT_CHANNEL_TIER`` must also be a real tier, not a typo — an
+    unrecognised fallback would fail closed and look identical to an
+    intentional refusal.
+    """
+    from crawdad.config import (
+        _VALID_CHANNEL_TIERS,
+        CAPTURE_ADMITTED_TIERS,
+        DEFAULT_CHANNEL_TIER,
+    )
+
+    assert DEFAULT_CHANNEL_TIER in _VALID_CHANNEL_TIERS
+    assert DEFAULT_CHANNEL_TIER in CAPTURE_ADMITTED_TIERS
 
 
 def test_load_config_parses_attachment_overrides(

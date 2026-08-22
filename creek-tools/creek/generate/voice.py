@@ -13,14 +13,44 @@ body texts to extract sentence structure, paragraph structure, transition
 patterns, metaphor families, rhetorical moves, vocabulary fingerprint, and
 punctuation habits.
 
-The collector is deliberately conservative about privacy: ``intimate``
-tier fragments are excluded by default and only included when the caller
-explicitly opts in. Saved exemplars include a per-register summary note
-recording the breakdown of confidence levels.
+**Voice fidelity** is guarded separately from privacy, by three additive
+gates in :func:`_eligible_register` and the walks around it. The primary
+one is authorship (#1213): a fragment whose ``source.author`` is not
+``self`` is refused outright, which is what enforces the guarantee
+:attr:`~creek.models.Fragment.voice_proxy_eligible` documents. Behind it
+sit two backstops from #466 — ``voice_weight > 0``, stamped to ``0.0`` on
+AI turns at ingest, and the ``11-Other-Authors`` path exclusion
+(:data:`_OTHER_AUTHORS_SEGMENT`). Both are retained deliberately: they
+catch a fragment whose authorship axis is missing or mis-set.
+
+The collector is deliberately conservative about privacy, and two
+independent gates say so. ``allow_intimate`` is a **consent** gate: the
+voice proxy is opt-in even at ``--include-tier intimate``
+(``creek/templates/skills/privacy-tier.SKILL.md:47``). ``override`` is a
+**ceiling** gate (#968): the caller's declared
+:class:`~creek.classify.privacy_filter.PrivacyTierOverride`, applied to each
+note's raw frontmatter via
+:func:`~creek.classify.privacy_filter.within_ceiling`. They are additive by
+design — admission is ``allow_intimate`` *and* ``within_ceiling`` — and must
+not be "simplified" into one.
+
+Both gates read the same tier because :func:`_load_fragment_with_body`
+materialises the **declared** tier onto every model it returns (#1212): a
+note with no ``privacy_tier`` key resolves to ``intimate`` rather than to
+the model's ``unclassified`` default, so it is refused wherever a
+declared-intimate note is. Without that, the consent gate — which sees only
+the model — admitted unvouched-for content whenever the ceiling gate was at
+:attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL` and therefore
+short-circuiting.
+
+Saved exemplars include a per-register summary note recording the breakdown
+of confidence levels and the manifest of the copies the run wrote
+(:func:`_sample_digest`), which is what entitles the next run to delete one.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -36,11 +66,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import frontmatter
-import yaml
 from pydantic import ValidationError
 
+from creek.classify.privacy_filter import (
+    PrivacyTierOverride,
+    raw_privacy_tier,
+    within_ceiling,
+)
 from creek.config import VoiceAudienceWeightingConfig
 from creek.models import (
+    Authorship,
     Confidence,
     Fragment,
     Frequency,
@@ -49,9 +84,11 @@ from creek.models import (
     PrivacyTier,
     VoiceRegister,
 )
+from creek.vault.links import read_header_meta
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +110,15 @@ _OTHER_AUTHORS_SEGMENT: str = "11-Other-Authors"
 Any fragment whose source path contains this segment is excluded from the
 voice corpus regardless of its ``voice_weight``, as a defensive backstop
 against voice drift.
+
+Since #1213 this is a backstop to a real frontmatter gate rather than a
+front-line defence, and it is **retained deliberately** — it still catches
+a fragment whose ``source.author`` axis is absent or mis-set. It was never
+load-bearing on its own: the walks only rglob :data:`_FRAGMENTS_SUBDIR`,
+while :meth:`creek.vault.writer.VaultWriter._fragment_target_dir` routes
+borrowed fragments to a vault-root ``11-Other-Authors/<slug>/`` that is
+outside the scan root entirely. What this segment check actually catches
+is a nested or symlinked occurrence *inside* ``01-Fragments/``.
 """
 
 _SAMPLES_SUBPATH: tuple[str, str] = ("07-Voice", "Register-Samples")
@@ -103,6 +149,30 @@ _CLASSIFICATION_BONUS: int = 1
 
 _SUMMARY_FILENAME: str = "_Summary.md"
 """Filename used for the per-register summary note."""
+
+_SUMMARY_STEM: str = Path(_SUMMARY_FILENAME).stem
+"""The summary's own stem, which no exemplar copy may claim.
+
+Derived rather than restated so the reserved name cannot drift away from
+the file it reserves.
+"""
+
+_MANIFEST_KEY: str = "exemplar_digests"
+"""Summary frontmatter key holding one fingerprint per copy the run wrote."""
+
+_ID_PATH_CHARS: frozenset[str] = frozenset({"/", "\\", "\x00"})
+"""Characters that make a ``Fragment.id`` a path rather than a filename."""
+
+_ID_DIRECTORY_NAMES: frozenset[str] = frozenset({"", ".", ".."})
+"""Whole-id values that name a directory (or nothing) rather than a file."""
+
+_NAME_MAX_BYTES: int = 255
+"""POSIX ``NAME_MAX``: the byte length limit on a single filename.
+
+255 on every filesystem creek runs on (APFS, ext4, XFS). The unit is bytes,
+not characters, because that is what the kernel counts: a non-ASCII id
+spends more of the budget than its length suggests.
+"""
 
 
 @dataclass(frozen=True)
@@ -160,6 +230,16 @@ def audience_authority(
     result multiplies a fragment's ranking score so higher-authority fragments
     win ties and dominate the exemplars that feed each voice profile.
 
+    A fragment whose file declared no ``privacy_tier`` reaches here as
+    ``intimate`` — :func:`_load_fragment_with_body` materialises the declared
+    tier (#1212) — and therefore scores ``0.0`` rather than ``unclassified``'s
+    ``0.75``. That is deliberate and accepted: keyless content behaves exactly
+    like declared-intimate content at every reader in this module, and on the
+    ``allow_intimate=True`` path where it is still admitted a ``0.0`` only
+    de-ranks it (:meth:`VoiceExemplarCollector.rank_exemplars` truncates by
+    position, not by score). Do not carve an exception out here — a second
+    tier opinion inside one module is the bug #1079 and #1212 both were.
+
     Args:
         fragment: The candidate exemplar fragment.
         weighting: The audience-weighting configuration. When disabled every
@@ -200,6 +280,60 @@ def _is_other_authors_path(md_file: Path) -> bool:
     return _OTHER_AUTHORS_SEGMENT in md_file.parts
 
 
+def _is_safe_sample_stem(fragment_id: str) -> bool:
+    """Return whether *fragment_id* may be used as a bare sample filename.
+
+    :meth:`VoiceExemplarCollector._persist_fragment` composes
+    ``<register_dir>/{fragment.id}.md``, and ``Fragment.id`` is an
+    unconstrained ``str`` carried over from an export
+    (``creek/models.py``), so an id has four separate hazards to clear
+    before it can name a file:
+
+    * **Traversal.** A separator or a ``..`` component steers the write
+      out of the register folder entirely — ``id="../../escape"`` lands
+      in ``07-Voice/``.
+    * **Emptiness.** An empty id writes ``.md``, whose ``Path.stem`` is
+      ``".md"`` rather than the id, so the prune pass could never
+      recognise the file as its own again.
+    * **Length.** The name that has to fit in a directory entry is
+      ``f"{id}.md"``, three bytes more than the id, and the limit is
+      :data:`_NAME_MAX_BYTES`. An over-long name reaches ``shutil.copy2``
+      and raises ``OSError`` (``ENAMETOOLONG``), which takes the whole
+      command down. The bound is measured on the **encoded** name because
+      the kernel's is: ids arrive verbatim from exports, and a non-ASCII
+      one costs more bytes than it shows characters.
+    * **Collision with the summary.** ``_Summary`` would send a verbatim
+      fragment body to the path :meth:`VoiceExemplarCollector._write_summary`
+      is about to write. Today the summary wins by writing last; a process
+      killed in between leaves a fragment body in ``_Summary.md`` instead
+      — a file the prune exempts *by name* and so never cleans up.
+
+    Same reasoning as the register guard in
+    :meth:`VoiceProfileGenerator.write_profile`; the response differs
+    because one unusable id is one unusable exemplar rather than a
+    malformed call, so the collector skips it and goes on saving the rest.
+
+    Windows device names (``CON``, ``NUL``), NTFS alternate data streams,
+    and Unicode-normalisation collisions are deliberately **not** handled
+    here — they are tracked in issue #1214, not overlooked.
+
+    Args:
+        fragment_id: The candidate id.
+
+    Returns:
+        ``True`` when ``f"{fragment_id}.md"`` is a plain filename that
+        resolves inside its own directory and fits in a directory entry.
+    """
+    if fragment_id in _ID_DIRECTORY_NAMES or fragment_id == _SUMMARY_STEM:
+        return False
+    if any(char in fragment_id for char in _ID_PATH_CHARS):
+        return False
+    filename = f"{fragment_id}.md"
+    if Path(filename).name != filename:
+        return False
+    return len(filename.encode("utf-8")) <= _NAME_MAX_BYTES
+
+
 def _eligible_register(
     fragment: Fragment,
     *,
@@ -213,14 +347,36 @@ def _eligible_register(
             fragments are rejected.
 
     Returns:
-        The canonical register string when the fragment has qualifying
-        confidence, a positive ``voice_weight``, allowed privacy tier,
-        and a canonical register; otherwise ``None``.
+        The canonical register string when the fragment is self-authored
+        and has qualifying confidence, a positive ``voice_weight``, allowed
+        privacy tier, and a canonical register; otherwise ``None``.
     """
-    # Voice-fidelity fail-closed gate (Issue #466): borrowed / AI-authored
-    # text (notably ``ai-as-user`` content with ``voice_weight=0.0``) must
-    # never train the voice proxy. ``voice_weight`` is already coerced to a
-    # float in ``[0, 1]`` by the model, so a plain comparison is safe.
+    # Authorship gate (Issue #1213), first because it is the primary one:
+    # this is what enforces the guarantee
+    # :attr:`~creek.models.Fragment.voice_proxy_eligible` documents — that
+    # AI-, collaborator- and other-authored prose can never train the voice
+    # proxy. Before this clause the corpus consulted no authorship axis at
+    # all, and the two gates below were the whole defence.
+    #
+    # Re-derived rather than delegated to the property, exactly as
+    # :func:`creek.generate.skills._is_snapshot_fragment` is and for the
+    # same documented reason: the property bakes in the INTIMATE exclusion,
+    # while ``allow_intimate=True`` deliberately overrides it, so
+    # ``return fragment.voice_proxy_eligible`` would silently revoke the
+    # operator's opt-in to their *own* intimate writing.
+    #
+    # Compared by value, not identity: ``FragmentSource`` sets
+    # ``use_enum_values=True``, so ``author`` is a plain ``str`` at runtime
+    # — the same idiom as the privacy-tier comparison below. Deliberately
+    # not ``Authorship(...) is Authorship.SELF``, which raises on a
+    # hand-corrupted frontmatter value instead of failing closed.
+    if str(fragment.source.author) != Authorship.SELF.value:
+        return None
+    # Voice-fidelity backstop (Issue #466): ``ai-as-user`` content is
+    # stamped ``voice_weight=0.0`` at ingest, which refuses it a second
+    # time even if its authorship axis is ever mis-set. ``voice_weight`` is
+    # already coerced to a float in ``[0, 1]`` by the model, so a plain
+    # comparison is safe.
     if fragment.voice_weight <= 0:
         return None
     if _confidence_value(fragment) not in _QUALIFYING_CONFIDENCE:
@@ -302,20 +458,55 @@ def _iter_exemplars_from_jsonl(jsonl_path: Path) -> Iterator[Exemplar]:
 
 def _load_fragment_with_body(
     md_file: Path,
-) -> tuple[Fragment, str] | None:
-    """Parse *md_file* into a Fragment and return it with its body text.
+) -> tuple[Fragment, str, dict[str, object]] | None:
+    """Parse *md_file* into a Fragment and return it with body and raw frontmatter.
+
+    The returned model carries the **declared** tier: this loader overwrites
+    ``privacy_tier`` with
+    :func:`~creek.classify.privacy_filter.raw_privacy_tier` of the raw
+    frontmatter, so a file with no ``privacy_tier`` key resolves to
+    ``INTIMATE`` (``creek/classify/privacy_filter.py:409-415``) instead of
+    reaching the consent gate as Pydantic's ``unclassified`` default (#1212).
+    That doctrine is not new here — "the tier field is missing → ``intimate``"
+    is already published to every vault at
+    ``creek/templates/skills/privacy-tier.SKILL.md:27`` — and the shape is
+    copied verbatim from :func:`creek.generate.mining._admitted_liminal_entry`
+    (``creek/generate/mining.py:441``), which closed the identical hole in
+    #1079. Doing it once, at the single loader every walk in this module goes
+    through, is what makes all three walks see one tier per file.
+
+    The substitution is **one-way**: it can only ever refuse more. Whenever the
+    key is present the two readers agree — both read the same dict, and an
+    unparseable value already failed ``model_validate`` above — so the only
+    fragment whose tier moves is the keyless one, and it moves towards
+    ``intimate``.
+
+    The raw frontmatter is still returned alongside the model because the
+    ceiling gate (#968) runs *before* the consent gate at each walk and takes
+    raw: :func:`~creek.classify.privacy_filter.within_ceiling` must keep
+    reading frontmatter rather than a model, since the tier it needs precedes
+    validation.
+
+    One subtlety the callers depend on: ``Fragment``'s config is
+    ``use_enum_values=True`` (``creek/models.py:766``), so ``privacy_tier`` is
+    normally a plain ``str`` at runtime, and ``model_copy(update=...)``
+    bypasses validation — after this substitution that one field holds a
+    genuine :class:`~creek.models.PrivacyTier` member. Every reader survives
+    because ``PrivacyTier`` is a ``StrEnum`` (``creek/models.py:333``):
+    ``str(member)`` is the value, ``model_dump(mode="json")`` emits the value,
+    and ``!=`` against another tier compares by value.
 
     Args:
         md_file: Markdown file to read.
 
     Returns:
-        A ``(fragment, body)`` pair, or ``None`` when the file is not a
-        valid fragment record (unreadable, wrong type, or invalid
-        frontmatter).
+        A ``(fragment, body, raw)`` triple whose fragment carries the declared
+        tier, or ``None`` when the file is not a valid fragment record
+        (unreadable, wrong type, or invalid frontmatter).
     """
     try:
         post = frontmatter.load(str(md_file))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         logger.debug("Skipping unreadable markdown file: %s", md_file)
         return None
     metadata = post.metadata
@@ -326,7 +517,88 @@ def _load_fragment_with_body(
     except ValidationError:
         logger.debug("Skipping invalid fragment frontmatter: %s", md_file)
         return None
-    return fragment, post.content
+    # Materialised unconditionally: for a file that reaches this line the key
+    # is either absent (the one case that changes) or a valid tier string that
+    # ``raw_privacy_tier`` reads back identically off the same dict. A guard
+    # would only add an arm that can never be taken.
+    declared = fragment.model_copy(
+        update={"privacy_tier": raw_privacy_tier(metadata)},
+    )
+    return declared, post.content, metadata
+
+
+def _sample_digest(stem: str) -> str:
+    """Return the manifest fingerprint of a sample filename *stem*.
+
+    The manifest records fingerprints rather than the ids themselves
+    because of where it lives — the frontmatter of ``_Summary.md``, an
+    ordinary ``.md`` file inside the vault. ``creek purge`` rewrites
+    **every** ``.md`` in the vault in place, replacing a purged id with
+    ``[purged]`` (``creek/purge/engine.py``). A plaintext manifest is
+    therefore edited out from under the prune by the very command whose
+    leftovers the prune exists to remove, leaving the copy undeletable. A
+    digest survives that rewrite untouched, so the copy stays deletable.
+
+    **This is a stability property, not an erasure guarantee.** The digest
+    is unsalted SHA-256 over a low-entropy, enumerable value: fragment ids
+    come verbatim from exports, so anyone holding a candidate id list can
+    confirm membership by recomputing the digest, including after a purge.
+    The manifest is therefore best understood as a *confirmable* record of
+    which ids this folder once held, not as an anonymised one. It is
+    accepted because the alternative — a plaintext ledger somewhere purge
+    cannot reach — is strictly worse residue, and because the prune it
+    enables removes the fragment *bodies*, which are the sensitive part.
+    Domain-separating the digest (HMAC under a per-vault key) would close
+    the confirmation gap and is the obvious upgrade if that judgement ever
+    changes.
+
+    Args:
+        stem: The sample filename stem — equivalently the fragment id,
+            since :meth:`VoiceExemplarCollector._persist_fragment` writes
+            ``f"{fragment.id}.md"``.
+
+    Returns:
+        The hex digest recorded for *stem*.
+    """
+    return hashlib.sha256(stem.encode("utf-8")).hexdigest()
+
+
+def _read_sample_manifest(register_dir: Path) -> frozenset[str]:
+    """Return the digests the previous run recorded writing into *register_dir*.
+
+    A missing, unreadable, or manifest-less summary yields an empty set,
+    which makes the prune a no-op. That is the safe direction: the
+    collector deletes only what it can prove it wrote, so a lost record
+    costs a stale copy rather than an operator's file.
+
+    The header is read with :func:`~creek.vault.links.read_header_meta`, which
+    folds every unreadable shape into that empty mapping — and, unlike
+    ``frontmatter.load``, never splats the parsed header into keyword
+    arguments, so a non-string frontmatter key no longer raises ``TypeError``
+    out of a prune (#1475). Only :data:`_MANIFEST_KEY` is read; the summary's
+    body is not consulted.
+
+    Header-only reading carries the same three deliberate consequences #1416
+    accepted and documents in full at
+    :func:`creek.generate.synchronicity._existing_synchronicity_pairs`: the
+    ``---`` fence must open line 1, the 200-line / 64 KB header caps apply, and
+    a note carrying a stray non-string key is tolerated rather than rejected.
+
+    Args:
+        register_dir: The register's samples folder, which may not exist.
+
+    Returns:
+        Every entry recorded under :data:`_MANIFEST_KEY`, read as text —
+        the note is on disk and may have been hand-edited, and an entry
+        that is not a digest simply matches no file.
+    """
+    summary_path = register_dir / _SUMMARY_FILENAME
+    if not summary_path.is_file():
+        return frozenset()
+    recorded = read_header_meta(summary_path).get(_MANIFEST_KEY)
+    if not isinstance(recorded, list):
+        return frozenset()
+    return frozenset(str(entry) for entry in recorded)
 
 
 class VoiceExemplarCollector:
@@ -345,7 +617,11 @@ class VoiceExemplarCollector:
         min_per_register: Minimum exemplars expected per register; below
             this threshold the collector emits a warning.
         allow_intimate: When ``True``, fragments tagged ``intimate``
-            participate in collection. Defaults to ``False``.
+            participate in collection. Defaults to ``False``. A *consent*
+            gate, not a ceiling one — see :attr:`override`.
+        override: The caller's tier ceiling (#968). Additive to
+            :attr:`allow_intimate`: a fragment is collected only when both
+            admit it.
     """
 
     def __init__(
@@ -354,6 +630,7 @@ class VoiceExemplarCollector:
         max_per_register: int = DEFAULT_MAX_PER_REGISTER,
         min_per_register: int = DEFAULT_MIN_PER_REGISTER,
         allow_intimate: bool = False,
+        override: PrivacyTierOverride = PrivacyTierOverride.ALL,
         audience_weighting: VoiceAudienceWeightingConfig | None = None,
     ) -> None:
         """Initialise the collector.
@@ -364,12 +641,32 @@ class VoiceExemplarCollector:
             min_per_register: Minimum exemplars per register before a
                 warning is emitted. Must be at least 1.
             allow_intimate: Whether to include ``intimate`` privacy tier
-                fragments. Defaults to ``False``.
+                fragments. Defaults to ``False``. This is the FEAT opt-in
+                for the voice proxy, which
+                ``creek/templates/skills/privacy-tier.SKILL.md:47`` requires
+                "even with ``--include-tier intimate``" — so it is *not*
+                superseded by *override* and the two must stay separate.
+            override: Tier ceiling for the corpus walk (#968). Defaults to
+                :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`,
+                meaning "no ceiling declared", so adding it is a genuine
+                no-op for every caller that predates #968. The default is
+                safe because both production report surfaces state an
+                override explicitly, which
+                ``tests/test_mcp_report_tier_ceiling.py``'s
+                ``test_production_report_callers_always_state_an_override``
+                enforces structurally.
             audience_weighting: Graduated audience-authority multipliers
                 applied during ranking. Defaults to the standard weighting,
                 which keeps a uniform-audience vault's relative ranking
                 unchanged while letting public-facing work dominate a
-                mixed-audience one.
+                mixed-audience one. On **this** path a ``0.0`` authority
+                only de-ranks: :meth:`rank_exemplars` returns
+                ``scored[:max_per_register]`` whatever the scores are, so the
+                weighting can never admit or exclude a fragment — membership
+                belongs to :func:`within_ceiling` and :meth:`_eligible_register`
+                alone. (The fingerprint path differs: ``if weight > 0.0`` at
+                ``creek/generate/ai_style/fingerprint.py`` makes a zero
+                authority a genuine membership gate there. See #1313.)
 
         Raises:
             ValueError: If ``max_per_register`` or ``min_per_register``
@@ -391,7 +688,8 @@ class VoiceExemplarCollector:
         self.max_per_register = max_per_register
         self.min_per_register = min_per_register
         self.allow_intimate = allow_intimate
-        self._audience_weighting = audience_weighting or VoiceAudienceWeightingConfig()
+        self.override = override
+        self.audience_weighting = audience_weighting or VoiceAudienceWeightingConfig()
         self._records: dict[str, _ExemplarRecord] = {}
 
     # ---- Collection ----
@@ -399,11 +697,16 @@ class VoiceExemplarCollector:
     def collect_exemplars(self, vault_path: Path) -> dict[str, list[Fragment]]:
         """Scan ``01-Fragments/`` and group qualifying exemplars by register.
 
-        Fragments are kept when their ``voice.confidence`` is ``settled``
-        or ``conviction`` and their ``voice.register`` is set. Intimate
-        privacy tier fragments are filtered out unless
-        :attr:`allow_intimate` is ``True``. Each register key in the
-        returned dict is always present; empty registers map to ``[]``.
+        Fragments are kept when they are **self-authored** (#1213), their
+        ``voice.confidence`` is ``settled`` or ``conviction``, their
+        ``voice_weight`` is positive, and their ``voice.register`` is set.
+        Intimate privacy tier fragments are filtered out unless
+        :attr:`allow_intimate` is ``True``, and so are untiered ones — a file
+        with no ``privacy_tier`` key reads as ``intimate`` at every gate
+        (#1212; see :func:`_load_fragment_with_body`). Every fragment must
+        additionally sit within :attr:`override` (#968). Each register key
+        in the returned dict is always present; empty registers map to
+        ``[]``.
 
         Args:
             vault_path: Path to the root of the Obsidian vault.
@@ -429,7 +732,12 @@ class VoiceExemplarCollector:
             loaded = _load_fragment_with_body(md_file)
             if loaded is None:
                 continue
-            fragment, body = loaded
+            fragment, body, raw = loaded
+            # Ceiling gate (#968), above the consent gate: an above-ceiling
+            # fragment must not reach the corpus even when the operator has
+            # opted the voice proxy in to intimate content.
+            if not within_ceiling(raw, self.override):
+                continue
             register = self._eligible_register(fragment)
             if register is None:
                 continue
@@ -445,13 +753,16 @@ class VoiceExemplarCollector:
     def collect_all_exemplars(self, vault_path: Path) -> list[Exemplar]:
         """Collect every qualifying exemplar across all registers, with bodies.
 
-        Shares the eligibility gate with :meth:`collect_exemplars` (``settled``
-        or ``conviction`` confidence, a set register, intimate filtered unless
-        :attr:`allow_intimate`, ``11-Other-Authors`` excluded) but returns a
-        flat :class:`Exemplar` list — fragment paired with its on-disk body —
-        rather than per-register ``Fragment`` buckets. Consumers that need the
-        whole voice corpus as one unit (e.g. the lexicon) use this so they share
-        a single source of truth for *which* fragments count as exemplars.
+        Shares the eligibility gate with :meth:`collect_exemplars`
+        (self-authored, ``settled`` or ``conviction`` confidence, positive
+        ``voice_weight``, a set register, intimate — and, since #1212,
+        untiered — filtered unless :attr:`allow_intimate`, within
+        :attr:`override`, ``11-Other-Authors`` excluded) but returns a flat
+        :class:`Exemplar` list — fragment paired
+        with its on-disk body — rather than per-register ``Fragment`` buckets.
+        Consumers that need the whole voice corpus as one unit (e.g. the
+        lexicon) use this so they share a single source of truth for *which*
+        fragments count as exemplars.
 
         Args:
             vault_path: Path to the root of the Obsidian vault.
@@ -469,14 +780,37 @@ class VoiceExemplarCollector:
             loaded = _load_fragment_with_body(md_file)
             if loaded is None:
                 continue
-            fragment, body = loaded
+            fragment, body, raw = loaded
+            # Ceiling gate (#968) — see collect_exemplars for why it sits
+            # above the consent gate rather than folded into it.
+            if not within_ceiling(raw, self.override):
+                continue
             if self._eligible_register(fragment) is None:
                 continue
             exemplars.append(Exemplar(fragment=fragment, body=body))
         return exemplars
 
     def _eligible_register(self, fragment: Fragment) -> str | None:
-        """Return the fragment's register if it qualifies, else ``None``."""
+        """Return the fragment's register if it qualifies, else ``None``.
+
+        This answers the *consent* question only (``allow_intimate``, plus
+        authorship / confidence / voice-weight / register eligibility).
+        The *ceiling*
+        question is asked separately by
+        :func:`~creek.classify.privacy_filter.within_ceiling` at each walk,
+        because it needs the raw frontmatter this method never sees. Do not
+        collapse the two: one is the operator's opt-in to voice-proxy
+        training, the other is the caller's declared ceiling, and a fragment
+        needs both.
+
+        The tier this method reads off the model *is* the declared one, even
+        though it never sees frontmatter, because
+        :func:`_load_fragment_with_body` materialised it there first (#1212).
+        The model still cannot distinguish "no key on disk" from an explicit
+        ``unclassified`` — it does not have to: the loader has already
+        resolved the keyless case to ``intimate``, and the model value
+        ``UNCLASSIFIED`` keeps its #876 standing here.
+        """
         return _eligible_register(fragment, allow_intimate=self.allow_intimate)
 
     def _warn_below_minimum(self, buckets: dict[str, list[Fragment]]) -> None:
@@ -543,7 +877,7 @@ class VoiceExemplarCollector:
             score += _LENGTH_BONUS
         if _is_fully_classified(fragment):
             score += _CLASSIFICATION_BONUS
-        return score * audience_authority(fragment, self._audience_weighting)
+        return score * audience_authority(fragment, self.audience_weighting)
 
     # ---- Persistence ----
 
@@ -551,13 +885,19 @@ class VoiceExemplarCollector:
         self,
         exemplars: dict[str, list[Fragment]],
         vault_path: Path,
+        *,
+        on_prune: Callable[[Path], None] | None = None,
     ) -> dict[str, Path]:
         """Copy ranked exemplars into ``07-Voice/Register-Samples/<register>/``.
 
-        For each non-empty register the collector creates the destination
-        folder, copies (or rewrites) up to :attr:`max_per_register` of
-        the top-ranked fragments, and writes a ``_Summary.md`` note
-        recording statistics about the cohort.
+        For every register named in *exemplars* the collector first prunes
+        the copies an earlier run recorded writing (#879), then — for the
+        non-empty ones — creates the destination folder, copies (or
+        rewrites) up to :attr:`max_per_register` of the top-ranked
+        fragments, and writes a ``_Summary.md`` note recording statistics
+        about the cohort. A register that has just emptied keeps neither:
+        its existing summary is rewritten to an honest zero rather than
+        left describing the cohort that has gone.
 
         Fragments in each register bucket are ranked internally via
         :meth:`rank_exemplars` before being persisted — callers do not
@@ -566,12 +906,22 @@ class VoiceExemplarCollector:
         Args:
             exemplars: Mapping of register → fragments, typically the
                 output of :meth:`collect_exemplars`. Non-canonical
-                register keys are skipped with a debug log entry.
+                register keys are skipped with a debug log entry, and are
+                not pruned either: an unrecognised key describes a folder
+                this collector never wrote.
             vault_path: Path to the root of the Obsidian vault.
+            on_prune: Invoked once per deleted copy, with its path.
+                Deletion is the half of this pass the return value cannot
+                describe, and ``creek fill`` runs it unattended, so the
+                CLI passes a collector here to report it (#879).
 
         Returns:
-            Mapping of register → path of the written summary note for
-            every non-empty register.
+            Mapping of register → path of the written summary note, one
+            entry per register that had exemplars to rank. A register that
+            has just lost its last exemplar gets its existing summary
+            rewritten to an honest zero, but is deliberately **absent**
+            from the mapping: callers count these entries as samples
+            written, and that register had none.
         """
         samples_root = vault_path.joinpath(*_SAMPLES_SUBPATH)
         summaries: dict[str, Path] = {}
@@ -579,18 +929,152 @@ class VoiceExemplarCollector:
             if register not in VOICE_REGISTERS:
                 logger.debug("Skipping unknown voice register %r", register)
                 continue
-            if not fragments:
-                continue
-            ranked = self.rank_exemplars(fragments)
-            register_dir = samples_root / register
-            register_dir.mkdir(parents=True, exist_ok=True)
-            for fragment in ranked:
-                self._persist_fragment(fragment, register_dir)
-            summaries[register] = self._write_summary(register, ranked, register_dir)
+            summary = self._save_register(
+                register,
+                fragments,
+                samples_root / register,
+                on_prune,
+            )
+            if summary is not None:
+                summaries[register] = summary
         return summaries
 
-    def _persist_fragment(self, fragment: Fragment, register_dir: Path) -> Path:
-        """Copy the source file for *fragment* (or serialise from memory)."""
+    def _save_register(
+        self,
+        register: str,
+        fragments: list[Fragment],
+        register_dir: Path,
+        on_prune: Callable[[Path], None] | None,
+    ) -> Path | None:
+        """Prune, persist, and summarise a single register.
+
+        Args:
+            register: The canonical register being saved.
+            fragments: Every candidate fragment collected for it.
+            register_dir: Its samples folder, which may not exist yet.
+            on_prune: Per-deletion callback, forwarded to
+                :meth:`_prune_stale_copies`.
+
+        Returns:
+            Path of the summary note describing this run's cohort, or
+            ``None`` when the register had nothing to rank.
+        """
+        ranked = self.rank_exemplars(fragments)
+        # Above the empty-bucket branch on purpose: a register that lost
+        # every exemplar is exactly the case with the most to clear.
+        self._prune_stale_copies(register_dir, {f.id for f in ranked}, on_prune)
+        if not ranked:
+            self._rewrite_emptied_summary(register, register_dir)
+            return None
+        register_dir.mkdir(parents=True, exist_ok=True)
+        # Only the fragments that actually reached disk are summarised: an
+        # id the filename guard rejected must not be counted, wikilinked,
+        # or recorded in the manifest, because a manifest entry for a file
+        # that was never written aims the next run's prune at a phantom.
+        persisted = [
+            fragment
+            for fragment in ranked
+            if self._persist_fragment(fragment, register_dir) is not None
+        ]
+        return self._write_summary(register, persisted, register_dir)
+
+    def _rewrite_emptied_summary(self, register: str, register_dir: Path) -> None:
+        """Rewrite the summary of a register that has just lost every exemplar.
+
+        The prune removes the copies, but the summary an earlier run wrote
+        outlives them and goes on naming the departed fragments by id
+        **and title**, and goes on reporting the ``tier_ceiling`` of a
+        corpus that no longer exists. That residue is introduced by the
+        prune pass itself, so it is the prune pass that has to clear it
+        (#879).
+
+        Nothing is created here. A register that never had a summary keeps
+        no folder and gains no note, which is what
+        ``tests/test_voice_exemplars.py::TestSaveExemplars::
+        test_skips_empty_registers`` holds.
+
+        Args:
+            register: The canonical register that emptied.
+            register_dir: Its samples folder, which may not exist.
+        """
+        if not (register_dir / _SUMMARY_FILENAME).is_file():
+            return
+        self._write_summary(register, [], register_dir)
+
+    @staticmethod
+    def _prune_stale_copies(
+        register_dir: Path,
+        keep_ids: set[str],
+        on_prune: Callable[[Path], None] | None,
+    ) -> None:
+        """Delete exemplar copies from an earlier run that no longer rank.
+
+        Persisting alone only ever adds, so without this pass a fragment
+        that drops out of the top :attr:`max_per_register`, is re-tiered
+        above the caller's ceiling, or is deleted from the vault outright
+        leaves a verbatim copy of its body in the samples tree forever
+        (#879).
+
+        A file is deleted only when the *previous* summary's manifest
+        records this collector writing it and this run is not about to
+        rewrite it. Authorship is a record, never a guess:
+        ``Register-Samples/<register>/`` is a folder an operator keeps
+        their own notes in, and a fragment they curated into it is — in
+        shape, byte for byte — indistinguishable from one this tool wrote.
+        Conversely the match is on the filename **stem**, so scrubbing a
+        copy's frontmatter, which ``creek purge`` does to every ``.md`` in
+        the vault, cannot make it unrecognisable and therefore immortal.
+
+        The scan is deliberately non-recursive, and never creates
+        *register_dir*, so a register with no exemplars stays folderless.
+
+        Args:
+            register_dir: The register's samples folder. Left untouched
+                when it does not exist.
+            keep_ids: Ids of the exemplars this run is about to write.
+            on_prune: Invoked with the path of each deleted copy, or
+                ``None`` when the caller does not need to know.
+        """
+        manifest = _read_sample_manifest(register_dir)
+        if not manifest:
+            return
+        for candidate in sorted(register_dir.glob("*.md")):
+            # The summary is exempted by name as well as by manifest: it
+            # is the one file in here the collector rewrites rather than
+            # replaces, and losing it would lose the manifest with it.
+            if candidate.name == _SUMMARY_FILENAME or candidate.stem in keep_ids:
+                continue
+            if _sample_digest(candidate.stem) not in manifest:
+                continue
+            candidate.unlink()
+            # Named, not just counted. The CLI reports a total, but a total
+            # scrolls past inside an unattended ``creek fill`` and cannot
+            # answer "which file did it take?". WARNING is the level rather
+            # than INFO because creek configures no logging handlers, so
+            # INFO is swallowed by ``logging.lastResort`` and a silent
+            # deletion is one nobody can audit (#879).
+            logger.warning("Pruned stale voice register sample: %s", candidate)
+            if on_prune is not None:
+                on_prune(candidate)
+
+    def _persist_fragment(self, fragment: Fragment, register_dir: Path) -> Path | None:
+        """Copy the source file for *fragment* (or serialise from memory).
+
+        Args:
+            fragment: The ranked exemplar to persist.
+            register_dir: The register's samples folder, already created.
+
+        Returns:
+            Path of the written copy, or ``None`` when ``fragment.id`` is
+            unusable as a filename (see :func:`_is_safe_sample_stem`) and
+            nothing was written.
+        """
+        if not _is_safe_sample_stem(fragment.id):
+            logger.warning(
+                "Skipping voice exemplar %r: its id is not usable as a filename.",
+                fragment.id,
+            )
+            return None
         target = register_dir / f"{fragment.id}.md"
         record = self._records.get(fragment.id)
         if record is not None and record.source_path.exists():
@@ -604,27 +1088,56 @@ class VoiceExemplarCollector:
     def _write_summary(
         self,
         register: str,
-        ranked: list[Fragment],
+        persisted: list[Fragment],
         register_dir: Path,
     ) -> Path:
-        """Write the per-register summary note and return its path."""
+        """Write the per-register summary note and return its path.
+
+        Beyond its human-readable statistics the note carries two records.
+
+        The :attr:`override` the run was taken under, for the same reason
+        ``00-Creek-Meta/Processing-Log/tag-history.json`` does
+        (``creek_mcp/tools/report.py``): a narrow ceiling surveys a
+        smaller corpus *and* prunes samples a wider one produced, so two
+        summaries written at two ceilings describe two different corpora
+        and their counts are not comparable.
+
+        And the manifest under :data:`_MANIFEST_KEY`, which is the record
+        of which copies in this folder are the collector's own and the
+        only thing that entitles the next run to delete one. It
+        fingerprints the fragments that actually reached disk — see
+        :func:`_sample_digest` for why the ids themselves are not stored.
+
+        Args:
+            register: The canonical register this cohort belongs to.
+            persisted: The exemplars written alongside this note. Empty
+                when the register has just lost its last one.
+            register_dir: The register's samples folder.
+
+        Returns:
+            Path of the written summary note.
+        """
         conviction = sum(
-            1 for f in ranked if _confidence_value(f) == Confidence.CONVICTION.value
+            1 for f in persisted if _confidence_value(f) == Confidence.CONVICTION.value
         )
         settled = sum(
-            1 for f in ranked if _confidence_value(f) == Confidence.SETTLED.value
+            1 for f in persisted if _confidence_value(f) == Confidence.SETTLED.value
         )
-        body = self._render_summary_body(register, ranked, conviction, settled)
+        body = self._render_summary_body(register, persisted, conviction, settled)
         post = frontmatter.Post(
             content=body,
             type="voice-register-summary",
             voice_register=register,
-            exemplar_count=len(ranked),
+            exemplar_count=len(persisted),
             conviction_count=conviction,
             settled_count=settled,
+            tier_ceiling=self.override.value,
             generated_at=datetime.now(tz=UTC).isoformat(),
             tags=["voice", "voice-register", register],
         )
+        # Assigned rather than passed as a keyword so the key stays the
+        # single constant the prune's reader looks it up by.
+        post.metadata[_MANIFEST_KEY] = [_sample_digest(f.id) for f in persisted]
         summary_path = register_dir / _SUMMARY_FILENAME
         summary_path.write_text(frontmatter.dumps(post), encoding="utf-8")
         return summary_path
@@ -632,7 +1145,7 @@ class VoiceExemplarCollector:
     @staticmethod
     def _render_summary_body(
         register: str,
-        ranked: list[Fragment],
+        persisted: list[Fragment],
         conviction: int,
         settled: int,
     ) -> str:
@@ -642,15 +1155,15 @@ class VoiceExemplarCollector:
             "",
             "## Statistics",
             "",
-            f"- Exemplar count: {len(ranked)}",
+            f"- Exemplar count: {len(persisted)}",
             f"- Conviction confidence: {conviction}",
             f"- Settled confidence: {settled}",
             "",
             "## Exemplars",
             "",
         ]
-        if ranked:
-            for fragment in ranked:
+        if persisted:
+            for fragment in persisted:
                 lines.append(f"- [[{fragment.id}|{fragment.title}]]")
         else:
             lines.append("_No exemplars collected._")
@@ -1686,6 +2199,7 @@ class VoiceProfileGenerator:
         min_exemplars: int = _DEFAULT_MIN_EXEMPLARS_PER_PROFILE,
         collector: VoiceExemplarCollector | None = None,
         extractor: VoicePatternExtractor | None = None,
+        override: PrivacyTierOverride = PrivacyTierOverride.ALL,
         audience_weighting: VoiceAudienceWeightingConfig | None = None,
     ) -> None:
         """Initialise the generator.
@@ -1697,10 +2211,51 @@ class VoiceProfileGenerator:
                 Must be at least 1 and no greater than ``max_exemplars``.
             collector: Optional :class:`VoiceExemplarCollector` used by
                 :meth:`generate_all_profiles`. Defaults to a collector
-                configured with the same exemplar bounds.
+                configured with the same exemplar bounds. **An injected
+                collector keeps its own** ``override``: it is a fully
+                configured object the caller built deliberately, and
+                silently overwriting one of its privacy settings from a
+                sibling argument would be the more surprising behaviour.
             extractor: Optional :class:`VoicePatternExtractor` used by
                 :meth:`generate_all_profiles`. Defaults to a plain
                 extractor.
+            override: Tier ceiling for the corpus walk (#968), forwarded
+                into the *default* collector only (see *collector*).
+                Defaults to
+                :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`,
+                meaning "no ceiling declared", so it is a genuine no-op for
+                callers that predate #968. The default is safe because both
+                production report surfaces state an override explicitly,
+                which ``tests/test_mcp_report_tier_ceiling.py``'s
+                ``test_production_report_callers_always_state_an_override``
+                enforces structurally. The value is *not* stored on the
+                generator: :meth:`_stream_into` reads it back off
+                ``self._collector`` so there is exactly one storage location
+                and an injected collector cannot be contradicted.
+            audience_weighting: Graduated audience-authority multipliers
+                applied during ranking, forwarded into the *default*
+                collector only (see *collector*), on the same terms as
+                *override*: the value is **not** stored on the generator.
+                :meth:`_rank_exemplars` and :meth:`_stream_into` read it back
+                off ``self._collector`` so there is exactly one storage
+                location and an injected collector cannot be contradicted.
+                ``None`` means "the standard weighting" —
+                :class:`~creek.config.VoiceAudienceWeightingConfig`'s defaults,
+                which is *enabled*. That is the opposite of
+                :func:`~creek.generate.ai_style.fingerprint.build_fingerprint`,
+                whose ``None`` means off; see that function's docstring for
+                why the two differ and why neither default moved (#1313).
+                No production caller *on this path* relies on the default:
+                ``tests/test_mcp_report_tier_ceiling.py``'s
+                ``test_production_voice_callers_always_state_an_audience_weighting``
+                requires every construction of this class,
+                :class:`VoiceExemplarCollector` and
+                :func:`generate_register_samples` to pass the vault's config
+                explicitly. That guard covers those three symbols only — it
+                says nothing about
+                :func:`~creek.generate.ai_style.fingerprint.build_fingerprint`,
+                which has a production caller still taking its default
+                (see #1410).
 
         Raises:
             ValueError: If either bound is less than 1, or if
@@ -1717,11 +2272,11 @@ class VoiceProfileGenerator:
             raise ValueError(msg)
         self.max_exemplars = max_exemplars
         self.min_exemplars = min_exemplars
-        self._audience_weighting = audience_weighting or VoiceAudienceWeightingConfig()
         self._collector = collector or VoiceExemplarCollector(
             max_per_register=max_exemplars,
             min_per_register=min_exemplars,
-            audience_weighting=self._audience_weighting,
+            override=override,
+            audience_weighting=audience_weighting,
         )
         self._extractor = extractor or VoicePatternExtractor()
 
@@ -1896,7 +2451,7 @@ class VoiceProfileGenerator:
                 ranked = self._rank_exemplars(register_exemplars)
                 bodies = [e.body for e in ranked]
                 weights = [
-                    audience_authority(e.fragment, self._audience_weighting)
+                    audience_authority(e.fragment, self._collector.audience_weighting)
                     for e in ranked
                 ]
                 patterns = self._extractor.extract_patterns(bodies, weights=weights)
@@ -1977,7 +2532,12 @@ class VoiceProfileGenerator:
         register_paths: dict[str, Path],
         register_handles: dict[str, _JsonlWriter],
     ) -> None:
-        """Walk *fragments_dir* and append eligible exemplars to JSONL files."""
+        """Walk *fragments_dir* and append eligible exemplars to JSONL files.
+
+        Both privacy settings are read back off ``self._collector`` rather
+        than duplicated onto the generator, so an injected collector governs
+        this walk exactly as it governs the collector's own (#968).
+        """
         for md_file in sorted(fragments_dir.rglob("*.md")):
             # Defensive path gate (Issue #466): skip borrowed / AI-authored
             # content under ``11-Other-Authors`` so it never reaches the
@@ -1987,7 +2547,11 @@ class VoiceProfileGenerator:
             loaded = _load_fragment_with_body(md_file)
             if loaded is None:
                 continue
-            fragment, body = loaded
+            fragment, body, raw = loaded
+            # Ceiling gate (#968), additive to the allow_intimate consent
+            # gate below — see ``VoiceExemplarCollector._eligible_register``.
+            if not within_ceiling(raw, self._collector.override):
+                continue
             register = _eligible_register(
                 fragment,
                 allow_intimate=self._collector.allow_intimate,
@@ -2008,7 +2572,7 @@ class VoiceProfileGenerator:
             )
             # Drop the local body reference before the next iteration
             # so the per-iteration peak is bounded by a single fragment.
-            del body, fragment, loaded
+            del body, fragment, raw, loaded
 
     def _rank_exemplars(self, exemplars: list[Exemplar]) -> list[Exemplar]:
         """Rank *exemplars* by the same quality heuristic as the collector.
@@ -2025,7 +2589,7 @@ class VoiceProfileGenerator:
         scored = sorted(
             exemplars,
             key=lambda e: (
-                -_exemplar_score(e, self._audience_weighting),
+                -_exemplar_score(e, self._collector.audience_weighting),
                 e.fragment.id,
             ),
         )
@@ -2064,6 +2628,73 @@ class VoiceProfileGenerator:
         return "\n".join(lines)
 
 
+def generate_register_samples(
+    vault_path: Path,
+    *,
+    override: PrivacyTierOverride = PrivacyTierOverride.ALL,
+    audience_weighting: VoiceAudienceWeightingConfig | None = None,
+    on_prune: Callable[[Path], None] | None = None,
+) -> dict[str, Path]:
+    """Collect the voice corpus and persist its register samples (#879).
+
+    Mirrors :func:`creek.generate.lexicon.generate_lexicon`: **one**
+    collector, built with the caller's ceiling, walks the vault and then
+    writes what that same walk found. The single instance is load-bearing
+    rather than stylistic — :meth:`VoiceExemplarCollector._persist_fragment`
+    copies a fragment's source file only while the collector's record cache
+    holds an entry for it, and only
+    :meth:`VoiceExemplarCollector.collect_exemplars` fills that cache.
+    Saving through a second collector still produces a full set of
+    valid-looking exemplar notes, every one of them with an **empty body**.
+
+    Only ``creek report --type voice`` calls this. The ``report_type="voice"``
+    MCP tool still writes profiles alone; that divergence is a recorded
+    decision tracked in issue #1204, not an oversight to tidy up by wiring
+    the MCP surface here.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+        override: Tier ceiling for the corpus walk (#968), forwarded to the
+            collector. Defaults to
+            :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`,
+            meaning "no ceiling declared", so the default is a genuine no-op
+            for callers that predate #968. Additive to — never a replacement
+            for — the collector's ``allow_intimate`` consent gate, which
+            stays off here. The ceiling matters more on this path than on a
+            rendered report: a persisted sample is a source fragment's file
+            copied into the vault byte for byte.
+        audience_weighting: Graduated audience-authority multipliers for the
+            ranking, forwarded to the collector (#1313). ``None`` selects
+            :class:`~creek.config.VoiceAudienceWeightingConfig`'s defaults, and
+            the default exists only for library callers: every production
+            caller must state the vault's own config, which
+            ``tests/test_mcp_report_tier_ceiling.py``'s
+            ``test_production_voice_callers_always_state_an_audience_weighting``
+            enforces structurally. This knob cannot change *who* is eligible —
+            :meth:`VoiceExemplarCollector.rank_exemplars` returns
+            ``scored[:max_per_register]`` regardless of score, so unlike
+            ``fingerprint.py``'s ``if weight > 0.0`` a zero authority here only
+            de-ranks. It can still change *which* fragments survive the top-N
+            cut, and because that cut decides whose file is copied verbatim,
+            disabling the weighting can replace a self-authored sample with a
+            borrowed one. That trade is documented in ``docs/configuration.md``.
+        on_prune: Invoked once per deleted stale copy, with its path. This
+            call both writes and *deletes* vault content, and the returned
+            mapping describes only the writing, so a caller that reports
+            what happened needs this to see the other half (#879).
+
+    Returns:
+        Mapping of register → path of the written ``_Summary.md``, one entry
+        per register that had exemplars. Empty when the corpus is.
+    """
+    collector = VoiceExemplarCollector(
+        override=override,
+        audience_weighting=audience_weighting,
+    )
+    buckets = collector.collect_exemplars(vault_path)
+    return collector.save_exemplars(buckets, vault_path, on_prune=on_prune)
+
+
 __all__ = [
     "DEFAULT_MAX_PER_REGISTER",
     "DEFAULT_MIN_PER_REGISTER",
@@ -2081,4 +2712,5 @@ __all__ = [
     "VoicePatterns",
     "VoiceProfile",
     "VoiceProfileGenerator",
+    "generate_register_samples",
 ]

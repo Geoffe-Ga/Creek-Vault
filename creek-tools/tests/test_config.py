@@ -1,13 +1,18 @@
 """Tests for creek.config module — configuration loader with Pydantic Settings."""
 
+import logging
+import warnings
 from pathlib import Path
+from typing import get_args
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from creek.config import (
     CONFIG_PATH_ENV_VAR,
     AIStyleConfig,
+    AuthorConfig,
     ChatbotCleaningConfig,
     ClassificationConfig,
     CleaningConfig,
@@ -31,6 +36,7 @@ from creek.config import (
     generate_default_config,
     load_config,
 )
+from creek.models import PrivacyTier
 
 # ---------------------------------------------------------------------------
 # Individual nested model defaults
@@ -152,15 +158,86 @@ class TestLinkingConfig:
         with pytest.raises(ValueError, match="greater than or equal to 0"):
             LinkingConfig(hierarchy_sibling_skip_window=-1)
 
-    def test_cross_source_aggregation_default_is_false(self) -> None:
-        """FEAT-027: cross-source aggregation is opt-in (default False)."""
-        cfg = LinkingConfig()
-        assert cfg.cross_source_aggregation is False
+    def test_detector_threshold_defaults_match_previous_constants(self) -> None:
+        """Issue #880: the five formerly-hardcoded knobs keep their values.
 
-    def test_cross_source_aggregation_accepts_true(self) -> None:
-        """FEAT-027: operators can flip cross-source aggregation on."""
-        cfg = LinkingConfig(cross_source_aggregation=True)
-        assert cfg.cross_source_aggregation is True
+        These thresholds lived as module-private constants in
+        ``creek.link.eddies`` and ``creek.link.threads``. Exposing them must
+        not change what an existing vault — whose ``creek_config.yaml``
+        predates the keys entirely — computes.
+        """
+        cfg = LinkingConfig()
+        assert cfg.eddy_eps == 0.3
+        assert cfg.eddy_min_samples == 5
+        assert cfg.eddy_correlation_threshold == 0.3
+        assert cfg.thread_window_days == 30
+        assert cfg.thread_similarity_threshold == 0.6
+
+    def test_cluster_limit_defaults(self) -> None:
+        """Issue #880: cluster-ceiling defaults never fire on ordinary vaults."""
+        cfg = LinkingConfig()
+        assert cfg.cluster_size_ceiling == 500
+        assert cfg.cluster_max_fraction == 0.10
+        assert cfg.cluster_split_max_depth == 3
+        assert cfg.eddy_split_eps_step == 0.05
+        assert cfg.thread_split_similarity_step == 0.1
+
+    def test_segmentation_defaults(self) -> None:
+        """Issue #880: only Discord and email are segmented into episodes."""
+        cfg = LinkingConfig()
+        assert cfg.stream_platforms == ["discord", "email"]
+        assert cfg.stream_episode_max_gap_hours == 24
+        assert cfg.stream_episode_max_span_days == 30
+
+    def test_thread_union_without_embeddings_defaults_to_closed(self) -> None:
+        """Issue #880: a partially-embedded vault must not union on frequency."""
+        cfg = LinkingConfig()
+        assert cfg.thread_union_without_embeddings is False
+
+    def test_cluster_max_fraction_accepts_the_documented_opt_out(self) -> None:
+        """``1.0`` disables the ceiling — a cluster may span the whole corpus."""
+        cfg = LinkingConfig(cluster_max_fraction=1.0)
+        assert cfg.cluster_max_fraction == 1.0
+
+    def test_cluster_max_fraction_rejects_zero(self) -> None:
+        """A zero fraction would make every cluster oversized."""
+        with pytest.raises(ValueError, match="greater than 0"):
+            LinkingConfig(cluster_max_fraction=0.0)
+
+    def test_cluster_split_max_depth_accepts_zero(self) -> None:
+        """Depth 0 disables splitting (oversized clusters go straight to noise)."""
+        cfg = LinkingConfig(cluster_split_max_depth=0)
+        assert cfg.cluster_split_max_depth == 0
+
+    def test_cluster_size_ceiling_rejects_zero(self) -> None:
+        """A ceiling below one fragment is nonsensical."""
+        with pytest.raises(ValueError, match="greater than or equal to 1"):
+            LinkingConfig(cluster_size_ceiling=0)
+
+    def test_eddy_split_eps_step_rejects_one(self) -> None:
+        """A full-width step would drive epsilon past its valid range at once."""
+        with pytest.raises(ValueError, match="less than 1"):
+            LinkingConfig(eddy_split_eps_step=1.0)
+
+    def test_stream_episode_max_gap_hours_rejects_zero(self) -> None:
+        """A zero-hour gap would cut an episode at every message."""
+        with pytest.raises(ValueError, match="greater than or equal to 1"):
+            LinkingConfig(stream_episode_max_gap_hours=0)
+
+    def test_stream_platforms_accepts_a_known_platform(self) -> None:
+        """Operators may opt extra conversational platforms into segmentation."""
+        cfg = LinkingConfig(stream_platforms=["discord", "chatgpt"])
+        assert cfg.stream_platforms == ["discord", "chatgpt"]
+
+    def test_stream_platforms_rejects_an_unknown_platform(self) -> None:
+        """A typo must fail loudly rather than silently segmenting nothing."""
+        with pytest.raises(ValueError, match="unknown source platform"):
+            LinkingConfig(stream_platforms=["discrod"])
+
+    def test_stream_platforms_accepts_an_empty_list(self) -> None:
+        """An empty list is the documented way to disable segmentation."""
+        cfg = LinkingConfig(stream_platforms=[])
+        assert cfg.stream_platforms == []
 
 
 class TestClassificationConfig:
@@ -197,9 +274,22 @@ class TestClassificationConfig:
             ClassificationConfig(reatomize_max_depth=0)
 
     def test_reatomize_direction_rejects_unknown_value(self) -> None:
-        """Only ``auto`` / ``split`` / ``aggregate`` are accepted."""
+        """Only ``auto`` / ``split`` are accepted."""
         with pytest.raises(ValueError, match="reatomize_direction"):
             ClassificationConfig(reatomize_direction="sideways")
+
+    def test_reatomize_direction_rejects_retired_aggregate_value(self) -> None:
+        """``aggregate`` is refused outright, never silently rewritten (#1342).
+
+        The FEAT-022 zoom-out aggregator had no production caller, so
+        ``reatomize_direction: aggregate`` in a vault's YAML did nothing
+        at all. ADR-0011 retires the operator. Coercing the stale value
+        to ``auto`` would preserve the original sin — the config would
+        keep claiming a behaviour it does not have — so the loader must
+        raise, and the message must name the retirement and the issue.
+        """
+        with pytest.raises(ValueError, match=r"(?is)retired.*1342|1342.*retired"):
+            ClassificationConfig(reatomize_direction="aggregate")
 
 
 class TestRedactionConfig:
@@ -508,7 +598,6 @@ class TestCreekConfig:
         cfg = CreekConfig()
         assert cfg.vault_path == Path(".")
         assert cfg.source_drive == Path(".")
-        assert cfg.timezone == "America/Los_Angeles"
         # Nested models should exist with their own defaults. ``llm`` is now a
         # per-stage LLMRoutingConfig (#646) whose ``default`` is an LLMConfig.
         assert isinstance(cfg.llm, LLMRoutingConfig)
@@ -522,27 +611,11 @@ class TestCreekConfig:
         assert isinstance(cfg.sources, SourcePaths)
         assert isinstance(cfg.cleaning, CleaningConfig)
 
-    def test_valid_timezone(self) -> None:
-        """CreekConfig should accept a valid timezone string."""
-        cfg = CreekConfig(timezone="Europe/London")
-        assert cfg.timezone == "Europe/London"
-
-    def test_invalid_timezone_rejected(self) -> None:
-        """CreekConfig must reject an invalid timezone string."""
-        with pytest.raises(ValueError, match="Invalid timezone"):
-            CreekConfig(timezone="Not/A/Timezone")
-
     def test_env_var_override_vault_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """CREEK_VAULT_PATH env var should override the default."""
         monkeypatch.setenv("CREEK_VAULT_PATH", "/tmp/my-vault")  # nosec B108
         cfg = CreekConfig()
         assert cfg.vault_path == Path("/tmp/my-vault")  # nosec B108
-
-    def test_env_var_override_timezone(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """CREEK_TIMEZONE env var should override the default."""
-        monkeypatch.setenv("CREEK_TIMEZONE", "UTC")
-        cfg = CreekConfig()
-        assert cfg.timezone == "UTC"
 
     def test_env_var_override_source_drive(
         self, monkeypatch: pytest.MonkeyPatch
@@ -565,14 +638,12 @@ class TestLoadConfig:
         """load_config() should return defaults when YAML file does not exist."""
         cfg = load_config(tmp_path / "nonexistent.yaml")
         assert cfg.vault_path == Path(".")
-        assert cfg.timezone == "America/Los_Angeles"
 
     def test_loads_yaml_file(self, tmp_path: Path) -> None:
         """load_config() should load values from a YAML file."""
         config_file = tmp_path / "creek_config.yaml"
         config_data = {
             "vault_path": "/home/user/vault",
-            "timezone": "America/New_York",
             "llm": {"provider": "anthropic", "model": "claude-3"},
             "embeddings": {"similarity_threshold": 0.85},
         }
@@ -580,7 +651,6 @@ class TestLoadConfig:
 
         cfg = load_config(config_file)
         assert cfg.vault_path == Path("/home/user/vault")
-        assert cfg.timezone == "America/New_York"
         assert cfg.llm.default.provider == "anthropic"
         assert cfg.llm.default.model == "claude-3"
         assert cfg.embeddings.similarity_threshold == 0.85
@@ -610,14 +680,83 @@ class TestLoadConfig:
         assert cfg.linking.temporal_window_hours == 48
         assert cfg.linking.thread_min_fragments == 3  # default preserved
 
-    def test_loads_cross_source_aggregation_flag(self, tmp_path: Path) -> None:
-        """YAML ``linking.cross_source_aggregation: true`` is honoured."""
+    def test_loads_cluster_ceiling_override_keeping_sibling_defaults(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Issue #880: one override applies; unset siblings keep their defaults.
+
+        This is the behaviour-preservation guard for vaults whose
+        ``creek_config.yaml`` predates the #880 keys: an operator who tunes a
+        single knob must not silently re-tune the other twelve.
+        """
         config_file = tmp_path / "creek_config.yaml"
-        config_data = {"linking": {"cross_source_aggregation": True}}
+        config_data = {
+            "linking": {
+                "cluster_max_fraction": 0.05,
+                "stream_platforms": ["discord"],
+            },
+        }
         config_file.write_text(yaml.dump(config_data))
 
         cfg = load_config(config_file)
-        assert cfg.linking.cross_source_aggregation is True
+        assert cfg.linking.cluster_max_fraction == 0.05
+        assert cfg.linking.stream_platforms == ["discord"]
+        assert cfg.linking.cluster_size_ceiling == 500
+        assert cfg.linking.eddy_eps == 0.3
+        assert cfg.linking.thread_window_days == 30
+        assert cfg.linking.stream_episode_max_gap_hours == 24
+
+    def test_load_config_ignores_retired_linking_aggregation_keys(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A legacy vault carrying the retired FEAT-022 knobs still loads (#1342).
+
+        ADR-0011 deletes four ``linking:`` fields that only ever fed the
+        zoom-out aggregator. Every vault ``creek init`` has ever scaffolded
+        carries them, so the loader must ignore them rather than reject the
+        file — an operator should not have to hand-edit YAML to run
+        ``creek link`` after upgrading. ``LinkingConfig`` declares no
+        ``model_config``, so pydantic's default ``extra='ignore'`` does
+        exactly that.
+
+        The surviving-neighbour assertion is load-bearing: without it this
+        test would pass just as happily if the entire ``linking:`` block
+        were being discarded, which is the failure mode "unknown keys are
+        tolerated" most easily degrades into.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        retired = (
+            "exchange_max_gap_minutes",
+            "burst_similarity_threshold",
+            "session_max_gap_minutes",
+            "cross_source_aggregation",
+        )
+        config_data = {
+            "linking": {
+                # All four at non-default values, so a loader that silently
+                # kept them would be caught by the hasattr sweep below
+                # rather than by a value that happens to match the default.
+                "exchange_max_gap_minutes": 99,
+                "burst_similarity_threshold": 0.99,
+                "session_max_gap_minutes": 999,
+                "cross_source_aggregation": True,
+                # A surviving key, also non-default.
+                "temporal_window_hours": 42,
+            },
+        }
+        config_file.write_text(yaml.dump(config_data))
+
+        cfg = load_config(config_file)
+
+        for name in retired:
+            assert not hasattr(cfg.linking, name), (
+                f"linking.{name} was retired by ADR-0011 (#1342) but "
+                "LinkingConfig still exposes it"
+            )
+        assert cfg.linking.temporal_window_hours == 42
+        assert cfg.linking.hierarchy_sibling_skip_window == 2
 
     def test_loads_cleaning_section(self, tmp_path: Path) -> None:
         """load_config() should load cleaning section from YAML."""
@@ -650,13 +789,13 @@ class TestLoadConfigEnvVar:
     ) -> None:
         """``CREEK_CONFIG`` is honoured when ``config_path`` is None."""
         config_file = tmp_path / "vault-config.yaml"
-        config_file.write_text(yaml.dump({"timezone": "UTC"}))
+        config_file.write_text(yaml.dump({"vault_path": "/vaults/from-env"}))
         monkeypatch.setenv(CONFIG_PATH_ENV_VAR, str(config_file))
         # Ensure cwd has no fallback creek_config.yaml that could mask the env var.
         monkeypatch.chdir(tmp_path)
 
         cfg = load_config()
-        assert cfg.timezone == "UTC"
+        assert cfg.vault_path == Path("/vaults/from-env")
 
     def test_explicit_config_path_overrides_env_var(
         self,
@@ -665,13 +804,13 @@ class TestLoadConfigEnvVar:
     ) -> None:
         """An explicit ``config_path`` argument wins over the env var."""
         env_file = tmp_path / "from-env.yaml"
-        env_file.write_text(yaml.dump({"timezone": "UTC"}))
+        env_file.write_text(yaml.dump({"vault_path": "/vaults/from-env"}))
         cli_file = tmp_path / "from-cli.yaml"
-        cli_file.write_text(yaml.dump({"timezone": "Europe/London"}))
+        cli_file.write_text(yaml.dump({"vault_path": "/vaults/from-cli"}))
         monkeypatch.setenv(CONFIG_PATH_ENV_VAR, str(env_file))
 
         cfg = load_config(cli_file)
-        assert cfg.timezone == "Europe/London"
+        assert cfg.vault_path == Path("/vaults/from-cli")
 
     def test_env_var_pointing_to_missing_file_raises(
         self,
@@ -692,11 +831,14 @@ class TestLoadConfigEnvVar:
     ) -> None:
         """An empty (or whitespace) env var behaves as if unset."""
         monkeypatch.setenv(CONFIG_PATH_ENV_VAR, "   ")
+        # A stray CREEK_VAULT_PATH in the ambient environment would otherwise
+        # override the built-in default this test is asserting.
+        monkeypatch.delenv("CREEK_VAULT_PATH", raising=False)
         monkeypatch.chdir(tmp_path)
 
         cfg = load_config()
         # No creek_config.yaml in tmp_path → defaults populated.
-        assert cfg.timezone == "America/Los_Angeles"
+        assert cfg.vault_path == Path(".")
 
     def test_unset_env_var_uses_cwd_default(
         self,
@@ -706,11 +848,11 @@ class TestLoadConfigEnvVar:
         """When the env var is unset, behaviour matches the historical contract."""
         monkeypatch.delenv(CONFIG_PATH_ENV_VAR, raising=False)
         config_file = tmp_path / "creek_config.yaml"
-        config_file.write_text(yaml.dump({"timezone": "Asia/Tokyo"}))
+        config_file.write_text(yaml.dump({"vault_path": "/vaults/from-cwd"}))
         monkeypatch.chdir(tmp_path)
 
         cfg = load_config()
-        assert cfg.timezone == "Asia/Tokyo"
+        assert cfg.vault_path == Path("/vaults/from-cwd")
 
 
 # ---------------------------------------------------------------------------
@@ -731,7 +873,11 @@ class TestGenerateDefaultConfig:
             data = yaml.safe_load(f)
         assert isinstance(data, dict)
         assert "vault_path" in data
-        assert "timezone" in data
+        # Issue #1339: the dead ``timezone`` knob was deleted, so freshly
+        # generated configs must stop shipping it — otherwise every new vault
+        # is born with a key the loader only tolerates for backwards
+        # compatibility.
+        assert "timezone" not in data
 
     def test_roundtrip(self, tmp_path: Path) -> None:
         """Generated config should round-trip back through load_config."""
@@ -740,7 +886,6 @@ class TestGenerateDefaultConfig:
 
         cfg = load_config(output)
         assert cfg.vault_path == Path(".")
-        assert cfg.timezone == "America/Los_Angeles"
         assert cfg.llm.default.provider == "ollama"
         assert cfg.embeddings.model == "all-MiniLM-L6-v2"
         assert cfg.google_drive.scopes == [
@@ -843,3 +988,324 @@ class TestVoiceConfigRoundtrip:
             config.ai_style.voice_distance_target
             <= config.ai_style.voice_distance_upper
         )
+
+
+# ---------------------------------------------------------------------------
+# Deletion of the dormant ``timezone`` field (issue #1339)
+# ---------------------------------------------------------------------------
+
+
+class TestTimezoneFieldDeleted:
+    """The dormant ``timezone`` knob is gone, behind a migration shim (#1339).
+
+    ``CreekConfig.timezone`` had zero production readers. Wiring it would have
+    made every fragment id a function of the setting — ``generate_fragment_id``
+    (``creek/ingest/base.py``) hashes ``timestamp.isoformat()``, whose rendered
+    UTC offset changes with the zone, so one instant yields a different
+    ``frag-…`` id per configured timezone. That is exactly the id-derivation
+    bug #1329 had to migrate vaults out of, so the field was **deleted**
+    instead of wired: Creek's anchor is America/Los_Angeles by ontology
+    mandate §8.3 (:data:`creek.time.LA_TZ`), not an operator knob.
+
+    Deletion needs a shim because ``CreekConfig`` forbids extra keys and
+    ``generate_default_config`` dumps the whole model — so every
+    ``creek_config.yaml`` ever written by ``creek init`` carries a
+    ``timezone:`` line. Without the shim, deleting the field would turn 100%
+    of existing operator configs into a hard ``ValidationError`` at load.
+    """
+
+    def test_timezone_is_not_a_config_field(self) -> None:
+        """``timezone`` is no longer a field on ``CreekConfig`` (#1339).
+
+        Named explicitly so a revert fails with the reason attached rather
+        than as a puzzling knock-on elsewhere: re-adding the field either
+        re-introduces a dead knob (caught by ``test_config_contract.py``) or,
+        if wired, makes fragment ids config-dependent again.
+        """
+        assert "timezone" not in CreekConfig.model_fields
+
+    def test_stale_timezone_key_still_loads(self, tmp_path: Path) -> None:
+        """A pre-#1339 config carrying ``timezone:`` still loads (#1339).
+
+        The migration path for every vault already on disk: the stale key is
+        dropped, and the rest of the file survives untouched.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(
+            yaml.dump(
+                {
+                    "timezone": "America/Los_Angeles",
+                    "vault_path": "/vaults/legacy",
+                },
+            ),
+        )
+
+        cfg = load_config(config_file)
+
+        assert not hasattr(cfg, "timezone")
+        assert "timezone" not in cfg.model_dump()
+        # The shim drops one key; it must not swallow the rest of the config.
+        assert cfg.vault_path == Path("/vaults/legacy")
+
+    def test_stale_timezone_key_warns_it_is_ignored(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Dropping the stale key is announced, not silent (#1339).
+
+        An operator who set ``timezone: Europe/London`` believed it did
+        something. Discarding that quietly would leave them believing it
+        still does, so the load emits a WARNING naming the key.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(yaml.dump({"timezone": "Europe/London"}))
+
+        with caplog.at_level(logging.WARNING, logger="creek.config"):
+            load_config(config_file)
+
+        messages = [record.getMessage() for record in caplog.records]
+        timezone_warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING and "timezone" in record.getMessage()
+        ]
+        assert timezone_warnings, (
+            f"no WARNING naming 'timezone'; records were {messages}"
+        )
+        # Substance, not prose: the operator must learn the key is dead.
+        assert any(
+            phrase in message.lower()
+            for message in timezone_warnings
+            for phrase in ("ignored", "obsolete", "no longer", "removed")
+        ), f"WARNING never says the key is ignored/obsolete: {timezone_warnings}"
+
+    def test_any_stale_timezone_value_is_tolerated(self, tmp_path: Path) -> None:
+        """A nonsense ``timezone:`` value now loads instead of raising (#1339).
+
+        Pins that the validator was *removed* rather than left half-alive: a
+        value the old ``validate_timezone`` rejected must sail through, because
+        nothing validates a key nothing reads.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(
+            yaml.dump({"timezone": "Not/A/Timezone", "vault_path": "/vaults/legacy"}),
+        )
+
+        cfg = load_config(config_file)
+
+        assert not hasattr(cfg, "timezone")
+        assert cfg.vault_path == Path("/vaults/legacy")
+
+    def test_genuinely_unknown_key_is_still_rejected(self, tmp_path: Path) -> None:
+        """The shim must not be implemented as a blanket ``extra='ignore'``.
+
+        The one-way ratchet: dropping *one* named, historically-generated key
+        is a migration; accepting *any* unknown key turns every config typo
+        into a silent no-op. ``redction:`` is a plausible ``redaction:`` typo.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(yaml.dump({"redction": {"enabled": True}}))
+
+        with pytest.raises(ValidationError) as excinfo:
+            load_config(config_file)
+
+        errors = excinfo.value.errors()
+        assert [error["type"] for error in errors] == ["extra_forbidden"]
+        assert [error["loc"] for error in errors] == [("redction",)]
+
+    def test_unknown_key_rejected_even_beside_a_stale_timezone(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Popping ``timezone`` must not amnesty its neighbours (#1339).
+
+        Guards the shim shape: it removes one key by name, rather than
+        clearing whatever the model would otherwise reject.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(
+            yaml.dump({"timezone": "UTC", "redction": {"enabled": True}}),
+        )
+
+        with pytest.raises(ValidationError) as excinfo:
+            load_config(config_file)
+
+        assert [error["loc"] for error in excinfo.value.errors()] == [("redction",)]
+
+    def test_stray_creek_timezone_env_var_is_inert(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A leftover ``CREEK_TIMEZONE`` export must not break startup (#1339).
+
+        pydantic-settings silently drops env vars that match no field, so the
+        operator whose shell profile still exports it gets defaults rather
+        than a crash. Pinned here so it cannot regress into a hard failure.
+        """
+        monkeypatch.setenv("CREEK_TIMEZONE", "Europe/London")
+
+        cfg = CreekConfig()
+
+        assert not hasattr(cfg, "timezone")
+        assert "timezone" not in cfg.model_dump()
+
+    def test_modern_config_loads_silently(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A config without the stale key warns about nothing (#1339).
+
+        The deprecation notice must be conditional on the key being present.
+        Hoisting the ``logger.warning`` above the shim's guard would make
+        every single load noisy forever, and every other test in this class
+        would still pass — so the silence is pinned explicitly.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(yaml.dump({"vault_path": "/vaults/modern"}))
+
+        with caplog.at_level(logging.WARNING, logger="creek.config"):
+            cfg = load_config(config_file)
+
+        assert cfg.vault_path == Path("/vaults/modern")
+        assert [record.getMessage() for record in caplog.records] == []
+
+    @pytest.mark.parametrize("payload", [None, 42], ids=["none", "int"])
+    def test_non_mapping_input_still_raises_a_validation_error(
+        self,
+        payload: object,
+    ) -> None:
+        """A non-``dict`` payload fails as pydantic's error, not the shim's.
+
+        The shim runs before pydantic has coerced anything, so it must not
+        assume it was handed a container. Dropping its ``isinstance`` guard
+        makes ``_OBSOLETE_TIMEZONE_KEY not in data`` raise ``TypeError:
+        argument of type 'int' is not iterable`` from *inside* validation,
+        instead of the ``ValidationError`` callers are written to handle.
+
+        Both payloads are deliberately non-iterable: a ``list`` or ``str``
+        would support ``in`` and so pass even without the guard (#1339).
+
+        Args:
+            payload: A non-mapping value handed straight to validation.
+        """
+        with pytest.raises(ValidationError):
+            CreekConfig.model_validate(payload)
+
+
+class TestAuthorMaxReproducedTier:
+    """Tests for ``AuthorConfig.max_reproduced_tier`` (#1354).
+
+    The privacy ceiling the Writing Desk's HARD leak gate enforces used to come
+    from the medium contract alone — and a medium contract is authored *inside
+    the vault*, so one edited YAML line disarmed the gate. This field moves the
+    permission out of the vault and into the operator's ``creek_config.yaml``,
+    where the effective ceiling becomes the more restrictive of the two.
+
+    Every invalid value therefore has to fail **closed**, at ``open``: this is
+    the input to a security gate, and the alternative — raising — turns a typo
+    into a crashed review, which is the pressure that gets checks skipped.
+    """
+
+    def test_defaults_to_the_strictest_tier(self) -> None:
+        """An operator who never touched the key gets the strictest ceiling.
+
+        The default is what every existing vault gets on upgrade, so it must
+        be the value that can only *narrow* the gate relative to today.
+        """
+        assert AuthorConfig().max_reproduced_tier == "open"
+
+    def test_a_garbage_value_fails_closed_to_open(self) -> None:
+        """An unrecognised tier string is ignored, not raised on.
+
+        Validated through ``model_validate`` rather than the keyword
+        constructor because that is the path a real config takes: the string
+        arrives from ``yaml.safe_load`` inside :func:`load_config`, where no
+        static type ever constrained it.
+        """
+        cfg = AuthorConfig.model_validate({"max_reproduced_tier": "banana"})
+
+        assert cfg.max_reproduced_tier == "open"
+
+    def test_an_explicit_null_fails_closed_to_open(self) -> None:
+        """``max_reproduced_tier:`` with no value parses as ``None``.
+
+        A bare key with an empty value is the single most likely hand-edit
+        mistake, and YAML hands it over as ``None`` rather than as a missing
+        key — so the field default never fires and the validator has to.
+        """
+        cfg = AuthorConfig.model_validate({"max_reproduced_tier": None})
+
+        assert cfg.max_reproduced_tier == "open"
+
+    def test_a_valid_tier_is_accepted(self) -> None:
+        """A deliberate operator choice survives validation unchanged.
+
+        The fail-closed cases above are all satisfied by a validator that
+        hard-codes ``"open"``; this is what stops that.
+        """
+        cfg = AuthorConfig(max_reproduced_tier="intimate")
+
+        assert cfg.max_reproduced_tier == "intimate"
+
+    def test_the_legacy_public_alias_maps_to_open(self) -> None:
+        """The pre-INC-003 spelling ``"public"`` still means ``open``.
+
+        :meth:`creek.models.PrivacyTier._missing_` maps the legacy value and
+        emits a :class:`DeprecationWarning`. An older vault's config must land
+        on ``open`` — the same tier — rather than fall through the alias into
+        the garbage path, which would also give ``open`` but by accident.
+
+        The warning is suppressed rather than asserted on: whether the
+        validator routes through the enum (and so re-emits it) is an
+        implementation detail; that ``"public"`` means ``open`` is not.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            cfg = AuthorConfig.model_validate({"max_reproduced_tier": "public"})
+
+        assert cfg.max_reproduced_tier == "open"
+
+    def test_the_literal_mirrors_every_privacy_tier(self) -> None:
+        """``PrivacyTierName`` must list exactly the tiers the enum defines.
+
+        ``creek/config.py`` cannot import :mod:`creek.models` at module level:
+        ``creek/models.py`` imports back from ``creek.config`` at the bottom of
+        the file (the ``# noqa: E402`` import at ``creek/models.py:1153``), so
+        the pair is only acyclic in one direction. The ``Literal`` is therefore
+        a **hand-maintained mirror** of
+        :class:`~creek.models.PrivacyTier`, and nothing but this test keeps the
+        two honest.
+
+        The drift matters in the dangerous direction: add a fifth tier to the
+        enum, forget the mirror, and an operator who configures the new tier
+        gets it silently rejected and replaced by the fail-closed default —
+        or, worse, the leak gate compares a name the ceiling table has never
+        heard of.
+
+        The import is local so this file still collects (and its ~200 other
+        tests still run) on a tree where the alias does not exist yet.
+        """
+        from creek.config import PrivacyTierName
+
+        assert set(get_args(PrivacyTierName)) == {tier.value for tier in PrivacyTier}
+
+    def test_generate_default_config_seeds_the_key(self, tmp_path: Path) -> None:
+        """``creek init`` writes the key out, at the safe default.
+
+        A field that only exists in Python is a field operators never discover.
+        ``generate_default_config`` is what ``creek init`` calls, so the
+        generated ``creek_config.yaml`` is where an operator learns the
+        ceiling is theirs to set — and it has to arrive at ``open``, not at
+        whatever the last vault-authored contract happened to declare.
+
+        Args:
+            tmp_path: Destination directory for the generated config.
+        """
+        output = tmp_path / "creek_config.yaml"
+
+        generate_default_config(output)
+
+        data = yaml.safe_load(output.read_text(encoding="utf-8"))
+        assert data["author"]["max_reproduced_tier"] == "open"

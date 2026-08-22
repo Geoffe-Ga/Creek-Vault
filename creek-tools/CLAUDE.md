@@ -1,19 +1,14 @@
 # Claude Code Project Context: creek-tools
 
 **Table of Contents**
+- [0. Repo topology](#0-repo-topology)
 - [1. Critical Principles](#1-critical-principles)
 - [2. Project Overview](#2-project-overview)
 - [3. The Maximum Quality Engineering Mindset](#3-the-maximum-quality-engineering-mindset)
 - [4. Stay Green Workflow](#4-stay-green-workflow)
 - [5. Architecture](#5-architecture)
 - [6. Quality Standards](#6-quality-standards)
-- [7. Development Workflow](#7-development-workflow)
-- [8. Testing Strategy](#8-testing-strategy)
-- [9. Tool Usage & Code Standards](#9-tool-usage--code-standards)
-- [10. Common Pitfalls & Troubleshooting](#10-common-pitfalls--troubleshooting)
-- [Appendix A: AI Subagent Guidelines](#appendix-a-ai-subagent-guidelines)
-- [Appendix B: Key Files](#appendix-b-key-files)
-- [Appendix C: External References](#appendix-c-external-references)
+- [7. Where the rest lives](#7-where-the-rest-lives)
 
 ---
 
@@ -51,10 +46,11 @@ Always invoke tools through `./scripts/*` instead of directly.
 | Lint code | `ruff check .` | `./scripts/lint.sh` |
 | Modernisation hints | `refurb creek/` | `./scripts/lint-refurb.sh` |
 | Exception hygiene | `tryceratops creek/` | `./scripts/lint-tryceratops.sh` |
+| Dead-code detection | `vulture creek/` | `./scripts/lint-vulture.sh` |
 | All checks | *(run each tool)* | `./scripts/check-all.sh` |
 | Security scan | `bandit -r src/` | `./scripts/security.sh` |
 
-See [9.1 Tool Invocation Patterns](#91-tool-invocation-patterns) for complete list.
+See [`scripts/`](scripts/) and the gate list in `scripts/check-all.sh` for the complete list.
 
 ---
 
@@ -89,7 +85,7 @@ Never bypass quality checks or suppress errors without justification.
 - ✅ Always run pre-commit checks
 - ✅ Refactor complex functions into smaller ones
 
-See [10.1 No Shortcuts Policy](#101-no-shortcuts-policy) for detailed examples.
+See [6.2 Forbidden Patterns](#62-forbidden-patterns) for detailed examples.
 
 ---
 
@@ -155,7 +151,7 @@ Run `./scripts/check-all.sh` before every commit. Only commit if exit code is 0.
 - [ ] No failing tests
 - [ ] Conventional commit message ready
 
-See [10. Common Pitfalls & Troubleshooting](#10-common-pitfalls--troubleshooting) for complete list.
+See [4.2 Quick Checklist](#42-quick-checklist) for complete list.
 
 ---
 
@@ -327,6 +323,8 @@ creek-tools/
 │   ├── test.sh                       # Run test suite (--unit / --integration / --e2e / --all)
 │   ├── lint.sh                       # Ruff lint
 │   ├── lint-extended.sh              # pylint, refurb, tryceratops, vulture, interrogate
+│   ├── lint-vulture.sh               # Dead-code gate wrapper — the one entrypoint (issue #1395)
+│   ├── lint_vulture.py               # Dead-code gate policy; see its module docstring
 │   ├── format.sh                     # Ruff format
 │   ├── typecheck.sh                  # MyPy strict (CI-001)
 │   ├── security.sh                   # Bandit + pip-audit (with documented ignores; DEP-003)
@@ -357,8 +355,8 @@ creek-tools/
 
 Significant architectural decisions live in
 [`docs/architecture/ADR/`](docs/architecture/ADR/) as numbered Markdown
-files. Skill guidance for *how* to write a decision record lives at
-the repository-level `.claude/skills/architectural-decisions/SKILL.md`.
+files. Follow the numbering and structure of the existing records when
+adding one.
 
 ### 5.4 Slash commands (FEAT-016)
 
@@ -405,9 +403,18 @@ All code must meet these standards before merging to main:
 
 #### Linting and Formatting
 - **Ruff**: lint + format, configured in `pyproject.toml` (no `|| true`).
-- **Pylint**: ≥9.0 (`pylint creek/ --fail-under=9.0`, in CI and
-  `lint-extended.sh`; CI-002).
-- **Bandit**: zero medium-or-above findings (`bandit -r creek/ -ll`).
+- **Ruff cache**: `--no-cache` on every invocation — lint and format,
+  check and fix — in `scripts/lint.sh`, `scripts/format.sh`, and both
+  `astral-sh/ruff-pre-commit` hooks. Ruff's per-file cache key is
+  mtime-only, so a local gate must never trust a cache CI doesn't
+  have. Costs ~0.05s on this tree (477 files); don't drop it for
+  speed. Issue #1119; enforced by `tests/test_ruff_cache_poisoning.py`
+  and `tests/test_ruff_gate_parity.py`. Same hazard is open for mypy's
+  cache (#1186) and `__pycache__` (#1187).
+- **Pylint**: ≥9.0 (`pylint creek/ creek_mcp/ --fail-under=9.0`, in CI
+  and `lint-extended.sh`; CI-002).
+- **Bandit**: zero medium-or-above findings
+  (`bandit -r creek/ creek_mcp/ -ll`).
 - **pip-audit**: zero vulnerabilities except documented unfixable
   CVEs in `scripts/security.sh` and `.github/workflows/ci.yml`
   (DEP-003).
@@ -422,8 +429,20 @@ All code must meet these standards before merging to main:
   `scripts/lint-tryceratops.sh`. The `# noqa: TRY…  # <one-liner>`
   escape hatch is reserved for intentional separation of failure modes
   and documented `ValueError` schema contracts.
-- **Vulture**: pre-commit-only today; tracked under a follow-up to
-  STYLE-001 to be gated once the dead-code surface is groomed.
+- **Vulture (dead-code detection)**: zero findings. Gated by
+  `scripts/lint-vulture.sh` in both `check-all.sh` and CI (issue
+  #1395). Per-type confidence floors, not one uniform threshold — see
+  `scripts/lint_vulture.py`'s module docstring for the policy and its
+  four documented blindnesses, the largest being code kept alive only
+  by its own tests. Unlike refurb/tryceratops there is **no allowlist
+  and no `# noqa`-style escape hatch**: the only remedy for a real
+  finding is deletion.
+  `scripts/lint_vulture.py` is also **crawdad's** dead-code policy
+  (issue #1472): `crawdad/scripts/lint-vulture.sh` runs this module
+  with `--scope crawdad` rather than a copy of it, so a floor change or
+  a new carve-out lands in both subprojects at once. Both scopes are
+  declared side by side in that module as `Scope` values; editing one
+  without the other is not possible.
 
 #### Documentation Standards
 - **Google-style Docstrings**: All public APIs
@@ -458,3 +477,49 @@ The following patterns are NEVER allowed without explicit justification and issu
    ```python
    # ❌ FORBIDDEN
    # TODO: optimize
+
+   # ✅ ALLOWED (with issue reference)
+   # TODO: optimize this query (Issue #N)
+
+   # ❌ FORBIDDEN
+   # FIXME: broken
+
+   # ✅ ALLOWED (with issue reference)
+   # FIXME: broken on empty input (Issue #N)
+   ```
+
+---
+
+## 7. Where the rest lives
+
+Until issue #1190 this file's table of contents promised six further
+sections — Development Workflow, Testing Strategy, Tool Usage & Code
+Standards, Common Pitfalls & Troubleshooting, and three appendices —
+that were never written: the file was truncated mid-code-fence in the
+repository's initial commit and every revision since ended on that same
+line. Rather than invent standards nobody agreed to, those entries were
+retired in favour of pointers to the artifacts that actually define each
+topic. A restatement is a second copy, and per §1.2 second copies drift
+from their source. Existing drift between this file and the sources
+below is tracked in issue #1194; this section only points, it does not
+describe.
+
+- **Development workflow**: [`../.claude/agents/shared/house-rules.md`](../.claude/agents/shared/house-rules.md)
+  (the four gates, commit/PR conventions); [`.pre-commit-config.yaml`](.pre-commit-config.yaml).
+- **Testing strategy**: [`scripts/test.sh`](scripts/test.sh) — `--help` names
+  every lane and which ones block a merge; the `[tool.pytest.ini_options]`
+  table in [`pyproject.toml`](pyproject.toml) for the marker definitions and
+  testpaths; [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml) for
+  which lanes actually gate (jobs `quality` and `integration-e2e`, aggregated
+  by `quality-gate`) — that workflow, not this file, is the authority.
+- **Tool usage & code standards**: [`scripts/check-all.sh`](scripts/check-all.sh)
+  for the gates, in order; the tool sections of [`pyproject.toml`](pyproject.toml).
+- **Common pitfalls & troubleshooting**: the Troubleshooting section of
+  [`docs/mcp.md`](docs/mcp.md); [`../.claude/skills/ci-debugging/`](../.claude/skills/ci-debugging/)
+  and [`../.claude/skills/stay-green/`](../.claude/skills/stay-green/).
+- **AI subagent guidelines**: [`../.claude/agents/README.md`](../.claude/agents/README.md)
+  and [`../.claude/agents/shared/house-rules.md`](../.claude/agents/shared/house-rules.md);
+  [`../scripts/ralph/PROMPT.md`](../scripts/ralph/PROMPT.md).
+- **Key files**: [`docs/README.md`](docs/README.md) (the docs index) and
+  §5.2 above.
+- **External references**: [`docs/architecture/ADR/`](docs/architecture/ADR/).

@@ -11,14 +11,19 @@ of the Creek Ontology.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING
 
 import frontmatter
-import yaml
 
+from creek.classify.privacy_filter import (
+    PrivacyTierOverride,
+    raw_privacy_tier,
+    within_ceiling,
+)
 from creek.models import (
     Decision,
     DecisionCandidate,
@@ -26,14 +31,21 @@ from creek.models import (
     Frequency,
     Phase,
     PraxisPotential,
+    PrivacyTier,
     _generate_decision_id,
 )
-from creek.vault.reader import iter_vault_fragments
+from creek.vault.reader import (
+    FRONTMATTER_LOAD_ERRORS,
+    iter_vault_fragments,
+    load_post_or_raise,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from creek.models import Fragment
+
+logger = logging.getLogger(__name__)
 
 DECISION_KEYWORDS: tuple[str, ...] = (
     "should i",
@@ -74,6 +86,27 @@ _VALID_PHASES: frozenset[str] = frozenset(
     },
 )
 
+_SOURCE_FRAGMENTS_HEADING: str = "## source fragments"
+"""Lowercased body heading whose first bullet names a note's source fragment.
+
+Compared against ``line.strip().lower()``, so a note that capitalises the
+heading differently still identifies itself.
+"""
+
+_MAX_FILENAME_ORDINALS: int = 10_000
+"""Cap on the paths :func:`_resolve_decision_note_path` probes.
+
+Counts the unsuffixed name, so a cap of 3 means ``stem``, ``stem-1``,
+``stem-2``. Mirrors ``creek.vault.writer._MAX_FILENAME_COLLISION_RETRIES``:
+high enough that no real vault reaches it, low enough that a runaway
+collision pattern surfaces as a loud ``RuntimeError`` rather than an
+infinite loop. The probe is
+dearer than the writer's — it parses each occupant rather than attempting an
+exclusive create — so a stem shared by *n* identities costs O(n²) reads across
+the batch. That is the same cost profile the writer already accepts, and it
+only bites a vault that has already gone degenerate.
+"""
+
 
 def _sanitize_title(title: str) -> str:
     """Sanitise a title string into a safe filename component.
@@ -106,6 +139,96 @@ def _build_frequency_context(fragment: Fragment) -> list[Frequency]:
     for sec in fragment.frequency.secondary:
         freqs.append(Frequency(sec))
     return freqs
+
+
+def _decision_source_fragment_id(post: frontmatter.Post) -> str | None:
+    """Return the source fragment id *post* records, or ``None``.
+
+    The identity rule, in one place: the first bullet under the note body's
+    ``## Source Fragments`` heading. ``None`` means the note declares no
+    source fragment at all — a hand-written Decision note, or one whose
+    generated section the operator removed — and therefore that its identity
+    cannot be positively established.
+
+    Args:
+        post: A parsed Decision note.
+
+    Returns:
+        The recorded source fragment id, or ``None``.
+    """
+    in_source_section = False
+    for line in post.content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            in_source_section = stripped.lower() == _SOURCE_FRAGMENTS_HEADING
+            continue
+        if in_source_section and stripped.startswith("- "):
+            return stripped[2:].strip()
+    return None
+
+
+def _recorded_decision_source(note: Path) -> str | None:
+    """Return the source fragment id a Decision note on disk records, or ``None``.
+
+    Args:
+        note: Path to a candidate markdown note.
+
+    Returns:
+        The recorded source fragment id, or ``None``.
+    """
+    post = _load_post(note)
+    return None if post is None else _decision_source_fragment_id(post)
+
+
+def _resolve_decision_note_path(
+    target_dir: Path,
+    stem: str,
+    fragment_id: str,
+) -> Path:
+    """Return the path *fragment_id*'s Decision note owns under *target_dir*.
+
+    Probes ``stem.md``, ``stem-1.md``, ``stem-2.md``, … and returns the first
+    path that is either free or already occupied by a note recording
+    *fragment_id*. A path occupied by anything else — a different fragment,
+    or a note whose identity :func:`_recorded_decision_source` cannot
+    establish — is skipped, never overwritten.
+
+    Deliberately *not* ``VaultWriter._atomic_create``: that helper advances on
+    occupancy, so it would mint a new file every run and never converge. This
+    one advances on ownership, so the file count is bounded by the number of
+    distinct source fragments.
+
+    Only exact paths are probed — never ``glob``/``iterdir``, which would make
+    a batch quadratic in directory size at 35k-fragment scale.
+
+    Args:
+        target_dir: Directory the note will be written into.
+        stem: Filename stem (without ``.md``) the candidate naturally wants.
+        fragment_id: The candidate's source fragment id — its identity.
+
+    Returns:
+        The path to write to.
+
+    Raises:
+        RuntimeError: If every one of :data:`_MAX_FILENAME_ORDINALS` probed
+            paths belongs to another fragment.
+    """
+    # The ordinal loop is duplicated in creek/generate/compost.py on purpose.
+    # Hoisting a shared filename builder is explicitly out of scope for #1334
+    # and is issue #1417's job; merging them here would pre-empt it.
+    for ordinal in range(_MAX_FILENAME_ORDINALS):
+        suffix = "" if ordinal == 0 else f"-{ordinal}"
+        note_path = target_dir / f"{stem}{suffix}.md"
+        if (
+            not note_path.exists()
+            or _recorded_decision_source(note_path) == fragment_id
+        ):
+            return note_path
+    msg = (
+        f"Could not allocate a unique filename for '{stem}.md' in "
+        f"{target_dir} after {_MAX_FILENAME_ORDINALS} attempts"
+    )
+    raise RuntimeError(msg)
 
 
 class DecisionDetector:
@@ -185,12 +308,59 @@ class DecisionDetector:
         Generates a markdown file with YAML frontmatter in
         ``08-Decisions/Active/``, defaulting to ``sensing`` status.
 
+        **This method applies no privacy screen and trusts its caller.** The
+        ``intimate`` screen added by #1431 lives upstream in
+        :func:`_admitted_decision_fragments`, which filters the *fragments*
+        before they ever become candidates — a :class:`DecisionCandidate`
+        carries no tier field, so by the time one reaches here the information
+        needed to screen it is gone. Production is covered, because
+        :func:`generate_decisions` is the only live producer into
+        ``08-Decisions``. A caller that builds a candidate itself and invokes
+        this method directly inherits the responsibility: ``candidate
+        .fragment_title`` is written verbatim into both the ``title:`` front
+        matter and the filename stem.
+
+        The filename is ``<date>-<sanitised fragment title>[-N].md``, falling
+        back to ``<date>[-N].md`` when the title sanitises to nothing. Because
+        that stem is derived from the title alone, two different fragments can
+        want it — :func:`_sanitize_title`'s 80-character truncation
+        manufactures collisions by itself, and every untitled candidate of a
+        given day wants the same bare date — so the path is resolved by
+        *ownership* rather than by name: :func:`_resolve_decision_note_path`
+        probes ``-1``, ``-2``, … until it finds a path that is free or already
+        records this candidate's source fragment. **A note recording a
+        different fragment is never overwritten** (#1334).
+
+        **A note this candidate already owns is refreshed in place, and the
+        refresh is destructive.** The rewritten note carries a freshly minted
+        ``id:`` and its ``status:`` resets to ``sensing``, discarding whatever
+        phase the operator had advanced it to along with any prose they added
+        beneath the generated sections. That is today's behaviour and is
+        preserved deliberately: :func:`generate_decisions` is index-gated and
+        never calls this method for a fragment already captured, so production
+        does not reach that branch. Callers that invoke this method directly
+        inherit the clobber.
+
+        "Already owns" means *at today's stem*. The stem embeds
+        ``date.today()``, so a note this candidate owns from an earlier day
+        is never probed, and a direct call on a later day writes a second
+        note rather than refreshing the first. ``creek/generate/paradox.py``
+        carries the same caveat for the same reason (#1320): a filename
+        containing the date is not a stable identity across runs. Production
+        is unaffected — the index spans both folders and every date, so
+        :func:`generate_decisions` skips the candidate before the stem is
+        ever built.
+
         Args:
             candidate: The DecisionCandidate to create a note for.
             vault_path: Path to the root of the Obsidian vault.
 
         Returns:
             Path to the created decision note file.
+
+        Raises:
+            RuntimeError: If :data:`_MAX_FILENAME_ORDINALS` consecutive
+                candidate filenames all belong to other fragments.
         """
         decision_id = _generate_decision_id()
         today = date.today()
@@ -216,12 +386,12 @@ class DecisionDetector:
         target_dir.mkdir(parents=True, exist_ok=True)
 
         sanitized = _sanitize_title(candidate.fragment_title)
-        filename = (
-            f"{today.isoformat()}-{sanitized}.md"
-            if sanitized
-            else f"{today.isoformat()}.md"
+        stem = f"{today.isoformat()}-{sanitized}" if sanitized else today.isoformat()
+        note_path = _resolve_decision_note_path(
+            target_dir,
+            stem,
+            candidate.fragment_id,
         )
-        note_path = target_dir / filename
 
         note_path.write_text(frontmatter.dumps(post), encoding="utf-8")
         return note_path
@@ -260,7 +430,7 @@ class DecisionDetector:
             raise ValueError(msg)
 
         # Update frontmatter
-        post = frontmatter.load(str(source_path))
+        post = load_post_or_raise(source_path)
         post["status"] = new_phase
         source_path.write_text(frontmatter.dumps(post), encoding="utf-8")
 
@@ -331,6 +501,17 @@ class DecisionDetector:
             decision_id: The decision ID to find.
             decisions_dir: The 08-Decisions directory path.
 
+        An unreadable neighbour costs itself, not the search: ``08-Decisions``
+        is an operator-editable folder, and this load was unguarded, so one
+        hand-edited note there — a non-string frontmatter key raises
+        ``TypeError`` out of ``frontmatter.load``'s ``**metadata`` splat —
+        aborted every lookup in the folder rather than being stepped over
+        (#924, #1475). Skipping is the same policy the module's other loader,
+        :func:`_load_post`, already applies, and it is safe here because the
+        skipped file could not have answered the query anyway: its ``id`` is
+        exactly what could not be read. The cost is the one #926 tracks — the
+        note is invisible, so a subsequent write may duplicate it.
+
         Returns:
             Path to the matching note, or None if not found.
         """
@@ -339,7 +520,11 @@ class DecisionDetector:
             if not search_dir.exists():
                 continue
             for md_file in search_dir.glob("*.md"):
-                post = frontmatter.load(str(md_file))
+                try:
+                    post = frontmatter.load(str(md_file))
+                except FRONTMATTER_LOAD_ERRORS:
+                    logger.debug("Skipping unreadable decision note: %s", md_file)
+                    continue
                 if post.get("id") == decision_id:
                     return md_file
         return None
@@ -480,15 +665,34 @@ def _jaccard(a: set[str], b: set[str]) -> float:
 def _load_post(path: Path) -> frontmatter.Post | None:
     """Safely load a frontmatter post from disk.
 
+    ``yaml.YAMLError`` is caught alongside ``OSError`` and ``ValueError``
+    because it is neither: a note whose frontmatter will not parse used to
+    escape this helper and crash the caller. Every call site already treats
+    ``None`` as "skip this note", so widening the tuple is what they all
+    meant — and :func:`_recorded_decision_source` now depends on it, having
+    taken over the inline handler
+    :func:`_existing_decision_fragment_ids` used to carry. Same bug class as
+    issue #1416.
+
+    The tuple is **not** exhaustive, and this docstring should not be read
+    as claiming it is: ``frontmatter.load`` passes the parsed mapping as
+    keyword arguments, so a non-string YAML key (``2024-01-01:``, ``true:``,
+    ``1:``) still raises ``TypeError`` past this handler. The synchronicity
+    scans closed that gap by dropping ``frontmatter`` for the header-only
+    :func:`creek.vault.links.read_header_meta` (#1416); this loader has not
+    yet followed, and the remaining gap is tracked on #1475 rather than
+    widened blindly here, because ``TypeError`` also covers genuine
+    programming errors that should not be silently skipped.
+
     Args:
         path: The markdown file path.
 
     Returns:
-        Loaded post, or ``None`` if the file cannot be parsed.
+        Loaded post, or ``None`` if the file cannot be read or parsed.
     """
     try:
         return frontmatter.load(str(path))
-    except (OSError, ValueError):
+    except FRONTMATTER_LOAD_ERRORS:
         return None
 
 
@@ -664,7 +868,7 @@ class DecisionContextGatherer:
         Returns:
             The path that was updated.
         """
-        post = frontmatter.load(str(decision_path))
+        post = load_post_or_raise(decision_path)
         body = post.content
         existing = re.search(r"\n## Context\b.*", body, flags=re.DOTALL)
         new_section = context_section.rstrip() + "\n"
@@ -980,7 +1184,7 @@ def decision_from_note(note_path: Path) -> Decision:
         A :class:`~creek.models.Decision` built from the note's
         frontmatter. Missing fields fall back to the model defaults.
     """
-    post = frontmatter.load(str(note_path))
+    post = load_post_or_raise(note_path)
     metadata = post.metadata.copy()
     metadata["title"] = metadata.get("title") or note_path.stem
     metadata["id"] = metadata.get("id") or _generate_decision_id()
@@ -1002,10 +1206,12 @@ def decision_from_note(note_path: Path) -> Decision:
 def _existing_decision_fragment_ids(vault_path: Path) -> set[str]:
     """Return the source fragment ids already captured by Decision notes (#581).
 
-    Scans ``08-Decisions/{Active,Archive}/`` and reads each note's first
-    ``## Source Fragments`` bullet — the source fragment id — so a re-run can
-    skip candidates whose decision note already exists. Unreadable notes are
-    skipped rather than crashing the report.
+    Walks ``08-Decisions/{Active,Archive}/`` and reads each note's identity
+    through :func:`_recorded_decision_source` — the same extractor the note
+    writer resolves filenames with, so the index and the writer can never
+    disagree about who owns what (#1334). A re-run therefore skips candidates
+    whose Decision note already exists. Unreadable notes are skipped rather
+    than crashing the report.
 
     Args:
         vault_path: Root of the Obsidian vault.
@@ -1020,23 +1226,182 @@ def _existing_decision_fragment_ids(vault_path: Path) -> set[str]:
         if not folder.is_dir():
             continue
         for md_file in folder.rglob("*.md"):
-            try:
-                post = frontmatter.load(str(md_file))
-            except (OSError, ValueError, yaml.YAMLError):
-                continue
-            in_source_section = False
-            for line in post.content.splitlines():
-                stripped = line.strip()
-                if stripped.startswith("## "):
-                    in_source_section = stripped.lower() == "## source fragments"
-                    continue
-                if in_source_section and stripped.startswith("- "):
-                    seen.add(stripped[2:].strip())
-                    break
+            fragment_id = _recorded_decision_source(md_file)
+            if fragment_id is not None:
+                seen.add(fragment_id)
     return seen
 
 
-def generate_decisions(vault_path: Path) -> list[Path]:
+def _admitted_decision_fragments(
+    vault_path: Path,
+    override: PrivacyTierOverride,
+) -> tuple[list[Fragment], int]:
+    """Return the fragments decisions may name, and how many were withheld (#1431).
+
+    Two independent conditions, in this order:
+
+    1. :func:`~creek.classify.privacy_filter.within_ceiling` — the shared #968
+       tier ceiling. This is the operator's dial: ``--include-tier``, or the
+       MCP ``privacy_tier_ceiling``, or the ``ALL`` that ``creek fill`` states
+       for every step because it has no tier flag of its own.
+    2. An **unconditional** intimate screen. This one is not a dial, and it is
+       not defeasible by any caller. It is here because ``decisions`` is the
+       one report whose artifact carries a source fragment's title in its
+       *filename*: ``create_decision_note`` sanitises ``fragment_title`` into
+       the stem, and that name is then visible to Obsidian's file pane, to
+       ``ls``, to Spotlight and to any sync client, with no front matter
+       attached that could declare what tier it came from. A ceiling of ``ALL``
+       is a reasonable instruction to include intimate *content* in a report;
+       it is not an instruction to spell an intimate title out in the vault
+       tree. (#1431 chose this — screen the fragment and write nothing —
+       over stubbing the title, because a stubbed title collapses every
+       intimate candidate onto the bare ``<date>`` stem that untitled
+       candidates already contend for under
+       :data:`_MAX_FILENAME_ORDINALS`.)
+
+    The screen reads :func:`~creek.classify.privacy_filter.raw_privacy_tier`,
+    not the model's ``fragment.privacy_tier``, for two reasons. It is the
+    reader ``within_ceiling`` itself reduces to, so the gate and the screen can
+    never end up holding two different tier opinions inside one expression. And
+    it fails closed: a note whose front matter has **no** ``privacy_tier:`` key
+    ranks ``intimate`` rather than the model's ``unclassified``, which is the
+    answer ``tests/test_mcp_report_tier_ceiling.py``'s
+    ``test_fragment_with_no_privacy_tier_key_fails_closed_to_intimate``
+    already pins for report artifacts. The model reader would leave the #1431
+    filename reproducible for exactly that fragment shape. An *explicit*
+    ``privacy_tier: unclassified`` is unaffected — it ranks with ``personal``
+    and still gets its note — and every pipeline-written fragment states the
+    key, because :meth:`creek.vault.writer.VaultWriter._write_model`
+    serialises ``model_dump(mode="json")``.
+
+    This differs from the sibling rule in :mod:`creek.generate.compost`, and
+    the difference is deliberate rather than an oversight:
+    ``CompostTracker.__init__`` takes ``skip_intimate: bool = True``, a
+    constructor *default* a caller can switch off, forced on only inside
+    ``run_compost_scan`` — and forced there because that scan feeds fragment
+    bodies to a potentially cloud-hosted verifier. Decisions makes no LLM call
+    at all; its harm is local filesystem visibility, which no caller has a
+    legitimate reason to opt into.
+
+    Withheld fragments are counted rather than named. The count exists so the
+    screen cannot disable a report in silence — see :func:`generate_decisions`
+    — and it is a count and nothing else because the title is the leaking
+    value.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+        override: The #968 tier ceiling to apply.
+
+    Returns:
+        ``(admitted fragments, number withheld by the intimate screen)``. The
+        count covers only condition 2; fragments refused by the ceiling are not
+        counted, since that refusal is what the operator asked for.
+    """
+    admitted: list[Fragment] = []
+    withheld = 0
+    for _path, fragment, _body, raw in iter_vault_fragments(
+        vault_path / "01-Fragments",
+    ):
+        # Kept as a literal ``within_ceiling(...)`` call resolved from module
+        # globals, never folded into ``tier_within_override(raw_privacy_tier(
+        # raw), override)``: the inverted-gate obedience proof in
+        # tests/test_mcp_report_tier_ceiling.py monkeypatches
+        # ``creek.generate.decisions.within_ceiling`` and asserts it was
+        # actually called.
+        if not within_ceiling(raw, override):
+            continue
+        if raw_privacy_tier(raw) is PrivacyTier.INTIMATE:
+            withheld += 1
+            continue
+        admitted.append(fragment)
+    return admitted, withheld
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionsReport:
+    """What one :func:`generate_decisions` run wrote, and what it refused.
+
+    Deliberately a plain dataclass rather than a tuple or a
+    :class:`typing.NamedTuple`, and that is a correctness choice rather than a
+    stylistic one. ``creek_mcp/tools/report.py`` consumes this function's
+    result as ``list(generate_decisions(...))``; against an *iterable* return
+    that call site would have kept type-checking and kept running, while
+    silently yielding ``[[Path, ...], 0]`` — a list whose first element is a
+    list and whose second is an int — straight into the MCP ``report_paths``
+    envelope. A non-iterable dataclass turns the same mistake into a
+    mypy-strict error at check time and a ``TypeError`` at run time, so no
+    call site can be missed when the return value grows a field (#1487).
+
+    ``notes`` is a ``tuple``, not a ``list``, so the report is immutable
+    through and through: a caller that mistakes it for the old ``list[Path]``
+    and appends to it fails loudly instead of mutating a result nobody
+    re-reads.
+
+    Attributes:
+        notes: Paths of the Decision notes this run newly wrote, in write
+            order. Empty when there was nothing new to write.
+        withheld: How many fragments the unconditional intimate screen in
+            :func:`_admitted_decision_fragments` refused. Counts that screen
+            only — never a ceiling refusal, which is what the operator asked
+            for. :func:`withheld_notice` turns it into the wording both the
+            log and the console use.
+    """
+
+    notes: tuple[Path, ...]
+    withheld: int
+
+
+def withheld_notice(withheld: int) -> str | None:
+    """Return the operator-facing explanation of a withholding, or ``None``.
+
+    This is the **single** source of that wording. It feeds both the
+    ``logger.warning`` in :func:`generate_decisions` and the console message
+    ``creek.cli._report_decisions`` prints, so a maintainer reading a log and
+    an operator reading a terminal cannot be handed two different
+    explanations of the same refusal (#1487).
+
+    The count is stated as "fragment(s)", never "candidate(s)": it is taken
+    *before* decision detection runs, so it includes withheld fragments that
+    were never decision candidates at all.
+
+    Both remedies the notice names were checked against what the pipeline
+    actually does. ``creek classify`` assigns a tier outright to a keyless
+    note (``creek/classify/privacy_pass.py:165-169`` — the ratchet is reached
+    only for a tier already on disk), so re-running it genuinely readmits
+    one; but ``creek/classify/privacy.py:136-140`` tiers a self-authored
+    ``platform: journal`` fragment ``INTIMATE`` unconditionally, and that is
+    the commonest keyless shape, so the exception is stated rather than left
+    for the operator to discover. Editing ``privacy_tier:`` by hand is the
+    remedy for that case and for an already-recorded ``intimate``.
+
+    The wording carries no square bracket anywhere on purpose: the console it
+    reaches is a Rich console, which would eat ``[anything]`` as a style tag
+    and drop the clause from the terminal while leaving it in the log.
+
+    Args:
+        withheld: Number of fragments the intimate screen refused.
+
+    Returns:
+        The notice, or ``None`` when nothing was withheld. ``None`` rather
+        than an empty string is what keeps the notice conditional by
+        construction at both call sites.
+    """
+    if withheld <= 0:
+        return None
+    return (
+        f"{withheld} fragment(s) withheld from the decisions report: intimate "
+        "tier, or no privacy_tier key at all (which fails closed to intimate). "
+        "Re-run `creek classify` to tier a keyless note — a self-authored "
+        "journal note is tiered intimate and stays out — or set privacy_tier "
+        "by hand. A tier already recorded as intimate is never lowered."
+    )
+
+
+def generate_decisions(
+    vault_path: Path,
+    *,
+    override: PrivacyTierOverride = PrivacyTierOverride.ALL,
+) -> DecisionsReport:
     """Detect decision candidates across the vault and write new notes (#581).
 
     Loads fragments via :func:`creek.vault.reader.iter_vault_fragments` (the
@@ -1045,19 +1410,73 @@ def generate_decisions(vault_path: Path) -> list[Path]:
     candidate whose source fragment is not already captured by an existing note
     — so re-running is idempotent and never duplicates notes for one fragment.
 
+    Since #1334 that guarantee holds in both directions: the index gate stops
+    one fragment getting two notes, and :func:`_resolve_decision_note_path`
+    stops two distinct candidates sharing one *file*. Before the fix, two
+    candidates whose titles sanitised to the same stem landed on the same
+    path; the second write destroyed the first, the index only ever saw the
+    survivor, and every later run re-detected and re-wrote the loser —
+    oscillating forever and churning the surviving note's ``id:`` each time.
+
+    A vault already damaged that way heals on the next run: the survivor is
+    left byte-for-byte alone and the fragment it displaced is written to the
+    next free ordinal. Content the pre-fix clobber already destroyed is gone
+    and cannot be recovered.
+
     Args:
         vault_path: Root of the Obsidian vault.
+        override: Tier ceiling (#968), applied to each fragment's *raw*
+            frontmatter — which the shared reader already yields, so no
+            second read is introduced. Defaults to
+            :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`,
+            meaning "no ceiling declared" — a genuine no-op for callers that
+            predate #968, and safe because both production report surfaces
+            state an override explicitly (pinned by
+            ``tests/test_mcp_report_tier_ceiling.py``'s
+            ``test_production_report_callers_always_state_an_override``).
+
+            The ceiling is **not** the whole admission rule here, and since
+            #1431 it is not the strictest part of it. The stakes are unusually
+            concrete: a generated note's ``title:`` frontmatter is a source
+            fragment's title verbatim, and its filename is that same title
+            sanitised — plus a ``-N`` ordinal when another fragment already
+            holds the name. So on top of the ceiling,
+            :func:`_admitted_decision_fragments` applies an unconditional
+            ``intimate`` screen that **no value of this argument can lift**,
+            reading the fail-closed
+            :func:`~creek.classify.privacy_filter.raw_privacy_tier`. See that
+            helper for why the reader is the fail-closed one and why this rule
+            is non-defeasible where compost's ``skip_intimate`` is a default.
+
+            How a screened fragment gets back in is worth stating precisely,
+            because getting it wrong prints a false remedy at the operator.
+            The ``privacy_tier`` ratchet binds a tier **already recorded on
+            disk** (``creek/classify/privacy_pass.py:165-169``: ``escalate``
+            is reached only on the ``not assigning`` branch), so an explicit
+            ``intimate`` is never lowered by ``creek classify``, even with
+            ``--force``, and a hand edit of the front matter is the only way
+            back in for that fragment. A note with **no** ``privacy_tier:``
+            key is not ratcheted at all — ``needs_tier`` is ``True`` when the
+            key is absent, so ``creek classify`` assigns it a tier outright
+            and can readmit it. The caveat that decides the common case:
+            ``creek/classify/privacy.py:136-140`` classifies a self-authored
+            ``platform: journal`` fragment ``INTIMATE`` unconditionally, so
+            for the commonest keyless shape re-running ``creek classify``
+            does *not* readmit it, and a hand edit of ``privacy_tier:`` is
+            again the remedy.
 
     Returns:
-        Paths of the newly written Decision notes; empty when there are no new
-        decision candidates.
+        A :class:`DecisionsReport` carrying the newly written note paths and
+        the number of fragments the intimate screen withheld. ``notes`` is
+        empty when there are no new decision candidates — or when every
+        candidate was screened, and telling those two cases apart is exactly
+        why ``withheld`` travels back to the caller instead of dying in the
+        log (#1487).
     """
-    fragments = [
-        fragment
-        for _path, fragment, _body, _raw in iter_vault_fragments(
-            vault_path / "01-Fragments",
-        )
-    ]
+    fragments, withheld = _admitted_decision_fragments(vault_path, override)
+    notice = withheld_notice(withheld)
+    if notice is not None:
+        logger.warning("%s", notice)
     detector = DecisionDetector()
     already = _existing_decision_fragment_ids(vault_path)
     written: list[Path] = []
@@ -1066,4 +1485,4 @@ def generate_decisions(vault_path: Path) -> list[Path]:
             continue
         written.append(detector.create_decision_note(candidate, vault_path))
         already.add(candidate.fragment_id)
-    return written
+    return DecisionsReport(notes=tuple(written), withheld=withheld)

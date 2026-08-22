@@ -52,11 +52,19 @@ def test_run_author_returns_shaped_draft(tmp_path: Path) -> None:
 
 
 def _seed_fragment(vault: Path, frag_id: str, title: str) -> None:
-    """Write a minimal fragment file so the real specialists have a corpus."""
+    """Write a minimal fragment file so the real specialists have a corpus.
+
+    The tier is stated explicitly because since #876 an untiered fragment
+    ranks as PERSONAL and is excluded from the Writing Desk's evidence at
+    the default OPEN ceiling — leaving the key off would silently empty
+    this corpus and make the assertions below pass vacuously. These tests
+    exercise desk mechanics, not tier policy, so the corpus is ``open``.
+    """
     folder = vault / "01-Fragments" / "Notes"
     folder.mkdir(parents=True, exist_ok=True)
     (folder / f"{frag_id}.md").write_text(
         f'---\ntype: fragment\nid: {frag_id}\ntitle: "{title}"\n'
+        f"privacy_tier: open\n"
         f"source:\n  platform: journal\n  author: self\n---\nbody\n",
         encoding="utf-8",
     )

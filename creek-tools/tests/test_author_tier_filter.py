@@ -49,7 +49,13 @@ def test_graph_specialist_excludes_above_override(tmp_path: Path) -> None:
     The open fragment links to the intimate one, so the walk *would* reach it —
     the tier filter is what keeps it out of the evidence.
     """
-    _seed(tmp_path, "frag-open", "Open note about q", body="[[frag-int]] body")
+    _seed(
+        tmp_path,
+        "frag-open",
+        "Open note about q",
+        tier="open",
+        body="[[frag-int]] body",
+    )
     _seed(tmp_path, "frag-int", "Intimate note about q", tier="intimate")
 
     default = GraphSpecialist().gather("q", tmp_path)
@@ -68,7 +74,13 @@ def test_personal_excluded_under_open_admitted_under_personal(
     tmp_path: Path,
 ) -> None:
     """A PERSONAL fragment is gated by the override rank, not summarised."""
-    _seed(tmp_path, "frag-open", "Open about q", body="[[frag-pers]] body")
+    _seed(
+        tmp_path,
+        "frag-open",
+        "Open about q",
+        tier="open",
+        body="[[frag-pers]] body",
+    )
     _seed(tmp_path, "frag-pers", "Personal about q", tier="personal")
 
     under_open = GraphSpecialist().gather("q", tmp_path)
@@ -82,9 +94,50 @@ def test_personal_excluded_under_open_admitted_under_personal(
     assert "frag-pers" in _ids(under_personal)
 
 
+def test_untiered_excluded_under_open_admitted_under_personal(
+    tmp_path: Path,
+) -> None:
+    """A fragment with no ``privacy_tier`` is gated like PERSONAL (#876).
+
+    Deliberate behaviour change. ``_load_corpus`` admits evidence through
+    :func:`creek.classify.privacy_filter.tier_within_override`, which used
+    to rank ``unclassified`` alongside ``open`` — so before ``creek
+    classify`` grew a privacy caller, *every* fragment in the vault was
+    untiered and the Writing Desk drew its evidence from the whole private
+    corpus at the default ceiling.
+
+    Three fragments at three distinct tiers, asserted as a set of admitted
+    ids, so the test cannot pass by admitting or dropping everything.
+    """
+    _seed(
+        tmp_path,
+        "frag-open",
+        "Open about q",
+        tier="open",
+        body="[[frag-untiered]] [[frag-int]] body",
+    )
+    _seed(tmp_path, "frag-untiered", "Untiered about q")  # no privacy_tier key
+    _seed(tmp_path, "frag-int", "Intimate about q", tier="intimate")
+
+    under_open = _ids(GraphSpecialist().gather("q", tmp_path))
+    assert "frag-open" in under_open
+    assert "frag-untiered" not in under_open
+    assert "frag-int" not in under_open
+
+    under_personal = _ids(
+        GraphSpecialist().gather(
+            "q",
+            tmp_path,
+            override=PrivacyTierOverride.PERSONAL,
+        )
+    )
+    assert "frag-untiered" in under_personal
+    assert "frag-int" not in under_personal  # personal ceiling still drops intimate
+
+
 def test_gather_evidence_threads_override(tmp_path: Path) -> None:
     """The conductor passes the override down to the specialists."""
-    _seed(tmp_path, "frag-open", "Open about q")
+    _seed(tmp_path, "frag-open", "Open about q", tier="open")
     _seed(tmp_path, "frag-int", "Intimate about q", tier="intimate")
 
     conductor = build_default_conductor(max_rounds=1)
@@ -126,11 +179,11 @@ def test_conductor_routes_voice_by_content_tier(tmp_path: Path) -> None:
 
 
 def test_content_tier_open_when_no_sensitive_evidence(tmp_path: Path) -> None:
-    """With only OPEN/unclassified evidence, the factory gets a non-INTIMATE tier."""
+    """With only OPEN evidence, the factory gets a non-INTIMATE tier."""
     from creek.author.conductor import build_default_conductor
     from creek.models import PrivacyTier
 
-    _seed(tmp_path, "frag-open", "Open note about q")
+    _seed(tmp_path, "frag-open", "Open note about q", tier="open")
 
     seen: dict[str, object] = {}
 

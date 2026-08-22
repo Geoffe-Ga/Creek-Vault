@@ -291,6 +291,17 @@ def parse_prompt_ontology_response(
     # Parsing lives on :func:`creek.classify.weighted.parse_weighted_yaml`
     # so the prompt-level and fragment-level paths share one source of
     # truth; this wrapper only adds the ``prompt`` echo onto the result.
+    #
+    # One dimension is intentionally not copied across. #1309 gave the
+    # fragment-level profile a ``confidences`` axis — the *author's*
+    # stance toward their own claim — and :class:`PromptOntology`
+    # deliberately does not gain it: an operator-supplied essay seed has
+    # no author whose stance could be detected, so the axis is undefined
+    # rather than merely unmeasured, and inventing a value for it would
+    # feed a privacy control (the INTIMATE escalation) a fabricated
+    # reading. The shared parser tolerating the extra key costs nothing
+    # here precisely because this field copy is hand-written: an axis
+    # this path has no meaning for is simply left behind.
     parsed = parse_weighted_yaml(response)
     return PromptOntology(
         prompt=prompt,

@@ -16,7 +16,7 @@ Level 2 leaf worker who owns **Gate 1 GREEN** and the **Refactor** step: write t
 smallest, cleanest production code that makes the test-specialist's failing tests
 pass while meeting every threshold, then refactor for clarity without breaking
 green. You are the primary lever on "best code possible," so the work runs on
-Opus. You also serve as the **correctness/maintainability reviewer**.
+Opus 5. You also serve as the **correctness/maintainability reviewer**.
 
 ## Scope
 

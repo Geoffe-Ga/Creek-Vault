@@ -16,11 +16,12 @@ The `generate` family of commands turns a classified, linked vault into the arte
 | `wavelength`     | `05-Wavelength/<period>-<date>.md`         | `creek.generate.wavelength` |
 | `synchronicity`  | `05-Wavelength/Synchronicities/`           | `creek.generate.synchronicity` |
 | `decision`       | `08-Decisions/<fragment>.md`               | `creek.generate.decisions` — see [`decisions.md`](decisions.md) |
-| `paradox`        | `04-Praxis/Paradoxes/`                     | `creek.generate.paradox` |
-| `compost`        | `04-Praxis/Compost/`                       | `creek.generate.compost` |
+| `paradox`        | `10-Liminal/Paradoxes/`                    | `creek.generate.paradox` |
+| `compost`        | `10-Liminal/Compost/`                      | `creek.generate.compost` |
 | `unnamed`        | `10-Liminal/Unnamed-Digest-<period>.md`    | `creek.generate.unnamed` |
 | `tags`           | `00-Creek-Meta/Tags/`                      | `creek.generate.tags` |
 | `lexicon`        | `09-Reference/Lexicon.md`                  | `creek.generate.lexicon` |
+| `voice`          | `07-Voice/<register>-profile.md` (profiles) + `07-Voice/Register-Samples/<register>/` (samples) | `creek.generate.voice` — see below |
 
 Periods are `--period weekly` or `--period monthly`. Wavelength reports contain phase-distribution histograms, dosage trends per frequency, and detected phase transitions.
 
@@ -37,13 +38,44 @@ creek report --type synchronicity --vault ~/Obsidian/Creek-Vault
 
 The `synchronicity`, `paradox`, `compost`, `unnamed`, and `tags` report types collectively make up the **emergence infrastructure** described in Ontology §10. The exact criteria that decide whether content is surfaced (similarity thresholds, time-gap floors, project-name filters) live in [`emergence.md`](emergence.md).
 
+### Voice register samples (#879)
+
+`creek report --type voice` writes **two** artefacts (`creek.generate.voice`): the rendered profiles at `07-Voice/<register>-profile.md` (as before), and — new in #879 — ranked exemplar copies at `07-Voice/Register-Samples/<register>/<fragment-id>.md`, plus one `_Summary.md` per register. Before #879, `VoiceExemplarCollector.save_exemplars` had no production caller, so this folder was never populated.
+
+```bash
+creek report --type voice --vault ~/Obsidian/Creek-Vault
+```
+
+```
+Voice profiles generated (1): analytical-profile
+Register samples written (1): analytical
+```
+
+- **Samples are byte-for-byte copies** of the source fragment file (`shutil.copy2`), not excerpts — up to `DEFAULT_MAX_PER_REGISTER` (20) per register. (If the source file disappears mid-run — a concurrent `creek purge`, say — the collector falls back to serialising the fragment from memory, which yields a valid note with an empty body.)
+- **The folder is generated; treat it as read-only.** A `<fragment-id>.md` under `Register-Samples/` is overwritten (or deleted) on the next run. Edit the source fragment in `01-Fragments/`, never the copy.
+- **Stale copies are pruned automatically.** A fragment that drops out of the top 20, is re-tiered above the run's ceiling, or is deleted from the vault has its copy removed on the next run; the CLI reports `Stale register samples pruned (N)`. Each register's `_Summary.md` carries an `exemplar_digests` manifest of exactly what this tool wrote, and only a file matching that manifest is ever deleted — an operator's own notes in the folder, including a fragment they hand-curated into it, are left untouched.
+- **A narrower `--include-tier` prunes what a wider run wrote.** This is the only way to retract above-ceiling copies after a broad run, but it also means the folder always reflects the *last* ceiling a run used, not the union of every ceiling ever run. Each `_Summary.md` records `tier_ceiling` so you can tell which corpus you're looking at. `--include-tier` on this report type follows the [same convention as every other generation flow](#local-first-ergonomics): omitting it is unfiltered, and supplying it narrows.
+- **A retraction does not survive the next `creek fill`.** `creek fill` has no `--include-tier` of its own and runs `report/voice` unfiltered, so a narrowed run's retraction lasts only until the next fill, which re-copies every above-ceiling body it removed. `creek report --type voice --include-tier <tier>` is a way to *inspect* a narrower corpus, **not** a durable redaction. To remove content permanently, act on the source fragment — `creek purge` or a tier change in `01-Fragments/` — so the next unfiltered run has nothing to copy.
+- **`_Summary.md` is machine state as well as a note.** Its `exemplar_digests` frontmatter key is the prune's authorship record, so it renders as up to 20 64-character hex strings in Obsidian's properties panel. That noise is a deliberate trade: keeping the record *in the note* is what lets it survive `creek purge`'s rewrite of every `.md` in the vault, which is what keeps a purged fragment's copy deletable. Don't hand-edit it — a corrupted manifest disarms the prune (fail-safe: it declines to delete rather than guessing).
+- **"Same set" idempotence, not byte-identical files.** A re-run over an unchanged corpus produces the same *set* of files, but `_Summary.md` restamps `generated_at` every time, so it is rewritten even when nothing changed. Exemplar copies themselves are only rewritten from their source.
+- **Intimate-tier fragments are never copied**, at any ceiling. The voice proxy's `allow_intimate` consent gate is separate from the tier ceiling and is not exposed on the CLI.
+- **Existing vaults need no migration.** Collection reads only frontmatter `creek classify` already writes, so the next `creek report --type voice` or `creek fill` run populates the folder from what's already there.
+- **`creek fill` now runs this report** (`report/voice`, between `report/mode-profiles` and `report/wavelength` in its step sequence), so `creek fill` also writes voice profiles and samples — and, via the prune above, `report/voice` is the step in `creek fill` that deletes vault files.
+
+**Known gap** (issue #1211): `creek purge` does not synchronously remove a purged fragment's content from `07-Voice/` derived artefacts. This predates #879 — on an unmodified vault, `creek purge` already leaves a purged body sitting in `07-Voice/<register>-profile.md`. This report's own prune does clear an orphaned register-sample copy the next time it runs, which mitigates the gap for that one artefact; it does not fix it, and it does nothing for the profile.
+
+**MCP divergence** (issue #1204): the `report_type="voice"` MCP tool still writes profiles only, not register samples. That is a recorded decision, not an oversight.
+
 ## State (audit report)
 
 `creek state` writes a single weekly snapshot of the entire vault to `00-Creek-Meta/State/<iso-year>-W<week>.md` (with `latest.md` always pointing at the most recent run). It is a **view**, not a pipeline — it re-reads existing fragments, threads, eddies, praxis, synchronicities, and the latest `run-summary.jsonl` line, and never invokes classify, link, or compile.
 
 ```bash
 creek state --vault ~/Obsidian/Creek-Vault
+creek state --vault ~/Obsidian/Creek-Vault --include-tier open
 ```
+
+`--include-tier` runs the same way round as it does on `creek report` (#968): **omitting it leaves the render unfiltered** — the CLI operator is the vault owner — and supplying it *narrows* what the artefact may contain. Only an explicitly supplied flag is recorded in `00-Creek-Meta/audit/privacy.jsonl`; a bare `creek state` writes no privacy-override entry, because `override_elevates` answers `True` for `all` and auditing the resolved ceiling would log the one case where the operator asked for nothing.
 
 The report is organised in eleven sections, in this order (FEAT-006 + FEAT-007 + FEAT-008):
 
@@ -61,7 +93,59 @@ The report is organised in eleven sections, in this order (FEAT-006 + FEAT-007 +
 
 Empty sections render an explicit `_No surfacing this week._` placeholder rather than disappearing — operators can tell at a glance whether a section had nothing to surface or whether the generator skipped it. Re-running in the same ISO week overwrites the existing file (idempotent).
 
-`latest.md` is created as a symlink where the filesystem supports it (POSIX hosts) and falls back to a copy on Windows or networked filesystems that reject `symlink(2)`. The report header renders the vault's leaf directory name only — never the absolute path — so committing or sharing the artefact does not leak an operator's home directory.
+`latest.md` is created as a symlink where the filesystem supports it (POSIX hosts) and falls back to a copy on Windows or networked filesystems that reject `symlink(2)`. No path anywhere in the artefact is absolute — the header renders the vault's leaf directory name only, section 9's drift rows are rendered vault-relative, and section 11's appended lint report is too — so committing or sharing the artefact does not leak an operator's home directory. Sections 9 and 11 are the reason that sentence used to be false, and both trace to the same scanner: `BrokenLinkScanner` and `OrphanScanner` return `str(path)`, which is absolute on a normal call. Section 9 rendered those paths verbatim, and `creek lint`'s `broken-links` check did too — which matters because section 11 appends the lint report *verbatim*, at `intimate` and above, and that includes a bare `creek state` (default ceiling `all`). Either route put an aged, unlinked `intimate` fragment's slugified title into the artefact inside a `/Users/...` path. Both are now rendered `relative_to(vault_path)`, as every other lint check already was.
+
+### What each section does at a tier ceiling (#969)
+
+Every section except **Pre-LLM yield** narrows with the ceiling, and the artefact then records the highest tier it actually admitted (see below). Read this table before choosing a ceiling — several of these exclusions are surprising the first time:
+
+| # | Section | Behaviour below the ceiling |
+|---|---------|-----------------------------|
+| 1 | Wavelength snapshot | Surveys the admitted corpus only. `Fragments observed:` is a per-tier count, and a count discloses the existence of what the rest of the report omitted. |
+| 2 | Vault summary | Same: counts and the frequency histogram are over admitted fragments, and the eddy/thread counts count *admitted* eddies and threads, so §2 cannot contradict §5/§6. |
+| 3 | Pre-LLM yield | **Ungated, deliberately.** The last line of `run-summary.jsonl` describes one pipeline *run* — a run id, a timestamp and four integers — and names no fragment, so there is nothing in it to filter by. |
+| 4 | Liminal Watch | A note is admitted only if its *raw* front matter is within the ceiling. `10-Liminal/Paradoxes/` has two producers and they gate differently. **Detector-written** notes (`creek report --type paradox`, via `creek.generate.paradox.create_paradox_note`) are `type: paradox` with no `privacy_tier` field in their model at all, so **they fail closed to `intimate` and disappear below `--include-tier intimate`** — not because they were classified but because nobody vouched for them. **Save-written** notes (`creek save --target paradox`) carry an explicit `privacy_tier` and are gated by it, so an `open` paradox save is admitted at `--include-tier open` and an `intimate` one is not (#1491). Any hand-written note missing the key behaves like the detector case. |
+| 5 | Active eddies | `Eddy` carries no `privacy_tier`, so its tier is *derived*: the maximum over the tiers of every fragment whose `eddies` wikilinks name it. An eddy with one `open` and one `intimate` member is `intimate`. **An eddy no fragment names has no tier evidence at all and is admitted only at `intimate` or broader** — including the "no fragments loaded, fall back to the stored `fragment_count`" path. |
+| 6 | Active threads | The same rule over `threads` wikilinks. |
+| 7 | Surprising connections | A row survives only when *both* endpoint ids resolve to admitted fragments. |
+| 8 | Hyperedges | A praxis is admitted only when **every** id in its `derived_from` resolves to an admitted fragment; an empty `derived_from` names no evidence and is excluded. The spanned eddy set is then **intersected with the admitted eddies of §5** — being named by an admitted fragment is not enough, since an `open` fragment's front matter can name an eddy that derived `intimate` from a sibling member. The intersection runs before the "spans 2+ eddies" cut, so an excluded eddy can neither render in `spans:` nor pad the count that decides whether the row appears at all. |
+| 9 | Drift warnings | Broken-link sources and orphan paths are kept only when they are admitted fragment files. A broken link's *target* has no note to tier, but the target string is text authored inside the source fragment, so it carries the source's tier — which is gated. Every rendered row is attributable to an admitted fragment. |
+| 10 | Suggested questions | **The whole section is dropped below `--include-tier personal`**: the shared tier filter *summarises* a personal fragment as `[Personal-tier summary: <title>]` rather than dropping it, so at an `open` ceiling a personal title could otherwise ride out inside a prompt. At `personal` and above the miner runs under the ceiling *and* is handed a corpus this generator has already narrowed — the mining loaders gate `01-Fragments` and `10-Liminal` but take no override at all for `02-Threads` / `03-Eddies`, so a thread whose every member is above the ceiling would otherwise title a prompt. Threads and eddies are replaced with §5/§6's admitted lists; fragments are intersected by id, because the miner reads the tier off the *model* (missing key → `unclassified`) where §5's cutoff reads the raw front matter (missing key → `intimate`). |
+| 11 | Lint summary | Rendered **only at `--include-tier intimate` or broader**. It is a verbatim copy of a `00-Creek-Meta/Processing-Log/lint-*.md` artefact that embeds titles and tag names, and `creek lint`'s tag survey deliberately runs at `all` so it cannot report "no orphan tags" about a vault that has them. There is no row-level tier to filter on, so the section is admitted whole or not at all. |
+
+### The artefact stamps its own tier
+
+`write()` prefixes the report with three scalar front-matter keys:
+
+```yaml
+---
+type: state-report
+privacy_tier: <highest tier the render actually admitted>
+tier_ceiling: <the --include-tier the render ran under>
+---
+```
+
+`privacy_tier` is what `creek.state.read` compares an MCP caller's ceiling against — not `tier_ceiling`, which is recorded for the audit trail only. Comparing the render ceiling would refuse a broad render over a narrow corpus for no reason: a report produced at `--include-tier all` over a vault holding nothing above `open` contains nothing above `open` and stays readable at `open`.
+
+A report that admitted nothing stamps `open`, not `intimate`. The empty case here means "the document contains no tiered content", which is knowledge; failing closed would make a freshly-`creek init`-ed vault's first report unreadable at every ceiling below `intimate`.
+
+"Highest tier the render actually admitted" is the maximum over one entry per admitted fragment, eddy, thread, praxis and Liminal-Watch note, plus two contributions that are only knowable once the sections have rendered: the `10-Liminal` notes §10 mined from subfolders the Liminal Watch does not walk (`Compost`, chiefly), and an escalation to `intimate` whenever §11 rendered a lint report. **Every section that can emit content has to be accounted for in exactly one of those three places.** A section that emits a title without contributing a tier makes the stamp under-report, and `creek.state.read` then serves the document below the tier it actually carries — the read gate fails open. That was the shape of both bugs the #969 review found: §8 rendered an eddy that was not in §5's admitted list, and §10 titled a prompt with a thread that was not in §6's.
+
+Three scalars is a constraint, not a coincidence: CrawDad keeps a report's `raw_markdown` *including* front matter and feeds it into prompts, and its bullet regex is `^\s*-\s+`, so a block-style YAML list in the stamp would be misread as a report bullet.
+
+### Upgrading a `latest.md` written before the stamp
+
+A pre-#969 `latest.md` carries no stamp, and an unreadable or absent `privacy_tier` fails closed to `intimate`. That is *accurate* rather than merely cautious: every such report was rendered completely unfiltered, i.e. at the equivalent of `--include-tier all`.
+
+The consequence is that the next `creek.state.read` at the MCP default `ceiling=open` (CrawDad, `/creek`, `/creek phase`, `/creek wavelength`) answers `status: "refused"`. Recovery is one command and loses nothing:
+
+```bash
+creek state --vault ~/Obsidian/Creek-Vault --include-tier open
+```
+
+or an MCP `creek.state.render`, which re-renders and re-stamps at the caller's ceiling. The ISO-week archive files are untouched, and `ceiling=all` admits every stamp — including the unstamped legacy one — so no report is ever permanently unreachable.
+
+**`latest.md` is a single slot shared across ceilings**, kept single deliberately: per-ceiling filenames would multiply artefacts in the operator's vault and break `latest.md` as the documented session-start context. So an `open` render replaces a richer `all` render's report for *everybody*, including subsequent CLI reads. A caller that wants the broader report re-renders at the broader ceiling. Note that the MCP `creek.state.render` default ceiling is `open`, so a bare MCP render narrows `latest.md` for the whole vault.
 
 ### Size budget (FEAT-007)
 
@@ -205,9 +289,11 @@ The goal of generation is text that sounds like **you**, measured from your own 
 
 Three refinements make the proxy reflect the *right* you:
 
-- **Audience-weighted authority.** Voice exemplars are ranked by a graduated multiplier (`voice_audience_weighting`): public-facing (`OPEN`) work outranks `PERSONAL` writing, and the `representativeness` axis (self → endorsed → aspirational → reference) further tunes influence, so the patterns of your published work dominate how drafts sound. `INTIMATE` stays excluded.
+- **Audience-weighted authority.** Voice exemplars are ranked by a graduated multiplier (`voice_audience_weighting`): public-facing (`OPEN`) work outranks `PERSONAL` writing, and the `representativeness` axis (self → endorsed → aspirational → reference) further tunes influence, so the patterns of your published work dominate how drafts sound. `INTIMATE` stays excluded — not by the weighting itself (which only ranks) but by the privacy-tier ceiling and consent gates the exemplar collector applies before ranking ever runs. See [configuration: `voice_audience_weighting`](./configuration.md#voice_audience_weighting--graduated-voice-authority) for the full mechanism, including the two additional maps (`platform_authority`, `audience_authority`) that scope the separate voice *fingerprint* but do not affect exemplar ranking. The lexicon (`creek report --type lexicon`) is the one exemplar-path consumer this weighting does **not** reach: `collect_all_exemplars` returns the whole eligible corpus with no ranking or capping, so there is nothing for the multiplier to reorder.
 - **Citation density.** The proxy measures how often you reference and quote sources (quotation spans, attribution phrases, `[1]` / author-year markers, links) — audience-weighted so the heavy-citation habit of public work shapes drafts. When it is prevalent, the generated voice skill says so explicitly.
 - **A faithful, loud de-slop pass.** The rewrite loop drives toward `ai_style.voice_distance_target` (distinct from, and never above, the `voice_distance_upper` ceiling), so a mannered draft below the ceiling is still stripped — not merely measured. Every outcome stamps `voice_guard_status`: `rewritten`, `measured_only:{below_target,above_target,no_llm,no_rewriter}`, or `skipped:{disabled,no_fingerprint,thin_fingerprint}`. A skip is loud (stderr + frontmatter), never silent.
+
+**The gate.** `creek voice-check <file> [--vault <path>] [--max-distance <float>] [--json]` scores one markdown file against the vault's voice fingerprint and **exits non-zero when it diverges** — `0` in voice, `1` over the ceiling, `2` for a missing file. That exit code is the point, and it is what separates this command from the read-only audit below: `voice-check` is the half of the voice surface a pre-commit hook or a CI step can call. With `--max-distance` omitted the ceiling is the vault's configured `voice_distance_upper`, i.e. the same ceiling `creek draft` enforces, so a hand-edited draft is held to the generator's own standard. It fails **open**, deliberately: an un-profiled vault (no persisted `00-Creek-Meta/voice-fingerprint.json` and no eligible self-authored fragments) prints a notice pointing at `creek report --type fingerprint` and exits `0`, so adopting the hook does not block a vault that has not been profiled yet. The scan is fully offline — no LLM, no consent.
 
 **The diagnostic.** `creek voice-authenticity --vault <path> [--draft <file>] [--json]` is a read-only audit: it reports the audience mix and whether weighting is active, the AI-corpus-leak fraction (claude/chatgpt content still feeding the proxy), and — given `--draft` — the recorded de-slop status. Use it after a `--refresh-ai-chat` migration to confirm the leak dropped.
 
@@ -220,7 +306,7 @@ All generation flows (`mine`, `draft`, `report`, `skills`) respect the privacy t
 - `intimate` fragments are **excluded** from prompts entirely.
 - `personal` fragments contribute a title-only summary, not the full body.
 - `open` (or `public`) fragments contribute full content.
-- `unclassified` fragments are treated as `open` (full body) on the assumption that anything still missing a tier was never deemed sensitive. **Run `creek classify` before generation flows** so each fragment carries an explicit tier; otherwise an unreviewed body could enter an LLM prompt that the privacy filter would have otherwise summarised or excluded. Fragments carrying a tier value the classifier doesn't recognise (e.g. hand-edited frontmatter, a forward-incompatible schema migration) fail **closed** to `intimate` and emit a warning that names the fragment ID.
+- `unclassified` fragments are treated as `personal` — a title-only summary, same as `personal` (changed in #876; they used to pass through with their full body). Untiered content is content nobody has vouched for, so an unreviewed body can no longer reach an LLM prompt by default. Since #961 the MCP read surface agrees: an untiered fragment needs a `personal` ceiling there too. **Run `creek classify` before generation flows** so each fragment carries an explicit tier — `creek fill` prints a hint counting the untiered fragments it finds. Fragments carrying a tier value the classifier doesn't recognise (e.g. hand-edited frontmatter, a forward-incompatible schema migration) fail **closed** to `intimate` and emit a warning that names the fragment ID.
 
 You can override with `--include-tier {open,personal,intimate,all}` on any of those commands. The default (`open` or omitting the flag) keeps the policy above. `personal` lets personal bodies through unredacted; `intimate` and `all` let intimate bodies through as well. Any value that elevates inclusion above the default appends an entry to `<vault>/00-Creek-Meta/audit/privacy.jsonl` capturing the operator, command, fragment IDs, and timestamp.
 

@@ -33,7 +33,10 @@ install -r requirements-dev.txt` still works as an unpinned fallback.
 ./scripts/check-all.sh          # Run ALL quality checks (do this before every commit)
 ./scripts/fix-all.sh            # Auto-fix linting + formatting
 ./scripts/test.sh               # Run unit tests
-./scripts/test.sh --all         # Run all test types (unit, integration, e2e)
+./scripts/test.sh --all         # Run all lanes (unit, integration, e2e, live)
+./scripts/test.sh --integration # Hermetic cross-component lane (blocking in CI)
+./scripts/test.sh --e2e         # Hermetic end-to-end lane (blocking in CI)
+./scripts/test.sh --live        # Live API/service smokes (needs keys; not in CI)
 ./scripts/test.sh --coverage    # Unit tests with coverage report
 ./scripts/coverage.sh           # Coverage report (--html for HTML output)
 ./scripts/lint.sh               # Ruff linting (--fix to auto-fix)
@@ -42,8 +45,10 @@ install -r requirements-dev.txt` still works as an unpinned fallback.
 ./scripts/security.sh           # Bandit + pip-audit scans
 ./scripts/complexity.sh         # Radon/Xenon complexity analysis
 ./scripts/coverage-per-file.sh  # Per-file coverage gate (TEST-002)
+./scripts/lint-vulture.sh       # Dead-code gate (vulture, per-type confidence floors); in check-all.sh + CI
 ./scripts/lint-extended.sh      # Optional: pylint, refurb, tryceratops, vulture, interrogate, shellcheck
-                                # (not in check-all.sh; CI runs the subset that matters for the gate)
+                                # (not in check-all.sh; CI runs the subset that matters for the gate —
+                                # vulture itself IS gated, via lint-vulture.sh above, not this script)
 ./scripts/pr-status.sh list        # List recent CI workflow runs
 ./scripts/pr-status.sh view ID     # View workflow run results
 ./scripts/pr-status.sh watch ID    # Watch workflow run progress
@@ -75,7 +80,9 @@ pytest tests/test_main.py::test_main_runs -v
 ### creek-tools
 - **Python >=3.11** (CI tests 3.11, 3.12, 3.13)
 - Package source: `creek/` (flat layout, not src/)
-- Tests: `tests/` (pytest with markers: `integration`, `e2e`)
+- Tests: `tests/` (pytest lane markers: `integration`, `e2e` — both hermetic
+  and blocking in CI; `live` — needs real keys/services, never run in CI;
+  `slow` — benchmarks. See the `markers` table in `pyproject.toml`.)
 - Config: `pyproject.toml` contains all tool configs (pytest, coverage, mypy, ruff, bandit)
 - CI: `/.github/workflows/ci.yml` (at repo root; jobs use `working-directory: creek-tools`)
 - Pre-commit: `creek-tools/.pre-commit-config.yaml` (install with `pre-commit install -c creek-tools/.pre-commit-config.yaml`)
@@ -90,3 +97,19 @@ Follow the 4-gate process:
 2. **Local**: `./scripts/check-all.sh` passes (exit 0)
 3. **CI**: All GitHub Actions jobs green
 4. **Review**: LGTM before merge
+
+## Knowledge Graph (graphify) — query first
+
+This repo publishes its code graph (~23k nodes) as assets on the rolling
+`knowledge-graph` GitHub Release (never committed; part of the adepthood
+federation). For ANY question about this codebase — structure, relationships,
+impact — query the graph BEFORE grep/read sweeps:
+
+- Restore once per session:
+  `gh release download knowledge-graph --pattern graph.json --dir graphify-out`
+  (or rebuild keyless: `pip install graphifyy && graphify extract . --code-only`).
+- `graphify query "<question>"` · `graphify path "A" "B"` ·
+  `graphify explain "X"` · `graphify affected "X"` (before changing X).
+- Quote each cited node's `source_location`; verify before trusting.
+- Fail-soft: if the CLI or graph is unavailable, proceed with normal file
+  tools — never stall.

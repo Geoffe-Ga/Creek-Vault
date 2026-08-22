@@ -1,27 +1,25 @@
-"""Tests for creek.link module — linking pipeline and component linkers.
+"""Tests for creek.link module — component linkers.
 
 Tests cover EmbeddingLinker, TemporalLinker (with TemporalLink scoring),
-ThreadDetector, EddyDetector, LinkingResult, and LinkingPipeline orchestration.
+ThreadDetector and EddyDetector. Orchestration is covered against the one
+surviving orchestrator, ``creek.link.link_engine.run_link``, in
+``tests/test_link_engine.py`` — the count-only ``LinkingPipeline`` that
+used to be exercised here was deleted in #1303.
 """
 
 import logging
 from datetime import datetime, timedelta
-from pathlib import Path
 
-from creek.config import EmbeddingsConfig, LinkingConfig
+from creek.config import EmbeddingsConfig
 from creek.link import (
     EddyDetector,
     EmbeddingLinker,
-    LinkingPipeline,
-    LinkingResult,
     TemporalLink,
     TemporalLinker,
     ThreadDetector,
 )
 from creek.link.eddies import EddyDetector as EddyDetectorDirect
 from creek.link.embeddings import EmbeddingLinker as EmbeddingLinkerDirect
-from creek.link.linker import LinkingPipeline as LinkingPipelineDirect
-from creek.link.linker import LinkingResult as LinkingResultDirect
 from creek.link.temporal import TemporalLink as TemporalLinkDirect
 from creek.link.temporal import TemporalLinker as TemporalLinkerDirect
 from creek.link.threads import ThreadDetector as ThreadDetectorDirect
@@ -103,13 +101,20 @@ class TestPackageExports:
         """EddyDetector should be importable from creek.link."""
         assert EddyDetector is EddyDetectorDirect
 
-    def test_linking_result_reexported(self) -> None:
-        """LinkingResult should be importable from creek.link."""
-        assert LinkingResult is LinkingResultDirect
+    def test_deleted_orchestrator_is_not_reexported(self) -> None:
+        """``creek.link`` must not resurrect the count-only orchestrator.
 
-    def test_linking_pipeline_reexported(self) -> None:
-        """LinkingPipeline should be importable from creek.link."""
-        assert LinkingPipeline is LinkingPipelineDirect
+        ``LinkingPipeline``/``LinkingResult`` computed the whole link graph
+        and returned counts without writing a byte, while ``creek process``
+        printed those counts as ``Links found: N`` (#1303). Re-exporting
+        either name would mean a second linking code path had come back.
+        """
+        import creek.link as link_pkg
+
+        assert not hasattr(link_pkg, "LinkingPipeline")
+        assert not hasattr(link_pkg, "LinkingResult")
+        assert "LinkingPipeline" not in link_pkg.__all__
+        assert "LinkingResult" not in link_pkg.__all__
 
 
 # ---- EmbeddingLinker Tests ----
@@ -468,6 +473,90 @@ class TestTemporalLinker:
         # +0.2 (2 shared textures) + 0.2 (different source) = 0.4
         assert result[0].overlap_score == 0.4
         assert "emotional_texture" in result[0].shared_dimensions
+
+    def test_score_emotional_texture_bonus_scales_per_shared_tag(self) -> None:
+        """The texture term is exactly +0.1 per shared tag (issue #878).
+
+        Pinned at two distinct overlap sizes against the same 0.2
+        cross-source floor, so the *slope* is asserted and not just one
+        point on it: one shared tag scores 0.3, three score 0.5. A
+        flat-rate implementation ("+0.1 if any overlap") passes the
+        pre-existing two-tag test at 0.4 by coincidence and fails here.
+
+        This term was structurally dead before #878 —
+        ``emotional_texture`` had no producer, so 100% of the operator's
+        35,330-fragment vault carried ``[]`` and this branch never once
+        executed on real data.
+        """
+        now = datetime.now()
+        linker = TemporalLinker()
+
+        def _score(texture_a: list[str], texture_b: list[str]) -> float:
+            """Link one cross-source pair and return its overlap score."""
+            links = linker.find_temporal_links(
+                [
+                    _make_fragment(
+                        "A",
+                        platform=SourcePlatform.CLAUDE,
+                        created=now,
+                        emotional_texture=texture_a,
+                    ),
+                    _make_fragment(
+                        "B",
+                        platform=SourcePlatform.DISCORD,
+                        created=now,
+                        emotional_texture=texture_b,
+                    ),
+                ],
+                window_hours=168,
+            )
+            assert len(links) == 1
+            return links[0].overlap_score
+
+        # +0.1 (one shared texture) + 0.2 (different source)
+        assert _score(["grief"], ["grief", "resolve"]) == 0.3
+        # +0.3 (three shared textures) + 0.2 (different source)
+        three = _score(
+            ["grief", "resolve", "wonder"],
+            ["wonder", "grief", "resolve"],
+        )
+        assert three == 0.5
+
+    def test_score_without_shared_emotional_texture_has_no_delta(self) -> None:
+        """Disjoint textures add nothing and name no shared dimension.
+
+        The negative control for the test above: without it, an
+        implementation that added +0.1 unconditionally (or that compared
+        the lists for truthiness rather than intersection) would still
+        satisfy every positive assertion.
+
+        ``min_score=0`` because the point is the *score*, not the
+        filtering: at the default 0.3 threshold a cross-source-only pair
+        (0.2) is dropped entirely and there would be nothing to assert on.
+        """
+        now = datetime.now()
+        linker = TemporalLinker(min_score=0.0)
+        fragments = [
+            _make_fragment(
+                "A",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                emotional_texture=["grief"],
+            ),
+            _make_fragment(
+                "B",
+                platform=SourcePlatform.DISCORD,
+                created=now,
+                emotional_texture=["resolve"],
+            ),
+        ]
+
+        result = linker.find_temporal_links(fragments, window_hours=168)
+
+        assert len(result) == 1
+        # Cross-source only: +0.2, with no texture contribution at all.
+        assert result[0].overlap_score == 0.2
+        assert "emotional_texture" not in result[0].shared_dimensions
 
     def test_score_different_source_bonus(self) -> None:
         """Different source platforms should add +0.2 to overlap_score."""
@@ -1844,201 +1933,152 @@ class TestEddyAssignment:
             assert new.eddies != []
 
 
-# ---- LinkingResult Tests ----
+# ---- Issue #880: bounded, honestly-named clusters ----
 
 
-class TestLinkingResult:
-    """Tests for the LinkingResult Pydantic model."""
+class TestIssue880Detectors:
+    """Regression tests for message-stream cluster degeneration (#880)."""
 
-    def test_creation_with_all_fields(self) -> None:
-        """LinkingResult should accept all four count fields."""
-        result = LinkingResult(
-            resonance_count=5,
-            temporal_count=3,
-            thread_count=2,
-            eddy_count=1,
-        )
-        assert result.resonance_count == 5
-        assert result.temporal_count == 3
-        assert result.thread_count == 2
-        assert result.eddy_count == 1
+    @staticmethod
+    def _embedded_pair_corpus() -> tuple[list[Fragment], dict[str, list[float]]]:
+        """Return three F1 fragments where only two carry an embedding.
 
-    def test_zero_counts(self) -> None:
-        """LinkingResult should work with all zero counts."""
-        result = LinkingResult(
-            resonance_count=0,
-            temporal_count=0,
-            thread_count=0,
-            eddy_count=0,
-        )
-        assert result.resonance_count == 0
-        assert result.temporal_count == 0
-        assert result.thread_count == 0
-        assert result.eddy_count == 0
-
-    def test_model_dump(self) -> None:
-        """LinkingResult model_dump should produce a serializable dict."""
-        result = LinkingResult(
-            resonance_count=1,
-            temporal_count=2,
-            thread_count=3,
-            eddy_count=4,
-        )
-        dump = result.model_dump()
-        assert dump == {
-            "resonance_count": 1,
-            "temporal_count": 2,
-            "thread_count": 3,
-            "eddy_count": 4,
+        Returns:
+            The fragments and a partial embedding map — the shape of a
+            vault whose embedding cache is mid-rebuild.
+        """
+        now = datetime(2026, 4, 1)
+        fragments = [
+            _make_fragment(
+                f"Kiln notes {i}",
+                created=now - timedelta(days=10 - i),
+                primary_freq=Frequency.F1,
+                fid=f"frag-880t-{i}",
+            )
+            for i in range(3)
+        ]
+        return fragments, {
+            "frag-880t-0": [1.0, 0.0, 0.0],
+            "frag-880t-1": [1.0, 0.0, 0.0],
         }
 
+    def test_eddy_id_is_stable_across_runs(self) -> None:
+        """Re-detecting the same cluster yields the same eddy id.
 
-# ---- LinkingPipeline Tests ----
+        A random uuid meant every ``creek link`` run rewrote every eddy page
+        under a fresh filename. Segmentation and splitting produce many more,
+        smaller eddies, which multiplies that churn — so eddy identity now
+        mirrors the content-stable thread identity from #718.
+        """
+        now = datetime(2026, 4, 1)
+        ids = [f"frag-880e-{i}" for i in range(6)]
+        offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(fid, "Kiln firing log", created=now - timedelta(days=off))
+            for fid, off in zip(ids, offsets, strict=True)
+        ]
+        embeddings = _dense_embeddings(ids)
 
+        first = EddyDetector(embeddings=embeddings).detect_eddies(fragments)
+        second = EddyDetector(embeddings=embeddings).detect_eddies(fragments)
 
-class TestLinkingPipeline:
-    """Tests for the LinkingPipeline orchestrator class."""
+        assert len(first) == 1
+        assert [e.id for e in first] == [e.id for e in second]
+        assert first[0].id.startswith("eddy-")
 
-    def test_init_stores_configs(self) -> None:
-        """LinkingPipeline should store both config objects."""
-        emb_config = EmbeddingsConfig()
-        link_config = LinkingConfig()
-        pipeline = LinkingPipeline(config=emb_config, linking_config=link_config)
-        assert pipeline.config is emb_config
-        assert pipeline.linking_config is link_config
+    def test_eddy_and_thread_pages_carry_a_description(self) -> None:
+        """Generated clusters never ship the empty description they used to.
 
-    def test_run_returns_linking_result(self) -> None:
-        """Pipeline.run should return a LinkingResult instance."""
-        pipeline = LinkingPipeline(
-            config=EmbeddingsConfig(),
-            linking_config=LinkingConfig(),
+        Neither detector ever passed ``description``, so 212 of 214
+        linker-written pages in the demo vault shipped ``description: ''``.
+        """
+        now = datetime(2026, 4, 1)
+        ids = [f"frag-880d-{i}" for i in range(6)]
+        offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(fid, "Kiln firing log", created=now - timedelta(days=off))
+            for fid, off in zip(ids, offsets, strict=True)
+        ]
+        eddies = EddyDetector(embeddings=_dense_embeddings(ids)).detect_eddies(
+            fragments,
         )
-        fragments = [_make_fragment("A"), _make_fragment("B")]
-        result = pipeline.run(
-            fragments=fragments,
-            vault_path=Path("/fake/vault"),
-        )
-        assert isinstance(result, LinkingResult)
+        assert eddies
+        assert all(eddy.description.strip() for eddy in eddies)
 
-    def test_run_returns_zero_temporal_thread_eddy(self) -> None:
-        """Pipeline.run should return zero counts for still-stubbed linkers."""
-        pipeline = LinkingPipeline(
-            config=EmbeddingsConfig(),
-            linking_config=LinkingConfig(),
-        )
-        fragments = [_make_fragment("A")]
-        result = pipeline.run(
-            fragments=fragments,
-            vault_path=Path("/fake/vault"),
-        )
-        assert result.temporal_count == 0
-        assert result.thread_count == 0
-        assert result.eddy_count == 0
+        thread_frags, _ = self._embedded_pair_corpus()
+        threads = ThreadDetector(now=now).detect_threads(thread_frags)
+        assert threads
+        assert all(thread.description.strip() for thread in threads)
 
-    def test_run_empty_fragments(self) -> None:
-        """Pipeline.run with empty fragment list should succeed."""
-        pipeline = LinkingPipeline(
-            config=EmbeddingsConfig(),
-            linking_config=LinkingConfig(),
-        )
-        result = pipeline.run(
-            fragments=[],
-            vault_path=Path("/fake/vault"),
-        )
-        assert isinstance(result, LinkingResult)
-        assert result.resonance_count == 0
+    def test_missing_embedding_does_not_union_on_an_embedded_corpus(self) -> None:
+        """The fail-open is closed: an unembedded fragment does not chain.
 
-    def test_run_logs_pipeline_stages(self, caplog) -> None:
-        """Pipeline.run should log info about each stage."""
-        pipeline = LinkingPipeline(
-            config=EmbeddingsConfig(),
-            linking_config=LinkingConfig(),
-        )
-        fragments = [_make_fragment("A")]
-        with caplog.at_level(logging.INFO):
-            pipeline.run(
-                fragments=fragments,
-                vault_path=Path("/fake/vault"),
-            )
-        messages = " ".join(r.message.lower() for r in caplog.records)
-        assert "embedding" in messages
-        assert "temporal" in messages
-        assert "thread" in messages
-        assert "edd" in messages
+        ``_topic_consistent`` returned ``True`` on frequency overlap alone
+        whenever either embedding was absent, so a partially-embedded vault
+        unioned far more aggressively than its similarity gate implied. Two
+        of these three fragments are embedded; the third must not join them.
+        """
+        now = datetime(2026, 4, 1)
+        fragments, embeddings = self._embedded_pair_corpus()
 
-    def test_add_wikilinks_to_threads(self) -> None:
-        """add_wikilinks should add links to fragment threads list."""
-        pipeline = LinkingPipeline(
-            config=EmbeddingsConfig(),
-            linking_config=LinkingConfig(),
-        )
-        fragment = _make_fragment("Test")
-        assert fragment.threads == []
-        updated = pipeline.add_wikilinks(
-            fragment=fragment,
-            links=["[[Thread A]]", "[[Thread B]]"],
-        )
-        assert "[[Thread A]]" in updated.threads
-        assert "[[Thread B]]" in updated.threads
+        threads = ThreadDetector(
+            embeddings=embeddings,
+            now=now,
+        ).detect_threads(fragments, min_fragments=3)
 
-    def test_add_wikilinks_preserves_existing(self) -> None:
-        """add_wikilinks should preserve existing thread entries."""
-        pipeline = LinkingPipeline(
-            config=EmbeddingsConfig(),
-            linking_config=LinkingConfig(),
-        )
-        fragment = Fragment(
-            id="frag-00000000000b",
-            title="Test",
-            source=FragmentSource(platform=SourcePlatform.CLAUDE),
-            threads=["existing-thread"],
-        )
-        updated = pipeline.add_wikilinks(
-            fragment=fragment,
-            links=["[[New Link]]"],
-        )
-        assert "existing-thread" in updated.threads
-        assert "[[New Link]]" in updated.threads
+        assert threads == []
 
-    def test_add_wikilinks_empty_links(self) -> None:
-        """add_wikilinks with empty links list should return fragment unchanged."""
-        pipeline = LinkingPipeline(
-            config=EmbeddingsConfig(),
-            linking_config=LinkingConfig(),
-        )
-        fragment = _make_fragment("Test")
-        updated = pipeline.add_wikilinks(fragment=fragment, links=[])
-        assert updated.threads == fragment.threads
+    def test_missing_embedding_may_union_when_explicitly_opted_in(self) -> None:
+        """The old permissive behaviour survives as a documented opt-in."""
+        now = datetime(2026, 4, 1)
+        fragments, embeddings = self._embedded_pair_corpus()
 
-    def test_add_wikilinks_no_duplicates(self) -> None:
-        """add_wikilinks should not add duplicate links."""
-        pipeline = LinkingPipeline(
-            config=EmbeddingsConfig(),
-            linking_config=LinkingConfig(),
-        )
-        fragment = Fragment(
-            id="frag-00000000000a",
-            title="Test",
-            source=FragmentSource(platform=SourcePlatform.CLAUDE),
-            threads=["[[Existing]]"],
-        )
-        updated = pipeline.add_wikilinks(
-            fragment=fragment,
-            links=["[[Existing]]", "[[New]]"],
-        )
-        assert updated.threads.count("[[Existing]]") == 1
-        assert "[[New]]" in updated.threads
+        threads = ThreadDetector(
+            embeddings=embeddings,
+            now=now,
+            union_without_embeddings=True,
+        ).detect_threads(fragments, min_fragments=3)
 
-    def test_add_wikilinks_returns_new_fragment(self) -> None:
-        """add_wikilinks should return a new Fragment, not mutate the original."""
-        pipeline = LinkingPipeline(
-            config=EmbeddingsConfig(),
-            linking_config=LinkingConfig(),
+        assert len(threads) == 1
+        assert threads[0].fragment_count == 3
+
+    def test_no_embeddings_at_all_still_uses_frequency_only(self) -> None:
+        """A detector with no embeddings keeps its documented fallback.
+
+        Closing the fail-open must not break the frequency-only mode the
+        class docstring has always promised for an unembedded corpus.
+        """
+        now = datetime(2026, 4, 1)
+        fragments, _ = self._embedded_pair_corpus()
+
+        threads = ThreadDetector(now=now).detect_threads(fragments, min_fragments=3)
+
+        assert len(threads) == 1
+        assert threads[0].fragment_count == 3
+
+    def test_colliding_titles_are_disambiguated_within_a_run(self) -> None:
+        """Two clusters that would share a title get distinct wiki-link names.
+
+        ``assign_fragments_to_eddies`` interpolates the title straight into
+        ``[[...]]``, so a collision sends both memberships to whichever page
+        resolves first.
+        """
+        now = datetime(2026, 4, 1)
+        cluster_a = [f"frag-880u-a{i}" for i in range(6)]
+        cluster_b = [f"frag-880u-b{i}" for i in range(6)]
+        embeddings = {fid: [1.0, 0.0, 0.0] for fid in cluster_a}
+        embeddings.update({fid: [0.0, 1.0, 0.0] for fid in cluster_b})
+        offsets = [600, 45, 400, 120, 500, 15]
+        fragments = [
+            _eddy_fragment(fid, "Kiln firing log", created=now - timedelta(days=off))
+            for fid, off in zip(cluster_a, offsets, strict=True)
+        ]
+        fragments.extend(
+            _eddy_fragment(fid, "Kiln firing log", created=now - timedelta(days=off))
+            for fid, off in zip(cluster_b, offsets, strict=True)
         )
-        fragment = _make_fragment("Test")
-        updated = pipeline.add_wikilinks(
-            fragment=fragment,
-            links=["[[Link]]"],
-        )
-        assert fragment.threads == []
-        assert "[[Link]]" in updated.threads
+
+        eddies = EddyDetector(embeddings=embeddings).detect_eddies(fragments)
+
+        assert len(eddies) == 2
+        assert len({eddy.title for eddy in eddies}) == 2

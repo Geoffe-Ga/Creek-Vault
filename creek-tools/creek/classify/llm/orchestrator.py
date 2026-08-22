@@ -20,6 +20,8 @@ from creek.classify.llm.batch import run_batch
 from creek.classify.llm.calibration import _apply_wavelength
 from creek.classify.llm.parsing import (
     _apply_frequency,
+    _apply_praxis,
+    _apply_texture,
     _apply_voice,
     _split_reasoning_and_yaml,
     validate_response,
@@ -33,6 +35,7 @@ from creek.classify.llm.providers import (
     provider_display_name,
     provider_is_cloud,
 )
+from creek.models import PraxisPotential
 
 if TYPE_CHECKING:
     from creek.classify.llm.base import LLMProvider
@@ -270,7 +273,9 @@ class LLMClassifier:
             data: Parsed classification dict from ``validate_response``.
 
         Returns:
-            A new fragment with updated classification fields.
+            A new fragment with updated classification fields — or
+            **the same object** when the response carried nothing that
+            changed it, which callers read as "this run marked nothing".
         """
         updates: dict[str, object] = {}
         _apply_frequency(data, updates)
@@ -279,7 +284,25 @@ class LLMClassifier:
             updates,
             unclassified_threshold=self.config.unclassified_threshold,
         )
-        _apply_voice(data, updates)
+        # Issue #1331: the voice block merges axis-by-axis, so it needs the
+        # one the fragment already carries — a response that names only
+        # ``voice_register`` must not null a persisted ``confidence``, which
+        # is half the INTIMATE privacy trigger.
+        _apply_voice(data, updates, fragment.voice)
+        # Issue #877: ``praxis_potential`` is monotone, so the merge needs
+        # the verdict the fragment already carries — a model answering
+        # ``latent`` for an ``explicit`` fragment must lose. ``_apply_praxis``
+        # routes that through ``praxis_pass.escalate``. The
+        # ``PraxisPotential(...)`` coercion is required because
+        # ``Fragment.model_config`` sets ``use_enum_values=True``, so the
+        # attribute is a plain ``str`` at runtime.
+        _apply_praxis(data, updates, PraxisPotential(fragment.praxis_potential))
+        # Issue #878: ``emotional_texture`` merges as a union, so it needs the
+        # list the fragment already carries — a model that saw only part of a
+        # long fragment must not be able to delete a tag an earlier run (or the
+        # operator) recorded. Copied into a fresh ``list`` so the merge can
+        # never alias, and therefore never mutate, the input fragment's field.
+        _apply_texture(data, updates, fragment.emotional_texture.copy())
         if not updates:
             return fragment
         return fragment.model_copy(update=updates)

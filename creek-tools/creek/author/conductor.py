@@ -335,13 +335,11 @@ class Conductor:
         """
         from pydantic import ValidationError
 
-        from creek.config import load_config, resolve_config_path
+        from creek.config import load_vault_config
         from creek.generate.ai_style import load_fingerprint
 
         try:
-            config = load_config(
-                resolve_config_path(vault, None), warn_on_missing=False
-            )
+            config = load_vault_config(vault)
         except (OSError, ValueError, ValidationError):
             # A malformed config must not crash the desk: voice-fidelity simply
             # stays dormant. ``ValidationError`` is not a ``ValueError`` subclass
@@ -480,6 +478,37 @@ def build_default_conductor(
     )
 
 
+def _resolve_max_rounds(vault: Path, max_rounds: int | None) -> int:
+    """Resolve the voice/reflect round bound for a desk run (#1465).
+
+    An explicit argument wins and short-circuits the read entirely; with
+    none, the bound comes from *vault*'s ``author.max_author_rounds``
+    (``AuthorConfig``'s built-in 3 when no config is reachable).
+    ``CREEK_CONFIG``/vault precedence is whatever
+    :func:`creek.config.load_vault_config` says — the one shared resolver every
+    vault-scoped consumer went through in #1409.
+
+    A malformed or unreachable config is deliberately left to raise. The
+    specialists load the same config unguarded ten lines later
+    (``creek/author/agents.py:96``), so a ``try/except`` here could not
+    change the caller's outcome — it would be unreachable code that the
+    gated vulture check flags — while turning a typo'd config into a silent
+    fallback to 3, which is the exact defect this function exists to fix.
+
+    Args:
+        vault: The vault whose config supplies the default.
+        max_rounds: An explicit bound, or ``None``.
+
+    Returns:
+        The effective round bound.
+    """
+    if max_rounds is not None:
+        return max_rounds
+    from creek.config import load_vault_config
+
+    return load_vault_config(vault).author.max_author_rounds
+
+
 def run_author(
     *,
     medium: str,
@@ -496,8 +525,12 @@ def run_author(
         medium: The requested medium (only ``research`` is wired).
         query: The user query.
         vault: The vault to author from.
-        max_rounds: Optional override for the round bound; defaults to the
-            ``author.max_author_rounds`` config default.
+        max_rounds: Optional override for the round bound. Precedence
+            (#1465): this explicit argument, else ``CREEK_CONFIG`` /
+            ``<vault>/00-Creek-Meta/creek_config.yaml``'s
+            ``author.max_author_rounds``, else the built-in 3. This
+            sentence was false before #1465 — the value came from a bare
+            ``AuthorConfig()``, so the vault's config was never read.
         llm_client: Optional voice client (#658). When supplied, the desk
             renders live voicing; ``None`` keeps the deterministic rendering.
         override: The privacy admission ceiling (#660) threaded to the
@@ -507,11 +540,9 @@ def run_author(
     Returns:
         The shaped :class:`AuthoredDraft`.
     """
-    from creek.config import AuthorConfig
-
     require_supported_medium(medium)
     contract = load_medium_contract(medium, vault)
-    rounds = max_rounds if max_rounds is not None else AuthorConfig().max_author_rounds
+    rounds = _resolve_max_rounds(vault, max_rounds)
     draft = build_default_conductor(
         max_rounds=rounds,
         llm_client=llm_client,

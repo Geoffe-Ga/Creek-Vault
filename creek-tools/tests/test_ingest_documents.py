@@ -17,7 +17,11 @@ if TYPE_CHECKING:
 
 import pytest
 
-from creek.ingest.base import ParsedFragment, RawDocument
+from creek.ingest.base import (
+    ParsedFragment,
+    RawDocument,
+    assemble_ingested_fragment,
+)
 from creek.ingest.documents import (
     DocumentIngestor,
     _detect_scanned_pdf,
@@ -29,7 +33,7 @@ from creek.ingest.documents import (
     _parse_pdf_to_text,
     _wrap_txt_with_structure,
 )
-from creek.models import SourcePlatform
+from creek.models import Authorship, SourcePlatform
 
 LA_TZ = ZoneInfo("America/Los_Angeles")
 
@@ -656,7 +660,7 @@ class TestDocumentIngestorFrontmatter:
     def test_frontmatter_includes_author_from_metadata(
         self, doc_ingestor: DocumentIngestor
     ) -> None:
-        """Frontmatter includes author when present in metadata."""
+        """A free-text author name is preserved under ``source.author_name``."""
         fragment = _make_fragment(
             "Content.",
             "/path/test.docx",
@@ -667,7 +671,7 @@ class TestDocumentIngestorFrontmatter:
             },
         )
         fm = doc_ingestor.generate_frontmatter(fragment)
-        assert fm["source"]["author"] == "Jane Doe"
+        assert fm["source"]["author_name"] == "Jane Doe"
 
     def test_frontmatter_includes_title_from_metadata(
         self, doc_ingestor: DocumentIngestor
@@ -935,3 +939,179 @@ class TestDocumentIngestorAuthoredAtPerFormat:
         parsed = self._ingest_one(doc_ingestor, txt)
         fm = doc_ingestor.generate_frontmatter(parsed)
         assert "authored_at" not in fm
+
+
+# ---- Document author metadata (issue #1229) ----
+
+
+def _real_docx_bytes(path: Path, author: str) -> Path:
+    """Write a genuine ``.docx`` at *path* stamped with *author*, and return it.
+
+    Word stamps ``core_properties.author`` on every save, so a fixture without
+    one is not a realistic document.
+    """
+    from docx import Document as DocxDocument
+
+    document = DocxDocument()
+    document.core_properties.author = author
+    document.add_paragraph("A real Word document.")
+    document.save(path)
+    return path
+
+
+def _real_pdf_bytes(path: Path, author: str) -> Path:
+    """Write a minimal but genuine PDF at *path* with ``/Author`` set.
+
+    Hand-assembled (rather than mocked) so the ``/Info``-dictionary path in
+    :func:`creek.ingest.documents._extract_pdf_metadata` is exercised for real:
+    a mocked extractor could not have caught issue #1229.
+    """
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>",
+        b"<< /Author (" + author.encode("ascii") + b") /Title (Notes) >>",
+    ]
+    body = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for number, obj in enumerate(objects, start=1):
+        offsets.append(len(body))
+        body += b"%d 0 obj\n" % number + obj + b"\nendobj\n"
+    xref_offset = len(body)
+    body += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    for offset in offsets:
+        body += b"%010d 00000 n \n" % offset
+    body += (
+        b"trailer\n<< /Size %d /Root 1 0 R /Info 4 0 R >>\nstartxref\n%d\n%%%%EOF\n"
+        % (len(objects) + 1, xref_offset)
+    )
+    path.write_bytes(bytes(body))
+    return path
+
+
+class TestDocumentAuthorMetadata:
+    """A document's free-text author must never land in the Authorship enum.
+
+    ``FragmentSource.author`` answers "whose views does this stand for?" on the
+    ``self|ai|other|collaborative`` axis. A DOCX ``core_properties.author`` or a
+    PDF ``/Author`` answers the different question "what name is on the file".
+    Issue #1229: writing the second into the first made every real Word document
+    fail Pydantic validation and get dropped at assembly.
+    """
+
+    def _assemble_one(
+        self, doc_ingestor: DocumentIngestor, file_path: Path
+    ) -> ParsedFragment:
+        """Ingest *file_path* and return its single ``ParsedFragment``."""
+        result = doc_ingestor.ingest(file_path)
+        assert result.errors == []
+        assert len(result.fragments) == 1
+        return result.fragments[0]
+
+    def test_word_document_with_author_ingests(
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
+    ) -> None:
+        """A ``.docx`` carrying an author assembles into a valid Fragment."""
+        path = _real_docx_bytes(tmp_path / "real.docx", "Jane Q. Author")
+        parsed = self._assemble_one(doc_ingestor, path)
+
+        assembled = assemble_ingested_fragment(parsed)
+
+        assert assembled.fragment.source.author == Authorship.OTHER
+        assert assembled.fragment.source.author_name == "Jane Q. Author"
+
+    def test_pdf_with_author_ingests(
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
+    ) -> None:
+        """A ``.pdf`` carrying ``/Author`` assembles into a valid Fragment."""
+        path = _real_pdf_bytes(tmp_path / "real.pdf", "Ada Lovelace")
+        parsed = self._assemble_one(doc_ingestor, path)
+
+        assembled = assemble_ingested_fragment(parsed)
+
+        assert assembled.fragment.source.author == Authorship.OTHER
+        assert assembled.fragment.source.author_name == "Ada Lovelace"
+
+    def test_rtf_and_html_carry_no_extracted_author(
+        self, doc_ingestor: DocumentIngestor, tmp_path: Path
+    ) -> None:
+        """RTF and HTML never populate ``author``, so they keep the self default.
+
+        Issue #1229 asserted these two shared the DOCX/PDF defect. They do not:
+        ``DocumentIngestor._extract_metadata`` branches only on ``.docx`` and
+        ``.pdf``, so an RTF ``\\author`` group and an HTML ``<meta name=author>``
+        are never read. This pins that, so a future author-extraction branch for
+        either format cannot reintroduce the enum collision unnoticed.
+        """
+        rtf = tmp_path / "note.rtf"
+        rtf.write_text(
+            "{\\rtf1\\ansi{\\info{\\author Ada Lovelace}}Body text.}",
+            encoding="ascii",
+        )
+        html = tmp_path / "note.html"
+        html.write_text(
+            '<html><head><meta name="author" content="Ada Lovelace">'
+            "</head><body><p>Body text.</p></body></html>",
+            encoding="utf-8",
+        )
+
+        for path in (rtf, html):
+            parsed = self._assemble_one(doc_ingestor, path)
+            assembled = assemble_ingested_fragment(parsed)
+            assert assembled.fragment.source.author == Authorship.SELF
+            assert assembled.fragment.source.author_name is None
+
+    def test_named_author_maps_to_other(self, doc_ingestor: DocumentIngestor) -> None:
+        """A person's name resolves the axis to ``other``, not ``self``."""
+        fragment = _make_fragment(
+            "Content.",
+            "/path/test.docx",
+            {
+                "file_type": ".docx",
+                "source_encoding": "utf-8",
+                "author": "Jane Doe",
+            },
+        )
+
+        fm = doc_ingestor.generate_frontmatter(fragment)
+
+        assert fm["source"]["author"] == Authorship.OTHER
+        assert fm["source"]["author_name"] == "Jane Doe"
+
+    def test_valid_authorship_value_is_honoured(
+        self, doc_ingestor: DocumentIngestor
+    ) -> None:
+        """A metadata author that already names an axis member is kept as one."""
+        fragment = _make_fragment(
+            "Content.",
+            "/path/test.docx",
+            {
+                "file_type": ".docx",
+                "source_encoding": "utf-8",
+                "author": "ai",
+            },
+        )
+
+        fm = doc_ingestor.generate_frontmatter(fragment)
+
+        assert fm["source"]["author"] == Authorship.AI
+        assert "author_name" not in fm["source"]
+
+    def test_blank_author_leaves_the_self_default(
+        self, doc_ingestor: DocumentIngestor
+    ) -> None:
+        """A whitespace-only author is no evidence, so nothing is written."""
+        fragment = _make_fragment(
+            "Content.",
+            "/path/test.docx",
+            {
+                "file_type": ".docx",
+                "source_encoding": "utf-8",
+                "author": "   ",
+            },
+        )
+
+        fm = doc_ingestor.generate_frontmatter(fragment)
+
+        assert "author" not in fm["source"]
+        assert "author_name" not in fm["source"]

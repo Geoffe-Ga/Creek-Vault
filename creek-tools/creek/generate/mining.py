@@ -34,19 +34,20 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, TypeVar
 
 import frontmatter
-import yaml
 from pydantic import ValidationError
 
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     filter_fragments_by_tier,
+    raw_privacy_tier,
+    within_ceiling,
 )
 from creek.generate.compile_routing import (
     COMPILE_GAPS_RELPATH,
     CompiledPageIndex,
     empty_index,
     load_compiled_pages,
-    log_compile_gap,
+    record_compile_gap,
 )
 from creek.models import (
     Dosage,
@@ -60,6 +61,8 @@ from creek.models import (
     ThreadStatus,
     VoiceRegister,
 )
+from creek.vault.links import read_header_meta
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -340,7 +343,7 @@ def _safe_post(md_file: Path) -> frontmatter.Post | None:
     """Load a frontmatter post, returning ``None`` on parse errors."""
     try:
         return frontmatter.load(str(md_file))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         logger.debug("Skipping unreadable markdown: %s", md_file)
         return None
 
@@ -399,6 +402,47 @@ def _liminal_kind(md_file: Path, liminal_root: Path) -> str | None:
     return kind
 
 
+def _admitted_liminal_entry(
+    md_file: Path,
+    liminal_root: Path,
+    ceiling: PrivacyTierOverride,
+) -> tuple[Fragment, str, str] | None:
+    """Return one admitted ``(fragment, body, kind)`` entry, or ``None`` to skip.
+
+    The per-file half of :func:`_load_liminal_fragments` — see that function
+    for why the tier is read off the raw frontmatter (#1079). ``None`` covers
+    every reason a ``10-Liminal`` file contributes nothing: it is a
+    Synchronicities reflection note, it does not parse, it is above the
+    ceiling, or it is not a valid fragment.
+
+    The ceiling is checked *before* validation deliberately. An above-ceiling
+    note should not be parsed into a model at all, and ``_validate_fragment``
+    logs the path of anything it rejects.
+
+    Args:
+        md_file: The candidate note.
+        liminal_root: ``<vault>/10-Liminal``, used to derive *kind*.
+        ceiling: The admission ceiling, already defaulted.
+
+    Returns:
+        The entry, with :func:`~creek.classify.privacy_filter.raw_privacy_tier`
+        materialised onto the fragment, or ``None``.
+    """
+    kind = _liminal_kind(md_file, liminal_root)
+    if kind is None:
+        return None
+    post = _safe_post(md_file)
+    if post is None or not within_ceiling(post.metadata, ceiling):
+        return None
+    fragment = _validate_fragment(post, md_file)
+    if fragment is None:
+        return None
+    declared = fragment.model_copy(
+        update={"privacy_tier": raw_privacy_tier(post.metadata)},
+    )
+    return declared, post.content, kind
+
+
 def _load_liminal_fragments(
     liminal_root: Path,
     *,
@@ -410,21 +454,64 @@ def _load_liminal_fragments(
     ``"Unnamed"`` or ``"Compost"``. The Synchronicities subfolder is
     excluded because its records are reflection notes, not fragments.
 
-    ``privacy_override`` is forwarded to the shared tier filter.
+    **The tier is read off the raw frontmatter, not off the validated model**
+    (#1079). ``10-Liminal`` notes are the one corpus two tools admit
+    independently: ``## Liminal Watch`` gates the same physical file through
+    :func:`creek.generate.state._admitted_liminal_notes`, which reads
+    :func:`~creek.classify.privacy_filter.within_ceiling` on the raw
+    frontmatter, while this loader reached the same file through the model.
+    A note with *no* ``privacy_tier`` key at all therefore came out
+    ``intimate`` on one side (fail-closed, absent means unvouched-for) and
+    ``unclassified`` on the other (the model's default, which ranks with
+    ``personal`` per #876/#961) — so one ``10-Liminal/Unnamed`` note needed
+    ``ceiling=intimate`` for its stem and only ``ceiling=open`` for its
+    generated id, inside one rendered document. That is the "two tools that
+    disagree about the same file" bug class
+    :mod:`creek.classify.privacy_filter` names in its own module docstring.
+
+    The divergence is closed by tightening this side up to the report's
+    reader rather than by loosening the report's down to this one, so the
+    change is a strict narrowing at every ceiling:
+
+    * :func:`~creek.classify.privacy_filter.raw_privacy_tier` is materialised
+      onto the loaded fragment, which is what makes every downstream reader —
+      :func:`~creek.classify.privacy_filter.filter_fragments_by_tier` below,
+      :func:`~creek.classify.privacy_filter.tier_of` in
+      :meth:`creek.generate.state.StateReportGenerator._content_tier` — see
+      one tier for one file instead of each re-deriving its own. It is a
+      narrowing because a raw read never answers *below* the model's: a
+      missing key escalates ``unclassified`` to ``intimate``, and an
+      unrecognised value never reaches here at all (the model refuses to
+      validate it, so :func:`_validate_fragment` has already dropped the
+      note).
+    * ``within_ceiling`` is applied as a hard rank cutoff *in addition to*
+      the body-level filter below, because the two answer different
+      questions: the filter *summarises* a personal body as
+      ``[Personal-tier summary: <title>]`` rather than excluding the note, so
+      at ``ceiling=open`` a personal liminal **title** entered the corpus
+      while the report refused the same file outright.
+
+    ``tests/test_liminal_tier_reader_agreement.py`` pins the two call sites
+    against each other note by note, at every ceiling.
+
+    Args:
+        liminal_root: ``<vault>/10-Liminal``.
+        privacy_override: The admission ceiling. ``None`` means ``OPEN``,
+            matching what it already meant to the body-level filter.
+
+    Returns:
+        The admitted ``(fragment, body, kind)`` tuples, each fragment
+        carrying the tier its raw frontmatter declares.
     """
     if not liminal_root.exists():
         return []
-    collected: list[tuple[Fragment, str, str]] = []
-    for md_file in sorted(liminal_root.rglob("*.md")):
-        kind = _liminal_kind(md_file, liminal_root)
-        if kind is None:
-            continue
-        post = _safe_post(md_file)
-        if post is None:
-            continue
-        fragment = _validate_fragment(post, md_file)
-        if fragment is not None:
-            collected.append((fragment, post.content, kind))
+    ceiling = privacy_override or PrivacyTierOverride.OPEN
+    collected = [
+        entry
+        for md_file in sorted(liminal_root.rglob("*.md"))
+        if (entry := _admitted_liminal_entry(md_file, liminal_root, ceiling))
+        is not None
+    ]
     kind_by_id: dict[str, str] = {f.id: kind for f, _body, kind in collected}
     pairs = [(f, body) for f, body, _kind in collected]
     filtered = list(filter_fragments_by_tier(pairs, override=privacy_override))
@@ -481,10 +568,7 @@ def _load_synchronicities(root: Path) -> list[tuple[str, str, float]]:
         return []
     pairs: list[tuple[str, str, float]] = []
     for md_file in sorted(root.rglob("*.md")):
-        post = _safe_post(md_file)
-        if post is None:
-            continue
-        meta = post.metadata
+        meta = read_header_meta(md_file)
         frag_a = meta.get("fragment_a_id")
         frag_b = meta.get("fragment_b_id")
         similarity = meta.get("similarity")
@@ -716,12 +800,12 @@ class IdeaMiner:
                 frag.id for frag, _body in fragments if thread.id in frag.threads
             )
             if not compiled.bypassed:
-                log_compile_gap(
+                record_compile_gap(
                     vault_path,
+                    compiled,
                     target_kind="thread",
                     target_id=thread.id,
                     surfaced_by="mine.thread_terminus",
-                    reason="missing",
                 )
         description = (
             f"Thread '{thread.id}' has accumulated {thread.fragment_count} "
@@ -996,12 +1080,12 @@ class IdeaMiner:
         """
         if not synchronicities:
             if not compiled.bypassed:
-                log_compile_gap(
+                record_compile_gap(
                     vault_path,
+                    compiled,
                     target_kind="synchronicities",
                     target_id="10-Liminal/Synchronicities",
                     surfaced_by="mine.resonance_chain",
-                    reason="missing",
                 )
             return _NO_SYNCHRONICITIES
         if seeds_kept == 0:
@@ -1166,12 +1250,12 @@ class IdeaMiner:
             return True
         if primary not in gaps_logged:
             gaps_logged.add(primary)
-            log_compile_gap(
+            record_compile_gap(
                 vault_path,
+                compiled,
                 target_kind="frequency_index",
                 target_id=primary,
                 surfaced_by="mine.wavelength_window",
-                reason="missing",
             )
         return True
 
@@ -1311,12 +1395,12 @@ class IdeaMiner:
             return f"{compiled_eddy.title}\n{compiled_eddy.body}"
         if not compiled.bypassed and eddy.id not in gaps_logged:
             gaps_logged.add(eddy.id)
-            log_compile_gap(
+            record_compile_gap(
                 vault_path,
+                compiled,
                 target_kind="eddy",
                 target_id=eddy.id,
                 surfaced_by="mine.liminal_cross_eddy",
-                reason="missing",
             )
         return f"{eddy.title}\n{eddy.description}"
 
@@ -1635,6 +1719,7 @@ def phase_filtered_seeds(
     *,
     n: int = DEFAULT_PHASE_FILTERED_SEEDS,
     miner: IdeaMiner | None = None,
+    snapshot: MiningSnapshot | None = None,
 ) -> list[IdeaSeed]:
     """Return up to *n* :class:`IdeaSeed` objects filtered for *phase*.
 
@@ -1653,6 +1738,22 @@ def phase_filtered_seeds(
             zero.
         miner: Optional pre-configured :class:`IdeaMiner`. Defaults to
             a fresh instance with library defaults.
+        snapshot: Optional pre-loaded :class:`MiningSnapshot`, forwarded
+            verbatim to :meth:`IdeaMiner.mine_all`, which already accepts
+            one. ``None`` (the default) leaves the miner to load its own, so
+            no existing caller's behaviour changes.
+
+            ``creek state`` supplies a snapshot it has narrowed to the
+            threads and eddies its tier ceiling admitted (#969). That
+            narrowing cannot be made here, or in
+            :func:`_load_mining_snapshot`: :class:`~creek.models.Thread` and
+            :class:`~creek.models.Eddy` carry no ``privacy_tier`` field, so a
+            raw-frontmatter gate on ``02-Threads`` / ``03-Eddies`` would have
+            no evidence to read and would fail closed on *every* thread and
+            eddy — silently deleting the thread-terminus and liminal-cross-
+            eddy strategies for every ``creek mine`` caller below
+            ``ceiling=intimate``. A caller that can derive those tiers
+            passes the result in; this module keeps its own behaviour.
 
     Returns:
         Up to *n* seeds ordered by descending score, then strategy, then
@@ -1666,7 +1767,11 @@ def phase_filtered_seeds(
     except ValueError:
         current_phase = Phase.UNCLASSIFIED
     active_miner = miner if miner is not None else IdeaMiner()
-    all_seeds = active_miner.mine_all(vault_path, current_phase=current_phase)
+    all_seeds = active_miner.mine_all(
+        vault_path,
+        current_phase=current_phase,
+        snapshot=snapshot,
+    )
     allowed = _PHASE_AWARE_STRATEGIES.get(phase_value)
     filtered = (
         all_seeds

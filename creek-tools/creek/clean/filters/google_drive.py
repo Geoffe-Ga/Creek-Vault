@@ -3,8 +3,9 @@
 Filters staged Google Drive files before they enter the ingest pipeline.
 Detects five categories of problematic documents:
 
-- **"Copy of..." duplicates**: Files with ``Copy of`` prefix or version
-  suffixes like ``(1)``, ``(2)`` — preserves the newest version.
+- **"Copy of..." duplicates**: Files with ``Copy of`` prefix or 1-2 digit
+  copy-counter suffixes like ``(1)``, ``(2)`` — preserves the newest
+  version. Parenthesized years like ``(2021)`` are not treated as versions.
 - **Empty documents**: Files with no extractable text or trivially
   short content.
 - **Multi-author documents**: Files where collaborator contributions
@@ -77,9 +78,11 @@ _COPY_OF_PATTERN: re.Pattern[str] = re.compile(
 """Matches filenames starting with 'Copy of '."""
 
 _VERSION_SUFFIX_PATTERN: re.Pattern[str] = re.compile(
-    r"^(?P<base>.+?)\s*\((?P<version>\d+)\)(?P<ext>\.[^.]+)?$",
+    r"^(?P<base>.+?)\s*\((?P<version>\d{1,2})\)(?P<ext>\.[^.]+)?$",
 )
-"""Matches filenames with version suffixes like ``report (1).docx``."""
+"""Matches 1-2 digit copy-counter suffixes like ``report (1).docx`` —
+the digit bound distinguishes Drive copy counters like ``(1)``/``(10)``
+from meaningful parenthesized content such as years like ``(2021)``."""
 
 
 # ---------------------------------------------------------------------------

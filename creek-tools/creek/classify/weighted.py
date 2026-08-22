@@ -19,7 +19,10 @@ The legacy single-pick fields on :class:`creek.models.Fragment`
 downstream consumers (compile, lint, voice-skill generation). When
 ``weighted`` is populated, the two stay synchronised via the
 :meth:`WeightedFragmentClassification.from_single_pick` and
-:meth:`WeightedFragmentClassification.to_legacy` adapters.
+:meth:`WeightedFragmentClassification.to_legacy` adapters — or, on a
+real classification run,
+:meth:`WeightedFragmentClassification.merge_onto`, which layers the
+collapse over the fragment instead of replacing it.
 """
 
 from __future__ import annotations
@@ -32,6 +35,8 @@ from typing import TYPE_CHECKING, Generic, TypeVar
 
 import yaml
 from pydantic import BaseModel, ConfigDict
+
+from creek.classify.evidence import layer_determined_over
 
 # Import :func:`_strip_code_fences` from its defining submodule rather
 # than the :mod:`creek.classify.llm` package surface. The package's
@@ -52,6 +57,7 @@ from creek.classify.llm.prompts import (
 )
 from creek.models import (
     Color,
+    Confidence,
     Dosage,
     Frequency,
     FrequencyClassification,
@@ -72,6 +78,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "WEIGHTED_CLASSIFICATION_TEMPLATE",
+    "WeightedClassificationResult",
     "WeightedDimension",
     "WeightedFragmentClassification",
     "build_weighted_classification_prompt",
@@ -109,6 +116,14 @@ class WeightedDimension(Generic[_DimT]):
 # classifier so the schema is enforced from one place. ``reasoning``
 # is populated outside the YAML path (via :func:`_split_reasoning_and_yaml`)
 # and therefore is not a permitted top-level YAML key here.
+#
+# This set is the SEC-004 injection boundary: it is what stops a model —
+# or a prompt injection riding in on fragment text — from writing an
+# arbitrary :class:`~creek.models.Fragment` field, ``privacy_tier`` above
+# all, straight out of an LLM response. Widening it is always a deliberate
+# act; #1309 added exactly one key, ``confidences``, and like every other
+# member it is named after the *dimension* rather than the Fragment field
+# it eventually feeds (``voice.confidence``).
 _ALLOWED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
     {
         "frequencies",
@@ -117,6 +132,7 @@ _ALLOWED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
         "orientations",
         "dosages",
         "voice_registers",
+        "confidences",
         "overall_confidence",
     },
 )
@@ -295,17 +311,27 @@ class WeightedFragmentClassification(BaseModel):
     """Weighted ontology profile attached to a :class:`Fragment`.
 
     Mirrors :class:`creek.classify.prompt.PromptOntology` minus the
-    ``prompt`` field. Each dimension is a tuple of
-    :class:`WeightedDimension` entries sorted weight-descending so the
-    heaviest signal sits at index 0.
+    ``prompt`` field, plus :attr:`confidences` — author stance is
+    undefined for an operator-supplied essay seed, so the prompt-level
+    twin deliberately stops one dimension short (see
+    :func:`creek.classify.prompt.parse_prompt_ontology_response`).
+    Each dimension is a tuple of :class:`WeightedDimension` entries
+    sorted weight-descending so the heaviest signal sits at index 0.
+
+    Every dimension defaults to the empty tuple, which is what lets a
+    profile written by an older release round-trip: a ``weighted:``
+    frontmatter block persisted before :attr:`confidences` existed
+    still validates, and reads back as "the model said nothing about
+    author stance" (#1309).
 
     Lives on :attr:`Fragment.weighted` as ``WeightedFragmentClassification |
     None``; ``None`` means "no weighted detection ran" (legacy
     fragments). When set, the legacy single-pick fields
     (:attr:`Fragment.frequency`, :attr:`Fragment.wavelength`,
     :attr:`Fragment.voice`) can be derived from the top weighted pick
-    per dimension via :meth:`to_legacy`; the reverse widening lives in
-    :meth:`from_single_pick`.
+    per dimension via :meth:`to_legacy`, or merged over a fragment's
+    existing classification via :meth:`merge_onto`; the reverse
+    widening lives in :meth:`from_single_pick`.
 
     Pydantic BaseModel rather than a frozen dataclass (the
     :class:`PromptOntology` shape) so the field plugs into
@@ -323,6 +349,7 @@ class WeightedFragmentClassification(BaseModel):
     orientations: tuple[WeightedDimension[Orientation], ...] = ()
     dosages: tuple[WeightedDimension[Dosage], ...] = ()
     voice_registers: tuple[WeightedDimension[VoiceRegister], ...] = ()
+    confidences: tuple[WeightedDimension[Confidence], ...] = ()
     overall_confidence: float = 0.0
     reasoning: str = ""
 
@@ -340,6 +367,11 @@ class WeightedFragmentClassification(BaseModel):
         dropped so :meth:`to_legacy` can distinguish "unset" from
         "explicitly classified as unclassified".
 
+        :attr:`VoiceClassification.confidence` round-trips since
+        #1309: it widens onto :attr:`confidences` and collapses back
+        out of it, so the author-stance evidence the INTIMATE privacy
+        escalation reads survives a weighted pass.
+
         The following legacy state does **not** round-trip back via
         :meth:`to_legacy` (documented limitations):
 
@@ -349,9 +381,14 @@ class WeightedFragmentClassification(BaseModel):
         * :attr:`WavelengthClassification.descriptor` is a free-form
           string with no weighted analogue; :meth:`to_legacy` returns
           ``""``.
-        * :attr:`VoiceClassification.confidence` is a
-          :class:`Confidence` enum with no weighted analogue;
-          :meth:`to_legacy` returns ``None``.
+
+        Both limitations are properties of :meth:`to_legacy`, which is
+        a *pure collapse* of this profile and knows nothing of the
+        fragment it came from. On a real classification run the loss
+        does not occur, because the engine goes through
+        :meth:`merge_onto`, which layers the collapse over the
+        fragment's existing classification and so leaves a descriptor
+        (or any other field the profile is silent about) standing.
 
         Args:
             fragment: A Pydantic ``Fragment`` instance.
@@ -365,7 +402,8 @@ class WeightedFragmentClassification(BaseModel):
         modes = _widen_single(fragment.wavelength.mode, Mode)
         orientations = _widen_single(fragment.wavelength.orientation, Orientation)
         dosages = _widen_single(fragment.wavelength.dosage, Dosage)
-        voice_registers = _widen_voice_register(fragment.voice.voice_register)
+        voice_registers = _widen_optional(fragment.voice.voice_register, VoiceRegister)
+        confidences = _widen_optional(fragment.voice.confidence, Confidence)
 
         return cls(
             frequencies=frequencies,
@@ -374,6 +412,7 @@ class WeightedFragmentClassification(BaseModel):
             orientations=orientations,
             dosages=dosages,
             voice_registers=voice_registers,
+            confidences=confidences,
         )
 
     def to_legacy(
@@ -387,9 +426,19 @@ class WeightedFragmentClassification(BaseModel):
         :class:`WeightedFragmentClassification` round-trips to the
         same default-empty legacy classifications.
 
+        This is a **pure collapse**: it sees only this profile, so
+        every dimension the profile is silent about comes back as that
+        field's "not determined" default. Assigning the result onto a
+        fragment wholesale therefore erases whatever that fragment
+        already knew — use :meth:`merge_onto` instead, which is the
+        operation the classify engine actually performs (#1309).
+
         See :meth:`from_single_pick` for the documented limitations
-        (color is recomputed; descriptor and voice confidence are
-        dropped).
+        (color is recomputed; descriptor is dropped). Voice confidence
+        is **not** among them any more: it collapses out of
+        :attr:`confidences`, so the evidence the INTIMATE privacy
+        escalation reads survives the weighted path exactly as it does
+        the single-pick one.
 
         Returns:
             A 3-tuple of ``(FrequencyClassification,
@@ -402,6 +451,11 @@ class WeightedFragmentClassification(BaseModel):
         orientation = _top_value(self.orientations, Orientation.UNCLASSIFIED)
         dosage = _top_value(self.dosages, Dosage.UNCLASSIFIED)
         voice_register = _top_value_optional(self.voice_registers)
+        # No weight floor, deliberately: the single-pick path applies
+        # none, so a floor here would make the weighted path *less*
+        # likely to surface a confessional+conviction verdict than the
+        # legacy one — the forbidden direction for a privacy control.
+        confidence = _top_value_optional(self.confidences)
         color = _FREQUENCY_TO_COLOR.get(primary, Color.UNCLASSIFIED)
 
         return (
@@ -416,9 +470,73 @@ class WeightedFragmentClassification(BaseModel):
             ),
             VoiceClassification(
                 voice_register=voice_register,
-                confidence=None,
+                confidence=confidence,
             ),
         )
+
+    def merge_onto(self, fragment: Fragment) -> Fragment:
+        """Layer this profile's derived legacy fields over a fragment.
+
+        The operation the classify engine performs when a weighted run
+        succeeds: persist the profile itself to
+        :attr:`Fragment.weighted`, and update the legacy single-pick
+        fields *only where the profile actually spoke*. Replacing them
+        wholesale from :meth:`to_legacy` — which this method
+        deliberately does not do — destroys the fragment's prior
+        ``voice.confidence`` and ``wavelength.descriptor``/``mode``,
+        which on the privacy path means erasing the very evidence the
+        INTIMATE escalation reads (#1309).
+
+        Precondition: this is only ever reached with a profile the model
+        genuinely produced. Every soft-failure mode — whitespace-only
+        body, provider unavailable, transport error, malformed YAML —
+        returns before the call site is reached
+        (:func:`~creek.classify.classify_engine._classify_one_weighted`,
+        #1330/#1358). That is what licenses the rule below: a dimension
+        this profile is silent about means "the model detected nothing
+        here", never "the call died", so deferring to the fragment's
+        prior evidence is always the right reading.
+
+        The rule itself is no longer local to this method:
+        :func:`~creek.classify.evidence.layer_determined_over` holds the
+        single implementation, now shared with the rule classifier's own
+        layering step (#1331), so the two paths cannot drift apart.
+
+        Args:
+            fragment: The fragment being classified, carrying whatever
+                classification a previous run or the rule classifier
+                already established.
+
+        Returns:
+            A copy of ``fragment`` with ``weighted`` set to this
+            profile and its legacy classification merged, not replaced.
+        """
+        freq, wave, voice = self.to_legacy()
+        # What makes this a merge rather than a replacement is THE
+        # ``exclude_defaults`` INVARIANT, documented in full on
+        # :func:`~creek.classify.evidence.layer_determined_over` — which
+        # is now the one implementation this path and the rules path
+        # (#1331) both call. Read it there before "simplifying" either
+        # call site back into the defect.
+        update: dict[str, object] = {
+            "weighted": self,
+            "wavelength": layer_determined_over(
+                prior=fragment.wavelength,
+                determined=wave,
+            ),
+            "voice": layer_determined_over(prior=fragment.voice, determined=voice),
+        }
+        # THE FREQUENCY ASYMMETRY: frequency is replaced wholesale when
+        # the profile has any frequencies (so stale secondaries from an
+        # earlier verdict are cleared rather than accumulating), and
+        # skipped entirely when it has none (so a signal-free profile
+        # does not wipe the rule classifier's output). The asymmetry is
+        # deliberate: ``FrequencyClassification.secondary`` is a list,
+        # and a list cannot be merged field-wise the way the scalar
+        # wavelength and voice axes can.
+        if self.frequencies:
+            update["frequency"] = freq
+        return fragment.model_copy(update=update)
 
 
 # ---- Adapter helpers -------------------------------------------------------
@@ -507,25 +625,34 @@ def _widen_single(
     return (WeightedDimension(value=member, weight=_LEGACY_SINGLE_WEIGHT),)
 
 
-def _widen_voice_register(
-    legacy: VoiceRegister | str | None,
-) -> tuple[WeightedDimension[VoiceRegister], ...]:
-    """Widen :attr:`VoiceClassification.voice_register` into weighted form.
+def _widen_optional(
+    legacy: _DimT | str | None,
+    enum_type: type[_DimT],
+) -> tuple[WeightedDimension[_DimT], ...]:
+    """Widen an optional legacy enum field into a one-entry weighted tuple.
 
-    Voice register has no ``UNCLASSIFIED`` sentinel; its absence is
-    modelled as ``None``. ``None`` widens to the empty tuple so the
-    round-trip distinguishes "no voice signal" from "explicitly the
-    confessional register".
+    The counterpart to :func:`_widen_single` for the two
+    :class:`VoiceClassification` axes — ``voice_register`` and
+    ``confidence`` — whose enums have **no** ``UNCLASSIFIED`` member:
+    absence is modelled as ``None`` instead. ``_widen_single`` cannot
+    serve them because it calls ``enum_type("unclassified")``, which
+    raises :class:`ValueError` on :class:`Confidence` and
+    :class:`VoiceRegister`. ``None`` widens to the empty tuple so the
+    round-trip distinguishes "no signal on this axis" from "explicitly
+    the confessional register" / "explicitly conviction".
 
     Args:
-        legacy: The voice register, possibly ``None``.
+        legacy: The legacy enum value, possibly serialised as a string
+            (Pydantic's ``use_enum_values=True``) or absent (``None``).
+        enum_type: The target :class:`StrEnum` subclass.
 
     Returns:
-        A single-entry tuple at weight 1.0, or empty when ``None``.
+        A single-entry tuple at weight 1.0, or empty when the input is
+        ``None`` / unresolvable.
     """
     if legacy is None:
         return ()
-    member = _coerce_enum(legacy, VoiceRegister)
+    member = _coerce_enum(legacy, enum_type)
     if member is None:
         return ()
     return (WeightedDimension(value=member, weight=_LEGACY_SINGLE_WEIGHT),)
@@ -638,6 +765,13 @@ bottoming_out, restoration
 6. **Voice Register**: confessional, analytical, playful, prophetic, \
 instructional, raw, conversational
 
+7. **Confidence**: musing, exploring, forming, settled, conviction
+   — the AUTHOR'S STANCE TOWARD THEIR OWN CLAIM, as evidenced in the
+   text. Score how firmly the writer holds what they are saying
+   ("maybe I'm just tired" is musing; "this is who I am" is
+   conviction). This is NOT your certainty about the classification —
+   see ``overall_confidence`` below for that.
+
 Wavelength Color (Spiral Dynamics) is anchored to the primary
 frequency for downstream visualisation only — you do not need to
 score it here. Canonical vocabulary, for reference: __COLOR_BLOCK__.
@@ -647,8 +781,8 @@ __FREQUENCY_COLOR_BLOCK__
 PROTOCOL:
 
 Step 1 — Reason briefly. Walk through which frequencies the fragment
-activates and why, then phases, modes, orientation, dosage, register.
-Two to four sentences.
+activates and why, then phases, modes, orientation, dosage, register,
+and the author's confidence in their own claim. Two to four sentences.
 
 Step 2 — Emit your classification as YAML inside a fenced ```yaml ... ```
 block. Only list dimension values you genuinely detect; omit entries
@@ -678,6 +812,9 @@ dosages:
 voice_registers:
   - value: analytical
     weight: 0.5
+confidences:
+  - value: exploring
+    weight: 0.6
 overall_confidence: 0.7
 ```
 
@@ -686,6 +823,16 @@ classification. Calibrate to the FEAT-017 threshold of {threshold:.2f}
 — above it means "I would stand behind this classification", below
 means "I would defer to a human." Per-dimension weights below this
 threshold will be ignored by downstream composition by default.
+
+``overall_confidence`` and ``confidences`` are DIFFERENT QUANTITIES
+and must be scored independently: ``overall_confidence`` is how sure
+YOU are of this classification, while ``confidences`` is how sure the
+AUTHOR is of what they wrote. A hesitant author described with total
+certainty is a high ``overall_confidence`` on a ``musing``
+``confidences`` entry, and a confident author you can barely read is
+the reverse. Never copy one into the other: downstream, a
+``conviction`` stance can permanently reclassify a fragment as
+private, and that decision is never revisited.
 
 FRAGMENT LEVEL: {level}
 FRAGMENT TITLE: {title}
@@ -789,15 +936,36 @@ def parse_weighted_yaml(response: str) -> WeightedFragmentClassification:
         orientations=_parse_dimension(data, "orientations", Orientation),
         dosages=_parse_dimension(data, "dosages", Dosage),
         voice_registers=_parse_dimension(data, "voice_registers", VoiceRegister),
+        confidences=_parse_dimension(data, "confidences", Confidence),
         overall_confidence=_coerce_weight(data.get("overall_confidence")),
         reasoning=reasoning,
     )
 
 
+@dataclass(frozen=True)
+class WeightedClassificationResult:
+    """Outcome of a single weighted-profile classification call.
+
+    Attributes:
+        classification: The detected weighted ontology profile. When
+            the call short-circuits (whitespace-only body, provider
+            unavailable, transport error, unparseable payload), this is
+            the empty :class:`WeightedFragmentClassification` default.
+        succeeded: ``True`` when the LLM actually produced a weighted
+            profile; ``False`` when the call short-circuited or failed
+            and ``classification`` is the empty default. Lets the engine
+            avoid stamping ``classification_method: llm`` on a failed
+            call (#1330).
+    """
+
+    classification: WeightedFragmentClassification
+    succeeded: bool = True
+
+
 def classify_weighted(
     fragment: IngestedFragment,
     config: LLMConfig,
-) -> WeightedFragmentClassification:
+) -> WeightedClassificationResult:
     """Classify a fragment, returning a weighted ontology profile.
 
     Fragment-level twin of
@@ -808,10 +976,14 @@ def classify_weighted(
     descending, the model's reasoning preamble, and the model's
     self-reported overall confidence.
 
-    Short-circuits to an empty :class:`WeightedFragmentClassification`
-    when the fragment body is whitespace-only, when the provider is
-    unavailable, or when the call raises — the caller can then decide
-    whether to abort or to proceed without weighted guidance.
+    That profile is wrapped in a :class:`WeightedClassificationResult`
+    rather than handed back bare because an empty profile is
+    indistinguishable from a genuine all-unclassified verdict: a caller
+    that cannot tell the two apart stamps a provenance the run did not
+    earn (#1330). So the wrapper reports ``succeeded=False`` when the
+    provider is unavailable and when the call raises — and equally for
+    a whitespace-only body, which short-circuits before a classifier is
+    even built: no LLM ran there either.
 
     Args:
         fragment: The fragment (paired with its body via
@@ -819,11 +991,16 @@ def classify_weighted(
         config: LLM provider configuration (provider, model, threshold).
 
     Returns:
-        The detected :class:`WeightedFragmentClassification`; empty
-        (all-zeros) when classification could not run.
+        The detected :class:`WeightedFragmentClassification` paired with
+        whether an LLM actually produced it. When classification could
+        not run the classification is empty (all-zeros) and
+        ``succeeded`` is ``False``.
     """
     if not fragment.body.strip():
-        return WeightedFragmentClassification()
+        return WeightedClassificationResult(
+            classification=WeightedFragmentClassification(),
+            succeeded=False,
+        )
 
     # Import inside the function to avoid pulling the heavy classify
     # package into module-load time — :mod:`creek.classify.weighted`
@@ -839,7 +1016,10 @@ def classify_weighted(
             "LLM provider %r unavailable; returning empty weighted classification",
             config.provider,
         )
-        return WeightedFragmentClassification()
+        return WeightedClassificationResult(
+            classification=WeightedFragmentClassification(),
+            succeeded=False,
+        )
 
     prompt = build_weighted_classification_prompt(
         body=fragment.body,
@@ -853,11 +1033,15 @@ def classify_weighted(
     except (RuntimeError, OSError, ValueError) as exc:
         # ValueError covers malformed YAML and schema violations from
         # the parser; RuntimeError/OSError cover provider transport
-        # failures. Both collapse to "no signal" so the caller can
-        # decide whether to proceed without weighted guidance.
+        # failures. Both report ``succeeded=False`` so the caller can
+        # tell a failed call from a genuine all-unclassified verdict
+        # and decide whether to proceed without weighted guidance.
         logger.warning(
             "Weighted fragment classification failed (%s); returning empty result",
             exc,
         )
-        return WeightedFragmentClassification()
-    return parsed
+        return WeightedClassificationResult(
+            classification=WeightedFragmentClassification(),
+            succeeded=False,
+        )
+    return WeightedClassificationResult(classification=parsed)

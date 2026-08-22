@@ -56,6 +56,7 @@ def _write_fragment(
     *,
     created: datetime | None = None,
     subfolder: str = "Conversations",
+    aliases: list[str] | None = None,
 ) -> Path:
     """Write a fragment markdown file with frontmatter.
 
@@ -65,6 +66,8 @@ def _write_fragment(
         content: Body content of the fragment.
         created: Optional created datetime for frontmatter.
         subfolder: Subfolder under 01-Fragments.
+        aliases: Optional ``aliases`` entries — the extra names Obsidian
+            lets the page be wiki-linked by.
 
     Returns:
         Path to the written file.
@@ -76,6 +79,8 @@ def _write_fragment(
         "type": "fragment",
         "source": {"platform": "claude", "original_file": f"{name}.json"},
     }
+    if aliases is not None:
+        metadata["aliases"] = aliases
     if created is not None:
         metadata["created"] = created.isoformat()
     post = frontmatter.Post(content=content, **metadata)
@@ -198,6 +203,131 @@ class TestOrphanScanner:
         scanner_loose = OrphanScanner(age_days=20)
         result_loose = scanner_loose.scan(vault)
         assert len(result_loose.orphan_paths) == 0
+
+    def test_anchor_wikilink_counts_in_link_graph(self, tmp_path: Path) -> None:
+        """An anchor wikilink connects both endpoints in the link graph (#835).
+
+        Fragment ``a`` links to ``b`` only via ``[[b#Section]]``; the anchor
+        must not hide the connection, so ``a`` has an outgoing link and ``b``
+        has an incoming link — neither is an orphan.
+        """
+        vault = _make_vault(tmp_path)
+        old = datetime.now(tz=UTC) - timedelta(days=60)
+        _write_fragment(vault, "b", created=old)
+        _write_fragment(
+            vault,
+            "a",
+            content="See [[b#Section]] for context.",
+            created=old,
+        )
+        scanner = OrphanScanner(age_days=30)
+        result = scanner.scan(vault)
+        assert result.orphan_paths == []
+
+    def test_inbound_alias_link_is_not_orphan(self, tmp_path: Path) -> None:
+        """An alias-form inbound link saves a page from the orphan list (#1225).
+
+        Since #730 the linkers write date-prefixed filenames and put the
+        human-readable name in ``aliases``, so fragments link ``[[Messages]]``
+        at a file called ``2020-09-26-messages.md``. Resolving against
+        filename stems alone — the behaviour #887 removed from
+        ``BrokenLinkScanner`` but not from here — calls that page an orphan
+        and tells the operator to delete live content.
+
+        The genuinely unreferenced ``lonely`` fragment must still be
+        reported, so alias-awareness cannot be bought by falling silent.
+        """
+        vault = _make_vault(tmp_path)
+        old = datetime.now(tz=UTC) - timedelta(days=60)
+        aliased = _write_fragment(
+            vault,
+            "2020-09-26-messages",
+            created=old,
+            aliases=["Messages"],
+        )
+        _write_fragment(
+            vault,
+            "referrer",
+            content="Filed under [[Messages]].",
+            created=old,
+        )
+        lonely = _write_fragment(vault, "lonely", created=old)
+
+        result = OrphanScanner(age_days=30).scan(vault)
+
+        assert str(aliased) not in result.orphan_paths
+        assert result.orphan_paths == [str(lonely)]
+
+    def test_outbound_alias_link_is_not_orphan(self, tmp_path: Path) -> None:
+        """A fragment linking a compiled page by alias has outgoing links.
+
+        The thread page's filename carries a date prefix; the fragment links
+        the alias. Stem-only matching found no such target and therefore
+        credited the fragment with no outgoing links at all.
+        """
+        vault = _make_vault(tmp_path)
+        old = datetime.now(tz=UTC) - timedelta(days=60)
+        thread = vault / "02-Threads" / "Active" / "2020-09-26-messages.md"
+        _write_md_file(
+            thread,
+            "---\naliases:\n  - Messages\n---\n\nThread body.\n",
+        )
+        _write_fragment(
+            vault,
+            "linker",
+            content="Belongs to [[Messages]].",
+            created=old,
+        )
+
+        result = OrphanScanner(age_days=30).scan(vault)
+
+        assert result.orphan_paths == []
+
+    def test_alias_resolution_credits_only_the_named_page(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Resolution is per-page: a resolving link credits one page only.
+
+        ``referrer`` names ``beta`` by alias. ``alpha`` also declares an
+        alias but nothing links it, so it stays orphaned — a check that
+        credited every aliased page as soon as *some* link resolved would
+        fall silent, which is the same end state as the bug being fixed.
+        """
+        vault = _make_vault(tmp_path)
+        old = datetime.now(tz=UTC) - timedelta(days=60)
+        alpha = _write_fragment(vault, "alpha", created=old, aliases=["Alpha Page"])
+        _write_fragment(vault, "beta", created=old, aliases=["Beta Page"])
+        _write_fragment(
+            vault,
+            "referrer",
+            content="See [[Beta Page]].",
+            created=old,
+        )
+
+        result = OrphanScanner(age_days=30).scan(vault)
+
+        assert result.orphan_paths == [str(alpha)]
+
+    def test_self_link_does_not_rescue_a_fragment(self, tmp_path: Path) -> None:
+        """A fragment whose only link points at itself is still an orphan.
+
+        Outgoing links already excluded self-references; incoming links did
+        not, so ``[[selfref]]`` inside ``selfref.md`` silently exempted the
+        page. Per-page resolution makes both directions agree.
+        """
+        vault = _make_vault(tmp_path)
+        old = datetime.now(tz=UTC) - timedelta(days=60)
+        selfref = _write_fragment(
+            vault,
+            "selfref",
+            content="Written about in [[selfref]].",
+            created=old,
+        )
+
+        result = OrphanScanner(age_days=30).scan(vault)
+
+        assert result.orphan_paths == [str(selfref)]
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +545,113 @@ class TestBrokenLinkScanner:
         # Must not raise; the unresolvable target is treated as not-a-file.
         assert result.total_broken == 0
 
+    def test_heading_anchor_wikilink_not_broken(self, tmp_path: Path) -> None:
+        """A ``[[b#Section]]`` link to an existing file is not broken (#835)."""
+        vault = _make_vault(tmp_path)
+        _write_fragment(vault, "b", content="Target with a heading.")
+        _write_fragment(vault, "a", content="See [[b#Section]] for details.")
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_broken == 0
+
+    def test_same_file_anchor_wikilink_not_broken(self, tmp_path: Path) -> None:
+        """A same-file anchor link like ``[[#Heading]]`` is not broken (#835)."""
+        vault = _make_vault(tmp_path)
+        _write_fragment(vault, "self-anchor", content="Jump to [[#Heading]] above.")
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_broken == 0
+
+    def test_heading_anchor_wikilink_with_alias_not_broken(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A ``[[b#Section|display]]`` link to an existing file is not broken (#835)."""
+        vault = _make_vault(tmp_path)
+        _write_fragment(vault, "b", content="Target with a heading.")
+        _write_fragment(vault, "a", content="See [[b#Section|display]] here.")
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_broken == 0
+
+    def test_relative_link_with_anchor_not_broken(self, tmp_path: Path) -> None:
+        """A relative link with a heading anchor to an existing file is fine (#835)."""
+        vault = _make_vault(tmp_path)
+        _write_fragment(vault, "b", content="Target content.")
+        _write_fragment(vault, "a", content="See [text](b.md#Section) for more.")
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_broken == 0
+
+    def test_missing_target_with_anchor_still_broken(self, tmp_path: Path) -> None:
+        """A ``[[missing#Section]]`` link to no file reports ``[[missing]]`` (#835)."""
+        vault = _make_vault(tmp_path)
+        _write_fragment(vault, "a", content="See [[missing#Section]] here.")
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_broken == 1
+        broken_targets = next(iter(result.broken_links.values()))
+        assert broken_targets == ["[[missing]]"]
+
+    def test_scan_covers_non_fragment_sources(self, tmp_path: Path) -> None:
+        """Threads, praxis and decisions carry links too (#1344).
+
+        The scanner surveyed ``01-Fragments`` alone while ``creek lint``
+        reported its count as a whole-vault verdict, so a dangling link on a
+        compiled page was invisible no matter how many times it ran.
+        """
+        vault = _make_vault(tmp_path)
+        source = _write_md_file(
+            vault / "02-Threads" / "Active" / "t.md",
+            "See [[ghost-thread]] here.",
+        )
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_broken == 1
+        assert result.broken_links[str(source)] == ["[[ghost-thread]]"]
+
+    def test_total_files_scanned_counts_every_surveyed_file(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The count reports the survey, which is no longer fragments-only.
+
+        ``creek lint`` renders this number as "across N file(s)", so leaving
+        it at the fragment count would keep the verdict overstating its own
+        coverage even after the survey widened (#1344).
+        """
+        vault = _make_vault(tmp_path)
+        _write_fragment(vault, "f1", content="No links at all.")
+        _write_md_file(vault / "02-Threads" / "Active" / "t.md", "Thread body.")
+        _write_md_file(vault / "00-Creek-Meta" / "Tag-Garden.md", "Garden body.")
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.total_files_scanned == 3
+        assert result.total_broken == 0
+
+    def test_scan_skips_creek_report_directories(self, tmp_path: Path) -> None:
+        """Creek's own reports echo findings; reading them back inflates them.
+
+        ``lint-<date>.md`` renders each finding as ``- `src` → `[[target]]` ``
+        and ``State/latest.md`` echoes the same lines, so a literal
+        whole-vault survey grew one genuine broken link into 1, then 2, then 3
+        over three successive runs (#1344).
+        """
+        vault = _make_vault(tmp_path)
+        _write_md_file(
+            vault / "00-Creek-Meta" / "Processing-Log" / "lint-2026-08-09.md",
+            "- `01-Fragments/Conversations/a.md` → `[[ghost]]`\n",
+        )
+        _write_md_file(
+            vault / "00-Creek-Meta" / "State" / "latest.md",
+            "- Broken links in `x`: [[phantom]]\n",
+        )
+        scanner = BrokenLinkScanner()
+        result = scanner.scan(vault)
+        assert result.broken_links == {}
+        assert result.total_broken == 0
+        assert result.total_files_scanned == 0
+
 
 # ---------------------------------------------------------------------------
 # DuplicateScanner tests
@@ -625,3 +862,30 @@ class TestLinkExtraction:
 
         content = "[x]( https://example.com/y)"
         assert _extract_relative_links(content) == []
+
+    def test_extract_wikilinks_strips_heading_anchor(self) -> None:
+        """Heading anchors are stripped from wiki-link targets (#835).
+
+        ``[[b#Section]]`` yields ``b``, ``[[Note#H|alias]]`` yields ``Note``,
+        and a same-file anchor like ``[[#Self]]`` yields no target at all.
+        """
+        from creek.clean.hygiene import _extract_wikilinks
+
+        content = "See [[b#Section]] and [[Note#H|alias]] and [[#Self]]."
+        assert _extract_wikilinks(content) == ["b", "Note"]
+        # A '#' inside the alias (after the pipe) must not affect the target,
+        # and a nested heading path keeps only the file portion.
+        assert _extract_wikilinks("[[Target|Display#thing]]") == ["Target"]
+        assert _extract_wikilinks("[[Note#H1#H2]]") == ["Note"]
+
+    def test_extract_relative_links_strips_anchor_and_query(self) -> None:
+        """Anchor and query suffixes are stripped from relative targets (#835).
+
+        The URL token is cut at the first ``#`` or ``?``; a target that is
+        empty after stripping (query-only) is skipped entirely.
+        """
+        from creek.clean.hygiene import _extract_relative_links
+
+        content = "[x](b.md#Section) and [y](c.md?raw=1)"
+        assert _extract_relative_links(content) == ["b.md", "c.md"]
+        assert _extract_relative_links("[q](?query)") == []

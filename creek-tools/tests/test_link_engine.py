@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+import pytest
 
 from creek.config import CreekConfig, EmbeddingsConfig
 from creek.link.embeddings import (
@@ -16,6 +18,7 @@ from creek.models import Fragment, FragmentSource, SourcePlatform
 from tests.helpers import write_fragment_file as _write_fragment
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -727,3 +730,450 @@ def test_run_link_eddies_preserves_extra_frontmatter_and_body(
         assert any(
             isinstance(entry, str) and entry.startswith("[[") for entry in eddies_field
         ), f"Fragment {frag.id} lost its eddy wiki-link"
+
+
+# ----- Issue #880: cluster-limit and segmentation plumbing -------------------
+
+
+def test_run_link_eddies_reports_largest_cluster(tmp_path: Path) -> None:
+    """``LinkSummary`` carries the largest detected cluster size.
+
+    Issue #880: ``docs/linking.md`` has advertised a ``largest: N fragments``
+    line since the linker shipped, and no code ever produced the number —
+    which is exactly the statistic that would have made the 30,795-fragment
+    mega-eddy visible without opening the vault.
+    """
+    vault = tmp_path / "vault"
+    fragments = _embedded_eddy_fragments(vault, count=8)
+
+    summary = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="eddies",
+        rebuild=False,
+    )
+
+    assert summary.eddies_detected == 1
+    assert summary.largest_cluster_fragments == len(fragments)
+    assert summary.clusters_split == 0
+    assert summary.oversized_discarded == 0
+
+
+def test_run_link_honours_configured_cluster_ceiling(tmp_path: Path) -> None:
+    """A configured ceiling reaches the detector and bounds what is emitted.
+
+    Issue #880: ``run_link`` used to construct ``EddyDetector(embeddings=...)``
+    with embeddings only, so every threshold fell back to a module constant
+    and no configured value could change the outcome. Here the ceiling is set
+    below the single dense cluster, which is eight identical vectors and
+    therefore cannot be split by any epsilon — so the guardrail's
+    discard-to-noise path fires and is reported.
+    """
+    vault = tmp_path / "vault"
+    fragments = _embedded_eddy_fragments(vault, count=8)
+    config = CreekConfig()
+    config.linking.cluster_size_ceiling = 1
+    config.linking.cluster_max_fraction = 0.5
+
+    summary = run_link(
+        vault_path=vault,
+        config=config,
+        method="eddies",
+        rebuild=False,
+    )
+
+    assert summary.eddies_detected == 0
+    assert summary.clusters_split == 1
+    assert summary.oversized_discarded == len(fragments)
+    assert summary.largest_cluster_fragments == 0
+
+
+def _embedded_message_stream(vault: Path) -> list[Fragment]:
+    """Seed *vault* with two Discord channels ten days apart, one dense blob.
+
+    Every fragment carries the same title and an identical embedding, so
+    without segmentation DBSCAN sees exactly one cluster spanning both
+    channels — the shape of the #880 mega-eddy in miniature.
+
+    Args:
+        vault: Vault root.
+
+    Returns:
+        The created fragments in creation order.
+    """
+    from datetime import datetime, timedelta
+
+    base = datetime(2026, 4, 1, 9, 0)
+    fragments: list[Fragment] = []
+    for channel_index, channel in enumerate(("stagecraft", "starlight")):
+        for message in range(5):
+            authored = base + timedelta(days=10 * channel_index, hours=message)
+            frag = Fragment(
+                id=f"frag-880-{channel_index}-{message:02d}",
+                title="messages",
+                source=FragmentSource(
+                    platform=SourcePlatform.DISCORD,
+                    channel=channel,
+                ),
+                created=authored,
+                authored_at=authored,
+            )
+            _write_fragment(vault=vault, fragment=frag, body="body")
+            fragments.append(frag)
+
+    config = CreekConfig()
+    linker = EmbeddingLinker(config=config.embeddings)
+    vectors = {frag.id: [1.0, 0.0, 0.0] for frag in fragments}
+    cache_path = embeddings_cache_path(vault)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    linker.save_cache(linker.build_cache_entries(fragments, vectors), cache_path)
+    return fragments
+
+
+def test_run_link_honours_configured_stream_platforms(tmp_path: Path) -> None:
+    """The configured stream-platform list reaches the detector, both ways.
+
+    Issue #880: with the default list, two Discord channels ten days apart
+    are two conversation episodes and therefore two eddies. Emptying the
+    list — the documented way to disable segmentation — collapses them back
+    into the single ten-fragment blob the bug produced. Neither outcome is
+    reachable unless ``run_link`` actually passes the configuration to
+    ``EddyDetector``, which it previously did not.
+    """
+    vault = tmp_path / "vault"
+    fragments = _embedded_message_stream(vault)
+
+    segmented = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="eddies",
+        rebuild=False,
+    )
+    assert segmented.eddies_detected == 2
+    assert segmented.largest_cluster_fragments == len(fragments) // 2
+
+    unsegmented_config = CreekConfig()
+    unsegmented_config.linking.stream_platforms = []
+    unsegmented = run_link(
+        vault_path=vault,
+        config=unsegmented_config,
+        method="eddies",
+        rebuild=False,
+    )
+    assert unsegmented.eddies_detected == 1
+    assert unsegmented.largest_cluster_fragments == len(fragments)
+
+
+def test_embedding_pass_splits_computed_from_reused(tmp_path: Path) -> None:
+    """``EmbeddingPass`` must distinguish fresh vectors from cache hits.
+
+    The distinction is what ``creek process`` bills ``local_model_processed``
+    against (#1303). Before it existed, the only number available to a
+    caller was ``len(fragments)``, which counted every cache hit as
+    local-model work the run never actually did.
+    """
+    from creek.link.link_engine import _load_or_compute_embeddings
+
+    vault = tmp_path / "vault"
+    first = Fragment(
+        id="frag-embedpass01",
+        title="First embedded fragment",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    _write_fragment(vault=vault, fragment=first, body="body")
+    cache_path = embeddings_cache_path(vault)
+
+    cold = _load_or_compute_embeddings(
+        fragments=[first],
+        config=CreekConfig(),
+        cache_path=cache_path,
+    )
+    assert cold.computed == 1
+    assert cold.reused == 0
+    assert set(cold.vectors) == {first.id}
+
+    second = Fragment(
+        id="frag-embedpass02",
+        title="Second embedded fragment",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+    )
+    warm = _load_or_compute_embeddings(
+        fragments=[first, second],
+        config=CreekConfig(),
+        cache_path=cache_path,
+    )
+    assert warm.computed == 1, "only the new fragment should have been embedded"
+    assert warm.reused == 1
+    assert set(warm.vectors) == {first.id, second.id}
+
+
+def test_run_link_reports_fragments_embedded_per_method(tmp_path: Path) -> None:
+    """Every method's summary reports the vectors that pass actually computed.
+
+    ``eddies`` and ``threads`` both load embeddings, so the first of the
+    two to run pays for them and the second reports zero. ``creek process``
+    relies on exactly that to avoid double-counting Pass-2 work (#1303).
+    """
+    vault = tmp_path / "vault"
+    for index in range(3):
+        _write_fragment(
+            vault=vault,
+            fragment=Fragment(
+                id=f"frag-embedcount{index}",
+                title=f"Counted fragment {index}",
+                source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+            ),
+            body="body",
+        )
+
+    first = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="eddies",
+        rebuild=False,
+    )
+    second = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="threads",
+        rebuild=False,
+    )
+    assert first.fragments_embedded == 3
+    assert second.fragments_embedded == 0
+
+
+# ----- Issue #1337: report what actually reached the parquet -----------------
+
+
+def _seeded_embeddings_vault(vault: Path, *, count: int) -> list[Fragment]:
+    """Seed *vault* with *count* fragments and no embeddings cache.
+
+    Deliberately does **not** pre-write the parquet: these tests are about
+    what a run persists, so the artifact must be created by the run under
+    test and by nothing else.
+
+    Args:
+        vault: Vault root.
+        count: Number of fragment files to write.
+
+    Returns:
+        The created fragments, in creation order.
+    """
+    fragments: list[Fragment] = []
+    for index in range(count):
+        frag = Fragment(
+            id=f"frag-1337persist{index:02d}",
+            title=f"Persisted vector {index}",
+            source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        )
+        _write_fragment(vault=vault, fragment=frag, body=f"Body {index}.")
+        fragments.append(frag)
+    return fragments
+
+
+def test_run_link_embeddings_reports_vectors_actually_persisted(
+    tmp_path: Path,
+) -> None:
+    """``vectors_persisted`` equals the rows the parquet now holds.
+
+    Issue #1337: the CLI claimed "vectors cached in
+    00-Creek-Meta/embeddings.parquet" from a hardcoded clause, with nothing
+    in the summary to contradict it. The count is now structured, and it is
+    pinned here against the artifact — ``pq.read_table(...).num_rows`` —
+    rather than a literal, so the fixture and the assertion cannot drift.
+    """
+    import pyarrow.parquet as pq
+
+    vault = tmp_path / "vault"
+    fragments = _seeded_embeddings_vault(vault, count=3)
+
+    summary = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="embeddings",
+        rebuild=False,
+    )
+
+    cache_path = embeddings_cache_path(vault)
+    assert cache_path.exists()
+    assert summary.fragment_count == len(fragments)
+    assert summary.vectors_persisted == summary.fragment_count
+    assert summary.vectors_persisted == pq.read_table(cache_path).num_rows
+
+
+def test_run_link_embeddings_empty_vault_persists_no_vectors(
+    tmp_path: Path,
+) -> None:
+    """The fragmentless early return must carry ``vectors_persisted == 0``.
+
+    Issue #1337: ``run_link`` returns a bare ``LinkSummary`` for an empty
+    vault, so the honest zero has to come from the field's default rather
+    than from a special case at the return site. If a later refactor gives
+    the field a non-zero default, or populates it unconditionally, this
+    fails — and so does the paired disk assertion, because no parquet is
+    written on this path at all.
+    """
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+
+    summary = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="embeddings",
+        rebuild=False,
+    )
+
+    assert summary.fragment_count == 0
+    assert summary.vectors_persisted == 0
+    assert not embeddings_cache_path(vault).exists()
+
+
+def test_run_link_embeddings_save_failure_reports_zero_persisted(
+    tmp_path: Path,
+) -> None:
+    """A swallowed ``OSError`` from ``save_cache`` must report zero persisted.
+
+    Issue #1337: ``_persist_cache`` degrades gracefully on a full disk or a
+    read-only volume, which is the right behaviour and is preserved (the
+    run still completes). What was wrong is that the operator was told the
+    vectors had been cached anyway. Two fragments are embedded and zero
+    persisted here on purpose: an implementation that aliased
+    ``vectors_persisted`` to ``fragments_embedded`` would pass a
+    single-fragment version of this test's disk check but dies on the
+    counter comparison.
+    """
+    from unittest.mock import patch
+
+    vault = tmp_path / "vault"
+    fragments = _seeded_embeddings_vault(vault, count=2)
+
+    with patch(
+        "creek.link.embeddings.EmbeddingLinker.save_cache",
+        side_effect=OSError("disk full"),
+    ):
+        summary = run_link(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="embeddings",
+            rebuild=False,
+        )
+
+    assert summary.fragments_embedded == len(fragments)
+    assert summary.vectors_persisted == 0
+    assert not embeddings_cache_path(vault).exists()
+
+
+def test_embedding_pass_requires_an_explicit_persisted_count() -> None:
+    """``EmbeddingPass.persisted`` has no default; every call site must state it.
+
+    Issue #1337: a default would let a future pass under-report silently —
+    the whole point of the field is that the number is measured, not
+    assumed. The dataclass-field check kills the mutant that swaps the
+    missing default for a ``default_factory`` returning zero, which would
+    keep the constructor call from raising while restoring the hazard.
+    """
+    from dataclasses import MISSING, fields
+
+    from creek.link import link_engine
+
+    # Widened deliberately: a precisely-typed call to a constructor with a
+    # required argument omitted is a type error, and the point here is the
+    # runtime contract, not the annotation.
+    constructor: Callable[..., object] = link_engine.EmbeddingPass
+    with pytest.raises(TypeError):
+        constructor(vectors={}, computed=0, reused=0)
+
+    persisted_field = next(
+        field
+        for field in fields(link_engine.EmbeddingPass)
+        if field.name == "persisted"
+    )
+    assert persisted_field.default is MISSING
+    assert persisted_field.default_factory is MISSING
+
+    complete = link_engine.EmbeddingPass(
+        vectors={},
+        computed=0,
+        reused=0,
+        persisted=0,
+    )
+    assert complete.persisted == 0
+
+
+class _FlatEncoder:
+    """Deterministic stand-in for the sentence-transformer model.
+
+    Row ``i`` is ``[1.0, 0.001 * i]``, so every pair clears the default
+    0.75 cosine threshold and the run produces a known-non-zero edge count.
+    The shared conftest mock returns random 384-dimension vectors, which
+    are near-orthogonal and typically yield zero edges — useless for a test
+    whose whole subject is what happens per edge.
+    """
+
+    def encode(self, texts: str | list[str], **_kwargs: object) -> list[list[float]]:
+        """Return one deterministic vector per entry in *texts*.
+
+        Args:
+            texts: A single text, or the batch the linker passes.
+            **_kwargs: ``show_progress_bar`` / ``batch_size``; ignored.
+
+        Returns:
+            One ``[1.0, 0.001 * i]`` row per input text.
+        """
+        batch = [texts] if isinstance(texts, str) else list(texts)
+        return [[1.0, 0.001 * index] for index, _text in enumerate(batch)]
+
+
+def test_run_link_embeddings_counts_edges_without_building_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``creek link --method embeddings`` must not allocate a model per edge.
+
+    Issue #1337: ``_run_embeddings`` called ``find_resonances`` and took
+    ``len`` of the result, so every above-threshold pair became a Pydantic
+    :class:`~creek.link.embeddings.Resonance` that was counted and dropped.
+    Measured at ~1KB of heap each, which at the documented 35k-fragment
+    scale is tens of gigabytes — the run dies before it can report anything.
+
+    ``tests/test_embeddings.py`` pins that ``count_resonances`` itself
+    allocates nothing. This pins the *call site*, which is the part a
+    revert would touch: swapping ``count_resonances`` back for
+    ``find_resonances`` here leaves every count in this suite correct and
+    reinstates the whole defect, so nothing else in the codebase notices.
+    """
+    from creek.link import embeddings as embeddings_module
+
+    vault = tmp_path / "vault"
+    _seeded_embeddings_vault(vault, count=6)
+
+    constructed = 0
+    real_resonance = embeddings_module.Resonance
+
+    def _spy(**kwargs: Any) -> object:
+        """Count each Resonance the link run builds."""
+        nonlocal constructed
+        constructed += 1
+        return real_resonance(**kwargs)
+
+    monkeypatch.setattr(embeddings_module, "Resonance", _spy)
+    monkeypatch.setattr(
+        embeddings_module.EmbeddingLinker,
+        "load_model",
+        lambda _self: _FlatEncoder(),
+    )
+
+    summary = run_link(
+        vault_path=vault,
+        config=CreekConfig(),
+        method="embeddings",
+        rebuild=False,
+    )
+
+    # Vacuity guard: 6 mutually-similar fragments must yield C(6,2) edges,
+    # so "zero objects built" is a real property and not an empty traversal.
+    assert summary.similarity_edges == 15
+    assert constructed == 0, (
+        f"the link run built {constructed} Resonance object(s) to count "
+        f"{summary.similarity_edges} edge(s); counting must allocate none"
+    )

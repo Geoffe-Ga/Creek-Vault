@@ -64,7 +64,7 @@ def write_fragment_file(
 
 _RAW_FRAGMENT_FM = (
     '---\ntype: fragment\nid: {id}\ntitle: "{title}"\n'
-    "source:\n  platform: {platform}\n  author: {author}\n{extra}---\n{body}\n"
+    "source:\n  platform: {platform}\n  author: {author}\n{extra}{tier}---\n{body}\n"
 )
 
 
@@ -78,6 +78,7 @@ def write_raw_fragment_file(
     author: str = "self",
     author_slug: str | None = None,
     platform: str = "journal",
+    privacy_tier: str | None = "open",
 ) -> None:
     """Write a minimal fragment markdown file under *subdir* of *vault*.
 
@@ -87,6 +88,14 @@ def write_raw_fragment_file(
     corpora (an ``author_slug`` lands the fragment under ``11-Other-Authors/``).
     For a fragment built from a :class:`~creek.models.Fragment` model, use
     :func:`write_fragment_file` instead.
+
+    ``privacy_tier`` defaults to ``"open"`` because the suites that use this
+    helper are seeding *ordinary admitted corpus content*. Since #876 an
+    untiered fragment ranks as PERSONAL and is therefore excluded from the
+    Writing Desk's evidence at the default ceiling, so leaving the key off
+    would silently empty those corpora. Pass ``privacy_tier=None`` to write a
+    file whose ``privacy_tier`` key is genuinely **absent** (the legacy /
+    hand-edited shape).
 
     Args:
         vault: The vault root to write under.
@@ -98,10 +107,12 @@ def write_raw_fragment_file(
         author: The authorship axis (``self`` / ``other`` / ...).
         author_slug: The ``11-Other-Authors/`` slug, or ``None`` for self.
         platform: The source platform string.
+        privacy_tier: Tier to stamp, or ``None`` to omit the key entirely.
     """
     folder = vault / subdir
     folder.mkdir(parents=True, exist_ok=True)
     extra = f"  author_slug: {author_slug}\n" if author_slug else ""
+    tier = f"privacy_tier: {privacy_tier}\n" if privacy_tier else ""
     (folder / f"{frag_id}.md").write_text(
         _RAW_FRAGMENT_FM.format(
             id=frag_id,
@@ -109,6 +120,7 @@ def write_raw_fragment_file(
             platform=platform,
             author=author,
             extra=extra,
+            tier=tier,
             body=body,
         ),
         encoding="utf-8",

@@ -1,0 +1,81 @@
+{
+  "$defs": {
+    "JournalAction": {
+      "description": "What an idempotent write actually did \u2014 journal upsert or upload.\n\n``UNCHANGED`` is a success, not an error: re-sending an unmodified entry is\nthe steady state of a continuous sync, and a client must be able to tell it\napart from a write without diffing content itself.\n\nShared by :class:`JournalUpsertResponse` and :class:`UploadResponse` rather\nthan duplicated under a second name. The three words are the same three\n:func:`creek_mcp.tools.upload._action_of` collapses an ingest tally into,\nand the ledger that decides them is one ledger. The name kept its\n``Journal`` prefix through contract 0.8 because it is a **published schema\ncomponent name**: Adepthood has vendored ``$defs/JournalAction`` since 0.2,\nand renaming it would break every consumer's schema validation to buy\nnothing a docstring cannot say.\n\nAttributes:\n    CREATED: A new fragment was written.\n    UPDATED: An existing fragment was updated in place.\n    UNCHANGED: The content hash matched; nothing was written.",
+      "enum": [
+        "created",
+        "updated",
+        "unchanged"
+      ],
+      "title": "JournalAction",
+      "type": "string"
+    },
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:func:`creek_mcp.policy.admitted_ceiling` refuses any remote call declaring\na ceiling outside :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` *before\ndispatch*. Since #1073 that decision is transport-neutral, so every adapter\nis meant to reach it the same way; the MCP surface does so today through\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool`, and #1074 mounts the\n``/v1`` handlers that will. This enum mirrors that frozenset, so\n``intimate`` and ``all`` are not merely refused at runtime \u2014 they cannot be\nconstructed at all, which is the half of the guarantee that does not depend\non a handler remembering to ask.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The result of an idempotent journal write.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call was served under \u2014 the caller's own\n        declared value, echoed for correlation.\n    external_id: The consumer-side identity of the entry, unchanged.\n    fragment_id: The vault-side identity now backing it.\n    action: Whether the write created, updated, or changed nothing.\n    tier: The tier the entry was created at. Not expressible as\n        ``intimate``, for the same reason as on the request.\n    warnings: Content-free operator advisories this write produced, and\n        absent entirely when there were none (#1372). Optional rather\n        than an always-present empty list on purpose: ``_WireModel`` is\n        ``extra=\"forbid\"`` and this server still serves contract minors\n        0.2, 0.3 and 0.4, so an unconditional key would put an\n        unnegotiated field in every ``200`` those clients receive. Paired\n        with ``exclude_none`` at the dump, the quiet write stays\n        byte-identical to what it was before this field existed. Every\n        entry is proven free of vault content at the producer \u2014 see\n        :attr:`creek.ingest.pipeline.IngestRunResult.ceiling_safe_warnings`\n        \u2014 so nothing here varies with the caller's ceiling.",
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/JournalAction",
+      "description": "Created, updated, or unchanged."
+    },
+    "external_id": {
+      "description": "Consumer-side entry identity.",
+      "title": "External Id",
+      "type": "string"
+    },
+    "fragment_id": {
+      "description": "Vault-side fragment identity.",
+      "title": "Fragment Id",
+      "type": "string"
+    },
+    "status": {
+      "const": "ok",
+      "description": "Always ok; failure is an error.",
+      "title": "Status",
+      "type": "string"
+    },
+    "tier": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Tier the entry was created at."
+    },
+    "tier_ceiling": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Ceiling the call ran at."
+    },
+    "warnings": {
+      "anyOf": [
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Content-free operator advisories this write produced; absent when none.",
+      "title": "Warnings"
+    }
+  },
+  "required": [
+    "status",
+    "tier_ceiling",
+    "external_id",
+    "fragment_id",
+    "action",
+    "tier"
+  ],
+  "title": "JournalUpsertResponse",
+  "type": "object"
+}

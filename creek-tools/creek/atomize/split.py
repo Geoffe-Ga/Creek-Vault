@@ -24,7 +24,8 @@ identical IDs and contents, because child IDs are derived deterministically
 from ``(parent_id, level, sibling_index)`` via
 :func:`creek.ingest.base.generate_child_fragment_id`.
 
-The twin zoom-out operator is FEAT-022 (aggregator); persistence of
+The twin zoom-out operator was FEAT-022 (aggregator), retired by issue
+#1342 (ADR-0011) for having no production caller; persistence of
 returned children is FEAT-023 (re-atomization driver). This module
 performs neither.
 

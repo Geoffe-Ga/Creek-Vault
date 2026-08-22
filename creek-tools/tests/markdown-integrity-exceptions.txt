@@ -1,0 +1,32 @@
+# Fence-integrity exceptions (issue #1190).
+#
+# Format: "<path> <reason>", mirroring scripts/coverage-waivers.txt.
+# Blank lines and lines whose stripped form starts with "#" are ignored;
+# every other line is partitioned on its FIRST space. Paths are
+# repo-relative POSIX paths as `git ls-files` emits them from the
+# repository root, so the canonical form is "creek-tools/<file>.md" for
+# anything inside the Python subproject and "<file>.md" for anything at
+# the repo root.
+#
+# An entry exempts its file from the UNCLOSED-FENCE check only. The
+# trailing-newline check and the same-file-anchor check in
+# tests/test_markdown_integrity.py still apply to every file listed here.
+#
+# The list is itself verified, so it cannot rot into permanent cover:
+# an entry naming a file git no longer tracks fails the suite, an entry
+# whose file now has balanced fences fails the suite, an entry with no
+# issue reference in its reason fails the suite, and adding a path not in
+# KNOWN_FENCE_EXCEPTIONS in tests/test_markdown_integrity.py fails the
+# suite. Fix the fence and delete the line; do not add new entries here
+# to make a red gate go green.
+#
+# The list is currently EMPTY, and that is the desired state.
+#
+# It once held three skill files broken by the same CommonMark trap:
+# fences do not nest, so a ```markdown block demonstrating an inner
+# ```json (or ```bash) block ended early at the inner block's bare
+# closer, and the outer block's intended closer then opened a fence that
+# was never closed. All three were deleted by the context prune, which
+# closes issue #1193 by removal rather than repair. With nothing
+# exempted, the fence check in tests/test_markdown_integrity.py now runs
+# over every tracked Markdown file without exception.

@@ -897,7 +897,6 @@ pytz = "^2024.1"         # Timezone normalization
 # creek_config.yaml
 vault_path: "/path/to/Creek-Vault"
 source_drive: "/path/to/external/drive"
-timezone: "America/Los_Angeles"
 
 llm:
   # DEFAULT: Local-only processing via Ollama. No data leaves your machine.
@@ -923,9 +922,30 @@ ocr:
   languages: ["eng"]
 
 linking:
-  temporal_window_hours: 168  # 1 week window for temporal proximity
+  temporal_window_hours: 168  # 1 week window for the temporal proximity linker
   thread_min_fragments: 3     # minimum fragments to form a thread
   eddy_min_fragments: 5       # minimum fragments to form an eddy
+
+  # Detector thresholds (defaults equal the constants they replaced)
+  eddy_eps: 0.3                       # max cosine DISTANCE for a DBSCAN neighbour
+  eddy_min_samples: 5                 # neighbours needed to be a core point
+  eddy_correlation_threshold: 0.3     # above this |Spearman|, it is a thread
+  thread_window_days: 30              # sliding window for thread pairing
+  thread_similarity_threshold: 0.6    # cosine a pair must exceed to union
+  thread_union_without_embeddings: false  # never union on frequency alone
+
+  # Cluster-size guardrail — no eddy/thread may swallow the vault
+  cluster_size_ceiling: 500     # never split a cluster below this size
+  cluster_max_fraction: 0.10    # max share of the corpus; 1.0 opts out
+  cluster_split_max_depth: 3    # re-clustering rounds; 0 disables splitting
+  eddy_split_eps_step: 0.05     # eddy_eps tightening per round
+  thread_split_similarity_step: 0.1  # similarity tightening per round
+
+  # Message-stream segmentation — chat has no low-density separator, so it
+  # is cut into conversation episodes BEFORE any similarity graph is built
+  stream_platforms: [discord, email]  # [] disables segmentation
+  stream_episode_max_gap_hours: 24    # silence that ends an episode
+  stream_episode_max_span_days: 30    # backstop for a never-idle channel
 
 classification:
   confidence_threshold: 0.7   # below this, add to review queue

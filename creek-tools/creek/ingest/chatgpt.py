@@ -22,13 +22,14 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from creek.ingest.base import (
-    LA_TZ,
     Ingestor,
     ParsedFragment,
     RawDocument,
     normalize_encoding,
 )
+from creek.ingest.turns import group_turn_runs, merge_turn_texts
 from creek.models import Authorship
+from creek.time import LA_TZ
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -167,7 +168,9 @@ class ChatGPTIngestor(Ingestor):
             source["conversation_id"] = conv_id
         if is_ai:
             # AI turns are AI-authored, excluded from the voice proxy via
-            # ``voice_proxy_eligible``; zero weight is belt-and-braces.
+            # ``voice_proxy_eligible``; zero weight is belt-and-braces. The
+            # authorship half is enforced by
+            # ``creek.generate.voice._eligible_register`` (#1213).
             source["author"] = _ROLE_AI
         frontmatter_dict: dict[str, Any] = {
             "title": fragment.metadata.get("title", "Untitled Conversation"),
@@ -538,12 +541,24 @@ def _pair_messages_to_fragments(
     conversation_id: str | None = None,
     conversation_create_time: float | None = None,
 ) -> list[ParsedFragment]:
-    """Pair consecutive user+assistant messages into fragments.
+    """Pair user+assistant turns into fragments.
 
-    Iterates through the ordered message list, pairing each user
-    message with the following assistant message. System messages
-    and unpaired user messages at the end are skipped. Each fragment
-    title includes a turn index to prevent collisions.
+    Segments the ordered message list into ``(user_run, assistant_run)``
+    turns via :func:`creek.ingest.turns.group_turn_runs`, merging each
+    run's text. System and tool messages are skipped; an unanswered user
+    turn at the end is discarded. Each fragment title includes a turn
+    index to prevent collisions.
+
+    Until #1333 this was an index walk that paired a user message only
+    with a *strictly adjacent* assistant message, which lost content
+    three ways, all silently: the first of two consecutive user messages
+    was skipped entirely, the second of two consecutive assistant
+    messages was swept up by the "any other role" arm, and a system node
+    sitting between a question and its answer suppressed the whole
+    exchange — despite this docstring already claiming system messages
+    were skipped. The user-side loss is the costly one: those fragments
+    are ``source.author=self`` and are what the voice fingerprint trains
+    on.
 
     FEAT-031: each pair carries ``authored_at`` derived from the
     user message's ``create_time``. When the per-message field is
@@ -562,84 +577,103 @@ def _pair_messages_to_fragments(
             ``create_time`` for the FEAT-031 ``authored_at`` fallback.
 
     Returns:
-        A list of ``ParsedFragment`` objects, one per pair.
+        A list of ``ParsedFragment`` objects, two per turn.
     """
     conv_authored_at = _epoch_to_authored_at(conversation_create_time)
+    turns = group_turn_runs(
+        messages,
+        role_of=_get_message_role,
+        human_role="user",
+        assistant_role="assistant",
+    )
 
     fragments: list[ParsedFragment] = []
-    turn_idx = 0
-    i = 0
-    while i < len(messages):
-        msg = messages[i]
-        role = _get_message_role(msg)
-
-        if role == "system":
-            i += 1
-            continue
-
-        if role == "user":
-            user_text = _extract_message_text(msg)
-            user_time: float | None = msg.get("create_time")
-            # Look for the next assistant message
-            if i + 1 < len(messages):
-                next_msg = messages[i + 1]
-                next_role = _get_message_role(next_msg)
-                if next_role == "assistant":
-                    assistant_text = _extract_message_text(next_msg)
-                    fragment_ts = (
-                        _epoch_to_la_datetime(user_time)
-                        if user_time
-                        else conversation_timestamp
-                    )
-                    msg_authored_at = _epoch_to_authored_at(user_time)
-                    authored_at = (
-                        msg_authored_at
-                        if msg_authored_at is not None
-                        else conv_authored_at
-                    )
-                    # Emit the human turn and the AI turn as two
-                    # separately-attributed fragments instead of one merged
-                    # fragment, so the AI's prose can never train the voice
-                    # proxy. Both share the conversation id, turn index, and
-                    # timestamp so threading/linking still works.
-                    base_meta: dict[str, Any] = {
-                        "platform": "chatgpt",
-                        "authored_at": authored_at,
-                    }
-                    if conversation_id is not None:
-                        base_meta["conversation_id"] = conversation_id
-                    fragments.extend(
-                        (
-                            ParsedFragment(
-                                content=user_text,
-                                metadata=base_meta
-                                | {
-                                    "title": f"{title} (turn {turn_idx})",
-                                    "author_role": _ROLE_SELF,
-                                },
-                                source_path=source_path,
-                                timestamp=fragment_ts,
-                            ),
-                            ParsedFragment(
-                                content=assistant_text,
-                                metadata=base_meta
-                                | {
-                                    "title": f"{title} (turn {turn_idx}, AI)",
-                                    "author_role": _ROLE_AI,
-                                },
-                                source_path=source_path,
-                                timestamp=fragment_ts,
-                            ),
-                        )
-                    )
-                    turn_idx += 1
-                    i += 2
-                    continue
-            # No assistant follows: skip this user message
-            i += 1
-            continue
-
-        # Skip any other role (e.g., tool)
-        i += 1
-
+    for turn_idx, (user_run, assistant_run) in enumerate(turns):
+        fragments.extend(
+            _build_turn_fragments(
+                user_run=user_run,
+                assistant_run=assistant_run,
+                turn_idx=turn_idx,
+                title=title,
+                conversation_timestamp=conversation_timestamp,
+                source_path=source_path,
+                conversation_id=conversation_id,
+                conv_authored_at=conv_authored_at,
+            )
+        )
     return fragments
+
+
+def _build_turn_fragments(
+    *,
+    user_run: list[dict[str, Any]],
+    assistant_run: list[dict[str, Any]],
+    turn_idx: int,
+    title: str,
+    conversation_timestamp: datetime,
+    source_path: str,
+    conversation_id: str | None,
+    conv_authored_at: datetime | None,
+) -> list[ParsedFragment]:
+    """Build the human and AI fragments for one ChatGPT turn.
+
+    The human turn and the AI turn are emitted as two
+    separately-attributed fragments rather than one merged fragment, so
+    the model's prose can never train the voice proxy. Both share the
+    conversation id, turn index, and timestamp so threading/linking
+    still works.
+
+    Args:
+        user_run: The turn's consecutive user messages, in order.
+        assistant_run: The turn's consecutive assistant messages.
+        turn_idx: Zero-based index of this turn in the conversation.
+        title: The conversation title.
+        conversation_timestamp: Fallback timestamp for the turn.
+        source_path: The source file path.
+        conversation_id: Optional ChatGPT conversation ID for metadata.
+        conv_authored_at: Conversation-level FEAT-031 fallback.
+
+    Returns:
+        ``[human_fragment, ai_fragment]`` for this turn.
+    """
+    user_text = merge_turn_texts([_extract_message_text(m) for m in user_run])
+    assistant_text = merge_turn_texts([_extract_message_text(m) for m in assistant_run])
+    # The run's *last* user message stamps the turn — the one the reply
+    # actually answered, and the one the pre-#1333 adjacency walk already
+    # picked, so no already-correct fragment id churns.
+    user_time: float | None = user_run[-1].get("create_time")
+    fragment_ts = (
+        _epoch_to_la_datetime(user_time) if user_time else conversation_timestamp
+    )
+    msg_authored_at = _epoch_to_authored_at(user_time)
+    authored_at = msg_authored_at if msg_authored_at is not None else conv_authored_at
+
+    base_meta: dict[str, Any] = {
+        "platform": "chatgpt",
+        "authored_at": authored_at,
+    }
+    if conversation_id is not None:
+        base_meta["conversation_id"] = conversation_id
+
+    return [
+        ParsedFragment(
+            content=user_text,
+            metadata=base_meta
+            | {
+                "title": f"{title} (turn {turn_idx})",
+                "author_role": _ROLE_SELF,
+            },
+            source_path=source_path,
+            timestamp=fragment_ts,
+        ),
+        ParsedFragment(
+            content=assistant_text,
+            metadata=base_meta
+            | {
+                "title": f"{title} (turn {turn_idx}, AI)",
+                "author_role": _ROLE_AI,
+            },
+            source_path=source_path,
+            timestamp=fragment_ts,
+        ),
+    ]

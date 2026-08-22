@@ -417,6 +417,69 @@ class TestAnalyzePeriod:
         )
         assert snap.emotional_texture_cloud[0] == ("grief", 3)
 
+    def test_emotional_texture_cloud_is_the_whole_ordered_list(
+        self,
+        tracker: WavelengthTracker,
+    ) -> None:
+        """The cloud is exactly the counted tags, most-common first (#878).
+
+        The two tests above assert one entry each; this pins the *whole*
+        list in one comparison, so an implementation that dropped a tag,
+        double-counted one, or appended an extra cannot pass. Counts are
+        strictly decreasing (3 / 2 / 1) so the ordering is unambiguous
+        and the assertion carries no tie-breaking assumption.
+        """
+        fragments = [
+            _make_fragment(
+                frag_id="a",
+                created=datetime(2025, 1, 2),
+                emotional_texture=["grief", "resolve", "wonder"],
+            ),
+            _make_fragment(
+                frag_id="b",
+                created=datetime(2025, 1, 3),
+                emotional_texture=["grief", "resolve"],
+            ),
+            _make_fragment(
+                frag_id="c",
+                created=datetime(2025, 1, 4),
+                emotional_texture=["grief"],
+            ),
+        ]
+
+        snap = tracker.analyze_period(
+            fragments,
+            date(2025, 1, 1),
+            date(2025, 1, 7),
+        )
+
+        assert snap.emotional_texture_cloud == [
+            ("grief", 3),
+            ("resolve", 2),
+            ("wonder", 1),
+        ]
+
+    def test_emotional_texture_cloud_is_empty_without_textures(
+        self,
+        tracker: WavelengthTracker,
+    ) -> None:
+        """Untagged fragments produce an empty cloud, not a phantom entry.
+
+        This is the state the operator's 35,330-fragment vault was in
+        before #878 gave ``emotional_texture`` a producer: every snapshot
+        empty, and every rendered report reading "_No emotional texture
+        tags recorded._". Kept as the negative control so the positive
+        assertions above cannot be satisfied by a generator that invents
+        tags.
+        """
+        snap = tracker.analyze_period(
+            [_make_fragment(frag_id="a", created=datetime(2025, 1, 2))],
+            date(2025, 1, 1),
+            date(2025, 1, 7),
+        )
+
+        assert snap.emotional_texture_cloud == []
+
     def test_confidence_is_one_when_fully_consistent(
         self,
         tracker: WavelengthTracker,

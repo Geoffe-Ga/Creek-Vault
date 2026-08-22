@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Self
+from typing import Final, Self
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -79,7 +79,25 @@ _DEFAULT_DENIED_EXTENSIONS: tuple[str, ...] = (
     ".jar",
 )
 
-_DEFAULT_STAGING_SUBPATH = Path("00-Creek-Meta") / "Inbound"
+CANONICAL_STAGING_ROOT: Final[Path] = Path("00-Creek-Meta") / "Inbound"
+"""The one staging subtree ``creek.redact.scan`` admits at every ceiling.
+
+Mirrored from ``creek-tools/creek_mcp/tools/redact.py:98``
+(``_STAGING_SUBDIR``), which is the source of truth. That tool reads no
+per-file privacy tier, so it ranks every *other* vault path as intimate
+content and refuses any caller whose ceiling is not ``intimate``/``all``.
+CrawDad channels are ``personal`` by default, so an
+``attachments.staging_subpath`` outside this subtree draws
+``status="refused"`` on every scan and the safety pass silently never
+runs — that is #1088.
+
+Mirrored rather than imported, on the same precedent as
+:data:`crawdad.bot._REDACT_SCAN_TOOL`: CrawDad has no Python-level
+dependency on creek-tools beyond the MCP contract, and a two-segment path
+is not worth coupling the two packages' install graphs for.
+``test_canonical_staging_root_mirrors_the_mcp_scan_scope`` is the guard
+against the mirror drifting from its source.
+"""
 
 _ENV_DISCORD_TOKEN = "DISCORD_BOT_TOKEN"
 _ENV_PROVIDER = "CRAWDAD_PROVIDER"
@@ -192,6 +210,58 @@ MAX_LOOP_ROUNDS: int = 5
 CREEK_SKILLS_DIRNAME: str = "creek-skills"
 DEFAULT_REGISTER: str = "confessional"
 
+# The privacy tier vocabulary a channel override may name. Mirrored from
+# :class:`creek_mcp.tier_ceiling.TierCeiling` without importing it — crawdad
+# has no Python dependency on creek-tools. Enforced at config-parse time by
+# :meth:`AttachmentConfig._validate_channel_tiers`.
+_VALID_CHANNEL_TIERS: Final[frozenset[str]] = frozenset(
+    {"open", "personal", "intimate", "all"}
+)
+
+# The only channel tiers whose messages bot-capture may write to the vault
+# (#1052).
+#
+# A capture record carries no tier field (``capture.py::_record_for``), and the
+# creek-tools side that reads the capture dir
+# (``stage_capture_as_data_package``) drops channel metadata, so a captured
+# message lands downstream as ``unclassified`` — which ranks WITH ``personal``
+# (``creek_mcp/tier_ceiling.py``, #961). Capture may therefore carry only
+# content whose ceiling the record can represent: ``open`` (narrower than
+# ``personal`` once landed) and ``personal`` (exact). ``intimate`` must be
+# refused, and so must ``all``, which admits intimate content by definition.
+#
+# Written out explicitly rather than derived as
+# ``_VALID_CHANNEL_TIERS - {"intimate", "all"}``: a subtraction would silently
+# auto-admit any tier added to the vocabulary later, when the safe default for
+# an unreviewed tier is refusal.
+#
+# The value coincides with ``workflows.WORKFLOW_ADMITTED_CEILINGS`` but is
+# deliberately NOT derived from it, and neither is canonical for the other:
+# that set draws its line at the cloud composer, this one at what a capture
+# record can represent. The reasoning above stands on its own if the workflow
+# set ever changes.
+#
+# Membership (``in``), never a rank comparison: ``crawdad.intents`` owns the
+# single tier-ordering table (``CEILING_RANK``, moved there from
+# ``crawdad.loop`` by #1152 so the capping rule sits beside the vocabulary it
+# caps) and a second one must not exist. The values stay
+# plain ``str`` rather than ``intents.PrivacyTierCeiling`` members because
+# ``channel_privacy_tiers`` is a ``dict[int, str]`` of operator-written YAML
+# and this module deliberately owns the tier vocabulary without importing
+# ``crawdad.intents``. (A ``StrEnum`` member would in fact match a plain string
+# here — ``str.__hash__`` precedes ``Enum.__hash__`` in the MRO — so this is a
+# layering choice, not a correctness workaround.)
+CAPTURE_ADMITTED_TIERS: Final[frozenset[str]] = frozenset({"open", "personal"})
+
+# The ceiling assumed for a channel with no ``channel_privacy_tiers`` entry.
+# Ingest writes are personal by default per FEAT-011, so a missing entry never
+# silently relaxes the ceiling. Named rather than inlined because
+# :func:`crawdad.bot._channel_tier` and :data:`CAPTURE_ADMITTED_TIERS` jointly
+# decide whether an operator who never wrote a ``channel_privacy_tiers`` block
+# keeps bot-capture: that promise holds only while this value is a member of
+# that set, which ``test_default_channel_tier_is_capture_admitted`` pins.
+DEFAULT_CHANNEL_TIER: Final[str] = "personal"
+
 
 class AttachmentConfig(BaseModel):
     """Per-attachment limits and staging-path config (FEAT-027).
@@ -212,7 +282,17 @@ class AttachmentConfig(BaseModel):
             the ingest pipeline cannot handle.
         staging_subpath: Vault-relative directory under which per-
             channel / per-message subdirectories are created. Default
-            ``00-Creek-Meta/Inbound``.
+            :data:`CANONICAL_STAGING_ROOT` (``00-Creek-Meta/Inbound``),
+            and it must stay inside that subtree — see
+            :meth:`_confine_staging_subpath` — because it is the only
+            scope ``creek.redact.scan`` admits at a CrawDad channel's
+            ceiling (#1088). That check is lexical and fail-fast: it is
+            defence in depth, **not** confinement. This model has no
+            ``vault_path`` and resolves nothing, so a symlink parked
+            under the canonical root still passes (#1087); the real
+            confinement boundary is creek-tools' ``resolve_within_vault``
+            plus the resolved ``is_relative_to`` at
+            ``creek_mcp/tools/redact.py:340``.
         channel_privacy_tiers: Optional per-channel privacy tier
             override (``open`` / ``personal`` / ``intimate`` / ``all``).
             When a channel id is absent, attachments inherit the bot's
@@ -231,7 +311,19 @@ class AttachmentConfig(BaseModel):
             to-md, etc.) before the user is even asked to ingest.
     """
 
-    model_config = ConfigDict(frozen=True)
+    # ``validate_default=True`` is load-bearing, and it belongs at the model
+    # level rather than on ``Field(...)``. Pydantic skips field validators for
+    # defaults unless asked, so without it a future edit to
+    # :data:`CANONICAL_STAGING_ROOT` — or a subclass re-declaring
+    # ``staging_subpath`` with an out-of-scope default — would reintroduce
+    # #1088 with every test still green. A per-field ``validate_default`` is
+    # NOT inherited by a subclass that re-declares the field; the model config
+    # is, which is why it lives here. Knock-on: the other defaults are now
+    # validated too — ``allowed_extensions``/``denied_extensions`` through
+    # :meth:`_normalise_extensions` and the empty ``channel_privacy_tiers``
+    # through :meth:`_validate_channel_tiers` — and each passes its own
+    # validator unchanged.
+    model_config = ConfigDict(frozen=True, validate_default=True)
 
     max_size_bytes: int = Field(
         default=_DEFAULT_MAX_ATTACHMENT_BYTES,
@@ -243,7 +335,7 @@ class AttachmentConfig(BaseModel):
     denied_extensions: frozenset[str] = Field(
         default_factory=lambda: frozenset(_DEFAULT_DENIED_EXTENSIONS),
     )
-    staging_subpath: Path = Field(default=_DEFAULT_STAGING_SUBPATH)
+    staging_subpath: Path = Field(default=CANONICAL_STAGING_ROOT)
     channel_privacy_tiers: dict[int, str] = Field(default_factory=dict)
     reject_on_mime_mismatch: bool = Field(default=False)
 
@@ -263,13 +355,46 @@ class AttachmentConfig(BaseModel):
 
     @field_validator("staging_subpath")
     @classmethod
-    def _refuse_absolute_subpath(cls, value: Path) -> Path:
-        """Refuse absolute and ``..``-traversing paths — must stay in the vault.
+    def _confine_staging_subpath(cls, value: Path) -> Path:
+        """Refuse a staging root the redaction scan could never reach.
 
-        ``Path.is_absolute()`` catches obvious ``/etc/foo`` cases; the
-        ``..`` check closes the defence-in-depth gap where a relative
-        path like ``../../tmp`` would still resolve outside the vault
-        root when joined against ``vault_path``.
+        Three arms, and **their order is load-bearing**:
+
+        1. ``Path.is_absolute()`` — catches the obvious ``/etc/foo`` case.
+        2. ``".." in value.parts`` — a relative ``../../tmp`` would still
+           land outside the vault root once joined onto ``vault_path``.
+        3. ``not value.is_relative_to(CANONICAL_STAGING_ROOT)`` — outside
+           :data:`CANONICAL_STAGING_ROOT` the scan ranks the target as
+           intimate content and refuses every ceiling a CrawDad channel
+           declares, so the safety pass silently never runs (#1088).
+
+        Arm 2 must stay ahead of arm 3: ``Path.is_relative_to`` is a pure
+        lexical prefix comparison and does not resolve ``..``, so
+        ``00-Creek-Meta/Inbound/../../01-Fragments`` *is* relative to the
+        canonical root and only the ``..`` arm catches it.
+
+        Every arm here is **lexical, fail-fast, defence in depth**. Nothing
+        calls ``resolve()``, and :class:`AttachmentConfig` is a nested model
+        with no ``vault_path`` to resolve against, so a symlink parked under
+        ``00-Creek-Meta/Inbound`` that points at ``01-Fragments`` still
+        passes — that is #1087. **The real confinement boundary is
+        creek-tools' ``resolve_within_vault`` plus the resolved
+        ``is_relative_to`` at ``creek_mcp/tools/redact.py:340``**; this
+        validator only turns an always-refused deployment into a startup
+        error that names the fix.
+
+        Normalisation is ``pathlib``'s, not ours: ``00-Creek-Meta/./Inbound``
+        and a trailing slash both collapse to ``('00-Creek-Meta',
+        'Inbound')`` and are accepted, while ``""`` becomes ``.`` and is
+        refused. Comparison is by parts and case-sensitive on every platform,
+        so ``00-Creek-Meta/Inbound-other`` and ``00-creek-meta/inbound`` are
+        both refused; case folding is deliberately NOT performed, because
+        ``redact.py:340`` compares literally and folding here would admit a
+        config the server then refuses — reopening the very hole this closes.
+
+        This is a parse-time gate, not an invariant: ``model_copy(update=…)``
+        and ``model_construct()`` bypass it, as they bypass any pydantic
+        validator. No such call site exists today.
         """
         if value.is_absolute():
             msg = (
@@ -283,6 +408,20 @@ class AttachmentConfig(BaseModel):
                 "parent-directory segments could escape the vault root."
             )
             raise ValueError(msg)
+        if not value.is_relative_to(CANONICAL_STAGING_ROOT):
+            # Restates creek_mcp.tools.redact._OUT_OF_SCOPE_REASON so the
+            # operator reads the same sentence from either side of the MCP
+            # boundary (creek-tools/creek_mcp/tools/redact.py:101-106).
+            msg = (
+                f"staging_subpath {value!r} must live under "
+                f"{CANONICAL_STAGING_ROOT.as_posix()}/; creek.redact.scan is "
+                "scoped to that staging subtree, which every ceiling admits. "
+                "The scan reads no per-file privacy tier, so any other vault "
+                "path is ranked as intimate content and needs a ceiling of "
+                "intimate or all — which no Discord channel gets by default, "
+                "so the safety pass would never run."
+            )
+            raise ValueError(msg)
         return value
 
     @field_validator("channel_privacy_tiers")
@@ -294,16 +433,15 @@ class AttachmentConfig(BaseModel):
         downstream, but a bogus override in ``crawdad.yaml`` would
         surface as a confusing MCP error at runtime instead of a clear
         config error at startup. Restrict the value set to the four
-        ``TierCeiling`` values (mirrored from
-        :class:`creek_mcp.tier_ceiling.TierCeiling` without importing it
-        — crawdad has no Python dependency on creek-tools).
+        ``TierCeiling`` values (:data:`_VALID_CHANNEL_TIERS`, mirrored
+        from :class:`creek_mcp.tier_ceiling.TierCeiling` without
+        importing it — crawdad has no Python dependency on creek-tools).
         """
-        allowed: frozenset[str] = frozenset({"open", "personal", "intimate", "all"})
         for channel_id, tier in value.items():
-            if tier not in allowed:
+            if tier not in _VALID_CHANNEL_TIERS:
                 msg = (
                     f"channel_privacy_tiers[{channel_id}] = {tier!r} is not a valid "
-                    f"tier ceiling; expected one of {sorted(allowed)}."
+                    f"tier ceiling; expected one of {sorted(_VALID_CHANNEL_TIERS)}."
                 )
                 raise ValueError(msg)
         return value

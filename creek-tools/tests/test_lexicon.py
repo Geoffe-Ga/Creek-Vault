@@ -36,6 +36,7 @@ from creek.generate.voice import (
     VoicePatterns,
 )
 from creek.models import (
+    Authorship,
     Confidence,
     Fragment,
     FragmentSource,
@@ -57,12 +58,20 @@ if TYPE_CHECKING:
 # ---- Helpers ----
 
 
-def _make_fragment(frag_id: str, title: str = "Untitled") -> Fragment:
-    """Build a minimal valid fragment for lexicon tests."""
+def _make_fragment(
+    frag_id: str,
+    title: str = "Untitled",
+    author: Authorship = Authorship.SELF,
+) -> Fragment:
+    """Build a minimal valid fragment for lexicon tests.
+
+    No ``voice_weight`` is passed, so the model default of ``1.0`` applies
+    and a non-self *author* has to be refused on authorship alone (#1213).
+    """
     return Fragment(
         id=frag_id,
         title=title,
-        source=FragmentSource(platform=SourcePlatform.JOURNAL),
+        source=FragmentSource(platform=SourcePlatform.JOURNAL, author=author),
         created=datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC),
         ingested=datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC),
         frequency=FrequencyClassification(primary=Frequency.F5),
@@ -83,13 +92,18 @@ def _exemplar(frag_id: str, body: str) -> Exemplar:
     return Exemplar(fragment=_make_fragment(frag_id), body=body)
 
 
-def _seed_exemplar_file(vault: Path, frag_id: str, body: str) -> None:
+def _seed_exemplar_file(
+    vault: Path,
+    frag_id: str,
+    body: str,
+    author: Authorship = Authorship.SELF,
+) -> None:
     """Write a qualifying voice-exemplar fragment file under the vault."""
     fragments_dir = vault / "01-Fragments" / "Journal"
     fragments_dir.mkdir(parents=True, exist_ok=True)
     post = frontmatter.Post(
         content=body,
-        **_make_fragment(frag_id).model_dump(mode="json"),
+        **_make_fragment(frag_id, author=author).model_dump(mode="json"),
     )
     (fragments_dir / f"{frag_id}.md").write_text(
         frontmatter.dumps(post),
@@ -125,6 +139,46 @@ def test_generate_lexicon_writes_populated_glossary(tmp_path: Path) -> None:
     assert "voice lexicon" in text
     # The Buddhist borrowed terms were detected — a non-empty glossary section.
     assert "dharma" in text
+
+
+@pytest.mark.parametrize(
+    "author",
+    [Authorship.AI, Authorship.OTHER, Authorship.COLLABORATIVE],
+)
+def test_generate_lexicon_excludes_non_self_authors(
+    tmp_path: Path,
+    author: Authorship,
+) -> None:
+    """A borrowed fragment's verbatim sentence never reaches the glossary (#1213).
+
+    The sharpest exposure of the whole bug: ``_build_borrowed_terms`` records
+    the *whole surrounding sentence* around a detected tradition keyword, so
+    an unfixed gate writes third-party prose verbatim into a generated vault
+    file. The self-authored fragment supplies its own keyword so the glossary
+    is written at all — the assertion is what is missing from a file that
+    exists.
+    """
+    _seed_exemplar_file(
+        tmp_path,
+        "lex-mine",
+        "The dharma teaches that the river flows toward the sea; the river flows on.",
+    )
+    _seed_exemplar_file(
+        tmp_path,
+        "lex-borrowed",
+        "Their karma was a zarquon of borrowed prose that nobody here ever wrote.",
+        author=author,
+    )
+
+    lexicon, _paths = generate_lexicon(tmp_path)
+
+    assert lexicon is not None
+    text = (tmp_path / "07-Voice" / "Lexicon" / "glossary.md").read_text(
+        encoding="utf-8",
+    )
+    assert "dharma" in text.lower()
+    assert "zarquon" not in text.lower()
+    assert "lex-borrowed" not in text
 
 
 def test_generate_lexicon_empty_vault_returns_none(tmp_path: Path) -> None:

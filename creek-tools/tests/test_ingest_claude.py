@@ -1060,7 +1060,13 @@ class TestEdgeCases:
         assert "\u2728" in fragments[1].content
 
     def test_consecutive_human_messages(self, ingestor: ClaudeIngestor) -> None:
-        """parse() should handle consecutive human messages correctly."""
+        """A run of consecutive human messages merges into one human fragment.
+
+        Both messages must reach the fragment, separated by a blank line.
+        Human turns are ``source.author=self`` and are what the voice
+        fingerprint trains on, so dropping one makes the voice corpus a
+        filtered sample of the operator's own prose (issue #1333).
+        """
         conv = _make_single_conversation(
             messages=[
                 {
@@ -1082,8 +1088,123 @@ class TestEdgeCases:
         )
         raw = _raw_doc_from_export(_make_claude_export([conv]))
         fragments = ingestor.parse(raw)
-        # Should handle gracefully; at least one fragment produced
-        assert len(fragments) >= 1
+        # Until issue #1333 this test ended at ``assert len(fragments) >= 1``,
+        # which no return value could fail: it corroborated the drop rather
+        # than catching it. The run is one turn pair -> one human + one AI
+        # fragment.
+        assert len(fragments) == 2
+        human_content = fragments[0].content
+        assert "First human message" in human_content
+        assert "Second human message" in human_content
+        # Separated by exactly one blank line, so the second message keeps its
+        # own Markdown block instead of running on from the first.
+        assert human_content == "First human message\n\nSecond human message"
+        assert fragments[0].metadata["author_role"] == "self"
+        assert fragments[1].content == "Response to both"
+
+    def test_consecutive_assistant_messages(self, ingestor: ClaudeIngestor) -> None:
+        """A run of consecutive assistant messages merges into one AI fragment.
+
+        The second and later assistant messages of a run were dropped for the
+        same reason the human ones were: the pairing loop only had room for
+        one message per side (issue #1333).
+        """
+        conv = _make_single_conversation(
+            messages=[
+                {
+                    "role": "human",
+                    "content": "One question",
+                    "created_at": "2024-11-15T10:00:00Z",
+                },
+                {
+                    "role": "assistant",
+                    "content": "Reply part one",
+                    "created_at": "2024-11-15T10:00:15Z",
+                },
+                {
+                    "role": "assistant",
+                    "content": "Reply part two",
+                    "created_at": "2024-11-15T10:00:30Z",
+                },
+            ],
+        )
+        raw = _raw_doc_from_export(_make_claude_export([conv]))
+        fragments = ingestor.parse(raw)
+        assert len(fragments) == 2
+        assert fragments[0].content == "One question"
+        assert fragments[1].content == "Reply part one\n\nReply part two"
+        assert fragments[1].metadata["author_role"] == "ai"
+
+    def test_single_message_turn_content_is_unchanged(
+        self, ingestor: ClaudeIngestor
+    ) -> None:
+        """An ordinary one-message turn keeps its content byte-for-byte.
+
+        Fragment ids hash the content, so the merge introduced for issue
+        #1333 must not strip, normalise, or re-wrap a turn that was already
+        a single message — otherwise every existing fragment id churns.
+        """
+        human_text = "A question with deliberate trailing space  \n\n"
+        assistant_text = "An answer that also ends in a newline.\n"
+        conv = _make_single_conversation(
+            messages=[
+                {
+                    "role": "human",
+                    "content": human_text,
+                    "created_at": "2024-11-15T10:00:00Z",
+                },
+                {
+                    "role": "assistant",
+                    "content": assistant_text,
+                    "created_at": "2024-11-15T10:00:15Z",
+                },
+            ],
+        )
+        raw = _raw_doc_from_export(_make_claude_export([conv]))
+        fragments = ingestor.parse(raw)
+        assert len(fragments) == 2
+        # Byte-identical, whitespace included: this is the id-stability
+        # guarantee.
+        assert fragments[0].content == human_text
+        assert fragments[1].content == assistant_text
+
+    def test_consecutive_human_turn_uses_last_message_timestamp(
+        self, ingestor: ClaudeIngestor
+    ) -> None:
+        """A merged human run is stamped from the LAST message of the run.
+
+        The timestamp (and ``authored_at``) are read off the human side of
+        the pair, and the pre-#1333 code kept the last human message. Keeping
+        the last one preserves the timestamp both fragments carry, which is
+        what stops the AI fragment's id from churning.
+        """
+        conv = _make_single_conversation(
+            messages=[
+                {
+                    "role": "human",
+                    "content": "Setting the scene",
+                    "created_at": "2024-11-15T18:00:00Z",
+                },
+                {
+                    "role": "human",
+                    "content": "and here is the actual question",
+                    "created_at": "2024-11-15T18:30:00Z",
+                },
+                {
+                    "role": "assistant",
+                    "content": "The answer",
+                    "created_at": "2024-11-15T18:30:15Z",
+                },
+            ],
+        )
+        raw = _raw_doc_from_export(_make_claude_export([conv]))
+        fragments = ingestor.parse(raw)
+        assert len(fragments) == 2
+        # 18:30 UTC in November = 10:30 PST (UTC-8).
+        expected = datetime(2024, 11, 15, 10, 30, tzinfo=LA_TZ)
+        assert fragments[0].timestamp == expected
+        assert fragments[1].timestamp == expected
+        assert fragments[0].metadata["authored_at"] == expected
 
     def test_conversation_missing_uuid(self, ingestor: ClaudeIngestor) -> None:
         """parse() should handle conversations missing uuid."""

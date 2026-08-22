@@ -7,6 +7,14 @@ name: "Hopper: queue-depth refill"
 # When the queue is healthy it stands down; when it is bloated it also stands
 # down, letting the backlog drain rather than piling on more.
 #
+# There is no MAX_QUEUE here any more (issue #1516). The bloat ceiling — and the
+# `gh issue list` that measures against it — now live in
+# `scripts/ralph/backlog-gate.sh`, which `_claude-scan.yml` runs too. Hopper's
+# private `MAX_QUEUE: "80"` guarded only hopper, so the eleven scheduled
+# producers filed straight past it and the backlog reached 158 while a "max 80"
+# was, technically, in the repository. One implementation, one number, both
+# paths: a second copy is how those two facts stopped being the same fact.
+#
 # No Claude token needed — pure gh + jq queue arithmetic.
 
 on:
@@ -15,6 +23,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  contents: read               # the checkout below now carries the gate script
   issues: read
   actions: write               # needed to dispatch scan workflows
 
@@ -28,22 +37,38 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       MIN_QUEUE: "12"           # ~6 hrs of runway at ~2 issues/hr
-      MAX_QUEUE: "80"           # above this, let the backlog drain
     steps:
       - name: Checkout repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           fetch-depth: 1
 
-      - name: Measure runway and refill if starving
+      - name: Measure the agent-ready backlog against the shared ceiling
+        id: backlog_gate
+        env:
+          # Named on the step as well as the job: this step is the one that
+          # talks to the API, and its dependency should be readable without
+          # scrolling up. The script takes no shell-interpolated inputs.
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ralph/backlog-gate.sh
+
+      - name: Refill if starving
+        env:
+          # The gate's verdict arrives as DATA, never interpolated into the
+          # shell body below — same rule as the scan core's gate step.
+          QUEUE_DEPTH: ${{ steps.backlog_gate.outputs.count }}
+          QUEUE_PROCEED: ${{ steps.backlog_gate.outputs.proceed }}
         run: |
           set -euo pipefail
-          COUNT=$(gh issue list --label agent-ready --state open \
-                    --limit 300 --json number --jq 'length')
-          echo "Agent-ready queue depth: $COUNT" | tee -a "$GITHUB_STEP_SUMMARY"
+          # The depth the gate already measured; the refill arithmetic below is
+          # unchanged from when hopper counted for itself.
+          COUNT="$QUEUE_DEPTH"
 
-          if [ "$COUNT" -ge "$MAX_QUEUE" ]; then
-            echo "Queue bloated (>= $MAX_QUEUE) — standing down so it drains." \
+          # The bloat branch, now decided by the shared gate rather than by a
+          # ceiling of hopper's own. `proceed=false` means "at or above the
+          # cap": stand down and let the backlog drain instead of piling on.
+          if [ "$QUEUE_PROCEED" != "true" ]; then
+            echo "Queue bloated (gate stood down at depth $COUNT) — standing down so it drains." \
               | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi

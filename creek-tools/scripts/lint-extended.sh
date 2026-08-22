@@ -72,18 +72,28 @@ run_or_skip() {
 
 echo "=== Extended Lint Suite ==="
 
+# Only pylint targets creek_mcp/ so far (issue #925). refurb,
+# tryceratops, vulture and interrogate stay on creek/ until their
+# creek_mcp backlog is groomed — widening them here would fail this
+# suite on findings nobody has triaged yet.
 run_or_skip "pylint"      pylint        \
-    pylint creek/ --fail-under="$PYLINT_FAIL_UNDER"
+    pylint creek/ creek_mcp/ --fail-under="$PYLINT_FAIL_UNDER"
 run_or_skip "refurb"      refurb        \
     refurb creek/
 run_or_skip "tryceratops" tryceratops   \
     tryceratops creek/
+# Dead code routes through the single wrapper (issue #1395) rather than
+# re-spelling a `--min-confidence` here. The old inline invocation used
+# 80, which excluded the entire unused-function tier and made the check
+# incapable of failing; scripts/lint_vulture.py owns the real policy now.
 run_or_skip "vulture"     vulture       \
-    vulture creek/ --min-confidence 80
+    ./scripts/lint-vulture.sh
 run_or_skip "interrogate" interrogate   \
     interrogate -vv --fail-under="$INTERROGATE_FAIL_UNDER" creek/
-# shellcheck takes a list of files directly; the shell expands the
-# glob before run_or_skip sees it.
+# Note: the shellcheck binary takes a list of files directly; the shell
+# expands the glob before run_or_skip sees it. (Do not start this comment
+# with the tool's name — shellcheck parses `# shellcheck ...` as a
+# directive and fails with SC1072/SC1073.)
 run_or_skip "shellcheck"  shellcheck    \
     shellcheck scripts/*.sh
 

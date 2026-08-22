@@ -7,7 +7,9 @@ from typing import Any
 
 import pytest
 
+from crawdad import dispatcher as dispatcher_module
 from crawdad.config import CrawDadConfig
+from crawdad.intents import PrivacyTierCeiling
 from crawdad.mcp_client import MCPUnavailableError
 from crawdad.slash_commands import (
     CRAWDAD_COMMANDS,
@@ -365,10 +367,14 @@ async def test_handle_workflow_run_invokes_runner_with_name() -> None:
     """``/crawdad workflow run <name>`` calls the runner with the cleaned name."""
     captured: dict[str, object] = {}
 
-    async def _runner(name: str, inputs: dict[str, str]) -> str:
+    async def _runner(
+        name: str, inputs: dict[str, str]
+    ) -> dispatcher_module.WorkflowRunReport:
         captured["name"] = name
         captured["inputs"] = inputs
-        return "workflow done"
+        return dispatcher_module.WorkflowRunReport(
+            reply="workflow done", privacy_tier_ceiling=PrivacyTierCeiling.OPEN
+        )
 
     replier = _FakeReplier()
     await handle_workflow(
@@ -384,13 +390,46 @@ async def test_handle_workflow_run_invokes_runner_with_name() -> None:
     assert replier.sent == ["workflow done"]
 
 
+async def test_workflow_run_replies_with_the_report_reply() -> None:
+    """#1152: the handler posts ``report.reply``, never the report itself.
+
+    The runner now returns a ``WorkflowRunReport`` so the dispatcher can
+    stamp the walk's ceiling on its ``ToolResult``. The Discord surface
+    must unwrap it: a missed ``.reply`` would post the model's ``repr``,
+    which carries the privacy tier into a user-visible message.
+    """
+
+    async def _runner(
+        _name: str, _inputs: dict[str, str]
+    ) -> dispatcher_module.WorkflowRunReport:
+        return dispatcher_module.WorkflowRunReport(
+            reply="the composed walk output",
+            privacy_tier_ceiling=PrivacyTierCeiling.PERSONAL,
+        )
+
+    replier = _FakeReplier()
+    await handle_workflow(
+        replier,
+        action="run",
+        name="compost-surfacing",
+        workflow_lister=None,
+        workflow_runner=_runner,
+    )
+
+    assert replier.sent == ["the composed walk output"]
+
+
 async def test_handle_workflow_run_without_name_returns_help() -> None:
     """``/crawdad workflow run`` with no name returns help — no runner call."""
     calls: list[str] = []
 
-    async def _runner(name: str, _inputs: dict[str, str]) -> str:
+    async def _runner(
+        name: str, _inputs: dict[str, str]
+    ) -> dispatcher_module.WorkflowRunReport:
         calls.append(name)
-        return ""
+        return dispatcher_module.WorkflowRunReport(
+            reply="", privacy_tier_ceiling=PrivacyTierCeiling.OPEN
+        )
 
     replier = _FakeReplier()
     await handle_workflow(
@@ -423,7 +462,9 @@ async def test_handle_workflow_run_without_runner_returns_soft_error() -> None:
 async def test_handle_workflow_run_maps_runner_exceptions_to_soft_reply() -> None:
     """A runner exception lands as a soft Discord reply, not a stack trace."""
 
-    async def _boom(_name: str, _inputs: dict[str, str]) -> str:
+    async def _boom(
+        _name: str, _inputs: dict[str, str]
+    ) -> dispatcher_module.WorkflowRunReport:
         msg = "no workflow named 'missing'"
         raise RuntimeError(msg)
 
@@ -676,10 +717,14 @@ async def test_workflow_callback_runs_workflow_and_replies() -> None:
     """``/crawdad workflow run <name>`` defers and invokes the workflow runner."""
     captured: dict[str, object] = {}
 
-    async def _runner(name: str, inputs: dict[str, str]) -> str:
+    async def _runner(
+        name: str, inputs: dict[str, str]
+    ) -> dispatcher_module.WorkflowRunReport:
         captured["name"] = name
         captured["inputs"] = inputs
-        return "workflow output"
+        return dispatcher_module.WorkflowRunReport(
+            reply="workflow output", privacy_tier_ceiling=PrivacyTierCeiling.OPEN
+        )
 
     async def _loop(_msg: str) -> str:
         return "should not be reached"
@@ -801,7 +846,9 @@ async def test_callback_denies_non_allowlisted_silently(
     assert interaction.followup.sent == []
 
 
-async def _unreached_workflow_runner(_name: str, _inputs: dict[str, str]) -> str:
+async def _unreached_workflow_runner(
+    _name: str, _inputs: dict[str, str]
+) -> dispatcher_module.WorkflowRunReport:
     """Workflow runner that must never be called under a denied interaction."""
     msg = "workflow runner reached despite denied allowlist"
     raise AssertionError(msg)

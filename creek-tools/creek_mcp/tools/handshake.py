@@ -14,6 +14,7 @@ from the tools actually registered.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -22,9 +23,31 @@ from creek_mcp.audit import MCPAuditLog
 from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
 from creek_mcp.tier_ceiling import TierCeiling
 
+logger = logging.getLogger(__name__)
+
 TOOL_NAME = "creek.handshake"
-_CREEK_MARKER = Path("00-Creek-Meta")
+
+CREEK_MARKER = Path("00-Creek-Meta")
+"""The directory whose presence means "a vault has been scaffolded here"."""
+
 TRANSPORT = "stdio"
+
+
+def vault_available(vault_path: Path) -> bool:
+    """Return whether a scaffolded vault is readable at *vault_path*.
+
+    The whole readiness probe, in one predicate with no side effect, so callers
+    that only need the answer — notably ``GET /v1/capabilities``, which must keep
+    the ADR's "present" and "uninitialised" states distinct across repeated
+    calls — can ask without entering the tool.
+
+    Args:
+        vault_path: Vault root to probe.
+
+    Returns:
+        ``True`` when :data:`CREEK_MARKER` is a directory under *vault_path*.
+    """
+    return (vault_path / CREEK_MARKER).is_dir()
 
 
 def _content_tiers() -> list[str]:
@@ -37,6 +60,70 @@ def _content_tiers() -> list[str]:
     return [t.value for t in PrivacyTier if t is not PrivacyTier.UNCLASSIFIED]
 
 
+def _record_call(
+    vault_path: Path,
+    *,
+    available: bool,
+    privacy_tier_ceiling: TierCeiling,
+    consumer: str,
+) -> None:
+    """Record this handshake somewhere that does not falsify what it reports.
+
+    The vault's audit log is the right home for the entry **when there is a
+    vault**. When there is not, it is the wrong home by construction:
+    ``mcp.jsonl`` lives at ``00-Creek-Meta/audit/mcp.jsonl`` and
+    :meth:`creek.audit.AuditLog.append` does ``mkdir(parents=True,
+    exist_ok=True)``, so writing the entry creates the marker directory whose
+    absence the entry is about — and the next handshake then reports
+    ``available: true`` for a vault nobody initialised (#1108). Creating the
+    vault in order to store the trail falsifies the state the trail describes.
+
+    So the entry moves rather than disappearing. Dropping it silently would
+    trade one dishonesty for another: an operator polling an uninitialised vault
+    would find no evidence they had ever called. The process log is the honest
+    third option the issue asks for — it is the one surface that exists whether
+    or not the vault does.
+
+    Why this guard sits here and not in :class:`creek.audit.AuditLog`: that
+    ``mkdir`` is the only one in either audit module, and it is on the path of
+    all thirty-one ``MCPAuditLog(vault_path).append(...)`` call sites (this one
+    included) plus five direct :class:`~creek.audit.AuditLog` construction sites
+    — the privacy filter, the purge and redact audit logs, the compile engine
+    and the vault writer's provenance log. Making it no-create by default
+    changes behaviour for every one of them, and making it opt-in collides with
+    :func:`creek_mcp.audit._shared_audit_log`, whose ``lru_cache`` is keyed on
+    the log path alone (#1126) — one path would need two log objects with
+    different creation policies, or a wider key that reinstates the cold-cache
+    re-read that cache exists to remove. Handshake is also the only tool whose
+    *return value* is a claim about the marker, so it is the only one that can
+    contradict itself. Tools that scaffold a vault root they were pointed at by
+    mistake remain a real defect, and a separate one.
+
+    Args:
+        vault_path: Vault root the call was made against.
+        available: Whether a scaffolded vault was found there.
+        privacy_tier_ceiling: The ceiling the caller declared.
+        consumer: Free-form consumer identifier.
+    """
+    if not available:
+        logger.info(
+            "%s: no Creek vault at %s — recording the call here rather than in "
+            "an audit log that would have to create the vault it reports "
+            "missing (consumer=%s, tier_ceiling=%s)",
+            TOOL_NAME,
+            vault_path,
+            consumer,
+            privacy_tier_ceiling.value,
+        )
+        return
+    MCPAuditLog(vault_path).append(
+        tool=TOOL_NAME,
+        args={},
+        tier_ceiling=privacy_tier_ceiling,
+        consumer=consumer,
+    )
+
+
 def handshake_tool(
     *,
     vault_path: Path,
@@ -47,11 +134,17 @@ def handshake_tool(
 ) -> dict[str, Any]:
     """Negotiate vault presence, versions, tier model, and capability list.
 
-    Audit-logs the call like every other tool (the only side effect — the
-    audit substrate creates its own directory on first write), then returns a
-    body-free negotiation envelope. ``available`` is computed *before* the audit
-    append so a fresh vault still reports ``False`` rather than being flipped
-    ``True`` by the audit directory the append creates.
+    Read-only with respect to the vault, and — since #1108 — read-only with
+    respect to whether the vault *exists*. Against a scaffolded vault the call
+    is audit-logged like every other tool (the only side effect, into a
+    directory the audit substrate creates on first write); against a vault that
+    is not there the record goes to the process log instead, because writing it
+    to ``00-Creek-Meta/audit/`` would conjure the marker this function's
+    ``available`` reports missing. :func:`_record_call` carries the reasoning.
+
+    The probe still runs before the record, which is what keeps the *first*
+    call honest; the guard in :func:`_record_call` is what keeps every call
+    after it honest.
 
     Args:
         vault_path: Vault root. Presence of ``00-Creek-Meta`` under it
@@ -71,11 +164,11 @@ def handshake_tool(
         ``ontology_version``, ``tiers``, and ``capabilities``, plus the
         ``tier_model``, ``transport``, and ``server`` name for the client.
     """
-    available = (vault_path / _CREEK_MARKER).is_dir()
-    MCPAuditLog(vault_path).append(
-        tool=TOOL_NAME,
-        args={},
-        tier_ceiling=privacy_tier_ceiling,
+    available = vault_available(vault_path)
+    _record_call(
+        vault_path,
+        available=available,
+        privacy_tier_ceiling=privacy_tier_ceiling,
         consumer=consumer,
     )
     return {
