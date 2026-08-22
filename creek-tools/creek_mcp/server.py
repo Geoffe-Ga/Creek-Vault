@@ -38,6 +38,7 @@ from creek_mcp.policy import (
 from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
     ConsumerTokenVerifier,
+    NamedConsumerVerifier,
     announce_rotation_window,
     load_consumer_tokens,
     remote_auth_settings,
@@ -467,11 +468,15 @@ def build_server(
             "an authenticated consumer it is local"
         )
         raise ValueError(msg)
+    # Wrapped, never used bare (#1100). ``token_verifier`` is an arbitrary
+    # ``TokenVerifier`` — nothing here can vouch for what its ``client_id``
+    # says — and an ``AccessToken`` naming nobody would be stamped on every
+    # audit line the call wrote. ``NamedConsumerVerifier`` maps that onto the
+    # unauthenticated answer, so the refusal lands before dispatch.
+    named = None if token_verifier is None else NamedConsumerVerifier(token_verifier)
     server: FastMCP = (
-        _BoundedFastMCP(
-            SERVER_NAME, token_verifier=token_verifier, auth=remote_auth_settings()
-        )
-        if token_verifier is not None
+        _BoundedFastMCP(SERVER_NAME, token_verifier=named, auth=remote_auth_settings())
+        if named is not None
         else _BoundedFastMCP(SERVER_NAME)
     )
     vault = _resolve_vault(vault_path)

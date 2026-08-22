@@ -111,8 +111,11 @@ _SYNC_LOCK_TIMEOUT_SECONDS: Final[float] = DEFAULT_LOCK_TIMEOUT_SECONDS
 Comfortably under the ``/v1`` request timeout
 (:data:`~creek_mcp.httpapi.middleware.limits.DEFAULT_TIMEOUT_SECONDS`, 30 s)
 so a caller that loses the race is answered with :data:`SYNC_BUSY_REASON` —
-which names what happened and is safe to retry — rather than with the
-middleware's generic timeout, which names nothing.
+which names what happened and is safe to retry — rather than sitting on the
+connection for as long as the running sync takes. That is the whole of the
+bound on this path since #1109: sync is a write, so the request deadline
+deliberately does not shed it, and this lock timeout is what keeps a queued
+caller's wait finite.
 
 An **alias**, not a second value (#1603). It was an independent ``10.0``
 carrying the same justification the primitive's own default already

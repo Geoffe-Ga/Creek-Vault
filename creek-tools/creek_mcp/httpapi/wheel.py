@@ -36,7 +36,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
-from starlette.concurrency import run_in_threadpool
 
 from creek_mcp.api.models import (
     OK_STATUS,
@@ -46,6 +45,7 @@ from creek_mcp.api.models import (
     WireTierCeiling,
 )
 from creek_mcp.httpapi.context import context_of
+from creek_mcp.httpapi.deadline import read_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
 from creek_mcp.httpapi.vault import configured_vault
 from creek_mcp.tools.wheel import wheel_tool
@@ -164,7 +164,7 @@ async def handle_wheel(request: Request) -> Response:
         The published wheel, or the refusal an unreadable configuration earns.
     """
     context = context_of(request.scope)
-    result = await run_in_threadpool(_tally, request, context)
+    result = await read_off_loop(_tally, request, context)
     if result is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
     return _render(result, context)

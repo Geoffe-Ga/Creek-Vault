@@ -32,10 +32,14 @@ all. :class:`~creek_mcp.api.models.LinkMethod` omits ``embeddings``, the
 unbounded pairwise-similarity stage. Both exclusions are about the
 thirty-second request deadline
 (:data:`creek_mcp.httpapi.middleware.limits.DEFAULT_TIMEOUT_SECONDS`), which
-``anyio.fail_after`` cannot enforce against a call already inside
-:func:`~starlette.concurrency.run_in_threadpool`: the caller would get a ``503``
-while the work carried on with no handle on it. Reaching ``llm`` classification
-over the network needs an asynchronous job surface this contract does not have.
+these routes deliberately do not honour. They are **writes**, so they dispatch
+through :func:`creek_mcp.httpapi.deadline.write_off_loop` and run to
+completion: shedding a vault mutation mid-flight to meet a deadline would
+report a failure for work that in fact landed (#1109). The caller therefore
+waits for the true answer, and an ``llm`` pass — minutes to hours over a seeded
+corpus — would mean waiting that long with no refusal to act on. Reaching it
+over the network needs an asynchronous job surface this contract does not
+have.
 
 **The deadline is not fully closed by those exclusions, and saying otherwise
 would be the lie worth avoiding.** ``eddies`` and ``threads`` are served, and
@@ -45,14 +49,14 @@ the cache does not already cover, which is minutes of work on a large vault.
 Two things keep that honest rather than broken. It is a **local** model — the
 egress guarantee is untouched, and this route can no more reach a network
 provider than the classification half can. And the parquet is a cache, so the
-work a timed-out call performs is not lost: it lands, and the retry the ``503``
-invites is the fast path. What is genuinely missing is a bounded job surface,
-which is the same gap ``llm`` and ``embeddings`` are waiting on (#1605).
+work a long call performs is not lost: it lands, and a retry is the fast path.
+What is genuinely missing is a bounded job surface, which is the same gap
+``llm`` and ``embeddings`` are waiting on (#1605).
 
 **Both passes are idempotent and resumable**, which is what makes a synchronous
 route honest despite that deadline. ``run_classify`` short-circuits on the
 ``classification_method`` stamp it already wrote (the OPS-001 resume contract),
-and a linker stage rewrites the same artefacts, so a timed-out call followed by
+and a linker stage rewrites the same artefacts, so an abandoned call followed by
 a retry converges rather than duplicating. ``complete`` on the classification
 response is the client's signal for which of the two it is looking at.
 """
@@ -63,7 +67,6 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Final, TypeVar
 
 from pydantic import BaseModel, ValidationError
-from starlette.concurrency import run_in_threadpool
 
 from creek_mcp.api.models import (
     OK_STATUS,
@@ -77,6 +80,7 @@ from creek_mcp.api.models import (
     WireTierCeiling,
 )
 from creek_mcp.httpapi.context import context_of
+from creek_mcp.httpapi.deadline import write_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
 from creek_mcp.httpapi.vault import configured_vault
 from creek_mcp.tools.classify import classify_tool
@@ -347,7 +351,7 @@ async def handle_classification(request: Request) -> Response:
     parsed = await _parsed(request, ClassificationRequest)
     if parsed is None:
         return error_response(ErrorCode.INVALID_REQUEST, context)
-    result = await run_in_threadpool(_classify, request, parsed, context)
+    result = await write_off_loop(_classify, request, parsed, context)
     return _rendered(
         result, context, partial(_classification_model, method=parsed.method)
     )
@@ -366,5 +370,5 @@ async def handle_link(request: Request) -> Response:
     parsed = await _parsed(request, LinkRequest)
     if parsed is None:
         return error_response(ErrorCode.INVALID_REQUEST, context)
-    result = await run_in_threadpool(_link, request, parsed, context)
+    result = await write_off_loop(_link, request, parsed, context)
     return _rendered(result, context, _link_model)

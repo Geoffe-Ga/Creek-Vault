@@ -295,6 +295,57 @@ def _token_set(consumer: str, configured: Sequence[str]) -> tuple[str, ...]:
     return resolved
 
 
+def names_a_consumer(consumer: str | None) -> bool:
+    """Return whether *consumer* identifies somebody at all (#1100).
+
+    One predicate, three callers, because a name that identifies nobody can
+    enter the system at three different seams and the answer has to be the
+    same at each: the configuration
+    (:func:`_normalized_token_sets`), a custom verifier wired into the MCP
+    transport (:class:`NamedConsumerVerifier`), and a verifier injected into
+    the ``/v1`` app (:class:`creek_mcp.httpapi.auth.BearerAuthMiddleware`).
+
+    Whitespace is stripped before the test rather than compared literally.
+    ``''``, ``'   '`` and ``'\t'`` are three *distinct* mapping keys and three
+    distinct verified identities, all of which render as no identity in an
+    audit line — so a rule that only refused the empty string would leave two
+    doors open, and per-consumer accounting would give a nameless caller a
+    bucket per spelling.
+
+    Args:
+        consumer: The candidate identity, or ``None``.
+
+    Returns:
+        ``True`` when *consumer* carries at least one non-whitespace
+        character.
+    """
+    return consumer is not None and bool(consumer.strip())
+
+
+def _refuse_unnamed_consumer(consumer: str) -> NoReturn:
+    """Refuse a configured consumer whose name identifies nobody (#1100).
+
+    The name is not decoration: it is stamped on every audit line, every
+    access line and every ceiling decision the credential produces, and it is
+    the key any per-consumer accounting is bucketed by. Admitting a blank one
+    writes ``consumer=''`` into the trail that exists to say who acted.
+
+    Args:
+        consumer: The offending key, as configured.
+
+    Raises:
+        ValueError: Always. The message names the offending key and never a
+            token value.
+    """
+    msg = (
+        f"a configured entry names no consumer ({consumer!r}); every consumer "
+        "needs a name with at least one non-whitespace character, because the "
+        "name is stamped on every audit line, access line and ceiling "
+        "decision the credential produces"
+    )
+    raise ValueError(msg)
+
+
 def _require_globally_unique(tokens: Mapping[str, tuple[str, ...]]) -> None:
     """Refuse any token value that appears more than once in *tokens*.
 
@@ -339,9 +390,13 @@ def _normalized_token_sets(
 
     Raises:
         TypeError: If any value is a bare :class:`str`.
-        ValueError: If a named consumer holds no tokens, or if one token value
-            is configured more than once.
+        ValueError: If a consumer's name identifies nobody (#1100), if a named
+            consumer holds no tokens, or if one token value is configured more
+            than once.
     """
+    for consumer in tokens:
+        if not names_a_consumer(consumer):
+            _refuse_unnamed_consumer(consumer)
     normalized = {
         consumer: _token_set(consumer, configured)
         for consumer, configured in tokens.items()
@@ -427,6 +482,26 @@ class ConsumerTokenVerifier(TokenVerifier):
         """
         self._tokens = _normalized_token_sets(tokens)
 
+    @property
+    def consumers(self) -> tuple[str, ...]:
+        """Return the configured consumer names, in configured order.
+
+        The public read of what was private state. A limiter that buckets by
+        consumer has to build its buckets **eagerly, from this**, and never
+        lazily from whatever name arrives: a map that grew on first sight would
+        hand a bucket to every distinct identity any future verifier let
+        through, turning a limit into an amplifier (#1110). Reaching into
+        ``_tokens`` from another module would work and would also make that
+        module's correctness depend on this one's internals.
+
+        No token value is reachable through this — only the names, which are
+        already stamped on every audit and access line.
+
+        Returns:
+            The configured consumer names.
+        """
+        return tuple(self._tokens)
+
     async def verify_token(self, token: str) -> AccessToken | None:
         """Return the consumer's :class:`AccessToken` for a valid token, else ``None``.
 
@@ -511,6 +586,49 @@ class ConsumerTokenVerifier(TokenVerifier):
             "it stays configured; drop the retired secret and restart once the "
             "consumer has redeployed."
         )
+
+
+class NamedConsumerVerifier(TokenVerifier):
+    """Wrap another verifier, refusing any token that names no consumer (#1100).
+
+    :class:`ConsumerTokenVerifier` cannot mint a nameless identity any more —
+    :func:`_normalized_token_sets` refuses the configuration outright — but
+    :func:`creek_mcp.server.build_server` accepts *any*
+    :class:`~mcp.server.auth.provider.TokenVerifier`, and a custom one runs
+    none of that validation. This wrapper is the boundary guard for that case,
+    and it is deliberately the *only* thing it does: identity, not
+    credentials. The inner verifier still decides whether the bearer is valid.
+
+    Mapping "authenticated but unnamed" onto ``None`` rather than raising is
+    what makes the refusal a ``401``: the SDK's ``RequireAuthMiddleware``
+    answers ``401`` for ``None``, so the call is refused before any tool
+    dispatches, before :func:`creek_mcp.policy.effective_consumer` is
+    consulted, and before an audit entry can be written under an empty name.
+    """
+
+    def __init__(self, inner: TokenVerifier) -> None:
+        """Wrap *inner*.
+
+        Args:
+            inner: The verifier that actually checks the credential.
+        """
+        self._inner = inner
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        """Return *inner*'s answer, unless it names nobody.
+
+        Args:
+            token: The bearer token presented on the request.
+
+        Returns:
+            The inner verifier's :class:`AccessToken` when it names a
+            consumer, else ``None`` — the same answer an unknown token gets,
+            so a caller cannot tell the two refusals apart.
+        """
+        access = await self._inner.verify_token(token)
+        if access is None or not names_a_consumer(access.client_id):
+            return None
+        return access
 
 
 def announce_rotation_window(verifier: ConsumerTokenVerifier) -> None:

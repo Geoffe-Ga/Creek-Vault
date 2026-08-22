@@ -532,12 +532,14 @@ then `threads`.
 **Budget for the first `eddies` or `threads` call.** `temporal` needs no
 vectors and returns promptly. The other two cluster over embeddings, so on a
 cold vault they run a *local* sentence-transformer over every fragment that is
-not already in the embeddings cache — minutes of work on a large corpus, behind
-a 30-second request deadline the server cannot cancel once the call is running.
-That first call may well come back `503`; the work still lands in the cache, so
-the retry is fast and converges rather than starting over. Nothing here is sent
-anywhere — the model is local — but do not wire a client that reads one `503`
-from `eddies` as "linking is broken".
+not already in the embeddings cache — minutes of work on a large corpus. These
+are **write** routes, so the 30-second request deadline deliberately does not
+shed them (see "Hardening" in `docs/api.md`): the call runs to completion and
+the client waits for the true answer. Set a generous client-side timeout for
+the first `eddies` or `threads` call on a cold vault, and do not wire a client
+that reads a slow first link pass as "linking is broken". If your client does
+hang up, the work still lands in the cache, so the retry is fast and converges
+rather than starting over. Nothing here is sent anywhere — the model is local.
 
 Both responses are **counts and a method name, and nothing else**. No fragment
 id, no path, no title, no prose. That is deliberate: the passes run over the
@@ -546,17 +548,18 @@ ceiling, and the only thing that makes that safe is that there is no field any
 of it could arrive in.
 
 Both are idempotent. Classification short-circuits on the
-`classification_method` stamp it already wrote, so a call that hits the
-server's request deadline and is retried converges rather than duplicating
-work — `complete: false` is the signal to call again.
+`classification_method` stamp it already wrote, so a call the client abandoned
+and retried converges rather than duplicating work — `complete: false` is the
+signal to call again.
 
 #### What these routes deliberately do not offer
 
 - **`{"method": "llm"}` on classification** and **`{"method": "embeddings"}`
   on links** are refused as schema errors (`422`), not merely discouraged.
-  Both are minutes-to-hours of work behind a 30-second request deadline the
-  server cannot cancel once the call is running, and `embeddings` is the
-  unbounded O(n²) pairwise-similarity stage no cache repairs. Excluding them
+  Both are minutes-to-hours of work on routes the request deadline
+  deliberately does not shed, so a caller would simply wait that long with no
+  refusal to act on, and `embeddings` is the unbounded O(n²)
+  pairwise-similarity stage no cache repairs. Excluding them
   is not a promise that everything left is quick — see the budget note above
   for `eddies` and `threads`. They remain operator steps on the vault host:
 

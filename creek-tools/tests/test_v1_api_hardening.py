@@ -45,9 +45,13 @@ middleware fault is logged and enveloped.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import json
 import logging
 import threading
+from pathlib import Path
+from time import sleep
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Final
 
@@ -56,28 +60,37 @@ from anyio import Event, create_task_group, sleep_forever
 from anyio import run as run_async
 from anyio import sleep as async_sleep
 from anyio.to_thread import run_sync
+from mcp.server.auth.provider import AccessToken
 from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 
 from creek.audit import log as audit_log_module
+from creek_mcp import httpapi as httpapi_package
 from creek_mcp.api.models import ERROR_MESSAGES, ERROR_STATUS, ErrorCode
-from creek_mcp.api.routes import AUTHORIZATION_HEADER
+from creek_mcp.api.routes import AUTHORIZATION_HEADER, ROUTE_BODY_CAPS
 from creek_mcp.audit import MCP_AUDIT_RELPATH, verify_mcp_audit_chain
 from creek_mcp.httpapi import capabilities as capabilities_module
 from creek_mcp.httpapi import handlers as handlers_module
+from creek_mcp.httpapi import journal as journal_module
 from creek_mcp.httpapi import vault as vault_module
 from creek_mcp.httpapi.auth import BearerAuthMiddleware
 from creek_mcp.httpapi.context import LIFESPAN_SCOPE, UnsupportedScopeError
+from creek_mcp.httpapi.deadline import read_off_loop
 from creek_mcp.httpapi.errors import NO_STORE
 from creek_mcp.httpapi.logging import ACCESS_LOGGER_NAME, ERROR_LOGGER_NAME
+from creek_mcp.httpapi.middleware import limits as limits_module
 from creek_mcp.httpapi.middleware.access_log import AccessLogMiddleware
 from creek_mcp.httpapi.middleware.boundary import ErrorBoundaryMiddleware
 from creek_mcp.httpapi.middleware.ceiling import CeilingAdmissionMiddleware
 from creek_mcp.httpapi.middleware.limits import (
+    DEFAULT_MAX_BODY_BYTES,
     BodySizeLimitMiddleware,
     ConcurrencyLimitMiddleware,
+    ConsumerConcurrencyLimitMiddleware,
     RequestTimeoutMiddleware,
+    message_ceiling,
 )
+from creek_mcp.remote_auth import REMOTE_SCOPE, ConsumerTokenVerifier
 from tests.v1_api_support import (
     ANONYMOUS_CONSUMER,
     CAPABILITIES_PATH,
@@ -88,23 +101,27 @@ from tests.v1_api_support import (
     JOURNAL_PATH,
     JOURNAL_TEMPLATE,
     OP_HEALTH,
+    OTHER_CONSUMER,
+    OTHER_TOKEN,
     REFLECTIONS_PATH,
     STRONG_TOKEN,
+    UPLOAD_PATH,
     VALID_JOURNAL_BODY,
     VALID_REFLECTION_BODY,
     WHEEL_PATH,
+    blank_request_id,
     build_app,
     client,
     contains_a_path,
     envelope,
     headers,
     seed_vault,
+    snapshot,
     verifier,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterator
-    from pathlib import Path
 
     from starlette.applications import Starlette
     from starlette.requests import Request
@@ -172,7 +189,7 @@ out and then requires the next one to be answered ``200`` is asserting two
 things at once, and at a ten-millisecond deadline the second of them is a
 stopwatch race a loaded runner can lose. A quarter second is still a quarter
 second of test time, and it is twenty-five times the margin an in-process
-request through seven middlewares and a constant handler actually needs.
+request through eight middlewares and a constant handler actually needs.
 """
 
 _JOIN_TIMEOUT: Final[float] = 10.0
@@ -262,13 +279,14 @@ _EXPECTED_STACK: Final[tuple[type, ...]] = (
     ConcurrencyLimitMiddleware,
     RequestTimeoutMiddleware,
     BearerAuthMiddleware,
+    ConsumerConcurrencyLimitMiddleware,
     BodySizeLimitMiddleware,
     CeilingAdmissionMiddleware,
 )
 
 
 def test_middleware_order_is_pinned_outermost_first(vault: Path) -> None:
-    """Seven middlewares, in the one order that makes their promises true.
+    """Eight middlewares, in the one order that makes their promises true.
 
     Reading outward-in: the access log mints the ``request_id`` and never
     refuses, so it must see every response including the boundary's own
@@ -276,9 +294,13 @@ def test_middleware_order_is_pinned_outermost_first(vault: Path) -> None:
     timeout limits sit above authentication so a flood of *unauthenticated*
     requests is shed rather than each paying for a token comparison.
     Authentication is above the router, so a ``401`` never depends on whether
-    a path matched. The body-size limit is below it, so an anonymous caller
-    cannot make the server buffer a large body. And the ceiling gate is last
-    before the router — above every handler, so no vault read can precede it.
+    a path matched. The per-consumer ceiling is immediately below it — it
+    cannot bucket a caller before that caller has an identity, and it is above
+    the body-size limit so an over-quota consumer is shed *before* the server
+    buffers its body. The body-size limit is below authentication, so an
+    anonymous caller cannot make the server buffer a large body. And the
+    ceiling gate is last before the router — above every handler, so no vault
+    read can precede it.
 
     Reordering any adjacent pair breaks a property some other test in this
     suite asserts, which is why the order is pinned as data here rather than
@@ -434,7 +456,15 @@ def test_an_oversize_streamed_body_writes_no_log_line_carrying_its_content(
 
 
 async def _slow_health(_request: Request) -> Response:
-    """Stand in for a handler that never returns in time.
+    """Stand in for a handler that never returns in time, on the loop.
+
+    **A control, not the production shape (#1109).** This is pure ``async``:
+    the deadline's cancel scope reaches it directly, so the test below has
+    always been green — including while the deadline fired on no real route at
+    all, because every real route blocks in a worker thread instead. Keep it
+    for what it does prove (the middleware itself refuses correctly), and read
+    ``test_a_slow_read_route_becomes_temporarily_unavailable`` for the claim
+    about routes.
 
     Args:
         _request: Ignored.
@@ -454,6 +484,10 @@ def test_a_slow_handler_becomes_temporarily_unavailable(
     Not ``500``: nothing faulted, the server simply declined to keep waiting.
     The distinction is the whole of the retry contract for this case, since
     ``retry-policy.json`` keys on the code alone.
+
+    Scope: this drives :func:`_slow_health`, which blocks **on the loop**. It
+    pins the middleware's own refusal and nothing about how a route behaves;
+    see that helper's docstring and #1109.
 
     Args:
         vault: A seeded vault.
@@ -1876,6 +1910,12 @@ _LAYERS: Final[tuple[tuple[str, Callable[[ASGIApp], ASGIApp]], ...]] = (
     ),
     ("auth", lambda app: BearerAuthMiddleware(app, verifier=verifier())),
     (
+        "per-consumer",
+        lambda app: ConsumerConcurrencyLimitMiddleware(
+            app, consumers=verifier().consumers, max_per_consumer=1
+        ),
+    ),
+    (
         "body-size",
         lambda app: BodySizeLimitMiddleware(app, max_body_bytes=_SMALL_LIMIT),
     ),
@@ -1893,10 +1933,10 @@ def test_the_scope_tests_cover_the_whole_pinned_stack() -> None:
     """The parametrization below *is* the stack, in order — not a subset.
 
     The non-vacuity twin for the two tests that follow. A scope guard is only
-    as good as its least-covered layer: six middlewares refusing a ``websocket``
-    and a seventh waving it through is a stack that waves it through, and a
-    parametrization that silently stopped covering the seventh would keep
-    reporting six green.
+    as good as its least-covered layer: seven middlewares refusing a
+    ``websocket`` and an eighth waving it through is a stack that waves it
+    through, and a parametrization that silently stopped covering the eighth
+    would keep reporting seven green.
     """
     spy = _ScopeSpy()
     assert tuple(type(build(spy)) for build in _LAYER_FACTORIES) == _EXPECTED_STACK
@@ -1913,7 +1953,7 @@ def test_a_websocket_scope_never_reaches_the_app_below(
     would break. Written as "anything that is not ``http``", it denies by
     omission: the allowlist is implicit, and the first ``websocket`` route ever
     mounted inherits an unauthenticated, unceilinged, unlogged path through
-    all seven layers by default.
+    all eight layers by default.
 
     Args:
         build: Wraps the spy in one layer of the stack.
@@ -1984,3 +2024,1014 @@ def test_a_websocket_scope_does_not_reach_the_assembled_app(
         run_async(app, scope, _no_messages, observed_send)
     assert sent == []
     assert _access_records(caplog) == []
+
+
+# --------------------------------------------------------------------------- #
+# Identity: a credential that names nobody (#1100)
+# --------------------------------------------------------------------------- #
+
+
+class _UnnamedConsumerVerifier(ConsumerTokenVerifier):
+    """Accepts the suite's bearer, then names nobody as the consumer.
+
+    Stands in for the case the constructor guard cannot see: ``create_app``
+    takes an injected verifier (``creek_mcp/httpapi/app.py``), and any
+    subclass or arbitrary :class:`~mcp.server.auth.provider.TokenVerifier`
+    reaching that seam bypasses ``_normalized_token_sets`` entirely. What it
+    cannot bypass is :class:`~creek_mcp.httpapi.auth.BearerAuthMiddleware`,
+    which is where the ``401``-equivalent refusal has to live.
+    """
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        """Return an access token whose ``client_id`` is blank.
+
+        Args:
+            token: The presented bearer.
+
+        Returns:
+            An :class:`AccessToken` naming no consumer.
+        """
+        return AccessToken(
+            token=token, client_id="", scopes=[REMOTE_SCOPE], expires_at=None
+        )
+
+
+def test_a_verifier_that_names_no_consumer_is_refused_before_dispatch(
+    vault: Path,
+) -> None:
+    """A blank ``client_id`` is ``401``, not a served request under an empty name.
+
+    Reproduced on the real stack before the fix: ``GET /v1/capabilities``
+    answered ``200`` and every layer below observed ``consumer=''``. The
+    refusal has to be byte-identical to the ordinary unauthenticated one —
+    telling a caller *why* its credential was rejected would describe the
+    server's verifier wiring to it.
+
+    Args:
+        vault: A seeded vault.
+    """
+    unnamed = _UnnamedConsumerVerifier({CONSUMER: (STRONG_TOKEN,)})
+    with client(vault_path=vault, verifier=unnamed) as test_client:
+        response = test_client.get(CAPABILITIES_PATH, headers=headers())
+    assert response.status_code == _UNAUTHENTICATED_STATUS
+    body = envelope(response)
+    assert body["code"] == ErrorCode.UNAUTHENTICATED.value
+    assert body["message"] == ERROR_MESSAGES[ErrorCode.UNAUTHENTICATED]
+    assert set(body) == {"code", "message", "request_id"}
+
+
+def test_a_verifier_that_names_no_consumer_writes_no_audit_entry(
+    vault: Path,
+) -> None:
+    """ "Refused before dispatch" is a claim about the vault, not only the status.
+
+    ``GET /v1/capabilities`` reaches :meth:`creek_mcp.audit.MCPAuditLog.append`
+    on the served path, so an empty audit log is the observable proof that the
+    handler never ran — and that no line was written attributing a call to
+    ``consumer=''``.
+
+    Args:
+        vault: A seeded vault.
+    """
+    audit = vault / MCP_AUDIT_RELPATH
+    unnamed = _UnnamedConsumerVerifier({CONSUMER: (STRONG_TOKEN,)})
+    with client(vault_path=vault, verifier=unnamed) as test_client:
+        response = test_client.get(CAPABILITIES_PATH, headers=headers())
+    assert response.status_code == _UNAUTHENTICATED_STATUS
+    written = audit.read_text(encoding="utf-8").splitlines() if audit.exists() else []
+    assert written == []
+
+
+def test_a_verifier_that_names_a_consumer_still_serves(vault: Path) -> None:
+    """The non-vacuity twin: an ordinary credential is unaffected by the guard.
+
+    Without this, a guard that refused every request would satisfy both tests
+    above while taking the surface offline.
+
+    Args:
+        vault: A seeded vault.
+    """
+    with client(vault_path=vault) as test_client:
+        response = test_client.get(CAPABILITIES_PATH, headers=headers())
+    assert response.status_code == _OK_STATUS
+    written = (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8").splitlines()
+    assert len(written) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Body message count (#1142)
+# --------------------------------------------------------------------------- #
+
+
+_AMPLIFIER_CAP: Final[int] = 4096
+"""A byte cap big enough that the *message* ceiling is the binding limit.
+
+The suite's other body tests use :data:`_SMALL_LIMIT`, where any interesting
+number of chunks would breach the byte cap first and prove nothing about the
+count. Four kibibytes derives a ceiling well under the number of one-byte
+chunks that fit inside it, which is exactly the gap #1142 reports.
+"""
+
+_ONE_BYTE: Final[bytes] = b"x"
+"""The smallest chunk a client can send, and the shape of the amplification."""
+
+_REALISTIC_CHUNK_BYTES: Final[int] = 64 * 1024
+"""What an ordinary streaming client sends per chunk."""
+
+_UNROUTED_PATH: Final[str] = "/v1/nonsense"
+"""A path no route claims — reachable, because the body gate is above the router."""
+
+_DISCONNECT: Final[str] = "http.disconnect"
+"""What a spent receive channel answers."""
+
+
+def _post_scope(path: str) -> dict[str, Any]:
+    """Return the ASGI scope a server would build for a chunked ``POST``.
+
+    No ``Content-Length``: the whole point is the undeclared-length path, on
+    which the middleware genuinely accumulates the caller's messages.
+
+    Args:
+        path: The request path.
+
+    Returns:
+        A complete ``http`` scope.
+    """
+    scope = _get_scope(path)
+    scope["method"] = "POST"
+    scope["headers"] = [
+        *scope["headers"],
+        (b"content-type", b"application/json"),
+        (CEILING_HEADER.lower().encode(), b"open"),
+    ]
+    return scope
+
+
+def _chunked_receive(count: int, chunk: bytes = _ONE_BYTE) -> Receive:
+    """Return a receive channel delivering *count* body messages of *chunk*.
+
+    Args:
+        count: How many ``http.request`` messages to deliver.
+        chunk: The body each message carries.
+
+    Returns:
+        An ASGI receive callable.
+    """
+    remaining = count
+
+    async def receive() -> Message:
+        """Deliver the next chunk, then disconnect.
+
+        Returns:
+            The next ASGI message.
+        """
+        nonlocal remaining
+        if remaining <= 0:
+            return {"type": _DISCONNECT}
+        remaining -= 1
+        return {
+            "type": "http.request",
+            "body": chunk,
+            "more_body": remaining > 0,
+        }
+
+    return receive
+
+
+def _byte_at_a_time(payload: bytes) -> Receive:
+    """Return a receive channel delivering *payload* one byte per message.
+
+    Args:
+        payload: The body to stream.
+
+    Returns:
+        An ASGI receive callable delivering ``len(payload)`` messages.
+    """
+    pending = iter(payload)
+    remaining = len(payload)
+
+    async def receive() -> Message:
+        """Deliver the next single byte, then disconnect.
+
+        Returns:
+            The next ASGI message.
+        """
+        nonlocal remaining
+        byte = next(pending, None)
+        if byte is None:
+            return {"type": _DISCONNECT}
+        remaining -= 1
+        return {
+            "type": "http.request",
+            "body": bytes([byte]),
+            "more_body": remaining > 0,
+        }
+
+    return receive
+
+
+def _counting_receive(count: int, observed: list[int]) -> Receive:
+    """Return a receive channel that records how many messages it has handed out.
+
+    Args:
+        count: How many ``http.request`` messages are available.
+        observed: Appended to on every delivery, so the caller can assert on
+            how far the buffer actually read rather than on how much memory it
+            happened to use.
+
+    Returns:
+        An ASGI receive callable.
+    """
+    delivered = 0
+
+    async def receive() -> Message:
+        """Deliver the next chunk and record the running count.
+
+        Returns:
+            The next ASGI message.
+        """
+        nonlocal delivered
+        if delivered >= count:
+            return {"type": _DISCONNECT}
+        delivered += 1
+        observed.append(delivered)
+        return {"type": "http.request", "body": _ONE_BYTE, "more_body": True}
+
+    return receive
+
+
+async def _drive_body(app: Starlette, path: str, receive: Receive) -> tuple[int, bytes]:
+    """Run one chunked ``POST`` through *app* and report status and body.
+
+    The test client cannot express "this body arrived in n messages" — ``httpx``
+    decides its own framing — so the raw ASGI callable is the only place the
+    message count is under the test's control.
+
+    Args:
+        app: The application under test.
+        path: The request path.
+        receive: The channel delivering the body.
+
+    Returns:
+        The status line and the concatenated response body.
+    """
+    status: list[int] = []
+    body = bytearray()
+
+    async def send(message: Message) -> None:
+        """Record the status line and accumulate the body.
+
+        Args:
+            message: The outgoing ASGI message.
+        """
+        if message["type"] == "http.response.start":
+            status.append(int(message["status"]))
+        elif message["type"] == "http.response.body":
+            body.extend(bytes(message.get("body", b"")))
+
+    await app(_post_scope(path), receive, send)
+    return status[0], bytes(body)
+
+
+def test_the_message_ceiling_is_derived_from_the_byte_cap(vault: Path) -> None:
+    """The ceiling scales with the route's own cap, and is never zero.
+
+    A flat constant cannot work in both directions: one sized for a journal
+    entry would refuse a legitimate thirteen-megabyte upload streamed in
+    ordinary chunks, and one sized for that upload would leave every other
+    route amplifiable. Deriving it is what keeps
+    :data:`creek_mcp.api.routes.ROUTE_BODY_CAPS` the single place a route's
+    appetite is declared.
+
+    Args:
+        vault: Unused; present so the test reads like its neighbours.
+    """
+    assert vault.exists()
+    assert message_ceiling(DEFAULT_MAX_BODY_BYTES) > message_ceiling(_AMPLIFIER_CAP)
+    assert message_ceiling(ROUTE_BODY_CAPS[UPLOAD_PATH]) > message_ceiling(
+        DEFAULT_MAX_BODY_BYTES
+    )
+    assert message_ceiling(0) > 0, "a tiny cap must not refuse every request"
+
+
+def _refusing_llm_factory() -> object:
+    """Fail deterministically, so the reflection route needs no live provider.
+
+    The reflection route answers ``503 temporarily_unavailable`` when its
+    factory raises, and the body gate answers ``422 invalid_request`` before
+    the router runs. Two different codes from two different layers is what
+    makes "the body reached the route" an observation rather than an
+    assumption.
+
+    Returns:
+        Never returns.
+
+    Raises:
+        RuntimeError: Always.
+    """
+    msg = "no provider in this test"
+    raise RuntimeError(msg)
+
+
+def test_a_body_arriving_in_too_many_chunks_is_refused(vault: Path) -> None:
+    """A body far under the byte cap is still refused once it is enough messages.
+
+    Reproduced before the fix: 200,000 one-byte chunks — 200 KB, a fifth of
+    the default cap — buffered 200,001 messages and were **accepted**, holding
+    roughly 54 MB of Python objects for a 200 KB body. Only the bytes were
+    counted, so the module's promise that "the refusal costs the server one
+    cap's worth of memory" was false as written.
+
+    The payload is a **well-formed** reflection body, streamed a byte at a
+    time. That matters: a stream of meaningless bytes would be refused ``422``
+    by the request parser too, and the test would pass against the unfixed
+    code while measuring nothing. With a valid body the only remaining reason
+    for a ``422`` is the message count — everything else answers ``503``.
+
+    Args:
+        vault: A seeded vault.
+    """
+    app = build_app(
+        vault_path=vault,
+        max_body_bytes=_AMPLIFIER_CAP,
+        reflect_llm_factory=_refusing_llm_factory,
+    )
+    over = message_ceiling(_AMPLIFIER_CAP) + 1
+    assert over < _AMPLIFIER_CAP, "the byte cap must not be what refuses this"
+    receive = _byte_at_a_time(_body_of_exactly(over))
+    status, body = run_async(_drive_body, app, REFLECTIONS_PATH, receive)
+    assert status == _INVALID_REQUEST_STATUS
+    envelope_body = json.loads(body)
+    assert envelope_body["code"] == ErrorCode.INVALID_REQUEST.value
+    assert envelope_body["message"] == ERROR_MESSAGES[ErrorCode.INVALID_REQUEST]
+    assert set(envelope_body) == {"code", "message", "request_id"}
+
+
+def test_a_body_just_below_the_message_ceiling_is_accepted(vault: Path) -> None:
+    """The non-vacuity twin: one message under the ceiling still reaches the route.
+
+    Without it, a ceiling of zero would satisfy the refusal test above while
+    taking every chunked request on the surface offline. What proves the body
+    got through is which *layer* answered: the body gate refuses with
+    ``invalid_request`` before the router runs, whereas this body travels into
+    the reflection route and is refused by the injected LLM factory, which
+    answers ``temporarily_unavailable``.
+
+    Args:
+        vault: A seeded vault.
+    """
+    app = build_app(
+        vault_path=vault,
+        max_body_bytes=_AMPLIFIER_CAP,
+        reflect_llm_factory=_refusing_llm_factory,
+    )
+    under = message_ceiling(_AMPLIFIER_CAP) - 1
+    payload = _body_of_exactly(under)
+    receive = _byte_at_a_time(payload)
+    status, _ = run_async(_drive_body, app, REFLECTIONS_PATH, receive)
+    assert status == _TEMPORARILY_UNAVAILABLE_STATUS
+
+
+def test_the_buffered_message_count_never_exceeds_the_ceiling() -> None:
+    """Counted directly, because measuring memory measures the interpreter.
+
+    ``_buffer_within`` is driven on its own here so the assertion is about the
+    list it builds rather than about ``sys.getsizeof`` or an RSS delta, either
+    of which would turn a security invariant into a flaky benchmark.
+    """
+    ceiling = message_ceiling(_AMPLIFIER_CAP)
+    observed: list[int] = []
+
+    async def scenario() -> list[Message] | None:
+        """Drive the buffer well past its ceiling.
+
+        Returns:
+            Whatever ``_buffer_within`` answered.
+        """
+        return await limits_module._buffer_within(
+            _counting_receive(ceiling * 4, observed), _AMPLIFIER_CAP
+        )
+
+    assert run_async(scenario) is None
+    assert observed, "the receive channel was never driven"
+    assert max(observed) == ceiling + 1, f"read {max(observed)} messages"
+
+
+def test_the_message_ceiling_applies_on_an_unrouted_path(vault: Path) -> None:
+    """A probe at a path that does not exist is capped too, and refused first.
+
+    The middleware sits **above** the router, so an authenticated caller can
+    aim the amplifier at ``/v1/nonsense`` — where no route, no ceiling gate and
+    no handler would ever run — and the buffer is built regardless. The refusal
+    has to be the body gate's ``422``, not the router's ``404``, because the
+    ``404`` only arrives after the buffer is complete.
+
+    Args:
+        vault: A seeded vault.
+    """
+    app = build_app(vault_path=vault, max_body_bytes=_AMPLIFIER_CAP)
+    over = message_ceiling(_AMPLIFIER_CAP) + 1
+    status, _ = run_async(_drive_body, app, _UNROUTED_PATH, _chunked_receive(over))
+    assert status == _INVALID_REQUEST_STATUS
+
+
+def test_a_realistic_chunked_upload_stays_inside_its_message_ceiling() -> None:
+    """``POST /v1/uploads`` at its own raised cap must not trip the count.
+
+    The route declares a cap sized for base64 of a ten-megabyte document, and
+    an ordinary client streams that in 64 KiB chunks. If the ceiling did not
+    scale with the route's cap, the fix for #1142 would refuse the one route
+    the raised cap exists for — so this is the assertion that keeps the two
+    limits in step.
+    """
+    cap = ROUTE_BODY_CAPS[UPLOAD_PATH]
+    chunks = -(-cap // _REALISTIC_CHUNK_BYTES)  # ceiling division
+    assert chunks < message_ceiling(cap), f"{chunks} chunks vs {message_ceiling(cap)}"
+
+
+# --------------------------------------------------------------------------- #
+# The deadline, and which routes it can bind (#1109)
+# --------------------------------------------------------------------------- #
+
+
+_OVERRUN_SECONDS: Final[float] = 0.6
+"""How long an overrunning write blocks. Comfortably past :data:`_SHED_TIMEOUT`."""
+
+_HTTPAPI_DIR: Final[Path] = Path(httpapi_package.__file__).parent
+"""The package whose every threadpool dispatch has to state its deadline class."""
+
+_READ_DISPATCH_MODULES: Final[frozenset[str]] = frozenset(
+    {"capabilities", "drive", "reflect", "wheel"}
+)
+"""Modules serving at least one route that mutates no vault state.
+
+``drive`` is in both sets on purpose: ``GET /v1/connectors/drive`` reports
+status, while the sync and disconnect routes beside it write.
+"""
+
+_WRITE_DISPATCH_MODULES: Final[frozenset[str]] = frozenset(
+    {"drive", "journal", "pipeline", "upload"}
+)
+"""Modules serving at least one route that mutates the vault."""
+
+
+def _module_imports(path: Path) -> set[str]:
+    """Return every name *path* imports, by AST rather than by text search.
+
+    Args:
+        path: A Python source file.
+
+    Returns:
+        The imported names, module paths and ``from``-imported symbols alike.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update(alias.name for alias in node.names)
+    return names
+
+
+def _modules_importing(symbol: str) -> set[str]:
+    """Return the stems of every ``creek_mcp.httpapi`` module importing *symbol*.
+
+    Args:
+        symbol: The imported name to look for.
+
+    Returns:
+        Module stems (``"journal"``, not the full path).
+    """
+    return {
+        source.stem
+        for source in sorted(_HTTPAPI_DIR.glob("*.py"))
+        if symbol in _module_imports(source)
+    }
+
+
+def test_no_route_dispatches_without_declaring_its_deadline_class() -> None:
+    """``run_in_threadpool`` is gone, so no route can inherit a deadline by omission.
+
+    This is the structural half of #1109 and the reason the fix is two named
+    helpers rather than a keyword argument. ``anyio``'s
+    ``abandon_on_cancel=False`` default is what made the published thirty-second
+    deadline unenforceable on ten of the eleven operations, and a default is
+    exactly what the next route would inherit. Importing
+    :func:`~creek_mcp.httpapi.deadline.read_off_loop` or
+    :func:`~creek_mcp.httpapi.deadline.write_off_loop` is a decision somebody
+    had to make; importing ``run_in_threadpool`` is not.
+    """
+    offenders = _modules_importing("run_in_threadpool")
+    assert offenders == set(), f"undeclared threadpool dispatch in {sorted(offenders)}"
+
+
+def test_the_read_and_write_dispatch_split_is_the_published_one() -> None:
+    """Every module dispatching off-loop is in exactly the classes it should be.
+
+    The non-vacuity twin for the test above: deleting every threadpool call in
+    the package would satisfy that one and break the whole surface. This pins
+    which side of the split each module actually landed on, so moving a write
+    onto the abandonable helper — the change that would introduce the torn
+    vault #1109 feared — fails here rather than in production.
+    """
+    assert _modules_importing("read_off_loop") == _READ_DISPATCH_MODULES
+    assert _modules_importing("write_off_loop") == _WRITE_DISPATCH_MODULES
+
+
+def test_a_slow_read_route_becomes_temporarily_unavailable(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read blocked in a **worker thread** is shed on time, not answered late.
+
+    The distinction that matters, and the one the suite was missing.
+    ``test_a_slow_handler_becomes_temporarily_unavailable`` above drives a
+    pure-``async`` handler, which no production route resembles: every route
+    hands its blocking work to a worker thread, and ``anyio`` defers
+    cancellation into a worker by default. Measured on this stack before the
+    fix, a 0.25 s deadline against a 1.2 s tool returned ``200`` in 1.223 s —
+    the real answer, late, with no ``503`` anywhere.
+
+    The worker is released explicitly rather than left to time out, so the
+    test costs milliseconds when it passes and does not depend on how loaded
+    the runner is.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Blocks the handshake's one synchronous seam.
+    """
+    release = threading.Event()
+
+    def _blocked(*_args: object, **_kwargs: object) -> bool:
+        """Block until the test releases this worker.
+
+        Args:
+            *_args: Ignored.
+            **_kwargs: Ignored.
+
+        Returns:
+            The usable-vault answer the real seam would have given.
+        """
+        release.wait(_JOIN_TIMEOUT)
+        return True
+
+    monkeypatch.setattr(capabilities_module, "_vault_is_usable", _blocked)
+    try:
+        with client(vault_path=vault, timeout_seconds=_SHED_TIMEOUT) as test_client:
+            response = test_client.get(CAPABILITIES_PATH, headers=headers())
+    finally:
+        release.set()
+    assert response.status_code == _UNAVAILABLE_STATUS
+    body = envelope(response)
+    assert body["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
+    assert set(body) == {"code", "message", "request_id"}
+
+
+def test_a_slow_write_route_runs_to_completion_and_answers_truthfully(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write past the deadline gets the **true** answer late, never a lying ``503``.
+
+    This test *is* the decision. Making the deadline bind a write would mean
+    abandoning a detached thread mid-mutation while telling the client the
+    request was shed — the torn-vault-plus-retry hazard #1109 was filed about,
+    and one that does not exist today. Consistency beats boundedness on this
+    side of the split, and ``docs/api.md`` now says so instead of publishing a
+    deadline these routes cannot keep.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Makes the journal tool overrun the deadline.
+    """
+    real = journal_module.journal_ingest_tool
+
+    def _overrunning(**kwargs: Any) -> dict[str, Any]:
+        """Overrun the deadline, then do the real write.
+
+        Args:
+            **kwargs: Passed straight through.
+
+        Returns:
+            The real tool's result.
+        """
+        sleep(_OVERRUN_SECONDS)
+        return real(**kwargs)
+
+    monkeypatch.setattr(journal_module, "journal_ingest_tool", _overrunning)
+    with client(vault_path=vault, timeout_seconds=_SHED_TIMEOUT) as test_client:
+        response = test_client.put(
+            JOURNAL_PATH,
+            json=VALID_JOURNAL_BODY,
+            headers=headers(ceiling="open"),
+        )
+    assert response.status_code == _OK_STATUS
+    assert response.json()["action"] == "created"
+
+
+def test_a_write_past_the_deadline_is_never_reported_created_twice(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The vault lands in one of two admitted states, and a retry says so.
+
+    #1109's own requested assertion. A write that overran the deadline and was
+    torn would leave a ledger entry with no fragment (or the reverse), and the
+    retry would mint a *second* ``created``. Because the write is not cut
+    short, the ledger and the writer agree: the second call reports something
+    other than ``created`` and adds no second fragment. That is the observable
+    form of "never a third state".
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Makes the journal tool overrun the deadline.
+    """
+    real = journal_module.journal_ingest_tool
+
+    def _overrunning(**kwargs: Any) -> dict[str, Any]:
+        """Overrun the deadline, then do the real write.
+
+        Args:
+            **kwargs: Passed straight through.
+
+        Returns:
+            The real tool's result.
+        """
+        sleep(_OVERRUN_SECONDS)
+        return real(**kwargs)
+
+    monkeypatch.setattr(journal_module, "journal_ingest_tool", _overrunning)
+    with client(vault_path=vault, timeout_seconds=_SHED_TIMEOUT) as test_client:
+        first = test_client.put(
+            JOURNAL_PATH, json=VALID_JOURNAL_BODY, headers=headers(ceiling="open")
+        )
+        after_first = snapshot(vault)
+        second = test_client.put(
+            JOURNAL_PATH, json=VALID_JOURNAL_BODY, headers=headers(ceiling="open")
+        )
+    assert first.status_code == _OK_STATUS
+    assert second.status_code == _OK_STATUS
+    assert first.json()["action"] == "created"
+    assert second.json()["action"] != "created", "the retry minted a second entry"
+    assert second.json()["fragment_id"] == first.json()["fragment_id"]
+    assert snapshot(vault) == after_first, "the retry changed the vault"
+
+
+class _BlockedInThreadOnce:
+    """A handler that overruns in a **worker thread** once, then answers instantly.
+
+    The non-vacuous twin of :class:`_SlowOnce`, whose ``await async_sleep`` is
+    a shape no production route has. Only this one exercises the path where
+    ``anyio``'s deferred cancellation used to swallow the deadline entirely.
+
+    Attributes:
+        calls: How many times the handler has been entered.
+        release: Set by the test to let the blocked worker finish.
+    """
+
+    def __init__(self) -> None:
+        """Start with nothing recorded and the worker gate shut."""
+        self.calls = 0
+        self.release = threading.Event()
+
+    async def __call__(self, _request: Request) -> Response:
+        """Block in a worker thread on the first call, answer on the rest.
+
+        Args:
+            _request: Ignored.
+
+        Returns:
+            A ``200`` the deadline must never let through on the first call.
+        """
+        self.calls += 1
+        if self.calls == 1:
+            await read_off_loop(self.release.wait, _JOIN_TIMEOUT)
+        return JSONResponse({"status": "ok"})
+
+
+def test_the_semaphore_is_released_after_a_timeout_in_a_worker_thread(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The slot comes back even when the overrun happened off the loop.
+
+    ``test_the_semaphore_is_released_after_a_timeout`` above proves the
+    ``finally`` runs when the deadline fires against an ``await``. It cannot
+    prove it for the shape production actually has, because before #1109 the
+    deadline never fired against a worker at all — the first request was
+    answered ``200``, late, and the slot was released by the ordinary path.
+    This drives the real shape: the first request is shed, and the second must
+    still find a free slot.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Swaps the health handler for one that blocks off-loop once.
+    """
+    handler = _BlockedInThreadOnce()
+    monkeypatch.setitem(handlers_module.HANDLERS, OP_HEALTH, handler)
+    try:
+        with client(
+            vault_path=vault, max_concurrency=1, timeout_seconds=_SHED_TIMEOUT
+        ) as test_client:
+            timed_out = test_client.get(HEALTH_PATH, headers=headers())
+            after = test_client.get(HEALTH_PATH, headers=headers())
+    finally:
+        handler.release.set()
+    assert timed_out.status_code == _UNAVAILABLE_STATUS
+    assert envelope(timed_out)["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
+    assert after.status_code == _OK_STATUS
+    assert handler.calls == 2, "the second request never reached the handler"
+
+
+# --------------------------------------------------------------------------- #
+# Per-consumer concurrency accounting (#1110)
+# --------------------------------------------------------------------------- #
+
+
+_SETTLE_SECONDS: Final[float] = 5.0
+"""How long a request that should be shed *immediately* may take to come back.
+
+Generous, because it only costs wall time when the assertion is about to fail:
+a shed request returns in milliseconds, and a request that was **not** shed
+never returns at all until the gate is released.
+"""
+
+_GHOST_CONSUMER: Final[str] = "ghost"
+"""A consumer name no configuration ever issued a token for."""
+
+_GHOST_PROBES: Final[int] = 3
+"""How many times the unconfigured consumer knocks.
+
+More than one, because a lazily-grown bucket map would refuse the first call
+and *serve* the second — which is precisely the N-buckets hole that makes
+per-consumer accounting worse than a global limit.
+"""
+
+
+class _GhostVerifier(ConsumerTokenVerifier):
+    """Names a consumer that is not in its own configured set.
+
+    A verifier is injectable, so the limiter cannot assume the identity it is
+    handed came from the map it was built from. This is the shape that decides
+    whether the accounting is safe: if an unrecognised name silently earns a
+    bucket, an attacker with one credential gets N buckets instead of one.
+    """
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        """Authenticate the suite's bearer as an unconfigured consumer.
+
+        Args:
+            token: The presented bearer.
+
+        Returns:
+            An :class:`AccessToken` naming :data:`_GHOST_CONSUMER`.
+        """
+        return AccessToken(
+            token=token,
+            client_id=_GHOST_CONSUMER,
+            scopes=[REMOTE_SCOPE],
+            expires_at=None,
+        )
+
+
+def test_a_loud_consumer_cannot_take_the_last_slot_from_a_quiet_one(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One consumer's traffic is bounded by its own quota, not by the process's.
+
+    The starvation #1110 reports, driven end to end. ``adepthood`` holds a
+    blocking request, then issues a second; with only per-process accounting
+    that second request takes the last global slot and ``crawdad`` — which has
+    sent nothing at all — is shed. With a per-consumer ceiling the *loud*
+    consumer is the one refused, and the quiet one is served.
+
+    The identity keyed on here is not attacker-chosen: ``context.consumer`` is
+    set from the verifier's ``client_id``, which is a key of the
+    operator-configured token map and never a byte off the request. So one
+    issued credential buys exactly one bucket.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Swaps the health handler for a blocking one.
+    """
+    gate = _Gate()
+    monkeypatch.setitem(handlers_module.HANDLERS, OP_HEALTH, gate)
+    held: list[int] = []
+    loud_again: list[int] = []
+
+    with client(vault_path=vault, max_concurrency=2, max_per_consumer=1) as test_client:
+
+        def _knock(results: list[int]) -> None:
+            """Issue one health request and record its status.
+
+            Args:
+                results: Where to record the status line.
+            """
+            results.append(test_client.get(HEALTH_PATH, headers=headers()).status_code)
+
+        holder = threading.Thread(target=_knock, args=(held,), daemon=True)
+        holder.start()
+        try:
+            assert gate.entered.wait(_JOIN_TIMEOUT), "the first request never started"
+            second = threading.Thread(target=_knock, args=(loud_again,), daemon=True)
+            second.start()
+            second.join(_SETTLE_SECONDS)
+            assert not second.is_alive(), "the loud consumer's second request queued"
+            quiet = test_client.get(
+                CAPABILITIES_PATH, headers=headers(token=OTHER_TOKEN)
+            )
+        finally:
+            gate.release.set()
+            holder.join(_JOIN_TIMEOUT)
+
+    assert loud_again == [_UNAVAILABLE_STATUS]
+    assert quiet.status_code == _OK_STATUS
+    assert held == [_OK_STATUS]
+
+
+def test_the_global_ceiling_still_sheds_before_any_token_comparison(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The process-wide limiter stays **above** authentication, and still sheds.
+
+    The per-consumer ceiling is a *second* limiter below authentication, never
+    a replacement for the first. A flood of unauthenticated requests has no
+    consumer to bucket by, so it has to be shed before anything pays for a
+    token comparison — which is why the anonymous probe below is answered
+    ``503`` rather than ``401``.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Swaps the health handler for a blocking one.
+    """
+    gate = _Gate()
+    monkeypatch.setitem(handlers_module.HANDLERS, OP_HEALTH, gate)
+    held: list[int] = []
+
+    with client(vault_path=vault, max_concurrency=1, max_per_consumer=4) as test_client:
+
+        def _hold() -> None:
+            """Occupy the only process-wide slot."""
+            held.append(test_client.get(HEALTH_PATH, headers=headers()).status_code)
+
+        holder = threading.Thread(target=_hold, daemon=True)
+        holder.start()
+        try:
+            assert gate.entered.wait(_JOIN_TIMEOUT), "the first request never started"
+            anonymous = test_client.get(HEALTH_PATH, headers=headers(token=None))
+        finally:
+            gate.release.set()
+            holder.join(_JOIN_TIMEOUT)
+
+    assert anonymous.status_code == _UNAVAILABLE_STATUS
+    assert envelope(anonymous)["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
+    assert held == [_OK_STATUS]
+
+
+def test_the_bucket_map_is_built_from_the_verifiers_configured_consumers() -> None:
+    """The keys come from the configuration, eagerly, and are a fixed set.
+
+    Built lazily from whatever string arrived, the map would hand a bucket to
+    every distinct identity a future verifier change let through — which turns
+    the limit into an amplifier. Building it from
+    :attr:`creek_mcp.remote_auth.ConsumerTokenVerifier.consumers` at
+    construction is what makes the key space finite and operator-controlled.
+    """
+    configured = verifier()
+    limiter = ConsumerConcurrencyLimitMiddleware(
+        _ScopeSpy(), consumers=configured.consumers, max_per_consumer=1
+    )
+    assert set(configured.consumers) == {CONSUMER, OTHER_CONSUMER}
+    assert set(limiter.consumers) == set(configured.consumers)
+
+
+def test_an_unconfigured_consumer_is_shed_rather_than_given_its_own_bucket(
+    vault: Path,
+) -> None:
+    """A name the limiter never heard of gets no bucket, every single time.
+
+    A dict that grew on first sight would refuse this once and then serve it
+    forever after, which is the failure mode that makes per-consumer accounting
+    *worse* than a global limit. Repeating the probe is what tells those two
+    implementations apart; a single call cannot.
+
+    Args:
+        vault: A seeded vault.
+    """
+    ghost = _GhostVerifier({CONSUMER: (STRONG_TOKEN,)})
+    with client(vault_path=vault, verifier=ghost, max_per_consumer=4) as test_client:
+        seen = [
+            test_client.get(CAPABILITIES_PATH, headers=headers()).status_code
+            for _ in range(_GHOST_PROBES)
+        ]
+    assert seen == [_UNAVAILABLE_STATUS] * _GHOST_PROBES
+
+
+def test_an_over_quota_consumer_gets_no_refusal_of_its_own(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The over-quota answer is byte-identical to the global shed, but for the id.
+
+    A distinct "you specifically are over quota" code would tell a caller
+    something about the *other* consumers' traffic, and the retry disposition
+    is identical either way — so there is nothing to buy with the disclosure.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Swaps the health handler for a blocking one.
+    """
+    gate = _Gate()
+    monkeypatch.setitem(handlers_module.HANDLERS, OP_HEALTH, gate)
+    held: list[int] = []
+
+    with client(vault_path=vault, max_concurrency=8, max_per_consumer=1) as test_client:
+
+        def _hold() -> None:
+            """Occupy the loud consumer's only bucket slot."""
+            held.append(test_client.get(HEALTH_PATH, headers=headers()).status_code)
+
+        holder = threading.Thread(target=_hold, daemon=True)
+        holder.start()
+        try:
+            assert gate.entered.wait(_JOIN_TIMEOUT), "the first request never started"
+            over_quota = test_client.get(CAPABILITIES_PATH, headers=headers())
+        finally:
+            gate.release.set()
+            holder.join(_JOIN_TIMEOUT)
+
+    with client(vault_path=vault, max_concurrency=0) as shedding_client:
+        globally_shed = shedding_client.get(CAPABILITIES_PATH, headers=headers())
+
+    assert over_quota.status_code == globally_shed.status_code
+    assert blank_request_id(envelope(over_quota)) == blank_request_id(
+        envelope(globally_shed)
+    )
+    assert held == [_OK_STATUS]
+
+
+def test_a_blank_consumer_never_reaches_the_per_consumer_limiter(
+    vault: Path,
+) -> None:
+    """The #1100 tie-back: an unnamed credential is ``401``, never a bucket key.
+
+    Order matters between the two fixes. Left unrefused, ``''``, ``'   '`` and
+    ``'\\t'`` are three *distinct* keys that all render as no identity, so a
+    limiter keyed on the verified name would hand a nameless caller three
+    buckets. Authentication sits above the limiter precisely so that cannot
+    happen, and this pins the ``401`` rather than a ``503``.
+
+    Args:
+        vault: A seeded vault.
+    """
+    unnamed = _UnnamedConsumerVerifier({CONSUMER: (STRONG_TOKEN,)})
+    with client(vault_path=vault, verifier=unnamed, max_per_consumer=1) as test_client:
+        response = test_client.get(CAPABILITIES_PATH, headers=headers())
+    assert response.status_code == _UNAUTHENTICATED_STATUS
+
+
+_ROOMY_CONCURRENCY: Final[int] = 8
+"""A process ceiling wide enough that only the *per-consumer* one can shed.
+
+The two limiters answer with the same status line on purpose, so a test that
+leaves both narrow cannot say which one refused. Holding the global one open
+is what makes the per-consumer bucket the only thing under test.
+"""
+
+
+def test_the_per_consumer_slot_is_released_on_both_paths(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bucket comes back after a shed request *and* after a served one.
+
+    The same ``finally`` argument the process-wide limiter has carried since
+    #1074, now for the second limiter — and it needed its own test, because
+    every existing one builds a fresh app and so never asks a bucket to be
+    reused after it was taken. A per-consumer semaphore acquired without a
+    ``finally`` is strictly worse than the global case it mirrors: one
+    overrunning request permanently retires ``max_per_consumer`` slots for
+    **that consumer alone**, so the surface keeps answering everybody else and
+    the operator sees one credential silently die rather than a dead server.
+
+    Both release paths are exercised in one sequence, and the ceiling of one
+    bucket slot is what makes each step evidence. The first request overruns
+    and is shed by the deadline, which unwinds *through* the limiter — if that
+    path leaks, the second request never reaches the handler. The second
+    request is served normally and gives its slot back the ordinary way — if
+    *that* path leaks, the third request is shed. The global ceiling is held
+    wide open throughout so a ``503`` here can only have come from the bucket.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Swaps the health handler for one that overruns once.
+    """
+    handler = _SlowOnce()
+    monkeypatch.setitem(handlers_module.HANDLERS, OP_HEALTH, handler)
+    with client(
+        vault_path=vault,
+        max_concurrency=_ROOMY_CONCURRENCY,
+        max_per_consumer=1,
+        timeout_seconds=_SHED_TIMEOUT,
+    ) as test_client:
+        timed_out = test_client.get(HEALTH_PATH, headers=headers())
+        after_shed = test_client.get(HEALTH_PATH, headers=headers())
+        after_served = test_client.get(HEALTH_PATH, headers=headers())
+    assert timed_out.status_code == _UNAVAILABLE_STATUS
+    assert envelope(timed_out)["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value
+    assert after_shed.status_code == _OK_STATUS, "the shed request kept its bucket slot"
+    assert after_served.status_code == _OK_STATUS, "the served request kept its slot"
+    assert handler.calls == 3, "a later request never reached the handler"

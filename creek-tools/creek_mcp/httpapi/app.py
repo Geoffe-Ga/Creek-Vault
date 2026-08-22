@@ -107,9 +107,11 @@ from creek_mcp.httpapi.middleware.ceiling import CeilingAdmissionMiddleware
 from creek_mcp.httpapi.middleware.limits import (
     DEFAULT_MAX_BODY_BYTES,
     DEFAULT_MAX_CONCURRENCY,
+    DEFAULT_MAX_PER_CONSUMER,
     DEFAULT_TIMEOUT_SECONDS,
     BodySizeLimitMiddleware,
     ConcurrencyLimitMiddleware,
+    ConsumerConcurrencyLimitMiddleware,
     RequestTimeoutMiddleware,
 )
 
@@ -434,8 +436,9 @@ def _middleware(
     max_body_bytes: int,
     timeout_seconds: float,
     max_concurrency: int,
+    max_per_consumer: int,
 ) -> list[Middleware]:
-    """Return the seven-layer stack, outermost first.
+    """Return the eight-layer stack, outermost first.
 
     The order is load-bearing and pinned by a test; see
     :mod:`creek_mcp.httpapi.middleware` for what each adjacent pair buys.
@@ -447,6 +450,9 @@ def _middleware(
             :data:`~creek_mcp.api.routes.ROUTE_BODY_CAPS`.
         timeout_seconds: Per-request deadline.
         max_concurrency: In-flight request limit, process-wide.
+        max_per_consumer: In-flight request limit for any one configured
+            consumer. A second ceiling below authentication, never a
+            replacement for the process-wide one above it (#1110).
 
     Returns:
         The middleware stack.
@@ -457,6 +463,11 @@ def _middleware(
         Middleware(ConcurrencyLimitMiddleware, max_concurrency=max_concurrency),
         Middleware(RequestTimeoutMiddleware, timeout_seconds=timeout_seconds),
         Middleware(BearerAuthMiddleware, verifier=verifier),
+        Middleware(
+            ConsumerConcurrencyLimitMiddleware,
+            consumers=verifier.consumers,
+            max_per_consumer=max_per_consumer,
+        ),
         Middleware(
             BodySizeLimitMiddleware,
             max_body_bytes=max_body_bytes,
@@ -473,6 +484,7 @@ def create_app(
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+    max_per_consumer: int = DEFAULT_MAX_PER_CONSUMER,
     reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
 ) -> Starlette:
     """Build the ``/v1`` application.
@@ -491,6 +503,10 @@ def create_app(
             does, so lowering this does not lower that route.
         timeout_seconds: Per-request deadline.
         max_concurrency: In-flight request limit, process-wide.
+        max_per_consumer: In-flight request limit for any one configured
+            consumer, so one loud consumer cannot take the last slot from a
+            quiet one. Keep ``max_concurrency`` at or above the sum of these
+            and both ceilings hold at once.
         reflect_llm_factory: Thunk returning the tier-keyed LLM factory
             ``POST /v1/reflections`` calls, or ``None`` to build the production
             one lazily on first use. A thunk rather than a factory so a server
@@ -517,6 +533,7 @@ def create_app(
             max_body_bytes,
             timeout_seconds,
             max_concurrency,
+            max_per_consumer,
         ),
         exception_handlers={
             ERROR_STATUS[ErrorCode.NOT_FOUND]: _routing_miss,

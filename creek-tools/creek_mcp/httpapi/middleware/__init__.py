@@ -1,4 +1,4 @@
-"""The seven ``/v1`` middlewares, outermost first (#1074).
+"""The eight ``/v1`` middlewares, outermost first (#1074).
 
 Every one of them is **pure ASGI** — ``async def __call__(self, scope, receive,
 send)`` — and never
@@ -28,8 +28,13 @@ every property the modules below promise depends on it:
    comparison.
 5. :mod:`creek_mcp.httpapi.auth` — above the router, so a ``401`` never depends
    on whether a path matched.
-6. the body-size limit — below authentication, so an anonymous caller cannot
+6. the same limits module's **per-consumer** concurrency ceiling — below
+   authentication, because it cannot bucket a caller that has no identity yet,
+   and above the body-size limit so an over-quota consumer is shed before the
+   server buffers its body (#1110). A second ceiling, never a replacement for
+   the process-wide one at 3.
+7. the body-size limit — below authentication, so an anonymous caller cannot
    make the server buffer a large body.
-7. :mod:`~creek_mcp.httpapi.middleware.ceiling` — last before the router, above
+8. :mod:`~creek_mcp.httpapi.middleware.ceiling` — last before the router, above
    every handler, so no vault read can precede the admission decision.
 """

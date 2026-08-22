@@ -44,6 +44,7 @@ from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
     ConsumerTokenVerifier,
     load_consumer_tokens,
+    names_a_consumer,
 )
 
 if TYPE_CHECKING:
@@ -150,6 +151,16 @@ class BearerAuthMiddleware:
         header — which is the fix for a consumer sending the *name* of an
         environment variable as an identity.
 
+        A verified token that names **nobody** is refused here, identically to
+        an unverified one (#1100). ``verifier`` is injectable — ``create_app``
+        takes one, and the suite passes one — so a verifier that is not a
+        :class:`~creek_mcp.remote_auth.ConsumerTokenVerifier` built through the
+        validated constructor can hand this middleware a blank ``client_id``.
+        Reproduced before the fix: the request was *served*, and every layer
+        below observed ``consumer=''``. The refusal is byte-identical to the
+        ordinary ``401`` but for the correlation id, because telling a caller
+        which of the two rules it tripped describes the server's wiring to it.
+
         Args:
             scope: The ASGI scope.
             receive: The ASGI receive channel.
@@ -161,7 +172,7 @@ class BearerAuthMiddleware:
         context = context_of(scope)
         token = _presented_token(scope)
         access = None if token is None else await self._verifier.verify_token(token)
-        if access is None:
+        if access is None or not names_a_consumer(access.client_id):
             refusal = error_response(ErrorCode.UNAUTHENTICATED, context)
             await refusal(scope, receive, send)
             return
