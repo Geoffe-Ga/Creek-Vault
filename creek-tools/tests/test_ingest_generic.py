@@ -768,6 +768,28 @@ _ENCODING_CORPORA: tuple[tuple[str, str], ...] = (
         "et les étoiles d'été. Il écrit lentement, mesure chaque phrase, "
         "puis referme son cahier élimé. ",
     ),
+    (
+        # #1600. chardet answers Windows-1250 for this exact text and
+        # decodes it cleanly, rewriting £85 to Ł85; until this path
+        # shared the encoding decision it took that guess at 0.05
+        # confidence and wrote the mojibake to a fragment. The corpus
+        # is the one that draws the wrong guess — reword it and chardet
+        # answers Windows-1252 instead, which decodes cp1252 correctly
+        # and quietly stops testing anything.
+        "cp1252",
+        "name,note\nAlice,café naïve — “quoted”\nBob,résumé \u2013 £85 €9 ©\n",
+    ),
+    (
+        # #1601's regression guard, and the row that is *supposed* to be
+        # green on both sides of the fix. This path had no confidence
+        # gate, so Cyrillic already decoded correctly here; a fix shaped
+        # as "impose the CSV path's 0.70 threshold on everyone" would
+        # push it from correct to mojibake. If this row ever goes red,
+        # the unification took a threshold-shaped shortcut.
+        "iso8859-5",
+        "Он каждое утро выходит к реке и долго смотрит на воду. "
+        "Она любит лес и тишину, и часто гуляет там одна. ",
+    ),
 )
 
 
@@ -834,4 +856,6 @@ class TestTryDecodeAcrossDetectionTables:
             "shift_jis",
             "gbk",
             "latin-1",
+            "cp1252",
+            "iso8859-5",
         }

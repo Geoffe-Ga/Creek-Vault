@@ -194,6 +194,17 @@ class WorkbookData:
 
     sheets: tuple[SheetData, ...]
 
+    codec: str | None = None
+    """The codec a text workbook was actually read with, or ``None``.
+
+    Only the CSV path sets this. Discovery cannot: it stamps
+    ``RawDocument.detected_encoding`` before opening the file, so
+    without this channel the stamp stayed a guess forever while the
+    real answer was computed here and dropped (#1602). ``None`` means
+    "not a text workbook" — an XLSX is a zip archive and has no
+    document-level codec to report.
+    """
+
 
 @runtime_checkable
 class SpreadsheetBackend(Protocol):
@@ -367,19 +378,30 @@ def _safe_parse_authored_at(candidate: object) -> datetime | None:
         return None
 
 
-CSV_CHARDET_CONFIDENCE_THRESHOLD: float = DEFAULT_CONFIDENCE_THRESHOLD
-"""Minimum ``chardet`` confidence required to trust a *single-byte* guess.
+UNKNOWN_ENCODING: str = "unknown"
+"""Encoding stamp for a text file discovery has not opened yet.
 
-This governs the single-byte path only, and is unchanged at 0.7. A
-multi-byte detection is admitted below it by codec class instead —
-see :mod:`creek.ingest.encoding` for why lowering this number was the
-wrong fix and what replaced it (#1589, #1591).
+:attr:`~creek.ingest.base.RawDocument.detected_encoding` is a required
+field, so discovery cannot decline to answer; ``"unknown"`` is the
+honest answer until ``parse`` replaces it with
+:attr:`WorkbookData.codec` (#1602).
+"""
+
+CSV_CHARDET_CONFIDENCE_THRESHOLD: float = DEFAULT_CONFIDENCE_THRESHOLD
+"""Minimum ``chardet`` confidence required to trust a guess unjudged.
+
+Unchanged at 0.7. Below it a guess is judged on placement and
+provenance rather than refused — see :mod:`creek.ingest.encoding` for
+why lowering this number was the wrong fix and what replaced it
+(#1589, #1591, #1600, #1601).
 
 For orientation, the measured verdicts under chardet 7.6.0 that the
-threshold alone cannot separate: a GBK CSV scores 0.38 and a short
+threshold alone cannot separate: a GBK CSV scores 0.36 and a short
 Shift-JIS one 0.32, both correct and both under the gate; a Cyrillic
-CSV scores 0.45 and a genuine cp1252 file's top guess 0.05, both of
-which must *not* be trusted.
+CSV scores 0.47, also correct and also under it; and a genuine cp1252
+file's top guess scores 0.05 and must *not* be trusted. Those numbers
+move with corpus length — they orient, they are not constants, and no
+test pins one.
 """
 
 
@@ -425,18 +447,37 @@ def _read_csv(path: Path, *, has_header: bool | None = None) -> WorkbookData:
             decoded.detected or "unknown",
             decoded.confidence,
         )
-    return _csv_text_to_workbook(path, decoded.text, has_header=has_header)
+    return _csv_text_to_workbook(
+        path,
+        decoded.text,
+        codec=decoded.codec,
+        has_header=has_header,
+    )
 
 
 def _csv_text_to_workbook(
     path: Path,
     text: str,
     *,
+    codec: str | None = None,
     has_header: bool | None = None,
 ) -> WorkbookData:
-    """Parse decoded CSV ``text`` into a single-sheet :class:`WorkbookData`."""
+    """Parse decoded CSV ``text`` into a single-sheet :class:`WorkbookData`.
+
+    Args:
+        path: The CSV file, used only for its stem as the sheet name.
+        text: The already-decoded CSV text.
+        codec: The codec *text* was decoded with, carried through to
+            :attr:`WorkbookData.codec` so ``parse`` can correct the
+            discovery-time encoding stamp (#1602).
+        has_header: Optional override for header auto-detection.
+
+    Returns:
+        A single-sheet :class:`WorkbookData`.
+    """
     rows = [tuple(row) for row in csv.reader(text.splitlines())]
     return WorkbookData(
+        codec=codec,
         sheets=(_split_header(path.stem, rows, has_header=has_header),),
     )
 
@@ -510,9 +551,14 @@ class SpreadsheetIngestor(Ingestor):
                 path=path,
                 content=b"",
                 metadata={"original_file": str(path)},
+                # Discovery does not read the file — ``content`` is
+                # empty and the codec is genuinely not known yet, so
+                # the stamp says so rather than guessing ``utf-8``.
+                # ``parse`` overwrites it with what the file was
+                # actually decoded with (#1602).
                 detected_encoding="binary"
                 if path.suffix.lower() == ".xlsx"
-                else "utf-8",
+                else UNKNOWN_ENCODING,
             )
             for path in paths
         ]
@@ -538,6 +584,9 @@ class SpreadsheetIngestor(Ingestor):
         filesystem mtime is *not* a substitute.
         """
         workbook = self.backend.read_workbook(raw.path, has_header=has_header)
+        if workbook.codec is not None:
+            # The only place the true codec is ever known (#1602).
+            raw.detected_encoding = workbook.codec
         timestamp = file_modified_time(raw.path)
         authored_at = _extract_xlsx_authored_at(raw.path)
         # Materialised before the loop because the *number* of non-empty
@@ -721,6 +770,7 @@ __all__ = [
     "SUMMARY_HEAD_ROWS",
     "SUMMARY_TAIL_ROWS",
     "SUMMARY_THRESHOLD",
+    "UNKNOWN_ENCODING",
     "OpenpyxlBackend",
     "OpenpyxlUnavailableError",
     "SheetData",

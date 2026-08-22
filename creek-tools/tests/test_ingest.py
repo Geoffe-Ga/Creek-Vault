@@ -325,11 +325,18 @@ class TestNormalizeEncoding:
     """Tests for the normalize_encoding utility function."""
 
     def test_utf8_passthrough(self) -> None:
-        """UTF-8 encoded bytes should decode correctly."""
+        """UTF-8 encoded bytes should decode correctly.
+
+        Since #1600 the codec name is exact rather than a family: the
+        UTF-8 probe runs before the detector and reports the codec it
+        used, ``utf-8-sig``, which decodes UTF-8 with or without the
+        BOM. That matters downstream, where three ingestors decode the
+        raw bytes a second time by this very name.
+        """
         text, encoding = normalize_encoding(b"hello world")
         assert text == "hello world"
-        # chardet may detect pure ASCII as "ascii" which is a subset of UTF-8
-        assert encoding.lower() in ("utf-8", "ascii", "utf8", "windows-1252")
+        assert encoding == "utf-8-sig"
+        assert b"hello world".decode(encoding) == text
 
     def test_latin1_detection(self) -> None:
         """Latin-1 (ISO-8859-1) bytes should be detected and decoded."""

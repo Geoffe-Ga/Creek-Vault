@@ -1,27 +1,14 @@
-"""The encoding decision for the CSV path, and the rule the others should adopt.
+"""The one encoding decision every ingest path makes.
 
-Three call sites decide independently how to turn bytes into text, with
-three different policies, each wrong in a different direction.
-``spreadsheets._read_csv`` gated ``chardet`` behind a single confidence
-threshold and fell back to ``cp1252``; ``generic._try_decode`` trusts it
-at any confidence and falls back to ``latin-1``; ``base.normalize_encoding``
-trusts it at any confidence with ``errors="replace"``.
-
-**Only the first of those three is routed through this module today.**
-``generic._try_decode`` and ``base.normalize_encoding`` are unchanged and
-still diverge — and they are not merely stale, they are wrong in the way
-#1589 describes: both silently rewrite a genuine cp1252 file (``naïve`` ->
-``naďve``, ``£85`` -> ``Ł85``), and ``base.normalize_encoding`` is the
-encoding path for ``markdown``, ``documents``, ``code``, ``chatgpt``,
-``claude`` and ``substack``, a far larger surface than the CSV path.
-
-They were deliberately left alone rather than rerouted here, because
-neither has a confidence gate today: imposing this module's 0.70
-single-byte threshold on them would push Cyrillic (0.45), Greek (0.37)
-and other correctly-decoded single-byte corpora from correct to mojibake.
-Unifying them needs a tie-break this module does not yet have. That work
-is #1600; until it lands, "one encoding decision" describes the intent of
-this module, not the state of the pipeline.
+Three call sites used to decide independently how to turn bytes into
+text, with three different policies, each wrong in a different
+direction: ``spreadsheets._read_csv`` gated ``chardet`` behind a single
+confidence threshold and fell back to ``cp1252``; ``generic._try_decode``
+trusted it at any confidence and fell back to ``latin-1``;
+``base.normalize_encoding`` trusted it at any confidence with
+``errors="replace"``. All three now route through :func:`decode_bytes`
+(#1600), so a file decodes the same way whether it arrives as a CSV, a
+markdown note, a source file or a Substack export.
 
 **The decision rule, and why it is not a threshold.**
 
@@ -29,31 +16,52 @@ Issues #1589 and #1591 both proposed threshold-shaped fixes — lower the
 gate, or trust any detection that decodes without raising. Measured
 against real corpora under chardet 7.6.0, both are unsafe:
 
-* Confidence does not separate the cases. A GBK CSV scores 0.38 and a
+* Confidence does not separate the cases. A GBK CSV scores 0.36 and a
   short Shift-JIS one 0.32, while a genuine cp1252 file's top guess
-  scores 0.05 and a Cyrillic one 0.45. There is no threshold that
-  admits the first two and excludes the fourth.
+  scores 0.05 and a Cyrillic one 0.45. No threshold admits the first
+  two and excludes the fourth.
 * "It decoded, so trust it" is not evidence for a **single-byte**
   codec, because single-byte codecs decode *everything*. chardet
   answers Windows-1250 for a genuine cp1252 file; that decode succeeds
   and silently rewrites ``naïve`` and ``£85``.
 
-What *is* evidence is the codec's class. Legacy CJK multi-byte codecs
-are strict: they reject byte sequences that do not conform to their
-lead/trail structure. All 21 codecs in :data:`MULTIBYTE_CODECS` reject
-random 8-bit noise, so a clean decode under one of them is a real
-signal rather than a tautology. So the rule is an asymmetry:
+So a below-threshold guess has to earn its acceptance against the
+fallback it would displace, on two counts.
 
-* a **single-byte** detection is accepted only above
-  :data:`DEFAULT_CONFIDENCE_THRESHOLD` — unchanged behaviour;
-* a **multi-byte** detection is additionally accepted below the
-  threshold when the bytes actually decode under it.
+**1. Placement.** :func:`_placement_score` asks, of every non-ASCII
+letter, whether it sits where a letter belongs: beside another letter
+of its own script. A wrong codec turns a *symbol* byte into a letter,
+and that letter lands beside a digit or a space — ``£85`` becomes
+``Ł85`` under cp1250, and ``-5°C`` becomes ``-5蚓`` under Big5, whose
+lead/trail pair swallows the ``C``. A right codec never does that. The
+candidate must score no worse than the ``cp1252`` fallback.
 
-Probed across nine single-byte corpora (cp1252, latin-1 French and
-German, ISO-8859-5, cp1251, ISO-8859-7, cp1254, ISO-8859-2), chardet
-never once answered a codec in :data:`MULTIBYTE_CODECS`, so the new
-branch cannot fire on Western text and the previously-correct
-behaviour is preserved by construction.
+**2. Provenance.** Placement alone is not enough for a *single-byte*
+guess, because within one script family a wrong codec can still land
+letters beside letters: ``5µg`` decodes to ``5Ág`` under cp850 and
+scores a perfect 1.00. There is no evidence to separate those, so a
+single-byte guess is additionally required to introduce a **writing
+system the fallback does not contain** — Cyrillic, Greek, Hebrew — and
+is rejected when it merely proposes a different Latin codec. A
+*multi-byte* guess is exempt from this second test, and only from
+this one: the 21 codecs in :data:`MULTIBYTE_CODECS` reject byte
+sequences that do not conform to their lead/trail structure, so a
+clean decode under one of them is already independent evidence, which
+is the asymmetry #1607 established. The exemption extends to
+placement in one narrow way — an isolated CJK character in an
+otherwise-ASCII cell (``1,Alice,河``) has no same-script neighbour but
+is not embedded in a Latin word either, so it is not counted against
+the guess.
+
+**What this deliberately does not fix.** A file written in a
+*Latin-script* single-byte codec that chardet gets wrong stays wrong:
+ISO-8859-2 Czech and cp1254 Turkish both round-trip incorrectly
+through the ``cp1252`` fallback, and admitting them would mean
+admitting cp850-for-``5µg`` too, which corrupts a Western file that is
+correct today. That trade is taken deliberately, and #1610 carries
+the measured table behind it. The recoverable route is a better
+detector or an operator-pinned per-source encoding, not a change to
+this rule.
 
 UTF-16 and UTF-32 are deliberately **absent** from
 :data:`MULTIBYTE_CODECS`. They are multi-byte, but they are detected at
@@ -64,7 +72,9 @@ the ordinary path and never need the exemption.
 from __future__ import annotations
 
 import codecs
+import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
 
 import chardet
 
@@ -73,6 +83,7 @@ __all__ = [
     "BINARY_CONTROL_THRESHOLD",
     "DEFAULT_CONFIDENCE_THRESHOLD",
     "MULTIBYTE_CODECS",
+    "PLACEMENT_SAMPLE_SIZE",
     "DecodedText",
     "UndecodableBytesError",
     "decode_bytes",
@@ -81,10 +92,13 @@ __all__ = [
 ]
 
 DEFAULT_CONFIDENCE_THRESHOLD: float = 0.7
-"""Minimum ``chardet`` confidence required to trust a *single-byte* guess.
+"""Minimum ``chardet`` confidence required to trust a guess *unjudged*.
 
-Multi-byte guesses bypass this by codec class (see the module
-docstring), never by lowering it.
+Below it a guess is not refused, it is judged: it must place its
+letters at least as well as the cp1252 fallback would, and — unless it
+is a strict multi-byte codec — propose a writing system that fallback
+cannot produce. See the module docstring. Lowering this number is not
+the fix for anything; it only widens the band that skips the judging.
 """
 
 BINARY_CHECK_SIZE: int = 8192
@@ -92,6 +106,15 @@ BINARY_CHECK_SIZE: int = 8192
 
 BINARY_CONTROL_THRESHOLD: float = 0.10
 """Control-character ratio above which a prefix is judged binary."""
+
+PLACEMENT_SAMPLE_SIZE: int = 4096
+"""Characters of a candidate decode scored by :func:`_placement_score`.
+
+The score is a ratio, so a prefix answers the same question as the
+whole file while keeping a per-character Python loop off multi-megabyte
+inputs. Both the candidate and the fallback are scored over the same
+prefix length, which is the beginning of the same file in both cases.
+"""
 
 MULTIBYTE_CODECS: frozenset[str] = frozenset(
     {
@@ -121,10 +144,17 @@ MULTIBYTE_CODECS: frozenset[str] = frozenset(
 """Legacy CJK codecs that reject non-conforming byte sequences.
 
 Entries are :func:`codecs.lookup` canonical names. Membership is what
-earns a below-threshold detection the right to be trusted, so a codec
-belongs here only if it actually rejects malformed input — see
+exempts a below-threshold detection from the *provenance* test: a
+strict codec's clean decode is independent evidence, where a
+single-byte codec's decode is a tautology. So a codec belongs here
+only if it actually rejects malformed input — see
 ``tests/test_ingest_encoding.py``, which proves that for every entry
 rather than taking the list on faith.
+
+Membership is not on its own enough to be trusted, and #1607 read it
+that way. ``0xB0 0x43`` — ``°C`` in cp1252 — is a valid Big5
+lead/trail pair, so a multi-byte guess still has to place its letters
+where letters belong.
 """
 
 _REJECTED_DETECTIONS: frozenset[str] = frozenset({"ascii", "utf_8_sig", "cp1252"})
@@ -231,15 +261,217 @@ def looks_binary(raw: bytes) -> bool:
     return control_count / len(sample) > BINARY_CONTROL_THRESHOLD
 
 
+_SCRIPT_FAMILIES: frozenset[str] = frozenset(
+    {
+        "ARABIC",
+        "ARMENIAN",
+        "BENGALI",
+        "CJK",
+        "CYRILLIC",
+        "DEVANAGARI",
+        "ETHIOPIC",
+        "GEORGIAN",
+        "GREEK",
+        "GUJARATI",
+        "HANGUL",
+        "HEBREW",
+        "HIRAGANA",
+        "KANNADA",
+        "KATAKANA",
+        "LATIN",
+        "MALAYALAM",
+        "MYANMAR",
+        "ORIYA",
+        "SYRIAC",
+        "TAMIL",
+        "TELUGU",
+        "THAANA",
+        "THAI",
+    },
+)
+"""First words of :mod:`unicodedata` names that name a writing system.
+
+A character whose name starts with anything else — ``MICRO SIGN``,
+``FEMININE ORDINAL INDICATOR``, ``DEGREE CELSIUS`` — is a letterlike
+symbol rather than a letter of some script. Those are never counted
+against a decode, because their placement says nothing: ``µ`` sits in
+``5µg`` exactly as happily as it would in mojibake.
+"""
+
+_SCRIPT_ALIASES: dict[str, str] = {"HIRAGANA": "CJK", "KATAKANA": "CJK"}
+"""Families that are one writing system split across three name prefixes.
+
+Japanese text mixes kanji, hiragana and katakana within a single word,
+so treating them as three scripts would score correct Japanese as
+misplaced.
+"""
+
+
+@lru_cache(maxsize=1024)
+def _script_family(char: str) -> str:
+    """Return the writing system *char* belongs to, or ``""``.
+
+    Args:
+        char: A single character.
+
+    Returns:
+        A member of :data:`_SCRIPT_FAMILIES` after alias folding, or
+        ``""`` for anything that is not a letter of a known script.
+    """
+    name = unicodedata.name(char, "")
+    family = name.split(" ", 1)[0]
+    if family not in _SCRIPT_FAMILIES:
+        return ""
+    return _SCRIPT_ALIASES.get(family, family)
+
+
+def _neighbours(text: str, index: int) -> tuple[str, ...]:
+    """Return the characters either side of *index*.
+
+    Args:
+        text: The text being scored.
+        index: Position of the character whose neighbours are wanted.
+
+    Returns:
+        Zero to two single-character strings.
+    """
+    before = text[index - 1] if index else ""
+    after = text[index + 1] if index + 1 < len(text) else ""
+    return tuple(char for char in (before, after) if char)
+
+
+def _is_well_placed(text: str, index: int, *, isolated_is_ok: bool) -> bool:
+    """Report whether the letter at *index* sits where a letter belongs.
+
+    Args:
+        text: The candidate decode.
+        index: Position of a non-ASCII letter within *text*.
+        isolated_is_ok: When ``True``, a letter with no neighbouring
+            ASCII alphanumeric counts as well placed even without a
+            same-script neighbour — an isolated CJK character in an
+            otherwise-ASCII cell. Only a multi-byte guess earns this;
+            see the module docstring.
+
+    Returns:
+        ``True`` when the letter's position is consistent with real
+        text rather than with a misread symbol byte.
+    """
+    family = _script_family(text[index])
+    if not family:
+        return True
+    neighbours = _neighbours(text, index)
+    if any(char.isalpha() and _script_family(char) == family for char in neighbours):
+        return True
+    return isolated_is_ok and not any(
+        char.isascii() and char.isalnum() for char in neighbours
+    )
+
+
+def _placement_score(text: str, *, isolated_is_ok: bool) -> float:
+    """Score what fraction of *text*'s non-ASCII letters are well placed.
+
+    Args:
+        text: A candidate decode.
+        isolated_is_ok: Passed through to :func:`_is_well_placed`.
+
+    Returns:
+        A ratio in ``[0.0, 1.0]``; ``1.0`` when there is nothing to
+        score, so an all-ASCII decode is never penalised.
+    """
+    sample = text[:PLACEMENT_SAMPLE_SIZE]
+    positions = [
+        index
+        for index, char in enumerate(sample)
+        if not char.isascii() and char.isalpha()
+    ]
+    if not positions:
+        return 1.0
+    placed = sum(
+        1
+        for index in positions
+        if _is_well_placed(sample, index, isolated_is_ok=isolated_is_ok)
+    )
+    return placed / len(positions)
+
+
+def _script_families(text: str) -> frozenset[str]:
+    """Return the writing systems the letters of *text* belong to.
+
+    Args:
+        text: A candidate decode.
+
+    Returns:
+        The set of non-empty families found in the scored prefix.
+    """
+    return frozenset(
+        family
+        for family in (
+            _script_family(char)
+            for char in text[:PLACEMENT_SAMPLE_SIZE]
+            if char.isalpha()
+        )
+        if family
+    )
+
+
+def _fallback_text(raw: bytes) -> tuple[str, str]:
+    """Decode *raw* with the last-resort chain, cp1252 before latin-1.
+
+    Order matters and is the whole content of this function. cp1252 is
+    what legacy Excel exports actually are, and it renders their smart
+    quotes, en/em dashes and ``€`` correctly; latin-1 maps those same
+    bytes to control characters. latin-1 runs second only to catch the
+    five values cp1252 leaves undefined (0x81 0x8d 0x8f 0x90 0x9d) —
+    the #1591 crash.
+
+    Args:
+        raw: The bytes to decode.
+
+    Returns:
+        ``(text, codec)``.
+    """
+    try:
+        return raw.decode("cp1252"), "cp1252"
+    except UnicodeDecodeError:
+        return raw.decode("latin-1"), "latin-1"
+
+
+def _guess_beats_fallback(raw: bytes, detected: str, candidate: str) -> bool:
+    """Report whether *candidate* is better evidence than the fallback.
+
+    The two tests are the module docstring's placement and provenance,
+    in that order.
+
+    Args:
+        raw: The bytes being decoded.
+        detected: ``chardet``'s guess, already known to decode *raw*.
+        candidate: The text that guess produced.
+
+    Returns:
+        ``True`` when the guess should be trusted below the confidence
+        threshold.
+    """
+    fallback, _codec = _fallback_text(raw)
+    multibyte = is_multibyte_codec(detected)
+    candidate_score = _placement_score(candidate, isolated_is_ok=multibyte)
+    if candidate_score < _placement_score(fallback, isolated_is_ok=False):
+        return False
+    if multibyte:
+        return True
+    return bool(_script_families(candidate) - _script_families(fallback))
+
+
 def _accept_detection(
     raw: bytes,
     confidence_threshold: float,
 ) -> tuple[DecodedText | None, str | None, float]:
-    """Run ``chardet`` and accept its guess if the asymmetry rule allows.
+    """Run ``chardet`` and accept its guess if the accept rule allows.
 
     Args:
         raw: The bytes to detect.
-        confidence_threshold: Floor applied to single-byte guesses.
+        confidence_threshold: Score at or above which a guess is taken
+            unjudged. Below it every guess — single-byte or
+            multi-byte — goes through :func:`_guess_beats_fallback`.
 
     Returns:
         ``(result, detected, confidence)``. *result* is ``None`` when
@@ -252,12 +484,15 @@ def _accept_detection(
     confidence = detection.get("confidence") or 0.0
     if not detected or _canonical_codec(detected) in _REJECTED_DETECTIONS:
         return None, detected, confidence
-    trusted = confidence >= confidence_threshold or is_multibyte_codec(detected)
-    if not trusted:
-        return None, detected, confidence
     try:
         text = raw.decode(detected)
     except (UnicodeDecodeError, LookupError):
+        return None, detected, confidence
+    if confidence < confidence_threshold and not _guess_beats_fallback(
+        raw,
+        detected,
+        text,
+    ):
         return None, detected, confidence
     return (
         DecodedText(
@@ -277,14 +512,12 @@ def _decode_by_fallback(
     detected: str | None,
     confidence: float,
 ) -> DecodedText:
-    """Decode *raw* with the last-resort chain, cp1252 before latin-1.
+    """Wrap :func:`_fallback_text` as a degraded :class:`DecodedText`.
 
-    Order matters and is the whole content of this function. cp1252 is
-    what legacy Excel exports actually are, and it renders their smart
-    quotes, en/em dashes and ``€`` correctly; latin-1 maps those same
-    bytes to control characters. latin-1 runs second only to catch the
-    five values cp1252 leaves undefined (0x81 0x8d 0x8f 0x90 0x9d) —
-    the #1591 crash — which by this point are known not to be binary.
+    The chain itself lives in :func:`_fallback_text` because the
+    accept rule scores the same text before choosing (see
+    :func:`_guess_beats_fallback`); the fallback a guess is compared
+    against has to be the fallback that would actually be used.
 
     Args:
         raw: The bytes to decode.
@@ -295,19 +528,10 @@ def _decode_by_fallback(
     Returns:
         A degraded :class:`DecodedText`; no codec was identified.
     """
-    try:
-        text = raw.decode("cp1252")
-    except UnicodeDecodeError:
-        return DecodedText(
-            text=raw.decode("latin-1"),
-            codec="latin-1",
-            degraded=True,
-            detected=detected,
-            confidence=confidence,
-        )
+    text, codec = _fallback_text(raw)
     return DecodedText(
         text=text,
-        codec="cp1252",
+        codec=codec,
         degraded=True,
         detected=detected,
         confidence=confidence,
@@ -319,13 +543,15 @@ def decode_bytes(
     *,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
 ) -> DecodedText:
-    """Decode *raw* to text, choosing a codec by class rather than score.
+    """Decode *raw* to text, judging a low-scoring guess rather than refusing it.
 
     Probe order:
 
     1. ``utf-8-sig`` — covers plain UTF-8 and the BOM Excel writes.
-    2. ``chardet``, accepted per the asymmetry rule in the module
-       docstring.
+    2. ``chardet``, accepted outright at or above
+       *confidence_threshold* and otherwise only if it beats the
+       cp1252 fallback on placement and provenance — the rule in the
+       module docstring.
     3. :func:`looks_binary` — refuse rather than reach an
        all-accepting codec.
     4. ``cp1252``, then ``latin-1``. cp1252 goes first because it is
@@ -336,7 +562,8 @@ def decode_bytes(
 
     Args:
         raw: The bytes to decode.
-        confidence_threshold: Floor for single-byte detections.
+        confidence_threshold: Score at or above which ``chardet``'s
+            guess is taken unjudged.
 
     Returns:
         A :class:`DecodedText`.
