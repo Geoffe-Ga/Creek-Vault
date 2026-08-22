@@ -1,12 +1,27 @@
-"""One encoding decision for every byte stream entering the pipeline.
+"""The encoding decision for the CSV path, and the rule the others should adopt.
 
-Three call sites used to decide independently how to turn bytes into
-text, with three different policies, and each was wrong in a different
-direction. ``spreadsheets._read_csv`` gated ``chardet`` behind a single
-confidence threshold and fell back to ``cp1252``; ``generic._try_decode``
-trusted ``chardet`` at any confidence and fell back to ``latin-1``;
-``base.normalize_encoding`` trusted it at any confidence with
-``errors="replace"``. This module holds the part they should agree on.
+Three call sites decide independently how to turn bytes into text, with
+three different policies, each wrong in a different direction.
+``spreadsheets._read_csv`` gated ``chardet`` behind a single confidence
+threshold and fell back to ``cp1252``; ``generic._try_decode`` trusts it
+at any confidence and falls back to ``latin-1``; ``base.normalize_encoding``
+trusts it at any confidence with ``errors="replace"``.
+
+**Only the first of those three is routed through this module today.**
+``generic._try_decode`` and ``base.normalize_encoding`` are unchanged and
+still diverge — and they are not merely stale, they are wrong in the way
+#1589 describes: both silently rewrite a genuine cp1252 file (``naïve`` ->
+``naďve``, ``£85`` -> ``Ł85``), and ``base.normalize_encoding`` is the
+encoding path for ``markdown``, ``documents``, ``code``, ``chatgpt``,
+``claude`` and ``substack``, a far larger surface than the CSV path.
+
+They were deliberately left alone rather than rerouted here, because
+neither has a confidence gate today: imposing this module's 0.70
+single-byte threshold on them would push Cyrillic (0.45), Greek (0.37)
+and other correctly-decoded single-byte corpora from correct to mojibake.
+Unifying them needs a tie-break this module does not yet have. That work
+is #1600; until it lands, "one encoding decision" describes the intent of
+this module, not the state of the pipeline.
 
 **The decision rule, and why it is not a threshold.**
 

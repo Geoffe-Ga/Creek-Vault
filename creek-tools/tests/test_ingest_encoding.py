@@ -383,3 +383,65 @@ class TestLooksBinary:
         assert len(sparse) == BINARY_CHECK_SIZE
         assert 100 / BINARY_CHECK_SIZE < BINARY_CONTROL_THRESHOLD
         assert looks_binary(sparse) is False
+
+
+class TestTheUnfixedPathsAreADeliberateBoundary:
+    """Pin the two decode paths this module does **not** yet own.
+
+    ``generic._try_decode`` and ``base.normalize_encoding`` are wrong in
+    exactly the way #1589 describes, and were left that way on purpose:
+    neither has a confidence gate, so imposing this module's 0.70
+    single-byte threshold would push correctly-decoded Cyrillic and Greek
+    into mojibake. The unification is #1600.
+
+    These tests exist so the scope boundary is *executed* rather than
+    claimed in a docstring. They pin the broken behaviour, so when #1600
+    lands they go red and force this module's docstring to be corrected
+    in the same change — which is the failure mode that produced the
+    review comment on PR #1607.
+    """
+
+    CP1252_TEXT = "naïve café — £85"
+
+    def test_normalize_encoding_still_mangles_a_genuine_cp1252_file(self) -> None:
+        """base.normalize_encoding round-trips cp1252 wrongly. Owned by #1600."""
+        from creek.ingest.base import normalize_encoding
+
+        raw = self.CP1252_TEXT.encode("cp1252")
+        text, detected = normalize_encoding(raw)
+
+        assert detected.lower() != "cp1252", (
+            "chardet started answering cp1252 for this corpus; the premise of "
+            "#1600 has changed and this boundary test must be re-derived"
+        )
+        assert text != self.CP1252_TEXT, (
+            "base.normalize_encoding now decodes cp1252 correctly. If #1600 "
+            "landed, delete this test AND correct the encoding module docstring, "
+            "which still says this path diverges"
+        )
+
+    def test_try_decode_still_mangles_a_genuine_cp1252_file(self) -> None:
+        """generic._try_decode round-trips cp1252 wrongly. Owned by #1600."""
+        from creek.ingest.generic import _try_decode
+
+        raw = self.CP1252_TEXT.encode("cp1252")
+        text = _try_decode(raw)
+
+        assert text is not None
+        assert text != self.CP1252_TEXT, (
+            "generic._try_decode now decodes cp1252 correctly. If #1600 landed, "
+            "delete this test AND correct the encoding module docstring"
+        )
+
+    def test_neither_unfixed_path_routes_through_decode_bytes(self) -> None:
+        """The boundary is structural, not incidental — assert the call graph."""
+        import inspect
+
+        from creek.ingest import base, generic
+
+        for module in (base, generic):
+            source = inspect.getsource(module)
+            assert "decode_bytes" not in source, (
+                f"{module.__name__} now calls decode_bytes. If #1600 landed, "
+                "delete this class and correct the encoding module docstring"
+            )
