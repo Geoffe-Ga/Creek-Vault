@@ -2071,3 +2071,761 @@ def test_an_unreadable_markdown_entry_does_not_tomb_the_whole_source(
         "warning every run would train the operator to ignore the advisory "
         f"that matters.\n\nwarnings={second.warnings}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 14. #1373 — the vault READ loader honours the same predicate
+#
+# ``creek/author/agents.py::_load_corpus`` walks the corpus subtrees through
+# ``iter_vault_fragments`` and filters on exactly one thing: the privacy tier.
+# A markdown file dropped into ``01-Fragments/`` that is a symlink to a file
+# OUTSIDE the vault is therefore loaded, ranked, and fed to the Writing Desk
+# specialists — measured at HEAD:
+#
+#   _load_corpus(vault) -> [('in-1', 'INROOT-MARK'), ('planted', 'LEAK-SENTINEL')]
+#
+# The ruling is REPORT (skip and log), not refuse, and the guard belongs in
+# ``iter_vault_fragments`` rather than in ``_load_corpus``: that loader has 25+
+# production consumers, so guarding the author desk alone guarantees the next
+# consumer re-invents the check — the drift #1294 killed. Raising there would
+# hand anyone with write access to the vault a denial of service over
+# classify, link, compile and every MCP read tool, which is worse than the
+# injection being closed.
+# ---------------------------------------------------------------------------
+
+
+_VAULT_LEAK_SENTINEL = "CANARY-VAULT-PLANTED-1373-c4e1"
+"""Body text of the fragment parked OUTSIDE the vault and symlinked into it."""
+
+_VAULT_INROOT_MARKER = "CONTROL-VAULT-INROOT-1373-8b7d"
+"""Body text of the genuine in-vault fragment every #1373 fixture also plants."""
+
+
+def _plant_vault_escape(tmp_path: Path) -> tuple[Path, Path]:
+    """Build a vault holding one real fragment and one symlinked-in outsider.
+
+    The planted file carries **valid Creek frontmatter**, so a skip cannot be
+    credited to a parse failure: if the loader declines it, it declined it on
+    containment grounds and nothing else.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+
+    Returns:
+        ``(vault, link)`` — the vault root and the escaping fragment link.
+    """
+    from tests.helpers import write_raw_fragment_file
+
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+    write_raw_fragment_file(
+        vault,
+        "01-Fragments",
+        "in-vault-1",
+        "In vault",
+        body=_VAULT_INROOT_MARKER,
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    write_raw_fragment_file(
+        tmp_path,
+        "outside",
+        "planted",
+        "Planted",
+        body=_VAULT_LEAK_SENTINEL,
+    )
+    link = vault / "01-Fragments" / "leak.md"
+    link.symlink_to(outside / "planted.md")
+    return vault, link
+
+
+def test_load_corpus_skips_a_fragment_symlinked_out_of_the_vault(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """RED. A planted link must not become Writing Desk evidence.
+
+    The Writing Desk corpus is not a neutral read: it is the evidence
+    specialists reason over, it is what a cloud LLM call carries, and the
+    privacy ceiling is applied to the *fragment's own* ``privacy_tier`` — a
+    field the planted file supplies itself. So an attacker who can drop one
+    symlink into ``01-Fragments/`` chooses both the content and the tier it is
+    admitted under.
+
+    Asserted on the body text rather than on the record count, because a count
+    assertion passes just as happily when the loader dropped the wrong one.
+
+    The WARNING is asserted too, deliberately at WARNING and not at the DEBUG
+    used by the unreadable-file skip beside it. An unreadable markdown file is
+    common and benign in a live Obsidian vault; a fragment symlinked out of the
+    vault cannot occur by accident, and #1087's own lesson was that a silent
+    skip in a safety path is its own hazard. Occurrences are ~zero, so the line
+    costs nothing.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        caplog: Pytest log-capture fixture.
+    """
+    from creek.author.agents import _load_corpus
+
+    vault, link = _plant_vault_escape(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="creek.vault.reader"):
+        records = _load_corpus(vault)
+
+    bodies = [body for _fragment, body in records]
+    assert _VAULT_INROOT_MARKER in bodies, (
+        "the genuine in-vault fragment was not loaded, so 'the planted body "
+        "is absent' below would be satisfied by a loader that read nothing at "
+        f"all.\n\nbodies={bodies}"
+    )
+    assert _VAULT_LEAK_SENTINEL not in bodies, (
+        "a fragment whose file is a symlink to a location outside the vault "
+        "entered the Writing Desk corpus. Its frontmatter — including the "
+        "privacy_tier it is admitted under — is attacker-chosen, and the "
+        f"corpus is what the cloud LLM call carries.\n\nbodies={bodies}"
+    )
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(link.name in message for message in warnings), (
+        "the loader dropped a fragment and said nothing. An operator whose "
+        "vault silently loses a file has no way to tell a containment skip "
+        f"from a lost fragment.\n\nwarnings={warnings}"
+    )
+    assert not any(_VAULT_LEAK_SENTINEL in message for message in warnings), (
+        f"the warning quoted the content it declined to read.\n\n{warnings}"
+    )
+
+
+def test_iter_vault_fragments_still_loads_an_intra_vault_alias(
+    tmp_path: Path,
+) -> None:
+    """NON-VACUITY ANCHOR (passes at HEAD and after). Not "skip every symlink".
+
+    Without this, the test above is satisfied by a predicate that drops every
+    symlinked fragment — which would silently shrink real vaults, since an
+    alias beside the file it aliases is an ordinary Obsidian shape. It is the
+    exact counterpart of ``test_an_intra_tree_symlink_is_still_ingested`` for
+    the ingest surface and ``test_redact_apply_admits_a_named_intra_tree_symlink``
+    for the redact surface.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    from creek.vault.reader import iter_vault_fragments
+    from tests.helpers import write_raw_fragment_file
+
+    vault = tmp_path / "vault"
+    fragments = vault / "01-Fragments"
+    fragments.mkdir(parents=True)
+    write_raw_fragment_file(
+        vault,
+        "01-Fragments",
+        "real-1",
+        "Real",
+        body=_VAULT_INROOT_MARKER,
+    )
+    (fragments / "alias.md").symlink_to(fragments / "real-1.md")
+
+    records = iter_vault_fragments(fragments)
+
+    loaded = sorted(path.name for path, _f, _b, _m in records)
+    assert loaded == ["alias.md", "real-1.md"], (
+        "an intra-vault alias was dropped. The guard is about the target "
+        "escaping the root, not about the link existing; refusing every "
+        f"symlink breaks ordinary vaults.\n\n{loaded}"
+    )
+
+
+def test_the_vault_containment_guard_lives_in_the_shared_loader(
+    tmp_path: Path,
+) -> None:
+    """RED. The chokepoint choice, asserted rather than described in prose.
+
+    Two halves.
+
+    ``_load_corpus`` must not carry a containment call of its own: a guard
+    bolted onto the author desk leaves the other 25-odd consumers of
+    ``iter_vault_fragments`` — classify's privacy filter, the link engine, the
+    compile engine, every lint check, the MCP read gate — reading the planted
+    file, and guarantees the next consumer re-invents the check.
+
+    A DIFFERENT consumer must inherit the skip on the same planted tree.
+    ``creek.link.link_engine._load_fragments`` is chosen because it is pure,
+    cheap, and nowhere near the author desk: if it declines the planted
+    fragment, the guard is demonstrably in the shared loader and not in the
+    caller this issue happened to name.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    import inspect
+
+    from creek.author import agents
+    from creek.link.link_engine import _load_fragments
+
+    vault, _link = _plant_vault_escape(tmp_path)
+
+    source = inspect.getsource(agents._load_corpus)
+    for symbol in ("escaping_child", "resolves_within", "assert_source_contained"):
+        assert symbol not in source, (
+            f"_load_corpus calls {symbol} directly. The guard belongs in "
+            "iter_vault_fragments, which every other consumer already goes "
+            "through; a per-caller copy is the drift #1294 closed.\n\n"
+            f"{source}"
+        )
+
+    ids = [fragment.id for fragment in _load_fragments(vault)]
+    assert "in-vault-1" in ids, (
+        "the link engine loaded no fragments at all, so the assertion below "
+        f"is vacuous.\n\nids={ids}"
+    )
+    assert "planted" not in ids, (
+        "creek.link.link_engine still loads the fragment symlinked in from "
+        "outside the vault, so the containment guard was placed in the author "
+        "desk rather than in the shared loader. Every other consumer of "
+        f"iter_vault_fragments is still reading it.\n\nids={ids}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 15. #1375 — the one hand-rolled walk must be bounded like the other ten
+#
+# ``CodeIngestor._discover_directory`` recurses on ``item.is_dir()``, and
+# ``is_dir()`` FOLLOWS symlinks. The other ten ingestors use ``Path.rglob``,
+# which surfaces a symlinked directory as one entry and does not descend.
+#
+# HAZARD 3 is respected throughout this section: ``assert_source_contained``
+# is NOT touched and the intra-root link stays ADMITTED. #1375 is a bound on a
+# walk, not a containment-policy change; refusing intra-root links would break
+# all eleven ingestors and contradict SEC-003. Measured at HEAD on the issue's
+# own tree (``src/a/loop -> src``, an entirely in-root link the containment
+# gate admits by design): ``_discover_directory`` returned 32 documents for a
+# 2-file tree, the same README re-read at 16 nesting depths.
+# ---------------------------------------------------------------------------
+
+
+def _relevant_rglob_files(root: Path) -> list[Path]:
+    """Return the files ``rglob`` + ``_is_relevant_file`` admit under *root*.
+
+    The expectation for both #1375 tests is DERIVED from the bound the other
+    ten ingestors already have, never written out as a literal count: a magic
+    number would have to be re-derived by hand the moment the fixture changes,
+    and a wrong one passes silently.
+
+    Args:
+        root: The source root to enumerate.
+
+    Returns:
+        Sorted paths the ``rglob`` bound admits.
+    """
+    from creek.ingest.code import CodeIngestor
+
+    ingestor = CodeIngestor()
+    return sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file() and ingestor._is_relevant_file(path)
+    )
+
+
+def test_code_ingestor_does_not_descend_into_a_symlinked_directory(
+    tmp_path: Path,
+) -> None:
+    """RED. The issue's own tree: an in-root directory link the gate admits.
+
+    ``src/a/loop -> src`` never leaves the source root, so
+    ``assert_source_contained`` admits it — correctly, and this test does not
+    ask it to do otherwise. The defect is entirely in the manual walk, which
+    follows the link and re-reads the whole tree at every nesting depth until
+    the operating system's path limit stops it.
+
+    The consequence is not merely duplication: each re-read is a fresh
+    ``RawDocument`` that becomes a fragment, an embedding, and a cloud LLM
+    prompt, so an accidental in-tree alias multiplies an ingest's cost and
+    fills the vault with near-duplicates that then poison the link graph.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    from creek.ingest.code import CodeIngestor
+
+    src = tmp_path / "src"
+    (src / "a").mkdir(parents=True)
+    (src / "main.py").write_text(f'"""{_IN_ROOT_MARKER}"""\n', encoding="utf-8")
+    (src / "a" / "README.md").write_text(
+        f"# A\n\n{_IN_ROOT_MARKER}\n",
+        encoding="utf-8",
+    )
+    (src / "a" / "loop").symlink_to(src)
+
+    expected = _relevant_rglob_files(src)
+    assert len(expected) == 2, (
+        "the fixture does not hold the two relevant files this test believes "
+        f"it does.\n\n{expected}"
+    )
+
+    docs: list[Any] = []
+    CodeIngestor()._discover_directory(src, docs)
+
+    discovered = sorted(doc.path for doc in docs)
+    assert discovered == expected, (
+        "the hand-rolled walk descended through a symlinked directory. "
+        "is_dir() follows links, so the walk re-read the whole tree once per "
+        "nesting level; every duplicate becomes a fragment, an embedding and "
+        "a cloud prompt. The other ten ingestors use rglob, which yields the "
+        "link and stops.\n\n"
+        f"discovered={len(discovered)} expected={len(expected)}\n"
+        f"{discovered}"
+    )
+
+
+def test_the_code_walk_matches_the_rglob_bound_on_links_of_both_kinds(
+    tmp_path: Path,
+) -> None:
+    """RED. One assertion covering a symlinked DIR and a symlinked FILE.
+
+    The fix must be "skip symlinked directories", not "skip symlinks": ``rglob``
+    yields a symlinked *file* and ``is_file()`` keeps it, so dropping those too
+    would make the code ingestor the odd one out in the other direction and
+    silently stop ingesting ordinary in-tree aliases.
+
+    Comparing against ``rglob``'s own answer rather than against a hand-written
+    list is what makes this hold in both directions at once, and it doubles as
+    the tripwire for a future Python flipping ``rglob``'s ``recurse_symlinks``
+    default: if that ever changes, this test and
+    ``test_rglob_does_not_descend_into_a_symlinked_directory`` fail together
+    rather than the manual walk silently becoming the stricter of the two.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    from creek.ingest.code import CodeIngestor
+
+    src = tmp_path / "src"
+    (src / "pkg").mkdir(parents=True)
+    (src / "README.md").write_text(f"# Root\n\n{_IN_ROOT_MARKER}\n", encoding="utf-8")
+    (src / "pkg" / "mod.py").write_text(f'"""{_IN_ROOT_MARKER}"""\n', encoding="utf-8")
+    (src / "linkdir").symlink_to(src / "pkg")
+    (src / "alias.py").symlink_to(src / "pkg" / "mod.py")
+
+    expected = _relevant_rglob_files(src)
+    assert (src / "alias.py") in expected, (
+        "the rglob bound does not admit a symlinked FILE, so this test cannot "
+        f"tell an over-broad fix from a correct one.\n\n{expected}"
+    )
+    assert (src / "linkdir" / "mod.py") not in expected, (
+        "rglob descended into a symlinked directory, so it is no longer the "
+        f"bound this test compares against.\n\n{expected}"
+    )
+
+    docs: list[Any] = []
+    CodeIngestor()._discover_directory(src, docs)
+
+    discovered = sorted(doc.path for doc in docs)
+    assert discovered == expected, (
+        "the manual walk and the rglob bound disagree. Descending into "
+        "linkdir means the walk is unbounded; dropping alias.py means the fix "
+        "over-corrected and the code ingestor now ignores ordinary in-tree "
+        f"aliases the other ten still read.\n\n"
+        f"discovered={discovered}\nexpected={expected}"
+    )
+
+
+def test_an_intra_root_symlinked_directory_is_still_admitted_by_containment(
+    tmp_path: Path,
+) -> None:
+    """HAZARD 3 GUARD (passes at HEAD and must keep passing). Do not weaken the gate.
+
+    The cheapest wrong way to close #1375 is to make
+    ``assert_source_contained`` refuse any symlinked directory under the root.
+    That would satisfy the two tests above while breaking all eleven ingestors
+    and contradicting SEC-003, whose policy is that containment is about the
+    *target* escaping, not about the link existing.
+
+    So this pins both halves explicitly: the gate still admits the in-root
+    directory link, and a full ``run_ingest`` over that tree still writes the
+    real content. The bound belongs in the walk; the policy stays where it is.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    from creek._containment import assert_source_contained
+
+    base = tmp_path / "lane"
+    vault = _make_vault(tmp_path)
+    src = base / "src"
+    (src / "pkg").mkdir(parents=True)
+    (src / "README.md").write_text(f"# Root\n\n{_IN_ROOT_MARKER}\n", encoding="utf-8")
+    (src / "pkg" / "mod.py").write_text(f'"""{_IN_ROOT_MARKER}"""\n', encoding="utf-8")
+    (src / "linkdir").symlink_to(src / "pkg")
+
+    assert_source_contained(src)
+
+    result = run_ingest(
+        ingestor_cls=INGESTOR_REGISTRY["code"],
+        source_type="code",
+        input_path=src,
+        vault_path=vault,
+    )
+
+    assert result.errors == [], (
+        "ingesting a tree whose only symlink stays inside it produced "
+        f"errors.\n\n{result.errors}"
+    )
+    assert _IN_ROOT_MARKER in _written_vault_text(vault), (
+        "a source tree holding an ordinary in-root directory alias wrote "
+        "nothing to the vault. The #1375 walk bound must not become a "
+        f"containment refusal.\n\n{result.errors}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 16. #1377 — the three Discord call sites must REFUSE CLEANLY and STOP
+#
+# ``creek/ingest/discord_dispatch.py:292`` (ExporterConnector._ingest),
+# ``creek/ingest/discord.py:860`` (ingest_capture_dir) and
+# ``creek/ingest/discord.py:885`` (run_discord_data_package) all call
+# ``DiscordIngestor().ingest(...)`` with no try/except, so an
+# EscapingSymlinkError reaches the operator as a raw traceback. Their CLI
+# parents do not help: ``_run_discord_exporter`` catches only
+# TokenMissingError/CalledProcessError and ``_run_discord_data_package``
+# catches nothing.
+#
+# HAZARD 2 is the whole point of the assertions below. The tempting "fix" is
+# to catch the error, append it to an errors list, and carry on. On this
+# codebase that is not a degraded pass, it is mass data loss: a swallowed
+# refusal leaves ``run_ingest``'s ``seen_keys`` empty and
+# ``tomb_missing_units`` then soft-tombs every live ledger key
+# (``creek/ingest/pipeline.py:867``). Section 6 above proves that for the
+# markdown path; these tests hold the line on the Discord paths by asserting
+# on what a swallow would produce — a normal return, a write_fragments call,
+# a reachable tomb sweep — rather than on the banner alone.
+# ---------------------------------------------------------------------------
+
+
+def _discord_package(root: Path) -> Path:
+    """Materialise a minimal, genuinely ingestible Discord Data Package.
+
+    Args:
+        root: Directory to build ``messages/<channel>/`` under.
+
+    Returns:
+        *root*, for chaining.
+    """
+    channel = root / "messages" / "123456"
+    channel.mkdir(parents=True)
+    (channel / "messages.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": "msg-001",
+                    "author": {"id": "user-alice", "name": "Alice"},
+                    "content": f"Hello. {_IN_ROOT_MARKER}",
+                    "timestamp": "2024-11-10T14:00:00Z",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (channel / "channel.json").write_text(
+        json.dumps({"id": "123456", "name": "general", "type": "text"}),
+        encoding="utf-8",
+    )
+    return root
+
+
+def _arm_hazard_two_spies(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[object]]:
+    """Record calls to the two functions a SWALLOWED refusal would reach.
+
+    ``write_fragments`` is the Discord paths' own write step; a call to it
+    after a refusal means the run continued past the gate.
+    ``tomb_missing_units`` is the mass-deletion loop; it must never be reached
+    by a run that refused to read its source, on any path.
+
+    Args:
+        monkeypatch: Pytest monkeypatch fixture, used to install the spies.
+
+    Returns:
+        ``{"write_fragments": [...], "tomb_missing_units": [...]}`` — live
+        lists that gain one entry per call.
+    """
+    from creek.ingest import discord as discord_module
+    from creek.ingest import pipeline as pipeline_module
+
+    calls: dict[str, list[object]] = {"write_fragments": [], "tomb_missing_units": []}
+    real_write = discord_module.write_fragments
+    real_tomb = pipeline_module.tomb_missing_units
+
+    def _spy_write(*args: Any, **kwargs: Any) -> Any:
+        """Record the call, then delegate to the real writer."""
+        calls["write_fragments"].append(args)
+        return real_write(*args, **kwargs)
+
+    def _spy_tomb(*args: Any, **kwargs: Any) -> Any:
+        """Record the call, then delegate to the real sweep."""
+        calls["tomb_missing_units"].append(args)
+        return real_tomb(*args, **kwargs)
+
+    monkeypatch.setattr(discord_module, "write_fragments", _spy_write)
+    monkeypatch.setattr(pipeline_module, "tomb_missing_units", _spy_tomb)
+    return calls
+
+
+def _assert_clean_discord_refusal(
+    *,
+    output: str,
+    link: Path,
+    outside: Path,
+    vault: Path,
+    calls: dict[str, list[object]],
+) -> None:
+    """Assert the shared #1377 contract for one Discord call site.
+
+    Five properties, and the last three are the HAZARD 2 proof:
+
+    1. a clean, labelled refusal reached the operator — not a traceback;
+    2. it named the LINK, so the operator can find and remove it;
+    3. it did NOT name the resolved target or the out-of-tree directory
+       (#1087's no-oracle invariant);
+    4. ``write_fragments`` was never called, so no partial ingest occurred;
+    5. ``tomb_missing_units`` was never called and ``01-Fragments`` is empty,
+       so the refusal did not degrade into "an empty discovery", which is the
+       shape that soft-tombs a whole vault.
+
+    Only the link's *name* is required in the message, not its absolute path:
+    Rich wraps a long temporary path across lines, and asserting on the
+    wrapped form would make this a formatting test.
+
+    Args:
+        output: Everything the call printed, stdout and stderr combined.
+        link: The escaping symlink that was planted.
+        outside: The directory parked outside the ingest root.
+        vault: The vault the run would have written to.
+        calls: The spy record from :func:`_arm_hazard_two_spies`.
+    """
+    assert "symlink containment" in output.lower(), (
+        "the operator got a raw traceback instead of a labelled refusal. "
+        "These three call sites have no try/except and their CLI parents "
+        f"catch only unrelated exceptions.\n\n{output}"
+    )
+    assert link.name in output, (
+        f"the refusal does not name the offending link.\n\n{output}"
+    )
+    assert _SENTINEL not in output, (
+        f"the refusal quoted content from outside the ingest root.\n\n{output}"
+    )
+    assert str(outside) not in output, (
+        "the refusal named the out-of-tree directory the link resolves to. "
+        f"That is the oracle #1087 closed.\n\n{output}"
+    )
+    assert calls["write_fragments"] == [], (
+        "write_fragments ran after a containment refusal, so the handler "
+        "swallowed the error and the run continued into the write step.\n\n"
+        f"{calls['write_fragments']}"
+    )
+    assert calls["tomb_missing_units"] == [], (
+        "tomb_missing_units was reached on a run that refused to read its "
+        "source. A swallowed EscapingSymlinkError leaves seen_keys empty and "
+        "the sweep then soft-tombs every live ledger key — the refusal "
+        f"becomes mass deletion.\n\n{calls['tomb_missing_units']}"
+    )
+    assert _vault_fragments(vault) == [], (
+        f"a refused run still wrote fragments.\n\n{_vault_fragments(vault)}"
+    )
+    assert _vault_orphans(vault) == [], (
+        f"a refused run tombed fragments.\n\n{_vault_orphans(vault)}"
+    )
+
+
+def test_discord_data_package_ingest_refuses_cleanly_and_stops(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED. ``run_discord_data_package`` — the compliant, always-available path.
+
+    The package root is operator-supplied — a ZIP Discord mailed them, opened
+    wherever they opened it — so an escaping link inside it is the most
+    ordinary way this fires, and the operator most likely to hit it is the one
+    least equipped to read a traceback.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        capsys: Pytest capture fixture for stdout/stderr.
+        monkeypatch: Pytest monkeypatch fixture, used for the HAZARD 2 spies.
+    """
+    from creek._containment import EscapingSymlinkError
+    from creek.ingest.discord import run_discord_data_package
+
+    base = tmp_path / "lane"
+    base.mkdir()
+    vault = _make_vault(tmp_path)
+    package = _discord_package(base / "package")
+    victim = _park_outside(base, "secret.md", f"# Secret\n\n{_SENTINEL}\n")
+    link = package / "messages" / "leak.md"
+    link.symlink_to(victim)
+    calls = _arm_hazard_two_spies(monkeypatch)
+    capsys.readouterr()
+
+    with pytest.raises(EscapingSymlinkError):
+        run_discord_data_package(vault, package)
+
+    captured = capsys.readouterr()
+    _assert_clean_discord_refusal(
+        output=captured.out + captured.err,
+        link=link,
+        outside=base / "outside",
+        vault=vault,
+        calls=calls,
+    )
+
+
+def test_discord_capture_ingest_refuses_cleanly_and_stops(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED. ``ingest_capture_dir`` — the bot-capture path, staged under the vault.
+
+    Its ingest root is a staging directory the function itself builds, so the
+    link is planted by wrapping the real staging step rather than by writing
+    into a directory that is about to be ``rmtree``-d. The wrapper runs the
+    genuine ``stage_capture_as_data_package`` first, so what
+    ``DiscordIngestor().ingest`` is then handed is a real staged package that
+    happens to contain a link — the same thing anything writing into that
+    directory would produce.
+
+    This path runs unattended behind the bot, which is exactly why the handler
+    must re-raise rather than collect: a swallowed refusal here would be
+    invisible until the vault was already tombed.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        capsys: Pytest capture fixture for stdout/stderr.
+        monkeypatch: Pytest monkeypatch fixture, used for the HAZARD 2 spies.
+    """
+    from creek._containment import EscapingSymlinkError
+    from creek.ingest import discord as discord_module
+
+    base = tmp_path / "lane"
+    base.mkdir()
+    vault = _make_vault(tmp_path)
+    capture = base / "discord-capture" / "general"
+    capture.mkdir(parents=True)
+    (capture / "live.jsonl").write_text(
+        json.dumps(
+            {
+                "id": "msg-001",
+                "author": {"id": "user-alice", "name": "Alice"},
+                "content": f"Hello. {_IN_ROOT_MARKER}",
+                "timestamp": "2024-11-10T14:00:00Z",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    victim = _park_outside(base, "secret.md", f"# Secret\n\n{_SENTINEL}\n")
+    planted: list[Path] = []
+    real_stage = discord_module.stage_capture_as_data_package
+
+    def _stage_then_plant(capture_dir: Path, staging_dir: Path) -> None:
+        """Stage for real, then leave an escaping link in the staged tree."""
+        real_stage(capture_dir, staging_dir)
+        link = staging_dir / "leak.md"
+        link.symlink_to(victim)
+        planted.append(link)
+
+    monkeypatch.setattr(
+        discord_module,
+        "stage_capture_as_data_package",
+        _stage_then_plant,
+    )
+    calls = _arm_hazard_two_spies(monkeypatch)
+    capsys.readouterr()
+
+    with pytest.raises(EscapingSymlinkError):
+        discord_module.ingest_capture_dir(base / "discord-capture", vault)
+
+    assert planted, "the staging wrapper never ran, so no link was planted"
+    captured = capsys.readouterr()
+    _assert_clean_discord_refusal(
+        output=captured.out + captured.err,
+        link=planted[0],
+        outside=base / "outside",
+        vault=vault,
+        calls=calls,
+    )
+
+
+class _UnusedExporterRunner:
+    """Exporter-runner stand-in that fails loudly if anything invokes it.
+
+    ``ExporterConnector._ingest`` never touches the runner — it is the
+    connector's ``run`` method that does — so a stub that raises is stronger
+    than a no-op: it turns "this test accidentally exercised the exporter"
+    into a failure rather than a silent extra code path.
+    """
+
+    def run(self, *, argv: list[str], token: str, out_dir: Path) -> None:
+        """Fail: the ingest step under test must not invoke the exporter.
+
+        Args:
+            argv: Unused.
+            token: Unused.
+            out_dir: Unused.
+
+        Raises:
+            AssertionError: Always.
+        """
+        msg = f"the exporter binary was invoked ({argv}, {out_dir}, {len(token)})"
+        raise AssertionError(msg)
+
+
+def test_discord_exporter_connector_ingest_refuses_cleanly_and_stops(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED. ``ExporterConnector._ingest`` — the third call site, in a second module.
+
+    Held separately rather than folded into the two above because it lives in
+    ``creek/ingest/discord_dispatch.py``: a handler added to
+    ``creek/ingest/discord.py`` alone leaves this one raw, and nothing else in
+    the suite would notice.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        capsys: Pytest capture fixture for stdout/stderr.
+        monkeypatch: Pytest monkeypatch fixture, used for the HAZARD 2 spies.
+    """
+    from creek._containment import EscapingSymlinkError
+    from creek.config import DiscordSourceConfig
+    from creek.ingest.discord_dispatch import ExporterConnector
+
+    base = tmp_path / "lane"
+    base.mkdir()
+    vault = _make_vault(tmp_path)
+    staging = _discord_package(base / "staging")
+    victim = _park_outside(base, "secret.md", f"# Secret\n\n{_SENTINEL}\n")
+    link = staging / "messages" / "leak.md"
+    link.symlink_to(victim)
+    calls = _arm_hazard_two_spies(monkeypatch)
+
+    connector = ExporterConnector(
+        config=DiscordSourceConfig(),
+        runner=_UnusedExporterRunner(),
+        vault=vault,
+    )
+    capsys.readouterr()
+
+    with pytest.raises(EscapingSymlinkError):
+        connector._ingest(staging)
+
+    captured = capsys.readouterr()
+    _assert_clean_discord_refusal(
+        output=captured.out + captured.err,
+        link=link,
+        outside=base / "outside",
+        vault=vault,
+        calls=calls,
+    )

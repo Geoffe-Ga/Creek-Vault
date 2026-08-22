@@ -9,12 +9,21 @@ from __future__ import annotations
 
 from datetime import datetime  # noqa: TC003  # used at runtime as a parameter type
 from pathlib import Path  # used at runtime to render sources vault-relative
+from typing import TYPE_CHECKING
 
 from creek.clean.hygiene import BrokenLinkScanner
 from creek.lint._result import CheckResult
 
+if TYPE_CHECKING:
+    from creek.vault.links import LinkIndex
 
-def run(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
+
+def run(
+    vault_path: Path,
+    *,
+    since: datetime | None = None,
+    link_index: LinkIndex | None = None,
+) -> CheckResult:
     """Scan the surveyed vault for broken wiki-links / relative markdown links.
 
     Wraps :class:`creek.clean.hygiene.BrokenLinkScanner`, whose survey is
@@ -25,6 +34,11 @@ def run(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
     The ``since`` parameter is accepted for interface consistency but
     ignored — the scanner is already fast enough that filtering by mtime adds
     little.
+
+    ``link_index`` is the shared index :class:`creek.lint.runner.LintRunner`
+    builds once per run and hands to every index-aware check (#1223). It is
+    optional, and ``None`` means "build your own" rather than "skip the
+    check", so every standalone caller keeps working unchanged.
 
     The source is rendered **vault-relative**, matching every sibling check
     (``compost``, ``unnamed``, ``skill_size_budget``, ``orphan_compiled``).
@@ -44,7 +58,7 @@ def run(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
     used here.
     """
     del since  # interface symmetry only
-    scan = BrokenLinkScanner().scan(vault_path)
+    scan = BrokenLinkScanner().scan(vault_path, link_index=link_index)
     findings: list[str] = []
     for source, targets in sorted(scan.broken_links.items()):
         relative = Path(source).relative_to(vault_path)

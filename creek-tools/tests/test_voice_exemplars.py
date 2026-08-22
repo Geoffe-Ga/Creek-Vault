@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING
 import frontmatter
 import pytest
 
+from creek.classify.privacy_filter import PrivacyTierOverride
+from creek.config import VoiceAudienceWeightingConfig
 from creek.generate.voice import (
     DEFAULT_MAX_PER_REGISTER,
     DEFAULT_MIN_PER_REGISTER,
@@ -23,6 +25,7 @@ from creek.generate.voice import (
     _eligible_register,
     _is_other_authors_path,
     _is_safe_sample_stem,
+    audience_authority,
 )
 from creek.models import (
     Authorship,
@@ -123,6 +126,70 @@ def _write_fragment(
     target = vault_path / "01-Fragments" / subfolder / f"{fragment.id}.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return target
+
+
+def _write_untiered_fragment(
+    vault_path: Path,
+    fragment: Fragment,
+    *,
+    body_words: int,
+    subfolder: str = "Journal",
+) -> Path:
+    """Persist *fragment* with the ``privacy_tier`` key **absent** from disk.
+
+    The sibling of :func:`_write_fragment` for #1212, and the only way to
+    produce the case that issue is about. ``_write_fragment`` serialises
+    ``fragment.model_dump(mode="json")``, and ``privacy_tier`` is a declared
+    field with a default, so that dump **always** carries the key: a vault
+    seeded through it cannot express "nobody ever wrote a tier down", which
+    is precisely the state a hand-edited, legacy, or non-creek-authored note
+    is in.
+
+    Two self-proofs, because a fixture that quietly stops producing the case
+    under test turns every assertion built on it into a vacuous pass:
+
+    1. The key must have been **present** before it is popped. A field
+       rename, or a model change that drops ``privacy_tier`` from the dump,
+       therefore fails here rather than silently writing a file that never
+       had the key and proving nothing.
+    2. The file is re-read with ``frontmatter.load`` and the key asserted
+       absent — and ``type: fragment`` asserted present, because
+       ``_load_fragment_with_body`` returns ``None`` for anything else and a
+       vault of files it skips walks zero fragments.
+
+    Args:
+        vault_path: Vault root, already scaffolded by the ``vault`` fixture.
+        fragment: The fragment to write. Its own ``privacy_tier`` is
+            discarded; only the rest of its frontmatter survives.
+        body_words: Word count of the generated body.
+        subfolder: Folder beneath ``01-Fragments/`` to write into.
+
+    Returns:
+        The path written.
+    """
+    body = " ".join(["word"] * body_words)
+    data = fragment.model_dump(mode="json")
+    assert "privacy_tier" in data, (
+        "the serialised fragment carries no 'privacy_tier' key, so removing "
+        "it writes the same file _write_fragment would and this helper can no "
+        "longer produce the untiered case #1212 is about"
+    )
+    del data["privacy_tier"]
+    post = frontmatter.Post(content=body, **data)
+    target = vault_path / "01-Fragments" / subfolder / f"{fragment.id}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    written = frontmatter.load(str(target))
+    assert "privacy_tier" not in written.metadata, (
+        f"{target} was written with a privacy_tier after all: "
+        f"{written.metadata.get('privacy_tier')!r}"
+    )
+    assert written.metadata.get("type") == "fragment", (
+        f"{target} is not typed 'fragment', so _load_fragment_with_body skips "
+        "it and every assertion about the corpus it feeds is vacuous"
+    )
     return target
 
 
@@ -462,10 +529,7 @@ class TestVoiceCorpusExcludesBorrowedContent:
         assert [f.id for f in exemplars["confessional"]] == []
 
     @pytest.mark.parametrize("author", list(Authorship))
-    @pytest.mark.parametrize(
-        "tier",
-        [PrivacyTier.OPEN, PrivacyTier.PERSONAL, PrivacyTier.INTIMATE],
-    )
+    @pytest.mark.parametrize("tier", list(PrivacyTier))
     def test_gate_matches_the_canonical_property_and_the_intimate_override(
         self,
         author: Authorship,
@@ -488,13 +552,33 @@ class TestVoiceCorpusExcludesBorrowedContent:
         excluded by the property and must be excluded here too, without
         anyone remembering to extend a hand-written list.
 
-        The tier axis is deliberately **not** ``list(PrivacyTier)``.
-        ``PrivacyTier.UNCLASSIFIED`` is omitted because #1212 will make
+        The tier axis is ``list(PrivacyTier)``, and it did not used to be.
+        An earlier revision of this docstring omitted
+        ``PrivacyTier.UNCLASSIFIED`` on the prediction that #1212 would make
         ``_eligible_register`` stop admitting a self-authored *untiered*
-        fragment, at which point the first arm stops holding for that cell
-        while the property (which only excludes INTIMATE) still reports
-        ``True``. Widening this parametrization is green today and a
-        landmine tomorrow.
+        fragment, breaking the first arm for that cell. **That prediction was
+        wrong**, on two counts. It conflated "the ``privacy_tier`` key is
+        absent from the file on disk" with "the model's ``privacy_tier`` is
+        the value ``unclassified``", which are different facts:
+        ``Fragment`` defaults a *missing* key to ``UNCLASSIFIED``, so the two
+        are indistinguishable here and distinguishable only in the raw
+        frontmatter. And this gate never sees raw frontmatter at all — it
+        takes a validated model — so #1212 does not touch it. The real fix
+        materialises the **declared** tier (``raw_privacy_tier`` of the raw
+        frontmatter) onto the model inside ``_load_fragment_with_body``, so
+        by the time an untiered file reaches this function it is already
+        carrying ``intimate`` and is refused by the clause that has always
+        refused intimate content. #1212's AC2 states the other half
+        explicitly: an *explicit* ``unclassified`` keeps its #876 ranking,
+        and nothing about how the model value ``UNCLASSIFIED`` is treated may
+        change.
+
+        Widening the axis is therefore not cosmetic. With ``UNCLASSIFIED``
+        present, arm 1 becomes a live regression test for that AC:
+        :attr:`~creek.models.Fragment.voice_proxy_eligible` is ``True`` for a
+        self-authored ``UNCLASSIFIED`` model (it excludes only INTIMATE), so
+        any "tidy-up" that starts refusing that model value here breaks this
+        cell instead of shipping quietly.
         """
         fragment = _build_fragment(
             frag_id="frag-equivalence",
@@ -1673,3 +1757,312 @@ class TestManifestCorruptionIsFailSafe:
 
         assert stale_copy.read_bytes() == before
         assert (register_dir / "frag-manifest-keep.md").is_file()
+
+
+# ---- Untiered fragments are refused (Issue #1212) ----
+
+
+_OPEN_CONTROL_ID = "frag-tier-open-control"
+"""The positive control: identical to the canary but for one frontmatter line."""
+
+_KEYLESS_CANARY_ID = "frag-tier-keyless-canary"
+"""The fragment whose ``privacy_tier`` key is absent from the file on disk."""
+
+_DECLARED_INTIMATE_ID = "frag-tier-declared-intimate"
+"""The comparator the canary's admission must track exactly (AC3)."""
+
+_EXPLICIT_UNCLASSIFIED_ID = "frag-tier-explicit-unclass"
+"""An explicit ``privacy_tier: unclassified`` — the case AC2 must not disturb."""
+
+
+def _write_tier_probe(vault_path: Path, frag_id: str, privacy: PrivacyTier) -> Path:
+    """Write one exemplar-qualifying probe fragment carrying *privacy*.
+
+    Every probe in this section is byte-identical but for its id and its
+    ``privacy_tier`` line, so any difference in admission is attributable to
+    the tier and to nothing else.
+
+    Args:
+        vault_path: Vault root, already scaffolded by the ``vault`` fixture.
+        frag_id: The fragment's id, which is also its filename stem.
+        privacy: The tier written into the frontmatter.
+
+    Returns:
+        The path written.
+    """
+    return _write_fragment(
+        vault_path,
+        _build_fragment(
+            frag_id=frag_id,
+            title="Tier probe",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+            privacy=privacy,
+        ),
+        body_words=400,
+    )
+
+
+def _write_keyless_canary(vault_path: Path) -> Path:
+    """Write the probe whose ``privacy_tier`` key never reaches the file.
+
+    Built from an ``OPEN`` fragment and then stripped, so the file differs
+    from :data:`_OPEN_CONTROL_ID`'s only by the absence of that one line. What
+    it was built from is deliberately the *most* permissive tier: nothing
+    about the admission decision may come from a value the file does not
+    carry.
+
+    Args:
+        vault_path: Vault root, already scaffolded by the ``vault`` fixture.
+
+    Returns:
+        The path written.
+    """
+    return _write_untiered_fragment(
+        vault_path,
+        _build_fragment(
+            frag_id=_KEYLESS_CANARY_ID,
+            title="Tier probe",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+            privacy=PrivacyTier.OPEN,
+        ),
+        body_words=400,
+    )
+
+
+class TestUntieredFragmentsAreRefused:
+    """A file with no ``privacy_tier`` key must not seed the voice corpus (#1212).
+
+    Two additive gates guard the corpus, and they read the tier from two
+    different places. The ceiling gate
+    (:func:`~creek.classify.privacy_filter.within_ceiling`) reads the **raw
+    frontmatter** and fails closed to ``INTIMATE`` when the key is absent. The
+    consent gate (``_eligible_register``) reads the **validated model**, where
+    an absent key has already become Pydantic's ``unclassified`` default.
+
+    At :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL` — the
+    collector's constructor default, and what a bare ``creek report`` resolves
+    to — the ceiling gate short-circuits to ``True``. Only the model-reading
+    gate is left, and it sees ``unclassified``, so a file that never said
+    anything about its own privacy walks into the voice corpus, into the
+    lexicon, into the rhetorical-patterns counts, and — worst — is copied
+    verbatim into ``07-Voice/Register-Samples/``.
+
+    Every test here carries a positive control identical to the canary in
+    every respect but its id and its ``privacy_tier`` line, and asserts the
+    admitted set by **equality**. ``_load_fragment_with_body`` returns
+    ``None`` for any file whose ``type`` is not ``fragment``, so a vault that
+    seeds nothing the walk recognises walks zero fragments and passes a
+    "canary not in admitted" assertion vacuously. An earlier audit of this
+    very defect did exactly that.
+    """
+
+    def test_collect_exemplars_refuses_a_file_with_no_privacy_tier_key(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """The register-bucket walk admits the control alone (AC1)."""
+        _write_tier_probe(vault, _OPEN_CONTROL_ID, PrivacyTier.OPEN)
+        _write_keyless_canary(vault)
+
+        exemplars = collector.collect_exemplars(vault)
+
+        assert [f.id for f in exemplars["confessional"]] == [_OPEN_CONTROL_ID]
+
+    def test_collect_all_exemplars_refuses_a_file_with_no_privacy_tier_key(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """The flat lexicon-facing walk refuses it too (AC1).
+
+        A second, independently written walk over the same directory:
+        asserting the gate on ``collect_exemplars`` alone would leave this one
+        uncovered, and it is the walk ``report --type lexicon`` consumes.
+        """
+        _write_tier_probe(vault, _OPEN_CONTROL_ID, PrivacyTier.OPEN)
+        _write_keyless_canary(vault)
+
+        exemplars = collector.collect_all_exemplars(vault)
+
+        assert [e.fragment.id for e in exemplars] == [_OPEN_CONTROL_ID]
+
+    def test_no_register_sample_is_copied_for_a_file_with_no_privacy_tier_key(
+        self,
+        vault: Path,
+    ) -> None:
+        """The verbatim-copy surface refuses it, asserted on disk (AC1).
+
+        This is the surface where admission is most expensive: ``creek report
+        --type voice`` ``shutil.copy2``-s the source file into the vault byte
+        for byte, so an untiered fragment admitted here becomes a durable
+        second copy of unvouched-for content sitting in ``07-Voice/``. The
+        assertion is therefore on the **directory listing**, not on the
+        mapping ``generate_register_samples`` returns: the mapping names
+        summaries, and it would look identical whether or not the canary's
+        body had been copied next to them.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        _write_tier_probe(vault, _OPEN_CONTROL_ID, PrivacyTier.OPEN)
+        _write_keyless_canary(vault)
+
+        generate_register_samples(vault)
+
+        register_dir = vault / "07-Voice" / "Register-Samples" / "confessional"
+        assert (register_dir / f"{_OPEN_CONTROL_ID}.md").is_file()
+        assert not (register_dir / f"{_KEYLESS_CANARY_ID}.md").exists()
+        assert sorted(p.name for p in register_dir.glob("*.md")) == [
+            "_Summary.md",
+            f"{_OPEN_CONTROL_ID}.md",
+        ]
+
+    @pytest.mark.parametrize(
+        "allow_intimate",
+        [
+            pytest.param(False, id="consent-default"),
+            pytest.param(True, id="consent-opted-in"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "override",
+        [
+            pytest.param(PrivacyTierOverride.OPEN, id="ceiling-open"),
+            pytest.param(PrivacyTierOverride.PERSONAL, id="ceiling-personal"),
+            pytest.param(PrivacyTierOverride.INTIMATE, id="ceiling-intimate"),
+            pytest.param(PrivacyTierOverride.ALL, id="ceiling-all"),
+        ],
+    )
+    def test_untiered_is_admitted_exactly_where_declared_intimate_is(
+        self,
+        vault: Path,
+        override: PrivacyTierOverride,
+        allow_intimate: bool,
+    ) -> None:
+        """``privacy_tier`` is a one-way ratchet: refuse more, never admit more (AC3).
+
+        A file with no tier carries strictly *less* assurance than one that
+        says ``intimate`` out loud, so it must be admitted in exactly the
+        cells where a declared-intimate fragment is — no fewer (that would be
+        a new refusal nobody asked for on the opt-in path) and no more (that
+        is the defect). The relation is asserted **comparatively** across the
+        whole ceiling-by-consent grid rather than against a hard-coded table,
+        so it fails in both directions and needs no maintenance when the
+        ceiling semantics change.
+
+        The open control is asserted present in every cell. Without it, a
+        vault the walk never reached would satisfy the comparison trivially —
+        ``False == False`` in all eight cells.
+        """
+        _write_tier_probe(vault, _OPEN_CONTROL_ID, PrivacyTier.OPEN)
+        _write_tier_probe(vault, _DECLARED_INTIMATE_ID, PrivacyTier.INTIMATE)
+        _write_keyless_canary(vault)
+
+        probe = VoiceExemplarCollector(
+            allow_intimate=allow_intimate,
+            override=override,
+        )
+        admitted = {f.id for f in probe.collect_exemplars(vault)["confessional"]}
+
+        assert _OPEN_CONTROL_ID in admitted, (
+            "the open control was refused, so this cell walked no admissible "
+            f"fragment and proves nothing. admitted={sorted(admitted)}"
+        )
+        canary_admitted = _KEYLESS_CANARY_ID in admitted
+        declared_intimate_admitted = _DECLARED_INTIMATE_ID in admitted
+        assert canary_admitted == declared_intimate_admitted, (
+            "an untiered fragment must be admitted exactly where a declared "
+            f"intimate one is (#1212 AC3). admitted={sorted(admitted)}"
+        )
+
+    def test_the_opted_in_canary_is_ranked_as_declared_intimate_content(
+        self,
+        vault: Path,
+    ) -> None:
+        """Opting in admits the canary, at intimate's authority — deliberately.
+
+        The accepted, *intended* consequence of materialising the declared
+        tier, not an oversight. Once an untiered fragment reads as
+        ``intimate`` at every reader, it also reads as ``intimate`` to
+        :func:`~creek.generate.voice.audience_authority`, whose default table
+        scores that tier ``0.0``. On this path a ``0.0`` authority only
+        **de-ranks**: :meth:`VoiceExemplarCollector.rank_exemplars` returns
+        ``scored[:max_per_register]`` whatever the scores are, so membership
+        is untouched and the operator who opted in still gets their content —
+        it simply stops outranking work they actually vouched for.
+        ``creek/generate/ai_style/fingerprint.py`` reads the same authority
+        table but loads its own frontmatter (``fingerprint.py:254``) rather
+        than going through ``_load_fragment_with_body``, so it is outside this
+        change and keeps scoring a keyless note as ``unclassified``.
+
+        ``== 0.0`` exactly, rather than "not 0.75": ``audience_authority``
+        looks the tier up as ``.get(str(fragment.privacy_tier), 1.0)``, so if
+        ``PrivacyTier`` ever stopped being a ``StrEnum`` the lookup would miss
+        and **fail open** to ``1.0``. An inequality against the old value
+        would wave that straight through.
+        """
+        _write_tier_probe(vault, _OPEN_CONTROL_ID, PrivacyTier.OPEN)
+        _write_keyless_canary(vault)
+
+        probe = VoiceExemplarCollector(
+            allow_intimate=True,
+            override=PrivacyTierOverride.ALL,
+        )
+        bucket = probe.collect_exemplars(vault)["confessional"]
+        loaded = {f.id: f for f in bucket}
+
+        assert sorted(loaded) == [_KEYLESS_CANARY_ID, _OPEN_CONTROL_ID]
+        weighting = VoiceAudienceWeightingConfig()
+        assert audience_authority(loaded[_KEYLESS_CANARY_ID], weighting) == 0.0
+        assert audience_authority(loaded[_OPEN_CONTROL_ID], weighting) == 1.5
+        assert [f.id for f in probe.rank_exemplars(bucket)] == [
+            _OPEN_CONTROL_ID,
+            _KEYLESS_CANARY_ID,
+        ]
+
+    def test_an_explicit_unclassified_file_is_still_admitted(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """An explicit ``unclassified`` keeps its #876 standing (AC2).
+
+        The half of #1212 that must *not* change. A pipeline-written fragment
+        that has not been through ``creek classify`` says ``unclassified`` out
+        loud, and saying so is itself an assurance the keyless file cannot
+        offer. Refusing both would be a far larger behaviour change than the
+        issue asks for, and would empty the corpus of every vault that has not
+        run the privacy classifier.
+        """
+        _write_tier_probe(vault, _EXPLICIT_UNCLASSIFIED_ID, PrivacyTier.UNCLASSIFIED)
+        _write_tier_probe(vault, _OPEN_CONTROL_ID, PrivacyTier.OPEN)
+
+        exemplars = collector.collect_exemplars(vault)
+
+        assert [f.id for f in exemplars["confessional"]] == [
+            _EXPLICIT_UNCLASSIFIED_ID,
+            _OPEN_CONTROL_ID,
+        ]
+
+    def test_eligible_register_still_admits_an_unclassified_model(self) -> None:
+        """The consent gate keeps admitting the model value ``UNCLASSIFIED`` (AC2).
+
+        Stated at the unit the fix must not touch. ``_eligible_register``
+        takes a validated :class:`~creek.models.Fragment` and never sees raw
+        frontmatter, so it cannot tell "no key on disk" from "the key said
+        ``unclassified``" — which is exactly why the fix belongs in
+        ``_load_fragment_with_body`` and not here. Any change that makes this
+        function refuse ``UNCLASSIFIED`` also refuses every unclassified
+        vault's whole corpus.
+        """
+        fragment = _build_fragment(
+            frag_id=_EXPLICIT_UNCLASSIFIED_ID,
+            title="Tier probe",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+            privacy=PrivacyTier.UNCLASSIFIED,
+        )
+
+        assert _eligible_register(fragment, allow_intimate=False) == "confessional"

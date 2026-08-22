@@ -83,6 +83,7 @@ from tests.v1_api_support import (
     CAPABILITIES_PATH,
     CEILING_HEADER,
     CONSUMER,
+    CONTRACT_VERSION_HEADER,
     HEALTH_PATH,
     JOURNAL_PATH,
     JOURNAL_TEMPLATE,
@@ -134,13 +135,19 @@ module here imports from another, because a shared fixture that two suites
 disagreed about would make their refusal tests measure different things.
 """
 
-_STANDING_VARY: Final[str] = f"{CEILING_HEADER}, {AUTHORIZATION_HEADER}"
+_STANDING_VARY: Final[str] = (
+    f"{CEILING_HEADER}, {AUTHORIZATION_HEADER}, {CONTRACT_VERSION_HEADER}"
+)
 """The whole ``Vary`` value a response with no caller ``Vary`` must render.
 
-Two tokens since #1129: an intermediary must key on the declared ceiling *and*
-on the credential, because every ``/v1`` body is a function of both. Composed
-here rather than restated as a literal so a third standing token is a one-line
-change; ``tests/test_v1_api_admission.py`` owns the policy tests behind it.
+Three tokens since #1144: an intermediary must key on the declared ceiling, on
+the credential *and* on the declared contract minor, because every ``/v1`` body
+is a function of all three — ``GET /v1/capabilities`` most visibly, where a
+served minor and a stale one produce different statuses and different capability
+lists from an otherwise identical request. Composed here rather than restated as
+a literal, which is why widening the set was in fact the one-line change the
+previous version of this docstring promised; ``tests/test_v1_api_admission.py``
+owns the policy tests behind it.
 """
 
 _SMALL_LIMIT: Final[int] = 64

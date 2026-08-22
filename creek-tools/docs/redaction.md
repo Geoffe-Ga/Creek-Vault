@@ -105,11 +105,11 @@ final.
 It rewrites more than fragment bodies. Every file whose extension is in
 `supported_extensions` is in scope, including structured `.yaml` and
 `.json` files, where a replacement marker can leave the file invalid or
-quietly change its meaning. In particular, a vault-wide `--apply` still
-rewrites `<vault>/00-Creek-Meta/creek_config.yaml` — an open bug, **tracked
-in #1398 and not fixed**. Only `00-Creek-Meta/audit/` and the legacy purge
-log are excluded unconditionally. Point `--source` at the narrowest tree
-that needs cleaning rather than at a whole vault.
+quietly change its meaning. Three paths are excluded unconditionally —
+`00-Creek-Meta/audit/`, the legacy purge log, and
+`<vault>/00-Creek-Meta/creek_config.yaml` (#1398) — and nothing else is.
+Your own structured files are still in scope, so point `--source` at the
+narrowest tree that needs cleaning rather than at a whole vault.
 
 For every match found by the scan:
 
@@ -248,12 +248,27 @@ Both residuals fail safe — intent present, rewrite lost.
 The audit trail lives inside the tree `--apply` walks, and `exclude_patterns`
 says nothing about `00-Creek-Meta`. Left alone, a vault-wide run rewrote its own
 history — and `verify()` still passed, because the entries appended afterwards
-re-anchored the chain onto the mutated line. So the whole of
-`00-Creek-Meta/audit/` and the legacy
-`00-Creek-Meta/Processing-Log/purge-log.json` are excluded from the rewrite set
-**unconditionally** — independent of `supported_extensions` and
-`exclude_patterns`. Detection is unaffected: `--scan` and `--review` still
-report matches there.
+re-anchored the chain onto the mutated line.
+
+`<vault>/00-Creek-Meta/creek_config.yaml` had the same problem for a
+different reason (#1398): `.yaml` *is* in the default
+`supported_extensions`, so a vault-wide apply rewrote the config that
+governs the next run. `false_positive_allowlist` entries were the one class
+of value it could never touch — the allowlist check is exact-string
+membership, so the scanner declines the match before the redactor sees it —
+but `exclude_patterns` tokens, custom `patterns`, paths and comments were
+all in scope. An entry like `backups-AKIAIOSFODNN7EXAMPLE` became
+`[REDACTED:high_entropy_string]`, and losing an exclusion *widens* what the
+next run walks.
+
+So three paths are excluded from the rewrite set **unconditionally** —
+independent of `supported_extensions` and `exclude_patterns`:
+
+- the whole of `00-Creek-Meta/audit/`
+- the legacy `00-Creek-Meta/Processing-Log/purge-log.json`
+- `00-Creek-Meta/creek_config.yaml`
+
+Detection is unaffected: `--scan` and `--review` still report matches there.
 
 Two known residuals:
 
@@ -261,17 +276,10 @@ Two known residuals:
   longer be remediated by `creek redact --apply`, because the file holding it is
   now protected. Rewriting a hash-chained log needs a chain-aware operation —
   that is purge-shaped work, tracked in #1397.
-- `<vault>/00-Creek-Meta/creek_config.yaml` **is** still rewritten by a
-  vault-wide apply. The `false_positive_allowlist` entries themselves are
-  safe — the allowlist check is exact-string membership, so an allowlisted
-  string is the one class of value the rewrite cannot touch. The hazard is
-  everything *else* in the file: `exclude_patterns` tokens, custom
-  `patterns`, paths, and comments are all in scope and can be replaced
-  with `[REDACTED:…]` markers, silently changing the config's meaning or
-  breaking its YAML. Concretely, an `exclude_patterns` entry like
-  `backups-AKIAIOSFODNN7EXAMPLE` becomes
-  `[REDACTED:high_entropy_string]`. Tracked in #1398, not fixed by this
-  change.
+- Structured files *you* own are still rewritten in place. A
+  replacement marker inside a `.json` or `.yaml` file can break its
+  syntax or quietly change its meaning, and there is no undo. Only the
+  three paths listed above are protected.
 
 ## How `creek process` interacts with redaction
 
@@ -345,3 +353,43 @@ The check is deliberately narrow. A symlink whose target stays *inside* the
 source tree is still admitted, and is still scanned **unresolved** — under
 the path it was reached by rather than its target's — so findings keep
 being reported at the path the operator actually has.
+
+### A named `--vault` must stay inside its own parent
+
+`--vault` is a *named* path rather than a discovered one, and every mode
+refuses one that is a symlink whose target escapes the link's own parent.
+`--apply` and `--review` have refused since #1293; `--scan` joined them in
+#1359.
+
+`--scan` looked like it could be exempt: it writes nothing, and `--vault`
+there does exactly one thing — locate
+`<vault>/00-Creek-Meta/creek_config.yaml`. That reading turned out to be
+wrong. An out-of-tree config is not passively read; it is a complete off
+switch. A scan of a file holding one email address and one API key reports
+**zero** findings if the config it is handed narrows `supported_extensions`
+past the source's extension, names the source directory in
+`exclude_patterns`, or lists the matched strings in
+`false_positive_allowlist`. (`enabled: false` is the one setting that
+changes nothing: the explicit CLI mode does not consult it, so it fails
+safe.) Refusing costs you a one-line correction; the alternative was a
+silent "no findings" on the command you run precisely because you are
+worried.
+
+```
+$ creek redact --scan --source ./notes --vault ~/linkvault
+Refusing to follow symlink that escapes the vault root: /Users/me/linkvault
+```
+
+The banner names the path you supplied and never its target — disclosing
+the target is the existence oracle the containment work exists to close.
+Pass the resolved path instead (`--vault /Volumes/Backup/vault`), or drop
+`--vault` and let config discovery fall back to `CREEK_CONFIG` or the
+working directory.
+
+This is **not** the skip-and-count contract, and does not dent it.
+Skip-and-count is about `--source` — the tree being examined — where one
+stray link must never disable the whole safety pass. A `--source` tree
+containing an escaping link is still scanned in full, the link is still
+declined, the exit code is still 0, and the skip is still named in the
+statistics. A `--vault` symlink that stays inside its own parent
+(`<root>/linkvault -> <root>/realvault`) is still admitted.

@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (Creek side)
 - **Date**: 2026-07-31
-- **Contract version**: `0.7.0`
+- **Contract version**: `0.9.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23`
 - **Driving issues**: [#1072](https://github.com/Geoffe-Ga/Creek-Vault/issues/1072) (this decision), epic [#1071](https://github.com/Geoffe-Ga/Creek-Vault/issues/1071)
 - **Mirrors**: [`Geoffe-Ga/adepthood#2044`](https://github.com/Geoffe-Ga/adepthood/issues/2044)
@@ -44,8 +44,8 @@ remote tier ceiling in order to demo a capability early — see
 behavioral implementation: a shape change in a shared `creek_mcp.tools.*`
 function changes what both adapters can honestly promise at the same moment.
 `ontology_version` (`aptitude-wavelength/2026-05-23`) is tracked separately —
-it is the shared APTITUDE-frequency / Wavelength-phase vocabulary, not the
-wire shape, and it changes on its own cadence (see
+it is the shared APTITUDE-frequency vocabulary, not the wire shape, and it
+changes on its own cadence (see
 [`2026-05-23-frequency-naming.md`](./2026-05-23-frequency-naming.md)).
 
 **Compatibility rule.** Below contract `1.0`: exact-minor match —
@@ -155,39 +155,91 @@ negotiation:
 The published OpenAPI document therefore lists `422` among `getCapabilities`'
 responses, and that is correct rather than a generator artefact.
 
-| State | `status` | `vault.available` | `capabilities` | Both version strings present? |
-|---|---|---|---|---|
-| (a) present and usable | `ok` | `true` | all four | yes |
-| (b) reachable, uninitialized | `uninitialized` | `false` | `[]` | yes |
-| (c) reachable, contract-incompatible | `incompatible` | — | `[]` | yes |
-| (d) unreachable | — no body at all — | — | — | — |
+<!-- capability-set: capabilities-states -->
+| `status` | `vault.available` | `capabilities` | Meaning |
+|---|---|---|---|
+| `ok` | `true` | advertised set | Vault present and usable. |
+| `uninitialized` | `false` | `[]` | Reachable; no vault scaffolded. Both version strings still present. |
+| `incompatible` | `true` or `false` — a real probe result | `[]` | The requested contract minor is not served here. |
+| *no body at all* | — | — | Unreachable. A client must map this to its own distinct state and must **not** fold it into `uninitialized`. |
+<!-- /capability-set -->
 
-(d) is distinguished purely by transport outcome: connection refused, a
-DNS/TLS failure, a timeout, a non-JSON body, or an HTTP status outside the
-closed set the contract publishes — `{200, 401, 403, 404, 409, 422, 500,
-501, 503}` (`ALLOWED_HTTP_STATUSES` in the contract test suite, derived from
-`ERROR_STATUS`'s range plus `200`). A conforming client MUST map (d) to a
-distinct local state and MUST NOT synthesize a capabilities body, and MUST
+Both version strings are present in every one of the three bodied states.
+
+**Row (c)'s `vault.available` used to read `—` here and in `docs/api.md`. That
+was wrong, and the correction is #1150's.** `handle_capabilities` computes
+`available` from the readiness probe unconditionally and `_render` emits
+`VaultState(available=available)` at *every* status, so an `incompatible` body
+always carries a concrete boolean; only `capabilities` is emptied for a
+non-`ok` status. `—` reads as absent-or-unspecified and it is neither. #1148
+changed the *audit* half alone — at an unserved minor the probe runs
+`audited=False`, so a poll at a version this server cannot speak no longer
+drives one locked, fsync'd append per request. Keeping the probe is deliberate,
+and `creek_mcp/httpapi/capabilities.py`'s own docstring argues it: skipping it
+would report `available: false` against a healthy vault and turn "you are on an
+old contract" into "your vault is down". **Whether it should nonetheless be
+reordered away at that status stays open** — recorded as open question 6 in the
+[sibling ADR](./2026-06-30-adepthood-creek-mcp-contract.md#open-questions-resolve-before-accepted)
+rather than on an issue, because #1150 asked for this table and #1148, which
+owned the reordering, is closed. This table states what the code emits, and the
+two documents' cells are now asserted identical to each other by
+`tests/test_mcp_contract_adr_shipped_surface.py`.
+
+The **unreachable** row is distinguished purely by transport outcome:
+connection refused, a DNS/TLS failure, a timeout, a non-JSON body, or an HTTP
+status outside the closed set the contract publishes — `{200, 401, 403, 404,
+409, 415, 422, 500, 501, 503}` (`ALLOWED_HTTP_STATUSES` in the contract test
+suite, derived from `ERROR_STATUS`'s range plus `200`; `415` joined it at
+contract `0.8.0` with `unsupported_source`). A conforming client MUST map it to
+a distinct local state and MUST NOT synthesize a capabilities body, and MUST
 NOT fold it into "uninitialized" — those are different facts an operator
 needs to act on differently.
 
-**"All four" describes the completed epic, not every commit of it.** While
-#1071 is being built out, `capabilities` advertises only the capabilities the
-running server actually implements: [#1074](https://github.com/Geoffe-Ga/Creek-Vault/issues/1074)
-ships `capabilities` alone, and #1075–#1077 each add one. A route that is
-mounted but unbuilt answers `501 unsupported_capability`, and advertising it in
-the handshake would be exactly the "the contract says yes, the call says no"
-divergence this epic exists to remove — a client would negotiate a capability
-and then discover, one round trip later, that it does not exist. The server's
-list is therefore driven by a single constant, `IMPLEMENTED_CAPABILITIES` in
-`creek_mcp/api/routes.py`, which also decides which routes answer `501`; the
-two can never disagree. `examples/capabilities/success.json` in the fixture
-bundle continues to document the completed steady state — all four — because
-re-publishing and re-hashing a consumer-pinned artifact four times inside one
-epic would train that consumer to re-pin without reading, which is the opposite
-of what a pinned bundle is for. The divergence between the fixture and the
-running server during the build-out is deliberate and is itself pinned by a
-test.
+**The advertised list is now caller-dependent (contract `0.8.0`).** It is the
+intersection of what this server implements with what the caller's declared
+contract minor published: `CAPABILITY_SINCE_MINOR` in `creek_mcp/api/models.py`
+is the one table, and `POST /v1/uploads` refuses a caller below `0.8` with
+`incompatible_version` off that same table, so what is withheld here is
+unreachable there. A caller that declares no minor at all is shown the full
+list — it has vendored nothing that a newer capability could contradict, and
+every content route refuses an undeclared minor anyway.
+
+**The set this server implements, and the minor each capability appeared at:**
+
+<!-- capability-set: v1-capabilities -->
+| Capability | Published since contract minor |
+|---|---|
+| `capabilities` | `0.2` |
+| `journal-upsert` | `0.2` |
+| `reflections` | `0.2` |
+| `wheel` | `0.2` |
+| `upload` | `0.8` |
+| `drive-connector` | `0.9` |
+<!-- /capability-set -->
+
+**The build-out divergence is closed (#1112).** While epic #1071 was being
+built, this section recorded a deliberate gap: the running server advertised
+only what it had actually implemented — [#1074](https://github.com/Geoffe-Ga/Creek-Vault/issues/1074)
+shipped `capabilities` alone and #1075–#1077 each added one — while the
+committed `examples/capabilities/success.json` fixture already documented the
+completed steady state, because re-publishing and re-hashing a consumer-pinned
+artifact four times inside one epic would have trained that consumer to re-pin
+without reading. **#1077 and epic #1071 are both closed**, so there is no gap
+left: `IMPLEMENTED_CAPABILITIES` is `frozenset(Capability)`, the fixture lists
+the same six, and a live response over a vault declaring the current minor
+returns the same six. `tests/test_v1_api_capabilities.py` asserts those three
+and the enum as **one four-way equality**, which is what replaced the old test
+that existed to record the divergence.
+
+The mechanism that made the gap safe is unchanged and still worth having. A
+route that is mounted but unbuilt answers `501 unsupported_capability`, and
+advertising it in the handshake would be exactly the "the contract says yes,
+the call says no" divergence this epic exists to remove — a client would
+negotiate a capability and then discover, one round trip later, that it does
+not exist. `IMPLEMENTED_CAPABILITIES` is kept as a distinct constant rather
+than folded away for that reason: it is what makes "a route exists but is
+unbuilt" expressible at all, and it drives both the advertised list and which
+routes answer `501`, so the two can never disagree.
 
 **A fifth state the issue's Problem section did not name.** Post-#961,
 `unclassified` ranks with `personal`, not `open`, on the MCP ceiling (see
@@ -313,8 +365,9 @@ is not a semantic identity.** Creek's `share` is a fraction of the
 per-stage `fullness` is curriculum completion in `[0, 1]` with no such
 summing constraint — they are genuinely different quantities that happen to
 both be ten numbers. `docs/decisions/2026-06-30-adepthood-creek-mcp-contract.md`
-pins the shared vocabulary as *frequencies = Aspects = Wavelength phases*,
-which is correct at the naming layer; it is Adepthood's own
+pins the shared vocabulary as the APTITUDE frequency axis and aligns
+*frequencies / Aspects / Stages* **at the naming layer only**, carrying this
+paragraph's hedge explicitly; it is Adepthood's own
 `docs/creek-vault-mcp-contract.md` that currently asserts the wheel is "the
 same shape as Adepthood's local `WheelBalanceResponse`" and that the two
 vocabularies are "one vocabulary under three names" at the *numeric* layer.
@@ -567,7 +620,7 @@ Not FastAPI.**
    taxonomy depends on. We would have to override it on every route anyway,
    which deletes the largest ergonomic reason to adopt the framework in the
    first place.
-4. The route table is five endpoints. The convenience a full framework buys
+4. The route table is six endpoints. The convenience a full framework buys
    scales with route-table size and does not clear the bar here.
 
 **Note for #1074**: Starlette must be **promoted to a declared direct
@@ -626,9 +679,11 @@ network MCP call. It is out of scope for #1117 and is tracked as follow-up
 
 [`docs/contracts/adepthood-v1/`](../contracts/adepthood-v1/) is the source of
 truth for the wire shapes in this repository:
-`manifest.json`, `retry-policy.json`, sixteen `schemas/*.schema.json` files
-(one per `CONTRACT_MODELS` entry), and twenty-eight
-`examples/<capability>/<state>.json` fixtures (four capabilities × seven
+`manifest.json`, `retry-policy.json`, one `schemas/*.schema.json` file per
+`CONTRACT_MODELS` entry (twenty-three at contract `0.9.0`: eighteen at `0.8.0`,
+plus `RelatedPraxis` and `RelatedEddy` from #873 and the three
+`Drive*Response` models from #1527), and forty-two
+`examples/<capability>/<state>.json` fixtures (six capabilities × seven
 states). Everything in the directory except its own `README.md` is
 **generated** by `build_bundle()`
 ([`creek_mcp/api/bundle.py`](../../creek-tools/creek_mcp/api/bundle.py)), and
@@ -667,6 +722,43 @@ unreachable.
 credential, or an `intimate`-tier success response. The `refusal` state
 fixtures are the intimate examples for every capability, and every one of
 them is a refusal — that is the entire point of publishing them.
+
+### The OpenAPI document is deliberately not in the bundle (#1111, 2026-08-21)
+
+`creek-tools-api --print-openapi` generates the document on demand. It is not
+committed, it is not a bundle file, and `manifest.json` has no row for it.
+**That is a decision, not an oversight**, and the reasoning is recorded here
+rather than left in an issue:
+
+- **Committing it is a consumer-visible contract event.** Every file in the
+  bundle is emitted by `build_bundle()` and hashed into `manifest.json`, and
+  the manifest is the artifact Adepthood pins. Adding `openapi.json` adds a
+  manifest row and therefore rewrites the manifest's own bytes and hash,
+  requiring a coordinated re-pin on the consumer side. A documentation change
+  must not emit that event.
+- **The gap it leaves is narrow.** `tests/test_v1_api_openapi.py` pins the
+  generated document's schema content against the committed
+  `schemas/<Model>.schema.json` files, pins that every `$ref` resolves, pins
+  its `(path, method)` set against the routes actually mounted, and pins every
+  documented status against the published closed set. What is unpinned is only
+  the *file* an operator vendors after running the generator.
+- **Determinism is not the reason.** `creek_mcp/httpapi/cli.py` prints
+  `json.dumps(build_openapi(), indent=2, sort_keys=True)`, the same canonical
+  form `bundle.py`'s `_serialise` uses. Committing it stays cheap whenever it
+  is taken up; it is declined on contract-event grounds.
+- **A middle option stays open at zero manifest cost.** Publishing
+  `openapi.json` as a rolling GitHub Release asset — the upgrade path the
+  bundle's own residual note already names — would let an operator diff a
+  vendored copy without touching the pinned bundle.
+
+**Revisit trigger, recorded here because the issue's own trigger has already
+elapsed twice.** #1111 asked to decide "at the next contract minor"; minors
+`0.8.0` (#1524) and `0.9.0` (#1527/#873) have each re-published the bundle
+since it was filed. So the trigger lives in this document, which is consulted
+at every bump: **at the next minor that re-publishes the bundle, either add
+`openapi.json` to `build_bundle()` or restate this decision in that minor's
+change-log row.** The operator-facing statement of the same decision is in
+[`creek-tools/docs/api.md`](../../creek-tools/docs/api.md#openapi).
 
 ## Six-divergence table
 
@@ -709,6 +801,8 @@ restating the other.
 
 | Contract version | Date | Change |
 |---|---|---|
+| *(no contract change)* | 2026-08-21 | **Documentation corrections (#1111/#1112/#1150).** No route, shape, status, error code or version moved. Three things were written down. **#1150:** row (c) of the capabilities state table said `vault.available` was `—`; the probe runs unconditionally and `_render` emits `VaultState(available=…)` at every status, so an `incompatible` body always carries a real boolean — the table now says so in both this document and `docs/api.md`, and a test asserts the two cells are identical. Whether the probe *should* run at that status is left open — as open question 6 of the [sibling ADR](./2026-06-30-adepthood-creek-mcp-contract.md#open-questions-resolve-before-accepted), not on #1150, whose requested correction this row delivers, and not on #1148, which owned the reordering and is closed. **#1112:** the recorded fixture-vs-server divergence is closed — #1077 and epic #1071 shipped, so the committed fixture, `IMPLEMENTED_CAPABILITIES`, the `Capability` enum and a live response are now asserted as one four-way equality, and the capability list is machine-checked against the enum from both documents. **#1111:** the OpenAPI document stays generated-on-demand and out of `build_bundle()`, because committing it would rewrite the consumer-pinned `manifest.json` — a contract event, not a docs change. The revisit trigger now lives in [The OpenAPI document is deliberately not in the bundle](#the-openapi-document-is-deliberately-not-in-the-bundle-1111-2026-08-21) rather than in an issue nobody reads at bump time. |
+| `0.9.0` | 2026-08-19 | #873 adds two **optional** fields to `ReflectionResponse`, `related_praxis` and `related_eddies`, naming the compiled-layer structures the reflected entry belongs to — bounded at 3 and 2 respectively, with two new wire models (`RelatedPraxis`, `RelatedEddy`) and their schemas joining the bundle. No route, no capability, no error code and no *required* field moves, so this is a `0.5.0`-shaped bump and `SUPPORTED_CONTRACT_MINORS` widens rather than shifts. **What it costs a `0.8` client, precisely:** nothing in the ordinary case — the route drops both keys when nothing qualified, so `examples/reflections/empty.json` is byte-identical and so is every reflection over a vault with no admitted compiled neighbours. A reflection that *does* find one carries two extra keys regardless of the negotiated minor, which a closed-validating `0.8` consumer will see; retained anyway on the `0.5.0` reasoning, because refusing every `0.8` request outright is strictly worse than occasionally serving a key it can ignore. The drop is deliberately narrow — exactly these two fields, never a blanket `exclude_none`, which would also have removed the explicit `essay: null` three published minors document. **Admission is stricter than for a fragment**, and that is the substance of the bump: a compiled page carries no `privacy_tier` of its own and is synthesised from fragments the caller may not be entitled to, so `creek_mcp/compiled_pages.py` publishes one only when *every* fragment it was compiled from resolves on disk and ranks within the caller's ceiling, and withholds as **opaque** any page whose provenance it cannot enumerate in full. A remote caller capped at `personal` therefore cannot be handed an eddy compiled from an `intimate` fragment, and cannot distinguish "no such eddy" from "that eddy was withheld". |
 | `0.2.0` | 2026-07-31 | This ADR: publishes `/v1`, the Adepthood HTTP application API, alongside the existing MCP agent adapter. No wire-shape change to the existing contract version — `creek_mcp.api.models` and the fixture bundle under `docs/contracts/adepthood-v1/` are the first publication of a new surface, not a revision of the MCP one (#1072, epic #1071). |
 | `0.2.0` | 2026-07-31 | #1074 mounts the routes: the tracer serves a real `GET /v1/capabilities` and answers `501 unsupported_capability` on journal, reflection and wheel. No wire shape changes, so no version moves. Two clarifications recorded above rather than left implicit: the advertised capability list tracks what is actually implemented during the epic's build-out, and the issue's provisional `not_implemented` spelling is superseded by `unsupported_capability` — the `ErrorCode` member this ADR already publishes for exactly that meaning at exactly that status. |
 | `0.2.0` | 2026-08-01 | #1117 review fixes: `creek-tools-api` now starts uvicorn with `access_log=False` (its own access logger was republishing the caller's address and the concrete request path alongside the audited middleware), and `GET /v1/capabilities`'s readiness probe now runs in a worker thread rather than on the event loop. Neither changes a wire shape, so no version moves. See [Serving: uvicorn's own logging and the readiness probe](#serving-uvicorns-own-logging-and-the-readiness-probe). |
@@ -718,3 +812,5 @@ restating the other.
 | `0.6.0` | 2026-08-13 | #1453 closes a right-to-be-forgotten leak, and the MCP half moves the shared contract minor. `creek.purge.*` results gain two integer counters: `ledger_rows_removed`, the ingest-ledger rows a scoped purge physically erased, and `meta_artifacts_removed`, the files a whole-vault purge destroyed under `00-Creek-Meta/` under its new deny-by-default sweep. `_result_payload` forwards every field of `PurgeResult`, so both reach the wire with no payload code change — which is precisely why the minor has to move rather than why it need not: a client validating the payload closed would otherwise meet two keys it never negotiated. **No `/v1` shape moved**, so this is a `0.3.0`/`0.4.0`-shaped bump rather than a `0.5.0`-shaped one, and a `0.5`-pinned client is served byte-identically on every `/v1` route it already calls. `SUPPORTED_CONTRACT_MINORS` is widened, not shifted, to keep serving `0.5` alongside `0.4`, `0.3` and `0.2`. Neither counter can carry vault content: both are plain integers, and the sweep's own record of *what* it destroyed never leaves the vault's audit log. |
 | `0.5.0` | 2026-08-12 | #1372 fixes five surfaces that computed operator-advisory data and threw it away at a boundary; the MCP/wire half moves the shared contract minor. Three MCP tools' return shapes changed: `creek.link` now reports `largest_cluster_fragments`, `clusters_split` and `oversized_discarded` — the cluster-health diagnostics `creek link` already printed to its console — and `creek.journal` / `creek.upload` now report `warnings`, the ingest run's content-free advisory channel. That is what carries the minor, by `contract.py`'s own rule: a tool's return shape moved. **Unlike `0.3.0` and `0.4.0`, a `/v1` shape moved too.** `JournalUpsertResponse` gained an *optional* `warnings` field, and the honest compatibility story is narrower than "invisible": the field defaults to `None` and the response is dumped with `exclude_none`, so a write that produced no advisory is byte-for-byte what it was before — the ordinary case. A write that DID produce an advisory now carries one additional key, and a `0.4`-pinned client validating the response shape closed should widen its validator or read the negotiated window off `GET /v1/capabilities`, rather than assume the newest minor is the only one accepted. `SUPPORTED_CONTRACT_MINORS` is widened, not shifted, to keep serving `0.4` alongside `0.3` and `0.2`, so no existing client is stranded. Every advisory crossing the MCP/`/v1` boundary is content-free *by construction at the producer*: `collapsed_unit_warning` interpolates real vault fragment ids that the caller's tier ceiling may not admit, so those ids reach the CLI console only, never a remote caller. |
 | `0.7.0` | 2026-08-13 | #1494 makes `tier` **mandatory** on `creek.journal` and `creek.upload`; the MCP tool surface's semantics move, so the shared contract minor moves. Both verbs declared `tier: str = "open"` twice each — once on the tool function and again, independently, on the `build_server` wrapper MCP clients actually reach — so a client that omitted the field had its content filed at `open` and was told so nowhere, and the `privacy_tier_ceiling` machinery could not catch it because at `ceiling=open` a defaulted `open` is trivially within the caller's own ceiling. Both now return `{"status": "refused", ...}` naming the missing `tier`, before anything is staged, ingested or audited. This row also covers **`creek.save`**, which took the identical break in [#1495](https://github.com/Geoffe-Ga/Creek-Vault/issues/1495) one commit earlier and shipped without a bump — recorded here retroactively because that was a miss rather than a precedent, and a published contract version that stays silent about a mandatory input on three write verbs is worse than a row that names all three late. An input becoming *required* is strictly larger than the optional **response** field that carried `0.5.0` for these same two tools, so it cannot carry less than a minor. **No `/v1` shape moved**, so this is a `0.3.0`/`0.4.0`-shaped bump rather than a `0.5.0`-shaped one: `JournalUpsertRequest.tier` (`creek_mcp/api/models.py:614`) never had a default and is typed `WireTierCeiling`, `PUT /v1/journal-entries/{external_id}` already passed `tier=parsed.tier.value` explicitly, and `creek.upload` has no `/v1` route at all — the HTTP adapter is the surface that already got this right, and this change restores MCP parity with it. `SUPPORTED_CONTRACT_MINORS` is widened, not shifted, to keep serving `0.6` alongside `0.5`, `0.4`, `0.3` and `0.2`; shifting it would refuse a `0.6`-pinned `/v1` client over a break it cannot express, since its journal writes already carried an explicit tier. `creek_mcp/httpapi/journal.py`'s `journal_refusal_code` maps the new `TIER_REQUIRED_REASON` to `invalid_request` as defence in depth, so the reason cannot fall through to `internal_error` in a function documented as total by construction. |
+| `0.9.0` | 2026-08-19 | #1527 publishes a **sixth capability**, `drive-connector`, served by three routes over the read-only Google Drive OAuth connector that has been shipping since long before this ADR: `GET /v1/connectors/drive` reports connection state, `POST /v1/connectors/drive/syncs` runs one incremental sync and ingests what it fetched, `DELETE /v1/connectors/drive` revokes the cached credential and erases it. The connector itself is unchanged — `GoogleApiDriveClient`, `GoogleDriveDownloader`'s mtime-keyed incremental skip, `route_to_ingestor`, the ledger-backed `run_ingest` and `revoke_token` are all reused verbatim; what was missing was a door, exactly as it was for `upload` at `0.8.0`. **This is the first capability served by more than one route**, and the first template (`/v1/connectors/drive`) serving more than one method; nothing downstream assumed otherwise, because `HANDLERS` is keyed on `operation_id`, the OpenAPI `paths` mapping accumulates per path, and the handshake advertises a set. Additive and shaped exactly like `0.8.0`: three wire models (`DriveConnectorStatusResponse`, `DriveSyncResponse`, `DriveDisconnectResponse`), **no new error code** and no new status — the refusals are the published `unavailable` and `temporarily_unavailable` — so a `0.8` client is answered byte-identically on every route it already calls and is neither told about nor served the three it is not. **The OAuth token is server-side and crosses no wire**: no route accepts a credential, none returns one, and none begins or completes an authorisation flow. Granting access stays a local operator action (`creek gdrive --download`), because the cached credential comes from an installed-app loopback flow that needs a browser on the host holding the client secret; a sync *refuses* rather than falling through to that flow, which is also what makes revocation bite — the next sync after a disconnect sees no credential and stops. `DriveSyncResponse` publishes **counts only**: no Drive file name, folder name or id, and no `affected_fragment_ids`, because a sync's fragments are the vault owner's content rather than the caller's and a list of them would be a corpus enumeration primitive. Synced files carry the tier the ordinary `creek ingest` would give them — the tool passes no `privacy_tier`, so no caller can make one less restrictive. |
+| `0.8.0` | 2026-08-18 | #1524 publishes a **fifth capability**, `upload`, served by `POST /v1/uploads`. `creek.upload` has existed since contract `0.3.0` and has been MCP-only ever since, so no HTTP client could seed a vault with a document; this route exposes the existing tool and reimplements none of it — staging, extension dispatch, the ledger-backed `run_ingest`, the write-tier gate, the #970 overwrite gate and the audit append are all `upload_tool`'s, unchanged. The request is JSON + base64, never multipart, because Adepthood's client is JSON and its CI bans `python-multipart`. **This is the first bump since `0.2.0` that moves a `/v1` shape by addition rather than an MCP-only surface**, so it is also the first where widening `SUPPORTED_CONTRACT_MINORS` has to be argued rather than assumed: it costs a `0.7` client nothing, because every shape it already knows is byte-identical and the addition is a route it is neither told about nor served. Both halves of that come off one table, `CAPABILITY_SINCE_MINOR` — `GET /v1/capabilities` filters the advertised list with it and `_predates_the_capability` refuses the route with it, so a `0.2`-pinned client is told `upload` does not exist and finds that it does not. Riding along, all additive: two wire models (`UploadRequest`, `UploadResponse`); one error code, `unsupported_source`, which brings `415` into the published status set and carries #1526's remedy for a conversation export, an archive or a legacy binary Office document instead of letting it fall through to `500`; and a per-route request-body cap (`ROUTE_BODY_CAPS`) of ~13.4 MiB on the upload path alone — the base64 envelope of `MAX_UPLOAD_BYTES`, matching the 10 MiB document cap Adepthood already enforces — rather than raising the 1 MiB global cap every other route would then be allowed to buffer. `UploadResponse` deliberately publishes **no `tier` field**: a document's own frontmatter can escalate the fragment above the declared tier, so the field could only be a false claim (the #1491 defect) or a tier oracle. |

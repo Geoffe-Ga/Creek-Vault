@@ -29,7 +29,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 import frontmatter
-import yaml
 
 from creek._fsio import create_exclusive, write_all
 from creek.audit import AuditLog
@@ -44,6 +43,7 @@ from creek.vault.authors import (
     OTHER_AUTHORS_DIR,
     load_author_manifest_or_default,
 )
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, load_post_or_raise
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -428,11 +428,25 @@ def _file_declares_id(path: Path, model_id: str) -> bool:
     :meth:`VaultWriter._rebuild_index` applies while scanning, so the
     verifier and the scanner can never disagree about which files
     declare an id — a file this function rejects is exactly a file the
-    rebuild would decline to index.
+    rebuild would decline to index. Both now name
+    :data:`~creek.vault.reader.FRONTMATTER_LOAD_ERRORS`, and they must keep
+    naming the *same* thing: widening one alone reintroduces the disagreement
+    #1083 closed.
+
+    Routing this through the splat-free
+    :func:`creek.vault.links.read_header_meta` — it reads only ``id``, so it
+    could — was measured and rejected. On a 1.9 KB fragment with ~20 header
+    keys ``frontmatter.load`` costs 66 us against ``read_header_meta``'s 424 us,
+    because the former resolves libyaml's C loader while the latter runs
+    ``yaml.safe_load`` on the pure-Python one. This runs once per index *hit*,
+    so on a 35k-fragment sweep that is ~2.3 s against ~14.8 s. The consequence
+    — a file whose header will not parse resolves as "not found" rather than
+    being reported — is issue #1543, whose fix is the bounded byte-scan for
+    ``id`` that :meth:`VaultWriter._find_in_dir_locked` already names.
     """
     try:
         post = frontmatter.load(str(path))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         return False
     declared = post.get("id")
     return isinstance(declared, str) and declared == model_id
@@ -742,7 +756,13 @@ class VaultWriter:
             self._provenance_log,
         )
 
-    def write_fragment(self, fragment: Fragment, body: str = "") -> Path:
+    def write_fragment(
+        self,
+        fragment: Fragment,
+        body: str = "",
+        *,
+        extra_frontmatter: dict[str, object] | None = None,
+    ) -> Path:
         """Write a Fragment to the correct vault folder, stamping attribution.
 
         A *native* fragment (``source.author_slug`` is ``None``/empty) routes by
@@ -767,6 +787,12 @@ class VaultWriter:
                 Empty strings are accepted (e.g. for placeholder writes
                 in tests) but should be considered a code smell in
                 production callers.
+            extra_frontmatter: Unmodelled frontmatter keys to merge into the
+                YAML block, from an ingestor that emitted structured
+                provenance ``Fragment`` does not model (#1392). Gated
+                upstream by
+                :data:`~creek.ingest.base.PASSTHROUGH_FRONTMATTER_KEYS`;
+                ``None`` (the default) writes model fields only.
 
         Returns:
             Path to the written (or existing duplicate) markdown file.
@@ -779,8 +805,12 @@ class VaultWriter:
             # attribution (#470).
             manifest = load_author_manifest_or_default(self.vault_path, slug)
             stamped = _apply_other_author_attribution(fragment, manifest)
-            return self._write_model(stamped, target_dir, body=body)
-        return self._write_model(fragment, target_dir, body=body)
+            return self._write_model(
+                stamped, target_dir, body=body, extra_frontmatter=extra_frontmatter
+            )
+        return self._write_model(
+            fragment, target_dir, body=body, extra_frontmatter=extra_frontmatter
+        )
 
     def _fragment_target_dir(self, fragment: Fragment) -> Path:
         """Return the vault directory a fragment routes to (#673).
@@ -850,14 +880,23 @@ class VaultWriter:
             Path to the rewritten file, or ``None`` when no existing file
             maps to the id — including the case where the mapped file
             exists but declares a different id and re-resolution finds no
-            live file declaring this one.
+            live file declaring this one, and the case where the mapped file's
+            frontmatter will not parse at all (#1543).
+
+        Raises:
+            OSError: If the located file cannot be read — the vanished or
+                half-rewritten file of the verify-then-load race. Kept in the
+                ``OSError`` family so the ingest loop's per-unit handler still
+                catches it (see :func:`load_post_or_raise`).
+            ValueError: If the located file was read but its frontmatter will
+                not parse; the message names the path (same function).
         """
         target_dir = self._fragment_target_dir(fragment)
         with self._lock:
             existing = self._find_existing_locked(fragment.id, target_dir)
             if existing is None:
                 return None
-            post = frontmatter.load(str(existing))
+            post = load_post_or_raise(existing)
             if _is_material_change(post.content, body, reclassify_threshold):
                 _clear_classification(post)
                 _retier_after_rewrite(post, fragment, body)
@@ -1122,10 +1161,17 @@ class VaultWriter:
             RuntimeError: If a unique filename cannot be allocated in the
                 orphan directory within
                 :data:`_MAX_FILENAME_COLLISION_RETRIES` attempts.
-            OSError: If the tombstone cannot be created, or its index entry
-                cannot be appended.
+            OSError: If the located file cannot be read (the verify-then-load
+                race), if the tombstone cannot be created, or if its index
+                entry cannot be appended.
+            ValueError: If the located file was read but its frontmatter will
+                not parse; the message names the path (see
+                :func:`load_post_or_raise`). A file that cannot be *read* at
+                all raises ``OSError`` above instead, so the ingest loop's
+                per-unit handler still catches it.
 
-        Both propagate from :meth:`_relocate_fragment_locked`.
+        The ``RuntimeError`` and ``OSError`` propagate from
+        :meth:`_relocate_fragment_locked`.
         :func:`creek.ingest.pipeline.tomb_missing_units` catches only
         ``(OSError, KeyError)`` around this call, so the exhaustion
         ``RuntimeError`` aborts the whole ingest run — deliberately loud, and
@@ -1136,7 +1182,7 @@ class VaultWriter:
             existing = self._find_in_fragments_locked(fragment_id)
             if existing is None:
                 return None
-            post = frontmatter.load(str(existing))
+            post = load_post_or_raise(existing)
             post["lifecycle"] = "orphaned"
             post["orphaned_at"] = datetime.now(UTC).isoformat()
             # Create-before-unlink and the #1120 in-memory-before-append
@@ -1177,10 +1223,17 @@ class VaultWriter:
             RuntimeError: If a unique filename cannot be allocated in the
                 target directory within
                 :data:`_MAX_FILENAME_COLLISION_RETRIES` attempts.
-            OSError: If the restored file cannot be created, or its index
+            OSError: If the located file cannot be read (the verify-then-load
+                race), if the restored file cannot be created, or if its index
                 entry cannot be appended.
+            ValueError: If the located file was read but its frontmatter will
+                not parse; the message names the path (see
+                :func:`load_post_or_raise`). A file that cannot be *read* at
+                all raises ``OSError`` above instead, so the ingest loop's
+                per-unit handler still catches it.
 
-        Both propagate from :meth:`_relocate_fragment_locked`.
+        The ``RuntimeError`` and ``OSError`` propagate from
+        :meth:`_relocate_fragment_locked`.
         :func:`creek.ingest.pipeline.restore_tombed` wraps this call in no
         handler at all — and the sibling tomb path catches only ``(OSError,
         KeyError)`` — so the exhaustion ``RuntimeError`` aborts the ingest
@@ -1193,7 +1246,7 @@ class VaultWriter:
             existing = self._find_existing_locked(fragment.id, orphan_dir)
             if existing is None:
                 return None
-            post = frontmatter.load(str(existing))
+            post = load_post_or_raise(existing)
             post.metadata.pop("lifecycle", None)
             post.metadata.pop("orphaned_at", None)
             # Same helper, same ordering guarantees as ``tomb_fragment``
@@ -1748,10 +1801,14 @@ class VaultWriter:
         for md_file in target_dir.glob("*.md"):
             try:
                 post = frontmatter.load(str(md_file))
-            except (OSError, ValueError, yaml.YAMLError):
+            except FRONTMATTER_LOAD_ERRORS:
                 # A non-fragment or unparseable sibling (e.g. a corrupt
                 # ``_author.md`` manifest) must not crash the index rebuild —
-                # it simply has no fragment id to index (#470).
+                # it simply has no fragment id to index (#470). The tuple
+                # includes ``TypeError`` because one hand-edited note with a
+                # bare-date frontmatter key used to take down ``find_fragment``
+                # / ``write_fragment`` / ``tomb_fragment`` for the whole
+                # directory (#1475).
                 continue
             mid = post.get("id")
             if isinstance(mid, str):

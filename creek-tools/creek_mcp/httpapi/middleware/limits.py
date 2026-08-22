@@ -17,6 +17,12 @@ turns a single bad request into a permanently dead server — a denial of servic
 any authenticated consumer could trigger by accident — so both the fault path
 and the timeout path give the slot back.
 
+**The body cap is per route where a route asks for one.** The default is a
+process-wide mebibyte; :data:`creek_mcp.api.routes.ROUTE_BODY_CAPS` raises it
+for ``POST /v1/uploads`` alone, because base64 of a ten-megabyte document does
+not fit in a limit sized for a journal entry — and raising the *global* cap to
+suit one route would let every route commit the same memory.
+
 **The body cap is enforced on the stream, not only on ``Content-Length``.** A
 chunked upload carries no length header at all, so a limit that only reads the
 header is a limit with a published bypass. The body is therefore read here,
@@ -37,6 +43,8 @@ from creek_mcp.httpapi.context import HTTP_SCOPE, context_of, pass_through
 from creek_mcp.httpapi.errors import error_response
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 DEFAULT_MAX_BODY_BYTES: Final[int] = 1024 * 1024
@@ -222,17 +230,62 @@ class RequestTimeoutMiddleware:
 
 
 class BodySizeLimitMiddleware:
-    """Refuse a request body larger than the cap, declared or streamed."""
+    """Refuse a request body larger than the cap, declared or streamed.
 
-    def __init__(self, app: ASGIApp, *, max_body_bytes: int) -> None:
+    One cap governs the whole surface, except for the paths that declare their
+    own in :data:`creek_mcp.api.routes.ROUTE_BODY_CAPS` — today that is
+    ``POST /v1/uploads`` and nothing else. A per-route cap exists because the
+    document surface and the text surfaces want opposite things: a journal
+    entry has no business being thirteen megabytes, and an upload of a
+    perfectly ordinary PDF has no business being refused at one.
+
+    **Matched on the literal path, and only on the literal path.** This
+    middleware runs above the router — it has to, or an unauthenticated caller
+    could make the server buffer a large body before anything decided whether
+    the path exists — so there is no matched route to ask, only
+    ``scope["path"]``. A path that is not in the map gets the default, which is
+    the fail-closed direction: an unrecognised path (a trailing slash, a
+    mis-spelling, a probe) is capped tightly and then answered ``404`` by the
+    router. :meth:`creek_mcp.api.routes.RouteSpec.__post_init__` is what keeps
+    that exact match honest, by refusing at import to let a templated path
+    declare a cap this lookup could never find.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        max_body_bytes: int,
+        route_caps: Mapping[str, int] | None = None,
+    ) -> None:
         """Wrap *app* with an inclusive body-size cap.
 
         Args:
             app: The next application in the stack.
-            max_body_bytes: The largest body that still reaches the router.
+            max_body_bytes: The largest body that still reaches the router, for
+                every path that does not declare its own.
+            route_caps: Literal-path overrides, or ``None`` for none. Copied
+                into a plain ``dict`` rather than retained, so a caller cannot
+                widen a live server's limits by mutating the mapping it passed.
         """
         self.app = app
         self._max_body_bytes = max_body_bytes
+        self._route_caps = dict(route_caps or {})
+
+    def _cap_for(self, scope: Scope) -> int:
+        """Return the body cap governing this request.
+
+        Args:
+            scope: The ASGI scope of an ``http`` request.
+
+        Returns:
+            The route's own cap when its literal path declares one, else the
+            process-wide default.
+        """
+        path = scope.get("path")
+        if isinstance(path, str):
+            return self._route_caps.get(path, self._max_body_bytes)
+        return self._max_body_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Cap the body on both axes, then hand the buffered copy downstream.
@@ -245,11 +298,12 @@ class BodySizeLimitMiddleware:
         if scope["type"] != HTTP_SCOPE:
             await pass_through(self.app, scope, receive, send)
             return
+        cap = self._cap_for(scope)
         declared = _declared_length(scope)
-        if declared is not None and declared > self._max_body_bytes:
+        if declared is not None and declared > cap:
             await _refuse_oversize(scope, receive, send)
             return
-        buffered = await _buffer_within(receive, self._max_body_bytes)
+        buffered = await _buffer_within(receive, cap)
         if buffered is None:
             await _refuse_oversize(scope, receive, send)
             return

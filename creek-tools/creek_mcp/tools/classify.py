@@ -15,7 +15,7 @@ from creek.classify.classify_engine import (
     LLMProviderUnavailableError,
     run_classify,
 )
-from creek.config import load_config
+from creek.config import load_vault_config
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 
@@ -49,7 +49,9 @@ def classify_tool(
                 f"unknown method {method!r}; supported: {', '.join(_VALID_METHODS)}"
             ),
         )
-    config = load_config()
+    # This config selects llm.provider — i.e. which model is shown the
+    # vault's text — so it must be the classified vault's own file (#1409).
+    config = load_vault_config(vault_path)
     try:
         summary = run_classify(
             vault_path=vault_path,

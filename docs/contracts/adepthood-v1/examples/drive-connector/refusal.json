@@ -1,0 +1,5 @@
+{
+  "code": "privacy_refused",
+  "message": "resolved content exceeds the declared tier ceiling",
+  "request_id": "req-example-drive-connector-refusal"
+}

@@ -36,11 +36,11 @@ from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import frontmatter
-import yaml
 from pydantic import ValidationError
 
 from creek.models import Fragment
 from creek.time import effective_authored_at, effective_authored_date
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -121,7 +121,7 @@ def _stable_digest_generated(
     if path.exists():
         try:
             existing = frontmatter.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, yaml.YAMLError):
+        except FRONTMATTER_LOAD_ERRORS:
             existing = None
         if (
             existing is not None
@@ -540,7 +540,7 @@ def _load_fragment(md_file: Path) -> tuple[Fragment, str] | None:
     """
     try:
         post = frontmatter.load(str(md_file))
-    except (OSError, ValueError):
+    except FRONTMATTER_LOAD_ERRORS:
         logger.debug("Skipping unreadable markdown file: %s", md_file)
         return None
     metadata = post.metadata

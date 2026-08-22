@@ -57,6 +57,16 @@ Deterministic (always run by default):
   withheld — `00-Creek-Meta/Tag-Garden.md` stays surveyed, since it
   emits real `[[fragment-id]]` links. `creek clean broken-links`
   shares this same scanner and scope.
+- `unparseable` — corpus files whose frontmatter will not load, reported
+  with their path and the exception class that stopped them. These are the
+  files every other pass *silently skips*: the reader, purge, hygiene and
+  reflect each guard the load and continue at `DEBUG`, so a corrupt fragment
+  is in no scan and no report and nothing else will ever mention it (#926).
+  Scans the same three subtrees the reader walks — `01-Fragments`,
+  `09-Reference`, `11-Other-Authors` — since a corrupt note is equally
+  invisible under any of them. The exception *class name* is reported and
+  never the parser's message: the file's `privacy_tier` is unknown precisely
+  because it would not parse, so nothing from inside it is quoted back.
 - `orphan-compiled` — Threads / Eddies / Praxis pages that nothing in
   that same surveyed set links to (a page's link to itself does not
   count). A page is never a candidate when its frontmatter `type` is

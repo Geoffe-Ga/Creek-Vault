@@ -30,6 +30,7 @@ from creek.config import AIStyleConfig, load_config
 from creek.generate.ai_style.fingerprint import load_fingerprint
 from creek.generate.ai_style.scanner import scan
 from creek.lint._result import CheckResult
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from creek.generate.ai_style.model import VoiceFingerprint
@@ -101,7 +102,7 @@ def _scan_draft(
     """Inspect one draft, returning a finding line or ``None`` when on-voice."""
     try:
         post = frontmatter.load(str(path))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         return None
     distance, divergences = _measure_draft(post, fingerprint, config)
     if distance <= config.voice_distance_upper:

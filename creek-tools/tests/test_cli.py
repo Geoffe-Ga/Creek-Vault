@@ -2632,18 +2632,48 @@ def test_report_rhetorical_patterns_no_exemplars_is_friendly(tmp_path: Path) -> 
     assert "No rhetorical patterns written" in result.output
 
 
-def test_report_rhetorical_patterns_generates(tmp_path: Path) -> None:
-    """``report --type rhetorical-patterns`` writes a per-register note (#582)."""
-    vault = tmp_path / "vault"
-    (vault / "00-Creek-Meta").mkdir(parents=True)
+def _seed_rhetorical_patterns_vault(vault: Path, *, tier_line: str) -> Path:
+    """Seed *vault* with one exemplar-qualifying fragment for the patterns report.
+
+    *tier_line* is spliced into the frontmatter verbatim, so a caller passes
+    either ``"privacy_tier: open\\n"`` or ``""`` — the empty string being the
+    only way to produce a file that never declared a tier at all, which is the
+    state #1212 is about and which no model-serialising helper can express.
+
+    Args:
+        vault: Vault root to create.
+        tier_line: The ``privacy_tier`` frontmatter line, or ``""`` to omit it.
+
+    Returns:
+        *vault*, for chaining.
+    """
+    (vault / "00-Creek-Meta").mkdir(parents=True, exist_ok=True)
     frags = vault / "01-Fragments" / "Journal"
-    frags.mkdir(parents=True)
+    frags.mkdir(parents=True, exist_ok=True)
     (frags / "ex-1.md").write_text(
         '---\ntype: fragment\nid: ex-1\ntitle: "T"\n'
+        f"{tier_line}"
         "source:\n  platform: journal\n  author: self\n"
         "voice:\n  voice_register: confessional\n  confidence: conviction\n"
         "---\nThe truth is we rise; as I said before, we rise.\n",
         encoding="utf-8",
+    )
+    return vault
+
+
+def test_report_rhetorical_patterns_generates(tmp_path: Path) -> None:
+    """``report --type rhetorical-patterns`` writes a per-register note (#582).
+
+    The fixture states ``privacy_tier: open`` explicitly (#1212). It used to
+    omit the key, which made this test depend on the very defect #1212 fixes:
+    an untiered fragment reaching the voice corpus at the CLI's default
+    ``ALL`` ceiling. Stating the tier keeps the test about *rhetorical-pattern
+    generation* rather than about tier admission, which
+    ``test_report_rhetorical_patterns_refuses_an_untiered_fragment`` owns.
+    """
+    vault = _seed_rhetorical_patterns_vault(
+        tmp_path / "vault",
+        tier_line="privacy_tier: open\n",
     )
 
     result = runner.invoke(
@@ -2654,6 +2684,56 @@ def test_report_rhetorical_patterns_generates(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "Rhetorical patterns written" in result.output
     assert (vault / "07-Voice" / "Rhetorical-Patterns" / "confessional.md").exists()
+
+
+def test_report_rhetorical_patterns_refuses_an_untiered_fragment(
+    tmp_path: Path,
+) -> None:
+    """A fragment with no ``privacy_tier`` key produces no patterns (#1212 AC1).
+
+    AC1 names ``rhetorical-patterns`` explicitly, and this is the surface as
+    the operator meets it: a bare ``creek report --type rhetorical-patterns``,
+    with no ``--include-tier``, which the CLI resolves to
+    ``PrivacyTierOverride.ALL``. At that ceiling the raw-frontmatter gate
+    short-circuits to "admit", leaving only the model-reading consent gate —
+    which sees Pydantic's ``unclassified`` default and cannot tell that the
+    file said nothing at all.
+
+    Both arms run, over two vaults identical but for that one frontmatter
+    line, because the negative arm alone is worthless: ``No rhetorical
+    patterns written`` is also what a vault the walk never reached would
+    print, and what a mis-typed fixture, a bad body, or an unqualifying
+    confidence would print. The positive arm is what proves the refusal is
+    about the tier.
+    """
+    untiered = _seed_rhetorical_patterns_vault(
+        tmp_path / "untiered-vault",
+        tier_line="",
+    )
+    tiered = _seed_rhetorical_patterns_vault(
+        tmp_path / "tiered-vault",
+        tier_line="privacy_tier: open\n",
+    )
+
+    refused = runner.invoke(
+        app,
+        ["report", "--type", "rhetorical-patterns", "--vault", str(untiered)],
+    )
+    admitted = runner.invoke(
+        app,
+        ["report", "--type", "rhetorical-patterns", "--vault", str(tiered)],
+    )
+
+    assert admitted.exit_code == 0, admitted.output
+    assert "Rhetorical patterns written" in admitted.output, (
+        "the tiered arm wrote nothing, so the untiered arm's silence says "
+        f"nothing about the tier. output={admitted.output!r}"
+    )
+    assert (tiered / "07-Voice" / "Rhetorical-Patterns" / "confessional.md").is_file()
+
+    assert refused.exit_code == 0, refused.output
+    assert "No rhetorical patterns written" in refused.output
+    assert not (untiered / "07-Voice" / "Rhetorical-Patterns").exists()
 
 
 def test_report_mode_profiles_no_data_is_friendly(tmp_path: Path) -> None:
@@ -4240,7 +4320,9 @@ def test_draft_command_no_seeds(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     vault.mkdir()
@@ -4276,8 +4358,8 @@ def test_draft_command_happy_path(
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _p: "Generated draft body.",
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "Generated draft body.",
     )
 
     def _stub_mine_all(
@@ -4351,8 +4433,8 @@ def test_draft_cohesion_flag_smooths_body(
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: _two_phase,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: _two_phase,
     )
 
     def _stub_mine_all(
@@ -4384,13 +4466,25 @@ def test_draft_command_errors_when_llm_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Test that draft fails fast with exit 1 when the LLM is unavailable."""
+    """Test that draft exits 1 with a message when the LLM is unavailable.
+
+    The client is built when the generator knows the tier of the fragments
+    its prompt will carry (#1031), so the vault here holds a fragment and the
+    draft is seeded from it — a run that composes no prompt at all now
+    reaches no provider, which is the same choice ``creek_mcp.tools.draft``
+    made in #958 and is why this test seeds rather than running on an empty
+    vault.
+    """
     from creek.classify.llm import LLMClassifier
 
     monkeypatch.setattr(LLMClassifier, "available", property(lambda _self: False))
     vault = tmp_path / "vault"
-    vault.mkdir()
-    result = runner.invoke(app, ["draft", "--vault", str(vault)])
+    _seed_test_vault(vault)
+    _write_seed_fragment(vault, frag_id="frag-unavailable")
+    result = runner.invoke(
+        app,
+        ["draft", "--vault", str(vault), "--seed-fragment", "frag-unavailable"],
+    )
     assert result.exit_code == 1
     assert "LLM provider unavailable" in result.output
 
@@ -4601,7 +4695,9 @@ def test_draft_seed_empty_topic_falls_back_to_mining(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -4644,8 +4740,8 @@ def _stub_outline_detector(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _p: "Stitched body.",
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "Stitched body.",
     )
     monkeypatch.setattr(
         cli_module,
@@ -4726,7 +4822,9 @@ def test_draft_seed_outline_mutually_exclusive_inline_and_file(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -4756,7 +4854,9 @@ def test_draft_seed_outline_mutually_exclusive_with_topic(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -4784,7 +4884,9 @@ def test_draft_seed_outline_file_read_error_exits_two(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -4810,7 +4912,9 @@ def test_draft_seed_fragment_mutually_exclusive_with_topic(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -4838,7 +4942,9 @@ def test_draft_seed_fragment_mutually_exclusive_with_frequency(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -4866,7 +4972,9 @@ def test_draft_seed_invalid_frequency_lists_options(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -4894,7 +5002,9 @@ def test_draft_seed_invalid_phase_lists_options(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -4920,7 +5030,9 @@ def test_draft_seed_invalid_mode_lists_options(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -4949,8 +5061,8 @@ def test_draft_seed_fragment_happy_path(
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _p: "Body composed from frag-keep.",
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "Body composed from frag-keep.",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -4980,7 +5092,9 @@ def test_draft_seed_unknown_fragment_errors_cleanly(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -5009,8 +5123,10 @@ def test_draft_seed_dimensional_filters_combine(
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _p: "Composed from the per-dimension blend.",
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: (
+            lambda _t: lambda _p: "Composed from the per-dimension blend."
+        ),
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -5074,7 +5190,9 @@ def test_draft_seed_zero_match_exits_with_honest_message(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -5104,7 +5222,9 @@ def test_draft_seed_topic_with_frequency_filters_candidates(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "Draft."
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "Draft.",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -5153,7 +5273,9 @@ def test_draft_without_seed_flags_keeps_mining_behaviour(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -5181,7 +5303,9 @@ def test_draft_ontology_twist_without_seed_exits_with_clear_message(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -5205,7 +5329,9 @@ def test_draft_ontology_twist_plurality_failure_exits_cleanly(
     from creek import cli as cli_module
 
     monkeypatch.setattr(
-        cli_module, "_build_draft_llm", lambda *_a, **_k: lambda _p: "body"
+        cli_module,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "body",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -5244,8 +5370,8 @@ def test_draft_ontology_twist_happy_path_writes_twist_frontmatter(
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _p: "Twisted draft body.",
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "Twisted draft body.",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -5301,8 +5427,8 @@ def test_draft_seed_empty_body_exits_cleanly(
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _p: "   ",
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "   ",
     )
     vault = tmp_path / "vault"
     _seed_test_vault(vault)
@@ -5325,8 +5451,8 @@ def test_draft_outline_empty_section_body_exits_cleanly(
 
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _p: "   ",
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _p: "   ",
     )
     monkeypatch.setattr(
         cli_module,
@@ -5361,11 +5487,12 @@ def test_draft_max_tokens_threaded_to_builder(
 
     captured: dict[str, object] = {}
 
-    def _fake_builder(max_tokens: int | None = None) -> object:
+    def _fake_builder(config: object, max_tokens: int | None = None) -> object:
         captured["max_tokens"] = max_tokens
-        return lambda _p: DraftLLMResponse(text="Generated draft body.")
+        captured["config"] = config
+        return lambda _tier: lambda _p: DraftLLMResponse(text="Generated draft body.")
 
-    monkeypatch.setattr(cli_module, "_build_draft_llm", _fake_builder)
+    monkeypatch.setattr(cli_module, "_build_draft_llm_factory", _fake_builder)
 
     def _stub_mine_all(
         _self: object,
@@ -5406,18 +5533,13 @@ def test_draft_max_tokens_threaded_to_builder(
 def test_build_draft_llm_falls_back_to_config_max_tokens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no flag, _build_draft_llm uses the loaded config's draft.max_tokens."""
+    """With no flag, the factory uses the passed config's draft.max_tokens."""
     from creek import cli as cli_module
     from creek.classify.llm.providers import AnthropicCompletion
     from creek.config import CreekConfig, DraftConfig
+    from creek.models import PrivacyTier
 
     captured: dict[str, object] = {}
-
-    monkeypatch.setattr(
-        cli_module,
-        "load_config",
-        lambda *_a, **_k: CreekConfig(draft=DraftConfig(max_tokens=2048)),
-    )
 
     class _Classifier:
         available = True
@@ -5437,8 +5559,10 @@ def test_build_draft_llm_falls_back_to_config_max_tokens(
 
     monkeypatch.setattr("creek.classify.llm.LLMClassifier", _Classifier)
 
-    llm = cli_module._build_draft_llm()
-    llm("a prompt")
+    factory = cli_module._build_draft_llm_factory(
+        CreekConfig(draft=DraftConfig(max_tokens=2048)),
+    )
+    factory(PrivacyTier.OPEN)("a prompt")
     assert captured["max_tokens"] == 2048
 
 

@@ -203,6 +203,56 @@ The Anthropic path is **not** the default — opt in deliberately. Cost on a 10k
 
 Generation flows (`mine`, `draft`, `report`, `skills`) honour the tier via the shared filter in `creek/classify/privacy_filter.py`: `intimate` fragments are excluded by default; `personal` fragments are included with their body replaced by a title-only summary; `open` (or `public`) fragments pass through unredacted. Override with `--include-tier {open,personal,intimate,all}` if you genuinely want a richer scope; any value above the default writes an audit entry to `<vault>/00-Creek-Meta/audit/privacy.jsonl`.
 
+### Re-tiering a vault processed before #974 (`--retier`)
+
+Before #974, `creek process` could stamp a self-authored, confessional
+fragment `privacy_tier: personal` (and therefore
+`voice_proxy_eligible: true`) where the current heuristic reads
+`intimate`. #974 fixed the *writer*; it did nothing for fragments already
+on disk, because `privacy_tier` is a one-way ratchet — nothing revisits a
+tier that is already concrete, and the untiered-fragment nag cannot see a
+fragment that is wrongly tiered rather than untiered.
+
+`creek fill` now reports that population on its own line — separately
+from the untiered-fragment count, which on a freshly-ingested vault can
+be every fragment in it — and
+
+```bash
+creek classify --vault ~/Obsidian/Creek-Vault --retier
+```
+
+remediates it. What `--retier` does, precisely:
+
+* it re-runs the **free, local** privacy heuristic over every fragment
+  that already carries a concrete tier. The re-tier itself makes no
+  provider call and costs no tokens — it is keyword and metadata work,
+  measured at 0.045 s over 35,000 fragments. (The flag adds nothing to
+  the surrounding run: `--retier` on top of `--method llm` still pays
+  that method's usual bill for the fragments it would have classified
+  anyway. Pair it with the default `--method rules` for a run that is
+  free end to end.);
+* it keeps the new verdict **only where it is more restrictive**. The
+  merge is `escalate()`, which ranks `open < personal < intimate`, so the
+  flag can raise a tier and has no code path that lowers one. That
+  matters because `privacy_tier` has no way back: a pass that could
+  lower a tier would bury content permanently;
+* it writes through the same narrow tier-only writer the resume
+  short-circuit uses, so `classification_method` (including `manual`),
+  `classified_at`, the classification block and the body are all left
+  exactly as they were. Only `privacy_tier` and the derived
+  `voice_proxy_eligible` change;
+* it is idempotent — a second run over the same vault reports `0
+  re-tiered` and rewrites nothing.
+
+Use it instead of `--method rules --force`, which would also fix the tier
+but re-stamps `classification_method` across the whole vault (destroying
+the record of which fragments an LLM classified) and bypasses the
+preserve-manual short-circuit.
+
+`--retier` is deliberately **opt-in**. Re-deriving a tier an operator set
+by hand is a decision only the operator can take, so a bare `creek
+classify` still leaves every concrete tier alone.
+
 ### Attribution and the voice corpus
 
 `privacy_tier` is one of two axes that decide whether a fragment may feed the voice proxy; the other is `source.author`. `Fragment.voice_proxy_eligible` is `True` only for `self`-authored, non-`intimate` fragments. AI-chat ingests are split per turn (see [ingestion](./ingestion.md#ai-chat-attribution-per-turn)): the human turn is `self` and eligible; the AI turn is `author=ai` with `voice_weight=0.0` and is excluded. Among eligible fragments, the audience-weighting model then grants `open` work more authority than `personal` (see [generation](./generation.md#voice-fidelity-feat-040)).

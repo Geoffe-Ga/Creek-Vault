@@ -151,7 +151,12 @@ def _inbound_pages(sources: list[Path], link_index: LinkIndex) -> set[Path]:
     return credited
 
 
-def run(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
+def run(
+    vault_path: Path,
+    *,
+    since: datetime | None = None,
+    link_index: LinkIndex | None = None,
+) -> CheckResult:
     """Find compiled-layer pages that nothing in the vault links to.
 
     A page is reported when it is a candidate — under a compiled directory
@@ -166,14 +171,18 @@ def run(vault_path: Path, *, since: datetime | None = None) -> CheckResult:
         vault_path: Root of the Obsidian vault.
         since: Accepted for interface symmetry with the other checks and
             ignored — the orphan check is cheap.
+        link_index: The shared index :class:`creek.lint.runner.LintRunner`
+            builds once per run and hands to every index-aware check
+            (#1223). ``None`` means "build your own" rather than "skip the
+            check", so every standalone caller keeps working unchanged.
 
     Returns:
         A :class:`~creek.lint._result.CheckResult` naming each orphan page
         vault-relative, in sorted path order.
     """
     del since
-    link_index = build_link_index(vault_path)
-    linked_pages = _inbound_pages(iter_link_sources(vault_path), link_index)
+    index = link_index if link_index is not None else build_link_index(vault_path)
+    linked_pages = _inbound_pages(iter_link_sources(vault_path), index)
 
     findings = [
         f"- `{page.relative_to(vault_path)}` (suggestion: review; never auto-deleted)"

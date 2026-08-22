@@ -42,7 +42,7 @@ import pytest
 
 from creek_mcp import policy
 from creek_mcp.api.models import ERROR_MESSAGES, ErrorCode
-from creek_mcp.api.routes import AUTHORIZATION_HEADER
+from creek_mcp.api.routes import AUTHORIZATION_HEADER, CONTRACT_VERSION_HEADER
 from creek_mcp.httpapi import capabilities as capabilities_module
 from creek_mcp.httpapi import handlers as handlers_module
 from creek_mcp.httpapi.errors import (
@@ -177,13 +177,23 @@ either way, which is what keeps the assertion about the repair and not about
 the drop.
 """
 
-_STANDING_VARY: Final[str] = f"{CEILING_HEADER}, {AUTHORIZATION_HEADER}"
+_STANDING_VARY: Final[str] = (
+    f"{CEILING_HEADER}, {AUTHORIZATION_HEADER}, {CONTRACT_VERSION_HEADER}"
+)
 """The whole ``Vary`` value a response with no caller ``Vary`` must render.
 
-Two tokens since #1129, in this order, and written once here so that a third
+Three tokens since #1144, in this order, and written once here so that a third
 standing token is a one-line change rather than a sweep through a dozen
 byte-exact assertions — the sweep is how one of them would be missed, and a
 missed one is a ``Vary`` that under-declares what the response turns on.
+
+:data:`~creek_mcp.api.routes.CONTRACT_VERSION_HEADER` joined the standing set
+because ``GET /v1/capabilities`` genuinely turns on it: the same request with a
+served minor and with a stale one differ in ``status`` and in the length of
+``capabilities``, so two responses that differ only in that request header must
+not share a cache entry. It is standing rather than per-route for the same
+reason the other two are — a ``Vary`` that varied by endpoint is a ``Vary`` a
+cache in front of the whole surface cannot apply uniformly.
 
 The order is part of the value, not an artefact of it: every assertion below
 that compares whole rendered lines would go red on a reordering, and that is
@@ -330,7 +340,7 @@ def test_inadmissible_ceiling_refuses_without_touching_the_vault(
 ) -> None:
     """An over-ceiling request is ``422`` and leaves the vault byte-for-byte.
 
-    Thirty cells: five routes times six inadmissible ceilings, each with a
+    Thirty-six cells: six routes times six inadmissible ceilings, each with a
     valid bearer and a valid contract minor, so the only thing wrong with the
     request is the ceiling it declares.
 
@@ -419,11 +429,11 @@ def test_inadmissible_ceiling_never_reaches_any_handler(
     and only one route could ever carry it: the other four answer ``501``
     without reaching a tool, so there is no tool call to intercept there. This
     one moves the probe up a layer, to the handler the router would dispatch
-    to, which every route has. Thirty cells — five routes times six
+    to, which every route has. Thirty-six cells — six routes times six
     inadmissible ceilings — and none of them may reach a handler.
 
-    That completes the pair. The filesystem snapshot covers all five routes
-    and would miss a handler that read nothing; this covers all five routes
+    That completes the pair. The filesystem snapshot covers all six routes
+    and would miss a handler that read nothing; this covers all six routes
     and would miss nothing that ran.
 
     Args:
@@ -446,7 +456,7 @@ def test_the_handler_probe_is_live_on_every_route(
     """The non-vacuity twin: an *admissible* request does reach the probe.
 
     Without this, the sweep above would be equally green against a substitution
-    that silently failed to take — five routes' worth of "no handler ran"
+    that silently failed to take — six routes' worth of "no handler ran"
     proving only that no handler was ever installed.
 
     Args:
@@ -781,6 +791,20 @@ def _vary_token_set(value: str) -> set[str]:
     return {token.strip().lower() for token in value.split(",")}
 
 
+_STANDING_VARY_TOKENS: Final[frozenset[str]] = frozenset(
+    _vary_token_set(_STANDING_VARY)
+)
+"""The standing tokens as a cache would compare them, derived not restated.
+
+The three assertions below that check a merged token *set* used to enumerate
+the standing names inline, so widening the standing set meant finding all of
+them — and the one that was missed would be a test still asserting the old,
+narrower key while the server sent the wider one. Deriving from
+:data:`_STANDING_VARY` makes those three follow the policy constant the way the
+byte-exact assertions already did.
+"""
+
+
 def test_a_caller_cannot_replace_the_standing_vary() -> None:
     """A caller's ``Vary`` may add to the standing one; it may never displace it.
 
@@ -817,10 +841,8 @@ def test_a_caller_added_vary_token_is_not_discarded() -> None:
     response = json_response({}, HTTP_OK, headers={VARY_HEADER: _CALLER_VARY_TOKEN})
     lines = _rendered_vary(response)
     assert len(lines) == 1
-    assert _vary_token_set(lines[0]) == {
-        CEILING_HEADER.lower(),
-        AUTHORIZATION_HEADER.lower(),
-        _CALLER_VARY_TOKEN.lower(),
+    assert _vary_token_set(lines[0]) == _STANDING_VARY_TOKENS | {
+        _CALLER_VARY_TOKEN.lower()
     }
 
 
@@ -863,11 +885,7 @@ def test_a_lowercase_vary_cannot_smuggle_a_second_header_line() -> None:
     response = json_response({}, HTTP_OK, headers={_LOWERCASE_VARY: "Cookie"})
     lines = _rendered_vary(response)
     assert len(lines) == 1
-    assert _vary_token_set(lines[0]) == {
-        CEILING_HEADER.lower(),
-        AUTHORIZATION_HEADER.lower(),
-        "cookie",
-    }
+    assert _vary_token_set(lines[0]) == _STANDING_VARY_TOKENS | {"cookie"}
 
 
 def test_both_spellings_of_vary_are_collected_into_the_one_value() -> None:
@@ -1257,12 +1275,12 @@ def test_vary_names_authorization_on_every_response(
     assert response.headers.get_list("vary") == [_STANDING_VARY]
 
 
-def test_the_unauthenticated_refusal_carries_both_standing_tokens_and_no_store(
+def test_the_unauthenticated_refusal_carries_the_standing_tokens_and_no_store(
     vault: Path,
 ) -> None:
     """Yes, ``Vary: Authorization`` belongs on a response nobody authenticated.
 
-    The pinned answer to the question the two-token seed raises, because it
+    The pinned answer to the question the standing set raises, because it
     reads backwards: the caller sent no credential, so what could the answer
     possibly vary on? Both directions of reuse, is the answer. A stored ``401``
     that does not name ``Authorization`` may be served to a caller who *did*
@@ -1282,10 +1300,7 @@ def test_the_unauthenticated_refusal_carries_both_standing_tokens_and_no_store(
     with client(vault_path=vault) as test_client:
         response = test_client.get(HEALTH_PATH, headers=headers(token=None))
     assert response.status_code == _UNAUTHENTICATED_STATUS
-    assert _vary_token_set(response.headers.get("vary", "")) == {
-        CEILING_HEADER.lower(),
-        AUTHORIZATION_HEADER.lower(),
-    }
+    assert _vary_token_set(response.headers.get("vary", "")) == _STANDING_VARY_TOKENS
     assert response.headers.get_list("vary") == [_STANDING_VARY]
     assert response.headers.get_list("cache-control") == [NO_STORE]
 

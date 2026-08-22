@@ -854,7 +854,9 @@ class TestTombOutcomeIsRecordedHonestly:
             set(),
             errors,
             "markdown",
+            None,
             discovery_complete=True,
+            may_tomb=True,
         )
         return count, errors
 

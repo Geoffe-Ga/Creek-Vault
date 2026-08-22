@@ -357,9 +357,6 @@ class _AttachmentLike(Protocol):
     @property
     def size(self) -> int: ...  # pragma: no cover - protocol stub
 
-    @property
-    def url(self) -> str: ...  # pragma: no cover - protocol stub
-
     async def read(self) -> bytes: ...  # pragma: no cover - protocol stub
 
 

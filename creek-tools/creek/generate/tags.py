@@ -38,6 +38,7 @@ without any ``tags:`` key at all. No decision title can reach
 from __future__ import annotations
 
 import json
+import logging
 import operator
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -48,9 +49,12 @@ from typing import TYPE_CHECKING
 import frontmatter
 
 from creek.classify.privacy_filter import PrivacyTierOverride, within_ceiling
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -407,12 +411,30 @@ class TagGardenGenerator:
             md_file: Path to the markdown file.
             override: The tier ceiling this scan admits under.
 
+        An unreadable note is skipped rather than fatal. This load was
+        unguarded, and :func:`creek.lint.checks.tags.run` calls
+        :meth:`scan_tags` with no per-check ``except`` anywhere in
+        :mod:`creek.lint.runner`, so one hand-edited note carrying a
+        non-string frontmatter key — ``TypeError`` out of
+        ``frontmatter.load``'s ``**metadata`` splat — took down the whole of
+        ``creek lint``, not merely the tag garden (#924, #1475).
+
+        Skipping is the safe direction *for this gate specifically*: the tier
+        ceiling above admits a note only on evidence, and a note whose header
+        will not parse has produced no evidence, so it is withheld exactly as
+        an over-ceiling note is. The cost is a tag tally short by one note,
+        which is the fail-open #926 tracks surfacing.
+
         Returns:
             _FragmentTags with the file's ID and tag list, or ``None`` when
-            the note's tier is above *override* — in which case not even its
-            id reaches the tally.
+            the note is unreadable, or when its tier is above *override* — in
+            which case not even its id reaches the tally.
         """
-        post = frontmatter.load(str(md_file))
+        try:
+            post = frontmatter.load(str(md_file))
+        except FRONTMATTER_LOAD_ERRORS:
+            logger.debug("Skipping unreadable note in tag scan: %s", md_file)
+            return None
         if not within_ceiling(post.metadata, override):
             return None
         raw_id = post.get("id", md_file.stem)

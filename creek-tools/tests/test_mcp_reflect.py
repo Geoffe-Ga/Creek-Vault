@@ -52,6 +52,7 @@ from creek.classify.llm.router import IntimateRoutingError
 from creek.models import PrivacyTier
 from creek_mcp import tier_ceiling
 from creek_mcp.audit import MCP_AUDIT_RELPATH
+from creek_mcp.compiled_pages import RelatedCompiled
 from creek_mcp.tier_ceiling import TierCeiling, to_privacy_override
 from creek_mcp.tools.reflect import TOOL_NAME, _routing_tier, reflect_tool
 
@@ -1993,3 +1994,377 @@ def test_injected_retrieve_bypasses_the_default_grounder(tmp_path: Path) -> None
     assert prompt is not None
     assert _source_section(prompt) == f"- {_INJECTED_SNIPPET}"
     assert _tiers_grounded_in(prompt) == set()
+
+
+# ---------------------------------------------------------------------------
+# The compiled layer: related_praxis / related_eddies (#873)
+# ---------------------------------------------------------------------------
+#
+# Additive and optional, and the tests below are ordered by stakes: the ceiling
+# first (a compiled page is synthesised from fragments the caller may not be
+# entitled to, so it is the laundering surface), then absence-when-nothing-
+# qualifies (a pre-#873 consumer's parse must not change), then the seam.
+
+_EDDY_873 = "Rest and Ruin"
+_PRAXIS_873 = "Rest before the collapse"
+
+
+def _write_compiled_layer(vault: Path, *, member_tier: str) -> str:
+    """Write an eddy + praxis compiled from one ``open`` and one *member_tier* fragment.
+
+    Args:
+        vault: Vault root.
+        member_tier: The ``privacy_tier`` of the *second* contributor. The
+            entry the caller reflects on is always the ``open`` one, so this is
+            the only thing that varies between the admitted and withheld cases.
+
+    Returns:
+        The ``entry_ref`` of the ``open`` fragment.
+    """
+    entry_ref = "frag-873open0001"
+    other = "frag-873other001"
+    link = f"[[{_EDDY_873}]]"
+    for frag_id, tier in ((entry_ref, "open"), (other, member_tier)):
+        directory = vault / "01-Fragments" / "Notes"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{frag_id}.md").write_text(
+            "---\ntype: fragment\n"
+            f"id: {frag_id}\ntitle: {frag_id}\nsource:\n  platform: journal\n"
+            f"privacy_tier: {tier}\n"
+            f'eddies:\n  - "{link}"\n---\n\n{_ENTRY}\n'
+        )
+    eddies = vault / "03-Eddies"
+    eddies.mkdir(parents=True, exist_ok=True)
+    (eddies / "eddy.md").write_text(
+        "---\ntype: eddy\nid: eddy-0000000001\n"
+        f"title: {_EDDY_873}\nformed: 2026-03-04\nfragment_count: 2\n"
+        "description: Where rest and ruin keep meeting.\n---\n\nSummary.\n"
+    )
+    praxis = vault / "04-Praxis" / "Daily"
+    praxis.mkdir(parents=True, exist_ok=True)
+    (praxis / "praxis.md").write_text(
+        "---\ntype: praxis\nid: prax-0000000001\n"
+        f"title: {_PRAXIS_873}\npraxis_type: practice\nstatus: active\n"
+        f"derived_from:\n  - {entry_ref}\n  - {other}\n---\n\nRest is the practice.\n"
+    )
+    return entry_ref
+
+
+def _reflect_with_compiled_layer(
+    vault: Path, entry_ref: str, ceiling: TierCeiling
+) -> dict[str, Any]:
+    """Run ``reflect_tool`` against the real compiled-layer lookup."""
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    return reflect_tool(
+        vault_path=vault,
+        entry_ref=entry_ref,
+        llm_factory=factory,
+        # Injected so this test needs no embedding stack. The entry's own
+        # ``entry_ref`` still seeds the compiled-layer lookup, so the
+        # production ``related_compiled`` really runs -- this does not quietly
+        # become a test of the injected path.
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=ceiling,
+    )
+
+
+def test_compiled_pages_reach_a_caller_admitted_to_every_contributor(
+    tmp_path: Path,
+) -> None:
+    """The control: an all-``open`` eddy and praxis are published at ``open``.
+
+    Without this, every withholding assertion below could be explained by the
+    feature simply never firing.
+    """
+    vault = _vault(tmp_path)
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+
+    result = _reflect_with_compiled_layer(vault, entry_ref, TierCeiling.OPEN)
+
+    assert [row["title"] for row in result["related_eddies"]] == [_EDDY_873]
+    assert [row["title"] for row in result["related_praxis"]] == [_PRAXIS_873]
+
+
+@pytest.mark.parametrize(
+    ("ceiling", "member_tier"),
+    [
+        (TierCeiling.OPEN, "personal"),
+        (TierCeiling.OPEN, "intimate"),
+        (TierCeiling.PERSONAL, "intimate"),
+    ],
+    ids=["personal@open", "intimate@open", "intimate@personal"],
+)
+def test_a_page_compiled_above_the_ceiling_never_reaches_the_response(
+    tmp_path: Path, ceiling: TierCeiling, member_tier: str
+) -> None:
+    """One above-ceiling contributor withholds the whole compiled page.
+
+    Asserted at the **narrowest** ceiling that can fail — ``personal`` content
+    refused an ``open``-ceiling caller — rather than at a permissive one where
+    nothing would have been filtered and the assertion would pass against
+    unfixed code. The remote cap
+    (:data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS`) means these two
+    ceilings are the only ones a network consumer can ever declare, so this is
+    the whole reachable surface for Adepthood.
+    """
+    vault = _vault(tmp_path)
+    entry_ref = _write_compiled_layer(vault, member_tier=member_tier)
+
+    result = _reflect_with_compiled_layer(vault, entry_ref, ceiling)
+
+    assert "related_eddies" not in result
+    assert "related_praxis" not in result
+    # The *whole* response, not just those two keys: a leak that renamed the
+    # field, or folded the description into the notes, would still be a leak.
+    assert "Where rest and ruin keep meeting" not in json.dumps(result)
+    assert _PRAXIS_873 not in json.dumps(result)
+
+
+def test_the_fields_are_absent_not_empty_when_nothing_qualifies(
+    tmp_path: Path,
+) -> None:
+    """A pre-#873 consumer's parse is unchanged when the vault has no matches.
+
+    ``absent`` rather than ``present-and-empty`` is the whole compatibility
+    claim: a consumer validating the older closed shape sees no new key at all.
+    """
+    vault = _vault(tmp_path)
+    _write_fragment(vault, "frag-873lonely01", _ENTRY, tier="open")
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+
+    result = reflect_tool(
+        vault_path=vault,
+        entry_ref="frag-873lonely01",
+        llm_factory=factory,
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "ok"
+    assert "related_praxis" not in result
+    assert "related_eddies" not in result
+    assert set(result) == {
+        "status",
+        "tool",
+        "tier_ceiling",
+        "routed_tier",
+        "notes",
+        "essay_grounded",
+    }
+
+
+def test_a_refused_entry_carries_no_compiled_layer(tmp_path: Path) -> None:
+    """The #846 read gate still short-circuits everything below it.
+
+    The compiled-layer lookup must not become a way around the gate: an
+    unadmitted ``entry_ref`` gets the four-key refusal and nothing else.
+    """
+    vault = _vault(tmp_path)
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+    (vault / "01-Fragments" / "Notes" / f"{entry_ref}.md").write_text(
+        "---\ntype: fragment\n"
+        f"id: {entry_ref}\ntitle: t\nsource:\n  platform: journal\n"
+        "privacy_tier: intimate\n---\n\nbody\n"
+    )
+    factory = _RecordingFactory(_notes_payload())
+
+    result = reflect_tool(
+        vault_path=vault,
+        entry_ref=entry_ref,
+        llm_factory=factory,
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert set(result) == {"status", "tool", "tier_ceiling", "reason"}
+
+
+def test_an_escalation_carries_no_compiled_layer(tmp_path: Path) -> None:
+    """A care escalation is care and nothing else -- no enrichment rides along."""
+    vault = _vault(tmp_path)
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+    factory = _RecordingFactory(_notes_payload())
+
+    result = reflect_tool(
+        vault_path=vault,
+        entry_ref=entry_ref,
+        llm_factory=factory,
+        retrieve=_no_retrieval,
+        care_guard=lambda _entry: "acute_distress",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "escalate"
+    assert "related_praxis" not in result
+    assert "related_eddies" not in result
+
+
+def test_a_failing_compiled_lookup_does_not_veto_the_reflection(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Enrichment may subtract itself; it may never take down the answer.
+
+    The failure mode this pins is the one that keeps recurring in this repo: a
+    tidy-up or enrichment step that raises and vetoes the operation it was
+    meant to decorate. The reflection was already produced by the time this
+    runs, so a raising lookup must cost only the optional fields.
+    """
+    vault = _vault(tmp_path)
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+
+    def _exploding(seeds: object, vault_arg: object, ceiling: object) -> object:
+        """Raise the way a corrupt vault page might."""
+        del seeds, vault_arg, ceiling
+        raise TypeError("keywords must be strings")
+
+    with caplog.at_level(logging.DEBUG, logger="creek_mcp.tools.reflect"):
+        result = reflect_tool(
+            vault_path=vault,
+            entry_ref=entry_ref,
+            llm_factory=factory,
+            retrieve=_no_retrieval,
+            related_lookup=_exploding,  # type: ignore[arg-type]
+            privacy_tier_ceiling=TierCeiling.OPEN,
+        )
+
+    assert result["status"] == "ok"
+    assert result["notes"], "the reflection itself was lost to an enrichment failure"
+    assert "related_praxis" not in result
+    assert "TypeError" in caplog.text
+    assert "keywords must be strings" not in caplog.text
+
+
+def test_the_entry_ref_seeds_the_compiled_lookup(tmp_path: Path) -> None:
+    """The reflected entry's own id is what selects its compiled neighbours.
+
+    Also pins the negative half: raw inline ``content`` has no vault identity,
+    so it contributes no seed and (with an injected grounder) selects nothing.
+    """
+    vault = _vault(tmp_path)
+    _write_fragment(vault, "frag-873seed0001", _ENTRY, tier="open")
+    seen: list[list[str]] = []
+
+    def _record(seeds, vault_arg, ceiling):
+        """Record the seeds handed to the lookup."""
+        del vault_arg, ceiling
+        seen.append(list(seeds))
+        return RelatedCompiled([], [])
+
+    factory = _RecordingFactory(_notes_payload())
+    reflect_tool(
+        vault_path=vault,
+        entry_ref="frag-873seed0001",
+        llm_factory=factory,
+        retrieve=_no_retrieval,
+        related_lookup=_record,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=_RecordingFactory(_notes_payload()),
+        retrieve=_no_retrieval,
+        related_lookup=_record,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    # Both sources supplied: ``content`` wins, so the reflected text is not the
+    # fragment named by ``entry_ref`` and that id never passed the #846 gate.
+    # It must not be seeded either -- a caller must not be able to point the
+    # selection at an arbitrary id by naming it alongside their own text.
+    reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        entry_ref="frag-873seed0001",
+        llm_factory=_RecordingFactory(_notes_payload()),
+        retrieve=_no_retrieval,
+        related_lookup=_record,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert seen == [["frag-873seed0001"], [], []]
+
+
+def test_the_default_grounder_carries_its_fragment_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One retrieval pass yields both the titles and the ids behind them.
+
+    #873 forbids a second embedding sweep on the hot path, so the compiled
+    layer has to be selected from the ids the grounding pass already resolved.
+    ``EvidenceClaim.source_fragments`` always carried them; before this they
+    were dropped on the floor.
+    """
+    from creek.author.models import EvidenceBundle as _Bundle
+    from creek.author.models import EvidenceClaim as _Claim
+    from creek_mcp.tools.reflect import _default_retrieve
+
+    def _fake_gather(
+        _self: object, _query: str, _vault: Path, *, override: object
+    ) -> EvidenceBundle:
+        """Return one claim carrying its source fragment ids."""
+        del override
+        return _Bundle(
+            claims=[_Claim(claim="A title", source_fragments=["frag-a", "frag-b"])]
+        )
+
+    monkeypatch.setattr(RetrievalSpecialist, "gather", _fake_gather)
+
+    grounding = _default_retrieve(
+        _ENTRY, _vault(tmp_path), to_privacy_override(TierCeiling.OPEN)
+    )
+
+    assert grounding.lines == ["A title"]
+    assert grounding.source_ids == ["frag-a", "frag-b"]
+
+
+def test_a_retrieval_seed_alone_selects_the_compiled_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A page reachable only through retrieval is still selected.
+
+    ``seeds = from_entry + retrieved_ids`` composes two independent sources,
+    and until this test only the ``entry_ref`` half was observed: every other
+    test that asserts ``related_*`` injects ``retrieve=``, and an injected
+    grounder contributes no ids by design. Mutating the line to
+    ``seeds = from_entry`` therefore left the whole suite green — the
+    retrieval-seeded half of selection was never exercised.
+
+    Here the request carries inline ``content`` and **no** ``entry_ref``, so
+    ``from_entry`` is empty by construction and the only way the eddy and
+    praxis can be found is through the ids the grounding pass resolved.
+    """
+    from creek.author.models import EvidenceBundle as _Bundle
+    from creek.author.models import EvidenceClaim as _Claim
+
+    vault = _vault(tmp_path)
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+
+    def _fake_gather(
+        _self: object, _query: str, _vault: Path, *, override: object
+    ) -> EvidenceBundle:
+        """Ground on the fragment the compiled pages were built from."""
+        del override
+        return _Bundle(claims=[_Claim(claim="A title", source_fragments=[entry_ref])])
+
+    monkeypatch.setattr(RetrievalSpecialist, "gather", _fake_gather)
+
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    result = reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        llm_factory=factory,
+    )
+
+    assert result.get("status") != "refused", result
+    assert [row["title"] for row in result["related_praxis"]] == [_PRAXIS_873], result

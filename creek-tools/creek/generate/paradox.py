@@ -33,10 +33,10 @@ from datetime import date
 from typing import TYPE_CHECKING
 
 import frontmatter
-import yaml
 
 from creek.link.neighbours import cosine_neighbours
 from creek.models import Confidence, Dosage, Frequency, Phase
+from creek.vault.links import read_header_meta
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -875,10 +875,24 @@ def _recorded_pair(note: Path) -> frozenset[str] | None:
     ``None`` covers three cases that must all be non-fatal, because
     ``10-Liminal/Paradoxes/`` is an operator-editable folder with a second
     producer: the file is unreadable, its YAML is malformed, or it carries no
-    two-element ``fragments:`` list. That last case is the common one — a
+    two-element ``fragments:`` list. The header is read with
+    :func:`~creek.vault.links.read_header_meta`, which is where "unreadable"
+    and "malformed" become an empty mapping. That reader is also splat-free,
+    which the previous ``frontmatter.loads`` was not: a note carrying a
+    non-string frontmatter key raised ``TypeError`` straight through this
+    guard and aborted the detector (#1475). Only the ``fragments:`` key is
+    ever consulted, so nothing is lost by not parsing the body.
+
+    A missing two-element list is the common case — a
     ``creek save --target paradox`` note records its provenance under
     ``saved_from.contributing_fragments``, so it must never be mistaken for a
     detector-recorded pair and suppress a real paradox.
+
+    Header-only reading carries the same three deliberate consequences #1416
+    accepted and documents in full at
+    :func:`creek.generate.synchronicity._existing_synchronicity_pairs`: the
+    ``---`` fence must open line 1, the 200-line / 64 KB header caps apply, and
+    a note carrying a stray non-string key is tolerated rather than rejected.
 
     Args:
         note: Path to a candidate markdown note.
@@ -886,11 +900,7 @@ def _recorded_pair(note: Path) -> frozenset[str] | None:
     Returns:
         The recorded fragment pair, or ``None`` when the note records none.
     """
-    try:
-        post = frontmatter.loads(note.read_text(encoding="utf-8"))
-    except (OSError, ValueError, yaml.YAMLError):
-        return None
-    raw = post.get("fragments")
+    raw = read_header_meta(note).get("fragments")
     if not isinstance(raw, list) or len(raw) < _PAIR_SIZE:
         return None
     return frozenset(

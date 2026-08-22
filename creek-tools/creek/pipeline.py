@@ -985,7 +985,21 @@ class Pipeline:
                 baseline=baseline,
                 classifier=self.privacy_classifier,
             )
-            classified.append(IngestedFragment(fragment=frag, body=item.body))
+            # ``extra_frontmatter`` is carried through, not rebuilt: this bundle
+            # is a re-wrap of ``item`` around a classified ``Fragment``, and the
+            # passthrough keys are provenance the ingestor already resolved
+            # (#1392). Dropping them here silently emptied the dict the write
+            # stage forwards, so ``creek process`` wrote a workbook fragment
+            # with no ``sheet``/``rows``/``columns`` while ``creek ingest``
+            # wrote all three for the same file. Classification never touches
+            # them, so copying is the whole of the contract.
+            classified.append(
+                IngestedFragment(
+                    fragment=frag,
+                    body=item.body,
+                    extra_frontmatter=item.extra_frontmatter,
+                ),
+            )
 
         self.review_generator.generate_queue(
             [item.fragment for item in classified],
@@ -1065,7 +1079,14 @@ class Pipeline:
 
         for item in classified:
             try:
-                writer.write_fragment(item.fragment, body=item.body)
+                # Forwarded so `creek process` writes the same frontmatter
+                # `creek ingest` does for the same source (#1392); the
+                # allowlist upstream decides which keys exist at all.
+                writer.write_fragment(
+                    item.fragment,
+                    body=item.body,
+                    extra_frontmatter=item.extra_frontmatter,
+                )
             except (OSError, KeyError) as exc:
                 # OSError covers filesystem-level failures (permissions,
                 # disk full). KeyError covers a missing platform mapping —

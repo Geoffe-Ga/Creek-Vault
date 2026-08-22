@@ -11,12 +11,14 @@
       "type": "string"
     },
     "Capability": {
-      "description": "The four capabilities ``/v1`` publishes.\n\nThe list is identical for every minor in\n:data:`SUPPORTED_CONTRACT_MINORS`: contract 0.3 grew the *MCP* tool surface\n(``creek.upload``, #1023) and added no ``/v1`` route, so a ``0.2`` client\nand a ``0.3`` client are answered from the same four names.\n\nThe values are also the directory names of the example matrix in\n:mod:`creek_mcp.api.bundle`, so the advertised capability list and the\ndocumented fixtures cannot name different things.\n\nAttributes:\n    CAPABILITIES: Version and feature handshake; safe before any read.\n    JOURNAL_UPSERT: Idempotent journal entry create/update.\n    REFLECTIONS: Margin notes on an entry, care-guarded.\n    WHEEL: Aggregate APTITUDE frequency distribution.",
+      "description": "The six capabilities ``/v1`` publishes.\n\nThe list was identical for every minor in\n:data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3\ngrew the *MCP* tool surface (``creek.upload``, #1023) and added no ``/v1``\nroute, so a ``0.2`` client and a ``0.7`` client were answered from the same\nfour names. Contract 0.8 (#1524) ends that by publishing ``UPLOAD``, and\nthe list is therefore **no longer minor-independent**: what a caller is\ntold, and what it is served, are both keyed on\n:data:`CAPABILITY_SINCE_MINOR`.\n\nThe values are also the directory names of the example matrix in\n:mod:`creek_mcp.api.bundle`, so the advertised capability list and the\ndocumented fixtures cannot name different things.\n\nAttributes:\n    CAPABILITIES: Version and feature handshake; safe before any read.\n    JOURNAL_UPSERT: Idempotent journal entry create/update.\n    REFLECTIONS: Margin notes on an entry, care-guarded.\n    WHEEL: Aggregate APTITUDE frequency distribution.\n    UPLOAD: Idempotent document upload \u2014 base64 bytes plus a filename,\n        dispatched to an ingestor by extension. Since contract 0.8.\n    DRIVE_CONNECTOR: The read-only Google Drive connector's *state* and\n        its two verbs \u2014 one incremental sync, and disconnection. Since\n        contract 0.9 (#1527). Three routes rather than one, and one\n        capability rather than three, because a client cannot usefully\n        negotiate \"may I read the connector's state\" separately from \"may\n        I sync it\": they are one feature, and splitting them would let a\n        server advertise half a connector.\n\n        **It does not include authorisation.** No route begins, completes\n        or carries an OAuth flow; the credential is minted locally by\n        ``creek gdrive --download`` and never leaves the host.",
       "enum": [
         "capabilities",
         "journal-upsert",
         "reflections",
-        "wheel"
+        "wheel",
+        "upload",
+        "drive-connector"
       ],
       "title": "Capability",
       "type": "string"

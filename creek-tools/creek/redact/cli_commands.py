@@ -26,8 +26,8 @@ from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 
-from creek._containment import find_escaping_symlink, named_path_escapes
-from creek.config import load_config, resolve_config_path
+from creek._containment import inspect_tree, named_path_escapes
+from creek.config import VAULT_CONFIG_RELPATH, load_vault_config
 from creek.purge.audit import LEGACY_PURGE_LOG_RELPATH
 from creek.redact.audit import (
     REDACT_AUDIT_RELPATH,
@@ -372,6 +372,25 @@ def _assert_no_escaping_symlinks(
     that legitimate intra-tree aliases (e.g. ``alias.md`` → ``real.md``)
     continue to work.
 
+    **A subtree the walk could not list refuses too (#1498)**, which is the
+    opposite of what the same condition earns on the ingest gate
+    (:func:`creek._containment.assert_source_contained` reports it and
+    continues). Three things invert here:
+
+    * There is no unattended loop behind this guard. It is reached only from
+      the interactive ``creek redact --apply`` / ``--review`` handlers; the
+      pipeline's redaction pass goes through
+      :func:`creek.redact.scanner.scan_batch` instead. Refusing cannot break
+      ``creek sync`` or ``creek process``.
+    * ``--apply`` destroys bytes irreversibly. Proceeding over a region it
+      could not examine and then printing "Applied redactions to N file(s)"
+      is a *false assurance* from a safety tool — strictly worse than a
+      refusal, because the operator's next action depends on believing the
+      tree was scrubbed.
+    * There is no report channel in this command. Nothing here corresponds
+      to ``IngestResult.discovery_complete``, and a warning line above a
+      green banner is noise, not a report.
+
     ``strict=False`` on ``Path.resolve`` is deliberate: a dangling
     symlink (pointing at a path that doesn't yet exist) still resolves
     to a candidate location that we can compare against *root*. The
@@ -387,26 +406,44 @@ def _assert_no_escaping_symlinks(
             (e.g. ``"source"`` or ``"vault"``).
 
     Raises:
-        typer.Exit: When any descendant symlink resolves outside
-            *root* or forms a loop.
+        typer.Exit: When any descendant symlink resolves outside *root* or
+            forms a loop, or when any directory beneath *root* could not be
+            listed.
     """
-    # The walk itself lives in :func:`creek._containment.find_escaping_symlink`
-    # (#1294), which the ingest gate also calls. Returning the offender rather
-    # than raising is what lets two callers with different refusal mechanics —
-    # ``typer.Exit`` here, ``EscapingSymlinkError`` there — share one walk.
+    # The walk itself lives in :func:`creek._containment.inspect_tree`
+    # (#1294/#1498), which the ingest gate also calls. Reporting the facts
+    # rather than raising is what lets two callers with different refusal
+    # mechanics — ``typer.Exit`` here, ``EscapingSymlinkError`` there — share
+    # one walk, and what lets them weigh an unlistable subtree differently.
     # ``logger.warning`` rather than ``logger.exception``: no exception is in
     # flight at this point any more, and ``logger.exception`` outside an
     # ``except`` block appends a bogus ``NoneType: None`` traceback.
-    candidate = find_escaping_symlink(root)
-    if candidate is not None:
+    report = inspect_tree(root)
+    if report.escaping is not None:
         logger.warning(
             "Refusing to follow symlink that escapes the %s root: %s",
             label,
-            candidate,
+            report.escaping,
         )
         _error_exit(
             console,
-            f"Refusing to follow symlink that escapes the {label} root: {candidate}",
+            "Refusing to follow symlink that escapes the "
+            f"{label} root: {report.escaping}",
+            code=1,
+        )
+    if report.unlistable:
+        # Only the directory is named. Nothing beneath it was opened, and a
+        # refusal that quoted what it could not read would be the #1087
+        # oracle in reverse.
+        logger.warning(
+            "Refusing to walk the %s root: %s could not be listed",
+            label,
+            report.unlistable[0],
+        )
+        _error_exit(
+            console,
+            f"Refusing to walk the {label} root: {report.unlistable[0]} "
+            "could not be listed, so no symlink beneath it could be checked",
             code=1,
         )
 
@@ -469,10 +506,29 @@ def run_scan(
 ) -> ScanSummary:
     """Scan *source* for sensitive data and render a report.
 
-    The read path never refuses over containment: a *source* that is itself
-    an escaping symlink is declined and counted in the statistics table
-    (:attr:`SymlinkPolicy.SKIP`), so one bad link cannot disable the whole
-    safety pass.
+    The two named paths take opposite sides of #1293's split, because they
+    answer different questions.
+
+    *source* is the tree being examined, and it is never refused over
+    containment: a *source* that is itself an escaping symlink is declined
+    and counted in the statistics table (:attr:`SymlinkPolicy.SKIP`), so one
+    bad link cannot disable the whole safety pass.
+
+    *vault* is not examined at all. It is used for exactly one thing —
+    locating ``<vault>/00-Creek-Meta/creek_config.yaml`` — and an escaping
+    one is refused, matching ``--apply`` and ``--review`` (#1359). #1293
+    left it open because the escape looked like an inert read; it is not.
+    ``test_a_vault_config_can_disarm_a_scan_completely`` takes a scan of a
+    two-finding file to zero findings three separate ways
+    (``supported_extensions``, ``exclude_patterns``,
+    ``false_positive_allowlist``), so an out-of-tree config is a silent off
+    switch on the pass the operator runs *because* they are worried. Naming
+    a different path for the config is a one-line correction; a scan that
+    reports "no findings" because a file outside the tree said so is not
+    correctable, because nothing tells the operator it happened.
+
+    The refusal is outright — no ``--force``, no environment variable, no
+    config key — per :func:`_assert_named_path_contained`.
 
     Args:
         source: File or directory to scan.
@@ -485,9 +541,19 @@ def run_scan(
 
     Returns:
         The :class:`ScanSummary` produced by the scanner.
+
+    Raises:
+        typer.Exit: With code ``1`` when *vault* is a symlink that escapes
+            its own parent. Never for *source* — see above.
     """
     _require_existing(console, source, "Source path")
-    config = load_config(resolve_config_path(vault, None))
+    # Before ``load_config``, which would otherwise read the config *through*
+    # the link and let a file outside the named tree configure the scanner
+    # (#1359). Deliberately NOT applied to ``source``: that path keeps its
+    # skip-and-count contract (#1087).
+    if vault is not None:
+        _assert_named_path_contained(vault, console=console, label="vault")
+    config = load_vault_config(vault, warn_on_missing=True)
     scanner, summary = _scan_source(
         source,
         config,
@@ -847,8 +913,9 @@ class _ApplyAudit:
 PROTECTED_AUDIT_RELPATHS: tuple[Path, ...] = (
     REDACT_AUDIT_RELPATH.parent,
     LEGACY_PURGE_LOG_RELPATH,
+    VAULT_CONFIG_RELPATH,
 )
-"""Vault-relative compliance artifacts ``--apply`` must never rewrite.
+"""Vault-relative files ``--apply`` must never rewrite.
 
 The first entry is the whole ``00-Creek-Meta/audit/`` directory, not
 just ``redact.jsonl``: ``purge.jsonl``, ``privacy.jsonl`` and
@@ -861,7 +928,25 @@ directory and is worse than plain data loss:
 replays it into the chained ``purge.jsonl`` on next use, so redacting it
 would get the mutated records chain-*signed* into the purge trail.
 
-Both are derived from their owning module's constant rather than
+The third is the vault's own ``creek_config.yaml`` (#1398). ``.yaml`` is
+in the default ``supported_extensions`` and ``exclude_patterns`` says
+nothing about ``00-Creek-Meta``, so a vault-wide apply treated the
+config as an ordinary candidate and rewrote it in place — the standing
+"``--apply`` corrupts structured files" hazard landing on the one
+structured file that steers the *next* run. The damage is not symmetric
+with losing data: an ``exclude_patterns`` token replaced by
+``[REDACTED:high_entropy_string]`` *widens* what the next apply walks,
+so running redaction reconfigures redaction. (``false_positive_allowlist``
+entries are the one class of value the rewrite could never touch —
+:meth:`creek.redact.scanner.RedactionScanner._is_allowlisted` is
+exact-string membership, so the scanner declines the match before the
+redactor sees it. Everything else in the file was in scope.)
+
+The name still says ``AUDIT`` because the tuple's *contract* has not
+changed — it is the never-rewrite set — and renaming it would churn every
+reference for no behavioural gain.
+
+All three are derived from their owning module's constant rather than
 restated here, so a future relocation cannot silently unprotect them.
 """
 
@@ -872,16 +957,18 @@ def _exclude_audit_artifacts(
     *,
     console: Console,
 ) -> list[Path]:
-    """Drop candidates that are the vault's own compliance artifacts.
+    """Drop candidates the vault must never have rewritten under it.
 
-    The audit trail sits *inside* the tree ``--apply`` walks:
-    ``exclude_patterns`` defaults to ``['.git', 'node_modules']`` and
-    says nothing about ``00-Creek-Meta``. ``redact.jsonl`` escaped only
-    because ``.jsonl`` happens to be absent from the *user-editable*
-    ``supported_extensions`` list. A run that redacts its own history
-    mutates lines the hash chain then re-anchors onto, and
-    :meth:`RedactionAuditLog.verify` still passes: silent, undetectable
-    tampering with a tamper-evidence log.
+    Both the audit trail and ``creek_config.yaml`` sit *inside* the tree
+    ``--apply`` walks: ``exclude_patterns`` defaults to
+    ``['.git', 'node_modules']`` and says nothing about ``00-Creek-Meta``.
+    ``redact.jsonl`` escaped only because ``.jsonl`` happens to be absent
+    from the *user-editable* ``supported_extensions`` list; ``.yaml`` is
+    in it, so the config did not escape at all (#1398). A run that
+    redacts its own history mutates lines the hash chain then re-anchors
+    onto, and :meth:`RedactionAuditLog.verify` still passes: silent,
+    undetectable tampering with a tamper-evidence log. A run that
+    redacts its own config changes what the *next* run walks.
 
     So the exclusion is unconditional — independent of both
     ``supported_extensions`` and ``exclude_patterns`` — and covers every
@@ -926,8 +1013,9 @@ def _exclude_audit_artifacts(
             kept.append(file_path)
     if dropped:
         console.print(
-            f"[yellow]Skipped {dropped} compliance artifact(s) under "
-            f"{vault_path / '00-Creek-Meta'}: the audit trail is never "
+            f"[yellow]Skipped {dropped} protected file(s) under "
+            f"{vault_path / '00-Creek-Meta'}: the audit trail, the legacy "
+            f"purge log and the config that governs redaction are never "
             f"rewritten in place.[/yellow]"
         )
     return kept
@@ -966,9 +1054,12 @@ def _is_protected(file_path: Path, protected: tuple[Path, ...]) -> bool:
 def _nothing_to_redact_message(summary: ScanSummary) -> str:
     """Return the message for an apply that has no file to rewrite.
 
-    Two ways to get here: the scan found nothing, or everything it found
-    was inside the audit directory, which is never rewritten. The
-    message must not contradict the summary table already printed.
+    Two ways to get here: the scan found nothing, or every match it found
+    was in a protected file (:data:`PROTECTED_AUDIT_RELPATHS` — the audit
+    trail, the legacy purge log, ``creek_config.yaml``), which is never
+    rewritten. The message must not contradict the summary table already
+    printed, and must not name only the audit trail when the config is
+    equally capable of being the sole reason (#1398).
 
     Args:
         summary: The scan summary just rendered.
@@ -979,8 +1070,10 @@ def _nothing_to_redact_message(summary: ScanSummary) -> str:
     """
     if summary.matches:
         return (
-            "[green]Nothing to redact — every match is in the audit "
-            "trail, which is never rewritten in place.[/green]"
+            "[green]Nothing to redact — every match is in a protected "
+            "file under 00-Creek-Meta (the audit trail, the legacy purge "
+            "log, or the config that governs redaction), which is never "
+            "rewritten in place.[/green]"
         )
     return "[green]No findings — nothing to redact.[/green]"
 
@@ -1192,7 +1285,7 @@ def run_apply(
         _assert_named_path_contained(vault, console=console, label="vault")
     if source.is_dir():
         _assert_no_escaping_symlinks(source, console=console, label="source")
-    config = load_config(resolve_config_path(vault, None))
+    config = load_vault_config(vault, warn_on_missing=True)
     vault_path = vault if vault is not None else config.vault_path
     scanner, summary = _scan_source(
         source,
@@ -1260,7 +1353,7 @@ def run_review(
     _assert_named_path_contained(vault, console=console, label="vault")
     if vault.is_dir():
         _assert_no_escaping_symlinks(vault, console=console, label="vault")
-    config = load_config(resolve_config_path(vault, None))
+    config = load_vault_config(vault, warn_on_missing=True)
     scanner, summary = _scan_source(
         vault,
         config,

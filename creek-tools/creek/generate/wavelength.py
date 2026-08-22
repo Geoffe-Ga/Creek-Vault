@@ -21,13 +21,13 @@ from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Final
 
 import frontmatter
-import yaml
 from pydantic import ValidationError
 
 from creek.classify.privacy_filter import PrivacyTierOverride, within_ceiling
 from creek.hierarchy import LevelPolicy, select_by_policy
 from creek.models import Dosage, Fragment, Frequency, Mode, Phase
 from creek.time import effective_authored_date
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from enum import StrEnum
@@ -196,7 +196,7 @@ def _safe_post(md_file: Path) -> frontmatter.Post | None:
     """Return a parsed frontmatter post, or ``None`` on parse errors."""
     try:
         return frontmatter.load(str(md_file))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         return None
 
 

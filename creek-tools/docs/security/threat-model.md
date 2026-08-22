@@ -117,7 +117,7 @@ from most to least likely:
   own parent, and admitted — with the resolved target used as the
   root everywhere thereafter — when the target stays under that
   parent, so `~/vault -> ~/Dropbox/vault` is still admitted and
-  still redacts under `~/Dropbox/vault`. Three residuals remain.
+  still redacts under `~/Dropbox/vault`. Two residuals remain.
   First, a named path reached through an escaping *ancestor*
   component (e.g. `<root>/linkdir/a.md`, where the leaf is a real
   file but `linkdir` is the escaping link) is still admitted and
@@ -128,15 +128,40 @@ from most to least likely:
   `source_path.rglob("*")` and `:484` `scan_batch`) still traverses
   a directly-named symlinked directory; it is read-only there and
   escalates to a hard refusal via the skip counter rather than
-  writing. Third, `--scan`'s own `--vault` is not contained. It is
-  used only to locate `creek_config.yaml`, and `--scan` writes
-  nothing, so this is a read-escape rather than a write: an
-  out-of-tree `creek_config.yaml` is opened, parsed, and used to
-  configure the pass (confirmed by pointing it at malformed YAML,
-  which surfaces as a parse error from outside the named tree). It
-  is deliberately not refused here, because a refusing `--scan` is
-  the denial of service the skip-and-count contract exists to
-  avoid; tracked separately in #1359. #1294 closed the last of the
+  writing. `--scan`'s own `--vault` **was** a third residual and is
+  now closed (#1359): it is contained, and an escaping one is
+  refused outright, like `--apply`'s and `--review`'s. #1293 left it
+  open on the reading that the escape was an inert read — `--vault`
+  only locates `creek_config.yaml` and `--scan` writes nothing — and
+  that refusing would be the denial of service the skip-and-count
+  contract exists to avoid. Execution refuted the first half. An
+  out-of-tree `creek_config.yaml` is not merely read: it is a
+  complete off switch on the pass. A scan of a file with one `email`
+  and one `api_key` reports **zero** findings under any of
+  `supported_extensions` (drop the source's extension),
+  `exclude_patterns` (name the source directory), or
+  `false_positive_allowlist` (the exact matched strings — the
+  original probe missed this only because the check is exact-string
+  membership, so a near-miss entry changes nothing). `enabled: false`
+  is the one inert setting, because the explicit CLI mode does not
+  consult it — which fails safe, scanning more rather than less. So
+  the choice was between a loud, correctable error and a silent "no
+  findings" on the one command an operator runs because they are
+  worried, and the refusal wins. The skip-and-count contract is
+  untouched: it is about the **source** — the tree being examined —
+  and `--scan --source <tree containing an escaping link>` still
+  declines that file, scans the rest, exits 0, and names the skip in
+  the statistics. A `--vault` symlink that stays inside its own
+  parent is still admitted. Separately, `--apply` no longer rewrites
+  `<vault>/00-Creek-Meta/creek_config.yaml` (#1398): `.yaml` is in
+  the default `supported_extensions`, so a vault-wide apply was
+  replacing `exclude_patterns` tokens and custom `patterns` with
+  `[REDACTED:…]` markers — and losing an exclusion *widens* what the
+  next run walks, so running redaction reconfigured redaction. The
+  config joins `00-Creek-Meta/audit/` and the legacy purge log in
+  `PROTECTED_AUDIT_RELPATHS`, excluded from the APPLY set only;
+  detection is unchanged, so `--scan` and `--review` still report
+  matches inside it. #1294 closed the last of the
   gaps: the ingestor walks had no containment check of any kind, so
   the pipeline refusal was a backstop that a vault with
   `redaction.enabled: false` never reached — and that a caller
@@ -288,6 +313,55 @@ from most to least likely:
   snapshots, and any git history of the vault all retain content a
   purge removed from the working tree.
 - **Multi-tenant safety.** The vault is single-user by design.
+- **Check-then-act windows (TOCTOU) in the symlink guards.** Both
+  redaction containment guards are two-phase, and neither holds an open
+  file descriptor across the gap, so a path admitted in phase one can be
+  replaced before phase two acts on it:
+  - **read path** — `creek/redact/scanner.py::_scannable_candidates`
+    walks the tree and materialises a candidate list; `scan_batch` then
+    opens each candidate;
+  - **write path** —
+    `creek/redact/cli_commands.py::_assert_no_escaping_symlinks` walks
+    the tree; `_apply_redactions` then rewrites in place the files it
+    found.
+
+  An attacker who can swap an admitted in-root file for a symlink
+  pointing out of the root, in the window between those two phases, is
+  read — or written — through the swap. The ingest gate
+  (`creek._containment.assert_source_contained`, which runs before each
+  ingestor's own discovery walk) carries the same shape of window.
+
+  **Why it is not closed.** The obvious hardening — open every candidate
+  with `O_NOFOLLOW` — is incompatible with the containment *policy* this
+  document records under SEC-003, and the incompatibility is measured,
+  not assumed. SEC-003 deliberately ADMITS a symlink whose target stays
+  inside the root; `tests/test_cli_redact.py::test_redact_apply_allows_internal_symlink`
+  builds `src/alias.md -> src/real.md` and requires `--apply` to exit 0,
+  and `_scannable_candidates` returns both files with `escaped == 0`.
+  Opening that same admitted alias with `os.open(..., O_RDONLY |
+  O_NOFOLLOW)` raises `OSError(ELOOP)`: the flag refuses *every* symlink
+  and cannot express "follow only links whose target stays under this
+  root". Adopting it would therefore fail the very test that pins the
+  admit-intra-root policy. There is no portable descriptor-based
+  alternative — a `/proc/self/fd`-style re-derivation of the opened path
+  does not exist on darwin — and re-validating each path immediately
+  before opening it narrows the window without closing it, while a test
+  for it could only exercise a monkeypatched seam rather than a real
+  race. The measurement is re-run on every test run by
+  `tests/test_threat_model_toctou.py::test_o_nofollow_cannot_express_the_shipped_containment_policy`,
+  so if a platform ever *can* express the in-root-only follow, that test
+  fails and this entry is due for re-litigation.
+
+  **Why it is acceptable here.** An attacker able to swap a symlink
+  mid-scan already holds write access to the tree being scanned, and to
+  the machine the operator is running on. That is outside the trust
+  boundary this document draws: see **Multi-user safety** and
+  **Network-exposed safety** under [Explicit
+  non-goals](#explicit-non-goals). **What would change the answer:** any
+  multi-user mode, any daemon or scheduled service running under a
+  different account from the vault's owner, or any scan of a tree a
+  second party can write to — i.e. the day either of those non-goals is
+  retired. (#1298, #1087, #1294)
 
 ## Recommended hygiene
 
@@ -342,7 +416,13 @@ Notable threat-model-adjacent IDs that have shipped or are in flight:
   discovery walk, which refuses. One predicate,
   `creek._containment.resolves_within`, serves all three surfaces; the
   escaping-ancestor-component residual is leaf-only and documented
-  above (resolved)
+  above (resolved). Since #1498 the shared walk also reports the
+  directories it could not list, instead of reporting them as clean: the
+  redaction write path refuses on one, and the ingest gate and
+  `--scan` log it and continue. Every one of these guards is
+  check-then-act — the walk and the read/write that follows it are
+  separate phases — and that accepted TOCTOU residual is recorded under
+  [What is NOT protected](#what-is-not-protected) (resolved)
 - **SEC-004** — Prompt injection hardening (resolved)
 - **SEC-005** — Audit log tamper-evidence
 - **SEC-006** — Privacy-tier enforcement in mine/draft

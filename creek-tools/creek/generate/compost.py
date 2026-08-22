@@ -23,7 +23,6 @@ from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import frontmatter
-import yaml
 
 from creek.generate.compost_verifier import CompostVerdict
 from creek.models import (
@@ -35,6 +34,7 @@ from creek.models import (
     ThreadStatus,
 )
 from creek.time import effective_authored_at, ensure_aware, now_la
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -286,7 +286,7 @@ def _recorded_compost_source(note: Path) -> tuple[str, str] | None:
     """
     try:
         post = frontmatter.load(str(note))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         logger.debug("Skipping unreadable compost note: %s", note)
         return None
     return _compost_source_of(post)
@@ -966,7 +966,7 @@ class CompostTracker:
                 continue
             try:
                 post = frontmatter.load(str(md_file))
-            except (OSError, ValueError, yaml.YAMLError):
+            except FRONTMATTER_LOAD_ERRORS:
                 continue
             if post.get("type") != "compost":
                 continue
@@ -989,7 +989,7 @@ class CompostTracker:
         for md_file in sorted(threads_dir.glob("*.md")):
             try:
                 post = frontmatter.load(str(md_file))
-            except (OSError, ValueError, yaml.YAMLError):
+            except FRONTMATTER_LOAD_ERRORS:
                 continue
             status = str(post.get("status") or "")
             if status != ThreadStatus.ACTIVE.value:

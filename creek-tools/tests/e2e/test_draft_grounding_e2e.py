@@ -107,8 +107,8 @@ def _draft_then_lint(
     )
     monkeypatch.setattr(
         cli_module,
-        "_build_draft_llm",
-        lambda *_a, **_k: lambda _prompt: body,
+        "_build_draft_llm_factory",
+        lambda *_a, **_k: lambda _t: lambda _prompt: body,
     )
     monkeypatch.setattr(
         "creek.generate.mining.IdeaMiner.mine_all",

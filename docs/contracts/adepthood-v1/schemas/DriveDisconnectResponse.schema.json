@@ -1,0 +1,55 @@
+{
+  "$defs": {
+    "DriveConnectionState": {
+      "description": "The four states the read-only Drive connector can be in (#1527).\n\nA closed enum rather than a boolean, because the three unusable states are\nanswered by three different operator actions and a client that could only\nsee ``connected: false`` would have to guess which to prompt for.\n\n**Every member is a fact about this server's own configuration**, never\nabout the user's Drive: no file, folder, id or count is expressible here.\n\nAttributes:\n    CONNECTED: A cached credential exists and is usable, so a sync will\n        run without a human present.\n    NOT_CONNECTED: No cached credential. The operator authorises with\n        ``creek gdrive --download`` on the host; there is no ``/v1`` route\n        that can do it for them.\n    EXPIRED: A credential exists but has lapsed and carries no refresh\n        token, so it cannot be renewed non-interactively. The same\n        operator action clears it.\n    UNSUPPORTED: The optional Google client libraries are not installed on\n        this server, so no credential could be used even if one existed.\n        Distinguished from :attr:`NOT_CONNECTED` because the remedy is an\n        install rather than an authorisation, and a client that conflated\n        them would send the operator round a loop that cannot terminate.",
+      "enum": [
+        "connected",
+        "not_connected",
+        "expired",
+        "unsupported"
+      ],
+      "title": "DriveConnectionState",
+      "type": "string"
+    },
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:func:`creek_mcp.policy.admitted_ceiling` refuses any remote call declaring\na ceiling outside :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` *before\ndispatch*. Since #1073 that decision is transport-neutral, so every adapter\nis meant to reach it the same way; the MCP surface does so today through\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool`, and #1074 mounts the\n``/v1`` handlers that will. This enum mirrors that frozenset, so\n``intimate`` and ``all`` are not merely refused at runtime \u2014 they cannot be\nconstructed at all, which is the half of the guarantee that does not depend\non a handler remembering to ask.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The outcome of ``DELETE /v1/connectors/drive`` (#1527).\n\nIdempotent, and constant-shaped: disconnecting an already-disconnected\nconnector is a success, and reports the same\n:attr:`~DriveConnectionState.NOT_CONNECTED` as disconnecting a live one.\nThat is why :attr:`connection` is published rather than a\n``token_erased`` boolean \u2014 the latter would answer \"was there a\ncredential a moment ago\", which is a question about the past that this\nverb has no reason to answer.\n\nAttributes:\n    status: Always ``\"ok\"``.\n    tier_ceiling: The ceiling the call ran at.\n    connection: The state afterwards. Always\n        :attr:`~DriveConnectionState.NOT_CONNECTED` on a ``200``: the\n        local credential is erased before the response is built, and a\n        failure to erase it is an :class:`ErrorEnvelope` rather than a\n        success reporting that nothing happened.\n    remote_revoked: Whether Google's revocation endpoint confirmed the\n        credential is dead on their side too. ``False`` does **not** mean\n        the local erase failed \u2014 it means the operator should finish the\n        job at Google's account page, which is the one piece of advice a\n        client can act on and cannot derive.",
+  "properties": {
+    "connection": {
+      "$ref": "#/$defs/DriveConnectionState",
+      "description": "State after the call."
+    },
+    "remote_revoked": {
+      "description": "Google confirmed the revocation.",
+      "title": "Remote Revoked",
+      "type": "boolean"
+    },
+    "status": {
+      "const": "ok",
+      "description": "Always ok; failure is an error.",
+      "title": "Status",
+      "type": "string"
+    },
+    "tier_ceiling": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Ceiling the call ran at."
+    }
+  },
+  "required": [
+    "status",
+    "tier_ceiling",
+    "connection",
+    "remote_revoked"
+  ],
+  "title": "DriveDisconnectResponse",
+  "type": "object"
+}

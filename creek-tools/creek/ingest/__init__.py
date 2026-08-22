@@ -36,11 +36,15 @@ from creek.ingest.code import CodeIngestor
 from creek.ingest.discord import DiscordIngestor
 from creek.ingest.documents import DocumentIngestor
 from creek.ingest.gdrive import (
+    ARCHIVE_GUIDANCE,
+    LEGACY_OFFICE_GUIDANCE,
+    STRUCTURED_EXPORT_GUIDANCE,
     DownloadResult,
     DriveClient,
     DriveFile,
     GoogleApiUnavailableError,
     GoogleDriveDownloader,
+    UnsupportedSourceError,
     route_to_ingestor,
 )
 from creek.ingest.generic import GenericIngestor
@@ -67,7 +71,10 @@ INGESTOR_REGISTRY: dict[str, type[Ingestor]] = {
 }
 
 __all__ = [
+    "ARCHIVE_GUIDANCE",
     "INGESTOR_REGISTRY",
+    "LEGACY_OFFICE_GUIDANCE",
+    "STRUCTURED_EXPORT_GUIDANCE",
     "ChatGPTIngestor",
     "ClaudeIngestor",
     "CodeIngestor",
@@ -89,6 +96,7 @@ __all__ = [
     "RawDocument",
     "SpreadsheetIngestor",
     "SubstackIngestor",
+    "UnsupportedSourceError",
     "assemble_ingested_fragment",
     "route_to_ingestor",
 ]
