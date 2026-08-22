@@ -280,11 +280,19 @@ refused at run time, naming the step.
 ./scripts/test.sh           # unit tests
 ./scripts/lint.sh --fix     # auto-fix
 ./scripts/typecheck.sh
+./scripts/lint-vulture.sh   # dead-code gate (shared policy, see below)
 ```
 
 The quality bar mirrors `creek-tools/`: ≥ 90 % branch coverage, MyPy
 strict clean, Ruff zero violations, ≥ 95 % docstring coverage,
-cyclomatic complexity ≤ 10.
+cyclomatic complexity ≤ 10, and zero dead-code findings.
+
+`./scripts/lint-vulture.sh` is a thin wrapper: the policy it runs lives
+in `creek-tools/scripts/lint_vulture.py` and is *shared*, not copied
+(#1472). Both subprojects' scan surfaces are declared there as `Scope`
+values, so a threshold or carve-out change cannot land in one and not
+the other. There is deliberately no allowlist — the only remedy for a
+finding is to delete the code.
 
 ## Architecture
 

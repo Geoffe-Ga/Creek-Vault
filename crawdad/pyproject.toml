@@ -65,6 +65,22 @@ dev = [
     "interrogate>=1.7.0",
     "radon>=6.0.0",
     "xenon>=0.9.0",
+    # scripts/lint-vulture.sh — the dead-code gate — runs creek-tools'
+    # scripts/lint_vulture.py rather than a copy of it (#1472), but that
+    # module is executed by THIS project's interpreter in CI, so the
+    # `vulture` distribution has to be resolvable here. It pulls no
+    # runtime dependency into crawdad's graph and never imports the code
+    # it scans (vulture is pure `ast.parse`), which is what makes one
+    # policy shared across two virtualenvs tractable at all.
+    #
+    # The floor and ceiling match creek-tools/pyproject.toml deliberately:
+    # both projects drive the same Python API (Vulture.scavenge,
+    # get_unused_code, ignore_decorators, Item.typ/.confidence) through
+    # the same module, and lint_vulture.py raises UnknownFindingTypeError
+    # on an item type it has no confidence floor for — so a major bump
+    # that adds a category fails the build loudly rather than passing
+    # silently. Bump the two together.
+    "vulture>=2.16,<3",
     "types-PyYAML>=6.0.0",
     # scripts/security.sh — the security gate — shells out to both of
     # these: pip-audit scans the installed environment and the exported

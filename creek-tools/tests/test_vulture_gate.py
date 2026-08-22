@@ -47,15 +47,20 @@ from vulture.core import ERROR_CODES
 from scripts import lint_vulture
 from scripts.lint_vulture import (
     CONFIDENCE_FLOORS,
-    DEFAULT_SCAN_PATHS,
+    CRAWDAD,
+    CREEK_TOOLS,
     IGNORE_DECORATORS,
+    IMPLICITLY_BOUND_PARAMETERS,
     IMPLICITLY_INVOKED_NAMES,
     LEGACY_MIN_CONFIDENCE,
-    REFERENCE_ONLY_PATHS,
+    SCOPES,
     Finding,
+    RelativeReferenceRootError,
+    Scope,
     UnknownFindingTypeError,
     find_dead_code,
     main,
+    scan_scope,
 )
 
 if TYPE_CHECKING:
@@ -361,10 +366,10 @@ def _write_package(root: Path, sources: Mapping[str, str]) -> Path:
 def _scan(*paths: Path) -> list[Finding]:
     """Run the gate over synthetic paths with reference-only filtering off.
 
-    ``reference_only`` is passed empty on purpose: the default names the
-    repository's own ``tests/`` tree, and a test that leaves it in place
-    would be asserting about a synthetic package *and* whatever the real
-    suite happens to contain.
+    ``reference_only`` is passed empty on purpose: a scope's own roots
+    name the repository's real ``tests/`` tree, and a test that left them
+    in place would be asserting about a synthetic package *and* whatever
+    the real suite happens to contain.
 
     Args:
         *paths: Directories or files to scan.
@@ -549,12 +554,28 @@ def test_the_policy_constants_are_pinned() -> None:
     them means weakening the gate has to be a deliberate, reviewable edit
     to this list.
     """
-    assert DEFAULT_SCAN_PATHS == ("creek", "creek_mcp", "tests"), (
+    assert CREEK_TOOLS.scan == ("creek", "creek_mcp", "tests"), (
         "the gate must scan both shipped packages plus the test tree; "
-        f"got {DEFAULT_SCAN_PATHS!r}"
+        f"got {CREEK_TOOLS.scan!r}"
     )
-    assert REFERENCE_ONLY_PATHS == ("tests",), (
-        f"tests/ is scanned for references only; got {REFERENCE_ONLY_PATHS!r}"
+    assert CREEK_TOOLS.reference_only == ("tests",), (
+        f"tests/ is scanned for references only; got {CREEK_TOOLS.reference_only!r}"
+    )
+    assert CRAWDAD.scan == ("crawdad", "tests"), (
+        "the sibling subproject is gated too (#1472); the scan surface must "
+        f"be its package plus its test tree. Got {CRAWDAD.scan!r}"
+    )
+    assert CRAWDAD.reference_only == ("tests",), (
+        f"crawdad/tests/ is scanned for references only; got {CRAWDAD.reference_only!r}"
+    )
+    assert set(SCOPES) == {"creek-tools", "crawdad"}, (
+        "SCOPES is what `--scope` selects and what the two wrapper scripts "
+        f"name; dropping one un-gates a whole subproject. Got {sorted(SCOPES)!r}"
+    )
+    assert frozenset({"cls", "self"}) == IMPLICITLY_BOUND_PARAMETERS, (
+        "this set is for parameters the interpreter binds whether the body "
+        "reads them or not -- it is not a burial ground for dead locals. Got "
+        f"{sorted(IMPLICITLY_BOUND_PARAMETERS)!r}"
     )
     assert dict(CONFIDENCE_FLOORS) == {
         "function": 60,
@@ -813,9 +834,9 @@ def test_a_checkout_inside_a_directory_named_tests_does_not_blind_the_gate(
 ) -> None:
     """A ``tests`` component in the *checkout path* must not suppress findings.
 
-    ``REFERENCE_ONLY_PATHS`` is the relative name ``tests``. If containment
-    were decided by looking for that name among a finding's path
-    components, then a perfectly ordinary clone into ``~/tests/creek-tools``
+    ``Scope.reference_only`` is the relative name ``tests``, joined to the
+    scope's own root. If containment were decided by looking for that name
+    among a finding's path components, then a clone into ``~/tests/creek-tools``
     would put ``tests`` in the path of every file in the repository, mark
     every finding reference-only, and the gate would report a cheerful zero
     forever -- silently, and only on some machines.
@@ -828,7 +849,9 @@ def test_a_checkout_inside_a_directory_named_tests_does_not_blind_the_gate(
     checkout = tmp_path / "tests" / "checkout"
     package = _write_package(checkout, {"module": _ZERO_CALLER_SOURCE})
 
-    findings = find_dead_code([package], reference_only=REFERENCE_ONLY_PATHS)
+    findings = find_dead_code(
+        [package], reference_only=CREEK_TOOLS.reference_only_paths
+    )
 
     assert _names(findings) == ["orphaned_helper"], (
         "the gate went blind because the checkout happens to live under a "
@@ -853,9 +876,7 @@ def test_a_symbol_used_only_from_a_reference_only_path_is_not_dead(
     package, reference = _reference_only_layout(tmp_path)
 
     without_references = _scan(package)
-    with_references = find_dead_code(
-        [package, reference], reference_only=(str(reference),)
-    )
+    with_references = find_dead_code([package, reference], reference_only=(reference,))
 
     assert "shared_helper" in _names(without_references), (
         "control failed: with the reference-only tree left out of the scan, "
@@ -886,7 +907,7 @@ def test_a_dead_symbol_inside_a_reference_only_path_is_not_reported(
     """
     package, reference = _reference_only_layout(tmp_path)
 
-    findings = find_dead_code([package, reference], reference_only=(str(reference),))
+    findings = find_dead_code([package, reference], reference_only=(reference,))
 
     assert "orphaned_fixture_builder" not in _names(findings), (
         "a dead symbol inside the reference-only tree must be discarded; "
@@ -984,7 +1005,7 @@ def test_main_exits_zero_and_reports_nothing_when_the_scan_is_clean(
         """Stand in for the scan, finding nothing."""
         return []
 
-    monkeypatch.setattr(lint_vulture, "find_dead_code", _clean_scan)
+    monkeypatch.setattr(lint_vulture, "scan_scope", _clean_scan)
 
     exit_code = main([])
 
@@ -1029,7 +1050,7 @@ def test_main_exits_three_and_prints_every_finding(
         calls.append((args, kwargs))
         return list(canned)
 
-    monkeypatch.setattr(lint_vulture, "find_dead_code", _stub_scan)
+    monkeypatch.setattr(lint_vulture, "scan_scope", _stub_scan)
 
     exit_code = main([])
 
@@ -1061,7 +1082,7 @@ def test_the_repository_has_no_residual_dead_code() -> None:
     blocks a merge -- the same class of mistake as the ``--min-confidence
     80`` this issue removes.
     """
-    findings = find_dead_code()
+    findings = scan_scope(CREEK_TOOLS)
 
     listing = "\n".join(f"  {finding}" for finding in findings)
     assert findings == [], (
@@ -1074,3 +1095,433 @@ def test_the_repository_has_no_residual_dead_code() -> None:
         "category (a decorator pattern or a protocol name), never the "
         "individual symbol."
     )
+
+
+def test_the_crawdad_tree_has_no_residual_dead_code() -> None:
+    """The sibling subproject is gated by the same policy (#1472).
+
+    Before this landed, ``crawdad/`` was outside the dead-code gate
+    entirely: #1395 built the policy here and wired it into this project's
+    ``check-all.sh`` and CI, and crawdad's ``check-all.sh`` ran seven gates,
+    none of them vulture. A zero-caller function added under ``crawdad/``
+    was reported by nothing.
+
+    Asserting it from *this* suite as well as from crawdad's own
+    ``check-all.sh`` is deliberate. The policy module lives here, so a
+    carve-out edited here can break the other subproject; without this
+    test that breakage would only surface in a different CI job, on a
+    different matrix, after the change had already been reviewed.
+    """
+    assert CRAWDAD.root.is_dir(), (
+        f"{CRAWDAD.root} is not a directory, so this gate is scanning "
+        "nothing and reporting clean -- the exact shape of failure the "
+        "whole issue is about. The sibling checkout must be present."
+    )
+    findings = scan_scope(CRAWDAD)
+
+    listing = "\n".join(f"  {finding}" for finding in findings)
+    assert findings == [], (
+        f"{len(findings)} dead symbol(s) in crawdad/ are reachable from no "
+        f"caller:\n{listing}\n"
+        "Delete them. The policy is shared with creek-tools, so do NOT "
+        "answer a crawdad finding by weakening a floor or adding a carve-out "
+        "here unless the carve-out is categorical and true of both trees."
+    )
+
+
+# ---------------------------------------------------------------------------
+# One policy, two subprojects (#1472)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("scope", [SCOPES[name] for name in sorted(SCOPES)])
+def test_every_scope_resolves_to_directories_that_exist(scope: Scope) -> None:
+    """A scope naming a directory that is not there scans nothing, silently.
+
+    ``Vulture.scavenge`` prints a message for a missing path and carries on,
+    so a scope with a typo'd or renamed entry produces a clean run rather
+    than an error. That is the "gate reports it did nothing" failure, and
+    the only defence is to assert the surface is real.
+
+    Args:
+        scope: One declared scope.
+    """
+    assert scope.root.is_dir(), f"{scope.name}: root {scope.root} is not a directory"
+    for path in scope.scan_paths:
+        assert path.is_dir(), (
+            f"{scope.name}: scan path {path} does not exist, so that whole "
+            "subtree is silently ungated"
+        )
+    for path in scope.reference_only_paths:
+        assert path.is_dir(), (
+            f"{scope.name}: reference-only path {path} does not exist. A "
+            "reference-only root that resolves to nothing filters nothing, "
+            "and every finding inside the real tree gets reported instead."
+        )
+
+
+def test_the_two_scopes_resolve_under_different_roots() -> None:
+    """Neither scope may resolve inside the other's tree.
+
+    This is the fail-open #1472 measured. When reference-only roots were
+    relative names anchored at one module-level project root, asking for
+    ``crawdad/tests`` resolved to ``creek-tools/crawdad/tests`` -- a path
+    that does not exist -- so nothing was filtered and findings inside
+    crawdad's own test tree were reported as production dead code.
+    """
+    assert not CRAWDAD.root.is_relative_to(CREEK_TOOLS.root), (
+        f"{CRAWDAD.root} resolved inside {CREEK_TOOLS.root}. A scope anchored "
+        "at the wrong project root matches nothing and fails open."
+    )
+    for path in (*CRAWDAD.scan_paths, *CRAWDAD.reference_only_paths):
+        assert path.is_relative_to(CRAWDAD.root), (
+            f"{path} is not under the crawdad scope's own root; scope paths "
+            "must be joined to the scope's root, never to a module default."
+        )
+
+
+def test_a_relative_reference_only_root_is_refused(tmp_path: Path) -> None:
+    """A relative reference-only root must raise, not be guessed at (#1472).
+
+    Guessing an anchor fails *open*: the guess resolves somewhere that does
+    not exist, containment matches nothing, and every finding the root was
+    meant to drop gets reported. Measured on crawdad at the time: 12
+    findings under the relative form against 11 under the absolute one, the
+    twelfth being an ``unreachable_code`` finding inside
+    ``crawdad/tests/test_cli.py`` that leaked through. Refusing is the only
+    reading of a relative root that cannot go quietly wrong.
+
+    Args:
+        tmp_path: Scratch directory for the synthetic package.
+    """
+    package = _write_package(tmp_path / "pkg", {"module": _ZERO_CALLER_SOURCE})
+
+    with pytest.raises(RelativeReferenceRootError, match="relative"):
+        find_dead_code([package], reference_only=(Path("tests"),))
+
+
+def test_a_scope_reference_only_root_suppresses_a_finding_inside_it(
+    tmp_path: Path,
+) -> None:
+    """The absolute form does filter -- the positive half of the pair above.
+
+    Without this, :func:`test_a_relative_reference_only_root_is_refused`
+    would be satisfied by a module that refuses relative roots and then
+    ignores absolute ones too.
+
+    Args:
+        tmp_path: Scratch directory for the synthetic trees.
+    """
+    scope = Scope(
+        name="synthetic",
+        root=tmp_path,
+        scan=("pkg", "tests"),
+        reference_only=("tests",),
+    )
+    _write_package(tmp_path / "pkg", {"module": _CLEAN_SOURCE})
+    _write_package(tmp_path / "tests", {"test_orphan": _ZERO_CALLER_SOURCE})
+
+    assert _names(find_dead_code(scope.scan_paths)) == ["orphaned_helper"], (
+        "the planted orphan is not being reported at all, so the suppression "
+        "asserted below would prove nothing"
+    )
+    assert scan_scope(scope) == [], (
+        "a finding inside a reference-only root must be dropped; the root is "
+        "scanned for the references it makes, not for the code it holds"
+    )
+
+
+def test_the_crawdad_wrapper_runs_the_shared_policy_and_is_wired_into_its_gate() -> (
+    None
+):
+    """crawdad's gate must execute this module, and its check-all must run it.
+
+    Two ways #1472 could regress into a green run, both closed here: the
+    wrapper could grow into a *copy* of the policy (four call sites that
+    will eventually disagree about a threshold -- the drift #1395's
+    single-wrapper design exists to prevent), and the wrapper could exist
+    but never be invoked, which is precisely the state the pre-#1395
+    vulture invocations were in.
+    """
+    wrapper = CRAWDAD.root / "scripts" / "lint-vulture.sh"
+    check_all = CRAWDAD.root / "scripts" / "check-all.sh"
+    assert wrapper.is_file(), f"{wrapper} is missing; crawdad has no dead-code gate"
+
+    wrapper_text = wrapper.read_text(encoding="utf-8")
+    assert "scripts.lint_vulture" in wrapper_text, (
+        f"{wrapper} no longer runs the shared policy module. A second copy of "
+        "the policy is how the two subprojects start disagreeing about a "
+        "floor without anyone deciding to."
+    )
+    assert f"--scope {CRAWDAD.name}" in wrapper_text, (
+        f"{wrapper} must select the crawdad scope explicitly; without it the "
+        "module defaults to creek-tools and crawdad's gate scans the wrong "
+        "tree while reporting success."
+    )
+    assert "lint-vulture.sh" in check_all.read_text(encoding="utf-8"), (
+        f"{check_all} does not run the dead-code gate. A gate nothing invokes "
+        "is the state this issue found crawdad in."
+    )
+
+
+def test_crawdad_declares_the_vulture_dependency_its_gate_needs() -> None:
+    """crawdad's CI installs from its own lock, so vulture must be in it.
+
+    The shared policy module is executed by *crawdad's* interpreter in
+    crawdad's CI job, which provisions itself from ``crawdad/uv.lock`` and
+    nothing else. An undeclared ``vulture`` would make the gate crash there
+    while passing on a developer machine that happens to have creek-tools'
+    virtualenv on ``PATH``.
+    """
+    for artefact, needle in (
+        (CRAWDAD.root / "pyproject.toml", "vulture"),
+        (CRAWDAD.root / "uv.lock", 'name = "vulture"'),
+    ):
+        assert needle in artefact.read_text(encoding="utf-8"), (
+            f"{artefact} does not mention {needle!r}. crawdad's CI installs "
+            "from the lock, so an undeclared gate dependency fails the job "
+            "rather than the policy."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Carve-outs that only became visible once crawdad was in scope (#1472)
+# ---------------------------------------------------------------------------
+
+# ``cls`` is never read, so vulture types it as an unused *variable* at
+# 100% -- above the 90 floor, and out of reach of ``ignore_decorators``,
+# which suppresses findings on the decorated function and not on its
+# parameters. ``orphaned_method`` is the control: a genuinely dead sibling
+# in the same class must still be reported.
+_UNREAD_CLS_SOURCE = """
+from pydantic import BaseModel, field_validator
+
+
+class Gadget(BaseModel):
+    \"\"\"A model whose validator never reads its bound class.\"\"\"
+
+    size: int
+
+    @field_validator("size")
+    @classmethod
+    def clamp_size(cls, value: int) -> int:
+        \"\"\"Invoked by pydantic; the bound class is never read.\"\"\"
+        return max(value, 0)
+
+    def orphaned_method(self) -> None:
+        \"\"\"Dead: an ordinary method with no caller.\"\"\"
+
+
+SCHEMA = Gadget
+"""
+
+# ``Sequence`` is used only inside a *string* annotation, which vulture
+# never evaluates, so it reports the import as unused at 90%. ``json`` is
+# the control: an ordinary unused import outside the guard, which must
+# still be reported.
+_STRING_ANNOTATION_SOURCE = """
+from __future__ import annotations
+
+import json
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+
+def widen(values: object) -> object:
+    \"\"\"Return the values under a quoted annotation vulture cannot read.\"\"\"
+    return cast("Sequence[int]", values)
+
+
+WIDENED = widen([1])
+"""
+
+
+def test_an_unread_cls_parameter_is_carved_out_and_a_dead_sibling_is_not(
+    tmp_path: Path,
+) -> None:
+    """``cls`` is bound by the interpreter; not reading it is not dead code.
+
+    Every one of crawdad's eight pydantic validators reported this way the
+    day the gate was pointed at it, and creek-tools was clean only by
+    accident: vulture resolves used names globally by bare identifier, so
+    one unrelated ``@classmethod`` in ``creek/`` that happens to mention
+    ``cls`` kept every ``cls`` parameter in the scan alive.
+
+    The dead sibling in the same class is the non-vacuousness control: a
+    carve-out that silenced the whole file would pass without it.
+
+    Args:
+        tmp_path: Scratch directory for the synthetic package.
+    """
+    package = _write_package(tmp_path / "pkg", {"models": _UNREAD_CLS_SOURCE})
+
+    assert _names(_scan(package)) == ["orphaned_method"], (
+        "expected the unread `cls` parameter to be carved out and the dead "
+        "sibling method to survive; got "
+        f"{[str(finding) for finding in _scan(package)]!r}"
+    )
+
+
+def test_a_type_checking_import_used_in_a_string_annotation_is_carved_out(
+    tmp_path: Path,
+) -> None:
+    """Deleting it would break mypy, so the two gates must not contradict.
+
+    Vulture parses the AST and never evaluates a string annotation, so an
+    import reachable only from ``cast("Sequence[int]", ...)`` or a quoted
+    annotation looks unreferenced. Nothing is ceded by dropping the
+    category: ruff's ``F401`` is selected in both subprojects and does
+    understand those use sites.
+
+    The ordinary unused import outside the guard is the control.
+
+    Args:
+        tmp_path: Scratch directory for the synthetic package.
+    """
+    package = _write_package(tmp_path / "pkg", {"widen": _STRING_ANNOTATION_SOURCE})
+
+    assert _names(_scan(package)) == ["json"], (
+        "expected the TYPE_CHECKING import to be carved out and the ordinary "
+        "unused import to survive; got "
+        f"{[str(finding) for finding in _scan(package)]!r}"
+    )
+
+
+def test_an_unreadable_source_file_still_reports_its_unused_import(
+    tmp_path: Path,
+) -> None:
+    """The TYPE_CHECKING carve-out must fail *safe*, not open.
+
+    The carve-out re-reads the file as UTF-8 to find the guard's line
+    range. Vulture itself honours a PEP-263 coding cookie, so it happily
+    scans a latin-1 module the re-read cannot decode. If that failure were
+    read as "no guard found, therefore carve everything out", a single
+    undecodable file would silently drop every import finding it contains.
+    It is read the other way: nothing is carved out, and the finding
+    stands.
+
+    Args:
+        tmp_path: Scratch directory for the synthetic package.
+    """
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "__init__.py").write_bytes(b"")
+    # A latin-1 coding cookie plus a byte that is not valid UTF-8.
+    (package / "legacy.py").write_bytes(
+        b'# -*- coding: latin-1 -*-\nimport json\nCAF\xc9 = "caf\xe9"\nUSED = CAF\xc9\n'
+    )
+
+    assert _names(_scan(package)) == ["json"], (
+        "an import finding in a file the carve-out cannot re-read must "
+        "survive; got "
+        f"{[str(finding) for finding in _scan(package)]!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The scope selector
+# ---------------------------------------------------------------------------
+
+
+def _record_scanned_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[Scope]:
+    """Replace the scan with a recorder, so a test can read the scope back.
+
+    Args:
+        monkeypatch: Used to stand in for the scan.
+
+    Returns:
+        The list the recorder appends each scanned scope to.
+    """
+    scanned: list[Scope] = []
+
+    def _record(scope: Scope) -> list[Finding]:
+        """Record the requested scope and report nothing."""
+        scanned.append(scope)
+        return []
+
+    monkeypatch.setattr(lint_vulture, "scan_scope", _record)
+    return scanned
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        pytest.param([], CREEK_TOOLS, id="bare-invocation"),
+        pytest.param(["--scope", "creek-tools"], CREEK_TOOLS, id="explicit"),
+        pytest.param(["--scope", "crawdad"], CRAWDAD, id="sibling"),
+    ],
+)
+def test_the_command_line_selects_the_scope_it_names(
+    argv: list[str],
+    expected: Scope,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Each wrapper's invocation must reach the scope that wrapper means.
+
+    The bare form is pinned because it is what ``scripts/lint-vulture.sh``
+    actually passes: leaving the default untested is how a default silently
+    starts pointing at the wrong tree while every explicit test stays green.
+
+    Args:
+        argv: The command line.
+        expected: The scope it must select.
+        monkeypatch: Used to stand in for the scan.
+        capsys: Captures the report.
+    """
+    scanned = _record_scanned_scope(monkeypatch)
+
+    exit_code = main(argv)
+
+    assert exit_code == 0, f"a clean scan must exit 0, got {exit_code}"
+    assert scanned == [expected], (
+        f"{argv!r} scanned {[scope.name for scope in scanned]!r}, expected "
+        f"[{expected.name!r}]"
+    )
+    assert expected.name in capsys.readouterr().out, (
+        "the report must name the scope it scanned, or two wrappers produce "
+        "indistinguishable output"
+    )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(["creek"], id="positional-path"),
+        pytest.param(["--scope"], id="flag-without-value"),
+        pytest.param(["--scope", "nonesuch"], id="unknown-scope"),
+        pytest.param(["--scope", "crawdad", "creek"], id="scope-plus-path"),
+    ],
+)
+def test_a_command_line_that_could_narrow_the_scan_is_refused(
+    argv: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Only a whole named scope may be requested.
+
+    A gate call site that could pass a path could narrow itself into a
+    green run -- the property ``scripts/lint-vulture.sh`` states in its
+    header and had no enforcement for. Exit 2 is distinct from 3 so a
+    wrapper can tell a bad invocation from real findings, and the scan must
+    not run at all.
+
+    Args:
+        argv: A command line the module must refuse.
+        monkeypatch: Used to prove the scan never ran.
+        capsys: Captures the usage message.
+    """
+    scanned = _record_scanned_scope(monkeypatch)
+
+    exit_code = main(argv)
+
+    assert exit_code == 2, f"a usage error must exit 2, got {exit_code}"
+    assert scanned == [], (
+        f"{argv!r} was refused but the scan ran anyway on "
+        f"{[scope.name for scope in scanned]!r}"
+    )
+    assert "usage:" in capsys.readouterr().err

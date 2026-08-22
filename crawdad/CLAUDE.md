@@ -21,6 +21,7 @@ These mirror `creek-tools/CLAUDE.md` at a smaller scale:
    - Cyclomatic complexity ≤ 10 per function (Xenon `--max-absolute B`)
    - MyPy strict mode, zero violations
    - Ruff lint + format, zero violations
+   - Vulture, zero dead-code findings (shared policy, no allowlist)
    - Bandit, zero medium-or-above findings
    - pip-audit, zero known vulnerabilities across both the installed
      environment and the exported `uv.lock` — no suppression without
@@ -346,6 +347,7 @@ The bot does **not** exit on MCP subprocess failure. The pattern is:
 | Type checking | strict, zero | `mypy --strict` |
 | Lint + format | zero | `ruff check` + `ruff format` |
 | Security | zero medium+ | `bandit -r crawdad/ -ll` |
+| Dead code | zero findings | `./scripts/lint-vulture.sh` (creek-tools' shared policy, `--scope crawdad`) |
 | Dependency vulnerabilities | zero known | `pip-audit` (installed env + exported `uv.lock` — `./scripts/security.sh`) |
 
 `scripts/security.sh` runs `pip-audit` twice because crawdad has two
