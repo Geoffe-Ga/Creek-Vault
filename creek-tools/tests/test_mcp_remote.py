@@ -55,6 +55,7 @@ from starlette.testclient import TestClient
 from creek_mcp import remote_auth as remote_auth_mod
 from creek_mcp import server as server_mod
 from creek_mcp.audit import MCP_AUDIT_RELPATH
+from creek_mcp.policy import Transport
 from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
     REMOTE_SCOPE,
@@ -402,6 +403,7 @@ def test_remote_call_above_personal_is_refused_before_dispatch(
         server_mod, "_current_access_token", lambda: _fake_token("adepthood")
     )
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -424,6 +426,7 @@ def test_remote_call_at_or_below_personal_dispatches(
         server_mod, "_current_access_token", lambda: _fake_token("adepthood")
     )
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -443,6 +446,7 @@ def test_remote_call_is_audited_under_token_consumer(
         server_mod, "_current_access_token", lambda: _fake_token("adepthood")
     )
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -464,6 +468,7 @@ def test_local_stdio_call_is_not_capped(
     """With no token (stdio), an ``intimate`` ceiling is *not* refused."""
     monkeypatch.setattr(server_mod, "_current_access_token", lambda: None)
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -499,6 +504,7 @@ def test_network_transport_refuses_without_tokens(
 def test_streamable_http_rejects_unauthenticated_request(vault: Path) -> None:
     """A POST with no / wrong bearer is refused 401 before any tool runs."""
     server = build_server(
+        transport=Transport.NETWORK,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
         token_verifier=ConsumerTokenVerifier({"adepthood": ("secret123",)}),
@@ -535,6 +541,7 @@ def _network_server(vault: Path, token: str) -> FastMCP:
     before the request reaches the auth middleware.
     """
     server = build_server(
+        transport=Transport.NETWORK,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
         token_verifier=ConsumerTokenVerifier({"adepthood": (token,)}),
@@ -1578,6 +1585,7 @@ def _pin_server(vault: Path) -> FastMCP:
         provider configured.
     """
     return build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )

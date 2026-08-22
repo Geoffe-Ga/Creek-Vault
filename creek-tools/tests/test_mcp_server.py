@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import os
 from datetime import UTC, datetime
@@ -15,6 +16,7 @@ import pytest
 
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
 from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
+from creek_mcp.policy import REMOTE_ADMITTED_CEILINGS, Transport
 from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
     ConsumerTokenVerifier,
@@ -85,6 +87,7 @@ def _structured(result: object) -> dict[str, object]:
 def test_build_server_returns_fastmcp_instance(vault: Path) -> None:
     """The bootstrap returns a configured :class:`FastMCP` instance."""
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -94,6 +97,7 @@ def test_build_server_returns_fastmcp_instance(vault: Path) -> None:
 def test_build_server_registers_all_tools(vault: Path) -> None:
     """All FEAT-010 read + FEAT-011 write tools surface via ``list_tools``."""
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -110,6 +114,7 @@ def test_call_tool_handshake_reflects_registered_tools(vault: Path) -> None:
     registered async handler rather than only the unit-level helper.
     """
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -139,6 +144,7 @@ def test_call_tool_reflect_returns_verbatim_notes(vault: Path) -> None:
     note = '{"quote": "I rest sometimes", "kind": "reframe", "note": "Yours."}'
     payload = '{"notes": [' + note + "]}"
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
         reflect_llm_factory=lambda: lambda tier: lambda prompt: payload,
@@ -163,6 +169,7 @@ def test_call_tool_reflect_escalates_on_acute_distress(vault: Path) -> None:
     ``acute_distress_guard`` into ``reflect_tool``.
     """
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
         reflect_llm_factory=lambda: lambda tier: lambda prompt: '{"notes": []}',
@@ -188,6 +195,7 @@ def test_call_tool_journal_ingests_entry_idempotently(vault: Path) -> None:
     fragment id and no duplicate — proving the ledger-backed path is wired.
     """
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -222,6 +230,7 @@ def test_upload_is_registered_and_advertised_as_a_capability(vault: Path) -> Non
     the regression the derivation exists to prevent.
     """
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -252,6 +261,7 @@ def test_upload_over_the_server_surface_ingests_bytes(vault: Path) -> None:
     per-call write — is what the closure hands the bytes to.
     """
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -282,6 +292,7 @@ def test_call_tool_wheel_returns_complete_frequency_balance(vault: Path) -> None
     case), proving the read-only aggregation is reachable through the registry.
     """
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -303,6 +314,7 @@ def test_call_tool_save_through_mcp(vault: Path) -> None:
     ):
         (vault.joinpath(*relparts)).mkdir(parents=True, exist_ok=True)
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -341,6 +353,7 @@ def test_call_tool_save_through_mcp_refuses_without_tier(vault: Path) -> None:
     ):
         (vault.joinpath(*relparts)).mkdir(parents=True, exist_ok=True)
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -392,6 +405,7 @@ def test_call_tool_journal_through_mcp_refuses_without_tier(vault: Path) -> None
     ):
         (vault.joinpath(*relparts)).mkdir(parents=True, exist_ok=True)
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -443,6 +457,7 @@ def test_call_tool_upload_through_mcp_refuses_without_tier(vault: Path) -> None:
     ):
         (vault.joinpath(*relparts)).mkdir(parents=True, exist_ok=True)
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -477,6 +492,7 @@ def test_every_tool_requires_privacy_tier_ceiling_parameter(vault: Path) -> None
     tier-ceiling invariant doesn't apply to them.
     """
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -513,6 +529,7 @@ def test_no_write_tool_advertises_a_default_tier(vault: Path) -> None:
     must be in it means such a rename fails loudly instead.
     """
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -532,6 +549,7 @@ def test_no_write_tool_advertises_a_default_tier(vault: Path) -> None:
 def test_purge_tools_require_auth_token_parameter(vault: Path) -> None:
     """FEAT-012: every ``creek.purge.*`` tool exposes an ``auth_token`` slot."""
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -563,6 +581,7 @@ def test_call_tool_state_read_through_mcp(vault: Path) -> None:
         encoding="utf-8",
     )
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -590,6 +609,7 @@ def test_call_tool_state_read_refuses_a_legacy_report_through_mcp(vault: Path) -
         encoding="utf-8",
     )
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -604,6 +624,7 @@ def test_call_tool_state_read_refuses_a_legacy_report_through_mcp(vault: Path) -
 def test_call_tool_state_render_through_mcp(vault: Path) -> None:
     """The render path is reachable via ``call_tool``."""
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -620,6 +641,7 @@ def test_call_tool_state_render_through_mcp(vault: Path) -> None:
 def test_call_tool_lint_through_mcp(vault: Path) -> None:
     """The lint path is reachable via ``call_tool`` and returns ``checks``."""
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -634,6 +656,7 @@ def test_call_tool_lint_through_mcp(vault: Path) -> None:
 def test_call_tool_mine_through_mcp(vault: Path) -> None:
     """The mine path is reachable via ``call_tool``."""
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -650,6 +673,7 @@ def test_call_tool_mine_through_mcp(vault: Path) -> None:
 def test_call_tool_draft_through_mcp(vault: Path) -> None:
     """The draft path is reachable via ``call_tool``."""
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -674,7 +698,9 @@ def test_build_server_falls_back_to_load_config(
         vault_path = vault
 
     monkeypatch.setattr("creek_mcp.server.load_config", lambda: _StubConfig())
-    server = build_server(draft_llm_factory=lambda tier: lambda prompt: "x")
+    server = build_server(
+        transport=Transport.STDIO, draft_llm_factory=lambda tier: lambda prompt: "x"
+    )
     assert server.name == SERVER_NAME
 
 
@@ -700,7 +726,7 @@ def test_main_invokes_server_run(monkeypatch: pytest.MonkeyPatch) -> None:
         def run(self, transport: str) -> None:
             runs.append((transport,))
 
-    monkeypatch.setattr(server_module, "build_server", lambda: _StubServer())
+    monkeypatch.setattr(server_module, "build_server", lambda **_kwargs: _StubServer())
     server_module.main([])
     assert runs == [("stdio",)]
 
@@ -723,7 +749,7 @@ def test_main_config_flag_sets_env_var_before_build_server(
         def run(self, transport: str) -> None:
             del transport
 
-    def _capture_build() -> _StubServer:
+    def _capture_build(**_kwargs: object) -> _StubServer:
         captured_env[CONFIG_PATH_ENV_VAR] = os.environ.get(CONFIG_PATH_ENV_VAR)
         return _StubServer()
 
@@ -744,7 +770,7 @@ def test_main_config_flag_missing_file_errors(
     missing = tmp_path / "no-such-config.yaml"
 
     # build_server must not be called when --config is invalid.
-    def _explode() -> object:  # pragma: no cover - asserts non-invocation
+    def _explode(**_kwargs: object) -> object:  # pragma: no cover - non-invocation
         msg = "build_server should not run when --config is missing"
         raise AssertionError(msg)
 
@@ -771,7 +797,7 @@ def test_main_without_config_flag_leaves_env_var_untouched(
         def run(self, transport: str) -> None:
             del transport
 
-    monkeypatch.setattr(server_module, "build_server", lambda: _StubServer())
+    monkeypatch.setattr(server_module, "build_server", lambda **_kwargs: _StubServer())
     server_module.main([])
 
     assert CONFIG_PATH_ENV_VAR not in os.environ
@@ -1056,7 +1082,7 @@ def test_build_server_wires_the_production_author_llm_factory(
 
     monkeypatch.setattr(server_mod, "_build_author_llm", _recording)
 
-    server = build_server(vault_path=vault)
+    server = build_server(transport=Transport.STDIO, vault_path=vault)
     result = _structured(asyncio.run(server.call_tool("creek.author", {"query": "q"})))
 
     assert result["status"] == "ok", result
@@ -1089,7 +1115,7 @@ def test_build_server_wires_the_production_compile_llm_factory(
     spy = _ProviderSpy()
     _patch_build_provider(monkeypatch, spy)
 
-    server = build_server(vault_path=vault)
+    server = build_server(transport=Transport.STDIO, vault_path=vault)
     result = asyncio.run(
         server.call_tool(
             "creek.compile",
@@ -1259,7 +1285,7 @@ def test_build_server_wires_the_production_draft_llm_factory(
 
     monkeypatch.setattr("creek_mcp.tools.draft.DraftGenerator", _RecordingGenerator)
 
-    server = build_server(vault_path=vault)
+    server = build_server(transport=Transport.STDIO, vault_path=vault)
     result = asyncio.run(
         server.call_tool(
             "creek.draft",
@@ -1303,7 +1329,7 @@ def test_main_rejects_short_elevated_token_on_stdio(
     monkeypatch.setenv(ELEVATED_TOKEN_ENV, _WEAK_ELEVATED_TOKEN)
     monkeypatch.delenv(CONSUMER_TOKENS_ENV, raising=False)
 
-    def _explode() -> object:  # pragma: no cover - asserts non-invocation
+    def _explode(**_kwargs: object) -> object:  # pragma: no cover - non-invocation
         msg = "build_server must not run with a weak elevated token"
         raise AssertionError(msg)
 
@@ -1374,7 +1400,7 @@ def test_main_starts_with_compliant_elevated_token(
         def run(self, transport: str) -> None:
             runs.append(transport)
 
-    monkeypatch.setattr(server_module, "build_server", lambda: _StubServer())
+    monkeypatch.setattr(server_module, "build_server", lambda **_kwargs: _StubServer())
     server_module.main([])
 
     assert runs == ["stdio"]
@@ -1400,7 +1426,7 @@ def test_main_starts_when_elevated_token_unset(
         def run(self, transport: str) -> None:
             runs.append(transport)
 
-    monkeypatch.setattr(server_module, "build_server", lambda: _StubServer())
+    monkeypatch.setattr(server_module, "build_server", lambda **_kwargs: _StubServer())
     server_module.main([])
 
     assert runs == ["stdio"]
@@ -1421,7 +1447,7 @@ def test_main_treats_empty_elevated_token_as_unconfigured(
         def run(self, transport: str) -> None:
             runs.append(transport)
 
-    monkeypatch.setattr(server_module, "build_server", lambda: _StubServer())
+    monkeypatch.setattr(server_module, "build_server", lambda **_kwargs: _StubServer())
     server_module.main([])
 
     assert runs == ["stdio"]
@@ -1536,3 +1562,175 @@ def test_network_startup_is_silent_when_no_rotation_window_is_open(
     assert len(served) == 1
     assert captured.err == ""
     assert captured.out == ""
+
+
+# --------------------------------------------------------------------------- #
+# #1583 — the handshake reports the channel the server is actually on
+# --------------------------------------------------------------------------- #
+
+
+def test_build_server_requires_the_transport_to_be_stated() -> None:
+    """``build_server`` will not guess which channel it is being served on.
+
+    No default, keyword-only. The value reaches ``creek.handshake``, which for
+    two releases answered from a module-level ``"stdio"`` literal — so a
+    defaulted parameter here would let the next adapter reintroduce #1583 simply
+    by not mentioning it, the same fail-closed reasoning that gives
+    :class:`~creek_mcp.policy.CallerIdentity` no default for ``is_remote``.
+    """
+    parameter = inspect.signature(build_server).parameters["transport"]
+    assert parameter.default is inspect.Parameter.empty
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError, match="transport"):
+        build_server()  # type: ignore[call-arg]
+
+
+@pytest.mark.parametrize(
+    ("transport", "expected"),
+    [(Transport.STDIO, "stdio"), (Transport.NETWORK, "network")],
+)
+def test_the_registered_handshake_reports_the_servers_own_transport(
+    vault: Path, transport: Transport, expected: str
+) -> None:
+    """End-to-end through the registered tool, both directions (#1583).
+
+    Driven through ``server.call_tool`` rather than ``handshake_tool`` directly,
+    because the registration closure is the seam that used to drop the answer:
+    the tool knew nothing about the channel and the server never told it. Both
+    directions are pinned so a fix that swapped one literal for the other fails.
+
+    Args:
+        vault: A scaffolded vault to negotiate against.
+        transport: The channel the server is built on.
+        expected: The wire value a consumer must read back.
+    """
+    server = build_server(
+        transport=transport,
+        vault_path=vault,
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
+    )
+    structured = _structured(
+        asyncio.run(
+            server.call_tool("creek.handshake", {"privacy_tier_ceiling": "open"}),
+        )
+    )
+    assert structured["transport"] == expected
+
+
+def test_a_network_server_never_advertises_a_ceiling_it_would_refuse(
+    vault: Path,
+) -> None:
+    """``tier_model.ceilings`` over the network is the remote cap, not the enum.
+
+    The higher-stakes half of the same defect: ``_BoundedFastMCP.call_tool``
+    refuses ``intimate`` and ``all`` from a remote caller before dispatch, while
+    the handshake was telling that caller it could request all four.
+
+    Args:
+        vault: A scaffolded vault to negotiate against.
+    """
+    server = build_server(
+        transport=Transport.NETWORK,
+        vault_path=vault,
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
+    )
+    structured = _structured(
+        asyncio.run(
+            server.call_tool("creek.handshake", {"privacy_tier_ceiling": "open"}),
+        )
+    )
+    tier_model = structured["tier_model"]
+    assert isinstance(tier_model, dict)
+    assert set(tier_model["ceilings"]) == {
+        ceiling.value for ceiling in REMOTE_ADMITTED_CEILINGS
+    }
+
+
+def test_build_server_refuses_a_token_verifier_on_a_local_transport(
+    vault: Path,
+) -> None:
+    """The two assertions may not disagree: an authenticated stdio server is refused.
+
+    ``transport`` and ``token_verifier`` are supplied separately, so nothing but
+    this guard stops a caller stating ``stdio`` while wiring up the network
+    verifier — at which point the handshake truthfully reports the lie it was
+    told. Refused at build time rather than served.
+
+    Args:
+        vault: A scaffolded vault; never reached, the guard fires first.
+    """
+    with pytest.raises(ValueError, match="network"):
+        build_server(
+            transport=Transport.STDIO,
+            vault_path=vault,
+            token_verifier=ConsumerTokenVerifier({"adepthood": ("secret123abc",)}),
+        )
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [([], Transport.STDIO), (["--transport", "stdio"], Transport.STDIO)],
+)
+def test_main_hands_build_server_the_transport_it_dispatched_on(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str], expected: Transport
+) -> None:
+    """AC1: the reported channel comes from the value ``main`` branches on.
+
+    ``main`` chooses the branch from ``args.transport`` and now passes that same
+    object to ``build_server``. Capturing the kwarg is what pins "one source":
+    a fix that re-derived the answer from, say, ``token_verifier is not None``
+    would create a second place the truth is written down, which is the failure
+    #1583 is about.
+
+    Args:
+        monkeypatch: Routes ``build_server`` to a capture and clears the env.
+        argv: The operator's command line.
+        expected: The transport that must reach ``build_server``.
+    """
+    from creek_mcp import server as server_module
+
+    monkeypatch.delenv(ELEVATED_TOKEN_ENV, raising=False)
+    monkeypatch.delenv(CONSUMER_TOKENS_ENV, raising=False)
+    captured: list[object] = []
+
+    class _StubServer:
+        def run(self, transport: str) -> None:
+            del transport
+
+    def _capture(**kwargs: object) -> _StubServer:
+        captured.append(kwargs["transport"])
+        return _StubServer()
+
+    monkeypatch.setattr(server_module, "build_server", _capture)
+    server_module.main(argv)
+
+    assert captured == [expected]
+
+
+def test_main_hands_build_server_the_network_transport_it_dispatched_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The network branch reaches ``build_server`` with ``network``, not a default.
+
+    Split from the stdio cases because the branch has its own preconditions —
+    consumer tokens and a loopback bind — and because this is the direction the
+    defect was actually visible in.
+
+    Args:
+        monkeypatch: Supplies consumer tokens and routes the branch off sockets.
+    """
+    from creek_mcp import server as server_module
+
+    monkeypatch.delenv(ELEVATED_TOKEN_ENV, raising=False)
+    monkeypatch.setenv(CONSUMER_TOKENS_ENV, f"adepthood={_STRONG_CONSUMER_TOKEN}")
+    captured: list[object] = []
+
+    def _capture(**kwargs: object) -> _StubNetworkServer:
+        captured.append(kwargs["transport"])
+        return _StubNetworkServer()
+
+    monkeypatch.setattr(server_module, "build_server", _capture)
+    monkeypatch.setattr(server_module, "_serve_network", lambda _server, _args: None)
+    server_module.main(["--transport", "network", "--host", "127.0.0.1"])
+
+    assert captured == [Transport.NETWORK]

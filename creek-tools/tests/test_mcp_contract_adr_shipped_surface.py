@@ -51,7 +51,7 @@ import pytest
 
 from creek_mcp.api.models import CAPABILITY_SINCE_MINOR, Capability
 from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
-from creek_mcp.policy import REMOTE_ADMITTED_CEILINGS
+from creek_mcp.policy import REMOTE_ADMITTED_CEILINGS, Transport
 from creek_mcp.server import SERVER_NAME, _build_arg_parser, build_server
 from creek_mcp.tools.handshake import handshake_tool
 from tests.v1_api_support import seed_vault
@@ -228,6 +228,7 @@ def _registered_tools(vault_path: Path) -> set[str]:
         Every name reachable through ``list_tools()``.
     """
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault_path,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
@@ -394,6 +395,7 @@ def test_the_handshake_example_matches_the_handshake_tool_keys(vault: Path) -> N
         vault_path=vault,
         capabilities=sorted(_registered_tools(vault)),
         server_name=SERVER_NAME,
+        transport=Transport.STDIO,
     )
     assert set(_handshake_example()) == set(live), (
         "the ADR's handshake example documents a different key set than "

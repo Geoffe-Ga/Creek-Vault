@@ -21,6 +21,7 @@ from typing import Any
 from creek.models import PrivacyTier
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
+from creek_mcp.policy import Transport, offered_ceilings
 from creek_mcp.tier_ceiling import TierCeiling
 
 logger = logging.getLogger(__name__)
@@ -29,8 +30,6 @@ TOOL_NAME = "creek.handshake"
 
 CREEK_MARKER = Path("00-Creek-Meta")
 """The directory whose presence means "a vault has been scaffolded here"."""
-
-TRANSPORT = "stdio"
 
 
 def vault_available(vault_path: Path) -> bool:
@@ -129,6 +128,7 @@ def handshake_tool(
     vault_path: Path,
     capabilities: list[str],
     server_name: str,
+    transport: Transport,
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
 ) -> dict[str, Any]:
@@ -146,6 +146,13 @@ def handshake_tool(
     call honest; the guard in :func:`_record_call` is what keeps every call
     after it honest.
 
+    ``tier_model.ceilings`` is answered by
+    :func:`creek_mcp.policy.offered_ceilings` rather than by the full
+    :class:`~creek_mcp.tier_ceiling.TierCeiling` enum, so a network consumer is
+    offered the two ceilings ``admitted_ceiling`` will actually admit instead of
+    all four. The enum has not changed; what has changed is that the handshake
+    stops advertising the two members the remote cap refuses before dispatch.
+
     Args:
         vault_path: Vault root. Presence of ``00-Creek-Meta`` under it
             determines ``available``.
@@ -153,6 +160,16 @@ def handshake_tool(
             by ``build_server`` so the list cannot drift.
         server_name: The MCP server's name, injected by ``build_server`` (its
             ``SERVER_NAME``) so this module need not duplicate the literal.
+        transport: The channel this server was started on, injected by
+            ``build_server`` from the same ``--transport`` value ``main``
+            dispatches on. No default, deliberately: until #1583 this module
+            held ``TRANSPORT = "stdio"`` and emitted it unconditionally, so a
+            streamable-HTTP consumer was told it was on ``stdio``. A default
+            here would let a new adapter reintroduce that silently; requiring
+            the argument makes "which channel is this?" a question the caller
+            has to answer out loud, exactly as
+            :attr:`creek_mcp.policy.CallerIdentity.is_remote` does for the
+            per-call question.
         privacy_tier_ceiling: The ceiling the caller declared; recorded and
             echoed. Handshake returns no fragment content, so the ceiling does
             not gate anything here, but it is audited like every other call.
@@ -176,13 +193,13 @@ def handshake_tool(
         "tool": TOOL_NAME,
         "tier_ceiling": privacy_tier_ceiling.value,
         "server": server_name,
-        "transport": TRANSPORT,
+        "transport": transport.value,
         "available": available,
         "contract_version": CONTRACT_VERSION,
         "ontology_version": ONTOLOGY_VERSION,
         "tiers": _content_tiers(),
         "tier_model": {
-            "ceilings": [ceiling.value for ceiling in TierCeiling],
+            "ceilings": [ceiling.value for ceiling in offered_ceilings(transport)],
             "default": TierCeiling.OPEN.value,
             "intimate_never_egresses": True,
         },
