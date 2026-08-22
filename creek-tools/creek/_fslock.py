@@ -1,16 +1,31 @@
 """Advisory locking for one vault path, across threads *and* processes (#1590).
 
-Creek's write paths guard themselves with per-instance
-:class:`threading.Lock` objects — :class:`creek.vault.writer.VaultWriter`
-says so in a comment at its own construction site ("cross-process safety
-for the index is out of scope"). That is enough for two calls inside one
-interpreter and nothing else, and ``/v1`` is not one interpreter: a sync
+Creek's write paths used to guard themselves with per-instance
+:class:`threading.Lock` objects alone. That is enough for two calls on
+one object and nothing else, and ``/v1`` is not even one object: a sync
 runs off the event loop in a worker thread
-(``starlette.concurrency.run_in_threadpool``), a deployment may run more
-than one uvicorn worker, and the operator's ``creek`` CLI is a third
-process entirely. Two overlapping Drive syncs measurably produced two
-files carrying **one** fragment id — one source unit, two notes, two
-ledger rows.
+(``starlette.concurrency.run_in_threadpool``),
+:func:`creek.ingest.pipeline.run_ingest` builds a fresh
+:class:`creek.vault.writer.VaultWriter` on every call, a deployment may
+run more than one uvicorn worker, and the operator's ``creek`` CLI is a
+different process entirely. Two overlapping Drive syncs measurably
+produced two files carrying **one** fragment id — one source unit, two
+notes, two ledger rows.
+
+Two callers hold locks from this module, and they are deliberately
+different keys:
+
+* ``creek_mcp.tools.drive`` takes ``gdrive.lock`` around one whole
+  download-and-ingest window (#1590);
+* :class:`creek.vault.writer.VaultWriter` takes
+  ``<fragment dir>/.id-index.lock`` around each index check-then-act
+  (#1603).
+
+Keeping them disjoint is a correctness requirement, not tidiness:
+:func:`vault_lock` is **not reentrant** — the thread lock in front of
+``flock`` is a plain :class:`threading.Lock` — so a write lock named
+after the ledger would nest inside the sync's own lock, burn the full
+timeout, and refuse every sync.
 
 :func:`vault_lock` is the missing primitive: a named lock file, an
 exclusive ``fcntl`` advisory lock over it, and a per-resolved-path
@@ -42,6 +57,7 @@ connectors and must not drag the package in behind it.
 from __future__ import annotations
 
 import contextlib
+import errno
 import logging
 import threading
 import time
@@ -68,6 +84,34 @@ DEFAULT_LOCK_TIMEOUT_SECONDS: Final[float] = 10.0
 Chosen below the ``/v1`` request timeout (30 s) so a queued caller is
 answered with a *meaningful* "busy, retry" refusal rather than with the
 generic timeout the middleware would otherwise produce.
+"""
+
+_UNSUPPORTED_FLOCK_ERRNOS: Final[frozenset[int]] = frozenset(
+    {
+        getattr(errno, name)
+        for name in ("ENOTSUP", "EOPNOTSUPP", "ENOLCK", "EINVAL", "ENOSYS")
+        if hasattr(errno, name)
+    }
+)
+"""The errnos that mean *this filesystem cannot lock*, and only those.
+
+Named explicitly because the guard used to be a bare ``except OSError``
+whose comment claimed only "a mount that does not implement flock" while
+the code also swallowed ``EPERM``/``EACCES`` (a permission
+misconfiguration), ``EBADF`` (a bug in this module), and ``EINTR`` (a
+retryable signal interruption) — each of them silently downgrading the
+cross-process guarantee to nothing (#1603).
+
+* ``ENOTSUP`` / ``EOPNOTSUPP`` — the classic "not implemented on this
+  mount" answer. Distinct values on macOS, the same value on Linux; both
+  are listed because the set is read, not compared to one platform.
+* ``ENOLCK`` — no locks available, e.g. an NFS mount whose lock manager
+  is not running.
+* ``EINVAL`` — the descriptor does not support locking at all.
+* ``ENOSYS`` — the syscall is absent.
+
+Anything else propagates. The members are looked up defensively because
+not every name is defined on every platform.
 """
 
 _POLL_INTERVAL_SECONDS: Final[float] = 0.01
@@ -184,7 +228,11 @@ def _acquire_flock(
 
     Raises:
         VaultLockTimeoutError: If another holder kept the lock past
-            *deadline*.
+            *deadline*, or if a signal kept interrupting the call until
+            the deadline passed.
+        OSError: If ``flock`` failed for any reason other than the
+            filesystem not implementing it — see
+            :data:`_UNSUPPORTED_FLOCK_ERRNOS`.
     """
     if not _HAS_FCNTL:  # pragma: no cover - exercised only on Windows
         return False
@@ -195,16 +243,37 @@ def _acquire_flock(
             if time.monotonic() >= deadline:
                 raise _timeout_error(lock_path, timeout) from None
             time.sleep(_POLL_INTERVAL_SECONDS)
-        except OSError:
+        except InterruptedError:
+            # EINTR: a signal arrived mid-syscall. Nothing about the
+            # lock is known — retrying to the same deadline is the only
+            # answer that neither abandons the OS lock nor waits past
+            # what the caller asked for. PEP 475 already retries this
+            # inside CPython, so this is belt-and-braces rather than a
+            # path production reaches; it is here because the previous
+            # bare ``except OSError`` silently *degraded* on it, turning
+            # a retryable interruption into a permanent loss of the
+            # cross-process guarantee (#1603).
+            if time.monotonic() >= deadline:
+                raise _timeout_error(lock_path, timeout) from None
+        except OSError as error:
+            if error.errno not in _UNSUPPORTED_FLOCK_ERRNOS:
+                # EPERM, EACCES, EBADF and friends are not "this mount
+                # has no flock" — they are a misconfiguration or a bug,
+                # and answering them by quietly dropping the guarantee
+                # is how a vault ends up unserialised without anyone
+                # being told. They propagate; ``run_ingest`` already
+                # reports an ``OSError`` per unit rather than crashing.
+                raise
             # A mount that does not implement flock (some SMB/NFS
             # setups). Degrading to the thread lock is strictly better
             # than refusing every write on such a vault, and it is the
             # same degradation Windows already gets — but it is a real
             # loss of guarantee, so it is said out loud once per call.
             logger.warning(
-                "advisory locking is unavailable for %s; overlapping "
-                "writers in other processes will NOT be serialised",
+                "advisory locking is unavailable for %s (errno %s); "
+                "overlapping writers in other processes will NOT be serialised",
                 lock_path,
+                error.errno,
             )
             return False
         else:
