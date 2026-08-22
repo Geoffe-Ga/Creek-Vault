@@ -38,17 +38,44 @@ admits it is unbuilt: the whole reason epic #1071 exists is that every failure
 used to collapse into "vault unavailable", indistinguishable from "no vault
 configured", and two repositories shipped a contract neither implemented.
 
-The machinery that enforced it is still in place and still tested. A fifth
+The machinery that enforced it is still in place and still tested. **The next**
 capability added to `Capability` before its handler exists is mounted to the
 same honest `501` and is left out of the advertised list, because both are
-driven by the one `IMPLEMENTED_CAPABILITIES` constant.
+driven by the one `IMPLEMENTED_CAPABILITIES` constant. (This sentence used to
+say "a fifth". An ordinal baked into prose is exactly what rots — there are six
+capabilities now, and the mechanism never depended on the count.)
 
-`GET /v1/capabilities` advertises only the capabilities actually implemented —
-today, all four: `["capabilities", "journal-upsert", "reflections", "wheel"]`.
-The advertised list and the
-set of routes that answer `501` are driven by a single constant,
-`IMPLEMENTED_CAPABILITIES` in `creek_mcp/api/routes.py`, so they cannot
-disagree.
+`GET /v1/capabilities` advertises only the capabilities actually implemented.
+Every member of `Capability` is implemented today, so
+`IMPLEMENTED_CAPABILITIES` is spelled `frozenset(Capability)` rather than as a
+list of names:
+
+<!-- capability-set: v1-capabilities -->
+| Capability | Published since contract minor |
+|---|---|
+| `capabilities` | `0.2` |
+| `journal-upsert` | `0.2` |
+| `reflections` | `0.2` |
+| `wheel` | `0.2` |
+| `upload` | `0.8` |
+| `drive-connector` | `0.9` |
+<!-- /capability-set -->
+
+**The advertised list is caller-dependent, and the count above is the ceiling,
+not the answer.** What a given caller is shown is the intersection of that set
+with what its *declared* contract minor published, off `CAPABILITY_SINCE_MINOR`
+in `creek_mcp/api/models.py`: a caller declaring `0.2` is shown the first four,
+one declaring `0.9` — or declaring no minor at all — is shown all six. The
+route that serves a withheld capability refuses the same caller off the same
+table, so what is hidden here is unreachable there.
+
+The advertised list and the set of routes that answer `501` are driven by that
+single constant, `IMPLEMENTED_CAPABILITIES` in `creek_mcp/api/routes.py`, so
+they cannot disagree. The table above is machine-checked against the enum by
+`tests/test_v1_api_capabilities.py`, along with the committed
+`docs/contracts/adepthood-v1/examples/capabilities/success.json` fixture and a
+live response — one four-way equality, so a seventh capability cannot be added
+without this page moving with it.
 
 > **On the issue's `not_implemented` spelling.** Issue #1074 was written before
 > the contract was ratified and asked for `code: "not_implemented"`. `ErrorCode`
@@ -192,21 +219,29 @@ satisfy an intimate-transit contract. That is entirely
 Every response `creek-tools-api` builds carries both of these, on every status:
 
 ```
-Vary: X-Creek-Tier-Ceiling, Authorization
+Vary: X-Creek-Tier-Ceiling, Authorization, X-Creek-Contract-Version
 Cache-Control: no-store
 ```
 
-Every `/v1` body is computed from two things a cache cannot see in the URL: the
-**declared tier ceiling** and the **authenticated consumer**. An entry keyed on
-neither — or on only one of them — may be handed to a caller the server would
-have answered differently. `Cache-Control: no-store` says do not keep it;
+Every `/v1` body is computed from three things a cache cannot see in the URL:
+the **declared tier ceiling**, the **authenticated consumer**, and the
+**declared contract minor**. An entry keyed on none of them — or on only some —
+may be handed to a caller the server would have answered differently. The
+version token is the concrete one to picture
+([#1144](https://github.com/Geoffe-Ga/Creek-Vault/issues/1144)):
+`GET /v1/capabilities` answers `status: ok` with the full capability list to a
+client declaring a served minor and `status: incompatible` with an empty list to
+one declaring a stale minor, from requests identical in every other respect —
+so without that token a cache may hand a current client the refusal minted for
+an outdated one, on the endpoint every client calls first.
+`Cache-Control: no-store` says do not keep it;
 `Vary` says that if you keep it anyway, these are the headers that decide
 whether it matches. The two answer different failure modes and neither replaces
 the other: drop the directive and a compliant cache is free to store, drop the
 tokens and a non-compliant one is free to mismatch.
 
 **These are unconditional, not "on authenticated responses".** Bearer
-authentication sits above the router, so all six routes are authenticated
+authentication sits above the router, so all nine operations are authenticated
 anyway; and refusals need the treatment as much as successes. A stored `404`
 is the concrete case — it is the one status this surface returns that both is
 reachable on any unrouted path and is *heuristically cacheable* under RFC 9110
@@ -332,12 +367,31 @@ refused separately: it would repair a bad value instead of leaving it refused,
 breaking the standing rule that an absent ceiling fails closed while a bad one
 is never coerced into meaning something.
 
+<!-- capability-set: capabilities-states -->
 | `status` | `vault.available` | `capabilities` | Meaning |
 |---|---|---|---|
-| `ok` | `true` | implemented set | Vault present and usable. |
+| `ok` | `true` | advertised set | Vault present and usable. |
 | `uninitialized` | `false` | `[]` | Reachable; no vault scaffolded. Both version strings still present. |
-| `incompatible` | — | `[]` | The requested contract minor is not served here. |
+| `incompatible` | `true` or `false` — a real probe result | `[]` | The requested contract minor is not served here. |
 | *no body at all* | — | — | Unreachable. A client must map this to its own distinct state and must **not** fold it into `uninitialized`. |
+<!-- /capability-set -->
+
+**Row (c)'s `vault.available` used to read `—` in this table and in the ADR's
+copy of it. That was wrong (#1150).** `_render` emits `VaultState(available=…)`
+at *every* status, and `handle_capabilities` computes `available` from the
+readiness probe unconditionally, so an `incompatible` body always carries a
+concrete boolean — `—` reads as absent-or-unspecified and it is neither. Only
+`capabilities` is emptied for a non-`ok` status. What #1148 changed is the
+*audit* half alone: at an unserved minor the probe runs with `audited=False`,
+so the poll no longer drives a locked, fsync'd append. The probe itself is kept
+deliberately, and the handler's own docstring says why — skipping it would
+report `available: false` against a perfectly healthy vault and turn "you are
+on an old contract" into "your vault is down". Whether the probe *should* be
+reordered away at that status is held open as a design question in
+[the MCP ADR's open questions](../../docs/decisions/2026-06-30-adepthood-creek-mcp-contract.md#open-questions-resolve-before-accepted)
+— #1150 asked for this table, and #1148, which owned the reordering, is closed
+— so the question lives in a document rather than on an issue. What this table
+now states is what the code emits.
 
 **A capabilities call against an absent vault is not audited.** There is nowhere
 honest to audit it to: `MCPAuditLog.append` creates its own directory tree, so
@@ -388,6 +442,20 @@ enumerate the corpus one id at a time without reading a byte of it. Every
 vault-object non-answer collapses to `403 privacy_refused` with one fixed
 reason. A method mismatch (`PUT /v1/wheel`) also renders `404`, because `405` is
 not in the contract's published status set.
+
+**`HEAD` is not served, on any path (#1143).** `HEAD /v1/health`,
+`HEAD /v1/capabilities`, `HEAD /v1/wheel` and `HEAD /v1/connectors/drive`
+answered `200` up to this change and answer `404 not_found` after it. They were
+never declared: Starlette adds `HEAD` wherever `GET` is, so four operations
+existed on the wire with no route spec, no schema, no documentation and no
+test — and the set had already grown from two to four with nobody deciding to
+add them. **Use `GET`.** Nothing is lost by it: authentication sits above the
+router, so an anonymous `HEAD` probe already got `401` and was never usable as a
+credential-free liveness check, and any caller holding a token can read the
+whole of `GET /v1/health`, whose body is a single small object. `HEAD` was also
+not the cheap existence check it looks like — the framework runs the full
+handler and discards the body, so `HEAD /v1/capabilities` was taking the audit
+log's file lock and `fsync` for a response nobody read.
 
 **A trailing slash is `404`, not a redirect (#1369).** `GET /v1/health/` is not
 a path this server serves, and it is answered as one. The router's default
@@ -536,11 +604,48 @@ rewrite that the two formats require. The document's `(path, method)` set is
 checked against the routes actually mounted on the app, so a route added without
 a `RouteSpec` turns the test red.
 
-Whether the OpenAPI document should itself join `build_bundle()` and the
-published fixture bundle at the next contract minor is a tracked follow-up. It
-does not today, so — stated plainly — the *file* an operator generates is not
-hash-pinned the way the fixture bundle is; only its schema content is pinned, by
-the tests above.
+**Decision (2026-08-21, #1111): the document stays generated-on-demand.** It
+does not join `build_bundle()`, and no `openapi.json` is committed. Four
+reasons, in the order that decided it:
+
+1. **Committing it is a consumer-visible contract event, not a docs change.**
+   Every file under `docs/contracts/adepthood-v1/` is generated by
+   `build_bundle()`, and `manifest.json` carries a per-file sha256. Adding
+   `openapi.json` adds a manifest row and therefore rewrites the manifest's own
+   bytes and hash — and the manifest is the artifact Adepthood pins. That is a
+   coordinated re-pin on the consumer side, which is a different kind of change
+   from publishing a document.
+2. **The residual gap is narrow.** `tests/test_v1_api_openapi.py` already pins
+   five properties of the generated document: schema-by-schema equality with
+   the committed `schemas/<Model>.schema.json` (modulo the mechanical `$defs` →
+   `components/schemas` rewrite), the same for hoisted definitions, that every
+   `$ref` resolves, that the `(path, method)` set equals the routes mounted on
+   the app, and that every documented status is in the published closed set.
+   What is unpinned is only the *file* an operator vendors after running
+   `--print-openapi`.
+3. **Determinism is not the blocker, and that is worth recording as a fact
+   rather than a worry.** `creek_mcp/httpapi/cli.py` prints
+   `json.dumps(build_openapi(), indent=2, sort_keys=True)` — the same canonical
+   form `creek_mcp/api/bundle.py`'s `_serialise` uses, plus a trailing newline.
+   So committing it remains cheap whenever it is taken up; it is declined on
+   contract-event grounds, not on flappiness grounds.
+4. **A zero-manifest-cost middle option stays available.** Publishing
+   `openapi.json` as an asset on a rolling GitHub Release would give an
+   operator something to diff a vendored copy against without touching the
+   pinned bundle at all.
+
+Stated plainly, and unchanged by the decision: the *file* an operator generates
+is not hash-pinned the way the fixture bundle is; only its schema content is
+pinned, by the tests above.
+
+**The revisit trigger, because "at the next contract minor" already came and
+went twice.** Minors `0.8.0` (#1524) and `0.9.0` (#1527/#873) have each
+re-published the bundle since #1111 was filed, so waiting for a free moment is
+not a plan. The trigger is recorded in
+[`docs/decisions/2026-07-31-adepthood-http-application-api.md`](../../docs/decisions/2026-07-31-adepthood-http-application-api.md)
+— a document consulted at every bump, unlike an issue — and reads: *at the next
+minor that re-publishes the bundle, either add `openapi.json` to
+`build_bundle()` or restate this decision in that minor's change-log row.*
 
 ## Why the adapter is not in `creek_mcp/api/`
 

@@ -433,10 +433,16 @@ All code must meet these standards before merging to main:
   `scripts/lint-vulture.sh` in both `check-all.sh` and CI (issue
   #1395). Per-type confidence floors, not one uniform threshold — see
   `scripts/lint_vulture.py`'s module docstring for the policy and its
-  five documented blindnesses, the largest being code kept alive only
+  four documented blindnesses, the largest being code kept alive only
   by its own tests. Unlike refurb/tryceratops there is **no allowlist
   and no `# noqa`-style escape hatch**: the only remedy for a real
   finding is deletion.
+  `scripts/lint_vulture.py` is also **crawdad's** dead-code policy
+  (issue #1472): `crawdad/scripts/lint-vulture.sh` runs this module
+  with `--scope crawdad` rather than a copy of it, so a floor change or
+  a new carve-out lands in both subprojects at once. Both scopes are
+  declared side by side in that module as `Scope` values; editing one
+  without the other is not possible.
 
 #### Documentation Standards
 - **Google-style Docstrings**: All public APIs

@@ -37,6 +37,7 @@ from tests.shell_command_support import (
     CI_WORKFLOW,
     CREEK_TOOLS_DIR,
     PRE_COMMIT_CONFIG,
+    REPO_ROOT,
     SCRIPTS_DIR,
     all_workflow_steps,
     command_lines,
@@ -50,6 +51,21 @@ if TYPE_CHECKING:
 
 _WRAPPER = "lint-vulture.sh"
 _WRAPPER_COMMAND = "./scripts/lint-vulture.sh"
+
+# One wrapper per subproject, both running the same policy module with a
+# different ``--scope`` (issue #1472). Spelled as repo-relative entries
+# because that is how the pre-commit hooks name them.
+_WRAPPER_ENTRIES = frozenset(
+    {
+        f"creek-tools/scripts/{_WRAPPER}",
+        f"crawdad/scripts/{_WRAPPER}",
+    }
+)
+
+# Every gate-script directory the sweeps below cover. crawdad joined the
+# gate in #1472, and a raw ``vulture`` call or a stray ``--min-confidence``
+# is exactly as corrosive there as here.
+_GATE_SCRIPT_DIRS = (SCRIPTS_DIR, REPO_ROOT / "crawdad" / "scripts")
 _THRESHOLD_FLAG = "--min-confidence"
 _STATIC_ANALYSIS_JOB = "Static Analysis"
 
@@ -69,8 +85,9 @@ def _script_lines() -> list[tuple[Path, str]]:
         ``(script_path, stripped_line)`` pairs, in filename order.
     """
     lines: list[tuple[Path, str]] = []
-    for script in sorted(SCRIPTS_DIR.glob("*.sh")):
-        lines.extend((script, line.strip()) for line in non_comment_lines(script))
+    for directory in _GATE_SCRIPT_DIRS:
+        for script in sorted(directory.glob("*.sh")):
+            lines.extend((script, line.strip()) for line in non_comment_lines(script))
     return lines
 
 
@@ -187,21 +204,27 @@ class TestVultureGateWiring:
         )
 
     def test_pre_commit_routes_through_the_wrapper(self) -> None:
-        """The pre-commit hook must call the wrapper, not vulture upstream.
+        """The pre-commit hooks must call the wrappers, not vulture upstream.
 
         The upstream ``jendrikseipp/vulture`` hook carried both halves of
         the defect: its own ``--min-confidence`` and its own pinned vulture
         version (2.10, while ``uv.lock`` resolves 2.16), so the hook and the
-        gate could disagree about the same tree. One wrapper means one
-        policy and one version.
+        gate could disagree about the same tree. One wrapper per subproject
+        means one policy and one version.
+
+        The assertion is set equality, not a count. A count is satisfied by
+        two hooks that both point at the same subproject -- which is how
+        crawdad would silently drop out of the pre-commit path again.
         """
         hooks = _pre_commit_hooks()
         routed = [hook for _, hook in hooks if _WRAPPER in str(hook.get("entry", ""))]
         upstream = sorted({repo for repo, _ in hooks if "vulture" in repo.lower()})
+        entries = {str(hook.get("entry", "")) for hook in routed}
 
-        assert len(routed) == 1, (
-            f"exactly one pre-commit hook must run {_WRAPPER}; found "
-            f"{[hook.get('id') for hook in routed]!r}"
+        assert entries == set(_WRAPPER_ENTRIES), (
+            "every subproject's dead-code wrapper must have a pre-commit "
+            f"hook; expected {sorted(_WRAPPER_ENTRIES)!r}, found "
+            f"{sorted(entries)!r}"
         )
         assert upstream == [], (
             "no pre-commit hook may install vulture from upstream and run it "

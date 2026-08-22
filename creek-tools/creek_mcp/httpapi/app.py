@@ -126,6 +126,28 @@ if TYPE_CHECKING:
     from creek_mcp.remote_auth import ConsumerTokenVerifier
     from creek_mcp.tools.reflect import _LLMFactory
 
+IMPLICIT_HEAD: Final[str] = "HEAD"
+"""The verb Starlette mints for free, and that ``/v1`` declines.
+
+:class:`~starlette.routing.Route` adds ``HEAD`` to its own method set wherever
+``GET`` is declared, so a route table listing nine operations mounted thirteen.
+The four extras had no ``RouteSpec``, no schema, no documentation and no test —
+they were not decided on, they were inherited, and the set grew from two to
+four while nothing went red. Severing the default once in :func:`_route_for`
+makes every future ``GET`` route safe by construction; declaring the four
+instead would need four more specs, four more handlers and four more OpenAPI
+operations, each mounted *after* the ``GET`` that already answers ``HEAD`` for
+them and therefore unreachable — that path needs this discard anyway.
+
+The cost is owned, not hidden: ``HEAD /v1/health`` answered ``200`` before this
+and answers ``404 not_found`` after it. It was never an anonymous probe — the
+bearer gate sits above the router, so an unauthenticated ``HEAD`` already got
+``401`` — and any caller holding a token can call ``GET /v1/health``, whose
+whole body is a few dozen bytes. ``HEAD`` was also not cheap here: Starlette
+runs the endpoint and discards the body, so ``HEAD /v1/capabilities`` was
+taking the audit log's ``fcntl`` lock and ``fsync`` for a response nobody read.
+"""
+
 REDIRECT_SLASHES: Final[bool] = False
 """Whether the router answers a trailing slash with a redirect. It does not.
 
@@ -267,12 +289,22 @@ def _route_for(spec: RouteSpec) -> Route:
         verb on that path falls through to the routing miss below.
     """
     endpoint = _endpoint_for(spec, handlers.HANDLERS[spec.operation_id])
-    return Route(
+    route = Route(
         spec.path,
         endpoint,
         methods=[spec.method],
         name=spec.operation_id,
     )
+    # The constructor is the only place that adds IMPLICIT_HEAD, and it does so
+    # unconditionally for GET, so the discard happens here rather than being a
+    # rule some later caller has to remember. Starlette reads route.methods at
+    # match time, so removing it now removes it from the served surface: the
+    # verb mismatch becomes a PARTIAL match, the router raises 405, and
+    # METHOD_NOT_ALLOWED is already remapped to 404 not_found below — so a HEAD
+    # probe is indistinguishable from any other path miss and leaks nothing.
+    if route.methods is not None:
+        route.methods.discard(IMPLICIT_HEAD)
+    return route
 
 
 async def _routing_miss(request: Request, _exc: Exception) -> Response:

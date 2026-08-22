@@ -84,7 +84,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol
 
 from creek.classify.privacy_filter import max_source_tier, source_tiers
-from creek.config import load_config, resolve_config_path
+from creek.config import load_vault_config
 from creek.generate.compile_routing import (
     NO_COMPILED_SOURCES,
     CompiledSources,
@@ -330,7 +330,7 @@ def draft_tool(
     # not a setup surface — ``creek init`` is where a missing config is worth
     # saying out loud, and :mod:`creek.lint.checks.draft_grounding` resolves
     # the same section the same quiet way.
-    config = load_config(resolve_config_path(vault_path, None), warn_on_missing=False)
+    config = load_vault_config(vault_path)
     generator = DraftGenerator(
         llm=llm,
         skills_root=skills_dir,

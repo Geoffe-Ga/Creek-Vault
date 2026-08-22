@@ -93,7 +93,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from creek.config import load_config
+from creek.config import load_vault_config
 from creek.models import PrivacyTier
 from creek.redact.scanner import RedactionMatch, RedactionScanner, ScanSummary
 from creek_mcp.audit import MCPAuditLog
@@ -211,7 +211,10 @@ def redact_scan_tool(
             reason=f"input_path not found: {input_path}",
         )
 
-    config = load_config()
+    # redaction.custom_patterns is how an operator names the secrets specific
+    # to their own material; read from anywhere else the scan reports a file
+    # clean that their own rule matches (#1409).
+    config = load_vault_config(vault_path)
     scanner = RedactionScanner(config.redaction)
 
     if resolved.is_file():

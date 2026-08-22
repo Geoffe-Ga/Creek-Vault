@@ -311,6 +311,96 @@ def ledger_dir(vault_path: Path) -> Path:
     return vault_path.joinpath(*_LEDGER_RELPARTS)
 
 
+UNPINNED_STATE_FILENAME: Final[str] = "unpinned-sources.json"
+"""File recording the source keys the pin migration refused to pin (#1367).
+
+Lives beside the ledgers, in :func:`ledger_dir`, because it answers the same
+question they do — what does this vault know about its own ingest identity —
+and because a reader that already found the ledger directory should not have
+to learn a second location.
+
+Deliberately **not** a ``.jsonl``: the ledgers are append-only logs whose
+latest line per key wins, and this is a whole-state snapshot that is rewritten
+or removed on every migration run. Sharing the extension would invite a reader
+to parse one as the other.
+"""
+
+_UNPINNED_STATE_KEY: Final[str] = "unpinned_source_keys"
+"""The one key inside :data:`UNPINNED_STATE_FILENAME`'s JSON object.
+
+An object rather than a bare array so a later field — a timestamp, a schema
+version — can be added without every existing reader breaking on the shape.
+"""
+
+
+def unpinned_state_path(vault_path: Path) -> Path:
+    """Return the file recording sources the pin migration could not pin.
+
+    Args:
+        vault_path: Vault root containing ``00-Creek-Meta/``.
+
+    Returns:
+        The state file's path, which need not exist.
+    """
+    return ledger_dir(vault_path) / UNPINNED_STATE_FILENAME
+
+
+def load_unpinned_sources(vault_path: Path) -> list[str]:
+    """Return the source keys the last pin migration refused to pin (#1367).
+
+    **Fail-quiet by design.** A missing file is the normal state of a vault
+    that has never been migrated or has nothing outstanding, and a malformed
+    one is not worth failing an ingest over: this drives an *advisory*, so the
+    worst outcome of returning ``[]`` is that the operator is not reminded,
+    while raising would abort a run that was about to succeed.
+
+    Args:
+        vault_path: Vault root.
+
+    Returns:
+        The recorded source keys, sorted and de-duplicated; empty when there
+        is no state file or it cannot be read as this schema.
+    """
+    path = unpinned_state_path(vault_path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    keys = data.get(_UNPINNED_STATE_KEY)
+    if not isinstance(keys, list):
+        return []
+    return sorted({key for key in keys if isinstance(key, str) and key})
+
+
+def store_unpinned_sources(vault_path: Path, source_keys: Iterable[str]) -> None:
+    """Record — or clear — the source keys the pin migration could not pin.
+
+    An **empty** *source_keys* removes the file rather than writing an empty
+    list. The advisory this state drives has to be able to go quiet, and an
+    advisory that cannot go quiet is one operators learn to ignore; leaving a
+    file behind that says "nothing is wrong" would also leave a reader unable
+    to tell "migrated, all clean" from "never migrated".
+
+    Written through the module's own atomic rewrite, not ``write_text``: a
+    plain write truncates before repopulating, so a crash mid-write would
+    leave a file whose surviving bytes are an arbitrary prefix — and this
+    file's whole job is to be trustworthy across process boundaries.
+
+    Args:
+        vault_path: Vault root.
+        source_keys: Every key that could not be pinned; empty to clear.
+    """
+    path = unpinned_state_path(vault_path)
+    keys = sorted({key for key in source_keys if key})
+    if not keys:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _rewrite_atomically(path, [json.dumps({_UNPINNED_STATE_KEY: keys})])
+
+
 def _doomed_source_keys(lines: list[str], doomed_ids: frozenset[str]) -> set[str]:
     """Collect the source keys belonging to any doomed fragment id.
 

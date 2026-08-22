@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, date, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import frontmatter
 import pytest
@@ -19,6 +19,9 @@ from creek.generate.drafts import (
     DraftGenerator,
     SeedResolutionError,
     SeedSpec,
+    _load_eddies_by_id,
+    _load_fragments_by_id,
+    _load_threads_by_id,
 )
 from creek.generate.grounding import GroundingThresholds
 from creek.generate.mining import IdeaSeed, MiningStrategy
@@ -43,6 +46,7 @@ from creek.models import (
     VoiceRegister,
     WavelengthClassification,
 )
+from tests.conftest import CORRUPT_NOTE_SHAPES
 from tests.factories.compiled import (
     write_compiled_eddy_page as _write_compiled_eddy_page,
 )
@@ -51,7 +55,7 @@ from tests.factories.compiled import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from pathlib import Path
 
 
@@ -3682,3 +3686,252 @@ class TestVoiceFidelityGuardWiring:
         result = gen._voice_grounding_check(vault, ())
         assert result is None
         assert called["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #996: one unreadable note must not swallow a whole vault folder
+# ---------------------------------------------------------------------------
+
+
+def _good_thread(thread_id: str, title: str) -> Thread:
+    """Return a deterministic, schema-valid Thread for the loader battery."""
+    return Thread(
+        id=thread_id,
+        title=title,
+        status=ThreadStatus.ACTIVE,
+        first_seen=date(2026, 1, 1),
+        last_seen=date(2026, 4, 1),
+        description=f"Description of {title}.",
+    )
+
+
+def _good_eddy(eddy_id: str, title: str) -> Eddy:
+    """Return a deterministic, schema-valid Eddy for the loader battery."""
+    return Eddy(
+        id=eddy_id,
+        title=title,
+        formed=date(2026, 1, 1),
+        description=f"Description of {title}.",
+    )
+
+
+def _write_raw_note(vault: Path, subdir: str, stem: str, header: str) -> Path:
+    """Write ``<vault>/<subdir>/<stem>.md`` carrying *header* frontmatter."""
+    root = vault / subdir
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{stem}.md"
+    path.write_text(f"---\n{header}---\nraw body\n", encoding="utf-8")
+    return path
+
+
+class TestDraftLoadersStepOverUnreadableNotes:
+    """``drafts``' three by-id loaders skip bad notes and keep the good ones.
+
+    Issue #996 asked for coverage of ``_render_thread_section``,
+    ``_render_eddy_section``, ``_render_dimension_slice`` and
+    ``_inline_skill_file``. **All four are gone** — threads and eddies are
+    no longer rendered by two near-duplicate helpers but by one
+    dimension-generic path (``_render_per_dimension_sections`` /
+    ``_render_one_dimension_section``), and skill inlining moved to
+    ``_render_skill_section``. The issue's remaining, still-live ask is
+    this one: the three ``_load_*_by_id`` loaders whose skip arms had no
+    witness. That is what this class covers.
+
+    The three loaders are near-identical by construction, so they are
+    driven from one table rather than three copies of the same test — the
+    duplication in the production code is exactly how the untested arm
+    spread across all three in the first place.
+
+    Discipline (the arms are characterization, so a new test goes green
+    immediately and cannot be proved by watching it fail):
+
+    * Every test writes **two** good records beside the poison and asserts
+      the exact surviving ids by list equality — never a length, never
+      ``in``, never "it did not raise". A loader returning ``{}``
+      unconditionally would satisfy any weaker assertion.
+    * The poison is deliberately named to sort *between* the two good
+      records, so a loader that aborted the walk mid-way returns one id
+      and is caught.
+    * ``post is None`` (corrupt) and ``type != tag`` (a legitimate
+      foreign note) are two adjacent ``continue``s and get separate
+      tests; one fixture covering both would credit one arm and leave the
+      other dead behind satisfied coverage.
+    """
+
+    # kind -> (subdir under the vault, the loader that walks it).
+    # ``Mapping`` and not ``dict`` in the callable's return: ``dict`` is
+    # invariant in its value type, so ``dict[str, Thread]`` is not a
+    # ``dict[str, object]`` and the three loaders would not share one
+    # signature. ``Mapping`` is covariant in the value, which is what
+    # this table actually needs — it only ever reads keys.
+    _CASES: ClassVar[dict[str, tuple[str, Callable[[Path], Mapping[str, object]]]]] = {
+        "fragment": ("01-Fragments", _load_fragments_by_id),
+        "thread": ("02-Threads", _load_threads_by_id),
+        "eddy": ("03-Eddies", _load_eddies_by_id),
+    }
+
+    @staticmethod
+    def _seed_good_records(vault: Path, kind: str) -> list[str]:
+        """Write the two good records of *kind* and return their ids, sorted."""
+        if kind == "fragment":
+            ids = ["frag-good-a", "frag-good-b"]
+            for record_id in ids:
+                _write_fragment(
+                    vault,
+                    _build_fragment(frag_id=record_id, title=f"Title {record_id}"),
+                    f"Body of {record_id}.",
+                )
+        elif kind == "thread":
+            ids = ["thread-good-a", "thread-good-b"]
+            for record_id in ids:
+                _write_thread(vault, _good_thread(record_id, f"Title {record_id}"))
+        else:
+            ids = ["eddy-good-a", "eddy-good-b"]
+            for record_id in ids:
+                _write_eddy(vault, _good_eddy(record_id, f"Title {record_id}"))
+        return ids
+
+    @classmethod
+    def _load_ids(cls, vault: Path, kind: str) -> list[str]:
+        """Return the ids *kind*'s loader recovers from *vault*, sorted."""
+        subdir, loader = cls._CASES[kind]
+        return sorted(loader(vault / subdir))
+
+    @staticmethod
+    def _poison_stem(kind: str) -> str:
+        """Return a stem sorting strictly between the two good records."""
+        return {
+            "fragment": "frag-good-aa",
+            "thread": "thread-good-aa",
+            "eddy": "eddy-good-aa",
+        }[kind]
+
+    @pytest.mark.parametrize("kind", ["fragment", "thread", "eddy"])
+    def test_positive_control_returns_both_good_records(
+        self,
+        vault: Path,
+        kind: str,
+    ) -> None:
+        """With no poison present, each loader returns both good records.
+
+        Without this control the whole skip battery below is vacuous: a
+        loader that returned ``{}`` for everything would pass every one of
+        those tests.
+        """
+        expected = self._seed_good_records(vault, kind)
+
+        assert self._load_ids(vault, kind) == expected
+
+    @pytest.mark.parametrize("kind", ["fragment", "thread", "eddy"])
+    def test_absent_root_returns_empty(self, tmp_path: Path, kind: str) -> None:
+        """A vault with no such folder yields nothing rather than raising.
+
+        Deliberately ``tmp_path`` and not the ``vault`` fixture: ``vault``
+        scaffolds the folder tree, so this arm would never be reached
+        through it. The precondition below is what keeps that true if the
+        fixture changes.
+
+        Honest scope, because it is easy to over-read this test: it pins
+        the *contract*, not the ``if not root.exists()`` guard. Deleting
+        that guard leaves this green, because ``Path.rglob`` on a missing
+        directory yields nothing rather than raising — so the early
+        return is behaviourally redundant today. The contract is still
+        worth pinning: it is what would break if the walk were ever
+        swapped for an ``os.listdir``-style call, which does raise.
+        """
+        subdir, _loader = self._CASES[kind]
+        assert not (tmp_path / subdir).exists()
+
+        assert self._load_ids(tmp_path, kind) == []
+
+    @pytest.mark.parametrize("shape", CORRUPT_NOTE_SHAPES)
+    @pytest.mark.parametrize("kind", ["fragment", "thread", "eddy"])
+    def test_skips_each_corrupt_shape(
+        self,
+        vault: Path,
+        kind: str,
+        shape: str,
+        corrupt_note: Callable[[Path, str], Path],
+    ) -> None:
+        """An unreadable note is stepped over; both good records survive.
+
+        The three shapes land on three different limbs of
+        ``FRONTMATTER_LOAD_ERRORS`` (``yaml.YAMLError`` / ``ValueError``
+        via ``UnicodeDecodeError`` / ``TypeError``), so covering one
+        proves nothing about the other two.
+        """
+        expected = self._seed_good_records(vault, kind)
+        subdir, _loader = self._CASES[kind]
+        corrupt_note(vault / subdir / f"{self._poison_stem(kind)}.md", shape)
+
+        assert self._load_ids(vault, kind) == expected
+
+    @pytest.mark.parametrize("kind", ["fragment", "thread", "eddy"])
+    def test_skips_foreign_type_note(self, vault: Path, kind: str) -> None:
+        """A readable note of another ``type`` is skipped, not mis-validated.
+
+        The note here is *well-formed* — it parses and would validate
+        against its own model — so the ``type`` gate is the only thing
+        that can reject it. A malformed note in its place would be caught
+        one arm earlier and leave this gate untested behind green
+        coverage.
+        """
+        expected = self._seed_good_records(vault, kind)
+        subdir, _loader = self._CASES[kind]
+        _write_raw_note(
+            vault,
+            subdir,
+            self._poison_stem(kind),
+            "type: praxis\nid: prx-impostor\ntitle: Not of this folder\n",
+        )
+
+        assert self._load_ids(vault, kind) == expected
+
+    @pytest.mark.parametrize("kind", ["fragment", "thread", "eddy"])
+    def test_skips_schema_invalid_note(
+        self,
+        vault: Path,
+        kind: str,
+        pydantic_invalid_note: Callable[[Path], Path],
+    ) -> None:
+        """A note that parses but fails ``model_validate`` is skipped.
+
+        This is the ``except ValidationError`` arm, which a corrupt note
+        can never reach: the note below carries the right ``type``, so it
+        passes the gate above and fails only on the schema.
+        """
+        expected = self._seed_good_records(vault, kind)
+        subdir, _loader = self._CASES[kind]
+        stem = self._poison_stem(kind)
+        if kind == "fragment":
+            pydantic_invalid_note(vault / subdir / f"{stem}.md")
+        else:
+            self._write_schema_invalid(vault, subdir, stem, kind)
+
+        assert self._load_ids(vault, kind) == expected
+
+    @staticmethod
+    def _write_schema_invalid(vault: Path, subdir: str, stem: str, kind: str) -> Path:
+        """Write a *surgically* invalid thread/eddy note under *subdir*.
+
+        Surgical matters: the record is dumped from a real, valid model
+        and exactly one date field is then broken, so the
+        ``ValidationError`` is about the schema and not about a
+        half-written stub that might have been rejected by some earlier
+        arm. ``Thread``/``Eddy`` both validate happily from ``type`` plus
+        ``title`` alone, so a bare stub would *not* reach this arm at all.
+        """
+        if kind == "thread":
+            data = _good_thread(f"{stem}-id", "Broken thread").model_dump(mode="json")
+            data["first_seen"] = "not-a-date"
+        else:
+            data = _good_eddy(f"{stem}-id", "Broken eddy").model_dump(mode="json")
+            data["formed"] = "not-a-date"
+        root = vault / subdir
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"{stem}.md"
+        path.write_text(
+            f"---\n{yaml.safe_dump(data, sort_keys=True)}---\nbroken body\n",
+            encoding="utf-8",
+        )
+        return path

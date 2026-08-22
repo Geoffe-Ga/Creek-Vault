@@ -30,7 +30,54 @@ to locate the originating commit for any reference below.
      <path>` against a real vault when you want to check report-size
      budgets.
 
+### Added
+
+- **A per-sheet fragment now records which sheet it came from (#1392).**
+  `sheet`, `rows` and `columns` reach the vault file via the writer's existing
+  `extra_frontmatter` seam, gated by the explicit
+  `PASSTHROUGH_FRONTMATTER_KEYS` allowlist in `creek/ingest/base.py`.
+  Post-#1305 a workbook becomes one fragment per sheet, which made the dropped
+  sheet name the only structured record of a fragment's origin. Implemented
+  without `extra="allow"` (which would let any ingestor typo become permanent
+  frontmatter) and without a nullable model field (which `_write_model`'s
+  `model_dump(mode="json")` would print as `sheet: null` on every fragment in
+  the vault). A fragment whose ingestor emitted no dimensions gains no keys.
+
 ### Breaking changes
+
+- **The ingest ledger now hashes the body the vault actually holds, not
+  `ParsedFragment.content` (#1393).** `SpreadsheetIngestor.parse` and
+  `PresentationIngestor.parse` return `ParsedFragment(content="")` and build
+  the real body in `convert_to_markdown`, so every workbook and every deck
+  recorded `sha256("")` forever. An edited re-upload compared equal to its own
+  predecessor, took the `unchanged` branch, and **the operator's edit was
+  silently never written** while the run reported success. All three ledger
+  hash sites — the recorded row, the changed/unchanged compare, and the
+  `--since`/`--incremental` filter — now route through one `ledger_body_hash()`
+  chokepoint, because fixing a subset is worse than fixing none: a ledger
+  recording a rendered hash while the filter still hashed `""` would mark
+  every workbook permanently changed and rewrite the corpus on every run.
+
+  **No fragment id moves.** Only the argument to `ledger.content_hash`
+  changed; every `generate_fragment_id` site is untouched. **Expect exactly
+  one run to report `updated` instead of `unchanged`** for each affected
+  source unit, as the ledger reconciles to the new convention. Markdown,
+  documents and plain-text generic files are byte-identical under both rules
+  (their converters are the identity function), so the `--pin-source-ids`
+  /#1329 population sees no churn at all. For fenced-generic and image units
+  the rewrite is byte-identical content, so classifications and privacy tiers
+  are preserved. For spreadsheets and presentations, that one run is where
+  previously-lost edits finally land.
+
+- **`creek ingest` now reports `unchanged` in its summary (#1482).** The line
+  printed created/updated/tombed/skipped, so a run that wrote fragments could
+  print four zeros directly above `Ingested N fragment(s).` — most visibly
+  after a `creek purge vault`, where the ledger row still matches but the file
+  is gone and the "unchanged" branch recreates it. The counting was always
+  correct; only the display omitted it. Anything parsing that line by position
+  must account for the new field, which sits after `updated` rather than at
+  the end so the invariant `written == created + updated + unchanged` reads
+  left to right.
 
 - **An `unclassified` `creek save` no longer writes its body into the vault in
   the clear (#1508).** `creek.classify.privacy_filter.pre_save_filter` branched

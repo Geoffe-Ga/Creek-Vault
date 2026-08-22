@@ -1018,7 +1018,7 @@ def test_redact_review_refusal_reads_no_config_through_the_link(
     every other test in this section. It has nonetheless already read a file
     from outside the tree the operator named and let it steer the run.
 
-    So the ordering is pinned directly: ``load_config`` is swapped for a
+    So the ordering is pinned directly: ``load_vault_config`` is swapped for a
     recording wrapper and asserted never to have been reached. The wrapper
     delegates to the real loader rather than raising, because a raising
     sentinel would be caught by ``CliRunner`` and reported as exit 1 —
@@ -1028,7 +1028,7 @@ def test_redact_review_refusal_reads_no_config_through_the_link(
         tmp_path: Pytest-provided temporary directory.
         monkeypatch: Pytest monkeypatch fixture.
     """
-    from creek.config import load_config as real_load_config
+    from creek.config import load_vault_config as real_load_vault_config
 
     outside_vault = tmp_path / "outside" / "vault"
     (outside_vault / "00-Creek-Meta").mkdir(parents=True)
@@ -1047,14 +1047,14 @@ def test_redact_review_refusal_reads_no_config_through_the_link(
 
     calls: list[Path | None] = []
 
-    def _recording_load_config(config_path=None, **kwargs):
+    def _recording_load_vault_config(vault_path=None, **kwargs):
         """Record the call, then delegate to the real loader."""
-        calls.append(config_path)
-        return real_load_config(config_path, **kwargs)
+        calls.append(vault_path)
+        return real_load_vault_config(vault_path, **kwargs)
 
     monkeypatch.setattr(
-        "creek.redact.cli_commands.load_config",
-        _recording_load_config,
+        "creek.redact.cli_commands.load_vault_config",
+        _recording_load_vault_config,
     )
 
     result = runner.invoke(
@@ -1067,7 +1067,7 @@ def test_redact_review_refusal_reads_no_config_through_the_link(
         f"exit_code={result.exit_code}\n{result.output}"
     )
     assert not calls, (
-        "load_config was called before the refusal, so the run read "
+        "load_vault_config was called before the refusal, so the run read "
         "<vault>/00-Creek-Meta/creek_config.yaml through the symlink — a "
         "file outside the named tree, resolved and parsed, and allowed to "
         f"configure the run that then refused.\n\ncalls={calls}\n"
@@ -1102,7 +1102,7 @@ def test_redact_apply_refusal_reads_no_config_through_the_link(
         tmp_path: Pytest-provided temporary directory.
         monkeypatch: Pytest monkeypatch fixture.
     """
-    from creek.config import load_config as real_load_config
+    from creek.config import load_vault_config as real_load_vault_config
 
     outside_vault = tmp_path / "outside" / "vault"
     (outside_vault / "00-Creek-Meta").mkdir(parents=True)
@@ -1121,14 +1121,14 @@ def test_redact_apply_refusal_reads_no_config_through_the_link(
 
     calls: list[Path | None] = []
 
-    def _recording_load_config(config_path=None, **kwargs):
+    def _recording_load_vault_config(vault_path=None, **kwargs):
         """Record the call, then delegate to the real loader."""
-        calls.append(config_path)
-        return real_load_config(config_path, **kwargs)
+        calls.append(vault_path)
+        return real_load_vault_config(vault_path, **kwargs)
 
     monkeypatch.setattr(
-        "creek.redact.cli_commands.load_config",
-        _recording_load_config,
+        "creek.redact.cli_commands.load_vault_config",
+        _recording_load_vault_config,
     )
 
     result = runner.invoke(
@@ -1149,7 +1149,7 @@ def test_redact_apply_refusal_reads_no_config_through_the_link(
         f"line.\n\nexit_code={result.exit_code}\n{result.output}"
     )
     assert not calls, (
-        "load_config was called before the refusal, so the run read "
+        "load_vault_config was called before the refusal, so the run read "
         "<vault>/00-Creek-Meta/creek_config.yaml through the symlink and "
         "let a file outside the named tree configure the run that then "
         f"refused it.\n\ncalls={calls}\nexit_code={result.exit_code}\n"
@@ -1639,7 +1639,7 @@ def test_redact_scan_refusal_reads_no_config_through_the_link(
     and only then refuses — satisfies every other assertion in this section
     while having already done the thing #1359 reports.
 
-    ``load_config`` is swapped for a recording wrapper that delegates to the
+    ``load_vault_config`` is swapped for a recording wrapper that delegates to the
     real loader rather than raising: a raising sentinel would be caught by
     ``CliRunner`` and reported as exit 1, manufacturing a pass for the
     exit-code assertion at HEAD.
@@ -1648,7 +1648,7 @@ def test_redact_scan_refusal_reads_no_config_through_the_link(
         tmp_path: Pytest-provided temporary directory.
         monkeypatch: Pytest monkeypatch fixture.
     """
-    from creek.config import load_config as real_load_config
+    from creek.config import load_vault_config as real_load_vault_config
 
     outside_vault = _write_vault_config(
         tmp_path / "outside" / "vault",
@@ -1663,14 +1663,14 @@ def test_redact_scan_refusal_reads_no_config_through_the_link(
 
     calls: list[Path | None] = []
 
-    def _recording_load_config(config_path=None, **kwargs):
+    def _recording_load_vault_config(vault_path=None, **kwargs):
         """Record the call, then delegate to the real loader."""
-        calls.append(config_path)
-        return real_load_config(config_path, **kwargs)
+        calls.append(vault_path)
+        return real_load_vault_config(vault_path, **kwargs)
 
     monkeypatch.setattr(
-        "creek.redact.cli_commands.load_config",
-        _recording_load_config,
+        "creek.redact.cli_commands.load_vault_config",
+        _recording_load_vault_config,
     )
 
     result = runner.invoke(
@@ -1683,7 +1683,7 @@ def test_redact_scan_refusal_reads_no_config_through_the_link(
         f"parent.\n\nexit_code={result.exit_code}\n{result.output}"
     )
     assert not calls, (
-        "load_config was called before the refusal, so the run read "
+        "load_vault_config was called before the refusal, so the run read "
         "<vault>/00-Creek-Meta/creek_config.yaml through the symlink — a "
         "file outside the named tree, parsed, and allowed to configure the "
         f"safety pass that then refused.\n\ncalls={calls}\n{result.output}"

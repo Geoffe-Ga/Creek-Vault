@@ -11,6 +11,7 @@ Tests cover the ``UnnamedDigestGenerator`` class:
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
@@ -20,13 +21,17 @@ import pytest
 from creek.config import EmbeddingsConfig
 from creek.generate.unnamed import (
     UnnamedDigestGenerator,
+    _connected_components,
     _iter_unnamed_records,
+    _read_history_entries,
     _render_fragments_section,
 )
 from creek.link.embeddings import EmbeddingLinker
 from creek.models import Fragment, FragmentSource, SourcePlatform
+from tests.conftest import CORRUPT_NOTE_SHAPES
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -1159,3 +1164,200 @@ class TestDigestExcerptResolutionCorrectness:
         assert "[[frag-empty]]" in content
         assert "STRAY BODY." not in content
         assert _excerpt_lines(content) == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #871: the digest's remaining unwitnessed arms
+# ---------------------------------------------------------------------------
+
+
+class TestUnnamedRecordsStepOverBadNotes:
+    """``_iter_unnamed_records`` drops unreadable and schema-invalid notes.
+
+    Issue #871 asked for coverage of ``_excerpt_from_file`` and
+    ``_find_fragment_file``. **Both are gone.** The #1321 one-pass
+    refactor replaced them with ``_excerpt_from_body`` (which cuts the
+    excerpt from the body already in hand rather than reopening the file)
+    and ``_iter_unnamed_records`` (a lazy generator carrying the
+    ``Digests/`` skip). Both replacements are already covered, so those
+    two asks are moot; what was genuinely uncovered is
+    ``_load_fragment``'s ``except ValidationError`` arm, which is what
+    this class pins.
+
+    As everywhere in this sweep, the assertions name the **survivors** by
+    list equality. ``_iter_unnamed_records`` yields nothing for an empty
+    vault, so "it did not raise" would be satisfied by a generator that
+    dropped every note on the floor.
+    """
+
+    @staticmethod
+    def _seed_good(vault: Path) -> list[str]:
+        """Write two readable unnamed fragments and return their ids."""
+        for name in ("good-a", "good-b"):
+            _write_unnamed_fragment(
+                vault,
+                name,
+                created=datetime(2026, 2, 10, tzinfo=UTC),
+            )
+        return ["frag-good-a", "frag-good-b"]
+
+    @staticmethod
+    def _ids(vault: Path) -> list[str]:
+        """Return the ids recovered from *vault*'s Unnamed folder, in order."""
+        return [frag.id for frag, _body in _iter_unnamed_records(vault)]
+
+    def test_positive_control_yields_both_records(self, vault: Path) -> None:
+        """With no poison present, both readable fragments come back."""
+        expected = self._seed_good(vault)
+
+        assert self._ids(vault) == expected
+
+    @pytest.mark.parametrize("shape", CORRUPT_NOTE_SHAPES)
+    def test_skips_each_corrupt_shape(
+        self,
+        vault: Path,
+        shape: str,
+        corrupt_note: Callable[[Path, str], Path],
+    ) -> None:
+        """An unreadable note is stepped over; both good records survive.
+
+        The poison is named to sort *between* the two good notes, so a
+        walk that aborted on it would return one id and be caught. A
+        length assertion would not catch that.
+        """
+        expected = self._seed_good(vault)
+        corrupt_note(vault / "10-Liminal" / "Unnamed" / "good-aa.md", shape)
+
+        assert self._ids(vault) == expected
+
+    def test_skips_schema_invalid_fragment(
+        self,
+        vault: Path,
+        pydantic_invalid_note: Callable[[Path], Path],
+    ) -> None:
+        """A note that parses but fails ``Fragment.model_validate`` is dropped.
+
+        This is the arm a corrupt note can never reach: the note carries
+        ``type: fragment``, so it passes the type gate and fails only on
+        the schema.
+        """
+        expected = self._seed_good(vault)
+        pydantic_invalid_note(vault / "10-Liminal" / "Unnamed" / "good-aa.md")
+
+        assert self._ids(vault) == expected
+
+
+class TestReadHistoryEntries:
+    """``_read_history_entries`` fails soft on every unusable history file.
+
+    Each arm returns the *same* ``[]`` the happy path returns for an empty
+    log, so these tests are only meaningful next to the positive control
+    below — without it, a reader that returned ``[]`` unconditionally
+    would pass every one of them.
+    """
+
+    def test_positive_control_returns_recorded_entries(self, tmp_path: Path) -> None:
+        """A well-formed history file round-trips to its entry list."""
+        path = tmp_path / "history.json"
+        entries = [{"week_start": "2026-02-09", "fragment_count": 3}]
+        path.write_text(json.dumps(entries), encoding="utf-8")
+
+        assert _read_history_entries(path) == entries
+
+    def test_missing_file_yields_no_entries(self, tmp_path: Path) -> None:
+        """A history file that was never written reads as no prior data."""
+        assert _read_history_entries(tmp_path / "absent.json") == []
+
+    @pytest.mark.parametrize("raw", ["", "   ", "\n\n  \t\n"])
+    def test_whitespace_only_file_is_silent_not_corrupt(
+        self,
+        tmp_path: Path,
+        raw: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A blank file reads as no prior data **without** a corruption warning.
+
+        The silence is the whole point of the empty-after-strip guard, and
+        it is the only thing that distinguishes the guard from its
+        absence. Deleting ``if not raw: return []`` still returns ``[]``,
+        because ``json.loads("")`` raises ``JSONDecodeError`` and the arm
+        below catches it — but it does so while crying "Corrupt unnamed
+        history" at the operator about a perfectly ordinary empty file.
+        Asserting only the return value would let that regression through;
+        asserting the empty log is what makes this test non-vacuous.
+        """
+        path = tmp_path / "history.json"
+        path.write_text(raw, encoding="utf-8")
+
+        with caplog.at_level(logging.DEBUG, logger="creek.generate.unnamed"):
+            assert _read_history_entries(path) == []
+
+        assert [record.message for record in caplog.records] == []
+
+    def test_corrupt_json_warns_and_yields_no_entries(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Unparseable JSON is reported at WARNING and treated as no data.
+
+        The log is part of the product here: silently discarding a
+        history file the operator can still see on disk is exactly the
+        kind of degradation that needs to surface at default level.
+        """
+        path = tmp_path / "history.json"
+        path.write_text("{not json", encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING, logger="creek.generate.unnamed"):
+            assert _read_history_entries(path) == []
+
+        assert any(
+            "Corrupt unnamed history" in record.message
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+        )
+
+    def test_json_object_root_yields_no_entries(self, tmp_path: Path) -> None:
+        """Valid JSON that is not a list is rejected rather than returned.
+
+        JSON permits a non-list root, and every caller indexes the result
+        as a list of rows — so a dict here would sail past the parse and
+        break downstream instead.
+        """
+        path = tmp_path / "history.json"
+        path.write_text('{"week_start": "2026-02-09"}', encoding="utf-8")
+
+        assert _read_history_entries(path) == []
+
+
+class TestConnectedComponents:
+    """``_connected_components`` is unchanged by edges inside a component.
+
+    Stated honestly, because the alternative reading flatters this test:
+    the ``if root_u != root_v`` check it drives is a **pure
+    optimisation**, not a correctness guard. Deleting it leaves
+    ``parent[root_u] = root_v`` with ``root_u == root_v`` — a
+    self-assignment, and therefore a no-op — so *no* behavioural test can
+    kill that mutant, and this one does not claim to. What it does pin is
+    the contract (a redundant edge must not disturb the partition) and
+    the previously unexecuted ``580->577`` branch. The redundancy is
+    reported as a finding rather than papered over with a test that
+    cannot fail.
+    """
+
+    def test_redundant_edge_leaves_components_unchanged(self) -> None:
+        """A second edge inside one component changes nothing.
+
+        The exact component list is asserted, not its length: a length
+        assertion survives a mutant that puts the right *number* of
+        components together out of the wrong nodes.
+        """
+        without_redundancy = _connected_components(4, [(0, 1), (1, 2)])
+        with_redundancy = _connected_components(4, [(0, 1), (1, 2), (2, 0), (0, 1)])
+
+        assert without_redundancy == [[0, 1, 2], [3]]
+        assert with_redundancy == [[0, 1, 2], [3]]
+
+    def test_isolated_nodes_each_form_their_own_component(self) -> None:
+        """With no edges at all every node stands alone, in index order."""
+        assert _connected_components(3, []) == [[0], [1], [2]]

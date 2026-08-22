@@ -68,7 +68,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
-from creek.config import CreekConfig, load_config, resolve_config_path
+from creek.config import CreekConfig, load_vault_config
 from creek.generate.ai_style.fingerprint import build_fingerprint, save_fingerprint
 from creek.generate.decisions import generate_decisions
 from creek.generate.lexicon import generate_lexicon
@@ -122,22 +122,16 @@ def _vault_config(request: _ReportRequest) -> CreekConfig:
     """Load *request*'s vault config — or ``CREEK_CONFIG``, if that is set.
 
     The name is a slight overstatement and the precedence is worth knowing:
-    :func:`resolve_config_path` consults ``CREEK_CONFIG`` *before* the vault's
-    own file, so a server process that inherited that variable will rank one
-    vault's exemplars under another vault's weighting. That is the established
-    repo-wide behaviour — ``creek_mcp/tools/draft.py`` and
-    ``creek/cli.py``'s ``_load_config_for_vault`` resolve identically — and
-    #1313 deliberately did not change it. The blast radius is bounded because
-    this knob is ranking-only: it cannot widen corpus membership whichever
-    file it comes from.
+    :func:`~creek.config.load_vault_config` consults ``CREEK_CONFIG`` *before*
+    the vault's own file, so a server process that inherited that variable will
+    rank one vault's exemplars under another vault's weighting. That is the
+    established repo-wide behaviour — every caller of the shared resolver
+    behaves identically — and #1313 deliberately did not change it.
 
-    The precedent is ``creek_mcp/tools/draft.py``, whose comment names the
-    hazard: this is deliberately **not** the bare process-wide
-    ``load_config()`` the other tool wrappers use. That form resolves
-    ``creek_config.yaml`` against the server's *current directory* and never
-    reads ``<vault>/00-Creek-Meta/creek_config.yaml``, so a vault-scoped
-    setting passed through it is silently ignored — the exact defect #1313
-    fixes on the voice path.
+    This wrapper survives the convergence in #1409 rather than being inlined,
+    because it adapts the shared resolver to the :class:`_ReportRequest` shape
+    the generator table is keyed on, and because the laziness below is a
+    contract of this module rather than of the resolver.
 
     Resolution is lazy, per generator, rather than eager in ``report_tool``.
     That construction serves all eleven report types, eight of which read no
@@ -156,10 +150,7 @@ def _vault_config(request: _ReportRequest) -> CreekConfig:
     Returns:
         The vault's fully-validated :class:`~creek.config.CreekConfig`.
     """
-    return load_config(
-        resolve_config_path(request.vault_path, None),
-        warn_on_missing=False,
-    )
+    return load_vault_config(request.vault_path)
 
 
 def _generate_tags(request: _ReportRequest) -> list[Path]:
@@ -319,9 +310,7 @@ def _generate_unnamed(request: _ReportRequest) -> list[Path]:
     Returns:
         The written digest path.
     """
-    # Still cwd-scoped rather than vault-scoped; see _vault_config. Reading a
-    # different config section (embeddings), so out of #1313's scope — #1409.
-    config = load_config()
+    config = _vault_config(request)
     generator = UnnamedDigestGenerator(
         embedding_linker=EmbeddingLinker(config=config.embeddings),
     )
@@ -360,8 +349,9 @@ def _generate_paradox(request: _ReportRequest) -> list[Path]:
     Returns:
         One path per written note; empty when no contradictory pair is found.
     """
-    # cwd-scoped, not vault-scoped: a different config section, tracked in #1409.
-    return list(generate_paradoxes(request.vault_path, load_config().embeddings))
+    return list(
+        generate_paradoxes(request.vault_path, _vault_config(request).embeddings),
+    )
 
 
 def _generate_synchronicity(request: _ReportRequest) -> list[Path]:
@@ -373,8 +363,9 @@ def _generate_synchronicity(request: _ReportRequest) -> list[Path]:
     Returns:
         One path per written note; empty when no pair qualifies.
     """
-    # cwd-scoped, not vault-scoped: a different config section, tracked in #1409.
-    return list(generate_synchronicities(request.vault_path, load_config().embeddings))
+    return list(
+        generate_synchronicities(request.vault_path, _vault_config(request).embeddings),
+    )
 
 
 _MCP_REPORTS: Final[dict[str, Callable[[_ReportRequest], list[Path]]]] = {

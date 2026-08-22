@@ -779,6 +779,7 @@ def test_main_without_config_flag_leaves_env_var_untouched(
 
 def test_build_reflect_llm_factory_routes_then_degrades(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """The reflect factory returns a working callable, and raises when no provider.
 
@@ -801,7 +802,11 @@ def test_build_reflect_llm_factory_routes_then_degrades(
     class _Config:
         model_router = _Router()
 
-    monkeypatch.setattr(server_mod, "load_config", lambda: _Config())
+    monkeypatch.setattr(
+        server_mod,
+        "load_vault_config",
+        lambda _vault, **_kwargs: _Config(),
+    )
 
     class _Completion:
         text = "reflected"
@@ -816,7 +821,7 @@ def test_build_reflect_llm_factory_routes_then_degrades(
         "creek.classify.llm.providers.build_provider",
         lambda cfg: _Provider(),
     )
-    factory = server_mod._build_reflect_llm_factory()
+    factory = server_mod._build_reflect_llm_factory(tmp_path)
     assert factory(PrivacyTier.OPEN)("p") == "reflected"
 
     class _Unavailable:
@@ -827,7 +832,7 @@ def test_build_reflect_llm_factory_routes_then_degrades(
         lambda cfg: _Unavailable(),
     )
     with pytest.raises(RuntimeError):
-        server_mod._build_reflect_llm_factory()(PrivacyTier.OPEN)
+        server_mod._build_reflect_llm_factory(tmp_path)(PrivacyTier.OPEN)
 
 
 # --------------------------------------------------------------------------- #
@@ -890,12 +895,17 @@ def _patch_build_provider(monkeypatch: pytest.MonkeyPatch, spy: _ProviderSpy) ->
     monkeypatch.setattr("creek.author.client.build_provider", spy.build)
 
 
-def _split_routing_config() -> object:
+def _split_routing_config(*_args: object, **_kwargs: object) -> object:
     """Return a config stub whose ``default`` is local and ``generation`` cloud.
 
     The two stages deliberately disagree so a resolved ``ollama`` proves the
     ``Intimate``-never-cloud redirect ran, while a resolved ``anthropic``
     proves the ``generation`` stage (not the ``default``) was consulted.
+
+    Signature-permissive because it stands in for ``load_vault_config(vault)``
+    since #1409 — the builders now resolve against the vault the server was
+    built for rather than the process cwd, and the vault argument is
+    irrelevant to what these tests assert.
     """
     from creek.classify.llm.router import ModelRouter
     from creek.config import AuthorConfig, LLMConfig, LLMRoutingConfig
@@ -940,6 +950,7 @@ def _write_open_fragment(vault: Path, frag_id: str) -> None:
 
 def test_build_compile_llm_routes_by_tier_then_degrades(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """The compile factory is tier-keyed and honours the router (#928/#929).
 
@@ -957,28 +968,30 @@ def test_build_compile_llm_routes_by_tier_then_degrades(
     from creek.models import PrivacyTier
     from creek_mcp import server as server_mod
 
-    monkeypatch.setattr(server_mod, "load_config", _split_routing_config)
+    monkeypatch.setattr(server_mod, "load_vault_config", _split_routing_config)
     spy = _ProviderSpy(text="compiled")
     _patch_build_provider(monkeypatch, spy)
 
     # INTIMATE: the cloud ``generation`` stage is redirected to local default.
-    assert server_mod._build_compile_llm(PrivacyTier.INTIMATE)("p") == "compiled"
+    compile_intimate = server_mod._build_compile_llm(tmp_path, PrivacyTier.INTIMATE)
+    assert compile_intimate("p") == "compiled"
     assert spy.provider_names == ["ollama"]
 
     # OPEN: no redirect, and the ``generation`` stage (not ``default``) wins.
-    assert server_mod._build_compile_llm(PrivacyTier.OPEN)("p") == "compiled"
+    assert server_mod._build_compile_llm(tmp_path, PrivacyTier.OPEN)("p") == "compiled"
     assert spy.provider_names == ["ollama", "anthropic"]
     assert spy.prompts == ["p", "p"]
 
     unavailable = _ProviderSpy(available=False)
     _patch_build_provider(monkeypatch, unavailable)
     with pytest.raises(RuntimeError) as excinfo:
-        server_mod._build_compile_llm(PrivacyTier.OPEN)
+        server_mod._build_compile_llm(tmp_path, PrivacyTier.OPEN)
     assert "unavailable" in str(excinfo.value).lower()
 
 
 def test_build_author_llm_routes_the_voice_role_through_the_router(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """The production author factory obeys the same chokepoint as its siblings.
 
@@ -997,18 +1010,18 @@ def test_build_author_llm_routes_the_voice_role_through_the_router(
     from creek.models import PrivacyTier
     from creek_mcp import server as server_mod
 
-    monkeypatch.setattr(server_mod, "load_config", _split_routing_config)
+    monkeypatch.setattr(server_mod, "load_vault_config", _split_routing_config)
     spy = _ProviderSpy()
     _patch_build_provider(monkeypatch, spy)
 
-    assert server_mod._build_author_llm(PrivacyTier.INTIMATE) is not None
+    assert server_mod._build_author_llm(tmp_path, PrivacyTier.INTIMATE) is not None
     assert spy.provider_names == ["ollama"]
 
-    assert server_mod._build_author_llm(PrivacyTier.OPEN) is not None
+    assert server_mod._build_author_llm(tmp_path, PrivacyTier.OPEN) is not None
     assert spy.provider_names == ["ollama", "anthropic"]
 
     _patch_build_provider(monkeypatch, _ProviderSpy(available=False))
-    assert server_mod._build_author_llm(None) is None
+    assert server_mod._build_author_llm(tmp_path, None) is None
 
 
 def test_build_server_wires_the_production_author_llm_factory(
@@ -1032,8 +1045,12 @@ def test_build_server_wires_the_production_author_llm_factory(
 
     reached: list[object] = []
 
-    def _recording(tier: object) -> None:
-        """Record the tier the desk asked for and decline to voice."""
+    def _recording(_vault: Path, tier: object) -> None:
+        """Record the tier the desk asked for and decline to voice.
+
+        Takes the vault ``build_server`` binds with ``functools.partial`` since
+        #1409, so the stand-in has the production signature.
+        """
         reached.append(tier)
         return None
 
@@ -1068,7 +1085,7 @@ def test_build_server_wires_the_production_compile_llm_factory(
     from creek_mcp import server as server_mod
 
     _write_open_fragment(vault, "frag-open")
-    monkeypatch.setattr(server_mod, "load_config", _split_routing_config)
+    monkeypatch.setattr(server_mod, "load_vault_config", _split_routing_config)
     spy = _ProviderSpy()
     _patch_build_provider(monkeypatch, spy)
 
@@ -1135,6 +1152,7 @@ def _patch_draft_miner(monkeypatch: pytest.MonkeyPatch, seed: object) -> None:
 
 def test_build_draft_llm_routes_by_tier_then_degrades(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """The draft factory is tier-keyed and honours the router (#958).
 
@@ -1154,23 +1172,23 @@ def test_build_draft_llm_routes_by_tier_then_degrades(
     from creek.models import PrivacyTier
     from creek_mcp import server as server_mod
 
-    monkeypatch.setattr(server_mod, "load_config", _split_routing_config)
+    monkeypatch.setattr(server_mod, "load_vault_config", _split_routing_config)
     spy = _ProviderSpy(text="drafted")
     _patch_build_provider(monkeypatch, spy)
 
     # INTIMATE: the cloud ``generation`` stage is redirected to local default.
-    assert server_mod._build_draft_llm(PrivacyTier.INTIMATE)("p") == "drafted"
+    assert server_mod._build_draft_llm(tmp_path, PrivacyTier.INTIMATE)("p") == "drafted"
     assert spy.provider_names == ["ollama"]
 
     # OPEN: no redirect, and the ``generation`` stage (not ``default``) wins.
-    assert server_mod._build_draft_llm(PrivacyTier.OPEN)("p") == "drafted"
+    assert server_mod._build_draft_llm(tmp_path, PrivacyTier.OPEN)("p") == "drafted"
     assert spy.provider_names == ["ollama", "anthropic"]
     assert spy.prompts == ["p", "p"]
 
     unavailable = _ProviderSpy(available=False)
     _patch_build_provider(monkeypatch, unavailable)
     with pytest.raises(RuntimeError) as excinfo:
-        server_mod._build_draft_llm(PrivacyTier.OPEN)
+        server_mod._build_draft_llm(tmp_path, PrivacyTier.OPEN)
     assert "unavailable" in str(excinfo.value).lower()
 
 
@@ -1200,7 +1218,7 @@ def test_build_server_wires_the_production_draft_llm_factory(
 
     _write_open_fragment(vault, "frag-open")
     _patch_draft_miner(monkeypatch, _open_source_seed("frag-open"))
-    monkeypatch.setattr(server_mod, "load_config", _split_routing_config)
+    monkeypatch.setattr(server_mod, "load_vault_config", _split_routing_config)
     spy = _ProviderSpy(text="drafted body")
     _patch_build_provider(monkeypatch, spy)
 

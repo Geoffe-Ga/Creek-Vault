@@ -5,7 +5,8 @@ Task-oriented how-to guides for the `creek-tools` pipeline. The top-level [`cree
 | Guide | When to read it |
 |-------|-----------------|
 | [getting-started.md](getting-started.md) | First time running `creek`. Walks you from a clean Obsidian vault to a fully indexed pipeline run. |
-| [ingestion.md](ingestion.md) | Picking the right `--type` for each export. Lists the 12 ingestors and their file formats. |
+| [seeding.md](seeding.md) | Getting your own material into a vault — every source, its shape (single file / archive / OAuth), the CLI command or `/v1` request, and what tier the result gets. |
+| [ingestion.md](ingestion.md) | Picking the right `--type` for each export. Lists the ingestors and their file formats. |
 | [redaction.md](redaction.md) | Scanning for secrets/PII before ingestion, applying redactions in place, and rendering the vault-wide review queue. |
 | [classification.md](classification.md) | Rule-based vs LLM classification, frequency / phase / privacy-tier tagging, and the review queue. |
 | [linking.md](linking.md) | Resonances (embeddings), threads (temporal), eddies (density), and how to read the resulting graph. |

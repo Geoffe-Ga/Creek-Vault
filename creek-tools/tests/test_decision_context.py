@@ -25,8 +25,11 @@ from creek.models import (
     Frequency,
     Phase,
 )
+from creek.time import today_la
+from tests.conftest import CORRUPT_NOTE_SHAPES
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -654,3 +657,359 @@ class TestEndToEnd:
         # Never contains recommendation language:
         for banned in ("you should", "best option", "you need to"):
             assert banned not in content.lower()
+
+
+# ---------------------------------------------------------------------------
+# Issue #1448: the context gatherer's unwitnessed skip and fallback arms
+# ---------------------------------------------------------------------------
+
+
+class TestGatherContextStepsOverUnreadableNotes:
+    """One unreadable note anywhere must not empty a context section.
+
+    ``gather_context`` walks four folders through ``_load_post``, and
+    every one of those call sites answered a ``None`` with a bare
+    ``continue``/``return None`` that nothing had ever driven. Rather
+    than five unit tests on five private scorers, this drives the
+    **public** entry point with poison in each folder in turn — the same
+    path an operator's hand-edited vault takes.
+
+    The assertions name the surviving context by list equality against
+    the clean baseline. "It did not raise" would be satisfied by a
+    gatherer that returned an empty context for everything, which is
+    precisely the regression this guards.
+    """
+
+    @staticmethod
+    def _context_tuple(ctx: DecisionContext) -> tuple[list[str], list[str], list[str]]:
+        """Return the three id lists that must survive a poisoned vault."""
+        return (
+            sorted(ctx.related_threads),
+            sorted(ctx.related_decisions),
+            sorted(ctx.relevant_praxis),
+        )
+
+    @pytest.mark.parametrize(
+        "folder",
+        [
+            "02-Threads",
+            "04-Praxis",
+            "08-Decisions/Archive",
+            "05-Wavelength/Observations",
+        ],
+    )
+    @pytest.mark.parametrize("shape", CORRUPT_NOTE_SHAPES)
+    def test_corrupt_note_in_any_folder_preserves_context(
+        self,
+        gatherer: DecisionContextGatherer,
+        seeded_vault: Path,
+        sample_decision: Decision,
+        folder: str,
+        shape: str,
+        corrupt_note: Callable[[Path, str], Path],
+    ) -> None:
+        """Poison in each walked folder leaves the gathered context intact."""
+        baseline = self._context_tuple(
+            gatherer.gather_context(sample_decision, seeded_vault),
+        )
+        assert baseline != ([], [], []), "baseline must be non-empty to be meaningful"
+
+        corrupt_note(seeded_vault / folder / "zz-unreadable.md", shape)
+
+        after = gatherer.gather_context(sample_decision, seeded_vault)
+        assert self._context_tuple(after) == baseline
+
+    def test_corrupt_wavelength_note_keeps_the_readable_phase(
+        self,
+        gatherer: DecisionContextGatherer,
+        seeded_vault: Path,
+        sample_decision: Decision,
+        corrupt_note: Callable[[Path, str], Path],
+    ) -> None:
+        """The phase still comes from the newest *readable* observation.
+
+        ``current_wavelength`` is not one of the id lists above, so it
+        needs its own assertion — otherwise the wavelength walk could
+        silently fall back to the decision's own phase and every other
+        assertion here would still pass.
+        """
+        corrupt_note(
+            seeded_vault / "05-Wavelength" / "Observations" / "9999-99-99.md",
+            "malformed-yaml",
+        )
+
+        ctx = gatherer.gather_context(sample_decision, seeded_vault)
+
+        assert ctx.current_wavelength == "peaking"
+
+    def test_notes_without_an_id_are_skipped(
+        self,
+        gatherer: DecisionContextGatherer,
+        seeded_vault: Path,
+        sample_decision: Decision,
+    ) -> None:
+        """A readable note carrying no ``id`` never reaches a context list.
+
+        This is the arm *after* the unreadable-note skip: the note parses
+        fine, so the ``_load_post`` sentinel never fires and only the
+        empty-id guard can reject it. An empty string sneaking into these
+        lists would render as a broken ``[[]]`` wiki-link in the note.
+        """
+        baseline = self._context_tuple(
+            gatherer.gather_context(sample_decision, seeded_vault),
+        )
+        _write_post(
+            seeded_vault / "02-Threads" / "no-id-thread.md",
+            type="thread",
+            title="Career direction and meaningful work",
+            frequency_affinity=["F1", "F5"],
+        )
+        _write_post(
+            seeded_vault / "04-Praxis" / "no-id-praxis.md",
+            type="praxis",
+            title="Quarterly goal setting",
+            frequency=["F1", "F5"],
+        )
+        _write_post(
+            seeded_vault / "08-Decisions" / "Archive" / "no-id-decision.md",
+            type="decision",
+            title="Should I change jobs this year",
+            frequency_context=["F1", "F5"],
+        )
+
+        after = gatherer.gather_context(sample_decision, seeded_vault)
+
+        assert self._context_tuple(after) == baseline
+        for ids in self._context_tuple(after):
+            assert "" not in ids
+
+    def test_observation_missing_date_or_phase_is_ignored(
+        self,
+        gatherer: DecisionContextGatherer,
+        seeded_vault: Path,
+        sample_decision: Decision,
+    ) -> None:
+        """A half-filled observation cannot become the current phase.
+
+        Both halves are tested at once with two separate notes, each
+        dated *after* every readable observation — so if either were
+        admitted it would win the recency comparison and change the
+        answer.
+        """
+        _write_post(
+            seeded_vault / "05-Wavelength" / "Observations" / "2025-03-20.md",
+            type="wavelength_observation",
+            id="wave-0320",
+            date=date(2025, 3, 20).isoformat(),
+        )
+        _write_post(
+            seeded_vault / "05-Wavelength" / "Observations" / "2025-03-21.md",
+            type="wavelength_observation",
+            id="wave-0321",
+            phase="bottoming",
+        )
+
+        ctx = gatherer.gather_context(sample_decision, seeded_vault)
+
+        assert ctx.current_wavelength == "peaking"
+
+    def test_absent_folders_yield_empty_context(
+        self,
+        gatherer: DecisionContextGatherer,
+        tmp_path: Path,
+        sample_decision: Decision,
+    ) -> None:
+        """A vault with none of the walked folders gathers nothing, calmly.
+
+        This is ``_iter_markdown``'s absent-directory arm reached through
+        the public API. ``tmp_path`` rather than the ``vault_path``
+        fixture, because that fixture scaffolds every folder and the arm
+        would never be reached through it.
+        """
+        assert not (tmp_path / "02-Threads").exists()
+
+        ctx = gatherer.gather_context(sample_decision, tmp_path)
+
+        assert self._context_tuple(ctx) == ([], [], [])
+
+
+class TestGatherInterventions:
+    """``_gather_interventions`` needs a phase, and never repeats a practice."""
+
+    def test_empty_phase_yields_no_interventions(
+        self,
+        gatherer: DecisionContextGatherer,
+    ) -> None:
+        """Without a phase there is no practice map row to consult."""
+        assert gatherer._gather_interventions(["F1", "F5"], "") == []
+
+    def test_practices_are_deduplicated_across_frequencies(
+        self,
+        gatherer: DecisionContextGatherer,
+    ) -> None:
+        """A practice shared by two frequencies is listed once, in first-seen order.
+
+        The same frequency is passed twice, which guarantees every
+        practice on the second pass is already in ``seen`` — the dedupe
+        branch. Asserting the exact list (not its length) is what catches
+        a mutant that drops the guard and returns each practice twice.
+        """
+        once = gatherer._gather_interventions(["F1"], "rising")
+        twice = gatherer._gather_interventions(["F1", "F1"], "rising")
+
+        assert once != []
+        assert twice == once
+
+
+class TestCoerceOpenedAndDecisionFromNote:
+    """``opened`` is coerced to a date, or dropped so the model default wins."""
+
+    def test_iso_string_becomes_a_date(self, vault_path: Path) -> None:
+        """A well-formed ISO string round-trips into a real ``date``."""
+        note = vault_path / "08-Decisions" / "Active" / "good.md"
+        _write_post(
+            note,
+            type="decision",
+            id="decision-good0001",
+            title="A readable decision",
+            status="sensing",
+            opened="2025-06-01",
+        )
+
+        assert decision_from_note(note).opened == date(2025, 6, 1)
+
+    def test_real_date_object_passes_through(self, vault_path: Path) -> None:
+        """A YAML date scalar is already a ``date`` and is kept as-is.
+
+        YAML parses an unquoted ``2025-06-02`` into a ``datetime.date``
+        before the coercer ever sees it, so this exercises the
+        short-circuit rather than the string-parsing branch.
+        """
+        note = vault_path / "08-Decisions" / "Active" / "yamldate.md"
+        note.write_text(
+            "---\n"
+            "type: decision\n"
+            "id: decision-yamldate1\n"
+            "title: A YAML-dated decision\n"
+            "status: sensing\n"
+            "opened: 2025-06-02\n"
+            "---\n"
+            "body\n",
+            encoding="utf-8",
+        )
+
+        assert decision_from_note(note).opened == date(2025, 6, 2)
+
+    @pytest.mark.parametrize("raw", ["not-a-date", "2025-13-45", "", "  "])
+    def test_unparseable_opened_falls_back_to_the_model_default(
+        self,
+        vault_path: Path,
+        raw: str,
+    ) -> None:
+        """An unparseable ``opened`` is dropped, never passed through as a string.
+
+        The assertion is on the *type*, not just on inequality: the
+        failure this pins is ``_coerce_opened`` returning the raw string,
+        which would sail into ``Decision.opened`` and make every
+        downstream date comparison a ``TypeError``.
+        """
+        note = vault_path / "08-Decisions" / "Active" / "bad.md"
+        _write_post(
+            note,
+            type="decision",
+            id="decision-bad00001",
+            title="An unparseable decision",
+            status="sensing",
+            opened=raw,
+        )
+
+        opened = decision_from_note(note).opened
+
+        assert isinstance(opened, date)
+        # The model default is ``Decision.opened``'s ``default_factory=today_la``
+        # (creek/models.py:1019) -- the LA date, NOT the system-local one. Asserting
+        # against ``date.today()`` here passes in LA and fails on a UTC runner for the
+        # seven hours after UTC midnight -- which is how this first went red in CI.
+        assert opened == today_la()
+
+    def test_non_scalar_opened_falls_back_to_the_model_default(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """An ``opened`` that is neither a date nor a string is dropped.
+
+        This is the coercer's final fallthrough — a list here reaches
+        neither the ``isinstance(raw, date)`` branch nor the string
+        branch.
+        """
+        note = vault_path / "08-Decisions" / "Active" / "listopened.md"
+        _write_post(
+            note,
+            type="decision",
+            id="decision-listopen1",
+            title="A list-opened decision",
+            status="sensing",
+            opened=["2025-06-01"],
+        )
+
+        assert isinstance(decision_from_note(note).opened, date)
+
+
+class TestRelatedDecisionRanking:
+    """The two ranking arms nothing had driven: too-weak, and not-newer."""
+
+    def test_unrelated_decision_is_scored_out(
+        self,
+        gatherer: DecisionContextGatherer,
+        seeded_vault: Path,
+        sample_decision: Decision,
+    ) -> None:
+        """A decision sharing neither tokens nor frequencies is excluded.
+
+        Every prior decision in the seeded vault overlaps on frequency and
+        is therefore boosted to the threshold, so the "score below
+        threshold" arm had no witness. This note overlaps on nothing, so
+        only that arm can reject it — and the assertion names the
+        surviving ids rather than merely checking the newcomer's absence,
+        which would also pass if the whole section had gone empty.
+        """
+        _write_post(
+            seeded_vault / "08-Decisions" / "Archive" / "2024-01-01-pasta.md",
+            type="decision",
+            id="decision-pasta001",
+            title="Weeknight pasta recipes",
+            status="enacted",
+            opened=date(2024, 1, 1).isoformat(),
+            frequency_context=["F2"],
+        )
+
+        ctx = gatherer.gather_context(sample_decision, seeded_vault)
+
+        assert "decision-pasta001" not in ctx.related_decisions
+        assert "decision-prior01" in ctx.related_decisions
+
+    def test_older_observation_does_not_displace_a_newer_one(
+        self,
+        gatherer: DecisionContextGatherer,
+        seeded_vault: Path,
+        sample_decision: Decision,
+    ) -> None:
+        """A complete but older observation leaves the current phase alone.
+
+        The filename deliberately sorts *after* the newest observation
+        while its ``date`` field is older, so the walk visits it last and
+        must reject it on the date comparison rather than on file order.
+        Without this, the "not newer" branch never executes and a mutant
+        that took the last file it saw would go unnoticed.
+        """
+        _write_post(
+            seeded_vault / "05-Wavelength" / "Observations" / "zzz-old.md",
+            type="wavelength_observation",
+            id="wave-old001",
+            date=date(2025, 1, 1).isoformat(),
+            phase="bottoming",
+        )
+
+        ctx = gatherer.gather_context(sample_decision, seeded_vault)
+
+        assert ctx.current_wavelength == "peaking"

@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 import yaml
 
 from creek.author.models import ReflectionFinding
-from creek.config import load_config, resolve_config_path
+from creek.config import load_vault_config
 from creek.generate.ai_style.scanner import scan
 from creek.generate.grounding import scan_biographical_sentences
 from creek.generate.jargon import detect_unglossed_jargon
@@ -577,7 +577,7 @@ def _configured_max_reproduced_tier(vault: Path) -> PrivacyTier:
         :attr:`PrivacyTier.OPEN` when the config cannot be read.
     """
     try:
-        config = load_config(resolve_config_path(vault, None), warn_on_missing=False)
+        config = load_vault_config(vault)
     except (OSError, ValueError, yaml.YAMLError):
         logger.warning(
             "Could not read author.max_reproduced_tier from the config for "

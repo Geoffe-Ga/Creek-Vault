@@ -289,7 +289,12 @@ class OrphanScanner:
         """
         self.age_days = age_days
 
-    def scan(self, vault_path: Path) -> OrphanResult:
+    def scan(
+        self,
+        vault_path: Path,
+        *,
+        link_index: LinkIndex | None = None,
+    ) -> OrphanResult:
         """Scan the vault for orphaned fragments.
 
         Every wiki-link in the vault is resolved to the page it actually
@@ -299,15 +304,19 @@ class OrphanScanner:
 
         Args:
             vault_path: Root of the Obsidian vault.
+            link_index: A pre-built vault-wide name → page index to reuse.
+                Optional so every existing caller keeps working; supplied by
+                :class:`HygieneReporter` and ``creek lint`` so one run walks
+                the vault once instead of once per scanner (#1223).
 
         Returns:
             An :class:`OrphanResult` with orphan paths and totals.
         """
         fragment_files = _list_fragment_files(vault_path)
         all_md_files = _list_all_md_files(vault_path)
-        link_index = build_link_index(vault_path)
+        index = link_index if link_index is not None else build_link_index(vault_path)
 
-        incoming, outgoing = self._build_link_graph(all_md_files, link_index)
+        incoming, outgoing = self._build_link_graph(all_md_files, index)
 
         now = datetime.now(tz=UTC)
         orphans = self._find_orphans(fragment_files, incoming, outgoing, now)
@@ -528,7 +537,12 @@ class BrokenLinkScanner:
     human-readable name in ``aliases``.
     """
 
-    def scan(self, vault_path: Path) -> BrokenLinkResult:
+    def scan(
+        self,
+        vault_path: Path,
+        *,
+        link_index: LinkIndex | None = None,
+    ) -> BrokenLinkResult:
         """Scan the vault for broken links.
 
         Checks wiki-links (``[[Target]]``) and relative markdown links
@@ -538,6 +552,10 @@ class BrokenLinkScanner:
 
         Args:
             vault_path: Root of the Obsidian vault.
+            link_index: A pre-built vault-wide name → page index to reuse.
+                Optional so every existing caller keeps working; supplied by
+                :class:`HygieneReporter` and ``creek lint`` so one run walks
+                the vault once instead of once per scanner (#1223).
 
         Returns:
             A :class:`BrokenLinkResult` whose ``total_files_scanned`` counts
@@ -545,13 +563,13 @@ class BrokenLinkScanner:
             ``creek lint`` prints does not overstate its own coverage.
         """
         source_files = iter_link_sources(vault_path)
-        link_index = build_link_index(vault_path)
+        index = link_index if link_index is not None else build_link_index(vault_path)
 
         broken_links: dict[str, list[str]] = {}
         total_broken = 0
 
         for source_file in source_files:
-            file_broken = self._check_file(source_file, link_index, vault_path)
+            file_broken = self._check_file(source_file, index, vault_path)
             if file_broken:
                 broken_links[str(source_file)] = file_broken
                 total_broken += len(file_broken)
@@ -747,15 +765,23 @@ class HygieneReporter:
     def generate(self, vault_path: Path) -> HygieneReport:
         """Run all scanners and compile a health report.
 
+        The name → page index is built **once here** and handed to both
+        scanners that need it. Each used to build its own, so a single
+        ``creek clean`` run header-parsed every ``*.md`` in the vault twice.
+        That is the same defect #1223 reports against ``creek lint``; it went
+        unticketed here, and the rule is to sweep the pattern rather than the
+        sample.
+
         Args:
             vault_path: Root of the Obsidian vault.
 
         Returns:
             A :class:`HygieneReport` with aggregated results.
         """
-        orphans = self.orphan_scanner.scan(vault_path)
+        link_index = build_link_index(vault_path)
+        orphans = self.orphan_scanner.scan(vault_path, link_index=link_index)
         stale = self.stale_review_scanner.scan(vault_path)
-        broken = self.broken_link_scanner.scan(vault_path)
+        broken = self.broken_link_scanner.scan(vault_path, link_index=link_index)
         dupes = self.duplicate_scanner.scan(vault_path)
         quality_dist = self._compute_quality_distribution(vault_path)
 
