@@ -30,6 +30,7 @@ import frontmatter
 import yaml
 from pydantic import ValidationError
 
+from creek._containment import escaping_child
 from creek.models import Fragment
 
 logger = logging.getLogger(__name__)
@@ -189,6 +190,44 @@ def iter_vault_fragments(
     skipped — callers that need to surface them to the operator
     should iterate manually with :func:`try_load_fragment`.
 
+    **Containment (#1373).** A ``.md`` file under *fragments_root* that is
+    itself a symlink resolving OUTSIDE that root is skipped and logged, via
+    the one shared predicate :func:`creek._containment.escaping_child`.
+    Without it, dropping a single link into ``01-Fragments/`` puts
+    attacker-chosen content — and the ``privacy_tier`` it is admitted under,
+    since that field is read from the planted file's own frontmatter — into
+    the Writing Desk corpus, the link graph, the compiled pages and every
+    cloud LLM prompt built from them.
+
+    Three deliberate choices, each the answer to a way this could go wrong:
+
+    * **The guard lives here, not in the caller that reported it.** This
+      function is the single loader for 25-odd consumers — classify's
+      privacy filter, the link engine, the compile engine, every lint check,
+      the MCP read gate. Guarding :func:`creek.author.agents._load_corpus`
+      alone would leave all of them reading the planted file and guarantee
+      the next consumer re-invents the check, which is the drift #1294
+      closed.
+    * **It skips, it never raises.** Hard-erroring in the shared loader
+      would turn one planted symlink into a hard failure of classify, link,
+      compile and every MCP read tool — a denial of service handed to anyone
+      with write access to the vault, which is worse than the injection
+      being closed. Skipping is also the direction :mod:`creek._containment`
+      permits: a containment helper may only ever cause a caller to read
+      *less*.
+    * **WARNING, not the DEBUG used by the unreadable-file skip below.** An
+      unreadable markdown file is common and benign in a live Obsidian
+      vault; a fragment symlinked out of the vault cannot happen by
+      accident. Occurrences are ~zero, so the line costs nothing, and #1087's
+      lesson was that a silent skip in a safety path is its own hazard.
+
+    ACCEPTED NARROWING: containment is judged against the root the CALLER
+    named, so ``01-Fragments/x.md -> ../09-Reference/y.md`` — inside the
+    vault but outside *this* root — is skipped. Machine-written Creek
+    fragments never take that shape, and an intra-root alias
+    (``01-Fragments/alias.md -> 01-Fragments/real.md``) is still loaded, so
+    the guard cannot quietly become "drop every symlink".
+
     Args:
         fragments_root: Path to ``<vault>/01-Fragments`` (or any
             directory tree containing fragment files).
@@ -200,8 +239,21 @@ def iter_vault_fragments(
     if not fragments_root.exists():
         return []
 
+    # Resolved exactly once, above the loop: resolving per child would be
+    # both wasteful and wrong, since the policy is resolve-the-root and
+    # ``lstat``-the-leaf.
+    resolved_root = fragments_root.resolve(strict=False)
     out: list[tuple[Path, Fragment, str, dict[str, object]]] = []
     for md_file in sorted(fragments_root.rglob("*.md")):
+        if escaping_child(md_file, resolved_root):
+            # Named as walked. The resolved target is never logged: that is
+            # the exfiltration oracle #1087 closed.
+            logger.warning(
+                "Skipping a fragment whose symlink leaves %s: %s",
+                fragments_root,
+                md_file,
+            )
+            continue
         try:
             record = try_load_fragment(md_file)
         except FRONTMATTER_LOAD_ERRORS:
