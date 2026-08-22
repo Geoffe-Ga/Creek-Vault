@@ -47,14 +47,20 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
+    from types import ModuleType
 
+# Declared before the import so the Windows fallback below is a legal
+# assignment rather than a suppressed type error. Call sites narrow on
+# ``fcntl is not None`` directly -- a separate `_HAS_FCNTL` bool cannot
+# narrow the module reference, so it would only push the suppression to
+# the `flock` calls (issue #852).
+fcntl: ModuleType | None
 try:
-    import fcntl
+    import fcntl as _fcntl
 
-    _HAS_FCNTL = True
+    fcntl = _fcntl
 except ImportError:  # pragma: no cover - exercised only on Windows
-    fcntl = None  # type: ignore[assignment]
-    _HAS_FCNTL = False
+    fcntl = None
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +214,7 @@ class AuditLog:
             self._lock_holder.lock,
             self.path.open("a", encoding="utf-8") as fh,
         ):
-            if _HAS_FCNTL:
+            if fcntl is not None:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
             # Invariant: the flock above is acquired iff control reaches
             # the ``try`` below. A failure of the ``flock`` call would
@@ -231,7 +237,7 @@ class AuditLog:
                 self._cached_last_hash = _hash_line(line)
                 self._cached_size = self.path.stat().st_size
             finally:
-                if _HAS_FCNTL:
+                if fcntl is not None:
                     fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
     def _compute_prev_hash(self) -> str:

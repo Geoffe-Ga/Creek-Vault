@@ -198,7 +198,7 @@ def _faiss_pair_indices(
     ``IndexFlatIP`` so an exact result is returned (useful when the
     pure-Python matmul would exceed the memory budget).
     """
-    import faiss  # type: ignore[import-not-found]
+    import faiss
     import numpy as np
 
     n, dim = matrix.shape
