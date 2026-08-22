@@ -19,6 +19,7 @@ from creek.generate.decisions import (
     DecisionContextGatherer,
     decision_from_note,
 )
+from creek.time import today_la
 from creek.models import (
     Decision,
     DecisionStatus,
@@ -925,8 +926,11 @@ class TestCoerceOpenedAndDecisionFromNote:
         opened = decision_from_note(note).opened
 
         assert isinstance(opened, date)
-        # The model default for a dropped ``opened`` is today's local date.
-        assert opened == date.today()
+        # The model default is ``Decision.opened``'s ``default_factory=today_la``
+        # (creek/models.py:1019) -- the LA date, NOT the system-local one. Asserting
+        # against ``date.today()`` here passes in LA and fails on a UTC runner for the
+        # seven hours after UTC midnight, which is exactly how this first went red in CI.
+        assert opened == today_la()
 
     def test_non_scalar_opened_falls_back_to_the_model_default(
         self,
