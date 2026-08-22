@@ -10,6 +10,7 @@ file — they must come from environment variables.
 """
 
 import logging
+import math
 import os
 import re
 from contextlib import suppress
@@ -1737,6 +1738,62 @@ class VoiceAudienceWeightingConfig(BaseModel):
     platform/privacy/representativeness factors so an unclassified vault
     (every fragment ``mixed`` → 1.0) still falls back to the platform
     heuristic, while a classified vault is scoped by the real axis."""
+
+    @field_validator(
+        "privacy_tier_authority",
+        "representativeness_authority",
+        "platform_authority",
+        "audience_authority",
+    )
+    @classmethod
+    def validate_authorities(cls, v: dict[str, float]) -> dict[str, float]:
+        """Validate every authority multiplier is finite and non-negative.
+
+        Issue #1412. These four maps are read straight into the exemplar
+        ranking multiplier in ``creek.generate.voice``, and two kinds of
+        value break it in different ways. A non-finite one destroys the
+        total order the ``sorted`` key depends on, so the chosen exemplars
+        vary with the order fragments happen to arrive in. A negative one
+        is deterministic but inverts rank, promoting precisely the
+        fragments the weighting exists to demote. Neither is detectable
+        downstream, so both are refused here, where the offending key can
+        still be named.
+
+        ``math.isfinite`` is explicit on purpose rather than relying on
+        NaN's comparison semantics to fall out of a range check: a range
+        check rejects NaN only as an accident of ``<`` always being
+        ``False``, which a later refactor can silently lose.
+
+        Zero stays legal, and deliberately so:
+        ``_default_privacy_tier_authority`` ships ``intimate: 0.0`` because
+        keyless or undeclared-tier content is meant to contribute nothing
+        to the voice. Tightening this to ``<= 0.0`` would look stricter and
+        would break that design.
+
+        Args:
+            v: One authority map to validate.
+
+        Returns:
+            The validated map, unchanged.
+
+        Raises:
+            ValueError: If any value is NaN, infinite, or negative.
+        """
+        for key, value in v.items():
+            if not math.isfinite(value):
+                msg = (
+                    f"authority for {key!r} must be a finite number, got "
+                    f"{value}; a non-finite multiplier makes exemplar "
+                    "ranking depend on input order"
+                )
+                raise ValueError(msg)
+            if value < 0.0:
+                msg = (
+                    f"authority for {key!r} must be >= 0.0, got {value}; a "
+                    "negative multiplier inverts exemplar rank"
+                )
+                raise ValueError(msg)
+        return v
 
 
 def _default_sync_sources() -> dict[str, bool]:

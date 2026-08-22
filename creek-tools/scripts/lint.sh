@@ -76,24 +76,35 @@ echo "=== Linting (Ruff) ==="
 # Running cold measures at ~0.05s over this tree (477 files) -- negligible --
 # so do not drop the flag to speed the gate up. tests/test_ruff_cache_poisoning.py
 # and tests/test_ruff_gate_parity.py fail if you do.
+
+# `set -e` (line 5) already owns the failure path: a non-zero ruff exits the
+# script immediately, with ruff's own status, which is what honours the three
+# exit codes documented above -- 2 ("Error running checks") stays 2 rather
+# than collapsing into 1. What `set -e` cannot do is say which gate spoke, and
+# an `EXIT_CODE=$?` capture cannot run after a command that already killed the
+# script, so the report that used to follow was unreachable (issue #1189).
+# An ERR trap is the one shape that adds the announcement without taking the
+# exit code away -- and without moving `ruff check` into an `if` condition,
+# where tests/test_ruff_gate_parity.py's `^ruff\s` scan would stop seeing it
+# and the --no-cache and no-autofix gates would silently assert over nothing.
+_announce_lint_failure() {
+    local rc=$?
+    echo "✗ Linting checks failed" >&2
+    exit "$rc"
+}
+trap _announce_lint_failure ERR
+
 if $FIX; then
     if $VERBOSE; then
         echo "Fixing linting issues..."
     fi
     ruff check . --fix --no-cache
-    EXIT_CODE=$?
 else
     if $VERBOSE; then
         echo "Checking for linting issues..."
     fi
     ruff check . --no-cache
-    EXIT_CODE=$?
 fi
 
-if [ $EXIT_CODE -eq 0 ]; then
-    echo "✓ Linting checks passed"
-    exit 0
-else
-    echo "✗ Linting checks failed" >&2
-    exit 1
-fi
+trap - ERR
+echo "✓ Linting checks passed"
