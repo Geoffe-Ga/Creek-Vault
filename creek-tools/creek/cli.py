@@ -571,10 +571,16 @@ def _run_ingest(
         raise typer.Exit(code=1) from exc
 
     if print_summary:
+        # `unchanged` is printed beside the others, not appended after them
+        # (#1482). Without it the four numbers could all read zero on a run
+        # that wrote fragments, directly above "Ingested N fragment(s)." --
+        # `written` counts every successful write, and an unchanged write is
+        # still a write. The invariant the operator can now check by eye is
+        # `written == created + updated + unchanged`.
         console.print(
             f"[dim]Ingest summary: {result.created} created, "
-            f"{result.updated} updated, {result.tombed} tombed, "
-            f"{result.skipped} skipped[/dim]",
+            f"{result.updated} updated, {result.unchanged} unchanged, "
+            f"{result.tombed} tombed, {result.skipped} skipped[/dim]",
         )
     return result.written, result.errors, result.discovered
 
