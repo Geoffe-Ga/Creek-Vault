@@ -52,6 +52,7 @@ from creek_mcp.tools.drive import (
     CONFIG_UNAVAILABLE_REASON,
     ERASE_FAILED_REASON,
     NOT_CONNECTED_REASON,
+    SYNC_BUSY_REASON,
     SYNC_FAILED_REASON,
     VAULT_UNAVAILABLE_REASON,
     drive_disconnect_tool,
@@ -89,12 +90,15 @@ that tells a client its own request was fine when it was not.
 """
 
 _TRANSIENT_REASONS: Final[frozenset[str]] = frozenset(
-    {SYNC_FAILED_REASON, VAULT_UNAVAILABLE_REASON}
+    {SYNC_BUSY_REASON, SYNC_FAILED_REASON, VAULT_UNAVAILABLE_REASON}
 )
 """The refusals a backoff can genuinely clear, so ``503 temporarily_unavailable``.
 
 A quota ceiling, a network blip, a vault directory that is momentarily not
-there. Neither carries any detail about what failed — see
+there, or a second sync of the same vault arriving while the first still holds
+the connector's lock (#1590) — the last of which clears the instant the holder
+finishes, which is precisely what a backoff is for. None of them carries any
+detail about what failed — see
 :data:`~creek_mcp.tools.drive.SYNC_FAILED_REASON` for why the detail stays in
 the server log.
 """
