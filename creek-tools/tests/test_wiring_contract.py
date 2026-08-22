@@ -84,14 +84,14 @@ import inspect
 import json
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import Any, Final
 from unittest import mock
 
-import click
 import frontmatter
 import pytest
 import typer
@@ -128,9 +128,6 @@ from creek_mcp.tools.link import link_tool
 from creek_mcp.tools.report import report_tool
 from tests.helpers import write_fragment_file
 
-if TYPE_CHECKING:
-    from collections.abc import Mapping
-
 pytestmark = pytest.mark.integration
 
 
@@ -139,28 +136,42 @@ pytestmark = pytest.mark.integration
 # ---------------------------------------------------------------------------
 
 
-def cli_surface_names(node: click.Command, prefix: tuple[str, ...] = ()) -> set[str]:
+def cli_surface_names(node: object, prefix: tuple[str, ...] = ()) -> set[str]:
     """Return every invocable CLI path under *node*, space-joined.
 
-    Walks the ``click`` command tree Typer builds, which is what a user's
-    shell actually resolves. ``app.registered_commands`` is deliberately
+    Walks the command tree Typer builds, which is what a user's shell
+    actually resolves. ``app.registered_commands`` is deliberately
     **not** used: every command under ``clean`` / ``purge`` / ``skills`` /
     ``compost`` lives in ``app.registered_groups`` instead, so that attribute
     sees only 23 of the 37 surfaces — a 38% blind spot in the very inventory
     this module exists to keep honest.
 
+    A group is identified by *having subcommands*, not by its class.
+    ``isinstance(node, click.Group)`` sat here until typer 0.27 vendored
+    click as ``typer._click``: ``TyperGroup`` stopped deriving from the
+    installed ``click.Group``, the branch went dead, and the walk
+    returned ``{""}`` — a single empty string standing in for all 37
+    surfaces. The contract test caught it, but only because it compares
+    against a full inventory; a laxer assertion would have passed on
+    nothing. Duck-typing on ``commands`` is what the walk actually needs
+    and it is immune to whose ``click`` a future typer ships: a
+    ``TyperCommand`` leaf has no ``commands`` attribute at all, so the
+    two cases stay cleanly separable (#1000).
+
     Args:
-        node: A ``click`` command or group to walk.
+        node: A command or group to walk. Typed as ``object`` because
+            the concrete class is precisely what must not be relied on.
         prefix: Command path accumulated so far.
 
     Returns:
         Space-joined CLI paths, e.g. ``{"classify", "clean orphans"}``.
     """
-    if isinstance(node, click.Group):
+    subcommands = getattr(node, "commands", None)
+    if isinstance(subcommands, Mapping):
         return {
             name
-            for sub_name, sub in node.commands.items()
-            for name in cli_surface_names(sub, (*prefix, sub_name))
+            for sub_name, sub in subcommands.items()
+            for name in cli_surface_names(sub, (*prefix, str(sub_name)))
         }
     return {" ".join(prefix)}
 
@@ -1867,6 +1878,38 @@ MODE_CONTRACT: Final[Mapping[str, str]] = {
 # ---------------------------------------------------------------------------
 # Inventory ratchets — derived from the live objects, never retyped
 # ---------------------------------------------------------------------------
+
+
+def test_the_cli_surface_walk_still_descends_into_groups() -> None:
+    """The inventory is a real tree walk, not a degenerate single node.
+
+    :func:`cli_surface_names` identified groups by
+    ``isinstance(node, click.Group)`` until typer 0.27 vendored click as
+    ``typer._click``. ``TyperGroup`` stopped deriving from the installed
+    ``click.Group``, so the recursion never fired and the whole
+    inventory collapsed to ``{""}`` — one empty string standing in for
+    37 commands.
+
+    ``test_every_cli_command_is_declared`` did catch that, but only
+    incidentally: it compares two sets, so it reports the collapse as 37
+    "stale entries" plus one unknown surface, which reads like a
+    contract that has drifted rather than a walk that has stopped
+    walking. This asserts the shape directly, so the next time a
+    dependency reparents Typer's classes the failure names the cause.
+    """
+    surfaces = registered_cli_commands()
+    assert "" not in surfaces, (
+        "the CLI surface walk produced an empty command path, which "
+        "means it stopped recognising groups and never descended — see "
+        "cli_surface_names (#1000)"
+    )
+    assert "clean orphans" in surfaces, (
+        "no nested surface was discovered; the walk is not descending "
+        "into command groups (#1000)"
+    )
+    assert len(surfaces) > len({name for name in surfaces if " " not in name}), (
+        "every discovered surface is top-level; nested groups were missed"
+    )
 
 
 def test_every_cli_command_is_declared(bench: Bench) -> None:

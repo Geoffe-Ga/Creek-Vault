@@ -667,6 +667,112 @@ class TestCsvFiles:
         # input kanji round-trips intact.
         assert any(ch in markdown for ch in "東京名前田中大阪京都")
 
+    def test_csv_shift_jis_cells_all_survive_the_detection_tables(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Every Shift-JIS cell reaches the markdown intact (#1257).
+
+        chardet 7.4.3 -> 7.6.0 reshapes the statistical tables behind
+        :func:`chardet.detect`, and this is one of the two call sites
+        where that choice decides what text enters a vault. Shift-JIS is
+        the family that clears
+        :data:`CSV_CHARDET_CONFIDENCE_THRESHOLD` (CP932 @ 0.93 on this
+        corpus, on both versions), so it is the one that actually
+        exercises the detection branch rather than the cp1252 fallback.
+
+        The neighbouring ``test_csv_shift_jis_decodes_with_chardet``
+        asserts that *at least one* kanji survives, which a partially
+        wrong codec still passes. This asserts every cell, because a
+        vault of half-corrupted rows looks healthy until someone reads
+        it.
+
+        The codec *name* is deliberately not asserted: 7.4.3 answers
+        ``cp932`` and 7.6.0 answers ``CP932``. Both decode identically
+        and ``_read_csv`` lowercases before its reject-set test, so
+        pinning the name would fail on a harmless rename while still
+        passing on real mojibake.
+        """
+        csv_path = tmp_path / "shift_jis_cells.csv"
+        rows = (
+            "名前,都市,メモ\n"
+            "田中,東京,ありがとうございます\n"
+            "鈴木,大阪,初めまして、よろしくお願いします\n"
+            "佐藤,京都,日本語のテキストはマルチバイトです\n"
+        )
+        csv_path.write_bytes((rows * 60).encode("shift_jis"))
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+        markdown = ingestor.convert_to_markdown(fragments[0])
+        for cell in (
+            "名前",
+            "都市",
+            "メモ",
+            "田中",
+            "東京",
+            "ありがとうございます",
+            "初めまして、よろしくお願いします",
+            "日本語のテキストはマルチバイトです",
+        ):
+            assert cell in markdown, (
+                f"Shift-JIS cell {cell!r} did not survive decoding; "
+                "chardet chose a codec whose tables disagree with the "
+                "writer's, which reaches a vault as mojibake (#1257)"
+            )
+
+    def test_csv_gbk_falls_under_the_confidence_gate_and_warns(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Chinese CSV is corrupted by the cp1252 fallback today (#1589).
+
+        This pins a **defect**, not a contract. chardet scores GB18030
+        at 0.54 on realistic CSV content — CSV structure itself is
+        ASCII, which dilutes a multi-byte codec's score — so the
+        detection never clears
+        :data:`CSV_CHARDET_CONFIDENCE_THRESHOLD` and every Chinese cell
+        is decoded as cp1252 into plausible-looking garbage. Verified
+        identical under chardet 7.4.3 (0.5437) and 7.6.0 (0.5411), so
+        the #1257 floor raise neither causes nor fixes it; #1589 owns
+        the fix.
+
+        It is asserted rather than left silent because the failure is
+        invisible: cp1252 accepts every byte, so nothing raises and
+        nothing downstream can tell a corrupted vault from a healthy
+        one. When #1589 lands, this test must go red and be replaced by
+        the round-trip assertion its Shift-JIS neighbour already makes.
+        """
+        import logging
+
+        csv_path = tmp_path / "gbk.csv"
+        rows = (
+            "姓名,城市,备注\n"
+            "王伟,北京,他每天早上都会沿着小河散步\n"
+            "李娜,上海,河水清澈。岸边的树木在风中轻轻摇动\n"
+            "张敏,广州,远处的山峦笼罩在薄雾里。世界还没有醒来\n"
+        )
+        csv_path.write_bytes((rows * 40).encode("gbk"))
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        with caplog.at_level(logging.WARNING, logger="creek.ingest.spreadsheets"):
+            fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+        markdown = ingestor.convert_to_markdown(fragments[0])
+
+        assert "姓名" not in markdown, (
+            "GBK CSV now decodes correctly — #1589 has been fixed, so "
+            "replace this defect-pinning test with the round-trip "
+            "assertion test_csv_shift_jis_cells_all_survive_the_"
+            "detection_tables makes"
+        )
+        assert any(
+            "decoded as cp1252" in record.message and "GB18030" in record.message
+            for record in caplog.records
+        ), (
+            "the cp1252 fallback corrupted a Chinese CSV without naming "
+            "chardet's rejected guess; the warning is the only signal a "
+            "user gets before the mojibake lands in the vault (#1589)"
+        )
+
     def test_csv_cp1252_fallback_logs_warning(
         self,
         tmp_path: Path,
