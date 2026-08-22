@@ -744,8 +744,8 @@ def _scannable_candidates(dir_path: Path) -> tuple[list[Path], int]:
     not scanned, not counted in ``escaped``, and not reported, and the
     operator read a clean result over a region that was never opened. The
     ruling for this surface is REPORT, not refuse — ``--scan`` writes nothing
-    and :meth:`creek.pipeline.Pipeline._run_redaction_pass` reaches it on the
-    unattended ``creek process`` / ``creek sync` path, so a refusal here would
+    and :meth:`creek.pipeline.Pipeline._run_redaction` reaches it on the
+    unattended ``creek process`` / ``creek sync`` path, so a refusal here would
     disable the operator's whole safety scan over one chmod-000 directory.
     The count is deliberately NOT folded into ``escaped``: an unreadable
     directory is not an escaping symlink, and conflating them would make the

@@ -41,7 +41,7 @@ argue with a test rather than quietly flip one of them:
   "Applied redactions to N file(s)" over a region it could not examine is a
   false assurance from a safety tool.
 * ``creek redact --scan`` — the redaction **read** path, which
-  ``Pipeline._run_redaction_pass`` also reaches on the ``creek process`` /
+  ``Pipeline._run_redaction`` also reaches on the ``creek process`` /
   ``creek sync`` path — **reports** (WARNING) and exits 0, matching the
   skip-and-count policy #1360 set for that surface.
 
@@ -572,7 +572,7 @@ def test_redact_scan_warns_about_a_subtree_it_could_not_list_and_does_not_refuse
     Two halves, and both are load-bearing.
 
     ``exit_code == 0`` pins that the read path is not turned into a hard
-    failure. ``Pipeline._run_redaction_pass`` reaches ``scan_batch`` on the
+    failure. ``Pipeline._run_redaction`` reaches ``scan_batch`` on the
     ``creek process`` / ``creek sync`` path, so refusing here *would* hit the
     unattended loop — the argument that does not apply to ``--apply`` applies
     in full force to this surface.
