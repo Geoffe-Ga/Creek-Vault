@@ -739,3 +739,100 @@ class TestDiscoverSkipsBinariesUnread:
         assert len(fragments) == 1
         assert fragments[0].content == body
         assert len(fragments[0].content) > _BINARY_CHECK_SIZE
+
+
+# ---- chardet detection-table crossing (#1257) ----
+
+#: Long, varied corpora per encoding. ``chardet`` scores byte
+#: statistics, so a two-word sample lands under any sensible confidence
+#: and tells you nothing about the detection tables. Each of these is
+#: repeated until the detector has hundreds of bytes of signal, which is
+#: also what a real ingested file looks like.
+_ENCODING_CORPORA: tuple[tuple[str, str], ...] = (
+    (
+        "shift_jis",
+        "彼は毎日、早朝に起きて川のそばを歩きながら、"
+        "今日一日のことを静かに考える習慣をもっています。"
+        "水の音と鳥の声だけが聞こえる時間が、"
+        "彼にとって最も大切なひとときです。",
+    ),
+    (
+        "gbk",
+        "他每天早上都会沿着小河散步。一边走一边安静地思考今天要做的事情。"
+        "河水清澈。岸边的树木在风中轻轻摇动。远处的山峦笼罩在薄雾里。"
+        "他喜欢这样的时刻。因为世界还没有完全醒来。",
+    ),
+    (
+        "latin-1",
+        "Le matin, après avoir préparé un café très serré, il s'installe "
+        "près de la fenêtre et relit ses notes sur la rivière, la forêt "
+        "et les étoiles d'été. Il écrit lentement, mesure chaque phrase, "
+        "puis referme son cahier élimé. ",
+    ),
+)
+
+
+class TestTryDecodeAcrossDetectionTables:
+    """``_try_decode`` reproduces the source text exactly, not approximately.
+
+    ``chardet`` 7.4.3 -> 7.6.0 (#1257) changes the statistical tables
+    behind :func:`chardet.detect`, and this is the only place in the
+    pipeline where that choice decides what text enters a vault. The
+    failure mode is silent: a shifted table picks a plausible neighbour
+    codec, every byte decodes without raising, and mojibake is written
+    to a fragment that nobody re-reads.
+
+    So these assert the *whole decoded string* against the original.
+    The pre-existing decode tests assert substrings (``"caf" in text``),
+    which survive exactly the corruption this guards — a wrong codec
+    still leaves the ASCII run intact.
+
+    The detected codec name is deliberately not asserted. chardet
+    answers CP932 for Shift-JIS and GB18030 for GBK: supersets that
+    decode these bytes identically. Pinning the name would fail on a
+    harmless rename while still passing on real mojibake, which is the
+    wrong test in both directions.
+    """
+
+    @pytest.mark.parametrize(("encoding", "corpus"), _ENCODING_CORPORA)
+    def test_non_utf8_corpus_round_trips_exactly(
+        self,
+        encoding: str,
+        corpus: str,
+    ) -> None:
+        """Bytes in *encoding* decode back to the exact source text.
+
+        Args:
+            encoding: Codec the corpus is written in.
+            corpus: Source text, repeated to give chardet real signal.
+        """
+        text = corpus * 4
+        decoded = _try_decode(text.encode(encoding))
+        assert decoded == text, (
+            f"{encoding} bytes decoded to text that differs from the "
+            "source; chardet picked a codec whose tables disagree with "
+            "the writer's, which reaches a vault as mojibake (#1257)"
+        )
+
+    def test_utf8_corpus_round_trips_exactly(self) -> None:
+        """UTF-8 never reaches chardet — it is tried and accepted first."""
+        text = "".join(corpus for _, corpus in _ENCODING_CORPORA)
+        assert _try_decode(text.encode()) == text
+
+    def test_utf16_corpus_round_trips_exactly(self) -> None:
+        """UTF-16 is claimed by the BOM check ahead of chardet."""
+        text = "".join(corpus for _, corpus in _ENCODING_CORPORA)
+        assert _try_decode(text.encode("utf-16")) == text
+
+    def test_the_corpus_table_still_covers_every_family(self) -> None:
+        """The parametrised table has not been emptied or trimmed.
+
+        Deleting a row here removes a guard without turning a single
+        test red — the parametrisation simply runs fewer cases and the
+        gate stays green.
+        """
+        assert {encoding for encoding, _ in _ENCODING_CORPORA} == {
+            "shift_jis",
+            "gbk",
+            "latin-1",
+        }

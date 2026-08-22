@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -1177,3 +1178,167 @@ def test_run_link_embeddings_counts_edges_without_building_them(
         f"the link run built {constructed} Resonance object(s) to count "
         f"{summary.similarity_edges} edge(s); counting must allocate none"
     )
+
+
+class TestEmbeddingsCacheParquetFormat:
+    """The on-disk parquet crossing a pyarrow major would break (#1001).
+
+    The embeddings cache is the only file this project keeps in a
+    third-party binary format, and ``pyarrow`` was declared ``>=17.0.0``
+    with no ceiling — so a routine relock could carry the writer across
+    a parquet major while caches written under the old one were still on
+    disk. Bounding the specifier stops the *unreviewed* crossing; these
+    tests are what make a reviewed one safe, by pinning the format the
+    two halves agree on rather than only that a round trip returns
+    something.
+
+    All six ``pyarrow`` call sites in ``creek.link.embeddings`` are
+    covered: the writer's ``pa.table`` / ``pa.array`` and
+    ``pq.write_table`` (``save_cache``), the reader's ``pq.read_table``
+    (``load_cache``), and the purge path's ``pq.read_table``,
+    ``pq.write_table`` and ``pq.read_metadata``. The purge *rewrite* is
+    the one an upgrade is most likely to break silently and the one the
+    issue's own call-site list omitted.
+    """
+
+    @staticmethod
+    def _entries() -> dict[str, Any]:
+        """Return three cache rows with distinguishable vectors.
+
+        Returns:
+            Mapping of fragment ID to :class:`CachedEmbedding`, ordered
+            so a purge can drop the middle row and leave neighbours to
+            assert against.
+        """
+        from creek.link.embeddings import CachedEmbedding
+
+        computed_at = datetime(2026, 8, 21, 12, 30, 45, tzinfo=UTC)
+        return {
+            f"frag-{index}": CachedEmbedding(
+                fragment_id=f"frag-{index}",
+                content_hash=f"hash-{index}",
+                model_name="all-MiniLM-L6-v2",
+                vector=[0.5 * index, -0.25 * index, 0.125],
+                computed_at=computed_at,
+            )
+            for index in range(3)
+        }
+
+    def test_saved_cache_declares_the_column_types_the_reader_expects(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """``save_cache`` writes the exact arrow schema, not merely a table.
+
+        A parquet major that widened ``float32`` to ``float64`` or
+        dropped the timestamp's timezone would still round-trip through
+        ``to_pylist()`` while changing every persisted vector's width
+        and every timestamp's meaning. Asserting the schema is what
+        makes that visible.
+        """
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        config = EmbeddingsConfig(model="all-MiniLM-L6-v2")
+        cache_path = tmp_path / "embeddings.parquet"
+        EmbeddingLinker(config=config).save_cache(self._entries(), cache_path)
+
+        schema = pq.read_schema(cache_path)
+        assert schema.field("fragment_id").type == pa.string()
+        assert schema.field("content_hash").type == pa.string()
+        assert schema.field("model_name").type == pa.string()
+        assert schema.field("embedding").type == pa.list_(pa.float32())
+        assert schema.field("computed_at").type == pa.timestamp("us", tz="UTC")
+
+    def test_saved_cache_is_snappy_compressed(self, tmp_path: Path) -> None:
+        """The writer's ``compression="snappy"`` reaches the file footer.
+
+        Snappy is what keeps a large vault's cache readable without a
+        codec the reader may not have; a default-compression regression
+        is invisible to every behavioural assertion except this one.
+        """
+        import pyarrow.parquet as pq
+
+        config = EmbeddingsConfig(model="all-MiniLM-L6-v2")
+        cache_path = tmp_path / "embeddings.parquet"
+        EmbeddingLinker(config=config).save_cache(self._entries(), cache_path)
+
+        metadata = pq.read_metadata(cache_path)
+        codecs = {
+            metadata.row_group(0).column(index).compression
+            for index in range(metadata.num_columns)
+        }
+        assert codecs == {"SNAPPY"}, f"cache columns compressed with {codecs}"
+
+    def test_round_trip_preserves_every_field_exactly(self, tmp_path: Path) -> None:
+        """``load_cache`` returns what ``save_cache`` was given.
+
+        Exact values, not shapes: a float32 column narrows the vector,
+        so the assertion is written against the narrowed value the
+        reader must reproduce rather than against the input floats.
+        """
+        config = EmbeddingsConfig(model="all-MiniLM-L6-v2")
+        linker = EmbeddingLinker(config=config)
+        cache_path = tmp_path / "embeddings.parquet"
+        entries = self._entries()
+        linker.save_cache(entries, cache_path)
+
+        loaded = linker.load_cache(cache_path)
+
+        assert set(loaded) == set(entries)
+        for frag_id, original in entries.items():
+            row = loaded[frag_id]
+            assert row.fragment_id == original.fragment_id
+            assert row.content_hash == original.content_hash
+            assert row.model_name == original.model_name
+            assert row.computed_at == original.computed_at
+            assert row.vector == pytest.approx(original.vector, abs=1e-6)
+
+    def test_purge_rewrites_a_cache_that_still_round_trips(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The purge rewrite keeps the file readable by ``load_cache``.
+
+        ``purge_fragment_ids_from_cache`` reads the table, filters it and
+        writes it back — a second, independent writer over the same
+        format. A major that changed ``Table.filter`` or the rewrite's
+        defaults would corrupt a vault's cache during a
+        right-to-be-forgotten erasure, which is the worst possible time
+        to find out.
+        """
+        from creek.link.embeddings import purge_fragment_ids_from_cache
+
+        config = EmbeddingsConfig(model="all-MiniLM-L6-v2")
+        linker = EmbeddingLinker(config=config)
+        cache_path = tmp_path / "embeddings.parquet"
+        entries = self._entries()
+        linker.save_cache(entries, cache_path)
+
+        removed = purge_fragment_ids_from_cache(cache_path, ["frag-1"])
+
+        assert removed == 1
+        survivors = linker.load_cache(cache_path)
+        assert set(survivors) == {"frag-0", "frag-2"}
+        assert survivors["frag-2"].vector == pytest.approx(
+            entries["frag-2"].vector,
+            abs=1e-6,
+        )
+
+    def test_footer_row_count_matches_the_rows_written(self, tmp_path: Path) -> None:
+        """``delete_embeddings_cache`` counts rows from the parquet footer.
+
+        It reports how much was erased, so a footer read that stopped
+        agreeing with the writer would under- or over-claim an erasure
+        in the audit record while the deletion itself still succeeded.
+        """
+        from creek.link.embeddings import delete_embeddings_cache
+
+        config = EmbeddingsConfig(model="all-MiniLM-L6-v2")
+        cache_path = tmp_path / "embeddings.parquet"
+        EmbeddingLinker(config=config).save_cache(self._entries(), cache_path)
+
+        assert delete_embeddings_cache(cache_path, dry_run=True) == 3
+        assert cache_path.exists()
+        assert delete_embeddings_cache(cache_path) == 3
+        assert not cache_path.exists()

@@ -122,6 +122,62 @@ extra, not a base dependency — which is why ``_openai_specifier()``
 below reads a different table from crawdad's namesake, where openai
 *is* declared in ``[project].dependencies``.
 
+``pyarrow``, ``sentence-transformers`` and ``anthropic`` (issue #1001):
+three bands with no advisory behind any of them, guarded together by
+``_BOUNDED_EXTRAS`` because they share one failure mode — an extra
+declared with a floor and no ceiling, on a load-bearing path, which a
+routine ``uv lock --upgrade`` then carries across a major nobody read.
+
+*pyarrow* is the writer and reader of the embeddings cache, the only
+file this project keeps on disk in a third-party binary format:
+``EmbeddingLinker.save_cache`` writes snappy parquet with ``string``,
+``list_(float32())`` and ``timestamp("us", tz="UTC")`` columns,
+``load_cache`` reads it back, ``purge_fragment_ids_from_cache``
+rewrites it after filtering, and ``delete_embeddings_cache`` reads the
+row count from its footer. At ``>=17.0.0`` a relock was free to cross
+a parquet major against caches written under the old one.
+
+Bounding pyarrow is also what made 25.0.1 get *read* rather than merely
+resolved, and reading it found the reason not to take it yet: 25.0.1
+ships no ``py.typed`` marker where 24.0.0 does, which under mypy strict
+turns every ``pa.`` and ``pq.`` call in the cache writer into ``Any``.
+So the band holds at ``>=24.0.0,<25.0.0`` — the release the lock
+resolves and has always run — and #1594 owns the adoption.
+
+``numpy`` (issue #1000): the fourth band, and the only one here whose
+reason is the *interpreter matrix* rather than a major. numpy 2.5
+declares ``requires-python >=3.12`` while this project declares
+``>=3.11``, so an open floor makes ``uv.lock`` carry two resolutions —
+2.4.6 for 3.11, 2.5.2 for 3.12+ — and the toolchain cannot straddle
+that: numpy 2.5's bundled ``__init__.pyi`` uses PEP 695 ``type``
+statements, which mypy rejects as a syntax error under
+``python_version = "3.11"``. ``ignore_missing_imports`` cannot suppress
+it, because the stub is present and unparseable rather than absent. The
+ceiling keeps one numpy across the whole declared support range.
+
+*sentence-transformers* loads the model that produces every vector in
+that same cache. It sat at ``>=2.2.0`` while 6.0.0 published on
+2026-08-18 — three days before this relock — and a bare ``uv lock
+--upgrade`` took it. The band records the release the lock resolves
+and holds the major for the vetting pass #1592 tracks.
+
+*anthropic* is the Claude SDK behind ``creek.classify``. It sat at
+``>=0.40.0`` while 1.0.0 published on 2026-08-20, one day before the
+relock, so the relock would have adopted a first stable major of an
+SDK on the classification path with no review at all. It is not only
+an SDK major: 1.0.0 makes ``httpx2<3,>=2.0.0`` a *hard* requirement,
+so taking it stands httpx2 + httpcore2 + httpx2-jsfetch + truststore
+beside the declared ``httpx>=0.27.0``. That is the same swap
+``mcp<2.0.0`` (#998) and ``openai<3.0.0`` (#1479) already hold open —
+holding anthropic too is what keeps this environment on one HTTP
+stack. Vetting is #1593; issue #999 owns the SDK line.
+
+Each band is asserted from both ends, the way openai and setuptools
+are: the floor must admit the release ``uv.lock`` resolves and reject
+the open floor it replaced, and the ceiling must reject both the
+unvetted major and a far-future probe, so a lazy ``!=26.0.0`` posing
+as a ceiling fails.
+
 Two independent guards per package:
 
 * **pyproject floor** — the declared specifier must reject the last
@@ -156,6 +212,7 @@ from __future__ import annotations
 import ast
 import sys
 import tomllib
+from dataclasses import dataclass
 from importlib.metadata import packages_distributions
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -245,11 +302,17 @@ _TORCH_PATCHED_VERSION = Version("2.13.0")
 _CRYPTOGRAPHY_PATCHED_VERSION = Version("50.0.0")
 
 #: The anyio floor. No CVE here — the floor simply records the version
-#: the lock already resolved when anyio was declared (issue #1123), the
-#: same rule the neighbouring uvicorn declaration follows. Inventing a
-#: lower bound would claim compatibility with releases this project has
-#: never run.
-_ANYIO_DECLARED_FLOOR = Version("4.13.0")
+#: the lock resolves, the same rule the neighbouring uvicorn
+#: declaration follows. Inventing a lower bound would claim
+#: compatibility with releases this project has never run. Raised from
+#: 4.13.0, the resolution when anyio was first declared (#1123), to the
+#: 2026-08-21 transitive relock's resolution (#1257).
+_ANYIO_DECLARED_FLOOR = Version("4.14.2")
+
+#: The anyio floor this one replaced. Probed so the assertion holds
+#: from both ends: without it a floor left behind at 4.13.0 would still
+#: satisfy every other anyio guard in this file.
+_ANYIO_PREVIOUS_FLOOR = Version("4.13.0")
 
 #: The last rpds-py release on the abandoned SemVer line, and the
 #: version both locks were frozen at before issue #1185.
@@ -289,6 +352,99 @@ _OPENAI_PRE_BOUND_FLOOR = Version("1.0")
 #: Both are shipped in the wheel, so anything they import at module
 #: scope has to be installable from the manifest alone.
 _IMPORT_ROOTS = ("creek", "creek_mcp")
+
+#: A far-future major shared by every ``_BoundedExtra`` assertion. It
+#: probes for a single-release exclusion (``!=26.0.0``) written where a
+#: ceiling belongs: that satisfies an assertion aimed at the next major
+#: while re-admitting its first patch and every later major.
+_BOUNDED_EXTRA_FUTURE_PROBE = Version("999.0.0")
+
+
+@dataclass(frozen=True)
+class _BoundedExtra:
+    """One optional-dependency band held from both ends (issue #1001).
+
+    Attributes:
+        extra: Name of the ``[project.optional-dependencies]`` table
+            declaring the distribution.
+        distribution: Distribution name as declared and as locked.
+        locked_floor: The release ``uv.lock`` resolves. The band must
+            admit it — a floor records what this project has run.
+        pre_bound_floor: The open floor this band replaced. The band
+            must reject it, so removing the floor is as red as removing
+            the ceiling.
+        unvetted_major: The major the ceiling exists to exclude.
+        rationale: One clause naming what crossing that major would
+            reach, quoted into the failure message.
+    """
+
+    extra: str
+    distribution: str
+    locked_floor: Version
+    pre_bound_floor: Version
+    unvetted_major: Version
+    rationale: str
+
+
+#: Every extra bounded by issue #1001, and the reason each bound exists.
+#: A parametrised table rather than three near-identical test bodies —
+#: but emptying it would make the guards vanish behind a green gate, so
+#: ``test_every_unbounded_major_the_relock_crossed_is_bounded`` asserts
+#: the membership rather than trusting the parametrisation.
+_BOUNDED_EXTRAS: tuple[_BoundedExtra, ...] = (
+    _BoundedExtra(
+        extra="embeddings",
+        distribution="pyarrow",
+        locked_floor=Version("24.0.0"),
+        pre_bound_floor=Version("17.0.0"),
+        unvetted_major=Version("25.0.0"),
+        rationale=(
+            "pyarrow reads and writes the embeddings cache, the only "
+            "on-disk file this project keeps in a third-party binary "
+            "format, so a parquet major crosses persisted data — and "
+            "25.0.1 also ships no py.typed marker, which would make "
+            "that writer untyped under mypy strict (#1594)"
+        ),
+    ),
+    _BoundedExtra(
+        extra="embeddings",
+        distribution="numpy",
+        locked_floor=Version("2.4.6"),
+        pre_bound_floor=Version("2.4.4"),
+        unvetted_major=Version("2.5.0"),
+        rationale=(
+            "numpy 2.5 requires Python >=3.12 while this project "
+            "declares >=3.11, so an open floor splits the lock into two "
+            "resolutions and mypy — targeting 3.11 — cannot parse 2.5's "
+            "PEP 695 stubs on a 3.12 interpreter"
+        ),
+    ),
+    _BoundedExtra(
+        extra="embeddings",
+        distribution="sentence-transformers",
+        locked_floor=Version("5.7.0"),
+        pre_bound_floor=Version("2.2.0"),
+        unvetted_major=Version("6.0.0"),
+        rationale=(
+            "sentence-transformers loads the model that produces every "
+            "vector in that cache; 6.0.0 published 2026-08-18 and its "
+            "vetting against the embedding engine is #1592"
+        ),
+    ),
+    _BoundedExtra(
+        extra="anthropic",
+        distribution="anthropic",
+        locked_floor=Version("0.125.0"),
+        pre_bound_floor=Version("0.40.0"),
+        unvetted_major=Version("1.0.0"),
+        rationale=(
+            "anthropic is the Claude SDK on the creek.classify path; "
+            "1.0.0 published 2026-08-20 and forces httpx2 as a hard "
+            "requirement, so its adoption is one decision with the mcp "
+            "#998 and openai #1479 ceilings — tracked in #1593"
+        ),
+    ),
+)
 
 
 def _mcp_specifier() -> SpecifierSet:
@@ -355,6 +511,59 @@ def _locked_openai_version() -> Version:
         if package["name"] == "openai":
             return Version(str(package["version"]))
     pytest.fail("openai has no [[package]] entry in uv.lock")
+
+
+def _extra_specifier(extra: str, distribution: str) -> SpecifierSet:
+    """Return the specifier one ``[project.optional-dependencies]`` entry declares.
+
+    Generalises ``_openai_specifier`` over the extras bounded by issue
+    #1001, which live in three different tables and would otherwise
+    need three copies of the same six lines.
+
+    Args:
+        extra: Name of the extra table to read.
+        distribution: Distribution name to find inside that table.
+
+    Returns:
+        The specifier set attached to *distribution* inside *extra*.
+        Fails the calling test if either the table or the entry is
+        missing — a band that has been deleted rather than widened is
+        just as much a regression.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    extras: dict[str, list[str]] = pyproject["project"]["optional-dependencies"]
+    if extra not in extras:
+        pytest.fail(
+            f"pyproject.toml declares no [project.optional-dependencies].{extra}"
+        )
+    for entry in extras[extra]:
+        requirement = Requirement(entry)
+        if requirement.name == distribution:
+            return requirement.specifier
+    pytest.fail(
+        f"{distribution} is not declared in "
+        f"[project.optional-dependencies].{extra} of pyproject.toml"
+    )
+
+
+def _locked_distribution_version(distribution: str) -> Version:
+    """Return the version ``uv.lock`` resolves for *distribution*.
+
+    Args:
+        distribution: Distribution name as it appears in ``uv.lock``.
+
+    Returns:
+        The resolved version. Fails the calling test when the lock has
+        no entry, which means the extra stopped resolving at all.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == distribution:
+            return Version(str(package["version"]))
+    pytest.fail(f"{distribution} has no [[package]] entry in uv.lock")
 
 
 def _pyasn1_constraint_specifier() -> SpecifierSet:
@@ -800,6 +1009,97 @@ def test_locked_openai_satisfies_the_declared_specifier() -> None:
         f"{_openai_specifier()!r} rejects; a bounded manifest with a lock "
         "outside the bound is the drift this guards — run `uv lock` after "
         "changing the openai extra (#1479)"
+    )
+
+
+@pytest.mark.parametrize("band", _BOUNDED_EXTRAS, ids=lambda b: b.distribution)
+def test_bounded_extra_ceiling_rejects_the_unvetted_major(band: _BoundedExtra) -> None:
+    """The band excludes the major nobody has read, and every later one.
+
+    The second assertion is the one that catches a half-measure: an
+    exclusion of the single release (``!=26.0.0``) reads like a ceiling
+    and is not one — it re-admits the first patch of that same major.
+
+    Args:
+        band: The bounded extra under test.
+    """
+    specifier = _extra_specifier(band.extra, band.distribution)
+    assert str(band.unvetted_major) not in specifier, (
+        f"{band.distribution} specifier {specifier!r} admits "
+        f"{band.unvetted_major}: {band.rationale}. A relock must not "
+        "cross that major unreviewed — write a ceiling below it (#1001)"
+    )
+    assert str(_BOUNDED_EXTRA_FUTURE_PROBE) not in specifier, (
+        f"{band.distribution} specifier {specifier!r} admits "
+        f"{_BOUNDED_EXTRA_FUTURE_PROBE}; excluding the single release "
+        f"`!={band.unvetted_major}` is not a ceiling — it re-admits the "
+        "next patch and every later major. Write a real upper bound (#1001)"
+    )
+
+
+@pytest.mark.parametrize("band", _BOUNDED_EXTRAS, ids=lambda b: b.distribution)
+def test_bounded_extra_floor_accepts_the_locked_release(band: _BoundedExtra) -> None:
+    """The band admits today's resolution and rejects the open floor.
+
+    Both ends matter. A ceiling alone satisfies every other assertion
+    here while leaving a floor years below anything this project has
+    run; a floor that overshoots the resolution fails at provisioning
+    time in CI rather than here.
+
+    Args:
+        band: The bounded extra under test.
+    """
+    specifier = _extra_specifier(band.extra, band.distribution)
+    assert str(band.locked_floor) in specifier, (
+        f"{band.distribution} specifier {specifier!r} rejects "
+        f"{band.locked_floor}, the version uv.lock resolves; a floor "
+        "records what this project has actually run, never a version it "
+        "has not (#1001)"
+    )
+    assert str(band.pre_bound_floor) not in specifier, (
+        f"{band.distribution} specifier {specifier!r} still admits "
+        f"{band.pre_bound_floor}, the open floor this band replaced; the "
+        "ceiling is only half the bound (#1001)"
+    )
+
+
+@pytest.mark.parametrize("band", _BOUNDED_EXTRAS, ids=lambda b: b.distribution)
+def test_locked_bounded_extra_satisfies_the_declared_band(band: _BoundedExtra) -> None:
+    """``uv.lock`` resolves the distribution inside its declared band.
+
+    The lockfile is what CI installs. A bounded manifest with a lock
+    outside the bound is exactly the drift these pairs exist to catch:
+    the declaration would be right and the installed environment still
+    wrong.
+
+    Args:
+        band: The bounded extra under test.
+    """
+    locked = _locked_distribution_version(band.distribution)
+    specifier = _extra_specifier(band.extra, band.distribution)
+    assert str(locked) in specifier, (
+        f"uv.lock pins {band.distribution} {locked}, which the declared "
+        f"specifier {specifier!r} rejects; run `uv lock` after changing "
+        f"the {band.extra} extra (#1001)"
+    )
+
+
+def test_every_unbounded_major_the_relock_crossed_is_bounded() -> None:
+    """``_BOUNDED_EXTRAS`` still names all three distributions #1001 bounded.
+
+    Parametrisation over an empty or trimmed table skips silently and
+    reads as a pass, so the membership is asserted rather than assumed.
+    The 2026-08-21 transitive relock (#1184) crossed exactly these three
+    unbounded majors; dropping one from the table would retire its guard
+    without a single red test.
+    """
+    bounded = {band.distribution for band in _BOUNDED_EXTRAS}
+    assert bounded == {"pyarrow", "sentence-transformers", "anthropic", "numpy"}, (
+        f"_BOUNDED_EXTRAS covers {sorted(bounded)}; issue #1001 bounded "
+        "pyarrow, sentence-transformers and anthropic — the three "
+        "unbounded majors a bare `uv lock --upgrade` crossed — plus "
+        "numpy, whose open floor split the lock across the supported "
+        "interpreter range. Removing an entry retires its guard silently"
     )
 
 
@@ -1341,9 +1641,11 @@ def test_anyio_floor_tracks_the_locked_resolution() -> None:
         f"anyio specifier {specifier!r} rejects {_ANYIO_DECLARED_FLOOR}, "
         "the version uv.lock resolves"
     )
-    assert "4.12.0" not in specifier, (
-        f"anyio specifier {specifier!r} admits 4.12.0; the floor must be "
-        f">={_ANYIO_DECLARED_FLOOR}, the resolution the project actually runs"
+    assert str(_ANYIO_PREVIOUS_FLOOR) not in specifier, (
+        f"anyio specifier {specifier!r} still admits "
+        f"{_ANYIO_PREVIOUS_FLOOR}, the floor it replaced; the floor must "
+        f"be >={_ANYIO_DECLARED_FLOOR}, the resolution the project "
+        "actually runs (#1257)"
     )
 
 
