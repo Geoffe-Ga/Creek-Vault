@@ -32,6 +32,7 @@ run "Type check"       "$SCRIPT_DIR/typecheck.sh"
 run "Security"         "$SCRIPT_DIR/security.sh"
 run "Docstrings"       "$SCRIPT_DIR/docstrings.sh"
 run "Complexity"       "$SCRIPT_DIR/complexity.sh"
+run "Dead code (vulture)" "$SCRIPT_DIR/lint-vulture.sh"
 run "Tests + coverage" "$SCRIPT_DIR/test.sh"
 
 echo "=== Summary ==="

@@ -47,6 +47,7 @@ cross-repo contract is
 | `creek.state.render`  | Re-render the audit report (expensive), **excluding** above-ceiling content section by section and stamping what it admitted (#969). |
 | `creek.lint`          | Run the unified hygiene lint pass (FEAT-008).              |
 | `creek.mine`          | Surface essay seeds from the compiled vault layer.         |
+| `creek.wheel`         | Return a per-frequency balance read of the corpus for the Map: an ordered `F1..F10` map of `{name, count, share}`, where `share` is the fraction of *classified* fragments at that frequency. A corpus walk (the same shape as `state.render` and `report`), so it **excludes** above-ceiling fragments from the tally rather than refusing (#969). |
 | `creek.draft`         | Draft an essay from a mined idea (requires an LLM).        |
 | `creek.redact.scan`   | Regex-scan a path for secrets/PII (FEAT-027); scoped to `00-Creek-Meta/Inbound/` at every ceiling, `intimate`/`all` elsewhere in the vault (#972). |
 
