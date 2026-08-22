@@ -72,6 +72,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 from yaml import YAMLError
 
+from creek._fslock import VaultLockTimeoutError, vault_lock
 from creek.config import load_vault_config
 from creek.ingest import INGESTOR_REGISTRY, UnsupportedSourceError, route_to_ingestor
 from creek.ingest.gdrive import (
@@ -80,6 +81,7 @@ from creek.ingest.gdrive import (
     inspect_token,
     revoke_token,
 )
+from creek.ingest.ledger import SourceLedger
 from creek.ingest.pipeline import run_ingest
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
@@ -98,6 +100,16 @@ SYNC_TOOL_NAME: Final[str] = "creek.drive.sync"
 
 DISCONNECT_TOOL_NAME: Final[str] = "creek.drive.disconnect"
 """Audit name of the revoke-and-erase verb."""
+
+_SYNC_LOCK_TIMEOUT_SECONDS: Final[float] = 10.0
+"""How long a queued sync waits for the running one before refusing.
+
+Comfortably under the ``/v1`` request timeout
+(:data:`~creek_mcp.httpapi.middleware.limits.DEFAULT_TIMEOUT_SECONDS`, 30 s)
+so a caller that loses the race is answered with :data:`SYNC_BUSY_REASON` —
+which names what happened and is safe to retry — rather than with the
+middleware's generic timeout, which names nothing.
+"""
 
 DRIVE_LEDGER_SOURCE: Final[str] = "gdrive"
 """The ingest ledger a synced Drive file is recorded under.
@@ -158,6 +170,19 @@ caller. The detail stays in the server log, where the operator is.
 
 VAULT_UNAVAILABLE_REASON: Final[str] = "vault unavailable"
 """The vault disappeared under the ingest. Transient, exactly as on upload."""
+
+SYNC_BUSY_REASON: Final[str] = "another drive sync is already running"
+"""A second sync arrived while the first still held the vault's Drive lock.
+
+Transient by construction — the holder finishes — so the published code is
+``temporarily_unavailable`` and the client's ordinary backoff clears it. Said
+plainly rather than folded into :data:`SYNC_FAILED_REASON`, because "wait and
+retry" and "the Drive read blew up" are different things for a caller to do,
+and because a queued sync did nothing wrong.
+
+Carries no path, no file name and no consumer id: like every reason here it
+is a constant, not a composition.
+"""
 
 ERASE_FAILED_REASON: Final[str] = "cached credential could not be erased"
 """The local token file survived :func:`~creek.ingest.gdrive.revoke_token`.
@@ -454,6 +479,74 @@ def _download(
     return result.downloaded, len(result.skipped), len(result.errors)
 
 
+def _sync_lock_path(vault_path: Path) -> Path:
+    """Return the lock file that serialises Drive syncs of *vault_path*.
+
+    Derived from the Drive ingest ledger's own path rather than spelled
+    out, so the lock and the state it protects cannot drift apart: it is
+    ``00-Creek-Meta/State/ingest/gdrive.lock`` beside
+    ``…/gdrive.jsonl``.
+
+    Naming the *connector* rather than the vault is the whole scoping
+    decision. A vault-wide lock would make a journal write, an upload and
+    a ``creek ingest`` wait on a Drive sync that has nothing to do with
+    them; this one is contended only by two syncs of the same Drive into
+    the same vault, which have no useful parallelism anyway —
+    :meth:`~creek.ingest.gdrive.GoogleDriveDownloader.download_all` is a
+    serial loop.
+
+    Args:
+        vault_path: Vault root.
+
+    Returns:
+        The lock file path. It need not exist yet.
+    """
+    return SourceLedger.path_for(vault_path, DRIVE_LEDGER_SOURCE).with_suffix(".lock")
+
+
+def _locked_download_and_ingest(
+    *,
+    client: DriveClient,
+    drive: GoogleDriveConfig,
+    staging: Path,
+    vault_path: Path,
+) -> tuple[tuple[tuple[Path, ...], int, int] | None, dict[str, int] | None]:
+    """Mirror Drive and ingest the result as **one** locked window.
+
+    The download and the ingest are held together on purpose. Locking only
+    the ingest would still let two runs both pass the downloader's
+    incremental mtime check against a staging file neither had written
+    yet, and locking only the download would still let two ingests race
+    the fragment index. Measured before the lock existed, two overlapping
+    syncs of one Drive file produced two notes carrying one fragment id
+    and two ledger rows for one ``source_key`` (#1590).
+
+    Args:
+        client: The Drive backend.
+        drive: The read-only Drive configuration.
+        staging: Where the mirror lives.
+        vault_path: Vault root — both the ingest target and the lock's home.
+
+    Returns:
+        ``(download outcome, ingest tally)``. The first is ``None`` when the
+        Drive read raised, in which case no ingest was attempted and the
+        second is ``None`` too; the second is ``None`` on its own when the
+        vault vanished mid-ingest.
+
+    Raises:
+        VaultLockTimeoutError: If another sync of this vault held the lock
+            for longer than :data:`_SYNC_LOCK_TIMEOUT_SECONDS`.
+    """
+    with vault_lock(
+        _sync_lock_path(vault_path),
+        timeout=_SYNC_LOCK_TIMEOUT_SECONDS,
+    ):
+        fetched = _download(client, drive, staging)
+        if fetched is None:
+            return None, None
+        return fetched, _ingest_downloaded(fetched[0], vault_path)
+
+
 def drive_sync_tool(
     *,
     vault_path: Path,
@@ -473,7 +566,20 @@ def drive_sync_tool(
     Incremental by the mechanism that was already there: the downloader skips
     any file whose local mtime is at least as new as Drive's ``modified_time``,
     and only the files it actually fetched are ingested. A second sync over an
-    unchanged Drive therefore fetches nothing and writes nothing.
+    unchanged Drive therefore fetches nothing and writes nothing — **provided
+    it does not overlap the first**, which until #1590 nothing arranged. That
+    skip is a check-then-act against a staging file the other run has not
+    written yet, so two simultaneous syncs both passed it and both ingested;
+    :func:`_locked_download_and_ingest` is what now makes the sentence true
+    unconditionally, by serialising the two per vault.
+
+    The lock is POSIX advisory (``fcntl``): on Windows, and on network mounts
+    that do not implement ``flock``, it degrades to serialising the threads of
+    one process — see :mod:`creek._fslock`. It is scoped to this connector, so
+    a journal write, an upload or a ``creek ingest`` never waits on a sync;
+    equally, those three still race *each other* through the same
+    :func:`~creek.ingest.pipeline.run_ingest` seam, which #1590 does not
+    address.
 
     Args:
         vault_path: Vault root — both the ingest target and the audit trail.
@@ -512,7 +618,22 @@ def drive_sync_tool(
             ceiling=privacy_tier_ceiling,
             reason=NOT_CONNECTED_REASON,
         )
-    fetched = _download(client, drive, config.source_drive / drive.staging_dir)
+    try:
+        fetched, tally = _locked_download_and_ingest(
+            client=client,
+            drive=drive,
+            staging=config.source_drive / drive.staging_dir,
+            vault_path=vault_path,
+        )
+    except VaultLockTimeoutError:
+        # Logged without the vault path: the refusal itself is constant, and
+        # the operator-facing detail belongs in the server log, not the wire.
+        logger.info("Drive sync refused: another sync of this vault holds the lock")
+        return refusal_response(
+            tool=SYNC_TOOL_NAME,
+            ceiling=privacy_tier_ceiling,
+            reason=SYNC_BUSY_REASON,
+        )
     if fetched is None:
         return refusal_response(
             tool=SYNC_TOOL_NAME,
@@ -520,7 +641,6 @@ def drive_sync_tool(
             reason=SYNC_FAILED_REASON,
         )
     downloaded, skipped, failed = fetched
-    tally = _ingest_downloaded(downloaded, vault_path)
     if tally is None:
         return refusal_response(
             tool=SYNC_TOOL_NAME,

@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any, Final
 import frontmatter
 import pytest
 
+from creek._fslock import vault_lock
 from creek.config import _READONLY_SCOPES, GoogleDriveConfig
 from creek.ingest import INGESTOR_REGISTRY
 from creek.ingest import gdrive as gdrive_module
@@ -125,6 +126,20 @@ Long enough that a loaded machine does not turn a real measurement into a
 timeout, short enough that a genuine deadlock fails the run rather than hanging
 it. A wait that expires leaves :attr:`_Rendezvous.met` ``False``, and the test
 refuses to draw any conclusion from that run."""
+
+_HELD_LOCK_SECONDS: Final[float] = 1.0
+"""How long the test itself holds the sync lock while a request is refused."""
+
+_OVERLAP_WINDOW_SECONDS: Final[float] = 0.5
+"""How long one sync waits *inside* the connector for the other to join it.
+
+Not a vacuity guard — the opposite. It is the window in which an unlocked
+second sync is guaranteed to catch the first, which is what turns "duplicates
+about a third of the time" into "duplicates every time" and makes the fix's
+absence provable in one run rather than ten. Once the lock is in place the
+wait expires exactly once per test, which is the whole price this deliberate
+amplifier charges the green suite.
+"""
 
 _GDRIVE_LEDGER_RELPATH: Final[str] = "00-Creek-Meta/State/ingest/gdrive.jsonl"
 """Where ``run_ingest(ledger_source=DRIVE_LEDGER_SOURCE)`` records what it saw."""
@@ -1307,6 +1322,25 @@ def test_disconnecting_a_disconnected_connector_is_a_success(
 # --------------------------------------------------------------------------- #
 
 
+def _published_reasons() -> tuple[str, ...]:
+    """Return every refusal reason :mod:`creek_mcp.tools.drive` exports.
+
+    Discovered rather than listed. A hand-maintained tuple silently stops
+    covering the newest reason the moment one is added — which is exactly what
+    happened when ``SYNC_BUSY_REASON`` arrived — and a sweep that has quietly
+    stopped sweeping reads identically to one that passed.
+
+    Returns:
+        The reason strings, sorted by constant name.
+    """
+    names = sorted(
+        name
+        for name in vars(drive_tools)
+        if name.endswith("_REASON") and isinstance(getattr(drive_tools, name), str)
+    )
+    return tuple(getattr(drive_tools, name) for name in names)
+
+
 @pytest.mark.parametrize(
     ("reason", "expected"),
     [
@@ -1314,6 +1348,7 @@ def test_disconnecting_a_disconnected_connector_is_a_success(
         (drive_tools.NOT_CONNECTED_REASON, ErrorCode.UNAVAILABLE),
         (drive_tools.ERASE_FAILED_REASON, ErrorCode.UNAVAILABLE),
         (drive_tools.SYNC_FAILED_REASON, ErrorCode.TEMPORARILY_UNAVAILABLE),
+        (drive_tools.SYNC_BUSY_REASON, ErrorCode.TEMPORARILY_UNAVAILABLE),
         (drive_tools.VAULT_UNAVAILABLE_REASON, ErrorCode.TEMPORARILY_UNAVAILABLE),
         ("something this adapter has never heard of", ErrorCode.INTERNAL_ERROR),
         ("", ErrorCode.INTERNAL_ERROR),
@@ -1339,19 +1374,32 @@ def test_the_refusal_projection_is_total_and_fails_closed(
     assert drive_refusal_code(reason) is expected
 
 
+def test_every_published_reason_is_classified_rather_than_defaulted() -> None:
+    """No reason the tools can emit falls through to ``internal_error``.
+
+    The row-by-row test above pins the mapping it knows about; this one asks
+    the module what reasons exist, so a new constant that nobody classified
+    fails here instead of quietly reaching a caller as a ``500``.
+    """
+    from creek_mcp.httpapi.drive import drive_refusal_code
+
+    reasons = _published_reasons()
+    assert len(reasons) >= 6, reasons
+    unclassified = [
+        reason
+        for reason in reasons
+        if drive_refusal_code(reason) is ErrorCode.INTERNAL_ERROR
+    ]
+    assert unclassified == []
+
+
 def test_the_reason_constants_carry_no_interpolation() -> None:
     """No connector refusal is built from a string something else composed.
 
     The structural reason the leak tests above hold: a reason with a ``%s`` or
     a ``{}`` in it is one that will eventually be handed a Drive file name.
     """
-    reasons = (
-        drive_tools.CONFIG_UNAVAILABLE_REASON,
-        drive_tools.NOT_CONNECTED_REASON,
-        drive_tools.ERASE_FAILED_REASON,
-        drive_tools.SYNC_FAILED_REASON,
-        drive_tools.VAULT_UNAVAILABLE_REASON,
-    )
+    reasons = _published_reasons()
     assert len(reasons) == len(set(reasons))
     for reason in reasons:
         assert "{" not in reason
@@ -1709,30 +1757,48 @@ def test_a_file_that_downloads_but_fails_to_ingest_is_reported(
 
 
 # --------------------------------------------------------------------------- #
-# Two syncs at once: what actually happens (#1569)
+# Two syncs at once: what they may not do to the corpus (#1569, #1590)
 # --------------------------------------------------------------------------- #
 
 
 class _Rendezvous:
     """A two-party meeting point that each thread reaches at most once.
 
-    :class:`threading.Barrier` alone is not enough here. The seams these
-    rendezvous sit on are entered a number of times that depends on how many
-    files a sync fetched, so a bare barrier would trip a second time with only
-    one party and hang. Recording which threads have already passed makes each
-    one wait exactly once, whatever the seam does afterwards.
+    :class:`threading.Barrier` alone is not enough here. The seam this
+    rendezvous sits on can be entered more than once per run, so a bare barrier
+    would trip a second time with only one party and hang. Recording which
+    threads have already passed makes each one wait exactly once, whatever the
+    seam does afterwards.
 
     :attr:`met` is the non-vacuity flag. A run where the wait timed out
     measured two *sequential* syncs, and the caller must refuse to draw any
     conclusion from it rather than reporting a green test.
 
+    **It must sit outside the lock.** The predecessor of the test below held
+    both syncs inside :meth:`~_StubDrive.list_files` and
+    :meth:`~_StubDrive.download_to` — both of which are now *behind* the
+    connector's lock, so the second sync can no longer reach either until the
+    first has finished. A rendezvous there would not deadlock (each wait is
+    bounded) but it would expire twice over, spending twenty seconds to prove
+    nothing. The meeting point therefore moved up to the one seam every sync
+    passes *before* the lock: constructing the Drive client.
+
     Attributes:
         met: Whether both parties arrived before the timeout.
     """
 
-    def __init__(self) -> None:
-        """Build an unmet, two-party rendezvous."""
+    def __init__(self, timeout: float = _BARRIER_TIMEOUT_SECONDS) -> None:
+        """Build an unmet, two-party rendezvous.
+
+        Args:
+            timeout: How long one party waits for the other. The default
+                is the vacuity-guard deadline; the overlap amplifier
+                inside :class:`_OccupancyDrive` passes a much shorter one
+                because there it is *expected* to expire once the lock is
+                doing its job.
+        """
         self._barrier = threading.Barrier(2)
+        self._timeout = timeout
         self._seen: set[int] = set()
         self._lock = threading.Lock()
         self.met = False
@@ -1744,43 +1810,69 @@ class _Rendezvous:
                 return
             self._seen.add(threading.get_ident())
         try:
-            self._barrier.wait(timeout=_BARRIER_TIMEOUT_SECONDS)
-        except threading.BrokenBarrierError:  # pragma: no cover - vacuity guard
+            self._barrier.wait(timeout=self._timeout)
+        except threading.BrokenBarrierError:
+            # An expired wait also *breaks* the barrier, so the party that
+            # arrives later returns from here immediately rather than
+            # paying the deadline a second time.
             return
         self.met = True
 
 
-class _RendezvousDrive(_StubDrive):
-    """A Drive that holds two syncs together at the listing and at the download.
+class _OccupancyDrive(_StubDrive):
+    """A Drive that records how many syncs were inside it at the same time.
 
-    Two meeting points, both inside the stub, so forcing the overlap patches no
-    production internals at all.
+    The window measured runs from :meth:`list_files` — the first thing
+    :meth:`~creek.ingest.gdrive.GoogleDriveDownloader.download_all` does, and
+    the first thing behind the lock — to the return of :meth:`download_to`.
+    :attr:`peak_inside` is therefore a direct reading of "were two syncs in the
+    connector at once", rather than something inferred from a timeout.
 
-    Holding both runs at the *listing* means neither has written the staging
-    file when the other evaluates the incremental mtime-skip — the connector's
-    real check-then-act, since ``list`` and ``decide whether to download`` are
-    not one atomic step and nothing between them holds a lock. Holding them
-    again at the *download* is what makes the measurement deterministic rather
-    than a coin flip: it proves both runs passed that skip, instead of leaving
-    the first to race ahead and write the staging file before the second
-    evaluates it.
+    A sync that is serialised behind another never calls :meth:`download_to`
+    at all: by the time it runs, the staging file already carries Drive's
+    ``modified_time`` and the incremental skip claims it. Its occupancy is
+    consequently never handed back, which is harmless — only the *peak* is
+    asserted, and one sync that never leaves still peaks at one.
+
+    :attr:`overlap` is the amplifier that makes the *consequences* of a
+    missing lock deterministic rather than load-dependent. Without it the two
+    runs, released together at the client seam, drift apart by microseconds and
+    duplicate only sometimes — measured 3 times in 10, which is a flaky test
+    that also under-reports the defect. With it, an unserialised second run
+    waits here for the first and the two proceed together every time. Under the
+    lock the wait simply expires (:data:`_OVERLAP_WINDOW_SECONDS`, once) and the
+    run continues, because the second sync is not in this method to be waited
+    for — which is the finding, stated as a bounded cost rather than a hang.
 
     Attributes:
-        listed: The rendezvous both runs meet at inside :meth:`list_files`.
-        downloading: The rendezvous both runs meet at inside
-            :meth:`download_to`, once both have decided to fetch.
+        peak_inside: The greatest number of syncs seen inside at once.
+        overlap: The bounded meeting point inside the connector.
     """
 
     def __init__(self, listing: list[DriveFile], bodies: dict[str, bytes]) -> None:
-        """Build a rendezvousing stub over the usual one.
+        """Build an occupancy-counting stub over the usual one.
 
         Args:
             listing: The files this Drive appears to hold.
             bodies: Their contents, by file id.
         """
         super().__init__(listing, bodies)
-        self.listed = _Rendezvous()
-        self.downloading = _Rendezvous()
+        self._occupancy_lock = threading.Lock()
+        self._inside = 0
+        self.peak_inside = 0
+        self.overlap = _Rendezvous(timeout=_OVERLAP_WINDOW_SECONDS)
+
+    def list_files(self) -> list[DriveFile]:
+        """Record one sync entering the connector, then answer the listing.
+
+        Returns:
+            The listing.
+        """
+        with self._occupancy_lock:
+            self._inside += 1
+            self.peak_inside = max(self.peak_inside, self._inside)
+        self.overlap.arrive()
+        return super().list_files()
 
     def download_to(
         self,
@@ -1789,73 +1881,124 @@ class _RendezvousDrive(_StubDrive):
         *,
         export_mime: str | None = None,
     ) -> None:
-        """Wait for the other sync, then stream the stubbed bytes.
+        """Stream the stubbed bytes, then record this sync leaving.
 
         Args:
             file_id: The Drive file id.
             destination: Where to stream it.
             export_mime: Unused; no stubbed file is Google-native.
         """
-        self.downloading.arrive()
         super().download_to(file_id, destination, export_mime=export_mime)
+        with self._occupancy_lock:
+            self._inside -= 1
 
-    def list_files(self) -> list[DriveFile]:
-        """Wait for the other sync, then answer with the configured listing.
+
+def _stubbed_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+    stub: _StubDrive,
+    dispatched: _Rendezvous,
+) -> None:
+    """Substitute the Drive client, holding both syncs at that seam.
+
+    :func:`~creek_mcp.tools.drive.build_drive_client` is the last thing
+    ``drive_sync_tool`` does before it reaches for the connector's lock, so a
+    meeting point here proves both requests were genuinely in flight inside the
+    tool at the same moment — without patching any production internal and
+    without sitting anywhere the lock could hold one party out.
+
+    Args:
+        monkeypatch: The active monkeypatch fixture.
+        stub: The backend to return.
+        dispatched: Where the two syncs meet.
+    """
+
+    def _build(_config: object) -> _StubDrive:
+        """Wait for the other sync, then hand back the stub.
+
+        Args:
+            _config: The Drive configuration, unused by the stub.
 
         Returns:
-            The listing.
+            The stub backend.
         """
-        self.listed.arrive()
-        return super().list_files()
+        dispatched.arrive()
+        return stub
+
+    monkeypatch.setattr(drive_tools, "build_drive_client", _build)
 
 
-def test_two_overlapping_syncs_do_not_see_each_other_at_any_layer(
+def _ledger_rows(vault_path: Path) -> list[dict[str, Any]]:
+    """Return the Drive ingest ledger's rows, oldest first.
+
+    Args:
+        vault_path: The vault root.
+
+    Returns:
+        One dict per non-blank line, or an empty list when nothing ingested.
+    """
+    path = vault_path / _GDRIVE_LEDGER_RELPATH
+    if not path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _fragment_ids(fragments: list[Path]) -> list[str]:
+    """Return the ``id`` each fragment file declares in its frontmatter.
+
+    Args:
+        fragments: The fragment paths to read.
+
+    Returns:
+        The declared ids, in the order the paths were given.
+    """
+    return [str(frontmatter.load(path).get("id", "")) for path in fragments]
+
+
+def test_two_overlapping_syncs_cannot_duplicate_the_corpus(
     vault: Path,
     configured: Path,
     token_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """MEASURED, not assumed: what two simultaneous syncs of one file really do.
+    """One Drive file stays one fragment however the two requests interleave.
 
-    ``POST /v1/connectors/drive/syncs`` takes no lock, and
+    ``POST /v1/connectors/drive/syncs`` is served by a worker thread and
     :data:`~creek_mcp.httpapi.middleware.limits.DEFAULT_MAX_CONCURRENCY` is 32,
-    so two callers — or one caller that retried — run a sync in two worker
-    threads at once. The reviewer's hope on #1527 was that the downloader's
-    incremental mtime-skip would make that benign. **It does not**, and this is
-    the measurement rather than the argument.
+    so two callers — or one caller that retried — reach the connector at once.
+    Until #1590 nothing stopped them at any of the three layers that might
+    have: the downloader's mtime skip is a check-then-act against a staging
+    file neither run had written; the ingest ledger is append-only JSONL loaded
+    once per run; and the writer's ``.id-index.jsonl`` is read before either
+    run appends to it. Measured on this box that duplicated **8 runs in 10**,
+    producing ``…-Ridge-notes.md`` and ``…-Ridge-notes-1.md`` carrying the same
+    ``frag-`` id, two ledger rows for one ``source_key``, and — because
+    ``_load_index_locked`` lets the last write win — an id lookup that resolved
+    to the *second* file and orphaned the first.
 
-    Neither run sees the other, at any of the three layers that could have
-    stopped it:
+    The fix serialises the download and the ingest per vault, so the two runs
+    become the sync-then-no-op pair
+    ``test_a_second_sync_of_an_unchanged_drive_creates_no_fragment`` already
+    pins: one fetch, one fragment, one ledger row, and a second response
+    reporting ``files_unchanged: 1``.
 
-    * **the mtime-skip** is a check-then-act evaluated against a local file
-      neither run has written yet, so both download the same file;
-    * **the ingest ledger** is append-only JSONL with no advisory lock and is
-      loaded once per run, so both record the same ``source_key``;
-    * **the writer's per-directory** ``.id-index.jsonl`` is read before either
-      run appends to it, so the second write can miss the first.
-
-    That last one is why this is worse than a miscount. The one Drive file
-    lands as **one or two** files on disk — both under the single fragment id
-    the ledger records — depending only on how tightly the two index reads
-    race, which is to say on machine load. Measured on an idle 10-core box it
-    duplicated in 6 runs out of 10, and it duplicated again inside a loaded
-    ``pytest -n 3`` run, producing ``…-Ridge-notes.md`` and
-    ``…-Ridge-notes-1.md`` for one source file. The range is asserted rather
-    than a single number *because the nondeterminism is the finding*: pinning
-    either value alone would be a flaky test that also misreported the defect.
-    Tracked as `#1590 <https://github.com/Geoffe-Ga/Creek-Vault/issues/1590>`_.
-
-    The overlap is forced rather than hoped for, at two rendezvous inside the
-    Drive stub — no production internals are patched. Without them this test
-    would usually measure two *sequential* syncs, whose behaviour is already
-    pinned one test up: the second reports ``files_unchanged: 1`` and
-    ``fragments_created: 0``. Every count below differs from that, which is the
-    whole of the answer.
-
-    **Asserted as the current behaviour on purpose.** #1569's stated non-goal is
-    adding the lock or the queue that would change the answer, so these are pins
-    to be revisited — deliberately, by whoever fixes #1590 — rather than claims
-    that any of it is right.
+    **Non-vacuity.** ``dispatched`` is a two-party barrier at the one seam
+    every sync passes *before* taking the lock, so a green run cannot be two
+    sequential syncs that never overlapped. ``peak_inside`` then reads the
+    occupancy behind the lock directly: two syncs were dispatched together and
+    exactly one was ever inside the connector. The stub's second, bounded
+    meeting point (:data:`_OVERLAP_WINDOW_SECONDS`) then makes the *corruption*
+    deterministic instead of load-dependent. Measured against the unfixed code
+    on this box: ``peak_inside`` red 10/10; ``downloads``, the ledger row count
+    and the fragment tallies red 9/10 *with the occupancy assertion relaxed so
+    they are what reports* — against 3/10 for a version of this test without the
+    amplifier, which is a flaky test that also under-reports the defect. The
+    on-disk file count is the one assertion that stays probabilistic (two racing
+    index reads duplicated 8 runs in 10) and it is asserted anyway, because the
+    duplicate file is the thing this issue is named after.
 
     Args:
         vault: A seeded vault, shared by both runs.
@@ -1865,8 +2008,9 @@ def test_two_overlapping_syncs_do_not_see_each_other_at_any_layer(
     """
     del configured
     _connect(token_path)
-    stub = _RendezvousDrive([_drive_file("id-1", "ridge.md")], {"id-1": _PLAIN_BODY})
-    _stubbed(monkeypatch, stub)
+    stub = _OccupancyDrive([_drive_file("id-1", "ridge.md")], {"id-1": _PLAIN_BODY})
+    dispatched = _Rendezvous()
+    _stubbed_concurrently(monkeypatch, stub, dispatched)
 
     with client(vault_path=vault) as test_client, ThreadPoolExecutor(2) as pool:
         responses = [
@@ -1875,49 +2019,109 @@ def test_two_overlapping_syncs_do_not_see_each_other_at_any_layer(
         ]
     payloads = [envelope(response) for response in responses]
 
-    # Non-vacuity first: without both meetings the rest measures two sequential
-    # syncs, which is a different — and already-pinned — thing to have measured.
-    assert stub.listed.met, "the two syncs did not overlap at the listing"
-    assert stub.downloading.met, "the two syncs did not overlap at the download"
+    assert dispatched.met, "the two syncs were never in flight together"
     assert [response.status_code for response in responses] == [_OK_STATUS] * 2
+    assert stub.peak_inside == 1, "two syncs were inside the connector at once"
 
-    # Layer 1 — the mtime-skip did not serialise them: both fetched the file,
-    # and neither reported the ``files_unchanged: 1`` a second serial sync gives.
-    assert stub.downloads == ["id-1", "id-1"]
-    assert [payload["files_fetched"] for payload in payloads] == [1, 1]
-    assert [payload["files_unchanged"] for payload in payloads] == [0, 0]
+    # Layer 1 — the mtime skip is no longer raced: the file is fetched once,
+    # and the run that lost reports the unchanged pass a serial second sync gives.
+    assert stub.downloads == ["id-1"]
+    assert sorted(payload["files_fetched"] for payload in payloads) == [0, 1]
+    assert sorted(payload["files_unchanged"] for payload in payloads) == [0, 1]
 
-    # Layer 2 — the ledger did not serialise them either: one source file,
-    # recorded twice, under the one fragment id both runs derived for it.
-    ledger_rows = [
-        json.loads(line)
-        for line in (vault / _GDRIVE_LEDGER_RELPATH)
-        .read_text(encoding="utf-8")
-        .splitlines()
-        if line.strip()
-    ]
-    assert len(ledger_rows) == 2
-    assert len({row["source_key"] for row in ledger_rows}) == 1
-    assert len({row["fragment_id"] for row in ledger_rows}) == 1
+    # Layer 2 — the ledger records one source unit once.
+    rows = _ledger_rows(vault)
+    assert len(rows) == 1, rows
+    assert len({row["fragment_id"] for row in rows}) == 1
 
-    # Layer 3 — the corpus. One or two files for that single id, and nothing on
-    # disk that did not come from this one Drive file.
+    # Layer 3 — the corpus. One file for that one id, and no two files sharing
+    # an id, which is the assertion that says "not corrupted" rather than
+    # merely "not duplicated".
     fragments = _fragments(vault)
-    assert 1 <= len(fragments) <= 2
+    ids = _fragment_ids(fragments)
+    assert len(fragments) == 1, fragments
+    assert len(set(ids)) == len(ids), ids
+    assert set(ids) == {row["fragment_id"] for row in rows}
     assert all(_PLAIN_MARKER in path.read_bytes() for path in fragments)
 
-    # The published counts against what actually landed, rather than against
-    # themselves: each run reports handling the one fragment it ingested and
-    # nothing failing, so the two responses between them claim two fragments
-    # for a corpus the ledger tracks as exactly one id. A caller that adds the
-    # two responses up is told twice what it got — the visible half of the same
-    # defect, and the reason #1590 must revisit these numbers too.
+    # The published counts add up to what actually landed, rather than telling
+    # a caller that summed the two responses it got two fragments for one.
     handled = [
         int(payload["fragments_created"]) + int(payload["fragments_updated"])
         for payload in payloads
     ]
-    assert handled == [1, 1], payloads
+    assert sum(handled) == 1, payloads
     assert [payload["fragments_failed"] for payload in payloads] == [0, 0]
     assert [payload["files_failed"] for payload in payloads] == [0, 0]
-    assert sum(handled) > len({row["fragment_id"] for row in ledger_rows})
-    assert sum(handled) >= len(fragments)
+
+
+def test_the_sync_lock_lives_beside_the_drive_ledger_it_protects(
+    vault: Path,
+    configured: Path,
+    token_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lock file is named here as well as derived there.
+
+    Its location is not decoration: a lock somewhere else would not be found
+    by a second *process* — the CLI, a second uvicorn worker — which is the
+    whole point of it being a file rather than an object.
+
+    Args:
+        vault: A seeded vault.
+        configured: The staging directory.
+        token_path: Where the cached credential lives.
+        monkeypatch: The active monkeypatch fixture.
+    """
+    del configured
+    _connect(token_path)
+    listing = [_drive_file("id-1", "ridge.md")]
+    _stubbed(monkeypatch, _StubDrive(listing, {"id-1": _PLAIN_BODY}))
+    lock_path = vault / "00-Creek-Meta" / "State" / "ingest" / "gdrive.lock"
+    assert not lock_path.exists()
+
+    with client(vault_path=vault) as test_client:
+        assert _sync(test_client).status_code == _OK_STATUS
+
+    assert lock_path.exists()
+    assert lock_path.parent == (vault / _GDRIVE_LEDGER_RELPATH).parent
+
+
+def test_a_sync_that_cannot_take_the_lock_is_refused_rather_than_queued(
+    vault: Path,
+    configured: Path,
+    token_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that loses the race is told to retry, in the published vocabulary.
+
+    ``503 temporarily_unavailable`` rather than a hung request: the work is
+    off the event loop in a worker thread, so a sync that waited indefinitely
+    would hold that thread while the request-timeout middleware answered
+    without it. The refusal names nothing about the vault or the holder.
+
+    Args:
+        vault: A seeded vault.
+        configured: The staging directory.
+        token_path: Where the cached credential lives.
+        monkeypatch: The active monkeypatch fixture.
+    """
+    del configured
+    _connect(token_path)
+    stub = _StubDrive([_drive_file("id-1", "ridge.md")], {"id-1": _PLAIN_BODY})
+    _stubbed(monkeypatch, stub)
+    monkeypatch.setattr(drive_tools, "_SYNC_LOCK_TIMEOUT_SECONDS", 0.05)
+    lock_path = vault / "00-Creek-Meta" / "State" / "ingest" / "gdrive.lock"
+
+    with (
+        vault_lock(lock_path, timeout=_HELD_LOCK_SECONDS),
+        client(vault_path=vault) as test_client,
+    ):
+        response = _sync(test_client)
+
+    assert response.status_code == _UNAVAILABLE_STATUS, response.text
+    body = envelope(response)
+    assert body["code"] == ErrorCode.TEMPORARILY_UNAVAILABLE.value, body
+    assert stub.downloads == []
+    assert _fragments(vault) == []
+    assert str(vault) not in response.text
