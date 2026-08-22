@@ -26,7 +26,7 @@ from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 
-from creek._containment import find_escaping_symlink, named_path_escapes
+from creek._containment import inspect_tree, named_path_escapes
 from creek.config import VAULT_CONFIG_RELPATH, load_vault_config
 from creek.purge.audit import LEGACY_PURGE_LOG_RELPATH
 from creek.redact.audit import (
@@ -372,6 +372,25 @@ def _assert_no_escaping_symlinks(
     that legitimate intra-tree aliases (e.g. ``alias.md`` → ``real.md``)
     continue to work.
 
+    **A subtree the walk could not list refuses too (#1498)**, which is the
+    opposite of what the same condition earns on the ingest gate
+    (:func:`creek._containment.assert_source_contained` reports it and
+    continues). Three things invert here:
+
+    * There is no unattended loop behind this guard. It is reached only from
+      the interactive ``creek redact --apply`` / ``--review`` handlers; the
+      pipeline's redaction pass goes through
+      :func:`creek.redact.scanner.scan_batch` instead. Refusing cannot break
+      ``creek sync`` or ``creek process``.
+    * ``--apply`` destroys bytes irreversibly. Proceeding over a region it
+      could not examine and then printing "Applied redactions to N file(s)"
+      is a *false assurance* from a safety tool — strictly worse than a
+      refusal, because the operator's next action depends on believing the
+      tree was scrubbed.
+    * There is no report channel in this command. Nothing here corresponds
+      to ``IngestResult.discovery_complete``, and a warning line above a
+      green banner is noise, not a report.
+
     ``strict=False`` on ``Path.resolve`` is deliberate: a dangling
     symlink (pointing at a path that doesn't yet exist) still resolves
     to a candidate location that we can compare against *root*. The
@@ -387,26 +406,44 @@ def _assert_no_escaping_symlinks(
             (e.g. ``"source"`` or ``"vault"``).
 
     Raises:
-        typer.Exit: When any descendant symlink resolves outside
-            *root* or forms a loop.
+        typer.Exit: When any descendant symlink resolves outside *root* or
+            forms a loop, or when any directory beneath *root* could not be
+            listed.
     """
-    # The walk itself lives in :func:`creek._containment.find_escaping_symlink`
-    # (#1294), which the ingest gate also calls. Returning the offender rather
-    # than raising is what lets two callers with different refusal mechanics —
-    # ``typer.Exit`` here, ``EscapingSymlinkError`` there — share one walk.
+    # The walk itself lives in :func:`creek._containment.inspect_tree`
+    # (#1294/#1498), which the ingest gate also calls. Reporting the facts
+    # rather than raising is what lets two callers with different refusal
+    # mechanics — ``typer.Exit`` here, ``EscapingSymlinkError`` there — share
+    # one walk, and what lets them weigh an unlistable subtree differently.
     # ``logger.warning`` rather than ``logger.exception``: no exception is in
     # flight at this point any more, and ``logger.exception`` outside an
     # ``except`` block appends a bogus ``NoneType: None`` traceback.
-    candidate = find_escaping_symlink(root)
-    if candidate is not None:
+    report = inspect_tree(root)
+    if report.escaping is not None:
         logger.warning(
             "Refusing to follow symlink that escapes the %s root: %s",
             label,
-            candidate,
+            report.escaping,
         )
         _error_exit(
             console,
-            f"Refusing to follow symlink that escapes the {label} root: {candidate}",
+            "Refusing to follow symlink that escapes the "
+            f"{label} root: {report.escaping}",
+            code=1,
+        )
+    if report.unlistable:
+        # Only the directory is named. Nothing beneath it was opened, and a
+        # refusal that quoted what it could not read would be the #1087
+        # oracle in reverse.
+        logger.warning(
+            "Refusing to walk the %s root: %s could not be listed",
+            label,
+            report.unlistable[0],
+        )
+        _error_exit(
+            console,
+            f"Refusing to walk the {label} root: {report.unlistable[0]} "
+            "could not be listed, so no symlink beneath it could be checked",
             code=1,
         )
 

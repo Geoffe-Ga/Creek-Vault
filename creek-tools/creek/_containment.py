@@ -36,9 +36,16 @@ The policy, unchanged from the shipped SEC-003 guard:
 That policy is deliberately LEAF-ONLY, so a path reached through an
 escaping *ancestor* component (``<root>/linkdir/a.md``, where ``linkdir``
 is the link) is admitted by :func:`resolves_within` alone. For a walked
-tree that residual is closed by :func:`find_escaping_symlink`, which sees
-``linkdir`` in its own right; for a directly-named path it remains the
-documented residual recorded in ``docs/security/threat-model.md``.
+tree that residual is closed by :func:`inspect_tree`, which sees ``linkdir``
+in its own right; for a directly-named path it remains the documented
+residual recorded in ``docs/security/threat-model.md``.
+
+A walk answers TWO questions, not one, and #1498 separated them: "did I find
+an escaping link?" and "was there a subtree I could not even list?". They are
+kept apart in :class:`TreeContainment` because the callers weigh them
+differently — the ingest gate reports an unlistable subtree and continues,
+the redaction write path refuses — and a single boolean would force one
+uniform answer onto both.
 
 Security direction here is one-way: every function may only ever cause a
 caller to read *less*. There is no waiver — no ``--force``, no environment
@@ -50,6 +57,7 @@ from __future__ import annotations
 import itertools
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -224,8 +232,57 @@ def named_path_escapes(path: Path) -> bool:
     )
 
 
-def find_escaping_symlink(root: Path) -> Path | None:
-    """Return the first descendant of *root* that links out of it, if any.
+def escaping_child(child: Path, resolved_root: Path) -> bool:
+    """Report whether a walked leaf is a symlink leaving *resolved_root*.
+
+    The leaf test every walk needs, in one place. The expression it holds —
+    ``child.is_symlink() and not resolves_within(child, resolved_root)`` — was
+    written out independently in :func:`inspect_tree`'s ancestor and in
+    :func:`creek.redact.scanner._scannable_candidates`, and #1373 needed it a
+    third time in :func:`creek.vault.reader.iter_vault_fragments`. #1294
+    already settled the same argument for :func:`resolves_within`: two copies
+    that agree today are two copies that disagree after the next fix lands in
+    one of them.
+
+    ``is_symlink()`` first is not merely an optimisation, it is the policy: a
+    child that is not itself a link is never resolved, which is what keeps a
+    root reached *through* a symlinked component (``/tmp`` ->
+    ``/private/tmp`` on macOS) from flagging every one of its children.
+
+    Args:
+        child: A path being tested for containment, exactly as walked.
+        resolved_root: The root, already resolved exactly once by the caller.
+
+    Returns:
+        ``True`` when *child* is a symlink whose target is not a descendant
+        of *resolved_root*.
+    """
+    return child.is_symlink() and not resolves_within(child, resolved_root)
+
+
+@dataclass(frozen=True, slots=True)
+class TreeContainment:
+    """What one containment walk of a tree was able to establish (#1498).
+
+    Two independent facts, deliberately not collapsed into one verdict:
+
+    Attributes:
+        escaping: The first entry found that links out of the root, as
+            walked and never resolved, or ``None`` when the walk saw no
+            such entry. ``None`` means "none seen", which is only "none
+            exists" when :attr:`unlistable` is empty.
+        unlistable: Every directory whose ``scandir`` was refused, as
+            walked. A non-empty tuple means the walk's answer is a
+            partial one: nothing beneath those directories was inspected,
+            so containment under them is unproven rather than proven good.
+    """
+
+    escaping: Path | None
+    unlistable: tuple[Path, ...]
+
+
+def inspect_tree(root: Path) -> TreeContainment:
+    """Walk *root* and report both what escaped and what could not be read.
 
     Walks with ``followlinks=False`` so the walk itself never descends
     through a link, and inspects BOTH ``dirnames`` and ``filenames``.
@@ -235,26 +292,60 @@ def find_escaping_symlink(root: Path) -> Path | None:
     so unlike the ``rglob`` ingestors it would otherwise walk an entire
     out-of-tree subtree.
 
-    Returning the offender rather than raising is what lets the two callers
-    with different refusal mechanics — ``typer.Exit`` in
-    :mod:`creek.redact.cli_commands`, :class:`EscapingSymlinkError` in
-    :func:`assert_source_contained` — share one walk instead of keeping two
-    copies of it.
+    **The ``onerror`` handler is the point of this function.** ``os.walk``
+    swallows a failed ``scandir`` when no handler is passed, so a directory
+    the process cannot list is indistinguishable from one that is empty, and
+    the walk then reports "no escaping symlink" over a region it never
+    opened. That is a guarantee the code cannot honour, and it contradicts
+    this module's own policy — "unprovable containment IS an escape" — which
+    :func:`_resolved_target` already applies to the identical ``EACCES``
+    condition when it is hit during *resolution* rather than during the walk.
+
+    Reporting rather than raising is what lets callers with different
+    refusal mechanics — ``typer.Exit`` in :mod:`creek.redact.cli_commands`,
+    :class:`EscapingSymlinkError` in :func:`assert_source_contained` — share
+    one walk instead of keeping two copies of it, and it is also what lets
+    them weigh an unlistable subtree differently: the ingest gate reports and
+    continues, the redaction write path refuses. See each caller for why.
+
+    The walk runs to COMPLETION rather than returning on the first escape,
+    because both facts have to be complete for a caller to weigh them. The
+    cost is paid only on a tree that already holds an escaping link; a clean
+    tree — the overwhelmingly common case — was always walked in full.
+
+    Deliberately mirrors
+    :func:`creek.ingest.markdown._enumerate_markdown_paths` (#1444): same
+    ``onerror`` idiom, same ``followlinks=False``, so the two walks over the
+    same trees cannot drift into disagreeing about what they saw.
 
     Args:
         root: The tree to inspect, exactly as the operator supplied it.
 
     Returns:
-        The first escaping entry found, as walked, or ``None`` when every
-        symlink under *root* resolves inside it.
+        A :class:`TreeContainment` naming the first escaping entry, if any,
+        and every directory the walk was refused.
     """
     resolved_root = root.resolve(strict=False)
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    unlistable: list[Path] = []
+
+    def _record(error: OSError) -> None:
+        """Record the directory ``scandir`` refused, named as walked.
+
+        Args:
+            error: The ``OSError`` ``os.walk`` would otherwise discard. Its
+                ``filename`` is the directory that could not be listed.
+        """
+        unlistable.append(Path(str(error.filename)))
+
+    escaping: Path | None = None
+    for dirpath, dirnames, filenames in os.walk(
+        root, followlinks=False, onerror=_record
+    ):
         for entry in itertools.chain(dirnames, filenames):
             candidate = Path(dirpath) / entry
-            if candidate.is_symlink() and not resolves_within(candidate, resolved_root):
-                return candidate
-    return None
+            if escaping is None and escaping_child(candidate, resolved_root):
+                escaping = candidate
+    return TreeContainment(escaping=escaping, unlistable=tuple(unlistable))
 
 
 def assert_source_contained(source_path: Path) -> None:
@@ -268,11 +359,38 @@ def assert_source_contained(source_path: Path) -> None:
        resolving a named symlinked directory launders every child as
        in-root: the tree walk would resolve the root to the link's target
        and then find nothing escaping inside it.
-    2. Every descendant, via :func:`find_escaping_symlink`.
+    2. Every descendant, via :func:`inspect_tree`.
 
     A symlink whose target stays inside the root is admitted, so ordinary
     intra-tree aliases keep working. Containment is about the target
     escaping, not about the link existing.
+
+    **An unlistable subtree is REPORTED, not refused (#1498).** That is a
+    deliberate split from the redaction write path's
+    ``_assert_no_escaping_symlinks``, which refuses on the same condition,
+    and the asymmetry is the whole ruling rather than an oversight:
+
+    * No leak is possible on this arm. A subtree the gate cannot list is one
+      the ingestor cannot list either — ``rglob`` yields only the directory
+      itself, and :meth:`creek.ingest.code.CodeIngestor._discover_directory`
+      takes the ``EACCES`` straight into ``_discover_safe``. What the walk
+      loses is a false *guarantee*, not a true *admission*; nothing
+      out-of-tree becomes readable.
+    * The durable report channel already exists on this path and #1444
+      already chose it. ``IngestResult.discovery_complete`` records a failed
+      enumeration and ``creek/ingest/pipeline.py`` disarms
+      ``tomb_missing_units`` on it. A second, contradictory answer for the
+      same physical condition on the same path is exactly the drift this
+      module exists to prevent.
+    * Refusing here is a measured outage. ``creek sync`` shares the ingest
+      path (see ``creek/cli.py``'s advisory policy), so one chmod-000
+      ``.Trashes`` or a root-owned ``.git/objects`` would refuse every
+      scheduled pass, permanently and silently.
+
+    The escaping-link arm is untouched by that ruling and still raises. The
+    residual — permissions relaxing between this walk and the ingestor's —
+    is the check-then-act window recorded in
+    ``docs/security/threat-model.md``.
 
     Args:
         source_path: The source file or directory as the caller supplied
@@ -291,12 +409,24 @@ def assert_source_contained(source_path: Path) -> None:
         raise EscapingSymlinkError(source_path, source_path)
     if not source_path.is_dir():
         return
-    escaping = find_escaping_symlink(source_path)
-    if escaping is not None:
+    report = inspect_tree(source_path)
+    if report.escaping is not None:
         logger.warning(
             "Refusing to ingest %s: it contains a symlink that escapes the "
             "source root: %s",
             source_path,
-            escaping,
+            report.escaping,
         )
-        raise EscapingSymlinkError(escaping, source_path)
+        raise EscapingSymlinkError(report.escaping, source_path)
+    for directory in report.unlistable:
+        # Only the directory is named, never anything beneath it: the walk
+        # never opened it, and #1087's no-oracle invariant applies to a
+        # report just as much as to a refusal.
+        logger.warning(
+            "Containment under %s could not be proven: %s could not be "
+            "listed, so no symlink beneath it was checked. Nothing beneath "
+            "it was read either; restore read+execute permission on it to "
+            "have it covered.",
+            source_path,
+            directory,
+        )

@@ -33,6 +33,9 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from pathlib import Path
 
+from rich.console import Console
+
+from creek._containment import EscapingSymlinkError
 from creek.clean.filters.discord import DiscordFilter, DiscordFilterConfig
 from creek.ingest.base import (
     Ingestor,
@@ -832,6 +835,52 @@ def write_fragments(result: IngestResult, vault: Path) -> list[Path]:
     return paths
 
 
+_REFUSAL_CONSOLE = Console(stderr=True)
+"""stderr sink for a containment refusal (#1377).
+
+stderr, not stdout: two of the three Discord entry points return a *count* on
+stdout that a caller may be parsing, and a refusal is not a result.
+"""
+
+
+def _print_containment_refusal(exc: EscapingSymlinkError) -> None:
+    """Show a containment refusal as a message rather than a traceback (#1377).
+
+    The three Discord ingest entry points call ``DiscordIngestor().ingest``
+    directly, and their CLI parents catch only unrelated exceptions
+    (``TokenMissingError`` / ``CalledProcessError``, or nothing at all), so
+    before #1377 an :class:`~creek._containment.EscapingSymlinkError` reached
+    the operator as a raw traceback — from the one path whose operator is
+    least equipped to read one, since a Discord Data Package is a ZIP someone
+    unzipped wherever they happened to unzip it.
+
+    **The caller must re-raise, and every caller here does.** Collecting this
+    error into an ``IngestResult.errors`` list and continuing is not a
+    degraded pass, it is mass data loss: a swallowed refusal leaves
+    ``run_ingest``'s ``seen_keys`` empty and ``tomb_missing_units`` then
+    soft-tombs every live ledger key. This function therefore only *prints*;
+    it deliberately does not raise ``typer.Exit`` either, because
+    :func:`ingest_capture_dir` also runs behind the bot with no typer context,
+    where ``typer.Exit`` would surface as an unhandled click error.
+
+    ``markup=False`` so a path containing square brackets cannot be eaten as
+    Rich markup, and ``soft_wrap=True`` so the link's name is never split
+    across a wrap point — the operator has to be able to copy it.
+
+    Args:
+        exc: The refusal to render. Its message names the link exactly as
+            walked and never its resolved target, per #1087; nothing is added
+            here that could reintroduce that oracle.
+    """
+    _REFUSAL_CONSOLE.print(
+        f"Symlink containment: {exc}",
+        style="red",
+        markup=False,
+        highlight=False,
+        soft_wrap=True,
+    )
+
+
 def ingest_capture_dir(capture_dir: Path, vault: Path) -> int:
     """Stage + ingest a bot-capture dir into *vault*; return fragments written.
 
@@ -857,7 +906,12 @@ def ingest_capture_dir(capture_dir: Path, vault: Path) -> int:
         shutil.rmtree(staging)
     staging.mkdir(parents=True, exist_ok=True)
     stage_capture_as_data_package(capture_dir, staging)
-    return len(write_fragments(DiscordIngestor().ingest(staging), vault))
+    try:
+        documents = DiscordIngestor().ingest(staging)
+    except EscapingSymlinkError as exc:
+        _print_containment_refusal(exc)
+        raise
+    return len(write_fragments(documents, vault))
 
 
 def run_discord_data_package(vault: Path, package: Path) -> int:
@@ -882,7 +936,12 @@ def run_discord_data_package(vault: Path, package: Path) -> int:
     """
     fragments_root = vault / "01-Fragments"
     before = set(fragments_root.rglob("*.md")) if fragments_root.is_dir() else set()
-    written = write_fragments(DiscordIngestor().ingest(package), vault)
+    try:
+        documents = DiscordIngestor().ingest(package)
+    except EscapingSymlinkError as exc:
+        _print_containment_refusal(exc)
+        raise
+    written = write_fragments(documents, vault)
     # New = distinct written paths that did not pre-exist. `set(written)` also
     # collapses any duplicate path emitted within a single run, so a fragment is
     # counted at most once.
