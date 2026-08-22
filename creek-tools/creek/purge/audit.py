@@ -89,12 +89,42 @@ class PurgeAuditEntry(BaseModel):
             ``saved_from.intimate_body_pointer`` (GAP-012). Zero for
             notes that carry no pointer, dry-runs count what *would* be
             removed, and an already-missing stub does not increment it.
-        journal_staged_removed: Number of staged journal source files
-            deleted under ``00-Creek-Meta/adepthood/journal/`` because
-            the fragment they produced was purged, or because a
-            whole-vault purge swept the staging dir (issue #845). Zero
-            for fragments with no ``source.origin_key``; dry-runs count
-            what *would* be removed.
+        journal_staged_removed: Number of staged Adepthood source files
+            deleted under ``00-Creek-Meta/adepthood/journal/`` or
+            ``00-Creek-Meta/adepthood/uploads/`` because the fragment
+            they produced was purged, or because a whole-vault purge
+            swept the staging dirs (issues #845, #1023). Zero for
+            fragments with no ``source.origin_key``; dry-runs count
+            what *would* be removed. The field keeps its journal-era
+            name because it is serialised into the append-only
+            ``purge.jsonl``, where a rename would break every existing
+            log.
+        voice_artifacts_removed: Number of derived ``07-Voice/`` notes
+            deleted because they carried the purged fragment's own
+            content — its ``Register-Samples`` file copy, the
+            ``<register>-profile.md`` quoting its body, and the
+            ``Lexicon`` notes quoting its sentences (#1211). Zero when
+            no voice report has ever run; dry-runs count what *would* be
+            removed. Without this field the outcome line reported a
+            successful erasure while the body survived in a derived
+            artifact.
+        ledger_rows_removed: Number of ingest-ledger rows physically
+            erased from ``00-Creek-Meta/State/ingest/*.jsonl`` because
+            they named a purged fragment or the source unit it came
+            from (#1453). Rows, not files: one source unit accumulates
+            an appended row per ingest, so one erased fragment takes
+            several rows with it. Zero for a whole-vault purge, which
+            destroys the files outright and counts them below rather
+            than counting the same erasure twice; dry-runs count what
+            *would* be erased.
+        meta_artifacts_removed: Number of files destroyed by the
+            deny-by-default sweep of ``00-Creek-Meta/`` during a
+            whole-vault purge (#1453). Files, not rows — the sweep does
+            not read what it deletes. Zero for every scoped purge;
+            dry-runs count what *would* be removed. Without this field
+            the outcome line reported a completed erasure while the
+            source-path → fragment-id → content-hash mapping survived
+            in the vault.
         operator: Who performed the purge.
         dry_run: Whether the purge was a dry-run preview.
         phase: GAP-002 discriminator. ``"intent"`` is written before
@@ -106,8 +136,12 @@ class PurgeAuditEntry(BaseModel):
         status: For outcome entries only — ``"complete"`` if the body
             ran without raising, ``"partial"`` if it aborted partway.
             ``None`` for intent entries and for pre-GAP-002 outcomes.
-        failure_reason: Short string capturing the exception type and
-            message when ``status="partial"``; ``None`` otherwise.
+        failure_reason: The exception **type name only** (e.g.
+            ``"OSError"``) when ``status="partial"``; ``None``
+            otherwise. The message is deliberately excluded: this log
+            is preserved by every purge, so vault-derived text quoted
+            in an exception would outlive the right-to-be-forgotten
+            request that produced it.
         target: Legacy field preserved for backward compatibility on
             read; populated only when reading pre-Batch-C entries.
         count: Legacy fragment count preserved for backward compatibility
@@ -126,6 +160,9 @@ class PurgeAuditEntry(BaseModel):
     provenance_scrubbed: int = 0
     intimate_stubs_removed: int = 0
     journal_staged_removed: int = 0
+    voice_artifacts_removed: int = 0
+    ledger_rows_removed: int = 0
+    meta_artifacts_removed: int = 0
     operator: str = _DEFAULT_OPERATOR
     dry_run: bool = False
 
@@ -160,6 +197,9 @@ def _coerce_legacy_entry(raw: dict[str, Any]) -> dict[str, Any]:
     upgraded.setdefault("provenance_scrubbed", 0)
     upgraded.setdefault("intimate_stubs_removed", 0)
     upgraded.setdefault("journal_staged_removed", 0)
+    upgraded.setdefault("voice_artifacts_removed", 0)
+    upgraded.setdefault("ledger_rows_removed", 0)
+    upgraded.setdefault("meta_artifacts_removed", 0)
     # GAP-002 fields take their schema defaults via Pydantic when
     # absent, so we leave them out here rather than fabricating a
     # phase / operation_id that doesn't correspond to anything on disk.
@@ -329,6 +369,9 @@ class PurgeAuditLog:
             "provenance_scrubbed": 0,
             "intimate_stubs_removed": 0,
             "journal_staged_removed": 0,
+            "voice_artifacts_removed": 0,
+            "ledger_rows_removed": 0,
+            "meta_artifacts_removed": 0,
             "operator": "system",
             "dry_run": False,
             "migrated_entries": migrated_count,

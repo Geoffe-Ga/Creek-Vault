@@ -81,6 +81,24 @@ RESPECT_EPICS="${RALPH_RESPECT_EPICS:-1}"
 #                                collapses to the previous oldest-first behavior
 #                                — this change is backward compatible.
 #
+# #1011 asked whether this default should move off P1, since untriaged issues
+# were reaching the front of the queue unjudged (two groom gates, ten issues,
+# eventual triage spanning P1..P3 — wrong more often than right, in BOTH
+# directions). The default stays at 1, deliberately:
+#
+#   * No fixed default is defensible. The evidence shows the correct tier for an
+#     untriaged issue is genuinely unknown, so any constant is a guess.
+#   * Between the two guesses, P1 fails safer. Ranking untriaged work last would
+#     let a genuinely urgent finding sit unseen indefinitely; ranking it first
+#     costs, at worst, some queue order that a human can re-triage.
+#   * The real defect was the *silence*, not the number — a rank asserted with no
+#     signal that it was assumed. So the fix is at the two ends instead: labels
+#     are mandatory at the point of filing (PROMPT.md step 8), and the walk below
+#     announces on stderr whenever it falls back to this default.
+#
+# Once labelling holds at the source the default should rarely be consulted at
+# all, which is the point: it is a backstop, not a policy.
+#
 # To enforce the pipeline's stricter "agent-ready required" gate (so ONLY fully
 # specified scan/feature issues are picked), set RALPH_REQUIRE_LABELS=agent-ready.
 # It is left empty by default to avoid starving an existing unlabeled backlog.
@@ -193,6 +211,19 @@ epic_labels() {
   printf '%s\n' "${1//,/$'\n'}" | grep -iE '^epic' | tr '[:upper:]' '[:lower:]' | sort -u || true
 }
 
+# Both label vocabularies that count as a deliberate triage decision (#1011).
+_PRIORITY_LABELS="P0 P1 P2 P3 priority-critical priority-high priority-medium priority-low"
+
+# Has this candidate been triaged at all? Delegates to has_label, so matching is
+# per whole comma-separated token — a near-miss like `P1x` is not triage.
+has_priority_label() {
+  local labels="$1" p
+  for p in $_PRIORITY_LABELS; do
+    has_label "$labels" "$p" && return 0
+  done
+  return 1
+}
+
 # Does the candidate (labels CSV) conflict with any active issue?
 conflicts_with_active() {
   local cand_labels="$1"
@@ -242,6 +273,16 @@ while IFS=$'\t' read -r n cand_labels; do
   is_active "$n" && continue
   if conflicts_with_active "$cand_labels"; then
     continue
+  fi
+  # Rank the untriaged, but never silently (#1011). An unlabeled issue sorts at
+  # DEFAULT_RANK, which two groom gates showed was wrong more often than right
+  # (ten issues; eventual triage spanned P1..P3, in both directions). The rank
+  # is left alone — ranking untriaged work last would bury a genuinely urgent
+  # finding, the worse of the two failures — so the fix is to stop the silence.
+  # stderr only: stdout is the orchestrator's parse target and stays bare.
+  if ! has_priority_label "$cand_labels"; then
+    printf 'pick-next: issue #%s has no priority label; ranking it at the default tier P%s. Triage it, or set RALPH_DEFAULT_PRIORITY_RANK.\n' \
+      "$n" "$DEFAULT_RANK" >&2
   fi
   echo "$n"
   exit 0

@@ -12,10 +12,10 @@ file — they must come from environment variables.
 import logging
 import os
 import re
+from contextlib import suppress
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
-from zoneinfo import ZoneInfo
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -27,6 +27,27 @@ if TYPE_CHECKING:
     from creek.classify.llm.router import ModelRouter
 
 logger = logging.getLogger(__name__)
+
+PrivacyTierName = Literal["open", "personal", "intimate", "unclassified"]
+"""Hand-maintained mirror of :class:`creek.models.PrivacyTier`'s values.
+
+This module **cannot** import :mod:`creek.models` at any position: that module
+imports back into this one at the bottom of the file (the ``# noqa: E402``
+import at ``creek/models.py:1153``, which reaches
+``creek/generate/ai_style/model.py:20`` and its
+``from creek.config import AIStyleCategory``), so a module-level
+``from creek.models import PrivacyTier`` here resolves against a partially
+initialised ``creek.config`` and dies with ``ImportError``. A
+``TYPE_CHECKING`` import does not help either: a Pydantic field's *default
+value* needs a real object at class-creation time.
+
+The mirror is therefore a duplicate by necessity, and it is pinned equal to the
+enum by ``tests/test_config.py::TestAuthorMaxReproducedTier::
+test_the_literal_mirrors_every_privacy_tier`` — the only thing standing between
+a fifth tier added to the enum and an operator whose configured value is
+silently rejected. The same reasoning (and the same shape) as
+:data:`AIStyleCategory` below.
+"""
 
 CONFIG_PATH_ENV_VAR = "CREEK_CONFIG"
 """Environment variable that, when set, supplies the default config path.
@@ -412,7 +433,7 @@ class OCRConfig(BaseModel):
     """Tesseract language codes for OCR."""
 
     min_confidence: float = Field(default=0.6, ge=0.0, le=1.0)
-    """Minimum OCR confidence below which a fragment lands in the review queue.
+    """Minimum OCR confidence below which a fragment is tagged in frontmatter.
 
     Image and scanned-PDF ingestors compare the per-page confidence
     reported by the engine to this threshold; a fragment whose OCR
@@ -433,22 +454,6 @@ class LinkingConfig(BaseModel):
     eddy_min_fragments: int = 5
     """Minimum fragments required to form an Eddy."""
 
-    exchange_max_gap_minutes: int = Field(default=30, ge=1)
-    """Maximum minute-gap between consecutive messages still grouped into
-    the same ``exchange`` by the FEAT-022 aggregator. Inclusive boundary.
-    """
-
-    burst_similarity_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
-    """Cosine-similarity floor below which two consecutive exchanges start
-    separate ``burst``-level parents in the FEAT-022 aggregator.
-    Inclusive boundary.
-    """
-
-    session_max_gap_minutes: int = Field(default=360, ge=1)
-    """Maximum minute-gap between consecutive bursts still grouped into the
-    same ``session`` by the FEAT-022 aggregator. Inclusive boundary.
-    """
-
     hierarchy_sibling_skip_window: int = Field(default=2, ge=0)
     """FEAT-024 sibling-suppression window for hierarchy-aware linking.
 
@@ -463,15 +468,140 @@ class LinkingConfig(BaseModel):
     skips immediate and one-removed neighbours on either side.
     """
 
-    cross_source_aggregation: bool = False
-    """When ``True``, the FEAT-027 aggregator drops the source-identity
-    gate so a single exchange/burst/session may span multiple sources
-    once the temporal/similarity thresholds permit. Each parent records
-    every contributing source key as a ``source/<key>`` tag while child
-    fragments retain their original :class:`~creek.models.FragmentSource`
-    pointers. ``False`` (default) preserves the single-source behaviour
-    introduced by FEAT-022.
+    # ---- Detector thresholds (issue #880) ----
+    #
+    # Every default below is the exact value of the module-private constant
+    # it replaces, so a vault whose creek_config.yaml predates these keys
+    # clusters identically after the upgrade.
+
+    eddy_eps: float = Field(default=0.3, gt=0.0, lt=1.0)
+    """Maximum cosine *distance* for a DBSCAN neighbour in eddy detection.
+
+    ``0.3`` means an edge exists between two fragments at cosine similarity
+    ``>= 0.70``. Lowering it tightens every cluster; it cannot, on its own,
+    separate a continuous message stream (see ``stream_platforms``).
     """
+
+    eddy_min_samples: int = Field(default=5, ge=1)
+    """Minimum neighbourhood size for a DBSCAN core point in eddy detection."""
+
+    eddy_correlation_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+    """Absolute Spearman ceiling above which a cluster is thread-like.
+
+    A candidate eddy whose content drift correlates with chronological rank
+    at or above this value is a directional progression, and is filtered out
+    of the eddy set rather than emitted as a topic cluster.
+    """
+
+    thread_window_days: int = Field(default=30, ge=1)
+    """Sliding-window width, in days, for thread detection.
+
+    Distinct from ``temporal_window_hours``, which feeds only the temporal
+    *proximity* linker and has never influenced threads.
+    """
+
+    thread_similarity_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    """Cosine similarity a pair must strictly exceed to join one thread."""
+
+    thread_union_without_embeddings: bool = False
+    """Whether a pair missing an embedding may union on frequency alone.
+
+    When the detector has *no* embeddings at all, thread detection falls
+    back to frequency agreement by design. On a *partially* embedded vault
+    the same fallback fires per pair, silently chaining fragments the
+    similarity gate would have rejected — so it is closed by default and
+    must be opted into.
+    """
+
+    # ---- Cluster-size guardrail (issue #880) ----
+
+    cluster_size_ceiling: int = Field(default=500, ge=1)
+    """Absolute member count below which a cluster is never split.
+
+    The effective ceiling is ``max(cluster_size_ceiling, floor(corpus_size *
+    cluster_max_fraction))``: the absolute floor dominates ordinary vaults,
+    so the guardrail stays inert until a corpus is large enough for
+    degeneration to matter.
+    """
+
+    cluster_max_fraction: float = Field(default=0.10, gt=0.0, le=1.0)
+    """Largest share of the corpus a single eddy or thread may hold.
+
+    ``1.0`` is the documented opt-out: one cluster may then span everything.
+    """
+
+    cluster_split_max_depth: int = Field(default=3, ge=0)
+    """Re-clustering rounds allowed per oversized cluster.
+
+    ``0`` disables splitting entirely, sending any oversized cluster
+    straight to noise.
+    """
+
+    eddy_split_eps_step: float = Field(default=0.05, gt=0.0, lt=1.0)
+    """Amount ``eddy_eps`` is tightened by on each re-clustering round."""
+
+    thread_split_similarity_step: float = Field(default=0.1, gt=0.0, lt=1.0)
+    """Amount ``thread_similarity_threshold`` is raised on each round."""
+
+    # ---- Message-stream segmentation (issue #880) ----
+
+    stream_platforms: list[str] = Field(
+        default_factory=lambda: ["discord", "email"],
+    )
+    """Source platforms whose fragments are cut into conversation episodes.
+
+    A continuous chat stream violates the precondition both detectors rely
+    on — clusters separated by low-density regions — so it is partitioned
+    into independent clustering domains *before* any similarity graph is
+    built. The default names the two platforms Creek already routes to the
+    ``01-Fragments/Messages/`` subfolder. An empty list disables
+    segmentation. Values must be :class:`~creek.models.SourcePlatform`
+    members.
+    """
+
+    stream_episode_max_gap_hours: int = Field(default=24, ge=1)
+    """Inactivity gap, in hours, that ends a conversation episode.
+
+    The conversational rule: people stop talking, and that silence is the
+    real topic boundary. Inclusive — a gap exactly this long does not cut.
+    """
+
+    stream_episode_max_span_days: int = Field(default=30, ge=1)
+    """Maximum span, in days, of a single conversation episode.
+
+    The backstop for a channel that never falls idle, so a permanently-busy
+    channel yields channel-month units rather than one multi-year blob.
+    Inclusive — a span exactly this long does not cut.
+    """
+
+    @field_validator("stream_platforms")
+    @classmethod
+    def _validate_stream_platforms(cls, value: list[str]) -> list[str]:
+        """Reject platform names that no ingestor can ever produce.
+
+        Args:
+            value: The configured platform values.
+
+        Returns:
+            The value unchanged when every entry names a
+            :class:`~creek.models.SourcePlatform` member.
+
+        Raises:
+            ValueError: If any entry is not a known source platform — a
+                typo would otherwise disable segmentation silently.
+        """
+        from creek.models import SourcePlatform
+
+        known = {platform.value for platform in SourcePlatform}
+        unknown = [name for name in value if name not in known]
+        if unknown:
+            msg = (
+                f"unknown source platform(s) in stream_platforms: "
+                f"{', '.join(sorted(unknown))}; "
+                f"valid values are {', '.join(sorted(known))}"
+            )
+            raise ValueError(msg)
+        return value
 
 
 class ClassificationConfig(BaseModel):
@@ -508,10 +638,12 @@ class ClassificationConfig(BaseModel):
     When ``False`` (default) the classify pipeline behaves exactly as
     it did before FEAT-023: a single pass over each fragment, no
     structural decomposition. When ``True``, low-confidence /
-    ``unclassified`` results trigger the zoom-in splitter (FEAT-021) or
-    zoom-out aggregator (FEAT-022), recursing until a leaf reaches the
-    confidence threshold, a terminal level (sentence / session), or
-    :attr:`reatomize_max_depth`.
+    ``unclassified`` results trigger the zoom-in splitter (FEAT-021),
+    recursing until a leaf reaches the confidence threshold, a terminal
+    level, or :attr:`reatomize_max_depth`. Fragments the splitter is
+    the wrong tool for — chat messages, which the retired FEAT-022
+    aggregator was to have coarsened (issue #1342, ADR-0011) — are left
+    exactly as they are.
     """
 
     reatomize_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -531,14 +663,58 @@ class ClassificationConfig(BaseModel):
     whatever classification it has, even if still ``unclassified``.
     """
 
-    reatomize_direction: Literal["auto", "split", "aggregate"] = "auto"
+    reatomize_direction: Literal["auto", "split"] = "auto"
     """FEAT-023 direction-choice override.
 
     ``"auto"`` (default) routes by ``source.platform`` and ``level``
     per the heuristic in :mod:`creek.classify.reatomize`. ``"split"``
-    or ``"aggregate"`` force a single direction regardless of source
-    — useful for triage runs over a known-uniform corpus.
+    forces zoom-in regardless of source — useful for triage runs over a
+    known-uniform corpus. The third value this field once accepted,
+    ``"aggregate"``, was retired with the operator it selected (issue
+    #1342, ADR-0011) and is now rejected outright; see
+    :meth:`reject_retired_aggregate_direction`.
     """
+
+    @field_validator("reatomize_direction", mode="before")
+    @classmethod
+    def reject_retired_aggregate_direction(cls, v: object) -> object:
+        """Refuse the retired ``aggregate`` direction instead of coercing it.
+
+        Runs ``mode="before"`` so the stale value is caught with its own
+        message rather than by pydantic's generic "not a permitted
+        literal" error, which would tell an operator what is legal but
+        not what happened to the value in their YAML.
+
+        Rejecting is deliberate: mapping ``aggregate`` to ``auto`` would
+        be a *behaviour change*, not a migration. Under the retired
+        value a non-chat fragment stopped where it was; under ``auto``
+        the same fragment splits, minting child fragments in a vault
+        that never had them. Failing loudly is both the honest answer
+        and the strictly behaviour-preserving one.
+
+        Args:
+            v: The raw ``reatomize_direction`` value from YAML, env or a
+                direct constructor call, before literal validation.
+
+        Returns:
+            ``v`` unchanged for every value other than ``"aggregate"``;
+            pydantic then validates it against the ``Literal``.
+
+        Raises:
+            ValueError: If ``v`` is ``"aggregate"``.
+        """
+        if v == "aggregate":
+            msg = (
+                "classification.reatomize_direction: 'aggregate' was retired "
+                "with the FEAT-022 zoom-out aggregator (issue #1342, "
+                "ADR-0011) — it selected an operator no production code path "
+                "ever invoked, so the setting did nothing. Use 'auto' or "
+                "'split'. Note that 'auto' is not a drop-in replacement: it "
+                "splits fragments this value left untouched. Coarsening work "
+                "is tracked in issue #1457."
+            )
+            raise ValueError(msg)
+        return v
 
     weighted_classification: bool = False
     """Opt-in switch for weighted classification across the holarchy.
@@ -551,15 +727,29 @@ class ClassificationConfig(BaseModel):
     actually reaches the LLM also gets a
     :class:`~creek.classify.weighted.WeightedFragmentClassification`
     persisted to :attr:`Fragment.weighted`; the legacy single-pick
-    fields are derived from the top weighted entries via
-    :meth:`WeightedFragmentClassification.to_legacy` so downstream
-    consumers (lint, compile, voice-skill generation) keep working
-    unchanged.
+    fields are derived from the top weighted entries so downstream
+    consumers (lint, compile, voice-skill generation) keep reading a
+    canonical pick.
+
+    Those derived fields are **merged** over the fragment via
+    :meth:`WeightedFragmentClassification.merge_onto`, not written over
+    it: a dimension the model said nothing about keeps whatever value
+    the fragment already carried. That, plus the author-stance
+    (``confidences``) axis added alongside it, is what makes the
+    weighted path reach the **same privacy tier as the single-pick
+    path for the same model verdict** — before #1309 a
+    confessional+conviction verdict escalated to INTIMATE on the
+    single-pick path and stayed OPEN here.
 
     Rule-confident fragments are NOT re-classified —
     :attr:`Fragment.weighted` stays ``None`` for those even with this
     flag on. This preserves the FEAT-017 cost gate that already keeps
-    the LLM from re-running over high-confidence rule picks.
+    the LLM from re-running over high-confidence rule picks. A fragment
+    whose weighted call reaches the LLM but *fails* (provider
+    unavailable, transport error, unparseable payload) likewise keeps
+    :attr:`Fragment.weighted` as ``None``, along with its honest
+    ``rules`` provenance, rather than persisting a fabricated all-zero
+    profile (#1330).
     """
 
 
@@ -662,8 +852,11 @@ class RedactionConfig(BaseModel):
 
     Higher values demand more entropy before flagging a substring; ``0.0``
     catches everything that looks base64-ish, ``1.0`` requires near-random
-    output. The default ``0.6`` corresponds to roughly 4.2 bits/char which
-    suppresses most natural-language false positives.
+    output. The default ``0.6`` corresponds to exactly 3.7 bits/char —
+    the ``2.5`` floor plus ``0.6`` of the span up to the ``4.5`` ceiling —
+    which suppresses most natural-language false positives. Raising it is
+    the supported way to trade detector reach for fewer false positives:
+    it narrows both the whole-run and the sub-run window gate.
     """
 
     replacement_template: str = "[REDACTED:{name}]"
@@ -1157,6 +1350,74 @@ class AuthorConfig(BaseModel):
     :attr:`synthesis_model` this is reserved-and-dormant: ``None`` falls back to
     ``llm.model``."""
 
+    max_reproduced_tier: PrivacyTierName = "open"
+    """Highest privacy tier a finished draft may reproduce **verbatim** (#1354).
+
+    The ceiling the HARD ``privacy_compliance`` gate actually enforces is the
+    *more restrictive* of this key and the medium contract's
+    ``default_privacy_tier``, so a contract — which is authored inside the
+    vault, at ``00-Creek-Meta/Skills/mediums/<medium>.MEDIUM.md``, alongside the
+    content it is meant to protect — can only ever **narrow** the gate. Before
+    #1354 the contract was the sole source, and one edited YAML line inside the
+    vault disarmed the gate on both ``creek author`` and the ``creek.author``
+    MCP verb.
+
+    At the shipped default (``open``, the strictest rank) this key is the
+    stricter of the pair for every one of the six shipped medium templates, so
+    the contract's declared tier is inert for this gate; the contract only
+    starts to matter once an operator deliberately raises this key. That
+    asymmetry is the point: the permissive direction lives in
+    ``creek_config.yaml``, which no template deploys and no vault-editing agent
+    is expected to touch.
+
+    Distinct from the **admission** axis owned by ``creek author
+    --include-tier`` and the MCP ``privacy_tier_ceiling`` argument: those govern
+    what the desk's specialists may *retrieve* as evidence; this governs what
+    the finished prose may *reproduce*.
+    """
+
+    @field_validator("max_reproduced_tier", mode="before")
+    @classmethod
+    def _coerce_max_reproduced_tier(cls, value: object) -> str:
+        """Fail closed to ``open`` for an unrecognised reproduction ceiling.
+
+        Mirrors :meth:`creek.models.AuthorProfile._coerce_privacy_tier`: it
+        **returns**, it never raises. A ``ValidationError`` escaping from here
+        would turn one typo in ``creek_config.yaml`` into a crashed review
+        inside a HARD privacy gate, and the pressure that follows a crashed
+        gate is to skip the gate.
+
+        Args:
+            value: The raw value as YAML or the environment handed it over — a
+                tier name, ``None`` for a bare ``max_reproduced_tier:`` key, or
+                anything at all.
+
+        Returns:
+            The canonical tier name, or ``"open"`` (the strictest ceiling) when
+            *value* is not one. The pre-INC-003 spelling ``"public"`` resolves
+            to ``"open"`` through :meth:`creek.models.PrivacyTier._missing_`.
+        """
+        # Function-local, and it has to be: see :data:`PrivacyTierName` for the
+        # import cycle that forbids reaching ``creek.models`` from module scope.
+        from creek.models import PrivacyTier
+
+        if isinstance(value, str):
+            with suppress(ValueError):
+                return PrivacyTier(value).value
+        if value is None:
+            logger.warning(
+                "'author.max_reproduced_tier' is null; failing closed to %r.",
+                PrivacyTier.OPEN.value,
+            )
+        else:
+            logger.warning(
+                "author.max_reproduced_tier %r is not a recognised privacy "
+                "tier; failing closed to %r.",
+                value,
+                PrivacyTier.OPEN.value,
+            )
+        return PrivacyTier.OPEN.value
+
 
 class AIStyleConfig(BaseModel):
     """Configuration for the FEAT-040 AI-style / voice-fidelity subsystem.
@@ -1498,9 +1759,11 @@ class SyncConfig(BaseModel):
     """Scheduling configuration for ``creek sync`` (#676 / SPEC R3).
 
     Holds the per-source enable toggles and the two-tier cadence. The cadence
-    values are config-tunable (decision #5) even though the skeleton command
-    does not schedule anything yet — a later issue emits the launchd/systemd
-    units that read them.
+    values are config-tunable (decision #5) and are read by
+    :func:`~creek.sync.schedule.render_launchd_plists`,
+    :func:`~creek.sync.schedule.render_systemd_units` and
+    :func:`~creek.sync.schedule.render_crontab`, which
+    ``creek sync --install-schedule launchd|systemd`` writes to disk.
     """
 
     tier_a_interval_minutes: int = Field(default=30, ge=1)
@@ -1592,12 +1855,22 @@ class DiscordSourceConfig(BaseModel):
         return value
 
 
+_OBSOLETE_TIMEZONE_KEY = "timezone"
+"""Config key deleted by #1339, still present in every pre-#1339 vault config.
+
+Creek anchors every timestamp it writes to America/Los_Angeles by ontology
+mandate §8.3 (:data:`creek.time.LA_TZ`); the knob had no production reader, and
+wiring one would have made fragment ids config-dependent (see
+:meth:`CreekConfig._drop_obsolete_timezone`).
+"""
+
+
 class CreekConfig(BaseSettings):
     """Top-level Creek configuration.
 
     Values are loaded from a YAML file and can be overridden by
     environment variables prefixed with ``CREEK_`` (e.g.
-    ``CREEK_VAULT_PATH``, ``CREEK_TIMEZONE``).
+    ``CREEK_VAULT_PATH``, ``CREEK_SOURCE_DRIVE``).
     """
 
     model_config = SettingsConfigDict(
@@ -1609,9 +1882,6 @@ class CreekConfig(BaseSettings):
 
     source_drive: Path = Path()
     """Path to the mounted source drive containing raw exports."""
-
-    timezone: str = "America/Los_Angeles"
-    """IANA timezone for timestamp normalisation."""
 
     llm: LLMRoutingConfig = Field(default_factory=LLMRoutingConfig)
     """Per-stage LLM routing (#642). A legacy flat ``llm`` block is promoted to
@@ -1678,26 +1948,61 @@ class CreekConfig(BaseSettings):
     discord: DiscordSourceConfig = Field(default_factory=DiscordSourceConfig)
     """Discord ingest mode toggles (data_package | exporter | bot_capture)."""
 
-    @field_validator("timezone")
+    @model_validator(mode="before")
     @classmethod
-    def validate_timezone(cls, v: str) -> str:
-        """Validate that *v* is a recognised IANA timezone.
+    def _drop_obsolete_timezone(cls, data: object) -> object:
+        """Discard the pre-#1339 ``timezone:`` key, loudly (#1339).
+
+        The field was deleted rather than wired: it had no production reader,
+        and :func:`creek.ingest.base.generate_fragment_id` hashes
+        ``timestamp.isoformat()`` — whose rendered UTC offset changes with the
+        zone — so an operator-settable anchor would mint a second id for every
+        fragment on re-ingest, reopening the bug #1329 had to migrate vaults
+        out of.
+
+        A shim is required because this model forbids extra keys while
+        :func:`generate_default_config` dumps the whole model, so every
+        ``creek_config.yaml`` ``creek init`` has ever written carries a
+        ``timezone:`` line. Without this, deletion would turn every existing
+        config into a hard ``ValidationError`` at load. It lives on the model
+        rather than in :func:`load_config` because direct construction reaches
+        validation without passing through that loader's YAML dict —
+        :func:`generate_default_config` builds its own ``CreekConfig()``, and
+        the environment-variable settings source populates the model whether or
+        not a config file was ever read.
+
+        Exactly one key is removed, by name: ``extra='forbid'`` still rejects
+        everything else, so a typo stays a loud error rather than a silent
+        no-op.
 
         Args:
-            v: Timezone string to validate.
+            data: The raw input to validation — a ``dict`` for YAML and
+                settings-source loads, but any object at all when a caller
+                hands one straight to ``model_validate``.
 
         Returns:
-            The validated timezone string.
-
-        Raises:
-            ValueError: If the timezone is not recognised by ``zoneinfo``.
+            *data* unchanged, or a new ``dict`` without the obsolete key.
+            Anything that is not a ``dict`` passes straight through, so it
+            still fails with pydantic's own ``ValidationError`` rather than
+            an ``AttributeError`` raised from inside this validator.
         """
-        try:
-            ZoneInfo(v)
-        except KeyError as exc:
-            msg = f"Invalid timezone: {v}"
-            raise ValueError(msg) from exc
-        return v
+        if not isinstance(data, dict) or _OBSOLETE_TIMEZONE_KEY not in data:
+            return data
+        logger.warning(
+            "Ignoring obsolete `%s` key in your Creek config: it is no longer "
+            "a setting. Creek anchors every timestamp it writes to "
+            "America/Los_Angeles by design, so the key had no effect and can "
+            "be deleted from your config file (issue #1339).",
+            _OBSOLETE_TIMEZONE_KEY,
+        )
+        # A copy, not a pop. As a ``BaseSettings``, this model is handed a
+        # dict its settings sources freshly merged, so an in-place ``del``
+        # would not actually reach the caller's parsed YAML today — but that
+        # is an implementation detail of pydantic-settings, not a promise.
+        # Copying keeps the validator side-effect-free regardless.
+        remaining = dict(data)
+        del remaining[_OBSOLETE_TIMEZONE_KEY]
+        return remaining
 
     @cached_property
     def model_router(self) -> "ModelRouter":
@@ -1777,6 +2082,59 @@ def load_config(
             CONFIG_PATH_ENV_VAR,
         )
     return CreekConfig()
+
+
+def load_vault_config(
+    vault: Path | None,
+    *,
+    explicit: Path | None = None,
+    warn_on_missing: bool = False,
+) -> CreekConfig:
+    """Load the configuration belonging to *vault* (#1409).
+
+    The single spelling of "resolve this vault's config". Every consumer that
+    acts *on a named vault* must use it, because the alternative —
+    ``load_config()`` with no argument — silently reads
+    ``creek_config.yaml`` relative to the **process's current working
+    directory** and never opens ``<vault>/00-Creek-Meta/creek_config.yaml``.
+    Nothing raises and nothing logs when that happens: the caller simply
+    proceeds with built-in defaults while reporting success, which is how the
+    defect in #1409 spread to eleven call sites unnoticed.
+
+    Precedence is :func:`resolve_config_path`'s, unchanged and deliberate:
+    ``explicit`` beats ``CREEK_CONFIG`` beats the vault's own file. In
+    particular ``CREEK_CONFIG`` still wins over the vault (#1313 examined that
+    ordering and left it alone), so a subprocess handed the variable keeps
+    behaving as its parent intended.
+
+    Neither a stale nor a malformed vault config is swallowed here. A key the
+    schema forbids raises ``pydantic.ValidationError`` and a dangling
+    ``CREEK_CONFIG`` raises ``FileNotFoundError``; callers that have a reason
+    to continue anyway catch them at their own level. Silent fallback is the
+    exact failure class this function exists to end.
+
+    The one thing it cannot fix is a vault with no config file at all: that
+    still falls through to :func:`load_config`'s cwd default and then to
+    built-in defaults. ``warn_on_missing`` defaults to ``False`` because most
+    callers are library surfaces (MCP tools, agents) with no operator console
+    to warn at; the CLI wrappers that do have one keep passing ``True``.
+
+    Args:
+        vault: Vault root to resolve against, or ``None`` when the caller
+            genuinely has no vault (several CLI commands take no ``--vault``).
+        explicit: Operator-supplied config path, e.g. a ``--config`` flag.
+        warn_on_missing: Log a WARNING when no config file is found anywhere.
+
+    Returns:
+        The vault's fully-validated ``CreekConfig``.
+
+    Raises:
+        FileNotFoundError: When ``CREEK_CONFIG`` names a missing path.
+    """
+    return load_config(
+        resolve_config_path(vault, explicit),
+        warn_on_missing=warn_on_missing,
+    )
 
 
 _ANTHROPIC_CONSENT_NOTE: str = """\

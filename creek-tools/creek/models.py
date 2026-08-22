@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Literal, TypeVar, get_args
 from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from creek.compile.provenance import CompileMethod, ProvenanceEntry
-from creek.time import now_la, today_la
+from creek.time import ensure_aware, now_la, today_la
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +46,15 @@ FragmentLevel = Literal[
 
 The first four values (``sentence`` … ``section``) describe levels carved
 *down* from a longer document by the FEAT-021 zoom-in splitter. The last
-three (``exchange``, ``burst``, ``session``) describe levels stitched
-*up* from short messages by the FEAT-022 zoom-out aggregator. ``document``
-is the default for any flat ingestion — a chat conversation, an essay, a
-note — and is therefore what every pre-FEAT-020 fragment is treated as
-when it loads without an explicit ``level`` field.
+three (``exchange``, ``burst``, ``session``) once described levels
+stitched *up* from short messages by the FEAT-022 zoom-out aggregator;
+issue #1342 (ADR-0011) retired that operator, so no production path mints
+them today. The three values stay in the type as vocabulary — a legacy or
+hand-authored fragment may still carry one — but nothing currently
+produces one. ``document`` is the default for any flat ingestion — a chat
+conversation, an essay, a note — and is therefore what every
+pre-FEAT-020 fragment is treated as when it loads without an explicit
+``level`` field.
 """
 
 
@@ -646,6 +650,17 @@ class FragmentSource(BaseModel):
     channel: str | None = None
     interlocutor: str | None = None
     author: Authorship = Authorship.SELF
+    # Issue #1229: the free-text name a source document carries — a DOCX
+    # ``core_properties.author``, a PDF ``/Author``. It answers "what name is on
+    # the file", which is a *different question* from ``author`` ("whose views
+    # does this stand for?") and from ``author_slug`` (which identity folder
+    # governs it). Keeping the three apart is the whole point: writing a name
+    # into ``author`` fails enum validation, and writing one into ``author_slug``
+    # would silently relocate the fragment into ``11-Other-Authors/<name>/`` and
+    # zero its voice weight. This slot is inert — nothing routes or classifies on
+    # it — so a name can be recorded without deciding anything on the owner's
+    # behalf, and promoted to a real ``author_slug`` later if they choose.
+    author_name: str | None = None
     # FEAT-041 §7.4: the `11-Other-Authors/<slug>/` folder this fragment came
     # from, or ``None`` for a native self/owner fragment. Distinct from
     # ``author`` (the self|ai|other|collaborative axis), which is unchanged.
@@ -729,6 +744,23 @@ class Fragment(BaseModel):
         source: Source metadata. Its ``author_slug`` names the
             ``11-Other-Authors/<slug>/`` folder a borrowed fragment came from
             (``None`` for a native fragment), distinct from ``source.author``.
+        created: When the fragment came into being on the vault side.
+            Normalised like every timestamp below.
+        ingested: The wall-clock moment the vault wrote the fragment.
+            Never naive when the fragment was built through the normal
+            constructor or ``model_validate`` path.
+        authored_at: The timestamp the source itself records, or ``None``
+            when none is extractable — the model never invents one.
+            ``created`` / ``ingested`` / ``authored_at`` are all
+            normalised at validation time by
+            :meth:`_normalise_timestamp` (#976), which *anchors* rather
+            than converts: a naive value keeps its wall clock and gains
+            the America/Los_Angeles offset, while an already-aware value
+            — a Sydney ``authored_at``, say — passes through untouched
+            with its ``tzinfo`` and microseconds intact. A ``None``
+            ``authored_at`` stays ``None``. See
+            :meth:`_normalise_timestamp` for exactly which construction
+            paths this normalisation covers, and which bypass it.
     """
 
     model_config = ConfigDict(use_enum_values=True)
@@ -751,6 +783,8 @@ class Fragment(BaseModel):
     # until the audience classifier runs — additive and backward-compatible,
     # and fails closed to ``mixed`` so a corrupt value never crashes a scan.
     audience: Audience = "mixed"
+    # All three timestamps below are anchored to LA when they arrive
+    # naive — see ``_normalise_timestamp`` for the contract (#976).
     created: datetime = Field(default_factory=now_la)
     ingested: datetime = Field(default_factory=now_la)
     # Timestamp the source itself records (a Substack post's publish
@@ -816,6 +850,58 @@ class Fragment(BaseModel):
             return value
         _warn_fail_closed("Fragment audience", value, "mixed")
         return "mixed"
+
+    @field_validator("created", "ingested", "authored_at", mode="after")
+    @classmethod
+    def _normalise_timestamp(cls, value: datetime | None) -> datetime | None:
+        """Anchor a naive timestamp to LA; leave an aware one untouched (#976).
+
+        Vault frontmatter routinely serialises timestamps without an
+        offset (``ingested: 2024-01-01 12:00:00``), which PyYAML parses
+        into a *naive* datetime. Stored verbatim, it raises ``TypeError:
+        can't compare offset-naive and offset-aware datetimes`` at
+        whichever consumer first compares it against a neighbouring
+        aware timestamp. Repairing it here — the chokepoint every
+        ``Fragment`` load crosses via the constructor or
+        ``model_validate`` — is what lets the downstream surfaces
+        (synchronicity, temporal linking, wavelength bucketing) treat
+        "never naive" as an invariant on those paths, instead of
+        re-repairing it site by site. The invariant does not reach
+        ``Fragment.model_construct``, ``model_copy(update=...)``, or a
+        direct attribute assignment on an existing ``Fragment``: none
+        of those routes through Pydantic field validators, so a caller
+        that builds or mutates a fragment that way can still hand a
+        naive datetime downstream. No production caller assigns a
+        timestamp that way today, but a future one should not assume
+        this validator ran.
+
+        ``mode="after"`` is load-bearing rather than stylistic: a
+        before-validator sees the raw input, which on the
+        ``model_validate`` path can still be an offsetless ISO-8601
+        ``str`` Pydantic has yet to parse into a ``datetime``. This
+        function calls ``ensure_aware(value)``, which reads
+        ``value.utcoffset()`` — handed that raw string, a
+        before-validator would raise ``AttributeError``, not silently
+        return a naive result. ``mode="after"`` guarantees Pydantic has
+        already parsed the value into a real ``datetime`` before this
+        validator runs.
+
+        Deliberately silent, unlike the sibling ``_coerce_*``
+        validators: those warn because they *discard* a malformed value
+        the operator needs to know about, whereas this repair is
+        lossless and expected of every legacy vault. Warning per field
+        would emit six figures of noise on a 35k-fragment scan.
+
+        Args:
+            value: The supplied timestamp; ``None`` only for the
+                optional ``authored_at``.
+
+        Returns:
+            ``None`` unchanged, otherwise the value with an offset
+            guaranteed — attached, never converted, per
+            :func:`creek.time.ensure_aware`.
+        """
+        return None if value is None else ensure_aware(value)
 
     # BUG-009: the ``[prop-decorator]`` suppression below is a known
     # mypy / Pydantic-v2 limitation when stacking ``@computed_field``

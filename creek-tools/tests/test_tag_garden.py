@@ -50,6 +50,23 @@ def generator(vault: Path) -> TagGardenGenerator:
     return TagGardenGenerator(vault)
 
 
+@pytest.fixture()
+def bare_vault(tmp_path: Path) -> Path:
+    """Create a vault holding ``01-Fragments/`` and nothing else.
+
+    This fixture deliberately omits ``00-Creek-Meta/`` — and with it
+    ``00-Creek-Meta/Processing-Log/``. That omission is the whole point: the
+    ``vault`` fixture above pre-creates both, so it cannot express the state a
+    real vault is in before anything has scaffolded the meta folder, which is
+    exactly the state in which ``generate_garden`` used to die on a missing
+    parent directory (issue #1318). ``01-Fragments/`` is present because
+    ``_write_fragment`` writes into it, and because a vault with no content at
+    all would make the assertions about the seeded tag vacuous.
+    """
+    (tmp_path / "01-Fragments").mkdir()
+    return tmp_path
+
+
 def _write_fragment(vault: Path, name: str, tags: list[str]) -> Path:
     """Write a mock fragment markdown file with frontmatter tags.
 
@@ -503,11 +520,28 @@ class TestGenerateGarden:
         generator: TagGardenGenerator,
         vault: Path,
     ) -> None:
-        """generate_garden loads previous scan for growth detection."""
+        """generate_garden loads previous scan for growth detection.
+
+        The seeded entry states ``tier_ceiling`` since #968. A history entry is
+        only a valid growth baseline for a scan taken at the *same* ceiling, and
+        a legacy entry that records none is skipped as non-comparable — so
+        without the key this test would still pass while exercising none of the
+        growth path, because ``python`` also appears in the unconditional "All
+        Tags" table. ``"all"`` is what the ``generator`` fixture runs at
+        (``TagGardenGenerator``'s default ``PrivacyTierOverride.ALL``).
+
+        The assertion is on the "Rapidly Growing" row rather than on the bare
+        tag name, for the same reason: only that row can distinguish "the
+        baseline was loaded and compared" from "the tag exists".
+        """
         # Write initial history
         history_path = vault / "00-Creek-Meta" / "Processing-Log" / "tag-history.json"
         initial_history = [
-            {"tag_counts": {"python": 2}, "timestamp": "2026-01-01T00:00:00"},
+            {
+                "tag_counts": {"python": 2},
+                "timestamp": "2026-01-01T00:00:00",
+                "tier_ceiling": "all",
+            },
         ]
         history_path.write_text(
             json.dumps(initial_history),
@@ -524,6 +558,7 @@ class TestGenerateGarden:
         content = path.read_text(encoding="utf-8")
         # python grew from 2 to 4 (100% growth), should appear in growing section
         assert "python" in content
+        assert "| python | 2 | 4 | +100% |" in content
 
     def test_renders_clusters_in_output(
         self,
@@ -595,3 +630,209 @@ class TestGenerateGarden:
         content = path.read_text(encoding="utf-8")
         # With no previous history, all tags are "new"
         assert "### New Tags" in content
+
+
+# ---- The Tag Garden is reachable once ``tags`` has a producer (#878) ----
+
+
+class TestTagGardenIsReachableOnceFragmentsCarryTags:
+    """The reader was always fine; the vault was always empty (issue #878).
+
+    ``Fragment.tags`` defaulted to ``[]`` and had essentially no
+    production writer, so on the operator's 35,330-fragment vault
+    ``00-Creek-Meta/Tag-Garden.md`` read ``*No tags found in vault.*`` and
+    every section below it was blank. **No production change is needed
+    here** — this class is the regression proof that the whole generator
+    (scan → growth → clusters → render) lights up the moment the ingest
+    and classify passes start writing the field, and that a future change
+    to the tags pass cannot silently re-empty the garden.
+
+    It reuses the module's existing ``vault`` fixture and
+    ``_write_fragment`` helper deliberately: seeding through the same
+    on-disk shape every other test in this file uses is what keeps the
+    assertion honest.
+    """
+
+    def test_a_tagged_vault_renders_a_populated_garden(
+        self,
+        generator: TagGardenGenerator,
+        vault: Path,
+    ) -> None:
+        """All-Tags, Clusters and Growing Tags are all non-empty (AC-2).
+
+        One rendered document, four assertions, each pinned to a
+        different section so a partial regression cannot pass:
+
+        * the "no tags" sentinel is **absent** — the exact string the
+          operator's real vault showed;
+        * the All-Tags table names the seeded tags;
+        * ``recovery`` and ``writing`` co-occur on three fragments and so
+          form a cluster row;
+        * ``recovery`` grew 2 → 4 against the seeded history, which is
+          the only section that can distinguish "the baseline was loaded
+          and compared" from "the tag exists somewhere in the file".
+
+        The history entry states ``tier_ceiling: all`` because since #968
+        an entry that records none is skipped as a non-comparable
+        baseline, and ``all`` is what the ``generator`` fixture runs at.
+        """
+        history_path = vault / "00-Creek-Meta" / "Processing-Log" / "tag-history.json"
+        history_path.write_text(
+            json.dumps(
+                [
+                    {
+                        "tag_counts": {"recovery": 2},
+                        "timestamp": "2026-01-01T00:00:00",
+                        "tier_ceiling": "all",
+                    },
+                ],
+            ),
+            encoding="utf-8",
+        )
+        for name in ("note1", "note2", "note3"):
+            _write_fragment(vault, name, ["recovery", "writing"])
+        _write_fragment(vault, "note4", ["recovery"])
+
+        content = generator.generate_garden().read_text(encoding="utf-8")
+
+        assert "No tags found in vault." not in content
+        assert "recovery" in content
+        assert "writing" in content
+        assert "| Tag A | Tag B | Co-occurrences |" in content
+        assert "| recovery | 2 | 4 | +100% |" in content
+
+
+# ---- The garden scaffolds its own parent directory (#1318) ----
+
+
+class TestGenerateGardenOnAnUnscaffoldedVault:
+    """``generate_garden`` must create ``00-Creek-Meta/`` instead of crashing.
+
+    Every sibling report generator makes its output directory on demand (the
+    #1231 convention); this one wrote straight to
+    ``00-Creek-Meta/Tag-Garden.md``, so on a vault where that folder does not
+    exist the very first write raised ``FileNotFoundError`` and nothing after
+    it ran — history persistence included, even though ``_save_history`` does
+    create its own parent, because it never got the chance.
+
+    These tests use ``bare_vault`` rather than the module's ``vault`` fixture:
+    ``vault`` pre-creates ``00-Creek-Meta`` and its ``Processing-Log``, so it
+    cannot express the defect at all.
+    """
+
+    def test_writes_the_garden_when_00_creek_meta_is_absent(
+        self,
+        bare_vault: Path,
+    ) -> None:
+        """The garden is written even though its parent folder is missing.
+
+        The absence of ``00-Creek-Meta`` is asserted *before* the call, so the
+        test proves it exercised the intended precondition and cannot quietly
+        rot into a duplicate of the happy-path cases above if a future fixture
+        change starts scaffolding the folder. Before the fix, the call raises
+        ``FileNotFoundError`` from ``write_text``.
+        """
+        _write_fragment(bare_vault, "note1", ["recovery"])
+        assert not (bare_vault / "00-Creek-Meta").exists()
+
+        path = TagGardenGenerator(bare_vault).generate_garden()
+
+        assert path == bare_vault / "00-Creek-Meta" / "Tag-Garden.md"
+        assert path.exists()
+        content = path.read_text(encoding="utf-8")
+        assert "recovery" in content
+        assert "type: tag-garden" in content
+
+    def test_history_is_persisted_when_00_creek_meta_is_absent(
+        self,
+        bare_vault: Path,
+    ) -> None:
+        """The scan history is saved too, so the whole call completed.
+
+        ``_save_history`` runs *after* the line that used to crash, which makes
+        this the assertion that distinguishes "the first write was repaired"
+        from "the method now runs end to end". The counts are compared by value
+        rather than checked for mere presence, so a history file written with
+        an empty or placeholder entry cannot pass.
+        """
+        _write_fragment(bare_vault, "note1", ["recovery"])
+
+        TagGardenGenerator(bare_vault).generate_garden()
+
+        history_path = (
+            bare_vault / "00-Creek-Meta" / "Processing-Log" / "tag-history.json"
+        )
+        assert history_path.exists()
+        history = json.loads(history_path.read_text(encoding="utf-8"))
+        assert len(history) == 1
+        assert history[0]["tag_counts"] == {"recovery": 1}
+
+    def test_an_existing_creek_meta_folder_and_its_contents_survive(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Creating the folder is idempotent and clobbers nothing already there.
+
+        Built from ``tmp_path`` rather than ``bare_vault`` because this case
+        needs the opposite precondition: ``00-Creek-Meta`` already exists and
+        already holds an unrelated file. A guard that forgets ``exist_ok`` —
+        or that removes and recreates the directory — still passes every test
+        above but fails here, on ``FileExistsError`` or on the sentinel's
+        exact bytes. The generator is run twice for the same reason: the
+        second pass exercises the path where the folder exists because *this*
+        code made it, not because the vault was scaffolded.
+        """
+        (tmp_path / "01-Fragments").mkdir()
+        (tmp_path / "00-Creek-Meta").mkdir()
+        sentinel = tmp_path / "00-Creek-Meta" / "creek_config.yaml"
+        sentinel_bytes = b"vault_path: /somewhere\n"
+        sentinel.write_bytes(sentinel_bytes)
+        _write_fragment(tmp_path, "note1", ["recovery"])
+
+        generator = TagGardenGenerator(tmp_path)
+        generator.generate_garden()
+        path = generator.generate_garden()
+
+        assert sentinel.read_bytes() == sentinel_bytes
+        assert path.exists()
+        assert path.parent == tmp_path / "00-Creek-Meta"
+
+    def test_the_only_directory_created_is_under_the_vault_root(
+        self,
+        bare_vault: Path,
+    ) -> None:
+        """Scaffolding stays inside the vault, and covers only what is written.
+
+        "Nothing was created outside the vault" cannot be asserted against the
+        whole filesystem without a brittle walk, so it is expressed two ways
+        that are both cheap and deterministic: the output path is relative to
+        the vault root and the new ``00-Creek-Meta`` is a *direct child* of it
+        rather than a sibling or an absolute path elsewhere; and the vault's
+        own parent directory gains no entry, which is the blast radius a
+        ``mkdir(parents=True)`` against a mistyped root would show up in.
+
+        The directory inventory inside the vault is then pinned exactly. A
+        report generator may create the folder it writes into, plus
+        ``Processing-Log`` for its history — it is not a vault scaffolder, and
+        must not materialise the other top-level folders on the way past.
+        """
+        _write_fragment(bare_vault, "note1", ["recovery"])
+        siblings_before = set(bare_vault.parent.iterdir())
+
+        path = TagGardenGenerator(bare_vault).generate_garden()
+
+        meta_dir = bare_vault / "00-Creek-Meta"
+        assert meta_dir.is_dir()
+        assert meta_dir.parent == bare_vault
+        assert path.is_relative_to(bare_vault)
+        assert set(bare_vault.parent.iterdir()) == siblings_before
+        created = {
+            child.relative_to(bare_vault).as_posix()
+            for child in bare_vault.rglob("*")
+            if child.is_dir()
+        }
+        assert created == {
+            "01-Fragments",
+            "00-Creek-Meta",
+            "00-Creek-Meta/Processing-Log",
+        }

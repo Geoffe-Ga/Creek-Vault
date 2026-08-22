@@ -23,6 +23,16 @@ Security properties under test:
   shorter than 32 chars fails ``load_consumer_tokens`` (and the network
   transport, via ``parser.error``) with a rotation recipe that names the
   consumer and lengths but never echoes the token value.
+- **Rotation needs no cutover** (#895) — a consumer may hold an *ordered set* of
+  currently-valid tokens, so the old and the new secret both authenticate for as
+  long as the operator leaves the window open, and dropping the old one revokes
+  it on the very next request. The configuration is refused outright for a
+  repeated consumer name (previously a silent last-wins), for a token value
+  reused anywhere in the configuration, and for a bare ``str`` map value —
+  ``str`` is itself a ``Sequence[str]``, so one would otherwise be read as one
+  single-character token per letter, each of which ``compare_digest`` accepts.
+  ``rotation_notice()`` tells the operator which consumers are mid-rotation, by
+  name and count only, so it cannot echo a value by construction.
 
 No real/production token material is hardcoded — every token is a test literal.
 """
@@ -32,8 +42,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import pytest
 import uvicorn
@@ -53,7 +64,7 @@ from creek_mcp.remote_auth import (
 from creek_mcp.server import build_server, main
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator, Mapping, Sequence
     from pathlib import Path
 
     from mcp.server.fastmcp import FastMCP
@@ -94,26 +105,71 @@ def _fake_token(consumer: str) -> AccessToken:
 _STRONG_TOKEN = "unit-test-strong-token-" + "a" * 20
 
 
+def _window_token(tag: str) -> str:
+    """Return a distinct, floor-clearing test token tagged with *tag* (#895).
+
+    The rotation-window tests need several tokens that differ from each other
+    and from :data:`_STRONG_TOKEN`, and all of which clear the 32-char floor so
+    a rotation test never trips the length gate by accident. Spelled as a
+    concatenation, matching the convention above, so a secret scanner reads a
+    constructed string rather than a credential.
+
+    Args:
+        tag: A short word distinguishing this token from its siblings.
+
+    Returns:
+        A constructed test string of at least 32 characters.
+    """
+    return f"unit-test-{tag}-token-" + "x" * 24
+
+
+# The rotation-window cast. Every one is a test literal, not a real credential.
+_OLD_TOKEN = _window_token("old")  # the secret being retired
+_NEW_TOKEN = _window_token("new")  # the secret replacing it
+_THIRD_TOKEN = _window_token("third")
+_FOURTH_TOKEN = _window_token("fourth")
+_FIFTH_TOKEN = _window_token("fifth")
+
+# 7 chars, well under the 32-char floor. Test literal, not a real credential.
+_WEAK_TOKEN = "hunter2"
+
+_ALL_TEST_TOKENS = (
+    _STRONG_TOKEN,
+    _OLD_TOKEN,
+    _NEW_TOKEN,
+    _THIRD_TOKEN,
+    _FOURTH_TOKEN,
+    _FIFTH_TOKEN,
+    _WEAK_TOKEN,
+)
+"""Every token literal a refusal message or a notice must never echo."""
+
+
 # --------------------------------------------------------------------------- #
 # load_consumer_tokens — parsing
 # --------------------------------------------------------------------------- #
 
 
 def test_load_consumer_tokens_parses_pairs() -> None:
-    """Well-formed ``consumer=token`` pairs parse into a map."""
+    """Well-formed ``consumer=token`` pairs parse into a map.
+
+    Today's single-token format is unchanged on the wire and now lands as a
+    one-element tuple (#895), so an operator who has never rotated anything
+    parses exactly as before.
+    """
     adepthood_token = "adepthood-strong-token-" + "a" * 20  # 43 chars, test literal
     crawdad_token = "crawdad-strong-token-" + "b" * 20  # 41 chars, test literal
     env = {CONSUMER_TOKENS_ENV: f"adepthood={adepthood_token};crawdad={crawdad_token}"}
     assert load_consumer_tokens(env) == {
-        "adepthood": adepthood_token,
-        "crawdad": crawdad_token,
+        "adepthood": (adepthood_token,),
+        "crawdad": (crawdad_token,),
     }
 
 
 def test_load_consumer_tokens_skips_blank_and_tokenless_entries() -> None:
     """Blank segments and ``name=`` entries with no token are dropped."""
     env = {CONSUMER_TOKENS_ENV: f" adepthood = {_STRONG_TOKEN} ; ; missing= ;=orphan"}
-    assert load_consumer_tokens(env) == {"adepthood": _STRONG_TOKEN}
+    assert load_consumer_tokens(env) == {"adepthood": (_STRONG_TOKEN,)}
 
 
 def test_load_consumer_tokens_rejects_sub_minimum_token() -> None:
@@ -132,25 +188,147 @@ def test_load_consumer_tokens_rejects_sub_minimum_token() -> None:
 def test_load_consumer_tokens_accepts_minimum_length_token() -> None:
     """A token at or above the 32-char minimum is accepted and returned intact."""
     env = {CONSUMER_TOKENS_ENV: f"adepthood={_STRONG_TOKEN}"}
-    assert load_consumer_tokens(env) == {"adepthood": _STRONG_TOKEN}
+    assert load_consumer_tokens(env) == {"adepthood": (_STRONG_TOKEN,)}
 
 
 def test_load_consumer_tokens_accepts_exact_boundary_token() -> None:
     """A token of exactly 32 chars sits on the floor and is accepted."""
     boundary_token = "a" * 32
     env = {CONSUMER_TOKENS_ENV: f"adepthood={boundary_token}"}
-    assert load_consumer_tokens(env) == {"adepthood": boundary_token}
+    assert load_consumer_tokens(env) == {"adepthood": (boundary_token,)}
 
 
 def test_load_consumer_tokens_skips_blanks_without_raising() -> None:
     """Blank and bare ``name=`` entries stay silently skipped, not length-checked."""
     env = {CONSUMER_TOKENS_ENV: f";;missing=;=orphan;adepthood={_STRONG_TOKEN}"}
-    assert load_consumer_tokens(env) == {"adepthood": _STRONG_TOKEN}
+    assert load_consumer_tokens(env) == {"adepthood": (_STRONG_TOKEN,)}
 
 
 def test_load_consumer_tokens_empty_when_unset() -> None:
     """An unset env var yields an empty map (caller treats as 'network denied')."""
     assert load_consumer_tokens({}) == {}
+
+
+# --------------------------------------------------------------------------- #
+# load_consumer_tokens — the rotation window (#895)
+#
+# One consumer, several currently-valid tokens, comma-separated inside its own
+# ``consumer=`` segment. The ``;`` separator still means "next consumer"; the
+# ``,`` separator means "another token this same consumer may present".
+# --------------------------------------------------------------------------- #
+
+
+def test_load_consumer_tokens_parses_an_ordered_token_set() -> None:
+    """``adepthood=old,new`` yields both tokens, in configured order.
+
+    Order is asserted with a tuple rather than a set: the configured order is
+    the operator's statement of which secret is the incumbent and which is the
+    replacement, and it is what a notice or a future report would read.
+    """
+    env = {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN},{_NEW_TOKEN}"}
+    assert load_consumer_tokens(env) == {"adepthood": (_OLD_TOKEN, _NEW_TOKEN)}
+
+
+def test_load_consumer_tokens_strips_whitespace_around_comma_segments() -> None:
+    """Whitespace around a comma is operator formatting, never token material.
+
+    The single-token form already strips, so a multi-token form that did not
+    would silently produce a token nobody can present.
+    """
+    env = {CONSUMER_TOKENS_ENV: f"adepthood= {_OLD_TOKEN} , {_NEW_TOKEN} "}
+    assert load_consumer_tokens(env) == {"adepthood": (_OLD_TOKEN, _NEW_TOKEN)}
+
+
+def test_load_consumer_tokens_drops_empty_comma_segments() -> None:
+    """A doubled or trailing comma leaves no empty token behind.
+
+    Dropping has to happen *before* the length floor runs, or a trailing comma
+    would be reported to the operator as a zero-character token.
+    """
+    env = {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN},,{_NEW_TOKEN},"}
+    assert load_consumer_tokens(env) == {"adepthood": (_OLD_TOKEN, _NEW_TOKEN)}
+
+
+def test_load_consumer_tokens_skips_a_consumer_whose_segments_are_all_empty() -> None:
+    """``missing=,,`` is the multi-token spelling of ``missing=``: skipped, not raised.
+
+    The single-token parser already skips ``name=`` silently; the comma form
+    must reach the same verdict rather than registering a consumer with no
+    tokens (which the verifier refuses outright).
+    """
+    env = {CONSUMER_TOKENS_ENV: f"missing=,,;adepthood={_STRONG_TOKEN}"}
+    assert load_consumer_tokens(env) == {"adepthood": (_STRONG_TOKEN,)}
+
+
+def test_load_consumer_tokens_applies_the_floor_to_every_token() -> None:
+    """The 32-char floor is per comma segment — one weak token in a set still raises.
+
+    A rotation is exactly when a fresh secret gets typed in, so the floor has to
+    hold on the *new* token and not only on whichever one happens to be first.
+    The message names the consumer, the observed and required lengths and the
+    rotation recipe, and echoes neither of the two configured values.
+    """
+    env = {CONSUMER_TOKENS_ENV: f"adepthood={_STRONG_TOKEN},{_WEAK_TOKEN}"}
+    with pytest.raises(ValueError, match="adepthood") as excinfo:
+        load_consumer_tokens(env)
+    message = str(excinfo.value)
+    assert "'adepthood'" in message  # consumer named via repr
+    assert "7" in message  # observed length of the rejected token
+    assert "32" in message  # the enforced minimum
+    assert "secrets.token_urlsafe(32)" in message  # the rotation recipe
+    assert _WEAK_TOKEN not in message  # NEVER echo the token value
+    assert _STRONG_TOKEN not in message  # nor the compliant one beside it
+
+
+def test_load_consumer_tokens_rejects_a_repeated_consumer_name() -> None:
+    """``adepthood=a;adepthood=b`` is a loud error, never a silent last-wins.
+
+    The pre-#895 parser wrote both entries into one dict key, so the first
+    token vanished without a word. Now that a consumer can legitimately hold
+    several tokens, either silent reading is indefensible: overwriting throws
+    away a credential the operator believes is live, and accumulating quietly
+    invents a rotation window they never asked for. The message names the
+    consumer and points at the comma form that expresses the intent properly.
+    """
+    env = {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN};adepthood={_NEW_TOKEN}"}
+    with pytest.raises(ValueError, match="adepthood") as excinfo:
+        load_consumer_tokens(env)
+    message = str(excinfo.value)
+    assert "adepthood" in message
+    assert "comma" in message.lower()  # the supported spelling is named
+    assert _OLD_TOKEN not in message  # NEVER echo the token value
+    assert _NEW_TOKEN not in message
+
+
+def test_load_consumer_tokens_rejects_a_value_shared_by_two_consumers() -> None:
+    """One secret configured for two consumers destroys attribution, so it is refused.
+
+    ``verify_token`` scans every consumer without breaking, so a shared value
+    resolves to whichever consumer the scan saw last — every audit line that
+    call produced would then name the wrong caller. The message names both
+    consumers and never the value they share.
+    """
+    env = {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN};crawdad={_OLD_TOKEN}"}
+    with pytest.raises(ValueError) as excinfo:
+        load_consumer_tokens(env)
+    message = str(excinfo.value)
+    assert "adepthood" in message
+    assert "crawdad" in message
+    assert _OLD_TOKEN not in message  # NEVER echo the token value
+
+
+def test_load_consumer_tokens_rejects_a_value_repeated_within_one_consumer() -> None:
+    """A duplicate inside one set is a rotation that rotated nothing.
+
+    Same rule and same message as the cross-consumer case: every configured
+    token value is globally unique, stated once so the two cannot drift.
+    """
+    env = {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN},{_OLD_TOKEN}"}
+    with pytest.raises(ValueError, match="adepthood") as excinfo:
+        load_consumer_tokens(env)
+    message = str(excinfo.value)
+    assert "adepthood" in message
+    assert _OLD_TOKEN not in message  # NEVER echo the token value
 
 
 # --------------------------------------------------------------------------- #
@@ -160,7 +338,7 @@ def test_load_consumer_tokens_empty_when_unset() -> None:
 
 def test_verify_token_returns_access_token_for_valid_bearer() -> None:
     """A known token resolves to its consumer's :class:`AccessToken`."""
-    verifier = ConsumerTokenVerifier({"adepthood": "secret123"})
+    verifier = ConsumerTokenVerifier({"adepthood": ("secret123",)})
     token = asyncio.run(verifier.verify_token("secret123"))
     assert token is not None
     assert token.client_id == "adepthood"
@@ -169,7 +347,7 @@ def test_verify_token_returns_access_token_for_valid_bearer() -> None:
 
 def test_verify_token_rejects_unknown_bearer() -> None:
     """An unknown token yields ``None`` (401 at the middleware)."""
-    verifier = ConsumerTokenVerifier({"adepthood": "secret123"})
+    verifier = ConsumerTokenVerifier({"adepthood": ("secret123",)})
     assert asyncio.run(verifier.verify_token("wrong")) is None
 
 
@@ -181,7 +359,7 @@ def test_verify_token_rejects_against_empty_map() -> None:
 
 def test_verify_token_rejects_non_ascii_bearer_cleanly() -> None:
     """A non-ASCII bearer is rejected (``None``), never a ``TypeError`` (#776)."""
-    verifier = ConsumerTokenVerifier({"adepthood": "secret123"})
+    verifier = ConsumerTokenVerifier({"adepthood": ("secret123",)})
     # hmac.compare_digest raises TypeError on a non-ASCII str; the byte-compare
     # must reject cleanly instead of crashing verification.
     assert asyncio.run(verifier.verify_token("nön-ascii-tökén")) is None
@@ -225,7 +403,7 @@ def test_remote_call_above_personal_is_refused_before_dispatch(
     )
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     result = _structured(
         asyncio.run(server.call_tool("creek.wheel", {"privacy_tier_ceiling": ceiling}))
@@ -247,7 +425,7 @@ def test_remote_call_at_or_below_personal_dispatches(
     )
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     result = _structured(
         asyncio.run(server.call_tool("creek.wheel", {"privacy_tier_ceiling": ceiling}))
@@ -266,7 +444,7 @@ def test_remote_call_is_audited_under_token_consumer(
     )
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     asyncio.run(server.call_tool("creek.wheel", {"privacy_tier_ceiling": "open"}))
 
@@ -287,7 +465,7 @@ def test_local_stdio_call_is_not_capped(
     monkeypatch.setattr(server_mod, "_current_access_token", lambda: None)
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )
     result = _structured(
         asyncio.run(
@@ -322,8 +500,8 @@ def test_streamable_http_rejects_unauthenticated_request(vault: Path) -> None:
     """A POST with no / wrong bearer is refused 401 before any tool runs."""
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
-        token_verifier=ConsumerTokenVerifier({"adepthood": "secret123"}),
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
+        token_verifier=ConsumerTokenVerifier({"adepthood": ("secret123",)}),
     )
     client = TestClient(server.streamable_http_app())
     path = server.settings.streamable_http_path
@@ -358,8 +536,8 @@ def _network_server(vault: Path, token: str) -> FastMCP:
     """
     server = build_server(
         vault_path=vault,
-        draft_llm_factory=lambda: lambda prompt: "ignored",
-        token_verifier=ConsumerTokenVerifier({"adepthood": token}),
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
+        token_verifier=ConsumerTokenVerifier({"adepthood": (token,)}),
     )
     server.settings.transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=False
@@ -477,7 +655,7 @@ def _verified_token_at_fixed_now(monkeypatch: pytest.MonkeyPatch) -> AccessToken
     lands.
     """
     monkeypatch.setattr(remote_auth_mod, "_now", lambda: _FIXED_NOW)
-    verifier = ConsumerTokenVerifier({"adepthood": "secret123"})
+    verifier = ConsumerTokenVerifier({"adepthood": ("secret123",)})
     token = asyncio.run(verifier.verify_token("secret123"))
     assert token is not None
     return token
@@ -506,6 +684,318 @@ def test_token_ttl_invalid_env_falls_back_to_default(
     monkeypatch.setenv(_TOKEN_TTL_ENV, raw_ttl)
     token = _verified_token_at_fixed_now(monkeypatch)
     assert token.expires_at == 1_000_000 + _DEFAULT_TTL_SECONDS
+
+
+# --------------------------------------------------------------------------- #
+# ConsumerTokenVerifier — the rotation window (#895)
+#
+# The #837 TTL bounds a *captured* AccessToken object; it does nothing to the
+# wire credential, which the SDK's bearer middleware re-verifies fresh on every
+# request. Rotating that credential used to mean a hard cutover: swap the env
+# value, restart, and break every consumer still holding the old secret. A
+# consumer may now hold an ordered set of currently-valid tokens instead, so the
+# operator opens a window, lets consumers redeploy, and then closes it.
+#
+# The window is only a window if closing it works, so the revocation test below
+# is load-bearing: without it this feature is a permanent widening of the
+# credential surface wearing a rotation's clothes.
+# --------------------------------------------------------------------------- #
+
+
+def test_every_token_in_the_window_verifies_as_the_same_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Old and new both authenticate, as one identity, each with a finite expiry.
+
+    Same ``client_id`` for both is the point: a window that changed the caller's
+    name for its duration would rewrite every audit line written while it was
+    open. ``expires_at`` is asserted exactly rather than as "not ``None``", so
+    the multi-token path cannot quietly issue the never-expiring token #837
+    removed.
+    """
+    monkeypatch.delenv(_TOKEN_TTL_ENV, raising=False)
+    monkeypatch.setattr(remote_auth_mod, "_now", lambda: _FIXED_NOW)
+    verifier = ConsumerTokenVerifier({"adepthood": (_OLD_TOKEN, _NEW_TOKEN)})
+    for presented in (_OLD_TOKEN, _NEW_TOKEN):
+        token = asyncio.run(verifier.verify_token(presented))
+        assert token is not None
+        assert token.client_id == "adepthood"
+        assert token.scopes == [REMOTE_SCOPE]
+        assert token.token == presented
+        assert token.expires_at == 1_000_000 + _DEFAULT_TTL_SECONDS
+
+
+def test_retiring_a_token_revokes_it_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dropping the old token from the set is what closes the window.
+
+    This is the assertion that makes the feature a *bounded* rotation rather
+    than a permanent widening of the credential surface: the retired secret
+    authenticates while it is configured and stops the moment it is not.
+    """
+    monkeypatch.setattr(remote_auth_mod, "_now", lambda: _FIXED_NOW)
+
+    during = ConsumerTokenVerifier({"adepthood": (_OLD_TOKEN, _NEW_TOKEN)})
+    assert asyncio.run(during.verify_token(_OLD_TOKEN)) is not None
+
+    after = ConsumerTokenVerifier({"adepthood": (_NEW_TOKEN,)})
+    assert asyncio.run(after.verify_token(_OLD_TOKEN)) is None
+    assert asyncio.run(after.verify_token(_NEW_TOKEN)) is not None
+
+
+def test_verifier_refuses_a_bare_string_token_value() -> None:
+    """A bare ``str`` map value is refused at runtime, not only by the type checker.
+
+    The signature is ``Mapping[str, Sequence[str]]`` and **not**
+    ``Mapping[str, str | Sequence[str]]``, because that union is unsound: ``str``
+    already *is* a ``Sequence[str]``, so the union collapses and mypy would wave
+    through ``{"adepthood": "secret123"}``. The runtime guard is the half that
+    protects a caller who never runs mypy — notably ``tests/v1_api_support.py``,
+    which builds verifiers from literal maps.
+    """
+    with pytest.raises(TypeError) as excinfo:
+        ConsumerTokenVerifier({"adepthood": _OLD_TOKEN})
+    message = str(excinfo.value)
+    assert "adepthood" in message  # the offending key is named
+    assert _OLD_TOKEN not in message  # NEVER echo the token value
+
+
+def test_a_single_character_of_a_configured_token_never_authenticates() -> None:
+    """The security complement of the guard above, observed rather than asserted.
+
+    Iterating a bare ``str`` value yields one single-character "token" per
+    letter, and ``compare_digest`` accepts each of them, so a 43-character
+    secret would degrade into an alphabet of valid credentials. Refusing the
+    bare string is the fix; this sweeps every distinct character of a correctly
+    configured token to show the consequence is really gone.
+    """
+    verifier = ConsumerTokenVerifier({"adepthood": (_OLD_TOKEN,)})
+    for character in sorted(set(_OLD_TOKEN)):
+        assert asyncio.run(verifier.verify_token(character)) is None
+
+
+def test_verifier_refuses_one_value_shared_by_two_consumers() -> None:
+    """Global token uniqueness is the *verifier's* rule, not only the parser's.
+
+    ``tests/v1_api_support.py`` and the wire tests in this module construct
+    verifiers directly from literal maps, never going through
+    ``load_consumer_tokens``, so the constructor is the narrowest ceiling this
+    invariant can sit under. Asserting it here rather than only at the parser
+    is what stops a direct caller from configuring an ambiguous identity.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        ConsumerTokenVerifier({"adepthood": (_OLD_TOKEN,), "crawdad": (_OLD_TOKEN,)})
+    message = str(excinfo.value)
+    assert "adepthood" in message
+    assert "crawdad" in message
+    assert _OLD_TOKEN not in message  # NEVER echo the token value
+
+
+def test_verifier_refuses_an_empty_token_set_for_a_named_consumer() -> None:
+    """A named consumer holding no tokens authenticates nobody — say so, loudly.
+
+    Silently keeping the entry would leave a consumer in the configuration that
+    can never connect, which reads to an operator as an auth outage rather than
+    as the typo it is.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        ConsumerTokenVerifier({"adepthood": ()})
+    assert "adepthood" in str(excinfo.value)
+
+
+def test_verifier_refuses_an_empty_iterable_that_is_not_a_sequence() -> None:
+    """The same refusal for an empty value that is *truthy* — pinning the ordering.
+
+    Not a second reading of the empty-tuple case above: ``()`` is falsy both
+    before and after materialisation, so it is refused under either ordering of
+    ``_token_set``'s emptiness check and cannot tell the two apart. An empty
+    iterable that is *not* a ``Sequence`` — a spent iterator, an exhausted
+    generator — is **truthy**, so it is only caught when the value is
+    materialised *before* it is tested. Under the reversed order it would slip
+    past the refusal and land as an empty tuple, leaving the named consumer
+    able to authenticate nobody: a silent auth outage in place of the loud
+    "can never authenticate" error. This pins that ordering, not the branch.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        ConsumerTokenVerifier({"adepthood": iter(())})
+    assert "adepthood" in str(excinfo.value)
+
+
+def test_verifier_over_no_consumers_at_all_stays_legal() -> None:
+    """``ConsumerTokenVerifier({})`` is still constructible, and refuses everything.
+
+    "No consumers configured" is a different statement from "this consumer has
+    no tokens": the callers treat the empty map as *network mode denied* and
+    refuse to serve on it, so making the constructor raise would turn a handled
+    posture into a crash.
+    """
+    verifier = ConsumerTokenVerifier({})
+    assert verifier.rotation_notice() is None
+    assert asyncio.run(verifier.verify_token(_OLD_TOKEN)) is None
+
+
+def test_verify_token_compares_against_every_configured_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scan never breaks early — not even when the very first token matches.
+
+    Newly load-bearing now the loop is nested consumer → tokens: a ``break`` on
+    either level would make verification time depend on *where* in the
+    configuration the presented token sits, which is a positional oracle over
+    the token set. Counted through ``remote_auth.hmac.compare_digest`` so the
+    property is measured rather than read off the source.
+
+    Args:
+        monkeypatch: Installs the counting wrapper over the real compare.
+    """
+    comparisons: list[tuple[bytes, bytes]] = []
+    real_compare = remote_auth_mod.hmac.compare_digest
+
+    def _counting(left: bytes, right: bytes) -> bool:
+        """Record the comparison, then delegate to the real constant-time one."""
+        comparisons.append((left, right))
+        return real_compare(left, right)
+
+    # Built before the patch, so only verification's own comparisons are counted.
+    verifier = ConsumerTokenVerifier(
+        {"adepthood": (_OLD_TOKEN, _NEW_TOKEN), "crawdad": (_THIRD_TOKEN,)}
+    )
+    monkeypatch.setattr(remote_auth_mod.hmac, "compare_digest", _counting)
+    token = asyncio.run(verifier.verify_token(_OLD_TOKEN))
+
+    assert token is not None
+    assert token.client_id == "adepthood"
+    # Three configured tokens across two consumers => three comparisons, even
+    # though the first one matched.
+    assert len(comparisons) == 3
+
+
+# --------------------------------------------------------------------------- #
+# rotation_notice — telling the operator a window is open, without a secret
+# --------------------------------------------------------------------------- #
+
+_NO_WINDOW_MAPS: list[dict[str, tuple[str, ...]]] = [
+    {},
+    {"adepthood": (_STRONG_TOKEN,)},
+    {"adepthood": (_STRONG_TOKEN,), "crawdad": (_OLD_TOKEN,)},
+]
+
+_NO_WINDOW_IDS = ["no-consumers", "one-consumer", "two-consumers"]
+
+
+@pytest.mark.parametrize("tokens", _NO_WINDOW_MAPS, ids=_NO_WINDOW_IDS)
+def test_rotation_notice_is_none_when_no_window_is_open(
+    tokens: Mapping[str, Sequence[str]],
+) -> None:
+    """One token per consumer is the steady state, and the steady state is silent.
+
+    A notice printed on every start is a notice operators stop reading, at which
+    point the one that matters — "you left a window open three months ago" —
+    goes unread too.
+
+    Args:
+        tokens: A configuration in which no consumer holds more than one token.
+    """
+    assert ConsumerTokenVerifier(tokens).rotation_notice() is None
+
+
+def test_rotation_notice_names_every_consumer_in_a_window() -> None:
+    """Each multi-token consumer is named with its count; settled ones are not.
+
+    Naming only the consumers mid-rotation is what makes the notice actionable:
+    it is a to-do list of windows still to close, not an inventory of the
+    configuration.
+    """
+    verifier = ConsumerTokenVerifier(
+        {
+            "adepthood": (_OLD_TOKEN, _NEW_TOKEN),
+            "crawdad": (_THIRD_TOKEN, _FOURTH_TOKEN, _FIFTH_TOKEN),
+            "settled": (_STRONG_TOKEN,),
+        }
+    )
+    notice = verifier.rotation_notice()
+    assert notice is not None
+    assert "adepthood" in notice
+    assert "2" in notice  # adepthood's token count
+    assert "crawdad" in notice
+    assert "3" in notice  # crawdad's token count
+    assert "settled" not in notice  # a single-token consumer is not in a window
+
+
+def test_rotation_notice_carries_no_token_value() -> None:
+    """The notice takes names and counts, so it cannot echo a secret by construction.
+
+    It is printed at startup, which means it lands in logs, terminals and
+    process supervisors — the same audience the #838 rejection message is
+    written for, and the same reason it must stay value-free.
+    """
+    verifier = ConsumerTokenVerifier(
+        {
+            "adepthood": (_OLD_TOKEN, _NEW_TOKEN),
+            "crawdad": (_THIRD_TOKEN, _FOURTH_TOKEN),
+        }
+    )
+    notice = verifier.rotation_notice()
+    assert notice is not None
+    for configured in _ALL_TEST_TOKENS:
+        assert configured not in notice
+
+
+# --------------------------------------------------------------------------- #
+# Cross-cutting: no refusal on ANY of the new paths ever echoes a token
+# --------------------------------------------------------------------------- #
+
+_RAISING_CONFIGURATIONS: list[Callable[[], object]] = [
+    lambda: load_consumer_tokens(
+        {CONSUMER_TOKENS_ENV: f"adepthood={_STRONG_TOKEN},{_WEAK_TOKEN}"}
+    ),
+    lambda: load_consumer_tokens(
+        {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN};adepthood={_NEW_TOKEN}"}
+    ),
+    lambda: load_consumer_tokens(
+        {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN};crawdad={_OLD_TOKEN}"}
+    ),
+    lambda: load_consumer_tokens(
+        {CONSUMER_TOKENS_ENV: f"adepthood={_OLD_TOKEN},{_OLD_TOKEN}"}
+    ),
+    lambda: ConsumerTokenVerifier({"adepthood": _OLD_TOKEN}),
+    lambda: ConsumerTokenVerifier({"adepthood": ()}),
+    lambda: ConsumerTokenVerifier(
+        {"adepthood": (_OLD_TOKEN,), "crawdad": (_OLD_TOKEN,)}
+    ),
+]
+
+_RAISING_IDS = [
+    "parser-weak-token-inside-a-set",
+    "parser-repeated-consumer-name",
+    "parser-value-shared-across-consumers",
+    "parser-value-repeated-within-one-set",
+    "verifier-bare-string-value",
+    "verifier-empty-token-set",
+    "verifier-value-shared-across-consumers",
+]
+
+
+@pytest.mark.parametrize("configure", _RAISING_CONFIGURATIONS, ids=_RAISING_IDS)
+def test_no_rejection_message_ever_echoes_a_token(
+    configure: Callable[[], object],
+) -> None:
+    """Every refusal on the #895 surface names configuration, never credentials.
+
+    Swept as one parametrize rather than left to each test's own assertion so a
+    path added later is a path that has to be added here too. Startup errors
+    land in logs, terminals and process supervisors, so a message that echoed
+    the value it rejected would publish the secret it exists to protect.
+
+    Args:
+        configure: A zero-argument call that must raise.
+    """
+    with pytest.raises((TypeError, ValueError)) as excinfo:
+        configure()
+    message = str(excinfo.value)
+    for configured in _ALL_TEST_TOKENS:
+        assert configured not in message, message
 
 
 # --------------------------------------------------------------------------- #
@@ -700,15 +1190,79 @@ def test_network_transport_rejects_missing_tls_cert_file(
     assert "file not found" in capsys.readouterr().err.lower()
 
 
-def test_serve_network_uses_ssl_when_tls_configured(
-    vault: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With TLS configured, ``_serve_network`` hands uvicorn the cert + key files."""
-    cert = tmp_path / "cert.pem"
-    key = tmp_path / "key.pem"
-    cert.write_text("dummy-cert")  # fixture material, not a real credential
-    key.write_text("dummy-key")
+_UVICORN_ACCESS_LOGGER: Final[str] = "uvicorn.access"
+"""The logger uvicorn writes ``client_addr - "METHOD /path" status`` to.
 
+Its handler list is what ``access_log=False`` actually empties, and
+``h11_impl`` consults ``hasHandlers()`` to decide whether to log at all — so
+"no handlers" is the observable form of the promise, not the flag.
+"""
+
+_UVICORN_LOGGERS: Final[tuple[str, ...]] = (
+    "uvicorn",
+    "uvicorn.error",
+    _UVICORN_ACCESS_LOGGER,
+    "uvicorn.asgi",
+)
+"""Every logger :data:`uvicorn.config.LOGGING_CONFIG` reconfigures.
+
+``uvicorn.Config.__init__`` calls ``configure_logging()``, which calls
+:func:`logging.config.dictConfig` — a mutation of *global* interpreter state
+that would otherwise outlive the test and change what every later module in the
+session can observe.
+"""
+
+
+class _AnyASGIApp:
+    """A callable that satisfies :class:`uvicorn.Config` without being a server.
+
+    uvicorn only needs something callable; nothing here is ever awaited, because
+    no test in this module binds a socket.
+    """
+
+    async def __call__(self, scope: object, receive: object, send: object) -> None:
+        """Accept the ASGI three-tuple and do nothing with it."""
+
+
+@pytest.fixture
+def restored_uvicorn_logging() -> Iterator[None]:
+    """Snapshot and restore the four ``uvicorn`` loggers around one test.
+
+    Yields:
+        ``None``. The restoration happens on the way back out.
+    """
+    saved = {
+        name: (
+            list(logging.getLogger(name).handlers),
+            logging.getLogger(name).propagate,
+            logging.getLogger(name).level,
+        )
+        for name in _UVICORN_LOGGERS
+    }
+    try:
+        yield
+    finally:
+        for name, (handlers, propagate, level) in saved.items():
+            logger = logging.getLogger(name)
+            logger.handlers = handlers
+            logger.propagate = propagate
+            logger.setLevel(level)
+
+
+def _capture_uvicorn(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Substitute uvicorn's ``Config`` and ``Server`` so nothing binds a socket.
+
+    One helper rather than a copy per test: three tests now ask what
+    ``_serve_network`` hands uvicorn, and three hand-rolled fakes are three
+    chances for one of them to accept a keyword the real ``uvicorn.Config``
+    would reject.
+
+    Args:
+        monkeypatch: The active monkeypatch fixture.
+
+    Returns:
+        The dict the fake config records ``app`` and every keyword into.
+    """
     captured: dict[str, object] = {}
 
     class _CapturingConfig:
@@ -743,6 +1297,19 @@ def test_serve_network_uses_ssl_when_tls_configured(
 
     monkeypatch.setattr(uvicorn, "Config", _CapturingConfig)
     monkeypatch.setattr(uvicorn, "Server", _IdleServer)
+    return captured
+
+
+def test_serve_network_uses_ssl_when_tls_configured(
+    vault: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With TLS configured, ``_serve_network`` hands uvicorn the cert + key files."""
+    cert = tmp_path / "cert.pem"
+    key = tmp_path / "key.pem"
+    cert.write_text("dummy-cert")  # fixture material, not a real credential
+    key.write_text("dummy-key")
+
+    captured = _capture_uvicorn(monkeypatch)
 
     server = _network_server(vault, _WIRE_TOKEN)
     server_mod._serve_network(
@@ -750,6 +1317,121 @@ def test_serve_network_uses_ssl_when_tls_configured(
         _parsed_network_args(host="0.0.0.0", port=8443, tls_cert=cert, tls_key=key),
     )
 
+    assert str(captured["ssl_certfile"]) == str(cert)
+    assert str(captured["ssl_keyfile"]) == str(key)
+
+
+def test_serve_network_disables_uvicorns_own_access_log(
+    vault: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE INVARIANT (#1125) — the MCP adapter suppresses uvicorn's access logger too.
+
+    ``creek_mcp/httpapi/cli.py`` has switched it off since #1117, and
+    ``tests/test_v1_api_uvicorn_logging.py`` proves uvicorn honours the flag.
+    This call site built its own :class:`uvicorn.Config` and kept the default,
+    so the two adapters logged the client address of every request under two
+    different postures — and a posture that differs between two surfaces of one
+    server is one an operator cannot reason about at all.
+
+    Args:
+        vault: The seeded vault.
+        tmp_path: Where the TLS fixture material is written.
+        monkeypatch: Substitutes uvicorn's config and server so nothing binds.
+    """
+    cert = tmp_path / "cert.pem"
+    key = tmp_path / "key.pem"
+    cert.write_text("dummy-cert")  # fixture material, not a real credential
+    key.write_text("dummy-key")
+
+    captured = _capture_uvicorn(monkeypatch)
+
+    server = _network_server(vault, _WIRE_TOKEN)
+    server_mod._serve_network(
+        server,
+        _parsed_network_args(host="0.0.0.0", port=8443, tls_cert=cert, tls_key=key),
+    )
+
+    assert captured["access_log"] is False
+
+
+def test_the_mcp_config_leaves_uvicorns_access_logger_unhandled(
+    tmp_path: Path, restored_uvicorn_logging: None
+) -> None:
+    """A real config built the MCP way installs no handler on ``uvicorn.access``.
+
+    A flag is not a behaviour. ``uvicorn/config.py`` implements ``access_log=False``
+    by emptying ``logging.getLogger("uvicorn.access").handlers`` and setting
+    ``propagate = False``, and ``h11_impl`` then decides whether to log at all
+    with ``hasHandlers()`` — so an unhandled logger is the state that actually
+    keeps the client address out of the operator's stream. Built directly rather
+    than through ``_serve_network`` because the point is what uvicorn does with
+    the configuration, and binding a socket for it would be a second copy of
+    ``tests/test_v1_api_uvicorn_logging.py``.
+
+    Args:
+        tmp_path: Where the TLS fixture material is written.
+        restored_uvicorn_logging: Puts the four uvicorn loggers back afterwards;
+            constructing a config calls :func:`logging.config.dictConfig`, which
+            is a mutation of global interpreter state.
+    """
+    cert = tmp_path / "cert.pem"
+    key = tmp_path / "key.pem"
+    cert.write_text("dummy-cert")  # fixture material, not a real credential
+    key.write_text("dummy-key")
+    config = server_mod.build_network_uvicorn_config(
+        _AnyASGIApp(),
+        _parsed_network_args(host="0.0.0.0", port=8443, tls_cert=cert, tls_key=key),
+        log_level="info",
+    )
+    assert config.access_log is False
+    assert logging.getLogger(_UVICORN_ACCESS_LOGGER).handlers == []
+
+
+def test_the_unhandled_access_logger_assertion_is_not_vacuous(
+    tmp_path: Path, restored_uvicorn_logging: None
+) -> None:
+    """THE NON-VACUITY TWIN — with the flag on, uvicorn *does* install a handler.
+
+    Without this, the assertion above would pass on any uvicorn that stopped
+    configuring the logger at all, and the leak would come back green.
+
+    Args:
+        tmp_path: Unused beyond keeping the two tests symmetrical.
+        restored_uvicorn_logging: Restores the mutated loggers.
+    """
+    assert tmp_path.exists()
+    uvicorn.Config(_AnyASGIApp(), access_log=True)
+    assert logging.getLogger(_UVICORN_ACCESS_LOGGER).handlers != []
+
+
+def test_serve_network_still_carries_the_bind_and_tls_material(
+    vault: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extracting the factory must not drop what ``_serve_network`` already passed.
+
+    A factory that silenced the access log and lost the certificate would
+    satisfy the invariant above and serve bearer tokens in cleartext.
+
+    Args:
+        vault: The seeded vault.
+        tmp_path: Where the TLS fixture material is written.
+        monkeypatch: Substitutes uvicorn's config and server so nothing binds.
+    """
+    cert = tmp_path / "cert.pem"
+    key = tmp_path / "key.pem"
+    cert.write_text("dummy-cert")  # fixture material, not a real credential
+    key.write_text("dummy-key")
+
+    captured = _capture_uvicorn(monkeypatch)
+
+    server = _network_server(vault, _WIRE_TOKEN)
+    server_mod._serve_network(
+        server,
+        _parsed_network_args(host="0.0.0.0", port=8443, tls_cert=cert, tls_key=key),
+    )
+
+    assert captured["host"] == "0.0.0.0"
+    assert captured["port"] == 8443
     assert str(captured["ssl_certfile"]) == str(cert)
     assert str(captured["ssl_keyfile"]) == str(key)
 
@@ -775,3 +1457,637 @@ def test_default_stdio_transport_unaffected(
     stub = _stub_build_server(monkeypatch)
     main([])
     assert stub.run_calls == ["stdio"]
+
+
+# --------------------------------------------------------------------------- #
+# CHARACTERIZATION PINS for the issue #1073 extraction
+#
+# Everything below this banner pins the *current* behaviour of the remote
+# tier-ceiling cap (``_BoundedFastMCP.call_tool``) and of per-call consumer
+# identity (``_effective_consumer``), exactly as they behave today, before any
+# of that logic is extracted out of ``creek_mcp/server.py``.
+#
+# These tests PASS against the unmodified code. They are pins, not RED tests.
+# Their whole job is to fail loudly if the extraction changes behaviour, so:
+#
+# * a diff to any test below across the extraction commit is itself a red flag
+#   — the pins are meant to be byte-identical before and after the move;
+# * every pin goes through the public boundary (``build_server`` +
+#   ``server.call_tool``, or the module-level ``_effective_consumer``), never
+#   through an internal the extraction is expected to relocate;
+# * the refusal ``reason`` is asserted against a hard-coded literal rather than
+#   an imported constant, so a refactor cannot silently reword the one sentence
+#   a remote consumer is told when intimate content is withheld.
+# --------------------------------------------------------------------------- #
+
+# The exact text ``_BoundedFastMCP.call_tool`` refuses with today. Spelled out
+# rather than imported on purpose: importing the constant would let a reword
+# sail through unnoticed.
+_CAP_REFUSAL_REASON = (
+    "remote consumers may not request a ceiling above 'personal'; "
+    "intimate content is not reachable over the network"
+)
+
+# The literal ``creek_mcp.tools.purge`` refuses with when the elevated gate
+# denies. Also spelled out, for the same reason.
+_PURGE_ELEVATED_REFUSAL_REASON = (
+    "elevated authorization required: set CREEK_MCP_ELEVATED_TOKEN on the "
+    "server and pass a matching auth_token"
+)
+
+_PURGE_VAULT_CONFIRM_REFUSAL_REASON = (
+    "creek.purge.vault requires confirm_vault_path matching the "
+    "target vault's absolute path"
+)
+
+_ELEVATED_TOKEN_ENV = "CREEK_MCP_ELEVATED_TOKEN"
+_CONSUMER_ENV = "CREEK_MCP_CONSUMER"
+
+_PURGE_TOOL_NAMES = (
+    "creek.purge.fragment",
+    "creek.purge.source",
+    "creek.purge.classifications",
+    "creek.purge.daterange",
+    "creek.purge.vault",
+)
+
+# Every ``privacy_tier_ceiling`` value the cap refuses for a REMOTE caller.
+# Only the exact strings ``open`` and ``personal`` (and an absent key, which
+# defaults to ``open``) clear it: no case folding, no whitespace tolerance, no
+# coercion of non-strings.
+_REMOTE_REFUSED_CEILINGS: list[object] = [
+    "intimate",
+    "all",
+    None,
+    "",
+    "OPEN",
+    "Personal",
+    " open",
+    "open ",
+    "bogus-tier",
+    "unclassified",
+    0,
+    1,
+    True,
+    False,
+    3.5,
+    [],
+    {},
+]
+
+_REMOTE_REFUSED_IDS = [
+    "intimate",
+    "all",
+    "none",
+    "empty-string",
+    "upper-open",
+    "title-personal",
+    "leading-space",
+    "trailing-space",
+    "bogus-tier",
+    "unclassified",
+    "int-zero",
+    "int-one",
+    "bool-true",
+    "bool-false",
+    "float",
+    "empty-list",
+    "empty-dict",
+]
+
+# Every argument set that dispatches locally, including the absent key.
+_VALID_CEILING_ARGUMENTS: list[dict[str, object]] = [
+    {},
+    {"privacy_tier_ceiling": "open"},
+    {"privacy_tier_ceiling": "personal"},
+    {"privacy_tier_ceiling": "intimate"},
+    {"privacy_tier_ceiling": "all"},
+]
+
+_VALID_CEILING_IDS = ["absent", "open", "personal", "intimate", "all"]
+
+
+def _pin_server(vault: Path) -> FastMCP:
+    """Build the server every characterization pin drives through ``call_tool``.
+
+    Args:
+        vault: The seeded vault root the tools read and audit under.
+
+    Returns:
+        A ``build_server`` instance with a stub draft LLM, so no pin needs a
+        provider configured.
+    """
+    return build_server(
+        vault_path=vault,
+        draft_llm_factory=lambda tier: lambda prompt: "ignored",
+    )
+
+
+def _remote(monkeypatch: pytest.MonkeyPatch, consumer: str = "adepthood") -> None:
+    """Make every subsequent call look like an authenticated remote request.
+
+    Args:
+        monkeypatch: The active monkeypatch fixture.
+        consumer: The ``client_id`` the fake bearer identifies.
+    """
+    monkeypatch.setattr(
+        server_mod, "_current_access_token", lambda: _fake_token(consumer)
+    )
+
+
+def _local(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every subsequent call look like a local stdio request (no token).
+
+    Args:
+        monkeypatch: The active monkeypatch fixture.
+    """
+    monkeypatch.setattr(server_mod, "_current_access_token", lambda: None)
+
+
+def _call(
+    server: FastMCP, tool: str, arguments: dict[str, object]
+) -> dict[str, object] | None:
+    """Invoke *tool* through the public boundary; return its structured payload.
+
+    Args:
+        server: The built server under test.
+        tool: Dot-namespaced tool name.
+        arguments: The raw argument mapping, deliberately untyped so a pin can
+            hand the boundary a value FastMCP would never construct.
+
+    Returns:
+        The structured payload, or ``None`` when the call raised before
+        producing one. ``None`` is what FastMCP's own pydantic argument
+        coercion yields for a value that is not a ``TierCeiling``; that
+        coercion is not the ceiling cap's business, so the local-path pins ask
+        only whether the *cap's* refusal was produced.
+    """
+    try:
+        return _structured(asyncio.run(server.call_tool(tool, arguments)))
+    except Exception:
+        return None
+
+
+def _audit_entries(vault: Path) -> list[dict[str, object]]:
+    """Return every parsed MCP audit entry under *vault*, in write order.
+
+    Args:
+        vault: The vault root.
+
+    Returns:
+        The decoded entries, or an empty list when the log does not exist.
+    """
+    log_path = vault / MCP_AUDIT_RELPATH
+    if not log_path.exists():
+        return []
+    return [
+        json.loads(line)
+        for line in log_path.read_text("utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _entries_for(vault: Path, tool: str) -> list[dict[str, object]]:
+    """Return the audit entries written for *tool*, in write order.
+
+    Args:
+        vault: The vault root.
+        tool: Dot-namespaced tool name to filter on.
+
+    Returns:
+        The matching entries.
+    """
+    return [entry for entry in _audit_entries(vault) if entry["tool"] == tool]
+
+
+def _consumers_for(vault: Path, tool: str) -> list[object]:
+    """Return the ``consumer`` of every audit entry for *tool*, in write order.
+
+    Args:
+        vault: The vault root.
+        tool: Dot-namespaced tool name to filter on.
+
+    Returns:
+        The consumer identifiers, one per matching entry.
+    """
+    return [entry["consumer"] for entry in _entries_for(vault, tool)]
+
+
+# --------------------------------------------------------------------------- #
+# Pin: the remote admission table, refused half
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("ceiling", _REMOTE_REFUSED_CEILINGS, ids=_REMOTE_REFUSED_IDS)
+def test_remote_cap_refuses_every_non_admitted_ceiling(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, ceiling: object
+) -> None:
+    """Pin the whole refused half of the remote admission table.
+
+    The cap admits the exact strings ``open`` and ``personal`` and nothing
+    else. Everything here — the two over-ceiling tiers, wrong case, leading or
+    trailing whitespace, ``None``, the empty string, unknown tier names, and
+    every non-string scalar or container — is refused *before dispatch* with
+    the one hard-coded reason, and leaves no audit entry behind.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Used to present an authenticated remote bearer.
+        ceiling: The ``privacy_tier_ceiling`` value under test.
+    """
+    _remote(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.wheel", {"privacy_tier_ceiling": ceiling})
+    assert result is not None
+    assert result["status"] == "refused"
+    assert result["tool"] == "creek.wheel"
+    assert result["reason"] == _CAP_REFUSAL_REASON
+    # Refused before dispatch => the tool never ran, so nothing was audited.
+    assert not (vault / MCP_AUDIT_RELPATH).exists()
+
+
+@pytest.mark.parametrize("ceiling", ["intimate", "all", "bogus-tier"])
+def test_remote_refusal_payload_is_exact_and_does_not_echo_the_request(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, ceiling: str
+) -> None:
+    """Pin the refusal payload key-for-key, including the ceiling it reports.
+
+    ``tier_ceiling`` is always ``"open"`` — the cap's own floor — never the
+    ceiling the caller asked for, so a client cannot read its own rejected
+    request back out of the response. The dict equality also pins that the
+    payload carries no key beyond ``status``/``tool``/``tier_ceiling``/
+    ``reason``.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Used to present an authenticated remote bearer.
+        ceiling: An over-ceiling or unrecognised request value.
+    """
+    _remote(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.wheel", {"privacy_tier_ceiling": ceiling})
+    assert result == {
+        "status": "refused",
+        "tool": "creek.wheel",
+        "tier_ceiling": "open",
+        "reason": _CAP_REFUSAL_REASON,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Pin: the remote admission table, admitted half
+# --------------------------------------------------------------------------- #
+
+
+def test_remote_call_without_the_ceiling_key_dispatches_and_audits(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An absent ``privacy_tier_ceiling`` defaults to ``open`` and is admitted.
+
+    The cap reads ``arguments.get(...)`` with an ``open`` fallback, so omitting
+    the key entirely is admitted rather than refused — and the call dispatches
+    far enough to write its audit entry under the bearer's consumer.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Used to present an authenticated remote bearer.
+    """
+    _remote(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.wheel", {})
+    assert result is not None
+    assert result["tool"] == "creek.wheel"
+    assert result.get("status") != "refused"
+    assert _consumers_for(vault, "creek.wheel") == ["adepthood"]
+
+
+# --------------------------------------------------------------------------- #
+# Pin: stdio is outside the cap entirely
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("ceiling", _REMOTE_REFUSED_CEILINGS, ids=_REMOTE_REFUSED_IDS)
+def test_local_call_never_produces_the_cap_refusal(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, ceiling: object
+) -> None:
+    """No local (stdio) call is refused *by the cap*, whatever the value is.
+
+    The garbage values still fail FastMCP's own pydantic coercion locally,
+    which raises instead of returning a payload. That is not this gate's
+    business, so the pin is deliberately narrow: whatever else happens, the
+    cap's refusal is never what comes back.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Used to make the call look local (no token).
+        ceiling: The ``privacy_tier_ceiling`` value under test.
+    """
+    _local(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.wheel", {"privacy_tier_ceiling": ceiling})
+    assert result is None or result.get("reason") != _CAP_REFUSAL_REASON
+
+
+@pytest.mark.parametrize("arguments", _VALID_CEILING_ARGUMENTS, ids=_VALID_CEILING_IDS)
+def test_local_call_dispatches_at_every_valid_ceiling(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, arguments: dict[str, object]
+) -> None:
+    """All four ceilings — plus an absent key — dispatch for a local caller.
+
+    ``intimate`` and ``all`` are exactly the two the remote cap refuses, so
+    this is the pin that stops the extraction from widening the cap onto the
+    stdio path.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Used to make the call look local (no token).
+        arguments: The argument mapping under test.
+    """
+    _local(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.wheel", arguments)
+    assert result is not None
+    assert result["tool"] == "creek.wheel"
+    assert result.get("status") != "refused"
+
+
+def test_local_call_is_audited_under_the_env_consumer(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stdio half of the identity rule: no token means ``CREEK_MCP_CONSUMER``.
+
+    The remote half is pinned by
+    ``test_remote_call_is_audited_under_token_consumer``; this is its
+    counterpart, so the extraction cannot make the env default win for a
+    bearer-identified caller (or vice versa) without turning one of the two
+    red.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Sets the process-default consumer and clears the token.
+    """
+    monkeypatch.setenv(_CONSUMER_ENV, "env-default")
+    _local(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.wheel", {"privacy_tier_ceiling": "open"})
+    assert result is not None
+    assert _consumers_for(vault, "creek.wheel") == ["env-default"]
+
+
+# --------------------------------------------------------------------------- #
+# Pin: caller identity and remoteness are resolved PER CALL, never cached
+#
+# The single highest-consequence failure mode of the #1073 extraction is a
+# caller identity built once at ``build_server`` time. Every call after the
+# first would then be audited under the first caller's name — forging
+# attribution — and the cap would be pinned to the first caller's remoteness,
+# so one local call could unlock intimate content for every later remote one.
+# --------------------------------------------------------------------------- #
+
+
+def test_consumer_identity_is_resolved_per_call_not_once_per_server(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two calls on ONE server under two bearers audit under two consumers.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Sets the process default and swaps the live bearer between
+            the two calls.
+    """
+    monkeypatch.setenv(_CONSUMER_ENV, "env-default")
+    bearer: list[AccessToken | None] = [_fake_token("adepthood")]
+    monkeypatch.setattr(server_mod, "_current_access_token", lambda: bearer[0])
+    server = _pin_server(vault)
+
+    assert _call(server, "creek.wheel", {"privacy_tier_ceiling": "open"}) is not None
+    bearer[0] = _fake_token("crawdad")
+    assert _call(server, "creek.wheel", {"privacy_tier_ceiling": "open"}) is not None
+
+    assert _consumers_for(vault, "creek.wheel") == ["adepthood", "crawdad"]
+
+
+def test_cap_re_evaluates_remoteness_remote_then_local(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One server, remote then local: the cap engages on the first call only.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Sets the process default and drops the bearer between the
+            two calls.
+    """
+    monkeypatch.setenv(_CONSUMER_ENV, "env-default")
+    bearer: list[AccessToken | None] = [_fake_token("adepthood")]
+    monkeypatch.setattr(server_mod, "_current_access_token", lambda: bearer[0])
+    server = _pin_server(vault)
+
+    refused = _call(server, "creek.wheel", {"privacy_tier_ceiling": "intimate"})
+    assert refused is not None
+    assert refused["reason"] == _CAP_REFUSAL_REASON
+    assert not (vault / MCP_AUDIT_RELPATH).exists()
+
+    bearer[0] = None
+    admitted = _call(server, "creek.wheel", {"privacy_tier_ceiling": "intimate"})
+    assert admitted is not None
+    assert admitted.get("status") != "refused"
+    assert _consumers_for(vault, "creek.wheel") == ["env-default"]
+
+
+def test_cap_re_evaluates_remoteness_local_then_remote(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One server, local then remote: an earlier local call does not unlock the cap.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Sets the process default and installs the bearer between
+            the two calls.
+    """
+    monkeypatch.setenv(_CONSUMER_ENV, "env-default")
+    bearer: list[AccessToken | None] = [None]
+    monkeypatch.setattr(server_mod, "_current_access_token", lambda: bearer[0])
+    server = _pin_server(vault)
+
+    admitted = _call(server, "creek.wheel", {"privacy_tier_ceiling": "intimate"})
+    assert admitted is not None
+    assert admitted.get("status") != "refused"
+    assert _consumers_for(vault, "creek.wheel") == ["env-default"]
+
+    bearer[0] = _fake_token("adepthood")
+    refused = _call(server, "creek.wheel", {"privacy_tier_ceiling": "intimate"})
+    assert refused is not None
+    assert refused["reason"] == _CAP_REFUSAL_REASON
+    # Refused before dispatch => no second entry joined the first.
+    assert _consumers_for(vault, "creek.wheel") == ["env-default"]
+
+
+# --------------------------------------------------------------------------- #
+# Pin: the deliberate creek.purge.* carve-out (server.py:120-131)
+#
+# Purge tools declare no ``privacy_tier_ceiling``, so the remote cap always
+# falls back to ``open`` for them and is a documented no-op. Their real gate is
+# ``CREEK_MCP_ELEVATED_TOKEN`` via ``creek_mcp.auth.is_elevated``. These pins
+# stop the extraction from either (a) accidentally routing purge through the
+# ceiling cap, or (b) treating the cap as purge's protection and weakening the
+# elevated gate.
+# --------------------------------------------------------------------------- #
+
+
+def test_purge_tools_declare_no_tier_ceiling_parameter(vault: Path) -> None:
+    """The carve-out's premise: purge tools expose no ceiling to cap.
+
+    ``creek.wheel`` declares ``privacy_tier_ceiling``; none of the five
+    ``creek.purge.*`` tools do.
+
+    Args:
+        vault: Seeded vault root.
+    """
+    server = _pin_server(vault)
+    listed = asyncio.run(server.list_tools())
+    schemas = {tool.name: tool.inputSchema for tool in listed}
+    assert "privacy_tier_ceiling" in schemas["creek.wheel"]["properties"]
+    for name in _PURGE_TOOL_NAMES:
+        assert "privacy_tier_ceiling" not in schemas[name]["properties"]
+
+
+def test_remote_purge_is_refused_by_the_elevated_gate_not_the_cap(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A remote purge call is refused by the ELEVATED gate, never by the ceiling cap.
+
+    The distinguishing evidence is the reason string plus the payload shape:
+    the purge refusal carries no ``tier_ceiling`` key at all, which the cap's
+    refusal always does.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Clears the elevated token and presents a remote bearer.
+    """
+    monkeypatch.delenv(_ELEVATED_TOKEN_ENV, raising=False)
+    _remote(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.purge.fragment", {"fragment_id": "frag-missing"})
+    assert result == {
+        "status": "refused",
+        "tool": "creek.purge.fragment",
+        "reason": _PURGE_ELEVATED_REFUSAL_REASON,
+    }
+
+
+def test_remote_purge_refusal_is_audited_under_the_bearer_consumer(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The elevated gate audits its denial, attributed to the bearer's consumer.
+
+    Also pins that the audit entry records ``tier_ceiling: "open"`` for a
+    purge, and that the caller's ``auth_token`` never enters ``args_summary``.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Sets a process default, clears the elevated token, and
+            presents a remote bearer.
+    """
+    monkeypatch.setenv(_CONSUMER_ENV, "env-default")
+    monkeypatch.delenv(_ELEVATED_TOKEN_ENV, raising=False)
+    _remote(monkeypatch)
+    server = _pin_server(vault)
+    _call(server, "creek.purge.fragment", {"fragment_id": "frag-missing"})
+
+    entries = _entries_for(vault, "creek.purge.fragment")
+    assert len(entries) == 1
+    assert entries[0]["consumer"] == "adepthood"
+    assert entries[0]["tier_ceiling"] == "open"
+    assert entries[0]["args_summary"] == {
+        "fragment_id": "frag-missing",
+        "dry_run": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("configured", "supplied"),
+    [
+        (None, None),
+        (None, _STRONG_TOKEN),
+        (_STRONG_TOKEN, None),
+        (_STRONG_TOKEN, "wrong-token-value"),
+    ],
+    ids=[
+        "unset-and-absent",
+        "unset-but-supplied",
+        "set-but-absent",
+        "set-and-mismatched",
+    ],
+)
+def test_elevated_gate_remains_the_real_purge_gate(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str | None,
+    supplied: str | None,
+) -> None:
+    """A remote bearer alone never satisfies the elevated gate, and denials audit.
+
+    Four ways to fail closed: no server token and no client token, no server
+    token with a client token, a server token with no client token, and a
+    server token with a mismatched client token. All four refuse with the
+    elevated reason and all four leave exactly one audit entry.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Configures (or clears) the elevated token and presents a
+            remote bearer.
+        configured: The server-side ``CREEK_MCP_ELEVATED_TOKEN``, or ``None``
+            to leave it unset.
+        supplied: The client-side ``auth_token``, or ``None`` to omit it.
+    """
+    if configured is None:
+        monkeypatch.delenv(_ELEVATED_TOKEN_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_ELEVATED_TOKEN_ENV, configured)
+    _remote(monkeypatch)
+    server = _pin_server(vault)
+
+    arguments: dict[str, object] = {"fragment_id": "frag-missing"}
+    if supplied is not None:
+        arguments["auth_token"] = supplied
+    result = _call(server, "creek.purge.fragment", arguments)
+
+    assert result is not None
+    assert result["status"] == "refused"
+    assert result["reason"] == _PURGE_ELEVATED_REFUSAL_REASON
+    assert len(_entries_for(vault, "creek.purge.fragment")) == 1
+
+
+def test_remote_purge_with_valid_elevated_token_clears_both_gates(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the elevated token, a remote purge gets past the cap AND the gate.
+
+    ``creek.purge.vault`` then stops on its own second factor — the missing
+    ``confirm_vault_path`` — which is the proof that neither the ceiling cap
+    nor the elevated gate refused it. Nothing is destroyed: the refusal lands
+    before ``PurgeEngine`` is ever constructed.
+
+    Args:
+        vault: Seeded vault root.
+        monkeypatch: Configures a floor-clearing elevated token and presents a
+            remote bearer.
+    """
+    monkeypatch.setenv(_ELEVATED_TOKEN_ENV, _STRONG_TOKEN)
+    _remote(monkeypatch)
+    server = _pin_server(vault)
+    result = _call(server, "creek.purge.vault", {"auth_token": _STRONG_TOKEN})
+
+    assert result == {
+        "status": "refused",
+        "tool": "creek.purge.vault",
+        "reason": _PURGE_VAULT_CONFIRM_REFUSAL_REASON,
+    }
+    entries = _entries_for(vault, "creek.purge.vault")
+    assert len(entries) == 1
+    assert entries[0]["consumer"] == "adepthood"
+    # The elevated token never reaches the audit log.
+    assert entries[0]["args_summary"] == {
+        "confirm_vault_path": False,
+        "dry_run": False,
+    }

@@ -1,33 +1,61 @@
-"""Redactor — replace sensitive data with safe markers and log redactions.
+"""Redactor — replace sensitive data with safe markers.
 
 The :class:`Redactor` re-scans content to locate match positions (since
 :class:`RedactionMatch` intentionally does **not** store the matched text)
 and replaces each hit with a ``[REDACTED:type]`` marker.
 
 Replacement is a single pass over the *original* content: every in-scope
-pattern is matched against the untouched text, truly overlapping spans
+detector — the regex patterns *and* the generic high-entropy detector
+alike — is matched against the untouched text, truly overlapping spans
 are unioned, and the merged spans are spliced out right-to-left. Because
-no pattern ever anchors on partially redacted text, a ``--scan`` finding
-cannot survive a ``--apply`` step (Issue #832).
+no detector ever anchors on partially redacted text, a ``--scan`` finding
+cannot survive a ``--apply`` step (Issue #832). Keeping the entropy
+detector inside that same union is what stops a regex match that covers
+only *part* of a high-entropy run from leaving the remainder — now too
+short for the detector to re-find — in cleartext (Issue #909).
 
-Redaction logs are written as JSON with a session salt in the header so
-that hashes can be correlated within a session but not reversed.
+The coverage is layered, and each layer is needed. The entropy detector
+itself has two gates: it fires when the *whole* run clears the
+confidence-derived threshold, and also when any contiguous
+``HIGH_ENTROPY_MIN_RUN``-character window of the run does. The second
+gate exists because concatenation averages — predictable filler glued to
+a genuine secret used to drag the whole-run average below the bar and
+hide the secret outright (Issue #942).
+
+Even both entropy gates together are not sufficient, because a run can
+fail both and still need covering. A documented AWS example key followed
+by fourteen repeats of a single character measures 3.14 bits/char
+whole-run with no clearing window, so the entropy detector contributes
+no span at all — yet an ``api_key`` match covers only the key half and
+would leave the tail of that same token in cleartext. Raising
+``min_confidence`` to cut false positives widens that class of run. So
+spans are also **snapped to token boundaries** before merging, as the
+threshold-independent backstop (Issue #909): a span whose edge falls
+strictly inside a ``HIGH_ENTROPY_CANDIDATE`` run is widened to that
+run's edge, making the last layer boundary-driven rather than
+threshold-driven. Runs the operator explicitly allowlisted are excluded
+from snapping: user intent wins, and a regex match inside such a run
+still redacts its own span unwidened.
+
+A consequence worth stating plainly: ``--apply`` may therefore redact
+slightly **more** than ``--scan`` reported, because snapping widens on
+token shape rather than on a reported finding. That asymmetry is
+deliberate, fail-closed behaviour — a missed secret is unrecoverable
+once written, whereas over-redaction is visible in the output and
+fixable via ``false_positive_allowlist``.
 """
 
-import json
 import re
-from pathlib import Path
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 from creek.config import RedactionConfig
 from creek.redact.patterns import PATTERN_METADATA, REDACTION_PATTERNS
 from creek.redact.scanner import (
     HIGH_ENTROPY_CANDIDATE,
     HIGH_ENTROPY_PATTERN_NAME,
-    RedactionMatch,
     entropy_threshold,
+    has_high_entropy_region,
     post_validate,
-    shannon_entropy,
 )
 
 _SEVERITY_RANKS: dict[str, int] = {
@@ -70,6 +98,36 @@ class _MergedSpan(NamedTuple):
     start: int
     end: int
     contributors: list[_Span]
+
+
+_Run = tuple[int, int]
+"""Half-open ``(start, end)`` offsets of one high-entropy candidate run."""
+
+
+def _snap_one(span: _Span, runs: list[_Run]) -> _Span:
+    """Widen *span* to the boundaries of any candidate run it bisects.
+
+    A boundary is only moved when the span's edge falls *strictly*
+    inside a run, so a span already flush with a run boundary — or one
+    that fully contains the run — is returned unchanged. The pattern
+    name and collection order are preserved verbatim so the merged
+    span's marker selection is unaffected.
+
+    Args:
+        span: The match span to snap.
+        runs: Half-open offsets of the candidate runs to snap against.
+
+    Returns:
+        The span, widened to whole-token boundaries where it bisected a
+        run; otherwise an equal copy of the input.
+    """
+    start, end = span.start, span.end
+    for run_start, run_end in runs:
+        if run_start < span.start < run_end:
+            start = run_start
+        if run_start < span.end < run_end:
+            end = run_end
+    return _Span(start, end, span.pattern_name, span.order)
 
 
 def _severity_rank(pattern_name: str) -> int:
@@ -148,7 +206,7 @@ def _select_marker_name(contributors: list[_Span]) -> str:
 
 
 class Redactor:
-    """Replace sensitive data in text and log redactions.
+    """Replace sensitive data in text with safe markers.
 
     Because :class:`RedactionMatch` never stores matched text, the
     redactor must re-scan content using the same patterns to locate
@@ -157,7 +215,8 @@ class Redactor:
     Args:
         config: Redaction configuration (allowlist, custom patterns).
         salt: The session salt used by the scanner that produced the
-            matches — stored in the log header for correlation.
+            matches, kept on the instance so hashes from that same
+            scan session can be correlated.
     """
 
     def __init__(self, config: RedactionConfig, salt: bytes) -> None:
@@ -202,12 +261,37 @@ class Redactor:
 
         Re-scans *content* against the configured patterns (since matched
         text is never stored in :class:`RedactionMatch`) in a single pass
-        over the original text: every in-scope pattern is matched against
+        over the original text: every in-scope detector is matched against
         the untouched content, truly overlapping spans are unioned, and
         each merged region is replaced by the marker of its most severe
-        contributor. This guarantees scan/apply parity — a ``--scan``
-        finding cannot survive ``--apply``, because no pattern ever
-        anchors on already-redacted text (Issue #832).
+        contributor. This guarantees scan/apply parity — when
+        *pattern_types* is not narrowed, a ``--scan`` finding cannot
+        survive ``--apply``, because no detector ever anchors on
+        already-redacted text (Issue #832). Narrowing *pattern_types*
+        deliberately takes the excluded detectors out of scope, so their
+        findings are left untouched by design.
+
+        The generic high-entropy detector participates in that *same*
+        single-pass union rather than running as a post-pass over the
+        spliced output. Otherwise a regex match covering only part of a
+        high-entropy run would splice its marker over that part and leave
+        a remainder too short for ``HIGH_ENTROPY_CANDIDATE`` to re-match,
+        leaking the tail of a secret in cleartext (Issue #909).
+
+        Because that union still depends on the *combined* run clearing
+        the entropy threshold, spans are additionally snapped to token
+        boundaries by :meth:`_snap_to_candidate_runs`: any span edge
+        falling strictly inside a ``HIGH_ENTROPY_CANDIDATE`` run is
+        pushed out to that run's edge, so no contiguous token is ever
+        left half-redacted regardless of how ``min_confidence`` is
+        tuned. Allowlisted runs are exempt — an explicitly allowlisted
+        token is never widened onto.
+
+        Snapping is shape-driven, so ``--apply`` may redact slightly
+        **more** than ``--scan`` reported. That is deliberate,
+        fail-closed behaviour: a missed secret is unrecoverable once
+        written, while over-redaction is visible and fixable by
+        allowlisting the affected token.
 
         Args:
             content: The text to redact.
@@ -226,12 +310,53 @@ class Redactor:
             patterns_to_use = self._patterns
 
         spans = self._collect_spans(content, patterns_to_use)
-        content = self._splice_markers(content, _merge_spans(spans))
-
         if self._should_apply_high_entropy(pattern_types):
-            content = self._replace_high_entropy(content)
+            spans.extend(self._collect_high_entropy_spans(content, len(spans)))
+            spans = self._snap_to_candidate_runs(content, spans)
 
-        return content
+        return self._splice_markers(content, _merge_spans(spans))
+
+    def _snap_to_candidate_runs(
+        self,
+        content: str,
+        spans: list[_Span],
+    ) -> list[_Span]:
+        """Widen every span that bisects a contiguous high-entropy run.
+
+        The entropy detector emits a span when the *whole* run clears
+        :func:`~creek.redact.scanner.entropy_threshold` or when any
+        contiguous ``HIGH_ENTROPY_MIN_RUN``-character window of it does
+        (Issue #942) — but a run can fail *both* of those gates and still
+        need covering. A documented AWS example key followed by fourteen
+        repeats of a single character measures 3.14 bits/char whole-run
+        with no clearing window, so the detector contributes no span at
+        all, and a regex matching only the key half would leave the tail
+        of that same token in cleartext; raising
+        :pyattr:`RedactionConfig.min_confidence` widens that class of
+        run. Snapping is the layer beneath both entropy gates, making
+        that coverage boundary-driven instead of threshold-driven
+        (Issue #909).
+
+        Runs on the false-positive allowlist are excluded, so an
+        explicitly allowlisted token is never widened onto — user intent
+        wins. A regex match *inside* such a run still redacts its own
+        span, just unwidened.
+
+        Args:
+            content: The original, untouched text the spans index into.
+            spans: Match spans collected against that content.
+
+        Returns:
+            The spans with bisecting edges pushed out to whole-token
+            boundaries; overlaps this creates are absorbed by
+            :func:`_merge_spans`.
+        """
+        runs: list[_Run] = [
+            (candidate.start(), candidate.end())
+            for candidate in HIGH_ENTROPY_CANDIDATE.finditer(content)
+            if not self._is_allowlisted(candidate.group())
+        ]
+        return [_snap_one(span, runs) for span in spans]
 
     def _collect_spans(
         self,
@@ -297,56 +422,65 @@ class Redactor:
             return True
         return HIGH_ENTROPY_PATTERN_NAME in pattern_types
 
-    def _replace_high_entropy(self, content: str) -> str:
-        """Replace high-entropy substrings with the configured marker.
-
-        Mirrors :meth:`creek.redact.scanner.RedactionScanner._scan_high_entropy`
-        so a `--scan` finding cannot survive a `--apply` step. The shared
-        ``HIGH_ENTROPY_CANDIDATE`` regex and ``shannon_entropy`` helper
-        keep both paths in lockstep.
-        """
-        marker = self.config.replacement_template.format(
-            name=HIGH_ENTROPY_PATTERN_NAME,
-        )
-        threshold = entropy_threshold(self.config.min_confidence)
-
-        def _replacer(m: re.Match[str]) -> str:
-            text = m.group()
-            if self._is_allowlisted(text):
-                return text
-            if shannon_entropy(text) < threshold:
-                return text
-            return marker
-
-        return HIGH_ENTROPY_CANDIDATE.sub(_replacer, content)
-
-    def log_redactions(
+    def _collect_high_entropy_spans(
         self,
-        matches: list[RedactionMatch],
-        log_path: Path,
-    ) -> None:
-        """Write redaction matches to a JSON log file.
+        content: str,
+        start_order: int,
+    ) -> list[_Span]:
+        """Locate high-entropy substrings as spans on the original content.
 
-        If the log file already exists, appends to the ``entries`` list.
-        The log header includes the hex-encoded session salt so hashes
-        can be correlated within the same scan session.
+        The gating mirrors
+        :meth:`creek.redact.scanner.RedactionScanner._scan_high_entropy`
+        *by construction* — the shared ``HIGH_ENTROPY_CANDIDATE`` regex,
+        the same allowlist check, and one
+        :func:`~creek.redact.scanner.has_high_entropy_region` helper
+        called from both sites against the same
+        :func:`~creek.redact.scanner.entropy_threshold` derived from
+        :pyattr:`RedactionConfig.min_confidence`. Because the entropy
+        decision lives in a single function rather than in two
+        hand-synchronised copies, scan/apply parity cannot drift: a
+        ``--scan`` finding cannot survive a ``--apply`` step, and
+        ``--apply`` cannot start firing on runs ``--scan`` reported as
+        clean.
+
+        ``post_validate`` is deliberately *not* consulted: no validator
+        is registered for ``high_entropy_string`` (it would return
+        ``True`` unconditionally) and ``_scan_high_entropy`` does not
+        call it either, so calling it here would both diverge from the
+        scanner and add a permanently-true branch.
+
+        Offsets are taken against the whole *content* — never per line —
+        so the spans can be unioned with the regex spans that
+        :meth:`_collect_spans` produced (Issue #909).
 
         Args:
-            matches: List of redaction matches to log.
-            log_path: Path to the JSON log file.
+            content: The original, untouched text.
+            start_order: Collection order to continue from, so entropy
+                spans keep :attr:`_Span.order` globally unique against the
+                already-collected regex spans and the marker tie-break
+                stays deterministic.
+
+        Returns:
+            Spans for every candidate that is not allowlisted and that
+            has a high-entropy region — the whole run, or any contiguous
+            ``HIGH_ENTROPY_MIN_RUN``-character window of it — clearing
+            the configured threshold. The span is always the whole
+            candidate run, never the hot sub-window.
         """
-        data: dict[str, Any]
-        entries: list[Any]
-
-        if log_path.exists():
-            data = json.loads(log_path.read_text())
-            entries = list(data.get("entries", []))
-        else:
-            data = {"salt_hex": self.salt.hex()}
-            entries = []
-
-        for match in matches:
-            entries.append(match.model_dump(mode="json"))
-
-        data["entries"] = entries
-        log_path.write_text(json.dumps(data, indent=2))
+        threshold = entropy_threshold(self.config.min_confidence)
+        spans: list[_Span] = []
+        for candidate in HIGH_ENTROPY_CANDIDATE.finditer(content):
+            text = candidate.group()
+            if self._is_allowlisted(text):
+                continue
+            if not has_high_entropy_region(text, threshold):
+                continue
+            spans.append(
+                _Span(
+                    candidate.start(),
+                    candidate.end(),
+                    HIGH_ENTROPY_PATTERN_NAME,
+                    start_order + len(spans),
+                )
+            )
+        return spans

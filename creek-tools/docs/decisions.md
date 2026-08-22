@@ -61,13 +61,23 @@ Each candidate captures `wavelength_phase_at_detection` and the active `frequenc
 
 ## Drafting (`create_decision_note`)
 
-`DecisionDetector.create_decision_note(candidate, vault_path)` writes a draft to `08-Decisions/Active/<date>-<sanitised-title>.md` with:
+`DecisionDetector.create_decision_note(candidate, vault_path)` writes a draft to `08-Decisions/Active/<date>-<sanitised-title>[-N].md` with:
 
 - `status: sensing`
 - `opened: <today, LA-tz>`
 - `wavelength_phase_at_opening` carried over from detection
 - a body skeleton with `## Source Fragments`, `## Options`, `## Criteria`
 - two `_Option 1_` / `_Option 2_` placeholders the user fills in
+
+`[-N]` is a collision ordinal, and it appears only on the second and later notes
+that want the same name — the ordinary one-decision-per-title case still gets
+`<date>-<sanitised-title>.md`, and no existing note is renamed, so `[[wikilinks]]`
+keep resolving. A title is not an identity, so the path is resolved by ownership:
+`-1`, `-2`, … are probed until one is free or already records this candidate's
+source fragment, and a note belonging to a different fragment is never
+overwritten (a vault damaged by the previous unconditional write heals on the
+next run, the displaced source taking the next free ordinal). The disambiguator
+is a bare integer on purpose — no identity-derived string belongs in a filename.
 
 The file is human-edited from there. Status advances are operator-driven, not automatic.
 

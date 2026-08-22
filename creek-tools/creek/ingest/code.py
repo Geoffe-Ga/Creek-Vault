@@ -30,29 +30,20 @@ from creek.ingest.base import (
     normalize_encoding,
     parse_authored_at,
 )
+from creek.ingest.routing import SKIPPED_DIRECTORY_NAMES
 from creek.models import SourcePlatform
 
 logger = logging.getLogger(__name__)
 
 # ---- Constants ----
 
-_SKIP_DIRS: frozenset[str] = frozenset(
-    {
-        "node_modules",
-        "vendor",
-        ".git",
-        "__pycache__",
-        ".tox",
-        ".venv",
-        ".mypy_cache",
-        ".ruff_cache",
-        ".pytest_cache",
-        "dist",
-        "build",
-        ".eggs",
-    }
-)
-"""Directory names to skip during discovery."""
+_SKIP_DIRS: frozenset[str] = SKIPPED_DIRECTORY_NAMES
+"""Directory names to skip during discovery.
+
+Shared with the pipeline's unclaimed-source report (issue #1304) via
+:data:`creek.ingest.routing.SKIPPED_DIRECTORY_NAMES` — a file this walk
+declines to visit must not then be reported as an ingestor's oversight.
+"""
 
 _README_PATTERNS: tuple[str, ...] = (
     "README.md",
@@ -424,7 +415,7 @@ def _get_file_timestamp(path: Path) -> datetime:
     Returns:
         A timezone-aware datetime from the file's modification time.
     """
-    from creek.ingest.base import LA_TZ
+    from creek.time import LA_TZ
 
     mtime = path.stat().st_mtime
     return datetime.fromtimestamp(mtime, tz=LA_TZ)
@@ -561,13 +552,40 @@ class CodeIngestor(Ingestor):
     def _discover_directory(self, dir_path: Path, docs: list[RawDocument]) -> None:
         """Recursively discover relevant code files in a directory.
 
+        The one hand-rolled walk among the eleven ingestors, so it is the one
+        place the ``rglob`` bound the other ten inherit has to be written out
+        (#1375). ``is_dir()`` FOLLOWS symlinks, so without the ``is_symlink``
+        guard below an ordinary in-root alias — ``src/a/loop -> src``, which
+        :func:`creek._containment.assert_source_contained` admits by design
+        because its target never leaves the root — sends this walk back
+        through the whole tree at every nesting depth until the operating
+        system's path limit stops it. Measured on that tree: 32 documents
+        from 2 files, the same README re-read 16 times. Each duplicate
+        becomes a fragment, an embedding and a cloud LLM prompt, and the
+        near-duplicates then poison the link graph.
+
+        SKIP rather than follow-once-with-a-visited-set, because skipping is
+        exactly what ``Path.rglob`` does — it surfaces a symlinked directory
+        as one entry and does not descend — and matching the other ten
+        ingestors beats inventing an eleventh behaviour. Symlinked *files*
+        stay admitted for the same reason: ``rglob`` yields them and
+        ``is_file()`` keeps them, so dropping them would make this ingestor
+        the odd one out in the other direction.
+
+        This is a bound on a walk, NOT a containment-policy change:
+        ``assert_source_contained`` is untouched and an intra-root link is
+        still admitted by the gate. Refusing intra-root links would break all
+        eleven ingestors and contradict SEC-003, whose policy is that
+        containment is about the target escaping, not about the link
+        existing.
+
         Args:
             dir_path: Directory to search.
             docs: List to append discovered documents to.
         """
         # Discover regular files
         for item in sorted(dir_path.iterdir()):
-            if item.is_dir():
+            if item.is_dir() and not item.is_symlink():
                 if not _is_skip_directory(item):
                     self._discover_directory(item, docs)
             elif item.is_file() and self._is_relevant_file(item):

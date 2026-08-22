@@ -69,6 +69,40 @@ class _BackfillChannel(Protocol):
     ) -> AsyncIterator[_MessageLike]: ...  # pragma: no cover - protocol stub
 
 
+def iter_channel_records(channel_dir: Path) -> Iterator[dict[str, object]]:
+    """Yield every parsed JSON record under a single capture channel dir.
+
+    The one reader of the on-disk capture format. :class:`MessageCapture` uses it
+    for dedup and gap-filling; :mod:`crawdad.capture_audit` uses it to summarise
+    a pre-#1052 tree (#1264). Both must agree on what "a record" is, so neither
+    parses JSONL itself.
+
+    Malformed lines, blank lines, and non-object JSON are skipped rather than
+    raised: a corrupt line must not hide the intact records around it from an
+    audit, and it never blocked the writer either.
+
+    Args:
+        channel_dir: A ``<capture_dir>/<channel>`` directory. A path that is not
+            a directory yields nothing.
+
+    Yields:
+        Each JSON object found, in filename then line order.
+    """
+    if not channel_dir.is_dir():
+        return
+    for jsonl in sorted(channel_dir.glob("*.jsonl")):
+        for line in jsonl.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+
+
 def _author_name(message: _MessageLike) -> str:
     """The display name if the author has one, else the plain name."""
     display = getattr(message.author, "display_name", "")
@@ -189,17 +223,4 @@ class MessageCapture:
 
     def _iter_records(self, channel: str) -> Iterator[dict[str, object]]:
         """Yield every parsed JSON record under ``<capture_dir>/<channel>/``."""
-        channel_dir = self._dir / channel
-        if not channel_dir.is_dir():
-            return
-        for jsonl in sorted(channel_dir.glob("*.jsonl")):
-            for line in jsonl.read_text(encoding="utf-8").splitlines():
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    obj = json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(obj, dict):
-                    yield obj
+        return iter_channel_records(self._dir / channel)

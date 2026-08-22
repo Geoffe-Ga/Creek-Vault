@@ -58,9 +58,11 @@ So, concretely:
 - Read the issue (`gh issue view "$RALPH_ISSUE" --comments`) and the house rules
   (`CLAUDE.md`, `creek-tools/CLAUDE.md`).
 - Spawn **chief-architect** for the plan + ordered dispatch list + risk flags.
-  It runs on Fable 5 (credit-metered): if the spawn fails because Fable is
-  unavailable or out of credits, re-spawn it with a `model: opus` override
-  rather than skipping the plan or designing the change yourself.
+  If the spawn fails, retry once; if it still fails, do the architecture
+  yourself and **state explicitly** in your report and the PR body that the plan
+  was not an independent architect pass. Never imply a planning pass happened
+  when it did not. A `Subagent spawn limit reached` error is terminal for the
+  session — report it and continue solo rather than retrying.
 - Run its specialists **sequentially** inside your worktree: `test-specialist`
   (Gate 1 RED) → `implementation-specialist` (Gate 1 GREEN + refactor) → only the
   cross-cutting specialists the architect flagged.
@@ -68,6 +70,10 @@ So, concretely:
   (`./scripts/fix-all.sh` for autofixable lint/format — never bypass).
 - **Gate 2.5:** dispatch `code-review-orchestrator` over your diff; fix every
   blocker (drop to Gate 1 via the owning specialist) until `CLEAN`.
+- **Filing a follow-up?** Any issue you `gh issue create` for an unrelated bug
+  needs a priority label (`--label P2` etc.) — see PROMPT.md step 8 for the
+  rubric. Unlabelled is not neutral: `pick-next.sh` ranks it P1 by default, so
+  it preempts triaged work on a judgement nobody made (#1011).
 - Commit with a conventional-commit subject and the repo trailer, push your
   branch, and open the PR with `## Summary`, `## Test plan`, `Closes #RALPH_ISSUE`
   (and `Refs #<epic>` if named).

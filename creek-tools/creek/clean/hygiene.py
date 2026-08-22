@@ -23,10 +23,14 @@ from typing import TYPE_CHECKING
 import frontmatter
 from pydantic import BaseModel, Field
 
+from creek.vault.links import build_link_index, iter_link_sources
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from creek.vault.links import LinkIndex
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +267,14 @@ class OrphanScanner:
     no connections after a configurable age threshold (in days) are
     reported as orphans.
 
+    Wiki-links resolve through :func:`creek.vault.links.build_link_index`,
+    the same index :class:`BrokenLinkScanner` and the ``orphan-compiled``
+    lint check use, so a page is credited for links naming it by its
+    frontmatter ``title`` or any ``aliases`` entry. Comparing filename
+    stems alone — the behaviour #887 removed from the lint checks and
+    #1225 removed from here — reported alias-linked pages as orphans,
+    which is a false positive telling the operator to delete live content.
+
     Attributes:
         age_days: Minimum age in days before a fragment is considered
             an orphan candidate (default 30).
@@ -277,81 +289,93 @@ class OrphanScanner:
         """
         self.age_days = age_days
 
-    def scan(self, vault_path: Path) -> OrphanResult:
+    def scan(
+        self,
+        vault_path: Path,
+        *,
+        link_index: LinkIndex | None = None,
+    ) -> OrphanResult:
         """Scan the vault for orphaned fragments.
 
-        Builds a set of all known filenames (stems), then checks each
-        fragment for outgoing wiki-links. A fragment is orphaned if it
-        has no outgoing links AND no other fragment links to it, and it
-        is older than ``age_days``.
+        Every wiki-link in the vault is resolved to the page it actually
+        names, then counted against that page alone. A fragment is orphaned
+        when nothing links to it, it links to nothing else, and it is older
+        than ``age_days``.
 
         Args:
             vault_path: Root of the Obsidian vault.
+            link_index: A pre-built vault-wide name → page index to reuse.
+                Optional so every existing caller keeps working; supplied by
+                :class:`HygieneReporter` and ``creek lint`` so one run walks
+                the vault once instead of once per scanner (#1223).
 
         Returns:
             An :class:`OrphanResult` with orphan paths and totals.
         """
         fragment_files = _list_fragment_files(vault_path)
         all_md_files = _list_all_md_files(vault_path)
+        index = link_index if link_index is not None else build_link_index(vault_path)
 
-        all_stems = {f.stem for f in all_md_files}
-        incoming: dict[str, set[str]] = {f.stem: set() for f in fragment_files}
-        outgoing: dict[str, list[str]] = {}
-
-        self._build_link_graph(all_md_files, incoming, outgoing)
+        incoming, outgoing = self._build_link_graph(all_md_files, index)
 
         now = datetime.now(tz=UTC)
-        orphans = self._find_orphans(
-            fragment_files,
-            incoming,
-            outgoing,
-            all_stems,
-            now,
-        )
+        orphans = self._find_orphans(fragment_files, incoming, outgoing, now)
 
         return OrphanResult(
             orphan_paths=[str(p) for p in orphans],
             total_fragments=len(fragment_files),
         )
 
+    @staticmethod
     def _build_link_graph(
-        self,
         all_md_files: list[Path],
-        incoming: dict[str, set[str]],
-        outgoing: dict[str, list[str]],
-    ) -> None:
-        """Build incoming and outgoing link maps from all markdown files.
+        link_index: LinkIndex,
+    ) -> tuple[dict[Path, set[Path]], dict[Path, set[Path]]]:
+        """Build page-keyed incoming and outgoing link maps for the vault.
+
+        Keys and values are resolved page paths rather than filename stems,
+        so a link written in alias form credits the page that declares the
+        alias — and only that page.
 
         Args:
             all_md_files: All markdown files in the vault.
-            incoming: Mutable dict mapping fragment stems to sets of
-                source stems that link to them.
-            outgoing: Mutable dict mapping file stems to lists of
-                wiki-link targets.
+            link_index: Vault-wide name → page index.
+
+        Returns:
+            A ``(incoming, outgoing)`` pair: ``incoming`` maps a page to the
+            files linking to it, ``outgoing`` maps a file to the pages it
+            links to. Targets that resolve to nothing are dropped from both.
         """
+        incoming: dict[Path, set[Path]] = {}
+        outgoing: dict[Path, set[Path]] = {}
         for md_file in all_md_files:
             content = md_file.read_text(encoding="utf-8", errors="replace")
-            targets = _extract_wikilinks(content)
-            outgoing[md_file.stem] = targets
-            for target in targets:
-                if target in incoming:
-                    incoming[target].add(md_file.stem)
+            resolved = {
+                page
+                for target in _extract_wikilinks(content)
+                if (page := link_index.resolve(target)) is not None
+            }
+            outgoing[md_file] = resolved
+            for page in resolved:
+                incoming.setdefault(page, set()).add(md_file)
+        return incoming, outgoing
 
     def _find_orphans(
         self,
         fragment_files: list[Path],
-        incoming: dict[str, set[str]],
-        outgoing: dict[str, list[str]],
-        all_stems: set[str],
+        incoming: dict[Path, set[Path]],
+        outgoing: dict[Path, set[Path]],
         now: datetime,
     ) -> list[Path]:
         """Filter fragments to those that are orphaned and old enough.
 
+        Self-references are discounted in both directions: a note that only
+        links to itself is as unconnected as one that links to nothing.
+
         Args:
             fragment_files: Fragment markdown files.
-            incoming: Map of fragment stem to set of linking stems.
-            outgoing: Map of file stem to list of link targets.
-            all_stems: Set of all known file stems.
+            incoming: Map of page to the files linking to it.
+            outgoing: Map of file to the pages it links to.
             now: Current UTC datetime for age calculation.
 
         Returns:
@@ -359,10 +383,9 @@ class OrphanScanner:
         """
         orphans: list[Path] = []
         for frag_file in fragment_files:
-            stem = frag_file.stem
-            has_incoming = bool(incoming.get(stem))
-            out_targets = outgoing.get(stem, [])
-            has_outgoing = any(t in all_stems and t != stem for t in out_targets)
+            self_only = {frag_file}
+            has_incoming = bool(incoming.get(frag_file, set()) - self_only)
+            has_outgoing = bool(outgoing.get(frag_file, set()) - self_only)
 
             if has_incoming or has_outgoing:
                 continue
@@ -494,69 +517,98 @@ class StaleReviewScanner:
 
 
 class BrokenLinkScanner:
-    """Scan fragments for wiki-links and relative links to nonexistent files.
+    """Scan the vault for wiki-links and relative links to nonexistent files.
 
-    Builds a set of all known file stems in the vault and checks each
-    link target against it.
+    The survey is :func:`creek.vault.links.iter_link_sources`: the whole vault
+    minus Creek's own report folders (``00-Creek-Meta/Processing-Log/``,
+    ``00-Creek-Meta/State/``, ``00-Creek-Meta/Ontology/``). Scanning
+    ``01-Fragments`` alone — the behaviour before #1344 — made a dangling link
+    on a thread, praxis or decision page invisible while ``creek lint``
+    published the count as a whole-vault verdict. Scanning the *literal* whole
+    vault is the other failure: the lint report renders every finding as
+    ``- `src` → `[[target]]` ``, so three successive runs over a vault holding
+    ONE genuine broken link reported 1, then 2, then 3.
+
+    Wiki-links resolve through :func:`creek.vault.links.build_link_index`,
+    which knows every name a page can be linked by — filename stem,
+    frontmatter ``title``, and each ``aliases`` entry. Matching stems alone
+    (the behaviour before #887) called 99.2% of the demo vault's links
+    broken, because the linkers write date-prefixed filenames and put the
+    human-readable name in ``aliases``.
     """
 
-    def scan(self, vault_path: Path) -> BrokenLinkResult:
+    def scan(
+        self,
+        vault_path: Path,
+        *,
+        link_index: LinkIndex | None = None,
+    ) -> BrokenLinkResult:
         """Scan the vault for broken links.
 
         Checks wiki-links (``[[Target]]``) and relative markdown links
-        (``[text](path)``) in all fragment files.
+        (``[text](path)``) in every surveyed source file — the whole vault
+        except Creek's own report folders, which quote findings back and would
+        otherwise inflate the count run over run.
 
         Args:
             vault_path: Root of the Obsidian vault.
+            link_index: A pre-built vault-wide name → page index to reuse.
+                Optional so every existing caller keeps working; supplied by
+                :class:`HygieneReporter` and ``creek lint`` so one run walks
+                the vault once instead of once per scanner (#1223).
 
         Returns:
-            A :class:`BrokenLinkResult` with broken link details.
+            A :class:`BrokenLinkResult` whose ``total_files_scanned`` counts
+            the files actually surveyed, so the "across N file(s)" line
+            ``creek lint`` prints does not overstate its own coverage.
         """
-        fragment_files = _list_fragment_files(vault_path)
-        all_stems = {f.stem for f in _list_all_md_files(vault_path)}
+        source_files = iter_link_sources(vault_path)
+        index = link_index if link_index is not None else build_link_index(vault_path)
 
         broken_links: dict[str, list[str]] = {}
         total_broken = 0
 
-        for frag_file in fragment_files:
-            file_broken = self._check_file(frag_file, all_stems, vault_path)
+        for source_file in source_files:
+            file_broken = self._check_file(source_file, index, vault_path)
             if file_broken:
-                broken_links[str(frag_file)] = file_broken
+                broken_links[str(source_file)] = file_broken
                 total_broken += len(file_broken)
 
         return BrokenLinkResult(
             broken_links=broken_links,
-            total_files_scanned=len(fragment_files),
+            total_files_scanned=len(source_files),
             total_broken=total_broken,
         )
 
     def _check_file(
         self,
-        frag_file: Path,
-        all_stems: set[str],
+        source_file: Path,
+        link_index: LinkIndex,
         vault_path: Path,
     ) -> list[str]:
         """Check a single file for broken links.
 
         Args:
-            frag_file: Path to the fragment file.
-            all_stems: Set of all known file stems in the vault.
+            source_file: Path to the surveyed markdown file.
+            link_index: Vault-wide name → page index. A wiki-link is broken
+                only when nothing in the vault answers to its target under
+                any of its names.
             vault_path: Root of the vault for resolving relative paths.
 
         Returns:
             List of broken link targets found in this file.
         """
-        content = frag_file.read_text(encoding="utf-8", errors="replace")
+        content = source_file.read_text(encoding="utf-8", errors="replace")
         broken: list[str] = [
             f"[[{target}]]"
             for target in _extract_wikilinks(content)
-            if target not in all_stems
+            if target not in link_index
         ]
 
         broken.extend(
             target
             for target in _extract_relative_links(content)
-            if self._is_broken_local_link(target, frag_file, vault_path)
+            if self._is_broken_local_link(target, source_file, vault_path)
         )
 
         return broken
@@ -564,7 +616,7 @@ class BrokenLinkScanner:
     @staticmethod
     def _is_broken_local_link(
         target: str,
-        frag_file: Path,
+        source_file: Path,
         vault_path: Path,
     ) -> bool:
         """Check whether a relative target resolves to no existing file.
@@ -577,15 +629,15 @@ class BrokenLinkScanner:
 
         Args:
             target: A relative link target (no URL scheme).
-            frag_file: The fragment file containing the link.
+            source_file: The surveyed file containing the link.
             vault_path: Root of the vault for resolving relative paths.
 
         Returns:
             True if the target resolves to no existing file under either
-            the fragment's directory or the vault root.
+            the source file's directory or the vault root.
         """
         try:
-            resolved = (frag_file.parent / target).resolve()
+            resolved = (source_file.parent / target).resolve()
             vault_resolved = (vault_path / target).resolve()
             missing = not resolved.exists() and not vault_resolved.exists()
         except OSError:
@@ -713,15 +765,23 @@ class HygieneReporter:
     def generate(self, vault_path: Path) -> HygieneReport:
         """Run all scanners and compile a health report.
 
+        The name → page index is built **once here** and handed to both
+        scanners that need it. Each used to build its own, so a single
+        ``creek clean`` run header-parsed every ``*.md`` in the vault twice.
+        That is the same defect #1223 reports against ``creek lint``; it went
+        unticketed here, and the rule is to sweep the pattern rather than the
+        sample.
+
         Args:
             vault_path: Root of the Obsidian vault.
 
         Returns:
             A :class:`HygieneReport` with aggregated results.
         """
-        orphans = self.orphan_scanner.scan(vault_path)
+        link_index = build_link_index(vault_path)
+        orphans = self.orphan_scanner.scan(vault_path, link_index=link_index)
         stale = self.stale_review_scanner.scan(vault_path)
-        broken = self.broken_link_scanner.scan(vault_path)
+        broken = self.broken_link_scanner.scan(vault_path, link_index=link_index)
         dupes = self.duplicate_scanner.scan(vault_path)
         quality_dist = self._compute_quality_distribution(vault_path)
 

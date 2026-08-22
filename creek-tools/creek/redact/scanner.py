@@ -14,7 +14,6 @@ Enhanced features (Issue #14):
 - File extension filtering
 - Configurable directory exclusion patterns
 - Progress bar via tqdm during directory scans
-- JSON report generation with match metadata
 - Markdown summary grouped by file and severity
 - Review queue with context for human review
 """
@@ -22,19 +21,76 @@ Enhanced features (Issue #14):
 from __future__ import annotations
 
 import hashlib
-import json
+import logging
 import math
 import os
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path  # noqa: TC003 — Pydantic needs Path at runtime
+from pathlib import Path
+from typing import Final
 
 from pydantic import BaseModel
 from tqdm import tqdm
 
+from creek._containment import escaping_child, resolves_within
 from creek.config import RedactionConfig  # noqa: TC001 — used at runtime
-from creek.redact.patterns import PATTERN_METADATA, REDACTION_PATTERNS
+from creek.redact.patterns import (
+    HIGH_ENTROPY_MIN_RUN,
+    PATTERN_METADATA,
+    REDACTION_PATTERNS,
+)
+
+logger = logging.getLogger(__name__)
+
+_CANONICAL_CONTAINMENT_PREDICATE: Final = resolves_within
+"""Pins ``creek.redact.scanner.resolves_within`` to the canonical object.
+
+Since #1498 this module's only containment call is :func:`escaping_child`,
+which is itself defined in terms of :func:`resolves_within`. The name is kept
+bound here anyway because #1294 pinned it BY IDENTITY —
+``test_the_containment_predicate_has_exactly_one_definition`` asserts
+``scanner.resolves_within is _containment.resolves_within`` — so dropping it
+would retire the guard that stops a local re-implementation of "inside" from
+appearing in this module. A binding, rather than a lint suppression, is what
+keeps that contract honest.
+"""
+
+SYMLINK_SKIP_LABEL = "Files skipped (escaping symlink)"
+"""Statistics label for files declined because they escape the scan root.
+
+Exported rather than spelled twice: the markdown summary this module
+renders and the Rich statistics table in
+:func:`creek.redact.cli_commands._render_stats_table` describe the same
+counter, and two literals are how the two surfaces drift apart.
+"""
+
+_EMPTY_SUMMARY_MARKDOWN = "# Redaction Scan Summary\n\nNo findings.\n"
+"""Rendering for a scan that found nothing *and* declined nothing.
+
+Held as a constant because it is a contract with every existing consumer of
+a clean scan — notably CrawDad, which posts the markdown verbatim into a
+Discord channel — and must stay byte-identical when nothing was skipped.
+"""
+
+_UNREAD_FILES_CAVEAT = (
+    "No findings — but the scan declined to read one or more files, so this "
+    "tree has not been fully checked. See the statistics above."
+)
+"""Replacement for a bare "No findings." when the walk skipped something.
+
+A clean result reached by *not looking* reads identically to a clean tree,
+which is the one place a silent skip in a safety scanner does real harm.
+"""
+
+FINDINGS_TABLE_HEADER = "| Line | Type | Severity |"
+"""Column header of the per-file findings table in the markdown summary.
+
+Exported rather than spelled twice: the table
+:meth:`RedactionScanner.generate_markdown_summary` renders and the copy
+of it quoted in ``docs/redaction.md`` are the same table, and two
+literals are how the two surfaces drift apart.
+"""
 
 HIGH_ENTROPY_PATTERN_NAME = "high_entropy_string"
 """Pattern key used by the generic high-entropy detector."""
@@ -43,6 +99,28 @@ HIGH_ENTROPY_PATTERN_NAME = "high_entropy_string"
 # so reports and the detector cannot drift apart silently.
 HIGH_ENTROPY_CANDIDATE = PATTERN_METADATA[HIGH_ENTROPY_PATTERN_NAME].pattern
 """Substring shape for the generic-secret detector (≥20 base64url chars)."""
+
+_LOG2_MIN_RUN: float = math.log2(HIGH_ENTROPY_MIN_RUN)
+"""``log2`` of the sub-run window width, precomputed for the window scan.
+
+Also the hard ceiling on any window's entropy: a window of
+``HIGH_ENTROPY_MIN_RUN`` characters cannot carry more than
+``log2(HIGH_ENTROPY_MIN_RUN)`` bits/char even when every character in it
+is distinct.
+"""
+
+_COUNT_LOG_TABLE: tuple[float, ...] = tuple(
+    count * math.log2(count) if count else 0.0
+    for count in range(HIGH_ENTROPY_MIN_RUN + 1)
+)
+"""Lookup of ``c * log2(c)`` for every count a fixed-width window can hold.
+
+A character's count inside a window of ``HIGH_ENTROPY_MIN_RUN`` characters
+is bounded by the window width, so the table needs no more entries than
+that. Index ``0`` is defined as ``0.0`` — the limit of ``c * log2(c)`` as
+``c`` approaches zero — which lets the sliding window drop a character to
+a zero count without a special case.
+"""
 
 _ENTROPY_FLOOR_BITS = 2.5
 """Lower bound (bits/char) for the entropy threshold at min_confidence=0.0.
@@ -107,12 +185,17 @@ class ScanSummary:
         files_scanned: Number of files that were scanned.
         files_skipped_binary: Number of files skipped as binary.
         files_skipped_extension: Number of files skipped due to extension.
+        files_skipped_symlink: Number of symlinked children declined because
+            their target resolves outside the scan root (#1087). Declared
+            last so that any positional construction of the three original
+            counters keeps its meaning.
     """
 
     matches: list[RedactionMatch] = field(default_factory=list)
     files_scanned: int = 0
     files_skipped_binary: int = 0
     files_skipped_extension: int = 0
+    files_skipped_symlink: int = 0
 
 
 class RedactionScanner:
@@ -279,6 +362,16 @@ class RedactionScanner:
         ``0.0`` flags any ≥20-char base64url-ish run, ``1.0`` requires the
         substring to be effectively random.
 
+        Gating is delegated to :func:`has_high_entropy_region`, so a run
+        counts as high-entropy when the whole run clears the threshold
+        **or** when any contiguous ``HIGH_ENTROPY_MIN_RUN``-character
+        window of it does. Averaging over a whole run alone let a
+        predictable neighbour mask a genuine secret (Issue #942). What
+        gets reported is still the whole candidate run, never the hot
+        sub-window: the match is hashed for deduplication, and hashing a
+        fragment would neither dedupe against nor describe the span that
+        ``--apply`` removes.
+
         Args:
             file_path: Path to the file being scanned (passed through to
                 the resulting :class:`RedactionMatch`).
@@ -294,7 +387,7 @@ class RedactionScanner:
             text = candidate.group()
             if self._is_allowlisted(text):
                 continue
-            if shannon_entropy(text) < threshold:
+            if not has_high_entropy_region(text, threshold):
                 continue
             results.append(
                 RedactionMatch(
@@ -306,30 +399,6 @@ class RedactionScanner:
             )
         return results
 
-    def scan_directory(
-        self,
-        dir_path: Path,
-        *,
-        progress: bool = False,
-    ) -> list[RedactionMatch]:
-        """Recursively scan all files in a directory for sensitive data.
-
-        Skips binary files and files with unsupported extensions.
-        Respects exclusion patterns from configuration.
-
-        Args:
-            dir_path: Path to the directory to scan.
-            progress: If ``True``, display a tqdm progress bar.
-
-        Returns:
-            Aggregated list of :class:`RedactionMatch` objects.
-
-        Raises:
-            FileNotFoundError: If *dir_path* does not exist.
-        """
-        summary = self.scan_batch(dir_path, progress=progress)
-        return summary.matches
-
     def scan_batch(
         self,
         dir_path: Path,
@@ -339,7 +408,16 @@ class RedactionScanner:
         """Recursively scan a directory and return a full scan summary.
 
         Returns a :class:`ScanSummary` with match details and statistics
-        about files scanned, skipped (binary), and skipped (extension).
+        about files scanned, skipped (binary), skipped (extension), and
+        skipped as symlinks escaping *dir_path*.
+
+        This is the single chokepoint every read-path caller reaches —
+        ``creek redact --scan/--apply/--review`` via
+        :func:`creek.redact.cli_commands._scan_source`, ``creek.redact.scan``
+        over MCP, and ``creek process`` via
+        :meth:`Pipeline._run_redaction <creek.pipeline.Pipeline>` — so the
+        containment policy lives here in :func:`_scannable_candidates` and
+        not in any one of them (#1087).
 
         Args:
             dir_path: Path to the directory to scan.
@@ -355,7 +433,7 @@ class RedactionScanner:
             msg = f"Directory not found: {dir_path}"
             raise FileNotFoundError(msg)
 
-        candidates = sorted(child for child in dir_path.rglob("*") if child.is_file())
+        candidates, files_skipped_symlink = _scannable_candidates(dir_path)
 
         matches: list[RedactionMatch] = []
         files_scanned = 0
@@ -392,44 +470,8 @@ class RedactionScanner:
             files_scanned=files_scanned,
             files_skipped_binary=files_skipped_binary,
             files_skipped_extension=files_skipped_extension,
+            files_skipped_symlink=files_skipped_symlink,
         )
-
-    def generate_report(self, matches: list[RedactionMatch]) -> str:
-        """Generate a human-readable report from a list of matches.
-
-        Args:
-            matches: Redaction matches to summarise.
-
-        Returns:
-            Multi-line string report suitable for console output.
-        """
-        if not matches:
-            return "Redaction scan complete: 0 findings."
-
-        lines: list[str] = [
-            f"Redaction scan complete: {len(matches)} finding(s).",
-            "",
-        ]
-
-        by_type: dict[str, int] = {}
-        by_file: dict[str, list[RedactionMatch]] = {}
-
-        for match in matches:
-            by_type[match.match_type] = by_type.get(match.match_type, 0) + 1
-            file_key = str(match.file_path)
-            by_file.setdefault(file_key, []).append(match)
-
-        lines.append("By type:")
-        for match_type, count in sorted(by_type.items()):
-            lines.append(f"  {match_type}: {count}")
-
-        lines.extend(("", "By file:"))
-        for file_key, file_matches in sorted(by_file.items()):
-            lines.append(f"  {file_key}:")
-            for fm in file_matches:
-                lines.append(f"    line {fm.line_number}: {fm.match_type}")
-
-        return "\n".join(lines)
 
     @staticmethod
     def extract_context(
@@ -461,60 +503,14 @@ class RedactionScanner:
         end = min(len(all_lines), line_number + window)
         return all_lines[start:end]
 
-    def generate_json_report(
-        self,
-        summary: ScanSummary,
-        output_path: Path,
-    ) -> None:
-        """Write a structured JSON report to *output_path*.
-
-        The report contains scan statistics and match details grouped
-        by file and sorted by severity.
-
-        Args:
-            summary: The scan summary to serialise.
-            output_path: Destination file path for the JSON report.
-        """
-        by_file: dict[str, list[dict[str, object]]] = defaultdict(list)
-
-        for match in summary.matches:
-            severity = _get_severity(match.match_type)
-            by_file[str(match.file_path)].append(
-                {
-                    "line_number": match.line_number,
-                    "match_type": match.match_type,
-                    "severity": severity,
-                    "salted_hash": match.salted_hash,
-                }
-            )
-
-        # Sort each file's matches by severity rank.
-        for file_matches in by_file.values():
-            file_matches.sort(key=lambda m: _severity_rank(str(m["severity"])))
-
-        report: dict[str, object] = {
-            "scan_statistics": {
-                "files_scanned": summary.files_scanned,
-                "files_skipped_binary": summary.files_skipped_binary,
-                "files_skipped_extension": summary.files_skipped_extension,
-                "total_findings": len(summary.matches),
-                "by_severity": _count_by_severity(summary.matches),
-                "by_type": _count_by_type(summary.matches),
-            },
-            "findings_by_file": dict(by_file),  # noqa: FURB123  # converts defaultdict to plain dict for JSON-serialised output.
-        }
-
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            json.dumps(report, indent=2, default=str) + "\n",
-            encoding="utf-8",
-        )
-
     def generate_markdown_summary(self, summary: ScanSummary) -> str:
         """Generate a human-readable markdown summary of scan results.
 
         Results are grouped by file and sorted by severity within
         each file section.
+
+        The findings-free arm is delegated to :func:`_no_findings_markdown`,
+        which distinguishes "nothing to report" from "nothing was read".
 
         Args:
             summary: The scan summary to format.
@@ -523,17 +519,14 @@ class RedactionScanner:
             Markdown-formatted string.
         """
         if not summary.matches:
-            return "# Redaction Scan Summary\n\nNo findings.\n"
+            return _no_findings_markdown(summary)
 
         lines: list[str] = [
             "# Redaction Scan Summary",
             "",
             "## Statistics",
             "",
-            f"- **Files scanned**: {summary.files_scanned}",
-            f"- **Files skipped (binary)**: {summary.files_skipped_binary}",
-            f"- **Files skipped (extension)**: {summary.files_skipped_extension}",
-            f"- **Total findings**: {len(summary.matches)}",
+            *_statistics_lines(summary),
             "",
         ]
 
@@ -562,7 +555,7 @@ class RedactionScanner:
                 (
                     f"### `{file_key}`",
                     "",
-                    "| Line | Type | Severity |",
+                    FINDINGS_TABLE_HEADER,
                     "|------|------|----------|",
                 )
             )
@@ -644,6 +637,202 @@ class RedactionScanner:
         return "\n".join(lines)
 
 
+def _no_findings_markdown(summary: ScanSummary) -> str:
+    """Render the markdown for a scan that produced no matches.
+
+    Two different documents, because "we read everything and found nothing"
+    and "we found nothing in what we agreed to read" are two different
+    facts, and only the first one licenses the reader's conclusion that the
+    tree is clean. A scan that declined a file therefore gets the full
+    statistics block — which names the skip — plus
+    :data:`_UNREAD_FILES_CAVEAT` in place of a bare "No findings.".
+
+    A scan that declined nothing renders :data:`_EMPTY_SUMMARY_MARKDOWN`
+    byte-for-byte, so the new wording is not paid for out of the pocket of
+    every existing consumer of a clean scan.
+
+    Args:
+        summary: A scan summary whose ``matches`` list is empty.
+
+    Returns:
+        Markdown-formatted string.
+    """
+    if not summary.files_skipped_symlink:
+        return _EMPTY_SUMMARY_MARKDOWN
+
+    return "\n".join(
+        (
+            "# Redaction Scan Summary",
+            "",
+            "## Statistics",
+            "",
+            *_statistics_lines(summary),
+            "",
+            _UNREAD_FILES_CAVEAT,
+            "",
+        )
+    )
+
+
+def _statistics_lines(summary: ScanSummary) -> list[str]:
+    """Render the bullet list of the Statistics block.
+
+    The escaping-symlink row is emitted only when the counter is non-zero.
+    A permanent "escaping symlink: 0" line in front of every operator whose
+    tree has never held one is the fastest way to teach a reader to skip
+    that part of the report.
+
+    Args:
+        summary: The scan summary to describe.
+
+    Returns:
+        One markdown bullet per reported counter, in display order.
+    """
+    lines = [
+        f"- **Files scanned**: {summary.files_scanned}",
+        f"- **Files skipped (binary)**: {summary.files_skipped_binary}",
+        f"- **Files skipped (extension)**: {summary.files_skipped_extension}",
+    ]
+    if summary.files_skipped_symlink:
+        lines.append(f"- **{SYMLINK_SKIP_LABEL}**: {summary.files_skipped_symlink}")
+    lines.append(f"- **Total findings**: {len(summary.matches)}")
+    return lines
+
+
+# ``resolves_within`` is re-exported, not defined here. It began as this
+# module's private ``_resolves_within``, was made public by #1293 when the
+# redaction CLI needed the same predicate for a directly-named path, and
+# moved to :mod:`creek._containment` in #1294 when the ingestor discovery
+# gate became its third consumer. Three copies of a containment predicate
+# are three predicates that drift; one definition cannot. The name stays
+# bound here because :mod:`creek.redact.cli_commands` imports it from this
+# module and ``_scannable_candidates`` below calls it.
+#
+# The dependency direction is deliberate: ``creek._containment`` is
+# stdlib-only and must not import this module back, because
+# :mod:`creek.ingest.base` depends on it and compiling this module's regex
+# battery on every ingest would be the cost of that cycle.
+
+
+def _scannable_candidates(dir_path: Path) -> tuple[list[Path], int]:
+    """Return the files under *dir_path* the scanner may read, plus escapes.
+
+    The only place :mod:`creek.redact.scanner` enumerates the filesystem, so
+    the containment policy cannot be applied to some children and not others.
+    That "one walk, one gate" property is itself pinned, by
+    ``test_scan_batch_is_the_only_filesystem_walk_in_the_scanner_module``.
+
+    The admission policy is the one the shipped SEC-003 *write* guard already
+    uses — :func:`creek.redact.cli_commands._assert_no_escaping_symlinks` —
+    rather than a second, subtly different predicate: resolve the root
+    once, and for a child that is *itself* a symlink require its resolved
+    target to be a descendant of that root. Non-symlink children are never
+    resolved, which is what keeps a root reached *through* a symlinked
+    component scannable (``/tmp`` → ``/private/tmp`` on macOS); resolving
+    them too would flag every child of such a root as escaping. Resolving
+    the root and ``lstat``-checking only the leaf is what makes a per-leaf
+    check sound: ``Path.rglob`` surfaces a symlinked *directory* as an entry
+    but does not descend into it, and ``is_file()`` then drops it, so the
+    residual is bounded to symlinked files.
+
+    Skips are logged naming only the as-scanned path. The resolved target is
+    never named: disclosing it is the very oracle #1087 closes.
+
+    Enumerates with ``os.walk(..., onerror=...)`` rather than ``rglob`` since
+    #1498. ``rglob`` swallows a failed ``scandir``, so a directory the scanner
+    could not list was indistinguishable from an empty one: the subtree was
+    not scanned, not counted in ``escaped``, and not reported, and the
+    operator read a clean result over a region that was never opened. The
+    ruling for this surface is REPORT, not refuse — ``--scan`` writes nothing
+    and :meth:`creek.pipeline.Pipeline._run_redaction` reaches it on the
+    unattended ``creek process`` / ``creek sync`` path, so a refusal here would
+    disable the operator's whole safety scan over one chmod-000 directory.
+    The count is deliberately NOT folded into ``escaped``: an unreadable
+    directory is not an escaping symlink, and conflating them would make the
+    one statistic the pipeline refusal is built on mean two things.
+
+    The ``os.walk`` swap is bound to be parity-preserving with the ``rglob``
+    it replaces, which is why it iterates ``filenames`` and re-applies
+    ``is_file()``: ``os.walk`` classifies a symlink-to-directory into
+    ``dirnames`` (and, with ``followlinks=False``, does not descend), exactly
+    as ``rglob`` yielded it and ``is_file()`` dropped it, while a *broken*
+    symlink lands in ``filenames`` and is dropped by ``is_file()`` before the
+    containment test — as it was before. The same idiom is proven in
+    :func:`creek.ingest.markdown._enumerate_markdown_paths`.
+
+    Known gaps, deliberately out of scope here:
+
+    * Escaping ANCESTOR components. The directly-named path is now tested
+      for containment by :mod:`creek.redact.cli_commands` before any mode
+      reads through it (#1293), but a path reached *through* a link one
+      level up — ``<root>/linkdir/a.md``, where ``linkdir`` is the escaping
+      link — is still admitted here. That is not an oversight: it is the
+      resolve-the-root / ``lstat``-the-leaf policy documented above, applied
+      consistently on both surfaces.
+    Closed since this docstring was written: #1294 — the ingestor walks no
+    longer follow symlinks out of the source root.
+    :func:`creek._containment.assert_source_contained` gates
+    ``Ingestor.ingest`` for every registered ingestor, so the pipeline
+    refusal built on this counter is now a second line of defence rather
+    than the only one.
+
+    Args:
+        dir_path: The scan root, exactly as the caller supplied it.
+
+    Returns:
+        ``(candidates, escaped)`` — the admitted files, sorted, and the
+        number of symlinked children declined for resolving outside the root.
+    """
+    resolved_root = dir_path.resolve(strict=False)
+    candidates: list[Path] = []
+    escaped = 0
+
+    def _record(error: OSError) -> None:
+        """Report a directory ``scandir`` refused instead of discarding it.
+
+        Args:
+            error: The ``OSError`` ``os.walk`` would otherwise swallow. Only
+                its ``filename`` — the directory, as walked — is logged.
+        """
+        logger.warning(
+            "Skipping a subtree the scan could not list: %s. Nothing beneath "
+            "it was scanned; restore read+execute permission to cover it.",
+            error.filename,
+        )
+
+    for dirpath, _dirnames, filenames in os.walk(
+        dir_path,
+        onerror=_record,
+        followlinks=False,
+    ):
+        for name in filenames:
+            child = Path(dirpath) / name
+            if not child.is_file():
+                continue
+            if escaping_child(child, resolved_root):
+                logger.warning("Skipping symlink that escapes the scan root: %s", child)
+                escaped += 1
+                continue
+            candidates.append(child)
+
+    return sorted(candidates), escaped
+
+
+def _entropy_from_counts(counts: dict[str, int], length: int) -> float:
+    """Return the Shannon entropy of a string given its character counts.
+
+    Args:
+        counts: Character frequencies of a non-empty string.
+        length: Total number of characters the counts were taken over.
+
+    Returns:
+        Entropy in bits per character.
+    """
+    return -sum(
+        (count / length) * math.log2(count / length) for count in counts.values()
+    )
+
+
 def shannon_entropy(text: str) -> float:
     """Return the Shannon entropy (bits/char) of *text*.
 
@@ -655,11 +844,102 @@ def shannon_entropy(text: str) -> float:
     """
     if not text:
         return 0.0
+    return _entropy_from_counts(Counter(text), len(text))
+
+
+def has_high_entropy_region(text: str, threshold: float) -> bool:
+    """Report whether *text* carries a dense enough region to be a secret.
+
+    The single decision point shared by ``--scan``
+    (:meth:`RedactionScanner._scan_high_entropy`) and ``--apply``
+    (:meth:`creek.redact.redactor.Redactor._collect_high_entropy_spans`),
+    so the two cannot drift apart.
+
+    A run qualifies when its *whole-run* Shannon entropy reaches
+    *threshold*, or when any contiguous window of exactly
+    :data:`~creek.redact.patterns.HIGH_ENTROPY_MIN_RUN` characters does.
+    The window gate exists because concatenation averages: gluing
+    predictable filler to a genuine secret drags the whole-run average
+    below the threshold and used to hide the secret from both call sites
+    (Issue #942). The window width equals the candidate regex's own
+    repetition floor, so the invariant restored is precisely "a run the
+    detector would flag standing alone stays flagged when concatenated to
+    a neighbour".
+
+    Args:
+        text: The candidate run to measure.
+        threshold: Entropy bar in bits/char, from
+            :func:`entropy_threshold`. A value landing exactly on the bar
+            counts as clearing it.
+
+    Returns:
+        ``True`` when the whole run or any window of it reaches
+        *threshold*; ``False`` for the empty string.
+    """
+    if not text:
+        return False
+
     counts = Counter(text)
-    length = len(text)
-    return -sum(
-        (count / length) * math.log2(count / length) for count in counts.values()
-    )
+    if _entropy_from_counts(counts, len(text)) >= threshold:
+        return True
+
+    # At or below the window width the only window is the whole run,
+    # which the check above already decided.
+    if len(text) <= HIGH_ENTROPY_MIN_RUN:
+        return False
+
+    # Entropy is bounded above by log2(distinct symbols), and a window can
+    # hold neither more symbols than the run has nor more than its own
+    # width. When even that ceiling falls short, no window can reach the
+    # bar. The comparison is strict: a perfectly uniform window *attains*
+    # the ceiling, so an exact tie must still be scanned. This is also why
+    # the gate is provably inert at ``min_confidence=1.0``, where the
+    # threshold (4.5) exceeds log2(HIGH_ENTROPY_MIN_RUN).
+    if math.log2(min(len(counts), HIGH_ENTROPY_MIN_RUN)) < threshold:
+        return False
+
+    return _window_entropy_clears(text, threshold)
+
+
+def _window_entropy_clears(text: str, threshold: float) -> bool:
+    """Slide a fixed-width window over *text*, testing entropy at each step.
+
+    Each step costs O(1) rather than O(window width): for a window of
+    fixed width ``L`` the entropy is exactly ``log2(L) - acc / L`` where
+    ``acc`` is ``sum(c * log2(c))`` over the window's character counts, so
+    only the outgoing and incoming characters' contributions need
+    adjusting. Re-measuring each window from scratch instead is roughly
+    48x slower on a token-dense body.
+
+    Args:
+        text: A run strictly longer than
+            :data:`~creek.redact.patterns.HIGH_ENTROPY_MIN_RUN`.
+        threshold: Entropy bar in bits/char; an exact tie clears it.
+
+    Returns:
+        ``True`` when any window reaches *threshold*.
+    """
+    width = HIGH_ENTROPY_MIN_RUN
+    counts: Counter[str] = Counter(text[:width])
+    acc = sum(_COUNT_LOG_TABLE[count] for count in counts.values())
+    if _LOG2_MIN_RUN - acc / width >= threshold:
+        return True
+
+    for index in range(width, len(text)):
+        outgoing = text[index - width]
+        leaving = counts[outgoing]
+        acc += _COUNT_LOG_TABLE[leaving - 1] - _COUNT_LOG_TABLE[leaving]
+        counts[outgoing] = leaving - 1
+
+        incoming = text[index]
+        arriving = counts[incoming]
+        acc += _COUNT_LOG_TABLE[arriving + 1] - _COUNT_LOG_TABLE[arriving]
+        counts[incoming] = arriving + 1
+
+        if _LOG2_MIN_RUN - acc / width >= threshold:
+            return True
+
+    return False
 
 
 def entropy_threshold(min_confidence: float) -> float:
@@ -778,19 +1058,4 @@ def _count_by_severity(matches: list[RedactionMatch]) -> dict[str, int]:
     for match in matches:
         sev = _get_severity(match.match_type)
         counts[sev] = counts.get(sev, 0) + 1
-    return counts
-
-
-def _count_by_type(matches: list[RedactionMatch]) -> dict[str, int]:
-    """Count matches grouped by pattern type.
-
-    Args:
-        matches: List of redaction matches.
-
-    Returns:
-        Dictionary mapping match type to count.
-    """
-    counts: dict[str, int] = {}
-    for match in matches:
-        counts[match.match_type] = counts.get(match.match_type, 0) + 1
     return counts

@@ -4,7 +4,7 @@ description: >-
   Write clear, comprehensive documentation with language-specific patterns.
   Use when writing docstrings, module docs, README files, API references,
   or architecture decision records. Covers Python, TypeScript, Go, and Rust
-  documentation conventions. Do NOT use for code style (use vibe skill).
+  documentation conventions.
 metadata:
   author: Geoff
   version: 1.0.0

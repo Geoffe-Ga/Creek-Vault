@@ -12,6 +12,17 @@ name: Claude Scan (reusable)
 # the GITHUB_TOKEN is `contents: read` / `issues: write`, so the only durable
 # output is new issues. Code changes remain the Ralph loop's job.
 #
+# BACKLOG CEILING (issue #1516). Every run starts with a `gate` job that runs
+# `scripts/ralph/backlog-gate.sh` and measures how deep the `agent-ready` queue
+# already is. Above the shared ceiling the `scan` job is skipped, because past
+# the cap new issues go stale before anyone can work them — filing more is
+# landfill, not throughput. Before this, the ONLY depth check in the repo lived
+# inside `hopper.yml`, i.e. on the one path that fires when the queue is
+# *starving*; the eleven scheduled producers that route through this core had
+# none, and the backlog reached 158 against a "max 80" guard. The ceiling
+# itself is stated once, in that script, so this core and hopper cannot drift
+# apart. `backlog_ceiling` raises it for a single deliberate catch-up run.
+#
 # Required configuration:
 #   secret  CLAUDE_CODE_OAUTH_TOKEN  - same token the other Claude workflows use.
 
@@ -31,6 +42,21 @@ on:
         description: "Priority label applied to filed issues: P0 | P1 | P2 | P3."
         required: true
         type: string
+      backlog_ceiling:
+        description: "Override the shared agent-ready backlog ceiling for this run. Blank = the default in scripts/ralph/backlog-gate.sh."
+        required: false
+        type: string
+        default: ""
+      enforce_backlog_ceiling:
+        description: "Whether a full backlog suppresses this scan. Default true. Only scan-security.yml sets false — see its header for the operator decision."
+        required: false
+        type: boolean
+        # Gating is the DEFAULT and exemption is opt-in. Inverting this
+        # would silently un-throttle the ten wrappers that never mention
+        # it, and no allowlist test would notice, because nobody would
+        # have declared anything. tests/test_backlog_ceiling_gate.py pins
+        # this value for exactly that reason.
+        default: true
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN:
         required: true
@@ -48,10 +74,72 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Measure first, produce second. This job is cheap (one checkout, one `gh`
+  # query) and short, so the throttle costs a minute rather than a scan.
+  gate:
+    name: "Backlog ceiling"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Narrower than the workflow-level grant below: this job only reads a file
+    # and counts issues, so it gets no `issues: write` and no `id-token`. Note
+    # `issues: read` is required, not optional — dropping to `contents: read`
+    # alone makes the `gh issue list` inside backlog-gate.sh 403, which would
+    # exit 1 and redden every scheduled scan.
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      proceed: ${{ steps.backlog_gate.outputs.proceed }}
+    steps:
+      - name: Checkout repository (the gate script only)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 1
+
+      - name: Measure the agent-ready backlog against the shared ceiling
+        id: backlog_gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # The override crosses from a workflow_dispatch input into a shell,
+          # so it arrives as DATA in the environment and is never interpolated
+          # into the `run:` body — a `${{ … }}` there is substituted into the
+          # shell SOURCE before bash ever sees it, which is the injection class
+          # the `scan_name` charset guard below exists for. The script
+          # allowlists it before use.
+          BACKLOG_CEILING: ${{ inputs.backlog_ceiling }}
+        run: scripts/ralph/backlog-gate.sh
+
+      # The measurement above runs for exempt scans too — knowing the depth
+      # is useful even when it does not gate — but a summary that says
+      # "standing down" beside a scan that then runs anyway is a lie the
+      # next reader has to debug. So say plainly which of the two it was.
+      - name: Note that this scan is exempt from enforcement
+        if: inputs.enforce_backlog_ceiling == false
+        run: |
+          set -euo pipefail
+          printf '%s\n' "This scan is EXEMPT from backlog-ceiling enforcement (see its wrapper for the operator decision); the measurement above is informational and does not suppress it." \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
   scan:
     name: "Scan ${{ inputs.scan_name }}"
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    needs: gate
+    # JOB-level, deliberately, not a per-step `if:`. A step-level guard has to
+    # be remembered by whoever adds the fourth step; a job-level one makes an
+    # ungated step structurally impossible. A skipped job also leaves the run's
+    # overall conclusion `success`, so a nightly stand-down is green — a
+    # workflow that goes red every night is a workflow everyone learns to
+    # ignore.
+    #
+    # Two clauses, and the ORDER of the reading matters: a caller may switch
+    # enforcement off (only scan-security.yml does — operator decision at a
+    # measured 163 agent-ready against a ceiling of 90, where gating would have
+    # suppressed CVE and injection findings until the backlog fell by 73), but
+    # it cannot switch off the MEASUREMENT: the gate job still runs, still
+    # reports the depth, and the exempt scan still honours its own max_issues
+    # cap. Exempt from the throttle is not exempt from the pipeline.
+    if: inputs.enforce_backlog_ceiling == false || needs.gate.outputs.proceed == 'true'
     steps:
       - name: Checkout repository (recent history for churn/bug analysis)
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -77,7 +165,7 @@ jobs:
           fi
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
 
@@ -105,7 +193,7 @@ jobs:
           done
 
       - name: Run Claude scan
-        uses: anthropics/claude-code-action@6c0083bb7289c31716797a039b6367b3079cc46e  # v1.0.162
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b  # v1.0.183
         env:
           # The scan-issue-writer skill files issues via gh; the action injects
           # GITHUB_TOKEN, but gh reads GH_TOKEN — bind it to the job token whose

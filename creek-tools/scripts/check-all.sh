@@ -34,10 +34,11 @@ Runs:
    6. Complexity analysis (Radon)
    7. Refurb (modernisation; STYLE-001)
    8. Tryceratops (exception hygiene; STYLE-001)
-   9. Docstring coverage (interrogate; GAP-007 parity)
-  10. Unit tests
-  11. Coverage report
-  12. Per-file coverage gate
+   9. Dead code (vulture, per-type floors; issue #1395)
+  10. Docstring coverage (interrogate; GAP-007 parity)
+  11. Unit tests
+  12. Coverage report
+  13. Per-file coverage gate
 
 This list matches the CI workflow gates (.github/workflows/ci.yml).
 ``scripts/state-budget.sh`` is intentionally NOT in this list — it
@@ -113,6 +114,7 @@ run_check "Security checks" "security.sh"
 run_check "Complexity analysis" "complexity.sh"
 run_check "Refurb (modernisation)" "lint-refurb.sh"
 run_check "Tryceratops (exceptions)" "lint-tryceratops.sh"
+run_check "Dead code (vulture)" "lint-vulture.sh"
 run_check "Docstring coverage (interrogate)" "lint-interrogate.sh"
 run_check "Unit tests" "test.sh" --unit
 run_check "Coverage report" "coverage.sh" --json

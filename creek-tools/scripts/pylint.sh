@@ -14,6 +14,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 FAIL_UNDER="${PYLINT_FAIL_UNDER:-9.0}"
+
+# Pylint's --py-version defaults to the interpreter running it, so the
+# version-dependent checks used to mean whichever matrix leg happened to
+# execute. Pinning the project's SUPPORTED FLOOR makes the result the same
+# everywhere and targets the oldest interpreter we ship on — which is the
+# strict reading, and the one that matches ruff's `target-version = "py311"`
+# in pyproject.toml. Raise this only when requires-python does (issue #1141).
+PY_VERSION_FLOOR="${PYLINT_PY_VERSION:-3.11}"
+
+# Pylint's own process parallelism. 0 = one worker per core. Measured
+# identical message sets at -j 0/2/4 and serial on this tree (issue #1141),
+# so this buys wall time without changing the verdict.
+JOBS="${PYLINT_JOBS:-0}"
+
 JSON_OUTPUT=""
 VERBOSE=false
 
@@ -61,22 +75,36 @@ if ! command -v pylint >/dev/null 2>&1; then
     exit 2
 fi
 
-echo "=== Pylint (--fail-under=$FAIL_UNDER) ==="
+echo "=== Pylint (--fail-under=$FAIL_UNDER, --py-version=$PY_VERSION_FLOOR) ==="
 
-# Gating run. Run via `python -m pylint` so the same interpreter that
-# has the project deps installed runs the linter — same hygiene
-# applied to typecheck.sh and test.sh.
-python -m pylint creek/ --output-format=colorized --fail-under="$FAIL_UNDER"
-
-# Optional JSON snapshot (informational artifact only). The gating
-# decision was already made by the previous command; if pylint exits
-# non-zero here it's a JSON-formatter-only failure and is reported
-# via stderr but not propagated.
+# ONE analysis pass, always. Until issue #1141 this script ran the whole
+# codebase through pylint TWICE whenever `--json` was passed — once to
+# gate, once more to write an informational snapshot nobody gates on —
+# and CI passes `--json`. That second pass was 167 of the step's 334 CI
+# seconds, on the critical path, on all three matrix legs. Pylint emits
+# several formats from a single run (`json:PATH,colorized`), so the
+# artifact costs nothing extra and the gate is unchanged.
+#
+# Anti-regression: `tests/test_scanner_coverage.py` asserts there is
+# exactly ONE `python -m pylint` invocation here. Adding a second
+# "just for the artifact" is the defect this comment exists to prevent.
+OUTPUT_FORMAT="colorized"
 if [[ -n "$JSON_OUTPUT" ]]; then
     mkdir -p "$(dirname "$JSON_OUTPUT")"
-    if ! python -m pylint creek/ --output-format=json > "$JSON_OUTPUT" 2>/dev/null; then
-        echo "  ⚠ pylint JSON snapshot failed; see $JSON_OUTPUT" >&2
-    fi
+    OUTPUT_FORMAT="json:${JSON_OUTPUT},colorized"
 fi
+
+# Run via `python -m pylint` so the same interpreter that has the project
+# deps installed runs the linter — same hygiene applied to typecheck.sh
+# and test.sh.
+#
+# Targets both first-party packages: creek/ (pipeline + CLI) and
+# creek_mcp/ (MCP server, auth, token policy, path confinement), which
+# was outside the target list until issue #925.
+#
+# Kept on ONE physical line: the gate-contract tests read this file
+# line-by-line, so splitting the targets away from --fail-under would
+# make those assertions pass vacuously.
+python -m pylint creek/ creek_mcp/ -j "$JOBS" --py-version="$PY_VERSION_FLOOR" --output-format="$OUTPUT_FORMAT" --fail-under="$FAIL_UNDER"
 
 echo "✓ Pylint score >= $FAIL_UNDER"

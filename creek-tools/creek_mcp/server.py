@@ -4,7 +4,10 @@ Stdio transport per the FEAT-010 pre-decided choice. Five read tools
 landed in FEAT-010; FEAT-011 adds seven write tools — ``creek.save``,
 ``creek.ingest``, ``creek.classify``, ``creek.link``, ``creek.report``,
 ``creek.skills.refresh``, and ``creek.compile``. All share the same
-audit-log + tier-ceiling substrate.
+audit-log + tier-ceiling substrate. ``creek.upload`` (#1023) is the
+Adepthood byte-staging surface: it takes one document's base64 bytes and
+ingests them through the same ledger-backed pipeline ``creek.journal``
+uses for text.
 
 The bootstrap is a single function so it can be exercised by unit
 tests (``build_server``) and serve as the ``creek-tools-mcp`` entry
@@ -14,20 +17,27 @@ point (``main``).
 from __future__ import annotations
 
 import argparse
-import ipaddress
 import os
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
 
 from creek.care.guardrail import acute_distress_guard
-from creek.config import CONFIG_PATH_ENV_VAR, load_config
+from creek.config import CONFIG_PATH_ENV_VAR, load_config, load_vault_config
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
+from creek_mcp.policy import (
+    Admission,
+    CallerIdentity,
+    admitted_ceiling,
+    effective_consumer,
+)
 from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
     ConsumerTokenVerifier,
+    announce_rotation_window,
     load_consumer_tokens,
     remote_auth_settings,
 )
@@ -55,27 +65,39 @@ from creek_mcp.tools import (
     skills_refresh_tool,
     state_read_tool,
     state_render_tool,
+    upload_tool,
     wheel_tool,
 )
 from creek_mcp.tools.draft import draft_tool
+from creek_mcp.transport_posture import is_loopback, require_transport_confidentiality
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    import uvicorn
     from mcp.server.auth.provider import AccessToken, TokenVerifier
     from mcp.types import ContentBlock
+    from starlette.types import ASGIApp
 
+    from creek.author.client import AuthorLLMClient
+    from creek.compile.engine import CompileLLM
     from creek.models import PrivacyTier
+    from creek_mcp.tools.author import AuthorLLMFactory
+    from creek_mcp.tools.compile import CompileLLMFactory
+    from creek_mcp.tools.draft import DraftLLMFactory
     from creek_mcp.tools.reflect import _LLM, _LLMFactory
 
 SERVER_NAME = "creek-tools-mcp"
 
-# Tier ceilings a REMOTE (network-authed) consumer may request. INTIMATE and ALL
-# are excluded so intimate content can never be reached over the network — the
-# load-bearing boundary of #759. Local (stdio) callers are unaffected.
-_REMOTE_ADMITTED_CEILINGS: frozenset[TierCeiling] = frozenset(
-    {TierCeiling.OPEN, TierCeiling.PERSONAL}
-)
+DEFAULT_MCP_NETWORK_PORT: Final[int] = 8000
+"""Default ``--port`` for the MCP network transport.
+
+Named rather than left as a bare literal so the ``/v1`` HTTP adapter can assert
+it picked a *different* one (#1074). The two adapters are meant to run side by
+side on one host, so a shared default would make the second one to start fail
+with ``address already in use`` — a collision that is trivial to prevent and
+annoying to diagnose. The value itself is unchanged.
+"""
 
 
 def _current_access_token() -> AccessToken | None:
@@ -83,9 +105,35 @@ def _current_access_token() -> AccessToken | None:
 
     A thin, monkeypatchable wrapper over the SDK's request-scoped
     ``get_access_token`` — non-``None`` exactly when the call arrived over the
-    authenticated network transport.
+    authenticated network transport. This is the single SDK seam on the
+    identity path: everything below reaches the request context through here
+    and nowhere else, which is what lets the tests drive both sides of the
+    boundary without standing up a transport.
     """
     return get_access_token()
+
+
+def _caller_identity() -> CallerIdentity:
+    """Answer :mod:`creek_mcp.policy`'s two questions with MCP's facts.
+
+    The MCP half of the #1073 split: policy decides, this states which side of
+    the network the call arrived from and whose credential it carried. An
+    authenticated network request has an access token whose ``client_id`` is
+    the consumer; a local stdio call has neither.
+
+    **Call this per call. Never hoist it.** ``get_access_token()`` is
+    request-scoped, while the ``consumer`` that :func:`build_server` resolves
+    from the environment is bound once at build time. Building the identity
+    beside it would pin every later call to whichever caller happened to be in
+    flight first — forging audit attribution, and, from a stdio-built identity,
+    uncapping every remote call thereafter. That is the highest-consequence
+    failure mode of this arrangement, and ``tests/test_mcp_remote.py`` pins it
+    by driving two bearers through one built server.
+    """
+    token = _current_access_token()
+    if token is None:
+        return CallerIdentity(consumer=None, is_remote=False)
+    return CallerIdentity(consumer=token.client_id, is_remote=True)
 
 
 def _effective_consumer(default: str) -> str:
@@ -93,20 +141,31 @@ def _effective_consumer(default: str) -> str:
 
     So a network call is audited under the consumer its bearer token identifies,
     while a local stdio call keeps the process-global ``CREEK_MCP_CONSUMER``.
+    The rule itself is :func:`creek_mcp.policy.effective_consumer`; all this
+    adds is MCP's answer to "who is calling", rebuilt for the request in flight.
+    Kept module-level under this exact name because the 24 tool closures below
+    call it on every request.
     """
-    token = _current_access_token()
-    return token.client_id if token is not None else default
+    return effective_consumer(_caller_identity(), default)
 
 
 class _BoundedFastMCP(FastMCP):
-    """``FastMCP`` that enforces the remote tier-ceiling cap at the one call chokepoint.
+    """The MCP adapter for :mod:`creek_mcp.policy`'s remote tier-ceiling cap.
 
-    Every tool call flows through :meth:`call_tool`. When the call is remote (an
-    authenticated network request — ``_current_access_token()`` is set), a
-    requested ceiling above the remote cap (i.e. ``INTIMATE`` or ``ALL``, or any
-    unrecognised value) is refused **before dispatch**, so intimate content is
-    never even read for a remote caller. Local stdio calls (no token) pass
-    through unchanged — the default per-tool ``OPEN`` ceiling still applies.
+    Every tool call flows through :meth:`call_tool`, the one MCP-side chokepoint
+    at which the requested ceiling is still a raw argument. The cap is not
+    decided here: since #1073 it is adapter-independent policy in
+    :func:`creek_mcp.policy.admitted_ceiling`, so the ``/v1`` HTTP surface
+    reaches the same verdict without an MCP request context to key off. What
+    this class owns is the two things only MCP can answer — *who is the caller*
+    and *is this remote*, via :func:`_caller_identity` — plus what a refusal
+    looks like on this transport: the
+    :func:`creek_mcp.tier_ceiling.refusal_response` payload, where ``/v1``
+    deliberately answers ``422 invalid_request`` instead.
+
+    A refused remote call is refused **before dispatch**, so intimate content is
+    never even read for it. Local stdio calls pass through unchanged — the
+    default per-tool ``OPEN`` ceiling still applies.
     """
 
     async def call_tool(
@@ -114,35 +173,50 @@ class _BoundedFastMCP(FastMCP):
     ) -> Sequence[ContentBlock] | dict[str, Any]:
         """Refuse over-ceiling remote calls, else dispatch normally.
 
+        The missing-key default is *adapter* vocabulary rather than policy's: a
+        tool that declares no ``privacy_tier_ceiling`` is read here as having
+        asked for ``OPEN``, exactly as ``/v1`` reads an absent
+        ``X-Creek-Tier-Ceiling`` header. Handing the absent key to policy as
+        ``None`` would also be safe — it fails closed — but it would refuse the
+        purge tools below rather than admitting them.
+
         Note: this ceiling gate is a **no-op for the ``creek.purge.*`` tools** —
         they declare no ``privacy_tier_ceiling`` parameter, so ``arguments.get``
         below always falls back to ``OPEN`` (admitted) for them. That is
         intentional: purge is not tier-scoped and is instead gated, fail-closed,
         by ``CREEK_MCP_ELEVATED_TOKEN`` (see ``creek_mcp.auth.is_elevated`` and the
         purge tools), which a per-consumer bearer alone does not satisfy. Do not
-        rely on this gate for purge protection.
+        rely on this gate — or on :mod:`creek_mcp.policy` — for purge protection.
         """
-        if _current_access_token() is not None:
-            raw = arguments.get("privacy_tier_ceiling", TierCeiling.OPEN.value)
-            try:
-                requested = TierCeiling(raw)
-            except ValueError:
-                requested = None
-            if requested not in _REMOTE_ADMITTED_CEILINGS:
-                return refusal_response(
-                    tool=name,
-                    ceiling=TierCeiling.OPEN,
-                    reason=(
-                        "remote consumers may not request a ceiling above "
-                        f"'{TierCeiling.PERSONAL.value}'; intimate content is not "
-                        "reachable over the network"
-                    ),
-                )
-        return await super().call_tool(name, arguments)
+        raw = arguments.get("privacy_tier_ceiling", TierCeiling.OPEN.value)
+        verdict = admitted_ceiling(_caller_identity(), raw)
+        # Dispatch on the POSITIVE verdict, never on "not a refusal". If policy
+        # ever grows a third verdict, this falls to the refusal branch instead
+        # of silently uncapping the call — and because the branch below then
+        # narrows to a type that has no ``reason``, mypy fails the build rather
+        # than leaving the regression to be noticed at runtime.
+        if isinstance(verdict, Admission):
+            return await super().call_tool(name, arguments)
+        # ``ceiling=OPEN`` rather than the requested one: the refusal echoes
+        # the transport's own default, never the value that was refused.
+        return refusal_response(
+            tool=name,
+            ceiling=TierCeiling.OPEN,
+            reason=verdict.reason,
+        )
 
 
 def _resolve_vault(vault_path: Path | None) -> Path:
-    """Return the supplied path or fall back to ``load_config().vault_path``."""
+    """Return the supplied path or fall back to ``load_config().vault_path``.
+
+    The bare :func:`~creek.config.load_config` here is deliberate and is one of
+    the two sites #1409 left alone. This function is the bootstrap that
+    *answers* "which vault?"; it runs before any vault is known, so resolving
+    it through :func:`~creek.config.load_vault_config` would be circular. Every
+    consumer downstream of it has a vault and must use the shared resolver
+    instead — ``tests/test_vault_config_resolver.py`` enforces exactly that
+    split, and lists this function by name as an allowed exception.
+    """
     if vault_path is not None:
         return vault_path
     return load_config().vault_path
@@ -153,41 +227,104 @@ def _consumer_from_env() -> str:
     return os.environ.get("CREEK_MCP_CONSUMER", "unknown")
 
 
-def _build_draft_llm() -> Callable[[str], str]:
-    """Return the production LLM callable, mirroring ``creek draft``.
+def _build_draft_llm(vault: Path, tier: PrivacyTier) -> Callable[[str], str]:
+    """Return the draft-side LLM callable, routed for *tier* (#958).
 
-    Imported lazily so an absent LLM provider only fails the ``draft``
-    invocation, not the whole server startup. ``state``/``lint``/``mine``
-    must remain callable on hosts without an Anthropic key or running
-    Ollama.
+    Mirrors :func:`_build_compile_llm`: the ``generation`` stage is resolved
+    through the config's :class:`~creek.classify.llm.router.ModelRouter`, so
+    an INTIMATE draft is forced onto the local ``default`` model — or the
+    router raises ``IntimateRoutingError`` rather than egressing the source
+    ids and titles the draft prompt carries. Nothing here re-checks the tier
+    or picks a provider: ``draft_tool`` derives the routing tier from the
+    seed's source fragments and this hands it to the one chokepoint that owns
+    the decision.
+
+    Lazy imports keep the server bootable with no provider configured — only
+    a ``creek.draft`` call then fails, and it fails as a structured refusal.
+    ``state``/``lint``/``mine`` stay callable on hosts with neither an
+    Anthropic key nor a running Ollama.
+
+    Args:
+        vault: The served vault, whose own ``creek_config.yaml`` owns the
+            routing. Bound by ``build_server`` at construction time (#1409):
+            reading it from the process cwd instead let the operator's
+            per-vault routing — including which provider a stage egresses to —
+            be decided by wherever the server happened to be started.
+        tier: The routing tier ``draft_tool`` computed from the caller's
+            ceiling and the seed's source fragments' own classifications.
+
+    Returns:
+        A prompt → completion-text callable bound to the resolved provider.
+
+    Raises:
+        RuntimeError: When the resolved provider is unavailable, or — as
+            :class:`~creek.classify.llm.router.IntimateRoutingError`, a
+            subclass — when intimate content has no local backend to fall
+            back to. ``draft_tool`` turns either into a refusal.
     """
-    from creek.classify.llm import LLMClassifier
+    from creek.classify.llm.providers import build_provider
 
-    config = load_config()
-    classifier = LLMClassifier(config.llm)
-    if not classifier.available:
+    cfg = load_vault_config(vault).model_router.resolve("generation", tier)
+    provider = build_provider(cfg)
+    if not provider.available:
         msg = (
-            "LLM provider unavailable; cannot generate draft. "
+            "LLM provider unavailable for draft. "
             "Check Ollama or ANTHROPIC_API_KEY configuration."
         )
         raise RuntimeError(msg)
-    return classifier.invoke_prompt
+    return lambda prompt: provider.complete(prompt).text
 
 
-def _build_compile_llm() -> Callable[[str], str]:
-    """Return the compile-side LLM callable, mirroring ``creek compile``.
+def _build_compile_llm(vault: Path, tier: PrivacyTier) -> CompileLLM:
+    """Return the compile-side LLM callable, routed for *tier* (#928/#929).
 
-    Lazy import so the server still boots when the LLM provider is not
-    configured; only ``creek.compile`` then fails. Calls into the CLI's
-    private factory rather than re-deriving the configuration so the
-    behaviour stays in lock-step with ``creek compile``.
+    Mirrors :func:`_build_reflect_llm_factory`'s inner factory: the
+    ``generation`` stage is resolved through the config's
+    :class:`~creek.classify.llm.router.ModelRouter`, so an INTIMATE compile is
+    forced onto the local ``default`` model — or the router raises
+    ``IntimateRoutingError`` rather than egressing the source titles the
+    compile prompt carries. Nothing here re-checks the tier or picks a
+    provider: the tier arrives already reconciled and this hands it to the one
+    chokepoint that owns the decision.
+
+    Lazy imports keep the server bootable with no provider configured — only a
+    ``creek.compile`` call then fails, and it fails as a structured refusal.
+
+    Args:
+        vault: The served vault, whose own ``creek_config.yaml`` owns the
+            routing. Bound by ``build_server`` at construction time (#1409):
+            reading it from the process cwd instead let the operator's
+            per-vault routing — including which provider a stage egresses to —
+            be decided by wherever the server happened to be started.
+        tier: The routing tier, reconciled from two signals: since #962
+            ``creek.compile.engine`` derives the source fragments' own
+            classification (it is the layer that loaded them) and
+            ``compile_tool`` folds in the caller's declared ceiling on the way
+            through. This function sees only the result.
+
+    Returns:
+        A prompt → completion-text callable bound to the resolved provider.
+
+    Raises:
+        RuntimeError: When the resolved provider is unavailable, or — as
+            :class:`~creek.classify.llm.router.IntimateRoutingError`, a
+            subclass — when intimate content has no local backend to fall
+            back to. ``compile_tool`` turns either into a refusal.
     """
-    from creek.compile.engine import _default_llm as _engine_default_llm
+    from creek.classify.llm.providers import build_provider
 
-    return _engine_default_llm(load_config().llm)
+    cfg = load_vault_config(vault).model_router.resolve("generation", tier)
+    provider = build_provider(cfg)
+    if not provider.available:
+        msg = (
+            "LLM provider unavailable for compile. "
+            "Check Ollama or ANTHROPIC_API_KEY configuration."
+        )
+        raise RuntimeError(msg)
+    return lambda prompt: provider.complete(prompt).text
 
 
-def _build_reflect_llm_factory() -> _LLMFactory:
+def _build_reflect_llm_factory(vault: Path) -> _LLMFactory:
     """Return a tier-keyed LLM factory for ``creek.reflect``.
 
     The returned ``factory(tier)`` resolves the ``generation`` stage through the
@@ -196,10 +333,17 @@ def _build_reflect_llm_factory() -> _LLMFactory:
     raises ``IntimateRoutingError`` rather than egressing). Lazy imports keep the
     server bootable without a provider — only a ``creek.reflect`` call then fails,
     surfacing as a structured refusal.
+
+    Args:
+        vault: The served vault, whose own config owns the routing (#1409).
+            Bound once here; the tier arrives per call.
+
+    Returns:
+        A tier → LLM-callable factory bound to *vault*'s router.
     """
     from creek.classify.llm.providers import build_provider
 
-    router = load_config().model_router
+    router = load_vault_config(vault).model_router
 
     def _factory(tier: PrivacyTier) -> _LLM:
         cfg = router.resolve("generation", tier)
@@ -215,11 +359,54 @@ def _build_reflect_llm_factory() -> _LLMFactory:
     return _factory
 
 
+def _build_author_llm(vault: Path, tier: PrivacyTier | None) -> AuthorLLMClient | None:
+    """Return the Writing Desk's voice client, routed for *tier* (#658/#661).
+
+    The author-side sibling of :func:`_build_draft_llm`, extracted from
+    ``author_tool`` by #1254 so ``build_server`` can be handed a different one.
+    Same chokepoint, same laziness: the router resolves the voice role for the
+    run's content tier, so Intimate content is redirected to a local provider
+    rather than egressing, and the config is read inside the call so a server
+    with no provider configured still boots and still serves every other verb.
+
+    Unlike its draft/compile siblings it does not raise on an unavailable
+    provider: ``for_voice_or_none`` answers ``None``, which the desk reads as
+    "render deterministically". That fallback is exactly what #460/#649/#658
+    made unobservable — the honest reading is that it is a *degradation*, not a
+    failure, and the caller is told so in prose rather than by an exception.
+
+    Args:
+        vault: The served vault. The one builder reading *two* config sections
+            — ``model_router`` and ``author`` — so resolving it from the
+            process cwd took both the routing and the desk's persona from
+            whichever vault the server's directory happened to name (#1409).
+        tier: The run's content tier, or ``None`` when the evidence carries no
+            classification to route on.
+
+    Returns:
+        The resolved :class:`~creek.author.client.AuthorLLMClient`, or ``None``
+        when no provider is available.
+
+    Raises:
+        IntimateRoutingError: When Intimate content has no local backend to
+            fall back to. ``author_tool`` turns it into a structured error.
+    """
+    from creek.author.client import AuthorLLMClient
+
+    config = load_vault_config(vault)
+    return AuthorLLMClient.for_voice_or_none(
+        config.model_router,
+        author=config.author,
+        tier=tier,
+    )
+
+
 def build_server(
     *,
     vault_path: Path | None = None,
-    draft_llm_factory: Callable[[], Callable[[str], str]] | None = None,
-    compile_llm_factory: Callable[[], Callable[[str], str]] | None = None,
+    author_llm_factory: AuthorLLMFactory | None = None,
+    draft_llm_factory: DraftLLMFactory | None = None,
+    compile_llm_factory: CompileLLMFactory | None = None,
     reflect_llm_factory: Callable[[], _LLMFactory] | None = None,
     token_verifier: TokenVerifier | None = None,
 ) -> FastMCP:
@@ -229,12 +416,20 @@ def build_server(
         vault_path: Override vault root. Defaults to
             ``load_config().vault_path`` so the MCP surface honours the
             same configuration as the CLI.
-        draft_llm_factory: Optional factory for the draft LLM. The
-            factory is invoked lazily so only ``creek.draft`` needs an
-            LLM provider.
-        compile_llm_factory: Optional factory for the compile LLM.
-            Invoked lazily so only ``creek.compile`` needs an LLM
-            provider.
+        author_llm_factory: Optional tier-keyed factory for the Writing Desk's
+            voice client — ``factory(tier)``. Passed straight to
+            ``creek.author``, which invokes it lazily inside the run (and not
+            at all on the ``dry_run`` path), so only ``creek.author`` needs an
+            LLM provider. Added by #1254: without it the verb's stubbed and
+            live bodies were indistinguishable from outside.
+        draft_llm_factory: Optional tier-keyed factory for the draft LLM —
+            ``factory(tier)``. Passed straight to ``creek.draft``, which
+            invokes it lazily (and only once it knows which seed it is
+            drafting), so only ``creek.draft`` needs an LLM provider.
+        compile_llm_factory: Optional tier-keyed factory for the compile
+            LLM — ``factory(tier)``. Passed straight to ``creek.compile``,
+            which invokes it lazily (and only after its source-tier gate),
+            so only ``creek.compile`` needs an LLM provider.
         reflect_llm_factory: Optional thunk returning the tier-keyed LLM
             factory for ``creek.reflect``. Invoked lazily per call so only
             ``creek.reflect`` needs an LLM provider.
@@ -253,9 +448,13 @@ def build_server(
     )
     vault = _resolve_vault(vault_path)
     consumer = _consumer_from_env()
-    factory = draft_llm_factory or _build_draft_llm
-    compile_factory = compile_llm_factory or _build_compile_llm
-    reflect_factory = reflect_llm_factory or _build_reflect_llm_factory
+    # Each default builder is bound to the vault this server serves (#1409).
+    # They used to resolve their config from the process cwd, which silently
+    # routed one vault's text with another vault's model routing.
+    factory = draft_llm_factory or partial(_build_draft_llm, vault)
+    author_factory = author_llm_factory or partial(_build_author_llm, vault)
+    compile_factory = compile_llm_factory or partial(_build_compile_llm, vault)
+    reflect_factory = reflect_llm_factory or partial(_build_reflect_llm_factory, vault)
 
     @server.tool(name="creek.handshake")
     async def _handshake(
@@ -304,13 +503,34 @@ def build_server(
         content: str,
         external_id: str,
         timestamp: str | None = None,
-        tier: str = "open",
+        tier: str | None = None,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Ingest one Adepthood journal entry as a vault fragment (idempotent)."""
+        """Ingest one journal entry as a fragment, idempotently; ``tier`` required."""
         return journal_ingest_tool(
             vault_path=vault,
             content=content,
+            external_id=external_id,
+            timestamp=timestamp,
+            tier=tier,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=_effective_consumer(consumer),
+        )
+
+    @server.tool(name="creek.upload")
+    def _upload(
+        filename: str,
+        content_base64: str,
+        external_id: str,
+        timestamp: str | None = None,
+        tier: str | None = None,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Stage one uploaded document and ingest it; ``tier`` required."""
+        return upload_tool(
+            vault_path=vault,
+            filename=filename,
+            content_base64=content_base64,
             external_id=external_id,
             timestamp=timestamp,
             tier=tier,
@@ -379,7 +599,7 @@ def build_server(
         """Generate an essay draft from a mined idea."""
         return draft_tool(
             vault_path=vault,
-            llm=factory(),
+            llm_factory=factory,
             privacy_tier_ceiling=privacy_tier_ceiling,
             phase=phase,
             index=index,
@@ -394,10 +614,14 @@ def build_server(
         dry_run: bool = False,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Author a draft for a query via the Writing Desk (stub shape)."""
+        """Author a draft for a query via the Writing Desk.
+
+        ``max_rounds`` defaults to the vault's ``author.max_author_rounds`` (3).
+        """
         return author_tool(
             vault_path=vault,
             query=query,
+            llm_factory=author_factory,
             medium=medium,
             max_rounds=max_rounds,
             dry_run=dry_run,
@@ -410,7 +634,7 @@ def build_server(
         target: str,
         body: str,
         title: str | None = None,
-        tier: str = "open",
+        tier: str | None = None,
         provenance: list[str] | None = None,
         source_kind: str = "mcp",
         source_id: str | None = None,
@@ -418,7 +642,7 @@ def build_server(
         full_body: bool = False,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Save a Discord/Claude answer back into the vault."""
+        """Save a Discord/Claude answer back into the vault; ``tier`` required."""
         return save_tool(
             vault_path=vault,
             target=target,
@@ -454,7 +678,12 @@ def build_server(
         input_path: str,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Read-only PII / secret scan over a vault-relative directory (FEAT-027)."""
+        """Read-only PII / secret scan of the FEAT-027 staging subtree.
+
+        Scoped to ``00-Creek-Meta/Inbound/``, which every ceiling admits. The
+        scan reads no per-file privacy tier, so any other vault path is ranked
+        as intimate content and needs privacy_tier_ceiling=intimate or all.
+        """
         return redact_scan_tool(
             vault_path=vault,
             input_path=input_path,
@@ -495,12 +724,14 @@ def build_server(
     @server.tool(name="creek.report")
     def _report(
         report_type: str = "tags",
+        period: str | None = None,
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     ) -> dict[str, Any]:
-        """Generate a vault-state report (``tags`` or ``voice``)."""
+        """Generate a vault-state report; `period` is for `wavelength` only."""
         return report_tool(
             vault_path=vault,
             report_type=report_type,
+            period=period,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
         )
@@ -662,7 +893,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--port", type=int, default=8000, help="Network transport bind port."
+        "--port",
+        type=int,
+        default=DEFAULT_MCP_NETWORK_PORT,
+        help="Network transport bind port.",
     )
     parser.add_argument(
         "--tls-cert",
@@ -685,61 +919,66 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _is_loopback(host: str) -> bool:
-    """Return whether *host* is a loopback bind (safe for plaintext transport).
+# Back-compat aliases for the posture gate that moved to
+# ``creek_mcp.transport_posture`` in #1074, so ``/v1`` and MCP share one
+# implementation instead of two that can drift. Kept under the original private
+# names because they are reached by name from ``main`` and from
+# ``tests/test_mcp_remote.py``; the move is behaviour-preserving, and the proof
+# is that not one of those tests needed editing. Retiring the aliases once
+# nothing imports them is tracked as a follow-up.
+_is_loopback = is_loopback
+_require_transport_confidentiality = require_transport_confidentiality
 
-    Loopback traffic never leaves the machine, so serving bearer-token auth
-    without TLS is acceptable there — and only there.
+
+def build_network_uvicorn_config(
+    app: ASGIApp, args: argparse.Namespace, *, log_level: str
+) -> uvicorn.Config:
+    """Build the uvicorn configuration the MCP network transport serves under.
+
+    Extracted from :func:`_serve_network` for the same reason
+    :func:`creek_mcp.httpapi.cli.build_uvicorn_config` was extracted from its
+    own serve seam: the one decision in it that is a security promise —
+    ``access_log=False`` — is then reachable by a test without binding a socket.
+
+    **Why uvicorn's own access log is switched off here too (#1125).** uvicorn
+    ships an access logger that is on by default and writes one line per
+    request in the form ``client_addr - "METHOD /concrete/path?query
+    HTTP/1.1" status``. ``/v1`` has suppressed it since #1117; this call site
+    built its own :class:`uvicorn.Config` and kept the default, so one server
+    logged the **client address** of every request on one adapter and not on
+    the other. The MCP surface publishes no identifier-bearing path parameters,
+    so the exposure is narrower than the ``external_id`` republication that
+    motivated #1117 — but the two adapters are one process with one operator,
+    and a logging posture that differs between them is one nobody can reason
+    about. Suppression rather than filtering, again: a
+    :class:`logging.Filter` would be a second redaction rule free to drift from
+    the first.
 
     Args:
-        host: The ``--host`` value: an IP literal or a hostname.
+        app: The ASGI application to serve — the SDK's
+            ``streamable_http_app()``.
+        args: The parsed arguments, carrying host, port and TLS material. TLS
+            is required here: this factory is reached only from the branch that
+            has both a certificate and a key.
+        log_level: uvicorn's own log level, taken from the built server's
+            settings so the two do not drift.
 
     Returns:
-        ``True`` for loopback IPs (``127.0.0.0/8``, ``::1``) and the literal
-        ``"localhost"`` (case-insensitive); ``False`` for everything else,
-        including ``""``, wildcard binds, other hostnames, and strings that
-        do not parse as an IP address at all.
+        The configuration, carrying the bind address, the TLS material, and no
+        access log of uvicorn's own.
     """
-    if host.lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        # Not an IP literal (hostname, empty, garbage): assume routable.
-        return False
+    # Lazy import, matching FastMCP's own transport bootstrap pattern.
+    import uvicorn
 
-
-def _require_transport_confidentiality(
-    parser: argparse.ArgumentParser, args: argparse.Namespace
-) -> None:
-    """Refuse network configurations that would put bearer tokens on the wire.
-
-    Enforces, in order: ``--tls-cert``/``--tls-key`` come as a pair; both
-    files exist on disk; and a non-loopback ``--host`` is only served when
-    TLS is configured. Each violation exits via :meth:`argparse.ArgumentParser.error`
-    (nonzero exit, message on stderr) *before* any socket is opened (#837).
-
-    Args:
-        parser: The CLI parser, used to report errors in argparse style.
-        args: Parsed arguments carrying ``host``, ``tls_cert``, ``tls_key``.
-    """
-    if (args.tls_cert is None) != (args.tls_key is None):
-        parser.error(
-            "--tls-cert and --tls-key are required together; supply both "
-            "(or neither, for a loopback-only bind)"
-        )
-    if args.tls_cert is not None:
-        for flag, path in (("--tls-cert", args.tls_cert), ("--tls-key", args.tls_key)):
-            if not path.exists():
-                parser.error(f"{flag}: file not found: {path}")
-        return
-    if not _is_loopback(args.host):
-        parser.error(
-            f"refusing to serve on non-loopback host {args.host!r} without TLS: "
-            "bearer tokens would transit the network in cleartext. Bind "
-            "127.0.0.1, terminate TLS in a reverse proxy, or pass "
-            "--tls-cert/--tls-key"
-        )
+    return uvicorn.Config(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=log_level,
+        ssl_certfile=str(args.tls_cert),
+        ssl_keyfile=str(args.tls_key),
+        access_log=False,
+    )
 
 
 def _serve_network(server: FastMCP, args: argparse.Namespace) -> None:
@@ -760,13 +999,10 @@ def _serve_network(server: FastMCP, args: argparse.Namespace) -> None:
         # Lazy import, matching FastMCP's own transport bootstrap pattern.
         import uvicorn
 
-        config = uvicorn.Config(
+        config = build_network_uvicorn_config(
             server.streamable_http_app(),
-            host=args.host,
-            port=args.port,
+            args,
             log_level=server.settings.log_level.lower(),
-            ssl_certfile=str(args.tls_cert),
-            ssl_keyfile=str(args.tls_key),
         )
         uvicorn.Server(config).run()
     else:
@@ -807,9 +1043,15 @@ def main(argv: list[str] | None = None) -> None:
     Startup is fail-closed four times over. On *every* transport it refuses
     an elevated token below the minimum-strength floor (#907). The network
     branch additionally refuses to start without per-consumer tokens (no
-    anonymous access), refuses a configured consumer token below the same
-    floor (#838), and refuses a non-loopback bind unless TLS is configured
-    (no cleartext bearer tokens, #837).
+    anonymous access), refuses a consumer-token configuration the parser
+    cannot read unambiguously — a token below the same floor (#838), a
+    consumer named twice, a token value shared by two consumers (#895) — and
+    refuses a non-loopback bind unless TLS is configured (no cleartext bearer
+    tokens, #837).
+
+    Having started, the network branch *announces* on stderr any consumer
+    holding more than one currently-valid token, so an open rotation window
+    is visible rather than permanent (#895).
 
     Args:
         argv: Optional list of command-line arguments. When ``None``
@@ -830,8 +1072,11 @@ def main(argv: list[str] | None = None) -> None:
         try:
             tokens = load_consumer_tokens()
         except ValueError as exc:
-            # A configured token is below the minimum-strength floor (#838):
-            # exit with the rotation recipe rather than serve a weak secret.
+            # An unreadable consumer-token configuration: a token below the
+            # minimum-strength floor (#838), a consumer named twice, or one
+            # token value configured for two consumers (#895). Exit naming the
+            # setting to fix rather than serve a weak or ambiguous registry;
+            # no such message ever carries a token value.
             parser.error(str(exc))
         if not tokens:
             # No anonymous access: refuse to expose the vault without per-consumer
@@ -841,7 +1086,12 @@ def main(argv: list[str] | None = None) -> None:
                 "(consumer=token pairs); refusing to serve without authentication"
             )
         _require_transport_confidentiality(parser, args)
-        server = build_server(token_verifier=ConsumerTokenVerifier(tokens))
+        verifier = ConsumerTokenVerifier(tokens)
+        # A rotation window has to be closed again, and an operator who cannot
+        # see one is open will not close it (#895). On stderr: stdout on this
+        # entry point belongs to the stdio transport's JSON-RPC framing.
+        announce_rotation_window(verifier)
+        server = build_server(token_verifier=verifier)
         server.settings.host = args.host
         server.settings.port = args.port
         _serve_network(server, args)

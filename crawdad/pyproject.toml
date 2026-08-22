@@ -16,7 +16,25 @@ dependencies = [
     # injection on Streamable HTTP bearer transport). Fixed in 1.28.1.
     "mcp>=1.28.1,<2.0.0",
     "anthropic>=0.40.0",
-    "openai>=1.0",
+    # Transport hold, not a CVE (OSV reports no advisories for openai):
+    # openai 3.0.0 swapped `httpx<1,>=0.23.0` for `httpx2<3,>=2.7.0` — a
+    # separate distribution, not a version bump — dragging httpcore2,
+    # truststore and idna>=3.18 in alongside httpx. An open ceiling is
+    # not a future risk on three separate grounds. (1) `uv lock` IS the
+    # live resolve now — #1501 moved CI's install off `pip install -e
+    # ".[dev]"` and onto the export of whatever `uv lock` last
+    # resolved — and a relock is a routine hundreds-of-line diff, the
+    # exact place a transport swap hides; the ceiling turns that swap
+    # into a loud relock failure instead of a silent green build. (2)
+    # Anyone installing crawdad from published metadata without ever
+    # touching the lock (`pip install crawdad[dev]` against PyPI, say)
+    # still resolves openai live, and the ceiling is the only thing
+    # standing between that install and 3.0.0. (3) `mcp>=1.28.1,<2.0.0`
+    # caps the other half of the same httpx2 swap (#998); the two
+    # ceilings must lift together, or one side silently reacquires the
+    # dependency the other is still holding off. Floor is the release
+    # uv.lock already resolves.
+    "openai>=2.41.0,<3.0.0",
     "google-genai>=1.0",
     "pydantic>=2.0.0",
     "pyyaml>=6.0.0",
@@ -47,11 +65,105 @@ dev = [
     "interrogate>=1.7.0",
     "radon>=6.0.0",
     "xenon>=0.9.0",
+    # scripts/lint-vulture.sh — the dead-code gate — runs creek-tools'
+    # scripts/lint_vulture.py rather than a copy of it (#1472), but that
+    # module is executed by THIS project's interpreter in CI, so the
+    # `vulture` distribution has to be resolvable here. It pulls no
+    # runtime dependency into crawdad's graph and never imports the code
+    # it scans (vulture is pure `ast.parse`), which is what makes one
+    # policy shared across two virtualenvs tractable at all.
+    #
+    # The floor and ceiling match creek-tools/pyproject.toml deliberately:
+    # both projects drive the same Python API (Vulture.scavenge,
+    # get_unused_code, ignore_decorators, Item.typ/.confidence) through
+    # the same module, and lint_vulture.py raises UnknownFindingTypeError
+    # on an item type it has no confidence floor for — so a major bump
+    # that adds a category fails the build loudly rather than passing
+    # silently. Bump the two together.
+    "vulture>=2.16,<3",
     "types-PyYAML>=6.0.0",
+    # scripts/security.sh — the security gate — shells out to both of
+    # these: pip-audit scans the installed environment and the exported
+    # lock, and uv performs the `uv export --locked` that produces that
+    # export. Since #1501, CI no longer installs this extra directly —
+    # it installs the export of `uv lock`'s resolution, covering every
+    # extra via `--all-extras`. That export is resolved FROM this
+    # extra, so the gate's own toolchain still has to be declared here
+    # or nothing forces pip-audit and uv into the lock CI installs from
+    # (#979, #1501).
+    "pip-audit>=2.10.0",
+    "uv>=0.11.16",
+    # Declared because #1501 deleted `pip install --upgrade pip
+    # setuptools wheel` from the CI job. The primary reason is
+    # completeness: with these two declared, the environment CI tests is
+    # fully described by the lock no matter what the interpreter's
+    # ensurepip happened to seed. `pip` is already locked (26.1.2, via
+    # pip-audit), so setuptools and wheel COMPLETE the seeded set rather
+    # than leaving it two-thirds covered.
+    #
+    # It is also a live advisory, measured on both arms. CPython 3.11's
+    # ensurepip bundles setuptools 79.0.1
+    # (`ensurepip._SETUPTOOLS_VERSION == '79.0.1'`); 3.12 and 3.13 bundle
+    # none, CPython having dropped setuptools from ensurepip in 3.12. And
+    # 79.0.1 carries PYSEC-2026-3447 / CVE-2026-59890, fixed in 83.0.0.
+    # The deleted upgrade line masked that by accident, dragging 79.0.1
+    # up to 84.0.0. Deleting it WITHOUT this declaration would leave
+    # 79.0.1 sitting there — `uv pip install --system` installs but never
+    # prunes — and scripts/security.sh's bare `pip-audit` audits whatever
+    # is left in that environment. On an ensurepip-seeded 3.11 the two
+    # arms read: without this declaration, "Found 2 known vulnerabilities
+    # in 1 package — setuptools 79.0.1 PYSEC-2026-3447"; with it, the
+    # locked install lifts 79.0.1 to 84.0.0 and pip-audit reports "No
+    # known vulnerabilities found".
+    #
+    # The band is EXACTLY the one in [build-system].requires below, and
+    # must stay so: tests/test_dependency_pins.py discovers declarations
+    # rather than naming them (`_DEPENDENCY_TABLE_PREFIXES` covers
+    # `project.optional-dependencies.`), so it picks this entry up
+    # automatically and holds it to the same >=83.0.0,<85.0.0 (#1258).
+    # Move the two together, never one alone.
+    "setuptools>=83.0.0,<85.0.0",
+    "wheel>=0.48.0",
 ]
 
+# setuptools is declared TWICE in this file, not once: here, governing
+# the PEP 518 isolated environment the build backend runs in, and in
+# [project.optional-dependencies].dev above, declared per #1501 so the
+# environment CI tests and audits is fully described by the lock rather
+# than left to whatever the interpreter's ensurepip happened to seed.
+# This list is still independent of [tool.uv].constraint-dependencies
+# below, which only governs the resolution graph behind uv.lock and
+# provably does not reach the backend (with the constraint bounded to
+# <84.0.0 a wheel build still ran setuptools 84.0.0; bounding THIS list
+# produced 83.0.0). crawdad still gets no [tool.uv] constraint entry for
+# setuptools — but no longer because there is nothing to constrain:
+# since #1501, `grep -c 'name = "setuptools"' crawdad/uv.lock` reports a
+# non-zero count, because the dev extra pulls one in. A constraint
+# tightens resolution when a package reaches the graph only
+# transitively; setuptools now arrives as a DIRECT dev-extra dependency
+# carrying its own >=83.0.0,<85.0.0 band, so there is nothing left for a
+# constraint to tighten. What is still true: crawdad has no RUNTIME or
+# transitive setuptools consumer. The dev-extra declaration is a
+# dev/tooling surface, not a production dependency — it exists so the
+# tested and audited environment is completely described by the lock,
+# never so crawdad's shipped package can import setuptools — and the
+# build backend remains the only setuptools surface that reaches an end
+# user's install. The floor is PYSEC-2026-3447 (CVE-2026-59890, path
+# traversal in the PackageIndex download path), fixed in 83.0.0;
+# `>=68.0` previously sat here admitting 81.0.0, the CVE release. The
+# ceiling is SemVer `<85.0.0` — 84.0.0 is vetted (its removals were
+# distutils C-compiler internals a pure-Python build never touches) and
+# every future 84.x patch still resolves freely, while 85.0.0 needs its
+# own review first. The band is held identical to creek-tools'
+# setuptools surfaces and to the dev-extra declaration above; move them
+# all together. THIS bound — [build-system].requires — never reaches
+# uv.lock: PEP 518 build-environment pins are invisible to `uv lock`'s
+# resolution graph, so its guard test in tests/test_dependency_pins.py
+# is the only thing holding it to the band (#1258). The dev-extra
+# declaration is a separate surface with its own, newer lock guard
+# (`test_locked_setuptools_sits_inside_the_vetted_band`) (#1501).
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=83.0.0,<85.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.uv]
@@ -60,11 +172,67 @@ build-backend = "setuptools.build_meta"
 # is in the graph without adding it as a direct dependency, so a future
 # `uv lock` cannot silently regress onto a vulnerable version.
 constraint-dependencies = [
+    # Security: pin aiohttp above the eleven advisories carried by
+    # 3.13.5 — PYSEC-2026-237 and PYSEC-2026-2104 through -2113
+    # (CVE-2026-34993 / -47265 / -50269 and -54273 through -54280).
+    # Transitive via discord.py → aiohttp, which backs discord.py's
+    # REST client — including user-supplied attachment downloads —
+    # and its gateway websocket. All eleven fixed in 3.14.1 (#978).
+    "aiohttp>=3.14.1",
+    # Security: pin pip above PYSEC-2026-3721 — the advisory that
+    # reds the crawdad security gate on locked 26.1.2, since
+    # pip-audit scans the *installed* environment. Fixed in 26.2;
+    # floored to 26.2.1, matching creek-tools (#1527 merge).
+    "pip>=26.2.1",
     # Security: pin pyasn1 above CVE-2026-59885 (quadratic OID-arc
     # decode DoS) and CVE-2026-59886 (REAL-exponent big-int DoS) —
     # transitive via google-genai → google-auth → pyasn1-modules.
     # Both fixed in 0.6.4 (#867).
     "pyasn1>=0.6.4",
+    # Security: pin cryptography above PYSEC-2026-3552 (CVE-2026-69247,
+    # GHSA-g6cj-pr64-35w5) — PKCS#7 EnvelopedData decryption exposed a
+    # Bleichenbacher oracle via distinguishable errors and timing;
+    # introduced in 44.0.0, fixed in 50.0.0 (#1167). Supersedes the
+    # earlier 48.0.1 floor for GHSA-537c-gmf6-5ccf (#979). Reached
+    # transitively via google-genai → google-auth → cryptography and via
+    # mcp → pyjwt → cryptography. Both consumers declare open floors
+    # (google-auth: cryptography>=38.0.3, pyjwt: cryptography>=3.4.0),
+    # so nothing upstream blocks the raise.
+    "cryptography>=50.0.0",
+    # Security: pin pydantic-settings above GHSA-4xgf-cpjx-pc3j,
+    # carried by the previously-locked 2.14.1 — transitive via mcp →
+    # pydantic-settings. Fixed in 2.14.2; mcp 1.28.1 declares
+    # pydantic-settings>=2.5.2, so the pinned mcp is unaffected (#979).
+    "pydantic-settings>=2.14.2",
+    # Security: pin python-multipart above PYSEC-2026-3036,
+    # PYSEC-2026-3037, and PYSEC-2026-3040, all carried by the
+    # previously-locked 0.0.29 — transitive via mcp → python-multipart.
+    # 0.0.30 fixes only the first two, so the floor is 0.0.31, the first
+    # fully patched release (same first-fully-patched convention as
+    # aiohttp>=3.14.1 above). mcp 1.28.1 declares
+    # python-multipart>=0.0.9 (#979).
+    "python-multipart>=0.0.31",
+    # Security: pin starlette above PYSEC-2026-248 and PYSEC-2026-249,
+    # both carried by the previously-locked 1.1.0 — transitive via
+    # mcp → starlette and mcp → sse-starlette → starlette. 1.3.0 fixes
+    # only PYSEC-2026-248, so the floor is 1.3.1, the first fully
+    # patched release. mcp 1.28.1 declares starlette>=0.27 (>=0.48.0 on
+    # Python ≥3.14) and sse-starlette 3.4.4 declares starlette>=0.49.1,
+    # so both consumers accept the raise (#979).
+    "starlette>=1.3.1",
+    # NOT a CVE. rpds-py switched from SemVer to CalVer at 2026.5.1 —
+    # the line runs 0.29.0, 0.30.0, 2026.5.1, with no 0.31 or 1.0 in
+    # between — and raised requires-python to >=3.11, which this project
+    # already declares. Transitive-only via mcp → jsonschema (and via
+    # referencing); both consumers declare open floors (>=0.25.0 and
+    # >=0.7.0), so nothing forced the lock off 0.30.0 for eight months.
+    # Keep this a BARE FLOOR: any SemVer-shaped ceiling — <1.0, ~=0.30,
+    # or a <2026.7 written as if the month were a minor version —
+    # excludes every subsequent CalVer release permanently. Express a
+    # bound, if one is ever needed, in CalVer (#1185). Held identical to
+    # creek-tools/pyproject.toml so both projects resolve the same
+    # native extension on the shared MCP path.
+    "rpds-py>=2026.6.3",
 ]
 
 [tool.setuptools.packages.find]

@@ -8,7 +8,7 @@ description: >-
   gotcha (absolute vault_path, State/latest.md, voice-core mirroring, env
   secrets, allowlists) and starts the bot in the background. Do NOT use for
   driving the `creek` CLI / writing essays (use creek-cli) or editing
-  crawdad/creek-tools source (use stay-green/work-issue).
+  crawdad/creek-tools source (use stay-green).
 metadata:
   author: Geoff
   version: 1.1.0

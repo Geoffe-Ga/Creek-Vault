@@ -7,20 +7,27 @@ records. The checks are *deterministic* — no LLM — so the mutation tests in
 produces. Citation completeness and privacy compliance are HARD gates for the
 research medium; the rest are softer rubric divergences.
 
-The privacy check reuses the vault fragment loader
-(:func:`creek.vault.reader.iter_vault_fragments`) to resolve each cited
-fragment's :class:`~creek.models.PrivacyTier`; the voice check reuses the
-FEAT-040.x AI-style scanner (:func:`creek.generate.ai_style.scanner.scan`).
+The privacy check resolves each cited fragment's
+:class:`~creek.models.PrivacyTier` with
+:func:`creek.vault.reader.try_load_fragment`, walking the corpus subtrees
+file by file rather than through :func:`~creek.vault.reader.iter_vault_fragments`
+(or the desk's own ``_load_corpus``), both of which materialise every fragment
+in the vault into a list before the caller sees the first record. The voice
+check reuses the FEAT-040.x AI-style scanner
+(:func:`creek.generate.ai_style.scanner.scan`).
 """
 
 from __future__ import annotations
 
+import logging
 import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import yaml
 
 from creek.author.models import ReflectionFinding
+from creek.config import load_vault_config
 from creek.generate.ai_style.scanner import scan
 from creek.generate.grounding import scan_biographical_sentences
 from creek.generate.jargon import detect_unglossed_jargon
@@ -34,7 +41,11 @@ from creek.models import (
     PHASE_LEGACY_ALIASES,
     PrivacyTier,
 )
-from creek.vault.reader import try_load_fragment
+from creek.vault.reader import (
+    CORPUS_SUBDIRS,
+    FRONTMATTER_LOAD_ERRORS,
+    try_load_fragment,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -45,9 +56,21 @@ if TYPE_CHECKING:
     from creek.generate.grounding import EmbeddingFn
     from creek.models import MediumContract
 
+logger = logging.getLogger(__name__)
+
 #: Privacy tiers from least to most restrictive; index = restrictiveness rank.
-#: ``UNCLASSIFIED`` is treated as the most restrictive (fail closed), matching
-#: :mod:`creek.classify.privacy_filter`.
+#: ``UNCLASSIFIED`` is treated as the most restrictive (fail closed) — this
+#: table deliberately differs from :mod:`creek.classify.privacy_filter` (which
+#: ranks ``UNCLASSIFIED`` with ``PERSONAL``, #876) and from
+#: :mod:`creek_mcp.tier_ceiling` (which now matches ``privacy_filter``, #961).
+#: This is the *leak gate* ordering: a cited fragment nobody has vouched for
+#: must always count as over-tier here, regardless of what the caller's
+#: ceiling admits on read, so it is pinned at the top rather than alongside
+#: ``PERSONAL``. All four tables (this one, ``privacy_filter``,
+#: ``tier_ceiling``, and the escalate-only merge in
+#: :mod:`creek.classify.privacy_pass`, which ranks ``UNCLASSIFIED`` *below*
+#: ``OPEN``) are pinned together by ``tests/test_mcp_tier_ceiling.py`` (see
+#: ``test_unclassified_ranks_differ_by_context_on_purpose``).
 _TIER_RANK: dict[PrivacyTier, int] = {
     PrivacyTier.OPEN: 0,
     PrivacyTier.PERSONAL: 1,
@@ -69,6 +92,18 @@ _LEAST_RESTRICTIVE_RANK = min(_TIER_RANK.values())
 An unrecognised contract ``default_privacy_tier`` gates as strictly as
 possible (the lowest ceiling), so more cited tiers count as over-tier rather
 than fewer — the conservative direction for a HARD gate."""
+
+_NO_CONTRACT_CEILING: PrivacyTier = PrivacyTier.OPEN
+"""Fail-closed ceiling for a caller that supplied no contract at all (#1310).
+
+A *different* condition from the one :data:`_LEAST_RESTRICTIVE_RANK` covers:
+there the contract exists and its ``default_privacy_tier`` is merely unranked;
+here there is no contract to read a ceiling from. Both fail closed in the same
+direction — gate at the strictest tier — so a contract-less caller gets the
+HARD gate rather than no gate. Every shipped medium template declares
+``default_privacy_tier: open``, so this is a no-op for contract-bearing
+callers. Skipping instead is how ``creek author`` shipped an intimate
+fragment's protected text to stdout with ``verdict=PASS``."""
 
 #: Legacy alias keys whose presence in a body signals non-canonical taxonomy
 #: (INC-019). Maps each deprecated alias to its canonical replacement.
@@ -163,43 +198,214 @@ def check_biographical_grounding(
     ]
 
 
+def _as_tier(value: PrivacyTier) -> PrivacyTier:
+    """Coerce a tier loaded from a fragment back into the enum.
+
+    :class:`~creek.models.Fragment` is configured with ``use_enum_values=True``,
+    so Pydantic hands back the plain ``str`` behind the member even though the
+    annotation says ``PrivacyTier``. Left as a ``str`` it misses every
+    :data:`_TIER_RANK` lookup — the gate would then fail closed at the most
+    restrictive rank for *every* cited fragment — and rendering the finding
+    would raise on the missing ``.value``.
+
+    Args:
+        value: A ``privacy_tier`` as loaded from a fragment's frontmatter.
+
+    Returns:
+        The corresponding :class:`~creek.models.PrivacyTier` member.
+    """
+    return PrivacyTier(value)
+
+
+def _fragment_rank(tier: PrivacyTier) -> int:
+    """Return the restrictiveness rank of a cited *fragment's* tier.
+
+    :data:`_TIER_RANK` is read at call time rather than captured, so a test can
+    shrink the table to stand in for a future tier nobody has ranked yet; such a
+    tier fails closed at :data:`_MOST_RESTRICTIVE_RANK` (#509).
+
+    Args:
+        tier: The fragment's privacy tier.
+
+    Returns:
+        The tier's rank; higher is more restrictive.
+    """
+    return _TIER_RANK.get(tier, _MOST_RESTRICTIVE_RANK)
+
+
+@dataclass(frozen=True, slots=True)
+class _CitedFragment:
+    """One cited fragment id's resolved tier and every body stored under it.
+
+    A vault id is not unique: the same id can sit in more than one corpus
+    subtree (an import, a copy, a re-export), and those records can disagree
+    about both tier and body. This type folds the sightings together for the
+    leak gate (#1341).
+
+    The fold is **monotone** — the tier never becomes less restrictive and no
+    body is ever dropped — and **commutative**, since rank-max and
+    append-if-absent both are. Walk order therefore cannot change the verdict,
+    which is what lets the resolver widen from one subtree to three without
+    acquiring a tie-break rule to argue about.
+
+    Its accepted cost: a genuinely ``open`` body is refused when a same-id
+    record above the ceiling exists, because the tier is treated as a property
+    of the *id*. That trade is a false-positive revise round in exchange for
+    never shipping a leak — the safe direction for a one-way ratchet.
+
+    Attributes:
+        tier: The most restrictive tier seen for this id.
+        bodies: Every distinct body seen for this id, at *every* tier rather
+            than only the winning one. Dropping the below-winner bodies would
+            reopen the hole one rank down: a draft could reproduce the ``open``
+            twin of an id that resolved ``intimate``.
+    """
+
+    tier: PrivacyTier
+    bodies: tuple[str, ...]
+
+    def merged_with(self, tier: PrivacyTier, body: str) -> _CitedFragment:
+        """Return a new record with one more sighting of this id folded in.
+
+        Args:
+            tier: The sighted record's privacy tier (coerced via
+                :func:`_as_tier`, since it arrives as a plain ``str``).
+            body: The sighted record's stored body.
+
+        Returns:
+            A new frozen record carrying the more restrictive of the two tiers
+            and every body of both. ``self`` is left untouched.
+        """
+        sighted = _as_tier(tier)
+        stricter = (
+            sighted
+            if _fragment_rank(sighted) > _fragment_rank(self.tier)
+            else self.tier
+        )
+        bodies = self.bodies if body in self.bodies else (*self.bodies, body)
+        return _CitedFragment(tier=stricter, bodies=bodies)
+
+
+def _scan_subtree_for_cited(
+    root: Path,
+    cited: set[str],
+    resolved: dict[str, _CitedFragment],
+) -> None:
+    """Fold every cited fragment found under *root* into *resolved*, in place.
+
+    The walk is sorted, mirroring :func:`~creek.vault.reader.iter_vault_fragments`,
+    so a run is reproducible across hosts. Correctness does not depend on it —
+    :class:`_CitedFragment`'s fold is order-independent — but a host-dependent
+    walk order in a HARD gate is a debugging trap worth not setting.
+
+    Unreadable files and markdown that is not a Creek fragment are skipped with
+    exactly the tolerance :func:`~creek.vault.reader.try_load_fragment` callers
+    already use — :data:`~creek.vault.reader.FRONTMATTER_LOAD_ERRORS`. That
+    parity is load-bearing now that the walk reaches beyond ``01-Fragments``:
+    the reference notes and the ``_author.md`` manifests living in the other
+    two subtrees must skip, not raise.
+
+    The skip is logged at **WARNING**, not DEBUG, and that asymmetry with every
+    other walk in the tree is deliberate. A skip here is a fail-open: this gate
+    reports a leak only for fragments whose tier it managed to read, so a file
+    it cannot parse is a file it cannot police, and the draft reviews as PASS
+    on incomplete evidence. Before #1475 a non-string frontmatter key raised
+    ``TypeError`` and aborted the review — loud, and safe. Catching it is the
+    right trade (one hand-edited note must not disable the Writing Desk) only
+    if the operator can hear that it happened.
+
+    Args:
+        root: An existing corpus subtree to walk.
+        cited: The fragment ids the draft cites.
+        resolved: Accumulator mapping cited id to its folded record; mutated.
+    """
+    for md_file in sorted(root.rglob("*.md")):
+        try:
+            record = try_load_fragment(md_file)
+        except FRONTMATTER_LOAD_ERRORS:
+            # Loud on purpose. Everywhere else in the tree an unreadable note
+            # is a DEBUG-level skip, but this walk feeds a HARD leak gate: a
+            # fragment whose tier cannot be read is a fragment this gate
+            # cannot police, and the draft then reviews as PASS on incomplete
+            # evidence. Widening the tuple (#1475) makes that fail-open reachable
+            # from one hand-edited note, so the operator hears about it. #926 is
+            # the general fix — surfacing every silently-skipped fragment.
+            logger.warning(
+                "Cited-tier scan skipped an unreadable fragment file: %s. "
+                "The privacy_compliance gate could not read its tier.",
+                md_file,
+            )
+            continue
+        if record is None:
+            continue
+        fragment, body, _raw = record
+        if fragment.id not in cited:
+            continue
+        # No `tier_within_override` here, deliberately. The admission ceiling
+        # decides what the specialists may *gather*; this gate must read the
+        # fragment's TRUE tier, or it goes blind to exactly the content it
+        # exists to catch. Filtering here is the single most tempting wrong
+        # edit in this file.
+        seen = resolved.get(fragment.id)
+        resolved[fragment.id] = (
+            seen.merged_with(fragment.privacy_tier, body)
+            if seen is not None
+            else _CitedFragment(tier=_as_tier(fragment.privacy_tier), bodies=(body,))
+        )
+
+
 def _resolve_cited_tiers(
     evidence: EvidenceBundle,
     vault: Path,
-) -> dict[str, tuple[PrivacyTier, str]]:
-    """Map each cited fragment id to its ``(privacy_tier, body)`` from *vault*.
+) -> dict[str, _CitedFragment]:
+    """Resolve each cited fragment id against every corpus subtree in *vault*.
+
+    Searches all of :data:`~creek.vault.reader.CORPUS_SUBDIRS` —
+    ``01-Fragments``, ``09-Reference`` and ``11-Other-Authors`` — which is the
+    same tuple the desk's specialists gather evidence from. Sharing the object
+    is the point: while the gate kept its own one-entry list it policed a
+    subtree the specialists had long since outgrown, and an over-tier fragment
+    cited out of either other subtree resolved to nothing at all (#1341). An
+    absent subtree is skipped on its own; the absence of one never disables the
+    others.
+
+    Records sharing an id are folded by :class:`_CitedFragment`: most
+    restrictive tier wins and every body is kept, an order-independent merge.
+    The fragment's own tier is read — never
+    :func:`~creek.classify.privacy_filter.tier_within_override`'s admitted view.
+
+    No containment check is applied to symlinked or otherwise out-of-tree files,
+    and none is wanted. Under a monotone fold an extra record can only raise a
+    tier or add a body, so a planted shadow cannot downgrade or mask anything;
+    adding a skip path would introduce the one genuinely unsafe move available
+    here — dropping a body, and with it a leak.
+
+    Honest cost: worst case this parses all three subtrees once per ``review``
+    call, and the conductor may call ``review`` once per round up to
+    ``max_author_rounds`` (default 3, capped at 10). The common miss — an LLM
+    inventing a fragment id — is now always exhaustive, where the old
+    single-root walk could exit early. No memo is kept on purpose: a cache with
+    wrong invalidation on a HARD leak gate is worse than a slow gate.
 
     Args:
         evidence: The evidence whose cited fragment ids are resolved.
         vault: The vault root to load fragments from.
 
     Returns:
-        A mapping of cited fragment id to its tier and stored body. Fragments
-        not found in the vault are omitted.
-
-    The walk is lazy — ``rglob`` is iterated directly (not materialised) and
-    exits as soon as every cited fragment is resolved, so a draft citing a
-    handful of fragments stops early instead of parsing the whole vault on every
-    ``review`` call inside the retry loop. Iteration order is therefore the
-    filesystem's; that is irrelevant here since results are keyed by fragment id.
+        A mapping of cited fragment id to its folded :class:`_CitedFragment`.
+        Ids with no matching file anywhere in the corpus are omitted.
     """
     cited = set(evidence.all_source_fragments())
-    resolved: dict[str, tuple[PrivacyTier, str]] = {}
-    fragments_root = vault / "01-Fragments"
-    if not cited or not fragments_root.is_dir():
+    resolved: dict[str, _CitedFragment] = {}
+    if not cited:
         return resolved
-    for md_file in fragments_root.rglob("*.md"):
-        try:
-            record = try_load_fragment(md_file)
-        except (OSError, ValueError, yaml.YAMLError):
-            continue
-        if record is None:
-            continue
-        fragment, body, _raw = record
-        if fragment.id in cited:
-            resolved[fragment.id] = (fragment.privacy_tier, body)
-            if len(resolved) == len(cited):
-                break  # every cited fragment found — stop scanning the vault
+    for sub in CORPUS_SUBDIRS:
+        subtree = vault / sub
+        # Per-root, never global: bailing on the whole walk because the first
+        # root is missing left a vault whose corpus lives under `09-Reference`
+        # with no privacy gate at all.
+        if subtree.is_dir():
+            _scan_subtree_for_cited(subtree, cited, resolved)
     return resolved
 
 
@@ -215,6 +421,15 @@ paraphrase and shorter snippets are left to the semantic judge (#474).
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
+_WORD_CHAR_RE = re.compile(r"\w")
+r"""Matches a single word character, testing whether an edge can carry a boundary.
+
+A ``\b`` anchor asserts a word/non-word *transition*, so it can never hold on an
+edge whose own character is already punctuation — as a whole fragment body's
+first/last character usually is (#939). :func:`_is_verbatim_leak` uses this to
+apply a boundary assertion to exactly the edges where one is meaningful.
+"""
+
 
 def _is_verbatim_leak(protected: str, body: str) -> bool:
     """Return whether *protected* appears in *body* as a substantive phrase.
@@ -224,7 +439,10 @@ def _is_verbatim_leak(protected: str, body: str) -> bool:
     * the protected snippet must be at least :data:`_MIN_PROTECTED_LEAK_WORDS`
       words long (a single common word/phrase is too coincidence-prone for a
       HARD gate), and
-    * it must match on word boundaries, so it cannot match inside a larger word.
+    * it must not be glued into a larger word. The boundary is asserted only on
+      an edge whose own character is a word character, so a snippet that starts
+      or ends with punctuation is still detected rather than silently missed
+      (#939).
 
     Whitespace is normalised on both sides first, so a reflowed line break in
     the draft cannot hide an otherwise-verbatim leak.
@@ -240,8 +458,175 @@ def _is_verbatim_leak(protected: str, body: str) -> bool:
         return False
     normalized_protected = _WHITESPACE_RE.sub(" ", protected).strip()
     normalized_body = _WHITESPACE_RE.sub(" ", body)
-    pattern = rf"\b{re.escape(normalized_protected)}\b"
+    # The word-count guard above makes the snippet non-empty here, so its edge
+    # characters are safe to index. Assert a boundary only where one can hold:
+    # a `\b` on a punctuation edge never matches when the draft's adjacent
+    # character is also punctuation or a string end, which let an exact
+    # reproduction of a protected body slip through the HARD gate (#939).
+    prefix = r"(?<!\w)" if _WORD_CHAR_RE.match(normalized_protected[0]) else ""
+    suffix = r"(?!\w)" if _WORD_CHAR_RE.match(normalized_protected[-1]) else ""
+    pattern = f"{prefix}{re.escape(normalized_protected)}{suffix}"
     return re.search(pattern, normalized_body) is not None
+
+
+def _leaks_any_body(cited: _CitedFragment, body: str) -> bool:
+    """Return whether the draft reproduces any text stored under a cited id.
+
+    Every stored body counts, not only the one on the record that won the tier
+    fold: the tier is a property of the *id*, so once that id resolves above the
+    ceiling its lower-tier twin's text is protected too (#1341).
+
+    Args:
+        cited: The resolved record for one cited fragment id.
+        body: The drafted prose under review.
+
+    Returns:
+        ``True`` when at least one stored body appears verbatim in the draft.
+    """
+    return any(_is_verbatim_leak(stored.strip(), body) for stored in cited.bodies)
+
+
+_CONFIG_SOURCE = "author.max_reproduced_tier"
+"""Names the operator's ``creek_config.yaml`` key as the ceiling's source.
+
+Every ``_..._SOURCE`` constant is rendered verbatim into a finding message, and
+``creek/cli.py``'s ``_emit_author_result`` prints those through Rich — so none
+of them may contain square brackets, which Rich would read as markup
+(``test_author_refusal_survives_markup_in_a_fragment_id``)."""
+
+_CONTRACT_SOURCE = "the medium contract"
+"""Names the medium contract as the ceiling's source.
+
+Deliberately silent about *which* file: a contract is either the shipped
+template or a vault copy shadowing it, and naming one path would send an
+operator to edit a file that may not be the one in play."""
+
+_NO_CONTRACT_SOURCE = "no medium contract"
+"""Names :data:`_NO_CONTRACT_CEILING` as the ceiling's source.
+
+Kept distinct from :data:`_CONTRACT_SOURCE` so the message says whether a
+contract was read and declared this tier or none was found at all — two
+different repairs."""
+
+
+def _ceiling_rank(tier: PrivacyTier) -> int:
+    """Return the restrictiveness rank of a *ceiling* tier.
+
+    The counterpart of :func:`_fragment_rank`, and the fail-closed direction is
+    the opposite one: an unranked ceiling drops to
+    :data:`_LEAST_RESTRICTIVE_RANK` (rank 0, the strictest ceiling there is), so
+    more cited tiers count as over-tier rather than fewer (#509).
+
+    Both sides of the ceiling fold in :func:`_resolve_effective_ceiling` go
+    through here, so an unranked tier on *either* side fails closed rather than
+    winning the comparison by accident.
+
+    Args:
+        tier: A candidate ceiling tier.
+
+    Returns:
+        The tier's rank; higher is more permissive as a ceiling.
+    """
+    return _TIER_RANK.get(tier, _LEAST_RESTRICTIVE_RANK)
+
+
+@dataclass(frozen=True, slots=True)
+class _EffectiveCeiling:
+    """The tier the leak gate enforces, plus which authority set it.
+
+    The source travels with the tier because the finding message has to name the
+    file an operator would edit to change the verdict: the two authorities live
+    in different places (``creek_config.yaml`` outside the vault, the medium
+    contract inside it) and pointing at the wrong one is a wasted debugging
+    session.
+
+    Attributes:
+        tier: The effective ceiling — the more restrictive of the two sources.
+        source: One of :data:`_CONFIG_SOURCE`, :data:`_CONTRACT_SOURCE` or
+            :data:`_NO_CONTRACT_SOURCE`.
+    """
+
+    tier: PrivacyTier
+    source: str
+
+
+def _configured_max_reproduced_tier(vault: Path) -> PrivacyTier:
+    """Read ``author.max_reproduced_tier`` from *vault*'s config, failing closed.
+
+    This is the half of the ceiling an in-vault medium contract cannot reach:
+    ``creek_config.yaml`` lives at ``00-Creek-Meta/creek_config.yaml`` and no
+    template deploys it with a raised value (#1354).
+
+    A config this function cannot read gates at :attr:`PrivacyTier.OPEN` rather
+    than propagating: the MCP ``creek.author`` verb must not surface a traceback
+    from inside a HARD gate. The caught set is exact, never widened — a stale
+    ``CREEK_CONFIG`` raises ``FileNotFoundError`` (``creek/config.py:83-89``),
+    which is an ``OSError``; pydantic's ``ValidationError`` subclasses
+    ``ValueError``; ``yaml.YAMLError`` subclasses neither.
+
+    The conversion itself cannot raise, and needs no second coercion:
+    ``max_reproduced_tier`` is a ``Literal`` of exactly the four tier names,
+    whose ``before`` validator already fails closed to ``"open"`` for anything
+    else. The ``except`` exists for I/O and YAML failure alone.
+
+    Args:
+        vault: The vault root whose config is consulted.
+
+    Returns:
+        The operator's configured reproduction ceiling, or
+        :attr:`PrivacyTier.OPEN` when the config cannot be read.
+    """
+    try:
+        config = load_vault_config(vault)
+    except (OSError, ValueError, yaml.YAMLError):
+        logger.warning(
+            "Could not read author.max_reproduced_tier from the config for "
+            "vault %s; failing closed to %r.",
+            vault,
+            PrivacyTier.OPEN.value,
+        )
+        return PrivacyTier.OPEN
+    return PrivacyTier(config.author.max_reproduced_tier)
+
+
+def _resolve_effective_ceiling(
+    contract: MediumContract | None,
+    configured: PrivacyTier,
+) -> _EffectiveCeiling:
+    """Fold the two ceiling authorities into the one the gate enforces.
+
+    "More restrictive" is the **lower** :data:`_TIER_RANK` — a ``min``, never a
+    ``max``. Word-association runs the other way ("take the more restrictive
+    tier" reads like ``max``), and taking ``max`` here ships either a no-op or a
+    widening of a HARD privacy gate;
+    ``test_the_effective_ceiling_is_the_more_restrictive_not_the_more_permissive``
+    is the direct detector for that inversion.
+
+    Ranks are compared, not tiers, so an unranked tier on either side falls to
+    :data:`_LEAST_RESTRICTIVE_RANK` and fails closed (#509).
+
+    Ties go to the config (``<=``, not ``<``) for two reasons. At the shipped
+    default both sources are ``open``, and the message should then name the
+    authority that a vault-authored contract cannot widen. And an unranked
+    contract tier ties at rank 0 with a configured ``open`` — it must never be
+    *named* as the ceiling, since its rank is a fail-closed guess rather than
+    something the contract declared.
+
+    Args:
+        contract: The medium contract, or ``None`` for a contract-less caller.
+        configured: The operator's ``author.max_reproduced_tier``.
+
+    Returns:
+        The effective ceiling and the authority that set it.
+    """
+    declared, source = (
+        (_NO_CONTRACT_CEILING, _NO_CONTRACT_SOURCE)
+        if contract is None
+        else (PrivacyTier(contract.default_privacy_tier), _CONTRACT_SOURCE)
+    )
+    if _ceiling_rank(configured) <= _ceiling_rank(declared):
+        return _EffectiveCeiling(configured, _CONFIG_SOURCE)
+    return _EffectiveCeiling(declared, source)
 
 
 def check_privacy_compliance(
@@ -250,51 +635,70 @@ def check_privacy_compliance(
     vault: Path | None,
     contract: MediumContract | None,
 ) -> list[ReflectionFinding]:
-    """Flag a draft that leaks text above the contract's privacy tier (HARD).
+    """Flag a draft that leaks text above the effective privacy ceiling (HARD).
 
-    For each cited fragment whose resolved tier is *more restrictive* than the
-    contract's ``default_privacy_tier``, the draft breaches privacy iff the body
-    still contains that fragment's protected text. The check is deterministic;
-    when *vault* or *contract* is ``None`` there is nothing to resolve against,
-    so no finding is raised. A cited fragment id with no matching file in the
-    vault is unresolvable (its tier cannot be known) and is skipped rather than
-    guessed — the hard citation gate still requires every claim to carry an id.
+    The ceiling has **two** sources and is the more restrictive of them: the
+    operator's ``author.max_reproduced_tier`` in ``creek_config.yaml`` and the
+    medium contract's ``default_privacy_tier`` (see
+    :func:`_resolve_effective_ceiling`). Until #1354 the contract was the only
+    source — and a contract is authored *inside the vault*, so one edited YAML
+    line in a skill file disarmed this gate. A contract can now only narrow it.
+
+    For each cited fragment whose resolved tier is *more restrictive* than that
+    ceiling, the draft breaches privacy iff the body still contains that
+    fragment's protected text. The check is deterministic; only *vault* being
+    ``None`` skips it, because without a vault there is no file to resolve a
+    tier, a protected body, or a configured ceiling from. A missing *contract*
+    does **not** skip: it gates at :data:`_NO_CONTRACT_CEILING` (#1310). A cited
+    fragment id with no matching file in the vault is unresolvable (its tier
+    cannot be known) and is skipped rather than guessed — the hard citation gate
+    still requires every claim to carry an id.
 
     Args:
         body: The drafted prose under review.
         evidence: The evidence the draft was rendered from.
-        vault: The vault root, or ``None`` to skip the check.
-        contract: The medium contract whose ``default_privacy_tier`` is the
-            ceiling, or ``None`` to skip.
+        vault: The vault root, or ``None`` to skip the check. Also the root the
+            configured half of the ceiling is read from.
+        contract: The medium contract whose ``default_privacy_tier`` is one of
+            the two ceiling sources — it applies only where it is stricter than
+            the configured tier — or ``None`` to fold
+            :data:`_NO_CONTRACT_CEILING` in instead.
 
     Returns:
         One ``HIGH`` finding per leaked over-tier fragment, dimension
         ``"privacy_compliance"``.
     """
-    if vault is None or contract is None:
+    if vault is None:
         return []
-    # Pydantic stores tiers as the underlying str; coerce back to the enum so
-    # the ordering lookup and display are well-defined.
-    ceiling_tier = PrivacyTier(contract.default_privacy_tier)
-    ceiling = _TIER_RANK.get(ceiling_tier, _LEAST_RESTRICTIVE_RANK)
+    # Reads the vault config on every call. Measured at 18.6ms against a real
+    # config and 0.5ms with none, and `review` runs once per round, bounded by
+    # `author.max_author_rounds` (<= 10) — at most ten reads per run, each
+    # alongside an LLM call. No module-level memo on purpose: it would go stale
+    # across vaults within one pytest session and hide a bad read, and the
+    # value of this chokepoint is that exactly one place decides the ceiling.
+    effective = _resolve_effective_ceiling(
+        contract, _configured_max_reproduced_tier(vault)
+    )
+    ceiling = _ceiling_rank(effective.tier)
     findings: list[ReflectionFinding] = []
-    for frag_id, (raw_tier, frag_body) in _resolve_cited_tiers(evidence, vault).items():
-        tier = PrivacyTier(raw_tier)
-        protected = frag_body.strip()
+    # Sorted by fragment id so a draft leaking several fragments always reports
+    # them in the same order, whichever subtree resolved each one first.
+    for frag_id, cited in sorted(_resolve_cited_tiers(evidence, vault).items()):
         # Deterministic scope: this catches substantive verbatim leakage of the
         # protected body (see :func:`_is_verbatim_leak`). A paraphrase of
         # over-tier content — or a snippet too short to be a reliable signal —
         # is NOT caught here; that needs the semantic LLM judge (#474).
-        rank = _TIER_RANK.get(tier, _MOST_RESTRICTIVE_RANK)
-        if rank > ceiling and _is_verbatim_leak(protected, body):
+        rank = _fragment_rank(cited.tier)
+        if rank > ceiling and _leaks_any_body(cited, body):
             findings.append(
                 ReflectionFinding(
                     dimension="privacy_compliance",
                     severity="HIGH",
                     message=(
-                        f"Cited fragment {frag_id!r} is {tier.value!r} "
-                        f"(above the {ceiling_tier.value!r} "
-                        "default) yet its protected text appears in the draft."
+                        f"Cited fragment {frag_id!r} is {cited.tier.value!r} "
+                        f"(above the effective {effective.tier.value!r} ceiling, "
+                        f"set by {effective.source}) yet its protected text "
+                        "appears in the draft."
                     ),
                 )
             )

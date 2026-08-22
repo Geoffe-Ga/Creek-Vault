@@ -33,11 +33,16 @@ repos:
     - main
 - repo: https://github.com/astral-sh/ruff-pre-commit
   rev: v0.15.13
+  # --no-cache: ruff's cache key is mtime-only, and these hooks seed the very
+  # cache check-all.sh would otherwise trust; CI has none (issue #1119).
   hooks:
   - id: ruff
     args:
     - --fix
+    - --no-cache
   - id: ruff-format
+    args:
+    - --no-cache
 - repo: https://github.com/pre-commit/mirrors-mypy
   # Kept in sync with uv.lock (mypy 2.1.0) and pyproject.toml's
   # [project.optional-dependencies].dev pin so all three install paths
@@ -58,6 +63,14 @@ repos:
     - pytest>=7.4.0
     - hypothesis>=6.92.0
     - pydantic>=2.0.0
+    # anthropic ships py.typed; scripts/ralph/recap.py imports it (guarded),
+    # so mypy needs the real package to resolve the module.
+    - anthropic>=0.40.0
+    # starlette ships py.typed and is a direct dependency as of #1074 (the
+    # /v1 HTTP adapter in creek_mcp/httpapi/). The hook runs in its own
+    # isolated env, so without this mypy reports import-not-found for every
+    # starlette import even though ./scripts/typecheck.sh is clean.
+    - starlette>=1.3.1
     args:
     - --strict
 - repo: https://github.com/PyCQA/bandit
@@ -103,14 +116,41 @@ repos:
   rev: v2.3.1
   hooks:
   - id: refurb
-- repo: https://github.com/jendrikseipp/vulture
-  rev: v2.10
+# Local hook: the dead-code gate (issue #1395). Was the upstream
+# jendrikseipp/vulture repo at rev v2.10 with `--min-confidence 80` over
+# creek-tools/creek/ — a check that could not fail, because vulture scores
+# unused functions/methods/classes at 60%. It also pinned 2.10 while
+# uv.lock resolves 2.16, so the hook and the rest of the toolchain ran
+# different versions. Routing through the wrapper removes both problems:
+# one policy, one version (whatever uv.lock installs), no threshold to
+# drift. `language: system` for the same reason as pylint-fast below.
+- repo: local
   hooks:
   - id: vulture
-    args:
-    - creek-tools/creek/
-    - --min-confidence
-    - '80'
+    name: vulture (dead code, per-type confidence floors)
+    entry: creek-tools/scripts/lint-vulture.sh
+    language: system
+    types: [python]
+    # The gate fixes its own scan scope; passing staged filenames would
+    # narrow it and reopen the hole this hook exists to close.
+    pass_filenames: false
+    # `scripts/` is in the trigger list because lint_vulture.py is the
+    # policy: editing a floor or a carve-out must re-run the gate, not
+    # wait for the next commit that happens to touch creek/.
+    files: ^creek-tools/(creek|creek_mcp|tests|scripts)/
+  # The same policy module, pointed at the sibling subproject (#1472).
+  # Two hooks rather than one because the two scopes fail independently
+  # and a reader of a failed run needs to know which tree is dirty.
+  - id: vulture-crawdad
+    name: vulture (dead code, crawdad)
+    entry: crawdad/scripts/lint-vulture.sh
+    language: system
+    types: [python]
+    pass_filenames: false
+    # creek-tools/scripts/ is a trigger for this hook too: the policy it
+    # runs lives there, so a carve-out edited in creek-tools must re-run
+    # crawdad's gate rather than wait for the next crawdad commit.
+    files: ^(crawdad/(crawdad|tests)|creek-tools/scripts)/
 - repo: https://github.com/econchick/interrogate
   rev: 1.7.0
   hooks:
@@ -130,7 +170,7 @@ repos:
     exclude: \.secrets\.baseline$
 # Local hook: pylint as a CI-aligned gate (CI-002 / CI-004). Runs only
 # on staged Python files so it stays fast; CI runs the full --fail-under
-# pass over creek/.
+# pass over creek/ and creek_mcp/.
 - repo: local
   hooks:
   - id: pylint-fast
@@ -151,7 +191,9 @@ repos:
     # --rcfile (pylint warned and fell back to defaults anyway). The
     # CLI --fail-under is the actual enforcement contract.
     args: [--fail-under=9.0]
-    files: ^creek-tools/creek/
+    # Both first-party packages, and only those — tests/ stays out
+    # (issue #925 added creek_mcp/).
+    files: ^creek-tools/(creek|creek_mcp)/
 ci:
   autofix_commit_msg: 'style: auto-fix by pre-commit hooks'
   autoupdate_commit_msg: 'chore: update pre-commit hooks'

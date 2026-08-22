@@ -1,0 +1,31 @@
+{
+  "additionalProperties": false,
+  "description": "One APTITUDE frequency's slice of the wheel.\n\nAttributes:\n    name: The canonical frequency name from\n        :data:`creek.generate.indexes.CANONICAL_FREQUENCY_NAMES`.\n    count: Classified fragments at this frequency. A tally, so never\n        negative.\n    share: Fraction of *classified* fragments at this frequency, bounded to\n        ``[0.0, 1.0]``.",
+  "properties": {
+    "count": {
+      "description": "Classified fragments here.",
+      "minimum": 0,
+      "title": "Count",
+      "type": "integer"
+    },
+    "name": {
+      "description": "Canonical APTITUDE frequency name.",
+      "title": "Name",
+      "type": "string"
+    },
+    "share": {
+      "description": "Fraction of classified fragments at this frequency.",
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "title": "Share",
+      "type": "number"
+    }
+  },
+  "required": [
+    "name",
+    "count",
+    "share"
+  ],
+  "title": "WheelFrequency",
+  "type": "object"
+}

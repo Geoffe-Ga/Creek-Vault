@@ -1,0 +1,469 @@
+{
+  "bundle": "adepthood-v1",
+  "contract_version": "0.9.0",
+  "files": [
+    {
+      "capability": "capabilities",
+      "model": "NotApplicableExample",
+      "path": "examples/capabilities/care-escalation.json",
+      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "state": "care-escalation"
+    },
+    {
+      "capability": "capabilities",
+      "model": "CapabilitiesResponse",
+      "path": "examples/capabilities/empty.json",
+      "sha256": "0b351a098f4086f3a6dea530ebf90790009658b95f6eb6216e9fd635dc37b3be",
+      "state": "empty"
+    },
+    {
+      "capability": "capabilities",
+      "model": "ErrorEnvelope",
+      "path": "examples/capabilities/incompatible-version.json",
+      "sha256": "31ec5c80d575fff4c4ef489e86bddbe7e3bcf2efa6e4ca0b9cb4ed727d93b210",
+      "state": "incompatible-version"
+    },
+    {
+      "capability": "capabilities",
+      "model": "ErrorEnvelope",
+      "path": "examples/capabilities/malformed-input.json",
+      "sha256": "0c7e796525f90bb81cac9f5f04173b2d1471733eb3606e807feea3dcac3fbfa7",
+      "state": "malformed-input"
+    },
+    {
+      "capability": "capabilities",
+      "model": "ErrorEnvelope",
+      "path": "examples/capabilities/refusal.json",
+      "sha256": "a27761795b0af5acb873c400b81a9e35f073c629d390f77ae762605436c6a5ac",
+      "state": "refusal"
+    },
+    {
+      "capability": "capabilities",
+      "model": "CapabilitiesResponse",
+      "path": "examples/capabilities/success.json",
+      "sha256": "8ee29fa6be1483af5392419697962b38a75bfd36a0cd0a7dc0fc28639748c835",
+      "state": "success"
+    },
+    {
+      "capability": "capabilities",
+      "model": "ErrorEnvelope",
+      "path": "examples/capabilities/unavailable-service.json",
+      "sha256": "89a0b5295b63a7c84f76da28bc556abf281afefa7993a3b5701ddd01baf9294d",
+      "state": "unavailable-service"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "NotApplicableExample",
+      "path": "examples/drive-connector/care-escalation.json",
+      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "state": "care-escalation"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "DriveSyncResponse",
+      "path": "examples/drive-connector/empty.json",
+      "sha256": "54f3f1431e62c7ea9f51cc54663149f80eb0f2acabb5eb3a7fca061d4860feb9",
+      "state": "empty"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "ErrorEnvelope",
+      "path": "examples/drive-connector/incompatible-version.json",
+      "sha256": "c30b8a6f89e5574f7393a9876aa65205ac52212da85eb3a45f886b8d0ed1b6f6",
+      "state": "incompatible-version"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "ErrorEnvelope",
+      "path": "examples/drive-connector/malformed-input.json",
+      "sha256": "4943689ec156ebd288dcb6e6f888e2284d43527de156a5b1b8e9f3649730aade",
+      "state": "malformed-input"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "ErrorEnvelope",
+      "path": "examples/drive-connector/refusal.json",
+      "sha256": "3dbec5a3c1e03cb60cdc213a9786d9cea6918d8cb136244d19eb5995ee1c0631",
+      "state": "refusal"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "DriveConnectorStatusResponse",
+      "path": "examples/drive-connector/success.json",
+      "sha256": "2029edc1fd756fb865226d72928915f463e75fcbe1bcd54645b1abc7829ad60c",
+      "state": "success"
+    },
+    {
+      "capability": "drive-connector",
+      "model": "ErrorEnvelope",
+      "path": "examples/drive-connector/unavailable-service.json",
+      "sha256": "bd64368c2cf504b3fc6c7619e4eb0f4c3eff52c31a839d3da4d24f8d00e9f68c",
+      "state": "unavailable-service"
+    },
+    {
+      "capability": "journal-upsert",
+      "model": "NotApplicableExample",
+      "path": "examples/journal-upsert/care-escalation.json",
+      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "state": "care-escalation"
+    },
+    {
+      "capability": "journal-upsert",
+      "model": "JournalUpsertResponse",
+      "path": "examples/journal-upsert/empty.json",
+      "sha256": "66498f2275528fb22151d8441c3cab5d3fa60d089100b3d39d35cdbd2f2b59ba",
+      "state": "empty"
+    },
+    {
+      "capability": "journal-upsert",
+      "model": "ErrorEnvelope",
+      "path": "examples/journal-upsert/incompatible-version.json",
+      "sha256": "11f79c2f713c309b0e7ef5d426950b1325f649e0ee353c96092d13d99b892432",
+      "state": "incompatible-version"
+    },
+    {
+      "capability": "journal-upsert",
+      "model": "ErrorEnvelope",
+      "path": "examples/journal-upsert/malformed-input.json",
+      "sha256": "16c1542153a2d53b3203107d4d299dc8fa819bbeb9666279301b18371bfa7e9a",
+      "state": "malformed-input"
+    },
+    {
+      "capability": "journal-upsert",
+      "model": "ErrorEnvelope",
+      "path": "examples/journal-upsert/refusal.json",
+      "sha256": "ae3f45dcfef37cf4d7aea5ce53a9d26b52db376e15c62f2e0773c53b3199643c",
+      "state": "refusal"
+    },
+    {
+      "capability": "journal-upsert",
+      "model": "JournalUpsertResponse",
+      "path": "examples/journal-upsert/success.json",
+      "sha256": "a1d405aa236bc6ea4c7f6e8f93354a5fbee2e631b4020299eb3208170a554411",
+      "state": "success"
+    },
+    {
+      "capability": "journal-upsert",
+      "model": "ErrorEnvelope",
+      "path": "examples/journal-upsert/unavailable-service.json",
+      "sha256": "a29004223b68de26c66e2dfaa64ff3fde4495e0b3bee0c21c3aae8c56be6a6a6",
+      "state": "unavailable-service"
+    },
+    {
+      "capability": "reflections",
+      "model": "CareEscalationResponse",
+      "path": "examples/reflections/care-escalation.json",
+      "sha256": "8558c3fa48b4be421fed76e7116f48568ce9eb4fba9ebe9f274e1c5e385b9b91",
+      "state": "care-escalation"
+    },
+    {
+      "capability": "reflections",
+      "model": "ReflectionResponse",
+      "path": "examples/reflections/empty.json",
+      "sha256": "acbc52f5a0d4928138cc2e2a83e8d71676951ca5b639c143ab588e63b397845f",
+      "state": "empty"
+    },
+    {
+      "capability": "reflections",
+      "model": "ErrorEnvelope",
+      "path": "examples/reflections/incompatible-version.json",
+      "sha256": "4c7b3c4625d963299263022c73a76ec98f8dbf7139211ca4e77446b27994de0a",
+      "state": "incompatible-version"
+    },
+    {
+      "capability": "reflections",
+      "model": "ErrorEnvelope",
+      "path": "examples/reflections/malformed-input.json",
+      "sha256": "8c38d1d2895086249a6d0f3a036b91ff647ecf2dfaf754854da19b04d1025240",
+      "state": "malformed-input"
+    },
+    {
+      "capability": "reflections",
+      "model": "ErrorEnvelope",
+      "path": "examples/reflections/refusal.json",
+      "sha256": "550679693ae83fea294a953e0df211d998d98901131c37500db986896b8131bc",
+      "state": "refusal"
+    },
+    {
+      "capability": "reflections",
+      "model": "ReflectionResponse",
+      "path": "examples/reflections/success.json",
+      "sha256": "ecb5b753260dcba1a5612b502e0ef3a6580cb0e9bbd856b9fc777d88396daca9",
+      "state": "success"
+    },
+    {
+      "capability": "reflections",
+      "model": "ErrorEnvelope",
+      "path": "examples/reflections/unavailable-service.json",
+      "sha256": "7102f95c0f3e31cae0aa55b9b73a17b4ba3c32aa3548ee7df4ba79962577c524",
+      "state": "unavailable-service"
+    },
+    {
+      "capability": "upload",
+      "model": "NotApplicableExample",
+      "path": "examples/upload/care-escalation.json",
+      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "state": "care-escalation"
+    },
+    {
+      "capability": "upload",
+      "model": "UploadResponse",
+      "path": "examples/upload/empty.json",
+      "sha256": "8405a1597da91b2b1c57570110ac302d52dec3b360862eddb3d6a5b98da7b159",
+      "state": "empty"
+    },
+    {
+      "capability": "upload",
+      "model": "ErrorEnvelope",
+      "path": "examples/upload/incompatible-version.json",
+      "sha256": "07bf423851cdaf6cf721ab0be7a1614253ddb54d8957d2567664a8897472d833",
+      "state": "incompatible-version"
+    },
+    {
+      "capability": "upload",
+      "model": "ErrorEnvelope",
+      "path": "examples/upload/malformed-input.json",
+      "sha256": "e67de3e48344f9b4d5b984d2817d46ece909e0381c3f6a0cfbb8e8773db8627f",
+      "state": "malformed-input"
+    },
+    {
+      "capability": "upload",
+      "model": "ErrorEnvelope",
+      "path": "examples/upload/refusal.json",
+      "sha256": "63c4668a4cb759863a2d5778c3175591385f2aeff1839b95bf4718bc4893a2b7",
+      "state": "refusal"
+    },
+    {
+      "capability": "upload",
+      "model": "UploadResponse",
+      "path": "examples/upload/success.json",
+      "sha256": "b0a907041d41ce5f2b918afbe1612903d05b3701f95052594b53194df2d76dde",
+      "state": "success"
+    },
+    {
+      "capability": "upload",
+      "model": "ErrorEnvelope",
+      "path": "examples/upload/unavailable-service.json",
+      "sha256": "c557c982eca814d9bfe391009cd5803f61261cfeb163edcc0e0ac4e67bfcd28e",
+      "state": "unavailable-service"
+    },
+    {
+      "capability": "wheel",
+      "model": "NotApplicableExample",
+      "path": "examples/wheel/care-escalation.json",
+      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "state": "care-escalation"
+    },
+    {
+      "capability": "wheel",
+      "model": "WheelResponse",
+      "path": "examples/wheel/empty.json",
+      "sha256": "6cb4819a51ef6b46d21d09b823ed5a2c54fc9531aa400355eb9effcb8fccc3e5",
+      "state": "empty"
+    },
+    {
+      "capability": "wheel",
+      "model": "ErrorEnvelope",
+      "path": "examples/wheel/incompatible-version.json",
+      "sha256": "490109a3068923a32f76df6ca4225ba5d851df7fac1f636a529d85bbeb780deb",
+      "state": "incompatible-version"
+    },
+    {
+      "capability": "wheel",
+      "model": "ErrorEnvelope",
+      "path": "examples/wheel/malformed-input.json",
+      "sha256": "27211ed75a39694528f23582127bd29adeb6ae0e015bbef0932e78c37cc29532",
+      "state": "malformed-input"
+    },
+    {
+      "capability": "wheel",
+      "model": "ErrorEnvelope",
+      "path": "examples/wheel/refusal.json",
+      "sha256": "e2fdd19cb5f8071c6397dd5a3c3e789b9ee4ecc8d145ca78e534433182d92631",
+      "state": "refusal"
+    },
+    {
+      "capability": "wheel",
+      "model": "WheelResponse",
+      "path": "examples/wheel/success.json",
+      "sha256": "c92e80eb28c198926cb2ad07c8de2c55a36a0aeda037496242ed5ba340f05ad8",
+      "state": "success"
+    },
+    {
+      "capability": "wheel",
+      "model": "ErrorEnvelope",
+      "path": "examples/wheel/unavailable-service.json",
+      "sha256": "06708a8b5a4e5544927d1615fc35da42fb57de2b64e3ff554945236a2fd2a22b",
+      "state": "unavailable-service"
+    },
+    {
+      "capability": null,
+      "model": null,
+      "path": "retry-policy.json",
+      "sha256": "8e6d5be69156f8934c5a7ab523e115e0053017107e53ef31a4be83147d0657fb",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "CapabilitiesResponse",
+      "path": "schemas/CapabilitiesResponse.schema.json",
+      "sha256": "c8dd894861567422befb5037d2fe5afb43b3b64c1c06927271b58ee60f8f044e",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "CareEscalationResponse",
+      "path": "schemas/CareEscalationResponse.schema.json",
+      "sha256": "1f4a89716c036acde720419f708925c814cbe222c58b795642f54682f4514f4a",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "CareResource",
+      "path": "schemas/CareResource.schema.json",
+      "sha256": "ae8893d6366f2a39d294721de29a0dad3140b04198991b2578292be7f60a41fd",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "CareSignal",
+      "path": "schemas/CareSignal.schema.json",
+      "sha256": "fc09e8583eca62438b9a4b4074da5fcb1f31c694a059d11e7efca5db9b60ce90",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "DriveConnectorStatusResponse",
+      "path": "schemas/DriveConnectorStatusResponse.schema.json",
+      "sha256": "9878918c1f8a1091a155f20a69fae343b3229f03cce54b784525d51ae09d9c1f",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "DriveDisconnectResponse",
+      "path": "schemas/DriveDisconnectResponse.schema.json",
+      "sha256": "0809789ee2628bb14545eb4ed87cff172dbbbe502972dc1d8f0d32f18e181502",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "DriveSyncResponse",
+      "path": "schemas/DriveSyncResponse.schema.json",
+      "sha256": "8fa0ddc2b9143f3962ceede733fede60695e250e5ec728509123ea8d1c150ea8",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "ErrorEnvelope",
+      "path": "schemas/ErrorEnvelope.schema.json",
+      "sha256": "6f9d0a3288cdf9f207cd28da3742f90ae686e12da6b21f28f82743895e0a634e",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "JournalUpsertRequest",
+      "path": "schemas/JournalUpsertRequest.schema.json",
+      "sha256": "76137d5fe64f4b3ced1866d9d50e2d0e66e9fb59b85359ab0971b1b9ce5d1b1c",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "JournalUpsertResponse",
+      "path": "schemas/JournalUpsertResponse.schema.json",
+      "sha256": "3ee3856e89c4739327d96c5ea035150912891a4ec3e0be344aeb1eaf2bbd912c",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "NotApplicableExample",
+      "path": "schemas/NotApplicableExample.schema.json",
+      "sha256": "4e69aa485c3297cd037885a6a8aeadf4d862eac27619bccef3aee4f66702f421",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "ReflectionNote",
+      "path": "schemas/ReflectionNote.schema.json",
+      "sha256": "a8c4e2163c65c664711fbfde82ea67eeeb274cfd3128e3610679d4600f30328e",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "ReflectionRequest",
+      "path": "schemas/ReflectionRequest.schema.json",
+      "sha256": "7e2b2db6842cd14beaeeea08fea5217065ddb9cf578a213a118098a25ae96658",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "ReflectionResponse",
+      "path": "schemas/ReflectionResponse.schema.json",
+      "sha256": "048a0db1587133ea96111d9293f0e08afcb15ac8cf29a9164dc063523a09ed9c",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "RelatedEddy",
+      "path": "schemas/RelatedEddy.schema.json",
+      "sha256": "d69d4fde0fea05a60333a9d4949a15488360f3600ca3da002a428d6b5c2d6c6d",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "RelatedPraxis",
+      "path": "schemas/RelatedPraxis.schema.json",
+      "sha256": "0561d2a8538e894969c4ec062e8234b5150477b07f137c10c3a65cc80138f85d",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "TierModel",
+      "path": "schemas/TierModel.schema.json",
+      "sha256": "2936160c5beb8595c47f61c9f1b4dea94f4dbf6074cd2f7805ee496c6359ff9d",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "UploadRequest",
+      "path": "schemas/UploadRequest.schema.json",
+      "sha256": "fe5b52dc44f8de0bf940dda6520494073d808630b2a2beea3a1ec3630eb233e4",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "UploadResponse",
+      "path": "schemas/UploadResponse.schema.json",
+      "sha256": "2818591a664cf6bae6a6ad108bbc82c5f547d3f3417f111cb3c90dcc77c61e38",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "VaultState",
+      "path": "schemas/VaultState.schema.json",
+      "sha256": "6cd84f27aa18111ab4a9c50da4d192ee2fe58d8d9b371ec5ce7b2c474820c8c9",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "WheelFrequencies",
+      "path": "schemas/WheelFrequencies.schema.json",
+      "sha256": "05262b931e2ecbfcbcf532af32c4ac99c90a8e54b763fa1f8f0dfbf64c1dad98",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "WheelFrequency",
+      "path": "schemas/WheelFrequency.schema.json",
+      "sha256": "3841faae5d27a54dae95d8ab24294bc670d3f4db428705643e3a9071a831e24e",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "WheelResponse",
+      "path": "schemas/WheelResponse.schema.json",
+      "sha256": "d0e80808e2559503d58149cffccac3efca52b055002e2e79e0aed5b9a4274a3d",
+      "state": null
+    }
+  ],
+  "ontology_version": "aptitude-wavelength/2026-05-23"
+}

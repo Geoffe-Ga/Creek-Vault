@@ -8,11 +8,18 @@ any draft whose stored scores fall outside the configured
 ``draft.derivative_upper`` / ``draft.grounding_fraction_lower``
 thresholds.
 
-Drafts written before issue #355 (and any markdown file that simply
-lacks the scores) are skipped silently — re-running ``creek draft``
-will backfill the metric. The check never deletes, rewrites, or
-auto-redrafts: it only surfaces, in keeping with the non-negotiable
-lint rules pinned by :mod:`creek.lint`.
+Drafts that lack the scores are skipped silently — re-running
+``creek draft`` will backfill the metric. Two populations land there:
+drafts written before issue #355, and drafts written on a host where
+the embedding model could not load (the guard says so on stderr at
+draft time and stamps nothing). Until #1040 wired the guard into the
+production draft paths, *every* draft landed there and this check
+reported every vault clean; that history is why the skip branch is
+worth naming rather than leaving implicit.
+
+The check never deletes, rewrites, or auto-redrafts: it only surfaces,
+in keeping with the non-negotiable lint rules pinned by
+:mod:`creek.lint`.
 """
 
 from __future__ import annotations
@@ -20,11 +27,11 @@ from __future__ import annotations
 from datetime import datetime  # noqa: TC003  # used at runtime as a parameter type
 from pathlib import Path  # noqa: TC003  # plain stdlib import; no lazy benefit
 
-import frontmatter
 import yaml
 
 from creek.config import DraftConfig, load_config
 from creek.lint._result import CheckResult
+from creek.vault.links import read_header_meta
 
 _DRAFTS_RELPATH = ("07-Voice", "Drafts")
 """Vault-relative location of generated drafts.
@@ -54,13 +61,21 @@ def _scan_draft(path: Path, draft_config: DraftConfig) -> str | None:
 
     Drafts that do not yet carry the guard's frontmatter (legacy drafts
     written before #355) are treated as clean — the operator can
-    regenerate them when convenient.
+    regenerate them when convenient. So is a draft whose header will not
+    parse: :func:`~creek.vault.links.read_header_meta` returns an empty
+    mapping, the two score keys are then absent, and the draft reports clean
+    rather than aborting ``creek lint``. Reading header-only also sidesteps
+    ``frontmatter.load``'s ``**metadata`` splat, which raised a bare
+    ``TypeError`` on a non-string frontmatter key (#1475); this check reads
+    two scores and never a body.
+
+    Header-only reading carries the same three deliberate consequences #1416
+    accepted and documents in full at
+    :func:`creek.generate.synchronicity._existing_synchronicity_pairs`: the
+    ``---`` fence must open line 1, the 200-line / 64 KB header caps apply, and
+    a note carrying a stray non-string key is tolerated rather than rejected.
     """
-    try:
-        post = frontmatter.load(str(path))
-    except (OSError, ValueError, yaml.YAMLError):
-        return None
-    metadata = post.metadata
+    metadata = read_header_meta(path)
     derivative = metadata.get("derivative_score")
     grounding = metadata.get("grounding_score")
     if not isinstance(derivative, (int, float)) or not isinstance(

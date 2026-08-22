@@ -26,12 +26,17 @@ CHANGES_REQUESTED = "CHANGES_REQUESTED"
 COMMENTS = "COMMENTS"
 
 # Anchors a genuine verdict LINE (heading- and bold-prefix tolerant) so a stray
-# mention of "verdict" in prose does not false-positive. Mirrors pr-ready.sh's
-# VERDICT_RE (its line 64) and must be kept in sync with it; single backslashes
+# mention of "verdict" in prose does not false-positive, and captures the token
+# the line itself states. The `\W*` bridge tolerates markdown/emoji decoration
+# between the anchor and the token ("**Verdict:** LGTM", "## Verdict\n✅ LGTM")
+# but no words, so prose after "Verdict" cannot smuggle in a token from later
+# in the sentence. The line anchor must be kept in sync with pr-ready.sh's
+# VERDICT_RE (this pattern additionally captures the token); single backslashes
 # here because — unlike pr-ready.sh — this pattern is not spliced into a jq
 # string literal.
 _VERDICT_LINE_RE = re.compile(
-    r"^\s*(?:#{1,6}\s+|\*\*)?verdict[:*\s]", re.IGNORECASE | re.MULTILINE
+    r"^\s*(?:#{1,6}\s+|\*\*)?verdict[:*\s]\W*(lgtm|changes[_ ]requested|comments)\b",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 ISO_NO_TZ = "%Y-%m-%dT%H:%M:%SZ"
@@ -40,32 +45,28 @@ ISO_NO_TZ = "%Y-%m-%dT%H:%M:%SZ"
 def parse_iso(timestamp: str) -> dt.datetime:
     """Parse a GitHub ISO-8601 timestamp into an aware UTC datetime.
 
-    GitHub stamps end in `Z`; `datetime.fromisoformat` only learned to accept
-    that in 3.11, so normalize it for 3.10 support.
+    GitHub stamps end in `Z`, which `datetime.fromisoformat` accepts natively
+    on the 3.11+ interpreters this repo's tooling pins.
     """
-    return dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    return dt.datetime.fromisoformat(timestamp)
 
 
 def normalize_verdict(raw: str) -> str | None:
     """Collapse a Claude review comment body to a single verdict token.
 
-    Returns None when the body carries no genuine verdict LINE, so callers can
-    ignore non-review comments (a stray "verdict" mentioned mid-prose does not
-    count). Line-anchoring mirrors pr-ready.sh's VERDICT_RE. When several verdict
-    lines exist (the reviewer re-verdicted after another pass), the LAST one
-    wins: we scan from its start to end-of-body and apply the precedence
-    CHANGES_REQUESTED beats a bare LGTM mention, so "this is not yet LGTM,
-    changes requested" is counted as a change request.
+    Returns None when no line states a genuine verdict, so callers can ignore
+    non-review comments (a stray "verdict" mentioned mid-prose, or a
+    "Verdict"-led sentence that never states a token, does not count). The
+    token is read from the verdict line itself — never by substring-scanning
+    the rest of the body, where a rationale that merely mentions "LGTM" or
+    "CHANGES_REQUESTED" in prose would flip the classification and skew the
+    recap's Review-iterations metric. When several verdict lines exist (the
+    reviewer re-verdicted after another pass), the LAST one wins.
     """
-    matches = list(_VERDICT_LINE_RE.finditer(raw))
-    if not matches:
+    tokens: list[str] = _VERDICT_LINE_RE.findall(raw)
+    if not tokens:
         return None
-    region = raw[matches[-1].start() :].upper()
-    if "CHANGES_REQUESTED" in region or "CHANGES REQUESTED" in region:
-        return CHANGES_REQUESTED
-    if "LGTM" in region:
-        return LGTM
-    return COMMENTS
+    return tokens[-1].upper().replace(" ", "_")
 
 
 def iterations_before_lgtm(verdicts: list[str]) -> int | None:
@@ -84,10 +85,12 @@ def iterations_before_lgtm(verdicts: list[str]) -> int | None:
 
 
 def _mean(values: list[float]) -> float:
+    """Mean."""
     return sum(values) / len(values) if values else 0.0
 
 
 def _median(values: list[float]) -> float:
+    """Median."""
     if not values:
         return 0.0
     ordered = sorted(values)
@@ -156,7 +159,10 @@ def merge_intervals_hours(merged_at: list[dt.datetime]) -> list[float]:
     if len(merged_at) < 2:
         return []
     ordered = sorted(merged_at)
-    return [(ordered[i] - ordered[i - 1]).total_seconds() / 3600.0 for i in range(1, len(ordered))]
+    return [
+        (ordered[i] - ordered[i - 1]).total_seconds() / 3600.0
+        for i in range(1, len(ordered))
+    ]
 
 
 def iteration_stats(per_pr: list[int]) -> dict[str, float]:
@@ -167,7 +173,13 @@ def iteration_stats(per_pr: list[int]) -> dict[str, float]:
     zero feedback rounds — a proxy for how often the loop nails it first try.
     """
     if not per_pr:
-        return {"mean": 0.0, "median": 0.0, "max": 0.0, "clean_merge_rate": 0.0, "sample": 0.0}
+        return {
+            "mean": 0.0,
+            "median": 0.0,
+            "max": 0.0,
+            "clean_merge_rate": 0.0,
+            "sample": 0.0,
+        }
     floats = [float(n) for n in per_pr]
     clean = sum(1 for n in per_pr if n == 0)
     return {
@@ -179,7 +191,9 @@ def iteration_stats(per_pr: list[int]) -> dict[str, float]:
     }
 
 
-def estimate_remaining(open_items: int, per_day: float, *, now: dt.datetime) -> dict[str, object]:
+def estimate_remaining(
+    open_items: int, per_day: float, *, now: dt.datetime
+) -> dict[str, object]:
     """Project how long the backlog will take at the current merge rate.
 
     Returns the remaining-item count, estimated days left, and an ETA date.
@@ -189,11 +203,21 @@ def estimate_remaining(open_items: int, per_day: float, *, now: dt.datetime) -> 
     if open_items <= 0:
         return {"open_items": 0, "days_remaining": 0.0, "eta": now, "known": True}
     if per_day <= 0:
-        return {"open_items": open_items, "days_remaining": None, "eta": None, "known": False}
+        return {
+            "open_items": open_items,
+            "days_remaining": None,
+            "eta": None,
+            "known": False,
+        }
 
     days_remaining = open_items / per_day
     eta = now + dt.timedelta(days=days_remaining)
-    return {"open_items": open_items, "days_remaining": days_remaining, "eta": eta, "known": True}
+    return {
+        "open_items": open_items,
+        "days_remaining": days_remaining,
+        "eta": eta,
+        "known": True,
+    }
 
 
 def churn_totals(churn: list[tuple[int, int, int]]) -> dict[str, int]:
@@ -216,7 +240,7 @@ def net_lines_from_code_frequency(weeks: list[list[int]]) -> int:
     as a negative number, so the running net is just additions and deletions added
     straight across every week. Returns 0 for an empty history.
     """
-    return sum(int(week[1]) + int(week[2]) for week in weeks)
+    return sum(week[1] + week[2] for week in weeks)
 
 
 def busiest_day(merged_at: list[dt.datetime]) -> tuple[str, int] | None:

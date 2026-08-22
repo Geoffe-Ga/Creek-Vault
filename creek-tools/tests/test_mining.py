@@ -25,7 +25,10 @@ from creek.generate.mining import (
     IdeaSeed,
     MiningStrategy,
     OntologyTuple,
+    _fragment_frequencies,
     _jaccard_similarity,
+    _load_fragments,
+    _load_typed,
     phase_filtered_seeds,
 )
 from creek.models import (
@@ -48,6 +51,7 @@ from creek.models import (
     VoiceRegister,
     WavelengthClassification,
 )
+from tests.conftest import CORRUPT_NOTE_SHAPES
 from tests.factories.compiled import (
     write_compiled_eddy_page as _write_compiled_eddy_page,
 )
@@ -59,6 +63,7 @@ from tests.factories.compiled import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -1965,3 +1970,197 @@ class TestIdeaMinerConfigKnobs:
         assert custom.min_chain_length == 2
         assert custom.similarity_liminal == pytest.approx(0.2)
         assert custom.similarity_resonance == pytest.approx(0.4)
+
+
+# ---------------------------------------------------------------------------
+# Issue #1450: a single unreadable note must not swallow the vault
+# ---------------------------------------------------------------------------
+
+
+class TestLoadersStepOverUnreadableNotes:
+    """The loaders' skip arms are pinned by what SURVIVES them, not by silence.
+
+    Every loader here returns ``[]`` on the happy path when the vault is
+    empty, so "it did not raise" proves nothing at all: a loader that
+    returned ``[]`` unconditionally would pass such a test against every
+    corrupt shape. Each test therefore writes **good notes beside the
+    poison** and asserts the exact surviving ids by equality — never a
+    length, never ``in``, never truthiness — and each battery carries a
+    positive control proving the same loader still returns the good notes
+    when no poison is present.
+
+    The three corrupt shapes are not interchangeable: they land on three
+    different limbs of :data:`creek.vault.reader.FRONTMATTER_LOAD_ERRORS`
+    (``yaml.YAMLError`` / ``ValueError`` / ``TypeError``), and the
+    schema-invalid note is a fourth case entirely — it loads fine and
+    only fails ``model_validate``, so it exercises the
+    ``except ValidationError`` arm that a corrupt note can never reach.
+    """
+
+    @staticmethod
+    def _seed_good_fragments(vault: Path) -> None:
+        """Write the two readable fragments every test in this class expects."""
+        for frag_id, title in (("frag-good-a", "Good A"), ("frag-good-b", "Good B")):
+            _write_fragment(
+                vault,
+                _build_fragment(frag_id=frag_id, title=title),
+                f"Body of {title}.",
+            )
+
+    def test_load_fragments_positive_control(self, vault: Path) -> None:
+        """With no poison present the loader returns both good fragments.
+
+        Without this control the whole skip battery below is vacuous: a
+        loader that always returned ``[]`` would satisfy every
+        ``== ["frag-good-a", "frag-good-b"]`` assertion made *after*
+        deleting a file, because the expected list would be empty too.
+        """
+        self._seed_good_fragments(vault)
+
+        loaded = _load_fragments(vault / "01-Fragments")
+
+        assert [frag.id for frag, _body in loaded] == ["frag-good-a", "frag-good-b"]
+
+    @pytest.mark.parametrize("shape", CORRUPT_NOTE_SHAPES)
+    def test_load_fragments_skips_each_corrupt_shape(
+        self,
+        vault: Path,
+        corrupt_note: Callable[[Path, str], Path],
+        shape: str,
+    ) -> None:
+        """Each unreadable shape is stepped over; both good fragments survive."""
+        self._seed_good_fragments(vault)
+        # Sorted between the two good ids, so a loader that aborted on the
+        # bad file would return only ``frag-good-a`` rather than nothing —
+        # a failure mode a "result is empty" assertion would miss.
+        corrupt_note(vault / "01-Fragments" / "Journal" / "frag-good-aa.md", shape)
+
+        loaded = _load_fragments(vault / "01-Fragments")
+
+        assert [frag.id for frag, _body in loaded] == ["frag-good-a", "frag-good-b"]
+
+    def test_load_fragments_skips_schema_invalid_fragment(
+        self,
+        vault: Path,
+        pydantic_invalid_note: Callable[[Path], Path],
+    ) -> None:
+        """A readable note that fails ``Fragment.model_validate`` is dropped.
+
+        This is the ``except ValidationError`` arm, not the load guard:
+        the note parses, carries ``type: fragment``, and reaches
+        ``model_validate`` before being rejected.
+        """
+        self._seed_good_fragments(vault)
+        pydantic_invalid_note(
+            vault / "01-Fragments" / "Journal" / "frag-good-aa.md",
+        )
+
+        loaded = _load_fragments(vault / "01-Fragments")
+
+        assert [frag.id for frag, _body in loaded] == ["frag-good-a", "frag-good-b"]
+
+    def test_load_fragments_skips_non_fragment_type(self, vault: Path) -> None:
+        """A perfectly readable non-fragment note is skipped by the type gate.
+
+        Kept separate from the corrupt-note tests on purpose: the type
+        gate and the unreadable-note guard are adjacent ``continue``
+        arms, and a single fixture that trips one leaves the other dead
+        while coverage looks satisfied.
+        """
+        self._seed_good_fragments(vault)
+        # Valid in *every* respect except its ``type`` tag, so the type gate
+        # is the only thing that can reject it. A malformed note here would
+        # be caught by the ValidationError arm instead, and the gate would
+        # stay untested while coverage claimed otherwise.
+        impostor = _build_fragment(frag_id="frag-good-aa", title="Impostor")
+        impostor.type = "thread"
+        _write_fragment(vault, impostor, "Impostor body.")
+
+        loaded = _load_fragments(vault / "01-Fragments")
+
+        assert [frag.id for frag, _body in loaded] == ["frag-good-a", "frag-good-b"]
+
+    @staticmethod
+    def _seed_good_threads(vault: Path) -> None:
+        """Write the two readable threads the ``_load_typed`` tests expect."""
+        for thread_id, title in (("TH-good-a", "Thread A"), ("TH-good-b", "Thread B")):
+            _write_thread(
+                vault,
+                _build_thread(thread_id=thread_id, title=title, fragment_count=3),
+            )
+
+    def test_load_typed_positive_control(self, vault: Path) -> None:
+        """With no poison present ``_load_typed`` returns both good threads."""
+        loaded = _load_typed(
+            vault / "02-Threads",
+            type_tag="thread",
+            cls=Thread,
+        )
+        assert loaded == []
+
+        self._seed_good_threads(vault)
+
+        loaded = _load_typed(vault / "02-Threads", type_tag="thread", cls=Thread)
+
+        assert [thread.id for thread in loaded] == ["TH-good-a", "TH-good-b"]
+
+    @pytest.mark.parametrize("shape", CORRUPT_NOTE_SHAPES)
+    def test_load_typed_skips_each_corrupt_shape(
+        self,
+        vault: Path,
+        corrupt_note: Callable[[Path, str], Path],
+        shape: str,
+    ) -> None:
+        """Each unreadable shape is stepped over; both good threads survive."""
+        self._seed_good_threads(vault)
+        corrupt_note(vault / "02-Threads" / "Active" / "TH-good-aa.md", shape)
+
+        loaded = _load_typed(vault / "02-Threads", type_tag="thread", cls=Thread)
+
+        assert [thread.id for thread in loaded] == ["TH-good-a", "TH-good-b"]
+
+    def test_load_typed_skips_schema_invalid_note(self, vault: Path) -> None:
+        """A ``type: thread`` note that fails validation is dropped, not raised."""
+        self._seed_good_threads(vault)
+        (vault / "02-Threads" / "Active" / "TH-good-aa.md").write_text(
+            "---\ntype: thread\nid: TH-broken\ntitle: Broken\n"
+            "fragment_count: not-an-integer\n---\nbody\n",
+            encoding="utf-8",
+        )
+
+        loaded = _load_typed(vault / "02-Threads", type_tag="thread", cls=Thread)
+
+        assert [thread.id for thread in loaded] == ["TH-good-a", "TH-good-b"]
+
+
+class TestFragmentFrequencies:
+    """``_fragment_frequencies`` returns primary-then-unique-secondaries."""
+
+    def test_includes_unique_secondaries_in_order(self) -> None:
+        """Secondaries are appended in order, dropping every repeat.
+
+        The duplicates are the point: ``F5`` repeats the primary and
+        ``F3`` repeats an earlier secondary, so the exact-tuple assertion
+        fails the moment the dedupe ``continue`` (or the ``seen.add``
+        that feeds it) stops working. Before this test no fragment in the
+        mining suite carried a secondary frequency at all.
+        """
+        fragment = _build_fragment(frag_id="frag-multi", title="Multi")
+        fragment.frequency.secondary = [
+            Frequency.F3,
+            Frequency.F5,
+            Frequency.F3,
+            Frequency.F7,
+        ]
+
+        assert _fragment_frequencies(fragment) == (
+            Frequency.F5,
+            Frequency.F3,
+            Frequency.F7,
+        )
+
+    def test_primary_only_fragment_yields_single_entry(self) -> None:
+        """A fragment with no secondaries yields exactly its primary."""
+        fragment = _build_fragment(frag_id="frag-solo", title="Solo")
+
+        assert _fragment_frequencies(fragment) == (Frequency.F5,)

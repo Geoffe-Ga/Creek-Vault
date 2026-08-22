@@ -28,10 +28,32 @@ dependencies = [
     # network transport (#837), so uvicorn is a direct dependency rather than
     # a transitive one via mcp. Floor matches the uv.lock resolution.
     "uvicorn>=0.47.0",
+    # creek_mcp.httpapi (the Adepthood /v1 HTTP application adapter, #1074)
+    # imports Starlette directly, so it is declared rather than left
+    # transitive via mcp — the undeclared-dependency drift the epic exists to
+    # stop. A floor, never a ceiling: the resolved version must stay
+    # compatible with the mcp SDK's own Starlette pin, because a conflict
+    # there would break the load-bearing MCP transport to serve the new one
+    # (see docs/decisions/2026-07-31-adepthood-http-application-api.md,
+    # "HTTP framework", reason 1). FastAPI is deliberately not adopted.
+    "starlette>=1.3.1",
+    # creek_mcp.httpapi.middleware.limits imports Semaphore, WouldBlock and
+    # fail_after from anyio at module scope to shed load and enforce the
+    # request deadline (#1074), so anyio is a direct dependency rather than
+    # something starlette happens to drag in — a starlette release that
+    # stopped depending on it would break the /v1 limits middleware with no
+    # lockfile signal (#1123). Floor matches the uv.lock resolution. A floor,
+    # never a ceiling: anyio is also starlette's own concurrency backend, so a
+    # ceiling here could deadlock resolution against the ASGI stack.
+    "anyio>=4.13.0",
     # At-rest volume key (creek.confidential): Argon2id / AES-GCM / HKDF are
     # imported unconditionally, so cryptography is a direct base dependency —
     # not left to transitive resolution via mcp -> pyjwt[crypto] (#758).
-    "cryptography>=48.0.0",
+    # Security: floor raised above PYSEC-2026-3552 (CVE-2026-69247,
+    # GHSA-g6cj-pr64-35w5) — PKCS#7 EnvelopedData decryption leaked a
+    # Bleichenbacher oracle through distinguishable errors and timing.
+    # Introduced in 44.0.0, fixed in 50.0.0 (#1167).
+    "cryptography>=50.0.0",
     # Security: pin urllib3 above CVE-2026-44431 / CVE-2026-44432
     # (transitive via requests/conan). Both are fixed in 2.7.0.
     "urllib3>=2.7.0",
@@ -52,10 +74,21 @@ classifiers = [
 [project.scripts]
 creek = "creek.cli:app"
 creek-tools-mcp = "creek_mcp.server:main"
+# The Adepthood /v1 HTTP application adapter (#1074). Separate from
+# creek-tools-mcp on purpose: MCP stays the agent adapter, /v1 is the
+# application adapter, and both call one behavioural implementation.
+creek-tools-api = "creek_mcp.httpapi.cli:main"
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40.0"]
-openai = ["openai>=1.0"]
+# Transport hold, not a CVE (OSV reports no advisories for openai):
+# openai 3.0.0 swapped `httpx<1,>=0.23.0` for `httpx2<3,>=2.7.0` — a
+# separate distribution, not a version bump — dragging httpcore2,
+# truststore and idna>=3.18 in beside the `httpx>=0.27.0` declared
+# above, i.e. two HTTP stacks in one environment. `mcp>=1.28.1,<2.0.0`
+# caps the other half of the same swap (#998), so the two majors move
+# together or not at all. Floor is the release both locks resolve.
+openai = ["openai>=2.41.0,<3.0.0"]
 gemini = ["google-genai>=1.0"]
 embeddings = [
     "sentence-transformers>=2.2.0",
@@ -129,7 +162,15 @@ dev = [
     # version. Bumping requires updating all three together
     # (issues #206, #409).
     "tryceratops>=2.4.1,<3",
-    "vulture>=2.10",
+    # Floor raised from 2.10 when vulture became a real gate (issue #1395).
+    # scripts/lint_vulture.py drives the Python API (Vulture.scavenge,
+    # get_unused_code, ignore_decorators) and reads Item.typ/.confidence,
+    # and it raises UnknownFindingTypeError on any item type it does not
+    # have a confidence floor for — so a major bump that adds a category
+    # fails the build loudly instead of passing silently. uv.lock already
+    # resolves 2.16; the `<3` ceiling matches the house style used for
+    # bandit/tryceratops/ruff.
+    "vulture>=2.16,<3",
     "detect-secrets>=1.5.0",
     "pre-commit>=3.4.0",
     "types-PyYAML>=6.0.0",
@@ -139,8 +180,23 @@ dev = [
     "lxml-stubs>=0.5.1",
 ]
 
+# This list is a SECOND, independent setuptools declaration surface,
+# separate from [tool.uv].constraint-dependencies below — the two do
+# not substitute for each other. constraint-dependencies governs the
+# resolution graph behind uv.lock; [build-system].requires governs the
+# PEP 518 isolated environment the build backend itself runs in. The uv
+# constraint provably does not reach here: with the constraint bounded
+# to <84.0.0 a wheel build still reported `Generator: setuptools
+# (84.0.0)`, while bounding this list instead produced 83.0.0. So the
+# PYSEC-2026-3447 floor has to be repeated here or the backend is
+# unbounded — `>=68.0` sat here for the whole life of the #861 pin
+# admitting 81.0.0, the CVE release. The band is held IDENTICAL to the
+# constraint entry below; the two must move together. This bound is
+# invisible to uv.lock (verified: `uv lock --check` passes with only
+# this line changed), so its guard test in tests/test_dependency_pins.py
+# is the only thing holding it (#1258).
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=83.0.0,<85.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.uv]
@@ -153,13 +209,28 @@ build-backend = "setuptools.build_meta"
 # in the graph without adding it as a direct dependency, so a future
 # `uv lock` cannot silently regress onto a vulnerable build/dev version.
 constraint-dependencies = [
-    "cryptography>=48.0.0",
+    # Security: matches the base-dependency floor — above PYSEC-2026-3552
+    # (CVE-2026-69247), the PKCS#7 EnvelopedData Bleichenbacher oracle.
+    # Fixed in 50.0.0 (#1167).
+    "cryptography>=50.0.0",
     "pyjwt>=2.13.0",
-    "pip>=26.1.2",
+    # Security: pip arrives transitively via pip-api (a pip-audit dep).
+    # Floored above PYSEC-2026-3721, fixed in 26.2. Build/dev tooling
+    # only, never a runtime import.
+    "pip>=26.2.1",
     # Security: pin setuptools above PYSEC-2026-3447 (CVE-2026-59890,
     # path traversal in the PackageIndex download path) — build/dev
-    # tooling only, never a runtime import. Fixed in 83.0.0 (#861).
-    "setuptools>=83.0.0",
+    # tooling only, never a runtime import. Fixed in 83.0.0 (#861), and
+    # the floor stays there. 84.0.0 was vetted for the ceiling by
+    # building this wheel under both 83.0.0 and 84.0.0 and comparing the
+    # results: content-identical, differing only in the `Generator:`
+    # string inside .dist-info/WHEEL and RECORD's sha256 of that file.
+    # 84.0.0's removals were distutils C-compiler internals this
+    # pure-Python build never touches. The ceiling is SemVer `<85.0.0`,
+    # so every future 84.x PATCH still resolves freely; 85.0.0 requires
+    # its own review before the ceiling moves (#1258). Held identical to
+    # [build-system].requires above — move the two together.
+    "setuptools>=83.0.0,<85.0.0",
     "wheel>=0.47.0",
     # Security: pin pyasn1 above CVE-2026-59885 (quadratic OID-arc
     # decode DoS) and CVE-2026-59886 (REAL-exponent big-int DoS) —
@@ -171,6 +242,19 @@ constraint-dependencies = [
     # so the floor lives here rather than [project].dependencies.
     # Fixed in 2.13.0 (#861).
     "torch>=2.13.0",
+    # NOT a CVE. rpds-py switched from SemVer to CalVer at 2026.5.1 —
+    # the line runs 0.29.0, 0.30.0, 2026.5.1, with no 0.31 or 1.0 in
+    # between — and raised requires-python to >=3.11, which this project
+    # already declares. Transitive-only via mcp → jsonschema (and via
+    # referencing); both consumers declare open floors (>=0.25.0 and
+    # >=0.7.0), so nothing forced the lock off 0.30.0 for eight months.
+    # Keep this a BARE FLOOR: any SemVer-shaped ceiling — <1.0, ~=0.30,
+    # or a <2026.7 written as if the month were a minor version —
+    # excludes every subsequent CalVer release permanently. Express a
+    # bound, if one is ever needed, in CalVer (#1185). Held identical to
+    # crawdad/pyproject.toml so both projects resolve the same native
+    # extension on the shared MCP path.
+    "rpds-py>=2026.6.3",
 ]
 
 [tool.setuptools.packages.find]
@@ -182,22 +266,56 @@ include = ["creek", "creek.*", "creek_mcp", "creek_mcp.*"]
 "creek.generate.exemplars" = ["*.yaml"]
 
 [tool.pytest.ini_options]
-minversion = "7.0"
+# pytest 9 is required: this config uses the `strict_markers` / `strict_config`
+# ini options introduced there. uv.lock pins 9.0.3, so this only bites an
+# unpinned fallback install, and it bites with a clear pytest error rather than
+# silently ignoring the strictness settings below.
+minversion = "9.0"
+
+# Strictness is set as INI OPTIONS, not only as the `--strict-markers` /
+# `--strict-config` flags in `addopts` below. Under pytest 9 those flags are
+# honoured when typed on the command line but do NOT take effect from
+# `addopts`: an unregistered marker degraded to a PytestUnknownMarkWarning and
+# the run still exited 0. That made the strictness illusory — a typo'd
+# `@pytest.mark.integraton` would silently drop a test out of the blocking
+# lane, which is precisely the "gate that looks green but tests nothing"
+# failure this suite's CI lanes exist to prevent. The flags stay in `addopts`
+# for anyone invoking pytest directly; these two lines are what actually bind.
+strict_markers = true
+strict_config = true
+
 addopts = [
     "-ra",
     "--strict-markers",
     "--strict-config",
     "--cov=creek",
     "--cov=creek_mcp",
+    # scripts/ holds one module: scripts/lint_vulture.py, the dead-code
+    # gate's policy (issue #1395). It is measured like product code so the
+    # gate cannot itself be the untested thing — see scripts/typecheck.sh.
+    "--cov=scripts",
     "--cov-branch",
     "--cov-report=term-missing:skip-covered",
     "--cov-report=html",
     "--cov-report=xml",
     "--cov-fail-under=90",
 ]
+# Lane markers. A test carries at most one of integration/e2e/live; anything
+# unmarked is a unit test. `--strict-markers` (above) makes a typo'd or retired
+# marker name a collection error rather than a silently-empty selection.
+#
+#   BLOCKING IN CI (.github/workflows/ci.yml, job `integration-e2e`):
+#     integration, e2e — both must be hermetic, or the merge gate is flaky.
+#   NOT IN CI:
+#     live  — needs credentials/services CI does not have (run it by hand).
+#     slow  — benchmarks, too slow for the merge path.
+#
+# Run each lane through ./scripts/test.sh (--integration/--e2e/--live), which
+# owns the marker expressions and the --no-cov policy for the non-unit lanes.
 markers = [
-    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
-    "e2e: marks tests as end-to-end tests (deselect with '-m \"not e2e\"')",
+    "integration: hermetic cross-component tests — no network, no API keys, no real vault; BLOCKING in CI (deselect with '-m \"not integration\"')",
+    "e2e: hermetic end-to-end journeys through the CLI against a synthetic vault; BLOCKING in CI (deselect with '-m \"not e2e\"')",
+    "live: opt-in smokes needing a real provider key or a reachable local service; never run in CI, and each skips cleanly when its credential/service is absent (deselect with '-m \"not live\"')",
     "slow: marks tests as slow benchmarks (deselect with '-m \"not slow\"')",
 ]
 testpaths = ["tests"]
@@ -206,7 +324,7 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 
 [tool.coverage.run]
-source = ["creek", "creek_mcp"]
+source = ["creek", "creek_mcp", "scripts"]
 branch = true
 omit = [
     "*/tests/*",
@@ -243,6 +361,14 @@ warn_unused_ignores = true
 warn_no_return = true
 strict_equality = true
 strict_concatenate = true
+
+[[tool.mypy.overrides]]
+# vulture ships no py.typed marker, so its Vulture/Item surface is Any.
+# scripts/lint_vulture.py confines that to a single conversion function
+# which coerces every field explicitly, so no Any escapes into the
+# module's own annotated API (issue #1395).
+module = "vulture"
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "frontmatter"

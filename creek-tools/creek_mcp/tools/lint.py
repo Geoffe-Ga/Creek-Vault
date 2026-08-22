@@ -24,10 +24,19 @@ def lint_tool(
 ) -> dict[str, Any]:
     """Run the unified lint pass and persist a markdown report.
 
-    Lint reads only compiled-layer metadata (eddies, threads, tag
-    indexes, paradoxes) so the tier ceiling does not gate any fragment
-    bodies — but the parameter is still required per FEAT-010 to keep
-    tool signatures uniform.
+    "Lint reads only compiled-layer metadata" is not true: the paradox
+    check loads ``Fragment.model_validate(post.metadata)`` straight out of
+    ``01-Fragments`` and ``10-Liminal`` (``creek/lint/checks/paradox.py``),
+    and the unnamed / orphan-compiled checks also scan ``01-Fragments``.
+    What actually keeps this tool ceiling-agnostic is narrower and holds up
+    better: those checks read fragment *frontmatter*, never bodies, and
+    this tool's response returns only ``name``, a count-shaped ``summary``,
+    and ``len(findings)`` — verified against every ``CheckResult``
+    construction under ``creek/lint/checks/``. The title- and path-bearing
+    strings live in ``findings``, which this tool never returns. The
+    written markdown report *does* embed titles and paths, but it is a
+    vault-internal artifact no MCP tool reads back. The ceiling parameter
+    is still required per FEAT-010 to keep tool signatures uniform.
     """
     resolved_checks = list(checks) if checks is not None else None
     MCPAuditLog(vault_path).append(

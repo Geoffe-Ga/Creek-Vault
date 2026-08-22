@@ -17,6 +17,7 @@ Exports:
     _detect_scanned_pdf: Check if a PDF is likely scanned (image-only).
     _extract_docx_metadata: Extract metadata from DOCX bytes.
     _extract_pdf_metadata: Extract metadata from PDF bytes.
+    _resolve_document_author: Split extracted author metadata into axis + name.
     _infer_document_platform: Map file extension to SourcePlatform.
 """
 
@@ -35,12 +36,13 @@ from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
     RawDocument,
+    file_modified_time,
     normalize_encoding,
     normalize_timestamp,
     parse_authored_at,
 )
 from creek.ingest.html import extract_html_authored_at, parse_html_to_markdown
-from creek.models import SourcePlatform
+from creek.models import Authorship, SourcePlatform
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,11 @@ _SCANNED_TEXT_THRESHOLD = 100
 
 _DOCUMENT_PLATFORM_EXTENSIONS: frozenset[str] = frozenset({".docx", ".pdf", ".rtf"})
 """Extensions that map to the DOCUMENT source platform."""
+
+_AUTHORSHIP_BY_VALUE: dict[str, Authorship] = {
+    member.value: member for member in Authorship
+}
+"""Lookup from an ``Authorship`` member's wire value to the member itself."""
 
 
 # ---- Helper Functions ----
@@ -490,6 +497,53 @@ def _extract_pdf_metadata(pdf_bytes: bytes) -> dict[str, Any]:
     return _extract_pdf_metadata_from_bytes(pdf_bytes)
 
 
+def _resolve_document_author(
+    raw_author: object,
+) -> tuple[Authorship, str | None] | None:
+    """Split a document's author metadata into an authorship axis and a name.
+
+    ``FragmentSource.author`` answers "whose views does this stand for?" on the
+    ``self|ai|other|collaborative`` axis. A DOCX ``core_properties.author`` or a
+    PDF ``/Author`` answers the different question "what name is on the file".
+    Copying the second into the first was issue #1229: every document Word saves
+    carries an author, so every such document failed Pydantic validation and was
+    dropped at assembly.
+
+    Returns ``None`` when there is no usable value — absent, non-string, or
+    blank — leaving the model's ``self`` default in force. "We know nothing" is
+    not evidence about anybody.
+
+    A value that already names an ``Authorship`` member is honoured as the axis
+    and yields no name; it is a classification, not somebody's name. Any other
+    string resolves the axis to :attr:`Authorship.OTHER` and is returned as the
+    name. ``OTHER`` is both the convention this codebase already applies to an
+    explicit author name
+    (:meth:`creek.clean.authorship.AuthorshipTagger._tag_self_platform`) and the
+    fail-closed choice: ``SELF`` is what unlocks the INTIMATE privacy tier
+    (:mod:`creek.classify.privacy`) and voice/skill generation
+    (:mod:`creek.generate.skills`), so guessing ``SELF`` for a stranger's
+    document would feed both from material that is not the owner's, whereas
+    guessing ``OTHER`` for the owner's own document merely under-uses it — and
+    the returned name is what makes that recoverable.
+
+    Args:
+        raw_author: The ``author`` value an ``_extract_*`` pass put in metadata.
+
+    Returns:
+        ``(authorship, name)`` where ``name`` is ``None`` for a value that was
+        already an axis member, or ``None`` when there is nothing to record.
+    """
+    if not isinstance(raw_author, str):
+        return None
+    name = raw_author.strip()
+    if not name:
+        return None
+    axis = _AUTHORSHIP_BY_VALUE.get(name.lower())
+    if axis is not None:
+        return axis, None
+    return Authorship.OTHER, name
+
+
 def _infer_document_platform(extension: str) -> SourcePlatform:
     """Map a file extension to a SourcePlatform value.
 
@@ -527,10 +581,15 @@ class DocumentIngestor(Ingestor):
 
         Substack export directories (``posts.csv`` + per-post
         ``<id>.<slug>.html``) are claimed by ``SubstackIngestor``;
-        ``DocumentIngestor`` defers to it rather than double-emitting
-        every post as an opaque HTML document, so the auto-detect path
-        of ``creek process`` (which fans every registered ingestor at
-        the source) produces one fragment per essay, not two.
+        ``DocumentIngestor`` defers to it rather than emitting every
+        post a second time as an opaque HTML document. Since issue #1304
+        the pipeline would arbitrate that contest anyway — ``substack``
+        outranks ``document`` in
+        :data:`creek.ingest.routing.CLAIM_PRIORITY` — but narrowing the
+        claim here is still worth doing: it saves parsing a whole export
+        directory whose output is guaranteed to be discarded, and it
+        keeps ``creek ingest --type document`` honest, which the
+        arbiter never sees.
 
         Args:
             source_path: A file or directory path to search.
@@ -757,12 +816,33 @@ class DocumentIngestor(Ingestor):
         Checks metadata for created_date first, then falls back to
         the file's modification time.
 
+        **This value is an identity anchor, not an authorship claim.**
+        :func:`creek.ingest.base.generate_fragment_id` hashes it, so the
+        fallback must be a pure function of the file's epoch mtime —
+        invariant under the host's ``TZ`` env var, its tzdata, its DST
+        state, and its operating system (#1329). That is exactly what
+        :func:`~creek.ingest.base.file_modified_time` guarantees, and it is
+        why this must never be "simplified" back to a bare
+        ``datetime.fromtimestamp(mtime)``, which renders the epoch in the
+        host's local zone and so mints one id per timezone.
+
+        Documents used to be more exposed to this than markdown, not less:
+        :func:`creek.ingest.pipeline.ledger_for_source` left them
+        unledgered, so there was no recorded id to fall back on and a
+        drifting derivation was an unconditional second write rather than a
+        merely possible one. #1363 closed that — ``document`` is now in
+        :data:`creek.ingest.pipeline.LEDGERED_SOURCES`, once #953 had made
+        ``derive_source_key`` collision-free for out-of-vault sources, which
+        was the blocker. A ledgered document's id comes from the record, so
+        the derivation below is only how a *new* document gets its first
+        one; keeping it host-independent still matters for exactly that.
+
         Args:
             metadata: Fragment metadata dict.
             file_path: Path to the source file.
 
         Returns:
-            A timezone-aware datetime.
+            A timezone-aware datetime; UTC when it comes from the filesystem.
         """
         created = metadata.get("created_date")
         if created is not None:
@@ -771,10 +851,7 @@ class DocumentIngestor(Ingestor):
             except ValueError:
                 logger.warning("Invalid metadata timestamp: %s", created)
 
-        # Fall back to file modification time
-        mtime = file_path.stat().st_mtime
-        ts_string = datetime.fromtimestamp(mtime).isoformat()
-        return normalize_timestamp(ts_string, None)
+        return file_modified_time(file_path)
 
     def convert_to_markdown(self, fragment: ParsedFragment) -> str:
         """Return the fragment content as markdown.
@@ -794,8 +871,11 @@ class DocumentIngestor(Ingestor):
         """Generate Creek-compatible YAML frontmatter for a document fragment.
 
         Builds frontmatter with type, title, source (platform, original_file,
-        original_encoding), created timestamp, and optional author/scanned
-        fields from metadata.
+        original_encoding), created timestamp, and optional scanned flag.
+
+        An extracted document author is split by :func:`_resolve_document_author`
+        into ``source.author`` (the ``Authorship`` axis) and ``source.author_name``
+        (the free-text name), never conflated into one slot (#1229).
 
         Args:
             fragment: The parsed fragment with metadata.
@@ -814,8 +894,12 @@ class DocumentIngestor(Ingestor):
         }
 
         # Add optional metadata fields
-        if "author" in fragment.metadata:
-            source["author"] = fragment.metadata["author"]
+        resolved_author = _resolve_document_author(fragment.metadata.get("author"))
+        if resolved_author is not None:
+            authorship, author_name = resolved_author
+            source["author"] = authorship
+            if author_name is not None:
+                source["author_name"] = author_name
         if fragment.metadata.get("scanned"):
             source["scanned"] = True
 

@@ -3,7 +3,8 @@
 Covers:
 
 * Workflow model validation (parser happy + malformed)
-* Constraint enforcement (phase-aware refusal, privacy floor propagation)
+* Constraint enforcement (phase-aware refusal, privacy ceiling cap +
+  propagation, deprecated ``privacy_tier_floor`` alias migration)
 * Step-walker semantics (deterministic walk + interpolation)
 * Registry file discovery (built-in + vault)
 * The three reference workflows shipped with the package
@@ -11,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from textwrap import dedent
 from typing import Any
@@ -24,6 +26,7 @@ from crawdad.state import SessionState
 from crawdad.workflows import (
     BUILTIN_WORKFLOWS_DIR,
     VAULT_WORKFLOWS_SUBPATH,
+    WORKFLOW_ADMITTED_CEILINGS,
     WorkflowConstraintError,
     WorkflowDefinition,
     WorkflowNotFoundError,
@@ -32,6 +35,7 @@ from crawdad.workflows import (
     WorkflowStep,
     WorkflowStepError,
     WorkflowWalker,
+    _build_call_arguments,
     _StepRefError,
     _synthesize_user_message,
     interpolate,
@@ -39,6 +43,35 @@ from crawdad.workflows import (
     resolve_phase,
     run_workflow_and_compose,
 )
+
+# The three reference workflows shipped in ``BUILTIN_WORKFLOWS_DIR``,
+# paired with the privacy ceiling each declares. The values are the
+# ones the files carried under the old ``privacy_tier_floor`` key — the
+# #1051 rename is value-preserving, so a drift here means a builtin's
+# effective MCP ceiling moved during the rename.
+_REFERENCE_WORKFLOW_CEILINGS: tuple[tuple[str, PrivacyTierCeiling], ...] = (
+    ("wavelength-checkin.workflow.yaml", PrivacyTierCeiling.OPEN),
+    ("compost-surfacing.workflow.yaml", PrivacyTierCeiling.PERSONAL),
+    (
+        "substack-draft-phase-transitions.workflow.yaml",
+        PrivacyTierCeiling.PERSONAL,
+    ),
+)
+
+_REFERENCE_WORKFLOW_IDS: list[str] = [
+    filename.removesuffix(".workflow.yaml")
+    for filename, _ in _REFERENCE_WORKFLOW_CEILINGS
+]
+
+
+def _workflow_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return WARNING+ messages emitted by the ``crawdad.workflows`` logger."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "crawdad.workflows" and record.levelno >= logging.WARNING
+    ]
+
 
 # ---------------------------------------------------------------------------
 # Models + parser
@@ -54,7 +87,7 @@ def test_workflow_definition_minimal() -> None:
     )
 
     assert wf.phase_aware is False
-    assert wf.privacy_tier_floor == PrivacyTierCeiling.OPEN
+    assert wf.privacy_tier_ceiling == PrivacyTierCeiling.OPEN
     assert wf.allowed_phases == ()
     assert wf.inputs == ()
     assert wf.trigger is None
@@ -102,7 +135,7 @@ def test_load_workflow_from_yaml_round_trip(tmp_path: Path) -> None:
             trigger: "/crawdad workflow run demo"
             phase_aware: true
             allowed_phases: [rising, peak]
-            privacy_tier_floor: personal
+            privacy_tier_ceiling: personal
             inputs: [topic]
             steps:
               - id: read
@@ -125,7 +158,7 @@ def test_load_workflow_from_yaml_round_trip(tmp_path: Path) -> None:
     assert wf.trigger == "/crawdad workflow run demo"
     assert wf.phase_aware is True
     assert wf.allowed_phases == ("rising", "peak")
-    assert wf.privacy_tier_floor == PrivacyTierCeiling.PERSONAL
+    assert wf.privacy_tier_ceiling == PrivacyTierCeiling.PERSONAL
     assert wf.inputs == ("topic",)
     assert len(wf.steps) == 2
     assert wf.steps[0].id == "read"
@@ -179,6 +212,157 @@ def test_load_workflow_from_yaml_empty_file_raises(tmp_path: Path) -> None:
     path.write_text("", encoding="utf-8")
 
     with pytest.raises(WorkflowParseError):
+        load_workflow_from_yaml(path)
+
+
+# ---------------------------------------------------------------------------
+# Deprecated ``privacy_tier_floor`` alias (#1051)
+# ---------------------------------------------------------------------------
+#
+# The field was misnamed: ``OPEN`` is the MOST restrictive tier and
+# ``ALL`` the broadest, so raising the so-called "floor" WIDENED what
+# the MCP server returned. The rename to ``privacy_tier_ceiling`` is
+# value-preserving — an existing file keeps the exact tier it declared,
+# it just stops lying about the direction.
+
+
+def _ceiling_workflow_yaml(key: str | None, value: str = "personal") -> str:
+    """Return a minimal workflow document declaring *key* = *value*.
+
+    ``key`` of ``None`` omits the privacy declaration entirely so the
+    default-path test exercises the same document shape as the rest.
+    """
+    declaration = "" if key is None else f"{key}: {value}\n"
+    return (
+        "name: aliased\n"
+        "description: exercises the privacy tier key\n"
+        f"{declaration}"
+        "steps:\n"
+        "  - id: read\n"
+        "    tool: creek.state.read\n"
+    )
+
+
+def test_yaml_legacy_privacy_tier_floor_key_migrates(tmp_path: Path) -> None:
+    """A file still using ``privacy_tier_floor`` loads under the new field name.
+
+    Value-preserving: ``personal`` in, ``PERSONAL`` out. The legacy key
+    must NOT survive as a second attribute — the model exposes exactly
+    one privacy attribute, ``privacy_tier_ceiling``.
+    """
+    path = tmp_path / "legacy.workflow.yaml"
+    path.write_text(
+        _ceiling_workflow_yaml("privacy_tier_floor", "personal"), encoding="utf-8"
+    )
+
+    wf = load_workflow_from_yaml(path)
+
+    assert wf.privacy_tier_ceiling == PrivacyTierCeiling.PERSONAL
+    assert not hasattr(wf, "privacy_tier_floor")
+
+
+def test_yaml_legacy_privacy_tier_floor_key_warns_naming_workflow(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The legacy key is accepted but logs a WARNING that names the workflow.
+
+    A silent migration would leave every authored file on a deprecated
+    key forever. The warning has to name the offending workflow or the
+    operator cannot find the file to edit.
+    """
+    path = tmp_path / "legacy-warn.workflow.yaml"
+    path.write_text(
+        _ceiling_workflow_yaml("privacy_tier_floor", "personal"), encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="crawdad.workflows"):
+        wf = load_workflow_from_yaml(path)
+
+    messages = _workflow_warnings(caplog)
+    assert len(messages) == 1
+    assert "privacy_tier_floor" in messages[0]
+    assert "privacy_tier_ceiling" in messages[0]
+    assert "aliased" in messages[0]
+    assert wf.privacy_tier_ceiling == PrivacyTierCeiling.PERSONAL
+
+
+def test_kwargs_legacy_privacy_tier_floor_migrates() -> None:
+    """Direct kwargs construction migrates too, not just ``model_validate``.
+
+    The alias lives in a ``mode="before"`` model validator precisely so
+    both entry points are covered: :func:`load_workflow_from_yaml` goes
+    through ``model_validate(dict)``, but in-process callers (and the
+    walker tests) construct ``WorkflowDefinition(...)`` directly.
+    """
+    wf = WorkflowDefinition(
+        name="kwargs-legacy",
+        description="constructed with the deprecated keyword",
+        privacy_tier_floor=PrivacyTierCeiling.PERSONAL,
+        steps=(WorkflowStep(id="read", tool="creek.state.read"),),
+    )
+
+    assert wf.privacy_tier_ceiling == PrivacyTierCeiling.PERSONAL
+
+
+def test_canonical_privacy_tier_ceiling_key_emits_no_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A file already on the canonical key is silent — no deprecation noise."""
+    path = tmp_path / "canonical.workflow.yaml"
+    path.write_text(
+        _ceiling_workflow_yaml("privacy_tier_ceiling", "personal"), encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="crawdad.workflows"):
+        wf = load_workflow_from_yaml(path)
+
+    assert wf.privacy_tier_ceiling == PrivacyTierCeiling.PERSONAL
+    assert _workflow_warnings(caplog) == []
+
+
+def test_absent_privacy_tier_key_defaults_to_open_without_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Omitting the key falls back to ``OPEN`` and warns about nothing.
+
+    ``OPEN`` is the most restrictive tier, so the default is the safe
+    one. A workflow that never mentioned the legacy key must not be
+    accused of using it.
+    """
+    path = tmp_path / "defaulted.workflow.yaml"
+    path.write_text(_ceiling_workflow_yaml(None), encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="crawdad.workflows"):
+        wf = load_workflow_from_yaml(path)
+
+    assert wf.privacy_tier_ceiling == PrivacyTierCeiling.OPEN
+    assert _workflow_warnings(caplog) == []
+
+
+def test_both_privacy_tier_keys_raise_workflow_parse_error(tmp_path: Path) -> None:
+    """Declaring both the legacy and canonical keys is ambiguous — refuse it.
+
+    Silently picking a winner would let a half-finished migration ship a
+    different effective ceiling than the author last read. The
+    ``ValueError`` the validator raises reaches the caller as a
+    :class:`WorkflowParseError` via the loader's ``ValidationError``
+    mapping.
+    """
+    path = tmp_path / "both.workflow.yaml"
+    path.write_text(
+        (
+            "name: ambiguous\n"
+            "description: declares the privacy tier twice\n"
+            "privacy_tier_floor: open\n"
+            "privacy_tier_ceiling: personal\n"
+            "steps:\n"
+            "  - id: read\n"
+            "    tool: creek.state.read\n"
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkflowParseError, match="privacy_tier_floor"):
         load_workflow_from_yaml(path)
 
 
@@ -643,18 +827,29 @@ class _FakeMCPClient:
     ignore[arg-type]`` at every call site. Both fakes implement the
     same ``call_tool`` shape; the walker only ever invokes that one
     method.
+
+    ``connect_calls`` / ``entered`` exist so pre-flight tests can prove
+    a constraint fired *before any tool could fire* (#1051). Asserting
+    only that ``run()`` raised is not enough: a check placed inside the
+    step loop would raise too, after the session was already open and
+    (for a multi-step workflow) after earlier tools had already run.
     """
 
     def __init__(self, session: Any) -> None:
         """Stash the session that ``connect()`` will yield."""
         self._session = session
+        self.connect_calls = 0
+        self.entered = False
 
     def connect(self) -> Any:
         """Async-context-manager that yields the wrapped session."""
         from contextlib import asynccontextmanager
 
+        self.connect_calls += 1
+
         @asynccontextmanager
         async def _ctx() -> Any:
+            self.entered = True
             yield self._session
 
         return _ctx()
@@ -698,19 +893,41 @@ async def test_walker_runs_each_step_in_order() -> None:
     assert results[0].body == "phase: rising"
 
 
-async def test_walker_propagates_privacy_floor_to_each_call() -> None:
-    """Every step receives ``privacy_tier_ceiling`` = the workflow's floor."""
+async def test_walker_propagates_privacy_ceiling_to_each_call() -> None:
+    """Every step receives ``privacy_tier_ceiling`` = the workflow's ceiling."""
     session = _FakeSession()
     walker = WorkflowWalker(
         mcp_client=_FakeMCPClient(session),
         known_tools=("creek.state.read", "creek.mine"),
     )
-    wf = _simple_workflow(privacy_tier_floor=PrivacyTierCeiling.PERSONAL)
+    wf = _simple_workflow(privacy_tier_ceiling=PrivacyTierCeiling.PERSONAL)
 
     await walker.run(wf, state=None, inputs={})
 
     for _name, args in session.calls:
         assert args["privacy_tier_ceiling"] == "personal"
+
+
+async def test_walker_propagates_privacy_ceiling_to_each_tool_result() -> None:
+    """The declared ceiling also lands on every returned ``ToolResult``.
+
+    Downstream, :func:`crawdad.loop._max_ceiling_from` reads
+    ``ToolResult.privacy_tier_ceiling`` to decide how sensitive the
+    composed reply may be. If the walker stamped the wrong attribute
+    the loop would under- or over-classify the whole batch.
+    """
+    session = _FakeSession()
+    walker = WorkflowWalker(
+        mcp_client=_FakeMCPClient(session),
+        known_tools=("creek.state.read", "creek.mine"),
+    )
+    wf = _simple_workflow(privacy_tier_ceiling=PrivacyTierCeiling.PERSONAL)
+
+    results = await walker.run(wf, state=None, inputs={})
+
+    assert len(results) == 2
+    for result in results:
+        assert result.privacy_tier_ceiling == PrivacyTierCeiling.PERSONAL
 
 
 async def test_walker_refuses_phase_aware_without_state() -> None:
@@ -990,6 +1207,328 @@ async def test_walker_step_error_carries_step_and_tool_metadata() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Walker — privacy ceiling cap (#1051)
+# ---------------------------------------------------------------------------
+#
+# CrawDad relays every ToolResult body to a cloud LLM composer and then
+# posts it to Discord. ``intimate`` / ``all`` content must therefore
+# never be *requestable* by an authored workflow file, no matter what
+# the file declares. The cap is enforced at WALK time, not parse time,
+# deliberately: a parse error would make the workflow vanish from
+# ``/crawdad workflow list`` via ``_absorb_dir``'s warn-and-skip, which
+# is a worse silent failure than a loud refusal at run time.
+
+_ADMITTED_TIERS = (PrivacyTierCeiling.OPEN, PrivacyTierCeiling.PERSONAL)
+_ADMITTED_TIER_IDS = [tier.value for tier in _ADMITTED_TIERS]
+_REFUSED_TIERS = (PrivacyTierCeiling.INTIMATE, PrivacyTierCeiling.ALL)
+_REFUSED_TIER_IDS = [tier.value for tier in _REFUSED_TIERS]
+
+
+def test_workflow_admitted_ceilings_is_open_and_personal() -> None:
+    """The cap is exactly ``{open, personal}`` — an immutable frozenset.
+
+    Mirrors ``creek_mcp.policy.REMOTE_ADMITTED_CEILINGS``. Pinned as an
+    exact set (not a membership spot-check) so widening the cap is a
+    deliberate, reviewable edit to this assertion rather than a silent
+    addition nobody notices.
+
+    #1152: the workflow cap and the router/dispatcher cap are the SAME
+    boundary — every ``ToolResult`` body, whoever produced it, is
+    relayed to a cloud LLM composer and posted into a Discord message.
+    Identity (``is``), not equality: two frozensets that agree today
+    are two places to widen tomorrow, and only one of them would show
+    up in a reviewer's diff.
+    """
+    from crawdad.intents import COMPOSER_ADMITTED_CEILINGS
+
+    assert (
+        frozenset({PrivacyTierCeiling.OPEN, PrivacyTierCeiling.PERSONAL})
+        == WORKFLOW_ADMITTED_CEILINGS
+    )
+    assert isinstance(WORKFLOW_ADMITTED_CEILINGS, frozenset)
+    assert PrivacyTierCeiling.INTIMATE not in WORKFLOW_ADMITTED_CEILINGS
+    assert PrivacyTierCeiling.ALL not in WORKFLOW_ADMITTED_CEILINGS
+    assert WORKFLOW_ADMITTED_CEILINGS is COMPOSER_ADMITTED_CEILINGS
+
+
+@pytest.mark.parametrize("tier", _REFUSED_TIERS, ids=_REFUSED_TIER_IDS)
+async def test_walker_refuses_ceiling_above_cap_before_any_tool_fires(
+    tier: PrivacyTierCeiling,
+) -> None:
+    """A workflow declaring ``intimate`` / ``all`` is refused pre-flight.
+
+    "Pre-flight" is the load-bearing word: the MCP session must never be
+    opened, so no tool has a chance to return over-broad content that
+    the walker would then have to discard. Asserting only on the raised
+    exception would pass even if the check lived inside the step loop.
+    """
+    session = _FakeSession()
+    client = _FakeMCPClient(session)
+    walker = WorkflowWalker(
+        mcp_client=client,
+        known_tools=("creek.state.read", "creek.mine"),
+    )
+    wf = _simple_workflow(privacy_tier_ceiling=tier)
+
+    with pytest.raises(WorkflowConstraintError):
+        await walker.run(wf, state=None, inputs={})
+
+    assert client.connect_calls == 0
+    assert client.entered is False
+    assert session.calls == []
+
+
+@pytest.mark.parametrize("tier", _ADMITTED_TIERS, ids=_ADMITTED_TIER_IDS)
+async def test_walker_admits_ceilings_within_cap(tier: PrivacyTierCeiling) -> None:
+    """``open`` and ``personal`` still walk to completion — the cap is not a ban."""
+    session = _FakeSession()
+    client = _FakeMCPClient(session)
+    walker = WorkflowWalker(
+        mcp_client=client,
+        known_tools=("creek.state.read", "creek.mine"),
+    )
+    wf = _simple_workflow(privacy_tier_ceiling=tier)
+
+    results = await walker.run(wf, state=None, inputs={})
+
+    assert len(results) == 2
+    assert client.entered is True
+    assert [name for name, _ in session.calls] == ["creek.state.read", "creek.mine"]
+    for _name, args in session.calls:
+        assert args["privacy_tier_ceiling"] == tier.value
+
+
+async def test_walker_ceiling_refusal_names_workflow_tier_and_allowed_set() -> None:
+    """The refusal message is actionable: which workflow, which tier, what's allowed.
+
+    The operator sees this text in Discord. Without the workflow name
+    they cannot find the file; without the allowed set they cannot tell
+    what to change it to.
+    """
+    session = _FakeSession()
+    client = _FakeMCPClient(session)
+    walker = WorkflowWalker(
+        mcp_client=client,
+        known_tools=("creek.state.read", "creek.mine"),
+    )
+    wf = _simple_workflow(
+        name="leaky-flow", privacy_tier_ceiling=PrivacyTierCeiling.ALL
+    )
+
+    with pytest.raises(WorkflowConstraintError) as excinfo:
+        await walker.run(wf, state=None, inputs={})
+
+    message = str(excinfo.value)
+    assert "'leaky-flow'" in message
+    assert "'all'" in message
+    assert "open" in message
+    assert "personal" in message
+    assert session.calls == []
+
+
+async def test_ceiling_refusal_reported_before_other_constraint_failures() -> None:
+    """The privacy refusal wins when several constraints fail at once.
+
+    ``_check_constraints`` reports the FIRST failure it finds, so check
+    order decides what the operator sees. A workflow that is over the
+    cap *and* names an unadvertised tool *and* is missing an input must
+    report the ceiling: fix-the-tool-then-rerun would otherwise walk the
+    author up to the privacy refusal one round trip at a time, and the
+    privacy rule is the one that must never be the second thing said.
+    """
+    wf = WorkflowDefinition(
+        name="multi-fail",
+        description="over the cap, unknown tool, and missing an input",
+        privacy_tier_ceiling=PrivacyTierCeiling.INTIMATE,
+        inputs=("topic",),
+        steps=(WorkflowStep(id="read", tool="creek.not.a.real.tool"),),
+    )
+    session = _FakeSession()
+    client = _FakeMCPClient(session)
+    walker = WorkflowWalker(mcp_client=client, known_tools=("creek.state.read",))
+
+    with pytest.raises(WorkflowConstraintError) as excinfo:
+        await walker.run(wf, state=None, inputs={})
+
+    message = str(excinfo.value)
+    assert "'intimate'" in message
+    assert "not.a.real.tool" not in message
+    assert "topic" not in message
+    assert client.connect_calls == 0
+
+
+async def test_workflow_over_cap_stays_visible_in_registry(tmp_path: Path) -> None:
+    """An over-cap workflow is refused at WALK time, not hidden at PARSE time.
+
+    This is the whole reason the cap is not a validator. If the parse
+    rejected it, ``_absorb_dir`` would log-and-skip and the workflow
+    would simply be absent from ``/crawdad workflow list`` — the author
+    would see no workflow and no reason. Instead it stays listed and
+    gettable, and refuses loudly when run.
+    """
+    user_dir = tmp_path / VAULT_WORKFLOWS_SUBPATH
+    _write_workflow(
+        user_dir / "too-private.workflow.yaml",
+        name="too-private",
+        body=dedent(
+            """\
+            name: too-private
+            description: declares a ceiling above the cap
+            privacy_tier_ceiling: intimate
+            steps:
+              - id: read
+                tool: creek.state.read
+            """
+        ),
+    )
+    registry = WorkflowRegistry(vault_path=tmp_path)
+
+    # Still discoverable — the file parsed, it just cannot be walked.
+    assert "too-private" in {wf.name for wf in registry.list()}
+    wf = registry.get("too-private")
+    assert wf.privacy_tier_ceiling == PrivacyTierCeiling.INTIMATE
+
+    session = _FakeSession()
+    client = _FakeMCPClient(session)
+    walker = WorkflowWalker(mcp_client=client, known_tools=("creek.state.read",))
+
+    with pytest.raises(WorkflowConstraintError, match="'too-private'"):
+        await walker.run(wf, state=None, inputs={})
+
+    assert client.connect_calls == 0
+    assert session.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Walker — step-arg ceiling smuggling (#1051)
+# ---------------------------------------------------------------------------
+#
+# ``_build_call_arguments`` overwrites any ``privacy_tier_ceiling`` key
+# a step's ``args`` carries. That backstop stays, but a silent
+# overwrite means an author who wrote ``privacy_tier_ceiling: all`` in
+# a step gets neither the tier they asked for nor any indication that
+# their line was discarded. Refuse it up front instead.
+
+
+async def test_walker_refuses_step_arg_ceiling_naming_the_step() -> None:
+    """A step ``args`` block declaring ``privacy_tier_ceiling`` is refused.
+
+    The message must name the offending step id — a workflow can have
+    many steps and the author needs to know which line to delete.
+    """
+    wf = WorkflowDefinition(
+        # Deliberately does NOT contain the step id as a substring, so
+        # the "names the step" assertion cannot be satisfied by the
+        # workflow name leaking into the message.
+        name="tier-override-flow",
+        description="a step tries to set its own ceiling",
+        privacy_tier_ceiling=PrivacyTierCeiling.OPEN,
+        steps=(
+            WorkflowStep(id="benign", tool="creek.state.read"),
+            WorkflowStep(
+                id="smuggle",
+                tool="creek.mine",
+                args={"strategy": "thread-terminus", "privacy_tier_ceiling": "all"},
+            ),
+        ),
+    )
+    session = _FakeSession()
+    client = _FakeMCPClient(session)
+    walker = WorkflowWalker(
+        mcp_client=client,
+        known_tools=("creek.state.read", "creek.mine"),
+    )
+
+    with pytest.raises(WorkflowConstraintError) as excinfo:
+        await walker.run(wf, state=None, inputs={})
+
+    message = str(excinfo.value)
+    assert "smuggle" in message
+    assert "privacy_tier_ceiling" in message
+    # Pre-flight: even the *earlier*, innocent step never ran.
+    assert client.connect_calls == 0
+    assert session.calls == []
+
+
+async def test_walker_refuses_step_arg_legacy_ceiling_key() -> None:
+    """The DEPRECATED spelling in a step's ``args`` is refused too.
+
+    Scoping the step-arg check to the canonical key alone would leave
+    ``privacy_tier_floor: all`` in a step silently accepted — the exact
+    false-assurance shape #1051 exists to close, one key over. No MCP
+    tool reads the legacy name, so nothing leaks either way; what is at
+    stake is that the author's line does something or says so.
+    """
+    wf = WorkflowDefinition(
+        name="tier-override-flow",
+        description="a step tries to set its own ceiling, old spelling",
+        privacy_tier_ceiling=PrivacyTierCeiling.OPEN,
+        steps=(
+            WorkflowStep(
+                id="smuggle",
+                tool="creek.mine",
+                args={"privacy_tier_floor": "all"},
+            ),
+        ),
+    )
+    session = _FakeSession()
+    client = _FakeMCPClient(session)
+    walker = WorkflowWalker(mcp_client=client, known_tools=("creek.mine",))
+
+    with pytest.raises(WorkflowConstraintError) as excinfo:
+        await walker.run(wf, state=None, inputs={})
+
+    message = str(excinfo.value)
+    assert "smuggle" in message
+    assert "privacy_tier_floor" in message
+    assert client.connect_calls == 0
+    assert session.calls == []
+
+
+async def test_walker_allows_steps_without_a_ceiling_arg() -> None:
+    """Ordinary steps are untouched by the step-arg refusal.
+
+    Guards against an over-broad check that trips on any arg key, or on
+    the walker-injected ``privacy_tier_ceiling`` it adds itself.
+    """
+    session = _FakeSession()
+    client = _FakeMCPClient(session)
+    walker = WorkflowWalker(
+        mcp_client=client,
+        known_tools=("creek.state.read", "creek.mine"),
+    )
+
+    results = await walker.run(_simple_workflow(), state=None, inputs={})
+
+    assert len(results) == 2
+    assert client.entered is True
+    assert [name for name, _ in session.calls] == ["creek.state.read", "creek.mine"]
+
+
+def test_build_call_arguments_still_overwrites_colliding_key() -> None:
+    """The ``_build_call_arguments`` backstop survives the pre-flight refusal.
+
+    Defence in depth: the constraint check is the loud gate, but the
+    merge helper must still clamp any ``privacy_tier_ceiling`` that
+    reaches it — e.g. from a future programmatic caller that never ran
+    ``_check_constraints``. (It is NOT reachable via interpolation:
+    ``interpolate`` recurses over dict values only, so no new top-level
+    key can appear.)
+
+    The tier parameter is passed positionally on purpose: it is being
+    renamed ``floor`` -> ``ceiling`` and this test pins behaviour, not
+    the parameter's spelling.
+    """
+    payload = _build_call_arguments(
+        {"strategy": "thread-terminus", "privacy_tier_ceiling": "all"},
+        PrivacyTierCeiling.OPEN,
+    )
+
+    assert payload["privacy_tier_ceiling"] == "open"
+    assert payload["strategy"] == "thread-terminus"
+
+
+# ---------------------------------------------------------------------------
 # Reference workflows
 # ---------------------------------------------------------------------------
 
@@ -1000,6 +1539,7 @@ def test_substack_draft_reference_workflow_parses() -> None:
     wf = load_workflow_from_yaml(path)
     assert wf.phase_aware is True
     assert any(step.tool == "creek.draft" for step in wf.steps)
+    assert wf.privacy_tier_ceiling == PrivacyTierCeiling.PERSONAL
 
 
 def test_wavelength_checkin_reference_workflow_parses() -> None:
@@ -1007,6 +1547,56 @@ def test_wavelength_checkin_reference_workflow_parses() -> None:
     path = BUILTIN_WORKFLOWS_DIR / "wavelength-checkin.workflow.yaml"
     wf = load_workflow_from_yaml(path)
     assert any(step.tool == "creek.state.read" for step in wf.steps)
+    assert wf.privacy_tier_ceiling == PrivacyTierCeiling.OPEN
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_ceiling"),
+    _REFERENCE_WORKFLOW_CEILINGS,
+    ids=_REFERENCE_WORKFLOW_IDS,
+)
+def test_reference_workflows_use_canonical_ceiling_key(
+    filename: str,
+    expected_ceiling: PrivacyTierCeiling,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every shipped workflow is migrated: canonical key, same tier, no warning.
+
+    Three things at once, because they are one property:
+
+    * the file parses under ``privacy_tier_ceiling``;
+    * its tier is *unchanged* by the #1051 rename (value-preserving —
+      a shifted value here would silently move what the MCP server
+      returns for a workflow nobody edited);
+    * loading it emits no deprecation warning, i.e. the builtins do not
+      ride the legacy alias they are meant to replace.
+    """
+    path = BUILTIN_WORKFLOWS_DIR / filename
+
+    with caplog.at_level(logging.WARNING, logger="crawdad.workflows"):
+        wf = load_workflow_from_yaml(path)
+
+    assert wf.privacy_tier_ceiling == expected_ceiling
+    assert _workflow_warnings(caplog) == []
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_ceiling"),
+    _REFERENCE_WORKFLOW_CEILINGS,
+    ids=_REFERENCE_WORKFLOW_IDS,
+)
+def test_reference_workflows_sit_inside_the_ceiling_cap(
+    filename: str, expected_ceiling: PrivacyTierCeiling
+) -> None:
+    """No shipped workflow declares a tier the walker would refuse.
+
+    A builtin that trips the cap would ship broken out of the box —
+    listed by ``/crawdad workflow list`` and guaranteed to fail on run.
+    """
+    wf = load_workflow_from_yaml(BUILTIN_WORKFLOWS_DIR / filename)
+
+    assert wf.privacy_tier_ceiling in WORKFLOW_ADMITTED_CEILINGS
+    assert expected_ceiling in WORKFLOW_ADMITTED_CEILINGS
 
 
 def test_compost_surfacing_reference_workflow_parses() -> None:
@@ -1039,6 +1629,7 @@ def test_compost_surfacing_reference_workflow_parses() -> None:
     assert any(
         "{{state.phase}}" in str(value) for value in mine_steps[0].args.values()
     ), "compost-surfacing's creek.mine step must scope to the current phase"
+    assert wf.privacy_tier_ceiling == PrivacyTierCeiling.PERSONAL
 
 
 async def test_compost_surfacing_refuses_when_session_state_unavailable() -> None:

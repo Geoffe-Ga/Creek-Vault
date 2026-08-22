@@ -10,7 +10,7 @@ Sonnet composer. The loop's contract:
        ▼  ── ROUND N ──┐
     router.extract_intents
        │
-       ├─ compose=True or intents=[] ─► composer.compose ─► reply
+       ├─ intents=[] ─► composer.compose ─► reply
        │
        └─ intents non-empty
               │
@@ -19,13 +19,23 @@ Sonnet composer. The loop's contract:
               │
               ▼
           dispatcher.dispatch(intents)  →  aggregate ToolResults
+              │                            + record the ``tool`` turn
               │
-              ▼
+              ├─ compose=True ─► composer.compose ─► reply
+              │
+              └─ compose=False ─► ROUND N+1 ──┘
        (loop until ``max_rounds`` rounds; the next attempt is refused)
+
+``compose`` is read *after* the dispatch, not before it: the router is
+prompted to emit its intents and set ``compose: true`` in the same
+response once it has everything it needs, so a bundled round must run
+the tools it asked for and then compose within that same round (#915).
+Only an *empty* intent list short-circuits straight to the composer.
 
 The cap defaults to :data:`MAX_LOOP_ROUNDS` (5) and can be raised or
 lowered per deployment via the ``max_loop_rounds`` key in
-``crawdad.yaml`` (FEAT-036, bounded ``[1, 50]``).
+``crawdad.yaml`` (FEAT-036, bounded ``[1, 50]``). The cap is reached
+only when the router keeps returning intents with ``compose=false``.
 
 Side-effects: the loop appends ``user`` and ``assistant`` turns to the
 shared :class:`ConversationHistory` (the source the next router pass
@@ -58,7 +68,12 @@ from crawdad.dispatcher import (
     ToolResult,
     UnknownIntentError,
 )
-from crawdad.intents import Intent, PrivacyTierCeiling, RouterResponse
+from crawdad.intents import (
+    CEILING_RANK,
+    Intent,
+    PrivacyTierCeiling,
+    RouterResponse,
+)
 from crawdad.mcp_client import MCPUnavailableError
 from crawdad.router import RouterParseError
 
@@ -173,7 +188,8 @@ class AgentLoop:
                 _LOGGER.warning("router parse error mid-loop: %s", exc)
                 return LoopOutcome(kind="router_parse_error", reply=_ROUTER_PARSE_REPLY)
 
-            if response.compose or not response.intents:
+            # Nothing to dispatch: go straight to the composer.
+            if not response.intents:
                 break
 
             try:
@@ -186,6 +202,14 @@ class AgentLoop:
                 return LoopOutcome(kind="mcp_unavailable", reply=_MCP_UNAVAILABLE_REPLY)
             aggregated.extend(results)
             self._record_tool_round(results)
+
+            # Intents bundled with compose=true (#915): the tools above
+            # have now run, so this round composes rather than costing an
+            # extra router pass. Recording the round above keeps history
+            # identical to the two-round path — the break below guarantees
+            # no second router pass, so there is no duplicate turn.
+            if response.compose:
+                break
         else:
             # Exhausted max_rounds without the router setting compose=true.
             _LOGGER.warning(
@@ -310,20 +334,24 @@ def _render_tool_results(results: list[ToolResult]) -> str:
 def _max_ceiling_from(results: list[ToolResult]) -> PrivacyTierCeiling:
     """Return the most permissive ceiling observed across *results*.
 
-    Ordered low→high by the underlying enum value strings: ``all`` is
-    treated as the most permissive (it's literally the "no ceiling"
-    sentinel), then ``intimate`` → ``personal`` → ``open``. Defaults
-    to OPEN when no results carry a ceiling.
+    Ordered low→high by :data:`crawdad.intents.CEILING_RANK`, which used
+    to live here as a local dict literal (#1152 moved it so the
+    dispatcher could share it — ``crawdad.dispatcher`` cannot import
+    ``crawdad.loop``). The ordering is *not* "by the underlying enum
+    value strings", as this docstring used to claim: the members are
+    ``StrEnum``, so comparing them compares spelling, which would rank
+    ``all`` — the broadest tier, the literal "no ceiling" sentinel —
+    below every other one. Hence the hand-written table, and hence
+    exactly one of it. Defaults to OPEN when no results carry a ceiling.
+
+    The comparison is one-directional by design: this only ever moves
+    upward. That is safe only because every ceiling that reaches a
+    :class:`ToolResult` was already clamped by
+    ``crawdad.dispatcher._capped``.
     """
-    rank = {
-        PrivacyTierCeiling.OPEN: 0,
-        PrivacyTierCeiling.PERSONAL: 1,
-        PrivacyTierCeiling.INTIMATE: 2,
-        PrivacyTierCeiling.ALL: 3,
-    }
     best = PrivacyTierCeiling.OPEN
     for result in results:
-        if rank[result.privacy_tier_ceiling] > rank[best]:
+        if CEILING_RANK[result.privacy_tier_ceiling] > CEILING_RANK[best]:
             best = result.privacy_tier_ceiling
     return best
 

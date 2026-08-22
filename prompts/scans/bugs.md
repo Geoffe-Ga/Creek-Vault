@@ -29,9 +29,9 @@ issue each, with a reproducing-test idea.
   - **Swallowed errors**: bare `except:` / `except Exception: pass` /
     `except Exception: ...` in `creek-tools/creek`, `creek-tools/creek_mcp`,
     and `crawdad/crawdad`.
-- Follow the repo's `bug-squashing-methodology`: every correctness claim needs a
-  reproduction. If a finding cannot be reproduced (even in principle by a named
-  test), DROP it — do not file speculation.
+- Every correctness claim needs a reproduction. If a finding cannot be
+  reproduced (even in principle by a named test), DROP it — do not file
+  speculation.
 
 ## Output Format
 Findings as a JSON list, one object per finding:

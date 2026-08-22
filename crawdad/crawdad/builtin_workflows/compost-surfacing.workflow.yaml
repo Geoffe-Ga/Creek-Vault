@@ -19,7 +19,7 @@ description: |
   the structured seed list into a short, voice-faithful summary.
 trigger: "/crawdad workflow run compost-surfacing"
 phase_aware: true
-privacy_tier_floor: personal
+privacy_tier_ceiling: personal
 steps:
   - id: read
     tool: creek.state.read

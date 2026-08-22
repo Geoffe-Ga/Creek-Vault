@@ -1017,3 +1017,55 @@ class TestAssembleIngestedFragment:
         )
         with pytest.raises(KeyError, match="specific-file"):
             assemble_ingested_fragment(parsed)
+
+    # ---- Hashtag extraction (issue #878) ----
+    #
+    # ``assemble_ingested_fragment`` is the universal ingest chokepoint:
+    # every adapter and every CLI surface funnels through it, so wiring the
+    # tags pass here (rather than into each ingestor) is what makes
+    # ``tags`` populated for markdown, Discord, ChatGPT, Substack and the
+    # rest in one place.
+
+    def test_body_hashtags_land_on_the_assembled_fragment(self) -> None:
+        """Hashtags in the markdown body become normalised ``tags``.
+
+        Before #878 nothing on any ingest path wrote this field, so every
+        fragment in a 35k-fragment vault reached the Tag Garden carrying
+        ``tags: []``.
+        """
+        parsed = self._parsed(
+            markdown="# A note\n\nBody about #recovery and #Writing.\n",
+        )
+
+        ingested = assemble_ingested_fragment(parsed)
+
+        assert ingested.fragment.tags == ["recovery", "writing"]
+
+    def test_existing_frontmatter_tags_are_unioned_and_renormalised(self) -> None:
+        """A hand-written ``tags:`` block survives *and* gets normalised.
+
+        One assertion proving two halves of the merge contract at once:
+        the pre-existing ``Recovery`` is not lost (a replace rather than a
+        union would delete operator-authored vault content on every
+        re-ingest), and it is re-normalised to ``recovery`` so the garden
+        does not count ``Recovery`` and ``recovery`` as two tags forever.
+        """
+        parsed = self._parsed(
+            markdown="# A note\n\nMore on #writing.\n",
+            frontmatter={
+                "type": "fragment",
+                "title": "A note",
+                "source": {"platform": "markdown"},
+                "tags": ["Recovery"],
+            },
+        )
+
+        ingested = assemble_ingested_fragment(parsed)
+
+        assert ingested.fragment.tags == ["recovery", "writing"]
+
+    def test_a_body_without_hashtags_leaves_tags_empty(self) -> None:
+        """The default is still ``[]`` — the pass adds nothing from nothing."""
+        ingested = assemble_ingested_fragment(self._parsed())
+
+        assert ingested.fragment.tags == []

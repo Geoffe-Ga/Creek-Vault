@@ -1,13 +1,19 @@
 """Confidence-driven re-atomization orchestrator (FEAT-023).
 
-Ties together the FEAT-021 zoom-in splitter and the FEAT-022 zoom-out
-aggregator: when a classifier returns ``unclassified`` or scores below
-the configured confidence floor, this orchestrator chooses a direction
-based on the fragment's source and structural level, re-atomizes
-accordingly, classifies the new units, and recurses. Recursion stops
-when a unit clears the threshold, hits a terminal level (sentence on
-the small end, session on the large end), or reaches the per-config
-max-depth ceiling.
+Drives the FEAT-021 zoom-in splitter: when a classifier returns
+``unclassified`` or scores below the configured confidence floor, this
+orchestrator decides whether carving the unit finer can help, splits
+it, classifies the new units, and recurses. Recursion stops when a unit
+clears the threshold, hits a terminal level (``sentence`` or
+``session``), reaches the per-config max-depth ceiling, or lands on a
+fragment the splitter is the wrong tool for.
+
+That last case is what the zoom-out twin left behind. Chat messages at
+message/exchange grain were once meant to be stitched into coarser
+parents by FEAT-022; issue #1342 retired that operator (ADR-0011)
+because no production path ever invoked it, so those fragments now stop
+with ``no_operator`` — see :data:`StopReason`. Issue #1457 tracks
+bringing coarsening back together with a caller that uses it.
 
 A leaf that still won't classify is honestly recorded as
 ``unclassified`` — exactly the philosophy the rest of the pipeline
@@ -26,7 +32,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
-from creek.atomize.aggregate import AggregateLevel, AggregationConfig, aggregate
 from creek.atomize.split import SentenceTokenizer, default_sentence_tokenizer, split
 from creek.ingest.base import IngestedFragment
 from creek.models import (
@@ -50,11 +55,10 @@ __all__ = [
     "choose_direction",
     "choose_intelligent_unit",
     "classify_reatomize",
-    "classify_reatomize_stream",
 ]
 
-Direction = Literal["split", "aggregate"]
-DirectionOverride = Literal["auto", "split", "aggregate"]
+Direction = Literal["split", "none"]
+DirectionOverride = Literal["auto", "split"]
 
 StopReason = Literal[
     "accepted",
@@ -62,40 +66,36 @@ StopReason = Literal[
     "max_depth",
     "disabled",
     "no_decomposition",
-    "aggregate_no_siblings",
-    "passthrough",
+    "no_operator",
     "split",
-    "aggregated",
-    "aggregated_weak",
 ]
 """Why the orchestrator stopped recursing on a given subtree.
+
+Every token here must have a producer a production run can actually
+reach. That is a standing requirement, not an observation: downstream
+dashboards and export queues gate on this string, so a token nothing
+emits is a promise the pipeline cannot keep. Three tokens named
+zoom-out outcomes whose only emitters were themselves uncalled; issue
+#1342 removed them along with the operator.
 
 Leaf reasons (``children`` is empty):
 
 ``accepted``: classifier cleared :attr:`ReatomizeConfig.threshold`.
-``terminal``: at a level the operators refuse to decompose
+``terminal``: at a level the splitter refuses to decompose
 (sentence / session).
 ``max_depth``: hit :attr:`ReatomizeConfig.max_depth`.
 ``disabled``: the run was opt-out; no recursion attempted.
-``no_decomposition``: the chosen operator returned no children.
-``aggregate_no_siblings``: zoom-out chosen on a lone fragment with no
-siblings; see :func:`classify_reatomize_stream`.
-``passthrough``: a stream member the FEAT-022 aggregator declined to
-combine (wrong level for the target transition) AND that didn't
-clear the threshold on its own — distinct from ``accepted`` so
-downstream gates don't conflate "the orchestrator did nothing" with
-"the classifier was confident".
+``no_decomposition``: the splitter ran and returned no children.
+``no_operator``: :func:`choose_direction` answered ``"none"`` — the
+fragment's source and level call for zoom-out, and Creek has no
+zoom-out operator (retired, issue #1342). An honest leaf, not a
+failure: nothing was attempted, because nothing could be. This is the
+only producer of the reason, and ``"none"`` is its only cause, so the
+two names move together or not at all.
 
 Internal reasons (``children`` is non-empty):
 
 ``split``: parent was decomposed by the FEAT-021 zoom-in splitter.
-``aggregated``: parent was assembled by the FEAT-022 zoom-out
-aggregator AND cleared the threshold (only produced by
-:func:`classify_reatomize_stream`).
-``aggregated_weak``: parent was assembled by the aggregator but the
-re-classified parent still failed the threshold. Symmetric with
-``aggregated`` for downstream consumers that want to find the
-"aggregation happened but didn't resolve uncertainty" subset.
 """
 
 Classifier = Callable[[IngestedFragment], tuple[IngestedFragment, float]]
@@ -124,21 +124,14 @@ Slack is named in the FEAT-023 spec but is not yet enumerated in
 _TERMINAL_LEVELS: frozenset[FragmentLevel] = frozenset({"sentence", "session"})
 """Levels that resist further re-atomization in either direction."""
 
-_AGGREGATE_NEXT_LEVEL: dict[FragmentLevel, AggregateLevel] = {
-    "document": "exchange",
-    "exchange": "burst",
-    "burst": "session",
-}
-"""For each source level, the FEAT-022 target one step coarser."""
-
 
 @dataclass(frozen=True)
 class ClassificationTree:
     """Recursive output of :func:`classify_reatomize`.
 
     Each node carries the classified fragment, the per-node confidence
-    score, the reason recursion stopped (or ``"split"`` / ``"aggregated"``
-    when the node has children), and the sub-trees produced.
+    score, the reason recursion stopped (or ``"split"`` when the node
+    has children), and the sub-trees produced.
     ``frozen=True`` so callers can hash or set-membership-test nodes
     without surprise.
 
@@ -146,8 +139,7 @@ class ClassificationTree:
         fragment: Classified fragment (frontmatter + body).
         confidence: Score the classifier returned for this fragment.
         stop_reason: Why recursion ended at this node, or how it
-            continued (``split`` / ``aggregated``) when ``children``
-            is non-empty.
+            continued (``split``) when ``children`` is non-empty.
         children: Sub-trees produced by re-atomization.
         depth: Distance from the root the caller invoked the
             orchestrator at (root is 0). Recorded so a downstream
@@ -178,13 +170,10 @@ class ReatomizeConfig:
             Default ``0.7`` matches
             :class:`creek.config.ClassificationConfig.confidence_threshold`.
         max_depth: Recursion ceiling counted from the root (depth 0).
-        direction: ``"auto"`` (heuristic), ``"split"``, or
-            ``"aggregate"`` — overrides :func:`choose_direction`.
+        direction: ``"auto"`` (heuristic) or ``"split"`` — overrides
+            :func:`choose_direction`.
         sentence_tokenizer: Forwarded into the FEAT-021 splitter for
             paragraph→sentence transitions.
-        aggregation_config: Forwarded into FEAT-022; defaults to stock
-            thresholds. Callers wire an embedder when burst runs are
-            in play.
     """
 
     enabled: bool = False
@@ -199,14 +188,11 @@ class ReatomizeConfig:
     sentence_tokenizer: SentenceTokenizer = field(
         default=default_sentence_tokenizer,
     )
-    aggregation_config: AggregationConfig = field(default_factory=AggregationConfig)
 
     @classmethod
     def from_classification_config(
         cls,
         config: ClassificationConfig,
-        *,
-        aggregation_config: AggregationConfig | None = None,
     ) -> ReatomizeConfig:
         """Project the FEAT-023 knobs out of a :class:`ClassificationConfig`.
 
@@ -215,8 +201,6 @@ class ReatomizeConfig:
 
         Args:
             config: Loaded vault classification config.
-            aggregation_config: Optional pre-built FEAT-022 config —
-                callers that want a calibrated embedder wire it here.
 
         Returns:
             A ready-to-use :class:`ReatomizeConfig`.
@@ -231,7 +215,6 @@ class ReatomizeConfig:
             threshold=threshold,
             max_depth=config.reatomize_max_depth,
             direction=config.reatomize_direction,
-            aggregation_config=aggregation_config or AggregationConfig(),
         )
 
 
@@ -249,13 +232,14 @@ def classify_reatomize(
     1. Classify the fragment.
     2. If accepted (confidence ≥ threshold AND no required dimension
        is ``unclassified``), return a leaf.
-    3. Otherwise pick a direction (split / aggregate) via
-       :func:`choose_direction`, decompose, recurse on the children.
-    4. Stop on terminal levels, ``max_depth``, empty decomposition,
-       or lone-fragment aggregate requests.
+    3. Otherwise ask :func:`choose_direction` whether the splitter
+       applies (``split``) or no operator does (``none``); on ``split``,
+       decompose and recurse on the children.
+    4. Stop on terminal levels, ``max_depth``, empty decomposition, or
+       a fragment no surviving operator fits (``no_operator``).
 
     Idempotency: re-running on byte-identical input yields a tree of
-    identical shape because both operators are deterministic and the
+    identical shape because the splitter is deterministic and the
     classifier-driven branches collapse to the same shape when the
     fragments are unchanged.
 
@@ -280,47 +264,9 @@ def classify_reatomize(
         return _leaf(classified, confidence, "max_depth", _depth)
 
     direction = choose_direction(classified.fragment, config.direction)
-    if direction == "aggregate":
-        return _leaf(classified, confidence, "aggregate_no_siblings", _depth)
+    if direction == "none":
+        return _leaf(classified, confidence, "no_operator", _depth)
     return _zoom_in(classified, confidence, classifier, config, _depth)
-
-
-def classify_reatomize_stream(
-    fragments: list[IngestedFragment],
-    classifier: Classifier,
-    *,
-    config: ReatomizeConfig,
-) -> list[ClassificationTree]:
-    """Batch entry point that supports zoom-out via FEAT-022 aggregation.
-
-    For chat-style inputs (short, low-content fragments) the single-
-    fragment API cannot aggregate — there are no siblings to combine
-    with. This helper accepts the full stream, classifies each member,
-    and when zoom-out is the chosen direction for the weak members,
-    rolls them up via FEAT-022, classifies the parents, and returns
-    trees whose ``children`` are the original (now-classified) leaves.
-
-    When no fragment is weak, every input becomes an ``accepted``
-    single-node tree. When the direction comes back as ``split``, the
-    stream falls through to the single-fragment orchestrator on each
-    input, preserving FEAT-023's zoom-in algorithm verbatim.
-
-    Args:
-        fragments: Stream to classify. The aggregator groups by
-            :class:`creek.models.FragmentSource` key per FEAT-022.
-        classifier: Same callable as :func:`classify_reatomize`.
-        config: Per-run knobs.
-
-    Returns:
-        A list of :class:`ClassificationTree` — one per parent
-        produced (or per pass-through fragment when zoom-out wasn't
-        triggered).
-    """
-    if not fragments:
-        return []
-
-    classified_leaves = [classifier(frag) for frag in fragments]
-    return _route_stream(fragments, classified_leaves, classifier, config)
 
 
 def choose_direction(
@@ -331,22 +277,33 @@ def choose_direction(
 
     Honours an explicit ``override`` first, then routes by
     ``source.platform`` and structural ``level`` per the FEAT-023
-    heuristic: chat sources (``discord`` / ``claude`` / ``chatgpt``)
-    at a chat-level (``document`` = message, ``exchange``) zoom
-    **out** to stitch sparse context into the level where meaning
-    lives; every other combination — document sources at top levels,
-    finer carved levels at any source, the unknown-platform fallback —
-    zooms **in**. Aggregate without a clear chat-stream signal risks
-    combining unrelated material; ``split`` can at worst return no
-    children and become an honest leaf.
+    heuristic: chat sources (``discord`` / ``claude`` / ``chatgpt``) at
+    a chat-level (``document`` = message, ``exchange``) get ``"none"``;
+    every other combination — document sources at top levels, finer
+    carved levels at any source, the unknown-platform fallback — zooms
+    **in** with ``"split"``.
+
+    Why ``"none"`` rather than falling through to ``"split"``: the
+    chat-level branch was the zoom-out branch, and the FEAT-022
+    zoom-out operator was retired by issue #1342 (ADR-0011) for having
+    no production caller. Creek now has no operator for that case, and
+    saying so is the behaviour-preserving answer. Splitting instead
+    would change what the pipeline does on real vaults in two ways: a
+    chat one-liner carves into nothing, which is merely a differently
+    named leaf; but a long chat turn carves into paragraphs, and every
+    one of those children is a new file the vault did not have before.
+    Where the retired branch persisted nothing, ``"split"`` would start
+    minting fragments. ``"none"`` keeps the fragment exactly as it is
+    and lets the caller record an honest ``no_operator`` leaf.
 
     Args:
         fragment: Fragment whose source + level drive the heuristic.
-        override: ``"auto"`` (use heuristic) or one of
-            ``"split"`` / ``"aggregate"`` to bypass it.
+        override: ``"auto"`` (use heuristic) or ``"split"`` to bypass
+            it. There is no override for ``"none"``: it is a statement
+            about which operators exist, not a strategy to select.
 
     Returns:
-        ``"split"`` or ``"aggregate"``.
+        ``"split"`` or ``"none"``.
     """
     if override != "auto":
         return override
@@ -358,12 +315,11 @@ def choose_direction(
     level = fragment.level
 
     if platform in _CHAT_PLATFORMS and level in {"document", "exchange"}:
-        return "aggregate"
+        return "none"
     # Document-source top levels, paragraph/subsection at any source, and
-    # the unknown-platform fallback all default to ``split``. Aggregate
-    # without a clear chat-stream signal risks combining unrelated
-    # material; ``split`` can at worst return no children and become an
-    # honest leaf.
+    # the unknown-platform fallback all default to ``split``: carving
+    # material that really is carvable can at worst return no children
+    # and become an honest leaf.
     return "split"
 
 
@@ -383,43 +339,6 @@ def _leaf(
         stop_reason=stop_reason,
         depth=depth,
     )
-
-
-def _route_stream(
-    fragments: list[IngestedFragment],
-    classified_leaves: list[tuple[IngestedFragment, float]],
-    classifier: Classifier,
-    config: ReatomizeConfig,
-) -> list[ClassificationTree]:
-    """Pick a stream-handling strategy after the initial pass.
-
-    Factored out of :func:`classify_reatomize_stream` so neither
-    function exceeds the per-function complexity ceiling (Xenon B).
-    """
-    if not config.enabled:
-        return [_leaf(cl, conf, "disabled", 0) for cl, conf in classified_leaves]
-
-    weak = [
-        (cl, conf)
-        for cl, conf in classified_leaves
-        if not _is_accepted(cl.fragment, conf, config.threshold)
-    ]
-    if not weak:
-        return [_leaf(cl, conf, "accepted", 0) for cl, conf in classified_leaves]
-
-    # Pin the direction off the first weak fragment. The stream API
-    # assumes a homogeneous source (one Discord conversation, one
-    # document corpus) — the FEAT-022 aggregator itself groups by
-    # FragmentSource key, so mixed streams already split cleanly at
-    # that layer. A caller mixing chat + document sources in the same
-    # batch should either segment up-front or invoke
-    # :func:`classify_reatomize` per fragment.
-    direction = choose_direction(weak[0][0].fragment, config.direction)
-    if direction != "aggregate":
-        return [
-            classify_reatomize(frag, classifier, config=config) for frag in fragments
-        ]
-    return _zoom_out_stream(classified_leaves, classifier, config)
 
 
 def _is_accepted(fragment: Fragment, confidence: float, threshold: float) -> bool:
@@ -462,90 +381,6 @@ def _zoom_in(
         stop_reason="split",
         children=sub_trees,
         depth=depth,
-    )
-
-
-def _zoom_out_stream(
-    classified_leaves: list[tuple[IngestedFragment, float]],
-    classifier: Classifier,
-    config: ReatomizeConfig,
-) -> list[ClassificationTree]:
-    """Aggregate the stream up one level and classify each parent.
-
-    The aggregator (FEAT-022) is fragment-centric. We strip the bodies,
-    ask it to roll the stream to the next coarser level, and rebuild
-    :class:`IngestedFragment` envelopes whose bodies are the joiner-
-    concatenated child bodies. That keeps the parent classifier-readable
-    without re-implementing FEAT-022's joining rules.
-    """
-    base_level = classified_leaves[0][0].fragment.level
-    target = _AGGREGATE_NEXT_LEVEL.get(base_level)
-    if target is None:
-        return [_leaf(cl, conf, "terminal", 0) for cl, conf in classified_leaves]
-
-    leaf_lookup: dict[str, tuple[IngestedFragment, float]] = {
-        cl.fragment.id: (cl, conf) for cl, conf in classified_leaves
-    }
-    parents = aggregate(
-        [cl.fragment for cl, _ in classified_leaves],
-        level=target,
-        config=config.aggregation_config,
-    )
-    return [
-        _tree_for_parent(parent, target, leaf_lookup, classifier, config)
-        for parent in parents
-    ]
-
-
-def _tree_for_parent(
-    parent: Fragment,
-    target: AggregateLevel,
-    leaf_lookup: dict[str, tuple[IngestedFragment, float]],
-    classifier: Classifier,
-    config: ReatomizeConfig,
-) -> ClassificationTree:
-    """Classify ``parent`` and wrap its leaves as a sub-tree."""
-    if parent.level != target:
-        # Pass-through: FEAT-022 declined to aggregate this fragment
-        # (wrong source level for the target transition). Distinguish
-        # the "classifier was confident" case from "we did nothing
-        # further" so a downstream gate on ``stop_reason == "accepted"``
-        # doesn't pick up weak fragments by accident.
-        cl, conf = leaf_lookup[parent.id]
-        reason: StopReason = (
-            "accepted"
-            if _is_accepted(cl.fragment, conf, config.threshold)
-            else "passthrough"
-        )
-        return _leaf(cl, conf, reason, 0)
-
-    body = config.aggregation_config.joiner.join(
-        leaf_lookup[c_id][0].body for c_id in parent.child_ids
-    )
-    parent_ingested = IngestedFragment(fragment=parent, body=body)
-    classified_parent, parent_conf = classifier(parent_ingested)
-    child_trees = tuple(
-        ClassificationTree(
-            fragment=leaf_lookup[c_id][0],
-            confidence=leaf_lookup[c_id][1],
-            stop_reason="terminal",
-            depth=1,
-        )
-        for c_id in parent.child_ids
-    )
-    # Children are non-empty here, so ``no_decomposition`` (defined as
-    # "operator returned no children") would be a lie. Use the dedicated
-    # ``aggregated_weak`` for the unconfident-parent case instead.
-    stop: StopReason = (
-        "aggregated"
-        if _is_accepted(classified_parent.fragment, parent_conf, config.threshold)
-        else "aggregated_weak"
-    )
-    return ClassificationTree(
-        fragment=classified_parent,
-        confidence=parent_conf,
-        stop_reason=stop,
-        children=child_trees,
     )
 
 

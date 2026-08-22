@@ -1,0 +1,5 @@
+{
+  "code": "unavailable",
+  "message": "the vault is not available to serve this request",
+  "request_id": "req-example-reflections-unavailable-service"
+}

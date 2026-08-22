@@ -25,6 +25,7 @@ deliberately neutral: no resolution, prescription, or judgment.
 from __future__ import annotations
 
 import itertools
+import logging
 import math
 import re
 from dataclasses import dataclass, field
@@ -35,13 +36,16 @@ import frontmatter
 
 from creek.link.neighbours import cosine_neighbours
 from creek.models import Confidence, Dosage, Frequency, Phase
+from creek.vault.links import read_header_meta
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
     from pathlib import Path
 
     from creek.config import EmbeddingsConfig
     from creek.models import Fragment
+
+logger = logging.getLogger(__name__)
 
 
 CONTRADICTION_KEYWORDS: tuple[str, ...] = (
@@ -131,6 +135,47 @@ _CONTRADICTION_DESCRIPTIONS: dict[str, str] = {
 
 
 _FILENAME_SANITIZER = re.compile(r"[^\w\-]+")
+
+
+_PARADOX_SUBPATH: tuple[str, str] = ("10-Liminal", "Paradoxes")
+"""Vault-relative folder paradox notes are written to and read back from."""
+
+
+_PAIR_SIZE: int = 2
+"""Fragments per paradox — the arity both the filename and the pair key use."""
+
+
+_WIKILINK_BRACKETS = re.compile(r"[\[\]]")
+"""Strips ``[[…]]`` from a frontmatter fragment reference.
+
+:meth:`ParadoxDetector.create_paradox_note` writes bare ids, but the sibling
+Synchronicity notes write wikilinks and an operator may normalise a paradox
+note by hand. Stripping costs nothing and makes the pair key tolerant of both,
+exactly as ``synchronicity._existing_synchronicity_pairs`` is.
+"""
+
+
+_DUPLICATE_SAMPLE: int = 3
+"""How many redundant note paths the pre-#1320 advisory names before stopping."""
+
+
+_DUPLICATE_WARNING_TEMPLATE: str = (
+    "This vault holds {count} paradox notes recording only {pairs} distinct "
+    "fragment pair(s). Before #1320 the note filename embedded the detection "
+    "date, so every re-run on a new calendar day wrote a fresh copy of an "
+    "unchanged paradox. This run wrote no further copy. The redundant notes "
+    "are left exactly where they are: {sample}. Nothing is deleted "
+    "automatically — open them in your vault and keep whichever one carries "
+    "the reflection you wrote. Any [[wikilink]] pointing at one of them keeps "
+    "resolving until you act."
+)
+"""Advisory for a vault still holding pre-#1320 per-calendar-day copies.
+
+Names paths and nothing else. A paradox note's excerpts are fragment prose and
+its tags can be intimate-derived, so neither belongs in a console line (#1404);
+the filename is already on disk and already surfaced by the state report's
+Liminal Watch, so naming it discloses nothing new.
+"""
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -250,7 +295,10 @@ class Paradox:
         excerpts: Short excerpts (one per fragment, matching
             :attr:`fragment_ids` order).
         detected_date: The date the paradox was recorded. Defaults to
-            today.
+            today, and :meth:`ParadoxDetector._build_paradox` leaves it at
+            that default, so it advances on every run. It is a record, not
+            an identity: the pair in :attr:`fragment_ids` is what
+            :func:`generate_paradoxes` keys on (#1320).
         similarity: Optional cosine similarity score between the
             fragments when embeddings are available. Stored for
             diagnostics; never surfaced to the human.
@@ -573,9 +621,16 @@ class ParadoxDetector:
         * states the detected tension in neutral, descriptive language;
         * includes the :data:`REFLECTION_PROMPT`.
 
-        The note is idempotent with respect to the paradox: writing the
-        same :class:`Paradox` twice produces the same file path and
-        overwrites the content without creating duplicates.
+        **This method clobbers.** The path it writes to embeds
+        ``paradox.detected_date``, so it is stable for one
+        :class:`Paradox` value — pass the same object twice and the second
+        call overwrites the first note in place. It is *not* stable for one
+        paradox across runs, because :attr:`Paradox.detected_date` defaults
+        to the day the object was built. Idempotency across runs is not this
+        method's job and never was: it belongs to
+        :func:`generate_paradoxes`, which reads the folder back and does not
+        call this method for a pair already recorded (#1320). Callers that
+        write notes themselves inherit the clobber.
 
         Args:
             paradox: The paradox to record.
@@ -584,7 +639,7 @@ class ParadoxDetector:
         Returns:
             The path to the written markdown note.
         """
-        target_dir = vault_path / "10-Liminal" / "Paradoxes"
+        target_dir = vault_path.joinpath(*_PARADOX_SUBPATH)
         target_dir.mkdir(parents=True, exist_ok=True)
 
         tags = ["paradox"]
@@ -797,33 +852,190 @@ class ParadoxDetector:
 
     @staticmethod
     def _filename(paradox: Paradox) -> str:
-        """Build a stable filename for a paradox note."""
+        """Build the filename for a paradox note.
+
+        Deterministic per :class:`Paradox` *value*, not per paradox: the
+        ``detected_date`` prefix means the same contradiction detected on two
+        days yields two names. That prefix is deliberately kept — it is the
+        operator-facing label the state report's Liminal Watch renders
+        verbatim (``creek/generate/state.py``), and paradox notes carry no
+        ``title:`` or ``aliases:``, so the stem is the only handle a
+        hand-written ``[[wikilink]]`` can use. :func:`generate_paradoxes`
+        supplies the cross-run identity instead (#1320).
+        """
         iso = paradox.detected_date.isoformat()
-        stem = "-".join(paradox.fragment_ids[:2]) or "paradox"
+        stem = "-".join(paradox.fragment_ids[:_PAIR_SIZE]) or "paradox"
         sanitized = _FILENAME_SANITIZER.sub("-", stem).strip("-")
         return f"{iso}-{sanitized}.md"
+
+
+def _recorded_pair(note: Path) -> frozenset[str] | None:
+    """Return the fragment pair a paradox note records, or ``None``.
+
+    ``None`` covers three cases that must all be non-fatal, because
+    ``10-Liminal/Paradoxes/`` is an operator-editable folder with a second
+    producer: the file is unreadable, its YAML is malformed, or it carries no
+    two-element ``fragments:`` list. The header is read with
+    :func:`~creek.vault.links.read_header_meta`, which is where "unreadable"
+    and "malformed" become an empty mapping. That reader is also splat-free,
+    which the previous ``frontmatter.loads`` was not: a note carrying a
+    non-string frontmatter key raised ``TypeError`` straight through this
+    guard and aborted the detector (#1475). Only the ``fragments:`` key is
+    ever consulted, so nothing is lost by not parsing the body.
+
+    A missing two-element list is the common case — a
+    ``creek save --target paradox`` note records its provenance under
+    ``saved_from.contributing_fragments``, so it must never be mistaken for a
+    detector-recorded pair and suppress a real paradox.
+
+    Header-only reading carries the same three deliberate consequences #1416
+    accepted and documents in full at
+    :func:`creek.generate.synchronicity._existing_synchronicity_pairs`: the
+    ``---`` fence must open line 1, the 200-line / 64 KB header caps apply, and
+    a note carrying a stray non-string key is tolerated rather than rejected.
+
+    Args:
+        note: Path to a candidate markdown note.
+
+    Returns:
+        The recorded fragment pair, or ``None`` when the note records none.
+    """
+    raw = read_header_meta(note).get("fragments")
+    if not isinstance(raw, list) or len(raw) < _PAIR_SIZE:
+        return None
+    return frozenset(
+        _WIKILINK_BRACKETS.sub("", str(item)).strip() for item in raw[:_PAIR_SIZE]
+    )
+
+
+def _paradox_notes_by_pair(vault_path: Path) -> dict[frozenset[str], list[Path]]:
+    """Map every already-recorded fragment pair to the notes recording it.
+
+    One pass over ``10-Liminal/Paradoxes/``, serving both jobs that need it:
+    the idempotency key for this run, and the census of pre-#1320 duplicates.
+    The pair — not the filename — is the identity, which is what makes the
+    scan see a note written on any earlier date.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+
+    Returns:
+        Recorded pair to the notes recording it, in sorted filename order.
+        Empty when the folder does not exist.
+    """
+    by_pair: dict[frozenset[str], list[Path]] = {}
+    folder = vault_path.joinpath(*_PARADOX_SUBPATH)
+    if not folder.is_dir():
+        return by_pair
+    for note in sorted(folder.glob("*.md")):
+        pair = _recorded_pair(note)
+        if pair is not None:
+            by_pair.setdefault(pair, []).append(note)
+    return by_pair
+
+
+def _advisory_for(
+    vault_path: Path,
+    by_pair: dict[frozenset[str], list[Path]],
+) -> str | None:
+    """Render the pre-#1320 duplicate advisory from an already-read census.
+
+    Args:
+        vault_path: Root of the Obsidian vault, used to relativise paths.
+        by_pair: Output of :func:`_paradox_notes_by_pair`.
+
+    Returns:
+        The advisory text, or ``None`` when no pair is recorded twice.
+    """
+    duplicated = {pair: notes for pair, notes in by_pair.items() if len(notes) > 1}
+    if not duplicated:
+        return None
+    notes = sorted(itertools.chain.from_iterable(duplicated.values()))
+    sample = ", ".join(
+        str(note.relative_to(vault_path)) for note in notes[:_DUPLICATE_SAMPLE]
+    )
+    if len(notes) > _DUPLICATE_SAMPLE:
+        sample = f"{sample}, …"
+    return _DUPLICATE_WARNING_TEMPLATE.format(
+        count=len(notes),
+        pairs=len(duplicated),
+        sample=sample,
+    )
+
+
+def duplicate_paradox_warning(vault_path: Path) -> str | None:
+    """Return the pre-#1320 duplicate-note advisory, or ``None`` (#1320).
+
+    Before #1320 a paradox note's identity lived only in its date-stamped
+    filename, so every run on a new calendar day wrote another copy of an
+    unchanged paradox. Fixing the generator stops the growth; it cannot undo
+    what is already on disk, and an operator who ran weekly for a year has ~52
+    copies of every paradox — one of which may carry the reflection they wrote
+    under :data:`REFLECTION_PROMPT`.
+
+    **Detected, reported, and left alone**, the answer #1304, #1305 and #1329
+    each gave the same shape of problem. Which copy to keep is a judgement
+    about the operator's own writing, and a generator does not get to make it
+    on a heuristic. The advisory is self-clearing: once the strays are gone,
+    the scan finds one note per pair and the run goes quiet. It is silent on a
+    fresh vault and on a vault that has only ever been generated once.
+
+    This is the read-only entry point — ask a vault whether it is affected
+    without writing to it. :func:`generate_paradoxes` renders the same advisory
+    from the folder scan it has already done, rather than calling this and
+    reading the folder a second time; both go through one formatter, so the
+    two can not drift.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+
+    Returns:
+        The advisory text, or ``None`` when every pair is recorded once.
+    """
+    return _advisory_for(vault_path, _paradox_notes_by_pair(vault_path))
 
 
 def generate_paradoxes(
     vault_path: Path,
     embeddings_config: EmbeddingsConfig,
+    *,
+    on_warning: Callable[[str], None] | None = None,
 ) -> list[Path]:
     """Detect contradictory fragment pairs and write paradox notes (#711).
 
     The runnable wiring for ``creek report --type paradox``: loads the vault's
     fragments and their cached embeddings, runs :class:`ParadoxDetector`, and
-    writes one note per paradox into ``10-Liminal/Paradoxes/``. Idempotent — each
-    note's path is stable per paradox, so re-running overwrites in place rather
-    than duplicating. Embeddings sharpen the topic-sharing rules; when the cache
-    is empty only the thread/frequency rules can match (still useful, no crash).
+    writes one note per paradox into ``10-Liminal/Paradoxes/``. Embeddings
+    sharpen the topic-sharing rules; when the cache is empty only the
+    thread/frequency rules can match (still useful, no crash).
+
+    **Idempotent**: a fragment pair already captured by an existing note is
+    skipped, so re-running never duplicates and never rewrites — necessary
+    because the note's filename embeds the detection date, which advances on
+    its own, so the filename alone is not stable across runs (#1320). The key
+    is the note's ``fragments:`` frontmatter, read back from the folder, which
+    is how a note written on any earlier day is still recognised. Skipping
+    rather than overwriting is also what preserves a reflection the operator
+    wrote into an existing note. This mirrors
+    :func:`~creek.generate.synchronicity.generate_synchronicities` and
+    :func:`~creek.generate.decisions.generate_decisions`, which key their own
+    read-back scans on the pair set and the source fragment id respectively.
 
     Args:
         vault_path: Root of the Obsidian vault.
         embeddings_config: Embeddings config (model + cache) used to load the
             per-vault vector cache for the topic-similarity rules.
+        on_warning: Called with each operator advisory at the moment it is
+            detected — today only :func:`duplicate_paradox_warning`'s. Optional
+            so callers that predate the channel (the MCP report tool) are
+            unchanged; the advisory still reaches the log either way.
 
     Returns:
-        Paths of the paradox notes written this run (empty when none are found).
+        Paths of the paradox notes written this run. Empty when no
+        contradictory pair was found *or* when every pair found is already
+        recorded — the caller cannot tell those apart from the return value
+        alone, which is why ``creek report`` phrases its empty-result line to
+        cover both.
     """
     from creek.link.embeddings import EmbeddingLinker, embeddings_cache_path
     from creek.vault.reader import iter_vault_fragments
@@ -839,7 +1051,35 @@ def generate_paradoxes(
     )
     embeddings = {fid: cached.vector for fid, cached in cache.items()}
     detector = ParadoxDetector()
-    return [
-        detector.create_paradox_note(paradox, vault_path)
-        for paradox in detector.detect_paradoxes(fragments, embeddings=embeddings)
-    ]
+    already = _paradox_notes_by_pair(vault_path)
+    _warn(_advisory_for(vault_path, already), on_warning)
+    written: list[Path] = []
+    for paradox in detector.detect_paradoxes(fragments, embeddings=embeddings):
+        pair = frozenset(paradox.fragment_ids[:_PAIR_SIZE])
+        if pair in already:
+            continue
+        note = detector.create_paradox_note(paradox, vault_path)
+        written.append(note)
+        # Recording it here also stops a pair the detector emits twice in one
+        # run from being written twice, exactly as the sibling loops do.
+        already[pair] = [note]
+    return written
+
+
+def _warn(advisory: str | None, on_warning: Callable[[str], None] | None) -> None:
+    """Log an advisory and hand it to the caller in the same breath.
+
+    The single way an advisory leaves this module. Logging without notifying
+    *on_warning* is how it becomes invisible to an operator at a terminal, so
+    the two are not separable here — the funnel is lifted verbatim from
+    ``creek.ingest.pipeline.run_ingest``'s (#1329).
+
+    Args:
+        advisory: The advisory text, or ``None`` for nothing to report.
+        on_warning: Optional consumer, typically the CLI's console printer.
+    """
+    if advisory is None:
+        return
+    logger.warning("%s", advisory)
+    if on_warning is not None:
+        on_warning(advisory)

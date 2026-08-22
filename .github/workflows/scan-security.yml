@@ -6,6 +6,33 @@ name: "Scan: Security audit"
 # (auth, permissions, SHA-pinned actions, the scan-issue-writer contract).
 # workflow_dispatch is REQUIRED on every scan wrapper — it is the hook the
 # queue-depth hopper uses to refill the Ralph backlog off-schedule.
+#
+# EXEMPT FROM BACKLOG-CEILING ENFORCEMENT (issue #1516; operator decision,
+# 2026-08-14). Every other producer stands down above the shared ceiling in
+# scripts/ralph/backlog-gate.sh. This one does not, and the measurement that
+# prompted the ruling is the argument: `agent-ready` stood at 163 against a
+# ceiling of 90, so gating security would have suppressed CVE and injection
+# findings until the backlog fell by 73 issues — an indefinite window with
+# security findings unfiled, introduced by a backlog-hygiene change. Security
+# is the one class where a MISSED issue costs more than a REDUNDANT one; that
+# asymmetry does not hold for the other ten scans, which is why this is not a
+# precedent for them.
+#
+# Note precisely what is and is not switched off. This scan still routes
+# through the gated core, the `gate` job still runs and still reports the
+# depth, and `max_issues` (5, unchanged) is still the per-run cap — that cap
+# is now the ONLY bound on this scan, so raising it is a policy change, not a
+# tweak. What is off is suppression, and only suppression, declared here as a
+# single explicit `enforce_backlog_ceiling: false` rather than inherited from
+# any default.
+#
+# This is the SECOND of exactly two exemptions, and the two are different
+# mechanisms for different reasons: scan-groom.yml BYPASSES the core entirely
+# because it is a consumer that shrinks the queue, whereas this one is a
+# producer that keeps the gate and turns enforcement off. "Exempt" is not a
+# generic escape hatch — creek-tools/tests/test_backlog_ceiling_gate.py pins
+# the allowlist to exactly these two, so a third needs the operator, not a
+# green test.
 
 on:
   schedule:
@@ -16,6 +43,10 @@ on:
         description: "Hard cap on issues created this run."
         required: false
         default: "5"
+      backlog_ceiling:
+        description: "Override the shared agent-ready backlog ceiling for this run (blank = default)."
+        required: false
+        default: ""
 
 jobs:
   run:
@@ -31,5 +62,16 @@ jobs:
       scan_name: security
       max_issues: ${{ fromJSON(github.event.inputs.max_issues || '5') }}
       priority: P0
+      # Plumbing only — the ceiling lives in the core's gate job. No fromJSON:
+      # an empty string must survive as "use the default". See scan-todo.yml.
+      # Kept for uniformity with the other ten wrappers even though it is
+      # inert here: with enforcement off, no ceiling value suppresses this
+      # scan. Removing it would make this the one wrapper shaped differently
+      # for two unrelated reasons.
+      backlog_ceiling: ${{ github.event.inputs.backlog_ceiling || '' }}
+      # THE exemption. See the header for the operator decision and the
+      # 163-vs-90 measurement behind it. Literal `false`, at the call site,
+      # never a default — so it is visible in a diff and in a review.
+      enforce_backlog_ceiling: false
     secrets:
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

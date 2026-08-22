@@ -14,20 +14,23 @@ never suggests the human "should" do anything, and never names a phase as
 from __future__ import annotations
 
 import itertools
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import frontmatter
-import yaml
 from pydantic import ValidationError
 
+from creek.classify.privacy_filter import PrivacyTierOverride, within_ceiling
 from creek.hierarchy import LevelPolicy, select_by_policy
 from creek.models import Dosage, Fragment, Frequency, Mode, Phase
 from creek.time import effective_authored_date
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
+    from enum import StrEnum
     from pathlib import Path
 
 
@@ -45,6 +48,13 @@ DEFAULT_TOXIC_CONSECUTIVE_WEEKS: int = 3
 
 _VALID_PERIODS: frozenset[str] = frozenset({"weekly", "monthly"})
 """Accepted period strings for :meth:`WavelengthTracker.generate_report`."""
+
+_PHASE_MAP_SUBPATH: tuple[str, str] = ("05-Wavelength", "Phase-Maps")
+"""Vault-relative home of every phase-map report this module writes.
+
+Named once, next to :data:`_MODE_PROFILE_SUBPATH`, so the scaffold drift
+guard can derive it rather than re-typing it (#1025). It used to be
+spelled inline at all three report-writing call sites."""
 
 
 _NOTABLE_FRAGMENT_LIMIT: int = 5
@@ -186,16 +196,39 @@ def _safe_post(md_file: Path) -> frontmatter.Post | None:
     """Return a parsed frontmatter post, or ``None`` on parse errors."""
     try:
         return frontmatter.load(str(md_file))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         return None
 
 
-def load_fragments_from_vault(vault_path: Path) -> list[Fragment]:
+def load_fragments_from_vault(
+    vault_path: Path,
+    *,
+    override: PrivacyTierOverride = PrivacyTierOverride.ALL,
+) -> list[Fragment]:
     """Load every classified fragment from ``01-Fragments/`` under *vault_path*.
 
     Files that fail to parse or that lack the ``type: fragment`` marker
     are silently skipped. Returns an empty list when the folder is
     absent.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+        override: Tier ceiling (#968), applied to each file's *raw*
+            frontmatter — which this loader already has in hand, and which
+            is the only place a missing ``privacy_tier`` is still
+            distinguishable from the model's ``unclassified`` default.
+            Defaults to
+            :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`,
+            meaning "no ceiling declared", so the three non-report callers
+            in this module and ``creek report --type wavelength`` are
+            byte-identical to before. The default is safe because both
+            production report surfaces state an override explicitly, which
+            ``tests/test_mcp_report_tier_ceiling.py``'s
+            ``test_production_report_callers_always_state_an_override``
+            enforces structurally.
+
+    Returns:
+        Every admitted fragment, in sorted on-disk order.
     """
     root = vault_path / "01-Fragments"
     if not root.exists():
@@ -207,6 +240,8 @@ def load_fragments_from_vault(vault_path: Path) -> list[Fragment]:
             continue
         metadata = dict(post.metadata)
         if metadata.get("type") != "fragment":
+            continue
+        if not within_ceiling(metadata, override):
             continue
         try:
             fragments.append(Fragment.model_validate(metadata))
@@ -313,11 +348,30 @@ def _fragment_in_window(fragment: Fragment, start: date, end: date) -> bool:
     return start <= frag_date <= end
 
 
-def _most_common_classified(values: list[str], unclassified: str) -> str:
-    """Return the most common *values* entry, ignoring *unclassified* markers."""
+def _most_common_classified(values: list[str], unclassified: StrEnum | str) -> str:
+    """Return the most common *values* entry, ignoring *unclassified* markers.
+
+    The sentinel is normalised to a plain :class:`str` before it is
+    returned. Callers may legitimately hand over a ``StrEnum`` member
+    (``Phase.UNCLASSIFIED``) or its ``.value``: the member satisfies a
+    ``str`` annotation, compares equal to its value, and so passes mypy
+    and every comparison here unnoticed — but PyYAML has no representer
+    for the member, so returning it unchanged made the note it landed in
+    fail to serialise with ``RepresenterError`` (issue #940). Normalising
+    at the single point of return keeps that trap disarmed for every
+    caller rather than relying on each one remembering ``.value``.
+
+    Args:
+        values: Candidate markers, typically one per fragment.
+        unclassified: The marker treated as "not classified", returned
+            (as a plain ``str``) when nothing else qualifies.
+
+    Returns:
+        The most frequent classified marker, or the normalised sentinel.
+    """
     classified = [v for v in values if v and v != unclassified]
     if not classified:
-        return unclassified
+        return str(unclassified)
     counter = Counter(classified)
     return counter.most_common(1)[0][0]
 
@@ -646,7 +700,7 @@ class WavelengthTracker:
             msg = f"Unknown period {period!r}; expected one of {sorted(_VALID_PERIODS)}"
             raise ValueError(msg)
 
-        target_dir = vault_path / "05-Wavelength" / "Phase-Maps"
+        target_dir = vault_path.joinpath(*_PHASE_MAP_SUBPATH)
         target_dir.mkdir(parents=True, exist_ok=True)
 
         snapshots = self._window_snapshots(fragments)
@@ -765,7 +819,7 @@ class WavelengthTracker:
             generated_on=date.today().isoformat(),
             tags=["wavelength", "wavelength-weekly"],
         )
-        target_dir = vault_path / "05-Wavelength" / "Phase-Maps"
+        target_dir = vault_path.joinpath(*_PHASE_MAP_SUBPATH)
         target_dir.mkdir(parents=True, exist_ok=True)
         note_path = target_dir / f"{iso_year}-W{iso_week:02d}-wavelength.md"
         note_path.write_text(frontmatter.dumps(post), encoding="utf-8")
@@ -827,7 +881,7 @@ class WavelengthTracker:
             generated_on=date.today().isoformat(),
             tags=["wavelength", "wavelength-monthly"],
         )
-        target_dir = vault_path / "05-Wavelength" / "Phase-Maps"
+        target_dir = vault_path.joinpath(*_PHASE_MAP_SUBPATH)
         target_dir.mkdir(parents=True, exist_ok=True)
         note_path = target_dir / f"{month.year}-{month.month:02d}-wavelength.md"
         note_path.write_text(frontmatter.dumps(post), encoding="utf-8")
@@ -1276,6 +1330,7 @@ def current_phase_summary(
     today: date | None = None,
     window_days: int = DEFAULT_CURRENT_PHASE_WINDOW_DAYS,
     level_policy: LevelPolicy = "all",
+    override: PrivacyTierOverride = PrivacyTierOverride.ALL,
 ) -> CurrentPhaseSummary:
     """Return a :class:`CurrentPhaseSummary` for the trailing *window_days*.
 
@@ -1298,13 +1353,23 @@ def current_phase_summary(
             ``"all"`` (default) reproduces the pre-FEAT-025 behaviour.
             ``creek state`` passes ``"documents"`` so the snapshot is
             read at whole-source granularity.
+        override: Tier ceiling (#969), handed to
+            :func:`load_fragments_from_vault`, which already applies the
+            raw-frontmatter cutoff #968 added. Defaults to
+            :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`
+            — "no ceiling declared" — so every pre-#969 caller is unchanged.
+            ``creek state`` states one explicitly, because the summary's
+            ``fragment_count`` is a per-tier count and therefore content: the
+            same one-bit disclosure ``creek.wheel``'s frequency tally is
+            ``GATED`` against. ``transitions`` renders phases and dates only,
+            so it names nothing that needs its own gate.
 
     Returns:
         A :class:`CurrentPhaseSummary`.
     """
     anchor = today or datetime.now(tz=UTC).date()
     start = anchor - timedelta(days=window_days - 1)
-    fragments = load_fragments_from_vault(vault_path)
+    fragments = load_fragments_from_vault(vault_path, override=override)
     fragments = select_by_policy(fragments, level_policy)
     tracker = WavelengthTracker()
     snapshot = tracker.analyze_period(fragments, start, anchor)
@@ -1338,11 +1403,27 @@ class ModeProfileGenerator:
     an unclassified corpus produces no files at all (#583).
     """
 
-    def generate_mode_profiles(self, vault_path: Path) -> list[Path]:
+    def generate_mode_profiles(
+        self,
+        vault_path: Path,
+        *,
+        override: PrivacyTierOverride = PrivacyTierOverride.ALL,
+    ) -> list[Path]:
         """Write one profile note per non-empty engagement mode.
 
         Args:
             vault_path: Path to the root of the Obsidian vault.
+            override: Tier ceiling (#968), forwarded to
+                :func:`load_fragments_from_vault`. Defaults to
+                :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL`,
+                meaning "no ceiling declared" — a genuine no-op for callers
+                that predate #968, and safe because both production report
+                surfaces state an override explicitly (pinned by
+                ``tests/test_mcp_report_tier_ceiling.py``'s
+                ``test_production_report_callers_always_state_an_override``).
+                A mode profile lists sample fragment *titles*, so an
+                unfiltered walk publishes above-ceiling titles into
+                ``05-Wavelength/Mode-Profiles/``.
 
         Returns:
             Paths written, in canonical :class:`~creek.models.Mode` order; empty
@@ -1354,7 +1435,7 @@ class ModeProfileGenerator:
         # enum's ``.value``s below, so the comparison stays string-to-string
         # throughout rather than mixing enum identity with string lookups.
         by_mode: dict[str, list[Fragment]] = defaultdict(list)
-        for fragment in load_fragments_from_vault(vault_path):
+        for fragment in load_fragments_from_vault(vault_path, override=override):
             mode = str(fragment.wavelength.mode)
             if mode != Mode.UNCLASSIFIED.value:
                 by_mode[mode].append(fragment)
@@ -1413,12 +1494,108 @@ class ModeProfileGenerator:
         return target
 
 
+_ISO_WEEK_RE = re.compile(r"^(\d{4})-W(\d{2})$")
+_MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
+
+PERIOD_HELP: Final = "'weekly', 'monthly', an ISO week (YYYY-Www), or a month (YYYY-MM)"
+"""How to phrase the accepted ``period`` values to an operator or an agent.
+
+One string so ``creek report --type wavelength`` and ``creek.report`` describe
+the same grammar (#1253); each surface wraps it in its own sentence.
+"""
+
+
+def resolve_period(period: str | None) -> tuple[str, date] | None:
+    """Resolve a wavelength period string to a ``(mode, anchor-date)`` pair.
+
+    Accepts the relative keywords ``weekly`` / ``monthly`` (anchored on today)
+    and explicit ``YYYY-Www`` (ISO week) / ``YYYY-MM`` (calendar month)
+    periods, so a historical phase-map can be regenerated deterministically.
+
+    Args:
+        period: The raw period value, as typed by a caller.
+
+    Returns:
+        ``("weekly", anchor)`` or ``("monthly", anchor)`` where *anchor* is any
+        date inside the target window, or ``None`` when *period* is missing or
+        unparseable — the caller surfaces the error in its own vocabulary.
+    """
+    if period is None:
+        return None
+    if period in {"weekly", "monthly"}:
+        return (period, date.today())
+    week_match = _ISO_WEEK_RE.match(period)
+    if week_match:
+        year, week = int(week_match.group(1)), int(week_match.group(2))
+        try:
+            return ("weekly", date.fromisocalendar(year, week, 1))
+        except ValueError:
+            return None
+    month_match = _MONTH_RE.match(period)
+    if month_match:
+        year, month = int(month_match.group(1)), int(month_match.group(2))
+        try:
+            return ("monthly", date(year, month, 1))
+        except ValueError:
+            return None
+    return None
+
+
+def generate_phase_map(
+    vault_path: Path,
+    *,
+    mode: str,
+    anchor: date,
+    override: PrivacyTierOverride = PrivacyTierOverride.ALL,
+) -> Path | None:
+    """Write the phase-map for one resolved period, or report it has no data.
+
+    The shared body of ``creek report --type wavelength`` and the MCP
+    ``creek.report`` branch of the same name (#1253). Keeping the corpus load,
+    the emptiness check and the weekly/monthly choice in one place is what
+    stops the two surfaces from disagreeing about any of the three — the drift
+    class that made the whole report type unreachable over MCP.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+        mode: ``"weekly"`` or ``"monthly"``, as returned by
+            :func:`resolve_period`.
+        anchor: Any date inside the target window.
+        override: Tier ceiling (#968) applied to the corpus load. Stated
+            explicitly by both production callers.
+
+    Returns:
+        The written phase-map path, or ``None`` when no admitted fragment
+        carries a classified wavelength phase — the dimension is unpopulated,
+        and writing an empty map would misreport that as a real result.
+    """
+    fragments = load_fragments_from_vault(vault_path, override=override)
+    populated = any(
+        fragment.wavelength.phase != Phase.UNCLASSIFIED for fragment in fragments
+    )
+    if not populated:
+        return None
+    tracker = WavelengthTracker()
+    if mode == "weekly":
+        return tracker.generate_weekly_report(
+            vault_path,
+            week_of=anchor,
+            fragments=fragments,
+        )
+    return tracker.generate_monthly_report(
+        vault_path,
+        month=anchor,
+        fragments=fragments,
+    )
+
+
 __all__ = [
     "DEFAULT_CURRENT_PHASE_WINDOW_DAYS",
     "DEFAULT_ROLLING_WEEKS",
     "DEFAULT_TOXIC_CONSECUTIVE_WEEKS",
     "DEFAULT_TOXIC_THRESHOLD",
     "DEFAULT_WINDOW_DAYS",
+    "PERIOD_HELP",
     "PHASE_DOMAIN_MAPPINGS",
     "CurrentPhaseSummary",
     "DosageTrend",
@@ -1427,5 +1604,7 @@ __all__ = [
     "WavelengthSnapshot",
     "WavelengthTracker",
     "current_phase_summary",
+    "generate_phase_map",
     "load_fragments_from_vault",
+    "resolve_period",
 ]

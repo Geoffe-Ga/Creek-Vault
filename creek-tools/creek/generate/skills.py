@@ -12,6 +12,24 @@ vault to harvest exemplar passages; ontology constants (frequency
 themes, phase rhythms, mode stances, register descriptions) are baked
 into this module so the generator can produce useful output even from a
 sparsely-populated vault.
+
+Harvesting is deliberately conservative about privacy, and — exactly as in
+:mod:`creek.generate.voice` — two independent gates say so. ``allow_intimate``
+is a **consent** gate: the voice proxy is opt-in even at ``--include-tier
+intimate`` (``creek/templates/skills/privacy-tier.SKILL.md:47``). ``override``
+is a **ceiling** gate (#971): the caller's declared
+:class:`~creek.classify.privacy_filter.PrivacyTierOverride`, applied to each
+fragment's validated tier through
+:func:`~creek.classify.privacy_filter.tier_within_override`. They are additive
+by design — admission is ``allow_intimate`` *and* the ceiling — and must not be
+"simplified" into one. The ceiling is a **hard cutoff** rather than the
+summarising filter its siblings use; :func:`_collect_fragments` records why a
+skill tree has to omit.
+
+The ceiling reaches threads and eddies too, but it cannot read their tier off
+the note — neither model has the field — so it derives one from their member
+fragments (#1284). :data:`_TYPED_TIER_POLICY` states the rule, what it costs,
+and when to revisit it.
 """
 
 from __future__ import annotations
@@ -23,13 +41,22 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, TypeVar
 
 import frontmatter
-import yaml
 from pydantic import BaseModel, ValidationError
 
+from creek.classify.privacy_filter import (
+    PrivacyTierOverride,
+    tier_of,
+    tier_within_override,
+)
 from creek.generate.indexes import (
     FREQUENCY_NAMES,
     FREQUENCY_SIGNALS,
     FREQUENCY_THEMES,
+)
+from creek.generate.state_tiers import (
+    admit_by_derived_tier,
+    derived_link_tiers,
+    wikilink_targets,
 )
 from creek.models import (
     Authorship,
@@ -43,6 +70,7 @@ from creek.models import (
     Thread,
     VoiceRegister,
 )
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -145,6 +173,44 @@ _EXEMPLAR_WORDS_MIN: int = 30
 
 _EXEMPLAR_WORDS_MAX: int = 180
 """Exemplar passages longer than this are truncated at a sentence boundary."""
+
+_CEILING_WITHHELD_MESSAGE: str = (
+    "Tier ceiling '%s' withheld %d self-authored fragment(s) from voice-skill "
+    "exemplar harvesting: personal and unclassified content ranks above it. "
+    "Widen the ceiling to include them: --include-tier personal on the CLI, "
+    "privacy_tier_ceiling=personal over MCP."
+)
+"""Library-level feedback emitted once per generation run when the ceiling bites.
+
+The remedy names both spellings because the same string is emitted from both
+callers, and ``skills_refresh_tool`` has no ``--include-tier`` flag to pass —
+naming only the CLI one told an MCP caller to reach for something that does not
+exist there.
+
+This is a ``logger.info`` on the ``creek.generate.skills`` logger and nothing
+under ``creek/`` or ``creek_mcp/`` ever configures a handler, so in a real run
+the record is dropped by the unconfigured root logger: **no operator sees this
+line**. Wiring a handler here would not be a fix, it would be a repo-wide
+logging policy, and on the MCP stdio transport a stdout handler would corrupt
+the protocol stream. The operator-facing remedy is the static
+``_SKILLS_DEFAULT_CEILING_HINT`` in ``creek/cli.py``, printed at the default
+ceiling on every exemplar-bearing run — that is what keeps an exemplar-free
+tree from reading as a broken command. It is withheld under
+``--signature-only``, where no ceiling admits an exemplar and the remedy would
+therefore be untrue (PR #1286 review).
+
+The line still earns its place: an embedder that has configured logging (and a
+future ``--verbose``) gets the count, the ceiling that applied and the remedy
+without a second vault walk, and the tests can assert on it. It is deliberately
+*not* carried into the MCP response — a count of above-ceiling fragments
+crossing that boundary would be a disclosure the tool has no reason to make.
+
+The count is taken *after* the consent gate, so "personal and unclassified" is
+exact on both production surfaces, neither of which passes ``allow_intimate``.
+Through the Python API with ``allow_intimate=True`` an intimate fragment
+reaches the ceiling gate too and is counted here, where that attribution no
+longer holds.
+"""
 
 
 # ---- Frequency voice descriptors ----
@@ -443,7 +509,17 @@ class SkillExemplar:
 
 @dataclass(frozen=True)
 class VaultSnapshot:
-    """In-memory snapshot of qualifying fragments, threads, and eddies."""
+    """In-memory snapshot of qualifying fragments, threads, and eddies.
+
+    Records **no ceiling**. ``fragments`` has already been filtered by
+    :func:`_collect_fragments`, and once filtered a snapshot taken at ``open``
+    is indistinguishable from one taken at ``all`` — so nothing downstream can
+    re-check it, and a caller who hand-builds one, or reuses one across
+    generators constructed with different overrides, owns the ceiling gate
+    entirely. Both production entry points therefore go through
+    :meth:`SkillTreeGenerator.generate_all_skills`, which collects its own
+    snapshot under its own override rather than accepting one (#971).
+    """
 
     fragments: tuple[tuple[Fragment, str], ...]
     threads: tuple[Thread, ...]
@@ -457,7 +533,7 @@ def _safe_load_post(md_file: Path, *, label: str) -> frontmatter.Post | None:
     """Load a frontmatter ``Post`` from *md_file*, logging on failure."""
     try:
         return frontmatter.load(str(md_file))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         logger.debug("Skipping unreadable %s: %s", label, md_file)
         return None
 
@@ -549,21 +625,120 @@ def _is_snapshot_fragment(fragment: Fragment, *, allow_intimate: bool) -> bool:
     return True
 
 
-def _collect_fragments(
-    fragments_root: Path, *, allow_intimate: bool
-) -> list[tuple[Fragment, str]]:
-    """Load proxy-eligible fragments under *fragments_root*."""
+def _log_ceiling_withheld(withheld: int, override: PrivacyTierOverride) -> None:
+    """Report, at most once per run, what the ceiling gate dropped.
+
+    Silent when the ceiling withheld nothing: a line that fires
+    unconditionally is a line nobody reads, and on an all-``open`` vault
+    there is nothing for the operator to widen.
+
+    Args:
+        withheld: How many otherwise-eligible fragments the ceiling refused.
+        override: The ceiling that refused them, named so the reader knows
+            what to widen.
+    """
+    if not withheld:
+        return
+    logger.info(_CEILING_WITHHELD_MESSAGE, override.value, withheld)
+
+
+def _read_all_fragments(fragments_root: Path) -> list[tuple[Fragment, str]]:
+    """Load every valid fragment under *fragments_root*, gating nothing.
+
+    Split out of :func:`_collect_fragments` for #1284, and the split is the
+    fix rather than tidying. A thread's or eddy's tier is derived from the
+    fragments that name it, and that derivation has to reduce over the
+    **unfiltered** corpus: an eddy with one ``open`` and one ``personal``
+    member is ``personal``, and reducing over the fragments the ceiling
+    already admitted would resolve it to ``open`` and render the title. That
+    is leak (3) of the three #969 reproduced for ``creek state``, and
+    :func:`~creek.generate.state.\
+_load_fragments_admitted` documents the same
+    ordering trap.
+
+    So the walk reads first and admits second, and this half deliberately
+    applies **neither** gate — not the ceiling, and not ``allow_intimate``.
+    A non-self-authored or intimate fragment is not eligible to be *quoted*,
+    but it is still evidence about how sensitive the eddy it names is.
+
+    Args:
+        fragments_root: The ``01-Fragments`` directory to walk.
+
+    Returns:
+        Every ``(fragment, body)`` pair on disk, in vault walk order.
+    """
     if not fragments_root.exists():
         return []
     collected: list[tuple[Fragment, str]] = []
     for md_file in sorted(fragments_root.rglob("*.md")):
         loaded = _load_fragment(md_file)
-        if loaded is None:
-            continue
-        fragment, body = loaded
+        if loaded is not None:
+            collected.append(loaded)
+    return collected
+
+
+def _collect_fragments(
+    corpus: list[tuple[Fragment, str]],
+    *,
+    allow_intimate: bool,
+    override: PrivacyTierOverride,
+) -> list[tuple[Fragment, str]]:
+    """Select the exemplar-eligible fragments from *corpus*.
+
+    Admission is the **AND** of two independent gates, in this order:
+
+    1. :func:`_is_snapshot_fragment` — self-authorship plus the
+       ``allow_intimate`` consent opt-in. Standing policy for the vault.
+    2. :func:`~creek.classify.privacy_filter.tier_within_override` — the
+       ceiling *this call* declared. Neither gate subsumes the other:
+       consent without a wide enough ceiling still excludes, and a ceiling of
+       ``all`` never manufactures consent for intimate content.
+
+    **A hard cutoff, not the summariser.**
+    :func:`~creek.classify.privacy_filter.filter_fragments_by_tier` is
+    deliberately not used here, for the reason
+    :func:`~creek.classify.privacy_filter.within_ceiling` already argues for
+    ``creek report`` (#968): it replaces a personal body with
+    ``"[Personal-tier summary: <title>]"``, and here that stub would be
+    written into ``## Exemplar Passages`` as a *voice exemplar* — beneath
+    ``> **<title>** (`<id>`)`` in bold — leaking the title it claims to
+    protect and poisoning the voice corpus with a synthetic sentence in
+    nobody's voice. Nor is the harvester's own floor any protection: the stub
+    is two tokens plus the title, so a 28-word title reaches exactly
+    :data:`_EXEMPLAR_WORDS_MIN`, and :func:`_extract_passage` accepts at
+    ``>=`` — the stub is quoted whole. A skill tree must omit.
+
+    The tier is read with the **model-side**
+    :func:`~creek.classify.privacy_filter.tier_of`, not with
+    ``within_ceiling`` / ``raw_privacy_tier``. The two diverge for exactly one
+    note — one with no ``privacy_tier`` key at all, which the raw reader fails
+    closed to ``INTIMATE`` while the model reader sees the schema's
+    ``UNCLASSIFIED`` default — and here the model reader is the honest one:
+    :func:`_load_fragment` has already validated a
+    :class:`~creek.models.Fragment`, so there is no un-modelled note type to
+    protect against, and reading raw would make ``--include-tier personal``
+    useless on the one corpus that needs it most, a freshly ingested vault
+    where every fragment is untiered. ``UNCLASSIFIED`` ranks with ``PERSONAL``
+    (#876), which :func:`tier_within_override` supplies for free.
+
+    Args:
+        corpus: Every fragment on disk, from :func:`_read_all_fragments`.
+        allow_intimate: The consent opt-in for intimate content.
+        override: The admission ceiling for this call.
+
+    Returns:
+        The admitted ``(fragment, body)`` pairs, in vault walk order.
+    """
+    collected: list[tuple[Fragment, str]] = []
+    withheld_by_ceiling = 0
+    for fragment, body in corpus:
         if not _is_snapshot_fragment(fragment, allow_intimate=allow_intimate):
             continue
+        if not tier_within_override(tier_of(fragment), override):
+            withheld_by_ceiling += 1
+            continue
         collected.append((fragment, body))
+    _log_ceiling_withheld(withheld_by_ceiling, override)
     return collected
 
 
@@ -583,29 +758,146 @@ def _collect_typed(
     return collected
 
 
+_TYPED_TIER_POLICY: str = (
+    "A thread or eddy skill is emitted only when every fragment naming it "
+    "clears the caller's ceiling; one that no fragment names is emitted only "
+    "at ceiling=intimate or all."
+)
+"""The product decision #1284 made, and the predicate for revisiting it.
+
+**The decision.** :class:`~creek.models.Thread` and :class:`~creek.models.Eddy`
+carry no ``privacy_tier`` field, but their titles, descriptions and member
+lists are computed from their member fragments
+(:func:`creek.link.naming.cluster_title`), and the generator slugifies the
+title into the SKILL **filename** — which ``creek.skills.refresh`` hands back
+to its caller in ``skill_paths``. So the tier is *derived*: the maximum over
+the tiers of every fragment whose ``threads`` / ``eddies`` wikilinks name the
+title, with the empty set reducing to ``INTIMATE``. Because the reduction and
+the cutoff rank the same way, that is equivalent to the sentence above.
+
+**What it costs, stated up front.** This only ever emits *less*. At
+``ceiling=open`` a thread with a single ``personal`` member disappears, and on
+a vault that has never been through ``creek classify`` every thread and eddy
+disappears, because an untiered fragment ranks with ``personal`` (#876). An
+orphaned thread — one no fragment links back to, which a partial or
+interrupted ``creek link`` run leaves behind — disappears at every ceiling
+below ``intimate``. All three are recoverable with ``--include-tier``; none is
+silent, because :func:`_log_ceiling_withheld` already names the remedy.
+
+**Why not the two cheaper answers.** Failing closed on the note itself
+(#968's shape, since neither model has the key) empties both categories at
+every ceiling below ``intimate`` even on a fully-classified all-``open`` vault
+— an outage, not a gate. Excluding the categories wholesale above some ceiling
+is the same outage with a switch on it. Deriving is more code and one extra
+corpus read, and it is the answer #969 already reached for the identical
+question in ``creek state``
+(:func:`~creek.generate.state_tiers.admit_by_derived_tier`); a second, quieter
+answer here would mean the state report and the skill tree disagreeing about
+the same eddy, which is a leak wearing the costume of a style difference.
+
+Recorded in full, with the options rejected and why, as
+``docs/architecture/ADR/0010-derived-tier-for-threads-and-eddies.md``.
+
+**Revisit when** :class:`~creek.models.Thread` and :class:`~creek.models.Eddy`
+gain a real ``privacy_tier`` field stamped at link time. At that point the
+derivation becomes a fallback for un-migrated vaults rather than the rule, the
+orphan case stops being "no evidence" and starts being "the note says so", and
+this whole reduction should shrink to
+:func:`~creek.classify.privacy_filter.within_ceiling` on the note's own
+frontmatter. Until then, do not narrow the derivation to the *admitted*
+corpus to save the extra read — that reintroduces the mixed-member leak this
+was written to close.
+"""
+
+
+def _member_tiers(
+    corpus: list[tuple[Fragment, str]],
+    attr: str,
+) -> dict[str, list[PrivacyTier]]:
+    """Group member tiers by the thread or eddy title each fragment names.
+
+    The evidence side of the #1284 gate. Membership is recorded on the
+    *fragment* — :class:`~creek.models.Thread` stores only a
+    ``fragment_count``, and :class:`~creek.models.Eddy` only a count and its
+    member threads — so the fragment's ``threads`` / ``eddies`` wikilinks are
+    the only place a derived tier can come from.
+
+    The per-member tier is read with
+    :func:`~creek.classify.privacy_filter.tier_of`, the **model-side** reader
+    this module already uses for a fragment's own admission, and not with the
+    raw-frontmatter reader ``creek state`` feeds the same reduction.
+    :func:`_collect_fragments` argues the choice in full; the short form is
+    that a keyless fragment is ``UNCLASSIFIED``, which ranks with ``PERSONAL``
+    (#876), and reading it raw would fail closed to ``INTIMATE`` and withhold
+    a thread every one of whose members *this same call* admits. A generator
+    that ranked a fragment one way and the thread it names another way would
+    be incoherent with itself.
+
+    Args:
+        corpus: Every fragment on disk, gated by nothing.
+        attr: ``"threads"`` or ``"eddies"`` — the membership field to read.
+
+    Returns:
+        ``{title: [member tier, ...]}``, ready for
+        :func:`~creek.generate.state_tiers.admit_by_derived_tier`.
+    """
+    return derived_link_tiers(
+        (tier_of(fragment), wikilink_targets(getattr(fragment, attr)))
+        for fragment, _body in corpus
+    )
+
+
 def _load_vault_snapshot(
     vault_path: Path,
     *,
     allow_intimate: bool,
+    override: PrivacyTierOverride,
 ) -> VaultSnapshot:
     """Scan *vault_path* for fragments, threads, and eddies.
+
+    Both privacy arguments are **required** keywords with no defaults. A
+    default ceiling here would be a second, silent privacy policy living
+    below :class:`SkillTreeGenerator`'s — and the one place the ambiguous
+    ``None`` is allowed to exist is that public constructor, which
+    normalises it once.
+
+    Read order is load-safe and must stay that way: the whole corpus is read
+    once, the derived link tiers are reduced over **all** of it, and only then
+    is anything admitted. Narrowing first and deriving second would resolve a
+    mixed-tier eddy to its most permissive member.
 
     Args:
         vault_path: Root of the Obsidian vault.
         allow_intimate: When ``False``, fragments tagged ``intimate`` are
             excluded from the snapshot to preserve privacy boundaries.
+        override: The admission ceiling; fragments ranking above it are
+            omitted from the snapshot entirely (see :func:`_collect_fragments`
+            for why they are omitted rather than summarised), and threads and
+            eddies whose members rank above it are omitted with them (see
+            :data:`_TYPED_TIER_POLICY`).
 
     Returns:
         A :class:`VaultSnapshot` containing validated records.
     """
+    corpus = _read_all_fragments(vault_path / _FRAGMENTS_SUBDIR)
     fragments = _collect_fragments(
-        vault_path / _FRAGMENTS_SUBDIR, allow_intimate=allow_intimate
+        corpus,
+        allow_intimate=allow_intimate,
+        override=override,
     )
-    threads = _collect_typed(
-        vault_path / _THREADS_SUBDIR, expected_type="thread", model_cls=Thread
+    threads, _thread_tiers = admit_by_derived_tier(
+        _collect_typed(
+            vault_path / _THREADS_SUBDIR, expected_type="thread", model_cls=Thread
+        ),
+        _member_tiers(corpus, "threads"),
+        override,
     )
-    eddies = _collect_typed(
-        vault_path / _EDDIES_SUBDIR, expected_type="eddy", model_cls=Eddy
+    eddies, _eddy_tiers = admit_by_derived_tier(
+        _collect_typed(
+            vault_path / _EDDIES_SUBDIR, expected_type="eddy", model_cls=Eddy
+        ),
+        _member_tiers(corpus, "eddies"),
+        override,
     )
     return VaultSnapshot(
         fragments=tuple(fragments),
@@ -886,6 +1178,11 @@ class SkillTreeGenerator:
             file. Defaults to five.
         allow_intimate: When ``True``, fragments tagged ``intimate``
             participate in exemplar harvesting. Defaults to ``False``.
+        override: The admission ceiling for this generator's corpus walk,
+            normalised from ``None`` to
+            :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.OPEN`
+            at construction. ANDed with *allow_intimate*, never merged
+            into it.
         signature_only: When ``True`` (issue #353), emit the
             signature-only variant. Files are written under the
             ``.SIGNATURE.md`` suffix, the exemplar section is omitted
@@ -901,6 +1198,7 @@ class SkillTreeGenerator:
         min_eddy_fragments: int = DEFAULT_MIN_EDDY_FRAGMENTS,
         max_exemplars: int = DEFAULT_MAX_EXEMPLARS,
         allow_intimate: bool = False,
+        override: PrivacyTierOverride | None = None,
         signature_only: bool = False,
     ) -> None:
         """Initialise the generator with the given configuration.
@@ -912,7 +1210,16 @@ class SkillTreeGenerator:
                 an eddy to earn a skill (strict >).
             max_exemplars: Maximum exemplar passages per skill.
             allow_intimate: Whether to include ``intimate`` privacy
-                tier fragments during harvesting.
+                tier fragments during harvesting. Consent, not ceiling:
+                it is deliberately *not* derivable from ``--include-tier``
+                (``creek/templates/skills/privacy-tier.SKILL.md`` rule 1).
+            override: The caller's declared admission ceiling, or ``None``
+                for the most restrictive one. This is the only place the
+                ambiguous ``None`` is accepted — it is normalised to
+                ``OPEN`` here, so everything below this constructor takes a
+                ceiling it cannot mistake for "unfiltered". A ``None``
+                default keeps the ``creek.generate`` re-export
+                source-compatible for callers that predate the ceiling.
             signature_only: When ``True``, write the signature-only
                 variant (issue #353) — abstract patterns only, no
                 quoted user content, ``.SIGNATURE.md`` suffix. The two
@@ -934,6 +1241,7 @@ class SkillTreeGenerator:
         self.min_eddy_fragments = min_eddy_fragments
         self.max_exemplars = max_exemplars
         self.allow_intimate = allow_intimate
+        self.override = override or PrivacyTierOverride.OPEN
         self.signature_only = signature_only
 
     # -- Public surface ------------------------------------------------
@@ -955,6 +1263,7 @@ class SkillTreeGenerator:
         snapshot = _load_vault_snapshot(
             vault_path,
             allow_intimate=self.allow_intimate,
+            override=self.override,
         )
         written: list[Path] = []
         written.extend(self._generate_frequency_skills(snapshot, output_dir))
@@ -1055,12 +1364,30 @@ class SkillTreeGenerator:
         vault_path: Path,
         snapshot: VaultSnapshot | None,
     ) -> VaultSnapshot:
-        """Return *snapshot* if provided, else scan *vault_path* once."""
+        """Return *snapshot* if provided, else scan *vault_path* once.
+
+        A supplied snapshot is returned **unexamined**, and it cannot be
+        anything else: :class:`VaultSnapshot` records no ceiling, so there is
+        nothing here to compare against ``self.override``. A snapshot collected
+        at ``PERSONAL`` will be rendered in full by a generator constructed at
+        ``OPEN``. Only tests pass the parameter — ``creek skills generate`` and
+        ``creek.skills.refresh`` both call :meth:`generate_all_skills`, which
+        collects under this generator's own override — so the bypass is real
+        but unreachable from either production surface (#971).
+
+        Args:
+            vault_path: Vault root, walked only when *snapshot* is ``None``.
+            snapshot: A caller-supplied snapshot, trusted as collected.
+
+        Returns:
+            The snapshot the per-category renderers will read.
+        """
         if snapshot is not None:
             return snapshot
         return _load_vault_snapshot(
             vault_path,
             allow_intimate=self.allow_intimate,
+            override=self.override,
         )
 
     def generate_meta_skills(self, output_dir: Path) -> list[Path]:
@@ -1259,10 +1586,11 @@ class SkillTreeGenerator:
             for eddy in snapshot.eddies
             if eddy.fragment_count > self.min_eddy_fragments
         ]
+        admitted_threads = frozenset(thread.title for thread in snapshot.threads)
         written: list[Path] = []
         used_slugs: set[str] = set()
         for eddy in qualifying:
-            body = self._render_eddy_body(eddy)
+            body = self._render_eddy_body(eddy, admitted_threads)
             slug = _unique_slug(_slugify(eddy.title), eddy.id, used_slugs)
             used_slugs.add(slug)
             filename = _skill_filename(slug, signature_only=self.signature_only)
@@ -1540,9 +1868,43 @@ class SkillTreeGenerator:
             ],
         )
 
-    def _render_eddy_body(self, eddy: Eddy) -> str:
-        """Render the full markdown body for an Eddy SKILL."""
-        threads_summary = ", ".join(eddy.threads) or "(no threads recorded)"
+    def _render_eddy_body(
+        self,
+        eddy: Eddy,
+        admitted_threads: frozenset[str],
+    ) -> str:
+        """Render the full markdown body for an Eddy SKILL.
+
+        **Member threads are filtered, not just listed.** ``eddy.threads``
+        holds wikilinks to the threads flowing through the cluster
+        (``EddyDetector._flowing_threads``), and an eddy admitted on its own
+        members can still name a thread that was withheld on *its* members —
+        a thread linked from one of this eddy's fragments and from an
+        above-ceiling fragment elsewhere. Gating the typed walk alone would
+        close the front door and leave that one open, so the rendered list is
+        intersected with the threads this snapshot actually admitted.
+
+        Withheld entries are dropped rather than counted or placeholdered: a
+        ``"+2 withheld"`` would restore the above-ceiling cardinality oracle
+        the gate exists to remove. An eddy whose every thread is withheld
+        renders the same ``(no threads recorded)`` an eddy with none does,
+        which is the point — the two must be indistinguishable.
+
+        Args:
+            eddy: The eddy to render.
+            admitted_threads: Titles of the threads this snapshot admitted.
+
+        Returns:
+            The eddy SKILL's markdown body.
+        """
+        visible = [
+            link
+            for link, title in zip(
+                eddy.threads, wikilink_targets(eddy.threads), strict=True
+            )
+            if title in admitted_threads
+        ]
+        threads_summary = ", ".join(visible) or "(no threads recorded)"
         description = (
             f"**Fragment count.** {eddy.fragment_count}\n\n"
             f"**Member threads.** {threads_summary}\n\n"

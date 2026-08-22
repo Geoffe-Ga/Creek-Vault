@@ -157,7 +157,7 @@ sub-issues API. Mark dependents `blocked` per the picker rule above.
 ## `gh` filing recipes (file-based bodies, never inline strings)
 
 Write the body to a temp file in the scratchpad, then file it. This avoids shell
-quoting bugs and matches the repo's `git-workflow` convention.
+quoting bugs.
 
 ```bash
 SCRATCH="${SCRATCHPAD:-/tmp}"; BODY="$SCRATCH/deslop-issue.md"

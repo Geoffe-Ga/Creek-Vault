@@ -3,9 +3,23 @@
 Takes one journal entry (raw ``content`` or an ``entry_ref`` fragment id) plus a
 privacy-tier ceiling and returns ``{notes: [{quote, kind, note}], essay?}`` —
 warm, second-person, anti-guru reflections that mirror the user's own wisdom,
-grounded in retrieval over their corpus. Distinct from the essay-shaped
-``draft``/``author``/``mine`` surface; this is the reflection surface Adepthood's
-journal needs.
+grounded in the *titles* of the ceiling-admitted corpus fragments nearest the
+entry (titles only, never body text). That grounding has been live only since
+#964: before it, the default grounder raised into a silent ``except`` and every
+reflection was ungrounded. Distinct from the essay-shaped
+``draft``/``author``/``mine`` surface; this is the reflection surface
+Adepthood's journal needs.
+
+Since #873 an ``ok``/``empty`` response may also carry two **optional**,
+bounded fields — ``related_praxis`` and ``related_eddies`` — naming the
+compiled-layer structures the entry and its grounding belong to. They are
+absent whenever nothing qualifies, so a consumer written against the older
+shape parses an unchanged response. Their admission rule is *not* the
+reflection's: a compiled page carries no ``privacy_tier`` of its own and is
+synthesised from fragments the caller may not be entitled to, so
+:mod:`creek_mcp.compiled_pages` publishes one only when every contributing
+fragment is within the ceiling, and withholds any page whose provenance it
+cannot enumerate in full.
 
 Four guarantees this module enforces:
 
@@ -46,28 +60,35 @@ structured dict rather than raising: a malformed or unreadable file under
 malformed model turn degrades to no notes. No parse error crosses the MCP
 boundary.
 
-The LLM and retrieval are injected so the tool is unit-testable with no live
-calls; ``build_server`` supplies the production factory + retrieval.
+The LLM and retrieval are both injectable seams so the tool is unit-testable
+with no live calls. ``build_server`` supplies the production LLM factory and
+leaves ``retrieve`` unset, so production grounding is :func:`_default_retrieve`
+— the ceiling-bounded title retrieval described above.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from creek.care.guardrail import CARE_POLICY, CARE_SIGNAL
-from creek.models import PrivacyTier
 from creek_mcp.audit import MCPAuditLog
+from creek_mcp.compiled_pages import RelatedCompiled, related_compiled
 from creek_mcp.tier_ceiling import (
     TierCeiling,
+    frontmatter_tier,
     refusal_response,
+    routing_tier,
     tier_allowed,
     to_privacy_override,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
     from pathlib import Path
+
+    from creek.classify.privacy_filter import PrivacyTierOverride
+    from creek.models import PrivacyTier
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +96,24 @@ TOOL_NAME = "creek.reflect"
 
 _DEFAULT_MAX_NOTES = 6
 _ALLOWED_KINDS = {"reframe", "fear", "longing", "value", "pattern", "tension", "gift"}
+
+
+class _Grounding(NamedTuple):
+    """One grounding pass: the prompt lines, and the fragments they came from.
+
+    Attributes:
+        lines: The grounding snippets fed to :func:`_build_prompt` — corpus
+            fragment *titles* under the default grounder, never body text.
+        source_ids: The ids of the fragments those lines were drawn from, in
+            retrieval order. Carried so :mod:`creek_mcp.compiled_pages` can
+            *select* candidate eddy and praxis pages from the same pass rather
+            than running a second embedding sweep (issue #873's constraint).
+            They select only: every candidate page's provenance is re-checked
+            against the ceiling there, so these ids confer no authority.
+    """
+
+    lines: list[str]
+    source_ids: list[str]
 
 
 class _LLM(Protocol):
@@ -89,30 +128,6 @@ class _LLMFactory(Protocol):
 
     def __call__(self, tier: PrivacyTier) -> _LLM:
         """Return an LLM callable routed for *tier* (may raise to refuse)."""
-
-
-# ``ALL`` admits intimate content, so a reflection under it must route as INTIMATE.
-_CEILING_ROUTING_TIER: dict[TierCeiling, PrivacyTier] = {
-    TierCeiling.OPEN: PrivacyTier.OPEN,
-    TierCeiling.PERSONAL: PrivacyTier.PERSONAL,
-    TierCeiling.INTIMATE: PrivacyTier.INTIMATE,
-    TierCeiling.ALL: PrivacyTier.INTIMATE,
-}
-
-# Sensitivity rank for picking the more-restrictive of two tiers (mirrors the
-# canonical ranking in :mod:`creek_mcp.tier_ceiling`): open/unclassified < personal
-# < intimate. An unranked value is treated as the most sensitive (fail closed).
-_TIER_SENSITIVITY: dict[PrivacyTier, int] = {
-    PrivacyTier.OPEN: 0,
-    PrivacyTier.UNCLASSIFIED: 0,
-    PrivacyTier.PERSONAL: 1,
-    PrivacyTier.INTIMATE: 2,
-}
-
-
-def _sensitivity(tier: PrivacyTier) -> int:
-    """Return the routing sensitivity of *tier*, defaulting to the most restrictive."""
-    return _TIER_SENSITIVITY.get(tier, _TIER_SENSITIVITY[PrivacyTier.INTIMATE])
 
 
 def _routing_tier(ceiling: TierCeiling, entry_tier: PrivacyTier | None) -> PrivacyTier:
@@ -138,11 +153,13 @@ def _routing_tier(ceiling: TierCeiling, entry_tier: PrivacyTier | None) -> Priva
     has no *entry_tier*) against the ceiling. It stays in place as defense in
     depth — the load-bearing INTIMATE-never-egresses guarantee — and must not be
     removed.
+
+    The reconciliation itself lives in
+    :func:`creek_mcp.tier_ceiling.routing_tier`, shared with ``creek.compile``
+    (#928); this wrapper keeps the reflect-specific reasoning above attached to
+    the call site that depends on it.
     """
-    ceiling_tier = _CEILING_ROUTING_TIER.get(ceiling, PrivacyTier.INTIMATE)
-    if entry_tier is None:
-        return ceiling_tier
-    return max(ceiling_tier, entry_tier, key=_sensitivity)
+    return routing_tier(ceiling, entry_tier)
 
 
 def _above_ceiling(entry_tier: PrivacyTier | None, ceiling: TierCeiling) -> bool:
@@ -266,14 +283,14 @@ def _fragment_tier(metadata: dict[str, Any]) -> PrivacyTier:
     (including ``unclassified``) is honoured; anything unrecognised — or a
     missing field — is treated as the most-restrictive tier so an unknown
     classification is never routed to a cloud provider.
+
+    The rule itself lives in :func:`creek_mcp.tier_ceiling.frontmatter_tier`,
+    shared with :mod:`creek_mcp.compiled_pages` (#873), which has to rank the
+    *contributors* to an eddy or praxis page by the identical reading — a
+    second copy that fails closed differently would admit a compiled page built
+    from a fragment this tool would refuse to reflect on.
     """
-    raw = metadata.get("privacy_tier")
-    if raw is None:
-        return PrivacyTier.INTIMATE
-    try:
-        return PrivacyTier(str(raw))
-    except ValueError:
-        return PrivacyTier.INTIMATE
+    return frontmatter_tier(metadata)
 
 
 def _resolve_entry(
@@ -290,15 +307,21 @@ def _resolve_entry(
     separately folds it into :func:`_routing_tier` so an admitted INTIMATE
     fragment still routes local. A fragment with the ``privacy_tier`` key
     missing entirely fails closed to INTIMATE (:func:`_fragment_tier`) — but
-    that only fires for hand-edited or legacy files. A normally
-    pipeline-written, not-yet-classified fragment carries an *explicit*
+    that only fires for hand-edited or legacy files, and is refused at
+    every ceiling below ``intimate``. A normally pipeline-written,
+    not-yet-classified fragment carries an *explicit*
     ``privacy_tier: unclassified`` (the ``Fragment`` model default,
-    serialised by every write), which ranks as open and is admitted at any
-    ceiling; that is a separate, deliberate policy owned by
-    ``creek_mcp.tier_ceiling._TIER_RANK`` and
-    :func:`creek.classify.privacy_filter.tier_of`, not by this fail-closed
-    path. A blank result yields ``("", None)``, which the caller turns into
-    a refusal.
+    serialised by every write), which ranks with ``personal`` (#876,
+    extended to the MCP ceiling by #961) and is refused by this same
+    #846 gate at ``ceiling=open`` — it needs at least ``personal`` to be
+    admitted. The distinction between the two cases still matters and is
+    now visible at ``ceiling=personal``: there, an explicit
+    ``unclassified`` entry is admitted while one with a missing key is
+    still refused (routing INTIMATE only, per :func:`_fragment_tier`).
+    That ranking is owned by ``creek_mcp.tier_ceiling._TIER_RANK`` and
+    matches ``creek.classify.privacy_filter._TIER_RANK``, not this
+    fail-closed path. A blank result yields ``("", None)``, which the
+    caller turns into a refusal.
 
     A fragment file that cannot be parsed or even read is skipped, debug-logged,
     and the scan continues (#847) — one hand-edited or half-written file must not
@@ -355,7 +378,10 @@ def reflect_tool(
     llm_factory: _LLMFactory,
     content: str | None = None,
     entry_ref: str | None = None,
-    retrieve: Callable[[str, Path, object], list[str]] | None = None,
+    retrieve: Callable[[str, Path, PrivacyTierOverride], list[str]] | None = None,
+    related_lookup: (
+        Callable[[Sequence[str], Path, TierCeiling], RelatedCompiled] | None
+    ) = None,
     care_guard: Callable[[str], str | None] | None = None,
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
@@ -371,8 +397,22 @@ def reflect_tool(
             *content* wins when both are given.
         entry_ref: A fragment id whose body is the entry, when *content* is
             absent.
-        retrieve: ``(query, vault, override) -> snippets`` grounding source;
-            defaults to the corpus retrieval specialist.
+        retrieve: ``(query, vault, override) -> grounding lines`` source. The
+            default (:func:`_default_retrieve`) returns ceiling-bounded corpus
+            fragment **titles**, never body text. An injected callable
+            *replaces* the default outright — the two are never merged — so a
+            deployment wanting richer grounding owns its own admission
+            filtering. Its ``list[str]`` return carries no fragment ids, so an
+            injected grounder contributes **no** seeds to the compiled-layer
+            lookup below; only the reflected entry's own ``entry_ref`` does.
+        related_lookup: ``(seed_ids, vault, ceiling) -> RelatedCompiled``
+            source for the optional ``related_praxis`` / ``related_eddies``
+            fields (#873). Defaults to
+            :func:`creek_mcp.compiled_pages.related_compiled`, which admits a
+            compiled page only when **every** fragment it was compiled from is
+            within *privacy_tier_ceiling*. Injectable so a test can drive the
+            projection without a corpus; the admission rule itself is not a
+            policy this tool implements.
         care_guard: ``(entry) -> reason | None``; a non-``None`` reason escalates
             to a human and skips the model entirely (#753 seam).
         privacy_tier_ceiling: The ceiling; gates admission of the *entry itself*
@@ -396,6 +436,18 @@ def reflect_tool(
         the optional ``essay`` is free model prose and is **not**
         grounding-checked, flagged by ``essay_grounded: False`` so a client never
         treats it as grounded.
+
+        An ``ok`` / ``empty`` result may additionally carry ``related_praxis``
+        (≤3 ``{title, praxis_type, status, excerpt}``) and ``related_eddies``
+        (≤2 ``{title, description, fragment_count, formed}``) — the compiled
+        structures the reflected entry and its grounding belong to (#873). Both
+        keys are **absent** when nothing qualifies, so the response a
+        pre-#873 consumer parses is unchanged whenever the vault has no
+        admitted compiled neighbours. Neither is a new read privilege: a
+        compiled page is published only when every fragment it was compiled
+        from is itself within *privacy_tier_ceiling*, and a page whose
+        provenance cannot be enumerated in full is withheld
+        (:mod:`creek_mcp.compiled_pages`).
     """
     # Logged unconditionally, above the ceiling gate below, so a refused
     # above-ceiling attempt is still recorded (tool, ceiling, consumer,
@@ -462,8 +514,17 @@ def reflect_tool(
 
     tier = _routing_tier(privacy_tier_ceiling, entry_tier)
     override = to_privacy_override(privacy_tier_ceiling)
-    grounder = retrieve if retrieve is not None else _default_retrieve
-    grounding = grounder(entry, vault_path, override)
+    if retrieve is not None:
+        grounding, retrieved_ids = _Grounding(retrieve(entry, vault_path, override), [])
+    else:
+        grounding, retrieved_ids = _default_retrieve(entry, vault_path, override)
+    # Seeds *select* candidate compiled pages; they never authorize one. An
+    # ``entry_ref`` seed is admitted by the #846 gate above, and a retrieval
+    # seed by the grounder's hard tier cutoff — but neither fact is relied on
+    # here, because ``related_compiled`` re-checks the tier of every fragment
+    # each candidate page was compiled from.
+    from_entry = [entry_ref] if entry_ref and entry_tier is not None else []
+    seeds = from_entry + retrieved_ids
 
     try:
         llm = llm_factory(tier)
@@ -480,6 +541,7 @@ def reflect_tool(
 
     raw_notes, essay = _parse_notes(response_text)
     notes = _clean_notes(raw_notes, entry, max_notes=max_notes)
+    related = _related(seeds, vault_path, privacy_tier_ceiling, related_lookup)
     result: dict[str, Any] = {
         "status": "ok" if notes else "empty",
         "tool": TOOL_NAME,
@@ -492,20 +554,161 @@ def reflect_tool(
     }
     if essay is not None:
         result["essay"] = essay
+    # Both keys are OMITTED when nothing qualifies, never present-and-empty: a
+    # consumer written before #873 must parse a reflection with no compiled
+    # neighbours byte-for-byte as it did before.
+    if related.praxis:
+        result["related_praxis"] = related.praxis
+    if related.eddies:
+        result["related_eddies"] = related.eddies
     return result
 
 
-def _default_retrieve(query: str, vault_path: Path, override: object) -> list[str]:
-    """Production grounding: top corpus fragments related to *query*.
+def _related(
+    seeds: Sequence[str],
+    vault_path: Path,
+    ceiling: TierCeiling,
+    lookup: Callable[[Sequence[str], Path, TierCeiling], RelatedCompiled] | None,
+) -> RelatedCompiled:
+    """Look up the compiled layer, degrading to nothing on any failure.
 
-    Lazily imports the author retrieval specialist so the server still boots
-    when its (heavier) deps are unavailable; any retrieval failure degrades to
-    no grounding rather than failing the reflection.
+    Runs **after** the model call on purpose, so a refused or unavailable
+    provider costs no corpus walk at all, and so a failure here can only ever
+    subtract the optional fields — never veto a reflection that was already
+    produced. That inversion is the point: this is an enrichment step, and an
+    enrichment step that can take down the answer it decorates is worse than
+    one that is silently absent.
+
+    The catch is broad for the same reason :func:`_default_retrieve`'s is: the
+    lookup walks user-managed vault markdown through several tolerant readers,
+    so its residual failure surface is open-ended, and none of it may cross the
+    MCP boundary. Only the exception's *type name* is logged — never
+    ``str(exc)`` — because a YAML error stringifies with the offending source
+    snippet, which would write tier-unknown vault content into an untiered log.
+
+    Args:
+        seeds: Fragment ids that select candidate pages; may be empty.
+        vault_path: Vault root.
+        ceiling: The caller's declared ceiling, enforced inside the lookup.
+        lookup: The injected seam, or ``None`` for the production default.
+
+    Returns:
+        The bounded, admitted compiled structures, or empty on both axes.
+    """
+    resolver = lookup if lookup is not None else related_compiled
+    try:
+        return resolver(seeds, vault_path, ceiling)
+    except Exception as exc:
+        logger.debug("Related compiled layer degraded to none (%s)", type(exc).__name__)
+        return RelatedCompiled([], [])
+
+
+def _default_retrieve(
+    query: str, vault_path: Path, override: PrivacyTierOverride
+) -> _Grounding:
+    """Production grounding: the *titles* of the corpus fragments nearest *query*.
+
+    Returns the titles of the top ``author.retrieval_top_k`` (default 5) corpus
+    fragments semantically nearest *query*, drawn from ``01-Fragments``,
+    ``09-Reference`` and ``11-Other-Authors``. The author retrieval specialist
+    is imported lazily so the server still boots when its (heavier) deps are
+    unavailable.
+
+    **Titles, not bodies — and that is the decision, not an accident.** Three
+    reasons, recorded because "grounding" reads like it ought to mean body text:
+
+    - :func:`_build_prompt` validates every returned ``notes[].quote`` as a
+      verbatim span of the *entry*, never of a source, so grounding supplies
+      thematic context and is structurally unquotable — titles serve that role.
+    - Bodies would mean changing ``creek.author.agents._fragment_claim``, whose
+      "one assertion, one short sentence" contract is shared by
+      ``GraphSpecialist`` and the Writing Desk's citation and leak-gate
+      machinery.
+    - :func:`reflect_tool`'s ``retrieve=`` is an injectable seam, so the
+      *default* is deliberately the conservative one; a deployment wanting
+      richer grounding supplies its own callable.
+
+    **The ceiling invariant.** ``creek.author.agents._load_corpus`` applies
+    ``tier_within_override`` — a **hard rank cutoff** — so an above-ceiling
+    fragment contributes *nothing*: no title, no body, no id. This is
+    explicitly NOT ``filter_fragments_by_tier``'s summarise-the-body path,
+    which is the shape #931/#1032 found leaking titles for fragments whose
+    bodies policy had already dropped. Verified admitted sets: ``open`` admits
+    ``open`` only; ``personal`` admits ``open`` + ``personal`` +
+    ``unclassified``; ``intimate`` and ``all`` admit all four.
+
+    **The routing consequence.** The most sensitive tier that can reach the
+    prompt is therefore bounded by the ceiling, and :func:`reflect_tool` keys
+    the model with :func:`creek_mcp.tier_ceiling.routing_tier`, whose
+    ceiling-derived floor is the most sensitive tier that ceiling admits. So
+    the routing tier always dominates every retrieved fragment's tier, and
+    intimate titles can only be retrieved under a ceiling that already forces
+    INTIMATE (local-only) routing. Pinned by
+    ``test_routing_tier_dominates_every_retrieved_fragment_tier``.
+
+    **The cost, honestly.** Each call constructs a fresh
+    ``RetrievalSpecialist``, so it parses the corpus and loads the embeddings
+    parquet per call, and live-embeds any fragment whose cached
+    ``content_hash`` is stale or missing — on a cold cache, that is the whole
+    admitted corpus. Tracked by #1034; the ``except Exception`` below does not
+    bound it, because slowness is not an exception.
+
+    A known asymmetry: a fragment with **no** ``privacy_tier`` key at all is
+    admitted here from ``ceiling=personal`` (the ``Fragment`` model default is
+    ``unclassified``), while :func:`_fragment_tier` fails that same file closed
+    to INTIMATE as an *entry*. Tracked by #1033.
+
+    **The provenance ride-along (#873).** The same claims already carry the
+    fragment ids they were drawn from, and the return type now keeps them
+    (:class:`_Grounding`) instead of dropping them on the floor. That is what
+    lets ``related_praxis`` / ``related_eddies`` be *selected* from this one
+    pass, honouring #873's "no second embedding sweep on the hot path"
+    constraint. The ids are a selection signal only — the tier of every
+    fragment a compiled page was built from is re-checked in
+    :func:`creek_mcp.compiled_pages.related_compiled`, so a widened id set
+    cannot widen what is returned.
+
+    Args:
+        query: The entry text to retrieve against.
+        vault_path: Vault root whose corpus subtrees are searched.
+        override: The ceiling-derived admission override, applied as a hard
+            cutoff inside the corpus walk.
+
+    Returns:
+        Fragment titles, most relevant first, paired with the ids they came
+        from — both empty when retrieval fails.
     """
     try:
         from creek.author.agents import RetrievalSpecialist
 
         bundle = RetrievalSpecialist().gather(query, vault_path, override=override)
-        return [claim.text for claim in bundle.claims]
-    except Exception:
-        return []
+        return _Grounding(
+            lines=[claim.claim for claim in bundle.claims],
+            source_ids=[
+                fragment_id
+                for claim in bundle.claims
+                for fragment_id in claim.source_fragments
+            ],
+        )
+    except Exception as exc:
+        # This log line is the #964 remedy. The attribute this comprehension
+        # reads was wrong for the entire life of the feature, so grounding
+        # raised on every production call and every reflection was ungrounded —
+        # undetected precisely because this swallow was silent. The log is what
+        # makes the next such failure findable.
+        #
+        # The catch stays broad on purpose: ``RetrievalSpecialist.gather``
+        # reaches ``load_config``, a full corpus parse and the
+        # sentence-transformer model load, so its failure surface is open-ended
+        # (ImportError, OSError, yaml errors, pydantic ``ValidationError``,
+        # model-load failures) and none of it may cross the MCP boundary.
+        #
+        # Log the exception's *type name only* — never ``str(exc)``,
+        # ``exc_info``, or ``logger.exception``, for the reason given at
+        # ``_resolve_entry`` above: these are the same user-managed corpus
+        # files, and ``yaml.MarkedYAMLError`` stringifies with the offending
+        # source snippet, so the message text would write tier-unknown vault
+        # content into a log that carries no tier and is not covered by the
+        # ceiling.
+        logger.debug("Grounding degraded to none (%s)", type(exc).__name__)
+        return _Grounding([], [])

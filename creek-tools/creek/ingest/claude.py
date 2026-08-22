@@ -27,6 +27,7 @@ from creek.ingest.base import (
     normalize_timestamp,
     parse_authored_at,
 )
+from creek.ingest.turns import group_turn_runs, merge_turn_texts
 from creek.models import Authorship
 
 if TYPE_CHECKING:
@@ -149,35 +150,94 @@ def _normalize_messages(
 # ---- Turn Pairing ----
 
 
+def _message_role(msg: dict[str, Any]) -> str:
+    """Return a normalized message's role, or ``""`` when it has none.
+
+    Args:
+        msg: A normalized message dict.
+
+    Returns:
+        The ``role`` field as a string.
+    """
+    return str(msg.get("role", ""))
+
+
+def _collapse_run(
+    run: list[dict[str, Any]],
+    carrier: dict[str, Any],
+) -> dict[str, Any]:
+    """Collapse a same-role run into one message dict (#1333).
+
+    Args:
+        run: The consecutive same-role messages of one turn side.
+        carrier: The message of *run* whose non-content fields survive.
+            Which one that is matters: :func:`_resolve_timestamp` and
+            :func:`_resolve_authored_at` read ``created_at`` off the
+            human dict, and both fragments of the turn are stamped from
+            it, so the human carrier is the run's **last** message —
+            what the pre-#1333 code already used. Anything else would
+            re-stamp, and therefore re-mint the id of, the AI fragment
+            whose text has not changed at all.
+
+    Returns:
+        A copy of *carrier* whose ``content`` is the merged run text.
+    """
+    merged = carrier.copy()
+    merged["content"] = merge_turn_texts(
+        [_extract_text(msg.get("content", "")) for msg in run]
+    )
+    return merged
+
+
 def _pair_turns(
     messages: list[dict[str, Any]],
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     """Pair human turns with their corresponding assistant responses.
 
-    Skips system prompts. Consecutive human messages are merged (only the
-    last is kept). A trailing human message without an assistant response
-    is discarded.
+    Skips system prompts. **Consecutive human messages are merged** into
+    one human turn, and consecutive assistant messages into one assistant
+    turn, joined by :data:`~creek.ingest.turns.TURN_TEXT_SEPARATOR`. A
+    trailing human message without an assistant response is discarded.
+
+    Until #1333 this function kept only *one* message per run — the last
+    human, the first assistant — and dropped the others without a word.
+    Sending a thought in two messages before the model replies is
+    ordinary usage, so the first half of the operator's own prose never
+    reached a fragment, and therefore never reached the voice corpus,
+    which is built from ``source.author=self`` fragments. The docstring
+    said "merged (only the last is kept)"; those are two different
+    behaviours and the code did the second.
+
+    Merging the assistant side does not fight
+    :meth:`creek.clean.filters.chatbot.ChatbotFilter._collapse_regenerations`,
+    which reduces an assistant run to its last message on the theory that
+    the earlier ones are regenerations. That filter runs *before* pairing
+    (:meth:`ClaudeIngestor._parse_conversation`), so when it is
+    configured this function only ever sees a single assistant message
+    and returns it byte-identically. When it is not configured, ingest
+    has no evidence about which of two assistant messages the operator
+    meant to keep, and preserving both is the only non-lossy answer.
 
     Args:
         messages: List of normalized message dicts.
 
     Returns:
-        List of (human_message, assistant_message) tuples.
+        List of (human_message, assistant_message) tuples, one per turn,
+        each carrying its run's merged text.
     """
-    pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    pending_human: dict[str, Any] | None = None
-
-    for msg in messages:
-        role = msg.get("role", "")
-        if role == "system":
-            continue
-        if role == "human":
-            pending_human = msg
-        elif role == "assistant" and pending_human is not None:
-            pairs.append((pending_human, msg))
-            pending_human = None
-
-    return pairs
+    runs = group_turn_runs(
+        messages,
+        role_of=_message_role,
+        human_role="human",
+        assistant_role="assistant",
+    )
+    return [
+        (
+            _collapse_run(human_run, human_run[-1]),
+            _collapse_run(assistant_run, assistant_run[0]),
+        )
+        for human_run, assistant_run in runs
+    ]
 
 
 # ---- Timestamp Resolution ----
@@ -365,7 +425,11 @@ class ClaudeIngestor(Ingestor):
         if is_ai:
             # The AI turn is AI-authored, so it can never feed the voice proxy
             # (``source.author=ai`` makes ``voice_proxy_eligible`` False); zero
-            # weight is belt-and-braces against future selectors.
+            # weight is belt-and-braces against future selectors. The voice
+            # corpus enforces the authorship half in
+            # ``creek.generate.voice._eligible_register`` (#1213); before that
+            # it read only the weight, and this comment described a mechanism
+            # nothing consulted.
             source["author"] = _ROLE_AI
 
         suffix = ", AI" if is_ai else ""

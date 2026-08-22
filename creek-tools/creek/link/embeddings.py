@@ -25,7 +25,7 @@ from creek.models import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Iterable, Iterator, Mapping
     from pathlib import Path
 
     import numpy as np
@@ -228,6 +228,22 @@ def delete_embeddings_cache(cache_path: Path, *, dry_run: bool = False) -> int:
     survives a full-vault purge — including the embedding vectors,
     which are partially invertible.
 
+    An unreadable cache is deleted anyway and reported as zero rows
+    (#1480). ``pq.read_metadata`` raises ``ArrowInvalid`` — a
+    ``ValueError`` subclass — on a truncated or corrupt parquet, and
+    this function is the last statement of ``purge_vault``'s body, so
+    letting that escape allowed a **derived** file to veto a
+    right-to-be-forgotten erasure. This cache is also the likeliest file
+    in a vault to be half-written, because it is the only one produced
+    by a bulk binary writer that a killed ``creek link`` can leave
+    truncated. Failing to *count* the rows must never stop them being
+    *removed*: the file is destroyed either way, so the erasure is
+    complete and only the size of the record degrades — under-claiming,
+    which is the safe direction (#1340). The count is not recoverable by
+    any other means once the bytes are gone, so zero is the honest
+    answer and the ``WARNING`` is what tells the operator it is a floor
+    rather than a fact.
+
     Args:
         cache_path: Embeddings parquet path.
         dry_run: When ``True``, count rows but leave the file alone.
@@ -235,16 +251,53 @@ def delete_embeddings_cache(cache_path: Path, *, dry_run: bool = False) -> int:
     Returns:
         Number of rows that were in the file when it was deleted
         (or that would be deleted in a dry run). Zero when the file
-        does not exist.
+        does not exist, and zero when it could not be parsed.
     """
     if not cache_path.exists():
         return 0
 
     import pyarrow.parquet as pq  # lazy: pyarrow lives in the [embeddings] extra
 
-    row_count = int(pq.read_metadata(cache_path).num_rows)
+    try:
+        row_count = int(pq.read_metadata(cache_path).num_rows)
+    except (OSError, ValueError) as exc:
+        # ``ArrowInvalid`` subclasses ``ValueError``; ``OSError`` covers a
+        # file that vanished or turned unreadable between the exists()
+        # check and the parse. Log the exception *type* only — the same
+        # rule the purge audit follows, since a parquet error message can
+        # quote a column name derived from vault content.
+        logger.warning(
+            "Embeddings cache %s could not be read (%s); deleting it anyway "
+            "and reporting 0 row(s) removed",
+            cache_path,
+            type(exc).__name__,
+        )
+        row_count = 0
     if not dry_run:
-        cache_path.unlink()
+        try:
+            cache_path.unlink(missing_ok=True)
+        except OSError as exc:
+            # The whole point of #1480 is that a bad embeddings cache must not
+            # veto an erasure — and a bare unlink() reinstated exactly that.
+            # The handler above deliberately tolerates a file that vanished or
+            # turned unreadable between exists() and the parse; unlink() would
+            # then raise FileNotFoundError straight back out of purge_vault.
+            # A directory standing at this path raises IsADirectoryError the
+            # same way. Both are OSError, both are the veto again.
+            #
+            # missing_ok=True covers the vanished case outright. Anything else
+            # is a real erasure SHORTFALL, so it is loud rather than silent:
+            # the cache may still hold vectors derived from purged content.
+            # Type only, never the message — a parquet error can quote a column
+            # name derived from vault content.
+            logger.warning(
+                "Embeddings cache %s could NOT be deleted (%s): this erasure "
+                "is PARTIAL and the cache may still hold vectors derived from "
+                "the purged content. Remove it by hand.",
+                cache_path,
+                type(exc).__name__,
+            )
+            return 0
         logger.info(
             "Deleted embeddings cache %s (%d row(s) removed)",
             cache_path,
@@ -290,8 +343,7 @@ def _hierarchy_index(
     - ``sibling_positions[child_id] = (parent_id, index)`` records each
       child's slot in its parent's ``child_ids`` list. Built from the
       *parent's* declaration so the index is anchored in the canonical
-      sibling order (which the FEAT-021 splitter and FEAT-022 aggregator
-      both emit deterministically).
+      sibling order (which the FEAT-021 splitter emits deterministically).
 
     Args:
         fragments: Mapping of fragment ID to :class:`Fragment`, or
@@ -439,6 +491,187 @@ def _is_hierarchy_suppressed(
     if parent_a != parent_b:
         return False
     return abs(index_a - index_b) <= sibling_skip_window
+
+
+@dataclass(frozen=True, eq=False)
+class _ResonanceScan:
+    """Everything the pair traversal needs, derived once from the raw inputs.
+
+    Built by :meth:`EmbeddingLinker._prepare_scan` and shared verbatim by
+    :meth:`~EmbeddingLinker.find_resonances` and
+    :meth:`~EmbeddingLinker.count_resonances` so the two entry points
+    cannot diverge on their inputs — including on how they *fail*. The
+    ragged-input ``ValueError`` numpy raises while stacking ``vectors``
+    happens inside the shared preparation step, so both surfaces raise it
+    identically (#1337).
+
+    ``eq=False`` because ``normalized`` is a numpy array: the generated
+    ``__eq__`` would raise ``ValueError`` ("truth value of an array … is
+    ambiguous") and the generated ``__hash__`` a ``TypeError``, so a frozen
+    dataclass would otherwise advertise equality and hashability it cannot
+    honour. Identity comparison is the honest contract — a scan is a
+    one-shot bundle of derived inputs, never a key or a value to compare.
+
+    Attributes:
+        ids: Fragment IDs in the row order of ``normalized``.
+        normalized: L2-normalised embedding matrix, so a dot product of
+            two rows is their cosine similarity.
+        threshold: Minimum cosine similarity for a pair to be emitted.
+        ancestors: Precomputed ancestor sets (see :func:`_hierarchy_index`).
+        sibling_positions: Precomputed sibling positions (idem).
+        levels: Fragment ID to declared structural level, used only when
+            materialising :class:`Resonance` records.
+        sibling_skip_window: Adjacent-sibling suppression radius.
+    """
+
+    ids: list[str]
+    normalized: NDArray[np.float32]
+    threshold: float
+    ancestors: dict[str, frozenset[str]]
+    sibling_positions: dict[str, tuple[str, int]]
+    levels: dict[str, FragmentLevel]
+    sibling_skip_window: int
+
+
+@dataclass
+class _ScanStats:
+    """Mutable tally the lazy pair scan writes back to its caller.
+
+    A generator cannot return a value alongside what it yields, so the
+    hierarchy-suppression count — which the exact and top-k paths both
+    accumulate mid-traversal — travels in this holder instead. The caller
+    owns it and reads it only after fully consuming the generator; a
+    partial consumer would see a partial tally.
+
+    Attributes:
+        suppressed: Above-threshold pairs dropped as hierarchy-trivial
+            (ancestor/descendant, or siblings inside the skip window).
+    """
+
+    suppressed: int = 0
+
+
+def _resonances_exact(
+    scan: _ResonanceScan,
+    stats: _ScanStats,
+) -> Iterator[tuple[int, int, float]]:
+    """Lazily yield every above-threshold pair ``(i, j, similarity)``, ``i < j``.
+
+    Computes the upper triangle one row-block at a time so peak memory is
+    ``block_rows x N`` rather than the full matrix. The laziness is the
+    point: :meth:`EmbeddingLinker.count_resonances` consumes this without
+    ever holding an edge, which is what keeps counting allocation-free at
+    35k fragments (#1337).
+
+    Args:
+        scan: Prepared inputs shared with the other entry point.
+        stats: Mutable tally; ``suppressed`` is incremented in place.
+
+    Yields:
+        ``(i, j, similarity)`` triples in ascending ``(i, j)`` index order,
+        where ``i`` and ``j`` index :attr:`_ResonanceScan.ids`.
+    """
+    import numpy as np  # lazy: numpy lives in the [embeddings] extra
+
+    ids = scan.ids
+    n = len(ids)
+    for start in range(0, n, _RESONANCE_BLOCK_ROWS):
+        stop = min(start + _RESONANCE_BLOCK_ROWS, n)
+        block_sims = scan.normalized[start:stop] @ scan.normalized.T
+        for local_index, i in enumerate(range(start, stop)):
+            row = block_sims[local_index]
+            # Upper triangle only: fragment i against each j > i.
+            above = np.nonzero(row[i + 1 :] >= scan.threshold)[0]
+            for offset in above:
+                j = i + 1 + int(offset)
+                if _is_hierarchy_suppressed(
+                    ids[i],
+                    ids[j],
+                    ancestors=scan.ancestors,
+                    sibling_positions=scan.sibling_positions,
+                    sibling_skip_window=scan.sibling_skip_window,
+                ):
+                    stats.suppressed += 1
+                    continue
+                yield i, j, float(row[j])
+        del block_sims
+
+
+def _resonances_topk(
+    scan: _ResonanceScan,
+    stats: _ScanStats,
+    *,
+    top_k: int,
+) -> Iterator[tuple[int, int, float]]:
+    """Yield each fragment's *top_k* best above-threshold neighbours.
+
+    Bounds the edge set to O(n·k). Each directed (i -> neighbour) pick is
+    folded to its undirected ``(i < j)`` form and de-duplicated, so the
+    output is always a subset of the exact path's edges; the picks are then
+    sorted into the same ascending ``(i, j)`` order the exact path emits.
+
+    Unlike :func:`_resonances_exact` this is a generator for signature
+    parity only — dedup-then-sort is inherently eager, so the full O(n·k)
+    pick list is materialised before the first triple is yielded. That
+    bound is small enough not to be the #1337 heap problem; pretending to
+    stream here would only hide the allocation.
+
+    Args:
+        scan: Prepared inputs shared with the other entry point.
+        stats: Mutable tally; ``suppressed`` is incremented in place.
+        top_k: Maximum neighbours to keep per fragment.
+
+    Yields:
+        ``(i, j, similarity)`` triples in ascending ``(i, j)`` index order.
+    """
+    ids = scan.ids
+    n = len(ids)
+    seen: set[tuple[int, int]] = set()
+    picked: list[tuple[int, int, float]] = []
+    for start in range(0, n, _RESONANCE_BLOCK_ROWS):
+        stop = min(start + _RESONANCE_BLOCK_ROWS, n)
+        block_sims = scan.normalized[start:stop] @ scan.normalized.T
+        for local_index, i in enumerate(range(start, stop)):
+            row = block_sims[local_index]
+            for j in _top_k_neighbours(row, i, scan.threshold, top_k):
+                lo, hi = (i, j) if i < j else (j, i)
+                if (lo, hi) in seen:
+                    continue
+                seen.add((lo, hi))
+                if _is_hierarchy_suppressed(
+                    ids[lo],
+                    ids[hi],
+                    ancestors=scan.ancestors,
+                    sibling_positions=scan.sibling_positions,
+                    sibling_skip_window=scan.sibling_skip_window,
+                ):
+                    stats.suppressed += 1
+                    continue
+                picked.append((lo, hi, float(row[j])))
+        del block_sims
+    # Tuples sort lexicographically; (lo, hi) keys are unique (deduped via
+    # ``seen``), so this yields ascending (i, j) order without a key.
+    picked.sort()
+    yield from picked
+
+
+def _log_scan_result(scan: _ResonanceScan, stats: _ScanStats, count: int) -> None:
+    """Log the outcome of a fully-consumed pair scan.
+
+    Args:
+        scan: The prepared scan that was traversed.
+        stats: The tally the traversal wrote to. Only meaningful once the
+            generator has been drained.
+        count: Number of resonances the traversal produced.
+    """
+    if stats.suppressed:
+        logger.info(
+            "Suppressed %d hierarchy-trivial resonance(s) "
+            "(ancestor/descendant or adjacent siblings within %d)",
+            stats.suppressed,
+            scan.sibling_skip_window,
+        )
+    logger.info("Found %d resonance(s)", count)
 
 
 class EmbeddingLinker:
@@ -722,6 +955,10 @@ class EmbeddingLinker:
         With no *fragments* mapping (the flat-fragment contract) the
         suppression is inert and behaviour is identical to pre-FEAT-024.
 
+        Callers that only need the edge total should use
+        :meth:`count_resonances`, which walks the same traversal without
+        building a :class:`Resonance` per pair.
+
         Args:
             embeddings: Mapping of fragment IDs to their embedding vectors.
             fragments: Optional mapping of fragment ID to :class:`Fragment`
@@ -734,9 +971,96 @@ class EmbeddingLinker:
             A list of :class:`Resonance` records, one per qualifying pair,
             in ascending ``(i, j)`` fragment-index order.
         """
+        scan = self._prepare_scan(embeddings, fragments, sibling_skip_window)
+        if scan is None:
+            return []
+
+        stats = _ScanStats()
+        # The comprehension drains the generator, so ``stats.suppressed`` is
+        # complete by the time it is logged. A future *partial* consumer of
+        # :meth:`_scan_pairs` would see only a partial tally.
+        resonances = [
+            Resonance(
+                fragment_a_id=scan.ids[i],
+                fragment_b_id=scan.ids[j],
+                similarity=similarity,
+                from_level=scan.levels[scan.ids[i]],
+                to_level=scan.levels[scan.ids[j]],
+            )
+            for i, j, similarity in self._scan_pairs(scan, stats)
+        ]
+        _log_scan_result(scan, stats, len(resonances))
+        return resonances
+
+    def count_resonances(
+        self,
+        embeddings: dict[str, list[float]],
+        fragments: Mapping[str, Fragment] | None = None,
+        *,
+        sibling_skip_window: int = 2,
+    ) -> int:
+        """Count the resonances :meth:`find_resonances` would return.
+
+        Returns exactly ``len(find_resonances(...))`` for the same inputs,
+        including identical hierarchy suppression, discovery strategy and
+        failure modes — both entry points derive their inputs from the same
+        :meth:`_prepare_scan` and walk the same generator.
+
+        It exists because the count is sometimes all a caller wants.
+        ``creek link --method embeddings`` reports the similarity-edge
+        total and then discards the edges: nothing in the codebase persists
+        a :class:`Resonance`. Materialising one Pydantic model per edge just
+        to call :func:`len` on the list costs a measured ~1,017 bytes per
+        edge, which extrapolates to tens of gigabytes of heap at the
+        documented 35k-fragment scale. This path allocates nothing per edge
+        (#1337).
+
+        Args:
+            embeddings: Mapping of fragment IDs to their embedding vectors.
+            fragments: Optional mapping of fragment ID to :class:`Fragment`
+                used for hierarchy-aware suppression.
+            sibling_skip_window: Adjacent-sibling suppression radius;
+                ``0`` disables sibling suppression (ancestor suppression
+                still applies).
+
+        Returns:
+            The number of qualifying resonance edges.
+        """
+        scan = self._prepare_scan(embeddings, fragments, sibling_skip_window)
+        if scan is None:
+            return 0
+
+        stats = _ScanStats()
+        count = sum(1 for _ in self._scan_pairs(scan, stats))
+        _log_scan_result(scan, stats, count)
+        return count
+
+    def _prepare_scan(
+        self,
+        embeddings: dict[str, list[float]],
+        fragments: Mapping[str, Fragment] | None,
+        sibling_skip_window: int,
+    ) -> _ResonanceScan | None:
+        """Derive the inputs both resonance entry points traverse.
+
+        Shared so :meth:`find_resonances` and :meth:`count_resonances`
+        cannot drift on normalisation, hierarchy indexing, the threshold or
+        the too-small-to-pair guard — and so a malformed corpus (vectors of
+        unequal length) raises from the same place on both (#1337).
+
+        Args:
+            embeddings: Mapping of fragment IDs to their embedding vectors.
+            fragments: Optional mapping of fragment ID to :class:`Fragment`.
+            sibling_skip_window: Adjacent-sibling suppression radius.
+
+        Returns:
+            A :class:`_ResonanceScan`, or ``None`` when fewer than two
+            embeddings were supplied — no pair can exist, so the caller
+            returns its empty answer without logging a traversal.
+        """
         ids = list(embeddings.keys())
         if len(ids) < 2:
-            return []
+            return None
 
         logger.info(
             "Finding resonances among %d embedding(s) with threshold %.2f",
@@ -752,153 +1076,36 @@ class EmbeddingLinker:
         normalized = vectors / norms
 
         ancestors, sibling_positions = _hierarchy_index(fragments)
-        levels = _level_lookup(ids, fragments)
-        threshold = self.config.similarity_threshold
+        return _ResonanceScan(
+            ids=ids,
+            normalized=normalized,
+            threshold=self.config.similarity_threshold,
+            ancestors=ancestors,
+            sibling_positions=sibling_positions,
+            levels=_level_lookup(ids, fragments),
+            sibling_skip_window=sibling_skip_window,
+        )
 
-        # ``exact`` (default) emits every above-threshold pair; ``topk`` keeps
-        # only each fragment's k best neighbours. Both compute similarities one
-        # row-block at a time via vectorized matmul (never the full NxN matrix)
-        # and emit pairs in ascending ``(i, j)`` index order.
+    def _scan_pairs(
+        self,
+        scan: _ResonanceScan,
+        stats: _ScanStats,
+    ) -> Iterator[tuple[int, int, float]]:
+        """Dispatch to the configured pair-discovery strategy.
+
+        ``exact`` (default) emits every above-threshold pair; ``topk`` keeps
+        only each fragment's k best neighbours. Both compute similarities one
+        row-block at a time via vectorized matmul (never the full NxN matrix)
+        and emit pairs in ascending ``(i, j)`` index order.
+
+        Args:
+            scan: Prepared inputs from :meth:`_prepare_scan`.
+            stats: Mutable tally the chosen strategy writes suppression
+                counts into.
+
+        Returns:
+            An iterator of ``(i, j, similarity)`` triples.
+        """
         if self.config.resonance_method == "topk":
-            resonances, suppressed = self._resonances_topk(
-                ids=ids,
-                normalized=normalized,
-                threshold=threshold,
-                top_k=self.config.resonance_top_k,
-                ancestors=ancestors,
-                sibling_positions=sibling_positions,
-                levels=levels,
-                sibling_skip_window=sibling_skip_window,
-            )
-        else:
-            resonances, suppressed = self._resonances_exact(
-                ids=ids,
-                normalized=normalized,
-                threshold=threshold,
-                ancestors=ancestors,
-                sibling_positions=sibling_positions,
-                levels=levels,
-                sibling_skip_window=sibling_skip_window,
-            )
-
-        if suppressed:
-            logger.info(
-                "Suppressed %d hierarchy-trivial resonance(s) "
-                "(ancestor/descendant or adjacent siblings within %d)",
-                suppressed,
-                sibling_skip_window,
-            )
-        logger.info("Found %d resonance(s)", len(resonances))
-        return resonances
-
-    def _resonances_exact(
-        self,
-        *,
-        ids: list[str],
-        normalized: NDArray[np.float32],
-        threshold: float,
-        ancestors: dict[str, frozenset[str]],
-        sibling_positions: dict[str, tuple[str, int]],
-        levels: dict[str, FragmentLevel],
-        sibling_skip_window: int,
-    ) -> tuple[list[Resonance], int]:
-        """Exact all-pairs path: emit every above-*threshold* pair (i < j).
-
-        Computes the upper triangle one row-block at a time so peak memory is
-        ``block_rows x N`` rather than the full matrix. Returns the resonances
-        and the count suppressed by hierarchy rules.
-        """
-        import numpy as np  # lazy: numpy lives in the [embeddings] extra
-
-        resonances: list[Resonance] = []
-        suppressed = 0
-        n = len(ids)
-        for start in range(0, n, _RESONANCE_BLOCK_ROWS):
-            stop = min(start + _RESONANCE_BLOCK_ROWS, n)
-            block_sims = normalized[start:stop] @ normalized.T
-            for local_index, i in enumerate(range(start, stop)):
-                row = block_sims[local_index]
-                # Upper triangle only: fragment i against each j > i.
-                above = np.nonzero(row[i + 1 :] >= threshold)[0]
-                for offset in above:
-                    j = i + 1 + int(offset)
-                    if _is_hierarchy_suppressed(
-                        ids[i],
-                        ids[j],
-                        ancestors=ancestors,
-                        sibling_positions=sibling_positions,
-                        sibling_skip_window=sibling_skip_window,
-                    ):
-                        suppressed += 1
-                        continue
-                    resonances.append(
-                        Resonance(
-                            fragment_a_id=ids[i],
-                            fragment_b_id=ids[j],
-                            similarity=float(row[j]),
-                            from_level=levels[ids[i]],
-                            to_level=levels[ids[j]],
-                        ),
-                    )
-            del block_sims
-        return resonances, suppressed
-
-    def _resonances_topk(
-        self,
-        *,
-        ids: list[str],
-        normalized: NDArray[np.float32],
-        threshold: float,
-        top_k: int,
-        ancestors: dict[str, frozenset[str]],
-        sibling_positions: dict[str, tuple[str, int]],
-        levels: dict[str, FragmentLevel],
-        sibling_skip_window: int,
-    ) -> tuple[list[Resonance], int]:
-        """Top-k path: keep each fragment's *top_k* best above-*threshold* neighbours.
-
-        Bounds the edge set to O(n·k). Each directed (i -> neighbour) pick is
-        folded to its undirected ``(i < j)`` form and de-duplicated, so the
-        output is always a subset of the exact path's edges; the final list is
-        sorted into the same ascending ``(i, j)`` order the exact path emits.
-        Returns the resonances and the hierarchy-suppressed count.
-        """
-        n = len(ids)
-        seen: set[tuple[int, int]] = set()
-        picked: list[tuple[int, int, float]] = []
-        suppressed = 0
-        for start in range(0, n, _RESONANCE_BLOCK_ROWS):
-            stop = min(start + _RESONANCE_BLOCK_ROWS, n)
-            block_sims = normalized[start:stop] @ normalized.T
-            for local_index, i in enumerate(range(start, stop)):
-                row = block_sims[local_index]
-                for j in _top_k_neighbours(row, i, threshold, top_k):
-                    lo, hi = (i, j) if i < j else (j, i)
-                    if (lo, hi) in seen:
-                        continue
-                    seen.add((lo, hi))
-                    if _is_hierarchy_suppressed(
-                        ids[lo],
-                        ids[hi],
-                        ancestors=ancestors,
-                        sibling_positions=sibling_positions,
-                        sibling_skip_window=sibling_skip_window,
-                    ):
-                        suppressed += 1
-                        continue
-                    picked.append((lo, hi, float(row[j])))
-            del block_sims
-        # Tuples sort lexicographically; (lo, hi) keys are unique (deduped via
-        # ``seen``), so this yields ascending (i, j) order without a key.
-        picked.sort()
-        resonances = [
-            Resonance(
-                fragment_a_id=ids[lo],
-                fragment_b_id=ids[hi],
-                similarity=sim,
-                from_level=levels[ids[lo]],
-                to_level=levels[ids[hi]],
-            )
-            for lo, hi, sim in picked
-        ]
-        return resonances, suppressed
+            return _resonances_topk(scan, stats, top_k=self.config.resonance_top_k)
+        return _resonances_exact(scan, stats)

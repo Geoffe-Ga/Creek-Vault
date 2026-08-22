@@ -9,22 +9,46 @@ compost step, and the summary reports real per-folder counts.
 from __future__ import annotations
 
 import logging
+import re
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from typer.testing import CliRunner
 
 import creek.cli as cli_mod
+import creek.time as creek_time
 from creek.cli import app
 from creek.generate import compost as compost_mod
 from creek.generate import indexes as indexes_mod
 from creek.link import link_engine
+from tests.synchronicity_support import (
+    plant_hostile_entry,
+    seed_synchronicity_vault,
+    sync_notes,
+)
 
 if TYPE_CHECKING:
+    from datetime import tzinfo
     from pathlib import Path
 
     import pytest
 
 runner = CliRunner()
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(text: str) -> str:
+    """Return *text* with ANSI escape sequences removed.
+
+    Typer/Click's Rich formatter splits styled lines across colour
+    segments when the terminal supports ANSI, and the literal substring
+    then disappears from ``result.output``. Stripping ANSI before a
+    substring assertion keeps it environment-independent — the same guard
+    ``tests/test_cli.py`` uses.
+    """
+    return _ANSI_RE.sub("", text)
+
 
 _EXPECTED_ORDER = [
     "link/embeddings",
@@ -36,6 +60,11 @@ _EXPECTED_ORDER = [
     "report/paradox",
     "report/synchronicity",
     "report/mode-profiles",
+    # #879: ``creek fill`` is the "make my vault prod-ready" command, so the
+    # voice report belongs in it — without this step the register samples are
+    # only ever written by an operator who knows to run
+    # ``creek report --type voice`` by hand.
+    "report/voice",
     "report/wavelength",
     "index",
 ]
@@ -69,13 +98,13 @@ def _install_recorders(
         ("_report_paradox", "report/paradox"),
         ("_report_synchronicity", "report/synchronicity"),
         ("_report_mode_profiles", "report/mode-profiles"),
+        ("_report_voice", "report/voice"),
     ):
         monkeypatch.setattr(cli_mod, name, rec(label))
-    monkeypatch.setattr(
-        cli_mod,
-        "_report_wavelength",
-        lambda _vault, _period: rec("report/wavelength")(),
-    )
+    # ``rec`` already accepts any signature; spelling ``_report_wavelength``'s
+    # out again would just be a third place to update when it changes (#1253
+    # added the ``override`` argument and broke exactly that).
+    monkeypatch.setattr(cli_mod, "_report_wavelength", rec("report/wavelength"))
 
     class _FakeIndex:
         def __init__(self, *, vault_path: Path) -> None:
@@ -108,6 +137,47 @@ def test_fill_runs_all_steps_in_dependency_order(
 
     assert result.exit_code == 0, result.output
     assert calls == _EXPECTED_ORDER
+
+
+def test_fill_voice_step_states_the_unfiltered_ceiling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``report/voice`` step declares ``PrivacyTierOverride.ALL`` (#879).
+
+    ``creek fill`` has no ``--include-tier`` of its own, and on the report
+    surface an absent flag means *unfiltered*, so the step has to say
+    ``ALL`` out loud rather than inherit a default nobody typed — the same
+    contract every other step in ``_build_fill_steps`` already keeps. The
+    step is fetched from the plan and invoked directly rather than through
+    ``creek fill`` so the assertion is about the argument, not about the
+    command happening to reach it.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        monkeypatch: Fixture used to capture the override the step passes.
+    """
+    from creek.classify.privacy_filter import PrivacyTierOverride
+
+    seen: list[object] = []
+    monkeypatch.setattr(
+        cli_mod,
+        "_report_voice",
+        lambda _vault, override: seen.append(override),
+    )
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    steps = dict(
+        cli_mod._build_fill_steps(
+            vault,
+            cli_mod._load_config_for_vault(vault),
+            with_compost=False,
+        )
+    )
+
+    assert "report/voice" in steps
+    steps["report/voice"]()
+
+    assert seen == [PrivacyTierOverride.ALL]
 
 
 def test_fill_step_failure_is_non_fatal(
@@ -158,6 +228,90 @@ def test_fill_with_compost_appends_compost_step(
 
     assert result.exit_code == 0, result.output
     assert calls == [*_EXPECTED_ORDER, "compost/report"]
+
+
+# ---- Issue #938: the compost report is dated on the LA calendar -----------
+
+_LA_AHEAD_UTC_INSTANT = datetime(2026, 7, 29, 6, 0, tzinfo=UTC)
+"""One absolute instant whose UTC and LA calendar dates disagree.
+
+06:00 UTC on 2026-07-29 is 23:00 PDT on 2026-07-28. A clock reading the UTC
+calendar stamps ``2026-07-29``; a clock reading LA stamps ``2026-07-28``.
+Freezing here turns issue #938's date bug from "true for about seven hours a
+day" into a deterministic assertion.
+"""
+
+
+class _FrozenDatetime(datetime):
+    """A ``datetime`` frozen at :data:`_LA_AHEAD_UTC_INSTANT`.
+
+    Deliberately timezone-agnostic, unlike the narrower stub in
+    ``tests/test_time.py``: it answers ``now(tz=...)`` with the one fixed
+    instant expressed in whatever zone it is handed, and asserts nothing
+    about which zone that is. The buggy implementation asks for UTC and the
+    fixed one asks for America/Los_Angeles — both have to run through this
+    stub, or the test would be measuring the patch instead of the behaviour.
+    """
+
+    @classmethod
+    def now(cls, tz: tzinfo | None = None) -> datetime:
+        """Return the frozen instant, expressed in *tz*.
+
+        Args:
+            tz: Target timezone. ``None`` yields the naive UTC reading,
+                matching :meth:`datetime.now`'s own default.
+
+        Returns:
+            The single frozen moment, converted into *tz*.
+        """
+        if tz is None:
+            return _LA_AHEAD_UTC_INSTANT.replace(tzinfo=None)
+        return _LA_AHEAD_UTC_INSTANT.astimezone(tz)
+
+
+def test_fill_with_compost_dates_the_report_on_the_la_calendar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``creek fill --with-compost`` stamps the LA date, never the UTC one.
+
+    Runs the **real** ``CompostTracker`` — every other test in this module
+    stubs it out — against a clock frozen at 23:00 PDT on 2026-07-28, which
+    is already 2026-07-29 in UTC. Both module-level ``datetime`` names are
+    replaced with the same stub: ``creek.generate.compost.datetime``, which
+    the buggy ``datetime.now(tz=UTC).replace(tzinfo=None)`` calls, and
+    ``creek.time.datetime``, which ``now_la()`` calls. Patching both is what
+    makes the failure a genuine date mismatch rather than an artefact of
+    which module happened to be frozen.
+
+    Args:
+        tmp_path: Pytest temporary directory used as the vault root.
+        monkeypatch: Fixture used to stub the steps and freeze the clock.
+    """
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    calls: list[str] = []
+
+    # ``_install_recorders`` swaps in a fake tracker; capture the real class
+    # first and put it back, so this test exercises production compost code
+    # while every other fill step stays stubbed.
+    real_tracker = compost_mod.CompostTracker
+    _install_recorders(monkeypatch, calls)
+    monkeypatch.setattr(compost_mod, "CompostTracker", real_tracker)
+    # Both clocks are frozen to the same instant, and both with raising=True:
+    # the RED failure has to be a real date mismatch, not a typo in a module
+    # path silently tolerated. Contract for the fix: ``creek.generate.compost``
+    # must keep ``datetime`` bound at module scope (not moved under
+    # ``TYPE_CHECKING``) so this patch point survives.
+    monkeypatch.setattr(compost_mod, "datetime", _FrozenDatetime, raising=True)
+    monkeypatch.setattr(creek_time, "datetime", _FrozenDatetime, raising=True)
+
+    result = runner.invoke(app, ["fill", "--vault", str(vault), "--with-compost"])
+
+    assert result.exit_code == 0, result.output
+    report = vault / "10-Liminal" / "Compost" / "_Compost-Report.md"
+    text = report.read_text(encoding="utf-8")
+    generated = [ln for ln in text.splitlines() if ln.startswith("generated:")]
+    assert generated == ["generated: 2026-07-28"]
 
 
 # ---- Issue #876: the untiered-fragment hint -------------------------------
@@ -510,3 +664,275 @@ def test_praxis_hint_failure_never_crashes_fill(
         )
 
     assert any("praxis" in record.getMessage().lower() for record in caplog.records)
+
+
+# ---- Issue #878: the tags-backfill hint ------------------------------------
+#
+# Same detector shape as the #877 praxis hint above, and for the same reason:
+# it cannot be "the ``tags`` key is absent" (``Fragment.model_dump`` always
+# writes it) and it must not be "the list is empty" (plenty of fragments
+# genuinely have no hashtags, so that nag would be permanent and instantly
+# ignored). The one shape that proves work is outstanding is **the free
+# hashtag extractor finds a tag the disk does not record**. Costs zero tokens,
+# and goes quiet the moment the operator acts on it.
+
+_TAGS_SIGNAL_BODY = "notes from the week ahead\n\n#gardening"
+"""A body carrying exactly one extractable hashtag."""
+
+_TAGS_QUIET_BODY = "a plain note about the walk to the shops and the weather"
+"""A body carrying no hashtag at all."""
+
+
+def _seed_tagged_fragment(
+    vault: Path,
+    frag_id: str,
+    *,
+    body: str,
+    tags: str,
+) -> None:
+    """Write a fragment with a chosen body and inline ``tags`` list.
+
+    Built from a literal frontmatter template so the on-disk value is
+    exactly what the test names, independent of ``Fragment`` defaults. A
+    real ``privacy_tier`` is stamped so the sibling #876 untiered hint
+    stays silent and cannot pollute the captured output.
+
+    Args:
+        vault: Vault root.
+        frag_id: Fragment id (also the file stem).
+        body: Markdown body the hashtag extractor scans.
+        tags: The ``tags`` value already on disk, as inline YAML
+            (e.g. ``"[]"`` or ``"[gardening]"``).
+    """
+    folder = vault / "01-Fragments" / "Notes"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{frag_id}.md").write_text(
+        f'---\ntype: fragment\nid: {frag_id}\ntitle: "A note"\n'
+        f"source:\n  platform: markdown\n  author: self\n"
+        f"privacy_tier: open\ntags: {tags}\n---\n{body}\n",
+        encoding="utf-8",
+    )
+
+
+def test_count_tags_backfillable_counts_only_provable_gaps(
+    tmp_path: Path,
+) -> None:
+    """Only "hashtag present but not recorded" counts as backfillable.
+
+    Three fragments spanning three distinct states so the count cannot be
+    right by accident:
+
+    * hashtag + ``tags: []`` — the real gap, the only one counted;
+    * hashtag + already recorded — nothing owed;
+    * no hashtag + ``tags: []`` — genuinely has no tags to extract.
+
+    Counting the last two would make the hint permanent, which is the
+    failure mode this detector is designed around.
+    """
+    from creek.cli import _count_tags_backfillable_fragments
+
+    vault = tmp_path / "vault"
+    _seed_tagged_fragment(vault, "frag-gap", body=_TAGS_SIGNAL_BODY, tags="[]")
+    _seed_tagged_fragment(
+        vault, "frag-done", body=_TAGS_SIGNAL_BODY, tags="[gardening]"
+    )
+    _seed_tagged_fragment(vault, "frag-quiet", body=_TAGS_QUIET_BODY, tags="[]")
+
+    assert _count_tags_backfillable_fragments(vault) == 1
+
+
+def test_count_tags_backfillable_is_zero_without_a_fragments_dir(
+    tmp_path: Path,
+) -> None:
+    """A vault with no ``01-Fragments`` counts zero rather than exploding."""
+    from creek.cli import _count_tags_backfillable_fragments
+
+    assert _count_tags_backfillable_fragments(tmp_path / "empty-vault") == 0
+
+
+def test_fill_hints_when_tags_can_be_backfilled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The hint reports a COUNT and leaks nothing about the fragments.
+
+    Printed ahead of the ``offer is None`` early return, like the #876
+    untiered and #877 praxis hints it sits beside, so it still fires on
+    the vault that most needs it (fully classified, no LLM upgrade to
+    offer).
+
+    It reports a **count only**. Naming a fragment id, quoting a body
+    excerpt, or — worst of all — printing the tags themselves would turn
+    an advisory line into an unaudited disclosure of vault content
+    through stdout, which the config-oracle rule (#846 / #848) forbids.
+    All three are asserted absent.
+    """
+    from creek.cli import _maybe_upgrade_classification
+
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", lambda *_a: None)
+    vault = tmp_path / "vault"
+    _seed_tagged_fragment(vault, "frag-gap", body=_TAGS_SIGNAL_BODY, tags="[]")
+    _seed_tagged_fragment(vault, "frag-quiet", body=_TAGS_QUIET_BODY, tags="[]")
+
+    _maybe_upgrade_classification(
+        vault,
+        cli_mod._load_config_for_vault(vault),
+        upgrade=False,
+    )
+
+    out = capsys.readouterr().out
+    assert "tag" in out.lower()
+    assert "1" in out
+    # …and nothing about the fragment itself leaks.
+    assert "frag-gap" not in out
+    assert "gardening" not in out
+    assert "week ahead" not in out
+
+
+def test_tags_hint_names_the_free_backfill_not_the_paid_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The remedy the hint names must be the free one (#1207).
+
+    Under #878 this line said ``creek classify --method llm --force`` and
+    stated its token cost, because the preserved short-circuit did not
+    tag. Since #1207 it does, through a narrow tags-only write, so a bare
+    ``creek classify`` backfills an ``llm``-stamped vault for nothing.
+    Naming ``--force`` now would bill the operator for a full
+    re-classification to recover data already on local disk — asserted
+    absent, alongside the paid framing, because a stale remedy in an
+    advisory line is worse than no line at all.
+    """
+    from creek.cli import _maybe_upgrade_classification
+
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", lambda *_a: None)
+    vault = tmp_path / "vault"
+    _seed_tagged_fragment(vault, "frag-gap", body=_TAGS_SIGNAL_BODY, tags="[]")
+
+    _maybe_upgrade_classification(
+        vault,
+        cli_mod._load_config_for_vault(vault),
+        upgrade=False,
+    )
+
+    # Rich soft-wraps at the console width, so collapse whitespace before
+    # matching — otherwise the assertion is really about line breaks.
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Run `creek classify` (no --force) to backfill" in out
+    assert "--method llm --force" not in out
+    assert "token" not in out.lower()
+
+
+def test_tags_hint_is_silent_when_every_hashtag_is_already_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A backfilled vault gets no hint — the nag must not be permanent.
+
+    The vault here is the steady state after one ``creek classify`` run:
+    every hashtag the extractor can see is already recorded, and the rest
+    of the fragments genuinely have none. Any implementation that keyed
+    off "tags == []" would print here forever and train the operator to
+    ignore the line.
+    """
+    from creek.cli import _maybe_upgrade_classification
+
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", lambda *_a: None)
+    vault = tmp_path / "vault"
+    _seed_tagged_fragment(
+        vault, "frag-done", body=_TAGS_SIGNAL_BODY, tags="[gardening]"
+    )
+    _seed_tagged_fragment(vault, "frag-quiet", body=_TAGS_QUIET_BODY, tags="[]")
+
+    _maybe_upgrade_classification(
+        vault,
+        cli_mod._load_config_for_vault(vault),
+        upgrade=False,
+    )
+
+    assert "tag" not in capsys.readouterr().out.lower()
+
+
+def test_tags_hint_failure_never_crashes_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A broken tags count is swallowed by its own best-effort guard.
+
+    Contract note for the implementation: the hint must call the
+    module-level ``_count_tags_backfillable_fragments`` (this test
+    patches it there) and log its own WARNING naming ``tags``, rather
+    than sharing another hint's guard — otherwise one failing scan
+    silently suppresses the others too.
+    """
+    from creek.cli import _maybe_upgrade_classification
+
+    def _boom(*_a: object) -> int:
+        raise OSError("unreadable fragment")
+
+    monkeypatch.setattr(cli_mod, "_count_tags_backfillable_fragments", _boom)
+    monkeypatch.setattr(cli_mod, "_detect_classify_upgrade", lambda *_a: None)
+
+    with caplog.at_level(logging.WARNING):
+        # Must not raise.
+        _maybe_upgrade_classification(
+            tmp_path, cli_mod._load_config_for_vault(tmp_path), upgrade=False
+        )
+
+    assert any("tag" in record.getMessage().lower() for record in caplog.records)
+
+
+# ---- Issue #1416: the synchronicity step over an operator-edited folder ----
+
+
+def test_fill_synchronicity_step_survives_a_hand_broken_note(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``creek fill`` must *complete* the synchronicity step, not survive it.
+
+    Asserting ``exit_code == 0`` alone would be vacuous here: the fill loop
+    at ``creek/cli.py:3645-3656`` wraps every step in ``except Exception``,
+    logs ``fill step %s failed: %s``, prints ``[fill] {label} failed:
+    {exc}`` and carries on — so ``creek fill`` already exits 0 at HEAD with
+    this note in the vault, having quietly written no synchronicities at
+    all. The real assertions are therefore the **absence** of the
+    ``report/synchronicity failed`` line and the presence on disk of the
+    note the seeded vault earned.
+
+    Every other step stays a recorder; only ``_report_synchronicity`` is
+    restored to the production function, so the test measures that step and
+    not the orchestration around it.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        monkeypatch: Fixture used to install the step recorders.
+    """
+    real_report_synchronicity = cli_mod._report_synchronicity
+    vault, _config = seed_synchronicity_vault(tmp_path)
+    plant_hostile_entry(vault, "hand-broken-yaml")
+    calls: list[str] = []
+    _install_recorders(monkeypatch, calls)
+    monkeypatch.setattr(
+        cli_mod,
+        "_report_synchronicity",
+        real_report_synchronicity,
+    )
+
+    result = runner.invoke(app, ["fill", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    assert "report/synchronicity failed" not in _strip_ansi(result.output)
+    # Every other step is still a recorder, and still ran in order — the one
+    # unrecorded label is the real function this test installed.
+    assert calls == [
+        label for label in _EXPECTED_ORDER if label != "report/synchronicity"
+    ]
+    real_notes = [p for p in sync_notes(vault) if p.is_file()]
+    generated = [p for p in real_notes if p.name != "hostile-yaml.md"]
+    assert len(generated) == 1

@@ -1,0 +1,22 @@
+{
+  "additionalProperties": false,
+  "description": "A way to reach a human, named and contactable.\n\nAttributes:\n    name: What the resource is called.\n    contact: How to reach it. Required \u2014 a resource without a contact\n        dead-ends the person reading it at the worst possible moment.",
+  "properties": {
+    "contact": {
+      "description": "How to reach it; required.",
+      "title": "Contact",
+      "type": "string"
+    },
+    "name": {
+      "description": "Name of the care resource.",
+      "title": "Name",
+      "type": "string"
+    }
+  },
+  "required": [
+    "name",
+    "contact"
+  ],
+  "title": "CareResource",
+  "type": "object"
+}

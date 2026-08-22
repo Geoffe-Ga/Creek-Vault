@@ -30,4 +30,12 @@ EOF
 done
 
 cd "$PROJECT_ROOT"
-exec refurb creek/
+
+# --python-version is pinned to the project's SUPPORTED FLOOR rather than left
+# to default to whichever interpreter is running. Refurb suggests newer idioms
+# as the target version rises, so an unpinned run on 3.13 can demand a rewrite
+# that does not parse on 3.11 — the oldest version `requires-python` promises.
+# Pinning also makes this gate interpreter-independent, which is what lets CI
+# run it once instead of once per matrix leg (issue #1141). It matches ruff's
+# `target-version = "py311"`; raise both together when requires-python moves.
+exec refurb creek/ --python-version "${REFURB_PY_VERSION:-3.11}"

@@ -22,6 +22,15 @@ contract this suite pins, in order of stakes:
 4. Corpus-grounded retrieval, audit logging, read-only wrt the corpus, clean
    degradation with no provider, the care seam (#753), and tolerance of
    malformed fragment frontmatter under ``01-Fragments`` (#847).
+5. **The default (production) grounder actually grounds (#964)** — every other
+   test in this file injects a ``retrieve=`` stub, so the retrieval
+   ``build_server`` really wires had zero coverage and silently returned no
+   grounding at all. The final section drives that path with no ``retrieve=``:
+   it feeds the prompt corpus fragment **titles** (never bodies), admits
+   exactly the within-ceiling corpus and leaves no trace of anything above it,
+   routes at a tier dominating every fragment it retrieved, and on a retrieval
+   failure degrades to ``(none)`` while logging the exception's *type name*
+   only.
 
 The LLM and retrieval are injected — no live calls.
 """
@@ -29,20 +38,28 @@ The LLM and retrieval are injected — no live calls.
 from __future__ import annotations
 
 import json
+import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import frontmatter
 import pytest
 
+from creek.author.agents import RetrievalSpecialist
 from creek.care.guardrail import CARE_SIGNAL
 from creek.classify.llm.router import IntimateRoutingError
 from creek.models import PrivacyTier
+from creek_mcp import tier_ceiling
 from creek_mcp.audit import MCP_AUDIT_RELPATH
+from creek_mcp.compiled_pages import RelatedCompiled
 from creek_mcp.tier_ceiling import TierCeiling, to_privacy_override
 from creek_mcp.tools.reflect import TOOL_NAME, _routing_tier, reflect_tool
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from creek.author.models import EvidenceBundle
 
 _ENTRY = (
     "I keep circling the same fear: that if I rest, everything I built quietly "
@@ -631,9 +648,14 @@ def test_intimate_entry_ref_is_allowed_under_intimate_ceiling_and_routes_local(
         # The ceiling wins when it is the more sensitive of the two...
         (TierCeiling.INTIMATE, PrivacyTier.OPEN, PrivacyTier.INTIMATE),
         (TierCeiling.ALL, PrivacyTier.OPEN, PrivacyTier.INTIMATE),
-        # ...and on a rank tie, which keeps ``unclassified`` from downgrading
-        # the routing tier below the ceiling's own.
-        (TierCeiling.OPEN, PrivacyTier.UNCLASSIFIED, PrivacyTier.OPEN),
+        # ...and ``unclassified`` now *raises* the routing tier to ``personal``
+        # rather than tying with ``open`` (#961): it ranks with ``personal``,
+        # and is normalised into the routing vocabulary because "unclassified"
+        # is not a routing key. This row is unreachable through ``reflect_tool``
+        # — the #846 gate refuses an unclassified ``entry_ref`` at ``open``
+        # before ``_routing_tier`` runs — which is why it is asserted against
+        # the helper directly (see the docstring below).
+        (TierCeiling.OPEN, PrivacyTier.UNCLASSIFIED, PrivacyTier.PERSONAL),
         # Raw inline ``content`` has no classification: the ceiling alone routes.
         (TierCeiling.OPEN, None, PrivacyTier.OPEN),
         (TierCeiling.PERSONAL, None, PrivacyTier.PERSONAL),
@@ -695,14 +717,42 @@ def test_intimate_entry_ref_is_allowed_under_all_ceiling(tmp_path: Path) -> None
     assert result["status"] == "ok"
 
 
-def test_explicitly_unclassified_entry_ref_is_allowed_under_open_ceiling(
+@pytest.mark.parametrize(
+    ("ceiling", "admitted"),
+    [
+        (TierCeiling.OPEN, False),
+        (TierCeiling.PERSONAL, True),
+    ],
+)
+def test_explicitly_unclassified_entry_ref_is_refused_under_open_ceiling(
     tmp_path: Path,
+    ceiling: TierCeiling,
+    admitted: bool,
 ) -> None:
-    """An explicit ``privacy_tier: unclassified`` is admitted at the OPEN ceiling.
+    """An explicit ``privacy_tier: unclassified`` needs a PERSONAL ceiling (#961).
 
-    ``unclassified`` shares rank 0 with ``open`` in the canonical ranking, so a
-    fragment that was *classified as* unclassified is admissible to the most
-    restrictive ceiling. Paired with the fail-closed test below.
+    Inverted by #961. This test previously asserted the OPEN ceiling *admitted*
+    an explicitly-unclassified fragment, because ``unclassified`` shared rank 0
+    with ``open`` in ``creek_mcp.tier_ceiling._TIER_RANK``. It now ranks 1, with
+    ``personal``: an untiered fragment is content nobody has vouched for, and
+    every pipeline-written pre-classification fragment carries an *explicit*
+    ``privacy_tier: unclassified`` (the ``Fragment`` model default), so the old
+    policy made a whole freshly-ingested vault readable through ``creek.reflect``
+    at ``ceiling=open``.
+
+    Both halves of the new policy are asserted, and the PERSONAL row is the
+    load-bearing one. A refusal at OPEN alone would be satisfied by any rank
+    above 0 — including a fail-closed-to-INTIMATE reading — which would erase
+    the distinction this file depends on: an *explicit* ``unclassified``
+    (rank 1, admitted at ``personal``) versus a *missing* ``privacy_tier`` key
+    (fails closed to INTIMATE, refused at ``personal`` — see
+    :func:`test_untiered_entry_ref_is_refused_fail_closed` below). The PERSONAL
+    row is what keeps those two cases distinguishable.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        ceiling: The caller's declared ceiling.
+        admitted: Whether *ceiling* must admit the unclassified fragment.
     """
     vault = _vault(tmp_path)
     body = "a note I never got round to sorting"
@@ -715,10 +765,16 @@ def test_explicitly_unclassified_entry_ref_is_allowed_under_open_ceiling(
         entry_ref="frag-unclassified",
         llm_factory=factory,
         retrieve=_no_retrieval,
-        privacy_tier_ceiling=TierCeiling.OPEN,
+        privacy_tier_ceiling=ceiling,
     )
-    assert result["status"] == "ok"
-    assert result["notes"][0]["quote"] == body
+    if admitted:
+        assert result["status"] == "ok"
+        assert result["notes"][0]["quote"] == body
+    else:
+        assert body not in json.dumps(result), "unclassified content egressed"
+        assert result["status"] == "refused"
+        assert result["reason"] == _REFUSAL_REASON
+        assert factory.asked_tier is None
 
 
 @pytest.mark.parametrize("ceiling", [TierCeiling.OPEN, TierCeiling.PERSONAL])
@@ -735,10 +791,19 @@ def test_untiered_entry_ref_is_refused_fail_closed(
     most-restrictive tier.
 
     Deliberately paired with
-    :func:`test_explicitly_unclassified_entry_ref_is_allowed_under_open_ceiling`:
-    an *explicit* ``unclassified`` is a classification decision and ranks 0,
-    whereas a *missing* key means the fragment was never classified at all.
-    ``_fragment_tier`` treats that as INTIMATE, so the gate must refuse it.
+    :func:`test_explicitly_unclassified_entry_ref_is_refused_under_open_ceiling`:
+    an *explicit* ``unclassified`` is a classification decision and ranks 1
+    (with ``personal``, #961), whereas a *missing* key means the fragment was
+    never classified at all. ``_fragment_tier`` treats that as INTIMATE, so the
+    gate must refuse it at ``personal`` too.
+
+    That pairing is what makes the PERSONAL row discriminating, and #961 made it
+    sharper rather than weaker. Both cases are now refused at OPEN, so only the
+    PERSONAL ceiling still tells them apart — and there they diverge outright:
+    an explicit ``unclassified`` is **admitted** while a missing key is
+    **refused**. Before #961 the two differed at OPEN and agreed nowhere else;
+    now the discrimination sits exactly on the rank boundary the fail-closed
+    default is supposed to clear.
 
     Scope, stated precisely: this fail-closed covers fragments missing the key
     *entirely* — hand-edited, legacy, or otherwise not written by the pipeline.
@@ -746,10 +811,10 @@ def test_untiered_entry_ref_is_refused_fail_closed(
     serialises via ``model_dump(mode="json")`` and ``Fragment.privacy_tier``
     defaults to ``PrivacyTier.UNCLASSIFIED``, so every pipeline-written
     pre-classification fragment carries an *explicit* ``privacy_tier:
-    unclassified``, which ranks 0 and is admitted at the OPEN ceiling (the test
-    above). Those fragments are governed by the separate, systemic
-    "``unclassified`` ranks as open" policy in :mod:`creek_mcp.tier_ceiling` /
-    :mod:`creek.classify.privacy_filter` — deliberate, and out of scope here.
+    unclassified``. Those fragments are governed by the separate, systemic
+    "``unclassified`` ranks with ``personal``" policy shared by
+    :mod:`creek_mcp.tier_ceiling` and :mod:`creek.classify.privacy_filter`
+    (#876/#961) — deliberate, and out of scope here.
 
     Args:
         tmp_path: pytest's per-test temporary directory.
@@ -1379,3 +1444,927 @@ def test_nonstring_frontmatter_key_is_skipped_not_crashed(tmp_path: Path) -> Non
     )
     assert result["status"] == "refused"
     assert result["reason"] == "entry_ref not found"
+
+
+# --- Default (production) grounding retrieval (#964) ------------------------------
+
+# Every test above injects ``retrieve=``, so ``_default_retrieve`` — the grounder
+# ``build_server`` actually wires — has never been executed by this suite. Nothing
+# below passes ``retrieve=`` (except the last test, whose subject *is* the seam),
+# so these drive the production path end to end.
+
+# A verbatim span of ``_ENTRY``, so the canned response survives ``_clean_notes``
+# and the call lands on ``status: "ok"``. Reused wherever a test needs to tell
+# "grounding degraded" apart from "the whole call degraded".
+_GROUNDED_QUOTE = "the garden grew while I slept"
+
+# The literal ``_build_prompt`` renders when the grounding list is empty — i.e.
+# exactly what #964 shipped for every production reflection.
+_NO_GROUNDING = "(none)"
+
+# Grounding supplied by an injected stub, distinct from every corpus sentinel.
+_INJECTED_SNIPPET = "INJECTED-GROUNDING-0d5e"
+
+# A vault-content-shaped marker carried in a retrieval exception's *message*.
+_RETRIEVAL_FAILURE_SENTINEL = "VAULT-SECRET-4c19"
+
+
+@dataclass(frozen=True)
+class _CorpusSentinels:
+    """The three markers identifying one corpus-fixture fragment in a prompt.
+
+    Title, body and id are deliberately distinct, mutually non-substring
+    strings that appear nowhere in :data:`_ENTRY`. That is what lets an
+    assertion say *which* of the three reached the model: a title/body mix-up
+    (the whole subject of #964 — grounding feeds titles, not bodies) and a
+    stray id both become impossible to miss rather than silently equivalent.
+    """
+
+    frag_id: str
+    title: str
+    body: str
+
+
+#: One corpus fixture per ``privacy_tier``, keyed by the tier's front-matter
+#: value. Four entries on purpose: ``author.retrieval_top_k`` defaults to 5, so
+#: nothing here is ever truncated by the top-k slice and "admitted" is exactly
+#: set-equal to "retrieved".
+_CORPUS: dict[str, _CorpusSentinels] = {
+    "open": _CorpusSentinels(
+        frag_id="frag-corpus-open-9f2a",
+        title="TITLE-OPEN-9f2a",
+        body="BODY-OPEN-3c71",
+    ),
+    "personal": _CorpusSentinels(
+        frag_id="frag-corpus-personal-5b8d",
+        title="TITLE-PERSONAL-5b8d",
+        body="BODY-PERSONAL-1a46",
+    ),
+    "unclassified": _CorpusSentinels(
+        frag_id="frag-corpus-unclassified-2e93",
+        title="TITLE-UNCLASSIFIED-2e93",
+        body="BODY-UNCLASSIFIED-7d05",
+    ),
+    "intimate": _CorpusSentinels(
+        frag_id="frag-corpus-intimate-8c4f",
+        title="TITLE-INTIMATE-8c4f",
+        body="BODY-INTIMATE-6b29",
+    ),
+}
+
+_SOURCES_MARKER = "SOURCE FRAGMENTS:\n"
+_ENTRY_MARKER = "\n\nENTRY:\n"
+
+
+def _source_section(prompt: str) -> str:
+    """Return only the ``SOURCE FRAGMENTS`` block of *prompt*.
+
+    **Every grounding assertion in this section runs against this slice, never
+    against the raw prompt**, and both directions of that matter:
+
+    * a bare ``title in prompt`` can pass off the ``ENTRY:`` block (or the
+      schema preamble) and report grounding that never happened;
+    * a bare ``body not in prompt`` can fail off the ``ENTRY:`` block whenever
+      the entry legitimately quotes the same words.
+
+    Slicing first makes each assertion mean what it says. The one deliberate
+    exception is :func:`_assert_tier_left_no_trace`, which asserts *absence*
+    from the whole prompt — nothing above the ceiling may reach the provider by
+    any route, grounding block or not.
+
+    Args:
+        prompt: The full prompt recorded by :class:`_RecordingFactory`.
+
+    Returns:
+        The text between the ``SOURCE FRAGMENTS:`` header and the ``ENTRY:``
+        header — ``"(none)"`` when the grounding list was empty.
+    """
+    assert _SOURCES_MARKER in prompt, "prompt carries no SOURCE FRAGMENTS block"
+    after = prompt.split(_SOURCES_MARKER, 1)[1]
+    assert _ENTRY_MARKER in after, "SOURCE FRAGMENTS block is never terminated"
+    return after.split(_ENTRY_MARKER, 1)[0]
+
+
+def _write_corpus_fragment(
+    vault: Path,
+    *,
+    frag_id: str,
+    title: str,
+    body: str,
+    privacy_tier: str,
+) -> None:
+    """Write a fragment the *retrieval corpus* can actually see.
+
+    **Do not "de-duplicate" this against :func:`_write_fragment`.** They look
+    alike and are not interchangeable. ``_write_fragment`` writes only ``id``
+    and ``privacy_tier``, which is all an ``entry_ref`` lookup needs — that path
+    reads front matter directly. Corpus retrieval goes through
+    ``creek.vault.reader.try_load_fragment``, which returns ``None`` for any
+    file without ``type: fragment`` and for anything the ``Fragment`` model
+    rejects. A ``_write_fragment`` file is therefore **invisible** to
+    ``_load_corpus``, so a grounding test built on it would run against an empty
+    corpus and pass vacuously — the exact false green that let #964 sit
+    undetected. This writer mirrors the full, model-valid recipe instead.
+
+    Args:
+        vault: Vault root as created by :func:`_vault`.
+        frag_id: The fragment ``id`` (also the file stem).
+        title: The fragment ``title`` — what ``_fragment_claim`` turns into an
+            ``EvidenceClaim.claim``, i.e. what grounding is made of.
+        body: The markdown body, which grounding must *not* carry.
+        privacy_tier: The ``privacy_tier`` front-matter value.
+    """
+    stamp = datetime(2026, 5, 1, tzinfo=UTC).isoformat()
+    metadata: dict[str, Any] = {
+        "type": "fragment",
+        "id": frag_id,
+        "title": title,
+        "created": stamp,
+        "ingested": stamp,
+        "source": {"platform": "journal", "author": "self"},
+        "frequency": {"primary": "F1", "secondary": []},
+        "privacy_tier": privacy_tier,
+        "eddies": [],
+    }
+    target = vault / "01-Fragments" / "Notes" / f"{frag_id}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        frontmatter.dumps(frontmatter.Post(content=body, **metadata)),
+        encoding="utf-8",
+    )
+
+
+def _write_tiered_corpus(vault: Path) -> None:
+    """Write every :data:`_CORPUS` fixture — one fragment per privacy tier.
+
+    Args:
+        vault: Vault root as created by :func:`_vault`.
+    """
+    for tier, sentinels in _CORPUS.items():
+        _write_corpus_fragment(
+            vault,
+            frag_id=sentinels.frag_id,
+            title=sentinels.title,
+            body=sentinels.body,
+            privacy_tier=tier,
+        )
+
+
+def _tiers_grounded_in(prompt: str) -> set[str]:
+    """Return the tiers whose corpus fixture reached *prompt*'s grounding block.
+
+    ORDERING HAZARD, and why this returns a *set*. The conftest's autouse
+    sentence-transformer mock seeds each vector from ``hash(text)``, which
+    Python randomises per process, so the similarity ranking of these fixtures
+    differs run to run. Nothing here may assert on order or index; membership is
+    the only stable observable. It is also the one that matters: the contract is
+    *which* fragments are admitted, not what order they came back in.
+
+    Args:
+        prompt: The full prompt recorded by :class:`_RecordingFactory`.
+
+    Returns:
+        The subset of :data:`_CORPUS` keys whose ``title`` appears in the
+        grounding block.
+    """
+    sources = _source_section(prompt)
+    return {tier for tier, marks in _CORPUS.items() if marks.title in sources}
+
+
+def _assert_tier_left_no_trace(prompt: str, tier: str) -> None:
+    """Assert nothing of the *tier* corpus fixture appears anywhere in *prompt*.
+
+    Checked against the **whole** prompt rather than :func:`_source_section`,
+    unlike every positive assertion here. An above-ceiling fragment crossing to
+    the provider is a leak wherever in the prompt it lands, so restricting this
+    to the grounding block would let a future "helpful context" section egress
+    it while the suite stayed green.
+
+    All three markers are checked because they fail differently: a *title* means
+    the ceiling filter admitted the fragment outright, a *body* means grounding
+    switched from titles to bodies (the design question #964 settles), and an
+    *id* means attribution metadata leaked without any prose to explain it.
+
+    Args:
+        prompt: The full prompt recorded by :class:`_RecordingFactory`.
+        tier: The :data:`_CORPUS` key that must be absent.
+    """
+    marks = _CORPUS[tier]
+    assert marks.title not in prompt, f"{tier} fragment title reached the model"
+    assert marks.body not in prompt, f"{tier} fragment body reached the model"
+    assert marks.frag_id not in prompt, f"{tier} fragment id reached the model"
+
+
+def _patch_gather_to_raise(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
+    """Make every :meth:`RetrievalSpecialist.gather` call raise *exc*.
+
+    Patches the class attribute rather than the module binding because
+    ``_default_retrieve`` imports ``RetrievalSpecialist`` lazily *inside* its own
+    body: it resolves the same class object this patch mutates, so the
+    substitution is picked up without reaching into the tool's import machinery.
+
+    Args:
+        monkeypatch: The builtin pytest fixture; restores the real ``gather``.
+        exc: The exception instance every ``gather`` call raises.
+    """
+
+    def _raise(*args: Any, **kwargs: Any) -> EvidenceBundle:
+        """Raise *exc* instead of gathering evidence."""
+        raise exc
+
+    monkeypatch.setattr(RetrievalSpecialist, "gather", _raise)
+
+
+def test_default_grounding_feeds_fragment_titles_not_bodies(tmp_path: Path) -> None:
+    """The production grounder retrieves, and what it retrieves is titles (#964).
+
+    The anti-vacuity test for this whole section, and the direct regression for
+    #964: ``_default_retrieve`` read ``claim.text`` off an ``EvidenceClaim``
+    that carries ``claim``, so it raised ``AttributeError`` into a bare
+    ``except`` and every production reflection was grounded on ``(none)``.
+    Nothing in the response shows that — only the prompt does.
+
+    Both halves are load-bearing. The grounding block must be the fragment's
+    **title**, asserted by exact equality so the rendering (``"- " + claim``)
+    is pinned rather than merely "the title is in there somewhere"; and the
+    fragment **body** must appear nowhere in the prompt at all, because
+    ``EvidenceClaim`` could just as easily have been made to carry body text,
+    and grounding on bodies would push whole corpus fragments to the provider on
+    every call.
+    """
+    vault = _vault(tmp_path)
+    marks = _CORPUS["open"]
+    _write_corpus_fragment(
+        vault,
+        frag_id=marks.frag_id,
+        title=marks.title,
+        body=marks.body,
+        privacy_tier="open",
+    )
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    result = reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "ok"
+    prompt = factory.prompt
+    assert prompt is not None
+    sources = _source_section(prompt)
+    assert sources != _NO_GROUNDING, "production grounding retrieved nothing (#964)"
+    assert sources == f"- {marks.title}"
+    assert marks.body not in prompt, "grounding carried the body, not the title"
+
+
+@pytest.mark.parametrize(
+    ("ceiling", "expected_tiers"),
+    [
+        (TierCeiling.OPEN, {"open"}),
+        (TierCeiling.PERSONAL, {"open", "personal", "unclassified"}),
+        (TierCeiling.INTIMATE, {"open", "personal", "unclassified", "intimate"}),
+        (TierCeiling.ALL, {"open", "personal", "unclassified", "intimate"}),
+    ],
+)
+def test_grounding_admits_exactly_the_within_ceiling_corpus(
+    tmp_path: Path, ceiling: TierCeiling, expected_tiers: set[str]
+) -> None:
+    """Production grounding admits the within-ceiling corpus — no more, no less.
+
+    Switching ``_default_retrieve`` on (#964) opens a *second* read path into
+    the vault, alongside the ``entry_ref`` resolution the #846 gate guards. This
+    one is not gated by tier at the tool: it relies entirely on the ceiling
+    being converted to a ``PrivacyTierOverride`` and handed to
+    ``RetrievalSpecialist.gather``, which drops above-override fragments inside
+    ``_load_corpus``. That is the only thing standing between an ``open``-ceiling
+    caller and the intimate half of their corpus, so it is pinned per ceiling.
+
+    Asserted as **set equality**, not as a leak check, so an *omission* fails as
+    loudly as a leak: a filter tightened to "open only" would silently strip
+    real grounding from every personal-tier caller, and a leak-only assertion
+    would call that a pass. The excluded fragments then get the stronger
+    whole-prompt check via :func:`_assert_tier_left_no_trace`.
+
+    ``ALL`` and ``INTIMATE`` deliberately share an expectation: ``ALL`` is a
+    ceiling, not a tier, and must not admit anything ``INTIMATE`` does not.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        ceiling: The caller's declared ceiling.
+        expected_tiers: The :data:`_CORPUS` keys whose titles must ground the
+            prompt at *ceiling* — exactly those, and no others.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=factory,
+        privacy_tier_ceiling=ceiling,
+    )
+    prompt = factory.prompt
+    assert prompt is not None
+    assert _tiers_grounded_in(prompt) == expected_tiers
+    for tier in _CORPUS:
+        if tier not in expected_tiers:
+            _assert_tier_left_no_trace(prompt, tier)
+
+
+@pytest.mark.parametrize(
+    ("ceiling", "expected_routed"),
+    [
+        (TierCeiling.OPEN, PrivacyTier.OPEN),
+        (TierCeiling.PERSONAL, PrivacyTier.PERSONAL),
+        (TierCeiling.INTIMATE, PrivacyTier.INTIMATE),
+        (TierCeiling.ALL, PrivacyTier.INTIMATE),
+    ],
+)
+def test_routing_tier_dominates_every_retrieved_fragment_tier(
+    tmp_path: Path, ceiling: TierCeiling, expected_routed: PrivacyTier
+) -> None:
+    """Whatever grounding pulled in, the routing tier is at least as sensitive.
+
+    This is the INTIMATE-never-egresses guarantee restated for the read path
+    #964 switches on. Retrieval widens what crosses to the provider from "the
+    caller's own entry" to "titles drawn from their corpus", so the routing tier
+    must dominate the most sensitive fragment *actually retrieved* — otherwise a
+    ceiling that admits intimate fragments into grounding while routing at a
+    cloud-eligible tier would egress them.
+
+    Two assertions, deliberately redundant, because each catches what the other
+    cannot:
+
+    (a) the hard-coded expected :class:`PrivacyTier` per ceiling, which fails if
+        ``_CEILING_ROUTING_TIER`` is ever retuned — the table is a policy
+        decision and a silent change to it must not pass;
+    (b) the inequality itself, derived from the tiers whose titles actually
+        reached the prompt rather than restated from the table above, so it
+        still holds if a *new* tier is added to the vocabulary and the fixtures
+        grow to match, and it fails if the admission filter and the routing
+        table ever drift apart.
+
+    (b) would be vacuous over an empty retrieval set — which is precisely the
+    #964 state — so a non-empty grounding set is asserted first.
+
+    Args:
+        tmp_path: pytest's per-test temporary directory.
+        ceiling: The caller's declared ceiling.
+        expected_routed: The tier the factory must be asked for.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=factory,
+        privacy_tier_ceiling=ceiling,
+    )
+    asked = factory.asked_tier
+    assert asked is not None, "the model was never reached"
+    assert asked is expected_routed
+    prompt = factory.prompt
+    assert prompt is not None
+    grounded = _tiers_grounded_in(prompt)
+    assert grounded, "no grounding reached the prompt (#964): (b) would be vacuous"
+    assert tier_ceiling.tier_sensitivity(asked) >= max(
+        tier_ceiling.tier_sensitivity(PrivacyTier(tier)) for tier in grounded
+    )
+
+
+def test_above_ceiling_fragment_contributes_nothing_not_even_a_title(
+    tmp_path: Path,
+) -> None:
+    """An intimate corpus fragment leaves no residue at an ``open`` ceiling.
+
+    Distinct from the residue #931/#1032 found on the compile/structural paths,
+    and the distinction is structural rather than lucky. Those paths run
+    ``filter_fragments_by_tier``, which *keeps* an above-ceiling fragment as a
+    summarised stub — so its title survives by design and the leak is the
+    surviving stub. Grounding retrieval does not go near that: ``_load_corpus``
+    applies ``tier_within_override``, a hard rank cutoff that drops the record
+    entirely before ranking, so there is no summarise-the-body step and nothing
+    can survive it. This test pins that *by construction* property, so a future
+    "reuse the compile filter here for consistency" refactor — which would look
+    like a tidy-up and would import the residue wholesale — fails loudly.
+
+    The ``open`` fragment is not decoration: it is the control that proves
+    grounding ran at all. Without it the intimate absences would hold trivially
+    under the #964 bug, and the test would be a permanent false green.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    prompt = factory.prompt
+    assert prompt is not None
+    # The control: grounding really ran, so the absences below mean something.
+    assert _CORPUS["open"].title in _source_section(prompt)
+    _assert_tier_left_no_trace(prompt, "intimate")
+
+
+def test_retrieval_failure_degrades_to_no_grounding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retrieval failure costs the reflection its grounding, not its answer.
+
+    Grounding is an enhancement; the entry is the subject. A corpus whose
+    embedding model is missing, whose cache is corrupt, or whose fragments fail
+    to load must not turn an ordinary journal reflection into a refusal — so
+    ``_default_retrieve`` swallows the failure and returns no snippets.
+
+    Pinned on both sides: the envelope is a normal ``ok`` (never ``refused``),
+    *and* the grounding block is exactly ``(none)``. The second half is what
+    stops a future "degrade to whatever we had" from shipping partial or stale
+    grounding out of a half-failed retrieval.
+
+    That broad ``except`` is also what hid #964 for the entire life of the
+    feature, which is why the degradation must stay observable — see
+    :func:`test_retrieval_failure_logs_the_exception_type_not_its_message`.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    _patch_gather_to_raise(monkeypatch, RuntimeError("embedding backend unavailable"))
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    result = reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+    assert result["status"] == "ok"
+    assert result["notes"][0]["quote"] == _GROUNDED_QUOTE
+    prompt = factory.prompt
+    assert prompt is not None
+    assert _source_section(prompt) == _NO_GROUNDING
+
+
+def test_retrieval_failure_logs_the_exception_type_not_its_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The silent degradation must leave a trace — a *type name*, never a message.
+
+    #964 is a bug that ran in production for the whole life of the feature
+    precisely because ``except Exception: return []`` says nothing. Every
+    reflection was ungrounded and no operator could tell. A DEBUG line naming
+    the exception type is what makes the next such failure findable.
+
+    Naming only ``type(exc).__name__`` is not fastidiousness, it is the same
+    rule ``_resolve_entry`` already follows at ``reflect.py:326-331``:
+    ``yaml.MarkedYAMLError`` stringifies *with the offending source snippet*, so
+    ``str(exc)``, ``exc_info=True`` or ``logger.exception`` would write
+    tier-unknown vault content into a log file that carries no tier and is not
+    covered by the ceiling. The failure paths here are the same corpus files, so
+    the same rule applies — and a retrieval exception can just as easily carry a
+    fragment's text in its message.
+
+    Asserted both ways round: the type name must be present (a silent swallow
+    fails) and the message sentinel absent (a chatty log fails).
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    _patch_gather_to_raise(monkeypatch, RuntimeError(_RETRIEVAL_FAILURE_SENTINEL))
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    with caplog.at_level(logging.DEBUG, logger="creek_mcp.tools.reflect"):
+        result = reflect_tool(
+            vault_path=vault,
+            content=_ENTRY,
+            llm_factory=factory,
+            privacy_tier_ceiling=TierCeiling.PERSONAL,
+        )
+    assert result["status"] == "ok"
+    assert "RuntimeError" in caplog.text, "the degradation was swallowed silently"
+    assert _RETRIEVAL_FAILURE_SENTINEL not in caplog.text, "exception message logged"
+
+
+def test_injected_retrieve_bypasses_the_default_grounder(tmp_path: Path) -> None:
+    """An injected ``retrieve=`` still wins outright over the default grounder.
+
+    The seam every other test in this file depends on. ``reflect_tool`` picks
+    ``_default_retrieve`` only when ``retrieve is None``, and switching the
+    default on (#964) is exactly the change that could turn that into a merge —
+    grounding from both sources — without any existing test noticing, since they
+    all run against empty vaults where the default contributes nothing anyway.
+
+    Asserted with a populated corpus, so "the default did not also run" is a
+    real observation rather than a tautology, and by exact equality on the
+    grounding block: the injected snippet is not merely *present*, it is the
+    *only* thing there.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    calls: list[str] = []
+
+    def _stub_retrieve(query: str, vault_arg: Path, override: object) -> list[str]:
+        """Record the call and return one sentinel grounding snippet."""
+        del vault_arg, override
+        calls.append(query)
+        return [_INJECTED_SNIPPET]
+
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=factory,
+        retrieve=_stub_retrieve,
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    assert calls == [_ENTRY]
+    prompt = factory.prompt
+    assert prompt is not None
+    assert _source_section(prompt) == f"- {_INJECTED_SNIPPET}"
+    assert _tiers_grounded_in(prompt) == set()
+
+
+# ---------------------------------------------------------------------------
+# The compiled layer: related_praxis / related_eddies (#873)
+# ---------------------------------------------------------------------------
+#
+# Additive and optional, and the tests below are ordered by stakes: the ceiling
+# first (a compiled page is synthesised from fragments the caller may not be
+# entitled to, so it is the laundering surface), then absence-when-nothing-
+# qualifies (a pre-#873 consumer's parse must not change), then the seam.
+
+_EDDY_873 = "Rest and Ruin"
+_PRAXIS_873 = "Rest before the collapse"
+
+
+def _write_compiled_layer(vault: Path, *, member_tier: str) -> str:
+    """Write an eddy + praxis compiled from one ``open`` and one *member_tier* fragment.
+
+    Args:
+        vault: Vault root.
+        member_tier: The ``privacy_tier`` of the *second* contributor. The
+            entry the caller reflects on is always the ``open`` one, so this is
+            the only thing that varies between the admitted and withheld cases.
+
+    Returns:
+        The ``entry_ref`` of the ``open`` fragment.
+    """
+    entry_ref = "frag-873open0001"
+    other = "frag-873other001"
+    link = f"[[{_EDDY_873}]]"
+    for frag_id, tier in ((entry_ref, "open"), (other, member_tier)):
+        directory = vault / "01-Fragments" / "Notes"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{frag_id}.md").write_text(
+            "---\ntype: fragment\n"
+            f"id: {frag_id}\ntitle: {frag_id}\nsource:\n  platform: journal\n"
+            f"privacy_tier: {tier}\n"
+            f'eddies:\n  - "{link}"\n---\n\n{_ENTRY}\n'
+        )
+    eddies = vault / "03-Eddies"
+    eddies.mkdir(parents=True, exist_ok=True)
+    (eddies / "eddy.md").write_text(
+        "---\ntype: eddy\nid: eddy-0000000001\n"
+        f"title: {_EDDY_873}\nformed: 2026-03-04\nfragment_count: 2\n"
+        "description: Where rest and ruin keep meeting.\n---\n\nSummary.\n"
+    )
+    praxis = vault / "04-Praxis" / "Daily"
+    praxis.mkdir(parents=True, exist_ok=True)
+    (praxis / "praxis.md").write_text(
+        "---\ntype: praxis\nid: prax-0000000001\n"
+        f"title: {_PRAXIS_873}\npraxis_type: practice\nstatus: active\n"
+        f"derived_from:\n  - {entry_ref}\n  - {other}\n---\n\nRest is the practice.\n"
+    )
+    return entry_ref
+
+
+def _reflect_with_compiled_layer(
+    vault: Path, entry_ref: str, ceiling: TierCeiling
+) -> dict[str, Any]:
+    """Run ``reflect_tool`` against the real compiled-layer lookup."""
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    return reflect_tool(
+        vault_path=vault,
+        entry_ref=entry_ref,
+        llm_factory=factory,
+        # Injected so this test needs no embedding stack. The entry's own
+        # ``entry_ref`` still seeds the compiled-layer lookup, so the
+        # production ``related_compiled`` really runs -- this does not quietly
+        # become a test of the injected path.
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=ceiling,
+    )
+
+
+def test_compiled_pages_reach_a_caller_admitted_to_every_contributor(
+    tmp_path: Path,
+) -> None:
+    """The control: an all-``open`` eddy and praxis are published at ``open``.
+
+    Without this, every withholding assertion below could be explained by the
+    feature simply never firing.
+    """
+    vault = _vault(tmp_path)
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+
+    result = _reflect_with_compiled_layer(vault, entry_ref, TierCeiling.OPEN)
+
+    assert [row["title"] for row in result["related_eddies"]] == [_EDDY_873]
+    assert [row["title"] for row in result["related_praxis"]] == [_PRAXIS_873]
+
+
+@pytest.mark.parametrize(
+    ("ceiling", "member_tier"),
+    [
+        (TierCeiling.OPEN, "personal"),
+        (TierCeiling.OPEN, "intimate"),
+        (TierCeiling.PERSONAL, "intimate"),
+    ],
+    ids=["personal@open", "intimate@open", "intimate@personal"],
+)
+def test_a_page_compiled_above_the_ceiling_never_reaches_the_response(
+    tmp_path: Path, ceiling: TierCeiling, member_tier: str
+) -> None:
+    """One above-ceiling contributor withholds the whole compiled page.
+
+    Asserted at the **narrowest** ceiling that can fail — ``personal`` content
+    refused an ``open``-ceiling caller — rather than at a permissive one where
+    nothing would have been filtered and the assertion would pass against
+    unfixed code. The remote cap
+    (:data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS`) means these two
+    ceilings are the only ones a network consumer can ever declare, so this is
+    the whole reachable surface for Adepthood.
+    """
+    vault = _vault(tmp_path)
+    entry_ref = _write_compiled_layer(vault, member_tier=member_tier)
+
+    result = _reflect_with_compiled_layer(vault, entry_ref, ceiling)
+
+    assert "related_eddies" not in result
+    assert "related_praxis" not in result
+    # The *whole* response, not just those two keys: a leak that renamed the
+    # field, or folded the description into the notes, would still be a leak.
+    assert "Where rest and ruin keep meeting" not in json.dumps(result)
+    assert _PRAXIS_873 not in json.dumps(result)
+
+
+def test_the_fields_are_absent_not_empty_when_nothing_qualifies(
+    tmp_path: Path,
+) -> None:
+    """A pre-#873 consumer's parse is unchanged when the vault has no matches.
+
+    ``absent`` rather than ``present-and-empty`` is the whole compatibility
+    claim: a consumer validating the older closed shape sees no new key at all.
+    """
+    vault = _vault(tmp_path)
+    _write_fragment(vault, "frag-873lonely01", _ENTRY, tier="open")
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+
+    result = reflect_tool(
+        vault_path=vault,
+        entry_ref="frag-873lonely01",
+        llm_factory=factory,
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "ok"
+    assert "related_praxis" not in result
+    assert "related_eddies" not in result
+    assert set(result) == {
+        "status",
+        "tool",
+        "tier_ceiling",
+        "routed_tier",
+        "notes",
+        "essay_grounded",
+    }
+
+
+def test_a_refused_entry_carries_no_compiled_layer(tmp_path: Path) -> None:
+    """The #846 read gate still short-circuits everything below it.
+
+    The compiled-layer lookup must not become a way around the gate: an
+    unadmitted ``entry_ref`` gets the four-key refusal and nothing else.
+    """
+    vault = _vault(tmp_path)
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+    (vault / "01-Fragments" / "Notes" / f"{entry_ref}.md").write_text(
+        "---\ntype: fragment\n"
+        f"id: {entry_ref}\ntitle: t\nsource:\n  platform: journal\n"
+        "privacy_tier: intimate\n---\n\nbody\n"
+    )
+    factory = _RecordingFactory(_notes_payload())
+
+    result = reflect_tool(
+        vault_path=vault,
+        entry_ref=entry_ref,
+        llm_factory=factory,
+        retrieve=_no_retrieval,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "refused"
+    assert set(result) == {"status", "tool", "tier_ceiling", "reason"}
+
+
+def test_an_escalation_carries_no_compiled_layer(tmp_path: Path) -> None:
+    """A care escalation is care and nothing else -- no enrichment rides along."""
+    vault = _vault(tmp_path)
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+    factory = _RecordingFactory(_notes_payload())
+
+    result = reflect_tool(
+        vault_path=vault,
+        entry_ref=entry_ref,
+        llm_factory=factory,
+        retrieve=_no_retrieval,
+        care_guard=lambda _entry: "acute_distress",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "escalate"
+    assert "related_praxis" not in result
+    assert "related_eddies" not in result
+
+
+def test_a_failing_compiled_lookup_does_not_veto_the_reflection(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Enrichment may subtract itself; it may never take down the answer.
+
+    The failure mode this pins is the one that keeps recurring in this repo: a
+    tidy-up or enrichment step that raises and vetoes the operation it was
+    meant to decorate. The reflection was already produced by the time this
+    runs, so a raising lookup must cost only the optional fields.
+    """
+    vault = _vault(tmp_path)
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+
+    def _exploding(seeds: object, vault_arg: object, ceiling: object) -> object:
+        """Raise the way a corrupt vault page might."""
+        del seeds, vault_arg, ceiling
+        raise TypeError("keywords must be strings")
+
+    with caplog.at_level(logging.DEBUG, logger="creek_mcp.tools.reflect"):
+        result = reflect_tool(
+            vault_path=vault,
+            entry_ref=entry_ref,
+            llm_factory=factory,
+            retrieve=_no_retrieval,
+            related_lookup=_exploding,  # type: ignore[arg-type]
+            privacy_tier_ceiling=TierCeiling.OPEN,
+        )
+
+    assert result["status"] == "ok"
+    assert result["notes"], "the reflection itself was lost to an enrichment failure"
+    assert "related_praxis" not in result
+    assert "TypeError" in caplog.text
+    assert "keywords must be strings" not in caplog.text
+
+
+def test_the_entry_ref_seeds_the_compiled_lookup(tmp_path: Path) -> None:
+    """The reflected entry's own id is what selects its compiled neighbours.
+
+    Also pins the negative half: raw inline ``content`` has no vault identity,
+    so it contributes no seed and (with an injected grounder) selects nothing.
+    """
+    vault = _vault(tmp_path)
+    _write_fragment(vault, "frag-873seed0001", _ENTRY, tier="open")
+    seen: list[list[str]] = []
+
+    def _record(seeds, vault_arg, ceiling):
+        """Record the seeds handed to the lookup."""
+        del vault_arg, ceiling
+        seen.append(list(seeds))
+        return RelatedCompiled([], [])
+
+    factory = _RecordingFactory(_notes_payload())
+    reflect_tool(
+        vault_path=vault,
+        entry_ref="frag-873seed0001",
+        llm_factory=factory,
+        retrieve=_no_retrieval,
+        related_lookup=_record,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=_RecordingFactory(_notes_payload()),
+        retrieve=_no_retrieval,
+        related_lookup=_record,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    # Both sources supplied: ``content`` wins, so the reflected text is not the
+    # fragment named by ``entry_ref`` and that id never passed the #846 gate.
+    # It must not be seeded either -- a caller must not be able to point the
+    # selection at an arbitrary id by naming it alongside their own text.
+    reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        entry_ref="frag-873seed0001",
+        llm_factory=_RecordingFactory(_notes_payload()),
+        retrieve=_no_retrieval,
+        related_lookup=_record,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert seen == [["frag-873seed0001"], [], []]
+
+
+def test_the_default_grounder_carries_its_fragment_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One retrieval pass yields both the titles and the ids behind them.
+
+    #873 forbids a second embedding sweep on the hot path, so the compiled
+    layer has to be selected from the ids the grounding pass already resolved.
+    ``EvidenceClaim.source_fragments`` always carried them; before this they
+    were dropped on the floor.
+    """
+    from creek.author.models import EvidenceBundle as _Bundle
+    from creek.author.models import EvidenceClaim as _Claim
+    from creek_mcp.tools.reflect import _default_retrieve
+
+    def _fake_gather(
+        _self: object, _query: str, _vault: Path, *, override: object
+    ) -> EvidenceBundle:
+        """Return one claim carrying its source fragment ids."""
+        del override
+        return _Bundle(
+            claims=[_Claim(claim="A title", source_fragments=["frag-a", "frag-b"])]
+        )
+
+    monkeypatch.setattr(RetrievalSpecialist, "gather", _fake_gather)
+
+    grounding = _default_retrieve(
+        _ENTRY, _vault(tmp_path), to_privacy_override(TierCeiling.OPEN)
+    )
+
+    assert grounding.lines == ["A title"]
+    assert grounding.source_ids == ["frag-a", "frag-b"]
+
+
+def test_a_retrieval_seed_alone_selects_the_compiled_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A page reachable only through retrieval is still selected.
+
+    ``seeds = from_entry + retrieved_ids`` composes two independent sources,
+    and until this test only the ``entry_ref`` half was observed: every other
+    test that asserts ``related_*`` injects ``retrieve=``, and an injected
+    grounder contributes no ids by design. Mutating the line to
+    ``seeds = from_entry`` therefore left the whole suite green — the
+    retrieval-seeded half of selection was never exercised.
+
+    Here the request carries inline ``content`` and **no** ``entry_ref``, so
+    ``from_entry`` is empty by construction and the only way the eddy and
+    praxis can be found is through the ids the grounding pass resolved.
+    """
+    from creek.author.models import EvidenceBundle as _Bundle
+    from creek.author.models import EvidenceClaim as _Claim
+
+    vault = _vault(tmp_path)
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+
+    def _fake_gather(
+        _self: object, _query: str, _vault: Path, *, override: object
+    ) -> EvidenceBundle:
+        """Ground on the fragment the compiled pages were built from."""
+        del override
+        return _Bundle(claims=[_Claim(claim="A title", source_fragments=[entry_ref])])
+
+    monkeypatch.setattr(RetrievalSpecialist, "gather", _fake_gather)
+
+    factory = _RecordingFactory(
+        _notes_payload({"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"})
+    )
+    result = reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        llm_factory=factory,
+    )
+
+    assert result.get("status") != "refused", result
+    assert [row["title"] for row in result["related_praxis"]] == [_PRAXIS_873], result

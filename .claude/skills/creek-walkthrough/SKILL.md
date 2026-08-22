@@ -8,7 +8,7 @@ description: >-
   for guided onboarding. Claude runs every command FOR the user and narrates
   gently, one stage at a time, at the user's pace. The user only makes
   decisions and gives consent; they never read code, docs, or a README.
-  Do NOT use for implementing FEATs (use work-issue), debugging CI
+  Do NOT use for implementing FEATs (use stay-green), debugging CI
   (use ci-debugging), PR review (use comprehensive-pr-review), or when the
   user explicitly wants to read the docs themselves.
 ---

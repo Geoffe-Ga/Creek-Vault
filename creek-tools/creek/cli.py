@@ -8,55 +8,72 @@ import logging
 import os
 import re
 import sys
+import textwrap
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Final, Literal, NoReturn, cast, get_args
 
 import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+from creek._containment import EscapingSymlinkError, assert_source_contained
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     override_elevates,
     parse_include_tier,
     record_privacy_override,
 )
-from creek.config import AIStyleConfig, load_config, resolve_config_path
-from creek.consent import ConsentManager
+from creek.config import (
+    AIStyleConfig,
+    ClassificationConfig,
+    VoiceAudienceWeightingConfig,
+    load_config,
+    load_vault_config,
+)
+from creek.consent import ConsentLogUnavailableError, ConsentManager
 from creek.models import PraxisPotential, PrivacyTier
 from creek.pipeline import (
     Pipeline,
+    PipelineResult,
     RedactionRequiredError,
+    SymlinkEscapedSourceError,
     resolve_tier_a_plan,
     resolve_tier_b_plan,
 )
 from creek.save import SaveTarget
+from creek.surface_modes import LINK_METHODS, REPORT_TYPES
 
 logger = logging.getLogger(__name__)
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
+    from creek.author.conductor import VoiceClientFactory
+    from creek.author.models import AuthoredDraft
     from creek.classify.prompt import PromptOntology
     from creek.config import CreekConfig
     from creek.generate.ai_style.model import ScanReport, VoiceFingerprint
     from creek.generate.compost_embedding import CompostExemplar
+    from creek.generate.compost_scan import CompostScanResult
     from creek.generate.compost_verifier import SupportsVerifyCompost
     from creek.generate.drafts import (
         DraftGenerator,
         DraftLLM,
+        DraftLLMFactory,
         OntologyDetector,
         SeedSpec,
     )
     from creek.generate.mining import MiningRunReport
     from creek.ingest.base import Ingestor
     from creek.ingest.discord_dispatch import DiscordMode
+    from creek.ingest.gdrive import DownloadResult
+    from creek.ingest.pin_ids import PinResult
     from creek.link.link_engine import LinkSummary
-    from creek.models import CompileTargetKind, Fragment, Frequency, Mode, Phase
+    from creek.models import CompileTargetKind, Frequency, Mode, Phase
     from creek.purge import PurgeEngine, PurgeResult
 
 
@@ -64,6 +81,42 @@ _INCLUDE_TIER_HELP = (
     "Privacy-tier override: open, personal, intimate, or all. "
     "Default policy excludes intimate fragments and replaces personal "
     "bodies with title-only summaries. Elevated values are recorded in "
+    "<vault>/00-Creek-Meta/audit/privacy.jsonl."
+)
+
+_SKILLS_DEFAULT_CEILING_HINT = (
+    "[yellow]Personal and unclassified fragments contribute no exemplars at "
+    "the default ceiling; pass --include-tier personal to include them."
+    "[/yellow]"
+)
+"""Static remedy printed after an exemplar-bearing ``creek skills generate``
+at the default ceiling.
+
+Static rather than conditional on a survey of what was actually withheld: the
+CLI needs no such survey otherwise, and "you would have been told" only
+reassures when the line is unconditional. On an unclassified vault every
+fragment ranks with ``personal`` (#876), so the default ceiling yields 34 files
+of "no qualifying exemplars" placeholders — indistinguishable, without this
+line, from a broken command.
+
+The one condition it *is* gated on is ``--signature-only``, where the remedy
+would be false rather than merely redundant: that mode emits no exemplars at
+any ceiling, so widening the ceiling changes nothing (PR #1286 review).
+"""
+
+# ``report`` needs its own wording because the flag runs the other way here
+# (#968). Everywhere else ``--include-tier`` *widens* an already-restrictive
+# default; on ``report`` an absent flag means **unfiltered**, and the flag
+# narrows. That is the same reasoning already written at ``creek compile``
+# below: the CLI operator *is* the vault owner, so there is no caller
+# declaration to reconcile against and no ceiling to default to. Making an
+# absent flag mean ``open`` would silently delete most of an existing
+# operator's tag garden — a data-loss bug wearing a privacy fix's costume.
+_REPORT_INCLUDE_TIER_HELP = (
+    "Privacy-tier ceiling for the report's vault scan: open, personal, "
+    "intimate, or all. Omitting the flag leaves the scan unfiltered (the CLI "
+    "operator is the vault owner), so this flag NARROWS what the generated "
+    "artifact may contain. Elevated values are recorded in "
     "<vault>/00-Creek-Meta/audit/privacy.jsonl."
 )
 
@@ -115,6 +168,23 @@ app.add_typer(purge_app, name="purge")
 app.add_typer(skills_app, name="skills")
 app.add_typer(compost_app, name="compost")
 console = Console()
+
+_SOURCE_COVERAGE_SAMPLE: Final[int] = 10
+"""How many contested/unclaimed source paths ``creek process`` lists.
+
+The full lists live on :class:`~creek.pipeline.PipelineResult`; the
+summary only samples them so a large source tree cannot bury the rest of
+the report.
+"""
+
+_CRON_NOTICE_WIDTH: Final[int] = 74
+"""Wrap width for the ``--install-schedule`` cron-refusal prose.
+
+Wrapped here rather than by the console so every line keeps its ``#``
+comment marker: the block is meant to be read as one commented note, and
+a console-folded continuation line would lose the marker. 74 plus the
+four-character indent stays inside Rich's 80-column default.
+"""
 
 
 def _consent_log_dir(vault_path: Path) -> Path:
@@ -176,7 +246,7 @@ def _format_summary(file_count: int, size_bytes: int) -> str:
     return f"{file_count} file(s), {mb:.1f} MB"
 
 
-def _gate_consent(
+def _gate_consent_unguarded(
     *,
     source_path: Path,
     vault_path: Path,
@@ -204,7 +274,15 @@ def _gate_consent(
     Raises:
         typer.Exit: With code ``1`` when the operator declines, or
             when consent has not been recorded and the caller is
-            non-interactive without ``--yes``.
+            non-interactive without ``--yes``. With code ``2`` when
+            *source_path* does not exist.
+        ConsentLogUnavailableError: Propagated from the consent-log
+            read (``check_consent``) or write (``record_consent``)
+            when the log cannot be read or safely set aside. This
+            function deliberately does not handle it; the
+            :func:`_gate_consent` wrapper turns it into a legible
+            refusal so an unreadable log can never be mistaken for a
+            source the operator simply never approved.
     """
     log_dir = _consent_log_dir(vault_path)
     manager = ConsentManager(log_dir=log_dir)
@@ -258,6 +336,64 @@ def _gate_consent(
     )
     console.print("[green]Consent recorded.[/green]")
     return manager
+
+
+def _gate_consent(
+    *,
+    source_path: Path,
+    vault_path: Path,
+    source_type: str,
+    assume_yes: bool,
+) -> ConsentManager:
+    """Run the consent gate, refusing outright if the log is unreadable.
+
+    Thin guard around :func:`_gate_consent_unguarded`. A single handler
+    here covers every consent-log touch in that function — the
+    ``check_consent`` read and both ``record_consent`` writes — so the
+    gate's own branching stays within the complexity budget. It is
+    narrow on purpose: only :class:`ConsentLogUnavailableError` is
+    caught, leaving an unrelated ``OSError`` (e.g. from the source
+    summary's directory walk) free to propagate.
+
+    An unreadable consent log is not the same fact as an ungranted
+    source, and must not be reported as one. Exit code ``1`` marks the
+    refusal; code ``2`` stays reserved for usage errors such as a
+    missing source path.
+
+    Args:
+        source_path: Source directory the operator wants to ingest.
+        vault_path: Vault path used to locate the consent log.
+        source_type: Source identifier for the consent record (e.g.
+            ``"pipeline"``, ``"markdown"``).
+        assume_yes: When ``True``, skip the interactive prompt.
+
+    Returns:
+        A :class:`ConsentManager` rooted at the vault's processing log.
+
+    Raises:
+        typer.Exit: With code ``1`` when the consent log cannot be read
+            or written, and (passed through from the wrapped gate) when
+            the operator declines or the caller is non-interactive
+            without ``--yes``; with code ``2`` when *source_path* does
+            not exist.
+    """
+    try:
+        manager = _gate_consent_unguarded(
+            source_path=source_path,
+            vault_path=vault_path,
+            source_type=source_type,
+            assume_yes=assume_yes,
+        )
+    except ConsentLogUnavailableError as exc:
+        console.print(f"[red]Consent log unavailable: {exc}[/red]")
+        console.print(
+            "[red]Refusing to proceed: the consent record could not be read, "
+            "so this run cannot tell an ungranted source from a destroyed "
+            "record.[/red]"
+        )
+        raise typer.Exit(code=1) from exc
+    else:
+        return manager
 
 
 def _is_interactive() -> bool:
@@ -337,6 +473,40 @@ def _parse_since_arg(text: str) -> datetime:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
+def _print_advisory(message: str) -> None:
+    """Show one operator advisory on the console, as it is detected (#1329).
+
+    Advisories go to the same stdout console as every other advisory the
+    surrounding command prints, rather than to stderr: these commands' output
+    is human prose, not data on a pipe, and an advisory routed to a stream
+    none of its neighbours use is one an operator can lose.
+
+    The exit code is deliberately left alone. An advisory reports vault state
+    that will cause trouble later, not a failure of this run — and
+    ``creek sync`` shares the ingest path, so escalating would turn every
+    scheduled pass over an un-migrated vault into a hard failure.
+
+    ``escape`` and ``soft_wrap=True`` are load-bearing for the same reasons as
+    in :func:`_print_pin_findings`: the text carries paths and commands the
+    operator is meant to read or copy, and rich would otherwise be free to
+    wrap them across lines (or read a bracketed path as markup — a paradox
+    advisory names ``[[wikilink]]`` literally).
+
+    Args:
+        message: The advisory text from the pipeline that detected it.
+    """
+    console.print(f"[yellow]{escape(message)}[/yellow]", soft_wrap=True)
+
+
+def _print_ingest_warning(message: str) -> None:
+    """Show one ingest advisory to the operator, as it is detected (#1329).
+
+    Args:
+        message: The advisory text from the ingest pipeline.
+    """
+    _print_advisory(message)
+
+
 def _run_ingest(
     *,
     ingestor_cls: type[Ingestor],
@@ -371,6 +541,12 @@ def _run_ingest(
         list of human-readable strings prefixed with ``[<source_type>]`` and
         ``discovered`` is how many inputs the ingestor's ``discover()`` found.
 
+        Operator advisories are **not** in this tuple. They are printed by
+        :func:`_print_ingest_warning` the moment the pipeline detects them, so
+        every caller of this helper surfaces them without having to remember
+        to — which is what went wrong when the un-pinned-vault advisory was
+        left to a return value nobody read (#1329).
+
     Raises:
         typer.Exit: With code ``1`` when the vault cannot be opened.
     """
@@ -385,18 +561,63 @@ def _run_ingest(
             reclassify_threshold=reclassify_threshold,
             since=since,
             incremental=incremental,
+            on_warning=_print_ingest_warning,
         )
     except FileNotFoundError as exc:
         console.print(f"[red]Vault unavailable: {exc}[/red]")
         raise typer.Exit(code=1) from exc
+    except EscapingSymlinkError as exc:
+        console.print(f"[red]Symlink containment: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
 
     if print_summary:
+        # `unchanged` is printed beside the others, not appended after them
+        # (#1482). Without it the four numbers could all read zero on a run
+        # that wrote fragments, directly above "Ingested N fragment(s)." --
+        # `written` counts every successful write, and an unchanged write is
+        # still a write. The invariant the operator can now check by eye is
+        # `written == created + updated + unchanged`.
         console.print(
             f"[dim]Ingest summary: {result.created} created, "
-            f"{result.updated} updated, {result.tombed} tombed, "
-            f"{result.skipped} skipped[/dim]",
+            f"{result.updated} updated, {result.unchanged} unchanged, "
+            f"{result.tombed} tombed, {result.skipped} skipped[/dim]",
         )
     return result.written, result.errors, result.discovered
+
+
+def _assert_ingest_source_contained(source_path: Path) -> None:
+    """Refuse a source that links out of itself, before anything reads it.
+
+    Translates :class:`creek._containment.EscapingSymlinkError` into the
+    CLI's refusal idiom so a handler can call the gate early — above
+    ``_gate_consent`` — without letting a traceback reach the operator.
+
+    **Every** ``_gate_consent`` caller must call this first, and it is not
+    redundant with the gate inside ``Ingestor.ingest``. The consent prompt
+    runs ``creek/consent.py::_build_source_summary``, which walks
+    ``rglob("*")`` and ``stat()``s every entry — following an escaping link
+    and folding out-of-tree file counts and byte totals into the very
+    summary the operator is asked to approve. When ``--source`` is itself a
+    link to an outside directory, that walk enumerates the target directly
+    and prints real out-of-tree *filenames* in the ``Sample:`` line. Under
+    ``--yes`` the inflated ``file_count`` is then written into the consent
+    log, so the leak outlives the process and a later run reads the record
+    back and skips the prompt. A guard that sits only downstream blocks the
+    write and still performs that out-of-root read first (#1294).
+
+    Args:
+        source_path: The ``--input`` / ``--source`` path exactly as the
+            operator gave it.
+
+    Raises:
+        typer.Exit: With code ``1`` when *source_path* is, or contains, a
+            symlink whose target resolves outside it.
+    """
+    try:
+        assert_source_contained(source_path)
+    except EscapingSymlinkError as exc:
+        console.print(f"[red]Symlink containment: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
 
 
 def _warn_if_discovered_but_empty(
@@ -405,6 +626,7 @@ def _warn_if_discovered_but_empty(
     discovered: int,
     source_type: str,
     strict: bool,
+    label: str | None = None,
 ) -> None:
     """Warn (and optionally exit non-zero) when inputs parsed to 0 fragments.
 
@@ -413,14 +635,29 @@ def _warn_if_discovered_but_empty(
     inputs but none parsed, signalling an unrecognized format. ``--strict``
     turns the warning into a non-zero exit for pipelines/CI.
 
+    Args:
+        written: Fragments the ingest actually produced.
+        discovered: Inputs ``discover()`` found.
+        source_type: The ingestor type the run used.
+        strict: Whether to turn the warning into a non-zero exit.
+        label: What to call the run in the message, defaulting to
+            *source_type*. ``creek sync`` needs this because
+            :func:`creek.pipeline.sync_ingest_type` maps ``journal ->
+            markdown`` and ``essays -> substack``, so a line built from the
+            ingestor type alone announces "discovered 2 substack input(s)" —
+            a word that appears in neither the operator's ``sync.sources``
+            toggles nor the scheduler's argv, and unattributable to any one
+            source when a tick runs several.
+
     Raises:
         typer.Exit: With code ``1`` when *strict* and the condition holds.
     """
     if written > 0 or discovered == 0:
         return
     console.print(
-        f"[yellow]WARNING: discovered {discovered} {source_type} input(s) but "
-        "produced 0 fragments — the export format may be unrecognized.[/yellow]",
+        f"[yellow]WARNING: discovered {discovered} {label or source_type} "
+        "input(s) but produced 0 fragments — the export format may be "
+        "unrecognized.[/yellow]",
     )
     if strict:
         raise typer.Exit(code=1)
@@ -447,21 +684,95 @@ def _guard_vault_path(vault: Path, allow_in_repo: bool) -> None:
     )
 
 
+def _print_skill_drift_refusal(
+    labels: Sequence[str],
+    *,
+    verb: str,
+    remedy: str,
+    whole_deployment: bool,
+) -> None:
+    """Explain a refused canonical-skill deployment and the way past it.
+
+    ``creek skills sync`` and ``creek init`` reach the same destructive
+    primitive, so they owe the operator the same explanation (issue
+    #1306). Each label gets its own line: Rich hard-wraps at the console
+    width, and a path folded across a wrap is both unreadable and
+    unsearchable. The labels are vault-relative on purpose — the bare
+    filename this used to print could not tell
+    ``mediums/essay.MEDIUM.md`` apart from a top-level skill.
+
+    Both the verb and the suggested command are supplied by the caller
+    rather than derived here. Printing a fixed menu of escapes is how a
+    refusal ends up advising ``--refresh`` to someone who never typed
+    it — which for a plain ``creek init`` would also skip seeding
+    ``creek_config.yaml``, so the "fix" would quietly do less than the
+    command it replaced.
+
+    Args:
+        labels: Vault-relative paths of the drifted files, as
+            ``creek.scaffold.DriftedSkillsError.labels`` renders them.
+            Plain strings so this module needs no import of the
+            exception type (``creek.scaffold`` is imported lazily inside
+            the commands that use it).
+        verb: What this invocation was trying to do, for the first line.
+        remedy: The exact command to re-run, already ``--force``-bearing
+            and matching the flags the operator actually passed.
+        whole_deployment: Whether the refusal aborted more than the skill
+            tree. An explicit flag, not a test on *verb*: what the
+            operator is told must not depend on how a word was spelled.
+    """
+    console.print(
+        f"[red]Refusing to {verb}: local changes detected in "
+        f"{len(labels)} skill file(s):[/red]",
+        highlight=False,
+    )
+    for label in labels:
+        console.print(f"[red]  - {escape(label)}[/red]", highlight=False)
+    if whole_deployment:
+        # A drifted skill aborts the *whole* canonical deployment, not
+        # just the skill tree. Say so, or the operator is left guessing
+        # whether the ontology spec and AGENTS.md landed.
+        console.print(
+            "[red]Nothing at all was deployed: no folders, no ontology "
+            "spec, no AGENTS.md.[/red]",
+            highlight=False,
+        )
+    console.print(
+        "[yellow]Revert the edit, or re-run to overwrite it:\n"
+        f"  {escape(remedy)}[/yellow]",
+        highlight=False,
+    )
+    console.print(
+        "[dim]--force keeps your version alongside the canonical file as "
+        "<name>.bak, replacing anything already at that path; a later "
+        "--force overwrites it again.[/dim]",
+        highlight=False,
+    )
+
+
 @app.command()
 def init(
     vault: Path = typer.Option(..., "--vault", help="Vault root to initialise"),
     force: bool = typer.Option(
         False,
         "--force",
-        help="Overwrite an existing creek_config.yaml.",
+        help=(
+            "Overwrite an existing creek_config.yaml, and overwrite "
+            "locally-modified canonical skill files (your version is kept "
+            "alongside as <name>.bak; a later --force overwrites that "
+            "backup)."
+        ),
     ),
     refresh: bool = typer.Option(
         False,
         "--refresh",
         help=(
-            "Re-copy canonical templates (ontology, AGENTS.md, schema "
-            "skills, scaffold) into an existing vault. User data and "
-            "creek_config.yaml are preserved."
+            "Re-copy canonical material (folder scaffold, ontology spec, "
+            "AGENTS.md, schema skills, medium contracts) into an existing "
+            "vault without seeding a fresh creek_config.yaml. AGENTS.md is "
+            "always overwritten; a locally-edited skill or medium contract "
+            "makes the command refuse unless --force. User content "
+            "elsewhere in the vault is untouched."
         ),
     ),
     allow_in_repo: bool = typer.Option(
@@ -487,11 +798,19 @@ def init(
     By default ``creek init`` refuses to scaffold inside a git repo;
     pass ``--allow-in-repo`` to override.
 
-    ``--refresh`` re-copies canonical material into an existing vault
-    without touching user-edited content or ``creek_config.yaml``.
+    Every run — with or without ``--refresh`` — restores the canonical
+    material: the folder scaffold, the ontology spec, ``AGENTS.md``, the
+    schema skills and the medium contracts. ``AGENTS.md`` is *always*
+    overwritten; it is the machine-facing agent contract, not
+    operator-authored content. A locally-edited skill or medium contract
+    makes the command refuse outright — deploying nothing — unless
+    ``--force`` is passed, which keeps the operator's bytes alongside as
+    ``<name>.bak``. ``--refresh`` differs from a plain run only in that
+    it leaves ``creek_config.yaml`` alone instead of seeding a fresh
+    one. User content elsewhere in the vault is never touched.
     """
     from creek.config import generate_default_config
-    from creek.scaffold import deploy_canonical
+    from creek.scaffold import DriftedSkillsError, deploy_canonical
 
     _guard_vault_path(vault, allow_in_repo)
 
@@ -505,7 +824,21 @@ def init(
         )
         raise typer.Exit(code=1)
 
-    result = deploy_canonical(vault)
+    try:
+        result = deploy_canonical(vault, force=force)
+    except DriftedSkillsError as exc:
+        # Name the invocation the operator actually made. A plain ``creek
+        # init`` can reach here too (existing skills, deleted config), and
+        # telling that operator to re-run with ``--refresh`` would skip the
+        # ``generate_default_config`` step they were owed.
+        refresh_flag = " --refresh" if refresh else ""
+        _print_skill_drift_refusal(
+            exc.labels,
+            verb="refresh" if refresh else "initialise",
+            remedy=f"creek init --vault {vault}{refresh_flag} --force",
+            whole_deployment=True,
+        )
+        raise typer.Exit(code=1) from exc
 
     if not refresh:
         generate_default_config(config_path)
@@ -531,12 +864,43 @@ def _sync_state_path(vault_path: Path) -> Path:
     return vault_path / "00-Creek-Meta" / "State" / "sync" / "last-run.json"
 
 
+_MAX_RECORDED_FAILURES: Final = 5
+"""How many failure lines per source ``last-run.json`` stores.
+
+A revoked token or a quota wall fails *every* file in the folder, and this
+file is rewritten inside the operator's vault on every tick. The recorded
+``failure_count`` therefore stays exact — the number is never a lie — while
+the stored lines are a bounded sample.
+"""
+
+
+@dataclass(frozen=True)
+class SourceRunRecord:
+    """What one Tier-A source did this tick, beyond how much it ingested.
+
+    An ``ingested`` of zero is what a healthy quiet tick and a totally failed
+    one both look like, which is the whole of #1372. The failures are
+    already-rendered operator-readable strings rather than exceptions: they
+    are printed, JSON-serialised into ``last-run.json``, and read back by
+    ``creek sync --status``.
+
+    Attributes:
+        ingested: Fragments this source's ingest step wrote.
+        failures: One line per advisory the tick produced for this source,
+            each naming the step it came from (``pull:``, ``ingest:``,
+            ``skipped:``) so the operator knows where to look.
+    """
+
+    ingested: int = 0
+    failures: tuple[str, ...] = ()
+
+
 def _write_sync_state(
     vault_path: Path,
     tier: str,
     *,
     dry_run: bool,
-    source_counts: dict[str, int] | None = None,
+    source_records: dict[str, SourceRunRecord] | None = None,
 ) -> dict[str, object] | None:
     """Write the sync last-run state, returning the prior state if any (#676).
 
@@ -545,6 +909,13 @@ def _write_sync_state(
     records its last ``{tier, at, ingested}``. Sources untouched by this run
     keep their prior entry, so ``--status`` always reflects the latest run of
     each source.
+
+    Each touched source additionally records ``failures`` (a sample, capped at
+    :data:`_MAX_RECORDED_FAILURES`) and the exact ``failure_count`` (#1372).
+    Both keys are additive: every ``last-run.json`` already on disk predates
+    them, so readers must treat them as optional. A whole per-source entry is
+    assigned rather than merged into, so a clean re-run of a source clears the
+    failures it recorded last tick instead of accumulating them forever.
     """
     state_path = _sync_state_path(vault_path)
     prior: dict[str, object] | None = None
@@ -558,12 +929,74 @@ def _write_sync_state(
     prior_sources = prior.get("sources", {}) if isinstance(prior, dict) else {}
     # Guard against a corrupted file where "sources" is not a dict.
     sources = dict(prior_sources) if isinstance(prior_sources, dict) else {}
-    for name, ingested in (source_counts or {}).items():
-        sources[name] = {"tier": tier, "at": now, "ingested": ingested}
+    for name, record in (source_records or {}).items():
+        sources[name] = {
+            "tier": tier,
+            "at": now,
+            "ingested": record.ingested,
+            "failures": list(record.failures[:_MAX_RECORDED_FAILURES]),
+            "failure_count": len(record.failures),
+        }
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state = {"tier": tier, "at": now, "dry_run": dry_run, "sources": sources}
     state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
     return prior
+
+
+def _status_row(name: str, entry: object) -> tuple[str, ...]:
+    """Build one ``--status`` table row for source *name* from its entry.
+
+    ``last-run.json`` is plain JSON in a folder the operator can open and
+    edit, so every read here is defensive in the same way the surrounding
+    reader already is: a non-dict entry, a missing key, or a hand-mangled
+    ``"failure_count": "nope"`` degrades the cell rather than killing the
+    table an operator opened *because* they suspect something is wrong.
+
+    The count falls back to the length of ``failures`` before it falls back
+    to zero, so a pre-#1372 entry — which has neither key — reads as ``0``
+    while an entry written by a version that recorded only the lines still
+    reports them honestly.
+
+    Args:
+        name: The source name (the row's first cell).
+        entry: The recorded per-source block, of unverified shape.
+
+    Returns:
+        The row's cells, in the table's column order.
+    """
+    cells = entry if isinstance(entry, dict) else {}
+    failures = cells.get("failures")
+    count = cells.get("failure_count")
+    if not isinstance(count, int):
+        count = len(failures) if isinstance(failures, list) else 0
+    return (
+        name,
+        str(cells.get("tier", "")),
+        str(cells.get("at", "")),
+        str(cells.get("ingested", "")),
+        str(count),
+    )
+
+
+def _print_status_failures(sources: dict[str, object]) -> None:
+    """Print the failure lines the last tick recorded for each source (#1372).
+
+    The count in the table says only that something is wrong; these lines
+    name the file the operator now has to go and fetch by hand. Recorded
+    text is escaped because it carries remote-supplied file names, and an
+    unbalanced Rich tag inside one of them would otherwise abort the very
+    command being used to diagnose the failure.
+
+    Args:
+        sources: The ``sources`` block, source name -> recorded entry.
+    """
+    for name, entry in sorted(sources.items()):
+        cells = entry if isinstance(entry, dict) else {}
+        failures = cells.get("failures")
+        if not isinstance(failures, list):
+            continue
+        for line in failures:
+            console.print(f"[yellow]  {name}: {escape(str(line))}[/yellow]")
 
 
 def _sync_status(vault_path: Path) -> None:
@@ -585,16 +1018,11 @@ def _sync_status(vault_path: Path) -> None:
     if not isinstance(sources, dict) or not sources:
         console.print("[dim](no per-source runs recorded yet)[/dim]")
         return
-    table = Table("source", "last tier", "last run", "ingested")
+    table = Table("source", "last tier", "last run", "ingested", "failed")
     for name, entry in sorted(sources.items()):
-        cells = entry if isinstance(entry, dict) else {}
-        table.add_row(
-            name,
-            str(cells.get("tier", "")),
-            str(cells.get("at", "")),
-            str(cells.get("ingested", "")),
-        )
+        table.add_row(*_status_row(name, entry))
     console.print(table)
+    _print_status_failures(sources)
 
 
 def _sync_tier_a(
@@ -629,17 +1057,25 @@ def _sync_source_input(source: str, config: CreekConfig) -> Path | None:
     return config.source_drive / rel
 
 
-def _sync_pull(source: str, config: CreekConfig, _vault_path: Path) -> None:
-    """Pull a remote source into staging (Tier A, #678).
+def _sync_pull(source: str, config: CreekConfig, _vault_path: Path) -> tuple[str, ...]:
+    """Pull a remote source into staging; return what failed (Tier A, #678).
 
     Only Google Drive has a pull step today (it mirrors files into a local
     staging directory via the existing read-only downloader); local sources
     such as the journal are already on disk and no-op here. Connector
     generalisation is a later epic. (``_vault_path`` is unused but kept so all
     step helpers share a uniform ``(source, config, vault_path)`` shape.)
+
+    ``download_all`` records each per-file failure and keeps going, so the
+    return value is advisory, never fatal: the caller folds it into the
+    source's :class:`SourceRunRecord` and the tick still exits 0 (#1372).
+
+    Returns:
+        One line per thing this pull failed to fetch — empty when the pull
+        succeeded, was not applicable, or had nothing to do.
     """
     if source != "gdrive":
-        return
+        return ()
     from creek.ingest.gdrive import GoogleApiDriveClient, GoogleDriveDownloader
 
     client = GoogleApiDriveClient(config.google_drive)
@@ -648,18 +1084,57 @@ def _sync_pull(source: str, config: CreekConfig, _vault_path: Path) -> None:
             "[yellow][sync] Google Drive libraries unavailable; skipping pull."
             "[/yellow]",
         )
-        return
+        # Recorded, not merely printed: nothing was pulled, and an operator
+        # reading `--status` and believing their ingest is current is exactly
+        # the harm this issue exists to fix.
+        return ("pull: Google Drive libraries unavailable",)
     staging = config.source_drive / config.google_drive.staging_dir
-    GoogleDriveDownloader(client=client, config=config.google_drive).download_all(
-        staging,
-    )
+    result = GoogleDriveDownloader(
+        client=client, config=config.google_drive
+    ).download_all(staging)
+    for line in result.failure_lines:
+        # Escaped: the line leads with a remote-supplied file name, and an
+        # unbalanced Rich tag inside one would abort the whole tick.
+        detail = escape(line)
+        console.print(f"[yellow][sync] {source}: pull failed — {detail}[/yellow]")
+    return tuple(f"pull: {line}" for line in result.failure_lines)
 
 
-def _sync_ingest_source(source: str, config: CreekConfig, vault_path: Path) -> int:
-    """Incrementally ingest one Tier-A source; return the units processed (#678).
+def _render_source_errors(source: str, errors: Sequence[str]) -> tuple[str, ...]:
+    """Print one source's ingest errors the way ``creek ingest`` does (#1372).
 
-    Returns ``0`` when the source has no ingestor (e.g. gdrive) or its path is
-    missing — both are logged so a scheduled run's no-ops are diagnosable.
+    Same shape as the block at the end of :func:`ingest` — a count line, then
+    one dim line per error — but source-prefixed. The source name has to
+    travel with the errors because the strings are already prefixed with the
+    *ingestor* type (``[markdown]``), which is not the name the operator
+    toggled on in ``sync.sources`` and not what they see in the argv.
+
+    Args:
+        source: The configured source name this ingest ran for.
+        errors: The ingestor's per-input error strings.
+
+    Returns:
+        The same errors, prefixed for :class:`SourceRunRecord` — empty when
+        there were none.
+    """
+    if not errors:
+        return ()
+    console.print(f"[yellow][sync] {source}: {len(errors)} ingest error(s)[/yellow]")
+    for err in errors:
+        console.print(f"  [dim]{escape(err)}[/dim]")
+    return tuple(f"ingest: {err}" for err in errors)
+
+
+def _sync_ingest_source(
+    source: str, config: CreekConfig, vault_path: Path
+) -> SourceRunRecord:
+    """Incrementally ingest one Tier-A source; report what it did (#678/#1372).
+
+    Returns an empty record when the source has no ingestor (e.g. gdrive), and
+    a record carrying a failure line when its path is missing — a renamed
+    folder or an unmounted source drive is the most common way a schedule
+    silently stops ingesting, so it belongs in the durable record and not only
+    in a log nobody reads.
     """
     from creek.ingest import INGESTOR_REGISTRY
     from creek.pipeline import sync_ingest_type
@@ -667,7 +1142,7 @@ def _sync_ingest_source(source: str, config: CreekConfig, vault_path: Path) -> i
     ingest_type = sync_ingest_type(source)
     ingestor_cls = INGESTOR_REGISTRY.get(ingest_type)
     if ingestor_cls is None:
-        return 0  # e.g. gdrive is a downloader, not an ingestor
+        return SourceRunRecord()  # e.g. gdrive is a downloader, not an ingestor
     input_path = _sync_source_input(source, config)
     if input_path is None or not input_path.exists():
         console.print(
@@ -675,8 +1150,10 @@ def _sync_ingest_source(source: str, config: CreekConfig, vault_path: Path) -> i
             f"({input_path}).[/yellow]",
         )
         logger.info("sync.tier_a.skip source=%s reason=path-missing", source)
-        return 0
-    written, _errors, _discovered = _run_ingest(
+        return SourceRunRecord(
+            failures=(f"skipped: source path not found ({input_path})",),
+        )
+    written, errors, discovered = _run_ingest(
         ingestor_cls=ingestor_cls,
         source_type=ingest_type,
         input_path=input_path,
@@ -684,8 +1161,22 @@ def _sync_ingest_source(source: str, config: CreekConfig, vault_path: Path) -> i
         reclassify_threshold=config.classification.reclassify_on_edit_threshold,
         incremental=True,
     )
+    recorded = _render_source_errors(source, errors)
+    # There is no `creek sync --strict`, and there must not be one here by
+    # accident: `strict=True` raises `typer.Exit(1)`, which propagates out of
+    # `_sync_run_tier_a` and straight past the `_write_sync_state` call in
+    # `sync` — exactly the way the LLM-provider abort does. One unrecognized
+    # export would then both fail the launchd unit and destroy the record
+    # that the tick ran at all, which is the harm this issue exists to fix.
+    _warn_if_discovered_but_empty(
+        written=written,
+        discovered=discovered,
+        source_type=ingest_type,
+        label=f"{source} ({ingest_type})",
+        strict=False,
+    )
     logger.info("sync.tier_a.ingest source=%s ingested=%d", source, written)
-    return written
+    return SourceRunRecord(ingested=written, failures=recorded)
 
 
 def _sync_classify(vault_path: Path, config: CreekConfig, method: str) -> None:
@@ -713,20 +1204,28 @@ def _sync_run_tier_a(
     config: CreekConfig,
     vault_path: Path,
     sources: list[str],
-) -> dict[str, int]:
-    """Execute Tier A; return per-source ingested counts (#678/#680).
+) -> dict[str, SourceRunRecord]:
+    """Execute Tier A; return what each source did (#678/#680/#1372).
 
     Per source: pull + incremental ingest, then one rules-classify pass.
     Linking and indexing are **never** invoked here (R6: they are O(n²)/global
     and belong to Tier B).
+
+    A source's pull failures and its ingest failures are merged into one
+    record, in that order: they happened to the same source in the same tick,
+    and the operator reads ``last-run.json`` by source, not by step.
     """
-    counts: dict[str, int] = {}
+    records: dict[str, SourceRunRecord] = {}
     for source in sources:
-        _sync_pull(source, config, vault_path)
-        counts[source] = _sync_ingest_source(source, config, vault_path)
+        pull_failures = _sync_pull(source, config, vault_path)
+        record = _sync_ingest_source(source, config, vault_path)
+        records[source] = SourceRunRecord(
+            ingested=record.ingested,
+            failures=(*pull_failures, *record.failures),
+        )
     _sync_classify(vault_path, config, "rules")
     logger.info("sync.tier_a.done count=%d", len(sources))
-    return counts
+    return records
 
 
 def _sync_run_tier_b(config: CreekConfig, vault_path: Path) -> None:
@@ -744,11 +1243,11 @@ def _sync_dispatch(
     config: CreekConfig,
     vault_path: Path,
     source: str | None,
-) -> dict[str, int] | None:
-    """Echo (dry-run) or execute the chosen sync tier; return Tier-A counts.
+) -> dict[str, SourceRunRecord] | None:
+    """Echo (dry-run) or execute the chosen sync tier; return Tier-A records.
 
-    Returns the per-source ingested counts for a real Tier-A run (for the
-    status file), or ``None`` for dry-run / Tier-B runs.
+    Returns what each source did on a real Tier-A run (for the status file),
+    or ``None`` for dry-run / Tier-B runs.
     """
     if tier_norm == "A":
         if dry_run:
@@ -788,6 +1287,46 @@ def _install_launchd(
     console.print(f"# To activate: launchctl load {tier_a} && launchctl load {tier_b}")
 
 
+def _print_cron_alternative(vault_path: Path, minutes: int, hour: int) -> None:
+    """Print the equivalent crontab, or say honestly why there isn't one.
+
+    An irregular Tier-A cadence is a supported configuration, not a failure:
+    the systemd units written alongside this are correct. Only the cron *hint*
+    is unavailable, so this prints an explanation and the command still exits
+    0. No cron line at all is printed in that case — not even the correct
+    Tier-B one — because vixie rejects a crontab as a whole, so a half-file
+    pasted into ``crontab -e`` would install nothing.
+
+    Args:
+        vault_path: The vault the emitted commands target.
+        minutes: The configured Tier-A cadence, in minutes.
+        hour: The configured Tier-B nightly hour.
+    """
+    from creek.sync import UnrepresentableCadenceError, render_crontab
+
+    try:
+        cron = render_crontab(
+            vault=vault_path,
+            tier_a_minutes=minutes,
+            tier_b_hour=hour,
+        )
+    except UnrepresentableCadenceError as exc:
+        console.print("# No crontab is printed for this cadence:")
+        for line in textwrap.wrap(
+            str(exc),
+            width=_CRON_NOTICE_WIDTH,
+            break_on_hyphens=False,
+        ):
+            console.print(f"#   {line}")
+        console.print("#   The systemd timer above is monotonic instead:")
+        console.print("#   it keeps the interval, but ticks missed while the")
+        console.print("#   host was off get no catch-up.")
+    else:
+        console.print("# Or as cron (crontab -e):")
+        for line in cron.splitlines():
+            console.print(f"#   {line}")
+
+
 def _install_systemd(
     vault_path: Path,
     minutes: int,
@@ -795,7 +1334,7 @@ def _install_systemd(
     out_dir: Path | None,
 ) -> None:
     """Write systemd service+timer units (and print the cron alternative)."""
-    from creek.sync import render_crontab, render_systemd_units
+    from creek.sync import render_systemd_units
 
     units = render_systemd_units(
         vault=vault_path, tier_a_minutes=minutes, tier_b_hour=hour
@@ -810,14 +1349,14 @@ def _install_systemd(
     ):
         (base / fname).write_text(content, encoding="utf-8")
         console.print(f"# wrote {base / fname}")
+    # daemon-reload first: systemd caches a unit it previously refused to load,
+    # so re-installing over a broken timer looks like a no-op without it.
+    console.print("# To activate: systemctl --user daemon-reload")
     console.print(
-        "# To activate: systemctl --user enable --now "
+        "#   then: systemctl --user enable --now "
         "creek-sync-tier-a.timer creek-sync-tier-b.timer",
     )
-    console.print("# Or as cron (crontab -e):")
-    cron = render_crontab(vault=vault_path, tier_a_minutes=minutes, tier_b_hour=hour)
-    for line in cron.splitlines():
-        console.print(f"#   {line}")
+    _print_cron_alternative(vault_path, minutes, hour)
 
 
 def _install_schedule(host: str, vault: Path | None, out_dir: Path | None) -> None:
@@ -859,6 +1398,127 @@ def _sync_validate_source(
         raise typer.Exit(code=2)
 
 
+def _sync_tier_b_fragment_count(vault_path: Path) -> int:
+    """Count the fragments a Tier-B pass could bill an LLM call for (#1335).
+
+    An upper bound, not an invoice: the pass skips fragments that are already
+    classified (``force=False``), so the announcement says "up to".
+
+    Args:
+        vault_path: Vault root whose ``01-Fragments`` tree is measured.
+
+    Returns:
+        The number of fragment notes under ``01-Fragments``, or ``0`` when
+        that directory does not exist yet.
+    """
+    root = vault_path / "01-Fragments"
+    if not root.exists():
+        return 0
+    return sum(1 for _ in root.rglob("*.md"))
+
+
+def _sync_gate_tier_b(
+    tier_norm: str,
+    vault_path: Path,
+    *,
+    dry_run: bool,
+    assume_yes: bool,
+) -> None:
+    """Announce Tier B's cost and, at a TTY, confirm it before spending (#1335).
+
+    Only a real Tier-B pass is gated: Tier A is the cheap per-source chain and
+    a dry run spends nothing. The announcement is unconditional because a
+    scheduler log is the only place a nightly Tier-B pass is otherwise opaque;
+    the *confirmation* is TTY-gated because every unit
+    :mod:`creek.sync.schedule` installs invokes a bare
+    ``creek sync --tier B --vault <path>`` with no ``--yes`` and no stdin, and
+    a prompt there would block forever on a question nobody can answer. The
+    skipped confirmation is stated out loud rather than left as an invisible
+    fork in behaviour.
+
+    All of this command's added branching lives here so ``sync`` itself gains
+    none, mirroring the :func:`_gate_consent` pair above.
+
+    Args:
+        tier_norm: The normalised tier, ``"A"`` or ``"B"``.
+        vault_path: Vault root the pass would classify.
+        dry_run: Whether this invocation only echoes the plan.
+        assume_yes: Whether ``--yes`` waived the confirmation.
+
+    Raises:
+        typer.Exit: With code ``1`` when the operator declines, before any
+            step (and before ``last-run.json``) is touched.
+    """
+    if tier_norm != "B" or dry_run:
+        return
+    count = _sync_tier_b_fragment_count(vault_path)
+    console.print(
+        f"[bold][sync] Tier B will classify up to {count} fragments "
+        f"(one LLM call each), then link and rebuild the index.[/bold]",
+    )
+    if not _is_interactive():
+        console.print("[sync] non-interactive; proceeding without confirmation.")
+        return
+    if not _confirm("Continue?", assume_yes=assume_yes):
+        console.print("[yellow]Aborted.[/yellow]")
+        raise typer.Exit(code=1)
+
+
+def _sync_dispatch_guarded(
+    tier_norm: str,
+    *,
+    dry_run: bool,
+    config: CreekConfig,
+    vault_path: Path,
+    source: str | None,
+) -> dict[str, SourceRunRecord] | None:
+    """Dispatch the tier, turning a provider refusal into a legible exit (#1335).
+
+    ``creek classify --method llm`` already catches this refusal; the sync path
+    did not, so a Tier-B tick with an unreachable provider (or no cloud
+    consent) died with an unhandled traceback into a scheduler log. The
+    exception carries its own provider-specific remediation, so this prints
+    that text rather than restating it, and lets the exit propagate before
+    ``last-run.json`` can record a pass that never ran.
+
+    The handler wraps the whole dispatch rather than only the Tier-B branch,
+    which is wider than the risk it covers but cannot misfire: Tier A always
+    classifies with ``method="rules"``, and
+    :func:`~creek.classify.classify_engine.run_classify` only builds the
+    provider-backed tier classifiers — the sole thing that raises this — when
+    the method is ``"llm"``. Keeping one handler here rather than two keeps
+    ``sync`` itself free of a ``try`` block.
+
+    Args:
+        tier_norm: The normalised tier, ``"A"`` or ``"B"``.
+        dry_run: Whether to echo the plan instead of executing it.
+        config: The resolved vault config.
+        vault_path: Vault root to operate on.
+        source: Optional single Tier-A source override.
+
+    Returns:
+        Per-source run records for a real Tier-A run, else ``None``.
+
+    Raises:
+        typer.Exit: With code ``1`` when the configured LLM provider refuses.
+    """
+    from creek.classify.classify_engine import LLMProviderUnavailableError
+
+    try:
+        records = _sync_dispatch(
+            tier_norm,
+            dry_run=dry_run,
+            config=config,
+            vault_path=vault_path,
+            source=source,
+        )
+    except LLMProviderUnavailableError as exc:
+        console.print(f"[red][sync] tier {tier_norm} aborted: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    else:
+        return records
+
+
 @app.command()
 def sync(
     tier: str = typer.Option(
@@ -870,7 +1530,16 @@ def sync(
         help="Limit a Tier-A run to one source (explicitly overrides its toggle)",
     ),
     dry_run: bool = typer.Option(
-        False, "--dry-run", help="Echo the plan without executing (current default)"
+        False,
+        "--dry-run",
+        help=(
+            "Echo the ordered plan and run nothing. Opt-in: a bare invocation "
+            "executes the tier, and Tier B spends one LLM call per "
+            "unclassified fragment before linking and rebuilding the index."
+        ),
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the interactive Tier-B confirmation."
     ),
     install_schedule: str | None = typer.Option(
         None,
@@ -894,8 +1563,15 @@ def sync(
     ``--tier A`` is the cheap per-source pass (pull -> incremental ingest ->
     rules classify) for each enabled source; ``--tier B`` is the nightly global
     pass (LLM classify -> link -> index). Linking and indexing run only in Tier
-    B (R6). ``--dry-run`` echoes the ordered plan without executing. Every run
-    records ``00-Creek-Meta/State/sync/last-run.json``; because every step is
+    B (R6). A bare invocation executes the chosen tier; ``--dry-run`` is the
+    opt-in that echoes the ordered plan and runs nothing.
+
+    Tier B spends one LLM call per unclassified fragment, so it announces that
+    cost on every run and asks for confirmation **only at an interactive
+    terminal**: ``--yes`` skips the question, and a scheduled or otherwise
+    non-interactive run (every unit ``--install-schedule`` writes) proceeds
+    unprompted. Every run records
+    ``00-Creek-Meta/State/sync/last-run.json``; because every step is
     idempotent, a missed tick self-heals on the next run (no catch-up queue).
 
     ``--install-schedule launchd|systemd`` emits the host's schedule units and
@@ -919,8 +1595,11 @@ def sync(
     config = _load_config_for_vault(vault)
     vault_path = vault or config.vault_path
     _sync_validate_source(tier_norm, source, config)
+    # After validation on purpose: announcing a cost for an invocation that is
+    # about to be rejected as a usage error would be misleading.
+    _sync_gate_tier_b(tier_norm, vault_path, dry_run=dry_run, assume_yes=yes)
 
-    source_counts = _sync_dispatch(
+    source_records = _sync_dispatch_guarded(
         tier_norm,
         dry_run=dry_run,
         config=config,
@@ -929,7 +1608,7 @@ def sync(
     )
 
     prior = _write_sync_state(
-        vault_path, tier_norm, dry_run=dry_run, source_counts=source_counts
+        vault_path, tier_norm, dry_run=dry_run, source_records=source_records
     )
     if prior is not None:
         console.print(
@@ -1097,6 +1776,68 @@ def discord(
     _dispatch_discord(selected, config, vault_path, dry_run=dry_run, package=package)
 
 
+def _run_pipeline_or_exit(
+    pipeline: Pipeline, *, source_path: Path, vault_path: Path
+) -> PipelineResult:
+    """Run *pipeline*, turning every refusal into a message and exit 1.
+
+    Each exception below is a deliberate refusal rather than a crash, so
+    each is reported in the operator's own terms instead of as a
+    traceback. They are handled here, out of line, so that ``process``
+    itself stays under the complexity gate as refusals are added.
+
+    Note the absence of a bare ``except OSError``: it would swallow the
+    unrelated filesystem errors ``Pipeline.run`` raises from its yield
+    summary and index writes, turning a genuine crash into a polite
+    refusal. Only the named types are caught.
+
+    Args:
+        pipeline: The configured pipeline to run.
+        source_path: Directory of source files to process.
+        vault_path: Obsidian vault root to write results into.
+
+    Returns:
+        The completed :class:`~creek.pipeline.PipelineResult`.
+
+    Raises:
+        typer.Exit: With code ``1`` when the pipeline refuses to run.
+    """
+    # Deferred, like every other heavy import in this module: nothing may
+    # be imported at CLI import time that builds a Rich console (#1141).
+    from creek.link import EmbeddingModelUnavailableError
+
+    try:
+        return pipeline.run(source_path=source_path, vault_path=vault_path)
+    except RedactionRequiredError as exc:
+        console.print(f"[red]Redaction gate: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    except (SymlinkEscapedSourceError, EscapingSymlinkError) as exc:
+        # ``EscapingSymlinkError`` is reachable only with
+        # ``redaction.enabled: false``, which returns early from
+        # ``_run_redaction`` before the #1087 check. The ingestor gate is
+        # then what stops the run, and its refusal must read like a
+        # refusal rather than a traceback (#1294). Both say the same
+        # thing to the operator, so they share one arm.
+        console.print(f"[red]Symlink containment: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    except EmbeddingModelUnavailableError as exc:
+        # The deleted ``LinkingPipeline`` already loaded the model, so
+        # this failure was always *reachable* from ``creek process`` — it
+        # was simply never handled, and surfaced as a traceback. #1303
+        # gives it the same treatment ``creek link`` has always had: the
+        # exception message names the model and spells out the
+        # remediation, so print it verbatim and exit non-zero.
+        console.print(f"[red]Embedding linker aborted: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    except ConsentLogUnavailableError as exc:
+        # The gate before the run passed, so the log was readable then;
+        # this is a log that became unreadable mid-run (Stage 0 re-reads
+        # it). Name it, rather than letting it surface as a traceback
+        # that looks like a crash instead of a refusal (#1312).
+        console.print(f"[red]Consent log unavailable: {exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+
 @app.command()
 def process(
     source: Path | None = typer.Option(None, help="Source directory to process"),
@@ -1142,6 +1883,10 @@ def process(
         f"{' (no-LLM)' if no_llm else ''}[/bold green]"
     )
 
+    # Above ``_gate_consent``, never below it — see the helper's docstring
+    # for why the consent summary is itself an out-of-root read (#1294).
+    _assert_ingest_source_contained(source_path)
+
     consent_manager = _gate_consent(
         source_path=source_path,
         vault_path=vault_path,
@@ -1154,16 +1899,15 @@ def process(
         consent_manager=consent_manager,
         no_llm=no_llm,
     )
-    try:
-        result = pipeline.run(source_path=source_path, vault_path=vault_path)
-    except RedactionRequiredError as exc:
-        console.print(f"[red]Redaction gate: {exc}[/red]")
-        raise typer.Exit(code=1) from exc
+
+    result = _run_pipeline_or_exit(
+        pipeline, source_path=source_path, vault_path=vault_path
+    )
 
     console.print(f"[bold]Files scanned:[/bold] {result.files_scanned}")
     console.print(f"[bold]Fragments created:[/bold] {result.fragments_created}")
     console.print(f"[bold]Classifications made:[/bold] {result.classifications_made}")
-    console.print(f"[bold]Links found:[/bold] {result.links_found}")
+    _print_link_summaries(result)
     console.print(f"[bold]Indexes generated:[/bold] {result.indexes_generated}")
     console.print(
         f"[bold]Deterministic:[/bold] {result.deterministic_classified} classified | "
@@ -1171,11 +1915,58 @@ def process(
         f"[bold]Residue:[/bold] {result.residue} "
         "(would go to LLM if Pass-3 enabled)"
     )
+    _print_source_coverage(result)
     error_count = len(result.errors)
     error_style = "red" if error_count else "dim"
     console.print(f"[bold {error_style}]Errors:[/bold {error_style}] {error_count}")
     for err in result.errors:
         console.print(f"  [dim]{err}[/dim]")
+
+
+def _print_source_coverage(result: PipelineResult) -> None:
+    """Report source files that were contested or that nobody ingested.
+
+    Silent when there is nothing to say, so a clean run's summary keeps
+    its current shape.
+
+    *Contested* is the migration notice for issue #1304. Before that
+    change several ingestors could each write a fragment for the same
+    file; now one wins. The loser's fragments in an existing vault are
+    left exactly where they are — deleting a fragment is not something a
+    processing run gets to decide — so this names the affected files and
+    the read-only command that finds the strays.
+
+    *Unclaimed* names files that produced nothing at all, which was
+    previously silent.
+
+    Args:
+        result: The finished pipeline result.
+    """
+    if result.contested_sources:
+        console.print(
+            f"[bold yellow]Contested sources:[/bold yellow] "
+            f"{len(result.contested_sources)} "
+            "(more than one ingestor claimed these; one won)"
+        )
+        console.print(
+            "  [dim]A vault ingested before this release may still hold the "
+            "losing ingestor's fragments. Nothing is deleted automatically; "
+            "inspect with[/dim]"
+        )
+        console.print(
+            "  [dim]creek purge source --source-path <path> --match exact "
+            "--dry-run[/dim]"
+        )
+        for path in result.contested_sources[:_SOURCE_COVERAGE_SAMPLE]:
+            console.print(f"  [dim]{path}[/dim]")
+    if result.unclaimed_sources:
+        console.print(
+            f"[bold yellow]Unclaimed sources:[/bold yellow] "
+            f"{len(result.unclaimed_sources)} "
+            "(no ingestor produced a fragment for these)"
+        )
+        for path in result.unclaimed_sources[:_SOURCE_COVERAGE_SAMPLE]:
+            console.print(f"  [dim]{path}[/dim]")
 
 
 @app.command()
@@ -1188,6 +1979,26 @@ def ingest(
         "--yes",
         "-y",
         help="Skip the consent prompt for first-time sources (logged).",
+    ),
+    pin_source_ids: bool = typer.Option(
+        False,
+        "--pin-source-ids",
+        help=(
+            "One-time migration: back-fill the ingest ledger with each existing "
+            "fragment's existing id, so no id moves under the #1329 "
+            "id-derivation fix. Operators MUST run this once after upgrading — "
+            "without it the next ingest mints a new id for every markdown "
+            "fragment already on disk and leaves the original behind as a "
+            "duplicate. Idempotent. --type / --input are ignored."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "With --pin-source-ids: print the plan and write nothing "
+            "(no ledger records, no frontmatter changes)."
+        ),
     ),
     refresh_dates: bool = typer.Option(
         False,
@@ -1241,18 +2052,25 @@ def ingest(
     input is idempotent: deterministic fragment IDs ensure existing
     files are recognised and skipped.
 
+    ``--pin-source-ids`` is a one-shot migration: it walks ``--vault``
+    (or the configured vault) and records each existing fragment's
+    **existing** id against its source in the ingest ledger, so the
+    #1329 id-derivation fix can never move an id already on disk.
+    ``--dry-run`` plans it without writing.
+
     ``--refresh-dates`` is a one-shot backfill: it walks
     ``--vault`` (or the configured vault), re-runs the per-format
     authored-date extraction chain against each fragment's source
     file, and rewrites the frontmatter in place. ``--type`` /
     ``--input`` are ignored in refresh mode.
     """
-    if refresh_dates:
-        _run_refresh_dates(vault)
-        return
-
-    if refresh_ai_chat:
-        _run_refresh_ai_chat(vault)
+    if _dispatch_ingest_migration(
+        vault,
+        pin_source_ids=pin_source_ids,
+        dry_run=dry_run,
+        refresh_dates=refresh_dates,
+        refresh_ai_chat=refresh_ai_chat,
+    ):
         return
 
     if type is None or input is None:
@@ -1266,6 +2084,10 @@ def ingest(
     if not input.exists():
         console.print(f"[red]Input path not found: {input}[/red]")
         raise typer.Exit(code=2)
+
+    # Above ``_gate_consent``, never below it — see the helper's docstring
+    # for why the consent summary is itself an out-of-root read (#1294).
+    _assert_ingest_source_contained(input)
 
     _gate_consent(
         source_path=input,
@@ -1299,6 +2121,143 @@ def ingest(
         source_type=type,
         strict=strict,
     )
+
+
+def _dispatch_ingest_migration(
+    vault: Path | None,
+    *,
+    pin_source_ids: bool,
+    dry_run: bool,
+    refresh_dates: bool,
+    refresh_ai_chat: bool,
+) -> bool:
+    """Run whichever one-shot migration ``creek ingest`` was asked for.
+
+    ``--pin-source-ids`` is checked before every other mode, including the two
+    refresh migrations: a vault that still needs pinning must not fall through
+    into a normal ingest, because that run is precisely the one that derives
+    fresh ids and duplicates it (#1329).
+
+    Args:
+        vault: ``--vault``, or ``None`` to use the configured vault.
+        pin_source_ids: Whether ``--pin-source-ids`` was given.
+        dry_run: Whether ``--dry-run`` was given.
+        refresh_dates: Whether ``--refresh-dates`` was given.
+        refresh_ai_chat: Whether ``--refresh-ai-chat`` was given.
+
+    Returns:
+        ``True`` when a migration ran and the caller should return
+        immediately; ``False`` to proceed with a normal ingest.
+
+    Raises:
+        typer.BadParameter: If ``--dry-run`` is combined with a migration that
+            does not support it.
+    """
+    if pin_source_ids:
+        _run_pin_source_ids(vault, dry_run=dry_run)
+        return True
+    if dry_run:
+        # Refusing beats ignoring. --dry-run is new to `creek ingest` and
+        # scoped to --pin-source-ids; silently running a different migration
+        # for real while the operator believes they asked for a preview is the
+        # worst possible reading of the flag.
+        msg = "--dry-run is only supported with --pin-source-ids."
+        raise typer.BadParameter(msg)
+    if refresh_dates:
+        _run_refresh_dates(vault)
+        return True
+    if refresh_ai_chat:
+        _run_refresh_ai_chat(vault)
+        return True
+    return False
+
+
+def _print_pin_findings(label: str, lines: list[str]) -> None:
+    """Print every finding under *label*, one per line, or nothing if there are none.
+
+    Findings are listed in full rather than counted. Each line names a
+    fragment the migration deliberately left unpinned, and an unpinned
+    fragment is one the next ingest can still orphan — a bare count would tell
+    the operator that a problem exists without telling them which file to fix.
+    Each line is markup-escaped because it carries a filesystem path, and a
+    path containing ``[`` would otherwise be swallowed as Rich markup or raise
+    ``MarkupError`` over the top of the message (#1310).
+
+    ``soft_wrap=True`` is load-bearing for the same reason: Rich's default
+    word-wrap breaks a long absolute path across lines mid-token, which is
+    exactly the string the operator needs to copy-paste into their next
+    command. Letting the terminal wrap it keeps the path intact.
+
+    Args:
+        label: Heading for this class of finding, e.g. ``"Conflicts"``.
+        lines: Human-readable finding lines from :class:`PinResult`.
+    """
+    if not lines:
+        return
+    console.print(f"[yellow]{label}: {len(lines)}[/yellow]")
+    for line in lines:
+        console.print(f"  [dim]{escape(line)}[/dim]", soft_wrap=True)
+
+
+def _render_pin_summary(result: PinResult, *, dry_run: bool) -> None:
+    """Render the one-screen summary of a ``--pin-source-ids`` run.
+
+    Args:
+        result: What the migration did, or would have done under *dry_run*.
+        dry_run: Whether this was a plan; when ``True`` nothing was written.
+    """
+    verb = "Would pin" if dry_run else "Pinned"
+    console.print(
+        f"[bold green]{verb} {result.pinned} existing fragment id(s) into the "
+        "ingest ledger.[/bold green]"
+    )
+    console.print(f"  already pinned: {result.already_pinned}")
+    console.print(f"  examined: {result.examined}")
+    if result.repaired:
+        # Surfaced rather than folded into "already pinned": a non-zero count
+        # is evidence that an earlier run did not finish, which the operator
+        # would otherwise have no way to learn.
+        console.print(
+            f"[yellow]  repaired {result.repaired} half-pinned fragment(s) left "
+            "by an interrupted earlier run.[/yellow]"
+        )
+    # Advisory only, and labelled as such on screen: a fragment that does not
+    # re-derive its own id is not a failure — its id was minted by the very
+    # build this migration exists to correct. Nothing is gated on this number,
+    # so nothing about the run should read as if a low one meant trouble.
+    console.print(
+        f"  re-derive their own id: {result.reproduced} "
+        "(advisory diagnostic only; nothing is gated on it)"
+    )
+    if dry_run:
+        console.print("[yellow]Dry run: nothing was written.[/yellow]")
+    _print_pin_findings("Conflicts (pinned none of these)", result.conflicts)
+    _print_pin_findings("Unpinnable", result.unpinnable)
+
+
+def _run_pin_source_ids(vault: Path | None, *, dry_run: bool) -> None:
+    """Execute the #1329 ``--pin-source-ids`` ledger back-fill.
+
+    Resolves the vault path (CLI flag → configured default), invokes
+    :func:`creek.ingest.pin_ids.pin_source_ids`, and renders a one-screen
+    summary. Exit codes mirror the rest of the CLI: 0 on success (regardless
+    of how many fragments were pinned, conflicted or were unpinnable), 1 if
+    the vault path is unusable.
+
+    Args:
+        vault: ``--vault``, or ``None`` to use the configured vault.
+        dry_run: ``--dry-run``; when ``True`` the plan is printed and neither
+            the ledger nor any frontmatter is written.
+    """
+    from creek.ingest.pin_ids import pin_source_ids
+
+    config = _load_config_for_vault(vault)
+    vault_path = vault or config.vault_path
+    if not vault_path.exists():
+        console.print(f"[red]Vault path does not exist: {vault_path}[/red]")
+        raise typer.Exit(code=1)
+
+    _render_pin_summary(pin_source_ids(vault_path, dry_run=dry_run), dry_run=dry_run)
 
 
 def _run_refresh_dates(vault: Path | None) -> None:
@@ -1387,7 +2346,10 @@ def _dispatch_redact(
         apply: ``--apply`` flag.
         review: ``--review`` flag.
         source: ``--source`` path (scan/apply).
-        vault: ``--vault`` path (review).
+        vault: ``--vault`` path. Required by ``--review`` as the tree to
+            re-scan; optional for ``--scan``/``--apply``, where it locates
+            ``creek_config.yaml`` and, for ``--apply``, receives the audit
+            record.
         report: ``--report`` flag (scan).
         dry_run: ``--dry-run`` flag (apply).
         verbose: ``--verbose`` flag.
@@ -1431,12 +2393,16 @@ def redact(
         False, "--apply", help="Apply redactions to matched files"
     ),
     review: bool = typer.Option(
-        False, "--review", help="Render the review queue for a vault"
+        False, "--review", help="Re-scan a vault and render its review queue"
     ),
     source: Path | None = typer.Option(
         None, "--source", help="Source path (scan/apply)"
     ),
-    vault: Path | None = typer.Option(None, "--vault", help="Vault path (review)"),
+    vault: Path | None = typer.Option(
+        None,
+        "--vault",
+        help="Vault path (review; also config/audit root for scan/apply)",
+    ),
     report: bool = typer.Option(
         False, "--report", help="Include the detailed markdown report (scan)"
     ),
@@ -1450,7 +2416,7 @@ def redact(
         False, "--yes", "-y", help="Skip the confirmation prompt (apply)"
     ),
 ) -> None:
-    """Scan for sensitive data, apply redactions, or review the queue.
+    """Scan for sensitive data, apply redactions, or review a vault.
 
     Exactly one of ``--scan``, ``--apply``, or ``--review`` must be given.
     """
@@ -1471,8 +2437,25 @@ def redact(
 
 
 _CLASSIFY_METHODS = ("rules", "llm")
-_LINK_METHODS = ("embeddings", "temporal", "eddies", "threads")
-_REATOMIZE_DIRECTIONS = ("auto", "split", "aggregate")
+
+_REATOMIZE_DIRECTIONS: Final[tuple[str, ...]] = get_args(
+    ClassificationConfig.model_fields["reatomize_direction"].annotation,
+)
+"""Directions ``creek classify --reatomize-direction`` accepts.
+
+Derived from the config ``Literal`` rather than retyped beside it, so the
+flag and the YAML key cannot drift apart — the same fix #1259 applied to
+the link methods and report types in :mod:`creek.surface_modes`. When
+``aggregate`` was retired (#1342) the hand-written copy here was the last
+place still advertising it.
+"""
+
+_RETIRED_REATOMIZE_DIRECTION: Final[str] = "aggregate"
+"""The one direction that is refused with an explanation, not just a list.
+
+An operator's shell script may still pass it, and "unknown value" alone
+would read as a typo rather than as a deliberate removal.
+"""
 
 
 _CLASSIFY_METHOD_HELP: str = (
@@ -1484,6 +2467,26 @@ _CLASSIFY_METHOD_HELP: str = (
     "still honored) to be set in the environment before the run "
     "(data-egress acknowledgement; see issue #320)."
 )
+
+
+def _print_retired_direction_hint(direction: str) -> None:
+    """Explain the removal when a rejected direction is the retired one.
+
+    Extracted rather than inlined: ``classify`` is already a long line of
+    guards and xenon's ``--max-modules B`` bites on this module's total
+    score, so the extra branch lives here.
+
+    Args:
+        direction: The rejected ``--reatomize-direction`` value.
+    """
+    if direction != _RETIRED_REATOMIZE_DIRECTION:
+        return
+    console.print(
+        "[yellow]That value named the FEAT-022 zoom-out aggregator, which "
+        "no code path ever invoked from this flag: passing it did nothing. "
+        "It was retired by issue #1342 (ADR-0011). Coarsening work is "
+        "tracked in issue #1457.[/yellow]",
+    )
 
 
 def _preflight_cloud_consent(config: CreekConfig) -> None:
@@ -1564,6 +2567,16 @@ def classify(
         "--force",
         help="Overwrite fragments classified as method: manual.",
     ),
+    retier: bool = typer.Option(
+        False,
+        "--retier",
+        help=(
+            "Re-derive the privacy tier of fragments that already carry one, "
+            "and keep the result only when it is MORE restrictive. Free (no "
+            "provider call) and raise-only; classification provenance and "
+            "manual curation are left untouched."
+        ),
+    ),
     calibrate: bool = typer.Option(
         False,
         "--calibrate",
@@ -1597,8 +2610,8 @@ def classify(
         help=(
             "Enable confidence-driven re-atomization for this run "
             "regardless of the YAML default. Below-threshold or unclassified "
-            "fragments are re-atomized (split or aggregated) and re-classified "
-            "until a leaf clears the threshold or a terminal level is reached."
+            "fragments are split and re-classified until a leaf clears the "
+            "threshold or a terminal level is reached."
         ),
     ),
     reatomize_direction: str = typer.Option(
@@ -1606,7 +2619,7 @@ def classify(
         "--reatomize-direction",
         help=(
             "Override the direction heuristic. 'auto' routes by "
-            "source/level; 'split' forces zoom-in; 'aggregate' forces zoom-out."
+            "source/level; 'split' forces zoom-in."
         ),
     ),
 ) -> None:
@@ -1618,6 +2631,17 @@ def classify(
     ``classification.confidence_threshold``. Fragments with
     ``classification.method: manual`` are preserved unless ``--force``
     is supplied.
+
+    ``--retier`` re-opens a case neither of the above covers (#1106): a
+    fragment stamped with a *concrete but too weak* tier by a pre-#974
+    pipeline. Nothing revisits such a tier — ``privacy_tier`` is a one-way
+    ratchet — so it stays admissible to a PERSONAL-ceiling caller and keeps
+    feeding voice-proxy generation. ``--retier`` re-runs the free local
+    heuristic over every already-tiered fragment and persists the verdict
+    only where it is *stricter*, through the same narrow tier-only writer
+    the resume short-circuit uses. Unlike ``--force`` it costs no tokens,
+    re-stamps no ``classification_method``, and overrides no manual
+    curation beyond the tier itself.
 
     ``--calibrate`` flips this into calibration mode: instead of touching
     the vault, the classifier runs against the calibration fixture and
@@ -1647,6 +2671,7 @@ def classify(
             f"[red]Unknown --reatomize-direction {reatomize_direction!r}. "
             f"Supported: {', '.join(_REATOMIZE_DIRECTIONS)}.[/red]",
         )
+        _print_retired_direction_hint(reatomize_direction)
         raise typer.Exit(code=2)
 
     config = _load_config_for_vault(vault)
@@ -1666,7 +2691,7 @@ def classify(
             update={
                 "reatomize": True,
                 "reatomize_direction": cast(
-                    "Literal['auto', 'split', 'aggregate']",
+                    "Literal['auto', 'split']",
                     reatomize_direction,
                 ),
             },
@@ -1684,6 +2709,7 @@ def classify(
             config=config,
             method=method,
             force=force,
+            retier=retier,
         )
     except LLMProviderUnavailableError as exc:
         # The engine refused to iterate because the configured LLM
@@ -1713,7 +2739,16 @@ def classify(
         f"{summary.privacy_tiers_assigned} privacy tier(s) assigned, "
         # Issue #877: same reasoning for the praxis axis — it is the only
         # visible evidence that the field has a producer at all.
-        f"{summary.praxis_marked} praxis marked"
+        f"{summary.praxis_marked} praxis marked, "
+        # Issue #878: and again for hashtag tags. Counts fragments gained,
+        # not tags written, so a second run over an unchanged vault reports
+        # zero rather than re-reporting the whole vault.
+        f"{summary.tags_extracted} tagged, "
+        # Issue #1106: reported even at zero, and separately from the
+        # tier-assignment count above, so "my vault has no pre-#974
+        # mis-stamps" is an answer the operator can actually read rather
+        # than an absence they have to infer.
+        f"{summary.retiered} re-tiered"
         ").[/bold green]",
     )
     if summary.errors:
@@ -1793,6 +2828,11 @@ def _run_calibration_cli(
         raise typer.Exit(code=2)
 
     config = _load_config_for_vault(vault)
+    # No tier argument, and none exists to pass: the classifier only ever sees
+    # `creek.classify.calibration.load_fixture(...)` output — a labelled fixture
+    # (default `tests/fixtures/classification/calibration_set.yaml`) that carries
+    # no `privacy_tier` and is not vault content. Unlike `creek compile` (#962),
+    # there is no fragment here whose tier the router could enforce.
     classifier = LLMClassifier(config=config.model_router.resolve("classification"))
     report = run_calibration(classifier, load_fixture(resolved))
     console.print(report.render())
@@ -1826,10 +2866,10 @@ def link(
     embeddings file before running ``--method embeddings`` so the
     similarity matrix is recomputed from scratch.
     """
-    if method not in _LINK_METHODS:
+    if method not in LINK_METHODS:
         console.print(
             f"[red]Unknown method {method!r}. "
-            f"Supported: {', '.join(_LINK_METHODS)}.[/red]",
+            f"Supported: {', '.join(LINK_METHODS)}.[/red]",
         )
         raise typer.Exit(code=2)
 
@@ -1856,6 +2896,28 @@ def link(
     console.print(_format_link_summary(summary))
 
 
+def _print_link_summaries(result: PipelineResult) -> None:
+    """Print what ``creek process`` actually persisted at its link stage.
+
+    Replaces the single ``Links found: N`` line, which was the operator-
+    facing face of #1303: it summed four in-memory counts — two of which
+    (resonance and temporal edges) nothing in this codebase can persist —
+    over a graph the pipeline then discarded. The per-stage phrasing is
+    :func:`_format_link_summary`, shared verbatim with ``creek link``, so
+    the two entry points describe the same work the same way. The trailing
+    total is ``PipelineResult.links_found``, which counts pages written.
+
+    Extracted rather than inlined: ``process`` is already long and
+    xenon's ``--max-modules B`` bites on this module's aggregate.
+
+    Args:
+        result: The completed pipeline result.
+    """
+    for summary in result.link_summaries:
+        console.print(_format_link_summary(summary))
+    console.print(f"[bold]Link artefacts persisted:[/bold] {result.links_found}")
+
+
 def _format_link_summary(summary: LinkSummary) -> str:
     """Render a method-specific summary message for the ``creek link`` CLI.
 
@@ -1864,6 +2926,14 @@ def _format_link_summary(summary: LinkSummary) -> str:
     (embeddings) and topic clusters that may or may not have been written
     to disk (eddies). Per-method strings name the actual side effect so
     operators can correlate the number with what they see on disk.
+
+    The embeddings sentence carries three separate numbers because they
+    are three separate facts and every pairing of them can differ:
+    *scanned* is the corpus size, *computed* is the local-model work this
+    run paid for (zero on a warm cache), and *cached* is what the parquet
+    holds after the write (the whole corpus on that same warm run, or zero
+    if the write failed). The similarity edges sit outside all three —
+    nothing persists them at all (#1337).
 
     Args:
         summary: The link summary returned by
@@ -1877,10 +2947,22 @@ def _format_link_summary(summary: LinkSummary) -> str:
     """
     fragments = summary.fragment_count
     if summary.method == "embeddings":
+        # #1303: the previous wording claimed the *edges* were cached in
+        # the parquet. Only the vectors are — the similarity edges are
+        # computed in memory and dropped, because there is no Resonance
+        # writer and Fragment has no ``resonances`` field.
+        # #1337: the remaining three claims are now measured rather than
+        # assumed. "embedded" conflated the corpus with the vectors this
+        # run computed (a warm cache computes none), and the cache clause
+        # was a hardcoded assertion that survived an empty vault and a
+        # swallowed OSError alike. Only the *edges* clause says "not
+        # persisted", so that phrase unambiguously pins the edge claim.
         body = (
-            f"Embeddings linker: {fragments} fragment(s) embedded, "
-            f"{summary.similarity_edges} similarity edge(s) cached in "
-            f"00-Creek-Meta/embeddings.parquet."
+            f"Embeddings linker: {fragments} fragment(s) scanned, "
+            f"{summary.fragments_embedded} vector(s) computed, "
+            f"{summary.similarity_edges} similarity edge(s) computed in memory "
+            f"(not persisted — no resonance writer exists); "
+            f"{_format_embeddings_cache_clause(summary)}."
         )
     elif summary.method == "eddies":
         body = (
@@ -1888,11 +2970,15 @@ def _format_link_summary(summary: LinkSummary) -> str:
             f"{summary.eddies_detected} eddy(ies) detected, "
             f"{summary.eddies_written} eddy file(s) written to 03-Eddies/, "
             f"{summary.member_fragments_updated} fragment(s) updated with "
-            f"`eddies:` wiki-links."
+            f"`eddies:` wiki-links"
+            f"{_format_cluster_stats(summary)}."
         )
     elif summary.method == "temporal":
+        # #1303: same honesty fix. The temporal linker writes nothing at
+        # all — no page, no frontmatter, not even a cache.
         body = (
-            f"Temporal linker: {fragments} fragment(s), {summary.link_count} link(s)."
+            f"Temporal linker: {fragments} fragment(s), {summary.link_count} "
+            f"link(s) computed in memory, not persisted."
         )
     elif summary.method == "threads":
         body = (
@@ -1901,12 +2987,77 @@ def _format_link_summary(summary: LinkSummary) -> str:
             f"{summary.threads_written} page(s) written to "
             "02-Threads/{Active,Dormant,Resolved}/, "
             f"{summary.member_fragments_updated} fragment(s) updated with "
-            "`threads:` wiki-links."
+            "`threads:` wiki-links"
+            f"{_format_cluster_stats(summary)}."
         )
     else:
         msg = f"Unknown link method: {summary.method!r}"
         raise ValueError(msg)
     return f"[bold green]{body}[/bold green]"
+
+
+def _format_embeddings_cache_clause(summary: LinkSummary) -> str:
+    """Render the parquet clause for the embeddings sentence.
+
+    Issue #1337: the clause used to be a constant asserting that vectors
+    had been cached, which stayed true-looking on the two paths where
+    nothing reached disk — a fragmentless vault (the cache write never
+    runs) and a swallowed ``OSError`` from a full or read-only volume.
+    Both now say so out loud, which is the only operator-visible trace of
+    that deliberately-swallowed error.
+
+    Extracted rather than inlined for the same reason as
+    :func:`_format_cluster_stats`: xenon's ``--max-modules B`` bites on
+    this module's aggregate, so branches live in their own small function.
+
+    Args:
+        summary: The link summary being rendered.
+
+    Returns:
+        The clause naming the row count the run persisted, or the explicit
+        admission that it persisted none.
+    """
+    # Named from the canonical constants rather than a literal, so a
+    # rename of the cache file cannot leave the sentence pointing at a
+    # path that no longer exists.
+    from creek.link.embeddings import (
+        EMBEDDINGS_CACHE_DIR,
+        EMBEDDINGS_CACHE_FILENAME,
+    )
+
+    cache_label = f"{EMBEDDINGS_CACHE_DIR}/{EMBEDDINGS_CACHE_FILENAME}"
+    if summary.vectors_persisted > 0:
+        return f"{summary.vectors_persisted} vector(s) cached in {cache_label}"
+    return f"no vectors written to {cache_label}"
+
+
+def _format_cluster_stats(summary: LinkSummary) -> str:
+    """Render the clustering-health clause for a link summary.
+
+    Issue #880: the largest cluster is the one number that tells an
+    operator whether detection degenerated — a single eddy holding 87% of
+    the vault used to be invisible from the CLI. Splits and discards are
+    reported only when they happened, so an ordinary run stays terse; a
+    discard is data loss (those fragments carry no wiki-link at all) and
+    therefore always named when non-zero.
+
+    Args:
+        summary: The link summary being rendered.
+
+    Returns:
+        A clause to append to the method's sentence, starting with ``", "``,
+        or an empty string when nothing was detected.
+    """
+    if summary.largest_cluster_fragments == summary.oversized_discarded == 0:
+        return ""
+    parts = [f"largest cluster: {summary.largest_cluster_fragments} fragment(s)"]
+    if summary.clusters_split:
+        parts.append(f"{summary.clusters_split} oversized cluster(s) re-clustered")
+    if summary.oversized_discarded:
+        parts.append(
+            f"{summary.oversized_discarded} fragment(s) discarded as unsplittable",
+        )
+    return ", " + ", ".join(parts)
 
 
 @app.command()
@@ -1976,17 +3127,28 @@ def _build_fill_steps(
             vault_path=vault_path, config=config, method=method, rebuild=False
         )
 
+    # ``creek fill`` has no ``--include-tier`` of its own, and an absent flag
+    # means unfiltered on the report surface (#968), so every step states
+    # ``ALL`` rather than inheriting a default nobody typed.
+    unfiltered = PrivacyTierOverride.ALL
     steps: list[tuple[str, Callable[[], object]]] = [
         ("link/embeddings", _link("embeddings")),
         ("link/temporal", _link("temporal")),
         ("link/eddies", _link("eddies")),
         ("link/threads", _link("threads")),
-        ("report/decisions", lambda: _report_decisions(vault_path)),
-        ("report/unnamed", lambda: _report_unnamed(vault_path)),
-        ("report/paradox", lambda: _report_paradox(vault_path)),
-        ("report/synchronicity", lambda: _report_synchronicity(vault_path)),
-        ("report/mode-profiles", lambda: _report_mode_profiles(vault_path)),
-        ("report/wavelength", lambda: _report_wavelength(vault_path, "weekly")),
+        ("report/decisions", lambda: _report_decisions(vault_path, unfiltered)),
+        ("report/unnamed", lambda: _report_unnamed(vault_path, unfiltered)),
+        ("report/paradox", lambda: _report_paradox(vault_path, unfiltered)),
+        ("report/synchronicity", lambda: _report_synchronicity(vault_path, unfiltered)),
+        ("report/mode-profiles", lambda: _report_mode_profiles(vault_path, unfiltered)),
+        # #879: ``fill`` is the "make my vault prod-ready" command, so the voice
+        # report belongs in it — otherwise the register samples are only ever
+        # written by an operator who knows to run ``report --type voice`` by hand.
+        ("report/voice", lambda: _report_voice(vault_path, unfiltered)),
+        (
+            "report/wavelength",
+            lambda: _report_wavelength(vault_path, "weekly", unfiltered),
+        ),
         ("index", lambda: IndexGenerator(vault_path=vault_path).generate_all()),
     ]
     if with_compost:
@@ -2107,7 +3269,7 @@ def _detect_classify_upgrade(
 class _FillGapCounts:
     """What one walk of the vault found for ``creek fill``'s hints.
 
-    Both gap detectors need the same expensive thing — every fragment's
+    Every gap detector needs the same expensive thing — each fragment's
     frontmatter *and* body, parsed. Bundling their answers lets
     :func:`_scan_fill_gaps` pay for that walk once on a 35k-fragment
     vault instead of once per hint.
@@ -2117,14 +3279,26 @@ class _FillGapCounts:
         praxis_backfillable: Fragments the free praxis heuristic can
             prove are ``explicit`` while the disk still says ``none``
             (#877).
+        tags_backfillable: Fragments whose body carries a hashtag the
+            frontmatter does not record (#878).
+        retierable: Fragments carrying a *concrete* privacy tier that the
+            free heuristic would now derive **more restrictively** — the
+            pre-#974 mis-stamp (#1106). Deliberately disjoint from
+            :attr:`untiered`: an untiered fragment satisfies the bare
+            escalate predicate too, and since ``needs_tier`` is ``True``
+            for an explicit ``unclassified``, ``untiered`` already reads
+            35,330 on the 35k-fragment demo vault. A retier count folded
+            into that number could not be seen at all.
     """
 
     untiered: int
     praxis_backfillable: int
+    tags_backfillable: int
+    retierable: int
 
 
 def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
-    """Walk the vault once and count both classes of fill-time gap.
+    """Walk the vault once and count every class of fill-time gap.
 
     The praxis detector deserves a note, because the two obvious choices
     are both wrong. It cannot be "the ``praxis_potential`` key is absent"
@@ -2137,6 +3311,31 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
     it costs zero tokens to compute, and it goes quiet the moment the
     operator acts on it.
 
+    The tags detector (#878) is the same shape for the same reasons:
+    ``tags`` is always written, and "the list is empty" would nag forever
+    about the many fragments that genuinely have no hashtags. The
+    provable gap is "the free extractor finds a tag the disk does not
+    record", which
+    :func:`~creek.classify.tags_pass.has_unrecorded_tags` answers in the
+    same normalised space the merge works in — comparing raw strings
+    would report ``tags: [Recovery]`` beside a body reading ``#recovery``
+    as a gap and send the operator off to run a backfill that changes
+    nothing. Computing it here rather than in its own function is
+    what keeps it free — it rides the walk the other two already pay for,
+    and must never become a second pass over 35k files.
+
+    The retier detector (#1106) is the fourth of the same shape and the
+    one with the sharpest edge. Its proof is "the heuristic would derive a
+    *stricter* tier than the one on disk", which
+    :func:`~creek.classify.privacy_pass.needs_retier` answers through the
+    two tier readers that already exist — no sixth opinion about what a
+    fragment's tier is (#1079) — and which, because
+    :func:`~creek.classify.privacy_pass.escalate` ranks by restrictiveness,
+    can only ever fire upwards. It excludes untiered fragments on purpose:
+    they satisfy the same predicate, they are ``untiered``'s population,
+    and merging the two would bury this count inside a number that already
+    reads 35,330 on the demo vault.
+
     The imports are function-local (like the rest of this module's) so a
     bare ``creek --help`` never pays to import the classification stack.
 
@@ -2148,11 +3347,18 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
         is no ``01-Fragments`` directory at all.
     """
     from creek.classify.praxis_pass import detect
-    from creek.classify.privacy_pass import needs_tier
+    from creek.classify.privacy import PrivacyClassifier
+    from creek.classify.privacy_pass import needs_retier, needs_tier
+    from creek.classify.tags_pass import has_unrecorded_tags
     from creek.vault.reader import iter_vault_fragments
 
+    # Stateless and read-only, so one instance serves the whole walk rather
+    # than 35k constructions.
+    privacy = PrivacyClassifier()
     untiered = 0
     backfillable = 0
+    untagged = 0
+    retierable = 0
     for _path, fragment, body, raw in iter_vault_fragments(
         vault_path / "01-Fragments",
     ):
@@ -2161,7 +3367,16 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
         recorded_none = str(fragment.praxis_potential) == PraxisPotential.NONE.value
         if recorded_none and detect(fragment, body) is PraxisPotential.EXPLICIT:
             backfillable += 1
-    return _FillGapCounts(untiered=untiered, praxis_backfillable=backfillable)
+        if has_unrecorded_tags(fragment.tags, body):
+            untagged += 1
+        if needs_retier(fragment, body, raw=raw, classifier=privacy):
+            retierable += 1
+    return _FillGapCounts(
+        untiered=untiered,
+        praxis_backfillable=backfillable,
+        tags_backfillable=untagged,
+        retierable=retierable,
+    )
 
 
 def _scan_fill_gaps_quietly(vault_path: Path) -> _FillGapCounts | None:
@@ -2236,6 +3451,57 @@ def _count_praxis_backfillable_fragments(
     return scan.praxis_backfillable
 
 
+def _count_tags_backfillable_fragments(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> int:
+    """Count fragments whose body carries a hashtag ``tags`` does not record.
+
+    See :func:`_scan_fill_gaps` for why "the extractor finds a tag the
+    disk is missing", and not "the list is empty", is the gap worth
+    reporting (issue #878).
+
+    Args:
+        vault_path: Vault root.
+        scan: An already-completed :func:`_scan_fill_gaps` result to read
+            the answer out of. Omit it to walk the vault here.
+
+    Returns:
+        The number of backfillable fragments; ``0`` when the vault has no
+        ``01-Fragments`` directory at all.
+    """
+    if scan is None:
+        scan = _scan_fill_gaps(vault_path)
+    return scan.tags_backfillable
+
+
+def _count_retierable_fragments(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> int:
+    """Count fragments whose recorded tier is weaker than today's verdict.
+
+    The #1106 population: fragments a pre-#974 ``creek process`` stamped
+    ``privacy_tier: personal`` (with ``voice_proxy_eligible: true``) that
+    the current heuristic reads as ``intimate``. See
+    :func:`_scan_fill_gaps` for why untiered fragments are excluded, and
+    :func:`~creek.classify.privacy_pass.needs_retier` for why the
+    predicate can only ever fire upwards.
+
+    Args:
+        vault_path: Vault root.
+        scan: An already-completed :func:`_scan_fill_gaps` result to read
+            the answer out of. Omit it to walk the vault here.
+
+    Returns:
+        The number of re-tierable fragments; ``0`` when the vault has no
+        ``01-Fragments`` directory at all.
+    """
+    if scan is None:
+        scan = _scan_fill_gaps(vault_path)
+    return scan.retierable
+
+
 def _hint_untiered_fragments(
     vault_path: Path,
     scan: _FillGapCounts | None = None,
@@ -2301,6 +3567,108 @@ def _hint_praxis_backfill(
     )
 
 
+def _hint_tags_backfill(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> None:
+    """Print the backfill nudge when body hashtags are provably unrecorded.
+
+    Own guard, own warning: sharing the praxis hint's ``try`` would let
+    one failing scan silently suppress the other hint too. Silent at
+    zero, so a vault the operator has already backfilled never nags.
+
+    Reports a **count only** — never a fragment id, a body excerpt, or
+    the tags themselves. Any of those would turn an advisory line into an
+    unaudited disclosure of vault content through stdout (the
+    config-oracle rule, #846 / #848), and the tags are the most
+    disclosive of the three.
+
+    The named remedy is a bare ``creek classify`` (#1207), and it is free:
+    the resume short-circuit preserves every ``llm``/``manual``-stamped
+    fragment — no provider call, no re-classification — while
+    :func:`creek.classify.classify_engine._write_tags_only` backfills the
+    ``tags`` key and nothing else.
+
+    Two commands it deliberately does **not** name, both of which it used
+    to. ``--method llm --force`` works but re-sends the vault to the
+    configured provider to recover data already on local disk.
+    ``--method rules --force`` is free but destructive: on that path
+    :func:`creek.classify.classify_engine._classify_one` returns
+    :meth:`~creek.classify.rules.RuleClassifier.classify`'s answer, which
+    overwrites ``frequency`` / ``wavelength`` / ``voice`` wholesale and
+    re-stamps ``classification_method: rules``, trading every considered
+    LLM classification for keyword output.
+
+    Args:
+        vault_path: Vault root.
+        scan: The shared vault walk, when one already succeeded.
+    """
+    try:
+        backfillable = _count_tags_backfillable_fragments(vault_path, scan)
+    except Exception as exc:
+        logger.warning("fill: skipping tags-backfill hint: %s", exc)
+        return
+    if backfillable == 0:
+        return
+    console.print(
+        f"[dim][fill] {backfillable} fragment(s) carry hashtags in their body "
+        "that `tags` does not record (ingested before the field had a "
+        "producer). Run `creek classify` (no --force) to backfill — it is "
+        "free: already-classified fragments keep their classification and "
+        "gain only the tags.[/dim]",
+    )
+
+
+def _hint_retier(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> None:
+    """Print the ``creek classify --retier`` nudge for mis-stamped tiers.
+
+    Its **own** line and its own guard, not a clause bolted onto the
+    untiered hint. ``needs_tier`` counts an explicit ``unclassified`` as
+    untiered, so that hint already reports 35,330 on the demo vault; a
+    handful of mis-stamped fragments folded into it would be invisible,
+    which is precisely the visibility failure #1106 was filed about. The
+    separate ``try`` is the same reasoning the praxis and tags hints
+    already follow — one failing scan must not silence a sibling.
+
+    Silent at zero, so a vault the operator has already re-tiered never
+    nags, and the pass is escalate-only so it goes quiet after one run.
+
+    Reports a **count only** — never a fragment id or a body excerpt.
+    Naming either would turn an advisory line into an unaudited
+    disclosure of vault content through stdout (the config-oracle rule,
+    #846 / #848), and these are by definition the vault's most sensitive
+    fragments.
+
+    The named remedy is ``creek classify --retier`` rather than
+    ``--force``. Both would move the tier; only ``--retier`` leaves
+    ``classification_method`` — and therefore manual operator curation —
+    intact, and only ``--retier`` touches nothing but the fragments whose
+    tier actually moves.
+
+    Args:
+        vault_path: Vault root.
+        scan: The shared vault walk, when one already succeeded.
+    """
+    try:
+        retierable = _count_retierable_fragments(vault_path, scan)
+    except Exception as exc:
+        logger.warning("fill: skipping retier hint: %s", exc)
+        return
+    if retierable == 0:
+        return
+    console.print(
+        f"[dim][fill] {retierable} fragment(s) carry a privacy tier that is "
+        "weaker than the one Creek would derive for them today (classified "
+        "before #974 tightened self-authored confessional content). Run "
+        "`creek classify --retier` to raise just those — it is free, it "
+        "only ever raises a tier, and it leaves classification provenance "
+        "and manual curation untouched.[/dim]",
+    )
+
+
 def _run_classify_upgrade(vault_path: Path, config: CreekConfig) -> None:
     """Re-classify ``rules`` fragments via the LLM, preserving manual/llm.
 
@@ -2326,15 +3694,19 @@ def _maybe_upgrade_classification(
     silently egresses): it only prints a hint. ``--upgrade`` applies the upgrade
     without a prompt; an interactive TTY prompts ``[y/N]`` (default No).
 
-    The #876 untiered-fragment hint and the #877 praxis-backfill hint fire
-    first, ahead of every early return: the vault that most needs them
-    (rules-classified, no LLM reachable, every fragment untiered) is exactly
-    the one where there is no upgrade to offer. Both read one shared vault
-    walk so ``creek fill`` parses every fragment once, not once per hint.
+    The #876 untiered-fragment hint, the #877 praxis-backfill hint, the
+    #878 tags-backfill hint and the #1106 retier hint all fire first,
+    ahead of every early return: the
+    vault that most needs them (rules-classified, no LLM reachable, every
+    fragment untiered) is exactly the one where there is no upgrade to offer.
+    All three read one shared vault walk so ``creek fill`` parses every
+    fragment once, not once per hint.
     """
     gaps = _scan_fill_gaps_quietly(vault_path)
     _hint_untiered_fragments(vault_path, gaps)
     _hint_praxis_backfill(vault_path, gaps)
+    _hint_tags_backfill(vault_path, gaps)
+    _hint_retier(vault_path, gaps)
     try:
         offer = _detect_classify_upgrade(vault_path, config)
     except Exception as exc:
@@ -2394,8 +3766,9 @@ def fill(
     Each step is non-fatal: a failure is logged and the sequence continues, so
     one bad step cannot abort the rest. ``--dry-run`` prints the plan and runs
     nothing. ``--with-compost`` appends the deterministic compost overview
-    report (the only compost vault-write currently wired). Every underlying step
-    is idempotent, so a second ``creek fill`` is a clean no-op.
+    report, which surveys whatever notes ``creek compost scan`` has filed —
+    run that first, or the report has nothing to survey (#882). Every
+    underlying step is idempotent, so a second ``creek fill`` is a clean no-op.
     """
     config = _load_config_for_vault(vault)
     vault_path = _resolve_vault(vault)
@@ -2455,7 +3828,12 @@ def compile_(
     compiled-layer directory. LLM-detected paradoxes are routed to the
     side-channel log under ``00-Creek-Meta/Processing-Log/`` rather
     than flattened into the synthesis page.
+
+    The privacy tier of the fragments being rolled up decides where the
+    synthesis runs: an intimate source is forced onto the local model, and
+    refused outright when no local model is configured to fall back to.
     """
+    from creek.classify.llm.router import IntimateRoutingError
     from creek.compile.engine import TARGET_KINDS, compile_to_vault, default_llm
 
     if target_kind not in TARGET_KINDS:
@@ -2468,29 +3846,71 @@ def compile_(
     config = _load_config_for_vault(vault)
     vault_path = _resolve_vault(vault)
     kind = cast("CompileTargetKind", target_kind)
-    written = compile_to_vault(
-        fragment_ids=[fragment_id],
-        vault_path=vault_path,
-        target_kind=kind,
-        target_id=target_id,
-        target_title=target_title,
-        llm=default_llm(config.model_router.resolve("generation")),
-    )
+    try:
+        written = compile_to_vault(
+            fragment_ids=[fragment_id],
+            vault_path=vault_path,
+            target_kind=kind,
+            target_id=target_id,
+            target_title=target_title,
+            # The content tier alone, with no ceiling term — unlike
+            # ``creek_mcp.tools.compile``, which reconciles the two via
+            # ``routing_tier``. The CLI operator *is* the vault owner, so
+            # there is no caller declaration to reconcile against. Modelling
+            # the CLI as ``ceiling=all`` would not be conservative but
+            # wrong: ``CEILING_ROUTING_TIER[ALL] == INTIMATE``, which would
+            # pin every compile of every open fragment to the local model.
+            llm_factory=lambda tier: default_llm(
+                config.model_router.resolve("generation", tier),
+            ),
+        )
+    except IntimateRoutingError as exc:
+        # The one refusal that must be legible. Threading the tier through
+        # *introduces* this failure mode on a P1 operator path (all-cloud
+        # config + intimate content), and a stack trace would read as a
+        # crash rather than as the privacy guarantee doing its job.
+        # Deliberately narrow: the not-found and target-escape ``ValueError``s
+        # already surface as tracebacks today, and widening the handler here
+        # would fold an unrelated UX gap into a privacy fix.
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
     console.print(
         f"[bold green]Compiled {fragment_id} -> {written}[/bold green]",
     )
 
 
-def _report_tags(vault_path: Path) -> None:
-    """Generate the tag-garden report."""
+def _report_tags(vault_path: Path, override: PrivacyTierOverride) -> None:
+    """Generate the tag-garden report.
+
+    Args:
+        vault_path: Vault root.
+        override: Tier ceiling for the scan (#968). Note the garden is
+            fragment-derived only below ``intimate``: the four non-fragment
+            scan directories hold note types with no ``privacy_tier``.
+    """
     from creek.generate.tags import TagGardenGenerator
 
-    path = TagGardenGenerator(vault_path=vault_path).generate_garden()
+    path = TagGardenGenerator(
+        vault_path=vault_path,
+        override=override,
+    ).generate_garden()
     console.print(f"[bold green]Tag Garden generated: {path}[/bold green]")
 
 
-def _report_unnamed(vault_path: Path) -> None:
-    """Generate the weekly unnamed-fragment digest."""
+def _report_unnamed(vault_path: Path, override: PrivacyTierOverride) -> None:
+    """Generate the weekly unnamed-fragment digest.
+
+    Args:
+        vault_path: Vault root.
+        override: Unused. ``unnamed`` IS served over MCP, but only at
+            ``privacy_tier_ceiling=all`` — UnnamedDigestGenerator.generate_weekly_digest
+            accepts no :class:`PrivacyTierOverride`, so a narrower ceiling
+            cannot be honoured and is refused by name rather than
+            silently widened (#968). The parameter exists only to satisfy
+            :data:`_REPORT_DISPATCH`'s uniform signature.
+    """
+    del override  # served at ceiling=all only; see the docstring above.
+
     from datetime import date as _date
     from datetime import timedelta as _timedelta
 
@@ -2508,11 +3928,77 @@ def _report_unnamed(vault_path: Path) -> None:
     )
 
 
-def _report_voice(vault_path: Path) -> None:
-    """Generate per-register voice profiles, if exemplars exist."""
-    from creek.generate.voice import VoiceProfileGenerator
+def _report_voice(vault_path: Path, override: PrivacyTierOverride) -> None:
+    """Generate per-register voice profiles and register samples (#879).
 
-    profile_paths = VoiceProfileGenerator().generate_all_profiles(vault_path)
+    Two halves of one report, over one corpus: the rendered profiles under
+    ``07-Voice/`` and the ranked exemplar copies under
+    ``07-Voice/Register-Samples/``.
+
+    The second half also **deletes** — a sample whose fragment has left the
+    corpus is removed — so this is a report that mutates the vault in both
+    directions, and prints both.
+
+    Args:
+        vault_path: Vault root.
+        override: Tier ceiling for the exemplar walk (#968). Additive to the
+            collector's ``allow_intimate`` consent gate, never a replacement
+            for it.
+    """
+    from creek.generate.voice import VoiceProfileGenerator, generate_register_samples
+
+    # Re-resolved from the *resolved* vault_path, deliberately. The command
+    # body already loaded a config from the raw ``--vault`` argument, and with
+    # ``--vault`` omitted those two can be different files: the command may
+    # find its vault via a cwd config while the vault carries its own. For
+    # vault-scoped behaviour the vault's file is the intended winner, matching
+    # ``_report_unnamed`` above. Bare ``load_config()`` would be wrong twice
+    # over — it reads ``creek_config.yaml`` from the *current directory* and
+    # never looks inside the vault at all, which is precisely how this knob
+    # stayed inert (#1313).
+    weighting = _load_config_for_vault(
+        vault_path,
+        warn_on_missing=False,
+    ).voice_audience_weighting
+    profile_paths = VoiceProfileGenerator(
+        override=override,
+        audience_weighting=weighting,
+    ).generate_all_profiles(
+        vault_path,
+    )
+    # Deliberately above the no-profiles early return: an emptied corpus has
+    # nothing left to profile, but the samples tree may still hold verbatim
+    # copies of the fragments that left it, and this is the call that prunes
+    # them (#879).
+    #
+    # This is a SECOND full walk of 01-Fragments, and knowingly so. It cannot
+    # share ``generate_all_profiles``' walk without a refactor: below,
+    # ``_persist_fragment`` copies a fragment's source file only while the
+    # collector's ``_records`` cache holds its entry, and only
+    # ``collect_exemplars`` fills that cache — so saving through a collector
+    # that never walked writes a full set of valid-looking samples with empty
+    # bodies. Measured on synthetic vaults (1k/5k fragments, linear scaling):
+    # the redundant walk takes ``_report_voice`` from 1.0x to 1.8x one corpus
+    # parse (~16s of ~39s projected at 35k). The trade is bounded because
+    # ``creek fill`` already makes ~12 full-corpus parse passes, so this is
+    # ~7% of its parse budget and less of its wall clock, which belongs to
+    # embedding inference and DBSCAN. ``save_exemplars`` itself is O(1) in
+    # vault size (<=7 registers x 20 copies). Sharing the walk is issue #1220.
+    pruned: list[Path] = []
+    summaries = generate_register_samples(
+        vault_path,
+        override=override,
+        audience_weighting=weighting,
+        on_prune=pruned.append,
+    )
+    # Announced before the early return, because the emptied corpus that
+    # takes that return is exactly the run with the most to delete. This
+    # command removes files from the vault, ``creek fill`` runs it
+    # unattended, and a silent deletion is one nobody can audit (#879).
+    if pruned:
+        console.print(
+            f"[yellow]Stale register samples pruned ({len(pruned)})[/yellow]",
+        )
     if not profile_paths:
         console.print(
             "[yellow]No voice profiles generated: "
@@ -2524,43 +4010,79 @@ def _report_voice(vault_path: Path) -> None:
         f"[bold green]Voice profiles generated ({len(profile_paths)}): "
         f"{names}[/bold green]",
     )
+    registers = ", ".join(sorted(summaries))
+    console.print(
+        f"[bold green]Register samples written ({len(summaries)}): "
+        f"{registers}[/bold green]",
+    )
 
 
-def _report_decisions(vault_path: Path) -> None:
+def _report_decisions(vault_path: Path, override: PrivacyTierOverride) -> None:
     """Generate draft Decision notes from decision-signalling fragments (#581).
 
     Scans the vault's fragments for decision signals and writes a draft note per
     *new* candidate to ``08-Decisions/Active/``; re-running is idempotent (a
     fragment already captured by a note is skipped). Prints a friendly message
     when there are no new candidates.
+
+    When the unconditional intimate screen refused anything, the withheld
+    notice is printed on **stdout** — in *both* branches, and after the
+    headline either way. Before #1487 the count reached only a
+    ``logger.warning``, so an operator whose one candidate had been refused
+    read "no new decision candidates found" on stdout: a false statement
+    produced by the tool itself. Printing it in the success branch too is not
+    belt-and-braces — a mixed vault writes some notes and refuses others, and
+    a green success line with nothing beside it is how a partial report reads
+    as a complete one. The single exit path below is what makes "both
+    branches" hold by construction rather than by two call sites that can
+    drift apart.
+
+    Args:
+        vault_path: Vault root.
+        override: Tier ceiling for the fragment walk (#968). A written note's
+            filename and ``title:`` are a source fragment's title verbatim.
     """
-    from creek.generate.decisions import generate_decisions
+    from creek.generate.decisions import generate_decisions, withheld_notice
 
-    written_paths = generate_decisions(vault_path)
-    if not written_paths:
+    report = generate_decisions(vault_path, override=override)
+    if report.notes:
+        rels = ", ".join(str(p.relative_to(vault_path)) for p in report.notes)
         console.print(
-            "[yellow]No decision notes generated: "
-            "no new decision candidates found.[/yellow]",
+            f"[bold green]Decision notes generated ({len(report.notes)}): "
+            f"{rels}[/bold green]",
         )
-        return
-    rels = ", ".join(str(p.relative_to(vault_path)) for p in written_paths)
-    console.print(
-        f"[bold green]Decision notes generated ({len(written_paths)}): "
-        f"{rels}[/bold green]",
-    )
+    else:
+        # The "No decision notes generated" prefix is byte-stable across both
+        # tails; only the reason varies, because claiming there were no
+        # candidates over a vault this report could not fully read is the
+        # falsehood #1487 exists to remove.
+        tail = (
+            "no new candidates among the fragments this report could read."
+            if report.withheld
+            else "no new decision candidates found."
+        )
+        console.print(f"[yellow]No decision notes generated: {tail}[/yellow]")
+    notice = withheld_notice(report.withheld)
+    if notice is not None:
+        console.print(f"[yellow]{notice}[/yellow]")
 
 
-def _report_lexicon(vault_path: Path) -> None:
+def _report_lexicon(vault_path: Path, override: PrivacyTierOverride) -> None:
     """Generate the voice lexicon glossary + metaphor index (#580).
 
     Collects the vault's voice exemplars (sharing the voice report's eligibility
     gate), builds a :class:`~creek.generate.lexicon.Lexicon`, and persists it to
     ``07-Voice/Lexicon/``. Mirrors ``_report_voice``'s friendly "no qualifying
     exemplars" message when the corpus is empty.
+
+    Args:
+        vault_path: Vault root.
+        override: Tier ceiling for the exemplar walk (#968). Borrowed-term
+            entries record the whole surrounding sentence verbatim.
     """
     from creek.generate.lexicon import generate_lexicon
 
-    lexicon, written_paths = generate_lexicon(vault_path)
+    lexicon, written_paths = generate_lexicon(vault_path, override=override)
     if lexicon is None or not written_paths:
         console.print(
             "[yellow]No lexicon generated: no qualifying exemplars found.[/yellow]",
@@ -2574,17 +4096,34 @@ def _report_lexicon(vault_path: Path) -> None:
     )
 
 
-def _report_rhetorical_patterns(vault_path: Path) -> None:
+def _report_rhetorical_patterns(
+    vault_path: Path,
+    override: PrivacyTierOverride,
+) -> None:
     """Persist per-register rhetorical-pattern notes (#582).
 
     Writes the ontology's "### Rhetorical Moves" section per voice register to
     ``07-Voice/Rhetorical-Patterns/``, reusing the voice subsystem's existing
     move detection. Mirrors ``_report_voice``'s friendly "no qualifying
     exemplars" message when the corpus is empty.
+
+    Args:
+        vault_path: Vault root.
+        override: Tier ceiling for the exemplar walk (#968). The notes hold
+            only integer counts, but *which* per-register files exist is
+            itself derived from who entered the corpus.
     """
     from creek.generate.voice import VoiceProfileGenerator
 
-    written_paths = VoiceProfileGenerator().generate_rhetorical_patterns(vault_path)
+    # Vault-scoped, not cwd-scoped — see the comment in ``_report_voice`` (#1313).
+    weighting = _load_config_for_vault(
+        vault_path,
+        warn_on_missing=False,
+    ).voice_audience_weighting
+    written_paths = VoiceProfileGenerator(
+        override=override,
+        audience_weighting=weighting,
+    ).generate_rhetorical_patterns(vault_path)
     if not written_paths:
         console.print(
             "[yellow]No rhetorical patterns written: "
@@ -2598,15 +4137,23 @@ def _report_rhetorical_patterns(vault_path: Path) -> None:
     )
 
 
-def _report_mode_profiles(vault_path: Path) -> None:
+def _report_mode_profiles(vault_path: Path, override: PrivacyTierOverride) -> None:
     """Generate per-mode wavelength profiles to 05-Wavelength/Mode-Profiles/ (#583).
 
     Writes one note per engagement mode that has fragments; prints a friendly
     message when no fragment carries a classified mode.
+
+    Args:
+        vault_path: Vault root.
+        override: Tier ceiling for the fragment walk (#968). A mode profile
+            lists sample fragment titles.
     """
     from creek.generate.wavelength import ModeProfileGenerator
 
-    written_paths = ModeProfileGenerator().generate_mode_profiles(vault_path)
+    written_paths = ModeProfileGenerator().generate_mode_profiles(
+        vault_path,
+        override=override,
+    )
     if not written_paths:
         console.print(
             "[yellow]No mode profiles written: "
@@ -2620,55 +4167,11 @@ def _report_mode_profiles(vault_path: Path) -> None:
     )
 
 
-_WAVELENGTH_ISO_WEEK_RE = re.compile(r"^(\d{4})-W(\d{2})$")
-_WAVELENGTH_MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
-
-
-def _resolve_wavelength_period(period: str | None) -> tuple[str, date] | None:
-    """Resolve a ``--period`` string to a ``(mode, anchor-date)`` pair.
-
-    Accepts the relative keywords ``weekly`` / ``monthly`` (anchored on today)
-    and explicit ``YYYY-Www`` (ISO week) / ``YYYY-MM`` (calendar month) periods,
-    so an operator can regenerate a historical phase-map deterministically.
-
-    Args:
-        period: The raw ``--period`` value.
-
-    Returns:
-        ``("weekly", anchor)`` or ``("monthly", anchor)`` where *anchor* is any
-        date inside the target window, or ``None`` when *period* is missing or
-        unparseable (the caller surfaces the error).
-    """
-    if period is None:
-        return None
-    if period in {"weekly", "monthly"}:
-        return (period, date.today())
-    week_match = _WAVELENGTH_ISO_WEEK_RE.match(period)
-    if week_match:
-        year, week = int(week_match.group(1)), int(week_match.group(2))
-        try:
-            return ("weekly", date.fromisocalendar(year, week, 1))
-        except ValueError:
-            return None
-    month_match = _WAVELENGTH_MONTH_RE.match(period)
-    if month_match:
-        year, month = int(month_match.group(1)), int(month_match.group(2))
-        try:
-            return ("monthly", date(year, month, 1))
-        except ValueError:
-            return None
-    return None
-
-
-def _wavelength_dimension_populated(fragments: list[Fragment]) -> bool:
-    """Return whether any *fragments* carry a classified wavelength phase."""
-    # Local import: cli.py defers model imports to keep CLI startup fast.
-    from creek.models import Phase
-
-    return any(f.wavelength.phase != Phase.UNCLASSIFIED for f in fragments)
-
-
-def _report_wavelength(vault_path: Path, period: str | None) -> None:
+def _report_wavelength(
+    vault_path: Path,
+    period: str | None,
+    override: PrivacyTierOverride,
+) -> None:
     """Generate a descriptive wavelength phase-map to ``05-Wavelength/Phase-Maps/``.
 
     Wires the deterministic :class:`WavelengthTracker` weekly/monthly generators
@@ -2677,23 +4180,41 @@ def _report_wavelength(vault_path: Path, period: str | None) -> None:
     classified wavelength phase the dimension is unpopulated, so it prints an
     informative message instead of writing a silent empty file. Wavelength
     output is descriptive only — it never prescribes action.
+
+    Period parsing and the write itself live in
+    :mod:`creek.generate.wavelength` because ``creek.report`` serves this same
+    type over MCP (#1253) and a second parser is exactly the drift that made
+    the type unreachable there in the first place.
+
+    Args:
+        vault_path: Vault root.
+        period: The raw ``--period`` value.
+        override: Tier ceiling for the corpus load (#968). ``wavelength`` is
+            special-cased out of :data:`_REPORT_DISPATCH` because it needs
+            ``--period``, but that is a signature difference, not a licence to
+            ignore ``--include-tier``.
     """
     from creek.generate.wavelength import (
-        WavelengthTracker,
-        load_fragments_from_vault,
+        PERIOD_HELP,
+        generate_phase_map,
+        resolve_period,
     )
 
-    resolved = _resolve_wavelength_period(period)
+    resolved = resolve_period(period)
     if resolved is None:
         console.print(
-            "[red]--period must be 'weekly', 'monthly', an ISO week "
-            "(YYYY-Www), or a month (YYYY-MM) for wavelength reports.[/red]",
+            f"[red]--period must be {PERIOD_HELP} for wavelength reports.[/red]",
         )
         raise typer.Exit(code=2)
     mode, anchor = resolved
 
-    fragments = load_fragments_from_vault(vault_path)
-    if not _wavelength_dimension_populated(fragments):
+    wavelength_path = generate_phase_map(
+        vault_path,
+        mode=mode,
+        anchor=anchor,
+        override=override,
+    )
+    if wavelength_path is None:
         console.print(
             "[yellow]No wavelength phase-map written: no fragment carries a "
             "classified wavelength phase. Classify the wavelength dimension "
@@ -2701,30 +4222,37 @@ def _report_wavelength(vault_path: Path, period: str | None) -> None:
         )
         return
 
-    tracker = WavelengthTracker()
-    if mode == "weekly":
-        wavelength_path = tracker.generate_weekly_report(
-            vault_path, week_of=anchor, fragments=fragments
-        )
-    else:
-        wavelength_path = tracker.generate_monthly_report(
-            vault_path, month=anchor, fragments=fragments
-        )
     console.print(
         f"[bold green]Wrote {wavelength_path.relative_to(vault_path)} "
         "(descriptive; non-prescriptive)[/bold green]",
     )
 
 
-def _report_fingerprint(vault_path: Path) -> None:
-    """Build and persist the voice fingerprint (FEAT-040.2)."""
-    from creek.config import load_config
+def _report_fingerprint(vault_path: Path, override: PrivacyTierOverride) -> None:
+    """Build and persist the voice fingerprint (FEAT-040.2).
+
+    Args:
+        vault_path: Vault root.
+        override: Unused. ``fingerprint`` IS served over MCP, but only at
+            ``privacy_tier_ceiling=all`` — build_fingerprint
+            accepts no :class:`PrivacyTierOverride`, so a narrower ceiling
+            cannot be honoured and is refused by name rather than
+            silently widened (#968). The parameter exists only to satisfy
+            :data:`_REPORT_DISPATCH`'s uniform signature.
+    """
+    del override  # served at ceiling=all only; see the docstring above.
+
     from creek.generate.ai_style.fingerprint import (
         build_fingerprint,
         save_fingerprint,
     )
 
-    full_config = load_config()
+    # Was a bare ``load_config()``, which resolves ``creek_config.yaml``
+    # against the *current directory* and never reads the vault's own file —
+    # so ``--vault X`` silently ignored X's settings and this half of the
+    # feature only looked wired. Moving to the vault's config corrects both
+    # ``voice_audience_weighting`` and ``ai_style`` in one line (#1313).
+    full_config = _load_config_for_vault(vault_path, warn_on_missing=False)
     config = full_config.ai_style
     fingerprint = build_fingerprint(
         vault_path,
@@ -2754,6 +4282,8 @@ def _report_fingerprint(vault_path: Path) -> None:
 def _resolve_voice_fingerprint(
     vault_path: Path,
     ai_style: AIStyleConfig,
+    *,
+    audience_weighting: VoiceAudienceWeightingConfig,
 ) -> VoiceFingerprint:
     """Return the vault's voice fingerprint, persisted-first then built.
 
@@ -2765,10 +4295,21 @@ def _resolve_voice_fingerprint(
     Args:
         vault_path: Vault root.
         ai_style: AI-style configuration (fingerprint path + weights).
+        audience_weighting: The vault's audience weighting, forwarded to
+            ``build_fingerprint`` on the fallback branch. Keyword-only and
+            **required, with no default**, because #1410 was precisely a
+            default going unnoticed: ``build_fingerprint``'s own parameter
+            defaults to ``None``, which means *disabled*, so this one caller
+            silently built the fallback fingerprint from the flat platform
+            average while every sibling honoured the vault's weighting. A
+            default here would let the next caller repeat that.
 
     Returns:
         A :class:`VoiceFingerprint`; its ``fragment_count`` is ``0`` when
-        neither a persisted artefact nor eligible fragments exist.
+        neither a persisted artefact nor eligible fragments exist — which
+        includes the case where *audience_weighting* zeroes the authority of
+        every tier the vault holds, since a zero weight drops a fragment from
+        the corpus rather than merely down-ranking it.
     """
     from creek.generate.ai_style.fingerprint import (
         build_fingerprint,
@@ -2778,7 +4319,11 @@ def _resolve_voice_fingerprint(
     fingerprint = load_fingerprint(vault_path, ai_style)
     if fingerprint.fragment_count > 0:
         return fingerprint
-    return build_fingerprint(vault_path, ai_style)
+    return build_fingerprint(
+        vault_path,
+        ai_style,
+        audience_weighting=audience_weighting,
+    )
 
 
 def _print_voice_check_summary(
@@ -2897,13 +4442,23 @@ def voice_check(
         raise typer.Exit(code=2)
 
     vault_path = _resolve_vault(vault)
-    ai_style = _load_config_for_vault(vault).ai_style
+    # From the RESOLVED root, not the raw ``--vault`` argument. With ``--vault``
+    # omitted, ``_load_config_for_vault(vault)`` falls through to the cwd while
+    # ``_resolve_vault`` has already named the vault the corpus comes from — so
+    # the config and the fragments would come from two different vaults. Same
+    # hazard ``_report_voice`` documents and re-resolves against.
+    config = _load_config_for_vault(vault_path)
+    ai_style = config.ai_style
     # Resolve the ceiling from THIS vault's config at call time so a per-vault
     # voice_distance_upper override is honoured; an explicit flag still wins.
     effective_max_distance = (
         max_distance if max_distance is not None else ai_style.voice_distance_upper
     )
-    fingerprint = _resolve_voice_fingerprint(vault_path, ai_style)
+    fingerprint = _resolve_voice_fingerprint(
+        vault_path,
+        ai_style,
+        audience_weighting=config.voice_audience_weighting,
+    )
 
     if fingerprint.fragment_count == 0:
         console.print(
@@ -2989,21 +4544,47 @@ def voice_authenticity(
         console.print(report.summary_line(), markup=False)
 
 
-def _report_paradox(vault_path: Path) -> None:
+def _report_paradox(vault_path: Path, override: PrivacyTierOverride) -> None:
     """Write Paradox notes for contradictory fragment pairs (#711).
 
     Wires the implemented ``ParadoxDetector`` to a runnable command: scans the
     vault for contradictory pairs and writes one neutral note per paradox into
-    ``10-Liminal/Paradoxes/``. Idempotent; deterministic (no LLM).
+    ``10-Liminal/Paradoxes/``. Deterministic (no LLM), and idempotent because
+    the generator skips pairs an existing note already records (#1320) — so a
+    re-run on a later day writes nothing rather than a second copy.
+
+    Any pre-#1320 duplicate copies already in the vault are reported through
+    ``on_warning`` as they are detected, before the empty/success line, and are
+    never deleted.
+
+    Args:
+        vault_path: Vault root.
+        override: Unused. ``paradox`` IS served over MCP, but only at
+            ``privacy_tier_ceiling=all`` — generate_paradoxes
+            accepts no :class:`PrivacyTierOverride`, so a narrower ceiling
+            cannot be honoured and is refused by name rather than
+            silently widened (#968). The parameter exists only to satisfy
+            :data:`_REPORT_DISPATCH`'s uniform signature.
     """
+    del override  # served at ceiling=all only; see the docstring above.
+
     from creek.generate.paradox import generate_paradoxes
 
     config = _load_config_for_vault(vault_path)
-    written = generate_paradoxes(vault_path, config.embeddings)
+    written = generate_paradoxes(
+        vault_path,
+        config.embeddings,
+        on_warning=_print_advisory,
+    )
     if not written:
+        # Deliberately covers both empty cases: no contradictory pair exists,
+        # and every pair that exists is already recorded. `generate_paradoxes`
+        # returns `[]` for both and the difference does not change what the
+        # operator should do — the notes they want are in the folder either way.
         console.print(
-            "[yellow]No paradox notes generated: "
-            "no contradictory fragment pairs found.[/yellow]",
+            "[yellow]No paradox notes generated: no contradictory fragment "
+            "pairs beyond those already recorded in "
+            "10-Liminal/Paradoxes/.[/yellow]",
         )
         return
     console.print(
@@ -3012,14 +4593,25 @@ def _report_paradox(vault_path: Path) -> None:
     )
 
 
-def _report_synchronicity(vault_path: Path) -> None:
+def _report_synchronicity(vault_path: Path, override: PrivacyTierOverride) -> None:
     """Write Synchronicity notes for surprising cross-source resonances (#711).
 
     Wires the implemented ``SynchronicityDetector`` to a runnable command: loads
     embeddings, computes resonances, filters for cross-source >0.9-similarity
     >30-day pairs, and writes one note per pair into
     ``10-Liminal/Synchronicities/``. Idempotent; deterministic (no LLM).
+
+    Args:
+        vault_path: Vault root.
+        override: Unused. ``synchronicity`` IS served over MCP, but only at
+            ``privacy_tier_ceiling=all`` — generate_synchronicities
+            accepts no :class:`PrivacyTierOverride`, so a narrower ceiling
+            cannot be honoured and is refused by name rather than
+            silently widened (#968). The parameter exists only to satisfy
+            :data:`_REPORT_DISPATCH`'s uniform signature.
     """
+    del override  # served at ceiling=all only; see the docstring above.
+
     from creek.generate.synchronicity import generate_synchronicities
 
     config = _load_config_for_vault(vault_path)
@@ -3036,7 +4628,7 @@ def _report_synchronicity(vault_path: Path) -> None:
     )
 
 
-_REPORT_DISPATCH: dict[str, Callable[[Path], None]] = {
+_REPORT_DISPATCH: dict[str, Callable[[Path, PrivacyTierOverride], None]] = {
     "tags": _report_tags,
     "unnamed": _report_unnamed,
     "voice": _report_voice,
@@ -3058,7 +4650,7 @@ def report(
     include_tier: str | None = typer.Option(
         None,
         "--include-tier",
-        help=_INCLUDE_TIER_HELP,
+        help=_REPORT_INCLUDE_TIER_HELP,
     ),
 ) -> None:
     """Generate reports on vault state.
@@ -3076,6 +4668,19 @@ def report(
     config = _load_config_for_vault(vault)
     vault_path = vault or config.vault_path
     override = _parse_include_tier(include_tier)
+    # NB (#968): this audits the *flag*, not the effective ceiling, and the
+    # shared ``override_elevates`` helper reads backwards on this surface —
+    # it was built for ``mine``/``author``, where the flag WIDENS, whereas on
+    # ``report`` the flag NARROWS. It answers ``False`` for both ``None`` and
+    # ``OPEN``, so a bare ``creek report`` (unfiltered, the widest scan there
+    # is) and a typed ``--include-tier open`` (the narrowest) are alike
+    # unaudited and indistinguishable in the log. Pinned by
+    # ``tests/test_cli_privacy.py::test_report_voice_include_tier_open_writes_no_audit``
+    # and tracked as issue #1218 — not fixed in place because auditing the
+    # resolved ceiling here fires before ``--type`` is validated, turning the
+    # #716 unknown-type exit-2 into an OSError on an unwritable vault path
+    # (``tests/test_cli.py::test_report_command``), so the fix is a reordering
+    # plus an audit-volume decision, not a one-line swap.
     _audit_privacy_override_if_needed(
         vault_path=vault_path,
         command=f"report.{type}" if type else "report",
@@ -3085,13 +4690,19 @@ def report(
 
     handler = _REPORT_DISPATCH.get(type or "")
     if handler is not None:
-        handler(vault_path)
+        # An absent ``--include-tier`` means *unfiltered* here, not ``open``
+        # (#968) — see ``_REPORT_INCLUDE_TIER_HELP``. On ``report`` the flag
+        # narrows rather than widens.
+        handler(vault_path, override or PrivacyTierOverride.ALL)
         return
     if type == "wavelength":
-        _report_wavelength(vault_path, period)
+        _report_wavelength(vault_path, period, override or PrivacyTierOverride.ALL)
         return
     # Unknown/missing type: fail loudly with the valid list, not a no-op (#716).
-    valid = ", ".join([*_REPORT_DISPATCH, "wavelength"])
+    # The list comes from :data:`creek.surface_modes.REPORT_TYPES`, the one
+    # declaration ``creek.report`` reads too (#1253), rather than from
+    # ``_REPORT_DISPATCH`` plus a hand-appended ``"wavelength"``.
+    valid = ", ".join(REPORT_TYPES)
     if type is None:
         console.print(f"[red]--type is required. Valid types: {valid}.[/red]")
     else:
@@ -3106,6 +4717,11 @@ def report(
 @app.command()
 def state(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    include_tier: str | None = typer.Option(
+        None,
+        "--include-tier",
+        help=_REPORT_INCLUDE_TIER_HELP,
+    ),
 ) -> None:
     """Render ``00-Creek-Meta/State/<iso-week>.md`` audit report.
 
@@ -3113,15 +4729,40 @@ def state(
     re-runs classification, linking, or compile. It reads existing
     fragments, threads, eddies, praxis, synchronicities, and the most
     recent ``run-summary.jsonl`` line, and writes a single markdown
-    document organised in seven sections (vault summary, pre-LLM yield,
-    active eddies, active threads, surprising connections, hyperedges,
-    drift warnings). ``latest.md`` next to the ISO-week file always
-    points at the most recent report.
+    document organised in eleven sections (wavelength snapshot, vault
+    summary, pre-LLM yield, liminal watch, active eddies, active threads,
+    surprising connections, hyperedges, drift warnings, suggested
+    questions, lint summary). ``latest.md`` next to the ISO-week file
+    always points at the most recent report.
+
+    ``--include-tier`` runs the same way round as it does on ``report``
+    (#968): omitting it leaves the render **unfiltered**, because the CLI
+    operator is the vault owner, and supplying it NARROWS what the artifact may
+    contain. It is also half of the documented upgrade path for a pre-#969
+    ``latest.md``: ``creek state --include-tier open`` re-renders and
+    re-stamps so an ``open``-ceiling MCP reader stops being refused.
+
+    Privacy override audit: the entry is written only when the flag was
+    **explicitly supplied**. ``override_elevates`` answers ``True`` for
+    ``PrivacyTierOverride.ALL``, so auditing the resolved ceiling would write a
+    line on every bare ``creek state`` — the loudest possible record of the one
+    case where the operator asked for nothing.
     """
     from creek.generate.state import StateReportGenerator
 
+    override = _parse_include_tier(include_tier)
     vault_path = _resolve_vault(vault)
-    written = StateReportGenerator(vault_path=vault_path).write()
+    if include_tier is not None:
+        _audit_privacy_override_if_needed(
+            vault_path=vault_path,
+            command="state",
+            override=override,
+            fragment_ids=[],
+        )
+    written = StateReportGenerator(
+        vault_path=vault_path,
+        override=override or PrivacyTierOverride.ALL,
+    ).write()
     console.print(f"[bold green]State report written: {written}[/bold green]")
 
 
@@ -3155,9 +4796,15 @@ def lint(
         None,
         "--check",
         help=(
+            # Kept in step with creek.lint.ALL_CHECKS by
+            # test_lint.py::test_the_check_help_string_lists_every_check.
+            # Restated rather than rendered because `creek.lint` is imported
+            # lazily inside the command bodies to keep CLI startup fast, and
+            # a module-level import here would undo that.
             "Run only this check (repeatable). Names: paradox, unnamed, "
             "synchronicity, compost, tags, broken-links, orphan-compiled, "
-            "skill-size."
+            "skill-size, draft-grounding, voice-fidelity, unparseable, "
+            "ancestry, root-hygiene."
         ),
     ),
     since: str | None = typer.Option(
@@ -3318,6 +4965,64 @@ def _gdrive_check() -> None:
         )
 
 
+def _render_download_outcome(result: DownloadResult, staging_dir: Path) -> None:
+    """Account for every file the Drive listing offered (#1372).
+
+    Downloaded + skipped + failed is :attr:`DownloadResult.attempted`, i.e.
+    the whole listing. Until this existed the line reported only the first
+    two, so a three-file listing where two downloads failed printed
+    ``Downloaded 1 / Skipped 0`` — indistinguishable from a listing that only
+    ever held one file, and the two lost files were named nowhere.
+
+    Extracted rather than inlined so the handler that calls it stays under
+    the cyclomatic-complexity gate: it already carries the mode-selection
+    branches and the broad Drive ``except``.
+
+    Args:
+        result: The outcome of the connector's fetch.
+        staging_dir: Where the files were mirrored, echoed for the operator.
+    """
+    console.print(
+        f"[bold green]Downloaded {len(result.downloaded)} / "
+        f"Skipped {len(result.skipped)} (unchanged) / "
+        f"Failed {len(result.errors)} files to "
+        f"{staging_dir}[/bold green]",
+    )
+    for line in result.failure_lines:
+        # Escaped for the same reason as the sync-path render: the line leads
+        # with a remote-supplied file name, and an unbalanced Rich tag inside
+        # one would abort the command instead of reporting the failure.
+        console.print(f"  [yellow]{escape(line)}[/yellow]")
+
+
+def _download_is_total_failure(result: DownloadResult) -> bool:
+    """Return ``True`` when a download listed files and landed none (#1372).
+
+    Every listed file errored and none was already up to date, so the staging
+    directory gained nothing: a schedule chaining ``creek gdrive --download &&
+    creek ingest ...`` would otherwise march on and report success over an
+    empty directory.
+
+    The ``not result.skipped`` term is the load-bearing one. The predicate
+    that looks natural — errors and nothing downloaded — declares total
+    failure on a routine warm incremental tick, where *every* healthy file is
+    reported as skipped rather than downloaded; one 403 among two up-to-date
+    files would then make a healthy scheduled unit look failed every thirty
+    minutes. Partial failure stays exit 0 and is discoverable from the
+    ``Failed`` count :func:`_render_download_outcome` prints.
+
+    Kept out of the caller so the handler stays inside the complexity gate:
+    a three-term predicate inline pushes ``gdrive`` past it.
+
+    Args:
+        result: The outcome of the connector's fetch.
+
+    Returns:
+        Whether the run should exit non-zero.
+    """
+    return bool(result.errors) and not result.downloaded and not result.skipped
+
+
 @app.command()
 def gdrive(
     download: bool = typer.Option(False, help="Download from Google Drive"),
@@ -3399,11 +5104,11 @@ def gdrive(
         console.print(f"[red]Google Drive download failed: {exc}[/red]")
         raise typer.Exit(code=1) from exc
 
-    console.print(
-        f"[bold green]Downloaded {len(result.downloaded)} / "
-        f"Skipped {len(result.skipped)} (unchanged) files to "
-        f"{staging_dir}[/bold green]",
-    )
+    _render_download_outcome(result, staging_dir)
+    # Non-zero only when the listing was non-empty and NOTHING landed — see
+    # the predicate's docstring for why a partial failure must stay exit 0.
+    if _download_is_total_failure(result):
+        raise typer.Exit(code=1)
 
 
 @skills_app.command("generate")
@@ -3439,11 +5144,19 @@ def skills_generate(
     content. The two variants can coexist in the same output directory.
     """
     override = _parse_include_tier(include_tier)
-    # Skill tree generation already excludes intimate exemplars; the
-    # override is recorded as an explicit operator decision rather
-    # than mutating downstream behaviour. _audit_privacy_override_if_
-    # needed already short-circuits for None / OPEN via override_elev-
-    # ates, so there is no extra guard to write at this call site.
+    # The override now *gates the corpus* (#971): it is threaded into
+    # SkillTreeGenerator below as a hard rank cutoff, so a personal or
+    # unclassified fragment contributes no exemplar until the operator
+    # widens the ceiling. ``allow_intimate`` is deliberately NOT derived from
+    # this flag: ``creek/templates/skills/privacy-tier.SKILL.md`` rule 1
+    # promises that "even with --include-tier intimate, intimate fragments
+    # contribute to the voice-skill tree only when the human has explicitly
+    # opted in (SkillTreeGenerator(allow_intimate=True) and consent on file).
+    # The tier flag alone is not enough." Wiring consent to the flag would be
+    # a strict loosening of a shipped promise, so consent stays a
+    # Python-API-only opt-in. _audit_privacy_override_if_needed already
+    # short-circuits for None / OPEN via override_elevates, so there is no
+    # extra guard to write at this call site.
     _audit_privacy_override_if_needed(
         vault_path=_resolve_vault(vault),
         command="skills",
@@ -3463,12 +5176,25 @@ def skills_generate(
     output_dir = output if output is not None else vault_path / "creek-skills"
     written = SkillTreeGenerator(
         signature_only=signature_only,
+        override=override,
     ).generate_all_skills(vault_path, output_dir)
     variant_label = "signature-only" if signature_only else "exemplar-bearing"
     console.print(
         f"[bold green]Voice Skill Tree generated ({len(written)} "
         f"{variant_label} files) at {output_dir}[/bold green]",
     )
+    # ``override_elevates`` is False for exactly None and OPEN — the two
+    # spellings of the default ceiling — so the hint reaches the operator who
+    # has not yet widened it and stays out of the way of the one who has.
+    # ``signature_only`` suppresses it outright rather than qualifying it: that
+    # mode drops every exemplar in ``_maybe_pick_exemplars`` before any tier is
+    # consulted, so the ceiling is inert and the advertised remedy would
+    # produce a byte-identical tree (PR #1286 review). There is no true
+    # rewording to fall back on, and the confusion the hint exists to prevent
+    # cannot arise here: the operator asked for zero exemplars and the success
+    # line above says "signature-only" back to them.
+    if not signature_only and not override_elevates(override):
+        console.print(_SKILLS_DEFAULT_CEILING_HINT)
 
 
 @skills_app.command("sync")
@@ -3481,33 +5207,40 @@ def skills_sync(
     force: bool = typer.Option(
         False,
         "--force",
-        help="Overwrite locally-modified skill files.",
+        help=(
+            "Overwrite locally-modified skill files, keeping your version "
+            "alongside as <name>.bak. A later --force overwrites that "
+            "backup."
+        ),
     ),
 ) -> None:
     """Re-deploy the canonical schema-skill tree into ``<vault>/00-Creek-Meta/Skills/``.
 
-    Pulls upstream changes from
-    ``creek-tools/creek/templates/skills/*.SKILL.md`` after upgrading
-    ``creek-tools``. Local edits to deployed skill files block the
-    overwrite unless ``--force`` is passed.
+    Pulls upstream changes to both classes of canonical skill file after
+    upgrading ``creek-tools``: the flat schema skills
+    (``creek/templates/skills/*.SKILL.md``) and the medium contracts
+    (``creek/templates/skills/mediums/*.MEDIUM.md``). Local edits to
+    either class block the overwrite unless ``--force`` is passed.
     """
-    from creek.scaffold import deploy_skills, detect_drifted_skills
+    from creek.scaffold import DriftedSkillsError, deploy_skills
 
-    drifted = detect_drifted_skills(vault)
-    if drifted and not force:
-        names = ", ".join(p.name for p in drifted)
-        console.print(
-            f"[red]Refusing to sync: local changes detected in "
-            f"{len(drifted)} skill file(s): {names}. "
-            "Pass --force to overwrite.[/red]",
+    try:
+        deployment = deploy_skills(vault, force=force)
+    except DriftedSkillsError as exc:
+        _print_skill_drift_refusal(
+            exc.labels,
+            verb="sync",
+            remedy=f"creek skills sync --vault {vault} --force",
+            whole_deployment=False,
         )
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from exc
 
-    synced = deploy_skills(vault)
     console.print(
-        f"[bold green]Synced {synced} skill file(s) to "
+        f"[bold green]Synced {deployment.written} skill file(s) to "
         f"{vault / '00-Creek-Meta' / 'Skills'}.[/bold green]",
     )
+    for backup in deployment.preserved:
+        console.print(f"[yellow]Kept your previous version at {backup}.[/yellow]")
 
 
 def _warn_bypass_compiled(verb: str) -> None:
@@ -3811,62 +5544,103 @@ def _build_seed_spec(
     )
 
 
-def _build_draft_llm(max_tokens: int | None = None) -> DraftLLM:
-    """Construct a :data:`DraftLLM` callable from the configured LLM provider.
+def _build_draft_llm_factory(
+    config: CreekConfig,
+    max_tokens: int | None = None,
+) -> DraftLLMFactory:
+    """Build the tier-keyed draft LLM factory for ``creek draft`` (#1031).
 
-    Uses the Ollama/Anthropic adapter already wired up for classification.
-    Reads the vault-resolved config via :func:`load_config` so the helper
-    keeps a stable signature; the ``draft`` command pre-warms
-    ``CREEK_CONFIG`` resolution by calling :func:`_load_config_for_vault`
-    upstream.
+    Returns a factory rather than a client because the tier this call must
+    be keyed with is not known here. ``creek draft`` resolves its source
+    fragments inside :class:`~creek.generate.drafts.DraftGenerator` — mined
+    seed, ``--seed-*`` spec, or per outline section — so the CLI has nothing
+    to hand :meth:`~creek.classify.llm.router.ModelRouter.resolve` at build
+    time, and the tier-less ``resolve`` it used to call switched off the
+    ``Intimate``-never-cloud gate (#647) on the one draft path that puts
+    whole fragment *bodies* in a prompt. The generator calls this back once
+    it knows what a prompt carries; see
+    :meth:`~creek.generate.drafts.DraftGenerator._bind_routing_tier`.
 
-    The returned callable yields a
-    :class:`~creek.generate.drafts.DraftLLMResponse` so the draft
-    generator can detect a ``max_tokens`` truncation via the provider's
-    stop reason instead of saving a silently cut-off essay.
+    The content tier alone, with no ceiling term — the CLI operator *is* the
+    vault owner, so unlike ``creek_mcp.tools.draft`` there is no caller
+    declaration to reconcile against. Modelling ``--include-tier all`` as a
+    ceiling would be actively wrong: ``creek_mcp.tier_ceiling``'s
+    ``CEILING_ROUTING_TIER[ALL]`` is ``INTIMATE``, which would pin every
+    such draft to the local model no matter what the prompt actually holds.
+
+    *config* is the **vault's** config, resolved by
+    :func:`_load_config_for_vault`. The bare ``load_config()`` this used to
+    call read the process's own config instead, so ``creek draft --vault
+    <v>`` routed on whatever config the current working directory happened
+    to expose and ignored the vault's routing policy entirely.
 
     Args:
+        config: The vault-resolved configuration supplying both the router
+            and the ``draft.max_tokens`` default, so the two cannot diverge.
         max_tokens: Explicit per-invocation token ceiling (the
             ``--max-tokens`` flag). ``None`` falls back to the loaded
             ``draft.max_tokens`` config, then to the provider's built-in
             default. The Ollama path ignores it.
 
     Returns:
-        A callable ``(prompt) -> DraftLLMResponse`` ready to feed to
-        :class:`DraftGenerator`.
-
-    Raises:
-        typer.Exit: If the configured LLM provider is not reachable.
+        A ``(tier) -> (prompt) -> DraftLLMResponse`` factory ready to feed
+        to :class:`DraftGenerator` as ``llm_factory``. Clients are cached
+        per tier so a multi-section draft pays one provider handshake per
+        distinct tier, not one per prompt. The
+        :class:`~creek.generate.drafts.DraftLLMResponse` return lets the
+        generator detect a ``max_tokens`` truncation via the provider's stop
+        reason instead of saving a silently cut-off essay.
     """
     from creek.classify.llm import LLMClassifier
+    from creek.classify.llm.router import IntimateRoutingError
     from creek.generate.drafts import DraftLLMResponse
 
-    config = load_config()
     # The explicit flag wins; otherwise honour the config default. Both
     # the provider settings and this ceiling come from the same loaded
     # config so they cannot diverge.
     effective_max_tokens = (
         max_tokens if max_tokens is not None else config.draft.max_tokens
     )
-    classifier = LLMClassifier(config.model_router.resolve("classification"))
-    if not classifier.available:
-        console.print(
-            "[red]LLM provider unavailable; cannot generate draft. "
-            "Check Ollama or ANTHROPIC_API_KEY configuration.[/red]",
-        )
-        raise typer.Exit(code=1)
+    clients: dict[PrivacyTier, DraftLLM] = {}
 
-    def _invoke(prompt: str) -> DraftLLMResponse:
-        completion = classifier.invoke_prompt_with_metadata(
-            prompt,
-            max_tokens=effective_max_tokens,
-        )
-        return DraftLLMResponse(
-            text=completion.text,
-            stop_reason=completion.stop_reason,
-        )
+    def _client_for(tier: PrivacyTier) -> DraftLLM:
+        """Return the draft client this *tier* may be sent to."""
+        cached = clients.get(tier)
+        if cached is not None:
+            return cached
+        try:
+            resolved = config.model_router.resolve("classification", tier)
+        except IntimateRoutingError as exc:
+            # The one refusal that must be legible, exactly as on ``creek
+            # compile`` (#962): keying the call by tier *introduces* this
+            # failure mode (all-cloud config + intimate sources), and a stack
+            # trace would read as a crash rather than as the privacy
+            # guarantee doing its job.
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        classifier = LLMClassifier(resolved)
+        if not classifier.available:
+            console.print(
+                "[red]LLM provider unavailable; cannot generate draft. "
+                "Check Ollama or ANTHROPIC_API_KEY configuration.[/red]",
+            )
+            raise typer.Exit(code=1)
 
-    return _invoke
+        def _invoke(prompt: str) -> DraftLLMResponse:
+            """Send *prompt* to the tier-routed provider."""
+            completion = classifier.invoke_prompt_with_metadata(
+                prompt,
+                max_tokens=effective_max_tokens,
+            )
+            return DraftLLMResponse(
+                text=completion.text,
+                stop_reason=completion.stop_reason,
+            )
+
+        clients[tier] = _invoke
+        return _invoke
+
+    return _client_for
 
 
 def _run_seeded_draft(
@@ -3894,6 +5668,13 @@ def _run_seeded_draft(
             vault_path=vault_path,
             current_phase=current_phase,
         )
+    except typer.Exit:
+        # `typer.Exit` subclasses `RuntimeError` (see
+        # `click.exceptions.Exit.__mro__`), so without this the handler below
+        # would swallow an exit raised *inside* the generator — the #1031
+        # tier refusal is one — print `str(Exit(1))`, which is the empty
+        # string, as a blank red line, and rewrite the exit code to 1.
+        raise
     except (SeedResolutionError, PluralitySourceError, RuntimeError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
@@ -3947,6 +5728,12 @@ def _build_ontology_detector(vault: Path | None) -> OntologyDetector:
     config = _load_config_for_vault(vault)
 
     def _detect(prompt: str) -> PromptOntology:
+        # No tier argument, and none exists to pass: `prompt` is only ever an
+        # `OutlineSection.seed_text`, i.e. operator-supplied `--seed-outline` /
+        # `--seed-outline-text` copy. No fragment content reaches this provider,
+        # so there is no classified tier for the router to enforce. Contrast
+        # `_build_draft_llm_factory` above, which does see fragment bodies and
+        # is therefore keyed by their tier (#1031).
         return detect_ontology(prompt, config.model_router.resolve("classification"))
 
     return _detect
@@ -3982,6 +5769,13 @@ def _run_outline_draft(
     except OutlineParseError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=2) from exc
+    except typer.Exit:
+        # `typer.Exit` subclasses `RuntimeError` (see
+        # `click.exceptions.Exit.__mro__`), so without this the handler below
+        # would swallow an exit raised *inside* the generator — the #1031
+        # tier refusal is one — print `str(Exit(1))`, which is the empty
+        # string, as a blank red line, and rewrite the exit code to 1.
+        raise
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
@@ -4203,6 +5997,7 @@ def draft(
     from creek.generate.ai_style.fingerprint import load_fingerprint
     from creek.generate.ai_style.preamble import build_style_preamble
     from creek.generate.drafts import DraftGenerator
+    from creek.generate.grounding import GroundingThresholds, default_embedding_fn
     from creek.generate.mining import IdeaMiner
 
     vault_path = _resolve_vault(vault)
@@ -4228,18 +6023,27 @@ def draft(
         seed_spec=seed_spec,
         ontology_twist=ontology_twist,
     )
-    llm = _build_draft_llm(max_tokens)
+    llm_factory = _build_draft_llm_factory(vault_config, max_tokens)
     if bypass_compiled:
         _warn_bypass_compiled("draft")
 
     generator = DraftGenerator(
-        llm=llm,
+        # A factory, not a client: only the generator knows which fragments
+        # a prompt will carry, so only it can key the router by tier (#1031).
+        llm_factory=llm_factory,
         skills_root=skills_dir,
         voice_core=voice_text,
         style_preamble=style_preamble,
         privacy_override=override,
         bypass_compiled=bypass_compiled,
         ontology_twist=ontology_twist,
+        # FEAT-032 grounding guard. Both kwargs are required together — the
+        # generator skips the guard entirely if either is missing, which is
+        # exactly how it stayed dormant on this path until #1040. The model
+        # loads lazily inside the factory, so an offline host pays nothing
+        # here and the generator degrades with a warning when it does.
+        embedding_fn=default_embedding_fn(vault_config.embeddings),
+        grounding_thresholds=GroundingThresholds.from_config(vault_config.draft),
         fingerprint=fingerprint,
         ai_style_config=ai_style,
         voice_guard_no_llm=no_llm,
@@ -4313,11 +6117,40 @@ _SAVE_TARGET_HELP = (
     "11-Other-Authors/ai-as-user/; observation files raw wavelength reflections "
     "to 05-Wavelength/Observations/."
 )
-_SAVE_TIER_HELP = (
-    "Privacy tier (open|personal|intimate). Required when stdin is the body "
-    "source; defaults to the source fragments' max tier when --provenance "
-    "is supplied."
+_SAVE_TITLE_HELP = (
+    "Optional title, written verbatim at every tier. Omit it and the note "
+    "is titled from the body's first line at --tier open only; above open "
+    "it gets a non-revealing 'untitled <target> <digest>' stand-in, because "
+    "the title is also the filename (issue #1505)."
 )
+"""Help for ``--title``.
+
+Spells out the tier-conditional fallback because the flag's blast radius is
+not where an operator looks for it: the title is written into the note's
+frontmatter in the clear, slugified into the *filename*, and — for
+``ai-as-user`` — embedded in the fragment ``id``. Advertising only
+"optional" is what let #1505 read as intended behaviour for two releases.
+"""
+
+_SAVE_TIER_HELP = (
+    "Privacy tier (open|personal|intimate). Required on every save; "
+    "creek save never infers a tier from --provenance."
+)
+_SAVE_TIER_REQUIRED_MSG = (
+    "--tier is required. Pass --tier open|personal|intimate explicitly; "
+    "creek save never infers a tier from --provenance."
+)
+"""Refusal text when ``--tier`` is omitted for a file-sourced body."""
+_SAVE_TIER_REQUIRED_STDIN_MSG = (
+    "--tier is required when the body comes from stdin. "
+    "Pass --tier open|personal|intimate explicitly."
+)
+"""Refusal text when ``--tier`` is omitted and the body arrived on stdin.
+
+Distinct from :data:`_SAVE_TIER_REQUIRED_MSG` because the stdin shape has
+no ``--body`` path for the operator to look at: naming stdin tells them
+which half of the invocation the missing flag belongs to.
+"""
 _SAVE_SOURCE_KINDS: tuple[str, ...] = (
     "discord",
     "claude-session",
@@ -4395,57 +6228,60 @@ def _parse_save_tier(value: str | None) -> PrivacyTier | None:
         raise typer.Exit(code=2) from exc
 
 
-def _warn_if_paradox_downgrades_tier(
-    target: SaveTarget,
-    tier: PrivacyTier | None,
-) -> None:
-    """Print a stderr warning when paradox saves silently widen the tier.
-
-    Per the FEAT, ``--target paradox`` always lands in
-    ``10-Liminal/Paradoxes/`` with the body filtered as ``open`` —
-    *the fact* of the contradiction is what's preserved, not a
-    tier-protected summary. A user who passes ``--tier intimate`` or
-    ``--tier personal`` for protection is likely surprised when the
-    body lands in the vault unredacted, so we surface the override
-    explicitly rather than letting it pass silently.
-    """
-    if target != SaveTarget.PARADOX:
-        return
-    if tier is None or tier == PrivacyTier.OPEN:
-        return
-    console.print(
-        f"[yellow]Note: --target paradox forces tier=open for the body; "
-        f"--tier {tier.value} will be widened. The contradiction will be "
-        "written in full to 10-Liminal/Paradoxes/. Use --target unnamed "
-        "(or thread/eddy/praxis) with --tier intimate if you want the "
-        "body protected.[/yellow]",
-    )
-
-
 def _resolve_save_tier(
     tier: PrivacyTier | None,
-    provenance: tuple[str, ...],
     *,
     came_from_stdin: bool,
 ) -> PrivacyTier:
-    """Resolve the effective tier per FEAT-009's tier-defaulting rule.
+    """Return the operator's explicit tier, or refuse the save (issue #1434).
 
-    * Explicit ``--tier`` always wins.
-    * Otherwise, when ``--provenance`` is supplied *and* the body did
-      not come from stdin, default to ``open`` (the v1 surface; a
-      future revision will derive from the source fragments' max tier).
-    * No tier and either no provenance or stdin body → refuse so the
-      operator makes an intentional choice.
+    The tier is always explicit. There is no default and no inheritance:
+    ``creek save`` never derives a tier from ``--provenance`` or from the
+    source fragments, because only the caller knows what the body it is
+    filing was actually derived from. Omitting ``--tier`` is a refusal,
+    not a hint. Previously an omitted ``--tier`` resolved to ``open``
+    whenever ``--provenance`` was supplied, which filed content derived
+    from an ``intimate`` fragment in the clear.
+
+    Args:
+        tier: The parsed ``--tier`` value, or ``None`` when it was omitted.
+        came_from_stdin: Whether the body arrived on stdin. Selects the
+            wording of the refusal so the message matches the invocation
+            the operator actually typed.
+
+    Returns:
+        The tier the note must be filed at.
+
+    Raises:
+        typer.Exit: With code 2 when ``--tier`` was omitted.
     """
     if tier is not None:
         return tier
-    if not provenance or came_from_stdin:
-        console.print(
-            "[red]--tier is required when --provenance is empty or the body "
-            "comes from stdin. Pass --tier open|personal|intimate explicitly.[/red]",
-        )
-        raise typer.Exit(code=2)
-    return PrivacyTier.OPEN
+    message = (
+        _SAVE_TIER_REQUIRED_STDIN_MSG if came_from_stdin else _SAVE_TIER_REQUIRED_MSG
+    )
+    console.print(f"[red]{message}[/red]")
+    raise typer.Exit(code=2)
+
+
+author_llm_factory: VoiceClientFactory | None = None
+"""Injection seam for the ``author`` command's voice client (#1254).
+
+The CLI twin of ``build_server(author_llm_factory=...)``, and it exists for
+the same reason: ``creek author`` otherwise builds its voice client from the
+vault's own config, so on a host with no provider it prints "rendering the
+deterministic stub", exits ``0`` and writes nothing — and *no hermetic test
+could tell that apart from a live run*, because a Typer command has no
+argument through which a Python callable can be handed in. That gap is why
+#1027's wiring contract could only record #460/#649/#658 as an exemption
+instead of asserting against it.
+
+A module attribute rather than a parameter because the seam has to survive
+``CliRunner.invoke(app, argv)``, which passes strings and nothing else;
+``tests/test_wiring_contract.py`` patches it for the length of one run.
+``None`` — the production value, never assigned anywhere in ``creek/`` — keeps
+the config-built factory, so the shipped behaviour is byte-identical.
+"""
 
 
 def _validate_author_inputs(
@@ -4517,6 +6353,109 @@ def _compose_author_query(query: str | None, work: Path | None) -> str:
     return query
 
 
+_PRIVACY_DIMENSION = "privacy_compliance"
+"""The reflection dimension whose findings make ``creek author`` withhold a body.
+
+Named once because it is asserted on twice — to select the findings and to name
+the gate in the refusal — and because the refusal is only intelligible if the
+word the operator reads is the same one the reflection node emitted (#1310).
+"""
+
+
+def _preflight_medium_contract(medium: str, vault_path: Path) -> None:
+    """Refuse to author when *medium*'s contract cannot be loaded (#1310).
+
+    The contract carries the ``default_privacy_tier`` that the HARD privacy gate
+    measures a draft against, and a vault may shadow a shipped contract with a
+    malformed one at ``00-Creek-Meta/Skills/mediums/<medium>.MEDIUM.md``. An
+    unusable contract therefore means *no ceiling*, which is the whole defect
+    #1310 closes — so it fails closed here, before anything is drafted or
+    printed, rather than degrading to a contract-less run.
+
+    The contract is loaded a second time inside
+    :func:`creek.author.conductor.run_author`; re-reading one small skill file
+    is cheaper than widening that function's signature to accept a pre-loaded
+    contract, and it keeps a single loader as the source of truth.
+
+    Args:
+        medium: The requested output medium (already validated as supported).
+        vault_path: The resolved vault root to load the contract from.
+
+    Raises:
+        typer.Exit: With code 1 when the contract cannot be read, parsed, or
+            validated.
+    """
+    # Function-local, matching this module's style for heavyweight/optional
+    # imports. ``ValidationError`` is not a ``ValueError`` in Pydantic v2 and
+    # ``yaml.YAMLError`` is not one either, so both are named explicitly
+    # alongside ``OSError`` (unreadable file) and ``ValueError``
+    # (``ContractConformanceError`` and friends).
+    import yaml
+    from pydantic import ValidationError
+
+    from creek.author.contracts import load_medium_contract
+
+    try:
+        load_medium_contract(medium, vault_path)
+    except (OSError, ValueError, ValidationError, yaml.YAMLError) as exc:
+        # The exception *class* only: a pydantic/YAML message embeds the
+        # offending input, and Rich would try to read its square brackets as
+        # markup. The path below is what the operator actually needs to fix.
+        console.print(
+            f"[red]Refusing to author: the {medium!r} medium contract could not "
+            f"be loaded ({type(exc).__name__}). That contract declares the "
+            "privacy ceiling the draft is judged against, so authoring without "
+            "it is refused. Fix or remove "
+            f"00-Creek-Meta/Skills/mediums/{medium}.MEDIUM.md.[/red]",
+        )
+        raise typer.Exit(code=1) from exc
+
+
+def _emit_author_result(draft: AuthoredDraft) -> None:
+    """Print the run summary, then either the draft body or a privacy refusal.
+
+    The summary line is unconditional — an operator is told the verdict either
+    way — but the body is withheld whenever the reflection node raised a
+    :data:`_PRIVACY_DIMENSION` finding, because that finding *means* the body
+    reproduces text above the medium's privacy ceiling (#1310).
+
+    The trigger is that one dimension, never ``ESCALATE`` as such: escalation is
+    routine on this surface (an empty vault escalates, and any unresolved soft
+    finding escalates once the round budget runs out), so refusing on it would
+    withhold ordinary drafts. Each finding's message is echoed because it names
+    the offending fragment id and tier — and only those, never the protected
+    text itself.
+
+    Args:
+        draft: The finished draft returned by
+            :func:`creek.author.conductor.run_author`.
+
+    Raises:
+        typer.Exit: With code 1 when the draft carries any privacy finding.
+    """
+    console.print(
+        f"medium={draft.medium} verdict={draft.verdict} "
+        f"rounds={draft.rounds} provenance={len(draft.provenance)}",
+    )
+    leaks = [hit for hit in draft.findings if hit.dimension == _PRIVACY_DIMENSION]
+    if not leaks:
+        console.print(draft.body)
+        return
+    # ``escape`` because each message interpolates a fragment id read straight
+    # from the vault: an id carrying square brackets is otherwise parsed as Rich
+    # markup, which either silently renders the WRONG id (``frag[bold]x`` prints
+    # as ``fragx``) or raises ``MarkupError`` and replaces the refusal with a
+    # traceback. A HARD gate's refusal has to survive its own input (#1310).
+    detail = escape(" ".join(hit.message for hit in leaks))
+    console.print(
+        f"[red]Draft withheld: the {_PRIVACY_DIMENSION} gate raised "
+        f"{len(leaks)} finding(s), so the body is not printed. {detail} "
+        "Narrow --include-tier, or redact the cited fragments, then "
+        "re-run.[/red]",
+    )
+    raise typer.Exit(code=1)
+
+
 @app.command()
 def author(
     query: str | None = typer.Option(None, "--query", help="What to author about."),
@@ -4540,7 +6479,10 @@ def author(
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
-        help="Print the pipeline plan and stub evidence summary without authoring.",
+        help=(
+            "Print the pipeline plan and the gathered evidence summary, "
+            "without voicing or reflection."
+        ),
     ),
     max_rounds: int | None = typer.Option(
         None,
@@ -4575,8 +6517,14 @@ def author(
     real evidence only (no voicing or reflection). ``book-report`` takes
     ``--work`` (the 11-Other-Authors path) instead of ``--query``; every other
     medium requires ``--query``.
+
+    The run is judged against the medium's contract. If that contract cannot be
+    loaded, or if the finished draft reproduces text above the contract's
+    privacy tier, the command prints the verdict, refuses, and exits non-zero
+    **without printing the body**. A ``chat`` draft is truncated to the medium's
+    character ceiling.
     """
-    from creek.author import SUPPORTED_MEDIUMS, build_default_conductor
+    from creek.author import SUPPORTED_MEDIUMS, build_default_conductor, run_author
     from creek.author.client import AuthorLLMClient
 
     _validate_author_inputs(medium, query, work, SUPPORTED_MEDIUMS)
@@ -4590,6 +6538,12 @@ def author(
 
     if dry_run:
         # The dry run only plans + gathers evidence; no voicing, so no client.
+        # Deliberately still the contract-less ``build_default_conductor``
+        # rather than ``plan_author`` (#1310): this branch renders no body, so
+        # there is nothing for the privacy gate to gate, and ``plan_author``
+        # returns counts only — switching to it would silently drop the
+        # ``_audit_privacy_override_if_needed`` call below, losing the record
+        # that the operator accessed elevated content, for zero privacy gain.
         conductor = build_default_conductor(max_rounds=rounds)
         evidence = conductor.gather_evidence(
             effective_query,
@@ -4612,16 +6566,25 @@ def author(
         )
         return
 
+    # #1310: fail closed on an unusable contract *before* anything is printed —
+    # a run with no ceiling is exactly the leak this command must not ship.
+    _preflight_medium_contract(medium, vault_path)
+
     # #658/#661: build the router-resolved voice client *per the run's content
     # tier* so live voicing of Intimate content is redirected to a local
     # provider by the chokepoint. The factory falls back to ``None``
     # (deterministic stub) when the provider is unavailable.
-    def _voice_client(tier: PrivacyTier | None) -> AuthorLLMClient | None:
+    def _config_voice_client(tier: PrivacyTier | None) -> AuthorLLMClient | None:
         return AuthorLLMClient.for_voice_or_none(
             config.model_router,
             author=config.author,
             tier=tier,
         )
+
+    # #1254: an injected factory wins, which is the only way a test can reach
+    # past the desk. Production never assigns it, so this reads as the config
+    # factory on every real run.
+    _voice_client = author_llm_factory or _config_voice_client
 
     if _voice_client(None) is None:
         console.print(
@@ -4629,17 +6592,26 @@ def author(
             "stub. Configure llm.generation (and consent for a cloud provider) "
             "for live voicing.[/dim]",
         )
-    draft_result = build_default_conductor(
-        max_rounds=rounds,
-        voice_client_factory=_voice_client,
-    ).run(
+    # #1310: route through ``run_author`` rather than driving a conductor
+    # directly, so the run carries the medium contract (the privacy ceiling the
+    # HARD gate needs) and the chat character ceiling, both of which
+    # ``Conductor.run`` alone does not apply. #1465: ``max_rounds`` stays
+    # explicit because ``config`` above resolves from the RAW ``--vault`` flag
+    # while ``vault_path`` falls back to ``config.vault_path`` when the flag is
+    # omitted — two different roots. Dropping the argument would silently start
+    # sourcing the budget from a different file than the one already read here.
+    draft_result = run_author(
         medium=medium,
         query=effective_query,
         vault=vault_path,
+        max_rounds=rounds,
+        voice_client_factory=_voice_client,
         override=override,
     )
     # #660: audit the elevated access using the fragments actually cited in the
-    # draft's provenance (no-op for None/OPEN).
+    # draft's provenance (no-op for None/OPEN). Before any refusal on purpose —
+    # the operator did read elevated content, and withholding the draft does not
+    # un-read it, so the audit trail must record the access either way (#1310).
     _audit_privacy_override_if_needed(
         vault_path=vault_path,
         command="author",
@@ -4648,11 +6620,7 @@ def author(
             fid for entry in draft_result.provenance for fid in entry.fragment_ids
         ],
     )
-    console.print(
-        f"medium={draft_result.medium} verdict={draft_result.verdict} "
-        f"rounds={draft_result.rounds} provenance={len(draft_result.provenance)}",
-    )
-    console.print(draft_result.body)
+    _emit_author_result(draft_result)
 
 
 @app.command(name="save")
@@ -4667,7 +6635,11 @@ def save_cmd(
         "--body",
         help="Path to the body file, '-' for stdin, or omitted for stdin.",
     ),
-    title: str | None = typer.Option(None, "--title", help="Optional title."),
+    title: str | None = typer.Option(
+        None,
+        "--title",
+        help=_SAVE_TITLE_HELP,
+    ),
     provenance: str | None = typer.Option(
         None,
         "--provenance",
@@ -4687,7 +6659,7 @@ def save_cmd(
     full_body: bool = typer.Option(
         False,
         "--full-body",
-        help="Allow personal-tier bodies into the vault unredacted.",
+        help="Allow personal/unclassified bodies into the vault unredacted.",
     ),
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
 ) -> None:
@@ -4698,8 +6670,18 @@ def save_cmd(
     privacy-tier policy: intimate bodies are diverted to the
     gitignored ``10-Liminal/Compost/intimate-stubs/`` directory and
     only a title-only summary is written into the vault; personal
-    bodies are summarised unless ``--full-body`` is passed; paradox
-    saves always land in ``10-Liminal/Paradoxes/``.
+    and unclassified bodies (which rank together, #876/#961) are
+    summarised unless ``--full-body`` is passed; paradox
+    saves always land in ``10-Liminal/Paradoxes/`` and, since #1491,
+    honour ``--tier`` there exactly like every other target.
+
+    ``--title`` is optional but not free above ``open``. The title is
+    written in the clear, slugified into the filename, and (for
+    ``ai-as-user``) embedded in the fragment ``id``, so since #1505 an
+    omitted ``--title`` falls back to the body's first line only at
+    ``open``; above it the note is titled ``untitled <target>
+    <digest>``. ``--full-body`` does not relax that — it widens the
+    body, not the filename. Pass ``--title`` to name a private note.
     """
     from creek.save import SaveRequest, save_to_vault
 
@@ -4712,10 +6694,8 @@ def save_cmd(
     )
     effective_tier = _resolve_save_tier(
         parsed_tier,
-        fragments,
         came_from_stdin=came_from_stdin,
     )
-    _warn_if_paradox_downgrades_tier(save_target, parsed_tier)
     vault_path = _resolve_vault(vault)
     request = SaveRequest(
         target=save_target,
@@ -4737,25 +6717,39 @@ def save_cmd(
 # ---------------------------------------------------------------------------
 
 
-def _load_config_for_vault(vault: Path | None) -> CreekConfig:
+def _load_config_for_vault(
+    vault: Path | None,
+    *,
+    warn_on_missing: bool = True,
+) -> CreekConfig:
     """Load :class:`CreekConfig`, auto-discovering ``--vault``'s config (issue #322).
 
-    Wraps :func:`creek.config.resolve_config_path` + :func:`load_config`
-    so every CLI command that accepts ``--vault <path>`` automatically
-    picks up ``<path>/00-Creek-Meta/creek_config.yaml`` when neither
-    ``--config`` nor ``CREEK_CONFIG`` is set. Explicit overrides still
-    take precedence; the helper is otherwise transparent to existing
-    callers.
+    The CLI's adapter over :func:`creek.config.load_vault_config`, which
+    #1409 made the single spelling of "resolve this vault's config". Every
+    command that accepts ``--vault <path>`` automatically picks up
+    ``<path>/00-Creek-Meta/creek_config.yaml`` when neither ``--config`` nor
+    ``CREEK_CONFIG`` is set. Explicit overrides still take precedence; the
+    helper is otherwise transparent to its callers.
+
+    It survives the convergence rather than being replaced at all thirty-odd
+    call sites because it flips the shared resolver's ``warn_on_missing``
+    default to ``True``: the CLI has an operator console to warn at, and most
+    of the resolver's other callers (MCP tools, the Writing Desk's agents) do
+    not.
 
     Args:
         vault: Vault root from the command's ``--vault`` flag, or
             ``None`` when the command was invoked without one.
+        warn_on_missing: Whether a missing config file logs the multi-line
+            "running with built-in defaults" warning. The ``report`` command
+            already resolved and warned once before dispatch, so its
+            per-handler re-resolutions (#1313) pass ``False`` rather than
+            repeat the same warning two or three times in one invocation.
 
     Returns:
         A fully-validated :class:`CreekConfig`.
     """
-    config_path = resolve_config_path(vault, None)
-    return load_config(config_path)
+    return load_vault_config(vault, warn_on_missing=warn_on_missing)
 
 
 def _resolve_vault(vault: Path | None) -> Path:
@@ -4776,7 +6770,6 @@ def _resolve_vault(vault: Path | None) -> Path:
 def clean_orphans(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     age_days: int = typer.Option(30, help="Minimum age in days for orphan detection"),
-    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
 ) -> None:
     """Identify fragments with zero incoming/outgoing links after N days."""
     from creek.clean.hygiene import OrphanScanner
@@ -4784,8 +6777,7 @@ def clean_orphans(
     vault_path = _resolve_vault(vault)
     result = OrphanScanner(age_days=age_days).scan(vault_path)
 
-    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
-    console.print(f"\n[bold]Orphan Scan[/bold] ({mode})")
+    console.print("\n[bold]Orphan Scan[/bold]")
     console.print(f"Total fragments: {result.total_fragments}")
     console.print(f"Orphans found: {len(result.orphan_paths)}")
 
@@ -4801,7 +6793,6 @@ def clean_orphans(
 def clean_stale_reviews(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
     age_days: int = typer.Option(14, help="Maximum age in days for review items"),
-    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
 ) -> None:
     """Find review queue items older than N days."""
     from creek.clean.hygiene import StaleReviewScanner
@@ -4809,8 +6800,7 @@ def clean_stale_reviews(
     vault_path = _resolve_vault(vault)
     result = StaleReviewScanner(age_days=age_days).scan(vault_path)
 
-    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
-    console.print(f"\n[bold]Stale Review Scan[/bold] ({mode})")
+    console.print("\n[bold]Stale Review Scan[/bold]")
     console.print(f"Total review files: {result.total_review_files}")
     console.print(f"Stale files: {len(result.stale_paths)}")
 
@@ -4825,16 +6815,19 @@ def clean_stale_reviews(
 @clean_app.command(name="broken-links")
 def clean_broken_links(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
-    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
 ) -> None:
-    """Scan fragments for wiki-links pointing to nonexistent files."""
+    """Scan the vault for wiki-links pointing to nonexistent files.
+
+    Surveys every markdown file except Creek's own report folders
+    (``00-Creek-Meta/Processing-Log/``, ``State/``, ``Ontology/``), which
+    quote findings back and would inflate the count on each rerun.
+    """
     from creek.clean.hygiene import BrokenLinkScanner
 
     vault_path = _resolve_vault(vault)
     result = BrokenLinkScanner().scan(vault_path)
 
-    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
-    console.print(f"\n[bold]Broken Link Scan[/bold] ({mode})")
+    console.print("\n[bold]Broken Link Scan[/bold]")
     console.print(f"Files scanned: {result.total_files_scanned}")
     console.print(f"Broken links: {result.total_broken}")
 
@@ -4853,7 +6846,6 @@ def clean_broken_links(
 @clean_app.command(name="duplicates")
 def clean_duplicates(
     vault: Path | None = typer.Option(None, help="Obsidian vault path"),
-    apply: bool = typer.Option(False, help="Apply changes (default is dry-run)"),
 ) -> None:
     """Execute normalized dedup sweep and output review report."""
     from creek.clean.hygiene import DuplicateScanner
@@ -4861,8 +6853,7 @@ def clean_duplicates(
     vault_path = _resolve_vault(vault)
     result = DuplicateScanner().scan(vault_path)
 
-    mode = "[red]APPLY[/red]" if apply else "[yellow]DRY-RUN[/yellow]"
-    console.print(f"\n[bold]Duplicate Scan[/bold] ({mode})")
+    console.print("\n[bold]Duplicate Scan[/bold]")
     console.print(f"Total fragments: {result.total_fragments}")
     console.print(f"Duplicate candidates: {len(result.candidates)}")
 
@@ -4916,6 +6907,84 @@ def clean_report(
 # ---------------------------------------------------------------------------
 
 
+_MAX_DELETED_FILE_ROWS = 20
+"""How many deleted paths the purge summary table prints before capping.
+
+A vault purge used to report the three top-level folders it walked, so
+an unbounded table was three rows. Since #1340 it reports one row per
+destroyed fragment, which at vault scale is a scrollback flood that
+pushes the counts — the part an operator actually reads — off screen.
+Twenty is enough to recognise *what kind* of content was destroyed
+without becoming the output. The remainder is always stated, never
+silently dropped: a truncated erasure record that does not admit it is
+truncated is worse than a long one, and ``PurgeAuditEntry`` does not
+carry ``deleted_files``, so there is no log to defer the operator to.
+"""
+
+
+def _render_embeddings_purge_shortfall(result: PurgeResult) -> None:
+    """Say so, on screen, when the embeddings cache outlived the erasure.
+
+    The sibling shortfall — an undecodable body — already prints here, and an
+    erasure that fell short must say so where the operator is already looking.
+    Without this the only signals are a WARNING log line and the audit JSONL,
+    neither of which an operator running ``creek purge vault`` interactively
+    is reading, so a partial erasure would look complete on screen.
+
+    The cache matters specifically because its vectors are partially
+    invertible back to the purged content, so a surviving cache is a surviving
+    derivative, not merely untidy.
+
+    Args:
+        result: The completed purge result.
+    """
+    if not result.embeddings_cache_undeleted:
+        return
+    console.print(
+        "[red]The embeddings cache could not be deleted, so this erasure is "
+        "PARTIAL.[/red] It may still hold vectors derived from the purged "
+        "content. Remove "
+        "[bold]00-Creek-Meta/embeddings.parquet[/bold] by hand, then re-run "
+        "[bold]creek purge vault[/bold] to confirm."
+    )
+
+
+def _render_voice_purge_notes(result: PurgeResult) -> None:
+    """Render the ``07-Voice`` sweep's count, follow-up, and any shortfall.
+
+    Two things an operator cannot infer from the count alone. First, the
+    swept notes are *shared* derived artifacts: deleting the profile or
+    glossary that quoted the purged fragment also drops every other
+    fragment's legitimately-retained content from it until the report is
+    regenerated, so the follow-up command is named here rather than left
+    to be discovered. Second, a fragment whose body is not valid UTF-8
+    cannot be matched against a profile at all (#1211), and an erasure
+    that fell short must say so where the operator is already looking —
+    the audit ``outcome`` line records the same shortfall as
+    ``status="partial"``.
+
+    Args:
+        result: The completed purge result.
+    """
+    if result.voice_artifacts_removed:
+        console.print(
+            f"Voice artifacts removed: {result.voice_artifacts_removed}",
+        )
+        console.print(
+            "[dim]Those derived notes are shared: re-run "
+            "`creek report --type voice` and `creek report --type lexicon` "
+            "to regenerate them for the fragments that remain.[/dim]",
+        )
+    if result.voice_body_undecodable:
+        named = ", ".join(result.voice_body_undecodable)
+        console.print(
+            f"[red]Voice sweep INCOMPLETE for: {named}[/red] — "
+            "the body is not valid UTF-8, so a "
+            "07-Voice/<register>-profile.md may still quote it. "
+            "Re-run `creek report --type voice` to regenerate 07-Voice.",
+        )
+
+
 def _render_purge_result(result: PurgeResult) -> None:
     """Render a purge result as a rich table.
 
@@ -4937,13 +7006,35 @@ def _render_purge_result(result: PurgeResult) -> None:
         console.print(
             f"Intimate stubs removed: {result.intimate_stubs_removed}",
         )
+    if result.ledger_rows_removed:
+        console.print(
+            f"Ledger rows removed: {result.ledger_rows_removed}",
+        )
+    if result.meta_artifacts_removed:
+        console.print(
+            f"Meta artifacts removed: {result.meta_artifacts_removed}",
+        )
+    _render_voice_purge_notes(result)
+    _render_embeddings_purge_shortfall(result)
+    _render_deleted_files(result.deleted_files)
 
-    if result.deleted_files:
-        table = Table(title="Deleted files")
-        table.add_column("Path", style="dim")
-        for path in result.deleted_files:
-            table.add_row(path)
-        console.print(table)
+
+def _render_deleted_files(paths: list[str]) -> None:
+    """Print the deleted-path table, capped at :data:`_MAX_DELETED_FILE_ROWS`.
+
+    Args:
+        paths: Every path the purge deleted (or would delete).
+    """
+    if not paths:
+        return
+    table = Table(title="Deleted files")
+    table.add_column("Path", style="dim")
+    for path in paths[:_MAX_DELETED_FILE_ROWS]:
+        table.add_row(path)
+    console.print(table)
+    hidden = len(paths) - _MAX_DELETED_FILE_ROWS
+    if hidden > 0:
+        console.print(f"[dim]... and {hidden} more (of {len(paths)}).[/dim]")
 
 
 def _confirm(message: str, *, assume_yes: bool) -> bool:
@@ -5514,6 +7605,18 @@ def _build_compost_verifier(config: CreekConfig) -> SupportsVerifyCompost | None
     # constructor and may raise (build_provider contract); a local provider
     # constructs but reports ``available is False`` when its host is down — both
     # fall back to embedding-only scoring.
+    #
+    # No tier argument, and this is *not* the same class of site as the
+    # `creek compile` bug (#962). The only call site is
+    # `_run_compost_calibration` above, reached only from `creek compost
+    # calibrate`, and the verifier this builds only ever sees
+    # `CompostCalibrationEntry` fields loaded from a YAML fixture — it never
+    # reads the vault, so no fragment tier exists to thread.
+    #
+    # Durable caveat: `creek.generate.compost.CompostDetector` accepts a
+    # `verifier`, so if a vault-scanning compost path ever wires this builder
+    # in, its input becomes fragment content and this call MUST resolve with a
+    # tier. Re-derive it there rather than assuming this comment still holds.
     try:
         provider = build_provider(config.model_router.resolve("generation"))
     except RuntimeError as exc:
@@ -5528,3 +7631,229 @@ def _build_compost_verifier(config: CreekConfig) -> SupportsVerifyCompost | None
         )
         return None
     return LLMCompostVerifier(provider=provider)
+
+
+def _build_compost_similarity_fn(
+    config: CreekConfig,
+    vault_path: Path,
+) -> Callable[[str], float]:
+    """Build the embedding-gate closure ``creek compost scan`` scores fragments with.
+
+    Split out of the command body so tests can substitute a deterministic
+    stub — the real closure loads a sentence-transformers model, which is far
+    too heavy for CLI wiring tests.
+
+    ``compost.exemplars_relpath`` is resolved against *vault_path*, matching
+    the field's own "vault-relative" contract and the handling its sibling
+    ``compost.review_queue_relpath`` already gets. Resolving it against the
+    process CWD instead would make the command depend on the operator's shell
+    location: a ``FileNotFoundError`` when run from elsewhere, or — worse,
+    silently — whatever same-named file happened to sit in that directory.
+
+    Args:
+        config: The loaded Creek config; supplies the embedding settings and,
+            when set, ``compost.exemplars_relpath``.
+        vault_path: Vault root that ``exemplars_relpath`` hangs off.
+
+    Returns:
+        A closure mapping fragment text to its maximum cosine similarity
+        against the compost exemplar set.
+    """
+    from creek.generate.compost_embedding import load_exemplars, make_similarity_fn
+    from creek.link.embeddings import EmbeddingLinker
+
+    relpath = config.compost.exemplars_relpath
+    exemplars_path = vault_path / relpath if relpath else None
+    try:
+        exemplars = load_exemplars(exemplars_path)
+    except (FileNotFoundError, ValueError) as exc:
+        # Same failure mode, same message as `compost_calibrate` — a config
+        # typo should read as a config typo, not as a Python traceback.
+        console.print(f"[red]Failed to load exemplars: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
+    return make_similarity_fn(exemplars, EmbeddingLinker(config=config.embeddings))
+
+
+def _refuse_scan_without_verifier(detail: str) -> NoReturn:
+    """Abort ``creek compost scan`` when the LLM verifier cannot be built.
+
+    ``creek compost calibrate`` degrades to embedding-only scoring in this
+    situation, which is harmless because it only prints a number. ``scan``
+    *writes to the vault*, so the same fallback would file unverified
+    embedding hits as canonical compost — asserting a finding the pipeline
+    never actually made. Refusing keeps the vault honest and leaves the
+    operator a deliberate opt-in.
+
+    Args:
+        detail: Why the verifier is unavailable, shown to the operator.
+
+    Raises:
+        typer.Exit: Always, with code 2 (matching the command's other
+            configuration failures).
+    """
+    console.print(f"[red]Cannot verify compost candidates: {detail}[/red]")
+    console.print(
+        "Set the provider credentials (API key + CREEK_CLOUD_CONSENT=1 for a "
+        "cloud provider, or start the local host), or re-run with "
+        "[bold]--no-llm[/bold] to file unverified candidates to the review "
+        "queue instead.",
+    )
+    raise typer.Exit(code=2)
+
+
+def _build_scan_verifier(config: CreekConfig) -> SupportsVerifyCompost:
+    """Construct the vault-scanning compost verifier, or refuse to scan.
+
+    This is the tier-aware builder the durable caveat on
+    :func:`_build_compost_verifier` asks for. That function feeds the verifier
+    YAML-fixture text and so needs no tier; **this** one feeds it real fragment
+    bodies, so the routing call must state a tier ceiling rather than pass
+    ``None``.
+
+    The ceiling is ``Personal``, and it is a derived fact rather than a guess:
+    :func:`creek.generate.compost_scan.run_compost_scan` forces
+    ``skip_intimate=True`` — not read from config, so no config edit or flag can
+    turn it off — which means an ``Intimate`` fragment is dropped before the
+    embedding gate, let alone the verifier. ``Personal`` is therefore the most
+    sensitive tier that can physically reach this provider. Issue #1311 moved
+    that drop from inside the fragment detector to the detection *boundary*
+    and made an undeclared ``privacy_tier`` fail closed to ``Intimate``, so
+    the derivation is strictly stronger than when it was written. Should that
+    forced flag ever become configurable, this resolve call must be re-derived
+    per-fragment instead of hoisted here.
+
+    Unlike :func:`_build_compost_verifier`, an unavailable provider is fatal —
+    see :func:`_refuse_scan_without_verifier`.
+
+    Args:
+        config: The loaded Creek config, supplying the model router.
+
+    Returns:
+        A ready :class:`~creek.generate.compost_verifier.LLMCompostVerifier`.
+
+    Raises:
+        typer.Exit: When the provider cannot be built or reports its
+            prerequisites unmet.
+    """
+    from creek.classify.llm import build_provider
+    from creek.generate.compost_verifier import LLMCompostVerifier
+
+    llm_config = config.model_router.resolve("generation", PrivacyTier.PERSONAL)
+    try:
+        provider = build_provider(llm_config)
+    except RuntimeError as exc:
+        _refuse_scan_without_verifier(str(exc))
+    if not provider.available:
+        _refuse_scan_without_verifier(
+            "provider prerequisites unmet (missing API key, missing cloud "
+            "consent, or local host unreachable)",
+        )
+    return LLMCompostVerifier(provider=provider)
+
+
+def _render_compost_scan(result: CompostScanResult, *, dry_run: bool) -> None:
+    """Print the pre-flight estimate and, for a real run, what was written."""
+    plan = result.plan
+    console.print(
+        f"[bold]Candidates:[/bold] {plan.fragment_candidates} fragment, "
+        f"{plan.thread_candidates} thread, {plan.project_candidates} project "
+        f"({result.skipped_existing} already composted, skipped)",
+    )
+    console.print(f"[bold]LLM calls this run:[/bold] {plan.llm_calls}")
+    if dry_run:
+        console.print("[dim]Dry run — nothing written.[/dim]")
+        return
+    console.print(
+        f"[green]Composted:[/green] {len(result.composted)} note(s) → "
+        "10-Liminal/Compost/",
+    )
+    console.print(
+        f"[yellow]Queued for review:[/yellow] {len(result.review_queued)} note(s)",
+    )
+
+
+@compost_app.command("scan")
+def compost_scan(
+    vault: Path | None = typer.Option(None, help="Obsidian vault path"),
+    no_llm: bool = typer.Option(
+        False,
+        "--no-llm",
+        help=(
+            "Run the embedding gate only — no fragment content leaves the "
+            "device. Candidates are filed to the review queue unverified "
+            "rather than as canonical compost."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Print the candidate counts and the LLM-call estimate, then stop "
+            "without verifying or writing anything."
+        ),
+    ),
+    embedding_threshold: float | None = typer.Option(
+        None,
+        "--embedding-threshold",
+        help=(
+            "Override the embedding-gate cosine floor for this run (default: "
+            "`compost.embedding_threshold`, 0.6). Raise it after "
+            "`creek compost calibrate` shows the default over-recalls."
+        ),
+    ),
+) -> None:
+    """Scan the vault for composted ideas and write `10-Liminal/Compost/` notes.
+
+    The production counterpart to `creek compost calibrate`: where calibrate
+    scores the FEAT-018 detector against a labelled fixture, this points it at
+    a real vault. Dormant threads, silent tagged projects, and fragments whose
+    text reads as abandonment become compost notes preserving what each idea
+    was, why it faded, and what energy remains.
+
+    Fragments run the two-stage pipeline — embedding gate, then LLM verifier.
+    A `yes` verdict files canonically; `ambiguous` goes to the review queue
+    for you to triage; `no` is dropped. `--no-llm` runs the gate alone and
+    files every hit to the review queue, because an embedding match on its own
+    is a suspicion rather than a finding.
+
+    Intimate-tier fragments are excluded before the gate and never reach a
+    provider. Re-running is idempotent: sources already carrying a compost
+    note are skipped and reported, so a second scan spends no LLM calls on
+    them.
+
+    Setting `compost.llm_verification: false` in `creek_config.yaml` has the
+    same effect as passing `--no-llm` on every run.
+    """
+    from creek.generate.compost_scan import run_compost_scan
+
+    config = _load_config_for_vault(vault)
+    vault_path = _resolve_vault(vault)
+
+    compost_config = config.compost
+    if embedding_threshold is not None:
+        compost_config = compost_config.model_copy(
+            update={"embedding_threshold": embedding_threshold},
+        )
+
+    # `--no-llm` is the per-run form of `compost.llm_verification: false`;
+    # either one declares an offline pass, so honour whichever is set rather
+    # than building (and then refusing on) a provider the operator never
+    # asked for.
+    verify_with_llm = not no_llm and compost_config.llm_verification
+
+    # A dry run never calls the verifier, so it must not require one to exist.
+    # Demanding credentials to print a cost estimate would defeat the estimate:
+    # not-yet-configured is exactly when an operator wants to see the number.
+    # `will_verify` keeps the quoted count honest despite the skipped build.
+    verifier = _build_scan_verifier(config) if verify_with_llm and not dry_run else None
+    similarity_fn = _build_compost_similarity_fn(config, vault_path)
+
+    result = run_compost_scan(
+        vault_path,
+        similarity_fn=similarity_fn,
+        config=compost_config,
+        verifier=verifier,
+        dry_run=dry_run,
+        will_verify=verify_with_llm,
+    )
+    _render_compost_scan(result, dry_run=dry_run)

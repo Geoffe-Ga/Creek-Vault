@@ -7,6 +7,8 @@ take priority). Files without frontmatter receive fresh Creek frontmatter.
 
 Exports:
     MarkdownIngestor: Concrete ``Ingestor`` subclass for markdown files.
+    _enumerate_markdown_paths: Walk a directory for ``.md`` paths, reporting
+        every subtree it could not list.
     _detect_document_type: Classify content as journal, essay, technical, or notes.
     _infer_platform: Map document type and path to a ``SourcePlatform``.
     _merge_frontmatter: Merge Creek defaults with existing frontmatter.
@@ -15,22 +17,27 @@ Exports:
 from __future__ import annotations
 
 import logging
+import os
 import re
-from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import frontmatter
 
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
+    PartialDiscoveryError,
     RawDocument,
+    file_modified_time,
     normalize_encoding,
     normalize_timestamp,
     parse_authored_at,
 )
 from creek.models import SourcePlatform
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -261,23 +268,67 @@ def _extract_authored_at_from_frontmatter(fm_data: dict[str, Any]) -> datetime |
     return None
 
 
-def _get_file_creation_timestamp(path: Path) -> datetime:
-    """Get the file creation timestamp from filesystem metadata.
+_MARKDOWN_SUFFIX = ".md"
+"""The one filename suffix this ingestor discovers, matched CASE-SENSITIVELY.
 
-    Falls back to modification time if creation time is not available.
-    Returns a timezone-aware datetime in America/Los_Angeles.
+``rglob("*.md")`` — the glob :func:`_enumerate_markdown_paths` replaces — is
+itself case-sensitive: measured on a case-insensitive APFS volume, a file
+named ``B.MD`` was matched by neither the glob nor this suffix test. So
+``name.lower().endswith(...)`` would not be a tidy-up, it would silently
+WIDEN what ingest picks up relative to every vault ingested before it.
+"""
+
+
+def _enumerate_markdown_paths(dir_path: Path) -> tuple[list[Path], list[str]]:
+    """List every ``.md`` path under *dir_path*, recording what it could not read.
+
+    ``os.walk(..., onerror=...)`` replaces ``Path.rglob("*.md")`` for exactly
+    one reason: ``rglob`` **swallows** a ``scandir`` failure, so a
+    subdirectory the process cannot list is indistinguishable from an empty
+    one, and the walk reports success with no documents. That is what let one
+    permission change silently orphan a whole corpus (#1444).
+
+    Parity with the glob it replaces is deliberate in three places:
+
+    * ``followlinks=False`` is what reproduces ``**``'s refusal to descend
+      through a symlinked directory. Do not change it.
+    * The suffix test is case-sensitive; see :data:`_MARKDOWN_SUFFIX`.
+    * The accumulated FULL paths are sorted once at the end, which is the
+      order ``sorted(dir_path.rglob("*.md"))`` produced. Sorting per-directory
+      basenames instead would not be the same order.
+
+    A real directory or a symlinked directory named ``*.md`` lands in the
+    walk's ``dirnames`` rather than its ``filenames``, so unlike the glob this
+    never offers one as a candidate — measured, and the reason the caller's
+    ``is_file()`` filter is now defence in depth rather than the only guard.
 
     Args:
-        path: The file path to inspect.
+        dir_path: Directory to walk.
 
     Returns:
-        A timezone-aware datetime from the file's metadata.
+        A tuple of (sorted candidate paths, one reason per unlistable
+        subtree). An empty reasons list means the enumeration saw the whole
+        tree.
     """
-    stat = path.stat()
-    # Use birth time on macOS, fall back to mtime
-    ctime = getattr(stat, "st_birthtime", stat.st_mtime)
-    ts_string = datetime.fromtimestamp(ctime).isoformat()
-    return normalize_timestamp(ts_string, None)
+    reasons: list[str] = []
+
+    def _record(error: OSError) -> None:
+        """Record a subtree the walk could not list, then let it walk on.
+
+        Args:
+            error: The ``scandir`` failure, whose ``filename`` is the path
+                that could not be listed.
+        """
+        reasons.append(f"cannot list {error.filename}: {error}")
+
+    found: list[Path] = []
+    for parent, _dirnames, filenames in os.walk(
+        dir_path, onerror=_record, followlinks=False
+    ):
+        for name in filenames:
+            if name.endswith(_MARKDOWN_SUFFIX):
+                found.append(Path(parent) / name)
+    return sorted(found), reasons
 
 
 # ---- MarkdownIngestor ----
@@ -296,14 +347,20 @@ class MarkdownIngestor(Ingestor):
         """Find all ``.md`` files at the given source path (recursively).
 
         If ``source_path`` is a file, returns a single-element list for
-        that file. If it is a directory, recursively globs for ``*.md``.
-        If the path does not exist, returns an empty list.
+        that file. If it is a directory, it is walked recursively for
+        ``*.md``. If the path does not exist, returns an empty list.
 
         Args:
             source_path: A file or directory path to search.
 
         Returns:
             A list of ``RawDocument`` objects for each discovered file.
+
+        Raises:
+            PartialDiscoveryError: When the directory walk could not list some
+                subtree or could not read some candidate file. Carries the
+                documents it did read, so the caller keeps the harvest
+                while learning the enumeration was incomplete (#1444).
         """
         if not source_path.exists():
             return []
@@ -336,15 +393,52 @@ class MarkdownIngestor(Ingestor):
     def _read_directory(self, dir_path: Path) -> list[RawDocument]:
         """Recursively discover all .md files in a directory.
 
+        Two passes, because they fail in different ways and both failures
+        matter: enumeration answers "which subtrees could be listed", reading
+        answers "which candidates could be opened". Either can come back
+        partial, and a partial pass reports itself by raising
+        :class:`~creek.ingest.base.PartialDiscoveryError` **carrying everything it
+        did read** — so an unreadable corner of the tree costs the tombing
+        pass and never the ingest (#1444).
+
         Args:
             dir_path: Directory path to search.
 
         Returns:
-            A list of RawDocument objects for each .md file found.
+            A list of RawDocument objects for each .md file read.
+
+        Raises:
+            PartialDiscoveryError: When any subtree could not be listed or any
+                candidate file could not be read. Carries the documents that
+                *were* read plus one reason per failure.
         """
+        candidates, reasons = _enumerate_markdown_paths(dir_path)
         docs: list[RawDocument] = []
-        for md_file in sorted(dir_path.rglob("*.md")):
-            raw_bytes = md_file.read_bytes()
+        for md_file in candidates:
+            # Defence in depth (#1378): ``*.md`` also matches a real directory
+            # and a dangling symlink, and ``read_bytes()`` on either raises.
+            # Skipping them keeps an ordinary junk entry from being reported
+            # as an unreadable part of the source. It is no longer what stands
+            # between one bad entry and a buried corpus — that is
+            # ``IngestResult.discovery_complete``'s job, which disarms the
+            # tomb sweep for any pass that could not see the whole source
+            # (#1444).
+            #
+            # ``is_file()`` is inside the ``try`` with the read, not before
+            # it. ``Path.is_file()`` swallows ENOENT/ENOTDIR/EBADF/ELOOP but
+            # NOT EACCES, so a permission failure from its internal ``stat``
+            # — an ancestor's execute bit revoked between the enumeration
+            # above and this entry — would otherwise escape ``_read_directory``
+            # entirely, past the ``raise`` below, and discard every document
+            # already read. The harvest survives a bad entry uniformly or the
+            # guarantee is not one.
+            try:
+                if not md_file.is_file():
+                    continue
+                raw_bytes = md_file.read_bytes()
+            except OSError as exc:
+                reasons.append(f"cannot read {md_file}: {exc}")
+                continue
             _text, encoding = normalize_encoding(raw_bytes)
             docs.append(
                 RawDocument(
@@ -354,6 +448,8 @@ class MarkdownIngestor(Ingestor):
                     detected_encoding=encoding,
                 )
             )
+        if reasons:
+            raise PartialDiscoveryError(docs, reasons)
         return docs
 
     def parse(self, raw: RawDocument) -> list[ParsedFragment]:
@@ -420,14 +516,28 @@ class MarkdownIngestor(Ingestor):
         """Resolve a timestamp from frontmatter or filesystem metadata.
 
         Checks frontmatter fields first (date, created, created_at),
-        then falls back to the file's creation/modification time.
+        then falls back to the file's modification time.
+
+        **This value is an identity anchor, not an authorship claim.**
+        :func:`creek.ingest.base.generate_fragment_id` hashes it, so the
+        fallback must be a pure function of the file's epoch mtime —
+        invariant under the host's ``TZ`` env var, its tzdata, its DST
+        state, and its operating system (#1329). That is exactly what
+        :func:`~creek.ingest.base.file_modified_time` guarantees, and it is
+        why this must never be "simplified" back to a bare
+        ``datetime.fromtimestamp(mtime)`` (host-local, so one file mints one
+        id per timezone) or to ``st_birthtime`` (present on macOS/BSD,
+        absent on Linux, so one file mints one id per operating system).
+
+        Authorship is ``authored_at``'s job (FEAT-031), which has its own
+        frontmatter fields and its own backfill.
 
         Args:
             fm_data: Parsed frontmatter dictionary.
             file_path: Path to the source file.
 
         Returns:
-            A timezone-aware datetime.
+            A timezone-aware datetime; UTC when it comes from the filesystem.
         """
         fm_ts = _extract_timestamp_from_frontmatter(fm_data)
         if fm_ts is not None:
@@ -436,7 +546,7 @@ class MarkdownIngestor(Ingestor):
             except ValueError:
                 logger.warning("Invalid frontmatter timestamp: %s", fm_ts)
 
-        return _get_file_creation_timestamp(file_path)
+        return file_modified_time(file_path)
 
     def convert_to_markdown(self, fragment: ParsedFragment) -> str:
         """Return the fragment content as-is (already markdown).

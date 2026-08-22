@@ -1,17 +1,26 @@
-"""End-to-end purge round-trip test (TEST-001 / INC-004).
+"""End-to-end purge round-trip: ingest one source, then erase it (TEST-001).
 
-Ingest a source, then purge by source identifier. Asserts that:
-  - The fragments produced by ingestion are gone after purge.
-  - The audit log has at least one entry recording the purge.
+The pipeline stamps a ``.md`` source with ``source.platform: markdown``
+(pinned independently by ``tests/e2e/test_pipeline_markdown_e2e.py``), so
+that is the platform this module purges. It reads the ingested fragment's
+id off disk, asserts the fragment file is gone, and asserts the GAP-002
+intent/outcome audit pair *by content* rather than by the presence of a
+file in the audit directory.
 
-Pairs with INC-004 (audit-log schema mismatch) and INC-005 (audit-log
-path mismatch) — both surface as missing audit files post-purge.
+Before #1345 this module purged ``source_type="other"`` — a platform the
+pipeline never stamps on a ``.md`` file — so the purge matched zero
+fragments and deleted nothing, while the test passed on two assertions
+that could not fail: ``assert purge_result is not None`` against a
+non-Optional return, and ``assert audit_files`` against a log that
+:meth:`creek.purge.engine.PurgeEngine._run_audited` writes whether or not
+anything matched.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import frontmatter
 import pytest
 
 if TYPE_CHECKING:
@@ -19,19 +28,27 @@ if TYPE_CHECKING:
 
 from creek.config import CreekConfig
 from creek.pipeline import Pipeline
+from creek.purge.audit import PurgeAuditLog
+from creek.purge.engine import PurgeEngine
 
 pytestmark = [pytest.mark.e2e]
+
+PLATFORM = "markdown"
+"""The platform the markdown ingestor stamps, and the platform purged.
+
+One constant drives both the frontmatter assertion and the ``purge_source``
+call on purpose. If an ingestor change moves the stamp, the failure is a
+loud ``assert '<new>' == 'markdown'`` at the stamp line rather than a
+silently empty purge. Reading the value out of the frontmatter and feeding
+it back into ``purge_source`` would agree with itself forever, hiding
+exactly the drift this test exists to catch.
+"""
 
 
 def test_purge_round_trip_clears_fragments_and_writes_audit(
     synthetic_vault: Path, synthetic_source: Path
 ) -> None:
-    """Ingest then purge — the fragment files should be gone and the audit log present.
-
-    This test calls into ``creek.purge`` if available; if the purge
-    engine isn't wired up yet (INC-002 / INC-008), the test marks itself
-    skipped with a clear reason rather than crashing on import.
-    """
+    """Ingest one markdown source, purge its platform, assert erasure and audit."""
     (synthetic_source / "ephemeral.md").write_text(
         "# Ephemeral\n\nWill be purged shortly.\n",
         encoding="utf-8",
@@ -39,22 +56,42 @@ def test_purge_round_trip_clears_fragments_and_writes_audit(
 
     config = CreekConfig()
     pipeline = Pipeline(config=config)
-    pipeline.run(source_path=synthetic_source, vault_path=synthetic_vault)
+    run_result = pipeline.run(source_path=synthetic_source, vault_path=synthetic_vault)
+    assert run_result.errors == []
+    assert run_result.fragments_created == 1
 
-    try:
-        from creek.purge.engine import PurgeEngine
-    except ImportError:
-        pytest.skip("creek.purge.engine not yet importable (INC-002)")
+    fragments_dir = synthetic_vault / "01-Fragments"
+    ingested = list(fragments_dir.rglob("*.md"))
+    assert len(ingested) == 1, f"expected exactly one fragment, got {ingested}"
+    frag_path = ingested[0]
+    post = frontmatter.load(str(frag_path))
+    source_meta = post["source"]
+    assert isinstance(source_meta, dict)
+    assert source_meta["platform"] == PLATFORM
+    ingested_id = str(post["id"])
 
     engine = PurgeEngine(vault_path=synthetic_vault)
-    # The pipeline ingestor stage tags fragments with platform "other"
-    # for unrecognised sources; purging by that platform exercises the
-    # source-purge path end-to-end.
-    purge_result = engine.purge_source(source_type="other")
-    assert purge_result is not None, (
-        "Purge engine returned None — purge command may be a stub (INC-002)"
-    )
+    purge_result = engine.purge_source(source_type=PLATFORM)
 
-    audit_dir = synthetic_vault / "00-Creek-Meta" / "audit"
-    audit_files = list(audit_dir.glob("*"))
-    assert audit_files, "Purge produced no audit log entry"
+    assert purge_result.fragments_affected == 1
+    assert purge_result.affected_fragment_ids == [ingested_id]
+    assert purge_result.deleted_files == [str(frag_path)]
+    assert purge_result.outcome_status == "complete"
+    assert purge_result.dry_run is False
+    assert not frag_path.exists()
+    assert list(fragments_dir.rglob("*.md")) == []
+
+    audit = PurgeAuditLog(synthetic_vault)
+    audit.verify()
+    entries = audit.read()
+    assert [entry.phase for entry in entries] == ["intent", "outcome"]
+    intent, outcome = entries
+    assert intent.operation_id != ""
+    assert outcome.operation_id == intent.operation_id
+    for entry in entries:
+        assert entry.operation == "source"
+        assert entry.criteria == {"source_type": PLATFORM}
+    assert outcome.fragments_deleted == 1
+    assert outcome.affected_fragments == [ingested_id]
+    assert outcome.status == "complete"
+    assert outcome.failure_reason is None

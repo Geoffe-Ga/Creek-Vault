@@ -34,21 +34,33 @@ When the scan returns, translate the report gently:
   will be false alarms (a long git hash can look like a key). Walk them
   through what was found, in plain terms, a few examples, not a wall.
 - Explain the next move: applying redaction replaces the sensitive spans
-  with markers like `[REDACTED:api_key]` and keeps a review queue. The
+  with markers like `[REDACTED:api_key]`, rewriting the files in place. The
   original secret is never written into the vault or any log.
 
-## Apply — only with a clear yes
+## Apply — only with a clear yes, and only after a backup
 
 If there were findings and the user wants to proceed, this is the first
-genuinely changing action of the walkthrough. Get an explicit yes. You may
-still run `creek redact --apply` with `--dry-run` first to preview, then
-the real apply. Narrate each step.
+genuinely changing action of the walkthrough — and it is final. `--apply`
+rewrites the source files in place; once it runs, the original text is
+gone, with no undo. Before you get their yes, make sure they know that and
+have a copy of their source material somewhere safe (a copy, a commit,
+a backup — anything that isn't the only copy).
+
+Get an explicit yes. Always run `creek redact --apply` with `--dry-run`
+first and walk them through what it would change, then run the real apply.
+Narrate each step.
 
 ## The word for this stage
 
-**Redaction.** Not deletion — *flagging*. Nothing is silently destroyed;
-sensitive spans are masked and logged for review, and you can restore a
-false alarm later. The creek protects you without erasing you.
+**Redaction.** Not deletion of a fragment — *masking*: matched spans in
+the source files are replaced with markers like `[REDACTED:api_key]`
+before anything is written into the vault. `--scan` is completely safe and
+changes nothing; `--dry-run` lets them preview an apply before it happens;
+and a false alarm is best fixed *before* applying, by adding it to
+`false_positive_allowlist` and re-scanning. But once `--apply` runs on a
+file, that change is final — there is no queue and no restore. The creek
+protects you, but it does not keep a copy of the water it already
+carried, so a backup is the user's job, not the tool's.
 
 ## Check in
 

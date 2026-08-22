@@ -94,3 +94,37 @@ def test_index_reports_count_matching_written_files(vault: Path) -> None:
         *vault.rglob("Eddy-Map.md"),
     }
     assert f"Wrote {len(on_disk)} index note" in result.output
+
+
+def test_index_on_vault_missing_frequency_folders_writes_them(tmp_path: Path) -> None:
+    """A vault whose ``06-Frequencies`` folders are absent is not silently skipped.
+
+    Issue #1231: ``_find_frequency_subdir`` returned ``None`` and the loop
+    hit a bare ``continue``, so the command exited 0 having written no
+    frequency index at all.
+    """
+    for folder in _TOP_LEVEL:
+        (tmp_path / folder).mkdir()
+    # 06-Frequencies exists but has been emptied (renamed / reorganised vault).
+
+    result = runner.invoke(app, ["index", "--vault", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    written = sorted((tmp_path / "06-Frequencies").rglob("*-Index.md"))
+    assert len(written) == 10, f"expected 10 frequency indexes, got {written}"
+    assert "F1-Index.md" in result.output
+
+
+def test_index_on_bare_vault_creates_every_write_target(tmp_path: Path) -> None:
+    """``creek index`` scaffolds each write target instead of raising.
+
+    Issue #1231: the thread and eddy writes called no ``mkdir`` at all, so a
+    vault missing ``02-Threads`` died with ``FileNotFoundError``.
+    """
+    result = runner.invoke(app, ["index", "--vault", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "02-Threads" / "Thread-Index.md").is_file()
+    assert (tmp_path / "03-Eddies" / "Eddy-Map.md").is_file()
+    assert (tmp_path / "00-Creek-Meta" / "Temporal-Index.md").is_file()
+    assert (tmp_path / "00-Creek-Meta" / "Source-Index.md").is_file()

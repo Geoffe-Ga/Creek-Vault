@@ -36,6 +36,7 @@ from creek.generate.ai_style import build_fingerprint, scan
 from creek.generate.drafts import DraftGenerator
 from creek.generate.mining import IdeaSeed, MiningStrategy
 from creek.models import Frequency
+from creek.scaffold import scaffold_vault
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -85,14 +86,17 @@ _OWNER_EXEMPLARS = (
 )
 
 
-def _scaffold_vault(vault: Path) -> None:
-    """Create the vault folders and self-authored seed fragments.
+def _seed_vault(vault: Path) -> None:
+    """Scaffold a real vault and fill it with self-authored seed fragments.
+
+    The folder tree comes from :func:`creek.scaffold.scaffold_vault` — the
+    ``creek init`` code path — rather than a local four-entry list, so the
+    harness cannot quietly run against a shape no user ever gets (#1025).
 
     Args:
         vault: The throwaway vault root.
     """
-    for sub in ("01-Fragments", "02-Threads", "03-Eddies", "07-Voice/Drafts"):
-        (vault / sub).mkdir(parents=True, exist_ok=True)
+    scaffold_vault(vault)
     fragments = vault / "01-Fragments"
     for index, body in enumerate(_OWNER_EXEMPLARS):
         front = (
@@ -158,7 +162,7 @@ def _generate_body(vault: Path, emitted: str) -> str:
 @pytest.fixture
 def vault(tmp_path: Path) -> Path:
     """Return a scaffolded throwaway vault with owner exemplar fragments."""
-    _scaffold_vault(tmp_path)
+    _seed_vault(tmp_path)
     return tmp_path
 
 

@@ -30,6 +30,7 @@ import frontmatter
 from creek.link.embeddings import Resonance
 from creek.models import Synchronicity
 from creek.time import effective_authored_at
+from creek.vault.links import read_header_meta
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -88,6 +89,12 @@ def _share_project(title_a: str, title_b: str) -> bool:
     """Return ``True`` if the two titles share a proper-noun project name."""
     return bool(_extract_proper_nouns(title_a) & _extract_proper_nouns(title_b))
 
+
+_SYNCHRONICITY_SUBPATH: tuple[str, str] = ("10-Liminal", "Synchronicities")
+"""Vault-relative home of the reflection notes this module writes.
+
+Named once so the scaffold drift guard can derive it instead of
+re-typing it (#1025)."""
 
 _LEGACY_TUPLE_ARITY: int = 3
 """Pre-FEAT-024 resonance tuple shape: (id_a, id_b, similarity)."""
@@ -335,7 +342,7 @@ class SynchronicityDetector:
         frag_a = fragments[sync.fragment_a_id]
         frag_b = fragments[sync.fragment_b_id]
 
-        target_dir = vault_path / "10-Liminal" / "Synchronicities"
+        target_dir = vault_path.joinpath(*_SYNCHRONICITY_SUBPATH)
         target_dir.mkdir(parents=True, exist_ok=True)
         note_path = target_dir / f"{sync.id}.md"
 
@@ -450,18 +457,45 @@ def _existing_synchronicity_pairs(vault_path: Path) -> set[frozenset[str]]:
 
     Reads each note's ``fragments: ["[[a]]", "[[b]]"]`` frontmatter so a re-run
     can skip pairs already written — the idempotency key, since the note's
-    ``sync-<uuid>`` filename is not stable across runs.
+    ``sync-<uuid>`` filename is not stable across runs. That key has to hold
+    over an operator-editable folder: Obsidian, a text editor and ``creek
+    save`` all write into ``10-Liminal/Synchronicities/``, so this scan meets
+    YAML nobody validated on most runs.
+
+    The header-only reader yields an empty mapping for an unreadable file,
+    malformed YAML, a header past its size caps, or a header that is not a
+    mapping. Such a note therefore costs itself its dedup entry and nothing
+    else — the run still writes the notes the vault has earned.
+
+    :func:`creek.vault.links.read_header_meta` is used **instead of**
+    ``frontmatter.load*`` because that API ends in ``Post(content, handler,
+    **metadata)``: a non-string YAML key (``2024-01-01:``) makes the splat
+    raise ``TypeError: keywords must be strings``, past any ``(OSError,
+    ValueError, yaml.YAMLError)`` guard. The crash is **structurally
+    impossible rather than caught**, which is why a genuine ``TypeError``
+    out of the extraction loop below still propagates (#1416).
+
+    Three consequences are deliberate. The header must open with ``---`` on
+    line 1, where ``frontmatter.loads`` tolerated leading whitespace; the
+    200-line / 64KB header caps apply; and a note carrying a stray non-string
+    key is **tolerated rather than rejected**. Rejecting it — the other
+    obvious reading of #1416 — would discard a pair this folder really does
+    record, and the scan would then re-write a duplicate note for it on every
+    subsequent run.
+
+    Args:
+        vault_path: Root of the Obsidian vault.
+
+    Returns:
+        One frozen pair per note recording a two-element ``fragments`` list;
+        notes recording none contribute nothing.
     """
     pairs: set[frozenset[str]] = set()
-    sync_dir = vault_path / "10-Liminal" / "Synchronicities"
+    sync_dir = vault_path.joinpath(*_SYNCHRONICITY_SUBPATH)
     if not sync_dir.is_dir():
         return pairs
     for note in sync_dir.glob("*.md"):
-        try:
-            post = frontmatter.loads(note.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        raw = post.get("fragments")
+        raw = read_header_meta(note).get("fragments")
         if not isinstance(raw, list) or len(raw) < _PAIR_SIZE:
             continue
         ids = [re.sub(r"[\[\]]", "", str(item)).strip() for item in raw[:_PAIR_SIZE]]

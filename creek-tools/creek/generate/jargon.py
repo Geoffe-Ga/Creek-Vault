@@ -14,6 +14,17 @@ holds any gloss signal — an em-dash, a parenthetical, an appositive comma, a
 keywords. Surface forms are matched case-sensitively on a word boundary so an
 ordinary lower-case word (``rising`` the verb) or a capitalised non-term
 (``London``) never trips the scan.
+
+Case-sensitivity only buys that where the registry holds no bare lower-case
+form to match. Every registered surface form is prose a draft writes — a label
+("Rising", "Ultraviolet") or a proper name ("Agency") — and a serialised wire
+value (``rising``, ``absorb``) can never be registered at all: constructing an
+:class:`~creek.generate.ontology_glossary.OntologyTerm` around a single
+all-lower-case word raises, in its ``__post_init__``. That guard is what stands
+between this module and the #1343 defect: re-adding a ``.value`` alias would,
+absent it, put the wire values back in the scan's path and make this module flag
+ordinary English again. Weakening the guard and re-adding the alias together is
+the one change that silently restores the bug.
 """
 
 from __future__ import annotations

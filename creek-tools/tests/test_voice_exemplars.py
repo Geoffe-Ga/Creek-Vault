@@ -15,14 +15,20 @@ from typing import TYPE_CHECKING
 import frontmatter
 import pytest
 
+from creek.classify.privacy_filter import PrivacyTierOverride
+from creek.config import VoiceAudienceWeightingConfig
 from creek.generate.voice import (
     DEFAULT_MAX_PER_REGISTER,
     DEFAULT_MIN_PER_REGISTER,
     VOICE_REGISTERS,
     VoiceExemplarCollector,
+    _eligible_register,
     _is_other_authors_path,
+    _is_safe_sample_stem,
+    audience_authority,
 )
 from creek.models import (
+    Authorship,
     Confidence,
     Fragment,
     FragmentSource,
@@ -71,9 +77,17 @@ def _build_fragment(
     confidence: Confidence | None,
     privacy: PrivacyTier = PrivacyTier.PERSONAL,
     fully_classified: bool = True,
-    voice_weight: float = 1.0,
+    voice_weight: float | None = None,
+    author: Authorship = Authorship.SELF,
 ) -> Fragment:
-    """Build a Fragment with the desired voice / privacy / classification state."""
+    """Build a Fragment with the desired voice / privacy / classification state.
+
+    ``voice_weight`` is omitted from the constructor call when ``None`` so a
+    test can exercise the *model default* (``1.0``, ``creek/models.py``)
+    rather than a value the helper supplied — the distinction #1213 turns on,
+    since a non-self fragment with no explicit weight is exactly what
+    ``DocumentIngestor`` produces.
+    """
     if fully_classified:
         frequency = FrequencyClassification(primary=Frequency.F5)
         wavelength = WavelengthClassification(
@@ -83,17 +97,18 @@ def _build_fragment(
     else:
         frequency = FrequencyClassification()
         wavelength = WavelengthClassification()
+    weight_kwargs = {} if voice_weight is None else {"voice_weight": voice_weight}
     return Fragment(
         id=frag_id,
         title=title,
-        source=FragmentSource(platform=SourcePlatform.JOURNAL),
+        source=FragmentSource(platform=SourcePlatform.JOURNAL, author=author),
         created=datetime(2026, 1, 15, 12, 0, 0),
         ingested=datetime(2026, 1, 15, 12, 0, 0),
         frequency=frequency,
         wavelength=wavelength,
         voice=VoiceClassification(voice_register=register, confidence=confidence),
         privacy_tier=privacy,
-        voice_weight=voice_weight,
+        **weight_kwargs,
     )
 
 
@@ -111,6 +126,70 @@ def _write_fragment(
     target = vault_path / "01-Fragments" / subfolder / f"{fragment.id}.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return target
+
+
+def _write_untiered_fragment(
+    vault_path: Path,
+    fragment: Fragment,
+    *,
+    body_words: int,
+    subfolder: str = "Journal",
+) -> Path:
+    """Persist *fragment* with the ``privacy_tier`` key **absent** from disk.
+
+    The sibling of :func:`_write_fragment` for #1212, and the only way to
+    produce the case that issue is about. ``_write_fragment`` serialises
+    ``fragment.model_dump(mode="json")``, and ``privacy_tier`` is a declared
+    field with a default, so that dump **always** carries the key: a vault
+    seeded through it cannot express "nobody ever wrote a tier down", which
+    is precisely the state a hand-edited, legacy, or non-creek-authored note
+    is in.
+
+    Two self-proofs, because a fixture that quietly stops producing the case
+    under test turns every assertion built on it into a vacuous pass:
+
+    1. The key must have been **present** before it is popped. A field
+       rename, or a model change that drops ``privacy_tier`` from the dump,
+       therefore fails here rather than silently writing a file that never
+       had the key and proving nothing.
+    2. The file is re-read with ``frontmatter.load`` and the key asserted
+       absent — and ``type: fragment`` asserted present, because
+       ``_load_fragment_with_body`` returns ``None`` for anything else and a
+       vault of files it skips walks zero fragments.
+
+    Args:
+        vault_path: Vault root, already scaffolded by the ``vault`` fixture.
+        fragment: The fragment to write. Its own ``privacy_tier`` is
+            discarded; only the rest of its frontmatter survives.
+        body_words: Word count of the generated body.
+        subfolder: Folder beneath ``01-Fragments/`` to write into.
+
+    Returns:
+        The path written.
+    """
+    body = " ".join(["word"] * body_words)
+    data = fragment.model_dump(mode="json")
+    assert "privacy_tier" in data, (
+        "the serialised fragment carries no 'privacy_tier' key, so removing "
+        "it writes the same file _write_fragment would and this helper can no "
+        "longer produce the untiered case #1212 is about"
+    )
+    del data["privacy_tier"]
+    post = frontmatter.Post(content=body, **data)
+    target = vault_path / "01-Fragments" / subfolder / f"{fragment.id}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    written = frontmatter.load(str(target))
+    assert "privacy_tier" not in written.metadata, (
+        f"{target} was written with a privacy_tier after all: "
+        f"{written.metadata.get('privacy_tier')!r}"
+    )
+    assert written.metadata.get("type") == "fragment", (
+        f"{target} is not typed 'fragment', so _load_fragment_with_body skips "
+        "it and every assertion about the corpus it feeds is vacuous"
+    )
     return target
 
 
@@ -314,12 +393,15 @@ class TestCollectExemplars:
 class TestVoiceCorpusExcludesBorrowedContent:
     """Issue #466: borrowed / AI-authored text must never reach the voice corpus.
 
-    Two additive gates protect voice fidelity, mirroring the privacy
+    Three additive gates protect voice fidelity, mirroring the privacy
     fail-closed rule:
 
-    1. ``voice_weight > 0`` — a fragment with ``voice_weight <= 0`` (the
+    1. ``source.author == self`` — the frontmatter axis that
+       :attr:`~creek.models.Fragment.voice_proxy_eligible` is derived from.
+       This is the primary gate (#1213); the two below are backstops to it.
+    2. ``voice_weight > 0`` — a fragment with ``voice_weight <= 0`` (the
        ``ai-as-user`` analogue with ``voice_weight=0.0``) is ineligible.
-    2. ``11-Other-Authors/`` path exclusion — any fragment whose source
+    3. ``11-Other-Authors/`` path exclusion — any fragment whose source
        path contains that segment is skipped regardless of weight.
     """
 
@@ -406,6 +488,261 @@ class TestVoiceCorpusExcludesBorrowedContent:
         native = tmp_path / "01-Fragments" / "Journal" / "f.md"
         assert _is_other_authors_path(other) is True
         assert _is_other_authors_path(native) is False
+
+    @pytest.mark.parametrize(
+        "author",
+        [Authorship.AI, Authorship.OTHER, Authorship.COLLABORATIVE],
+    )
+    def test_excludes_non_self_authors_at_default_voice_weight(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+        author: Authorship,
+    ) -> None:
+        """Non-self prose is refused on authorship alone, with no weight help.
+
+        Issue #1213. Neither backstop applies here: the fragment sits in
+        ``01-Fragments/Journal/`` (so the ``11-Other-Authors`` path gate
+        never sees it) and carries no explicit ``voice_weight``, so the
+        model default of ``1.0`` applies. ``other`` is the live case —
+        ``DocumentIngestor`` resolves a DOCX ``core_properties.author`` /
+        PDF ``/Author`` to :attr:`~creek.models.Authorship.OTHER` and sets
+        no weight, so a stranger's document reaches this walk today.
+
+        The fragment round-trips through ``frontmatter`` and
+        ``Fragment.model_validate``, so the gate is exercised against the
+        plain ``str`` that ``FragmentSource``'s ``use_enum_values=True``
+        yields at runtime — not against an enum member.
+        """
+        borrowed = _build_fragment(
+            frag_id=f"frag-authored-{author.value}",
+            title=f"Written by {author.value}",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+            author=author,
+        )
+        assert borrowed.voice_weight == 1.0
+        _write_fragment(vault, borrowed, body_words=400)
+
+        exemplars = collector.collect_exemplars(vault)
+
+        assert [f.id for f in exemplars["confessional"]] == []
+
+    @pytest.mark.parametrize("author", list(Authorship))
+    @pytest.mark.parametrize("tier", list(PrivacyTier))
+    def test_gate_matches_the_canonical_property_and_the_intimate_override(
+        self,
+        author: Authorship,
+        tier: PrivacyTier,
+    ) -> None:
+        """The gate is equivalent to the canonical predicate, override aside.
+
+        Two arms, and both are load-bearing (#1213):
+
+        * At ``allow_intimate=False`` admission must equal
+          :attr:`~creek.models.Fragment.voice_proxy_eligible` exactly.
+        * At ``allow_intimate=True`` admission must equal *self-authorship
+          alone* — the opt-in overrides the INTIMATE exclusion the property
+          bakes in, and nothing else. This arm is what fails if anyone
+          "simplifies" ``_eligible_register`` to
+          ``return fragment.voice_proxy_eligible``: that would silently
+          revoke the operator's opt-in to their own intimate writing.
+
+        ``list(Authorship)`` is deliberate: a fifth member added later is
+        excluded by the property and must be excluded here too, without
+        anyone remembering to extend a hand-written list.
+
+        The tier axis is ``list(PrivacyTier)``, and it did not used to be.
+        An earlier revision of this docstring omitted
+        ``PrivacyTier.UNCLASSIFIED`` on the prediction that #1212 would make
+        ``_eligible_register`` stop admitting a self-authored *untiered*
+        fragment, breaking the first arm for that cell. **That prediction was
+        wrong**, on two counts. It conflated "the ``privacy_tier`` key is
+        absent from the file on disk" with "the model's ``privacy_tier`` is
+        the value ``unclassified``", which are different facts:
+        ``Fragment`` defaults a *missing* key to ``UNCLASSIFIED``, so the two
+        are indistinguishable here and distinguishable only in the raw
+        frontmatter. And this gate never sees raw frontmatter at all — it
+        takes a validated model — so #1212 does not touch it. The real fix
+        materialises the **declared** tier (``raw_privacy_tier`` of the raw
+        frontmatter) onto the model inside ``_load_fragment_with_body``, so
+        by the time an untiered file reaches this function it is already
+        carrying ``intimate`` and is refused by the clause that has always
+        refused intimate content. #1212's AC2 states the other half
+        explicitly: an *explicit* ``unclassified`` keeps its #876 ranking,
+        and nothing about how the model value ``UNCLASSIFIED`` is treated may
+        change.
+
+        Widening the axis is therefore not cosmetic. With ``UNCLASSIFIED``
+        present, arm 1 becomes a live regression test for that AC:
+        :attr:`~creek.models.Fragment.voice_proxy_eligible` is ``True`` for a
+        self-authored ``UNCLASSIFIED`` model (it excludes only INTIMATE), so
+        any "tidy-up" that starts refusing that model value here breaks this
+        cell instead of shipping quietly.
+        """
+        fragment = _build_fragment(
+            frag_id="frag-equivalence",
+            title="Equivalence probe",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+            privacy=tier,
+            author=author,
+        )
+
+        admitted_default = _eligible_register(fragment, allow_intimate=False)
+        admitted_opted_in = _eligible_register(fragment, allow_intimate=True)
+
+        assert (admitted_default is not None) == fragment.voice_proxy_eligible
+        assert (admitted_opted_in is not None) == (
+            str(fragment.source.author) == Authorship.SELF.value
+        )
+
+    def test_self_authored_intimate_admitted_when_allow_intimate(
+        self,
+        vault: Path,
+    ) -> None:
+        """The operator's own intimate writing survives the authorship gate.
+
+        The regression the issue body's suggested fix would have caused
+        (#1213): delegating to ``voice_proxy_eligible`` bakes in the
+        INTIMATE exclusion and silently drops this fragment even though the
+        operator opted the voice proxy in.
+        """
+        mine = _build_fragment(
+            frag_id="frag-self-intimate",
+            title="My own intimate writing",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+            privacy=PrivacyTier.INTIMATE,
+        )
+        _write_fragment(vault, mine, body_words=400)
+
+        exemplars = VoiceExemplarCollector(allow_intimate=True).collect_exemplars(vault)
+
+        assert [f.id for f in exemplars["confessional"]] == ["frag-self-intimate"]
+
+    def test_self_author_with_positive_weight_is_still_admitted(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """The admit direction is pinned independently of the weight gate (#1213)."""
+        mine = _build_fragment(
+            frag_id="frag-self-default",
+            title="My own writing",
+            register=VoiceRegister.PROPHETIC,
+            confidence=Confidence.CONVICTION,
+        )
+        _write_fragment(vault, mine, body_words=400)
+
+        exemplars = collector.collect_exemplars(vault)
+
+        assert [f.id for f in exemplars["prophetic"]] == ["frag-self-default"]
+
+    @pytest.mark.parametrize(
+        "author",
+        [Authorship.AI, Authorship.OTHER, Authorship.COLLABORATIVE],
+    )
+    def test_collect_all_exemplars_excludes_non_self_authors(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+        author: Authorship,
+    ) -> None:
+        """The flat lexicon-facing walk shares the authorship gate (#1213).
+
+        ``collect_all_exemplars`` is a second, independent walk; asserting
+        the gate on ``collect_exemplars`` alone would not cover it.
+        """
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id=f"frag-flat-{author.value}",
+                title="Borrowed",
+                register=VoiceRegister.ANALYTICAL,
+                confidence=Confidence.SETTLED,
+                author=author,
+            ),
+            body_words=400,
+        )
+
+        assert collector.collect_all_exemplars(vault) == []
+
+    def test_register_samples_are_not_written_for_non_self_authors(
+        self,
+        vault: Path,
+    ) -> None:
+        """No verbatim copy of borrowed prose lands in ``Register-Samples`` (#1213).
+
+        ``generate_register_samples`` ``shutil.copy2``-s the source file into
+        the vault byte for byte, so this surface turns an excerpt into a
+        durable copy of someone else's writing.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-samples-other",
+                title="Stranger's document",
+                register=VoiceRegister.INSTRUCTIONAL,
+                confidence=Confidence.CONVICTION,
+                author=Authorship.OTHER,
+            ),
+            body_words=400,
+        )
+
+        assert generate_register_samples(vault) == {}
+        register_dir = vault / "07-Voice" / "Register-Samples" / "instructional"
+        assert not register_dir.exists()
+
+    def test_previously_written_non_self_samples_are_pruned(
+        self,
+        vault: Path,
+    ) -> None:
+        """A sample written before the fix is deleted on the next run (#1213/#879).
+
+        Two runs through the public entry point. The first writes the copy
+        while the fragment is still self-authored; the frontmatter is then
+        rewritten on disk to ``author: other`` — the state a pre-fix vault is
+        already in — and the second run must remove the copy it recorded
+        writing and rewrite the summary to an honest zero. ``_save_register``
+        prunes above its empty-bucket branch precisely so an emptied register
+        is cleared rather than left describing a cohort that has gone.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        source = _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-prune-other",
+                title="Later reattributed",
+                register=VoiceRegister.RAW,
+                confidence=Confidence.CONVICTION,
+            ),
+            body_words=400,
+        )
+        register_dir = vault / "07-Voice" / "Register-Samples" / "raw"
+        copy = register_dir / "frag-prune-other.md"
+        summary = register_dir / "_Summary.md"
+
+        first_pruned: list[Path] = []
+        generate_register_samples(vault, on_prune=first_pruned.append)
+        assert copy.is_file()
+        assert summary.is_file()
+        assert first_pruned == []
+
+        post = frontmatter.load(str(source))
+        post["source"] = {**post["source"], "author": Authorship.OTHER.value}
+        source.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+        second_pruned: list[Path] = []
+        result = generate_register_samples(vault, on_prune=second_pruned.append)
+
+        assert second_pruned == [copy]
+        assert not copy.exists()
+        assert "raw" not in result
+        assert "frag-prune-other" not in summary.read_text(encoding="utf-8")
 
     def test_path_helper_no_substring_false_positive(self, tmp_path: Path) -> None:
         """A folder merely containing the text is not excluded (segment match only)."""
@@ -977,3 +1314,755 @@ class TestWarningBehavior:
             collector.collect_exemplars(vault)
         playful_warnings = [r for r in caplog.records if "playful" in r.message]
         assert len(playful_warnings) == 1
+
+
+# ---- Filename safety (Issue #879) ----
+
+
+class TestPersistFilenameSafety:
+    """``Fragment.id`` becomes a filename, so it is untrusted input.
+
+    ``_persist_fragment`` composes ``register_dir / f"{fragment.id}.md"``.
+    Nothing validates ``Fragment.id`` — the model declares a bare ``id:
+    str`` — so an id carrying path separators steers the write out of the
+    register folder entirely, and one equal to the summary's stem aims it
+    at a file the collector is about to write itself.
+    """
+
+    def test_traversing_id_writes_nothing_outside_the_register_folder(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """An id containing ``..`` must not place a file outside its register."""
+        frag = _build_fragment(
+            frag_id="../../escape",
+            title="Escaping fragment",
+            register=VoiceRegister.ANALYTICAL,
+            confidence=Confidence.SETTLED,
+        )
+
+        collector.save_exemplars({"analytical": [frag]}, vault)
+
+        assert not (vault / "07-Voice" / "escape.md").exists()
+        assert not (vault / "escape.md").exists()
+        register_dir = vault / "07-Voice" / "Register-Samples" / "analytical"
+        assert sorted(p.name for p in register_dir.glob("*.md")) == ["_Summary.md"]
+
+    def test_summary_named_id_leaves_the_summary_note_intact(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """A fragment id of ``_Summary`` must not become the summary note.
+
+        NOTE (regression pin, not a RED test): at the time of writing this
+        passes, because ``save_exemplars`` persists fragments *before*
+        ``_write_summary`` runs, so the summary overwrites the colliding
+        copy and the final file is correct by accident of ordering. The
+        invariant is worth stating anyway — it is the thing a filename
+        guard, a re-ordering, or the #879 prune pass must not break — but
+        it is honest about what it can and cannot catch: a guard confined
+        to ``_persist_fragment`` produces no observable change here at all.
+        """
+        frag = _build_fragment(
+            frag_id="_Summary",
+            title="Colliding sample",
+            register=VoiceRegister.ANALYTICAL,
+            confidence=Confidence.CONVICTION,
+        )
+        _write_fragment(vault, frag, body_words=400)
+
+        buckets = collector.collect_exemplars(vault)
+        collector.save_exemplars(buckets, vault)
+
+        register_dir = vault / "07-Voice" / "Register-Samples" / "analytical"
+        post = frontmatter.load(str(register_dir / "_Summary.md"))
+        assert post["type"] == "voice-register-summary"
+        assert post["voice_register"] == "analytical"
+
+    def test_rejects_an_id_whose_filename_exceeds_the_name_limit(self) -> None:
+        """An id too long to be a filename is rejected before the copy.
+
+        The guard bounds an id's *content* but not its *length*, so a
+        300-character id sails through and reaches ``shutil.copy2``,
+        which raises ``OSError``/``ENAMETOOLONG`` and takes the whole
+        command down with it. ``NAME_MAX`` is 255 **bytes** on every
+        filesystem creek runs on (APFS, ext4, XFS), and the name that has
+        to fit is ``f"{id}.md"`` — three bytes more than the id itself.
+
+        The accepted case is asserted alongside the rejected one and sits
+        exactly on the boundary: a guard that simply rejects long ids
+        somewhere short of the real limit would silently drop exemplars
+        the filesystem would have accepted.
+        """
+        assert _is_safe_sample_stem("a" * 252) is True
+        assert _is_safe_sample_stem("a" * 253) is False
+        assert _is_safe_sample_stem("a" * 300) is False
+
+    def test_measures_the_name_limit_in_bytes_not_characters(self) -> None:
+        """The length bound is a byte bound, because ``NAME_MAX`` is.
+
+        U+00E9 (LATIN SMALL LETTER E WITH ACUTE) encodes to two UTF-8
+        bytes, so 127 of them plus ``.md`` is 257 bytes in a name of only
+        130 characters. A ``len(filename) > 255`` check reads that as
+        comfortably short and lets it through — straight back into the
+        ``OSError`` the guard exists to prevent. Non-ASCII ids are not
+        hypothetical: ids are carried over verbatim from exports.
+
+        The 126-character case is the same boundary from below: 255
+        bytes exactly, which the filesystem accepts and so must this.
+        """
+        # Built from its codepoint rather than typed literally: the source
+        # stays ASCII, and the character under test cannot be mangled by an
+        # editor, a diff tool, or a normalising paste.
+        two_byte_char = chr(0xE9)  # LATIN SMALL LETTER E WITH ACUTE
+        # Stated, not assumed: the whole point of the test is the 2:1 ratio.
+        assert len(two_byte_char.encode("utf-8")) == 2
+        assert _is_safe_sample_stem(two_byte_char * 126) is True
+        assert _is_safe_sample_stem(two_byte_char * 127) is False
+
+    def test_rejects_the_summary_filename_as_a_sample_stem(self) -> None:
+        """An id of ``_Summary`` must not be usable as a sample stem.
+
+        ``_persist_fragment`` would write the fragment's verbatim body to
+        ``_Summary.md``; only the fact that ``_write_summary`` overwrites
+        it moments later makes the end state correct. Kill the process in
+        between — SIGKILL, OOM, a full disk — and ``_Summary.md`` holds a
+        fragment body instead, which the prune then exempts **by name**
+        and so never cleans up. Correct-by-ordering is not correct; the
+        collision belongs to the guard.
+
+        ``test_summary_named_id_leaves_the_summary_note_intact`` above
+        documents itself as a regression pin for the end state and must
+        keep passing once this guard lands: the summary is still written,
+        it is just no longer racing a body copy to the same path.
+        """
+        assert _is_safe_sample_stem("_Summary") is False
+
+
+# ---- generate_register_samples (Issue #879) ----
+
+
+class TestGenerateRegisterSamples:
+    """The module-level entry point the CLI report surface calls.
+
+    Mirrors ``creek.generate.lexicon.generate_lexicon``: build **one**
+    collector, ``collect_exemplars`` on it, then ``save_exemplars`` on
+    that same instance. The single-instance part is load-bearing rather
+    than stylistic — ``_persist_fragment`` copies the source file only
+    when ``self._records[fragment.id]`` is populated, and only
+    ``collect_exemplars`` populates it.
+    """
+
+    def test_returns_the_register_to_summary_path_mapping(
+        self,
+        vault: Path,
+    ) -> None:
+        """Every non-empty register maps to its written summary note."""
+        from creek.generate.voice import generate_register_samples
+
+        frag = _build_fragment(
+            frag_id="frag-grs-1",
+            title="Analytical sample",
+            register=VoiceRegister.ANALYTICAL,
+            confidence=Confidence.CONVICTION,
+        )
+        _write_fragment(vault, frag, body_words=400)
+
+        result = generate_register_samples(vault)
+
+        register_dir = vault / "07-Voice" / "Register-Samples" / "analytical"
+        assert set(result) == {"analytical"}
+        assert result["analytical"] == register_dir / "_Summary.md"
+        assert result["analytical"].is_file()
+        assert (register_dir / "frag-grs-1.md").is_file()
+
+    def test_copies_the_source_file_verbatim(self, vault: Path) -> None:
+        """The persisted sample is the source file, byte for byte.
+
+        The single assertion that separates a correct implementation from
+        one that builds a second collector (or skips ``collect_exemplars``
+        on the instance it saves with): the fallback path serialises
+        ``frontmatter.Post(content="", **fragment.model_dump())``, which
+        is a *valid* fragment note with an **empty body**, and a voice
+        corpus of empty bodies is silently useless.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        frag = _build_fragment(
+            frag_id="frag-grs-body",
+            title="Body carrier",
+            register=VoiceRegister.PLAYFUL,
+            confidence=Confidence.CONVICTION,
+        )
+        source = _write_fragment(vault, frag, body_words=400)
+
+        generate_register_samples(vault)
+
+        copy = vault / "07-Voice" / "Register-Samples" / "playful" / "frag-grs-body.md"
+        assert copy.read_bytes() == source.read_bytes()
+        assert frontmatter.load(str(copy)).content.strip() != ""
+
+    def test_empty_vault_returns_an_empty_mapping_and_writes_nothing(
+        self,
+        vault: Path,
+    ) -> None:
+        """No qualifying exemplars means no mapping and no folders created."""
+        from creek.generate.voice import generate_register_samples
+
+        assert generate_register_samples(vault) == {}
+        assert list((vault / "07-Voice" / "Register-Samples").iterdir()) == []
+
+    def test_override_excludes_above_ceiling_fragments(self, vault: Path) -> None:
+        """The declared ceiling narrows the corpus the samples are drawn from.
+
+        Additive to — never a replacement for — the ``allow_intimate``
+        consent gate: this is the caller's ceiling, applied to the raw
+        frontmatter by ``within_ceiling``.
+        """
+        from creek.classify.privacy_filter import PrivacyTierOverride
+        from creek.generate.voice import generate_register_samples
+
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-grs-open",
+                title="Open sample",
+                register=VoiceRegister.RAW,
+                confidence=Confidence.CONVICTION,
+                privacy=PrivacyTier.OPEN,
+            ),
+            body_words=400,
+        )
+        _write_fragment(
+            vault,
+            _build_fragment(
+                frag_id="frag-grs-personal",
+                title="Personal sample",
+                register=VoiceRegister.RAW,
+                confidence=Confidence.CONVICTION,
+                privacy=PrivacyTier.PERSONAL,
+            ),
+            body_words=400,
+        )
+
+        generate_register_samples(vault, override=PrivacyTierOverride.OPEN)
+
+        register_dir = vault / "07-Voice" / "Register-Samples" / "raw"
+        copied = sorted(
+            p.name for p in register_dir.glob("*.md") if p.name != "_Summary.md"
+        )
+        assert copied == ["frag-grs-open.md"]
+
+    def test_is_exported_from_the_module(self) -> None:
+        """The entry point is part of the module's public surface."""
+        from creek.generate import voice as voice_module
+
+        assert "generate_register_samples" in voice_module.__all__
+
+
+# ---- Manifest corruption is fail-safe (Issue #879) ----
+
+
+_MANIFEST_REGISTER_DIR = ("07-Voice", "Register-Samples", "analytical")
+"""Vault-relative samples folder the manifest-corruption tests operate in."""
+
+
+def _seed_pruneable_register(vault_path: Path) -> tuple[Path, Path]:
+    """Leave a register in the exact state its stale copy is prune-eligible in.
+
+    Runs one full save of two analytical exemplars — so both copies are on
+    disk **and** both are fingerprinted in ``_Summary.md``'s manifest —
+    then deletes one fragment's source file, dropping it out of the
+    corpus. A second ``generate_register_samples`` therefore *would*
+    delete ``frag-manifest-stale.md``, which is what makes "the copy
+    survived" an assertion about the manifest read rather than about a
+    prune that was never going to fire in this fixture anyway.
+
+    Args:
+        vault_path: Vault root, already scaffolded by the ``vault``
+            fixture.
+
+    Returns:
+        The ``(register_dir, stale_copy)`` pair the callers assert on.
+    """
+    from creek.generate.voice import generate_register_samples
+
+    for frag_id in ("frag-manifest-keep", "frag-manifest-stale"):
+        _write_fragment(
+            vault_path,
+            _build_fragment(
+                frag_id=frag_id,
+                title=f"Manifest fixture {frag_id}",
+                register=VoiceRegister.ANALYTICAL,
+                confidence=Confidence.CONVICTION,
+            ),
+            body_words=400,
+        )
+
+    generate_register_samples(vault_path)
+
+    register_dir = vault_path.joinpath(*_MANIFEST_REGISTER_DIR)
+    stale_copy = register_dir / "frag-manifest-stale.md"
+    assert stale_copy.is_file(), "the seeding run wrote no copy to go stale"
+    (vault_path / "01-Fragments" / "Journal" / "frag-manifest-stale.md").unlink()
+    return register_dir, stale_copy
+
+
+def _rewrite_manifest(register_dir: Path, value: object) -> None:
+    """Replace the summary's recorded manifest with *value*, keeping the rest.
+
+    Rewriting through ``frontmatter`` rather than by hand keeps every
+    other key the prune and the operator rely on intact, so the only
+    variable in the test is the shape of the manifest itself.
+
+    Args:
+        register_dir: The register's samples folder.
+        value: The hand-edited value to store under ``exemplar_digests``.
+    """
+    summary_path = register_dir / "_Summary.md"
+    post = frontmatter.load(str(summary_path))
+    post.metadata["exemplar_digests"] = value
+    summary_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+
+class TestManifestCorruptionIsFailSafe:
+    """A manifest the prune cannot trust must disarm it, not crash or over-delete.
+
+    ``_read_sample_manifest`` answers the only question that entitles the
+    collector to ``unlink`` a file in a folder the operator also keeps
+    notes in: "did I write this?". Its two defensive branches — an
+    unreadable ``_Summary.md`` and a recorded value that is not a list —
+    both answer "I cannot tell", and the contract is that "I cannot tell"
+    means *delete nothing*. The cost is a stale copy; the cost of the
+    other direction is an operator's file.
+
+    Both branches were reachable only through fixtures nothing exercised,
+    which leaves two regressions invisible: a refactor that lets the read
+    raise takes down the whole command — and ``creek fill`` runs it
+    unattended — while one that drops the type check turns a hand-edited
+    manifest into a deletion list.
+
+    Every test here goes through the real save path, so what is pinned is
+    the prune's observable safety rather than a private helper's return
+    value.
+    """
+
+    def test_prunes_the_stale_copy_when_the_manifest_is_intact(
+        self,
+        vault: Path,
+    ) -> None:
+        """Baseline: an uncorrupted manifest DOES delete the stale copy.
+
+        Not a duplicate of the CLI-level prune tests but the control that
+        makes the three below non-vacuous: it establishes that in this
+        exact fixture the prune is armed and reaches this file. Without
+        it, "the copy survived" would be equally true of an implementation
+        that never prunes anything at all.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        register_dir, stale_copy = _seed_pruneable_register(vault)
+
+        generate_register_samples(vault)
+
+        assert not stale_copy.exists()
+        assert (register_dir / "frag-manifest-keep.md").is_file()
+
+    def test_unreadable_summary_leaves_the_stale_copy_alone(
+        self,
+        vault: Path,
+    ) -> None:
+        """Malformed summary YAML degrades to a no-op prune, not a traceback.
+
+        ``_Summary.md`` is an ordinary note inside the vault: an operator
+        edit, a half-written file from an interrupted run, or a merge
+        conflict marker all land here as YAML that ``frontmatter.load``
+        refuses. Uncaught, that exception escapes ``save_exemplars`` and
+        kills ``creek report --type voice`` and the unattended ``creek
+        fill`` step with it — over a file whose only job is to say which
+        copies are deletable.
+
+        The rewritten summary is the control: it proves the run carried on
+        past the unreadable manifest and completed the save, rather than
+        the copy surviving because nothing ran.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        register_dir, stale_copy = _seed_pruneable_register(vault)
+        before = stale_copy.read_bytes()
+        (register_dir / "_Summary.md").write_text(
+            "---\nexemplar_digests: [\n---\n\nbroken\n",
+            encoding="utf-8",
+        )
+
+        generate_register_samples(vault)
+
+        assert stale_copy.read_bytes() == before
+        rewritten = frontmatter.load(str(register_dir / "_Summary.md"))
+        assert rewritten["exemplar_count"] == 1
+        assert (register_dir / "frag-manifest-keep.md").is_file()
+
+    def test_a_scalar_manifest_leaves_the_stale_copy_alone(
+        self,
+        vault: Path,
+    ) -> None:
+        """A manifest that is a bare string prunes nothing.
+
+        The shape a hand-edit produces when someone strips the YAML list
+        dashes, or a note is authored by something that never read the
+        schema. Nothing about it is a record of authorship, so the prune
+        must treat it as no record at all — the file the collector cannot
+        prove it wrote is the file it must not delete.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        register_dir, stale_copy = _seed_pruneable_register(vault)
+        before = stale_copy.read_bytes()
+        _rewrite_manifest(register_dir, "oops")
+
+        generate_register_samples(vault)
+
+        assert stale_copy.read_bytes() == before
+        rewritten = frontmatter.load(str(register_dir / "_Summary.md"))
+        assert rewritten["exemplar_count"] == 1
+        assert (register_dir / "frag-manifest-keep.md").is_file()
+
+    def test_a_mapping_manifest_leaves_the_stale_copy_alone(
+        self,
+        vault: Path,
+    ) -> None:
+        """A manifest that is a mapping prunes nothing — the guard's live case.
+
+        The scalar case above cannot on its own prove the ``isinstance``
+        check earns its keep: iterating a string yields single characters,
+        which match no digest, so deleting the check would leave that test
+        green. A mapping is the shape where the check is load-bearing —
+        iterating it yields exactly the digest keys, so a prune that
+        skipped the type test would read this as a perfectly good manifest
+        and delete the copy. Keeping the real digests as the keys is the
+        whole point: a placeholder would prove nothing.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        register_dir, stale_copy = _seed_pruneable_register(vault)
+        before = stale_copy.read_bytes()
+        seeded = frontmatter.load(str(register_dir / "_Summary.md"))
+        recorded = seeded["exemplar_digests"]
+        assert isinstance(recorded, list), "the seeding run recorded no manifest"
+        _rewrite_manifest(register_dir, dict.fromkeys(recorded, True))
+
+        generate_register_samples(vault)
+
+        assert stale_copy.read_bytes() == before
+        assert (register_dir / "frag-manifest-keep.md").is_file()
+
+
+# ---- Untiered fragments are refused (Issue #1212) ----
+
+
+_OPEN_CONTROL_ID = "frag-tier-open-control"
+"""The positive control: identical to the canary but for one frontmatter line."""
+
+_KEYLESS_CANARY_ID = "frag-tier-keyless-canary"
+"""The fragment whose ``privacy_tier`` key is absent from the file on disk."""
+
+_DECLARED_INTIMATE_ID = "frag-tier-declared-intimate"
+"""The comparator the canary's admission must track exactly (AC3)."""
+
+_EXPLICIT_UNCLASSIFIED_ID = "frag-tier-explicit-unclass"
+"""An explicit ``privacy_tier: unclassified`` — the case AC2 must not disturb."""
+
+
+def _write_tier_probe(vault_path: Path, frag_id: str, privacy: PrivacyTier) -> Path:
+    """Write one exemplar-qualifying probe fragment carrying *privacy*.
+
+    Every probe in this section is byte-identical but for its id and its
+    ``privacy_tier`` line, so any difference in admission is attributable to
+    the tier and to nothing else.
+
+    Args:
+        vault_path: Vault root, already scaffolded by the ``vault`` fixture.
+        frag_id: The fragment's id, which is also its filename stem.
+        privacy: The tier written into the frontmatter.
+
+    Returns:
+        The path written.
+    """
+    return _write_fragment(
+        vault_path,
+        _build_fragment(
+            frag_id=frag_id,
+            title="Tier probe",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+            privacy=privacy,
+        ),
+        body_words=400,
+    )
+
+
+def _write_keyless_canary(vault_path: Path) -> Path:
+    """Write the probe whose ``privacy_tier`` key never reaches the file.
+
+    Built from an ``OPEN`` fragment and then stripped, so the file differs
+    from :data:`_OPEN_CONTROL_ID`'s only by the absence of that one line. What
+    it was built from is deliberately the *most* permissive tier: nothing
+    about the admission decision may come from a value the file does not
+    carry.
+
+    Args:
+        vault_path: Vault root, already scaffolded by the ``vault`` fixture.
+
+    Returns:
+        The path written.
+    """
+    return _write_untiered_fragment(
+        vault_path,
+        _build_fragment(
+            frag_id=_KEYLESS_CANARY_ID,
+            title="Tier probe",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+            privacy=PrivacyTier.OPEN,
+        ),
+        body_words=400,
+    )
+
+
+class TestUntieredFragmentsAreRefused:
+    """A file with no ``privacy_tier`` key must not seed the voice corpus (#1212).
+
+    Two additive gates guard the corpus, and they read the tier from two
+    different places. The ceiling gate
+    (:func:`~creek.classify.privacy_filter.within_ceiling`) reads the **raw
+    frontmatter** and fails closed to ``INTIMATE`` when the key is absent. The
+    consent gate (``_eligible_register``) reads the **validated model**, where
+    an absent key has already become Pydantic's ``unclassified`` default.
+
+    At :attr:`~creek.classify.privacy_filter.PrivacyTierOverride.ALL` — the
+    collector's constructor default, and what a bare ``creek report`` resolves
+    to — the ceiling gate short-circuits to ``True``. Only the model-reading
+    gate is left, and it sees ``unclassified``, so a file that never said
+    anything about its own privacy walks into the voice corpus, into the
+    lexicon, into the rhetorical-patterns counts, and — worst — is copied
+    verbatim into ``07-Voice/Register-Samples/``.
+
+    Every test here carries a positive control identical to the canary in
+    every respect but its id and its ``privacy_tier`` line, and asserts the
+    admitted set by **equality**. ``_load_fragment_with_body`` returns
+    ``None`` for any file whose ``type`` is not ``fragment``, so a vault that
+    seeds nothing the walk recognises walks zero fragments and passes a
+    "canary not in admitted" assertion vacuously. An earlier audit of this
+    very defect did exactly that.
+    """
+
+    def test_collect_exemplars_refuses_a_file_with_no_privacy_tier_key(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """The register-bucket walk admits the control alone (AC1)."""
+        _write_tier_probe(vault, _OPEN_CONTROL_ID, PrivacyTier.OPEN)
+        _write_keyless_canary(vault)
+
+        exemplars = collector.collect_exemplars(vault)
+
+        assert [f.id for f in exemplars["confessional"]] == [_OPEN_CONTROL_ID]
+
+    def test_collect_all_exemplars_refuses_a_file_with_no_privacy_tier_key(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """The flat lexicon-facing walk refuses it too (AC1).
+
+        A second, independently written walk over the same directory:
+        asserting the gate on ``collect_exemplars`` alone would leave this one
+        uncovered, and it is the walk ``report --type lexicon`` consumes.
+        """
+        _write_tier_probe(vault, _OPEN_CONTROL_ID, PrivacyTier.OPEN)
+        _write_keyless_canary(vault)
+
+        exemplars = collector.collect_all_exemplars(vault)
+
+        assert [e.fragment.id for e in exemplars] == [_OPEN_CONTROL_ID]
+
+    def test_no_register_sample_is_copied_for_a_file_with_no_privacy_tier_key(
+        self,
+        vault: Path,
+    ) -> None:
+        """The verbatim-copy surface refuses it, asserted on disk (AC1).
+
+        This is the surface where admission is most expensive: ``creek report
+        --type voice`` ``shutil.copy2``-s the source file into the vault byte
+        for byte, so an untiered fragment admitted here becomes a durable
+        second copy of unvouched-for content sitting in ``07-Voice/``. The
+        assertion is therefore on the **directory listing**, not on the
+        mapping ``generate_register_samples`` returns: the mapping names
+        summaries, and it would look identical whether or not the canary's
+        body had been copied next to them.
+        """
+        from creek.generate.voice import generate_register_samples
+
+        _write_tier_probe(vault, _OPEN_CONTROL_ID, PrivacyTier.OPEN)
+        _write_keyless_canary(vault)
+
+        generate_register_samples(vault)
+
+        register_dir = vault / "07-Voice" / "Register-Samples" / "confessional"
+        assert (register_dir / f"{_OPEN_CONTROL_ID}.md").is_file()
+        assert not (register_dir / f"{_KEYLESS_CANARY_ID}.md").exists()
+        assert sorted(p.name for p in register_dir.glob("*.md")) == [
+            "_Summary.md",
+            f"{_OPEN_CONTROL_ID}.md",
+        ]
+
+    @pytest.mark.parametrize(
+        "allow_intimate",
+        [
+            pytest.param(False, id="consent-default"),
+            pytest.param(True, id="consent-opted-in"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "override",
+        [
+            pytest.param(PrivacyTierOverride.OPEN, id="ceiling-open"),
+            pytest.param(PrivacyTierOverride.PERSONAL, id="ceiling-personal"),
+            pytest.param(PrivacyTierOverride.INTIMATE, id="ceiling-intimate"),
+            pytest.param(PrivacyTierOverride.ALL, id="ceiling-all"),
+        ],
+    )
+    def test_untiered_is_admitted_exactly_where_declared_intimate_is(
+        self,
+        vault: Path,
+        override: PrivacyTierOverride,
+        allow_intimate: bool,
+    ) -> None:
+        """``privacy_tier`` is a one-way ratchet: refuse more, never admit more (AC3).
+
+        A file with no tier carries strictly *less* assurance than one that
+        says ``intimate`` out loud, so it must be admitted in exactly the
+        cells where a declared-intimate fragment is — no fewer (that would be
+        a new refusal nobody asked for on the opt-in path) and no more (that
+        is the defect). The relation is asserted **comparatively** across the
+        whole ceiling-by-consent grid rather than against a hard-coded table,
+        so it fails in both directions and needs no maintenance when the
+        ceiling semantics change.
+
+        The open control is asserted present in every cell. Without it, a
+        vault the walk never reached would satisfy the comparison trivially —
+        ``False == False`` in all eight cells.
+        """
+        _write_tier_probe(vault, _OPEN_CONTROL_ID, PrivacyTier.OPEN)
+        _write_tier_probe(vault, _DECLARED_INTIMATE_ID, PrivacyTier.INTIMATE)
+        _write_keyless_canary(vault)
+
+        probe = VoiceExemplarCollector(
+            allow_intimate=allow_intimate,
+            override=override,
+        )
+        admitted = {f.id for f in probe.collect_exemplars(vault)["confessional"]}
+
+        assert _OPEN_CONTROL_ID in admitted, (
+            "the open control was refused, so this cell walked no admissible "
+            f"fragment and proves nothing. admitted={sorted(admitted)}"
+        )
+        canary_admitted = _KEYLESS_CANARY_ID in admitted
+        declared_intimate_admitted = _DECLARED_INTIMATE_ID in admitted
+        assert canary_admitted == declared_intimate_admitted, (
+            "an untiered fragment must be admitted exactly where a declared "
+            f"intimate one is (#1212 AC3). admitted={sorted(admitted)}"
+        )
+
+    def test_the_opted_in_canary_is_ranked_as_declared_intimate_content(
+        self,
+        vault: Path,
+    ) -> None:
+        """Opting in admits the canary, at intimate's authority — deliberately.
+
+        The accepted, *intended* consequence of materialising the declared
+        tier, not an oversight. Once an untiered fragment reads as
+        ``intimate`` at every reader, it also reads as ``intimate`` to
+        :func:`~creek.generate.voice.audience_authority`, whose default table
+        scores that tier ``0.0``. On this path a ``0.0`` authority only
+        **de-ranks**: :meth:`VoiceExemplarCollector.rank_exemplars` returns
+        ``scored[:max_per_register]`` whatever the scores are, so membership
+        is untouched and the operator who opted in still gets their content —
+        it simply stops outranking work they actually vouched for.
+        ``creek/generate/ai_style/fingerprint.py`` reads the same authority
+        table but loads its own frontmatter (``fingerprint.py:254``) rather
+        than going through ``_load_fragment_with_body``, so it is outside this
+        change and keeps scoring a keyless note as ``unclassified``.
+
+        ``== 0.0`` exactly, rather than "not 0.75": ``audience_authority``
+        looks the tier up as ``.get(str(fragment.privacy_tier), 1.0)``, so if
+        ``PrivacyTier`` ever stopped being a ``StrEnum`` the lookup would miss
+        and **fail open** to ``1.0``. An inequality against the old value
+        would wave that straight through.
+        """
+        _write_tier_probe(vault, _OPEN_CONTROL_ID, PrivacyTier.OPEN)
+        _write_keyless_canary(vault)
+
+        probe = VoiceExemplarCollector(
+            allow_intimate=True,
+            override=PrivacyTierOverride.ALL,
+        )
+        bucket = probe.collect_exemplars(vault)["confessional"]
+        loaded = {f.id: f for f in bucket}
+
+        assert sorted(loaded) == [_KEYLESS_CANARY_ID, _OPEN_CONTROL_ID]
+        weighting = VoiceAudienceWeightingConfig()
+        assert audience_authority(loaded[_KEYLESS_CANARY_ID], weighting) == 0.0
+        assert audience_authority(loaded[_OPEN_CONTROL_ID], weighting) == 1.5
+        assert [f.id for f in probe.rank_exemplars(bucket)] == [
+            _OPEN_CONTROL_ID,
+            _KEYLESS_CANARY_ID,
+        ]
+
+    def test_an_explicit_unclassified_file_is_still_admitted(
+        self,
+        vault: Path,
+        collector: VoiceExemplarCollector,
+    ) -> None:
+        """An explicit ``unclassified`` keeps its #876 standing (AC2).
+
+        The half of #1212 that must *not* change. A pipeline-written fragment
+        that has not been through ``creek classify`` says ``unclassified`` out
+        loud, and saying so is itself an assurance the keyless file cannot
+        offer. Refusing both would be a far larger behaviour change than the
+        issue asks for, and would empty the corpus of every vault that has not
+        run the privacy classifier.
+        """
+        _write_tier_probe(vault, _EXPLICIT_UNCLASSIFIED_ID, PrivacyTier.UNCLASSIFIED)
+        _write_tier_probe(vault, _OPEN_CONTROL_ID, PrivacyTier.OPEN)
+
+        exemplars = collector.collect_exemplars(vault)
+
+        assert [f.id for f in exemplars["confessional"]] == [
+            _EXPLICIT_UNCLASSIFIED_ID,
+            _OPEN_CONTROL_ID,
+        ]
+
+    def test_eligible_register_still_admits_an_unclassified_model(self) -> None:
+        """The consent gate keeps admitting the model value ``UNCLASSIFIED`` (AC2).
+
+        Stated at the unit the fix must not touch. ``_eligible_register``
+        takes a validated :class:`~creek.models.Fragment` and never sees raw
+        frontmatter, so it cannot tell "no key on disk" from "the key said
+        ``unclassified``" — which is exactly why the fix belongs in
+        ``_load_fragment_with_body`` and not here. Any change that makes this
+        function refuse ``UNCLASSIFIED`` also refuses every unclassified
+        vault's whole corpus.
+        """
+        fragment = _build_fragment(
+            frag_id=_EXPLICIT_UNCLASSIFIED_ID,
+            title="Tier probe",
+            register=VoiceRegister.CONFESSIONAL,
+            confidence=Confidence.SETTLED,
+            privacy=PrivacyTier.UNCLASSIFIED,
+        )
+
+        assert _eligible_register(fragment, allow_intimate=False) == "confessional"

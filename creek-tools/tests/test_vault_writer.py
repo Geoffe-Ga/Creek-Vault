@@ -9,10 +9,14 @@ via write_any.
 
 from __future__ import annotations
 
+import errno
 import json
+import logging
+import os
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
+import frontmatter
 import pytest
 from pydantic import BaseModel
 
@@ -25,6 +29,7 @@ from creek.models import (
     Praxis,
     PraxisStatus,
     PraxisType,
+    PrivacyTier,
     SourcePlatform,
     Thread,
     ThreadStatus,
@@ -33,6 +38,8 @@ from creek.vault.writer import VaultWriter
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from conftest import ShortWriteController
 
 
 # ---- Fixtures ----
@@ -1390,6 +1397,297 @@ class TestIdIndex:
         assert writer._find_existing("frag-unknown", target_dir) is None
 
 
+# ---- ID index verification (#1083) ----
+
+
+def _seed_victim(writer: VaultWriter) -> Path:
+    """Write one distinctive bystander fragment and return its path."""
+    victim = Fragment(
+        id="frag-victim001",
+        title="Victim",
+        source=FragmentSource(platform=SourcePlatform.CLAUDE),
+        created=datetime(2025, 1, 15, 10, 30, 0),
+        privacy_tier=PrivacyTier.INTIMATE,
+    )
+    return writer.write_fragment(victim, body="victim body")
+
+
+def _edited_fragment() -> Fragment:
+    """Return the fragment whose id a poisoned index will mis-resolve."""
+    return Fragment(
+        id="frag-edited001",
+        title="Edited",
+        source=FragmentSource(platform=SourcePlatform.CLAUDE),
+        created=datetime(2025, 1, 15, 10, 30, 0),
+    )
+
+
+def _files_declaring(target_dir: Path, model_id: str) -> list[Path]:
+    """Return the ``.md`` files in *target_dir* declaring *model_id* on disk."""
+    return sorted(
+        path
+        for path in target_dir.glob("*.md")
+        if str(frontmatter.load(str(path)).get("id")) == model_id
+    )
+
+
+class TestIdIndexVerification:
+    """The located file must itself declare the id the index claimed (#1083).
+
+    A stale or poisoned ``.id-index.jsonl`` entry names a file belonging to a
+    *different* fragment. Every locator caller — ``update_fragment``, the
+    ``_write_model`` duplicate check, ``tomb_fragment`` and
+    ``restore_fragment`` — then acts destructively on that foreign file.
+    """
+
+    def test_update_fragment_does_not_clobber_foreign_id_file(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """A stale index entry must not redirect an update onto a foreign file."""
+        seed = VaultWriter(vault_path=vault_path)
+        victim = Fragment(
+            id="frag-victim001",
+            title="Victim",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+            created=datetime(2025, 1, 15, 10, 30, 0),
+            privacy_tier=PrivacyTier.INTIMATE,
+        )
+        victim_path = seed.write_fragment(victim, body="victim body")
+        before = victim_path.read_bytes()
+
+        # Poison the on-disk index: a DIFFERENT id now names the victim's file.
+        seed._append_index_entry(
+            victim_path.parent,
+            "frag-edited001",
+            victim_path.name,
+        )
+
+        # Fresh writer, so the poisoned mapping is loaded from the JSONL
+        # rather than an in-process dict.
+        fresh = VaultWriter(vault_path=vault_path)
+        edited = Fragment(
+            id="frag-edited001",
+            title="Edited",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+            created=datetime(2025, 1, 15, 10, 30, 0),
+        )
+        result = fresh.update_fragment(edited, "therapy session notes")
+
+        assert victim_path.read_bytes() == before
+        assert "therapy session notes" not in victim_path.read_text(encoding="utf-8")
+        assert frontmatter.load(str(victim_path))["privacy_tier"] == "intimate"
+        assert result is None
+
+    def test_update_fragment_reresolves_to_the_real_file(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """A mismatch re-resolves to the file that genuinely declares the id."""
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        edited = _edited_fragment()
+        owner_path = seed.write_fragment(edited, body="owner body")
+        before = victim_path.read_bytes()
+        seed._append_index_entry(victim_path.parent, edited.id, victim_path.name)
+
+        fresh = VaultWriter(vault_path=vault_path)
+        result = fresh.update_fragment(edited, "revised owner body")
+
+        assert result == owner_path
+        assert "revised owner body" in frontmatter.load(str(owner_path)).content
+        assert victim_path.read_bytes() == before
+
+    def test_index_repair_is_persisted(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """The corrected mapping survives into a fresh writer's index load."""
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        edited = _edited_fragment()
+        owner_path = seed.write_fragment(edited, body="owner body")
+        target_dir = victim_path.parent
+        seed._append_index_entry(target_dir, edited.id, victim_path.name)
+
+        VaultWriter(vault_path=vault_path).update_fragment(edited, "revised body")
+
+        third = VaultWriter(vault_path=vault_path)
+        assert third._find_existing(edited.id, target_dir) == owner_path
+        assert _files_declaring(target_dir, edited.id) == [owner_path]
+
+    def test_write_model_does_not_return_foreign_file_as_duplicate(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """A poisoned entry must not turn a brand-new fragment into a silent no-op."""
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        before = victim_path.read_bytes()
+        newcomer = _edited_fragment()
+        seed._append_index_entry(victim_path.parent, newcomer.id, victim_path.name)
+
+        fresh = VaultWriter(vault_path=vault_path)
+        result = fresh.write_fragment(newcomer, body="newcomer body")
+
+        assert result != victim_path
+        assert result.exists()
+        assert frontmatter.load(str(result))["id"] == newcomer.id
+        assert victim_path.read_bytes() == before
+
+    def test_tomb_fragment_does_not_move_and_unlink_foreign_file(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Tombing a ghost id must not relocate and delete a bystander fragment."""
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        before = victim_path.read_bytes()
+        seed._append_index_entry(
+            victim_path.parent,
+            "frag-ghost0001",
+            victim_path.name,
+        )
+        orphan_dir = vault_path / "10-Liminal" / "Orphaned"
+
+        fresh = VaultWriter(vault_path=vault_path)
+        result = fresh.tomb_fragment("frag-ghost0001")
+
+        assert result is None
+        assert victim_path.exists()
+        assert victim_path.read_bytes() == before
+        assert list(orphan_dir.glob("*.md")) == []
+
+    def test_restore_fragment_does_not_move_and_unlink_foreign_file(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Restoring a ghost id must not drag a real tomb out of Orphaned."""
+        orphan_dir = vault_path / "10-Liminal" / "Orphaned"
+        orphan_dir.mkdir(parents=True, exist_ok=True)
+        seed = VaultWriter(vault_path=vault_path)
+        _seed_victim(seed)
+        tombed_path = seed.tomb_fragment("frag-victim001")
+        assert tombed_path is not None  # setup guard
+        before = tombed_path.read_bytes()
+        seed._append_index_entry(orphan_dir, "frag-ghost0001", tombed_path.name)
+
+        ghost = Fragment(
+            id="frag-ghost0001",
+            title="Ghost",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+            created=datetime(2025, 1, 15, 10, 30, 0),
+        )
+        fresh = VaultWriter(vault_path=vault_path)
+        result = fresh.restore_fragment(ghost)
+
+        assert result is None
+        assert tombed_path.exists()
+        assert tombed_path.read_bytes() == before
+
+    def test_unparseable_located_file_is_a_mismatch_not_a_crash(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Broken YAML in the located file resolves to no match, not an exception."""
+        edited = _edited_fragment()
+        seed = VaultWriter(vault_path=vault_path)
+        target_dir = seed._fragment_target_dir(edited)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        broken = target_dir / "broken.md"
+        broken.write_text(
+            "---\nid: [unterminated\ntitle: Broken\n---\nbroken body\n",
+            encoding="utf-8",
+        )
+        seed._append_index_entry(target_dir, edited.id, broken.name)
+
+        fresh = VaultWriter(vault_path=vault_path)
+
+        assert fresh._find_existing(edited.id, target_dir) is None
+        assert broken.exists()
+
+    def test_located_file_without_id_key_is_a_mismatch(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Valid frontmatter with no ``id`` key declares no id, so it never matches."""
+        edited = _edited_fragment()
+        seed = VaultWriter(vault_path=vault_path)
+        target_dir = seed._fragment_target_dir(edited)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        idless = target_dir / "idless.md"
+        idless.write_text(
+            "---\ntitle: No Id Here\n---\nidless body\n",
+            encoding="utf-8",
+        )
+        seed._append_index_entry(target_dir, edited.id, idless.name)
+
+        fresh = VaultWriter(vault_path=vault_path)
+
+        assert fresh._find_existing(edited.id, target_dir) is None
+
+    def test_non_str_id_in_frontmatter_is_a_mismatch(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """A YAML-int ``id`` does not satisfy the string id the caller asked for."""
+        numeric = Fragment(
+            id="12345",
+            title="Numeric",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+            created=datetime(2025, 1, 15, 10, 30, 0),
+        )
+        seed = VaultWriter(vault_path=vault_path)
+        target_dir = seed._fragment_target_dir(numeric)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        int_id_path = target_dir / "int-id.md"
+        int_id_path.write_text(
+            "---\nid: 12345\ntitle: Int Id\n---\nint id body\n",
+            encoding="utf-8",
+        )
+        before = int_id_path.read_bytes()
+        seed._append_index_entry(target_dir, numeric.id, int_id_path.name)
+
+        fresh = VaultWriter(vault_path=vault_path)
+        result = fresh.write_fragment(numeric, body="string id body")
+
+        assert result != int_id_path
+        assert frontmatter.load(str(result))["id"] == "12345"
+        assert int_id_path.read_bytes() == before
+        # ``_rebuild_index`` only indexes ids where ``isinstance(mid, str)``, so
+        # the int-typed file is invisible to re-resolution. The honest outcome
+        # is therefore two files carrying the same *logical* id — declining the
+        # foreign file cannot also deduplicate an id the index cannot see.
+        assert _files_declaring(target_dir, "12345") == sorted([int_id_path, result])
+
+    def test_vanished_file_does_not_trigger_a_rescan(
+        self,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An ordinary vanished file resolves to ``None`` without a directory scan.
+
+        Regression guard: the mismatch fix must not route the everyday
+        deleted-or-tombed case into a full ``_rebuild_index`` sweep, which
+        would undo the O(1) lookup PERF-001 bought.
+        """
+
+        def _no_rescan(target_dir: Path) -> dict[str, str]:
+            """Fail loudly instead of scanning the directory."""
+            msg = f"unexpected directory rescan of {target_dir}"
+            raise AssertionError(msg)
+
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+        victim_path.unlink()
+        monkeypatch.setattr(VaultWriter, "_rebuild_index", staticmethod(_no_rescan))
+
+        fresh = VaultWriter(vault_path=vault_path)
+
+        assert fresh._find_existing("frag-victim001", target_dir) is None
+
+
 # ---- Concurrent writes (BUG-006) ----
 
 
@@ -1525,6 +1823,549 @@ class TestAtomicWriteHardening:
                 "2025-01-15-collide",
                 "irrelevant",
             )
+
+    def test_atomic_create_writes_full_body_under_short_writes(
+        self,
+        vault_path: Path,
+        short_write: ShortWriteController,
+    ) -> None:
+        """A short ``os.write`` must not truncate the created note (#987).
+
+        ``_atomic_create`` writes straight to the final path — there is no
+        tempfile + rename — so a discarded byte count lands a half-written
+        note at the real filename with no exception raised.
+        """
+        short_write.halve()
+        target_dir = vault_path / "01-Fragments" / "Conversations"
+        content = "x" * 400 + "TAIL"
+
+        path = VaultWriter._atomic_create(target_dir, "demo", content)
+
+        assert path.read_text(encoding="utf-8") == content
+
+    def test_atomic_create_leaves_no_file_when_write_makes_no_progress(
+        self,
+        vault_path: Path,
+        short_write: ShortWriteController,
+    ) -> None:
+        """A stalled descriptor raises instead of returning an empty note.
+
+        Today the zero-byte return is ignored: the caller receives a path
+        to a 0-byte file and indexes it as a real fragment.
+        """
+        short_write.stall()
+        target_dir = vault_path / "01-Fragments" / "Conversations"
+
+        with pytest.raises(OSError) as excinfo:
+            VaultWriter._atomic_create(target_dir, "demo", "x" * 400 + "TAIL")
+
+        assert excinfo.value.errno == errno.EIO
+        assert not list(target_dir.glob("demo*.md"))
+
+    def test_append_index_entry_writes_complete_line_under_short_writes(
+        self,
+        vault_path: Path,
+        short_write: ShortWriteController,
+    ) -> None:
+        """A short append writes the whole JSON line, not half of one.
+
+        Half a line is not valid JSON, so ``_load_index_file`` skips it and
+        the id-to-filename mapping is silently dropped — the fragment
+        becomes invisible to duplicate detection and to ``update_fragment``.
+
+        Also pins the on-the-wire framing: the record is bracketed by a
+        newline on *both* sides. The leading one is the record delimiter
+        that makes any remnant ahead of it self-terminating (#1120), so
+        it is part of the contract, not incidental whitespace.
+        """
+        from creek.vault.writer import INDEX_FILENAME
+
+        short_write.halve()
+        target_dir = vault_path / "01-Fragments" / "Conversations"
+        model_id = "frag-short-write"
+        filename = "2025-01-15-demo.md"
+
+        VaultWriter._append_index_entry(target_dir, model_id, filename)
+
+        index_path = target_dir / INDEX_FILENAME
+        expected = (
+            "\n"
+            + json.dumps({"id": model_id, "filename": filename}, sort_keys=True)
+            + "\n"
+        )
+        assert index_path.read_text(encoding="utf-8") == expected
+        assert VaultWriter._load_index_file(index_path) == {model_id: filename}
+
+    def test_append_index_entry_raises_when_write_makes_no_progress(
+        self,
+        vault_path: Path,
+        short_write: ShortWriteController,
+    ) -> None:
+        """A stalled index append fails loudly rather than dropping the entry."""
+        from creek.vault.writer import INDEX_FILENAME
+
+        short_write.stall()
+        target_dir = vault_path / "01-Fragments" / "Conversations"
+
+        with pytest.raises(OSError) as excinfo:
+            VaultWriter._append_index_entry(
+                target_dir,
+                "frag-stalled",
+                "2025-01-15-demo.md",
+            )
+
+        assert excinfo.value.errno == errno.EIO
+        assert VaultWriter._load_index_file(target_dir / INDEX_FILENAME) == {}
+
+    def test_torn_index_append_does_not_swallow_the_next_entry(
+        self,
+        vault_path: Path,
+        short_write: ShortWriteController,
+    ) -> None:
+        """A half-written index line costs at most *its own* entry (#1120).
+
+        The inversion of the #987-era characterization test that pinned
+        the defect. ``_append_index_entry`` opens with ``O_APPEND``, so
+        every record lands at EOF with no separator the filesystem
+        supplies. When a drain fails part-way (``ENOSPC`` here, after
+        half the bytes are on disk) a remnant survives at the tail.
+
+        Each record is now framed as ``\\n{json}\\n``, so the *next*
+        record opens with a newline of its own: it terminates whatever
+        remnant precedes it instead of being concatenated onto it. The
+        torn entry is still lost at this layer — it never got its own
+        content on disk — but the innocent next entry parses cleanly.
+        Recovery of the torn id itself is the damage-rescan half of
+        #1120, covered by ``TestIndexDamageRecovery``.
+        """
+        from creek.vault.writer import INDEX_FILENAME
+
+        target_dir = vault_path / "01-Fragments" / "Conversations"
+        index_path = target_dir / INDEX_FILENAME
+        next_line = json.dumps(
+            {"id": "frag-next", "filename": "2025-01-16-next.md"},
+            sort_keys=True,
+        )
+
+        # First append: half the encoded line reaches disk (the payload
+        # is ~60 bytes, so the cut lands deep inside the JSON, far short
+        # of the terminating newline), then the drain hits ENOSPC.
+        short_write.fail_after_half(errno.ENOSPC)
+        with pytest.raises(OSError) as excinfo:
+            VaultWriter._append_index_entry(
+                target_dir,
+                "frag-partial",
+                "2025-01-15-partial.md",
+            )
+        assert excinfo.value.errno == errno.ENOSPC
+
+        # Second append: an entirely healthy, complete write.
+        short_write.passthrough()
+        VaultWriter._append_index_entry(
+            target_dir,
+            "frag-next",
+            "2025-01-16-next.md",
+        )
+
+        raw = index_path.read_text(encoding="utf-8")
+        # Both halves of the scenario are genuinely on disk, so neither
+        # write can have silently become a no-op: the file is non-empty,
+        # the second entry landed complete at the tail, and something
+        # (the remnant) precedes it.
+        assert raw
+        assert raw.endswith(next_line + "\n")
+        assert len(raw) > len(next_line) + 1
+        # ...and the second record's leading newline terminated the
+        # remnant, so the two are separate lines rather than one merged,
+        # unparseable one. (Three elements, not two: the file now opens
+        # with a newline, so ``splitlines`` yields a leading empty item.)
+        assert len(raw.splitlines()) >= 2
+
+        index = VaultWriter._load_index_file(index_path)
+        # The torn entry never reached disk in full, so it is genuinely
+        # absent — but the innocent next one survives.
+        assert "frag-partial" not in index
+        assert index["frag-next"] == "2025-01-16-next.md"
+        # A remnant must never be misread as some *other* valid mapping.
+        assert set(index) <= {"frag-partial", "frag-next"}
+
+    def test_any_torn_tail_prefix_leaves_the_next_entry_parseable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Every byte-prefix of a record is a tolerable tail (#1120).
+
+        The forcing function. No exception is in flight anywhere here:
+        the torn tail is written straight to disk, which is what a
+        ``SIGKILL``/OOM/power loss between two ``os.write`` iterations
+        inside :func:`creek._fsio.write_all` actually leaves behind. A
+        fix that only cleans up inside an ``except OSError:`` handler
+        cannot satisfy this, because there is no handler to run.
+        """
+        from creek.vault.writer import INDEX_FILENAME
+
+        encoded = (
+            "\n"
+            + json.dumps({"id": "frag-torn", "filename": "torn.md"}, sort_keys=True)
+            + "\n"
+        ).encode()
+
+        for cut in range(len(encoded)):
+            target_dir = tmp_path / f"cut-{cut:03d}"
+            target_dir.mkdir()
+            index_path = target_dir / INDEX_FILENAME
+            index_path.write_bytes(encoded[:cut])
+
+            VaultWriter._append_index_entry(target_dir, "frag-next", "next.md")
+
+            index = VaultWriter._load_index_file(index_path)
+            assert index.get("frag-next") == "next.md", f"lost at cut={cut}"
+            assert set(index) <= {"frag-torn", "frag-next"}, f"phantom at cut={cut}"
+
+    def test_a_legacy_format_remnant_does_not_swallow_the_next_entry(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An OLD-format torn tail is tolerated by a NEW-format append (#1120).
+
+        Every ``.id-index.jsonl`` in a live vault was written by the
+        pre-#1120 encoder, so any torn tail already on disk at upgrade
+        time has **no** leading newline. The new record supplies the
+        delimiter, so the legacy remnant terminates without a migration.
+        """
+        from creek.vault.writer import INDEX_FILENAME
+
+        target_dir = tmp_path / "legacy-remnant"
+        target_dir.mkdir()
+        index_path = target_dir / INDEX_FILENAME
+        index_path.write_bytes(b'{"filename": "old.md", "id": "frag-le')
+
+        VaultWriter._append_index_entry(target_dir, "frag-next", "next.md")
+
+        index = VaultWriter._load_index_file(index_path)
+        assert index["frag-next"] == "next.md"
+        assert set(index) == {"frag-next"}
+
+    def test_a_legacy_format_index_still_parses_unchanged(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Old-format complete records keep parsing beside new-format ones.
+
+        Pins the no-migration claim: the reader already skips blank
+        lines, so a file mixing both framings resolves every id.
+        """
+        from creek.vault.writer import INDEX_FILENAME
+
+        target_dir = tmp_path / "legacy-mixed"
+        target_dir.mkdir()
+        index_path = target_dir / INDEX_FILENAME
+        legacy = "".join(
+            json.dumps({"id": mid, "filename": f"{mid}.md"}, sort_keys=True) + "\n"
+            for mid in ("frag-old-a", "frag-old-b")
+        )
+        index_path.write_text(legacy, encoding="utf-8")
+
+        VaultWriter._append_index_entry(target_dir, "frag-new", "frag-new.md")
+
+        assert VaultWriter._load_index_file(index_path) == {
+            "frag-old-a": "frag-old-a.md",
+            "frag-old-b": "frag-old-b.md",
+            "frag-new": "frag-new.md",
+        }
+
+    def test_consecutive_torn_tails_do_not_compound(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Two remnants in a row still cost only themselves (#1120).
+
+        Two processes can tear back-to-back — one running pre-#1120 code
+        (no leading newline), one running post-#1120 code. Neither is
+        allowed to take the following healthy record down with it.
+        """
+        from creek.vault.writer import INDEX_FILENAME
+
+        target_dir = tmp_path / "consecutive"
+        target_dir.mkdir()
+        index_path = target_dir / INDEX_FILENAME
+        index_path.write_bytes(
+            b'{"filename": "old.md", "id": "frag-le'
+            b'\n{"filename": "newer.md", "id": "frag-ne',
+        )
+
+        VaultWriter._append_index_entry(target_dir, "frag-healthy", "healthy.md")
+
+        index = VaultWriter._load_index_file(index_path)
+        assert index["frag-healthy"] == "healthy.md"
+        assert set(index) == {"frag-healthy"}
+
+    def test_write_fragment_survives_short_writes_end_to_end(
+        self,
+        writer: VaultWriter,
+        vault_path: Path,
+        short_write: ShortWriteController,
+    ) -> None:
+        """The public write path keeps both the body and the index intact.
+
+        Exercises the full blast radius of #987 in one pass: the note body
+        goes through ``_atomic_create`` and the id mapping goes through
+        ``_append_index_entry``, and a short write corrupts both.
+        """
+        import frontmatter as fm_mod
+
+        from creek.vault.writer import INDEX_FILENAME
+
+        fragment = Fragment(
+            id="frag-short-e2e",
+            title="Short write end to end",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+            created=datetime(2025, 1, 15, 10, 0, 0),
+        )
+        body = "x" * 400 + "TAIL"
+        short_write.halve()
+
+        path = writer.write_fragment(fragment, body=body)
+
+        # Raw bytes first: a truncated note can lose its closing ``---``
+        # delimiter, and a parser error would obscure the real failure.
+        assert path.read_text(encoding="utf-8").rstrip("\n").endswith("TAIL")
+        post = fm_mod.load(str(path))
+        assert post.content.strip() == body
+        assert post["id"] == "frag-short-e2e"
+        index_path = vault_path / "01-Fragments" / "Conversations" / INDEX_FILENAME
+        index = VaultWriter._load_index_file(index_path)
+        assert index == {"frag-short-e2e": path.name}
+
+
+class TestIndexDamageRecovery:
+    """A damaged ``.id-index.jsonl`` re-resolves by scan rather than lying (#1120).
+
+    Self-delimiting records stop a torn append from taking the *next*
+    one down with it, but the torn record's own mapping is still absent.
+    Before #1120 that absence was permanent: ``_load_index_locked``
+    rescanned only when the index file was *missing*, so an id absent
+    from a *present* index was never re-derived and ``_write_model``
+    minted a second file for it. These tests pin the recovery half.
+    """
+
+    def test_damaged_index_rescans_and_recovers_the_dropped_id(
+        self,
+        vault_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An unparseable line makes the reader re-resolve, and say so."""
+        from creek.vault.writer import INDEX_FILENAME
+
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+        edited = _edited_fragment()
+        owner_path = seed.write_fragment(edited, body="owner body")
+
+        # Hand-write an index that names only the victim and carries a
+        # torn line where the owner's record should be.
+        index_path = target_dir / INDEX_FILENAME
+        good = json.dumps(
+            {"id": "frag-victim001", "filename": victim_path.name},
+            sort_keys=True,
+        )
+        index_path.write_text(
+            f'{good}\n{{"filename": "{owner_path.name}", "id": "frag-edi',
+            encoding="utf-8",
+        )
+
+        fresh = VaultWriter(vault_path=vault_path)
+        with caplog.at_level(logging.WARNING, logger="creek.vault.writer"):
+            resolved = fresh._find_existing(edited.id, target_dir)
+
+        assert resolved == owner_path
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            INDEX_FILENAME in message and "1 unparseable line" in message
+            for message in messages
+        ), messages
+
+    def test_unreadable_index_rescans_instead_of_looking_empty(
+        self,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An index that cannot be read is damage, not an empty directory.
+
+        The adjacent hole #1120 exposed: a read ``OSError`` used to
+        return ``{}``, which ``_load_index_locked`` then cached because
+        the file *existed* — silently identical to a vault with no
+        fragments, and every subsequent write a duplicate.
+        """
+        from pathlib import Path as RuntimePath
+
+        from creek.vault.writer import INDEX_FILENAME
+
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+
+        real_read_text = RuntimePath.read_text
+
+        def _deny_index(path: Path, *args: Any, **kwargs: Any) -> str:
+            """Refuse to read the index file; pass everything else through."""
+            if path.name == INDEX_FILENAME:
+                raise OSError(errno.EACCES, os.strerror(errno.EACCES))
+            return real_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(RuntimePath, "read_text", _deny_index)
+
+        fresh = VaultWriter(vault_path=vault_path)
+        with caplog.at_level(logging.WARNING, logger="creek.vault.writer"):
+            resolved = fresh._find_existing("frag-victim001", target_dir)
+
+        assert resolved == victim_path
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("could not be read" in message for message in messages), messages
+
+    def test_undecodable_index_rescans_instead_of_crashing_the_write(
+        self,
+        vault_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Invalid UTF-8 in the index is damage, not an exception to the caller.
+
+        ``UnicodeDecodeError`` is a ``ValueError``, not an ``OSError``,
+        so it used to escape the read guard and take down every vault
+        write into the directory. Our own writers only ever emit ASCII
+        (``json.dumps`` escapes non-ASCII), so a torn append cannot
+        cause this — but a hand-edited or externally corrupted index
+        can, and a directory scan is the right price for it.
+        """
+        from creek.vault.writer import INDEX_FILENAME
+
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+        (target_dir / INDEX_FILENAME).write_bytes(b'\n{"id": "\xff\xfe", "filen')
+
+        fresh = VaultWriter(vault_path=vault_path)
+        with caplog.at_level(logging.WARNING, logger="creek.vault.writer"):
+            resolved = fresh._find_existing("frag-victim001", target_dir)
+
+        assert resolved == victim_path
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("could not be read" in message for message in messages), messages
+
+    def test_clean_index_never_rescans(
+        self,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An undamaged index still resolves in O(1) — no directory sweep.
+
+        Regression guard for PERF-001: the damage-triggered rescan must
+        stay triggered by damage, not paid on every cold load.
+        """
+
+        def _no_rescan(target_dir: Path) -> dict[str, str]:
+            """Fail loudly instead of scanning the directory."""
+            msg = f"unexpected directory rescan of {target_dir}"
+            raise AssertionError(msg)
+
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+        monkeypatch.setattr(VaultWriter, "_rebuild_index", staticmethod(_no_rescan))
+
+        fresh = VaultWriter(vault_path=vault_path)
+
+        assert fresh._find_existing("frag-victim001", target_dir) == victim_path
+
+    def test_a_torn_index_tail_does_not_mint_a_duplicate_file(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """The end-to-end consequence: no second file for the same id.
+
+        This is the harm #1120 actually causes in a vault. A torn tail
+        drops a mapping; a later ``write_fragment`` for that id sees no
+        entry, ``_atomic_create``s a counter-suffixed sibling, and the
+        fragment now exists twice with ``update_fragment`` reaching
+        neither reliably.
+        """
+        from creek.vault.writer import INDEX_FILENAME
+
+        seed = VaultWriter(vault_path=vault_path)
+        fragment = _edited_fragment()
+        original = seed.write_fragment(fragment, body="original body")
+        target_dir = original.parent
+        index_path = target_dir / INDEX_FILENAME
+
+        # Truncate the tail so the last record is torn — the on-disk
+        # residue of a crash mid-append, with no exception in flight.
+        index_path.write_bytes(index_path.read_bytes()[:-8])
+
+        fresh = VaultWriter(vault_path=vault_path)
+        again = fresh.write_fragment(fragment, body="original body")
+
+        assert again == original
+        assert len(list(target_dir.glob("*.md"))) == 1
+        assert fresh.update_fragment(fragment, "revised body") == original
+
+    def test_torn_repair_append_does_not_poison_the_index_it_repairs(
+        self,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The fourth call site: a tear during *recovery* stays contained.
+
+        PR #1295 put an index append on the read path —
+        ``_find_existing_locked`` -> ``_repair_index_locked`` -> append.
+        A torn write there used to poison the very file the repair was
+        fixing, swallowing the next healthy record written to it.
+        """
+        from creek._fsio import write_all as real_write_all
+        from creek.vault import writer as writer_mod
+        from creek.vault.writer import INDEX_FILENAME
+
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+        edited = _edited_fragment()
+        owner_path = seed.write_fragment(edited, body="owner body")
+        # Poison: the edited id now names the victim's file, which EXISTS
+        # and declares a different id — the only shape that reaches the
+        # repair append. (Deleting the file instead takes the
+        # ``del index[model_id]; return None`` branch and never appends.)
+        seed._append_index_entry(target_dir, edited.id, victim_path.name)
+
+        torn = {"done": False}
+
+        def _tear_once(fd: int, data: bytes | memoryview) -> None:
+            """Half-write the first drain and fail; drain fully after that."""
+            if not torn["done"]:
+                torn["done"] = True
+                payload = bytes(data)
+                os.write(fd, payload[: max(1, len(payload) // 2)])
+                raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+            real_write_all(fd, data)
+
+        monkeypatch.setattr(writer_mod, "write_all", _tear_once)
+
+        fresh = VaultWriter(vault_path=vault_path)
+        with pytest.raises(OSError) as excinfo:
+            fresh._find_existing(edited.id, target_dir)
+        assert excinfo.value.errno == errno.ENOSPC
+
+        # A healthy append to the index the repair just tore must not be
+        # swallowed by the remnant the repair left behind.
+        seed._append_index_entry(target_dir, "frag-bystander", "bystander.md")
+
+        index_path = target_dir / INDEX_FILENAME
+        on_disk = VaultWriter._load_index_file(index_path)
+        assert on_disk["frag-bystander"] == "bystander.md"
+
+        second = VaultWriter(vault_path=vault_path)
+        assert second._find_existing(edited.id, target_dir) == owner_path
+        assert second._find_existing("frag-victim001", target_dir) == victim_path
 
 
 @pytest.mark.slow

@@ -41,12 +41,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from types import ModuleType
 from typing import Any, cast
 
 import stats
 
 # Optional dependency: only needed for the Claude-written headline. Imported at
-# module top level so the rest of the recap works even when it is absent.
+# module top level so the rest of the recap works even when it is absent. The
+# explicit `ModuleType | None` annotation keeps the None fallback type-safe
+# under mypy --strict.
+_anthropic_mod: ModuleType | None
 try:
     import anthropic as _anthropic_mod
 except ImportError:
@@ -57,6 +61,7 @@ class RecapError(Exception):
     """A user-facing failure with an associated process exit code."""
 
     def __init__(self, message: str, code: int = 1) -> None:
+        """Store the process exit code alongside the message."""
         super().__init__(message)
         self.code = code
 
@@ -114,15 +119,21 @@ def _request_json(
     """Perform an HTTP request and parse a JSON response body.
 
     Returns the parsed JSON (typed as `object`; callers cast). Raises
-    urllib.error.HTTPError / URLError on transport or HTTP failures.
+    urllib.error.HTTPError / URLError on transport or HTTP failures, and
+    ValueError for a non-HTTPS URL (every caller builds URLs from the https
+    GITHUB_API / DISCORD_API constants, so anything else is a bug).
     """
+    if not url.startswith("https://"):
+        message = f"refusing non-HTTPS URL: {url}"
+        raise ValueError(message)
     request = urllib.request.Request(url, data=body, headers=headers, method=method)
-    with urllib.request.urlopen(request) as response:
+    with urllib.request.urlopen(request) as response:  # nosec B310 - https enforced above
         raw = response.read().decode("utf-8")
     return json.loads(raw) if raw else None
 
 
 def _gh_headers(token: str) -> dict[str, str]:
+    """Standard GitHub REST headers for a bearer token."""
     return {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
@@ -141,7 +152,7 @@ def _gh_get_paged(
     while len(out) < max_items:
         query = "&".join(
             f"{k}={v}"
-            for k, v in {**params, "per_page": "100", "page": str(page)}.items()
+            for k, v in (params | {"per_page": "100", "page": str(page)}).items()
         )
         url = f"{GITHUB_API}{path}?{query}"
         chunk = cast("list[dict[str, Any]]", _request_json(url, headers=headers))
@@ -402,6 +413,7 @@ def generate_headline(title: str, body: str) -> str:
 
 
 def _fmt_hours(hours: float) -> str:
+    """Render an hour count as compact minutes/hours/days text."""
     if hours < 1:
         return f"{round(hours * 60)}m"
     if hours < 48:
@@ -410,6 +422,7 @@ def _fmt_hours(hours: float) -> str:
 
 
 def _fmt_eta(estimate: dict[str, object]) -> str:
+    """Render an estimate_remaining() result as a human ETA line."""
     if not estimate["known"]:
         return "unknown (loop is stalled — no recent merges)"
     days = cast("float | None", estimate["days_remaining"])
@@ -567,6 +580,7 @@ def _loc_line(
     """Lines-of-code churn over the 24h and 7d windows, plus the full-repo net."""
 
     def churn(totals: dict[str, int]) -> str:
+        """Render one +adds / -dels churn pair."""
         return f"+{totals['additions']:,} / -{totals['deletions']:,}"
 
     full_repo = f"{repo_net:,} net" if repo_net is not None else "—"
@@ -713,36 +727,41 @@ def _gather(repo: str, gh_token: str, max_prs: int) -> dict[str, Any] | None:
     try:
         return build_recap(repo, token=gh_token, max_prs=max_prs, now=now)
     except urllib.error.HTTPError as exc:
-        raise RecapError(f"GitHub API request failed: {exc.code} {exc.reason}") from exc
+        message = f"GitHub API request failed: {exc.code} {exc.reason}"
+        raise RecapError(message) from exc
     except urllib.error.URLError as exc:
-        raise RecapError(f"network failure talking to GitHub: {exc.reason}") from exc
+        message = f"network failure talking to GitHub: {exc.reason}"
+        raise RecapError(message) from exc
 
 
 def _deliver(channel_id: str | None, payload: dict[str, Any]) -> None:
     """Post the payload to Discord, mapping failures to RecapError."""
     if not channel_id:
-        raise RecapError(
-            "RALPH_CHANNEL_ID (or --channel-id) is required to post", code=2
-        )
+        message = "RALPH_CHANNEL_ID (or --channel-id) is required to post"
+        raise RecapError(message, code=2)
     discord_token = os.environ.get("DISCORD_BOT_TOKEN")
     if not discord_token:
-        raise RecapError("DISCORD_BOT_TOKEN is required to post", code=2)
+        message = "DISCORD_BOT_TOKEN is required to post"
+        raise RecapError(message, code=2)
     try:
         post_to_discord(channel_id, discord_token, payload)
     except urllib.error.HTTPError as exc:
-        raise RecapError(
-            f"Discord API request failed: {exc.code} {exc.reason}"
-        ) from exc
+        message = f"Discord API request failed: {exc.code} {exc.reason}"
+        raise RecapError(message) from exc
     except urllib.error.URLError as exc:
-        raise RecapError(f"network failure talking to Discord: {exc.reason}") from exc
+        message = f"network failure talking to Discord: {exc.reason}"
+        raise RecapError(message) from exc
 
 
 def _run(args: argparse.Namespace) -> int:
+    """Drive one recap: gather, then print or deliver per the CLI flags."""
     if not args.repo:
-        raise RecapError("--repo or $GITHUB_REPOSITORY is required", code=2)
+        message = "--repo or $GITHUB_REPOSITORY is required"
+        raise RecapError(message, code=2)
     gh_token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if not gh_token:
-        raise RecapError("GITHUB_TOKEN (or GH_TOKEN) is required", code=2)
+        message = "GITHUB_TOKEN (or GH_TOKEN) is required"
+        raise RecapError(message, code=2)
 
     payload = _gather(str(args.repo), gh_token, int(args.max_prs))
     if payload is None:
@@ -758,6 +777,7 @@ def _run(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point: parse args and map RecapError to an exit code."""
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )

@@ -1,0 +1,35 @@
+{
+  "additionalProperties": false,
+  "description": "One eddy the reflected entry belongs to (contract 0.9, #873).\n\nCarries the same compiled-page caveat as :class:`RelatedPraxis`, and one\nmore that is specific to it: ``description`` and ``fragment_count`` are\n*synthesised from the eddy's members*, so publishing the page to a caller\nadmitted to only some of them would hand over a summary of content they\ncannot read. :mod:`creek_mcp.compiled_pages` therefore admits an eddy only\nwhen the members it can enumerate account for ``fragment_count`` exactly\n**and** every one of them is within the ceiling.\n\nAttributes:\n    title: The eddy page's title.\n    description: The eddy's own one-line description; ``\"\"`` when the page\n        declares none.\n    fragment_count: How many fragments the eddy clusters. A tally, so never\n        negative.\n    formed: The ``YYYY-MM-DD`` the eddy was first detected.",
+  "properties": {
+    "description": {
+      "description": "The eddy's own description; may be empty.",
+      "title": "Description",
+      "type": "string"
+    },
+    "formed": {
+      "description": "ISO date the eddy was first detected.",
+      "title": "Formed",
+      "type": "string"
+    },
+    "fragment_count": {
+      "description": "How many fragments the eddy clusters.",
+      "minimum": 0,
+      "title": "Fragment Count",
+      "type": "integer"
+    },
+    "title": {
+      "description": "The eddy page's title.",
+      "title": "Title",
+      "type": "string"
+    }
+  },
+  "required": [
+    "title",
+    "description",
+    "fragment_count",
+    "formed"
+  ],
+  "title": "RelatedEddy",
+  "type": "object"
+}

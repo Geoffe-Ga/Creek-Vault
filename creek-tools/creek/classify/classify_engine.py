@@ -53,9 +53,36 @@ call it:
 * **Escalate-only, never auto-downgrade.** ``--force`` may raise a tier
   that is too light, and the post-classification reassess may raise one
   the classifier just hardened, but neither ever lowers a tier —
-  lowering is the one direction that leaks content. An explicit
-  non-``unclassified`` tier on disk also survives any non-``--force``
-  run untouched: the operator's decision outranks the heuristic.
+  lowering is the one direction that leaks content.
+* **A settled tier moves only on new evidence** (#1105). A concrete
+  non-``unclassified`` tier on disk survives a non-``--force`` run
+  *assignment* untouched — :func:`~creek.classify.privacy_pass.apply_tier`
+  will not overwrite it. The post-classification reassess can still raise
+  it, but only when *this run's* classification made the privacy
+  heuristic strictly more restrictive than it was on the fragment as
+  loaded (:attr:`_PreparedFragment.tier_baseline`). So a re-run over
+  unchanged evidence never disturbs a tier the operator chose, while a
+  freshly-revealed INTIMATE signal is no longer discarded just because
+  some tier was already on record. A fragment the resume short-circuit
+  preserves is not reassessed at all: this run produced no evidence
+  about it.
+* **``--retier``: the one case the two rules above leave stranded**
+  (#1106). A vault processed before #974 holds fragments whose tier is
+  *concrete but too weak* — self-authored confessional content stamped
+  ``personal``. ``needs_tier`` is ``False`` for them, so no assignment
+  happens; the reassess gate is ``False`` for them too, because the voice
+  signal that would justify raising the tier is already on disk, so this
+  run learns nothing new (correctly — that is what gives the operator a
+  durable override). ``--retier`` is the explicit, opt-in third door:
+  :func:`_should_retier` re-reads
+  :attr:`_PreparedFragment.tier_baseline` — already computed, so free —
+  and hands the fragment to the *same* narrow
+  :func:`_write_tier_only` path the bullet two up describes. It is not
+  ``--force``: it does not enter the short-circuit's condition, so
+  ``classification_method`` is never re-stamped and no cloud call is
+  re-paid. And because it selects through
+  :func:`~creek.classify.privacy_pass.escalate`, it is raise-only like
+  everything else here.
 
 Praxis pass (issue #877)
 ------------------------
@@ -93,6 +120,57 @@ structurally unreachable. The policy lives in
 actually raised — the observability that was missing when this field had
 an invisible (in fact absent) producer.
 
+Tags pass (issue #878)
+----------------------
+
+Same shape, one axis over: :attr:`~creek.models.Fragment.tags` had no
+real producer either, so 2000/2000 sampled fragments of the operator's
+35,330-fragment vault read ``tags: []`` and the Tag Garden read "*No tags
+found in vault.*". The policy lives in :mod:`creek.classify.tags_pass`
+and there are exactly **two** call sites for it in the whole toolchain:
+
+* :func:`creek.ingest.base.assemble_ingested_fragment`, the universal
+  ingest chokepoint, which tags everything arriving from now on; and
+* this engine, beside the praxis pass, which is the *backfill* half —
+  and the half that matters today, because the operator's vault was
+  ingested long before ``tags`` had any producer at all.
+
+There is deliberately **no third call** in
+:func:`creek.pipeline.run_pipeline` (``creek/pipeline.py:655``), where
+the praxis pass does need one. Praxis is a classification verdict, so it
+has to run after the LLM dispatch; tags come from the body, which no
+stage between ingest and write mutates. The ingest chokepoint is
+therefore strictly earlier and strictly sufficient for the ``creek
+process`` path, and a second call there would be pure duplication.
+
+* **Union-merge, never replace.** :func:`~creek.classify.tags_pass.merge`
+  keeps every tag already on record and appends what the body yields, so
+  a re-classify can never delete a tag an operator hand-wrote in Obsidian
+  (or the ``low-priority`` literal
+  :mod:`creek.clean.context` appends). That makes the pass idempotent: a
+  second run over an unchanged vault reports ``0``.
+* **On the preserved short-circuit too, since #1207** — the one place
+  this axis parts company with praxis. #878 originally declined the
+  exception, which left the operator's vault (35,330 fragments, every one
+  of them stamped ``classification_method: llm``) able to gain tags only
+  through a paid ``creek classify --method llm --force``, to recover data
+  already sitting in the fragment bodies on local disk. Two properties
+  make the free pass safe here where the praxis pass is not: hashtag
+  extraction is a lossless mechanical restatement of literal
+  author-written syntax rather than a judgment, so re-deriving it cannot
+  disagree with operator curation; and the merge is a union, so it cannot
+  drop a tag a hand ever wrote. The backfill goes through the **sibling**
+  narrow writer :func:`_write_tags_only` — :func:`_write_tier_only`'s
+  "changes ONLY the privacy-tier fields" promise is untouched, because a
+  writer whose field set is legible from its name survives review of a
+  path that rewrites already-curated user vaults, and one that takes its
+  scope as an argument does not. ``creek fill`` still surfaces the
+  outstanding count, now naming the free command
+  (:func:`creek.cli._hint_tags_backfill`).
+
+:attr:`ClassifySummary.tags_extracted` reports how many fragments the run
+actually gained a tag on, on both paths.
+
 Known residual (not fixable by ordering)
 ----------------------------------------
 
@@ -109,6 +187,15 @@ voice-proxy generation, the Writing Desk), which is a strict improvement
 on the prior behaviour where 100% of intimate content routed to the
 cloud, every time. Fixing the residual properly needs a local
 pre-classification pass, which is out of scope here.
+
+That "once, not every time" promise was true only of the single-pick
+path until #1309. The weighted path could not keep it: it had no
+author-stance axis to detect ``conviction`` with, and it overwrote
+``voice.confidence`` with ``None`` on every run — so the escalation
+never fired, and even a tier escalated by some other route lost the
+evidence explaining it. Both paths now reach the same tier for the
+same model verdict, and both leave the evidence in place across
+re-runs, so the residual above is genuinely one egress on either.
 """
 
 from __future__ import annotations
@@ -124,7 +211,6 @@ from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
 from typing import TYPE_CHECKING
 
 import frontmatter
-import yaml
 
 from creek.classify.audience import AudienceClassifier
 from creek.classify.constants import (
@@ -147,6 +233,7 @@ from creek.classify.privacy_pass import (
     PRIVACY_TIER_KEY,
     apply_tier,
     needs_tier,
+    outranks_recorded_tier,
     reassess,
 )
 from creek.classify.reatomize import (
@@ -157,11 +244,12 @@ from creek.classify.reatomize import (
     classify_reatomize,
 )
 from creek.classify.rules import RuleClassifier
+from creek.classify.tags_pass import TAGS_KEY, apply_tags
 from creek.classify.weighted import classify_weighted
 from creek.ingest.base import IngestedFragment
 from creek.models import Fragment, Frequency, PrivacyTier
 from creek.time import now_la
-from creek.vault.reader import try_load_fragment
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, try_load_fragment
 from creek.vault.writer import VaultWriter
 
 LLM_PROGRESS_FILENAME = "llm-progress.jsonl"
@@ -268,8 +356,10 @@ class ClassifySummary:
         privacy_tiers_assigned: Fragments whose privacy tier this run
             owned and (re-)derived — i.e. the frontmatter carried no
             tier (or an explicit ``unclassified``), or ``--force`` was
-            passed (issue #876). A fragment carrying a deliberate
-            operator tier that the run left alone is **not** counted.
+            passed (issue #876), or ``--retier`` found the recorded tier
+            weaker than today's verdict (issue #1106, also counted on
+            :attr:`retiered`). A fragment carrying a deliberate operator
+            tier that the run left alone is **not** counted.
             This counts the decision, not the bytes: a fragment whose
             subsequent write fails is counted here *and* reported on
             :attr:`errors`.
@@ -283,6 +373,29 @@ class ClassifySummary:
             module docstring). Like :attr:`privacy_tiers_assigned` this
             counts the decision, not the bytes — a fragment whose write
             then fails is counted here *and* reported on :attr:`errors`.
+        tags_extracted: Fragments this run added at least one
+            :attr:`~creek.models.Fragment.tags` entry to (issue #878).
+            Counts *fragments changed*, not tags written, and only
+            genuine additions: re-deriving a hashtag the fragment already
+            records is not work the operator needs reported, so the merge
+            being a union makes a second run over an unchanged vault
+            report ``0``. Fragments the resume short-circuit preserved
+            **are** counted since #1207: the free backfill runs on them
+            too, through a narrow tags-only write that touches no other
+            frontmatter field (see the module docstring). Like
+            :attr:`privacy_tiers_assigned` this counts the decision, not
+            the bytes — a fragment whose write then fails is counted here
+            *and* reported on :attr:`errors`.
+        retiered: Fragments this run raised to a **stricter** privacy tier
+            because the recorded one was weaker than the heuristic's
+            verdict today (issue #1106) — the pre-#974 mis-stamp. Only
+            ``--retier`` produces a non-zero value here, and only for
+            fragments that already carried a concrete tier: an untiered
+            fragment is :attr:`privacy_tiers_assigned`'s population, and
+            counting it twice would hide the one this exists to surface.
+            Escalate-only, so a second run over an unchanged vault reports
+            ``0``. Like :attr:`privacy_tiers_assigned` this counts the
+            decision, not the bytes.
     """
 
     total: int
@@ -296,6 +409,8 @@ class ClassifySummary:
     # compiles unchanged.
     privacy_tiers_assigned: int = 0
     praxis_marked: int = 0
+    tags_extracted: int = 0
+    retiered: int = 0
 
 
 @dataclass
@@ -313,6 +428,8 @@ class _RunCounts:
     skipped: int = 0
     privacy_tiers_assigned: int = 0
     praxis_marked: int = 0
+    tags_extracted: int = 0
+    retiered: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -411,6 +528,7 @@ def run_classify(
     config: CreekConfig,
     method: str,
     force: bool,
+    retier: bool = False,
 ) -> ClassifySummary:
     """Classify every fragment in *vault_path* using the chosen method.
 
@@ -420,6 +538,15 @@ def run_classify(
         method: ``"rules"`` or ``"llm"``.
         force: When ``True``, overwrite ``classification_method:
             manual`` decisions.
+        retier: When ``True``, also re-derive the privacy tier of
+            fragments that already carry a concrete one, and persist it
+            when — and only when — the new verdict is *stricter* (issue
+            #1106). Deliberately opt-in and deliberately not ``--force``:
+            it rides the preserved short-circuit's narrow tier-only
+            writer, so ``classification_method`` provenance and manual
+            curation survive and no LLM call is made. It is not the
+            default because re-deriving a tier the operator settled by
+            hand is a decision only the operator can take.
 
     Returns:
         A :class:`ClassifySummary` reporting per-method counts.
@@ -484,6 +611,7 @@ def run_classify(
         _process_file,
         method=method,
         force=force,
+        retier=retier,
         rules=rules,
         audience=audience,
         # Issue #876: stateless and read-only for the duration of the
@@ -512,6 +640,8 @@ def run_classify(
         errors=tuple(counts.errors),
         privacy_tiers_assigned=counts.privacy_tiers_assigned,
         praxis_marked=counts.praxis_marked,
+        tags_extracted=counts.tags_extracted,
+        retiered=counts.retiered,
     )
 
 
@@ -641,6 +771,32 @@ def _record_praxis(
         counts.praxis_marked += 1
 
 
+def _record_tags(
+    before: list[str],
+    fragment: Fragment,
+    counts: _RunCounts,
+) -> None:
+    """Tally a fragment this run added a tag to (issue #878).
+
+    Kept as its own function for the same reason as :func:`_record_praxis`
+    — :func:`_process_file`'s cyclomatic complexity is already at its
+    working ceiling and does not need another ``if``. Comparing
+    before/after is safe precisely because
+    :func:`~creek.classify.tags_pass.apply_tags` merges as a union that
+    never loses a tag: the list can only grow, or be re-canonicalised in
+    place — which can shorten it, when two spellings of one tag collapse
+    to the single tag they always named — so any difference is real work
+    and never churn.
+
+    Args:
+        before: The tags the fragment carried before the pass.
+        fragment: The fragment after the pass.
+        counts: Mutable per-run counters; mutated in place.
+    """
+    if fragment.tags != before:
+        counts.tags_extracted += 1
+
+
 def _assert_classifiers_available(tier_classifiers: TierClassifiers | None) -> None:
     """Raise if any per-tier classifier's provider is unreachable (#666).
 
@@ -708,24 +864,78 @@ class _PreparedFragment:
             keys are preserved through the rewrite).
         llm: The classifier the fragment's tier resolved to, or ``None``
             on the rules path.
-        owns_tier: Whether *this* run owns the fragment's tier — true
-            when the frontmatter carried none (or ``unclassified``), or
-            when ``--force`` was passed. Gates the post-classification
-            reassess so a hand-set tier is never silently escalated
-            either.
+        tier_baseline: The privacy heuristic's verdict on the fragment
+            **as loaded**, taken before this run classified anything.
+            :func:`~creek.classify.privacy_pass.reassess` compares its
+            own verdict against this to answer the only question that
+            licenses touching a settled tier: did *this run* make the
+            heuristic stricter? (#1105)
     """
 
     fragment: Fragment
     body: str
     raw: dict[str, object]
     llm: LLMClassifier | None
-    owns_tier: bool
+    tier_baseline: PrivacyTier
+
+
+def _should_retier(
+    fragment: Fragment,
+    *,
+    raw: dict[str, object],
+    retier: bool,
+    baseline: PrivacyTier,
+) -> bool:
+    """Decide whether ``--retier`` owns this fragment's tier (issue #1106).
+
+    Three conditions, and each one is load-bearing.
+
+    *The flag.* Re-deriving a tier that is already concrete is opt-in.
+    A tier on disk may be an operator's deliberate call — the frontmatter
+    records no provenance, so the engine cannot tell — and overruling one
+    silently on every run would destroy the durable override #1105 was
+    careful to preserve.
+
+    *Not untiered.* An untiered fragment is :func:`needs_tier`'s
+    population (#876): ``apply_tier`` assigns it a tier on the very next
+    line and :attr:`_RunCounts.privacy_tiers_assigned` already reports it.
+    Since ``tier_of`` reads ``unclassified`` for those and
+    ``_ESCALATION_RANK`` puts that below ``open``, they would *all*
+    satisfy the escalate check, so omitting this clause would make
+    ``retiered`` a second, louder copy of a count that already exists —
+    35,330 of 35,330 on the demo vault — and hide the population this
+    exists to surface.
+
+    *Strictly stricter.* :func:`~creek.classify.privacy_pass.outranks_recorded_tier`
+    merges through ``escalate``, which ranks by restrictiveness, so it is
+    ``True`` only when the recomputed tier is **higher** than the recorded
+    one. A fragment whose verdict got *weaker* is never selected, and
+    ``privacy_tier`` therefore keeps its one-way-ratchet guarantee.
+
+    *baseline* is the verdict on the fragment **as loaded**, captured
+    before any mutation this run makes, so the decision is free (no second
+    classify call) and cannot be contaminated by this run's own output.
+
+    Args:
+        fragment: The fragment as loaded from disk.
+        raw: Its frontmatter exactly as read.
+        retier: The ``--retier`` flag for this run.
+        baseline: :attr:`_PreparedFragment.tier_baseline` — the
+            heuristic's verdict on the fragment as loaded.
+
+    Returns:
+        ``True`` when this run should raise the fragment's recorded tier.
+    """
+    if not retier or needs_tier(raw):
+        return False
+    return outranks_recorded_tier(fragment, baseline)
 
 
 def _prepare_fragment(
     *,
     md_file: Path,
     force: bool,
+    retier: bool,
     privacy: PrivacyClassifier,
     tier_classifiers: TierClassifiers | None,
     counts: _RunCounts,
@@ -741,9 +951,27 @@ def _prepare_fragment(
     ``llm``/``manual``-stamped fragments that make up a mature vault can
     acquire a tier without ``--force`` re-paying for their classification.
 
+    One more ordering is load-bearing (issue #1105):
+    :attr:`_PreparedFragment.tier_baseline` is captured *first of all*, on
+    the fragment exactly as loaded. It is the reference point
+    :func:`~creek.classify.privacy_pass.reassess` needs to judge whether
+    this run learned anything new about the fragment's privacy, so any
+    mutation taken before it — the tier stamp here, the classifier's voice
+    verdict later — would fold this run's own output back into the
+    baseline and blind the gate to it.
+
     Args:
         md_file: The file to consider.
         force: Whether to re-derive settled classifications and tiers.
+        retier: Whether to re-derive an already-concrete tier and keep the
+            result when it is stricter (issue #1106). Unlike *force* it
+            widens nothing else — it does not enter the preserved
+            short-circuit's condition below — so a ``manual``/``llm``
+            fragment still short-circuits and reaches only the narrow
+            tier-only writer, keeping its provenance and costing no
+            provider call. A fragment the short-circuit does not preserve
+            takes the ordinary classification path it would have taken
+            anyway, carrying the raised tier with it.
         privacy: Shared :class:`PrivacyClassifier`.
         tier_classifiers: Per-tier :class:`LLMClassifier` set, or ``None``
             on the rules path.
@@ -760,12 +988,43 @@ def _prepare_fragment(
         return None
     fragment, body, raw = record
 
+    # #1105: record the heuristic's verdict on the fragment as loaded, BEFORE
+    # ``apply_tier`` (and the classifier below) change anything it reads. The
+    # post-classification reassess needs this to tell "the model just revealed
+    # something new" from "the model echoed what was already on disk"; only the
+    # former licenses raising a tier that is already on record.
+    tier_baseline = privacy.classify_tier(fragment, content=body)
+
     # #876: stamp a real tier before anything else looks at one. ``force``
     # merges escalate-only, so an existing ``intimate`` is never lowered.
-    owns_tier = needs_tier(raw) or force
-    fragment = apply_tier(fragment, body, raw=raw, force=force, classifier=privacy)
+    #
+    # Since #1105 this answers only "did this run *assign* the tier?", and its
+    # two remaining consumers are the ``privacy_tiers_assigned`` counter just
+    # below and the preserved-path :func:`_persist_tier_only` write. It no
+    # longer gates the post-classification reassess — ``tier_baseline`` does
+    # that — because "a tier is already on record" turned out to say nothing
+    # about whether a *person* put it there.
+    # #1106: a fragment mis-stamped by the pre-#974 pipeline carries a tier
+    # that is *concrete but too weak*, so neither ``needs_tier`` nor the #1105
+    # reassess will ever revisit it. ``--retier`` re-opens exactly that case,
+    # reading the baseline captured above rather than re-classifying.
+    retierable = _should_retier(
+        fragment, raw=raw, retier=retier, baseline=tier_baseline
+    )
+    owns_tier = needs_tier(raw) or force or retierable
+    # ``force=`` here is the *merge* switch inside ``apply_tier``, not the CLI
+    # flag: with a concrete tier on disk it takes ``escalate(tier_of(fragment),
+    # candidate)``, which by construction can only raise. Nothing about the
+    # preserved short-circuit below is affected — that still tests the real
+    # ``force`` — so a re-tiered fragment keeps its ``classification_method``
+    # and costs no provider call.
+    fragment = apply_tier(
+        fragment, body, raw=raw, force=force or retierable, classifier=privacy
+    )
     if owns_tier:
         counts.privacy_tiers_assigned += 1
+    if retierable:
+        counts.retiered += 1
 
     # Per-tier routing (#666): pick the classifier for this fragment's
     # privacy tier. ``tier_of`` fails closed to INTIMATE for an unrecognised
@@ -780,24 +1039,25 @@ def _prepare_fragment(
     # Skip fragments whose previous run already settled the classification.
     # Tracked on distinct counters so the CLI summary can label "manual
     # preserved" and "previously LLM-classified preserved" honestly
-    # (issue #321). A tier assigned above still lands, through the narrow
-    # writer that touches nothing else.
+    # (issue #321). The free, non-destructive passes — the tier assigned
+    # above (#876) and the hashtag backfill (#1207) — still land, each
+    # through a narrow writer that touches nothing else.
     if not force and _record_if_preserved(raw, counts):
-        if owns_tier:
-            _persist_tier_only(
-                md_file=md_file,
-                fragment=fragment,
-                body=body,
-                raw=raw,
-                counts=counts,
-            )
+        _backfill_preserved(
+            md_file=md_file,
+            fragment=fragment,
+            body=body,
+            raw=raw,
+            owns_tier=owns_tier,
+            counts=counts,
+        )
         return None
     return _PreparedFragment(
         fragment=fragment,
         body=body,
         raw=raw,
         llm=llm,
-        owns_tier=owns_tier,
+        tier_baseline=tier_baseline,
     )
 
 
@@ -806,6 +1066,7 @@ def _process_file(
     *,
     method: str,
     force: bool,
+    retier: bool,
     rules: RuleClassifier,
     audience: AudienceClassifier,
     privacy: PrivacyClassifier,
@@ -824,6 +1085,8 @@ def _process_file(
         md_file: The file to consider.
         method: ``"rules"`` or ``"llm"``.
         force: Whether to overwrite previously-classified fragments.
+        retier: Whether to re-derive an already-concrete privacy tier and
+            persist it when the new verdict is stricter (issue #1106).
         rules: Shared :class:`RuleClassifier` instance.
         audience: Shared :class:`AudienceClassifier`; stamps the #634
             audience axis on every (re)classified fragment, deterministically,
@@ -868,6 +1131,7 @@ def _process_file(
         prepared = _prepare_fragment(
             md_file=md_file,
             force=force,
+            retier=retier,
             privacy=privacy,
             tier_classifiers=tier_classifiers,
             counts=counts,
@@ -911,16 +1175,37 @@ def _process_file(
     praxis_before = new_fragment.praxis_potential
     new_fragment = apply_praxis(new_fragment, body)
 
+    # #878: extract the body's hashtags into ``tags``. Unconditional for the
+    # same reason as the praxis pass above — ``apply_tags`` is pure and
+    # returns the same object when the union adds nothing, so this adds no
+    # branch here. Placed beside praxis rather than in ``_prepare_fragment``
+    # so the #876 tier-then-router ordering stays untouched; the merge is a
+    # union, so it is order-independent with respect to everything around it.
+    tags_before = new_fragment.tags.copy()
+    new_fragment = apply_tags(new_fragment, body)
+
     # #876: classification may have hardened the fragment's voice signals
     # (confessional + conviction is one of the INTIMATE triggers), which the
     # pre-pass could not see. Take the stricter of the two verdicts —
-    # escalate-only, and only when this run owns the tier, so a deliberate
-    # operator tier is never silently raised either.
-    if prepared.owns_tier:
-        new_fragment = reassess(new_fragment, body, classifier=privacy)
+    # escalate-only, so nothing here can lower a tier.
+    #
+    # #1105: unconditional, because ``reassess`` now carries its own gate.
+    # Its ``baseline`` is the heuristic's verdict on the fragment as loaded,
+    # so it fires only where this run's classification made the heuristic
+    # strictly stricter — new evidence, which no tier on disk predates. The
+    # gate this replaces asked "does this run own the tier?", which is False
+    # for every already-tiered fragment, i.e. for the whole of a mature
+    # vault; that answer discarded exactly the verdicts it was here to catch.
+    new_fragment = reassess(
+        new_fragment,
+        body,
+        baseline=prepared.tier_baseline,
+        classifier=privacy,
+    )
 
     with lock:
         _record_praxis(praxis_before, new_fragment, counts)
+        _record_tags(tags_before, new_fragment, counts)
 
         # FEAT-023 wire-up (issue #318): when ``classification.reatomize`` is
         # True we run the orchestrator on the root fragment and persist any
@@ -982,7 +1267,7 @@ def _load_classifiable_fragment(
     """
     try:
         record = _read_fragment(md_file)
-    except (OSError, ValueError, yaml.YAMLError) as exc:
+    except FRONTMATTER_LOAD_ERRORS as exc:
         counts.errors.append(f"unreadable fragment {md_file}: {exc}")
         return None
     if record is None:
@@ -1048,6 +1333,73 @@ def _finalise_fragment_write(
         _record_llm_progress(progress_path, new_fragment.id)
 
 
+def _backfill_preserved(
+    *,
+    md_file: Path,
+    fragment: Fragment,
+    body: str,
+    raw: dict[str, object],
+    owns_tier: bool,
+    counts: _RunCounts,
+) -> None:
+    """Apply the free, non-destructive passes to a preserved fragment.
+
+    The whole of the OPS-001 short-circuit's write surface, and the only
+    place where more than one narrow writer can fire on one file. Both
+    passes are deterministic, local and free, so neither threatens what
+    the short-circuit protects (operator curation and paid tokens):
+
+    * the #876 privacy tier, when this run owns it; then
+    * the #1207 hashtag backfill, when the body carries a tag ``tags``
+      does not already record.
+
+    **The ordering is a data dependency, not a preference.** Each writer
+    rewrites the whole file from the frontmatter it is handed, so the
+    tags write has to build on what the tier write actually left on disk.
+    Handing it the frontmatter as originally *read* would drop the tier
+    that had just been assigned and silently re-open the cloud-egress
+    hole #876 exists to close — which is why :func:`_persist_tier_only`
+    returns its result rather than ``None``.
+
+    Args:
+        md_file: The preserved fragment's file, rewritten in place.
+        fragment: The fragment as loaded, carrying any tier this run
+            assigned.
+        body: Its markdown body; retained byte-identical by both
+            writers, and the input the hashtag extractor reads.
+        raw: Its frontmatter exactly as read from disk.
+        owns_tier: Whether this run assigned the privacy tier (and so
+            has one to persist).
+        counts: Mutable per-run counters; mutated in place.
+    """
+    metadata = raw
+    if owns_tier:
+        written = _persist_tier_only(
+            md_file=md_file,
+            fragment=fragment,
+            body=body,
+            raw=metadata,
+            counts=counts,
+        )
+        if written is not None:
+            metadata = written
+
+    tagged = apply_tags(fragment, body)
+    if tagged is fragment:
+        # ``apply_tags`` returns the same object when the union adds
+        # nothing, so an already-backfilled vault is not rewritten at
+        # all — the pass is idempotent down to the file's bytes.
+        return
+    counts.tags_extracted += 1
+    _persist_tags_only(
+        md_file=md_file,
+        fragment=tagged,
+        body=body,
+        raw=metadata,
+        counts=counts,
+    )
+
+
 def _persist_tier_only(
     *,
     md_file: Path,
@@ -1055,7 +1407,7 @@ def _persist_tier_only(
     body: str,
     raw: dict[str, object],
     counts: _RunCounts,
-) -> None:
+) -> dict[str, object] | None:
     """Write a preserved fragment's new privacy tier, recording any failure.
 
     A single unwritable file must not abort a 35k-file run, so an
@@ -1071,13 +1423,24 @@ def _persist_tier_only(
         raw: The frontmatter as read from disk.
         counts: Mutable per-run counters; write failures land on
             :attr:`_RunCounts.errors`.
+
+    Returns:
+        The frontmatter now on disk, so the sibling writer that may run
+        after it (see :func:`_backfill_preserved`) composes on this
+        result instead of reverting it; ``None`` when the write failed.
     """
     try:
-        _write_tier_only(md_file=md_file, fragment=fragment, body=body, raw=raw)
+        return _write_tier_only(
+            md_file=md_file,
+            fragment=fragment,
+            body=body,
+            raw=raw,
+        )
     except OSError as exc:
         counts.errors.append(
             f"failed to update privacy tier for {fragment.id} ({md_file}): {exc}",
         )
+        return None
 
 
 def _write_tier_only(
@@ -1086,7 +1449,7 @@ def _write_tier_only(
     fragment: Fragment,
     body: str,
     raw: dict[str, object],
-) -> None:
+) -> dict[str, object]:
     """Rewrite *md_file* changing ONLY the privacy-tier fields (issue #876).
 
     Used exclusively on the preserved short-circuit path, where the whole
@@ -1102,11 +1465,24 @@ def _write_tier_only(
       would let a fragment freshly marked ``intimate`` keep advertising
       itself as voice-proxy eligible.
 
+    That promise is unchanged by #1207: the tags backfill went into the
+    **sibling** :func:`_write_tags_only` rather than widening this
+    function's scope into a parameter. A writer whose scope is its name
+    can be audited from its call site; one whose scope is an argument
+    cannot, and these run over already-classified user vaults. The
+    return value is not a widening — it is exactly the two fields above
+    on top of *raw*, handed back so a sibling writer can compose on what
+    is now on disk rather than clobber it.
+
     Args:
         md_file: Destination file, rewritten in place.
         fragment: The fragment carrying the freshly-assigned tier.
         body: Markdown body to retain unchanged.
         raw: Original frontmatter; every other key is copied verbatim.
+
+    Returns:
+        The frontmatter written, i.e. *raw* with the two tier fields
+        replaced.
 
     Raises:
         OSError: When the file cannot be written. The caller
@@ -1119,8 +1495,108 @@ def _write_tier_only(
     new_metadata[PRIVACY_TIER_KEY] = PrivacyTier(fragment.privacy_tier).value
     new_metadata[_VOICE_PROXY_ELIGIBLE_KEY] = fragment.voice_proxy_eligible
 
+    _rewrite_frontmatter(md_file=md_file, body=body, metadata=new_metadata)
+    return new_metadata
+
+
+def _persist_tags_only(
+    *,
+    md_file: Path,
+    fragment: Fragment,
+    body: str,
+    raw: dict[str, object],
+    counts: _RunCounts,
+) -> None:
+    """Write a preserved fragment's backfilled tags, recording any failure.
+
+    The exact contract :func:`_persist_tier_only` honours, one axis over:
+    an unwritable file is reported on :attr:`_RunCounts.errors` and the
+    rest of the vault still backfills.
+
+    Args:
+        md_file: Destination file, rewritten in place.
+        fragment: The fragment carrying the merged tag list.
+        body: Markdown body to retain, byte-identical, below the
+            frontmatter.
+        raw: The frontmatter to write on top of — the tier writer's
+            result when it ran, otherwise the frontmatter as read.
+        counts: Mutable per-run counters; write failures land on
+            :attr:`_RunCounts.errors`.
+    """
+    try:
+        _write_tags_only(md_file=md_file, fragment=fragment, body=body, raw=raw)
+    except OSError as exc:
+        counts.errors.append(
+            f"failed to update tags for {fragment.id} ({md_file}): {exc}",
+        )
+
+
+def _write_tags_only(
+    *,
+    md_file: Path,
+    fragment: Fragment,
+    body: str,
+    raw: dict[str, object],
+) -> None:
+    """Rewrite *md_file* changing ONLY ``tags`` (issue #1207).
+
+    The deliberate sibling of :func:`_write_tier_only` rather than a
+    widening of it. Both run over vaults that are already classified and
+    already curated, and the property that makes them reviewable is that
+    the set of fields each may touch is legible from its *name* — a
+    field-scoped writer taking its scope as an argument would push that
+    question out to every call site.
+
+    Unlike the tier, ``tags`` has no derived companion key: nothing else
+    in the frontmatter is computed from it, so this writer's field set is
+    exactly one key. ``classification_method``, ``classified_at``, the
+    provider/reasoning stamps and the body are all left byte-identical —
+    the run did not re-classify anything, and must not claim to have.
+
+    Safe on the preserved path only because
+    :func:`~creek.classify.tags_pass.merge` is a union: the value written
+    always contains every tag already on record, so a hand-written
+    Obsidian tag cannot be lost to a pass the operator did not ask for.
+
+    Args:
+        md_file: Destination file, rewritten in place.
+        fragment: The fragment carrying the merged tag list.
+        body: Markdown body to retain unchanged.
+        raw: Frontmatter to write on top of; every other key is copied
+            verbatim.
+
+    Raises:
+        OSError: When the file cannot be written. The caller
+            (:func:`_persist_tags_only`) records it and carries on.
+    """
+    new_metadata = raw.copy()
+    new_metadata[TAGS_KEY] = fragment.tags.copy()
+    _rewrite_frontmatter(md_file=md_file, body=body, metadata=new_metadata)
+
+
+def _rewrite_frontmatter(
+    *,
+    md_file: Path,
+    body: str,
+    metadata: dict[str, object],
+) -> None:
+    """Rewrite *md_file* as *metadata* over an unchanged *body*.
+
+    The shared I/O tail of the narrow writers above. It deliberately
+    decides *nothing* about which fields may change — that is each
+    writer's own, named responsibility — so that keeping the two in
+    lockstep on serialisation cannot blur their scopes.
+
+    Args:
+        md_file: Destination file, rewritten in place.
+        body: Markdown body to retain unchanged.
+        metadata: The complete frontmatter to serialise.
+
+    Raises:
+        OSError: When the file cannot be written.
+    """
     post = frontmatter.Post(content=body)
-    post.metadata.update(new_metadata)
+    post.metadata.update(metadata)
     md_file.write_text(frontmatter.dumps(post), encoding="utf-8")
 
 
@@ -1148,13 +1624,18 @@ def _classify_one(
             dispatches through
             :func:`creek.classify.weighted.classify_weighted`, persists
             the resulting weighted profile to
-            :attr:`Fragment.weighted`, and derives the legacy
-            single-pick fields via
-            :meth:`WeightedFragmentClassification.to_legacy` so
-            downstream consumers stay synchronised. Has no effect on
+            :attr:`Fragment.weighted`, and merges the derived legacy
+            single-pick fields over the fragment via
+            :meth:`WeightedFragmentClassification.merge_onto` — a
+            dimension the profile is silent about keeps its prior
+            value rather than being reset. Has no effect on
             the rules path or on ``--method llm`` runs where the rule
             classifier already cleared the confidence floor; for those
             fragments :attr:`Fragment.weighted` stays ``None``.
+            The *merge* itself is no longer particular to this flag:
+            since #1331 the rule pass and the single-pick LLM parse
+            layer their verdicts the same way, through the one shared
+            rule in :mod:`creek.classify.evidence`.
 
     Returns:
         ``(updated_fragment, skipped, reasoning)``. ``skipped`` is
@@ -1199,14 +1680,26 @@ def _classify_one_weighted(
     :attr:`ClassificationConfig.weighted_classification` is set.
     Populates :attr:`Fragment.weighted` with the full weighted
     profile and derives the legacy single-pick fields from the
-    profile's top entries via
-    :meth:`WeightedFragmentClassification.to_legacy` so existing
-    consumers (lint, compile, voice-skill generation) stay
-    synchronised. When the underlying call fails soft to an empty
-    profile (provider unavailable, transport error, malformed YAML)
-    the legacy fields collapse to ``UNCLASSIFIED`` — the operator
-    sees the same "no signal" verdict the single-pick path produces
-    on failure.
+    profile's top entries, so existing consumers (lint, compile,
+    voice-skill generation) keep reading a canonical pick.
+
+    Those derived fields **merge** over the fragment's existing
+    classification rather than replacing it wholesale — a dimension
+    the profile is silent about leaves the prior value standing. The
+    merge rule, and why the wholesale form was a privacy defect, live
+    on :func:`creek.classify.evidence.layer_determined_over`, which
+    :meth:`WeightedFragmentClassification.merge_onto` calls (#1309) and
+    which the rule pass upstream of it now calls too (#1331) — so by
+    the time a fragment reaches here its rule-derived evidence is
+    intact rather than already half destroyed.
+
+    When the underlying call fails soft to an empty
+    profile (whitespace-only body, provider unavailable, transport
+    error, malformed YAML) nothing is derived from it: the input
+    fragment is handed back untouched — rule verdict intact,
+    :attr:`Fragment.weighted` still ``None`` — and reported as a
+    skip, exactly as the single-pick path reports its own failures
+    (#744, #1330).
 
     Args:
         fragment: Fragment carrying any rule-classifier output that
@@ -1217,23 +1710,28 @@ def _classify_one_weighted(
             Anthropic selection the legacy LLM path uses.
 
     Returns:
+        ``(fragment, skipped, reasoning)``. On success,
         ``(updated_fragment, False, reasoning)``: the weighted profile
-        plus its derived legacy fields land on the returned Fragment;
-        ``False`` reflects "the LLM was actually invoked"; the
+        plus its derived legacy fields land on the returned Fragment,
+        ``False`` reflects "the LLM was actually invoked", and the
         reasoning trace mirrors the model's preamble for FEAT-017
-        observability.
+        observability. On failure, ``(fragment, True, "")``: the input
+        fragment unchanged, and ``True`` so the caller treats it like
+        the rules-sufficed skip.
     """
     ingested = IngestedFragment(fragment=fragment, body=body)
-    weighted = classify_weighted(ingested, llm_config)
-    freq, wave, voice = weighted.to_legacy()
-    updated = fragment.model_copy(
-        update={
-            "weighted": weighted,
-            "frequency": freq,
-            "wavelength": wave,
-            "voice": voice,
-        },
-    )
+    result = classify_weighted(ingested, llm_config)
+    if not result.succeeded:
+        # The weighted call produced nothing (whitespace-only body, provider
+        # unavailable, transport error, malformed YAML) and there is no profile
+        # to derive from. Treat it like the rules-sufficed skip so the write
+        # path stamps ``rules`` (the result that actually stands), NOT a lying
+        # ``classification_method: llm`` — and the fragment stays eligible for
+        # a later re-classify rather than being skipped by
+        # ``_record_if_preserved`` forever (#744, #1330).
+        return fragment, True, ""
+    weighted = result.classification
+    updated = weighted.merge_onto(fragment)
     return updated, False, weighted.reasoning
 
 

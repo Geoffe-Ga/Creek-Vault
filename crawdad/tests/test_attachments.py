@@ -21,6 +21,9 @@ FEAT-035 adds:
 - Unknown extension (``.xyz`` — no verifier, status="unknown").
 - ``reject_on_mime_mismatch=True`` flips soft warning into hard reject.
 - Summary surfaces the mismatch warning line for accepted-but-suspect files.
+- Multibyte UTF-8 codepoints straddling the text-sample byte boundary
+  (issue #916) still verify as ``match``, while genuinely invalid bytes
+  at that same offset still verify as ``mismatch``.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from pathlib import Path
 import pytest
 
 from crawdad.attachments import (
+    _TEXT_SAMPLE_BYTES,
     AcceptedAttachment,
     MimeVerification,
     ProcessedAttachments,
@@ -429,6 +433,120 @@ def test_config_refuses_parent_traversal_in_staging_subpath() -> None:
         AttachmentConfig(staging_subpath=Path("../../tmp"))
 
 
+# ---------------------------------------------------------------------------
+# #1088 — staging_subpath must stay inside the one subtree creek.redact.scan
+# will actually scan. Outside it, the scan is refused at every ceiling a
+# CrawDad channel ever declares, so the safety pass silently never runs.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(Path("00-Creek-Meta/Inbound"), id="the-canonical-root-itself"),
+        pytest.param(Path("00-Creek-Meta/Inbound/discord"), id="one-level-below"),
+        pytest.param(Path("00-Creek-Meta/Inbound/a/b"), id="two-levels-below"),
+        pytest.param(Path("00-Creek-Meta/./Inbound"), id="dot-segment-normalised"),
+        pytest.param(Path("00-Creek-Meta/Inbound/"), id="trailing-slash-normalised"),
+        pytest.param("00-Creek-Meta/Inbound", id="plain-str-coerced-by-pydantic"),
+    ],
+)
+def test_config_accepts_staging_subpath_inside_canonical_root(
+    value: Path | str,
+) -> None:
+    """#1088: the canonical scan scope, and anything under it, are accepted.
+
+    ``creek.redact.scan`` is hard-scoped to ``00-Creek-Meta/Inbound/``
+    (``creek-tools/creek_mcp/tools/redact.py:98``) and admits that subtree
+    at *every* ceiling, so every value here can actually be scanned and
+    must keep parsing.
+
+    ``dot-segment-normalised`` and ``trailing-slash-normalised`` pin that
+    ``pathlib`` collapses ``.`` and a trailing separator before the
+    validator ever sees the value, so the scope check does not have to
+    re-implement normalisation. ``plain-str-coerced-by-pydantic`` pins
+    that a YAML string flows through the same validator as a ``Path``.
+    """
+    config = AttachmentConfig(staging_subpath=value)
+    assert config.staging_subpath.parts[:2] == ("00-Creek-Meta", "Inbound")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(Path("01-Fragments"), id="unrelated-vault-folder"),
+        pytest.param(Path("00-Creek-Meta/Inbound-other"), id="sibling-prefix"),
+        pytest.param(Path("00-Creek-Meta/Outbound"), id="sibling-folder"),
+        pytest.param(Path("00-Creek-Meta"), id="the-parent-is-not-inside"),
+        pytest.param(Path("00-creek-meta/inbound"), id="case-differs"),
+        pytest.param(Path(""), id="empty-normalises-to-dot"),
+    ],
+)
+def test_config_refuses_staging_subpath_outside_canonical_root(value: Path) -> None:
+    """#1088: a staging root the scan cannot reach is refused at parse time.
+
+    Outside ``00-Creek-Meta/Inbound/`` the scan ranks the target as
+    intimate content, so a ``personal``/``open`` CrawDad channel gets
+    ``status="refused"`` on every call and the safety pass never runs.
+    Refusing at config-parse time turns that silent runtime hole into a
+    startup error naming the fix.
+
+    ``sibling-prefix`` (``00-Creek-Meta/Inbound-other``) is the case that
+    forces ``Path.is_relative_to`` over ``str.startswith``: it shares the
+    canonical root's string prefix but is a different directory, and a
+    ``startswith`` check would wave it through.
+
+    ``case-differs`` (``00-creek-meta/inbound``) must be refused on every
+    platform, including case-insensitive filesystems. Case folding is
+    deliberately NOT performed: ``creek_mcp/tools/redact.py:340`` compares
+    the target against ``00-Creek-Meta/Inbound`` literally, so folding
+    here would admit a config the server then refuses — reopening the
+    exact never-scanned hole this issue closes.
+    """
+    with pytest.raises(ValueError, match="00-Creek-Meta/Inbound") as excinfo:
+        AttachmentConfig(staging_subpath=value)
+    # The message must restate the scope rule, not just name the folder —
+    # the operator needs to know *why* their path cannot be scanned.
+    assert "ranked as intimate content" in str(excinfo.value)
+
+
+def test_config_refuses_out_of_scope_staging_subpath_at_every_ceiling() -> None:
+    """#1088: the config gate does not merely shadow the downstream tier rule.
+
+    A channel declaring ``intimate`` *would* be admitted by
+    ``creek.redact.scan`` for an out-of-scope path, so a gate that only
+    fired for narrow ceilings would be a restatement of the server's rule
+    rather than an independent one. The refusal must turn on the path
+    alone, whatever ``channel_privacy_tiers`` says.
+    """
+    with pytest.raises(ValueError, match="00-Creek-Meta/Inbound"):
+        AttachmentConfig(
+            staging_subpath=Path("01-Fragments"),
+            channel_privacy_tiers={1: "intimate"},
+        )
+
+
+def test_config_refuses_traversal_out_of_canonical_root_via_the_dotdot_arm() -> None:
+    """#1088: ``..`` inside the canonical root is caught by the ``..`` arm.
+
+    ``00-Creek-Meta/Inbound/../../01-Fragments`` is *lexically*
+    ``is_relative_to`` the canonical root — ``Path.is_relative_to`` is a
+    pure prefix comparison and does not resolve ``..`` — so the new scope
+    arm alone would wave it through. Only the pre-existing ``..`` arm
+    catches it, which means the arms must stay in order: absolute, then
+    ``..``, then scope.
+
+    The negative assertion is the real discriminator: both arms
+    interpolate ``value!r``, so the path's own dots satisfy ``match``
+    either way, but only the scope arm restates the tier rule.
+    """
+    with pytest.raises(ValueError, match=r"\.\.") as excinfo:
+        AttachmentConfig(
+            staging_subpath=Path("00-Creek-Meta/Inbound/../../01-Fragments")
+        )
+    assert "ranked as intimate content" not in str(excinfo.value)
+
+
 async def test_empty_allowed_extensions_passes_anything_not_denied(
     tmp_path: Path,
 ) -> None:
@@ -583,6 +701,206 @@ def test_verify_mime_type_invalid_utf8_under_text_extension_is_mismatch() -> Non
     assert result.expected_mime == "text/plain"
 
 
+# ---------------------------------------------------------------------------
+# Issue #916: the text sample is cut at a fixed byte offset, so a multibyte
+# UTF-8 codepoint can straddle the window edge. Truncation is not corruption
+# — the tests below pin "a split codepoint is still text" without loosening
+# the checks that catch genuinely binary or malformed bodies at that offset.
+# All boundary arithmetic derives from ``_TEXT_SAMPLE_BYTES`` so the tests
+# follow the constant if it is ever retuned.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("char", "inside_bytes"),
+    [
+        pytest.param("é", 1, id="2byte-char-1-inside-1-outside"),
+        pytest.param("文", 1, id="3byte-char-1-inside-2-outside"),
+        pytest.param("文", 2, id="3byte-char-2-inside-1-outside"),
+        pytest.param("😀", 1, id="4byte-char-1-inside-3-outside"),
+        pytest.param("😀", 2, id="4byte-char-2-inside-2-outside"),
+        pytest.param("😀", 3, id="4byte-char-3-inside-1-outside"),
+    ],
+)
+def test_verify_mime_type_multibyte_split_at_sample_boundary_is_match(
+    char: str, inside_bytes: int
+) -> None:
+    """A codepoint split across the sample edge is text, not a binary blob.
+
+    ``inside_bytes`` of the character's UTF-8 encoding land inside the
+    sampled window and the remainder falls past it, for every split of
+    every multibyte width (2, 3 and 4 bytes). The body is valid UTF-8
+    end to end, so the only reason a naive strict decode of the slice
+    fails is the cut itself — issue #916's false ``mismatch``.
+    """
+    encoded = char.encode()
+    pad = b"a" * (_TEXT_SAMPLE_BYTES - inside_bytes)
+    data = pad + encoded + b" trailing\n"
+
+    # Self-checks: fail loudly if the fixture does not actually straddle.
+    assert len(data) > _TEXT_SAMPLE_BYTES
+    assert data[:_TEXT_SAMPLE_BYTES][-inside_bytes:] == encoded[:inside_bytes]
+    # The premise: the whole payload is valid UTF-8, only the slice is cut.
+    assert data.decode("utf-8").endswith(f"{char} trailing\n")
+
+    result = verify_mime_type("notes.md", data)
+    assert result.status == "match"
+    assert result.detected_mime == "text/markdown"
+    assert result.expected_mime == "text/markdown"
+    assert result.is_mismatch is False
+
+
+def test_verify_mime_type_accented_char_at_byte_1024_boundary_is_match() -> None:
+    """Issue #916 acceptance criterion 1, spelled out verbatim.
+
+    ``verify_mime_type("notes.md", b"a" * 1023 + "é".encode() + b" more
+    text\\n").status == "match"``. The literal 1023 is intentional here
+    (every other test derives from :data:`_TEXT_SAMPLE_BYTES`) so the
+    stated criterion stays greppable against the issue text.
+    """
+    data = b"a" * 1023 + "é".encode() + b" more text\n"
+    result = verify_mime_type("notes.md", data)
+    assert result.status == "match"
+    assert result.detected_mime == "text/markdown"
+    assert result.expected_mime == "text/markdown"
+
+
+def test_verify_mime_type_truncated_utf8_tail_in_short_file_is_mismatch() -> None:
+    """Invariant: a dangling lead byte at end-of-file is still a mismatch.
+
+    The whole body fits inside the sample window, so nothing was cut by
+    sampling — the file itself ends mid-codepoint and is genuinely not
+    valid UTF-8. The #916 fix must not forgive this.
+    """
+    data = b"hello\xc3"
+    assert len(data) < _TEXT_SAMPLE_BYTES
+
+    result = verify_mime_type("notes.txt", data)
+    assert result.status == "mismatch"
+    assert result.detected_mime == "application/octet-stream"
+    assert result.expected_mime == "text/plain"
+
+
+def test_verify_mime_type_dangling_lead_byte_at_sample_size_is_mismatch() -> None:
+    """Invariant: a body of exactly ``_TEXT_SAMPLE_BYTES`` was never cut.
+
+    Adjacent pair with
+    :func:`test_verify_mime_type_complete_char_one_byte_past_sample_is_match`:
+    together they pin the off-by-one. Truncation forgiveness may only
+    apply when the body extends *past* the window (``len(data) >
+    _TEXT_SAMPLE_BYTES``), never when it ends exactly at it — here the
+    trailing ``\\xc3`` has no continuation byte anywhere in the file.
+    """
+    data = b"a" * (_TEXT_SAMPLE_BYTES - 1) + b"\xc3"
+    assert len(data) == _TEXT_SAMPLE_BYTES
+
+    result = verify_mime_type("notes.txt", data)
+    assert result.status == "mismatch"
+    assert result.detected_mime == "application/octet-stream"
+    assert result.expected_mime == "text/plain"
+
+
+def test_verify_mime_type_complete_char_one_byte_past_sample_is_match() -> None:
+    """Invariant: one byte past the window completes the codepoint.
+
+    Adjacent pair with
+    :func:`test_verify_mime_type_dangling_lead_byte_at_sample_size_is_mismatch`:
+    the same 1023 ``a``\\ s plus ``\\xc3``, but this body carries the
+    ``\\xa9`` continuation just outside the window. Same leading bytes,
+    opposite verdict — that is the ``>`` vs ``>=`` boundary.
+    """
+    data = b"a" * (_TEXT_SAMPLE_BYTES - 1) + b"\xc3\xa9"
+    assert len(data) == _TEXT_SAMPLE_BYTES + 1
+
+    result = verify_mime_type("notes.txt", data)
+    assert result.status == "match"
+    assert result.detected_mime == "text/plain"
+    assert result.expected_mime == "text/plain"
+
+
+def test_verify_mime_type_invalid_bytes_mid_sample_is_mismatch() -> None:
+    """Invariant: undecodable bytes far from the edge stay a mismatch.
+
+    ``\\xff\\xfe`` sits at offset 500 with 600 bytes of text after it —
+    nowhere near the sample boundary, so no truncation-tolerance logic
+    may excuse it.
+    """
+    data = b"a" * 500 + b"\xff\xfe" + b"a" * 600
+    assert len(data) > _TEXT_SAMPLE_BYTES
+
+    result = verify_mime_type("notes.txt", data)
+    assert result.status == "mismatch"
+    assert result.detected_mime == "application/octet-stream"
+    assert result.expected_mime == "text/plain"
+
+
+def test_verify_mime_type_invalid_bytes_at_sample_boundary_is_mismatch() -> None:
+    """Invariant: never blanket-drop the tail of the sample.
+
+    ``\\xff`` and ``\\xfe`` are not legal UTF-8 lead bytes anywhere, and
+    here they occupy the last two bytes of the window. A fix that simply
+    shaves up to three trailing bytes off the sample and re-decodes
+    would call this text — it is not.
+    """
+    data = b"a" * (_TEXT_SAMPLE_BYTES - 2) + b"\xff\xfe" + b"a" * 100
+    assert len(data) > _TEXT_SAMPLE_BYTES
+    assert data[_TEXT_SAMPLE_BYTES - 2 : _TEXT_SAMPLE_BYTES] == b"\xff\xfe"
+
+    result = verify_mime_type("notes.txt", data)
+    assert result.status == "mismatch"
+    assert result.detected_mime == "application/octet-stream"
+    assert result.expected_mime == "text/plain"
+
+
+def test_verify_mime_type_bad_continuation_at_boundary_is_mismatch() -> None:
+    """Invariant: a legal lead byte with an illegal continuation is binary.
+
+    ``\\xe6`` is a valid 3-byte lead and sits two bytes from the window
+    edge, but ``\\x28`` is not a continuation byte — the sequence is
+    malformed where it stands, not merely unfinished. Only an *unfinished
+    but well-formed* trailing sequence may be forgiven.
+    """
+    data = b"a" * (_TEXT_SAMPLE_BYTES - 2) + b"\xe6\x28" + b"a" * 100
+    assert len(data) > _TEXT_SAMPLE_BYTES
+
+    result = verify_mime_type("notes.txt", data)
+    assert result.status == "mismatch"
+    assert result.detected_mime == "application/octet-stream"
+    assert result.expected_mime == "text/plain"
+
+
+def test_verify_mime_type_nul_byte_early_in_long_file_is_mismatch() -> None:
+    """Invariant: the NUL-byte heuristic survives the #916 fix.
+
+    A NUL at offset 100 of a 2101-byte body is the disguised-binary
+    signal; UTF-8 truncation handling must not route around this check.
+    """
+    data = b"a" * 100 + b"\x00" + b"a" * 2000
+    assert len(data) > _TEXT_SAMPLE_BYTES
+
+    result = verify_mime_type("notes.txt", data)
+    assert result.status == "mismatch"
+    assert result.detected_mime == "application/octet-stream"
+    assert result.expected_mime == "text/plain"
+
+
+def test_verify_mime_type_nul_byte_at_last_sample_byte_is_mismatch() -> None:
+    """Invariant: the NUL scan still covers the final byte of the window.
+
+    The NUL sits at offset ``_TEXT_SAMPLE_BYTES - 1`` — the last byte
+    inspected. A fix that shrinks the scanned window to dodge a split
+    codepoint would stop seeing it.
+    """
+    data = b"a" * (_TEXT_SAMPLE_BYTES - 1) + b"\x00" + b"a" * 100
+    assert len(data) > _TEXT_SAMPLE_BYTES
+    assert data[_TEXT_SAMPLE_BYTES - 1] == 0
+
+    result = verify_mime_type("notes.txt", data)
+    assert result.status == "mismatch"
+    assert result.detected_mime == "application/octet-stream"
+    assert result.expected_mime == "text/plain"
+
+
 def test_verify_mime_type_unknown_extension_returns_unknown_status() -> None:
     """An extension outside both tables can't be verified — status=unknown."""
     result = verify_mime_type("weird.xyz", b"any bytes here")
@@ -713,6 +1031,38 @@ async def test_process_attachment_text_polyglot_rejected_when_configured(
     assert result.accepted == ()
     assert len(result.rejected) == 1
     assert "MIME mismatch" in result.rejected[0].reason
+
+
+async def test_process_attachment_boundary_straddle_accepted_in_reject_mode(
+    tmp_path: Path,
+) -> None:
+    """Issue #916 acceptance criterion 3: valid text is not hard-rejected.
+
+    Reject mode is the strictest setting, so it is where the false
+    ``mismatch`` costs the user their file. A markdown note whose only
+    peculiarity is an accented character landing on the sample boundary
+    must be accepted, verified as ``match``, and written to staging.
+    """
+    config = AttachmentConfig(reject_on_mime_mismatch=True)
+    payload = b"a" * (_TEXT_SAMPLE_BYTES - 1) + "é".encode() + b" tail\n"
+    attachment = _FakeAttachment(
+        filename="notes.md",
+        size=len(payload),
+        payload=payload,
+    )
+    result = await process_attachments(
+        attachments=[attachment],
+        vault_path=tmp_path,
+        channel_id=1,
+        message_id=2,
+        config=config,
+    )
+    assert result.rejected == ()
+    assert len(result.accepted) == 1
+    assert result.accepted[0].mime_verification.status == "match"
+    staged = tmp_path / "00-Creek-Meta" / "Inbound" / "1" / "2" / "notes.md"
+    assert staged.exists()
+    assert staged.read_bytes() == payload
 
 
 async def test_process_attachment_unknown_extension_still_accepts(

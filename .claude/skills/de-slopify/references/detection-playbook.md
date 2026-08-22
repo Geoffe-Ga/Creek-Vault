@@ -74,7 +74,7 @@ when running outside the collector script).
 | Tool | Finds | Invocation |
 |------|-------|------------|
 | **ruff** | bugs (`B`,`BLE`,`RUF`), simplifications (`SIM`), complexity (`PLR`), datetimes (`DTZ`), dead imports (`F401`) | `ruff check $ROOTS --config=creek-tools/pyproject.toml --output-format=json` |
-| **vulture** | dead code: unused funcs/classes/vars/imports | `vulture $ROOTS --min-confidence 80` |
+| **vulture** | dead code: unused funcs/classes/vars/imports | `vulture $ROOTS --min-confidence 60` (80 hides the whole unused-function tier, which vulture scores at 60 — issue #1395; the gated policy is `creek-tools/scripts/lint-vulture.sh`) |
 | **radon** | cyclomatic complexity + maintainability index | `radon cc $ROOTS -s -n C` / `radon mi $ROOTS -s` |
 | **xenon** | complexity grade gate | `xenon $ROOTS --max-absolute B --max-average A` |
 | **mypy** (strict) | type holes, `Any` creep, unreachable code | `mypy $ROOTS --config-file=creek-tools/pyproject.toml` |
