@@ -67,14 +67,20 @@ from typing import TYPE_CHECKING, Final
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
+    from types import ModuleType
 
+# Declared before the import so the Windows fallback below is a legal
+# assignment rather than a suppressed type error. Call sites narrow on
+# ``fcntl is not None`` directly -- a separate `_HAS_FCNTL` bool cannot
+# narrow the module reference, so it would only push the suppression to
+# the `flock` calls (issue #852).
+fcntl: ModuleType | None
 try:
-    import fcntl
+    import fcntl as _fcntl
 
-    _HAS_FCNTL = True
+    fcntl = _fcntl
 except ImportError:  # pragma: no cover - exercised only on Windows
-    fcntl = None  # type: ignore[assignment]
-    _HAS_FCNTL = False
+    fcntl = None
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +240,7 @@ def _acquire_flock(
             filesystem not implementing it — see
             :data:`_UNSUPPORTED_FLOCK_ERRNOS`.
     """
-    if not _HAS_FCNTL:  # pragma: no cover - exercised only on Windows
+    if fcntl is None:  # pragma: no cover - exercised only on Windows
         return False
     while True:
         try:
@@ -324,7 +330,7 @@ def vault_lock(
             try:
                 yield
             finally:
-                if held:
+                if held and fcntl is not None:
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     finally:
         holder.lock.release()

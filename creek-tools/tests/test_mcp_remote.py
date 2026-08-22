@@ -50,6 +50,7 @@ import pytest
 import uvicorn
 from mcp.server.auth.provider import AccessToken
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import AnyHttpUrl
 from starlette.testclient import TestClient
 
 from creek_mcp import remote_auth as remote_auth_mod
@@ -61,6 +62,7 @@ from creek_mcp.remote_auth import (
     REMOTE_SCOPE,
     ConsumerTokenVerifier,
     load_consumer_tokens,
+    remote_auth_settings,
 )
 from creek_mcp.server import build_server, main
 
@@ -2099,3 +2101,54 @@ def test_remote_purge_with_valid_elevated_token_clears_both_gates(
         "confirm_vault_path": False,
         "dry_run": False,
     }
+
+
+def test_remote_auth_settings_urls_are_parsed_pydantic_urls() -> None:
+    """``AuthSettings`` exposes both URLs as ``AnyHttpUrl``, not raw ``str``.
+
+    This is the characterisation of the constructor's *existing* coercion: the
+    module hands ``AuthSettings`` plain strings and pydantic validates them
+    into ``AnyHttpUrl``. It pins the post-validation type so the typing sweep
+    in #850 — which passes ``AnyHttpUrl`` in rather than ``str`` — cannot
+    change what the network auth path actually serves.
+    """
+    settings = remote_auth_settings()
+
+    assert isinstance(settings.issuer_url, AnyHttpUrl)
+    assert isinstance(settings.resource_server_url, AnyHttpUrl)
+
+
+def test_remote_auth_settings_urls_keep_their_exact_spelling() -> None:
+    """Neither URL is rewritten — no trailing slash, no scheme or host change.
+
+    pydantic's URL types normalise a bare host by appending ``/``. Both of
+    these carry a path, so the round-trip is byte-identical; asserting the
+    exact string is what would catch a normalisation change slipping in with
+    a type change.
+    """
+    settings = remote_auth_settings()
+
+    assert str(settings.issuer_url) == "https://creek.invalid/mcp"
+    assert str(settings.resource_server_url) == "https://creek.invalid/mcp"
+
+
+def test_remote_auth_settings_requires_only_the_remote_scope() -> None:
+    """Every call is gated on ``creek:remote`` and nothing wider.
+
+    The scope list is the authorisation surface of the whole remote
+    transport, so it is pinned exactly rather than by membership.
+    """
+    settings = remote_auth_settings()
+
+    assert settings.required_scopes == [REMOTE_SCOPE]
+    assert settings.required_scopes == ["creek:remote"]
+
+
+def test_remote_auth_settings_is_stable_across_calls() -> None:
+    """Two calls serialise identically, so the factory holds no hidden state.
+
+    ``creek_mcp.server`` builds the settings afresh on every server
+    construction; a differing dump between calls would mean the auth surface
+    depended on call order.
+    """
+    assert remote_auth_settings().model_dump() == remote_auth_settings().model_dump()

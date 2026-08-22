@@ -44,7 +44,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from difflib import SequenceMatcher
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 import frontmatter
 
@@ -158,6 +158,27 @@ class _FragmentTags:
     tags: list[str] = field(default_factory=list)
 
 
+class _GrowthResult(TypedDict):
+    """Payload returned by :meth:`TagGardenGenerator.detect_growth`.
+
+    Total: both keys are emitted on every return path, so the
+    ``.get(key, default)`` reads in the renderer never fall back in practice.
+    """
+
+    new_tags: list[str]
+    growing_tags: dict[str, dict[str, int]]
+
+
+class _Cluster(TypedDict):
+    """One co-occurring tag pair from :meth:`TagGardenGenerator.detect_clusters`.
+
+    Total: the comprehension that builds these emits both keys for every entry.
+    """
+
+    tags: list[str]
+    count: int
+
+
 class TagGardenGenerator:
     """Generate and maintain the Tag Garden for the Creek vault.
 
@@ -233,7 +254,7 @@ class TagGardenGenerator:
         current: TagScanResult,
         *,
         previous_counts: dict[str, int] | None,
-    ) -> dict[str, object]:
+    ) -> _GrowthResult:
         """Compare current scan against previous, flagging growth and new tags.
 
         Tags with >50% growth or that are entirely new are reported.
@@ -264,7 +285,7 @@ class TagGardenGenerator:
 
         return {"new_tags": new_tags, "growing_tags": growing_tags}
 
-    def detect_clusters(self, scan: TagScanResult) -> list[dict[str, object]]:
+    def detect_clusters(self, scan: TagScanResult) -> list[_Cluster]:
         """Identify co-occurring tags via a co-occurrence matrix.
 
         Builds a matrix of how often each pair of tags appears on the
@@ -293,7 +314,7 @@ class TagGardenGenerator:
                 for tag_b in sorted_tags[i + 1 :]:
                     co_occur[(tag_a, tag_b)] += 1
 
-        clusters: list[dict[str, object]] = [
+        clusters: list[_Cluster] = [
             {"tags": [tag_a, tag_b], "count": count}
             for (tag_a, tag_b), count in sorted(
                 co_occur.items(),
@@ -528,7 +549,7 @@ class TagGardenGenerator:
         return "\n".join(lines) + "\n"
 
     @staticmethod
-    def _render_growing_tags(growth: dict[str, object]) -> str:
+    def _render_growing_tags(growth: _GrowthResult) -> str:
         """Render the Growing Tags section of the Tag Garden.
 
         Args:
@@ -538,8 +559,8 @@ class TagGardenGenerator:
             Markdown string for the Growing Tags section.
         """
         lines = ["## Growing Tags\n"]
-        new_tags: list[str] = growth.get("new_tags", [])  # type: ignore[assignment]
-        growing_tags: dict[str, dict[str, int]] = growth.get("growing_tags", {})  # type: ignore[assignment]
+        new_tags: list[str] = growth.get("new_tags", [])
+        growing_tags: dict[str, dict[str, int]] = growth.get("growing_tags", {})
 
         if not new_tags and not growing_tags:
             lines.append("*No significant growth detected.*\n")
@@ -568,7 +589,7 @@ class TagGardenGenerator:
         return "\n".join(lines) + "\n"
 
     @staticmethod
-    def _render_clusters(clusters: list[dict[str, object]]) -> str:
+    def _render_clusters(clusters: list[_Cluster]) -> str:
         """Render the Tag Clusters section of the Tag Garden.
 
         Args:
@@ -588,7 +609,7 @@ class TagGardenGenerator:
                 )
             )
             for cluster in clusters:
-                tags: list[str] = cluster["tags"]  # type: ignore[assignment]
+                tags: list[str] = cluster["tags"]
                 count = cluster["count"]
                 lines.append(f"| {tags[0]} | {tags[1]} | {count} |")
             lines.append("")

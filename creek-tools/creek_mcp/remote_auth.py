@@ -61,6 +61,7 @@ from typing import TYPE_CHECKING, Final, NoReturn
 
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
+from pydantic import AnyHttpUrl
 
 from creek_mcp.token_policy import require_min_length
 
@@ -537,7 +538,7 @@ def announce_rotation_window(verifier: ConsumerTokenVerifier) -> None:
 def remote_auth_settings() -> AuthSettings:
     """Return the :class:`AuthSettings` requiring the remote scope on every call."""
     return AuthSettings(
-        issuer_url=_ISSUER_URL,  # type: ignore[arg-type]
-        resource_server_url=_RESOURCE_URL,  # type: ignore[arg-type]
+        issuer_url=AnyHttpUrl(_ISSUER_URL),
+        resource_server_url=AnyHttpUrl(_RESOURCE_URL),
         required_scopes=[REMOTE_SCOPE],
     )

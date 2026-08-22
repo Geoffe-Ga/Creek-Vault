@@ -20,7 +20,7 @@ import hashlib
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TypedDict
 
 from pydantic import BaseModel, Field
 
@@ -176,10 +176,27 @@ def _determine_action(
     return "keep"
 
 
+# ---------------------------------------------------------------------------
+# Internal result accumulator type
+# ---------------------------------------------------------------------------
+
+
+class _FileResult(TypedDict):
+    """Per-file mutable result accumulator.
+
+    Total: both keys are populated for every file at construction, and no
+    reader uses ``.get()``, so a missing key is not a state this module can
+    reach.
+    """
+
+    reasons: list[str]
+    duplicate_of: str | None
+
+
 def _keep_newest_skip_rest(
     indices: list[int],
     files: list[StagedFile],
-    results: list[dict[str, list[str] | str | None]],
+    results: list[_FileResult],
     skip_indices: set[int],
     reason_template: str,
 ) -> None:
@@ -200,7 +217,7 @@ def _keep_newest_skip_rest(
     for idx in indices:
         if idx == newest_idx:
             continue
-        reasons: list[str] = results[idx]["reasons"]  # type: ignore[assignment]
+        reasons: list[str] = results[idx]["reasons"]
         reasons.append(
             reason_template.format(
                 filename=files[newest_idx].filename,
@@ -208,14 +225,6 @@ def _keep_newest_skip_rest(
         )
         results[idx]["duplicate_of"] = newest_path
         skip_indices.add(idx)
-
-
-# ---------------------------------------------------------------------------
-# Internal result accumulator type
-# ---------------------------------------------------------------------------
-
-_FileResult = dict[str, list[str] | str | None]
-"""Type alias for per-file mutable result dicts."""
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +333,7 @@ class GoogleDriveFilter:
         """
         for i, f in enumerate(files):
             if self._is_empty(f):
-                reasons: list[str] = results[i]["reasons"]  # type: ignore[assignment]
+                reasons: list[str] = results[i]["reasons"]
                 reasons.append("Empty or too-short document")
                 skip_indices.add(i)
 
@@ -369,7 +378,7 @@ class GoogleDriveFilter:
         for i, f in enumerate(files):
             if i in skip_indices:
                 continue
-            reasons: list[str] = results[i]["reasons"]  # type: ignore[assignment]
+            reasons: list[str] = results[i]["reasons"]
             self._check_staleness(f, reasons, flag_indices, i)
             self._check_multi_author(f, reasons, flag_indices, i)
         return flag_indices
@@ -437,7 +446,7 @@ class GoogleDriveFilter:
         """
         final: list[GoogleDriveFilterResult] = []
         for i in range(len(files)):
-            reasons: list[str] = results[i]["reasons"]  # type: ignore[assignment]
+            reasons: list[str] = results[i]["reasons"]
             dup_of = results[i]["duplicate_of"]
             action = _determine_action(i, skip_indices, flag_indices)
             final.append(
@@ -517,7 +526,7 @@ class GoogleDriveFilter:
             original_name = _strip_copy_of(f.filename)
             if original_name is None:
                 continue
-            reasons: list[str] = results[i]["reasons"]  # type: ignore[assignment]
+            reasons: list[str] = results[i]["reasons"]
             reasons.append(
                 f"'Copy of' duplicate detected: {f.filename}",
             )

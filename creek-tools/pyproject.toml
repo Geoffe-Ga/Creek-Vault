@@ -468,6 +468,15 @@ module = [
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+# faiss-cpu ships no py.typed marker and no stubs. The import is
+# function-local and optional (creek/clean/semantic_dedup.py falls back to a
+# pure-numpy path when it is absent), so the missing-stub allowance is
+# declared here with every other untyped third-party dependency rather than
+# as an inline suppression in the source (issue #853).
+module = ["faiss", "faiss.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "tests.*"
 disallow_untyped_defs = false
 
