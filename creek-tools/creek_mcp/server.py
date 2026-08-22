@@ -31,6 +31,7 @@ from creek_mcp.auth import ELEVATED_TOKEN_ENV
 from creek_mcp.policy import (
     Admission,
     CallerIdentity,
+    Transport,
     admitted_ceiling,
     effective_consumer,
 )
@@ -403,6 +404,7 @@ def _build_author_llm(vault: Path, tier: PrivacyTier | None) -> AuthorLLMClient 
 
 def build_server(
     *,
+    transport: Transport,
     vault_path: Path | None = None,
     author_llm_factory: AuthorLLMFactory | None = None,
     draft_llm_factory: DraftLLMFactory | None = None,
@@ -413,6 +415,13 @@ def build_server(
     """Construct a :class:`FastMCP` instance with all FEAT-010/011 tools.
 
     Args:
+        transport: The channel this server will be served on, from the
+            operator's ``--transport``. No default, on purpose: it reaches
+            ``creek.handshake``, which used to answer the question from a
+            module-level ``"stdio"`` literal and so told every streamable-HTTP
+            consumer it was talking over stdio (#1583). A default would let the
+            next adapter reintroduce that by omission — the same fail-closed
+            reasoning as :attr:`creek_mcp.policy.CallerIdentity.is_remote`.
         vault_path: Override vault root. Defaults to
             ``load_config().vault_path`` so the MCP surface honours the
             same configuration as the CLI.
@@ -438,7 +447,26 @@ def build_server(
             verifier accepts (no anonymous access), and remote calls are
             capped below INTIMATE. ``None`` (the default) is the local stdio
             server, unauthenticated as before.
+
+    Raises:
+        ValueError: When a ``token_verifier`` is supplied for a non-network
+            *transport*. The two are asserted separately, so they can disagree;
+            a server that authenticates remote consumers while telling them it
+            is on stdio is precisely the defect #1583 fixed, and it is refused
+            here rather than served.
     """
+    if token_verifier is not None and not transport.is_remote:
+        # A verifier is only ever wired up for the authenticated network
+        # transport, so this combination means the caller stated one thing and
+        # served another — and the handshake would then publish the local
+        # answer to a remote consumer, which is #1583 all over again. Refuse at
+        # build time rather than serve a server that misdescribes itself.
+        msg = (
+            f"token_verifier is only served on {Transport.NETWORK.value!r}; "
+            f"refusing to build a {transport.value!r} server that would tell "
+            "an authenticated consumer it is local"
+        )
+        raise ValueError(msg)
     server: FastMCP = (
         _BoundedFastMCP(
             SERVER_NAME, token_verifier=token_verifier, auth=remote_auth_settings()
@@ -466,6 +494,7 @@ def build_server(
             vault_path=vault,
             capabilities=sorted(tool.name for tool in tools),
             server_name=SERVER_NAME,
+            transport=transport,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
         )
@@ -875,8 +904,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--transport",
-        choices=("stdio", "network"),
-        default="stdio",
+        type=Transport,
+        choices=tuple(Transport),
+        default=Transport.STDIO,
         help=(
             "stdio (default) for local consumers, or network (authenticated "
             "streamable-http) for a remote consumer. Network mode requires "
@@ -1068,7 +1098,7 @@ def main(argv: list[str] | None = None) -> None:
 
     _require_strong_elevated_token(parser)
 
-    if args.transport == "network":
+    if args.transport is Transport.NETWORK:
         try:
             tokens = load_consumer_tokens()
         except ValueError as exc:
@@ -1091,12 +1121,12 @@ def main(argv: list[str] | None = None) -> None:
         # see one is open will not close it (#895). On stderr: stdout on this
         # entry point belongs to the stdio transport's JSON-RPC framing.
         announce_rotation_window(verifier)
-        server = build_server(token_verifier=verifier)
+        server = build_server(transport=args.transport, token_verifier=verifier)
         server.settings.host = args.host
         server.settings.port = args.port
         _serve_network(server, args)
     else:
-        build_server().run(transport="stdio")
+        build_server(transport=args.transport).run(transport="stdio")
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised via the entry point

@@ -62,9 +62,51 @@ to call.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Final
 
 from creek_mcp.tier_ceiling import TierCeiling
+
+
+class Transport(StrEnum):
+    """The channel a Creek MCP server was started on, named once (#1583).
+
+    This is a *process-lifetime* fact chosen by the operator at start-up —
+    ``creek-tools-mcp --transport`` — and it is deliberately not the same thing
+    as :attr:`CallerIdentity.is_remote`, which is a *per-call* fact an adapter
+    asserts about one request. The two agree in practice; they are separate
+    because their lifetimes are, and conflating them is how a value cached at
+    build time comes to describe a caller who arrived later.
+
+    It lives in this module because this module already owns the one sentence
+    that depends on it — :data:`REMOTE_ADMITTED_CEILINGS`, what a caller on the
+    far side of a network may request. Writing the transport names down a
+    second time (an argparse ``choices`` tuple here, a module constant in the
+    handshake there) is exactly how ``creek.handshake`` came to tell a
+    streamable-HTTP consumer it was talking over ``stdio``. The argument
+    parser's choices, the server it builds, and the handshake it answers with
+    all read these members now.
+    """
+
+    STDIO = "stdio"
+    NETWORK = "network"
+
+    @property
+    def is_remote(self) -> bool:
+        """Whether a caller reaching a server on this transport crossed a network.
+
+        Note what this is *not*: it is not a way for policy to sniff a caller's
+        remoteness out of ambient state. The transport is handed in by the
+        adapter that was started on it, the same way ``is_remote`` is handed to
+        :class:`CallerIdentity` — this property only spells out which of the two
+        published transports is the networked one, so no caller has to
+        rediscover it by string comparison.
+
+        Returns:
+            ``True`` for :attr:`NETWORK`, ``False`` for :attr:`STDIO`.
+        """
+        return self is Transport.NETWORK
+
 
 REMOTE_ADMITTED_CEILINGS: Final[frozenset[TierCeiling]] = frozenset(
     {TierCeiling.OPEN, TierCeiling.PERSONAL}
@@ -91,6 +133,36 @@ caller's input here — even "for debugging" — is what turns the refusal into 
 channel, so the tests pin the wording against a hard-coded literal and pin that
 it carries no ``{``, ``}`` or ``%``.
 """
+
+
+def offered_ceilings(transport: Transport) -> tuple[TierCeiling, ...]:
+    """The tier ceilings a caller on *transport* may actually request.
+
+    The negotiation half of :data:`REMOTE_ADMITTED_CEILINGS`, and its only
+    other reader. ``admitted_ceiling`` refuses an over-ceiling request once it
+    has been made; this answers the same question *before* the caller makes
+    one, so ``creek.handshake`` can publish the menu the caller will actually
+    be served rather than the four-member enum. Advertising ``intimate`` and
+    ``all`` to a network consumer that :func:`admitted_ceiling` refuses before
+    dispatch is not a courtesy — it is the contract describing a door that is
+    bolted shut.
+
+    Returned in :class:`~creek_mcp.tier_ceiling.TierCeiling` declaration order
+    (most restrictive first), not in set order, so the published list is stable
+    across processes.
+
+    Args:
+        transport: The channel the server was started on.
+
+    Returns:
+        The requestable ceilings, least- to most-permissive: every member for a
+        local ``stdio`` server, and :data:`REMOTE_ADMITTED_CEILINGS` for a
+        networked one.
+    """
+    admitted = (
+        REMOTE_ADMITTED_CEILINGS if transport.is_remote else frozenset(TierCeiling)
+    )
+    return tuple(ceiling for ceiling in TierCeiling if ceiling in admitted)
 
 
 @dataclass(frozen=True, slots=True)

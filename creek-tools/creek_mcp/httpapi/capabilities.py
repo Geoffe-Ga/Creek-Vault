@@ -69,6 +69,7 @@ from creek_mcp.httpapi import SERVER_NAME
 from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.errors import HTTP_OK, json_response
 from creek_mcp.httpapi.vault import UNREADABLE_CONFIG, configured_vault
+from creek_mcp.policy import Transport
 from creek_mcp.tools.handshake import handshake_tool, vault_available
 
 if TYPE_CHECKING:
@@ -158,6 +159,10 @@ def _negotiate(vault: Path, context: RequestContext, advertised: list[str]) -> b
             vault_path=vault,
             capabilities=advertised,
             server_name=SERVER_NAME,
+            # ``/v1`` is HTTP and nothing else: every caller that reaches this
+            # module crossed a network, so the transport is a property of the
+            # adapter rather than a runtime choice (#1583).
+            transport=Transport.NETWORK,
             privacy_tier_ceiling=context.ceiling,
             consumer=context.consumer,
         )

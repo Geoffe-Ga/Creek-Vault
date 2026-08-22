@@ -122,6 +122,7 @@ from creek.models import (
 from creek.save import SaveTarget
 from creek.surface_modes import LINK_METHODS
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
+from creek_mcp.policy import Transport
 from creek_mcp.server import build_server
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.link import link_tool
@@ -195,7 +196,7 @@ def registered_mcp_tools(vault: Path) -> frozenset[str]:
     Returns:
         Every registered tool name.
     """
-    server = build_server(vault_path=vault)
+    server = build_server(transport=Transport.STDIO, vault_path=vault)
     return frozenset(tool.name for tool in asyncio.run(server.list_tools()))
 
 
@@ -845,6 +846,7 @@ class Bench:
         for step in prepare:
             self._runner.invoke(app, [part.format(**slots) for part in step])
         server = build_server(
+            transport=Transport.STDIO,
             vault_path=vault,
             draft_llm_factory=lambda _tier: lambda _prompt: _LLM_CANARY,
             compile_llm_factory=lambda _tier: lambda _prompt: _LLM_CANARY,

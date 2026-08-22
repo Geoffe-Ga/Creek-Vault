@@ -47,6 +47,7 @@ import creek_mcp
 from creek.classify.classify_engine import ClassifySummary
 from creek.config import CreekConfig
 from creek.link.link_engine import LinkSummary
+from creek_mcp.policy import Transport
 from creek_mcp.tier_ceiling import TierCeiling
 
 if TYPE_CHECKING:
@@ -781,7 +782,7 @@ def test_build_server_binds_the_served_vault_into_its_default_llm_builder(
     monkeypatch.setattr(server_mod, tool_attr, _standin_tool)
 
     served = _vault(tmp_path, "served")
-    server = server_mod.build_server(vault_path=served)
+    server = server_mod.build_server(transport=Transport.STDIO, vault_path=served)
     asyncio.run(server.call_tool(tool_name, args))
 
     assert bound == [served], (

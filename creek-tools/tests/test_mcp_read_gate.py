@@ -168,6 +168,7 @@ from creek.classify.llm.completion import Completion
 from creek.config import CreekConfig
 from creek.generate.mining import MiningStrategy
 from creek.models import PrivacyTier
+from creek_mcp.policy import Transport
 from creek_mcp.read_gate import (
     CANONICAL_GATE_PRIMITIVES,
     GENERIC_ABOVE_CEILING_REASON,
@@ -619,6 +620,7 @@ def registered_tools(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Tool
     for sub in ("00-Creek-Meta/audit", "01-Fragments/Notes", "creek-skills"):
         (vault / sub).mkdir(parents=True, exist_ok=True)
     server = build_server(
+        transport=Transport.STDIO,
         vault_path=vault,
         draft_llm_factory=lambda tier: lambda prompt: "ignored",
     )

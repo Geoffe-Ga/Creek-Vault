@@ -483,7 +483,8 @@ def drive_sync_tool(
         consumer: The authenticated consumer id.
 
     Returns:
-        The seven counts, or a structured refusal.
+        The eight counts :func:`_sync_payload` assembles, or a structured
+        refusal.
     """
     config = _loaded_config(vault_path)
     if config is None:
