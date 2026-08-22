@@ -183,13 +183,21 @@ class TestDiscover:
     def test_returns_raw_documents(
         self, ingestor: ClaudeIngestor, sample_export_dir: Path
     ) -> None:
-        """discover() should return RawDocument instances."""
+        """discover() should return RawDocument instances.
+
+        The encoding stamp is asserted as a *usable* name rather than
+        as a member of a family list. Since #1600 it comes from
+        ``decode_bytes``, which reports the codec that actually decoded
+        the bytes — ``utf-8-sig`` for UTF-8 with or without a BOM — and
+        ``parse`` below decodes ``raw.content`` by this name with a
+        bare ``.decode()`` that raises on a wrong answer.
+        """
         docs = ingestor.discover(sample_export_dir)
         assert len(docs) > 0
         doc = docs[0]
         assert isinstance(doc.path, Path)
         assert isinstance(doc.content, bytes)
-        assert doc.detected_encoding.lower() in {"utf-8", "ascii", "windows-1252"}
+        assert doc.content.decode(doc.detected_encoding)
 
     def test_ignores_non_claude_json(
         self, ingestor: ClaudeIngestor, tmp_path: Path

@@ -2,7 +2,7 @@
 
 Handles files that are not claimed by any specialized ingestor (Markdown,
 ChatGPT, Claude, Discord).  Attempts text reading with multiple encoding
-strategies (UTF-8, UTF-16, Latin-1, chardet fallback), skips binary files,
+strategies (UTF-16 by BOM, then the shared encoding decision), skips binary files,
 and routes unclassified content to ``01-Fragments/Unsorted/`` with
 ``source.platform: "other"`` in frontmatter.
 
@@ -25,8 +25,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import chardet
-
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
@@ -34,7 +32,7 @@ from creek.ingest.base import (
     file_modified_time,
     normalize_encoding,
 )
-from creek.ingest.encoding import BINARY_CHECK_SIZE, looks_binary
+from creek.ingest.encoding import BINARY_CHECK_SIZE, decode_bytes, looks_binary
 from creek.models import SourcePlatform
 from creek.time import LA_TZ
 
@@ -79,15 +77,27 @@ def _safe_file_mtime(path: Path) -> datetime | None:
 def _try_decode(raw_bytes: bytes) -> str | None:
     """Attempt to decode raw bytes using multiple encoding strategies.
 
-    Tries encodings in order: UTF-8, UTF-16, Latin-1, then chardet
-    detection as a final fallback. Returns ``None`` only if all
-    strategies fail or the content is detected as binary.
+    UTF-16 is claimed by its BOM first, because those bytes are full of
+    nulls and would otherwise read as binary. Everything else is
+    :func:`creek.ingest.encoding.decode_bytes`, the decision every
+    ingest path now shares (#1600). Before that, this trusted
+    ``chardet`` at any confidence, which silently rewrote a cp1252 file's
+    ``£85`` to ``Ł85``.
+
+    The binary screen stays here rather than being left to
+    ``decode_bytes``, and stays *ahead* of it: ``decode_bytes`` probes
+    UTF-8 before it judges binary, so a null-riddled blob that happens
+    to be valid UTF-8 would come back as text. This path has always
+    dropped it instead, and a dropped file is the loud outcome. The
+    screen is therefore also why ``decode_bytes`` cannot raise
+    :class:`~creek.ingest.encoding.UndecodableBytesError` below — its
+    only raise sits behind the same predicate.
 
     Args:
         raw_bytes: The raw bytes to decode.
 
     Returns:
-        The decoded text string, or ``None`` if decoding fails.
+        The decoded text string, or ``None`` if the content is binary.
     """
     if not raw_bytes:
         return ""
@@ -100,18 +110,7 @@ def _try_decode(raw_bytes: bytes) -> str | None:
     if looks_binary(raw_bytes):
         return None
 
-    # Try UTF-8 first (most common encoding)
-    with suppress(UnicodeDecodeError, ValueError):
-        return raw_bytes.decode("utf-8")
-
-    # Try chardet detection before falling back to Latin-1
-    detected_encoding = chardet.detect(raw_bytes).get("encoding")
-    if detected_encoding:
-        with suppress(UnicodeDecodeError, ValueError, LookupError):
-            return raw_bytes.decode(detected_encoding)
-
-    # Latin-1 as final fallback (can decode any byte sequence)
-    return raw_bytes.decode("latin-1")
+    return decode_bytes(raw_bytes).text
 
 
 def _read_unless_binary(file_path: Path) -> bytes | None:

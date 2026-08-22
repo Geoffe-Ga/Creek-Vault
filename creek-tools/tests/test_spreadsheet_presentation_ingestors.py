@@ -8,7 +8,7 @@ import frontmatter
 import pytest
 
 from creek.ingest.base import assemble_ingested_fragment
-from creek.ingest.encoding import UndecodableBytesError
+from creek.ingest.encoding import UndecodableBytesError, decode_bytes
 from creek.ingest.presentations import (
     PRESENTATION_EXTENSIONS,
     PresentationBackend,
@@ -20,6 +20,7 @@ from creek.ingest.presentations import (
 )
 from creek.ingest.spreadsheets import (
     SPREADSHEET_EXTENSIONS,
+    UNKNOWN_ENCODING,
     OpenpyxlBackend,
     OpenpyxlUnavailableError,
     SheetData,
@@ -767,6 +768,10 @@ class TestCsvFiles:
 #: ``_parse_safe`` turns into a dropped file (#1591). Same gate, two
 #: symptoms, so they are one table rather than two tests.
 #:
+#: The bottom three rows arrived with #1600/#1601/#1607 and are about
+#: the *accept rule* rather than the gate: which below-threshold
+#: guesses are taken, and which are refused in favour of cp1252.
+#:
 #:   id                  codec      chardet verdict     was
 #:   zh-gbk              gbk        GB18030 @ 0.38      mojibake
 #:   zh-rare-lead-bytes  gbk        GB18030 @ 0.57      crash on 0x81
@@ -774,8 +779,15 @@ class TestCsvFiles:
 #:   jp-long-sjis        shift_jis  CP932   @ 0.89      correct
 #:   ko-euckr           euc-kr     CP949   @ 0.69      mojibake
 #:   cp1252-rich         cp1252     cp862   @ 0.08      correct
+#:   cp1252-degree       cp1252     Big5    @ 0.10      mojibake, unwarned
+#:   ru-cyrillic         cp1251     Win1251 @ 0.47      mojibake
+#:   gr-greek            iso8859-7  Win1253 @ 0.41      mojibake
 #:   utf8-plain          utf-8      never reaches chardet
 #:   utf8-bom            utf-8-sig  never reaches chardet
+#:
+#: The confidences orient; they are not constants and no test pins
+#: one. They move with corpus length, and four of the six quoted in
+#: the #1600/#1601 issue bodies did not reproduce at all.
 _CSV_ENCODING_MATRIX: tuple[tuple[str, str, str], ...] = (
     (
         "zh-gbk",
@@ -836,6 +848,35 @@ _CSV_ENCODING_MATRIX: tuple[tuple[str, str, str], ...] = (
         "cp1252-rich",
         "cp1252",
         "name,note\nAlice,café naïve — “quoted”\nBob,résumé \u2013 £85 €9 ©\n",
+    ),
+    (
+        # #1607's regression, and the reason a strict codec's clean
+        # decode is not on its own enough. 0xB0 0x43 ("°C") is a valid
+        # Big5 lead/trail pair, so the multi-byte exemption fired at
+        # 0.10 confidence, swallowed the C into an ideograph, and set
+        # degraded=False — not even the warning fired.
+        "cp1252-degree",
+        "cp1252",
+        "city,temp\nOslo,-5°C\nRio,32°C\n",
+    ),
+    (
+        # #1601. chardet scores this far under the gate, so before the
+        # placement/provenance rule it fell back to cp1252 and every
+        # Cyrillic cell arrived as Latin garbage. It is admitted
+        # because it proposes a writing system cp1252 cannot produce.
+        "ru-cyrillic",
+        "cp1251",
+        "имя,город,заметка\n"
+        "Иванов,Москва,Он каждое утро выходит к реке и долго смотрит на воду\n"
+        "Петрова,Казань,Она любит лес и тишину\n",
+    ),
+    (
+        # #1601, the other alphabet named in the issue.
+        "gr-greek",
+        "iso8859-7",
+        "όνομα,πόλη,σημείωση\n"
+        "Γιώργος,Αθήνα,Κάθε πρωί περπατάει δίπλα στο ποτάμι\n"
+        "Μαρία,Πάτρα,Της αρέσει το δάσος και η ησυχία\n",
     ),
     ("utf8-plain", "utf-8", "name,city\n田中,東京\nAlice,Münster\n"),
     ("utf8-bom", "utf-8-sig", "name,city\nMünster,São Paulo\n"),
@@ -912,6 +953,9 @@ class TestCsvEncodingDecisionMatrix:
             "jp-long-sjis",
             "ko-euckr",
             "cp1252-rich",
+            "cp1252-degree",
+            "ru-cyrillic",
+            "gr-greek",
             "utf8-plain",
             "utf8-bom",
         }
@@ -2196,3 +2240,110 @@ class TestSingleUnitIdentityIsUnchanged:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestTheEncodingStampReportsWhatTheFileWasReadWith:
+    """#1602: ``detected_encoding`` stopped being a guess made before the read.
+
+    ``discover`` builds every :class:`~creek.ingest.base.RawDocument`
+    with ``content=b""`` — it does not open the file at all — and used
+    to stamp every non-XLSX one ``"utf-8"``. A Shift-JIS CSV therefore
+    reported ``utf-8`` while ``decode_bytes`` was reading it as CP932
+    and throwing that answer away. The field is required on the model
+    and three other ingestors decode by it, so it cannot simply be
+    dropped: discovery now says ``"unknown"`` and ``parse`` replaces it
+    with the codec the file was actually read with.
+    """
+
+    @pytest.mark.parametrize(
+        ("codec", "corpus"),
+        [
+            ("shift_jis", "名前,都市,メモ\n田中,東京,ありがとうございます\n"),
+            (
+                "cp1251",
+                "имя,город,заметка\n"
+                "Иванов,Москва,Он каждое утро выходит к реке и долго смотрит\n"
+                "Петрова,Казань,Она любит лес и тишину\n",
+            ),
+            ("cp1252", "name,note\nAlice,café naïve — “quoted”\n"),
+            ("utf-8", "name,city\nAlice,Münster\n"),
+        ],
+        ids=["shift_jis", "cp1251", "cp1252", "utf-8"],
+    )
+    def test_parse_stamps_the_codec_the_csv_was_decoded_with(
+        self,
+        tmp_path: Path,
+        codec: str,
+        corpus: str,
+    ) -> None:
+        """After ``parse`` the stamp names a codec that decodes the file.
+
+        Args:
+            tmp_path: Per-test directory holding the CSV.
+            codec: Codec the corpus is written in.
+            corpus: Source CSV text.
+        """
+        csv_path = tmp_path / "stamped.csv"
+        raw_bytes = corpus.encode(codec)
+        csv_path.write_bytes(raw_bytes)
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+
+        raw = ingestor.discover(tmp_path)[0]
+        assert raw.detected_encoding == UNKNOWN_ENCODING, (
+            "discovery has not read the file, so it must not claim to know the encoding"
+        )
+
+        ingestor.parse(raw)
+        assert raw.detected_encoding == decode_bytes(raw_bytes).codec
+        assert raw_bytes.decode(raw.detected_encoding) == corpus, (
+            f"the stamp {raw.detected_encoding!r} does not decode the file it "
+            "describes; three ingestors decode raw bytes by this name, one of "
+            "them with a bare .decode() that raises"
+        )
+
+    def test_the_stamp_is_not_the_old_unconditional_utf8(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A Shift-JIS CSV no longer reports ``utf-8``.
+
+        This is the concrete case from #1602: the ternary in
+        ``discover`` answered ``utf-8`` for everything that was not an
+        ``.xlsx``, which for this file is simply false.
+
+        Args:
+            tmp_path: Per-test directory holding the CSV.
+        """
+        corpus = "名前,都市,メモ\n田中,東京,ありがとうございます\n"
+        (tmp_path / "jp.csv").write_bytes(corpus.encode("shift_jis"))
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+
+        raw = ingestor.discover(tmp_path)[0]
+        ingestor.parse(raw)
+
+        assert raw.detected_encoding.lower() not in {"utf-8", "utf8", "unknown"}
+
+    def test_an_xlsx_keeps_its_binary_stamp(self, tmp_path: Path) -> None:
+        """A workbook is a zip archive and has no document-level codec.
+
+        :attr:`WorkbookData.codec` is ``None`` for the XLSX path, and
+        ``parse`` must leave the discovery stamp alone rather than
+        overwrite it with something invented.
+
+        Args:
+            tmp_path: Per-test directory holding the workbook.
+        """
+        (tmp_path / "book.xlsx").write_bytes(b"not really a workbook")
+        backend = StubSpreadsheetBackend(
+            workbooks={
+                "book.xlsx": WorkbookData(
+                    sheets=(SheetData(name="Sheet1", headers=["a"], rows=[["1"]]),),
+                ),
+            },
+        )
+        ingestor = SpreadsheetIngestor(backend=backend)
+
+        raw = ingestor.discover(tmp_path)[0]
+        assert raw.detected_encoding == "binary"
+        ingestor.parse(raw)
+        assert raw.detected_encoding == "binary"

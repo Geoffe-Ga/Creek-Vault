@@ -26,11 +26,11 @@ from pathlib import Path
 from typing import Any, Final
 from zoneinfo import ZoneInfo
 
-import chardet
 from pydantic import BaseModel, ConfigDict, Field
 
 from creek._containment import assert_source_contained
 from creek.classify.tags_pass import apply_tags
+from creek.ingest.encoding import UndecodableBytesError, decode_bytes
 from creek.ingest.source_unit import compose_source_unit
 from creek.models import Fragment, FragmentLevel
 
@@ -363,8 +363,24 @@ class PartialDiscoveryError(Exception):
 def normalize_encoding(raw_bytes: bytes) -> tuple[str, str]:
     """Detect the encoding of raw bytes and convert to UTF-8 text.
 
-    Uses ``chardet`` for encoding detection. Empty input returns an
-    empty string with ``"utf-8"`` as the detected encoding.
+    The decision itself belongs to
+    :func:`creek.ingest.encoding.decode_bytes`, which every ingest path
+    shares (#1600). Before that, this trusted ``chardet`` at any
+    confidence, which rewrote a genuine cp1252 file's ``£85`` to
+    ``Ł85`` on the markdown, documents, code, chatgpt, claude and
+    substack paths at once.
+
+    Two properties of this function are contract rather than detail,
+    because ~19 call sites depend on them — several inside discovery
+    loops that guard only ``OSError``, and three ingestors that later
+    ``decode()`` by the codec name this returns:
+
+    * it never raises, so binary content comes back as ``latin-1``
+      text rather than as an exception;
+    * the codec name it reports always decodes *raw_bytes*, so a bare
+      ``raw_bytes.decode(name)`` downstream cannot fail.
+
+    Empty input returns an empty string with ``"utf-8"``.
 
     Args:
         raw_bytes: The raw bytes to detect and decode.
@@ -375,11 +391,11 @@ def normalize_encoding(raw_bytes: bytes) -> tuple[str, str]:
     if not raw_bytes:
         return "", "utf-8"
 
-    detection = chardet.detect(raw_bytes)
-    encoding = detection.get("encoding") or "utf-8"
-
-    text = raw_bytes.decode(encoding, errors="replace")
-    return text, encoding
+    try:
+        decoded = decode_bytes(raw_bytes)
+    except UndecodableBytesError:
+        return raw_bytes.decode("latin-1"), "latin-1"
+    return decoded.text, decoded.codec
 
 
 def normalize_timestamp(ts_string: str, source_tz: str | None) -> datetime:
