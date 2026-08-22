@@ -14,7 +14,11 @@ operator's edit is never written. The run reports success.
 ``sheet``/``rows``/``columns`` on its frontmatter dict; ``Fragment`` leaves
 pydantic's default ``extra="ignore"``, so all three are discarded before
 anything reaches disk. The #1305 pin recorded that drop as accepted-for-now
-and named this issue as the place to decide it.
+and named this issue as the place to decide it. Both entry points are pinned:
+``creek ingest`` writes them through the assembler, and ``creek process`` has
+its own drop — the classification stage re-wraps every ``IngestedFragment``
+and used to leave the passthrough dict behind — so the two are asserted
+against each other over one source directory.
 
 **#1482 — the summary that adds up to nothing.** ``creek ingest`` prints
 created/updated/tombed/skipped and omits ``unchanged``, so a run that writes N
@@ -42,9 +46,11 @@ import frontmatter
 import pytest
 
 from creek.cli import _run_ingest
+from creek.config import CreekConfig
 from creek.ingest import INGESTOR_REGISTRY, route_to_ingestor
 from creek.ingest.ledger import SourceLedger
 from creek.ingest.pipeline import run_ingest
+from creek.pipeline import Pipeline
 from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.upload import UPLOAD_LEDGER_SOURCE, upload_tool
 
@@ -627,6 +633,89 @@ def test_a_markdown_fragment_gains_no_dimension_keys(tmp_path: Path) -> None:
 
     _ingest_markdown(vault, source)
 
+    post = frontmatter.load(str(_fragments(vault)[0]))
+    assert {"sheet", "rows", "columns"}.isdisjoint(post.metadata)
+    source_block = post.metadata["source"]
+    assert isinstance(source_block, dict)
+    assert {"sheet", "rows", "columns"}.isdisjoint(source_block)
+
+
+def _process(vault: Path, source: Path) -> Any:
+    """Run the ``creek process`` pipeline over *source* into *vault*.
+
+    ``no_llm=True`` keeps it hermetic: without it the run reaches the LLM
+    classifier on any machine with ollama up or a provider key exported,
+    which is network egress from a test about frontmatter keys.
+
+    Args:
+        vault: Vault root to write into.
+        source: Directory of source files to process.
+
+    Returns:
+        The :class:`~creek.pipeline.PipelineResult`.
+    """
+    return Pipeline(config=CreekConfig(), no_llm=True).run(
+        source_path=source, vault_path=vault
+    )
+
+
+def test_creek_process_writes_the_dimension_keys_creek_ingest_writes(
+    tmp_path: Path,
+) -> None:
+    """The two entry points must frontmatter the same workbook the same way.
+
+    RED before the ``extra_frontmatter`` forwarding in
+    ``Pipeline._run_classification``: ``creek ingest`` wrote
+    ``sheet``/``rows``/``columns``, and ``creek process`` — over the byte-identical
+    workbook — wrote none of them. The classification stage re-wrapped each
+    ``IngestedFragment`` around its classified ``Fragment`` and dropped the
+    passthrough dict on the way, so the write stage below it forwarded ``{}``
+    every time and its forwarding was dead code.
+
+    Both surfaces read the SAME source directory, so nothing here can pass by
+    the two runs having seen different bytes; and the ingest side is asserted
+    to the literal values as well, so this cannot go green by both surfaces
+    dropping the keys together.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "book.xlsx").write_bytes(_workbook_bytes(tmp_path, _ORIGINAL_CELL))
+    ingest_vault = _vault(tmp_path, "vault-ingest")
+    process_vault = _vault(tmp_path, "vault-process")
+
+    _ingest_workbook(ingest_vault, source)
+    result = _process(process_vault, source)
+
+    assert result.errors == []
+    ingested = frontmatter.load(str(_fragments(ingest_vault)[0])).metadata
+    processed = frontmatter.load(str(_fragments(process_vault)[0])).metadata
+    assert ingested["sheet"] == "Budget"
+    assert ingested["rows"] == 1
+    assert ingested["columns"] == 2
+    for key in ("sheet", "rows", "columns"):
+        assert processed[key] == ingested[key], key
+
+
+def test_creek_process_gives_a_markdown_fragment_no_dimension_keys(
+    tmp_path: Path,
+) -> None:
+    """The presence-keying survives on the process path too.
+
+    The twin of the parity test above, and the reason that one cannot be
+    satisfied by stamping the three keys unconditionally: a journal entry
+    processed by the same pipeline must gain no dimension keys at all,
+    because its ingestor emitted none. The exact key sets are asserted so a
+    future nullable ``Fragment`` field — the ``sheet: null``-on-everything
+    trap ``PASSTHROUGH_FRONTMATTER_KEYS`` exists to avoid — fails here loudly.
+    """
+    vault = _vault(tmp_path)
+    source = tmp_path / "src"
+    source.mkdir()
+    _write_journal(source, "A processed entry with no sheets and no slides.")
+
+    result = _process(vault, source)
+
+    assert result.errors == []
     post = frontmatter.load(str(_fragments(vault)[0]))
     assert {"sheet", "rows", "columns"}.isdisjoint(post.metadata)
     source_block = post.metadata["source"]
