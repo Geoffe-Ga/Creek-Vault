@@ -734,6 +734,162 @@ class TestTemporalLinker:
             linker.find_temporal_links(fragments, window_hours=168)
         assert any("temporal" in r.message.lower() for r in caplog.records)
 
+    def test_a_texture_only_pair_does_not_outrank_a_full_classification_match(
+        self,
+    ) -> None:
+        """A long shared tag list must not buy its way to the head of the list.
+
+        Issue #1216. The texture and secondary-frequency terms were the
+        only two that scaled with the *size* of an overlap while every
+        other dimension contributed a fixed amount, so an author who tags
+        generously could push a pair sharing nothing but vocabulary above
+        a pair that genuinely matches on primary frequency, wavelength
+        phase and mode. ``find_temporal_links`` sorts by score, so that is
+        not a rounding detail — it is which link an operator reads first.
+
+        The two pairs are placed 100 hours apart with a 24-hour window so
+        the only cross-source pairs in scope are the intended ones.
+        """
+        now = datetime.now()
+        later = now + timedelta(hours=100)
+        linker = TemporalLinker()
+        texture = [f"tag-{index:02d}" for index in range(40)]
+        fragments = [
+            _make_fragment(
+                "texture-only-a",
+                platform=SourcePlatform.CLAUDE,
+                created=now,
+                emotional_texture=texture,
+            ),
+            _make_fragment(
+                "texture-only-b",
+                platform=SourcePlatform.DISCORD,
+                created=now,
+                emotional_texture=list(texture),
+            ),
+            _make_fragment(
+                "classified-a",
+                platform=SourcePlatform.CLAUDE,
+                created=later,
+                primary_freq=Frequency.F3,
+                phase=Phase.RISING,
+                mode=Mode.EXPRESS,
+            ),
+            _make_fragment(
+                "classified-b",
+                platform=SourcePlatform.DISCORD,
+                created=later,
+                primary_freq=Frequency.F3,
+                phase=Phase.RISING,
+                mode=Mode.EXPRESS,
+            ),
+        ]
+
+        links = linker.find_temporal_links(fragments, window_hours=24)
+
+        expected_pairs = 2
+        assert len(links) == expected_pairs, (
+            f"expected exactly the two intended cross-source pairs: {links!r}"
+        )
+        top_dimensions = set(links[0].shared_dimensions)
+        assert "primary_frequency" in top_dimensions, (
+            "a pair sharing 40 emotional_texture tags and nothing else "
+            "outranked a pair matching on primary frequency, phase and mode; "
+            "the per-tag term is unbounded (#1216). "
+            f"ranked: {[(lnk.overlap_score, lnk.shared_dimensions) for lnk in links]!r}"
+        )
+        assert "emotional_texture" not in top_dimensions
+
+    def test_the_shared_texture_term_stops_growing_past_the_ceiling(self) -> None:
+        """Beyond the ceiling, extra shared tags add nothing to the score.
+
+        Issue #1216. The ceiling matches ``_MAX_TEXTURES`` in
+        ``creek/classify/llm/parsing.py`` — the number of texture tags the
+        classifier is allowed to emit — so a classified pair can still
+        reach the term's maximum, and only hand-authored lists longer than
+        the classifier could ever produce are bounded.
+        """
+        now = datetime.now()
+        linker = TemporalLinker()
+
+        def _score(shared: int) -> float:
+            """Link one cross-source pair sharing ``shared`` texture tags."""
+            texture = [f"tag-{index:02d}" for index in range(shared)]
+            links = linker.find_temporal_links(
+                [
+                    _make_fragment(
+                        "A",
+                        platform=SourcePlatform.CLAUDE,
+                        created=now,
+                        emotional_texture=texture,
+                    ),
+                    _make_fragment(
+                        "B",
+                        platform=SourcePlatform.DISCORD,
+                        created=now,
+                        emotional_texture=list(texture),
+                    ),
+                ],
+                window_hours=168,
+            )
+            assert len(links) == 1
+            return links[0].overlap_score
+
+        # +0.5 (five shared textures, the ceiling) + 0.2 (different source)
+        at_ceiling = 0.7
+        assert _score(5) == at_ceiling
+        assert _score(10) == at_ceiling, (
+            "ten shared texture tags scored above the five-tag ceiling (#1216)"
+        )
+        assert _score(40) == at_ceiling, (
+            "forty shared texture tags scored above the five-tag ceiling (#1216)"
+        )
+
+    def test_the_shared_secondary_frequency_term_stops_growing_past_the_ceiling(
+        self,
+    ) -> None:
+        """The secondary-frequency term is bounded on the same ceiling.
+
+        Issue #1216. It has the identical unbounded shape as the texture
+        term — ``+0.1`` per shared member, with ten members available — so
+        a pair sharing every secondary frequency and nothing else scored
+        1.0 on that dimension alone, outranking every fixed-weight
+        dimension combined.
+        """
+        now = datetime.now()
+        linker = TemporalLinker()
+        every_frequency = [freq for freq in Frequency if freq != Frequency.UNCLASSIFIED]
+
+        def _score(shared: int) -> float:
+            """Link one cross-source pair sharing ``shared`` secondaries."""
+            secondaries = every_frequency[:shared]
+            links = linker.find_temporal_links(
+                [
+                    _make_fragment(
+                        "A",
+                        platform=SourcePlatform.CLAUDE,
+                        created=now,
+                        secondary_freqs=secondaries,
+                    ),
+                    _make_fragment(
+                        "B",
+                        platform=SourcePlatform.DISCORD,
+                        created=now,
+                        secondary_freqs=list(secondaries),
+                    ),
+                ],
+                window_hours=168,
+            )
+            assert len(links) == 1
+            return links[0].overlap_score
+
+        # +0.5 (five shared secondaries, the ceiling) + 0.2 (different source)
+        at_ceiling = 0.7
+        assert _score(5) == at_ceiling
+        assert _score(len(every_frequency)) == at_ceiling, (
+            "sharing all ten secondary frequencies scored above the ceiling (#1216)"
+        )
+
 
 # ---- ThreadDetector Tests ----
 

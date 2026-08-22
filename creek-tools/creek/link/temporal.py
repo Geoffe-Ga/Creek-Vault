@@ -27,6 +27,28 @@ logger = logging.getLogger(__name__)
 
 _UNCLASSIFIED = "unclassified"
 
+# How many members of a shared *set* dimension -- emotional texture, secondary
+# frequency -- can still earn their +0.1 (issue #1216).
+#
+# Those two are the only terms that scale with the size of an overlap; every
+# other dimension contributes a fixed amount. Unbounded, they let a generously
+# tagged pair sharing nothing else outscore a pair that genuinely matches on
+# primary frequency, phase and mode, and ``find_temporal_links`` sorts by
+# score, so that decides which link an operator reads first.
+#
+# Five is deliberately the same ceiling as ``_MAX_TEXTURES`` in
+# ``creek/classify/llm/parsing.py`` -- the number of texture tags the
+# classifier may emit. A classifier-produced pair can therefore still reach
+# the term's maximum, and only hand-authored lists longer than the pipeline
+# could ever generate are bounded. Kept as a local constant rather than an
+# import: taking one integer from a classify internal would couple the linker
+# to that package for nothing.
+#
+# The *total* is deliberately not clamped. Bounding each dimension keeps one
+# of them from dominating; clamping the sum would flatten the genuine ranking
+# distinctions the sort exists to express.
+_MAX_SHARED_DIMENSION_TERMS = 5
+
 
 class TemporalLink(BaseModel):
     """A scored temporal proximity link between two fragments.
@@ -58,11 +80,17 @@ def _score_pair(frag_a: Fragment, frag_b: Fragment) -> tuple[float, list[str]]:
 
     Scoring breakdown:
     - Same primary frequency (non-unclassified): +0.3
-    - Each shared secondary frequency: +0.1
+    - Each shared secondary frequency: +0.1, up to
+      ``_MAX_SHARED_DIMENSION_TERMS`` of them
     - Same wavelength phase (non-unclassified): +0.2
     - Same mode (non-unclassified): +0.1
-    - Each shared emotional_texture tag: +0.1
+    - Each shared emotional_texture tag: +0.1, up to
+      ``_MAX_SHARED_DIMENSION_TERMS`` of them
     - Different source platforms: +0.2
+
+    The two per-member terms are capped so neither can dominate the fixed
+    weight of an actual classification match (issue #1216); see that
+    constant for why the total is left unclamped.
 
     Args:
         frag_a: First fragment.
@@ -86,7 +114,7 @@ def _score_pair(frag_a: Fragment, frag_b: Fragment) -> tuple[float, list[str]]:
     sec_b = set(frag_b.frequency.secondary)
     shared_sec = sec_a & sec_b
     if shared_sec:
-        score += 0.1 * len(shared_sec)
+        score += 0.1 * min(len(shared_sec), _MAX_SHARED_DIMENSION_TERMS)
         dimensions.append("secondary_frequency")
 
     # Same wavelength phase
@@ -108,7 +136,7 @@ def _score_pair(frag_a: Fragment, frag_b: Fragment) -> tuple[float, list[str]]:
     tex_b = set(frag_b.emotional_texture)
     shared_tex = tex_a & tex_b
     if shared_tex:
-        score += 0.1 * len(shared_tex)
+        score += 0.1 * min(len(shared_tex), _MAX_SHARED_DIMENSION_TERMS)
         dimensions.append("emotional_texture")
 
     # Different source platforms bonus

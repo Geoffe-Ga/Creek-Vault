@@ -17,6 +17,9 @@ import pytest
 from creek.classify.privacy_filter import PrivacyTierOverride
 from creek.generate import decisions as decisions_mod
 from creek.generate.decisions import (
+    _ACTIVE_STATUSES,
+    _DECISION_FREQUENCY_PAIRS,
+    _VALID_PHASES,
     DECISION_KEYWORDS,
     DecisionDetector,
     DecisionsReport,
@@ -27,6 +30,7 @@ from creek.generate.decisions import (
 from creek.models import (
     Confidence,
     DecisionCandidate,
+    DecisionStatus,
     Fragment,
     FragmentSource,
     Frequency,
@@ -710,6 +714,84 @@ class TestUpdateDecisionPhase:
         assert any(
             frontmatter.load(str(f))["id"] == "decision-arch0001" for f in active_files
         )
+
+    def test_a_status_member_round_trips_through_frontmatter(
+        self,
+        detector: DecisionDetector,
+        vault_path: Path,
+        active_decision_path: Path,
+    ) -> None:
+        """A ``DecisionStatus`` member must serialise as its plain value.
+
+        Issue #991. ``_VALID_PHASES`` holds ``DecisionStatus`` members, so a
+        member passes the validity guard, is written straight into
+        ``post["status"]``, and only then reaches ``frontmatter.dumps`` --
+        where PyYAML has no representer for the enum and raises
+        ``RepresenterError``. The guard accepting a value the writer cannot
+        write is what makes this a crash rather than a rejection, so the
+        assertion is on the written bytes, not merely on not raising.
+        """
+        detector.update_decision_phase(
+            "decision-test0001",
+            DecisionStatus.ENACTED,
+            vault_path,
+        )
+
+        archive_dir = vault_path / "08-Decisions" / "Archive"
+        archive_files = list(archive_dir.glob("*.md"))
+        assert len(archive_files) == 1
+        written = archive_files[0].read_text(encoding="utf-8")
+        assert "!!python/object/apply" not in written, (
+            f"the enum was serialised as a Python object tag: {written!r}"
+        )
+        post = frontmatter.load(str(archive_files[0]))
+        assert post["status"] == "enacted"
+        assert type(post["status"]) is str, (
+            "status round-tripped as something other than a plain string: "
+            f"{type(post['status'])!r}"
+        )
+
+    def test_the_valid_phase_sets_hold_the_strings_they_are_annotated_to_hold(
+        self,
+    ) -> None:
+        """``frozenset[str]`` must mean strings, not ``StrEnum`` members.
+
+        Issue #991. Both sets were built from ``DecisionStatus`` members
+        while annotated ``frozenset[str]``. ``StrEnum`` comparison hides
+        that at every membership test, so the annotation lie was invisible
+        until a member survived the guard and reached a YAML serialiser.
+        ``type(...) is str`` is deliberate -- ``isinstance`` is satisfied by
+        a ``StrEnum`` member and would leave this test unable to fail.
+        """
+        for name, members in (
+            ("_ACTIVE_STATUSES", _ACTIVE_STATUSES),
+            ("_VALID_PHASES", _VALID_PHASES),
+        ):
+            assert members, f"{name} is empty, so the loop below asserts nothing"
+            for member in members:
+                assert type(member) is str, (
+                    f"{name} is annotated frozenset[str] but holds "
+                    f"{type(member)!r}: {member!r}"
+                )
+
+    def test_the_decision_frequency_pairs_hold_the_strings_they_promise(self) -> None:
+        """``frozenset[tuple[str, str]]`` must likewise mean strings.
+
+        Issue #991. This one has no crash path -- it is only ever compared
+        against a set of ``str(...)``-converted frequencies, never
+        serialised -- so this is an annotation-honesty lock, not a bug fix.
+        It is pinned anyway because the next reader has no way to tell the
+        harmless case from the crashing one by inspection.
+        """
+        pairs = _DECISION_FREQUENCY_PAIRS
+        assert pairs, "_DECISION_FREQUENCY_PAIRS is empty"
+        for pair in pairs:
+            for member in pair:
+                assert type(member) is str, (
+                    "_DECISION_FREQUENCY_PAIRS is annotated "
+                    f"frozenset[tuple[str, str]] but holds {type(member)!r}: "
+                    f"{member!r}"
+                )
 
 
 # ---- Issue #1334: colliding filenames destroy notes and oscillate forever ----

@@ -58,31 +58,41 @@ DECISION_KEYWORDS: tuple[str, ...] = (
 )
 """Case-insensitive keywords that signal decision-relevant content."""
 
+# All three sets below are built from ``.value`` rather than from the enum
+# members themselves (issue #991). ``StrEnum`` members compare equal to their
+# values, so a set of members satisfies every membership test a set of strings
+# would -- which is exactly why the ``frozenset[str]`` annotations went
+# unchallenged, and why the discrepancy only surfaced once a member survived
+# ``_VALID_PHASES``' guard and reached ``frontmatter.dumps``, where PyYAML has
+# no representer for it and raises. Holding the values makes the annotations
+# true and keeps a member from being smuggled through a set that claims to
+# contain only plain strings.
+
 # Frequency pairs that indicate active deliberation when combined
 # with explicit praxis potential and exploring confidence.
 _DECISION_FREQUENCY_PAIRS: frozenset[tuple[str, str]] = frozenset(
     {
-        (Frequency.F1, Frequency.F4),
-        (Frequency.F1, Frequency.F5),
+        (Frequency.F1.value, Frequency.F4.value),
+        (Frequency.F1.value, Frequency.F5.value),
     },
 )
 
 # Statuses that map to the Active/ folder; all others go to Archive/.
 _ACTIVE_STATUSES: frozenset[str] = frozenset(
     {
-        DecisionStatus.SENSING,
-        DecisionStatus.DELIBERATING,
-        DecisionStatus.COMMITTING,
+        DecisionStatus.SENSING.value,
+        DecisionStatus.DELIBERATING.value,
+        DecisionStatus.COMMITTING.value,
     },
 )
 
 _VALID_PHASES: frozenset[str] = frozenset(
     {
-        DecisionStatus.SENSING,
-        DecisionStatus.DELIBERATING,
-        DecisionStatus.COMMITTING,
-        DecisionStatus.ENACTED,
-        DecisionStatus.REFLECTING,
+        DecisionStatus.SENSING.value,
+        DecisionStatus.DELIBERATING.value,
+        DecisionStatus.COMMITTING.value,
+        DecisionStatus.ENACTED.value,
+        DecisionStatus.REFLECTING.value,
     },
 )
 
@@ -399,7 +409,7 @@ class DecisionDetector:
     def update_decision_phase(
         self,
         decision_id: str,
-        new_phase: str,
+        new_phase: DecisionStatus | str,
         vault_path: Path,
     ) -> Path:
         """Update a decision's phase and move between Active/Archive folders.
@@ -408,9 +418,19 @@ class DecisionDetector:
         ``08-Decisions/Active/``. Completed statuses (enacted, reflecting)
         live in ``08-Decisions/Archive/``.
 
+        A ``DecisionStatus`` member is accepted as well as its value and is
+        narrowed to that value on the way in (issue #991). Callers naturally
+        reach for the member, and the validity guard has always accepted one
+        -- ``StrEnum`` compares equal to its value -- but the member itself
+        has no PyYAML representer, so writing it unconverted raised
+        ``RepresenterError`` from ``frontmatter.dumps`` rather than producing
+        a note. Converting once, here at the boundary, is what keeps the
+        vault free of enum objects.
+
         Args:
             decision_id: The ID of the decision to update.
-            new_phase: The new phase string (must be a valid DecisionStatus).
+            new_phase: The new phase, as a ``DecisionStatus`` member or as
+                the equivalent string.
             vault_path: Path to the root of the Obsidian vault.
 
         Returns:
@@ -419,7 +439,8 @@ class DecisionDetector:
         Raises:
             ValueError: If the decision ID is not found or the phase is invalid.
         """
-        if new_phase not in _VALID_PHASES:
+        phase = str(new_phase)
+        if phase not in _VALID_PHASES:
             msg = f"Invalid decision phase: {new_phase!r}"
             raise ValueError(msg)
 
@@ -431,11 +452,11 @@ class DecisionDetector:
 
         # Update frontmatter
         post = load_post_or_raise(source_path)
-        post["status"] = new_phase
+        post["status"] = phase
         source_path.write_text(frontmatter.dumps(post), encoding="utf-8")
 
         # Determine correct folder
-        target_subfolder = "Active" if new_phase in _ACTIVE_STATUSES else "Archive"
+        target_subfolder = "Active" if phase in _ACTIVE_STATUSES else "Archive"
         target_dir = decisions_dir / target_subfolder
         target_dir.mkdir(parents=True, exist_ok=True)
 

@@ -31,7 +31,9 @@ inline.
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from typing import TYPE_CHECKING
 
 from tests.shell_command_support import (
@@ -548,3 +550,151 @@ def test_gate_ruff_invocations_do_not_autofix() -> None:
             f"a gate ruff invocation autofixes with {mutating!r}, so it can "
             f"never fail: {line!r}"
         )
+
+
+# --------------------------------------------------------------------------
+# Issue #1189: lint.sh's failure path.
+#
+# ``set -euo pipefail`` (lint.sh:5) kills the script at the bare ``ruff
+# check`` line, so the ``EXIT_CODE=$?`` capture and the ``if [ $EXIT_CODE
+# -eq 0 ]`` report that followed it were unreachable: the gate exited
+# non-zero, correctly, but never said why. The tests below pin the three
+# properties any fix must hold simultaneously -- the announcement, ruff's
+# own exit code, and the ruff lines staying visible to the parser above.
+# --------------------------------------------------------------------------
+
+_LINT_FIXTURE_CONFIG = '[lint]\nselect = ["F"]\n'
+# F401: imported and never used. Rejected by ruff with exit 1.
+_LINT_FIXTURE_VIOLATION = "import os\n"
+# Not parseable as TOML at all, which ruff reports as exit 2 rather than 1.
+_LINT_FIXTURE_BROKEN_CONFIG = "this is not = valid toml [[[\n"
+
+_LINT_FAILURE_MESSAGE = "✗ Linting checks failed"
+
+
+def _lint_fixture_tree(tmp_path: Path, *, config: str, source: str) -> Path:
+    """Build a throwaway project tree whose ``scripts/`` holds the real lint.sh.
+
+    ``scripts/lint.sh`` is exposed as a *symlink*, so the file that executes
+    is byte-identical to the one this repository ships; a copy could drift.
+    ``lint.sh`` derives ``PROJECT_ROOT`` from the parent of its own
+    directory, so the symlink makes ``tmp_path`` the project root and ruff
+    runs over the fixture rather than over this repository.
+
+    Args:
+        tmp_path: An empty directory to use as the project root.
+        config: Contents of the fixture's ``ruff.toml``, which anchors
+            ruff's config discovery inside the tree so no repository
+            setting can change what the fixture means.
+        source: Contents of the single Python module in the tree.
+
+    Returns:
+        The fixture project root.
+    """
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "lint.sh").symlink_to(SCRIPTS_DIR / "lint.sh")
+    (tmp_path / "ruff.toml").write_text(config, encoding="utf-8")
+    (tmp_path / "sample.py").write_text(source, encoding="utf-8")
+    return tmp_path
+
+
+def _run_lint_sh(root: Path) -> subprocess.CompletedProcess[str]:
+    """Run the fixture tree's ``scripts/lint.sh --check``.
+
+    Args:
+        root: A project root built by :func:`_lint_fixture_tree`.
+
+    Returns:
+        The completed process, with stdout and stderr captured separately
+        so the failure announcement can be located on the stream the
+        script is supposed to write it to.
+    """
+    env = dict(os.environ)
+    env.pop("RUFF_OUTPUT_FORMAT", None)
+    # Keeps the fixture from touching the developer's real .ruff_cache.
+    env["RUFF_CACHE_DIR"] = str(root / ".ruff_cache")
+    return subprocess.run(
+        ["bash", str(root / "scripts" / "lint.sh"), "--check"],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+
+def test_lint_gate_announces_the_failure_it_exits_on(tmp_path: Path) -> None:
+    """A rejected tree must produce the failure message, not a silent exit.
+
+    ``check-all.sh`` runs eleven gates in sequence; one of them exiting
+    non-zero with no line naming itself leaves the operator reading raw
+    ruff output to work out which gate spoke. The message existed in the
+    script and was unreachable, which is indistinguishable from absent.
+    """
+    root = _lint_fixture_tree(
+        tmp_path,
+        config=_LINT_FIXTURE_CONFIG,
+        source=_LINT_FIXTURE_VIOLATION,
+    )
+
+    result = _run_lint_sh(root)
+
+    assert result.returncode != 0, (
+        "the fixture premise never held: scripts/lint.sh cleared a tree "
+        f"carrying an unused import.\nstdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+    assert _LINT_FAILURE_MESSAGE in result.stderr, (
+        "scripts/lint.sh rejected the tree without announcing that it was "
+        "the linting gate that failed; the message is unreachable under "
+        f"`set -e` (#1189).\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+
+def test_lint_gate_preserves_ruffs_error_exit_code(tmp_path: Path) -> None:
+    """``2`` (error running checks) must not collapse into ``1`` (violations).
+
+    ``lint.sh --help`` documents three exit codes, and the difference
+    between them is operationally real: ``1`` means fix your code, ``2``
+    means the linter never ran. Any failure path that hard-codes ``exit 1``
+    -- as the dead branch did, and as an ``if ruff check …; then … else
+    exit 1; fi`` restructure would -- silently breaks that contract.
+    """
+    root = _lint_fixture_tree(
+        tmp_path,
+        config=_LINT_FIXTURE_BROKEN_CONFIG,
+        source=_LINT_FIXTURE_VIOLATION,
+    )
+
+    result = _run_lint_sh(root)
+
+    ruff_error_exit = 2
+    assert result.returncode == ruff_error_exit, (
+        "scripts/lint.sh must report ruff's own exit 2 ('Error running "
+        "checks', per its --help) rather than flattening every failure to "
+        f"1.\nexit={result.returncode}\nstdout:\n{result.stdout}\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
+def test_lint_sh_ruff_calls_stay_visible_to_the_parity_parser() -> None:
+    """Both ruff invocations must stay bare commands inside the mode branch.
+
+    The parser above finds ruff lines with ``^ruff\\s`` against stripped,
+    non-comment lines, and finds the mode branch with ``^if \\$FIX; then$``.
+    Moving either invocation into an ``if`` *condition* -- the shape the
+    obvious rewrite of the dead branch reaches for -- makes both lines
+    invisible to it, and the cache-freedom and no-autofix gates then stop
+    seeing ``lint.sh`` at all while still passing. That is a gate going
+    blind, so it is locked here explicitly rather than left implied.
+    """
+    assert _mode_branch_ruff_lines(SCRIPTS_DIR / "lint.sh") == {
+        "check": ["ruff check . --no-cache"],
+        "fix": ["ruff check . --fix --no-cache"],
+    }, (
+        "the parity parser can no longer see lint.sh's ruff invocations, so "
+        "the --no-cache and no-autofix gates above now assert over an empty "
+        f"set: {_mode_branch_ruff_lines(SCRIPTS_DIR / 'lint.sh')!r}"
+    )

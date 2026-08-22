@@ -1,5 +1,6 @@
 """Tests for creek.config module — configuration loader with Pydantic Settings."""
 
+import itertools
 import logging
 import warnings
 from pathlib import Path
@@ -988,6 +989,202 @@ class TestVoiceConfigRoundtrip:
             config.ai_style.voice_distance_target
             <= config.ai_style.voice_distance_upper
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #1412: the voice-audience authority maps took any float at all
+# ---------------------------------------------------------------------------
+
+_AUTHORITY_MAP_KEYS: tuple[tuple[str, str], ...] = (
+    ("privacy_tier_authority", "open"),
+    ("representativeness_authority", "self"),
+    ("platform_authority", "substack"),
+    ("audience_authority", "audience-facing"),
+)
+"""Each unvalidated authority map, paired with a real key of that map."""
+
+# ``.nan`` / ``.inf`` are how these reach a vault: YAML spells them, so an
+# operator config carries them without anything looking unusual.
+_REJECTED_AUTHORITIES: tuple[tuple[str, float], ...] = (
+    ("nan", float("nan")),
+    ("inf", float("inf")),
+    ("-inf", float("-inf")),
+    ("negative", -1.0),
+)
+"""Authority values a ranking multiplier must never be handed."""
+
+
+class TestVoiceAudienceAuthorityValues:
+    """The four authority maps must refuse values ranking cannot order.
+
+    Issue #1412. ``VoiceAudienceWeightingConfig``'s four maps were bare
+    ``dict[str, float]``, so a vault's ``creek_config.yaml`` could set any
+    float. Two kinds are not merely odd, they break the exemplar ranking
+    at ``creek/generate/voice.py`` in different ways: a non-finite
+    authority destroys the total order the ``sorted`` key depends on, so
+    the chosen exemplars vary with input order; a negative one is
+    deterministic but inverts rank, promoting exactly the fragments the
+    weighting exists to demote.
+
+    This is robustness, not a privacy control: admission is gated by
+    ``within_ceiling`` *before* ranking, so an authority value can only
+    reorder an already-admitted set, never widen it.
+    """
+
+    @pytest.mark.parametrize(("field_name", "key"), _AUTHORITY_MAP_KEYS)
+    @pytest.mark.parametrize(("label", "value"), _REJECTED_AUTHORITIES)
+    def test_an_unusable_authority_is_refused_at_load(
+        self,
+        tmp_path: Path,
+        field_name: str,
+        key: str,
+        label: str,
+        value: float,
+    ) -> None:
+        """Every map rejects NaN, both infinities, and negatives.
+
+        Driven through ``load_config`` on a real YAML file rather than
+        through the model constructor, because the operator's vault config
+        is the path these values actually arrive by.
+
+        Args:
+            tmp_path: Directory for the throwaway vault config.
+            field_name: The authority map under test.
+            key: A real key of that map, so the value is reachable.
+            label: Human-readable name of the rejected value.
+            value: The value the map must refuse.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(
+            yaml.safe_dump(
+                {"voice_audience_weighting": {field_name: {key: value}}},
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValidationError) as excinfo:
+            load_config(config_file)
+
+        message = str(excinfo.value)
+        assert key in message, (
+            f"the {label} rejection for {field_name} does not name the "
+            f"offending key {key!r}, so an operator cannot find it: {message}"
+        )
+
+    def test_the_rejected_value_table_is_not_empty(self) -> None:
+        """The parametrised table above must actually carry cases.
+
+        A parametrise list that empties out produces zero tests and reads
+        as a fast pass, which is how a security- or robustness-shaped gate
+        silently stops gating.
+        """
+        expected_maps = 4
+        expected_values = 4
+        assert len(_AUTHORITY_MAP_KEYS) == expected_maps
+        assert len(_REJECTED_AUTHORITIES) == expected_values
+
+    @pytest.mark.parametrize(("field_name", "key"), _AUTHORITY_MAP_KEYS)
+    def test_a_zero_authority_is_still_legal(
+        self,
+        field_name: str,
+        key: str,
+    ) -> None:
+        """Zero is a designed value, not an edge case to be validated away.
+
+        ``creek/generate/voice.py`` documents that keyless or
+        undeclared-tier content deliberately scores ``0.0`` via the
+        ``intimate`` authority and warns against carving an exception
+        there, and ``_default_privacy_tier_authority`` ships
+        ``intimate: 0.0``. A validator that rejected ``<= 0.0`` instead of
+        ``< 0.0`` would break that design while looking stricter.
+
+        Args:
+            field_name: The authority map under test.
+            key: A real key of that map.
+        """
+        config = VoiceAudienceWeightingConfig(**{field_name: {key: 0.0}})
+
+        assert getattr(config, field_name)[key] == 0.0
+
+    def test_the_shipped_defaults_survive_their_own_validator(self) -> None:
+        """The defaults must not be rejected by the rule added for #1412.
+
+        ``_default_privacy_tier_authority`` ships a ``0.0``, so a validator
+        written a hair too strictly would reject the values this package
+        itself ships.
+
+        Pydantic does not run field validators over defaults unless
+        ``validate_default`` is set, so simply constructing the model would
+        never exercise the rule -- the assertion would hold no matter what
+        the validator said. The defaults are therefore read off a default
+        instance and then fed back in *explicitly*, which is the only way
+        this test can see the validator at all.
+        """
+        defaults = VoiceAudienceWeightingConfig()
+        shipped = {
+            field_name: getattr(defaults, field_name)
+            for field_name, _ in _AUTHORITY_MAP_KEYS
+        }
+        assert shipped["privacy_tier_authority"]["intimate"] == 0.0, (
+            "the 0.0 this test exists to protect is no longer in the "
+            f"defaults: {shipped['privacy_tier_authority']!r}"
+        )
+
+        revalidated = VoiceAudienceWeightingConfig(**shipped)
+
+        assert all(
+            value >= 0.0
+            for field_name, _ in _AUTHORITY_MAP_KEYS
+            for value in getattr(revalidated, field_name).values()
+        )
+
+    def test_a_nan_authority_cannot_reach_the_exemplar_ranking(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The premise, then the guarantee: NaN is unorderable, so it is refused.
+
+        The first half establishes that a NaN score genuinely destroys the
+        ``sorted(..., key=lambda f: (-score(f), f.id))`` total order that
+        ``rank_exemplars`` relies on -- the same four fragments yield
+        different top-two sets depending only on the order they arrive in.
+        The second half is what makes that unreachable: the config that
+        would have supplied the NaN never loads.
+
+        Without the first half this would just be another "invalid input
+        raises" test; the point of the issue is *why* it has to.
+
+        Args:
+            tmp_path: Directory for the throwaway vault config.
+        """
+        nan = float("nan")
+        scores = {"a": nan, "b": 3.0, "c": 2.0, "d": 1.0}
+        top_twos = {
+            tuple(
+                sorted(order, key=lambda fid: (-scores[fid], fid))[:2],
+            )
+            for order in itertools.permutations(scores)
+        }
+        assert len(top_twos) > 1, (
+            "the premise no longer holds: a NaN score no longer makes the "
+            f"exemplar sort order-dependent, so this test's reason is stale: "
+            f"{top_twos!r}"
+        )
+
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(
+            yaml.safe_dump(
+                {
+                    "voice_audience_weighting": {
+                        "platform_authority": {"substack": nan},
+                    },
+                },
+            ),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValidationError):
+            load_config(config_file)
 
 
 # ---------------------------------------------------------------------------
