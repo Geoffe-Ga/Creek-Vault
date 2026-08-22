@@ -78,6 +78,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.9",
     "0.8",
     "0.7",
     "0.6",
@@ -211,7 +212,7 @@ class WireTierCeiling(StrEnum):
 
 
 class Capability(StrEnum):
-    """The six capabilities ``/v1`` publishes.
+    """The seven capabilities ``/v1`` publishes.
 
     The list was identical for every minor in
     :data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3
@@ -244,6 +245,23 @@ class Capability(StrEnum):
             **It does not include authorisation.** No route begins, completes
             or carries an OAuth flow; the credential is minted locally by
             ``creek gdrive --download`` and never leaves the host.
+        PIPELINE: Whole-vault classification and linking — the two passes that
+            turn ingested bytes into a *usable* corpus. Since contract 0.10
+            (#1570). Two routes and one capability, for the
+            ``drive-connector`` reason: a consumer cannot usefully negotiate
+            "may I classify" apart from "may I link", because a classified
+            corpus with no resonances is as inert as an unclassified one, and
+            a server advertising half the pipeline would be advertising a
+            vault it cannot finish.
+
+            **It is the tightening half of the surface, not a widening one.**
+            :data:`creek_mcp.tier_ceiling._TIER_RANK` admits ``unclassified``
+            at ceiling ``personal``, so a network-seeded corpus is *already*
+            readable by a remote consumer; classification is what can move a
+            fragment up to ``intimate`` and out of that reach. Neither
+            response carries a fragment id, a path or a byte of prose, which
+            is what makes running the whole vault under a remote ceiling
+            disclose nothing.
     """
 
     CAPABILITIES = "capabilities"
@@ -252,6 +270,7 @@ class Capability(StrEnum):
     WHEEL = "wheel"
     UPLOAD = "upload"
     DRIVE_CONNECTOR = "drive-connector"
+    PIPELINE = "pipeline"
 
 
 _FOUNDING_MINOR: Final[str] = "0.2"
@@ -273,6 +292,16 @@ A literal for the same reason :data:`_UPLOAD_MINOR` is one: written as
 :data:`CONTRACT_MINOR` it would follow the next bump forward and stop
 advertising the capability to the very clients pinned to the minor that
 introduced it.
+"""
+
+_PIPELINE_MINOR: Final[str] = "0.10"
+"""The minor ``pipeline`` was published at (#1570).
+
+A literal for the same reason :data:`_UPLOAD_MINOR` is one. It is also the
+first double-digit minor this contract has had, which is why
+:func:`minor_at_least` compares componentwise as integers: a string compare
+would sort ``"0.10"`` below ``"0.8"`` and hide the capability from precisely
+the clients new enough to negotiate it.
 """
 
 RELATED_FIELDS_SINCE_MINOR: Final[str] = "0.9"
@@ -298,6 +327,7 @@ CAPABILITY_SINCE_MINOR: Final[dict[Capability, str]] = {
     Capability.WHEEL: _FOUNDING_MINOR,
     Capability.UPLOAD: _UPLOAD_MINOR,
     Capability.DRIVE_CONNECTOR: _DRIVE_CONNECTOR_MINOR,
+    Capability.PIPELINE: _PIPELINE_MINOR,
 }
 """The contract minor each capability was first published at.
 
@@ -1264,6 +1294,213 @@ class DriveDisconnectResponse(_WireModel):
     remote_revoked: bool = Field(description="Google confirmed the revocation.")
 
 
+class ClassificationMethod(StrEnum):
+    """The classification methods ``POST /v1/classifications`` serves.
+
+    One member, and the single member is the point. ``creek classify`` also
+    accepts ``llm``, and it is **deliberately absent here** rather than
+    accepted-and-refused:
+
+    * **Time.** :data:`creek_mcp.httpapi.middleware.limits.DEFAULT_TIMEOUT_SECONDS`
+      is thirty seconds, and the timeout middleware uses ``anyio.fail_after``,
+      which cannot cancel a call already inside ``run_in_threadpool``. An LLM
+      pass over a seeded corpus is minutes to hours: the caller would be handed
+      a ``503`` while the work carried on with no handle on it.
+    * **Egress.** With no ``llm`` member there is no value a producer or a
+      consumer can put on the wire that reaches a provider at all, so "no byte
+      of the vault leaves the host on this route" is a property of the type
+      rather than of a runtime check somebody can forget to call.
+
+    Reaching ``llm`` classification over the network needs an asynchronous job
+    surface — ``202``, a job id, a status route — which this contract does not
+    have. Until then it stays an operator step on the host.
+
+    Attributes:
+        RULES: Keyword classification. No model, no key, no consent, no egress.
+    """
+
+    RULES = "rules"
+
+
+class LinkMethod(StrEnum):
+    """The linker stages ``POST /v1/links`` serves.
+
+    Three of :data:`creek.surface_modes.LINK_METHODS`. ``embeddings`` is the
+    fourth and is excluded for the same shape of reason ``llm`` is excluded
+    from :class:`ClassificationMethod`, with a different cause: it is the
+    O(n²) pairwise-similarity stage, which has been observed being abandoned
+    at 35k fragments and is unbounded in a way no cache repairs.
+
+    **Excluding it does not make every served member cheap, and the schema
+    should not be read as promising that.** ``eddies`` and ``threads`` both
+    need vectors, so both fill the embeddings parquet on a cold cache — a
+    local sentence-transformer pass over every uncached fragment, which is
+    minutes of work on a large vault and can outrun the request deadline.
+    They are served anyway because the parquet is a *cache*: the work a
+    timed-out first call performs still lands, so a retry converges instead of
+    starting over. Nothing about that reaches a network provider; the model is
+    local (ADR-0004). Budget for the first call on a cold vault, and prefer
+    ``temporal`` when you only need the corpus navigable.
+
+    Attributes:
+        TEMPORAL: Same-window adjacency links. The one genuinely cheap stage —
+            no vectors, no model — and the one that makes a freshly-seeded
+            corpus navigable at all.
+        EDDIES: Topic clusters, materialised under ``03-Eddies/``. Embeds on a
+            cold cache.
+        THREADS: Narrative currents, materialised under ``02-Threads/``. Embeds
+            on a cold cache, and reads the APTITUDE labels a classification
+            pass writes, so run classification first.
+    """
+
+    TEMPORAL = "temporal"
+    EDDIES = "eddies"
+    THREADS = "threads"
+
+
+class ClassificationRequest(_WireModel):
+    """A whole-vault classification pass (#1570).
+
+    There is no fragment selector, and there will not be one. The pass is
+    idempotent and resumable — :func:`creek.classify.classify_engine.run_classify`
+    short-circuits on the ``classification_method`` stamp it already wrote — so
+    "classify everything" converges on retry, whereas a caller-supplied id list
+    would be an enumeration primitive on a corpus this consumer cannot read.
+
+    Attributes:
+        method: Which classifier to run. Defaults to the only served member so
+            the empty body — the request a consumer writes first — is the
+            correct one.
+        retier: Whether to also re-derive the privacy tier of fragments that
+            already carry a concrete one. Off by default, because re-deriving a
+            tier the operator settled by hand is the operator's decision. It is
+            the *only* way this surface can correct a consumer that declared
+            ``personal`` on intimate bytes at upload time, and it cannot loosen
+            anything: the engine merges the new verdict with
+            ``escalate``, so a recorded tier is replaced only by a stricter one
+            (#1106).
+    """
+
+    method: ClassificationMethod = Field(
+        default=ClassificationMethod.RULES,
+        description="Classifier to run; rules is the only served method.",
+    )
+    retier: bool = Field(
+        default=False,
+        description="Also re-derive an already-recorded tier, escalate-only.",
+    )
+
+
+class ClassificationResponse(_WireModel):
+    """What one classification pass did, in counts alone (#1570).
+
+    **Nothing here names a fragment.** No id, no path, no title, no excerpt,
+    not even an error string — the engine's per-fragment errors interpolate
+    file paths, so they are collapsed into :attr:`complete`. That is what makes
+    it safe for this route to run over the *whole* vault while serving a caller
+    capped at ``personal``: the pass reads material above the ceiling on the
+    host, and reports nothing whatsoever about it.
+
+    Attributes:
+        status: Always ``"ok"``. Failure is an :class:`ErrorEnvelope`.
+        tier_ceiling: The ceiling the call ran at.
+        method: The classifier that ran, echoed so a client that sent an empty
+            body learns which default it got.
+        total: Creek fragments visited.
+        classified: Fragments whose frontmatter this run rewrote.
+        preserved_manual: Fragments left alone because an operator had stamped
+            them by hand.
+        preserved_llm: Fragments left alone by the resume short-circuit.
+        privacy_tiers_assigned: Fragments whose privacy tier this run derived.
+            **Zero is the expected answer for a network-seeded corpus**, and it
+            is not a failure: ``POST /v1/uploads`` requires an explicit tier
+            (#1497), so an uploaded fragment already carries the caller's
+            declared one and the tier pass does not own it. Only ``retier``
+            re-opens that case.
+        retiered: Subset of the above where an already-recorded tier was
+            replaced by a stricter one. Non-zero only under ``retier``.
+        praxis_marked: Fragments raised to a stronger praxis potential.
+        tags_extracted: Fragments that gained a hashtag ``tags`` entry.
+        complete: Whether every visited fragment was processed without error.
+            ``False`` means some were skipped, and — because the pass is
+            resumable — that the honest next step is to call again rather than
+            to treat the corpus as done. The *reasons* stay in the server log:
+            each one names the file it failed on.
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    method: ClassificationMethod = Field(description="The classifier that ran.")
+    total: int = Field(ge=0, description="Creek fragments visited.")
+    classified: int = Field(ge=0, description="Fragments rewritten this run.")
+    preserved_manual: int = Field(ge=0, description="Left alone: operator stamp.")
+    preserved_llm: int = Field(ge=0, description="Left alone: resume stamp.")
+    privacy_tiers_assigned: int = Field(ge=0, description="Tiers derived this run.")
+    retiered: int = Field(ge=0, description="Recorded tiers replaced by stricter.")
+    praxis_marked: int = Field(ge=0, description="Fragments raised to praxis.")
+    tags_extracted: int = Field(ge=0, description="Fragments that gained tags.")
+    complete: bool = Field(description="Every visited fragment processed cleanly.")
+
+
+class LinkRequest(_WireModel):
+    """One linker stage over the whole vault (#1570).
+
+    ``method`` is required and has no default, unlike
+    :class:`ClassificationRequest`'s. The three stages are not
+    interchangeable — one writes adjacency into fragment frontmatter, one
+    materialises ``03-Eddies/``, one materialises ``02-Threads/`` — so a
+    default would silently run a pass the caller did not choose and report it
+    as the one they asked for.
+
+    Attributes:
+        method: The linker stage to run.
+    """
+
+    method: LinkMethod = Field(description="Linker stage to run.")
+
+
+class LinkResponse(_WireModel):
+    """What one linker stage did, in counts alone (#1570).
+
+    Counts only, for the same reason :class:`ClassificationResponse` carries
+    none: the stage runs over every fragment in the vault, including material
+    far above the caller's ceiling, and a thread title or an eddy name is the
+    corpus talking.
+
+    There is no ``complete`` twin of the classification field. The linker has
+    no per-fragment error accumulator to collapse — a stage either finishes or
+    raises, and a raise is an :class:`ErrorEnvelope` — so a boolean here would
+    be a constant ``True`` wearing the shape of a fact.
+    :attr:`oversized_discarded` is the honest partial-loss signal instead.
+
+    Attributes:
+        status: Always ``"ok"``. Failure is an :class:`ErrorEnvelope`.
+        tier_ceiling: The ceiling the call ran at.
+        method: The stage that ran, echoed for correlation.
+        fragment_count: Fragments loaded from the vault.
+        link_count: The stage's own count — temporal links, eddies detected,
+            or threads detected.
+        largest_cluster_fragments: Members of the biggest cluster emitted; the
+            proof that no single cluster swallowed the corpus (#880).
+        clusters_split: Clusters re-clustered at a tighter parameter for
+            exceeding the configured ceiling.
+        oversized_discarded: Fragments dropped to noise because their cluster
+            stayed oversized after the split budget was spent. **This is data
+            loss** — those fragments carry no link at all — and it is published
+            rather than folded away because a caller who cannot see it reads a
+            lossy pass as a clean one (#1372).
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    method: LinkMethod = Field(description="The linker stage that ran.")
+    fragment_count: int = Field(ge=0, description="Fragments loaded from the vault.")
+    link_count: int = Field(ge=0, description="The stage's own count.")
+    largest_cluster_fragments: int = Field(ge=0, description="Biggest cluster's size.")
+    clusters_split: int = Field(ge=0, description="Clusters re-clustered tighter.")
+    oversized_discarded: int = Field(ge=0, description="Fragments dropped to noise.")
+
+
 class ReflectionRequest(_WireModel):
     """A request for margin notes on exactly one source.
 
@@ -1652,12 +1889,16 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "CareEscalationResponse": CareEscalationResponse,
     "CareResource": CareResource,
     "CareSignal": CareSignal,
+    "ClassificationRequest": ClassificationRequest,
+    "ClassificationResponse": ClassificationResponse,
     "DriveConnectorStatusResponse": DriveConnectorStatusResponse,
     "DriveDisconnectResponse": DriveDisconnectResponse,
     "DriveSyncResponse": DriveSyncResponse,
     "ErrorEnvelope": ErrorEnvelope,
     "JournalUpsertRequest": JournalUpsertRequest,
     "JournalUpsertResponse": JournalUpsertResponse,
+    "LinkRequest": LinkRequest,
+    "LinkResponse": LinkResponse,
     "NotApplicableExample": NotApplicableExample,
     "ReflectionNote": ReflectionNote,
     "ReflectionRequest": ReflectionRequest,

@@ -31,6 +31,7 @@ def classify_tool(
     vault_path: Path,
     method: str = "rules",
     force: bool = False,
+    retier: bool = False,
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
 ) -> dict[str, Any]:
@@ -39,7 +40,28 @@ def classify_tool(
     Classification rewrites the frontmatter of existing fragments. The
     tier-ceiling parameter is recorded for the audit trail; it does not
     gate execution because classify never creates new fragments — it
-    only updates the labels on existing ones.
+    only updates the labels on existing ones. It is also not the
+    *widening* operation the name might suggest: the tier pass is
+    escalate-only, so a run can move a fragment out of a remote
+    consumer's reach and never into it.
+
+    Args:
+        vault_path: Vault root to classify.
+        method: ``"rules"`` or ``"llm"``.
+        force: Overwrite ``classification_method: manual`` decisions.
+        retier: Re-derive the privacy tier of fragments that already
+            carry a concrete one, persisting it only when the new
+            verdict is *stricter* (issue #1106). Surfaced here because
+            it is the only setting under which a caller who declared the
+            wrong tier at write time can be corrected — a case
+            ``POST /v1/uploads`` makes routine, since it requires an
+            explicit tier and never re-derives it (#1497).
+        privacy_tier_ceiling: Recorded for the audit trail.
+        consumer: Who is calling, for the audit trail.
+
+    Returns:
+        A structured result: per-method counts on success, or a
+        refusal for an unknown method or an unreachable provider.
     """
     if method not in _VALID_METHODS:
         return refusal_response(
@@ -58,6 +80,7 @@ def classify_tool(
             config=config,
             method=method,
             force=force,
+            retier=retier,
         )
     except LLMProviderUnavailableError as exc:
         # The engine refuses to iterate when the configured LLM
@@ -74,7 +97,7 @@ def classify_tool(
     # entry (per the audit-schema convention documented in docs/mcp.md).
     MCPAuditLog(vault_path).append(
         tool=TOOL_NAME,
-        args={"method": method, "force": force},
+        args={"method": method, "force": force, "retier": retier},
         tier_ceiling=privacy_tier_ceiling,
         consumer=consumer,
         affected_fragment_ids=[],
@@ -96,6 +119,12 @@ def classify_tool(
         # tier. Surfaced separately from ``classified`` because the tier
         # pass also runs on fragments the resume short-circuit preserved.
         "privacy_tiers_assigned": summary.privacy_tiers_assigned,
+        # Issue #1106 / #1570: the subset of the above where an
+        # already-recorded tier was replaced by a stricter one. Reported
+        # separately because ``privacy_tiers_assigned`` alone cannot tell
+        # "this fragment had no tier" from "this fragment had the wrong
+        # one", and only the second is evidence that ``retier`` did work.
+        "retiered": summary.retiered,
         # Issue #877: how many fragments this run raised to a stronger
         # praxis potential. Surfaced for the same reason as the tier count
         # — the field previously had no producer at all, and a silent

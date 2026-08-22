@@ -127,6 +127,12 @@ is why :data:`MOUNTED` below carries it twice.
 DRIVE_SYNC_PATH: Final[str] = "/v1/connectors/drive/syncs"
 """The Drive incremental-sync endpoint (contract 0.9, #1527)."""
 
+CLASSIFICATIONS_PATH: Final[str] = "/v1/classifications"
+"""The whole-vault classification endpoint (contract 0.10, #1570)."""
+
+LINKS_PATH: Final[str] = "/v1/links"
+"""The whole-vault linking endpoint (contract 0.10, #1570)."""
+
 HEALTH_PATH: Final[str] = "/v1/health"
 """The liveness probe."""
 
@@ -154,6 +160,12 @@ OP_DRIVE_SYNC: Final[str] = "syncDriveConnector"
 OP_DRIVE_DISCONNECT: Final[str] = "disconnectDriveConnector"
 """``operation_id`` of ``DELETE /v1/connectors/drive``."""
 
+OP_CLASSIFY: Final[str] = "createClassification"
+"""``operation_id`` of ``POST /v1/classifications``."""
+
+OP_LINK: Final[str] = "createLink"
+"""``operation_id`` of ``POST /v1/links``."""
+
 OP_HEALTH: Final[str] = "getHealth"
 """``operation_id`` of ``GET /v1/health``."""
 
@@ -166,6 +178,8 @@ MOUNTED: Final[tuple[tuple[str, str], ...]] = (
     ("GET", DRIVE_CONNECTOR_PATH),
     ("POST", DRIVE_SYNC_PATH),
     ("DELETE", DRIVE_CONNECTOR_PATH),
+    ("POST", CLASSIFICATIONS_PATH),
+    ("POST", LINKS_PATH),
     ("GET", HEALTH_PATH),
 )
 """Every ``(method, concrete path)`` pair a client can actually reach."""
@@ -179,6 +193,8 @@ MOUNTED_IDS: Final[tuple[str, ...]] = (
     "drive-status",
     "drive-sync",
     "drive-disconnect",
+    "classifications",
+    "links",
     "health",
 )
 """Stable parametrize ids for :data:`MOUNTED`, in the same order."""
@@ -191,8 +207,10 @@ VERSIONED: Final[tuple[tuple[str, str], ...]] = (
     ("GET", DRIVE_CONNECTOR_PATH),
     ("POST", DRIVE_SYNC_PATH),
     ("DELETE", DRIVE_CONNECTOR_PATH),
+    ("POST", CLASSIFICATIONS_PATH),
+    ("POST", LINKS_PATH),
 )
-"""The seven routes the contract-version gate applies to."""
+"""The nine routes the contract-version gate applies to."""
 
 VERSIONED_IDS: Final[tuple[str, ...]] = (
     "journal-upsert",
@@ -202,6 +220,8 @@ VERSIONED_IDS: Final[tuple[str, ...]] = (
     "drive-status",
     "drive-sync",
     "drive-disconnect",
+    "classifications",
+    "links",
 )
 """Stable parametrize ids for :data:`VERSIONED`."""
 
@@ -270,6 +290,12 @@ VALID_UPLOAD_BODY: Final[dict[str, Any]] = {
     "tier": "open",
 }
 """A body that validates against ``UploadRequest``."""
+
+VALID_CLASSIFICATION_BODY: Final[dict[str, Any]] = {"method": "rules"}
+"""A body that validates against ``ClassificationRequest``."""
+
+VALID_LINK_BODY: Final[dict[str, Any]] = {"method": "temporal"}
+"""A body that validates against ``LinkRequest``."""
 
 
 # --------------------------------------------------------------------------- #

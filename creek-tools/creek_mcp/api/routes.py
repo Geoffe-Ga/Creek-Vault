@@ -16,11 +16,11 @@ what lets the published OpenAPI document outlive whatever serves it.
 **Exposed versus implemented.** :data:`ROUTES` says which endpoints exist;
 :data:`IMPLEMENTED_CAPABILITIES` says which of them actually answer. #1075—#1077
 moved the last three capabilities from the first set into the second, and #1524
-(``upload``) and #1527 (``drive-connector``) both arrived already built, so the
-two still coincide. The distinction is
+(``upload``), #1527 (``drive-connector``) and #1570 (``pipeline``) all arrived
+already built, so the two still coincide. The distinction is
 not obsolete: while a capability was unbuilt it was wired to an honest ``501``
 rather than to a fabricated ``200``, because a stub that looks like success is
-one a consumer integrates against and only discovers in production. A seventh
+one a consumer integrates against and only discovers in production. An eighth
 capability published before its handler exists gets exactly that treatment,
 from the same constant, with no code change.
 """
@@ -33,11 +33,15 @@ from typing import TYPE_CHECKING, Final
 from creek_mcp.api.models import (
     CapabilitiesResponse,
     Capability,
+    ClassificationRequest,
+    ClassificationResponse,
     DriveConnectorStatusResponse,
     DriveDisconnectResponse,
     DriveSyncResponse,
     JournalUpsertRequest,
     JournalUpsertResponse,
+    LinkRequest,
+    LinkResponse,
     ReflectionRequest,
     ReflectionResponse,
     UploadRequest,
@@ -107,10 +111,16 @@ OP_DRIVE_SYNC: Final[str] = "syncDriveConnector"
 OP_DRIVE_DISCONNECT: Final[str] = "disconnectDriveConnector"
 """``operation_id`` of ``DELETE /v1/connectors/drive``."""
 
+OP_CLASSIFY: Final[str] = "createClassification"
+"""``operation_id`` of ``POST /v1/classifications``."""
+
+OP_LINK: Final[str] = "createLink"
+"""``operation_id`` of ``POST /v1/links``."""
+
 OP_HEALTH: Final[str] = "getHealth"
 """``operation_id`` of ``GET /v1/health``.
 
-The nine are named constants rather than bare literals in the table below
+The eleven are named constants rather than bare literals in the table below
 because the adapter's handler map is keyed on them: a client generator's method
 name and a server's dispatch key have to be the same string, and two spellings
 of it are one rename away from a route mounted to nothing.
@@ -321,6 +331,26 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         response_model=DriveDisconnectResponse,
         requires_contract_version=True,
         summary="Revoke the cached Drive credential and erase it from disk.",
+    ),
+    RouteSpec(
+        path="/v1/classifications",
+        method="POST",
+        operation_id=OP_CLASSIFY,
+        capability=Capability.PIPELINE,
+        request_model=ClassificationRequest,
+        response_model=ClassificationResponse,
+        requires_contract_version=True,
+        summary="Classify every fragment in the vault, idempotently.",
+    ),
+    RouteSpec(
+        path="/v1/links",
+        method="POST",
+        operation_id=OP_LINK,
+        capability=Capability.PIPELINE,
+        request_model=LinkRequest,
+        response_model=LinkResponse,
+        requires_contract_version=True,
+        summary="Run one linker stage over the whole vault.",
     ),
     RouteSpec(
         path="/v1/health",

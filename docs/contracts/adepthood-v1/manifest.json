@@ -1,6 +1,6 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.9.0",
+  "contract_version": "0.10.0",
   "files": [
     {
       "capability": "capabilities",
@@ -13,7 +13,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "0b351a098f4086f3a6dea530ebf90790009658b95f6eb6216e9fd635dc37b3be",
+      "sha256": "744a15964dd31c589c9cf58f01d6c517712e238b00eecd7db951a3e71be85506",
       "state": "empty"
     },
     {
@@ -41,7 +41,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "8ee29fa6be1483af5392419697962b38a75bfd36a0cd0a7dc0fc28639748c835",
+      "sha256": "69c509771e60440a19966ba3b9ba093bfa62346f7f65802c76c336fbc807906a",
       "state": "success"
     },
     {
@@ -147,6 +147,55 @@
       "model": "ErrorEnvelope",
       "path": "examples/journal-upsert/unavailable-service.json",
       "sha256": "a29004223b68de26c66e2dfaa64ff3fde4495e0b3bee0c21c3aae8c56be6a6a6",
+      "state": "unavailable-service"
+    },
+    {
+      "capability": "pipeline",
+      "model": "NotApplicableExample",
+      "path": "examples/pipeline/care-escalation.json",
+      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "state": "care-escalation"
+    },
+    {
+      "capability": "pipeline",
+      "model": "LinkResponse",
+      "path": "examples/pipeline/empty.json",
+      "sha256": "266e38b543f0d7405cb291edc0d70fdb3144de367f0173224993942dbfab5b21",
+      "state": "empty"
+    },
+    {
+      "capability": "pipeline",
+      "model": "ErrorEnvelope",
+      "path": "examples/pipeline/incompatible-version.json",
+      "sha256": "05ba769f3e7d662a92d8f020c31eb534822af1f2339b6e914301707f8ecd9578",
+      "state": "incompatible-version"
+    },
+    {
+      "capability": "pipeline",
+      "model": "ErrorEnvelope",
+      "path": "examples/pipeline/malformed-input.json",
+      "sha256": "2cf7207f484e341f224291c62368a2dbab6d5f5c5c7890a6a05acf4f49c70759",
+      "state": "malformed-input"
+    },
+    {
+      "capability": "pipeline",
+      "model": "ErrorEnvelope",
+      "path": "examples/pipeline/refusal.json",
+      "sha256": "771885e64ce9809b0931d1990cebed94300f9817b6b9b4dbdb3e4dcd9b0007f1",
+      "state": "refusal"
+    },
+    {
+      "capability": "pipeline",
+      "model": "ClassificationResponse",
+      "path": "examples/pipeline/success.json",
+      "sha256": "fa983e80c2b2b6662b1a6169c11fcc0dff2d608a86cbb18c1d63a0b308d2a67a",
+      "state": "success"
+    },
+    {
+      "capability": "pipeline",
+      "model": "ErrorEnvelope",
+      "path": "examples/pipeline/unavailable-service.json",
+      "sha256": "152f17b333cbd64be186f3b462eaa7f76cd5996937d7a04111b835785f4bb9ac",
       "state": "unavailable-service"
     },
     {
@@ -307,7 +356,7 @@
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "schemas/CapabilitiesResponse.schema.json",
-      "sha256": "c8dd894861567422befb5037d2fe5afb43b3b64c1c06927271b58ee60f8f044e",
+      "sha256": "730f04f35cc9342817225bce8ef6ce53b3049b2b040569965385e8ce578c44d6",
       "state": null
     },
     {
@@ -329,6 +378,20 @@
       "model": "CareSignal",
       "path": "schemas/CareSignal.schema.json",
       "sha256": "fc09e8583eca62438b9a4b4074da5fcb1f31c694a059d11e7efca5db9b60ce90",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "ClassificationRequest",
+      "path": "schemas/ClassificationRequest.schema.json",
+      "sha256": "340f63de211b904c7c87a5608ab72ddf1c14ed5386a0329b1bb396b1fed46e75",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "ClassificationResponse",
+      "path": "schemas/ClassificationResponse.schema.json",
+      "sha256": "cb45a61852f41be211235c75766de08ad2825eeedc93a02f45d960eff00e18ba",
       "state": null
     },
     {
@@ -371,6 +434,20 @@
       "model": "JournalUpsertResponse",
       "path": "schemas/JournalUpsertResponse.schema.json",
       "sha256": "3ee3856e89c4739327d96c5ea035150912891a4ec3e0be344aeb1eaf2bbd912c",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "LinkRequest",
+      "path": "schemas/LinkRequest.schema.json",
+      "sha256": "ed451891ee2476c7f0747fef9038f066c102d5fe5a29619430c3832b78aed86c",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "LinkResponse",
+      "path": "schemas/LinkResponse.schema.json",
+      "sha256": "201ba880113dbbb5dbfb343a3a2ca05d32e99b5b06956c9ad0b14b7ea0487c32",
       "state": null
     },
     {

@@ -53,6 +53,7 @@ from creek_mcp.api.models import (
     DriveDisconnectResponse,
     DriveSyncResponse,
     ErrorCode,
+    minor_at_least,
 )
 from creek_mcp.api.openapi import build_openapi
 from creek_mcp.httpapi import drive as drive_module
@@ -482,14 +483,20 @@ def test_drive_connector_is_a_published_capability() -> None:
     assert CAPABILITY_SINCE_MINOR[Capability.DRIVE_CONNECTOR] == _DRIVE_MINOR
 
 
-def test_the_capability_minor_is_served_and_current() -> None:
-    """0.9 is the current minor and the compatibility window widened, not shifted.
+def test_the_capability_minor_is_still_served_after_later_bumps() -> None:
+    """0.9 stays in the window, which widened again at 0.10 rather than shifting.
 
-    ``0.8`` staying in the window is the half that costs nothing to assert and
-    everything to get wrong: dropping it would refuse every correct ``0.8``
-    client over a capability it was never told about.
+    Rewritten at #1570, when ``CONTRACT_MINOR`` moved past ``0.9`` for the
+    first time. The original asserted ``CONTRACT_MINOR == _DRIVE_MINOR``, which
+    was true only while ``drive-connector`` was the newest capability — an
+    assertion that would have had to be deleted at the next bump rather than
+    kept. What actually matters, and what is asserted now, is that ``0.9`` and
+    ``0.8`` both stay served: dropping either would refuse a correct client
+    over a capability it was never told about. ``CONTRACT_MINOR`` is checked to
+    be *at least* the Drive minor, so the server always serves the capability
+    it publishes.
     """
-    assert CONTRACT_MINOR == _DRIVE_MINOR
+    assert minor_at_least(CONTRACT_MINOR, _DRIVE_MINOR)
     assert _DRIVE_MINOR in SUPPORTED_CONTRACT_MINORS
     assert _PREVIOUS_MINOR in SUPPORTED_CONTRACT_MINORS
 

@@ -40,11 +40,15 @@ from creek_mcp.api.models import (
     CONTRACT_MODELS,
     CapabilitiesResponse,
     Capability,
+    ClassificationRequest,
+    ClassificationResponse,
     DriveConnectorStatusResponse,
     DriveDisconnectResponse,
     DriveSyncResponse,
     JournalUpsertRequest,
     JournalUpsertResponse,
+    LinkRequest,
+    LinkResponse,
     ReflectionRequest,
     ReflectionResponse,
     UploadRequest,
@@ -147,6 +151,24 @@ _EXPECTED: Final[
         True,
     ),
     (
+        "/v1/classifications",
+        "POST",
+        "createClassification",
+        Capability.PIPELINE,
+        ClassificationRequest,
+        ClassificationResponse,
+        True,
+    ),
+    (
+        "/v1/links",
+        "POST",
+        "createLink",
+        Capability.PIPELINE,
+        LinkRequest,
+        LinkResponse,
+        True,
+    ),
+    (
         "/v1/health",
         "GET",
         "getHealth",
@@ -166,10 +188,12 @@ _EXPECTED_IDS: Final[tuple[str, ...]] = (
     "drive-status",
     "drive-sync",
     "drive-disconnect",
+    "classifications",
+    "links",
     "health",
 )
 
-_EXPECTED_ROUTE_COUNT: Final[int] = 9
+_EXPECTED_ROUTE_COUNT: Final[int] = 11
 
 
 def _by_operation(operation_id: str) -> RouteSpec:
@@ -204,10 +228,10 @@ def _by_operation(operation_id: str) -> RouteSpec:
 # --------------------------------------------------------------------------- #
 
 
-def test_routes_declares_exactly_nine_specs() -> None:
-    """``/v1`` publishes nine endpoints and no tenth.
+def test_routes_declares_exactly_eleven_specs() -> None:
+    """``/v1`` publishes eleven endpoints and no twelfth.
 
-    A tenth would be an endpoint no fixture, no OpenAPI response set and no
+    A twelfth would be an endpoint no fixture, no OpenAPI response set and no
     capability entry describes — reachable, undocumented surface.
     """
     assert len(ROUTES) == _EXPECTED_ROUTE_COUNT
@@ -222,7 +246,7 @@ def test_routes_is_a_tuple() -> None:
     assert isinstance(ROUTES, tuple)
 
 
-def test_route_paths_and_methods_are_the_published_nine() -> None:
+def test_route_paths_and_methods_are_the_published_eleven() -> None:
     """Every ``(path, method)`` pair matches the ADR, in order."""
     assert [(spec.path, spec.method) for spec in ROUTES] == [
         (path, method) for path, method, *_rest in _EXPECTED
@@ -353,11 +377,11 @@ def test_exactly_one_route_declares_no_capability() -> None:
     assert uncapable == ["/v1/health"]
 
 
-def test_implemented_capabilities_is_exactly_the_published_six() -> None:
-    """Every published capability answers for real, Drive included (#1527).
+def test_implemented_capabilities_is_exactly_the_published_seven() -> None:
+    """Every published capability answers for real, pipeline included (#1570).
 
     An exhaustive literal, not a containment check, and still named one by
-    one: a seventh capability added to ``Capability`` has to change this line
+    one: an eighth capability added to ``Capability`` has to change this line
     before it can be advertised, which is what keeps a new endpoint's landing a
     visible edit rather than a silent widening.
     """
@@ -370,6 +394,7 @@ def test_implemented_capabilities_is_exactly_the_published_six() -> None:
                 Capability.WHEEL,
                 Capability.UPLOAD,
                 Capability.DRIVE_CONNECTOR,
+                Capability.PIPELINE,
             }
         )
         == IMPLEMENTED_CAPABILITIES

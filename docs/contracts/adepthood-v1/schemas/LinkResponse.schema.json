@@ -1,0 +1,83 @@
+{
+  "$defs": {
+    "LinkMethod": {
+      "description": "The linker stages ``POST /v1/links`` serves.\n\nThree of :data:`creek.surface_modes.LINK_METHODS`. ``embeddings`` is the\nfourth and is excluded for the same shape of reason ``llm`` is excluded\nfrom :class:`ClassificationMethod`, with a different cause: it is the\nO(n\u00b2) pairwise-similarity stage, which has been observed being abandoned\nat 35k fragments and is unbounded in a way no cache repairs.\n\n**Excluding it does not make every served member cheap, and the schema\nshould not be read as promising that.** ``eddies`` and ``threads`` both\nneed vectors, so both fill the embeddings parquet on a cold cache \u2014 a\nlocal sentence-transformer pass over every uncached fragment, which is\nminutes of work on a large vault and can outrun the request deadline.\nThey are served anyway because the parquet is a *cache*: the work a\ntimed-out first call performs still lands, so a retry converges instead of\nstarting over. Nothing about that reaches a network provider; the model is\nlocal (ADR-0004). Budget for the first call on a cold vault, and prefer\n``temporal`` when you only need the corpus navigable.\n\nAttributes:\n    TEMPORAL: Same-window adjacency links. The one genuinely cheap stage \u2014\n        no vectors, no model \u2014 and the one that makes a freshly-seeded\n        corpus navigable at all.\n    EDDIES: Topic clusters, materialised under ``03-Eddies/``. Embeds on a\n        cold cache.\n    THREADS: Narrative currents, materialised under ``02-Threads/``. Embeds\n        on a cold cache, and reads the APTITUDE labels a classification\n        pass writes, so run classification first.",
+      "enum": [
+        "temporal",
+        "eddies",
+        "threads"
+      ],
+      "title": "LinkMethod",
+      "type": "string"
+    },
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:func:`creek_mcp.policy.admitted_ceiling` refuses any remote call declaring\na ceiling outside :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` *before\ndispatch*. Since #1073 that decision is transport-neutral, so every adapter\nis meant to reach it the same way; the MCP surface does so today through\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool`, and #1074 mounts the\n``/v1`` handlers that will. This enum mirrors that frozenset, so\n``intimate`` and ``all`` are not merely refused at runtime \u2014 they cannot be\nconstructed at all, which is the half of the guarantee that does not depend\non a handler remembering to ask.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "What one linker stage did, in counts alone (#1570).\n\nCounts only, for the same reason :class:`ClassificationResponse` carries\nnone: the stage runs over every fragment in the vault, including material\nfar above the caller's ceiling, and a thread title or an eddy name is the\ncorpus talking.\n\nThere is no ``complete`` twin of the classification field. The linker has\nno per-fragment error accumulator to collapse \u2014 a stage either finishes or\nraises, and a raise is an :class:`ErrorEnvelope` \u2014 so a boolean here would\nbe a constant ``True`` wearing the shape of a fact.\n:attr:`oversized_discarded` is the honest partial-loss signal instead.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call ran at.\n    method: The stage that ran, echoed for correlation.\n    fragment_count: Fragments loaded from the vault.\n    link_count: The stage's own count \u2014 temporal links, eddies detected,\n        or threads detected.\n    largest_cluster_fragments: Members of the biggest cluster emitted; the\n        proof that no single cluster swallowed the corpus (#880).\n    clusters_split: Clusters re-clustered at a tighter parameter for\n        exceeding the configured ceiling.\n    oversized_discarded: Fragments dropped to noise because their cluster\n        stayed oversized after the split budget was spent. **This is data\n        loss** \u2014 those fragments carry no link at all \u2014 and it is published\n        rather than folded away because a caller who cannot see it reads a\n        lossy pass as a clean one (#1372).",
+  "properties": {
+    "clusters_split": {
+      "description": "Clusters re-clustered tighter.",
+      "minimum": 0,
+      "title": "Clusters Split",
+      "type": "integer"
+    },
+    "fragment_count": {
+      "description": "Fragments loaded from the vault.",
+      "minimum": 0,
+      "title": "Fragment Count",
+      "type": "integer"
+    },
+    "largest_cluster_fragments": {
+      "description": "Biggest cluster's size.",
+      "minimum": 0,
+      "title": "Largest Cluster Fragments",
+      "type": "integer"
+    },
+    "link_count": {
+      "description": "The stage's own count.",
+      "minimum": 0,
+      "title": "Link Count",
+      "type": "integer"
+    },
+    "method": {
+      "$ref": "#/$defs/LinkMethod",
+      "description": "The linker stage that ran."
+    },
+    "oversized_discarded": {
+      "description": "Fragments dropped to noise.",
+      "minimum": 0,
+      "title": "Oversized Discarded",
+      "type": "integer"
+    },
+    "status": {
+      "const": "ok",
+      "description": "Always ok; failure is an error.",
+      "title": "Status",
+      "type": "string"
+    },
+    "tier_ceiling": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Ceiling the call ran at."
+    }
+  },
+  "required": [
+    "status",
+    "tier_ceiling",
+    "method",
+    "fragment_count",
+    "link_count",
+    "largest_cluster_fragments",
+    "clusters_split",
+    "oversized_discarded"
+  ],
+  "title": "LinkResponse",
+  "type": "object"
+}

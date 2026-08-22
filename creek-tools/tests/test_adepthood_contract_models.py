@@ -83,6 +83,8 @@ from creek_mcp.api.models import (
     CareEscalationResponse,
     CareResource,
     CareSignal,
+    ClassificationRequest,
+    ClassificationResponse,
     DriveConnectorStatusResponse,
     DriveDisconnectResponse,
     DriveSyncResponse,
@@ -91,6 +93,8 @@ from creek_mcp.api.models import (
     JournalAction,
     JournalUpsertRequest,
     JournalUpsertResponse,
+    LinkRequest,
+    LinkResponse,
     NotApplicableExample,
     NoteKind,
     PraxisKind,
@@ -236,6 +240,39 @@ DRIVE_SYNC_RESPONSE_PAYLOAD: dict[str, Any] = {
     "fragments_unchanged": 0,
 }
 
+CLASSIFICATION_REQUEST_PAYLOAD: dict[str, Any] = {
+    "method": "rules",
+    "retier": False,
+}
+
+CLASSIFICATION_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "ok",
+    "tier_ceiling": "personal",
+    "method": "rules",
+    "total": 12,
+    "classified": 10,
+    "preserved_manual": 2,
+    "preserved_llm": 0,
+    "privacy_tiers_assigned": 0,
+    "retiered": 0,
+    "praxis_marked": 0,
+    "tags_extracted": 5,
+    "complete": True,
+}
+
+LINK_REQUEST_PAYLOAD: dict[str, Any] = {"method": "temporal"}
+
+LINK_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "ok",
+    "tier_ceiling": "personal",
+    "method": "temporal",
+    "fragment_count": 12,
+    "link_count": 9,
+    "largest_cluster_fragments": 0,
+    "clusters_split": 0,
+    "oversized_discarded": 0,
+}
+
 DRIVE_DISCONNECT_RESPONSE_PAYLOAD: dict[str, Any] = {
     "status": "ok",
     "tier_ceiling": "open",
@@ -328,12 +365,16 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     CareEscalationResponse.__name__: CARE_ESCALATION_RESPONSE_PAYLOAD,
     CareResource.__name__: CARE_RESOURCE_PAYLOAD,
     CareSignal.__name__: CARE_SIGNAL,
+    ClassificationRequest.__name__: CLASSIFICATION_REQUEST_PAYLOAD,
+    ClassificationResponse.__name__: CLASSIFICATION_RESPONSE_PAYLOAD,
     DriveConnectorStatusResponse.__name__: DRIVE_STATUS_RESPONSE_PAYLOAD,
     DriveDisconnectResponse.__name__: DRIVE_DISCONNECT_RESPONSE_PAYLOAD,
     DriveSyncResponse.__name__: DRIVE_SYNC_RESPONSE_PAYLOAD,
     ErrorEnvelope.__name__: ERROR_ENVELOPE_PAYLOAD,
     JournalUpsertRequest.__name__: JOURNAL_UPSERT_REQUEST_PAYLOAD,
     JournalUpsertResponse.__name__: JOURNAL_UPSERT_RESPONSE_PAYLOAD,
+    LinkRequest.__name__: LINK_REQUEST_PAYLOAD,
+    LinkResponse.__name__: LINK_RESPONSE_PAYLOAD,
     NotApplicableExample.__name__: NOT_APPLICABLE_EXAMPLE_PAYLOAD,
     ReflectionNote.__name__: REFLECTION_NOTE_PAYLOAD,
     ReflectionRequest.__name__: REFLECTION_REQUEST_PAYLOAD,
@@ -426,6 +467,7 @@ EXPECTED_UNREACHABLE_CELLS: frozenset[tuple[str, str]] = frozenset(
         ("wheel", "care-escalation"),
         ("upload", "care-escalation"),
         ("drive-connector", "care-escalation"),
+        ("pipeline", "care-escalation"),
     }
 )
 
@@ -887,7 +929,7 @@ def test_bundle_root_name_matches_the_declared_dir_name() -> None:
 
 
 def test_capability_and_state_axes_are_pinned() -> None:
-    """The fixture matrix is 6 capabilities x 7 states = 42 cells."""
+    """The fixture matrix is 7 capabilities x 7 states = 49 cells."""
     assert CAPABILITIES == (
         "capabilities",
         "journal-upsert",
@@ -895,6 +937,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "wheel",
         "upload",
         "drive-connector",
+        "pipeline",
     )
     assert EXAMPLE_STATES == (
         "success",
@@ -905,7 +948,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "incompatible-version",
         "unavailable-service",
     )
-    assert len(_matrix()) == 42
+    assert len(_matrix()) == 49
 
 
 @pytest.mark.parametrize(("capability", "state"), _matrix())
@@ -993,8 +1036,8 @@ def test_retry_policy_json_mirrors_the_runtime_table() -> None:
     }
 
 
-def test_unreachable_cells_are_the_five_non_reflection_care_escalations() -> None:
-    """Only ``reflections`` can escalate; the other five cells are N/A."""
+def test_unreachable_cells_are_the_six_non_reflection_care_escalations() -> None:
+    """Only ``reflections`` can escalate; the other six cells are N/A."""
     assert UNREACHABLE_CELLS == EXPECTED_UNREACHABLE_CELLS
 
 
@@ -1653,10 +1696,13 @@ def test_the_committed_success_reflection_fixture_shows_the_populated_shape() ->
 
 
 def test_the_previous_minor_is_still_served() -> None:
-    """0.9 widened the compatibility window rather than shifting it.
+    """0.10 widened the compatibility window rather than shifting it.
 
-    A ``0.8`` client's ``/v1`` traffic is unaffected by an optional response
-    field, so refusing it outright would be a break invented by the bump.
+    A ``0.9`` client's ``/v1`` traffic is unaffected by two additive routes it
+    is not told about and cannot reach, so refusing it outright would be a
+    break invented by the bump. ``0.8`` is checked alongside because the
+    window only ever widens.
     """
+    assert "0.9" in SUPPORTED_CONTRACT_MINORS
     assert "0.8" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.9"
+    assert CONTRACT_MINOR == "0.10"

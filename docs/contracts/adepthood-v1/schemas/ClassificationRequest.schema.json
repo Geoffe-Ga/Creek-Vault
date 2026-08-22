@@ -1,0 +1,29 @@
+{
+  "$defs": {
+    "ClassificationMethod": {
+      "description": "The classification methods ``POST /v1/classifications`` serves.\n\nOne member, and the single member is the point. ``creek classify`` also\naccepts ``llm``, and it is **deliberately absent here** rather than\naccepted-and-refused:\n\n* **Time.** :data:`creek_mcp.httpapi.middleware.limits.DEFAULT_TIMEOUT_SECONDS`\n  is thirty seconds, and the timeout middleware uses ``anyio.fail_after``,\n  which cannot cancel a call already inside ``run_in_threadpool``. An LLM\n  pass over a seeded corpus is minutes to hours: the caller would be handed\n  a ``503`` while the work carried on with no handle on it.\n* **Egress.** With no ``llm`` member there is no value a producer or a\n  consumer can put on the wire that reaches a provider at all, so \"no byte\n  of the vault leaves the host on this route\" is a property of the type\n  rather than of a runtime check somebody can forget to call.\n\nReaching ``llm`` classification over the network needs an asynchronous job\nsurface \u2014 ``202``, a job id, a status route \u2014 which this contract does not\nhave. Until then it stays an operator step on the host.\n\nAttributes:\n    RULES: Keyword classification. No model, no key, no consent, no egress.",
+      "enum": [
+        "rules"
+      ],
+      "title": "ClassificationMethod",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "A whole-vault classification pass (#1570).\n\nThere is no fragment selector, and there will not be one. The pass is\nidempotent and resumable \u2014 :func:`creek.classify.classify_engine.run_classify`\nshort-circuits on the ``classification_method`` stamp it already wrote \u2014 so\n\"classify everything\" converges on retry, whereas a caller-supplied id list\nwould be an enumeration primitive on a corpus this consumer cannot read.\n\nAttributes:\n    method: Which classifier to run. Defaults to the only served member so\n        the empty body \u2014 the request a consumer writes first \u2014 is the\n        correct one.\n    retier: Whether to also re-derive the privacy tier of fragments that\n        already carry a concrete one. Off by default, because re-deriving a\n        tier the operator settled by hand is the operator's decision. It is\n        the *only* way this surface can correct a consumer that declared\n        ``personal`` on intimate bytes at upload time, and it cannot loosen\n        anything: the engine merges the new verdict with\n        ``escalate``, so a recorded tier is replaced only by a stricter one\n        (#1106).",
+  "properties": {
+    "method": {
+      "$ref": "#/$defs/ClassificationMethod",
+      "default": "rules",
+      "description": "Classifier to run; rules is the only served method."
+    },
+    "retier": {
+      "default": false,
+      "description": "Also re-derive an already-recorded tier, escalate-only.",
+      "title": "Retier",
+      "type": "boolean"
+    }
+  },
+  "title": "ClassificationRequest",
+  "type": "object"
+}

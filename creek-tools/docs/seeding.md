@@ -26,7 +26,7 @@ confidently.
 - [Which shape is my source?](#which-shape-is-my-source)
 - [Seeding from the CLI](#seeding-from-the-cli)
 - [Seeding over the network](#seeding-over-the-network)
-  - [Ingests, but does not classify or link](#seeding-over-the-network-ingests-but-does-not-classify-or-link)
+  - [Making a seeded vault usable](#making-a-seeded-vault-usable)
 - [Google Drive](#google-drive)
 - [Four traps that silently cost you fragments](#four-traps-that-silently-cost-you-fragments)
 - [Privacy of seeded content](#privacy-of-seeded-content)
@@ -336,7 +336,7 @@ here:
 ## Seeding over the network
 
 The `/v1` API is how an application seeds a vault it does not share a
-filesystem with. It publishes exactly nine routes:
+filesystem with. It publishes exactly eleven routes:
 
 <!-- capability-set: v1-routes -->
 
@@ -350,11 +350,13 @@ filesystem with. It publishes exactly nine routes:
 | `GET` | `/v1/connectors/drive` |
 | `POST` | `/v1/connectors/drive/syncs` |
 | `DELETE` | `/v1/connectors/drive` |
+| `POST` | `/v1/classifications` |
+| `POST` | `/v1/links` |
 | `GET` | `/v1/health` |
 
 <!-- /capability-set -->
 
-Two of those nine were observed writing a fragment into `01-Fragments/`
+Two of those eleven were observed writing a fragment into `01-Fragments/`
 here — `POST /v1/uploads` and `PUT /v1/journal-entries/{external_id}`:
 
 ```console
@@ -369,10 +371,12 @@ POST /v1/uploads                        200 {"status":"ok","fragment_id":"frag-a
 
 The Drive connector is the third seeding surface, but its sync route could
 only be observed refusing here — see [Google Drive](#google-drive). The
-remaining six wrote no fragment in these runs; note that `POST
+remaining eight wrote no fragment in these runs; note that `POST
 /v1/reflections` was only reachable as a `503 temporarily_unavailable` (no
 LLM backend was configured), so "it does not seed" is observed for its
-refusal path only.
+refusal path only. `POST /v1/classifications` and `POST /v1/links` do not
+seed either, and are not meant to: they are what makes seeded bytes *usable*
+— see [Making a seeded vault usable](#making-a-seeded-vault-usable).
 
 The rest of this section is about `POST /v1/uploads`, which is the route an
 application uses to seed arbitrary documents. The journal route is
@@ -494,57 +498,97 @@ the published schema:
 {"tier_model": {"ceilings": ["open", "personal"], "default": "open",
                 "intimate_never_egresses": true},
  "capabilities": ["capabilities", "journal-upsert", "reflections", "wheel",
-                  "upload", "drive-connector"]}
+                  "upload", "drive-connector", "pipeline"]}
 ```
 
 The MCP tool `creek.upload` is the same surface over stdio, and its gates are
 documented row-by-row in [mcp.md](./mcp.md).
 
-### Seeding over the network ingests, but does not classify or link
+### Making a seeded vault usable
 
-**This is the most important limitation on this page.** Everything above gets
-your bytes into the vault as fragments. It does not make them *usable*.
-
-`/v1` publishes nine routes across six capabilities, and **none of them
-classifies or links**:
-
-```console
-$ grep -ic "classify\|link" creek_mcp/api/routes.py
-0
-```
-
-`POST /v1/uploads` calls `run_ingest` and stops there. `creek.classify` and
-`creek.link` exist only as **MCP tools** — there is no HTTP route for either.
-
-So a vault seeded entirely over the network contains fragments with:
-
-- no APTITUDE frequency,
-- no Archetypal Wavelength phase,
-- no resonances, and
-- `privacy_tier: unclassified` (see
-  [Privacy of seeded content](#privacy-of-seeded-content) — `unclassified`
-  ranks *with* `personal`, so a fresh vault is fail-closed rather than open).
-
-Nothing errors. The upload returns `200`, the fragments are genuinely on disk,
-and the vault is simply **inert** — the Higher Self Resonance runs over an
-unclassified corpus.
-
-**Until this closes, a network-only seeding flow is incomplete.** Someone with
-shell access on the vault host has to run:
+Everything above gets your bytes into the vault as fragments. On its own that
+is not enough: a fragment with no APTITUDE frequency, no Archetypal Wavelength
+phase and no resonances is **inert** — the Higher Self Resonance would be
+running over an unclassified corpus. Two more routes finish the job, and both
+are ordinary `/v1` calls needing no shell access on the vault host:
 
 ```console
-$ creek classify --vault <vault>
-$ creek link --vault <vault>
+POST /v1/classifications  {"method": "rules"}
+  200 {"status":"ok","method":"rules","total":12,"classified":12,
+       "privacy_tiers_assigned":0,"retiered":0,"complete":true}
+
+POST /v1/links            {"method": "temporal"}
+  200 {"status":"ok","method":"temporal","fragment_count":12,"link_count":9,
+       "oversized_discarded":0}
 ```
 
-Tracked as
-[#1570](https://github.com/Geoffe-Ga/Creek-Vault/issues/1570). Unlike the Drive
-OAuth gap ([#1568](https://github.com/Geoffe-Ga/Creek-Vault/issues/1568)),
-which was a deliberate cut, this one was not filed until the seeding epic's
-Definition of Done was re-read against the shipped routes — the DoD promises
-fragments land *"correctly-typed, correctly-tiered — over the network, with no
-CLI and no shell access,"* and typing and tiering are exactly what `classify`
-and `link` produce.
+Run classification first and linking second. Thread detection unions fragments
+that are *topic consistent* — semantic similarity **and frequency agreement** —
+so it reads the APTITUDE labels classification writes, and running it over an
+unclassified corpus agrees on `unclassified` everywhere. `POST /v1/links` takes
+one stage per call, so a full pass is three calls: `temporal`, then `eddies`,
+then `threads`.
+
+**Budget for the first `eddies` or `threads` call.** `temporal` needs no
+vectors and returns promptly. The other two cluster over embeddings, so on a
+cold vault they run a *local* sentence-transformer over every fragment that is
+not already in the embeddings cache — minutes of work on a large corpus, behind
+a 30-second request deadline the server cannot cancel once the call is running.
+That first call may well come back `503`; the work still lands in the cache, so
+the retry is fast and converges rather than starting over. Nothing here is sent
+anywhere — the model is local — but do not wire a client that reads one `503`
+from `eddies` as "linking is broken".
+
+Both responses are **counts and a method name, and nothing else**. No fragment
+id, no path, no title, no prose. That is deliberate: the passes run over the
+*whole* vault, including material far above the calling consumer's tier
+ceiling, and the only thing that makes that safe is that there is no field any
+of it could arrive in.
+
+Both are idempotent. Classification short-circuits on the
+`classification_method` stamp it already wrote, so a call that hits the
+server's request deadline and is retried converges rather than duplicating
+work — `complete: false` is the signal to call again.
+
+#### What these routes deliberately do not offer
+
+- **`{"method": "llm"}` on classification** and **`{"method": "embeddings"}`
+  on links** are refused as schema errors (`422`), not merely discouraged.
+  Both are minutes-to-hours of work behind a 30-second request deadline the
+  server cannot cancel once the call is running, and `embeddings` is the
+  unbounded O(n²) pairwise-similarity stage no cache repairs. Excluding them
+  is not a promise that everything left is quick — see the budget note above
+  for `eddies` and `threads`. They remain operator steps on the vault host:
+
+  ```console
+  $ creek classify --vault <vault> --method llm
+  $ creek link --vault <vault> --method embeddings
+  ```
+
+- **A fragment selector.** There is none, and adding one would be a mistake:
+  the passes are idempotent, so "classify everything" converges, whereas a
+  caller-supplied id list would let a consumer enumerate a corpus it cannot
+  read.
+
+#### Tiering, and the one thing to know about it
+
+`privacy_tiers_assigned: 0` is the **expected** answer for a
+network-seeded vault, and it is not a failure. `POST /v1/uploads` requires an
+explicit `tier` and refuses without one, so an uploaded fragment already
+carries the tier its caller declared and the classification pass does not own
+it. Only `{"retier": true}` re-opens that case, and it can only tighten: a
+recorded tier is replaced when — and only when — today's verdict is
+*stricter*. Nothing on this surface can make a fragment less private.
+
+That direction matters more than it first looks. `unclassified` ranks *with*
+`personal` (see [Privacy of seeded content](#privacy-of-seeded-content)), so
+an unclassified fragment is already served to a `personal` consumer.
+Classification is what can move genuinely-intimate content **out** of reach —
+so declining to classify preserves an exposure rather than preventing one.
+
+Published at contract minor `0.10` as the `pipeline` capability. A client
+pinned to `0.9` or below is neither told these routes exist nor served them,
+and nothing else on the wire changes for it.
 
 ## Google Drive
 
