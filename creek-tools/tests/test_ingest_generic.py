@@ -19,10 +19,9 @@ import pytest
 
 from creek.ingest import generic as generic_module
 from creek.ingest.base import IngestResult, ParsedFragment, RawDocument
+from creek.ingest.encoding import BINARY_CHECK_SIZE, looks_binary
 from creek.ingest.generic import (
-    _BINARY_CHECK_SIZE,
     GenericIngestor,
-    _is_binary_content,
     _try_decode,
 )
 from creek.models import SourcePlatform
@@ -61,38 +60,38 @@ def source_dir(tmp_path: Path) -> Path:
     return tmp_path
 
 
-# ---- _is_binary_content Tests ----
+# ---- looks_binary Tests ----
 
 
 class TestIsBinaryContent:
-    """Tests for the _is_binary_content helper function."""
+    """Tests for the looks_binary helper function."""
 
     def test_text_content_is_not_binary(self) -> None:
         """Plain text bytes should not be classified as binary."""
-        assert _is_binary_content(b"Hello, world!") is False
+        assert looks_binary(b"Hello, world!") is False
 
     def test_empty_bytes_are_not_binary(self) -> None:
         """Empty bytes should not be classified as binary."""
-        assert _is_binary_content(b"") is False
+        assert looks_binary(b"") is False
 
     def test_null_bytes_are_binary(self) -> None:
         """Bytes containing null characters should be classified as binary."""
-        assert _is_binary_content(b"hello\x00world") is True
+        assert looks_binary(b"hello\x00world") is True
 
     def test_png_header_is_binary(self) -> None:
         """PNG file header bytes should be classified as binary."""
         png_header = b"\x89PNG\r\n\x1a\n"
-        assert _is_binary_content(png_header) is True
+        assert looks_binary(png_header) is True
 
     def test_utf8_text_is_not_binary(self) -> None:
         """UTF-8 encoded text with special characters is not binary."""
-        assert _is_binary_content("caf\u00e9 na\u00efve".encode()) is False
+        assert looks_binary("caf\u00e9 na\u00efve".encode()) is False
 
     def test_high_control_char_ratio_is_binary(self) -> None:
         """Content with many non-text control characters should be binary."""
         # Many control characters mixed with some text
         content = b"\x01\x02\x03\x04\x05\x06\x07\x08" * 10 + b"text"
-        assert _is_binary_content(content) is True
+        assert looks_binary(content) is True
 
 
 # ---- _try_decode Tests ----
@@ -131,7 +130,7 @@ class TestTryDecode:
         binary = bytes(range(256)) * 2
         result = _try_decode(binary)
         # Either None or decoded with replacement chars — binary detection
-        # happens separately in _is_binary_content
+        # happens separately in looks_binary
         assert result is None or isinstance(result, str)
 
     def test_chardet_fallback_for_non_utf8(self) -> None:
@@ -655,16 +654,16 @@ class TestDiscoverSkipsBinariesUnread:
         """
         (tmp_path / "big.bin").write_bytes(b"\x00\xff" * (2 * 1024 * 1024))
         judged: list[int] = []
-        real_predicate = generic_module._is_binary_content
+        real_predicate = generic_module.looks_binary
 
         def spy(raw_bytes: bytes) -> bool:
             judged.append(len(raw_bytes))
             return real_predicate(raw_bytes)
 
-        monkeypatch.setattr(generic_module, "_is_binary_content", spy)
+        monkeypatch.setattr(generic_module, "looks_binary", spy)
 
         assert ingestor.discover(tmp_path) == []
-        assert judged == [_BINARY_CHECK_SIZE]
+        assert judged == [BINARY_CHECK_SIZE]
 
     def test_a_null_byte_past_the_prefix_is_left_to_parse(
         self,
@@ -681,7 +680,7 @@ class TestDiscoverSkipsBinariesUnread:
         discover would be the prefix overreaching.
         """
         path = tmp_path / "late.txt"
-        path.write_bytes(b"a" * (_BINARY_CHECK_SIZE + 16) + b"\x00tail")
+        path.write_bytes(b"a" * (BINARY_CHECK_SIZE + 16) + b"\x00tail")
 
         discovered = ingestor.discover(tmp_path)
 
@@ -731,14 +730,14 @@ class TestDiscoverSkipsBinariesUnread:
         to reach the fragment, or the change would quietly amputate every
         source file over 8 KiB.
         """
-        body = "line of text\n" * ((_BINARY_CHECK_SIZE // 13) + 500)
+        body = "line of text\n" * ((BINARY_CHECK_SIZE // 13) + 500)
         (tmp_path / "long.txt").write_text(body, encoding="utf-8")
 
         fragments = ingestor.ingest(tmp_path).fragments
 
         assert len(fragments) == 1
         assert fragments[0].content == body
-        assert len(fragments[0].content) > _BINARY_CHECK_SIZE
+        assert len(fragments[0].content) > BINARY_CHECK_SIZE
 
 
 # ---- chardet detection-table crossing (#1257) ----

@@ -8,6 +8,7 @@ import frontmatter
 import pytest
 
 from creek.ingest.base import assemble_ingested_fragment
+from creek.ingest.encoding import UndecodableBytesError
 from creek.ingest.presentations import (
     PRESENTATION_EXTENSIONS,
     PresentationBackend,
@@ -720,59 +721,6 @@ class TestCsvFiles:
                 "writer's, which reaches a vault as mojibake (#1257)"
             )
 
-    def test_csv_gbk_falls_under_the_confidence_gate_and_warns(
-        self,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """Chinese CSV is corrupted by the cp1252 fallback today (#1589).
-
-        This pins a **defect**, not a contract. chardet scores GB18030
-        at 0.54 on realistic CSV content — CSV structure itself is
-        ASCII, which dilutes a multi-byte codec's score — so the
-        detection never clears
-        :data:`CSV_CHARDET_CONFIDENCE_THRESHOLD` and every Chinese cell
-        is decoded as cp1252 into plausible-looking garbage. Verified
-        identical under chardet 7.4.3 (0.5437) and 7.6.0 (0.5411), so
-        the #1257 floor raise neither causes nor fixes it; #1589 owns
-        the fix.
-
-        It is asserted rather than left silent because the failure is
-        invisible: cp1252 accepts every byte, so nothing raises and
-        nothing downstream can tell a corrupted vault from a healthy
-        one. When #1589 lands, this test must go red and be replaced by
-        the round-trip assertion its Shift-JIS neighbour already makes.
-        """
-        import logging
-
-        csv_path = tmp_path / "gbk.csv"
-        rows = (
-            "姓名,城市,备注\n"
-            "王伟,北京,他每天早上都会沿着小河散步\n"
-            "李娜,上海,河水清澈。岸边的树木在风中轻轻摇动\n"
-            "张敏,广州,远处的山峦笼罩在薄雾里。世界还没有醒来\n"
-        )
-        csv_path.write_bytes((rows * 40).encode("gbk"))
-        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
-        with caplog.at_level(logging.WARNING, logger="creek.ingest.spreadsheets"):
-            fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
-        markdown = ingestor.convert_to_markdown(fragments[0])
-
-        assert "姓名" not in markdown, (
-            "GBK CSV now decodes correctly — #1589 has been fixed, so "
-            "replace this defect-pinning test with the round-trip "
-            "assertion test_csv_shift_jis_cells_all_survive_the_"
-            "detection_tables makes"
-        )
-        assert any(
-            "decoded as cp1252" in record.message and "GB18030" in record.message
-            for record in caplog.records
-        ), (
-            "the cp1252 fallback corrupted a Chinese CSV without naming "
-            "chardet's rejected guess; the warning is the only signal a "
-            "user gets before the mojibake lands in the vault (#1589)"
-        )
-
     def test_csv_cp1252_fallback_logs_warning(
         self,
         tmp_path: Path,
@@ -797,6 +745,202 @@ class TestCsvFiles:
         assert any(
             "decoded as cp1252" in record.message and "ascii.csv" in record.message
             for record in caplog.records
+        )
+
+
+# ---- the CSV encoding decision matrix (#1589, #1591) ------------------
+
+#: One row per encoding family that reaches ``_read_csv``, with the
+#: chardet verdict measured on *this* corpus under chardet 7.6.0. The
+#: figures are recorded here so nobody has to re-derive them, and
+#: because both issues were filed with wrong ones: #1589 claimed
+#: GB18030 scored 0.54-0.63 and that CSV commas diluted it, and that
+#: Shift-JIS was unaffected. Measured, none of that holds — Chinese
+#: prose scores *lower* than the same characters in a CSV, confidence
+#: is flat with length, and Japanese lands under the gate too.
+#:
+#: What actually splits the rows is two independent facts: whether the
+#: corpus scores under :data:`CSV_CHARDET_CONFIDENCE_THRESHOLD`, and
+#: whether its bytes happen to include one of cp1252's five undefined
+#: values (0x81 0x8d 0x8f 0x90 0x9d). The first face is silent
+#: mojibake (#1589); the second is a ``UnicodeDecodeError`` that
+#: ``_parse_safe`` turns into a dropped file (#1591). Same gate, two
+#: symptoms, so they are one table rather than two tests.
+#:
+#:   id                  codec      chardet verdict     was
+#:   zh-gbk              gbk        GB18030 @ 0.38      mojibake
+#:   zh-rare-lead-bytes  gbk        GB18030 @ 0.57      crash on 0x81
+#:   jp-short-sjis       shift_jis  CP932   @ 0.32      crash on 0x81
+#:   jp-long-sjis        shift_jis  CP932   @ 0.89      correct
+#:   ko-euckr           euc-kr     CP949   @ 0.69      mojibake
+#:   cp1252-rich         cp1252     cp862   @ 0.08      correct
+#:   utf8-plain          utf-8      never reaches chardet
+#:   utf8-bom            utf-8-sig  never reaches chardet
+_CSV_ENCODING_MATRIX: tuple[tuple[str, str, str], ...] = (
+    (
+        "zh-gbk",
+        "gbk",
+        "姓名,城市,备注\n"
+        "王伟,北京,他每天早上都会沿着小河散步\n"
+        "李娜,上海,河水清澈岸边的树木在风中轻轻摇动\n",
+    ),
+    (
+        # Contains 丂丄丅丆丏 — GBK encodes these with a 0x81 lead
+        # byte, which cp1252 leaves undefined. This row is #1591's
+        # crash wearing Chinese rather than Japanese, which is why
+        # "the defect is specific to the Chinese detector" and "a
+        # Japanese spreadsheet aborts the run" are both wrong about
+        # which axis matters.
+        "zh-rare-lead-bytes",
+        "gbk",
+        "姓名,城市,备注\n"
+        "王伟,北京,他每天早上都会沿着小河散步丂丄丅丆丏\n"
+        "李娜,上海,河水清澈岸边的树木在风中轻轻摇动\n",
+    ),
+    (
+        # 、 is 0x8141 and 。 is 0x8142 in Shift-JIS: the exact bytes
+        # #1591 was filed on. Two short rows, so it scores far under
+        # the gate — character variety, not length, is what moves
+        # chardet's confidence.
+        "jp-short-sjis",
+        "shift_jis",
+        "名前、年齢。\n田中、三十。\n",
+    ),
+    (
+        # The one CJK corpus that already clears the gate, kept as a
+        # regression guard: the fix must not disturb the path that
+        # was already correct.
+        "jp-long-sjis",
+        "shift_jis",
+        "名前,都市,メモ\n"
+        "田中,東京,ありがとうございます\n"
+        "鈴木,大阪,初めまして、よろしくお願いします\n",
+    ),
+    (
+        "ko-euckr",
+        "euc-kr",
+        "이름,도시,비고\n"
+        "김철수,서울,그는 매일 아침 강변을 걷습니다\n"
+        "이영희,부산,그녀는 숲을 좋아합니다\n",
+    ),
+    (
+        # The row that forbids the two fixes both issues suggested.
+        # chardet answers a *single-byte* codec here (cp862 @ 0.08),
+        # and raw.decode() of that guess succeeds while producing
+        # naïve -> naïve-shaped garbage. So "trust a detection that
+        # round-trips, even below the gate" (#1589) would corrupt
+        # this row, and swapping the fallback to latin-1 (#1591)
+        # would turn every smart quote, dash and € into a control
+        # character. Both stay green only because the fix keys on
+        # codec *class*, not on confidence or decodability.
+        "cp1252-rich",
+        "cp1252",
+        "name,note\nAlice,café naïve — “quoted”\nBob,résumé \u2013 £85 €9 ©\n",
+    ),
+    ("utf8-plain", "utf-8", "name,city\n田中,東京\nAlice,Münster\n"),
+    ("utf8-bom", "utf-8-sig", "name,city\nMünster,São Paulo\n"),
+)
+
+
+def _cells(text: str) -> list[str]:
+    """Split a CSV corpus into its individual cell strings."""
+    return [
+        cell for line in text.strip().split("\n") for cell in line.split(",") if cell
+    ]
+
+
+class TestCsvEncodingDecisionMatrix:
+    """Every encoding family round-trips through ``_read_csv`` intact.
+
+    The pre-existing CSV encoding tests assert substrings — "café" is
+    in the markdown, or *at least one* kanji survived. Both survive the
+    corruption they exist to catch, because a wrong codec still leaves
+    the ASCII run and some fraction of the multi-byte run intact. These
+    assert **every cell**, which is the only assertion a half-corrupted
+    vault fails.
+    """
+
+    @pytest.mark.parametrize(
+        ("codec", "corpus"),
+        [(codec, corpus) for _, codec, corpus in _CSV_ENCODING_MATRIX],
+        ids=[name for name, _, _ in _CSV_ENCODING_MATRIX],
+    )
+    def test_every_cell_survives_decoding(
+        self,
+        tmp_path: Path,
+        codec: str,
+        corpus: str,
+    ) -> None:
+        """Bytes written in *codec* reach the markdown unchanged.
+
+        Args:
+            tmp_path: Per-test directory holding the CSV.
+            codec: Codec the corpus is written in.
+            corpus: Source CSV text.
+        """
+        csv_path = tmp_path / "matrix.csv"
+        csv_path.write_bytes(corpus.encode(codec))
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        fragments = ingestor.parse(ingestor.discover(tmp_path)[0])
+        markdown = ingestor.convert_to_markdown(fragments[0])
+        assert "\ufeff" not in markdown, (
+            "a BOM reached the rendered table; utf-8-sig must strip it"
+        )
+        for cell in _cells(corpus):
+            assert cell in markdown, (
+                f"cell {cell!r} did not survive decoding of {codec} bytes. "
+                "Either chardet's guess was rejected and cp1252 mangled "
+                "the row (#1589), or the codec chosen disagrees with the "
+                "writer's. A vault of half-corrupted rows looks healthy "
+                "until someone reads it."
+            )
+
+    def test_the_matrix_still_covers_every_family(self) -> None:
+        """The table has not been emptied, trimmed, or re-scoped.
+
+        Deleting a row removes a guard without turning anything red —
+        the parametrisation simply runs fewer cases and the gate stays
+        green. The two rows that matter most are the ones a naive fix
+        would drop: ``cp1252-rich`` is what forbids the latin-1 swap
+        and the round-trip tie-breaker, and ``jp-long-sjis`` is the
+        only corpus that was already correct.
+        """
+        assert {name for name, _, _ in _CSV_ENCODING_MATRIX} == {
+            "zh-gbk",
+            "zh-rare-lead-bytes",
+            "jp-short-sjis",
+            "jp-long-sjis",
+            "ko-euckr",
+            "cp1252-rich",
+            "utf8-plain",
+            "utf8-bom",
+        }
+
+    def test_undecodable_binary_csv_fails_loudly_and_writes_nothing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A binary ``.csv`` raises, and ``ingest()`` drops it with an error.
+
+        #1591 suggested falling back to latin-1, which decodes all 256
+        byte values — that would convert this loud failure into a
+        silent fragment of garbage. The fallback chain therefore
+        refuses binary input before it reaches any all-accepting
+        codec, so a genuinely undecodable file stays loud.
+        """
+        csv_path = tmp_path / "binary.csv"
+        csv_path.write_bytes(bytes(range(256)) * 4)
+        ingestor = SpreadsheetIngestor(backend=OpenpyxlBackend())
+        with pytest.raises(UndecodableBytesError):
+            ingestor.parse(ingestor.discover(tmp_path)[0])
+        result = ingestor.ingest(tmp_path)
+        assert result.fragments == [], (
+            "a binary CSV produced a fragment; undecodable input must "
+            "never reach the vault"
+        )
+        assert any("binary.csv" in error for error in result.errors), (
+            "the dropped file was not recorded in result.errors, so the "
+            "operator has no signal that a file went missing (#1591)"
         )
 
 

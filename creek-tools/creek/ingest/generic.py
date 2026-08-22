@@ -6,9 +6,14 @@ strategies (UTF-8, UTF-16, Latin-1, chardet fallback), skips binary files,
 and routes unclassified content to ``01-Fragments/Unsorted/`` with
 ``source.platform: "other"`` in frontmatter.
 
+The binary heuristic this module used to define lives in
+:mod:`creek.ingest.encoding` as
+:func:`~creek.ingest.encoding.looks_binary`, so the CSV path and this one
+judge "binary" by the same rule rather than by two copies of it that can
+drift apart.
+
 Exports:
     GenericIngestor: Concrete ``Ingestor`` subclass for unclaimed files.
-    _is_binary_content: Heuristic check for binary file content.
     _try_decode: Multi-strategy text decoding with fallback chain.
 """
 
@@ -29,6 +34,7 @@ from creek.ingest.base import (
     file_modified_time,
     normalize_encoding,
 )
+from creek.ingest.encoding import BINARY_CHECK_SIZE, looks_binary
 from creek.models import SourcePlatform
 from creek.time import LA_TZ
 
@@ -40,12 +46,6 @@ _CLAIMED_EXTENSIONS: frozenset[str] = frozenset({".md", ".json"})
 
 # Extensions rendered as plain text (no code block wrapping)
 _PLAIN_TEXT_EXTENSIONS: frozenset[str] = frozenset({".txt", ".text", ".log"})
-
-# Number of bytes to sample for binary content detection
-_BINARY_CHECK_SIZE = 8192
-
-# If more than 10% of bytes are non-text control chars, treat as binary
-_BINARY_CONTROL_THRESHOLD = 0.10
 
 # UTF-16 byte-order marks. UTF-16 text is full of null bytes, so it trips
 # every binary heuristic here and has to be recognised before they run.
@@ -76,30 +76,6 @@ def _safe_file_mtime(path: Path) -> datetime | None:
         return None
 
 
-def _is_binary_content(raw_bytes: bytes) -> bool:
-    """Determine whether raw bytes represent binary (non-text) content.
-
-    Uses two heuristics:
-    1. Presence of null bytes (``\\x00``) — almost always binary.
-    2. High ratio of non-text control characters (codes 0-8, 14-31).
-
-    Args:
-        raw_bytes: The raw bytes to check.
-
-    Returns:
-        ``True`` if the content appears to be binary, ``False`` otherwise.
-    """
-    if not raw_bytes:
-        return False
-
-    if b"\x00" in raw_bytes:
-        return True
-
-    sample = raw_bytes[:_BINARY_CHECK_SIZE]
-    control_count = sum(1 for byte in sample if byte < 9 or (14 <= byte <= 31))
-    return control_count / len(sample) > _BINARY_CONTROL_THRESHOLD
-
-
 def _try_decode(raw_bytes: bytes) -> str | None:
     """Attempt to decode raw bytes using multiple encoding strategies.
 
@@ -121,7 +97,7 @@ def _try_decode(raw_bytes: bytes) -> str | None:
         with suppress(UnicodeDecodeError, ValueError):
             return raw_bytes.decode("utf-16")
 
-    if _is_binary_content(raw_bytes):
+    if looks_binary(raw_bytes):
         return None
 
     # Try UTF-8 first (most common encoding)
@@ -149,8 +125,8 @@ def _read_unless_binary(file_path: Path) -> bytes | None:
     continues reading when the content might survive parsing.
 
     Output-neutral by construction rather than by an extension list.
-    :func:`_is_binary_content` looks for a null byte anywhere and
-    otherwise scores only the first ``_BINARY_CHECK_SIZE`` bytes, so if
+    :func:`~creek.ingest.encoding.looks_binary` looks for a null byte anywhere and
+    otherwise scores only the first ``BINARY_CHECK_SIZE`` bytes, so if
     the prefix tests binary the whole file necessarily does too, and
     ``parse`` would have dropped it. The UTF-16 BOM exemption is applied
     here for the same reason ``_try_decode`` applies it: UTF-16 text is
@@ -164,8 +140,8 @@ def _read_unless_binary(file_path: Path) -> bytes | None:
         would have discarded it anyway.
     """
     with file_path.open("rb") as handle:
-        prefix = handle.read(_BINARY_CHECK_SIZE)
-        if prefix[:2] not in _UTF16_BOMS and _is_binary_content(prefix):
+        prefix = handle.read(BINARY_CHECK_SIZE)
+        if prefix[:2] not in _UTF16_BOMS and looks_binary(prefix):
             logger.debug("Skipping binary file without reading it: %s", file_path)
             return None
         return prefix + handle.read()

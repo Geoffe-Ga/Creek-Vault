@@ -30,8 +30,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-import chardet
-
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
@@ -39,6 +37,7 @@ from creek.ingest.base import (
     file_modified_time,
     parse_authored_at,
 )
+from creek.ingest.encoding import DEFAULT_CONFIDENCE_THRESHOLD, decode_bytes
 from creek.ingest.source_unit import sanitize_unit
 from creek.models import SourcePlatform
 
@@ -368,63 +367,65 @@ def _safe_parse_authored_at(candidate: object) -> datetime | None:
         return None
 
 
-CSV_CHARDET_CONFIDENCE_THRESHOLD: float = 0.7
-"""Minimum ``chardet`` confidence required to trust an auto-detected encoding.
+CSV_CHARDET_CONFIDENCE_THRESHOLD: float = DEFAULT_CONFIDENCE_THRESHOLD
+"""Minimum ``chardet`` confidence required to trust a *single-byte* guess.
 
-Below this we fall through to ``cp1252`` and emit a warning so the
-user knows the result may be mojibake.
+This governs the single-byte path only, and is unchanged at 0.7. A
+multi-byte detection is admitted below it by codec class instead —
+see :mod:`creek.ingest.encoding` for why lowering this number was the
+wrong fix and what replaced it (#1589, #1591).
+
+For orientation, the measured verdicts under chardet 7.6.0 that the
+threshold alone cannot separate: a GBK CSV scores 0.38 and a short
+Shift-JIS one 0.32, both correct and both under the gate; a Cyrillic
+CSV scores 0.45 and a genuine cp1252 file's top guess 0.05, both of
+which must *not* be trusted.
 """
 
 
 def _read_csv(path: Path, *, has_header: bool | None = None) -> WorkbookData:
     """Read a CSV file as a single-sheet workbook.
 
-    Probe order:
-
-    1. ``utf-8-sig`` — handles BOM + plain UTF-8, the dominant case.
-    2. ``chardet`` — detects non-Western encodings (Shift-JIS, GBK,
-       ISO-8859-5, …) when its confidence exceeds
-       :data:`CSV_CHARDET_CONFIDENCE_THRESHOLD`.
-    3. ``cp1252`` — last-resort fallback that accepts any byte
-       sequence. Emits a ``WARNING`` log including the file path so
-       the user has a chance to spot mojibake before it lands in the
-       vault (BUG-010).
+    Decoding is delegated whole to
+    :func:`creek.ingest.encoding.decode_bytes`, which owns the probe
+    order and the accept/reject rule. When it reports a degraded
+    result — no codec positively identified, so a fallback was used —
+    this emits a ``WARNING`` naming the file and the guess that was
+    rejected, so the user has a chance to spot mojibake before it
+    lands in the vault (BUG-010).
 
     ``has_header`` is threaded into :func:`_split_header` so callers
     can override per-call header auto-detection (#165).
+
+    Args:
+        path: The CSV file to read.
+        has_header: Optional override for header auto-detection.
+
+    Returns:
+        A single-sheet :class:`WorkbookData`.
+
+    Raises:
+        UndecodableBytesError: When the file is binary rather than
+            text. It propagates to ``Ingestor._parse_safe``, which
+            records the failure and skips the file — the loud outcome
+            #1591 asked for. Returning garbage instead would write a
+            fragment nothing downstream could tell from real text.
     """
     raw = path.read_bytes()
-    try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        pass
-    else:
-        return _csv_text_to_workbook(path, text, has_header=has_header)
-
-    detection = chardet.detect(raw)
-    detected = detection.get("encoding")
-    confidence = detection.get("confidence") or 0.0
-    if (
-        detected
-        and confidence >= CSV_CHARDET_CONFIDENCE_THRESHOLD
-        and detected.lower() not in {"ascii", "utf-8-sig", "cp1252"}
-    ):
-        try:
-            text = raw.decode(detected)
-        except (UnicodeDecodeError, LookupError):
-            pass
-        else:
-            return _csv_text_to_workbook(path, text, has_header=has_header)
-
-    text = raw.decode("cp1252")
-    logger.warning(
-        "CSV %s decoded as cp1252 (chardet best guess: %s @ %.2f); "
-        "non-Western content may render as mojibake.",
-        path,
-        detected or "unknown",
-        confidence,
+    decoded = decode_bytes(
+        raw,
+        confidence_threshold=CSV_CHARDET_CONFIDENCE_THRESHOLD,
     )
-    return _csv_text_to_workbook(path, text, has_header=has_header)
+    if decoded.degraded:
+        logger.warning(
+            "CSV %s decoded as %s (chardet best guess: %s @ %.2f); "
+            "non-Western content may render as mojibake.",
+            path,
+            decoded.codec,
+            decoded.detected or "unknown",
+            decoded.confidence,
+        )
+    return _csv_text_to_workbook(path, decoded.text, has_header=has_header)
 
 
 def _csv_text_to_workbook(
