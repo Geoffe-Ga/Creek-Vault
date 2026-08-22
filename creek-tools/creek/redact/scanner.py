@@ -27,12 +27,13 @@ import os
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path  # noqa: TC003 — Pydantic needs Path at runtime
+from pathlib import Path
+from typing import Final
 
 from pydantic import BaseModel
 from tqdm import tqdm
 
-from creek._containment import resolves_within
+from creek._containment import escaping_child, resolves_within
 from creek.config import RedactionConfig  # noqa: TC001 — used at runtime
 from creek.redact.patterns import (
     HIGH_ENTROPY_MIN_RUN,
@@ -41,6 +42,19 @@ from creek.redact.patterns import (
 )
 
 logger = logging.getLogger(__name__)
+
+_CANONICAL_CONTAINMENT_PREDICATE: Final = resolves_within
+"""Pins ``creek.redact.scanner.resolves_within`` to the canonical object.
+
+Since #1498 this module's only containment call is :func:`escaping_child`,
+which is itself defined in terms of :func:`resolves_within`. The name is kept
+bound here anyway because #1294 pinned it BY IDENTITY —
+``test_the_containment_predicate_has_exactly_one_definition`` asserts
+``scanner.resolves_within is _containment.resolves_within`` — so dropping it
+would retire the guard that stops a local re-implementation of "inside" from
+appearing in this module. A binding, rather than a lint suppression, is what
+keeps that contract honest.
+"""
 
 SYMLINK_SKIP_LABEL = "Files skipped (escaping symlink)"
 """Statistics label for files declined because they escape the scan root.
@@ -724,6 +738,28 @@ def _scannable_candidates(dir_path: Path) -> tuple[list[Path], int]:
     Skips are logged naming only the as-scanned path. The resolved target is
     never named: disclosing it is the very oracle #1087 closes.
 
+    Enumerates with ``os.walk(..., onerror=...)`` rather than ``rglob`` since
+    #1498. ``rglob`` swallows a failed ``scandir``, so a directory the scanner
+    could not list was indistinguishable from an empty one: the subtree was
+    not scanned, not counted in ``escaped``, and not reported, and the
+    operator read a clean result over a region that was never opened. The
+    ruling for this surface is REPORT, not refuse — ``--scan`` writes nothing
+    and :meth:`creek.pipeline.Pipeline._run_redaction_pass` reaches it on the
+    unattended ``creek process`` / ``creek sync` path, so a refusal here would
+    disable the operator's whole safety scan over one chmod-000 directory.
+    The count is deliberately NOT folded into ``escaped``: an unreadable
+    directory is not an escaping symlink, and conflating them would make the
+    one statistic the pipeline refusal is built on mean two things.
+
+    The ``os.walk`` swap is bound to be parity-preserving with the ``rglob``
+    it replaces, which is why it iterates ``filenames`` and re-applies
+    ``is_file()``: ``os.walk`` classifies a symlink-to-directory into
+    ``dirnames`` (and, with ``followlinks=False``, does not descend), exactly
+    as ``rglob`` yielded it and ``is_file()`` dropped it, while a *broken*
+    symlink lands in ``filenames`` and is dropped by ``is_file()`` before the
+    containment test — as it was before. The same idiom is proven in
+    :func:`creek.ingest.markdown._enumerate_markdown_paths`.
+
     Known gaps, deliberately out of scope here:
 
     * Escaping ANCESTOR components. The directly-named path is now tested
@@ -751,14 +787,33 @@ def _scannable_candidates(dir_path: Path) -> tuple[list[Path], int]:
     candidates: list[Path] = []
     escaped = 0
 
-    for child in dir_path.rglob("*"):
-        if not child.is_file():
-            continue
-        if child.is_symlink() and not resolves_within(child, resolved_root):
-            logger.warning("Skipping symlink that escapes the scan root: %s", child)
-            escaped += 1
-            continue
-        candidates.append(child)
+    def _record(error: OSError) -> None:
+        """Report a directory ``scandir`` refused instead of discarding it.
+
+        Args:
+            error: The ``OSError`` ``os.walk`` would otherwise swallow. Only
+                its ``filename`` — the directory, as walked — is logged.
+        """
+        logger.warning(
+            "Skipping a subtree the scan could not list: %s. Nothing beneath "
+            "it was scanned; restore read+execute permission to cover it.",
+            error.filename,
+        )
+
+    for dirpath, _dirnames, filenames in os.walk(
+        dir_path,
+        onerror=_record,
+        followlinks=False,
+    ):
+        for name in filenames:
+            child = Path(dirpath) / name
+            if not child.is_file():
+                continue
+            if escaping_child(child, resolved_root):
+                logger.warning("Skipping symlink that escapes the scan root: %s", child)
+                escaped += 1
+                continue
+            candidates.append(child)
 
     return sorted(candidates), escaped
 
