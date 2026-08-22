@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import frontmatter
 
 from creek._fsio import create_exclusive, write_all
+from creek._fslock import vault_lock
 from creek.audit import AuditLog
 from creek.models import (
     Authorship,
@@ -151,6 +152,53 @@ INDEX_FILENAME = ".id-index.jsonl"
 JSONL format (one JSON object per line, ``{"id": ..., "filename": ...}``)
 keeps each write O(1) — appends never touch existing entries — so a
 directory of 10 000 fragments does not produce O(N²) total work.
+"""
+
+_NO_INDEX_FILE = -1
+"""Cursor value meaning "*this directory has no index file*" (#1603).
+
+Negative so it can never be confused with a real byte size, which lets
+one equality test decide "nothing changed" for a present index and an
+absent one alike — and so an empty directory keeps the "no ids here"
+memo #1332 introduced instead of re-globbing on every lookup.
+"""
+
+INDEX_LOCK_FILENAME = ".id-index.lock"
+"""Per-directory advisory lock guarding the check-then-act around the index.
+
+Scoped to *one fragment directory* on purpose (#1603). The thing that
+needed serialising is the "is this id already here? no — create it"
+window in :meth:`VaultWriter._write_model`, and that window is only ever
+contended by two writers aiming at the same directory. A vault-wide lock
+would additionally make a bulk ``creek ingest`` block a ``/v1`` journal
+save that shares nothing with it; measured, journal-vs-Drive writes into
+one shared directory produced zero anomalies in 25 overlapping runs, so
+serialising unrelated routes would buy nothing and cost throughput.
+
+It is deliberately a key no connector holds.
+:func:`creek._fslock.vault_lock` fronts ``flock`` with a plain
+:class:`threading.Lock` and is therefore **not reentrant**;
+``creek_mcp.tools.drive`` already holds ``gdrive.lock`` across its whole
+download-and-ingest window, so a fragment-write lock named after the
+ledger would self-deadlock every sync for the full timeout and then
+refuse it.
+
+**What it costs, measured.** One uncontended acquire-and-release is
+~0.09 ms (20 000 cycles in 1.88 s on the reference machine), against
+~1.0-1.3 ms of existing work per ingested unit (2 000 units in
+1.98-2.33 s; 4 000 in 5.31 s) — inside the run-to-run variance of a
+loaded box. The wait is
+:data:`creek._fslock.DEFAULT_LOCK_TIMEOUT_SECONDS` (10 s), comfortably
+under the ``/v1`` request budget of 30 s
+(:data:`creek_mcp.httpapi.middleware.limits.DEFAULT_TIMEOUT_SECONDS`),
+and it is scoped to a *single write* rather than to a whole run, so a
+bulk ingest can never hold it long enough to refuse a journal save.
+
+**What it does not serialise**, deliberately: writes into different
+fragment directories; a Drive sync against a journal save (measured
+0/25 anomalous with no lock at all, because the two load different
+ledger files and never share a ``source_key``); and unledgered archive
+ingests of different content.
 """
 
 PROVENANCE_FILENAME = "provenance.jsonl"
@@ -464,16 +512,54 @@ class _IndexLoad(NamedTuple):
         torn_lines: How many lines failed ``json.loads``. A torn append
             leaves exactly one; a crash-heavy history can leave several.
         read_failed: ``True`` when the file could not be read at all.
+        consumed: How many *bytes* of the file this parse accounted for.
+            The cursor a later incremental refresh resumes from (#1603).
+            :data:`_NO_INDEX_FILE` — never ``0`` — when the file could not
+            be read at all: ``0`` is a real size, the size of an index
+            that exists and is empty, and a cursor equal to the file's
+            size is what tells the refresh nothing has changed. Carrying
+            the sentinel instead keeps an unreadable file from reading as
+            a fully-consumed empty one. Required rather than defaulted,
+            so a new construction site has to decide which it means.
     """
 
     entries: dict[str, str]
     torn_lines: int
     read_failed: bool
+    consumed: int
 
     @property
     def damaged(self) -> bool:
         """Return ``True`` when *entries* may be missing a real mapping."""
         return self.torn_lines > 0 or self.read_failed
+
+
+class _IndexCursor(NamedTuple):
+    """How far into ``.id-index.jsonl`` a cached index has been read (#1603).
+
+    The per-directory index cache used to be load-once-per-writer, which
+    is correct only while this process is the sole writer. It is not:
+    two overlapping ingests each build their own
+    :class:`VaultWriter`, so the loser of a race went on consulting a
+    snapshot taken before the winner's entries existed and minted a
+    second file for every id the winner had already written. Serialising
+    the write window alone does not fix that — a lock makes the
+    check-then-act atomic, it does not make a stale *answer* fresh.
+
+    Attributes:
+        consumed: Byte offset already folded into the cached mapping.
+            An index file still exactly this long has told us everything
+            it knows.
+        incremental: Whether the tail past *consumed* may simply be
+            appended to the cached mapping. ``False`` after a damaged
+            load, whose mapping came partly from a directory scan that
+            deliberately overrides what the file said — replaying the
+            file's tail onto it would reinstate the claims the scan just
+            disproved.
+    """
+
+    consumed: int
+    incremental: bool
 
 
 def _is_material_change(old_body: str, new_body: str, threshold: float) -> bool:
@@ -734,10 +820,20 @@ class VaultWriter:
         # Loaded lazily on first access; persisted to disk on every
         # write so a second process picks up entries written by the first.
         self._dir_indexes: dict[Path, dict[str, str]] = {}
-        # Single process-level lock guards the in-memory index cache.
-        # Cross-process safety for the index is out of scope (BUG-006);
-        # the provenance log uses creek.audit.AuditLog which has its own
-        # cross-process flock.
+        # How much of each directory's index file the cache above has
+        # already absorbed (#1603). A cache with no cursor is a cache
+        # that must be rebuilt from scratch before it is trusted.
+        self._index_cursors: dict[Path, _IndexCursor] = {}
+        # Guards the in-memory index cache against the *threads of this
+        # process*. It is not the vault's serialisation boundary and
+        # never was: this object is per-VaultWriter, and every ingest run
+        # builds its own writer, so two overlapping runs hold two of
+        # these and neither can see the other. Writes that must be
+        # atomic against another writer — in this process or another —
+        # take creek._fslock.vault_lock on the target directory's
+        # INDEX_LOCK_FILENAME as well, always *outside* this one, so the
+        # two are acquired in one order everywhere and cannot invert
+        # (#1603, superseding BUG-006's cross-process carve-out).
         self._lock = threading.Lock()
         # Reuse a single AuditLog instance across every provenance
         # append so the per-instance hash cache stays warm across the
@@ -892,7 +988,14 @@ class VaultWriter:
                 not parse; the message names the path (same function).
         """
         target_dir = self._fragment_target_dir(fragment)
-        with self._lock:
+        if not target_dir.is_dir():
+            # Nothing can map to the id, and the index load below would
+            # answer the same. Returning here keeps this lookup-shaped
+            # path from creating a directory and a lock file in the
+            # operator's vault as a side effect of finding nothing —
+            # the same trap #1332 closed for the empty-index memo.
+            return None
+        with vault_lock(self._index_lock_path(target_dir)), self._lock:
             existing = self._find_existing_locked(fragment.id, target_dir)
             if existing is None:
                 return None
@@ -1416,18 +1519,25 @@ class VaultWriter:
         """
         model_id: str = getattr(model, "id", "")
 
-        # The lock is intentionally held across the whole write —
-        # duplicate check, file creation, index append, and provenance
-        # append all run serially within a single process. Narrowing
+        # Both locks are held across the whole write — duplicate check,
+        # file creation, index append, and provenance append. Narrowing
         # the critical section would re-introduce the TOCTOU between
         # ``_find_existing_locked`` and ``_atomic_create`` that BUG-006
-        # was filed to close. The throughput trade-off is documented
-        # in the PR description; revisit only with a benchmark-driven
-        # follow-up issue. The id verification and any index repair
+        # was filed to close. The id verification and any index repair
         # ``_find_existing_locked`` performs (#1083) run inside this same
         # critical section, so a repaired mapping cannot be raced by a
         # concurrent write between the re-resolution and the file creation.
-        with self._lock:
+        #
+        # The outer lock is the cross-*process* half BUG-006 declared out
+        # of scope and #1603 closed: ``self._lock`` belongs to this
+        # instance, and ``run_ingest`` builds a fresh VaultWriter per
+        # call, so two overlapping runs never shared it — not across
+        # processes, and not even across two threads of the ``/v1``
+        # threadpool. Measured before the fix, two overlapping ingests of
+        # one six-unit corpus produced twelve notes carrying six ids.
+        # Order is always vault_lock-then-self._lock, here and in
+        # ``_update_existing``, so the pair cannot invert.
+        with vault_lock(self._index_lock_path(target_dir)), self._lock:
             existing = self._find_existing_locked(model_id, target_dir)
             if existing is not None:
                 return existing
@@ -1626,6 +1736,116 @@ class VaultWriter:
         with self._lock:
             return self._find_existing_locked(model_id, target_dir)
 
+    @staticmethod
+    def _index_lock_path(target_dir: Path) -> Path:
+        """Return the advisory lock file guarding *target_dir*'s index.
+
+        Args:
+            target_dir: The fragment directory being written into.
+
+        Returns:
+            The lock file path. It need not exist yet;
+            :func:`creek._fslock.vault_lock` creates it and its parent.
+        """
+        return target_dir / INDEX_LOCK_FILENAME
+
+    def _refresh_index_locked(
+        self,
+        target_dir: Path,
+        cached: dict[str, str],
+    ) -> dict[str, str] | None:
+        """Fold anything appended since *cached* was built into it (#1603).
+
+        Caller must hold ``self._lock``. This is what keeps a cached
+        index honest about writes another process (or another
+        :class:`VaultWriter` in this one) made after the cache was
+        populated. Without it the fix for the write race would be half a
+        fix: the lock makes each check-then-act atomic, but a writer
+        answering from a snapshot taken before its partner's entries
+        existed still concludes "not here" and creates a second file.
+
+        Cheap by construction — the index is append-only in steady
+        state, so the refresh reads only the bytes past the cursor,
+        which after this writer's own last append is a single line.
+
+        Args:
+            target_dir: The directory whose index is cached.
+            cached: The mapping to bring up to date, mutated in place so
+                every holder of the same dict sees the new entries.
+
+        Returns:
+            *cached*, updated, when it could be brought current; ``None``
+            when the caller must reload the index from scratch — the file
+            shrank (a whole-file rewrite), the tail would not parse, or
+            the previous load was damaged and its mapping outranks what
+            the file claims.
+        """
+        cursor = self._index_cursors.get(target_dir)
+        if cursor is None:
+            return None
+        size = self._index_size(target_dir)
+        if size == cursor.consumed:
+            # Includes "absent then, absent now" (both ``_NO_INDEX_FILE``),
+            # which is what keeps #1332's empty-directory memo intact.
+            return cached
+        if min(size, cursor.consumed) < 0 or size < cursor.consumed:
+            return None
+        if not cursor.incremental:
+            return None
+        appended = self._read_index_tail(target_dir / INDEX_FILENAME, cursor.consumed)
+        if appended is None:
+            return None
+        cached.update(appended)
+        self._index_cursors[target_dir] = _IndexCursor(size, incremental=True)
+        return cached
+
+    @staticmethod
+    def _index_size(target_dir: Path) -> int:
+        """Return the byte size of *target_dir*'s index file.
+
+        Args:
+            target_dir: The directory whose index is being measured.
+
+        Returns:
+            The size in bytes, or :data:`_NO_INDEX_FILE` when the file
+            does not exist or cannot be stat'ed. The sentinel is negative
+            so it can never collide with a real size, which lets one
+            equality test cover "unchanged" for both a present and an
+            absent index.
+        """
+        try:
+            return (target_dir / INDEX_FILENAME).stat().st_size
+        except OSError:
+            return _NO_INDEX_FILE
+
+    @staticmethod
+    def _read_index_tail(index_path: Path, offset: int) -> dict[str, str] | None:
+        """Parse the index records written past *offset*.
+
+        Args:
+            index_path: The ``.id-index.jsonl`` file.
+            offset: Byte position the previous parse stopped at. Every
+                record is framed with a leading newline
+                (:meth:`_append_index_entry`), so a read resuming at a
+                record boundary always starts on a self-delimiting line.
+
+        Returns:
+            The mappings the tail declares, or ``None`` when the tail
+            could not be read or did not parse cleanly — in which case
+            the caller falls back to a full load, which owns the damage
+            recovery.
+        """
+        try:
+            with index_path.open("rb") as handle:
+                handle.seek(offset)
+                raw = handle.read().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        load = VaultWriter._parse_index_text(raw)
+        if load.damaged:
+            return None
+        return load.entries
+
     def _load_index_locked(self, target_dir: Path) -> dict[str, str]:
         """Return the cached per-directory index, loading it if needed.
 
@@ -1677,20 +1897,28 @@ class VaultWriter:
         """
         cached = self._dir_indexes.get(target_dir)
         if cached is not None:
-            return cached
+            refreshed = self._refresh_index_locked(target_dir, cached)
+            if refreshed is not None:
+                return refreshed
         index_path = target_dir / INDEX_FILENAME
+        incremental = True
         if index_path.exists():
             load = self._read_index_records(index_path)
             index = load.entries
+            consumed = load.consumed
             if load.damaged:
                 index = self._recover_damaged_index(index_path, target_dir, load)
-        elif target_dir.is_dir():
-            index = self._rebuild_index(target_dir)
+                incremental = False
+        else:
+            index = self._rebuild_index(target_dir) if target_dir.is_dir() else {}
             if index:
                 self._persist_full_index(target_dir, index)
-        else:
-            index = {}
+            # Measured *after* the optional persist, so the freshly
+            # written file is already accounted for and the very next
+            # lookup does not re-read what this call just produced.
+            consumed = self._index_size(target_dir)
         self._dir_indexes[target_dir] = index
+        self._index_cursors[target_dir] = _IndexCursor(consumed, incremental)
         return index
 
     @staticmethod
@@ -1762,13 +1990,34 @@ class VaultWriter:
 
         Returns:
             An :class:`_IndexLoad` holding the parsed mappings, the
-            count of unparseable lines, and whether the read failed.
+            count of unparseable lines, whether the read failed, and how
+            many bytes of the file the parse accounted for.
         """
-        index: dict[str, str] = {}
         try:
             raw = index_path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
-            return _IndexLoad(index, 0, read_failed=True)
+            return _IndexLoad({}, 0, read_failed=True, consumed=_NO_INDEX_FILE)
+        return VaultWriter._parse_index_text(raw)
+
+    @staticmethod
+    def _parse_index_text(raw: str) -> _IndexLoad:
+        """Parse index records out of already-read JSONL text.
+
+        Split from :meth:`_read_index_records` so the incremental
+        refresh (#1603) can apply the identical parse — same blank-line
+        framing, same torn-record accounting — to the *tail* of a file
+        rather than to the whole of it. Two parsers would be two chances
+        to disagree about what a record is.
+
+        Args:
+            raw: The decoded text to parse.
+
+        Returns:
+            The parse outcome, with ``consumed`` set to the UTF-8 byte
+            length of *raw* — the cursor a later refresh resumes from.
+
+        """
+        index: dict[str, str] = {}
         torn_lines = 0
         for line in raw.splitlines():
             stripped = line.strip()
@@ -1790,7 +2039,12 @@ class VaultWriter:
             filename = entry.get("filename")
             if isinstance(mid, str) and isinstance(filename, str):
                 index[mid] = filename
-        return _IndexLoad(index, torn_lines, read_failed=False)
+        return _IndexLoad(
+            index,
+            torn_lines,
+            read_failed=False,
+            consumed=len(raw.encode("utf-8")),
+        )
 
     @staticmethod
     def _rebuild_index(target_dir: Path) -> dict[str, str]:

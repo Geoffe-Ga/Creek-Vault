@@ -72,7 +72,11 @@ from typing import TYPE_CHECKING, Any, Final
 
 from yaml import YAMLError
 
-from creek._fslock import VaultLockTimeoutError, vault_lock
+from creek._fslock import (
+    DEFAULT_LOCK_TIMEOUT_SECONDS,
+    VaultLockTimeoutError,
+    vault_lock,
+)
 from creek.config import load_vault_config
 from creek.ingest import INGESTOR_REGISTRY, UnsupportedSourceError, route_to_ingestor
 from creek.ingest.gdrive import (
@@ -101,7 +105,7 @@ SYNC_TOOL_NAME: Final[str] = "creek.drive.sync"
 DISCONNECT_TOOL_NAME: Final[str] = "creek.drive.disconnect"
 """Audit name of the revoke-and-erase verb."""
 
-_SYNC_LOCK_TIMEOUT_SECONDS: Final[float] = 10.0
+_SYNC_LOCK_TIMEOUT_SECONDS: Final[float] = DEFAULT_LOCK_TIMEOUT_SECONDS
 """How long a queued sync waits for the running one before refusing.
 
 Comfortably under the ``/v1`` request timeout
@@ -109,6 +113,15 @@ Comfortably under the ``/v1`` request timeout
 so a caller that loses the race is answered with :data:`SYNC_BUSY_REASON` —
 which names what happened and is safe to retry — rather than with the
 middleware's generic timeout, which names nothing.
+
+An **alias**, not a second value (#1603). It was an independent ``10.0``
+carrying the same justification the primitive's own default already
+carried, so the two could drift and only one of them was pinned by a
+test. The name survives because it is the seam the ``/v1`` busy-path
+tests shorten; the number now has one home,
+:data:`creek._fslock.DEFAULT_LOCK_TIMEOUT_SECONDS`, and
+``tests/test_fslock.py`` pins every in-tree call site against the request
+deadline in one place.
 """
 
 DRIVE_LEDGER_SOURCE: Final[str] = "gdrive"
@@ -576,10 +589,21 @@ def drive_sync_tool(
     The lock is POSIX advisory (``fcntl``): on Windows, and on network mounts
     that do not implement ``flock``, it degrades to serialising the threads of
     one process — see :mod:`creek._fslock`. It is scoped to this connector, so
-    a journal write, an upload or a ``creek ingest`` never waits on a sync;
-    equally, those three still race *each other* through the same
-    :func:`~creek.ingest.pipeline.run_ingest` seam, which #1590 does not
-    address.
+    a journal write, an upload or a ``creek ingest`` never waits on a sync.
+
+    An earlier version of this note went on to say those three "still race
+    each other through the same ``run_ingest`` seam". That was wrong twice
+    over (#1603). It was wrong then, because two *different* routes never
+    shared a ``source_key``: each source type loads its own ledger file, and
+    the fragment index is append-only, so 25 overlapping journal-and-Drive
+    runs into one directory produced zero anomalies. And it is wrong now,
+    because the race that did exist — two overlapping runs over the *same*
+    source unit — is closed underneath every route at once, by
+    :data:`creek.vault.writer.INDEX_LOCK_FILENAME`. That lock is per fragment
+    directory and is never this connector's key, so it does not nest inside
+    the one taken here: :func:`~creek._fslock.vault_lock` is not reentrant,
+    and a fragment-write lock named after the ledger would deadlock every
+    sync for the full timeout and then refuse it.
 
     Args:
         vault_path: Vault root — both the ingest target and the audit trail.
