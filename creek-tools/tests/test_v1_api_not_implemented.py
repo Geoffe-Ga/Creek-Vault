@@ -428,9 +428,13 @@ def test_a_method_or_path_miss_is_404_never_405(
 
 
 def test_405_is_not_in_the_published_status_set() -> None:
-    """The contract's closed set has no ``405`` in it, by derivation."""
+    """The contract's closed set has no ``405`` in it, by derivation.
+
+    ``415`` joined the set at contract 0.8 with ``unsupported_source``
+    (#1524); it is the only member added since 0.2.
+    """
     assert _METHOD_NOT_ALLOWED not in ALLOWED_HTTP_STATUSES
-    assert {200, 401, 403, 404, 409, 422, 500, 501, 503} == ALLOWED_HTTP_STATUSES
+    assert {200, 401, 403, 404, 409, 415, 422, 500, 501, 503} == ALLOWED_HTTP_STATUSES
 
 
 def test_no_reachable_request_produces_a_status_outside_the_set(
@@ -438,7 +442,7 @@ def test_no_reachable_request_produces_a_status_outside_the_set(
 ) -> None:
     """Sweep every route against every method: nothing escapes the closed set.
 
-    Thirty requests. A single ``405`` — or a ``200`` from a route that
+    Thirty-six requests. A single ``405`` — or a ``200`` from a route that
     should be ``501``, or a stray ``500`` — shows up here even if no targeted
     test happens to cover that cell.
 
@@ -497,7 +501,7 @@ def test_no_unrouted_request_produces_a_status_outside_the_set(vault: Path) -> N
 
 def test_the_method_sweep_is_not_vacuous() -> None:
     """The sweep above really does try every verb on every route."""
-    assert len(MOUNTED) * len(_ALL_METHODS) == 30
+    assert len(MOUNTED) * len(_ALL_METHODS) == 54
     assert "PATCH" in _ALL_METHODS
 
 

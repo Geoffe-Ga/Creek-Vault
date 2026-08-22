@@ -286,10 +286,39 @@ class ExporterConnector:
         self.save_cursor(datetime.now(UTC).isoformat())
 
     def _ingest(self, staging: Path) -> None:
-        """Ingest the staged Data Package via the existing DiscordIngestor."""
-        from creek.ingest.discord import DiscordIngestor, write_fragments
+        """Ingest the staged Data Package via the existing DiscordIngestor.
 
-        write_fragments(DiscordIngestor().ingest(staging), self._vault)
+        The third of the three #1377 call sites, and the reason the handler is
+        written out here as well as in :mod:`creek.ingest.discord`: this one
+        lives in a different module, so a fix applied only there would leave
+        the exporter path emitting a raw traceback with nothing in the suite
+        noticing.
+
+        Re-raises rather than collecting, exactly as the other two do. This
+        path runs unattended behind the scheduled exporter, so a swallowed
+        refusal would be invisible until ``tomb_missing_units`` had already
+        soft-tombed every live ledger key.
+
+        Args:
+            staging: The staged Data Package root the exporter wrote.
+
+        Raises:
+            EscapingSymlinkError: When the staged tree contains a symlink
+                resolving outside it. Announced first, then re-raised.
+        """
+        from creek._containment import EscapingSymlinkError
+        from creek.ingest.discord import (
+            DiscordIngestor,
+            _print_containment_refusal,
+            write_fragments,
+        )
+
+        try:
+            documents = DiscordIngestor().ingest(staging)
+        except EscapingSymlinkError as exc:
+            _print_containment_refusal(exc)
+            raise
+        write_fragments(documents, self._vault)
 
     def load_cursor(self) -> str | None:
         """Return the persisted ``--after`` cursor, or ``None`` if unset."""

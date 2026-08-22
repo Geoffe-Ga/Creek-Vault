@@ -1824,3 +1824,212 @@ def test_generate_decisions_logs_exactly_the_shared_notice(
         "#1487: the log wording and withheld_notice() have drifted apart, so "
         "the console and the log now explain the same refusal differently."
     )
+
+
+# ---------------------------------------------------------------------------
+# Issue #1448: the module-level coercers and lookups
+# ---------------------------------------------------------------------------
+
+
+class TestDetectPatternRequiresExploringConfidence:
+    """``_detect_pattern`` demands *all three* signals, not just the frequencies.
+
+    The confidence arm is the one nothing had driven: every existing
+    pattern fixture already carries ``exploring``, so a mutant deleting
+    the check would have gone unnoticed. A fragment that is explicit and
+    carries the F1+F5 pair but has *settled* confidence is the exact
+    shape that must not be flagged — the decision has already been made,
+    so surfacing it is noise.
+    """
+
+    @staticmethod
+    def _fragment(confidence: Confidence) -> Fragment:
+        """Return an F1+F5, explicit fragment at the given *confidence*."""
+        return Fragment(
+            id="frag-conf0001",
+            title="Structure and meaning",
+            source=FragmentSource(platform=SourcePlatform.JOURNAL),
+            created=datetime(2025, 3, 12, 9, 0, 0),
+            frequency=FrequencyClassification(
+                primary=Frequency.F1,
+                secondary=[Frequency.F5],
+            ),
+            wavelength=WavelengthClassification(phase=Phase.PEAKING),
+            voice=VoiceClassification(confidence=confidence),
+            praxis_potential=PraxisPotential.EXPLICIT,
+        )
+
+    def test_exploring_confidence_matches(self) -> None:
+        """The positive control: exploring + explicit + F1/F5 does match."""
+        assert DecisionDetector._detect_pattern(self._fragment(Confidence.EXPLORING))
+
+    def test_settled_confidence_does_not_match(self) -> None:
+        """Everything else identical, settled confidence is rejected."""
+        assert not DecisionDetector._detect_pattern(self._fragment(Confidence.SETTLED))
+
+
+class TestJaccard:
+    """``_jaccard`` scores set overlap and never divides by zero.
+
+    Recorded as a finding rather than covered: the second guard,
+    ``if not union: return 0.0`` (``decisions.py:660-661``), is
+    **unreachable**. ``a | b`` is empty if and only if both ``a`` and
+    ``b`` are empty, which the preceding ``if not a and not b`` has
+    already returned for. No input can reach it, so no honest test can
+    execute it, and the PR proposes deleting it rather than fabricating a
+    path to it.
+    """
+
+    def test_both_empty_scores_zero(self) -> None:
+        """Two empty sets score 0.0 rather than raising ZeroDivisionError."""
+        assert decisions_mod._jaccard(set(), set()) == 0.0
+
+    def test_one_empty_scores_zero(self) -> None:
+        """No overlap with an empty set, but the union is non-empty."""
+        assert decisions_mod._jaccard(set(), {"a"}) == 0.0
+        assert decisions_mod._jaccard({"a"}, set()) == 0.0
+
+    def test_partial_overlap_is_the_exact_ratio(self) -> None:
+        """The score is intersection over union, asserted exactly."""
+        assert decisions_mod._jaccard({"a", "b"}, {"b", "c"}) == pytest.approx(1 / 3)
+
+    def test_identical_sets_score_one(self) -> None:
+        """Full overlap scores 1.0."""
+        assert decisions_mod._jaccard({"a", "b"}, {"a", "b"}) == 1.0
+
+
+class TestListify:
+    """``_listify`` coerces a frontmatter scalar/list into a list of strings."""
+
+    def test_list_becomes_strings(self) -> None:
+        """Every element is stringified, order preserved."""
+        assert decisions_mod._listify(["F1", 2, None]) == ["F1", "2", "None"]
+
+    def test_bare_string_is_wrapped(self) -> None:
+        """A single string becomes a one-element list, not a list of characters.
+
+        The failure this pins is real and silent: ``list("F1")`` yields
+        ``["F", "1"]``, which would then never match a frequency code and
+        would quietly empty every affinity comparison.
+        """
+        assert decisions_mod._listify("F1") == ["F1"]
+
+    @pytest.mark.parametrize("value", [42, 3.5, {"a": 1}, object()])
+    def test_unsupported_scalar_yields_empty(self, value: object) -> None:
+        """A value that is neither list nor string coerces to no entries."""
+        assert decisions_mod._listify(value) == []
+
+    @pytest.mark.parametrize("value", [None, "", [], 0])
+    def test_falsy_values_yield_empty(self, value: object) -> None:
+        """Falsy input short-circuits to an empty list."""
+        assert decisions_mod._listify(value) == []
+
+
+class TestFindDecisionByIdWalksBothSubfolders:
+    """``_find_decision_by_id`` tolerates a half-scaffolded decisions folder."""
+
+    def test_missing_active_folder_still_searches_archive(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """With only ``Archive`` present, a note there is still found.
+
+        The absent ``Active`` folder is the ``continue`` arm; without it
+        the walk would raise instead of falling through to ``Archive``.
+        """
+        archive = tmp_path / "08-Decisions" / "Archive"
+        archive.mkdir(parents=True)
+        note = archive / "archived.md"
+        note.write_text(
+            "---\ntype: decision\nid: decision-arch0001\n---\nbody\n",
+            encoding="utf-8",
+        )
+
+        found = DecisionDetector()._find_decision_by_id(
+            "decision-arch0001",
+            tmp_path / "08-Decisions",
+        )
+
+        assert found == note
+
+    def test_absent_decisions_tree_returns_none(self, tmp_path: Path) -> None:
+        """Neither subfolder present means "not found", not an exception."""
+        assert not (tmp_path / "08-Decisions").exists()
+
+        found = DecisionDetector()._find_decision_by_id(
+            "decision-missing1",
+            tmp_path / "08-Decisions",
+        )
+
+        assert found is None
+
+    def test_unmatched_id_exhausts_both_folders(self, tmp_path: Path) -> None:
+        """A populated tree with no matching id returns None.
+
+        This drives the loop all the way to its fallthrough rather than
+        returning early, which is the branch a test that only ever
+        searched for a *present* id would leave dead.
+        """
+        for subfolder in ("Active", "Archive"):
+            folder = tmp_path / "08-Decisions" / subfolder
+            folder.mkdir(parents=True)
+            (folder / f"{subfolder}.md").write_text(
+                f"---\ntype: decision\nid: decision-{subfolder.lower()}1\n---\nbody\n",
+                encoding="utf-8",
+            )
+
+        found = DecisionDetector()._find_decision_by_id(
+            "decision-absent01",
+            tmp_path / "08-Decisions",
+        )
+
+        assert found is None
+
+
+class TestExistingDecisionFragmentIds:
+    """``_existing_decision_fragment_ids`` indexes what the vault already holds."""
+
+    def test_missing_subfolder_is_stepped_over(self, tmp_path: Path) -> None:
+        """Only ``Archive`` present: its ids are still indexed.
+
+        The absent ``Active`` folder is the ``continue`` arm. Asserting
+        the exact id set (not merely "non-empty") is what proves the walk
+        reached ``Archive`` rather than bailing out of the loop entirely.
+        """
+        archive = tmp_path / "08-Decisions" / "Archive"
+        archive.mkdir(parents=True)
+        (archive / "note.md").write_text(
+            "---\ntype: decision\nid: decision-arch0001\n---\n"
+            "## Source Fragments\n\n- frag-archived1\n",
+            encoding="utf-8",
+        )
+
+        assert decisions_mod._existing_decision_fragment_ids(tmp_path) == {
+            "frag-archived1",
+        }
+
+    def test_note_without_a_source_is_not_indexed(self, tmp_path: Path) -> None:
+        """A decision note recording no source fragment contributes nothing.
+
+        This is the ``fragment_id is not None`` arm. The good note beside
+        it is what keeps the assertion from being satisfied by a walk
+        that indexed nothing at all.
+        """
+        active = tmp_path / "08-Decisions" / "Active"
+        active.mkdir(parents=True)
+        (active / "sourced.md").write_text(
+            "---\ntype: decision\nid: decision-sourced1\n---\n"
+            "## Source Fragments\n\n- frag-sourced1\n",
+            encoding="utf-8",
+        )
+        # No ``## Source Fragments`` section at all: the extractor cannot
+        # establish this note's identity, so it must contribute nothing.
+        (active / "unsourced.md").write_text(
+            "---\ntype: decision\nid: decision-unsrc01\n---\n"
+            "## Context\n\n- not a source bullet\n",
+            encoding="utf-8",
+        )
+
+        assert decisions_mod._existing_decision_fragment_ids(tmp_path) == {
+            "frag-sourced1",
+        }

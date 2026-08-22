@@ -78,6 +78,8 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.8",
+    "0.7",
     "0.6",
     "0.5",
     "0.4",
@@ -124,6 +126,28 @@ does not: ``JournalUpsertRequest.tier`` never had a default, so the HTTP
 adapter already required what MCP now requires, and ``creek.upload`` has no
 ``/v1`` route to move. Dropping ``0.6`` here would therefore refuse a
 correct-by-construction ``/v1`` client over a break it cannot even express.
+
+Contract 0.8 (#1524) is the first since 0.2 that is **not** an MCP-only move:
+it publishes a fifth ``/v1`` route, ``POST /v1/uploads``, and with it the
+``upload`` capability, two wire models and one error code. Widening rather than
+shifting costs a ``0.7`` client nothing at all, because every ``/v1`` shape it
+already knows is byte-identical — the addition is a route it is not told about
+and cannot reach. That last clause is enforced, not hoped for: see
+:data:`CAPABILITY_SINCE_MINOR`, which drives both what
+``GET /v1/capabilities`` advertises to a given caller and which callers
+``POST /v1/uploads`` will answer.
+
+Contract 0.9 (#873) is a 0.5-shaped move: two **optional** fields —
+``related_praxis`` and ``related_eddies`` — on :class:`ReflectionResponse`, and
+the two wire models they are made of. The route omits both keys when nothing
+qualified, so a ``0.8`` client's ordinary reflection is byte-identical; and one
+that finds an admitted compiled neighbour carries two extra keys — which a
+``0.8`` consumer validating against its vendored, closed schema would reject
+outright, not ignore. So the fields are gated on the declared minor via
+:data:`RELATED_FIELDS_SINCE_MINOR`: a ``0.8`` caller is served the ``0.8``
+shape, byte-for-byte, whether or not a neighbour qualified. ``0.8`` is retained
+for the same reason ``0.4`` was retained at 0.5 — refusing it outright is
+strictly worse — but retention alone was not enough here.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
@@ -187,12 +211,16 @@ class WireTierCeiling(StrEnum):
 
 
 class Capability(StrEnum):
-    """The four capabilities ``/v1`` publishes.
+    """The six capabilities ``/v1`` publishes.
 
-    The list is identical for every minor in
-    :data:`SUPPORTED_CONTRACT_MINORS`: contract 0.3 grew the *MCP* tool surface
-    (``creek.upload``, #1023) and added no ``/v1`` route, so a ``0.2`` client
-    and a ``0.3`` client are answered from the same four names.
+    The list was identical for every minor in
+    :data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3
+    grew the *MCP* tool surface (``creek.upload``, #1023) and added no ``/v1``
+    route, so a ``0.2`` client and a ``0.7`` client were answered from the same
+    four names. Contract 0.8 (#1524) ends that by publishing ``UPLOAD``, and
+    the list is therefore **no longer minor-independent**: what a caller is
+    told, and what it is served, are both keyed on
+    :data:`CAPABILITY_SINCE_MINOR`.
 
     The values are also the directory names of the example matrix in
     :mod:`creek_mcp.api.bundle`, so the advertised capability list and the
@@ -203,12 +231,119 @@ class Capability(StrEnum):
         JOURNAL_UPSERT: Idempotent journal entry create/update.
         REFLECTIONS: Margin notes on an entry, care-guarded.
         WHEEL: Aggregate APTITUDE frequency distribution.
+        UPLOAD: Idempotent document upload — base64 bytes plus a filename,
+            dispatched to an ingestor by extension. Since contract 0.8.
+        DRIVE_CONNECTOR: The read-only Google Drive connector's *state* and
+            its two verbs — one incremental sync, and disconnection. Since
+            contract 0.9 (#1527). Three routes rather than one, and one
+            capability rather than three, because a client cannot usefully
+            negotiate "may I read the connector's state" separately from "may
+            I sync it": they are one feature, and splitting them would let a
+            server advertise half a connector.
+
+            **It does not include authorisation.** No route begins, completes
+            or carries an OAuth flow; the credential is minted locally by
+            ``creek gdrive --download`` and never leaves the host.
     """
 
     CAPABILITIES = "capabilities"
     JOURNAL_UPSERT = "journal-upsert"
     REFLECTIONS = "reflections"
     WHEEL = "wheel"
+    UPLOAD = "upload"
+    DRIVE_CONNECTOR = "drive-connector"
+
+
+_FOUNDING_MINOR: Final[str] = "0.2"
+"""The minor ``/v1`` was first published at; the four founding capabilities."""
+
+_UPLOAD_MINOR: Final[str] = "0.8"
+"""The minor ``upload`` was published at (#1524).
+
+A literal, deliberately, and **not** :data:`CONTRACT_MINOR`. Written as the
+derived constant it would silently follow the next bump forward, at which point
+every client pinned to 0.8 — the very clients this table exists to serve — would
+stop being told about a capability they negotiated correctly for.
+"""
+
+_DRIVE_CONNECTOR_MINOR: Final[str] = "0.9"
+"""The minor ``drive-connector`` was published at (#1527).
+
+A literal for the same reason :data:`_UPLOAD_MINOR` is one: written as
+:data:`CONTRACT_MINOR` it would follow the next bump forward and stop
+advertising the capability to the very clients pinned to the minor that
+introduced it.
+"""
+
+RELATED_FIELDS_SINCE_MINOR: Final[str] = "0.9"
+"""First contract minor whose ``ReflectionResponse`` carries the #873 fields.
+
+The same two-sided rule :data:`CAPABILITY_SINCE_MINOR` enforces for routes,
+applied to *fields*: a client is served only what the minor it declared can
+describe.
+
+It is load-bearing rather than decorative because every published response
+schema sets ``additionalProperties: false``. A ``0.8`` consumer that vendored
+the ``0.8`` ``ReflectionResponse`` and validates closed does **not** "ignore" an
+unknown key — it rejects the entire response. Emitting ``related_praxis`` to a
+caller that declared ``0.8`` would therefore break exactly the consumer #873
+exists to unblock, and only on the reflections that found a compiled neighbour,
+which is the worst possible distribution of a failure.
+"""
+
+CAPABILITY_SINCE_MINOR: Final[dict[Capability, str]] = {
+    Capability.CAPABILITIES: _FOUNDING_MINOR,
+    Capability.JOURNAL_UPSERT: _FOUNDING_MINOR,
+    Capability.REFLECTIONS: _FOUNDING_MINOR,
+    Capability.WHEEL: _FOUNDING_MINOR,
+    Capability.UPLOAD: _UPLOAD_MINOR,
+    Capability.DRIVE_CONNECTOR: _DRIVE_CONNECTOR_MINOR,
+}
+"""The contract minor each capability was first published at.
+
+Total over :class:`Capability`, so no lookup can ``KeyError`` mid-request, and
+pinned as total by a test — a capability added without an entry here would
+otherwise be advertised to everyone including clients whose vendored contract
+predates it.
+
+**One table, two enforcement points, and that is the point.**
+:mod:`creek_mcp.httpapi.capabilities` filters the advertised list with it, and
+:func:`creek_mcp.httpapi.app._endpoint_for` refuses a route with it. Two
+separate tables would drift into the worst of both readings: a capability
+advertised but refused (a server calling itself a liar) or one refused but
+reachable (an endpoint a client integrates against without ever having
+negotiated it, which is the ``501``-stub hazard
+:mod:`creek_mcp.httpapi.handlers` documents, one layer up).
+
+Every value must be a served minor; nothing is ever *removed* from this table,
+because :data:`SUPPORTED_CONTRACT_MINORS` only ever widens.
+"""
+
+
+def minor_at_least(declared: str, required: str) -> bool:
+    """Return whether *declared* is at or above the *required* contract minor.
+
+    Compared componentwise as integers, never as strings. Lexicographic order
+    puts ``"0.10"`` below ``"0.8"``, so a string compare here would start
+    hiding capabilities from the newest clients on the day the minor reaches
+    double digits — a failure that cannot be caught by any test written before
+    that day unless the comparison is right from the start.
+
+    Args:
+        declared: The caller's ``major.minor``, already checked for membership
+            in :data:`SUPPORTED_CONTRACT_MINORS` by the caller of this
+            function. Anything unparseable is treated as *below* every
+            requirement, which fails closed.
+        required: The minor being demanded, from :data:`CAPABILITY_SINCE_MINOR`.
+
+    Returns:
+        ``True`` when *declared* is at least *required*.
+    """
+    try:
+        parsed = tuple(int(part) for part in declared.split("."))
+    except ValueError:
+        return False
+    return parsed >= tuple(int(part) for part in required.split("."))
 
 
 class CapabilitiesStatus(StrEnum):
@@ -229,11 +364,20 @@ class CapabilitiesStatus(StrEnum):
 
 
 class JournalAction(StrEnum):
-    """What an idempotent journal upsert actually did.
+    """What an idempotent write actually did — journal upsert or upload.
 
     ``UNCHANGED`` is a success, not an error: re-sending an unmodified entry is
     the steady state of a continuous sync, and a client must be able to tell it
     apart from a write without diffing content itself.
+
+    Shared by :class:`JournalUpsertResponse` and :class:`UploadResponse` rather
+    than duplicated under a second name. The three words are the same three
+    :func:`creek_mcp.tools.upload._action_of` collapses an ingest tally into,
+    and the ledger that decides them is one ledger. The name kept its
+    ``Journal`` prefix through contract 0.8 because it is a **published schema
+    component name**: Adepthood has vendored ``$defs/JournalAction`` since 0.2,
+    and renaming it would break every consumer's schema validation to buy
+    nothing a docstring cannot say.
 
     Attributes:
         CREATED: A new fragment was written.
@@ -289,8 +433,49 @@ class NoteKind(StrEnum):
     VALUE = "value"
 
 
+class PraxisKind(StrEnum):
+    """The five praxis types, mirroring the vault's own vocabulary.
+
+    Kept in lock-step with :class:`creek.models.PraxisType`, which is what a
+    ``04-Praxis/`` page's ``praxis_type`` is actually constrained to;
+    :mod:`creek_mcp.compiled_pages` withholds any page naming something outside
+    it, so a wire enum that drifted would refuse a legitimate page on the way
+    out — or, worse, admit a hand-edited value the vault never sanctioned.
+    ``tests/test_adepthood_contract_models.py`` pins the two lists equal.
+
+    Attributes:
+        COMMITMENT: A promise the writer has made.
+        FRAMEWORK: A way of seeing they reuse.
+        HABIT: Something done repeatedly, near-automatically.
+        INSIGHT: A distilled realisation.
+        PRACTICE: Something done deliberately and returned to.
+    """
+
+    COMMITMENT = "commitment"
+    FRAMEWORK = "framework"
+    HABIT = "habit"
+    INSIGHT = "insight"
+    PRACTICE = "practice"
+
+
+class PraxisLifecycle(StrEnum):
+    """The four praxis lifecycle statuses, mirroring :class:`creek.models.PraxisStatus`.
+
+    Attributes:
+        ACTIVE: Currently being practised.
+        INTEGRATED: Absorbed; no longer needs deliberate attention.
+        PROPOSED: Named but not yet taken up.
+        RELEASED: Deliberately let go.
+    """
+
+    ACTIVE = "active"
+    INTEGRATED = "integrated"
+    PROPOSED = "proposed"
+    RELEASED = "released"
+
+
 class ErrorCode(StrEnum):
-    """The nine wire error codes, closed at contract 0.3 and unchanged since 0.2.
+    """The ten wire error codes: nine from contract 0.2, one added at 0.8.
 
     There is deliberately **no** ``care_escalation`` member: an escalation is a
     successful, 200-shaped :class:`CareEscalationResponse`, because a person in
@@ -311,6 +496,12 @@ class ErrorCode(StrEnum):
             "not for you" is a corpus enumeration primitive.
         UNSUPPORTED_CAPABILITY: A published capability this server does not
             implement.
+        UNSUPPORTED_SOURCE: The uploaded file's **extension** names a format
+            Creek must not ingest as one document — a conversation export, an
+            archive, a legacy binary Office file (#1526). A statement about
+            the caller's own filename and nothing else, so it discloses
+            nothing about the vault. Added at contract 0.8 (#1524), and
+            reachable only on ``POST /v1/uploads``.
         UNAVAILABLE: The vault is absent or unreadable; a human must act.
         TEMPORARILY_UNAVAILABLE: A transient condition; backoff will clear it.
         INTERNAL_ERROR: An unexpected server fault.
@@ -322,6 +513,7 @@ class ErrorCode(StrEnum):
     PRIVACY_REFUSED = "privacy_refused"
     NOT_FOUND = "not_found"
     UNSUPPORTED_CAPABILITY = "unsupported_capability"
+    UNSUPPORTED_SOURCE = "unsupported_source"
     UNAVAILABLE = "unavailable"
     TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
     INTERNAL_ERROR = "internal_error"
@@ -354,6 +546,7 @@ ERROR_STATUS: Final[dict[ErrorCode, int]] = {
     ErrorCode.PRIVACY_REFUSED: 403,
     ErrorCode.NOT_FOUND: 404,
     ErrorCode.UNSUPPORTED_CAPABILITY: 501,
+    ErrorCode.UNSUPPORTED_SOURCE: 415,
     ErrorCode.UNAVAILABLE: 503,
     ErrorCode.TEMPORARILY_UNAVAILABLE: 503,
     ErrorCode.INTERNAL_ERROR: 500,
@@ -362,10 +555,17 @@ ERROR_STATUS: Final[dict[ErrorCode, int]] = {
 
 Total over :class:`ErrorCode`, so no dispatch path can ``KeyError`` while
 building a response. As prose: 401 Unauthorized, 422 Unprocessable Content, 409
-Conflict, 403 Forbidden, 404 Not Found, 501 Not Implemented, 503 Service
-Unavailable (twice — the two 503s differ only in retry disposition, which is
-the distinction that actually matters to a client) and 500 Internal Server
-Error.
+Conflict, 403 Forbidden, 404 Not Found, 501 Not Implemented, 415 Unsupported
+Media Type, 503 Service Unavailable (twice — the two 503s differ only in retry
+disposition, which is the distinction that actually matters to a client) and
+500 Internal Server Error.
+
+``415`` is the one status contract 0.8 added to the published set, and it is a
+status of its own rather than a second ``422`` on purpose: the OpenAPI document
+carries one response object per status, so a code sharing ``422`` with
+``INVALID_REQUEST`` could not be documented at all — and, more to the point, a
+client's generic "fix your JSON and retry" handling is exactly the wrong
+handling for "this file format is never going to work".
 
 ``PRIVACY_REFUSED`` is 403 rather than 404 on purpose. 404 would be the very
 oracle :attr:`ErrorCode.NOT_FOUND` is fenced off to avoid: a caller able to
@@ -384,6 +584,20 @@ ERROR_MESSAGES: Final[dict[ErrorCode, str]] = {
     # collapsed.
     ErrorCode.NOT_FOUND: "no such endpoint on this server",
     ErrorCode.UNSUPPORTED_CAPABILITY: "this capability is not implemented here",
+    # Phrased about the FORMAT, never about the file, and it carries the
+    # remedy rather than only the refusal — a refusal that does not say what
+    # to do instead is one the caller retries verbatim. It is one constant
+    # covering all three refused families (#1526's conversation exports,
+    # archives and legacy binary Office documents) precisely so that it can
+    # stay a constant: a per-extension message would have to be selected at
+    # render time, and the moment `error_response` can be handed a message it
+    # is a place caller — or vault — material eventually gets interpolated.
+    ErrorCode.UNSUPPORTED_SOURCE: (
+        "this file format cannot be ingested as one document: unpack a "
+        "conversation export or archive and run `creek ingest --type "
+        "<chatgpt|claude|discord|substack> --input <dir>`, or re-save a "
+        "legacy Office document as .docx, .xlsx or .pptx"
+    ),
     ErrorCode.UNAVAILABLE: "the vault is not available to serve this request",
     ErrorCode.TEMPORARILY_UNAVAILABLE: "the service is briefly unable to answer",
     ErrorCode.INTERNAL_ERROR: "the server failed to complete this request",
@@ -409,6 +623,7 @@ RETRY_POLICY: Final[dict[ErrorCode, RetryDisposition]] = {
     ErrorCode.PRIVACY_REFUSED: RetryDisposition.TERMINAL,
     ErrorCode.NOT_FOUND: RetryDisposition.TERMINAL,
     ErrorCode.UNSUPPORTED_CAPABILITY: RetryDisposition.TERMINAL,
+    ErrorCode.UNSUPPORTED_SOURCE: RetryDisposition.TERMINAL,
     ErrorCode.UNAVAILABLE: RetryDisposition.RETRY_AFTER_OPERATOR_ACTION,
     ErrorCode.TEMPORARILY_UNAVAILABLE: RetryDisposition.RETRY_WITH_BACKOFF,
     ErrorCode.INTERNAL_ERROR: RetryDisposition.RETRY_WITH_BACKOFF,
@@ -479,6 +694,50 @@ in a default.
 
 _MIN_CARE_RESOURCES: Final[int] = 1
 """A care signal with no resources would dead-end the person reading it."""
+
+_MAX_RELATED_PRAXIS: Final[int] = 3
+"""Published ceiling on :attr:`ReflectionResponse.related_praxis` (#873)."""
+
+_MAX_RELATED_EDDIES: Final[int] = 2
+"""Published ceiling on :attr:`ReflectionResponse.related_eddies` (#873).
+
+Restated here rather than imported from
+:mod:`creek_mcp.compiled_pages`, because this module is deliberately
+declarative — it opens no file and imports no vault reader (#1079) — and that
+producer module reaches the filesystem. The two are pinned equal by
+``test_the_published_related_bounds_match_the_producer`` in
+``tests/test_adepthood_contract_models.py``, so the restatement cannot drift
+into a schema that promises a bound the producer does not keep.
+"""
+
+MAX_EXTERNAL_ID_CHARS: Final[int] = 512
+"""Inclusive upper bound on a consumer-supplied ``external_id``.
+
+Generous enough for any namespaced consumer id — the published example is 38
+characters — and small enough that the id cannot become a payload.
+:func:`creek_mcp.staged_names.safe_stem` accepts literally any string and
+truncates only the *readable slug* to 80 characters before appending a digest
+of the whole raw id, so without a bound here an unbounded id would be accepted,
+stored and echoed back at full length.
+
+Declared in this framework-free module, and imported by
+:mod:`creek_mcp.httpapi.journal` rather than restated there, because both write
+surfaces have to mean the same thing by "an id that can serve as an idempotency
+key": the journal route takes it as a URL path segment and the upload route as
+a JSON field, and two bounds would let the same id be addressable through one
+and not the other.
+"""
+
+MAX_FILENAME_CHARS: Final[int] = 255
+"""Inclusive upper bound on the uploaded ``filename``.
+
+The classical POSIX single-component limit. Only the extension is ever trusted
+— :func:`creek_mcp.staged_names.safe_suffix` truncates that, and the staged
+name is built from the ``external_id``, never from this string — so the bound
+is not protecting a filesystem call. It is protecting the audit log and the
+wire from a caller who discovers that "filename" is an unbounded free-text
+field nobody reads.
+"""
 
 
 # --------------------------------------------------------------------------
@@ -681,6 +940,330 @@ class JournalUpsertResponse(_WireModel):
     )
 
 
+class UploadRequest(_WireModel):
+    """One document's bytes, handed to the vault under a stable id (#1524).
+
+    The wire half of :func:`creek_mcp.tools.upload.upload_tool`, and
+    deliberately its *subset*: it carries no ``source_type``. The tool refuses
+    that override because the ``chatgpt`` / ``claude`` / ``discord`` /
+    ``substack`` ingestors are directory-only and would discover nothing from a
+    single staged file, reporting a silent no-op as a success. Dispatch is by
+    the filename's extension, through
+    :func:`creek.ingest.route_to_ingestor`, and nothing else. Uploading a whole
+    export archive is tracked separately, in #1525.
+
+    **JSON and base64, never multipart.** The consumer's HTTP client is JSON
+    and its CI bans ``python-multipart``, so a multipart route would be one
+    neither end could use. The cost is the ~33% base64 expansion, which is what
+    :data:`creek_mcp.api.routes.UPLOAD_MAX_BODY_BYTES` is sized around.
+
+    Attributes:
+        filename: The caller's original filename. Only its **extension** is
+            trusted, and only to choose an ingestor; the staged file's name is
+            derived from *external_id*, so nothing here reaches a path.
+        content_base64: The document's bytes, base64-encoded. Refused when
+            blank; refused by the tool when it is not valid base64, and — via
+            the encoded-length guard — before an oversize payload is ever
+            turned into memory.
+        external_id: The consumer-side stable id, and the idempotency key. The
+            same id updates in place; a new id creates a new fragment.
+        timestamp: Optional ISO-8601 upload time, accepted for symmetry with
+            :class:`JournalUpsertRequest` and echoed nowhere on disk — a binary
+            document has no frontmatter to put it in, so the fragment's
+            timestamp comes from the ingestor.
+        tier: The tier to file the document at. **Required, and typed
+            :class:`WireTierCeiling`,** so ``intimate`` is not expressible and
+            omission is not defaultable. Both halves matter: #1494 removed this
+            field's ``open`` default from ``creek.upload`` precisely because
+            only the caller knows what the document holds, and a default filed
+            intimate-derived bytes in the clear.
+    """
+
+    filename: str = Field(
+        max_length=MAX_FILENAME_CHARS,
+        description="Original filename; only its extension is trusted.",
+    )
+    content_base64: str = Field(description="The document's bytes, base64.")
+    external_id: str = Field(
+        max_length=MAX_EXTERNAL_ID_CHARS,
+        description="Consumer-side stable id; the idempotency key.",
+    )
+    timestamp: str | None = Field(
+        default=None,
+        description="Optional client-supplied upload time.",
+    )
+    tier: WireTierCeiling = Field(description="Tier to file the document at.")
+
+    @field_validator("filename", "content_base64", "external_id")
+    @classmethod
+    def _reject_blank(cls, value: str) -> str:
+        """Refuse a whitespace-only value on any of the three required strings.
+
+        One validator over three fields rather than three validators: they
+        share a rule, and a rule stated three times is one that gets relaxed
+        twice.
+
+        Args:
+            value: The submitted field value.
+
+        Returns:
+            *value* unchanged when it carries a non-space character.
+
+        Raises:
+            ValueError: When *value* is empty or whitespace-only.
+        """
+        if not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+
+class UploadResponse(_WireModel):
+    """The result of an idempotent document upload.
+
+    **There is deliberately no ``tier`` field**, and its absence is the whole
+    of this model's privacy argument. ``creek classify`` is escalate-only and
+    :meth:`creek.vault.writer.VaultWriter.update_fragment` re-derives a
+    fragment's tier the same way, so an uploaded ``.md`` whose own frontmatter
+    declares ``intimate`` is filed at ``intimate`` however modest a tier the
+    caller declared. A ``tier`` field here would have exactly two possible
+    values and both are wrong: echo the declared tier and the response asserts
+    something about the file on disk that is false — the #1491 defect, where a
+    response claimed a tier the bytes did not carry — or report the resolved
+    tier and the response becomes a tier oracle, spelled in a vocabulary
+    (:class:`WireTierCeiling`) that cannot even express the answer. So the
+    response says only what it can say truthfully: which ceiling the call ran
+    at, and which fragments now exist.
+
+    Attributes:
+        status: Always ``"ok"``. Failure is an :class:`ErrorEnvelope`.
+        tier_ceiling: The ceiling the call was served under — the caller's own
+            declared value, echoed for correlation and carrying no bit of the
+            vault's state.
+        external_id: The consumer-side identity of the document, unchanged.
+        fragment_id: The vault-side identity now backing it. For the
+            one-fragment-per-file majority this is simply *the* fragment; for a
+            document that splits (a multi-sheet workbook) it is the first of
+            :attr:`affected_fragment_ids` in ledger-key order, which is
+            deterministic across runs.
+        affected_fragment_ids: **Every** fragment this document produced, in
+            that same order. Published rather than left implicit because a
+            right-to-be-forgotten request answered from ``fragment_id`` alone
+            would miss the other sheets of a workbook (#1305).
+        action: Whether the upload created, updated, or changed nothing.
+        source_type: The ingestor the extension dispatched to (``markdown``,
+            ``document``, ``spreadsheet``, …). Derived from the caller's own
+            filename, so it discloses nothing, and worth publishing because
+            "which reader interpreted my bytes" is otherwise unknowable.
+        warnings: Content-free operator advisories this ingest produced, absent
+            entirely when there were none — the same optional-and-omitted shape
+            :class:`JournalUpsertResponse` uses, and for the same reason. This
+            is the surface that most needs it: the collapsed-unit advisory
+            reports actual data loss on the multi-sheet workbook path. Every
+            entry is proven ceiling-safe at the producer (see
+            :attr:`creek.ingest.pipeline.IngestRunResult.ceiling_safe_warnings`).
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    external_id: str = Field(description="Consumer-side document identity.")
+    fragment_id: str = Field(description="Vault-side fragment identity.")
+    affected_fragment_ids: list[str] = Field(
+        description="Every fragment this document produced, in ledger order.",
+    )
+    action: JournalAction = Field(description="Created, updated, or unchanged.")
+    source_type: str = Field(description="Ingestor the extension dispatched to.")
+    warnings: list[str] | None = Field(
+        default=None,
+        description=(
+            "Content-free operator advisories this upload produced; absent when none."
+        ),
+    )
+
+
+class DriveConnectionState(StrEnum):
+    """The four states the read-only Drive connector can be in (#1527).
+
+    A closed enum rather than a boolean, because the three unusable states are
+    answered by three different operator actions and a client that could only
+    see ``connected: false`` would have to guess which to prompt for.
+
+    **Every member is a fact about this server's own configuration**, never
+    about the user's Drive: no file, folder, id or count is expressible here.
+
+    Attributes:
+        CONNECTED: A cached credential exists and is usable, so a sync will
+            run without a human present.
+        NOT_CONNECTED: No cached credential. The operator authorises with
+            ``creek gdrive --download`` on the host; there is no ``/v1`` route
+            that can do it for them.
+        EXPIRED: A credential exists but has lapsed and carries no refresh
+            token, so it cannot be renewed non-interactively. The same
+            operator action clears it.
+        UNSUPPORTED: The optional Google client libraries are not installed on
+            this server, so no credential could be used even if one existed.
+            Distinguished from :attr:`NOT_CONNECTED` because the remedy is an
+            install rather than an authorisation, and a client that conflated
+            them would send the operator round a loop that cannot terminate.
+    """
+
+    CONNECTED = "connected"
+    NOT_CONNECTED = "not_connected"
+    EXPIRED = "expired"
+    UNSUPPORTED = "unsupported"
+
+
+class DriveConnectorStatusResponse(_WireModel):
+    """What ``GET /v1/connectors/drive`` reports about the connector (#1527).
+
+    **The one thing this model must never carry is the credential**, and its
+    closed field list is what enforces that: ``_WireModel`` forbids extras, so
+    a token cannot be bolted on without editing this class and the schema it
+    publishes. What a caller gets is the *state* of the connection and the
+    *scope set* it was granted under — never the token, the refresh token, the
+    client secret, or the path any of them live at.
+
+    Publishing connection state deliberately is not in tension with the
+    no-oracle rule the refusals follow. This route **is** the negotiated
+    disclosure — a client that cannot tell "connected" from "not connected"
+    cannot render a connect button — and it is reachable only by an
+    authenticated consumer. The rule the refusals keep is the complementary
+    one: because this route answers the question honestly, no *other* route
+    has any reason to leak the answer sideways.
+
+    Attributes:
+        status: Always ``"ok"``. An unreadable vault or config is an
+            :class:`ErrorEnvelope`, not a state.
+        tier_ceiling: The ceiling the call ran at — the caller's own declared
+            value, echoed for correlation.
+        connection: The connector's state.
+        scopes: The OAuth scope set the cached credential was requested
+            under, verbatim. Published because a client showing a user "Creek
+            can read your Drive" should be able to *check* that claim rather
+            than repeat it;
+            :meth:`creek.config.GoogleDriveConfig.validate_readonly_scopes`
+            refuses to construct a config carrying anything else, so a widened
+            scope cannot reach this field without failing validation first.
+        can_sync: Whether ``POST /v1/connectors/drive/syncs`` would run rather
+            than refuse. Derived from :attr:`connection` and published
+            separately so a client need not encode this server's state
+            algebra to know whether its button is live.
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    connection: DriveConnectionState = Field(description="Connector state.")
+    scopes: list[str] = Field(
+        description="Read-only OAuth scopes the credential was granted under.",
+    )
+    can_sync: bool = Field(description="True when a sync would run, not refuse.")
+
+
+class DriveSyncResponse(_WireModel):
+    """The tally of one incremental Drive sync (#1527).
+
+    **Counts, and nothing but counts.** Not a file name, not a folder name,
+    not a Drive id, not a fragment id, not a tier. Every one of those is the
+    user's own content or a handle onto it, and this response is the only
+    thing a remote caller learns from a run that may have touched material far
+    above its ceiling — a sync ingests whatever the user's own Drive holds,
+    because the tier of that content is derived from the content, never
+    declared by the caller.
+
+    That is also why there is no ``affected_fragment_ids`` here, despite
+    :class:`UploadResponse` publishing one for the #1305 right-to-be-forgotten
+    argument. An upload's fragments are the caller's own bytes, handed over a
+    moment earlier; a sync's are the vault owner's, and a list of them handed
+    to an ``open``-ceiling consumer is a corpus enumeration primitive dressed
+    as a receipt. The vault-side record of what a sync wrote is the ingest
+    ledger, which RTBF already reads.
+
+    Attributes:
+        status: Always ``"ok"``. Failure is an :class:`ErrorEnvelope`.
+        tier_ceiling: The ceiling the call ran at.
+        files_fetched: Files Drive reported as newer than the local copy and
+            this run downloaded.
+        files_unchanged: Files the incremental skip passed over. This is the
+            number that makes a second sync of an untouched Drive visibly a
+            no-op rather than an invisible one.
+        files_failed: Files whose download raised. The run continues past
+            each, so a quota blip mid-sync does not abandon the rest — and the
+            count is published because a caller told only about successes
+            would believe an incomplete sync was complete. The *reasons* stay
+            in the server log: they interpolate Drive file names.
+        fragments_failed: Files that downloaded cleanly and then failed to
+            become fragments — a per-unit assemble or write error. Published
+            separately from ``files_failed`` because the two are different
+            shortfalls: one never landed, the other landed and was lost.
+            Without it a sync whose content half-failed reports ``ok`` with
+            silently fewer fragments and no signal anywhere.
+        files_unsupported: Files that downloaded cleanly and were **not**
+            ingested, because their extension names a format Creek must not
+            read as one document (#1526) — a conversation export, an archive,
+            a legacy binary Office file. Published rather than folded into
+            :attr:`files_failed`, which would be untrue, and rather than left
+            out, which would be worse: a fetched-but-undigested file is
+            precisely the silent no-op this whole surface exists to prevent.
+            The bytes are in the staging mirror and ``creek ingest`` can read
+            them; nothing is lost, but nothing happened either.
+        fragments_created: Fragments this run's ingest newly wrote.
+        fragments_updated: Fragments it rewrote in place.
+        fragments_unchanged: Fragments the ledger recognised as identical.
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    files_fetched: int = Field(ge=0, description="Files downloaded this run.")
+    files_unchanged: int = Field(ge=0, description="Files the skip passed over.")
+    files_failed: int = Field(ge=0, description="Files whose download raised.")
+    files_unsupported: int = Field(
+        ge=0,
+        description="Files fetched but of a format Creek must not ingest.",
+    )
+    fragments_failed: int = Field(
+        ge=0,
+        description=(
+            "Files that downloaded cleanly and then failed to become "
+            "fragments. Distinct from files_failed, which is a download that "
+            "never landed."
+        ),
+    )
+    fragments_created: int = Field(ge=0, description="Fragments newly written.")
+    fragments_updated: int = Field(ge=0, description="Fragments rewritten.")
+    fragments_unchanged: int = Field(ge=0, description="Fragments left as they were.")
+
+
+class DriveDisconnectResponse(_WireModel):
+    """The outcome of ``DELETE /v1/connectors/drive`` (#1527).
+
+    Idempotent, and constant-shaped: disconnecting an already-disconnected
+    connector is a success, and reports the same
+    :attr:`~DriveConnectionState.NOT_CONNECTED` as disconnecting a live one.
+    That is why :attr:`connection` is published rather than a
+    ``token_erased`` boolean — the latter would answer "was there a
+    credential a moment ago", which is a question about the past that this
+    verb has no reason to answer.
+
+    Attributes:
+        status: Always ``"ok"``.
+        tier_ceiling: The ceiling the call ran at.
+        connection: The state afterwards. Always
+            :attr:`~DriveConnectionState.NOT_CONNECTED` on a ``200``: the
+            local credential is erased before the response is built, and a
+            failure to erase it is an :class:`ErrorEnvelope` rather than a
+            success reporting that nothing happened.
+        remote_revoked: Whether Google's revocation endpoint confirmed the
+            credential is dead on their side too. ``False`` does **not** mean
+            the local erase failed — it means the operator should finish the
+            job at Google's account page, which is the one piece of advice a
+            client can act on and cannot derive.
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    connection: DriveConnectionState = Field(description="State after the call.")
+    remote_revoked: bool = Field(description="Google confirmed the revocation.")
+
+
 class ReflectionRequest(_WireModel):
     """A request for margin notes on exactly one source.
 
@@ -787,6 +1370,60 @@ class CareSignal(_WireModel):
     )
 
 
+class RelatedPraxis(_WireModel):
+    """One praxis page the reflected entry contributed to (contract 0.9, #873).
+
+    **Compiled, not raw.** A praxis page is distilled *from* fragments, so it
+    is published only when every id in its ``derived_from`` resolves to a
+    fragment within the caller's ceiling — and withheld outright when its
+    provenance cannot be enumerated in full. That rule lives in
+    :mod:`creek_mcp.compiled_pages`; nothing on this model re-derives it, and
+    no field here carries a tier, because a page that reached the wire is one
+    whose whole provenance was already admitted.
+
+    Attributes:
+        title: The praxis page's title.
+        praxis_type: Which of the five :class:`PraxisKind` values it is.
+        status: Where it sits in the :class:`PraxisLifecycle`.
+        excerpt: The page's own opening prose, whitespace-collapsed and capped
+            at :data:`creek_mcp.compiled_pages.EXCERPT_CHARS`. Not a model
+            summary and not grounding-checked — it is the page as written.
+    """
+
+    title: str = Field(description="The praxis page's title.")
+    praxis_type: PraxisKind = Field(description="Which kind of praxis this is.")
+    status: PraxisLifecycle = Field(description="Where it sits in its lifecycle.")
+    excerpt: str = Field(description="The page's own opening prose, capped.")
+
+
+class RelatedEddy(_WireModel):
+    """One eddy the reflected entry belongs to (contract 0.9, #873).
+
+    Carries the same compiled-page caveat as :class:`RelatedPraxis`, and one
+    more that is specific to it: ``description`` and ``fragment_count`` are
+    *synthesised from the eddy's members*, so publishing the page to a caller
+    admitted to only some of them would hand over a summary of content they
+    cannot read. :mod:`creek_mcp.compiled_pages` therefore admits an eddy only
+    when the members it can enumerate account for ``fragment_count`` exactly
+    **and** every one of them is within the ceiling.
+
+    Attributes:
+        title: The eddy page's title.
+        description: The eddy's own one-line description; ``""`` when the page
+            declares none.
+        fragment_count: How many fragments the eddy clusters. A tally, so never
+            negative.
+        formed: The ``YYYY-MM-DD`` the eddy was first detected.
+    """
+
+    title: str = Field(description="The eddy page's title.")
+    description: str = Field(description="The eddy's own description; may be empty.")
+    fragment_count: int = Field(
+        ge=_MIN_COUNT, description="How many fragments the eddy clusters."
+    )
+    formed: str = Field(description="ISO date the eddy was first detected.")
+
+
 class ReflectionResponse(_WireModel):
     """Margin notes for one entry.
 
@@ -840,6 +1477,28 @@ class ReflectionResponse(_WireModel):
     # can detect, so it needs a contract minor bump — not a quiet relaxation.
     essay_grounded: Literal[False] = Field(
         description="Required; only False is admissible at contract 0.2.",
+    )
+    # Contract 0.9 (#873). Optional and bounded. The route drops these two
+    # keys when they are ``None`` -- and only these two, never ``essay``, whose
+    # explicit ``null`` a 0.2 consumer has been reading since the contract
+    # opened -- so a reflection with no admitted compiled neighbours is
+    # byte-identical to what a 0.8 client already receives. Present only when
+    # something qualified — which is the whole compatibility claim, and the
+    # reason these are ``| None`` rather than defaulting to ``[]``: an empty
+    # list is a *statement* that nothing qualified, and this contract does not
+    # make that statement, because a vault that has never run ``creek link``
+    # and one whose neighbours were all withheld above the ceiling must be
+    # indistinguishable to the caller. Telling them apart would be a one-bit
+    # oracle over the compiled layer.
+    related_praxis: list[RelatedPraxis] | None = Field(
+        default=None,
+        max_length=_MAX_RELATED_PRAXIS,
+        description="Praxis pages the entry contributed to; absent when none.",
+    )
+    related_eddies: list[RelatedEddy] | None = Field(
+        default=None,
+        max_length=_MAX_RELATED_EDDIES,
+        description="Eddies the entry belongs to; absent when none.",
     )
 
 
@@ -960,9 +1619,9 @@ class WheelResponse(_WireModel):
 class NotApplicableExample(_WireModel):
     """Marks a fixture-matrix cell that has no response shape to document.
 
-    The published example matrix is 4 capabilities x 7 states. Three of those
-    cells — care escalation for ``capabilities``, ``journal-upsert`` and
-    ``wheel`` — are *structurally* unreachable: the acute-distress guard runs
+    The published example matrix is 5 capabilities x 7 states. Four of those
+    cells — care escalation for ``capabilities``, ``journal-upsert``, ``wheel``
+    and ``upload`` — are *structurally* unreachable: the acute-distress guard runs
     only inside :func:`creek_mcp.tools.reflect.reflect_tool`, so no other
     capability can ever escalate.
 
@@ -993,6 +1652,9 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "CareEscalationResponse": CareEscalationResponse,
     "CareResource": CareResource,
     "CareSignal": CareSignal,
+    "DriveConnectorStatusResponse": DriveConnectorStatusResponse,
+    "DriveDisconnectResponse": DriveDisconnectResponse,
+    "DriveSyncResponse": DriveSyncResponse,
     "ErrorEnvelope": ErrorEnvelope,
     "JournalUpsertRequest": JournalUpsertRequest,
     "JournalUpsertResponse": JournalUpsertResponse,
@@ -1000,7 +1662,11 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "ReflectionNote": ReflectionNote,
     "ReflectionRequest": ReflectionRequest,
     "ReflectionResponse": ReflectionResponse,
+    "RelatedEddy": RelatedEddy,
+    "RelatedPraxis": RelatedPraxis,
     "TierModel": TierModel,
+    "UploadRequest": UploadRequest,
+    "UploadResponse": UploadResponse,
     "VaultState": VaultState,
     "WheelFrequencies": WheelFrequencies,
     "WheelFrequency": WheelFrequency,

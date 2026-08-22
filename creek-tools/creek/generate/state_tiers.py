@@ -57,6 +57,7 @@ from creek.classify.privacy_filter import (
     tier_within_override,
 )
 from creek.models import Eddy, PrivacyTier, Thread
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -322,8 +323,11 @@ def stamped_content_tier(text: str) -> PrivacyTier:
         unreadable.
     """
     try:
-        metadata = frontmatter.loads(text).metadata
-    except (yaml.YAMLError, ValueError):
+        # The bracket holds the load and nothing else: the house rule is one
+        # Assign/Return call per guard, so a widened bracket cannot swallow a
+        # genuine programming-error TypeError from the attribute access.
+        post = frontmatter.loads(text)
+    except FRONTMATTER_LOAD_ERRORS:
         logger.debug("State artifact frontmatter is unparsable; failing closed")
         return PrivacyTier.INTIMATE
-    return raw_privacy_tier(metadata)
+    return raw_privacy_tier(post.metadata)

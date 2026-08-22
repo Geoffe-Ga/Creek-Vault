@@ -356,13 +356,18 @@ def test_load_or_default_fails_closed_when_present_but_unreadable(
     the existence check) is what fails. The resulting ``PermissionError`` (an
     ``OSError``) is caught and normalised to the same safe default a missing
     manifest produces — confirming the two paths agree (#500 item 3).
+
+    Patched at ``load_post_or_raise``, the loader this module now calls (#1548).
+    That helper deliberately re-raises the ``OSError`` family AS ``OSError``
+    rather than collapsing it to ``ValueError``, which is exactly what keeps
+    this fail-closed path working — so this assertion is unchanged.
     """
     _write_manifest(tmp_path, "locked", _FULL_MANIFEST)
 
-    def _deny(_path: str) -> object:
+    def _deny(_path: object) -> object:
         raise PermissionError("locked")
 
-    monkeypatch.setattr(authors.frontmatter, "load", _deny)
+    monkeypatch.setattr(authors, "load_post_or_raise", _deny)
 
     manifest = load_author_manifest_or_default(tmp_path, "locked")
 

@@ -91,6 +91,11 @@ vault, because a captured message currently can't carry its channel's
 privacy tier with it. #1262 tracks carrying that tier end-to-end so
 `intimate` channels can be captured faithfully instead of refused.
 
+A **thread inherits its parent channel's declared tier** (#1265):
+declaring channel `555` as `intimate` covers every thread inside it,
+even threads you never listed. A thread may declare itself *stricter*
+than its parent, never looser.
+
 #### Upgrading from a pre-#1052 build — audit your capture tree
 
 #1052 stopped future bad writes; it did nothing about what an older build
@@ -275,11 +280,19 @@ refused at run time, naming the step.
 ./scripts/test.sh           # unit tests
 ./scripts/lint.sh --fix     # auto-fix
 ./scripts/typecheck.sh
+./scripts/lint-vulture.sh   # dead-code gate (shared policy, see below)
 ```
 
 The quality bar mirrors `creek-tools/`: ≥ 90 % branch coverage, MyPy
 strict clean, Ruff zero violations, ≥ 95 % docstring coverage,
-cyclomatic complexity ≤ 10.
+cyclomatic complexity ≤ 10, and zero dead-code findings.
+
+`./scripts/lint-vulture.sh` is a thin wrapper: the policy it runs lives
+in `creek-tools/scripts/lint_vulture.py` and is *shared*, not copied
+(#1472). Both subprojects' scan surfaces are declared there as `Scope`
+values, so a threshold or carve-out change cannot land in one and not
+the other. There is deliberately no allowlist — the only remedy for a
+finding is to delete the code.
 
 ## Architecture
 

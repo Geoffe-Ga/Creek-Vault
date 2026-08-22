@@ -29,7 +29,7 @@ document and the expectation would come from the same table, and a route the
 adapter failed to *mount* would still appear documented.
 
 **Why the component set is wider than ``CONTRACT_MODELS``.** The registry holds
-the sixteen wire *models*. Each committed schema carries the definitions it
+every registered wire *model*. Each committed schema carries the definitions it
 references — the six enums (``Capability``, ``WireTierCeiling``,
 ``CapabilitiesStatus``, ``JournalAction``, ``NoteKind``, ``ReflectionStatus``)
 and the nested models — inline under its own ``$defs``, which is what makes each
@@ -38,7 +38,7 @@ schema file independently resolvable. An OpenAPI document has one shared
 and become siblings.
 
 Hoisting is not optional: dropping ``$defs`` while rewriting ``#/$defs/X`` to
-``#/components/schemas/X`` and publishing only the sixteen models would emit a
+``#/components/schemas/X`` and publishing only the registered models would emit a
 document whose references point at names it never defines. Every standard
 validator and code generator rejects that, so "OpenAPI generation succeeds"
 would be true only in the sense that a broken file was produced. The component
@@ -47,7 +47,7 @@ schemas' own ``$defs`` keys — derived from the bundle at test time, never
 hard-coded, so a definition added to a model shows up here without anybody
 remembering to update a list.
 
-This changes nothing about what the bundle publishes. The sixteen schema files
+This changes nothing about what the bundle publishes. The committed schema files
 and the manifest hashes are untouched; hoisting happens only in the OpenAPI
 projection, and every hoisted definition is itself checked against the committed
 bytes it came from. :func:`test_every_reference_resolves` is the assertion that
@@ -57,20 +57,36 @@ actually holds the line — it is the one a dangling ref fails.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 
-from creek_mcp.api.models import CONTRACT_MODELS, ERROR_STATUS
-from creek_mcp.api.openapi import build_openapi
+from creek_mcp.api.models import (
+    CONTRACT_MODELS,
+    ERROR_STATUS,
+    MAX_EXTERNAL_ID_CHARS,
+)
+from creek_mcp.api.openapi import (
+    BEARER_SCHEME_DESCRIPTION,
+    EXTERNAL_ID_PARAM,
+    EXTERNAL_ID_PATTERN,
+    SECURITY_SCHEME_NAME,
+    build_openapi,
+)
+from creek_mcp.api.routes import AUTHORIZATION_HEADER
 from creek_mcp.contract import CONTRACT_VERSION
+from creek_mcp.httpapi.journal import admissible_external_id
 from tests.v1_api_support import (
     CAPABILITIES_PATH,
     CONTRACT_VERSION_HEADER,
+    DRIVE_CONNECTOR_PATH,
+    DRIVE_SYNC_PATH,
     HEALTH_PATH,
     JOURNAL_TEMPLATE,
     REFLECTIONS_PATH,
+    UPLOAD_PATH,
     WHEEL_PATH,
     build_app,
     mounted_method_paths,
@@ -271,7 +287,7 @@ def test_components_are_exactly_the_models_plus_their_committed_definitions() ->
     publishes nothing for, so a consumer generating code from the document
     would get a type the fixtures never validate.
 
-    The expectation is the sixteen registered models plus every name the
+    The expectation is every registered model plus every name the
     committed schemas hoist out of their own ``$defs`` — read from the bundle,
     not restated — so this cannot be satisfied by inventing a component or by
     quietly dropping one.
@@ -395,12 +411,21 @@ def test_documented_paths_equal_the_mounted_routes(vault: Path) -> None:
 
 
 def test_every_published_route_is_documented() -> None:
-    """All five paths appear, named explicitly so a silent drop is visible."""
+    """All eight paths appear, named explicitly so a silent drop is visible.
+
+    Eight paths over nine operations since #1527: ``/v1/connectors/drive``
+    serves both ``GET`` and ``DELETE``, which is why this is a set of paths
+    while ``test_documented_routes_are_the_mounted_ones`` above compares
+    ``(method, path)`` pairs.
+    """
     assert set(_paths()) == {
         CAPABILITIES_PATH,
         JOURNAL_TEMPLATE,
         REFLECTIONS_PATH,
         WHEEL_PATH,
+        UPLOAD_PATH,
+        DRIVE_CONNECTOR_PATH,
+        DRIVE_SYNC_PATH,
         HEALTH_PATH,
     }
 
@@ -519,3 +544,206 @@ def test_the_content_routes_declare_the_contract_version_parameter(
 def test_the_versioned_operations_list_is_not_vacuous() -> None:
     """The parametrize above covers three routes, not zero."""
     assert len(VERSIONED_OPERATIONS) == 3
+
+
+# --------------------------------------------------------------------------- #
+# The bearer requirement (#1371)
+# --------------------------------------------------------------------------- #
+
+
+def _security_schemes() -> dict[str, Any]:
+    """Return the document's ``components/securitySchemes`` mapping.
+
+    Returns:
+        The declared schemes, keyed by name. Empty when the document declares
+        none at all — which is the state #1371 was filed about, and which this
+        helper renders as an assertion failure rather than a ``KeyError``.
+    """
+    schemes: dict[str, Any] = build_openapi()["components"].get("securitySchemes", {})
+    return schemes
+
+
+def test_the_document_declares_the_bearer_scheme_every_route_enforces() -> None:
+    """THE INVARIANT — the published document names the credential the server demands.
+
+    :class:`~creek_mcp.httpapi.auth.BearerAuthMiddleware` sits above the router,
+    so all six published routes are unreachable without a token and
+    :func:`~creek_mcp.httpapi.auth.build_verifier` refuses to construct a server
+    with no consumers configured. A document that declares no scheme therefore
+    says the surface is open while the server refuses everything, and a client
+    generated from it has no way to present a credential at all.
+    """
+    assert _security_schemes()[SECURITY_SCHEME_NAME] == {
+        "type": "http",
+        "scheme": "bearer",
+        "description": BEARER_SCHEME_DESCRIPTION,
+    }
+
+
+def test_the_document_requires_that_scheme_globally() -> None:
+    """The requirement is document-level, so it reaches every operation.
+
+    Declared once rather than repeated per operation: five copies of a
+    requirement are five places for one of them to be dropped, and OpenAPI
+    already resolves an absent operation-level ``security`` against the
+    document-level default.
+    """
+    assert build_openapi()["security"] == [{SECURITY_SCHEME_NAME: []}]
+
+
+def test_no_operation_publishes_its_own_security_override() -> None:
+    """No operation carries an operation-level ``security`` key at all.
+
+    An operation-level ``security: []`` is how OpenAPI spells "this one is
+    open". ``GET /v1/health`` is the route somebody would eventually be tempted
+    to spell that way, and it is still behind the gate — a probe with no bearer
+    is a ``401``, which the suite pins elsewhere.
+
+    Asserted as *absence of the key*, not as ``get(..., default) != []``. The
+    earlier form could not fail: with no operation publishing ``security``, the
+    default was returned every time and the comparison was always true — a
+    forward guard wearing the clothes of evidence. Absence is falsifiable: any
+    override, permissive or not, fails here and forces the decision to be made
+    deliberately rather than inherited.
+    """
+    ops = list(_operations())
+    assert ops, "no operations found — the walk missed the document"
+
+    overrides = [
+        f"{method.upper()} {path}"
+        for path, method, operation in ops
+        if "security" in operation
+    ]
+    assert overrides == [], (
+        "these operations override the document-level bearer requirement; "
+        f"decide each one deliberately: {overrides}"
+    )
+
+
+def test_the_bearer_scheme_is_truthful_about_the_header_the_server_reads() -> None:
+    """THE NON-VACUITY TWIN — ``http``/``bearer`` names ``Authorization``, implicitly.
+
+    OpenAPI's ``type: http`` scheme has no place to name a header: it *means*
+    the ``Authorization`` header, by RFC 7235. So the declaration above is only
+    a true statement about this server while
+    :data:`~creek_mcp.api.routes.AUTHORIZATION_HEADER` — the constant
+    :mod:`creek_mcp.httpapi.auth` reads and :mod:`creek_mcp.httpapi.errors`
+    names in every ``Vary`` — is that header. Move the constant and this scheme
+    becomes a lie no other test in this module could see.
+    """
+    assert AUTHORIZATION_HEADER == "Authorization"
+
+
+def test_the_bearer_requirement_added_no_component_schema() -> None:
+    """Publishing the scheme must not disturb the byte-pinned schema bundle.
+
+    ``components/securitySchemes`` is a different namespace from
+    ``components/schemas``; the committed schema files are what a
+    consumer vendors, and a security declaration must not move one of them.
+    """
+    assert SECURITY_SCHEME_NAME not in _components()
+    assert "securitySchemes" not in _components()
+
+
+# --------------------------------------------------------------------------- #
+# The external_id path parameter (#1132)
+# --------------------------------------------------------------------------- #
+
+
+def _path_parameters() -> list[tuple[str, str, dict[str, Any]]]:
+    """Return every ``(path, method, parameter)`` triple for an ``in: path`` parameter.
+
+    Returns:
+        One entry per declared path parameter across the whole document.
+    """
+    return [
+        (path, method, parameter)
+        for path, method, operation in _operations()
+        for parameter in operation.get("parameters", [])
+        if parameter["in"] == "path"
+    ]
+
+
+def test_every_published_path_parameter_is_bounded() -> None:
+    """THE INVARIANT — no path parameter is published as an unbounded string.
+
+    Starlette's default converter is ``[^/]+``, which admits a NUL byte, a
+    control character and an id of any length straight through to the handler.
+    The server already refuses those —
+    :func:`~creek_mcp.httpapi.journal.admissible_external_id` bounds the length
+    and demands printable characters — so an unconstrained
+    declaration understates the contract, and a consumer that pins this schema
+    bundle pins the understatement.
+    """
+    declared = _path_parameters()
+    assert declared, "the document declares no path parameters at all"
+    for path, method, parameter in declared:
+        schema = parameter["schema"]
+        assert "maxLength" in schema, f"{method} {path}: {parameter['name']}"
+        assert "pattern" in schema, f"{method} {path}: {parameter['name']}"
+
+
+def test_the_external_id_bound_is_the_one_both_write_surfaces_share() -> None:
+    """The published maximum is :data:`MAX_EXTERNAL_ID_CHARS` itself, not a restatement.
+
+    #1524 made that constant the single canonical bound imported by the journal
+    route and the upload model alike. A literal here would be a fourth spelling
+    of it, free to drift the day the bound moves.
+    """
+    (_path, _method, parameter) = next(
+        entry for entry in _path_parameters() if entry[2]["name"] == EXTERNAL_ID_PARAM
+    )
+    assert parameter["schema"]["maxLength"] == MAX_EXTERNAL_ID_CHARS
+    assert parameter["schema"]["minLength"] == 1
+
+
+@pytest.mark.parametrize(
+    "external_id",
+    [
+        "adepthood:doc:2026-08-19",
+        "abc",
+        "a" * MAX_EXTERNAL_ID_CHARS,
+        "..",
+        "an id with spaces",
+        "émoji-ok-\N{SNOWMAN}",
+    ],
+    ids=["namespaced", "short", "at-the-bound", "dot-dot", "spaces", "unicode"],
+)
+def test_the_published_pattern_admits_every_id_the_server_admits(
+    external_id: str,
+) -> None:
+    """THE NON-VACUITY TWIN — the published constraint refuses nothing the server takes.
+
+    A pattern *tighter* than the server is the more dangerous error of the two:
+    it makes a generated client refuse, client-side, an id the vault would have
+    accepted and already holds — so a consumer's own sync silently stops
+    addressing entries it wrote. ``..`` is in the list deliberately: the server
+    accepts it (``safe_stem`` digests the raw id rather than pathing on it), so
+    the document must not pretend otherwise.
+
+    Args:
+        external_id: An id :func:`admissible_external_id` accepts.
+    """
+    assert admissible_external_id(external_id)
+    assert re.fullmatch(EXTERNAL_ID_PATTERN, external_id) is not None
+
+
+@pytest.mark.parametrize(
+    "external_id",
+    ["with\x00nul", "with\nnewline", "with\x7fdelete", "with/slash"],
+    ids=["nul", "newline", "delete", "slash"],
+)
+def test_the_published_pattern_refuses_what_it_claims_to_refuse(
+    external_id: str,
+) -> None:
+    """The pattern is not the identity: it rejects the bytes #1132 named.
+
+    Without this, a pattern of ``.*`` would satisfy every assertion above.
+    ``/`` is included because Starlette's converter already excludes it, so a
+    published pattern that admitted it would document a path the router cannot
+    match.
+
+    Args:
+        external_id: An id the published pattern must refuse.
+    """
+    assert re.fullmatch(EXTERNAL_ID_PATTERN, external_id) is None

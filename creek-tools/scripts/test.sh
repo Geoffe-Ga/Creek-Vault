@@ -8,6 +8,28 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
+# How many lanes to assume are running when nothing says otherwise. This is
+# `fleet.sh`'s own documented default for `max_workers`, restated rather than
+# read, because `scripts/ralph/` is repo-root tooling and this script must keep
+# working in a checkout that has none. An explicit CREEK_TEST_WORKERS is the
+# override for a fleet configured differently.
+readonly ASSUMED_CONCURRENT_LANES=4
+
+# Workers one lane may claim when it has not been given an explicit budget:
+# the machine's cores divided among the lanes assumed to be sharing it, floored
+# at 1. Deriving it rather than hardcoding is the point — a fixed 2 still
+# oversubscribes a 4-core box 2x at four lanes, which is the same defect #1554
+# was filed to remove, only smaller. Guessing high OOMs every lane at once;
+# guessing low only costs time, so this rounds down.
+creek_lane_workers() {
+    local cores
+    cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+    [[ "$cores" =~ ^[0-9]+$ ]] && (( cores > 0 )) || cores=1
+    local slice=$(( cores / ASSUMED_CONCURRENT_LANES ))
+    (( slice < 1 )) && slice=1
+    printf '%s' "$slice"
+}
+
 # shellcheck source=scripts/_lib.sh
 source "$SCRIPT_DIR/_lib.sh"
 
@@ -80,8 +102,19 @@ OPTIONS:
 
 ENVIRONMENT:
     CREEK_TEST_WORKERS  pytest-xdist worker count for the unit lane.
-                        Default 'auto' (one per core). Set to 1 to run
-                        serially — needed for pdb, which xdist swallows.
+                        Default 'auto' (one per core) for a normal checkout
+                        and for CI, which own the machine. Inside a Ralph
+                        fleet lane (a checkout under .ralph/worktrees/) the
+                        default is instead the machine's cores divided among
+                        the lanes assumed to share it — max(1, nproc / 4),
+                        so 1 on a 4-core box and 3 on a 12-core one. A slice
+                        of 1 means serial, i.e. no -n at all. Every
+                        concurrent lane runs this script, so 'auto' there
+                        would claim every core in each of them — 'lanes x
+                        ncpu' workers, which exhausts memory (#1554). Set it
+                        explicitly to give a lane an exact budget; set 1 (or
+                        0) to run serially, needed for pdb, which xdist
+                        swallows.
 
 WHICH LANE BLOCKS A MERGE:
     --unit, --integration and --e2e all gate the Quality Gate in
@@ -143,7 +176,31 @@ case "$TEST_TYPE" in
         #
         # CREEK_TEST_WORKERS=1 (or 0) forces serial for an interactive
         # debugging session — xdist swallows pdb and interleaves output.
-        WORKERS="${CREEK_TEST_WORKERS:-auto}"
+        #
+        # `auto` means one worker per core, which assumes THIS RUN OWNS THE
+        # MACHINE. That holds for CI (one job per runner) and for a developer
+        # running the suite once. It does NOT hold inside a Ralph fleet lane:
+        # check-all.sh runs this script, and the fleet runs up to `max_workers`
+        # lanes at once, so the real worker count is `lanes x ncpu` rather than
+        # `ncpu`. On a 10-core box that was ~60 pytest processes at ~1 GB each
+        # and it OOM'd the machine (#1554).
+        #
+        # So a lane — detected by its worktree path, since fleet.sh injects no
+        # environment — takes a derived slice of the box rather than all of it,
+        # and says so on stderr. An explicit CREEK_TEST_WORKERS always wins, which
+        # is how an orchestrator that knows the real lane count sets an exact
+        # budget.
+        WORKERS="${CREEK_TEST_WORKERS:-}"
+        if [[ -z "$WORKERS" ]]; then
+            if [[ "$PROJECT_ROOT" == *"/.ralph/worktrees/"* ]]; then
+                WORKERS="$(creek_lane_workers)"
+                echo "NOTE: fleet lane detected; using -n $WORKERS instead of" \
+                     "'auto' so concurrent lanes do not exhaust memory (#1554)." \
+                     "Set CREEK_TEST_WORKERS to override." >&2
+            else
+                WORKERS="auto"
+            fi
+        fi
         if [[ "$WORKERS" != "0" && "$WORKERS" != "1" ]]; then
             PYTEST_ARGS+=(-n "$WORKERS")
         fi

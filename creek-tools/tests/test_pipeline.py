@@ -515,9 +515,12 @@ class TestPipelineWithFragments:
         pipeline = Pipeline(config=config)
         with patch("creek.pipeline.INGESTOR_REGISTRY", registry):
             pipeline.run(source_path=source_path, vault_path=vault_path)
-        # Review queue file should exist in vault_path
-        review_files = list(vault_path.glob("review-queue-*.md"))
+        # The queue lives under 00-Creek-Meta/Processing-Log/ since #883, and
+        # never at the vault root the operator opens in Obsidian.
+        review_files = list(vault_path.rglob("review-queue-*.md"))
         assert len(review_files) == 1
+        assert review_files[0].parent == vault_path / "00-Creek-Meta" / "Processing-Log"
+        assert list(vault_path.glob("review-queue-*.md")) == []
 
 
 class TestPipelineErrorSurfacing:

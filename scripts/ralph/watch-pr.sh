@@ -105,6 +105,30 @@ readonly DEFAULT_TIMEOUT=1800
 # persistently unreadable lane escalates rather than being re-watched forever.
 readonly -a IN_FLIGHT_TOKENS=(pending awaiting-review main-not-green review-quota-exhausted ci-unreadable)
 
+# The subset of IN_FLIGHT_TOKENS whose wait is measured in hours or days rather
+# than minutes, and which nothing the orchestrator does can shorten.
+# `review-quota-exhausted` (#1160) held a lane for SEVEN DAYS on PR #1158;
+# `main-not-green` (#1159) for ~20 minutes and occasionally far longer.
+#
+# `pending` and `awaiting-review` are deliberately NOT here: they resolve in
+# ~14 and ~3 minutes, and polling them briskly is what makes a lane merge
+# promptly. `ci-unreadable` is also excluded — it is transient GitHub weather
+# that usually clears on the very next poll, so backing off would turn a
+# one-poll blip into a multi-minute stall.
+readonly -a LONG_HOLD_TOKENS=(main-not-green review-quota-exhausted)
+
+# How much less often to ask when the answer cannot change soon. A MULTIPLIER
+# of the caller's interval, not an absolute floor in seconds: the offline test
+# suite drives this script at fractional intervals, and an absolute floor would
+# hang it. At the 30s default this is a 5-minute poll — the "back off to
+# minutes" #1197 asked for — while a caller who already chose a slow interval
+# keeps its proportions.
+#
+# Each pr-ready.sh poll costs ~8-10 gh calls, so one lane held at 30s is
+# ~1,000 calls/hour against a 5,000/hour REST budget. Four held lanes exceeded
+# it outright, and did so precisely when nothing could merge anyway.
+readonly LONG_HOLD_FACTOR=10
+
 # `gh pr view --json state` values that mean the PR no longer exists to watch.
 readonly MERGED_STATE="MERGED"
 readonly CLOSED_STATE="CLOSED"
@@ -153,6 +177,24 @@ fi
 echo "$$" > "$pidfile"
 trap 'rm -f "$pidfile"' EXIT
 
+long_hold() { # long_hold <token> — is this a wait measured in hours or days?
+  local t
+  for t in "${LONG_HOLD_TOKENS[@]}"; do
+    [[ "$1" == "$t" ]] && return 0
+  done
+  return 1
+}
+
+# poll_pause <token> — seconds to wait before asking again. awk, not bash
+# arithmetic, because INTERVAL may be fractional and bash has no float math.
+poll_pause() {
+  if long_hold "$1"; then
+    awk -v i="$interval" -v f="$LONG_HOLD_FACTOR" 'BEGIN { print i * f }'
+  else
+    printf '%s' "$interval"
+  fi
+}
+
 in_flight() { # in_flight <token> — is this a keep-waiting token?
   local t
   for t in "${IN_FLIGHT_TOKENS[@]}"; do
@@ -192,5 +234,8 @@ while :; do
     echo "WATCH $pr timeout $last_token"
     exit 0
   fi
-  sleep "$interval"
+  # Keyed on last_token, so a lane that has not yet been classified (or whose
+  # poll just failed) keeps the brisk interval rather than inheriting a
+  # back-off it never earned.
+  sleep "$(poll_pause "$last_token")"
 done

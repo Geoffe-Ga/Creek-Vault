@@ -13,10 +13,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import frontmatter
-
 from creek.models import MediumContract
 from creek.scaffold import SKILLS_TEMPLATE_DIR
+from creek.vault.reader import load_post_or_raise
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -134,7 +133,7 @@ def load_medium_contract(medium: str, vault: Path) -> MediumContract:
     if path is None:
         msg = f"No medium contract found for {medium!r}."
         raise FileNotFoundError(msg)
-    post = frontmatter.load(str(path))
+    post = load_post_or_raise(path)
     data: dict[str, object] = post.metadata.copy()
     data.setdefault("medium", medium)
     return MediumContract.model_validate(data)

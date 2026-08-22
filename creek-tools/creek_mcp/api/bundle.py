@@ -2,7 +2,7 @@
 
 :func:`build_bundle` renders the whole of ``docs/contracts/adepthood-v1/`` from
 the code in :mod:`creek_mcp.api.models`: one JSON Schema per published model, a
-4x7 matrix of worked example responses, the retry table, and a manifest that
+6x7 matrix of worked example responses, the retry table, and a manifest that
 hashes every one of them. :func:`write_bundle` materialises it.
 
 **Why generate it instead of hand-writing it.** A hand-written fixture bundle
@@ -30,7 +30,7 @@ its whole error-handling surface against fixtures:
 - ``refusal`` — an :class:`~creek_mcp.api.models.ErrorEnvelope` carrying
   ``privacy_refused``. **These are the intimate examples, and every one of them
   is a refusal rather than a success** — that is the point of publishing them.
-- ``care-escalation`` — ``reflections`` only; the other three cells are
+- ``care-escalation`` — ``reflections`` only; the other five cells are
   :class:`~creek_mcp.api.models.NotApplicableExample`, because the
   acute-distress guard runs only inside ``reflect_tool``.
 - ``malformed-input`` / ``incompatible-version`` / ``unavailable-service`` —
@@ -71,9 +71,12 @@ from creek_mcp.api.models import (
     SUPPORTED_CONTRACT_MINORS,
     CapabilitiesStatus,
     Capability,
+    DriveConnectionState,
     ErrorCode,
     JournalAction,
     NoteKind,
+    PraxisKind,
+    PraxisLifecycle,
     ReflectionStatus,
     WireTierCeiling,
 )
@@ -164,8 +167,9 @@ UNREACHABLE_CELLS: Final[frozenset[tuple[str, str]]] = frozenset(
 Derived from the axes rather than listed, so it cannot fall out of step with
 the matrix it describes. The acute-distress guard runs only inside
 :func:`creek_mcp.tools.reflect.reflect_tool`, so ``capabilities``,
-``journal-upsert`` and ``wheel`` can never escalate. Those three cells are
-filled with a :class:`~creek_mcp.api.models.NotApplicableExample` that says so.
+``journal-upsert``, ``wheel``, ``upload`` and ``drive-connector`` can never
+escalate. Those five cells are filled with a
+:class:`~creek_mcp.api.models.NotApplicableExample` that says so.
 """
 
 _ERROR_STATE_CODES: Final[dict[str, ErrorCode]] = {
@@ -198,7 +202,7 @@ _CAPABILITIES_SUCCESS: Final[dict[str, Any]] = {
     "tier_model": _TIER_MODEL_PAYLOAD,
     "capabilities": list(CAPABILITIES),
 }
-"""A ready server: vault present, all four capabilities served."""
+"""A ready server: vault present, all six capabilities served."""
 
 _CAPABILITIES_EMPTY: Final[dict[str, Any]] = {
     **_CAPABILITIES_SUCCESS,
@@ -244,6 +248,92 @@ _JOURNAL_EMPTY: Final[dict[str, Any]] = {
 }
 """A re-sync that changed nothing: a success, not an error."""
 
+_EXAMPLE_UPLOAD_EXTERNAL_ID: Final[str] = "adepthood:doc:2026-08-18T09:30:00Z"
+"""A synthetic consumer-side document id, in the shape Adepthood mints."""
+
+_EXAMPLE_UPLOAD_FRAGMENT_ID: Final[str] = "frag-8c41d0be59a7"
+"""A second synthetic fragment id, opaque for the same reason as the first."""
+
+_UPLOAD_SOURCE_TYPE: Final[str] = "document"
+"""The ingestor a ``.pdf`` / ``.docx`` upload dispatches to.
+
+A :data:`creek.ingest.INGESTOR_REGISTRY` key, spelled here as the literal it is
+on the wire: the fixture documents the *response*, and a consumer reading this
+cell needs to know the field carries a short registry name rather than a MIME
+type or a filename.
+"""
+
+_UPLOAD_SUCCESS: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "tier_ceiling": WireTierCeiling.PERSONAL.value,
+    "external_id": _EXAMPLE_UPLOAD_EXTERNAL_ID,
+    "fragment_id": _EXAMPLE_UPLOAD_FRAGMENT_ID,
+    "affected_fragment_ids": [_EXAMPLE_UPLOAD_FRAGMENT_ID],
+    "action": JournalAction.CREATED.value,
+    "source_type": _UPLOAD_SOURCE_TYPE,
+}
+"""A first upload.
+
+The fixture is the *response*, so no document bytes are published — and no
+``tier`` either, because :class:`~creek_mcp.api.models.UploadResponse` has none:
+a document's own frontmatter can escalate the fragment above the declared tier,
+so any tier field here would be either a false claim or an oracle.
+"""
+
+_UPLOAD_EMPTY: Final[dict[str, Any]] = {
+    **_UPLOAD_SUCCESS,
+    "action": JournalAction.UNCHANGED.value,
+}
+"""A re-send of identical bytes under the same id: a success, not an error.
+
+This is the cell that documents idempotency. The ledger recognised the content,
+nothing was written, and the *same* ``fragment_id`` comes back — which is why
+the payload is spread from the success cell rather than written out with a new
+id.
+"""
+
+_DRIVE_READONLY_SCOPE: Final[str] = "https://www.googleapis.com/auth/drive.readonly"
+"""The single scope the connector may hold, spelled as it appears on the wire.
+
+Written out rather than imported from
+:data:`creek.config._READONLY_SCOPES`, because the fixture documents what a
+*consumer* will be shown and a set has no published order. The two are pinned
+equal by a test, which is the half of the trade that catches a widened scope.
+"""
+
+_DRIVE_STATUS_SUCCESS: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "tier_ceiling": WireTierCeiling.OPEN.value,
+    "connection": DriveConnectionState.CONNECTED.value,
+    "scopes": [_DRIVE_READONLY_SCOPE],
+    "can_sync": True,
+}
+"""A connected, syncable connector.
+
+No token, no refresh token, no expiry and no path to any of them — the whole
+of what a consumer learns about the credential is that one exists and that it
+was granted read-only.
+"""
+
+_DRIVE_SYNC_EMPTY: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "tier_ceiling": WireTierCeiling.OPEN.value,
+    "files_fetched": 0,
+    "files_unchanged": 0,
+    "files_failed": 0,
+    "files_unsupported": 0,
+    "fragments_failed": 0,
+    "fragments_created": 0,
+    "fragments_updated": 0,
+    "fragments_unchanged": 0,
+}
+"""A sync of an unchanged Drive: all zeroes, and emphatically a success.
+
+Published as its own fixture because "nothing happened" is the answer a client
+integrating against this route will see most often, and a client that treated
+an all-zero tally as a failure would retry a working connector forever.
+"""
+
 _EXAMPLE_NOTE: Final[dict[str, Any]] = {
     "quote": "I keep saying yes to things I do not want",
     "kind": NoteKind.PATTERN.value,
@@ -254,6 +344,37 @@ _EXAMPLE_NOTE: Final[dict[str, Any]] = {
 }
 """One margin note. Deliberately invented, and labelled as such in the note."""
 
+_EXAMPLE_PRAXIS: Final[dict[str, Any]] = {
+    "title": "Rest before the collapse",
+    "praxis_type": PraxisKind.PRACTICE.value,
+    "status": PraxisLifecycle.ACTIVE.value,
+    "excerpt": (
+        "Synthetic example prose. A real excerpt is the praxis page's own "
+        "opening lines, taken verbatim and capped."
+    ),
+}
+"""The ``related_praxis`` cell of the success fixture (contract 0.9, #873).
+
+Synthetic, like the note beside it: no fixture in this bundle carries real
+vault prose. What it documents is the *shape*, and one property a consumer
+cannot see from the shape — a praxis page reaches the wire only when every
+fragment its ``derived_from`` names is within the caller's ceiling.
+"""
+
+_EXAMPLE_EDDY: Final[dict[str, Any]] = {
+    "title": "Rest and Ruin",
+    "description": "Synthetic example description of a topic cluster.",
+    "fragment_count": 12,
+    "formed": "2026-03-04",
+}
+"""The ``related_eddies`` cell of the success fixture (contract 0.9, #873).
+
+``description`` and ``fragment_count`` are *compiled from* the eddy's members,
+which is why the page is published only when the members that can be
+enumerated account for ``fragment_count`` exactly and every one of them is
+admitted. An eddy whose provenance is partial is withheld, not summarised.
+"""
+
 _REFLECTIONS_SUCCESS: Final[dict[str, Any]] = {
     "status": ReflectionStatus.OK.value,
     "tier_ceiling": WireTierCeiling.PERSONAL.value,
@@ -261,19 +382,38 @@ _REFLECTIONS_SUCCESS: Final[dict[str, Any]] = {
     "notes": [_EXAMPLE_NOTE],
     "essay": None,
     "essay_grounded": False,
+    "related_praxis": [_EXAMPLE_PRAXIS],
+    "related_eddies": [_EXAMPLE_EDDY],
 }
 """A reflection that found something.
 
 ``routed_tier`` equals ``tier_ceiling`` here, and always will: it is a constant
 function of the declared ceiling, which is why publishing it discloses nothing.
+
+The two ``related_*`` fields are optional at 0.9 and are shown *present* here
+on purpose: a consumer needs the populated shape to write its parser against,
+and :data:`_REFLECTIONS_EMPTY` next door shows the absent case, which is what
+the route actually emits whenever nothing qualified.
 """
 
 _REFLECTIONS_EMPTY: Final[dict[str, Any]] = {
-    **_REFLECTIONS_SUCCESS,
+    **{
+        key: value
+        for key, value in _REFLECTIONS_SUCCESS.items()
+        if key not in {"related_praxis", "related_eddies"}
+    },
     "status": ReflectionStatus.EMPTY.value,
     "notes": [],
 }
-"""A reflection with nothing to say. Still a 200."""
+"""A reflection with nothing to say. Still a 200.
+
+Also the published example of the ``related_*`` fields being **absent** rather
+than present-and-empty — the shape a pre-0.9 consumer keeps seeing, and the
+one the route emits when the vault has no compiled neighbours the caller is
+admitted to. The two cases are indistinguishable here by design: telling "no
+eddies exist" from "the eddies that exist were withheld" would be a one-bit
+oracle over the compiled layer.
+"""
 
 _CARE_PAYLOAD: Final[dict[str, Any]] = {
     "status": ReflectionStatus.ESCALATE.value,
@@ -347,7 +487,7 @@ _WHEEL_EMPTY: Final[dict[str, Any]] = {
 
 
 # --------------------------------------------------------------------------
-# The 4 x 7 matrix
+# The 6 x 7 matrix
 # --------------------------------------------------------------------------
 
 _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
@@ -367,8 +507,22 @@ _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
         model="WheelResponse",
         payload=_WHEEL_SUCCESS,
     ),
+    Capability.UPLOAD.value: _Example(
+        model="UploadResponse",
+        payload=_UPLOAD_SUCCESS,
+    ),
+    Capability.DRIVE_CONNECTOR.value: _Example(
+        model="DriveConnectorStatusResponse",
+        payload=_DRIVE_STATUS_SUCCESS,
+    ),
 }
-"""The ``success`` column: one canonical happy response per capability."""
+"""The ``success`` column: one canonical happy response per capability.
+
+``drive-connector`` is the one capability whose column spans three response
+models, because it is one capability over three verbs. Its two success-ish
+cells are chosen to be the two a client meets first: the connected *state*
+here, and an unchanged *sync* in the ``empty`` column below.
+"""
 
 _EMPTY_EXAMPLES: Final[dict[str, _Example]] = {
     Capability.CAPABILITIES.value: _Example(
@@ -387,6 +541,14 @@ _EMPTY_EXAMPLES: Final[dict[str, _Example]] = {
         model="WheelResponse",
         payload=_WHEEL_EMPTY,
     ),
+    Capability.UPLOAD.value: _Example(
+        model="UploadResponse",
+        payload=_UPLOAD_EMPTY,
+    ),
+    Capability.DRIVE_CONNECTOR.value: _Example(
+        model="DriveSyncResponse",
+        payload=_DRIVE_SYNC_EMPTY,
+    ),
 }
 """The ``empty`` column. Every cell is a success envelope, not an error."""
 
@@ -399,7 +561,7 @@ def _care_example(capability: str) -> _Example:
 
     Returns:
         The real escalation envelope for ``reflections``; an explicit
-        unreachability marker for the three capabilities that cannot escalate.
+        unreachability marker for the five capabilities that cannot escalate.
     """
     if (capability, _STATE_CARE_ESCALATION) in UNREACHABLE_CELLS:
         return _Example(model="NotApplicableExample", payload=_UNREACHABLE_PAYLOAD)

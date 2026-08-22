@@ -43,7 +43,6 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import frontmatter
-import yaml
 from pydantic import ValidationError
 
 from creek.classify.privacy_filter import raw_privacy_tier
@@ -55,7 +54,7 @@ from creek.generate.compost import (
 )
 from creek.generate.compost_verifier import CompostVerdict
 from creek.models import Thread
-from creek.vault.reader import iter_vault_fragments
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, iter_vault_fragments
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -122,7 +121,7 @@ def _safe_post(md_file: Path) -> frontmatter.Post | None:
     """Return a parsed frontmatter post, or ``None`` when it will not parse."""
     try:
         return frontmatter.load(str(md_file))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         logger.debug("Skipping unreadable markdown file: %s", md_file)
         return None
 

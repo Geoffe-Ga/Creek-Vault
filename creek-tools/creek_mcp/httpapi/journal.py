@@ -40,6 +40,7 @@ from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from creek_mcp.api.models import (
+    MAX_EXTERNAL_ID_CHARS,
     OK_STATUS,
     ErrorCode,
     JournalAction,
@@ -59,16 +60,6 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
     from creek_mcp.httpapi.context import RequestContext
-
-MAX_EXTERNAL_ID_CHARS: Final[int] = 512
-"""Inclusive upper bound on an ``external_id`` path segment.
-
-Generous enough for any namespaced consumer id — the published example is 38
-characters — and small enough that the id cannot become a payload. There is no
-bound below this one: ``safe_stem`` truncates only the *readable slug* to 80
-characters and then appends a digest of the whole raw id, so an unbounded id
-would be accepted, stored and echoed at full length.
-"""
 
 REPLACEMENT_CHARACTER: Final[str] = "�"
 """U+FFFD, the marker that a path segment did not survive URL decoding.
@@ -159,9 +150,10 @@ def admissible_external_id(raw: str) -> bool:
 
     Returns:
         ``True`` when the id is non-blank, within
-        :data:`MAX_EXTERNAL_ID_CHARS`, free of the replacement character, and
-        made entirely of printable characters — a control byte would reach both
-        the staged frontmatter and the audit trail.
+        :data:`creek_mcp.api.models.MAX_EXTERNAL_ID_CHARS` — the one bound both
+        write surfaces share — free of the replacement character, and made
+        entirely of printable characters: a control byte would reach both the
+        staged frontmatter and the audit trail.
     """
     if not raw.strip() or len(raw) > MAX_EXTERNAL_ID_CHARS:
         return False

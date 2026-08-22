@@ -1002,3 +1002,143 @@ def test_atomic_write_has_exactly_one_call_site_and_it_records() -> None:
         "the per-file audit append must sit next to the write it records, "
         "not in a batch loop after the rewrite loop"
     )
+
+
+# ---------------------------------------------------------------------------
+# #1398: ``--apply`` must not rewrite the config that governs redaction
+#
+# ``.yaml`` is in the default ``supported_extensions`` and ``exclude_patterns``
+# defaults to ``['.git', 'node_modules']``, so a vault-wide apply treats
+# ``<vault>/00-Creek-Meta/creek_config.yaml`` as an ordinary candidate and
+# rewrites it in place. That is the standing "``--apply`` corrupts structured
+# files" hazard arriving on the one structured file that steers the next run.
+#
+# The payload is deliberately NOT a ``false_positive_allowlist`` entry. The
+# allowlist check is exact-string membership
+# (``RedactionScanner._is_allowlisted``), so an allowlisted string is the one
+# class of value the rewrite is structurally unable to touch — a test built on
+# it passes against the unfixed code and certifies nothing. An
+# ``exclude_patterns`` token is red today, and losing one *widens* what the
+# next run walks.
+# ---------------------------------------------------------------------------
+
+
+_CONFIG_WITH_SECRET_SHAPED_TOKEN = """\
+redaction:
+  exclude_patterns:
+    - .git
+    - node_modules
+    - backups-AKIAIOSFODNN7EXAMPLE
+"""
+"""A config whose ``exclude_patterns`` holds a secret-shaped directory name.
+
+Realistic rather than contrived: an operator who parks exports in a folder
+named after the key they rotated out gets an ``exclude_patterns`` entry the
+high-entropy detector matches. None of the three entries excludes anything in
+the fixture tree, so the apply still walks the whole vault.
+"""
+
+
+def test_apply_never_rewrites_the_vault_config_that_governs_it(
+    tmp_path: Path,
+) -> None:
+    """A vault-wide ``--apply`` leaves ``creek_config.yaml`` byte-identical.
+
+    Three assertions that only mean something together:
+
+    * the config is byte-identical — the property under test;
+    * an ordinary in-vault fragment WAS redacted — the non-vacuity guard. A
+      run that refused, crashed, or found nothing would satisfy the first
+      assertion perfectly, and a protected-set bug that dropped every
+      candidate would look exactly like a fix;
+    * the config never appears in the audit trail's ``intent`` line, which is
+      the operator-facing claim about what the run was authorised to touch.
+      A file excluded from the rewrite loop but still named in ``intent``
+      would make the log assert a rewrite that did not happen.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    vault = _make_vault(tmp_path)
+    config_path = vault / "00-Creek-Meta" / "creek_config.yaml"
+    config_path.write_text(_CONFIG_WITH_SECRET_SHAPED_TOKEN, encoding="utf-8")
+    original_bytes = config_path.read_bytes()
+    fragment = vault / "notes.md"
+    _write_secret_file(fragment)
+
+    result = runner.invoke(
+        app,
+        [
+            "redact",
+            "--apply",
+            "--source",
+            str(vault),
+            "--vault",
+            str(vault),
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert fragment.read_text(encoding="utf-8") != f"contact: {SECRET_SSN}\n", (
+        "the ordinary in-vault fragment was not redacted, so this run "
+        "rewrote nothing at all and the byte-identity assertion below "
+        f"would be vacuous.\n\n{result.output}"
+    )
+    assert config_path.read_bytes() == original_bytes, (
+        "creek_config.yaml was rewritten by the run it governs. Losing an "
+        "exclude_patterns token WIDENS what the next apply walks, so "
+        "running redaction silently changes the configuration of "
+        f"redaction.\n\n{config_path.read_text(encoding='utf-8')}"
+    )
+    intent = next(e for e in RedactionAuditLog(vault).read() if e.phase == "intent")
+    assert str(config_path) not in (intent.files or []), (
+        "the audit trail's intent line names creek_config.yaml among the "
+        "files the run was authorised to rewrite, so a reader concludes it "
+        f"was touched.\n\nfiles={intent.files}"
+    )
+
+
+def test_the_protected_set_covers_the_vault_config_by_its_owning_constant(
+    tmp_path: Path,
+) -> None:
+    """``_exclude_audit_artifacts`` drops the config, derived not restated.
+
+    The unit-level companion to the CLI test above, and the guard against a
+    literal ``"00-Creek-Meta/creek_config.yaml"`` creeping in beside
+    :data:`creek.config.VAULT_CONFIG_RELPATH`. A second, independently
+    maintained spelling of the same path is how the two ends drift apart
+    when the config relocates.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    from rich.console import Console
+
+    import creek.redact.cli_commands as cli_commands
+    from creek.config import VAULT_CONFIG_RELPATH
+
+    assert VAULT_CONFIG_RELPATH in cli_commands.PROTECTED_AUDIT_RELPATHS, (
+        "the vault config is not in the protected set under the constant "
+        "its owning module exports, so a relocation of the config path "
+        "would silently unprotect it.\n\n"
+        f"{cli_commands.PROTECTED_AUDIT_RELPATHS}"
+    )
+
+    vault = tmp_path / "vault"
+    (vault / "00-Creek-Meta").mkdir(parents=True)
+    config_path = vault / VAULT_CONFIG_RELPATH
+    config_path.write_text("redaction: {}\n", encoding="utf-8")
+    ordinary = vault / "notes.md"
+    ordinary.write_text("hello\n", encoding="utf-8")
+
+    kept = cli_commands._exclude_audit_artifacts(
+        [config_path, ordinary],
+        vault,
+        console=Console(),
+    )
+
+    assert kept == [ordinary], (
+        "the exclusion kept the vault config in the rewrite set (or dropped "
+        f"the ordinary file with it).\n\nkept={kept}"
+    )

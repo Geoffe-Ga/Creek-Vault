@@ -54,6 +54,32 @@ _ERROR_LOGGER: Final[logging.Logger] = logging.getLogger(ERROR_LOGGER_NAME)
 """The fault logger itself."""
 
 
+def log_unhandled_fault(request_id: str) -> None:
+    """Log the fault currently being handled, with its traceback, once.
+
+    Called from inside an ``except`` block — :meth:`ErrorBoundaryMiddleware.__call__`
+    and, for the one line above this layer, the ``Exception`` handler in
+    :mod:`creek_mcp.httpapi.app` — so :meth:`logging.Logger.exception` finds the
+    live exception and attaches it. Shared rather than written twice: the two
+    sites answer for the same kind of event, and two spellings of the message,
+    or two loggers, would leave an operator filtering for one of them.
+
+    ``exception`` rather than ``error``: it is what attaches the traceback,
+    which is the entire point of #1122. The id is passed lazily and repeated in
+    ``extra`` so it stays machine-readable for an operator shipping JSON logs,
+    exactly as the access line does.
+
+    Args:
+        request_id: The correlation id the caller was handed, so the operator's
+            traceback and the client's envelope name the same request.
+    """
+    _ERROR_LOGGER.exception(
+        "unhandled fault answering /v1 request_id=%s",
+        request_id,
+        extra={"request_id": request_id},
+    )
+
+
 class ErrorBoundaryMiddleware:
     """Turn any exception from below into ``500 internal_error``."""
 
@@ -92,14 +118,6 @@ class ErrorBoundaryMiddleware:
                 # exception, it keeps unwinding, and the ASGI server records
                 # it. Logging it as well would report one fault twice.
                 raise
-            # ``exception`` rather than ``error``: it is what attaches the
-            # traceback, which is the entire point. The id is passed lazily
-            # and repeated in ``extra`` so it stays machine-readable for an
-            # operator shipping JSON logs, exactly as the access line does.
-            _ERROR_LOGGER.exception(
-                "unhandled fault answering /v1 request_id=%s",
-                context.request_id,
-                extra={"request_id": context.request_id},
-            )
+            log_unhandled_fault(context.request_id)
             refusal = error_response(ErrorCode.INTERNAL_ERROR, context)
             await refusal(scope, receive, send)

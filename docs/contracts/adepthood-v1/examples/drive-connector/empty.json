@@ -1,0 +1,12 @@
+{
+  "files_failed": 0,
+  "files_fetched": 0,
+  "files_unchanged": 0,
+  "files_unsupported": 0,
+  "fragments_created": 0,
+  "fragments_failed": 0,
+  "fragments_unchanged": 0,
+  "fragments_updated": 0,
+  "status": "ok",
+  "tier_ceiling": "open"
+}

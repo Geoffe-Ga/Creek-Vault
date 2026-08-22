@@ -5390,8 +5390,10 @@ def test_a_keep_is_matched_by_path_and_never_by_string_prefix(
     A ``startswith`` keep-test shelters anything whose path merely
     begins with a kept one, which is the cheapest way to smuggle content
     past a deny-by-default sweep: name the file after something on the
-    list. ``is_relative_to`` compares path components and cannot be
-    fooled that way.
+    list. ``is_kept`` compares whole ``PurePosixPath`` values for
+    equality and cannot be fooled that way. (It used ``is_relative_to``
+    until #1484; that also defeated the string prefix, but sheltered
+    ``audit/purge.jsonl/leak.md`` by containment instead.)
     """
     vault = _make_vault(tmp_path)
     audit = vault / "00-Creek-Meta" / "audit"
@@ -5473,16 +5475,21 @@ def test_vault_purge_leaves_the_embeddings_cache_to_the_cache_delete(
 def test_a_corrupt_embeddings_parquet_does_not_veto_the_ledger_erasure(
     tmp_path: Path,
 ) -> None:
-    """A truncated parquet aborts the purge, but only after the erasure (#1453).
+    """A truncated parquet does not veto the erasure — and no longer aborts.
 
-    ``delete_embeddings_cache`` reads the parquet footer and raises an
-    unhandled ``ArrowInvalid`` on a corrupt file, aborting the whole
-    operation. Ordering is the defence: the meta sweep runs strictly
-    before it, so a corrupt cache cannot veto the right-to-be-forgotten
-    work. The crash itself is a separate defect, tracked as #1480; this
-    test asserts the erasure survives it, not that it is gone.
+    The ledger assertion is the original one and is unchanged: #1453 made
+    ordering the defence, running the meta sweep strictly before the cache
+    delete so a corrupt cache could not veto the right-to-be-forgotten work.
+    That defence lasted exactly as long as nobody appended a step to
+    ``purge_vault``'s body, which is why the crash itself was tracked
+    separately as #1480 and is now fixed: ``delete_embeddings_cache``
+    catches the parse failure, destroys the unreadable cache anyway, and
+    reports zero rows. The ``pytest.raises(ArrowInvalid)`` wrapper this test
+    used to carry described the defect, not the contract — the contract was
+    always "the erasure still happened", and it still holds, with the abort
+    gone from underneath it.
     """
-    pa_lib = pytest.importorskip("pyarrow.lib")
+    pytest.importorskip("pyarrow.lib")
     vault = _make_vault(tmp_path)
     _write_ledger_row(
         vault,
@@ -5493,11 +5500,13 @@ def test_a_corrupt_embeddings_parquet_does_not_veto_the_ledger_erasure(
     cache = vault / "00-Creek-Meta" / "embeddings.parquet"
     cache.write_bytes(b"PAR1")
 
-    with pytest.raises(pa_lib.ArrowInvalid):
-        PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+    result = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
 
     ingest_dir = vault / "00-Creek-Meta" / "State" / "ingest"
     assert not any(ingest_dir.glob("*.jsonl"))
+    assert not cache.exists(), "the unreadable cache is destroyed, not spared"
+    assert result.embeddings_removed == 0
+    assert result.outcome_status == "complete"
 
 
 def test_vault_purge_dry_run_predicts_its_own_meta_sweep(tmp_path: Path) -> None:

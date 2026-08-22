@@ -17,7 +17,8 @@ AST-counts the construction sites across the package and pins the total at one.
 **Two standing headers, two merge rules.** Every response this builder
 constructs — the ``200``, the ``501``, the routing ``404``, and the ``401``
 that never reaches the ceiling middleware at all — carries
-``Vary: X-Creek-Tier-Ceiling, Authorization`` and ``Cache-Control: no-store``.
+``Vary: X-Creek-Tier-Ceiling, Authorization, X-Creek-Contract-Version`` and
+``Cache-Control: no-store``.
 Authentication sits *above* the ceiling gate, so there is no single middleware
 every response passes through on the way out with the ceiling in scope. There
 is, however, exactly one builder: :func:`json_response`. Routing every response
@@ -27,12 +28,13 @@ only two protected: everything else a call site passes rides through untouched,
 which is what a ``401`` needs — see :func:`_challenge_for`.
 
 Scope that claim to what it covers — *every response this builder constructs*,
-which is not the same as every ``/v1`` response. Two paths reach a client
-without passing through here: Starlette's router answers a trailing-slash
-request with its own ``307`` before any handler runs, and Starlette's
-``ServerErrorMiddleware`` renders a ``text/plain`` ``500`` if a fault escapes
-the access-log layer's own ``try``. Both are filed separately and neither is
-closable from inside this module. A security docstring that overstates its
+which is not the same as every ``/v1`` response. One path still reaches a client
+without passing through here: Starlette's ``ServerErrorMiddleware`` renders a
+``text/plain`` ``500`` if a fault escapes the access-log layer's own ``try``. It
+is filed separately and is not closable from inside this module. The router's
+own ``307`` on a trailing slash used to be the second such path; it is gone,
+because :data:`~creek_mcp.httpapi.app.REDIRECT_SLASHES` turns the redirect off
+and the miss is rendered here like any other. A security docstring that overstates its
 reach is worse than one that says nothing, because the next reader stops
 looking where the hole actually is.
 
@@ -134,7 +136,11 @@ from creek_mcp.api.models import (
     ErrorCode,
     ErrorEnvelope,
 )
-from creek_mcp.api.routes import AUTHORIZATION_HEADER, CEILING_HEADER
+from creek_mcp.api.routes import (
+    AUTHORIZATION_HEADER,
+    CEILING_HEADER,
+    CONTRACT_VERSION_HEADER,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -146,10 +152,25 @@ if TYPE_CHECKING:
 VARY_HEADER: Final[str] = "Vary"
 """The response header naming which request headers the body depends on."""
 
-_STANDING_VARY_TOKENS: Final[tuple[str, ...]] = (CEILING_HEADER, AUTHORIZATION_HEADER)
+_STANDING_VARY_TOKENS: Final[tuple[str, ...]] = (
+    CEILING_HEADER,
+    AUTHORIZATION_HEADER,
+    CONTRACT_VERSION_HEADER,
+)
 """Every field name a response declares its body depends on, in wire order.
 
-Two since #1129, and load-bearing for the same reason from two directions: a
+Three since #1144. :data:`~creek_mcp.api.routes.CONTRACT_VERSION_HEADER` is not
+a courtesy entry: ``GET /v1/capabilities`` answers ``status: ok`` with the full
+capability list to a caller declaring a served minor, and ``status:
+incompatible`` with an empty list to one declaring a stale minor, and those two
+responses are identical in every other respect. Without the token they share a
+cache key, so an intermediary can hand a compatible client the refusal minted
+for an incompatible one — on the endpoint every client calls first. Standing
+rather than set only on ``/v1/capabilities``, because a cache in front of the
+surface applies one rule, and the routes gated by
+:func:`~creek_mcp.httpapi.app._speaks_a_served_minor` turn on the same header.
+
+The first two arrived with #1129, load-bearing from two directions: a
 ``/v1`` body is a function of the declared ceiling *and* of the authenticated
 consumer, so an entry keyed on either alone may be served to a caller the other
 would have told apart. :data:`~creek_mcp.api.routes.AUTHORIZATION_HEADER` is
@@ -160,7 +181,8 @@ a ``Vary`` naming a header no request carries varies on nothing at all.
 A tuple rather than a set, and iterated rather than indexed: the order is part
 of the rendered value and is asserted byte-for-byte, and a merge that seeded
 itself from ``[0]`` alone would emit the second token twice the moment a caller
-echoed it. Adding a third standing token is therefore a one-line change here.
+echoed it. That the third token was a one-line addition here is the payoff for
+having written the merge once rather than at each of the sites that stamps it.
 """
 
 _TCHAR: Final[frozenset[str]] = frozenset(
@@ -382,8 +404,9 @@ def json_response(
 
     The single builder. Every ``/v1`` response constructed by this application
     — success, refusal, and the two produced by exception handlers — is built
-    here, which is what makes ``Vary: X-Creek-Tier-Ceiling, Authorization`` and
-    ``Cache-Control: no-store`` unconditional rather than something each call
+    here, which is what makes ``Vary: X-Creek-Tier-Ceiling, Authorization,
+    X-Creek-Contract-Version`` and ``Cache-Control: no-store``
+    unconditional rather than something each call
     site has to remember. The module docstring names the two paths that reach a
     client without being constructed here; the guarantee is over this builder's
     output, not over every byte the process emits.

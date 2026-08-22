@@ -16,14 +16,18 @@ channel, and it merges with
 source that already declares a *higher* tier can never be lowered by the
 caller's declaration.
 
-**The ledger channel.** ``ledger_for_source`` hard-codes ``if source_type
-!= "markdown": return None``, so ``attach_origin_key`` returns early and
-a staged ``.pdf`` gets no ``source.origin_key`` — which is exactly the
-field the RTBF purge sweep keys on, so the sweep would silently no-op.
-:func:`~creek.ingest.pipeline.resolve_ledger` lets a caller that owns a
-stable staging path opt a non-markdown source type into ledger-backed
-identity without changing what ``creek ingest --type document`` does on
-the CLI; ``ledger_for_source`` itself is deliberately untouched.
+**The ledger channel.** ``ledger_for_source`` used to hard-code ``if
+source_type != "markdown": return None``, so ``attach_origin_key``
+returned early and a staged ``.pdf`` got no ``source.origin_key`` — which
+is exactly the field the RTBF purge sweep keys on, so the sweep would
+silently no-op. :func:`~creek.ingest.pipeline.resolve_ledger` lets a
+caller that owns a stable staging path name the ledger it wants
+regardless. That override is still what routes an upload into
+``upload.jsonl`` rather than into the source type's own ledger, and it is
+still what these tests are about — but it is no longer the *only* way a
+document gets an ``origin_key``: #1363 put ``document`` and ``generic``
+into :data:`~creek.ingest.pipeline.LEDGERED_SOURCES`, so the CLI path is
+ledger-backed too.
 
 The end-to-end case uses ``DocumentIngestor`` over a ``.txt``: it is the
 cheapest supported document format with no optional binary dependency
@@ -126,17 +130,24 @@ class TestResolveLedger:
         self,
         tmp_path: Path,
     ) -> None:
-        """``document`` is unledgered by default and ledgered on override.
+        """An override redirects a source type to a ledger that is not its own.
 
-        The ``None`` case preserves ``creek ingest --type document``
-        semantics exactly; the override case must land on the dedicated
-        ``00-Creek-Meta/State/ingest/upload.jsonl`` that
-        :meth:`SourceLedger.path_for` names, because relocating it would
-        orphan every staged upload.
+        Since #1363 ``document`` carries its own ledger by default, so the
+        ``None`` case now lands on ``document.jsonl``. The override case must
+        still land on the dedicated ``00-Creek-Meta/State/ingest/upload.jsonl``
+        that :meth:`SourceLedger.path_for` names, because relocating it would
+        orphan every staged upload — and the two must remain *different*
+        files, or an upload and a CLI document ingest would share one key
+        space.
         """
         vault = _make_vault(tmp_path)
 
-        assert resolve_ledger("document", vault, None) is None
+        default = resolve_ledger("document", vault, None)
+
+        assert default is not None
+        assert SourceLedger.path_for(vault, "document") == (
+            vault / "00-Creek-Meta" / "State" / "ingest" / "document.jsonl"
+        )
 
         ledger = resolve_ledger("document", vault, UPLOAD_LEDGER_SOURCE)
 
@@ -162,10 +173,10 @@ class TestRunIngestDeclaredTier:
         """A ledgered document ingest writes the tier AND the origin key.
 
         Without ``stamp_declared_tier`` the frontmatter would read
-        ``privacy_tier: unclassified``; without the ``ledger_source``
-        override ``attach_origin_key`` returns early and
-        ``source.origin_key`` stays ``None`` — which is precisely what
-        would make the RTBF purge sweep no-op on an uploaded document.
+        ``privacy_tier: unclassified``. The ``ledger_source`` override is
+        what files the record under ``upload.jsonl``, which is the ledger
+        ``creek.upload`` reads back; since #1363 a document run without it
+        is ledgered too, under ``document.jsonl``.
         """
         vault = _make_vault(tmp_path)
         staged = vault / "00-Creek-Meta" / "adepthood" / "uploads" / "note.txt"

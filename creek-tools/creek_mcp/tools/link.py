@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from creek.config import load_config
+from creek.config import load_vault_config
 from creek.link.link_engine import run_link
 from creek.surface_modes import LINK_METHODS
 from creek_mcp.audit import MCPAuditLog
@@ -54,7 +54,8 @@ def link_tool(
             ceiling=privacy_tier_ceiling,
             reason=(f"unknown method {method!r}; supported: {', '.join(LINK_METHODS)}"),
         )
-    config = load_config()
+    # The vault being linked owns its own embeddings/linking knobs (#1409).
+    config = load_vault_config(vault_path)
     summary = run_link(
         vault_path=vault_path,
         config=config,

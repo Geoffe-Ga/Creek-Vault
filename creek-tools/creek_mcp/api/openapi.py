@@ -12,7 +12,7 @@ schema in ``docs/contracts/adepthood-v1/schemas/`` carries the definitions it
 references inline under its own ``$defs``, which is what makes each file
 independently resolvable. An OpenAPI document has one shared
 ``components/schemas`` namespace instead, so those definitions are hoisted out
-and become siblings. Hoisting is not optional: publishing only the sixteen
+and become siblings. Hoisting is not optional: publishing only the
 registered models while rewriting ``#/$defs/X`` to ``#/components/schemas/X``
 would emit a document whose references point at names it never defines, which
 every standard validator and code generator rejects.
@@ -36,6 +36,8 @@ from creek_mcp.api.models import (
     CONTRACT_MODELS,
     ERROR_MESSAGES,
     ERROR_STATUS,
+    MAX_EXTERNAL_ID_CHARS,
+    Capability,
     ErrorCode,
 )
 from creek_mcp.api.routes import (
@@ -69,7 +71,8 @@ DOCUMENT_TITLE: Final[str] = "Creek Adepthood /v1 application API"
 DOCUMENT_DESCRIPTION: Final[str] = (
     "Authenticated HTTP/JSON access to Creek's Adepthood-facing capabilities. "
     f"Every response this application builds carries Vary: {CEILING_HEADER}, "
-    f"{AUTHORIZATION_HEADER} and Cache-Control: no-store — do not enable "
+    f"{AUTHORIZATION_HEADER}, {CONTRACT_VERSION_HEADER} and "
+    "Cache-Control: no-store — do not enable "
     "caching for /v1 on an intermediary. Every error is the ErrorEnvelope, and "
     "retryability is the static retry-policy.json table keyed on the error "
     "code alone."
@@ -122,6 +125,131 @@ before any handler does.
 though it shares ``503`` with ``TEMPORARILY_UNAVAILABLE`` — one status may
 carry one documented response, and the transient one is the one every route can
 actually produce.
+"""
+
+_CAPABILITY_ERROR_CODES: Final[dict[Capability, tuple[ErrorCode, ...]]] = {
+    Capability.UPLOAD: (ErrorCode.UNSUPPORTED_SOURCE,),
+}
+"""Refusals only one capability can produce, keyed by that capability.
+
+A table rather than an ``if spec.capability is Capability.UPLOAD`` in
+:func:`_error_codes`, because the question "which refusals does this route
+document" is data about the route, and the *next* capability-specific code
+should be one line here rather than a second branch.
+
+Only ``upload`` has an entry today.
+:attr:`~creek_mcp.api.models.ErrorCode.UNSUPPORTED_SOURCE` is emitted by
+:func:`creek_mcp.httpapi.upload.upload_refusal_code` and nowhere else, so
+documenting it on every route would advertise a ``415`` five endpoints cannot
+return — and omitting it from the one that can leaves a generated client with
+no branch for the refusal it will meet the first time somebody uploads a
+``conversations.json``.
+"""
+
+SECURITY_SCHEME_NAME: Final[str] = "bearerAuth"
+"""The name the document gives the one credential ``/v1`` accepts (#1371).
+
+A name rather than a literal at three call sites — the scheme itself, the
+document-level requirement, and whatever eventually reads either back — because
+a security requirement that names a scheme the components never define is
+accepted by no validator and generated into by no client.
+"""
+
+BEARER_SCHEME_DESCRIPTION: Final[str] = (
+    f"Consumer bearer token, presented as {AUTHORIZATION_HEADER}: Bearer <token>. "
+    "Enforced above the router, so every published route refuses without it and "
+    "there is no anonymous access to any of them."
+)
+"""What the scheme means to this server, in the consumer's vocabulary.
+
+Interpolated from :data:`~creek_mcp.api.routes.AUTHORIZATION_HEADER` for the
+same reason :data:`DOCUMENT_DESCRIPTION` interpolates the other two headers: the
+sentence a consumer reads and the header the server authenticates on cannot be
+allowed to drift. OpenAPI's ``type: http`` scheme has nowhere to *name* a
+header — it means ``Authorization`` by RFC 7235 — so the prose is the only
+place the two can be pinned together, and a test holds the pin.
+"""
+
+_SECURITY_SCHEMES: Final[dict[str, Any]] = {
+    SECURITY_SCHEME_NAME: {
+        "type": "http",
+        "scheme": "bearer",
+        "description": BEARER_SCHEME_DESCRIPTION,
+    }
+}
+"""``components/securitySchemes``: the one way in.
+
+Declared beside ``components/schemas`` and **not** inside it. The committed
+schema files under ``docs/contracts/adepthood-v1/schemas/`` are byte-pinned by
+``tests/test_v1_api_openapi.py`` and are what a consumer vendors; a security
+scheme is a different namespace, so publishing one moves none of them and the
+contract minor does not advance. It documents a requirement
+:class:`~creek_mcp.httpapi.auth.BearerAuthMiddleware` has enforced since the
+stack was built.
+"""
+
+_DOCUMENT_SECURITY: Final[list[dict[str, list[str]]]] = [{SECURITY_SCHEME_NAME: []}]
+"""``security``: the requirement, declared once for the whole document.
+
+Document-level rather than per-operation because it is true of every operation,
+and five copies are five places for one to be dropped or to acquire an
+``security: []`` opt-out. The empty scope list is what OpenAPI requires of an
+``http`` scheme, which has no scopes.
+"""
+
+EXTERNAL_ID_PARAM: Final[str] = "external_id"
+"""The one path parameter ``/v1`` publishes today.
+
+Named so :data:`_PATH_PARAMETER_SCHEMAS` is keyed on a constant rather than on
+a string that also appears in ``routes.py``'s path template.
+"""
+
+EXTERNAL_ID_PATTERN: Final[str] = "^[^\u0000-\u001f\u007f/]+$"
+"""What a published ``{external_id}`` may be made of (#1132).
+
+Starlette's default path converter is ``[^/]+``, which admits a NUL byte, a
+control character and an id of unbounded length straight through to the
+handler. :func:`creek_mcp.httpapi.journal.admissible_external_id` already
+refuses those, so an unconstrained declaration understates the contract — and a
+consumer pins the schema bundle, so it pins the understatement.
+
+Deliberately **looser** than the server rather than tighter. The server also
+refuses a whitespace-only id, the replacement character, and every non-printable
+character outside ASCII; none of those is expressible in an ECMA-262 pattern
+without a lookahead or a Unicode-property escape that generators disagree
+about. A published pattern that is tighter than the server is the worse error of
+the two: it makes a generated client refuse, client-side, an id the vault
+already holds, and the consumer's own sync silently stops addressing entries it
+wrote. So this excludes exactly the two classes the issue named — the ASCII
+control range including NUL, and ``DEL`` — plus ``/``, which the router's own
+converter excludes and which therefore names no reachable path.
+
+``..`` is admitted, because the server admits it:
+:func:`creek_mcp.staged_names.safe_stem` digests the raw id rather than pathing
+on it.
+"""
+
+_MIN_EXTERNAL_ID_CHARS: Final[int] = 1
+"""An empty path segment does not match the route at all, let alone identify one."""
+
+_PATH_PARAMETER_SCHEMAS: Final[dict[str, dict[str, Any]]] = {
+    EXTERNAL_ID_PARAM: {
+        "type": "string",
+        "minLength": _MIN_EXTERNAL_ID_CHARS,
+        "maxLength": MAX_EXTERNAL_ID_CHARS,
+        "pattern": EXTERNAL_ID_PATTERN,
+    },
+}
+"""The published schema for each path parameter, keyed by parameter name.
+
+A table rather than one shape applied to every ``{...}`` placeholder, for the
+same reason :data:`_CAPABILITY_ERROR_CODES` is a table: the constraint is a fact
+about *that* parameter, and silently reusing ``external_id``'s bound for the
+next one would publish a lie about it. :func:`_path_parameter` indexes this
+directly, so a parameter added to a route template without an entry here fails
+the document build rather than being published unconstrained — the same
+fail-loud posture :meth:`~creek_mcp.api.routes.RouteSpec.__post_init__` takes
+for a body cap on a templated path.
 """
 
 _HEALTH_RESPONSE_SCHEMA: Final[dict[str, Any]] = {
@@ -190,13 +318,16 @@ def _error_codes(spec: RouteSpec) -> tuple[ErrorCode, ...]:
 
     Returns:
         The universal refusals, plus ``409``/``403`` for the routes that
-        negotiate a contract minor and resolve vault objects, plus ``501`` for
-        the routes that are published but not yet built. Ordered by status so
-        the document is byte-stable across runs.
+        negotiate a contract minor and resolve vault objects, plus whatever
+        :data:`_CAPABILITY_ERROR_CODES` reserves for this route's capability,
+        plus ``501`` for the routes that are published but not yet built.
+        Ordered by status so the document is byte-stable across runs.
     """
     codes = list(_UNIVERSAL_ERROR_CODES)
     if spec.requires_contract_version:
         codes += [ErrorCode.INCOMPATIBLE_VERSION, ErrorCode.PRIVACY_REFUSED]
+    if spec.capability is not None:
+        codes += _CAPABILITY_ERROR_CODES.get(spec.capability, ())
     if _is_unbuilt(spec):
         codes.append(ErrorCode.UNSUPPORTED_CAPABILITY)
     return tuple(sorted(codes, key=lambda code: ERROR_STATUS[code]))
@@ -284,6 +415,31 @@ def _header_parameter(name: str, *, required: bool, description: str) -> dict[st
     }
 
 
+def _path_parameter(name: str) -> dict[str, Any]:
+    """Return the declaration for one ``{name}`` path parameter.
+
+    Args:
+        name: The placeholder's name, as it appears in the route template.
+
+    Returns:
+        The OpenAPI parameter object, carrying the bound
+        :data:`_PATH_PARAMETER_SCHEMAS` publishes for this parameter.
+
+    Raises:
+        KeyError: When the table has no entry for *name*. Deliberate: an
+            unlisted parameter would otherwise be published as an unbounded
+            string, which is the understatement #1132 was filed to end, and a
+            build failure is the version of that a reviewer sees.
+    """
+    return {
+        "name": name,
+        "in": "path",
+        "required": True,
+        "description": "Consumer-side identifier for this entry.",
+        "schema": _PATH_PARAMETER_SCHEMAS[name],
+    }
+
+
 def _parameters(spec: RouteSpec) -> list[dict[str, Any]]:
     """Return every parameter *spec* declares.
 
@@ -298,14 +454,7 @@ def _parameters(spec: RouteSpec) -> list[dict[str, Any]]:
         Path parameters first, then the two ``/v1`` headers.
     """
     parameters: list[dict[str, Any]] = [
-        {
-            "name": name,
-            "in": "path",
-            "required": True,
-            "description": "Consumer-side identifier for this entry.",
-            "schema": {"type": "string"},
-        }
-        for name in _PATH_PARAMETER.findall(spec.path)
+        _path_parameter(name) for name in _PATH_PARAMETER.findall(spec.path)
     ]
     if spec.requires_contract_version:
         parameters.append(
@@ -380,6 +529,10 @@ def build_openapi() -> dict[str, Any]:
             "version": CONTRACT_VERSION,
             "description": DOCUMENT_DESCRIPTION,
         },
+        "security": _DOCUMENT_SECURITY,
         "paths": _paths(),
-        "components": {"schemas": _components()},
+        "components": {
+            "schemas": _components(),
+            "securitySchemes": _SECURITY_SCHEMES,
+        },
     }

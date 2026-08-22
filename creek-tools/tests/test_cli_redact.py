@@ -1018,7 +1018,7 @@ def test_redact_review_refusal_reads_no_config_through_the_link(
     every other test in this section. It has nonetheless already read a file
     from outside the tree the operator named and let it steer the run.
 
-    So the ordering is pinned directly: ``load_config`` is swapped for a
+    So the ordering is pinned directly: ``load_vault_config`` is swapped for a
     recording wrapper and asserted never to have been reached. The wrapper
     delegates to the real loader rather than raising, because a raising
     sentinel would be caught by ``CliRunner`` and reported as exit 1 —
@@ -1028,7 +1028,7 @@ def test_redact_review_refusal_reads_no_config_through_the_link(
         tmp_path: Pytest-provided temporary directory.
         monkeypatch: Pytest monkeypatch fixture.
     """
-    from creek.config import load_config as real_load_config
+    from creek.config import load_vault_config as real_load_vault_config
 
     outside_vault = tmp_path / "outside" / "vault"
     (outside_vault / "00-Creek-Meta").mkdir(parents=True)
@@ -1047,14 +1047,14 @@ def test_redact_review_refusal_reads_no_config_through_the_link(
 
     calls: list[Path | None] = []
 
-    def _recording_load_config(config_path=None, **kwargs):
+    def _recording_load_vault_config(vault_path=None, **kwargs):
         """Record the call, then delegate to the real loader."""
-        calls.append(config_path)
-        return real_load_config(config_path, **kwargs)
+        calls.append(vault_path)
+        return real_load_vault_config(vault_path, **kwargs)
 
     monkeypatch.setattr(
-        "creek.redact.cli_commands.load_config",
-        _recording_load_config,
+        "creek.redact.cli_commands.load_vault_config",
+        _recording_load_vault_config,
     )
 
     result = runner.invoke(
@@ -1067,7 +1067,7 @@ def test_redact_review_refusal_reads_no_config_through_the_link(
         f"exit_code={result.exit_code}\n{result.output}"
     )
     assert not calls, (
-        "load_config was called before the refusal, so the run read "
+        "load_vault_config was called before the refusal, so the run read "
         "<vault>/00-Creek-Meta/creek_config.yaml through the symlink — a "
         "file outside the named tree, resolved and parsed, and allowed to "
         f"configure the run that then refused.\n\ncalls={calls}\n"
@@ -1102,7 +1102,7 @@ def test_redact_apply_refusal_reads_no_config_through_the_link(
         tmp_path: Pytest-provided temporary directory.
         monkeypatch: Pytest monkeypatch fixture.
     """
-    from creek.config import load_config as real_load_config
+    from creek.config import load_vault_config as real_load_vault_config
 
     outside_vault = tmp_path / "outside" / "vault"
     (outside_vault / "00-Creek-Meta").mkdir(parents=True)
@@ -1121,14 +1121,14 @@ def test_redact_apply_refusal_reads_no_config_through_the_link(
 
     calls: list[Path | None] = []
 
-    def _recording_load_config(config_path=None, **kwargs):
+    def _recording_load_vault_config(vault_path=None, **kwargs):
         """Record the call, then delegate to the real loader."""
-        calls.append(config_path)
-        return real_load_config(config_path, **kwargs)
+        calls.append(vault_path)
+        return real_load_vault_config(vault_path, **kwargs)
 
     monkeypatch.setattr(
-        "creek.redact.cli_commands.load_config",
-        _recording_load_config,
+        "creek.redact.cli_commands.load_vault_config",
+        _recording_load_vault_config,
     )
 
     result = runner.invoke(
@@ -1149,7 +1149,7 @@ def test_redact_apply_refusal_reads_no_config_through_the_link(
         f"line.\n\nexit_code={result.exit_code}\n{result.output}"
     )
     assert not calls, (
-        "load_config was called before the refusal, so the run read "
+        "load_vault_config was called before the refusal, so the run read "
         "<vault>/00-Creek-Meta/creek_config.yaml through the symlink and "
         "let a file outside the named tree configure the run that then "
         f"refused it.\n\ncalls={calls}\nexit_code={result.exit_code}\n"
@@ -1456,4 +1456,357 @@ def test_redact_apply_on_a_looping_named_symlink_exits_two(tmp_path: Path) -> No
     assert "not found" in result.output.lower(), (
         "the loop was reported as something other than a missing path.\n\n"
         f"{result.output}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #1359: containment for ``--scan``'s own ``--vault``
+#
+# ``--scan`` is the one mode whose ``--vault`` was left unguarded by #1293.
+# It is used for exactly one thing there — locating
+# ``<vault>/00-Creek-Meta/creek_config.yaml`` — so the escape is a READ, not
+# a write. #1293 left it open because refusing looked like a denial of
+# service on the safety pass, and because the filer could not demonstrate the
+# out-of-tree config actually *weakening* what the scan reports.
+#
+# It can. ``test_a_vault_config_can_disarm_a_scan_completely`` below is that
+# demonstration, run against an in-tree vault so it holds whatever the
+# containment guard does: three independent settings each take a scan of a
+# file with two findings down to zero. An out-of-tree config is therefore not
+# merely "read"; it is a silent off switch on the pass the operator runs
+# *because* they are worried. That promotes the remedy to refusal, matching
+# ``--apply`` and ``--review``.
+#
+# What is NOT refused: the SOURCE. ``--scan``'s skip-and-count contract
+# (#1087) is about the tree being scanned, and it is unchanged — see
+# ``test_redact_scan_still_skips_an_escaping_source_when_the_vault_is_sound``.
+# ---------------------------------------------------------------------------
+
+
+_DISARMING_SOURCE_PII = (
+    "Contact: alice@example.com\nAPI_KEY=sk-abcdefghijklmnopqrstuvwx\n"
+)
+"""In-tree payload with two findings: one ``email`` and one ``api_key``."""
+
+
+def _write_vault_config(vault: Path, redaction_block: str) -> Path:
+    """Write ``<vault>/00-Creek-Meta/creek_config.yaml`` and return the vault.
+
+    Args:
+        vault: Vault root to create (parents included).
+        redaction_block: YAML fragment placed under a ``redaction:`` key.
+
+    Returns:
+        The vault root, for chaining.
+    """
+    meta = vault / "00-Creek-Meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    (meta / "creek_config.yaml").write_text(
+        f"redaction:\n{redaction_block}",
+        encoding="utf-8",
+    )
+    return vault
+
+
+@pytest.mark.parametrize(
+    ("label", "redaction_block"),
+    [
+        ("supported_extensions", "  supported_extensions: ['.txt']\n"),
+        ("exclude_patterns", "  exclude_patterns: ['src']\n"),
+        (
+            "false_positive_allowlist",
+            "  false_positive_allowlist:\n"
+            "    - alice@example.com\n"
+            "    - sk-abcdefghijklmnopqrstuvwx\n",
+        ),
+    ],
+)
+def test_a_vault_config_can_disarm_a_scan_completely(
+    tmp_path: Path,
+    label: str,
+    redaction_block: str,
+) -> None:
+    """A ``--vault`` config takes a two-finding scan to zero findings.
+
+    The severity evidence #1359 asked for and the original filer could not
+    produce — their probe used ``false_positive_allowlist``, whose check is
+    exact-string membership, so a near-miss entry changes nothing. With the
+    exact strings, and with two settings that do not depend on guessing the
+    payload at all, the answer is unambiguous: the config a ``--vault``
+    points at is a complete off switch on the pass.
+
+    Run against an in-tree vault on purpose. This is a characterisation of
+    the *lever*, not of containment, so it must keep passing after the
+    containment guard lands; what it establishes is what an out-of-tree
+    config would be able to do if it were still reachable.
+
+    The baseline in the same run is the non-vacuity guard: without
+    ``--vault`` the identical source reports both findings, so "zero
+    findings" cannot be a scan that silently did nothing.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        label: Name of the setting under test (readable parametrize id).
+        redaction_block: YAML fragment installed under ``redaction:``.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "notes.md").write_text(_DISARMING_SOURCE_PII, encoding="utf-8")
+    vault = _write_vault_config(tmp_path / "vault", redaction_block)
+
+    baseline = runner.invoke(app, ["redact", "--scan", "--source", str(source)])
+    assert baseline.exit_code == 0, f"the baseline scan failed.\n\n{baseline.output}"
+    assert "email" in baseline.output.lower(), (
+        "the baseline scan found no email, so the payload is wrong and "
+        f"every 'disarmed' assertion below would be vacuous.\n\n{baseline.output}"
+    )
+    assert "api_key" in baseline.output.lower(), (
+        "the baseline scan found no api_key, so the payload is wrong and "
+        f"every 'disarmed' assertion below would be vacuous.\n\n{baseline.output}"
+    )
+
+    disarmed = runner.invoke(
+        app,
+        ["redact", "--scan", "--source", str(source), "--vault", str(vault)],
+    )
+
+    assert disarmed.exit_code == 0, (
+        f"the scan under the narrowing config failed.\n\n{disarmed.output}"
+    )
+    assert "email" not in disarmed.output.lower(), (
+        f"redaction.{label} did not suppress the email finding; if no "
+        "setting suppresses anything, #1359 is a read-escape with no "
+        f"security consequence.\n\n{disarmed.output}"
+    )
+    assert "api_key" not in disarmed.output.lower(), (
+        f"redaction.{label} did not suppress the api_key finding.\n\n{disarmed.output}"
+    )
+
+
+def test_redact_scan_refuses_an_escaping_vault_symlink(tmp_path: Path) -> None:
+    """``--scan --vault <escaping link>`` refuses, like ``--apply``/``--review``.
+
+    The remedy #1359 lists as option 1, chosen because the test above shows
+    the out-of-tree file is an off switch rather than an inert read. The
+    banner names the path as supplied and never the resolved target — that
+    disclosure is the oracle #1087 closes.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    outside_vault = _write_vault_config(
+        tmp_path / "outside" / "vault",
+        "  supported_extensions: ['.txt']\n",
+    )
+    root = tmp_path / "root"
+    source = root / "src"
+    source.mkdir(parents=True)
+    (source / "notes.md").write_text(_DISARMING_SOURCE_PII, encoding="utf-8")
+    link = root / "linkvault"
+    link.symlink_to(outside_vault)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--scan", "--source", str(source), "--vault", str(link)],
+    )
+
+    assert result.exit_code == 1, (
+        "--scan accepted a --vault symlink whose target escapes its own "
+        "parent, so an out-of-tree creek_config.yaml still configures the "
+        f"safety pass.\n\nexit_code={result.exit_code}\n{result.output}"
+    )
+    normalised = " ".join(result.output.split())
+    assert "escapes the vault root" in normalised, (
+        "the refusal does not say which of the two named paths was "
+        "refused, so an operator who supplied both cannot tell which to "
+        f"correct.\n\n{result.output}"
+    )
+    assert str(outside_vault) not in result.output, (
+        "the refusal disclosed the resolved target of the link, which is "
+        f"the existence oracle #1087 exists to close.\n\n{result.output}"
+    )
+
+
+def test_redact_scan_refusal_reads_no_config_through_the_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal lands BEFORE the out-of-tree config is opened.
+
+    The half of the contract prose cannot check, and the whole point of the
+    issue: a handler that resolves ``<vault>/00-Creek-Meta/creek_config.yaml``
+    through the link, opens it, parses it, lets it configure the scanner —
+    and only then refuses — satisfies every other assertion in this section
+    while having already done the thing #1359 reports.
+
+    ``load_vault_config`` is swapped for a recording wrapper that delegates to the
+    real loader rather than raising: a raising sentinel would be caught by
+    ``CliRunner`` and reported as exit 1, manufacturing a pass for the
+    exit-code assertion at HEAD.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        monkeypatch: Pytest monkeypatch fixture.
+    """
+    from creek.config import load_vault_config as real_load_vault_config
+
+    outside_vault = _write_vault_config(
+        tmp_path / "outside" / "vault",
+        "  supported_extensions: ['.txt']\n",
+    )
+    root = tmp_path / "root"
+    source = root / "src"
+    source.mkdir(parents=True)
+    (source / "notes.md").write_text(_DISARMING_SOURCE_PII, encoding="utf-8")
+    link = root / "linkvault"
+    link.symlink_to(outside_vault)
+
+    calls: list[Path | None] = []
+
+    def _recording_load_vault_config(vault_path=None, **kwargs):
+        """Record the call, then delegate to the real loader."""
+        calls.append(vault_path)
+        return real_load_vault_config(vault_path, **kwargs)
+
+    monkeypatch.setattr(
+        "creek.redact.cli_commands.load_vault_config",
+        _recording_load_vault_config,
+    )
+
+    result = runner.invoke(
+        app,
+        ["redact", "--scan", "--source", str(source), "--vault", str(link)],
+    )
+
+    assert result.exit_code == 1, (
+        "--scan accepted a --vault symlink whose target escapes its own "
+        f"parent.\n\nexit_code={result.exit_code}\n{result.output}"
+    )
+    assert not calls, (
+        "load_vault_config was called before the refusal, so the run read "
+        "<vault>/00-Creek-Meta/creek_config.yaml through the symlink — a "
+        "file outside the named tree, parsed, and allowed to configure the "
+        f"safety pass that then refused.\n\ncalls={calls}\n{result.output}"
+    )
+
+
+def test_redact_scan_still_skips_an_escaping_source_when_the_vault_is_sound(
+    tmp_path: Path,
+) -> None:
+    """Containing ``--vault`` must not leak into ``--source``'s contract.
+
+    The trap this fix has to avoid. ``--scan``'s source contract is
+    skip-and-count (#1087, #1293): the escaping file is declined, the rest of
+    the tree is still scanned, the exit code stays 0, and the skip is named
+    in the statistics. Guarding the *config* path must leave every bit of
+    that alone — they are different paths answering different questions.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "notes.md").write_text(_IN_ROOT_PII, encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text(_ESCAPING_TARGET_PII, encoding="utf-8")
+    (source / "linked.md").symlink_to(outside)
+    vault = _write_vault_config(tmp_path / "vault", "  dry_run: false\n")
+
+    result = runner.invoke(
+        app,
+        ["redact", "--scan", "--source", str(source), "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, (
+        "an escaping file inside --source refused the whole scan once a "
+        "--vault was supplied; the source contract is skip-and-count.\n\n"
+        f"exit_code={result.exit_code}\n{result.output}"
+    )
+    assert "ssn" not in result.output.lower(), (
+        "the scan followed the escaping link and read the out-of-root "
+        f"file.\n\n{result.output}"
+    )
+    assert "email" in result.output.lower(), (
+        "the in-root control produced no finding, so 'ssn absent' proves "
+        f"nothing.\n\n{result.output}"
+    )
+    assert _SYMLINK_SKIP_LABEL in result.output, (
+        f"the skip is not reported in the statistics.\n\n{result.output}"
+    )
+
+
+def test_redact_scan_admits_a_vault_symlink_that_stays_inside_its_parent(
+    tmp_path: Path,
+) -> None:
+    """The over-refusal guard: only *escaping* links are refused.
+
+    ``~/vault -> ~/Dropbox/vault`` is the shape #1293 deliberately kept
+    working, and the leaf-only predicate is what keeps it working. A guard
+    that refused every symlinked ``--vault`` would pass every assertion in
+    the refusal tests above while breaking a supported layout.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    root = tmp_path / "root"
+    source = root / "src"
+    source.mkdir(parents=True)
+    (source / "notes.md").write_text(_IN_ROOT_PII, encoding="utf-8")
+    real_vault = _write_vault_config(root / "realvault", "  dry_run: false\n")
+    link = root / "linkvault"
+    link.symlink_to(real_vault)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--scan", "--source", str(source), "--vault", str(link)],
+    )
+
+    assert result.exit_code == 0, (
+        "a --vault symlink that never leaves its own parent was refused; "
+        "the guard is supposed to be leaf-only and escape-only.\n\n"
+        f"exit_code={result.exit_code}\n{result.output}"
+    )
+    assert "email" in result.output.lower(), (
+        f"the scan under the admitted vault link found nothing.\n\n{result.output}"
+    )
+
+
+def test_redaction_enabled_false_does_not_silence_the_explicit_scan(
+    tmp_path: Path,
+) -> None:
+    """``enabled: false`` is the one setting that cannot disarm ``--scan``.
+
+    Pinned because both `docs/redaction.md` and
+    `docs/security/threat-model.md` now say so in prose, and an unexecuted
+    prose claim about a security posture is worth less than nothing. The
+    explicit CLI mode does not consult ``redaction.enabled`` — that flag
+    gates the *pipeline* stage — so the exemption fails SAFE: it scans more
+    than the config asked for, never less. If that ever inverts, this test
+    is the thing that says so, and the two documents stop being true the
+    same day.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+    """
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "notes.md").write_text(_DISARMING_SOURCE_PII, encoding="utf-8")
+    vault = _write_vault_config(tmp_path / "vault", "  enabled: false\n")
+
+    result = runner.invoke(
+        app,
+        ["redact", "--scan", "--source", str(source), "--vault", str(vault)],
+    )
+
+    assert result.exit_code == 0, (
+        f"the scan under enabled: false failed.\n\n{result.output}"
+    )
+    assert "email" in result.output.lower(), (
+        "redaction.enabled: false silenced an explicitly requested --scan. "
+        "The docs claim this setting is inert here and that the mode fails "
+        "safe; if it now suppresses findings, both documents are wrong and "
+        f"the off switch has one more lever than they admit.\n\n{result.output}"
+    )
+    assert "api_key" in result.output.lower(), (
+        f"redaction.enabled: false silenced the api_key finding.\n\n{result.output}"
     )

@@ -2776,3 +2776,167 @@ def test_declarations_survive_a_colour_terminal(
             "the surface never printed. An assertion that passes on the wrong "
             "message is worse than the failure it replaced."
         )
+
+
+# ---------------------------------------------------------------------------
+# Documentation coverage: a registration nobody documents is an orphan (#1470)
+# ---------------------------------------------------------------------------
+#
+# The dead-code gate (``scripts/lint_vulture.py``) carves ``@app.command`` and
+# ``@server.tool`` out of its scan, because registration — not a Python call
+# site — is what invokes them. That carve-out is correct and it is also a hole:
+# a *retired* command still wired into the app is indistinguishable from a live
+# one, so vulture reports zero either way. Blindness #2 in that module's
+# docstring names it.
+#
+# This section is the missing half. Registration proves a surface is reachable;
+# a doc naming it proves somebody still means for it to be reachable. Nothing
+# else in the repository asks that question: ``test_every_cli_command_is_declared``
+# only asks whether the contract table knows about it, and the table is written
+# by the same hand that writes the decorator.
+#
+# The inventory is the LIVE registry, never :data:`_ALL_SURFACES`. Parametrising
+# over the contract table would make the check unfalsifiable by exactly the
+# defect it exists to catch: an orphan is added as a decorator, and a decorator
+# that nobody added a table entry for would simply never be asked about.
+
+
+DOC_ROOTS: Final[tuple[str, ...]] = ("README.md", "docs", ".claude/commands")
+"""Where a surface may be documented, relative to ``creek-tools/``.
+
+This tuple is the whole strength of the check below, which is why it is a
+named constant rather than a literal inside a test body: the cheapest way to
+turn a doc-coverage failure green is not to write the doc, it is to widen the
+search until something already mentions the name. Every root here is a place a
+*reader* looks — the README, the ``docs/`` tree, and the slash-command
+definitions under ``.claude/commands/``. Adding a source or test directory
+would let a docstring, or the surface's own test, certify the surface;
+:func:`test_doc_roots_hold_documentation_and_nothing_else` refuses that.
+
+Deliberately confined to ``creek-tools/``. The repo root also carries prose
+that happens to name some surfaces (ADRs under ``docs/decisions/``), but a
+gate on the surfaces this package registers must not depend on a sibling
+directory being checked out, and an ADR recording a past decision is not the
+documentation a user of ``creek link`` needs to find.
+"""
+
+_NON_DOC_ROOTS: Final[tuple[str, ...]] = ("creek", "creek_mcp", "tests")
+
+_PACKAGE_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
+
+
+def _doc_files() -> tuple[Path, ...]:
+    """Return every Markdown file reachable from :data:`DOC_ROOTS`.
+
+    Returns:
+        Absolute paths, deduplicated and sorted.
+    """
+    found: set[Path] = set()
+    for root in DOC_ROOTS:
+        target = _PACKAGE_ROOT / root
+        if target.is_file():
+            found.add(target)
+        else:
+            found.update(path for path in target.rglob("*.md") if path.is_file())
+    return tuple(sorted(found))
+
+
+_DOC_CORPUS: Final[tuple[tuple[Path, str], ...]] = tuple(
+    (path, path.read_text(encoding="utf-8", errors="replace")) for path in _doc_files()
+)
+
+
+def _docs_naming(needle: str) -> list[str]:
+    """Return the doc files whose text names `needle` as a whole token.
+
+    The trailing guard is what keeps ``creek state`` from being certified by a
+    page that only ever mentions ``creek state-budget``. It rejects a following
+    word character or hyphen and nothing else, so ordinary prose punctuation
+    (``creek link.``, ``creek link``` ) still counts.
+
+    Args:
+        needle: The invocation a doc would have to spell out, e.g.
+            ``"creek clean orphans"`` or ``"creek.purge.vault"``.
+
+    Returns:
+        Package-relative paths of the files that name it.
+    """
+    pattern = re.compile(re.escape(needle) + r"(?![\w-])")
+    return [
+        str(path.relative_to(_PACKAGE_ROOT))
+        for path, text in _DOC_CORPUS
+        if pattern.search(text)
+    ]
+
+
+def test_doc_roots_hold_documentation_and_nothing_else() -> None:
+    """The search surface must be real, and must not include source or tests.
+
+    Three ways the doc-coverage check below could go quietly vacuous, all
+    closed here: a root that no longer exists (the corpus shrinks and nobody
+    notices), a root that is not prose (a ``.py`` file certifying a surface by
+    its own docstring), and a root under ``creek/``, ``creek_mcp/`` or
+    ``tests/`` (the implementation or its test certifying itself).
+    """
+    for root in DOC_ROOTS:
+        target = _PACKAGE_ROOT / root
+        assert target.exists(), (
+            f"DOC_ROOTS names {root!r}, which does not exist under "
+            f"{_PACKAGE_ROOT}. A root that resolves to nothing shrinks the "
+            "search surface in silence."
+        )
+    assert _DOC_CORPUS, "the doc corpus is empty, so every check over it passes"
+    for path, _ in _DOC_CORPUS:
+        assert path.suffix == ".md", (
+            f"{path} is not Markdown. DOC_ROOTS is a prose surface; a "
+            "non-prose file lets a symbol certify itself."
+        )
+        for forbidden in _NON_DOC_ROOTS:
+            assert not path.is_relative_to(_PACKAGE_ROOT / forbidden), (
+                f"{path} lives under {forbidden}/, so the doc-coverage check "
+                "would accept an implementation or a test as this surface's "
+                "documentation. Widening DOC_ROOTS is not how a missing doc "
+                "gets written."
+            )
+
+
+@pytest.mark.parametrize("command", sorted(registered_cli_commands()))
+def test_every_registered_cli_command_is_named_by_a_doc(command: str) -> None:
+    """A registered command no doc mentions is an orphan (#1470).
+
+    Args:
+        command: A live ``creek`` command path, e.g. ``"clean orphans"``.
+    """
+    invocation = f"creek {command}"
+    assert _docs_naming(invocation), (
+        f"{invocation!r} is registered on the Typer app and named by none of "
+        f"the {len(_DOC_CORPUS)} files under DOC_ROOTS={DOC_ROOTS!r}. The "
+        "dead-code gate cannot see this: scripts/lint_vulture.py carves out "
+        "@app.command because registration is the caller, so a retired "
+        "command still wired into the app reports as live forever. Either "
+        "delete the command and its tests, or document it — and do not widen "
+        "DOC_ROOTS to make this sentence go away."
+    )
+
+
+def test_every_registered_mcp_tool_is_named_by_a_doc(bench: Bench) -> None:
+    """A registered MCP tool no doc mentions is an orphan (#1470).
+
+    Reported in one pass rather than parametrised because the inventory comes
+    from a live server, which needs a vault, which needs a fixture.
+
+    Args:
+        bench: The bench, for the throwaway vault the probe server binds to.
+    """
+    tools = sorted(registered_mcp_tools(bench.bare_vault()))
+    assert tools, "the probe server registered no tools, so this proves nothing"
+
+    orphans = [tool for tool in tools if not _docs_naming(tool)]
+
+    assert orphans == [], (
+        f"{orphans} are registered MCP tools that none of the "
+        f"{len(_DOC_CORPUS)} files under DOC_ROOTS={DOC_ROOTS!r} names. "
+        "scripts/lint_vulture.py carves out @server.tool because the MCP "
+        "registry is the caller, so a retired tool looks alive to every other "
+        "gate. Either delete the tool and its tests, or document it."
+    )

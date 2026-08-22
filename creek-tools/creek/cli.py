@@ -29,8 +29,9 @@ from creek.classify.privacy_filter import (
 from creek.config import (
     AIStyleConfig,
     ClassificationConfig,
+    VoiceAudienceWeightingConfig,
     load_config,
-    resolve_config_path,
+    load_vault_config,
 )
 from creek.consent import ConsentLogUnavailableError, ConsentManager
 from creek.models import PraxisPotential, PrivacyTier
@@ -62,6 +63,7 @@ if TYPE_CHECKING:
     from creek.generate.drafts import (
         DraftGenerator,
         DraftLLM,
+        DraftLLMFactory,
         OntologyDetector,
         SeedSpec,
     )
@@ -569,10 +571,16 @@ def _run_ingest(
         raise typer.Exit(code=1) from exc
 
     if print_summary:
+        # `unchanged` is printed beside the others, not appended after them
+        # (#1482). Without it the four numbers could all read zero on a run
+        # that wrote fragments, directly above "Ingested N fragment(s)." --
+        # `written` counts every successful write, and an unchanged write is
+        # still a write. The invariant the operator can now check by eye is
+        # `written == created + updated + unchanged`.
         console.print(
             f"[dim]Ingest summary: {result.created} created, "
-            f"{result.updated} updated, {result.tombed} tombed, "
-            f"{result.skipped} skipped[/dim]",
+            f"{result.updated} updated, {result.unchanged} unchanged, "
+            f"{result.tombed} tombed, {result.skipped} skipped[/dim]",
         )
     return result.written, result.errors, result.discovered
 
@@ -2559,6 +2567,16 @@ def classify(
         "--force",
         help="Overwrite fragments classified as method: manual.",
     ),
+    retier: bool = typer.Option(
+        False,
+        "--retier",
+        help=(
+            "Re-derive the privacy tier of fragments that already carry one, "
+            "and keep the result only when it is MORE restrictive. Free (no "
+            "provider call) and raise-only; classification provenance and "
+            "manual curation are left untouched."
+        ),
+    ),
     calibrate: bool = typer.Option(
         False,
         "--calibrate",
@@ -2613,6 +2631,17 @@ def classify(
     ``classification.confidence_threshold``. Fragments with
     ``classification.method: manual`` are preserved unless ``--force``
     is supplied.
+
+    ``--retier`` re-opens a case neither of the above covers (#1106): a
+    fragment stamped with a *concrete but too weak* tier by a pre-#974
+    pipeline. Nothing revisits such a tier — ``privacy_tier`` is a one-way
+    ratchet — so it stays admissible to a PERSONAL-ceiling caller and keeps
+    feeding voice-proxy generation. ``--retier`` re-runs the free local
+    heuristic over every already-tiered fragment and persists the verdict
+    only where it is *stricter*, through the same narrow tier-only writer
+    the resume short-circuit uses. Unlike ``--force`` it costs no tokens,
+    re-stamps no ``classification_method``, and overrides no manual
+    curation beyond the tier itself.
 
     ``--calibrate`` flips this into calibration mode: instead of touching
     the vault, the classifier runs against the calibration fixture and
@@ -2680,6 +2709,7 @@ def classify(
             config=config,
             method=method,
             force=force,
+            retier=retier,
         )
     except LLMProviderUnavailableError as exc:
         # The engine refused to iterate because the configured LLM
@@ -2713,7 +2743,12 @@ def classify(
         # Issue #878: and again for hashtag tags. Counts fragments gained,
         # not tags written, so a second run over an unchanged vault reports
         # zero rather than re-reporting the whole vault.
-        f"{summary.tags_extracted} tagged"
+        f"{summary.tags_extracted} tagged, "
+        # Issue #1106: reported even at zero, and separately from the
+        # tier-assignment count above, so "my vault has no pre-#974
+        # mis-stamps" is an answer the operator can actually read rather
+        # than an absence they have to infer.
+        f"{summary.retiered} re-tiered"
         ").[/bold green]",
     )
     if summary.errors:
@@ -3246,11 +3281,20 @@ class _FillGapCounts:
             (#877).
         tags_backfillable: Fragments whose body carries a hashtag the
             frontmatter does not record (#878).
+        retierable: Fragments carrying a *concrete* privacy tier that the
+            free heuristic would now derive **more restrictively** — the
+            pre-#974 mis-stamp (#1106). Deliberately disjoint from
+            :attr:`untiered`: an untiered fragment satisfies the bare
+            escalate predicate too, and since ``needs_tier`` is ``True``
+            for an explicit ``unclassified``, ``untiered`` already reads
+            35,330 on the 35k-fragment demo vault. A retier count folded
+            into that number could not be seen at all.
     """
 
     untiered: int
     praxis_backfillable: int
     tags_backfillable: int
+    retierable: int
 
 
 def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
@@ -3280,6 +3324,18 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
     what keeps it free — it rides the walk the other two already pay for,
     and must never become a second pass over 35k files.
 
+    The retier detector (#1106) is the fourth of the same shape and the
+    one with the sharpest edge. Its proof is "the heuristic would derive a
+    *stricter* tier than the one on disk", which
+    :func:`~creek.classify.privacy_pass.needs_retier` answers through the
+    two tier readers that already exist — no sixth opinion about what a
+    fragment's tier is (#1079) — and which, because
+    :func:`~creek.classify.privacy_pass.escalate` ranks by restrictiveness,
+    can only ever fire upwards. It excludes untiered fragments on purpose:
+    they satisfy the same predicate, they are ``untiered``'s population,
+    and merging the two would bury this count inside a number that already
+    reads 35,330 on the demo vault.
+
     The imports are function-local (like the rest of this module's) so a
     bare ``creek --help`` never pays to import the classification stack.
 
@@ -3291,13 +3347,18 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
         is no ``01-Fragments`` directory at all.
     """
     from creek.classify.praxis_pass import detect
-    from creek.classify.privacy_pass import needs_tier
+    from creek.classify.privacy import PrivacyClassifier
+    from creek.classify.privacy_pass import needs_retier, needs_tier
     from creek.classify.tags_pass import has_unrecorded_tags
     from creek.vault.reader import iter_vault_fragments
 
+    # Stateless and read-only, so one instance serves the whole walk rather
+    # than 35k constructions.
+    privacy = PrivacyClassifier()
     untiered = 0
     backfillable = 0
     untagged = 0
+    retierable = 0
     for _path, fragment, body, raw in iter_vault_fragments(
         vault_path / "01-Fragments",
     ):
@@ -3308,10 +3369,13 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
             backfillable += 1
         if has_unrecorded_tags(fragment.tags, body):
             untagged += 1
+        if needs_retier(fragment, body, raw=raw, classifier=privacy):
+            retierable += 1
     return _FillGapCounts(
         untiered=untiered,
         praxis_backfillable=backfillable,
         tags_backfillable=untagged,
+        retierable=retierable,
     )
 
 
@@ -3409,6 +3473,33 @@ def _count_tags_backfillable_fragments(
     if scan is None:
         scan = _scan_fill_gaps(vault_path)
     return scan.tags_backfillable
+
+
+def _count_retierable_fragments(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> int:
+    """Count fragments whose recorded tier is weaker than today's verdict.
+
+    The #1106 population: fragments a pre-#974 ``creek process`` stamped
+    ``privacy_tier: personal`` (with ``voice_proxy_eligible: true``) that
+    the current heuristic reads as ``intimate``. See
+    :func:`_scan_fill_gaps` for why untiered fragments are excluded, and
+    :func:`~creek.classify.privacy_pass.needs_retier` for why the
+    predicate can only ever fire upwards.
+
+    Args:
+        vault_path: Vault root.
+        scan: An already-completed :func:`_scan_fill_gaps` result to read
+            the answer out of. Omit it to walk the vault here.
+
+    Returns:
+        The number of re-tierable fragments; ``0`` when the vault has no
+        ``01-Fragments`` directory at all.
+    """
+    if scan is None:
+        scan = _scan_fill_gaps(vault_path)
+    return scan.retierable
 
 
 def _hint_untiered_fragments(
@@ -3528,6 +3619,56 @@ def _hint_tags_backfill(
     )
 
 
+def _hint_retier(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> None:
+    """Print the ``creek classify --retier`` nudge for mis-stamped tiers.
+
+    Its **own** line and its own guard, not a clause bolted onto the
+    untiered hint. ``needs_tier`` counts an explicit ``unclassified`` as
+    untiered, so that hint already reports 35,330 on the demo vault; a
+    handful of mis-stamped fragments folded into it would be invisible,
+    which is precisely the visibility failure #1106 was filed about. The
+    separate ``try`` is the same reasoning the praxis and tags hints
+    already follow — one failing scan must not silence a sibling.
+
+    Silent at zero, so a vault the operator has already re-tiered never
+    nags, and the pass is escalate-only so it goes quiet after one run.
+
+    Reports a **count only** — never a fragment id or a body excerpt.
+    Naming either would turn an advisory line into an unaudited
+    disclosure of vault content through stdout (the config-oracle rule,
+    #846 / #848), and these are by definition the vault's most sensitive
+    fragments.
+
+    The named remedy is ``creek classify --retier`` rather than
+    ``--force``. Both would move the tier; only ``--retier`` leaves
+    ``classification_method`` — and therefore manual operator curation —
+    intact, and only ``--retier`` touches nothing but the fragments whose
+    tier actually moves.
+
+    Args:
+        vault_path: Vault root.
+        scan: The shared vault walk, when one already succeeded.
+    """
+    try:
+        retierable = _count_retierable_fragments(vault_path, scan)
+    except Exception as exc:
+        logger.warning("fill: skipping retier hint: %s", exc)
+        return
+    if retierable == 0:
+        return
+    console.print(
+        f"[dim][fill] {retierable} fragment(s) carry a privacy tier that is "
+        "weaker than the one Creek would derive for them today (classified "
+        "before #974 tightened self-authored confessional content). Run "
+        "`creek classify --retier` to raise just those — it is free, it "
+        "only ever raises a tier, and it leaves classification provenance "
+        "and manual curation untouched.[/dim]",
+    )
+
+
 def _run_classify_upgrade(vault_path: Path, config: CreekConfig) -> None:
     """Re-classify ``rules`` fragments via the LLM, preserving manual/llm.
 
@@ -3553,8 +3694,9 @@ def _maybe_upgrade_classification(
     silently egresses): it only prints a hint. ``--upgrade`` applies the upgrade
     without a prompt; an interactive TTY prompts ``[y/N]`` (default No).
 
-    The #876 untiered-fragment hint, the #877 praxis-backfill hint and the
-    #878 tags-backfill hint all fire first, ahead of every early return: the
+    The #876 untiered-fragment hint, the #877 praxis-backfill hint, the
+    #878 tags-backfill hint and the #1106 retier hint all fire first,
+    ahead of every early return: the
     vault that most needs them (rules-classified, no LLM reachable, every
     fragment untiered) is exactly the one where there is no upgrade to offer.
     All three read one shared vault walk so ``creek fill`` parses every
@@ -3564,6 +3706,7 @@ def _maybe_upgrade_classification(
     _hint_untiered_fragments(vault_path, gaps)
     _hint_praxis_backfill(vault_path, gaps)
     _hint_tags_backfill(vault_path, gaps)
+    _hint_retier(vault_path, gaps)
     try:
         offer = _detect_classify_upgrade(vault_path, config)
     except Exception as exc:
@@ -4139,6 +4282,8 @@ def _report_fingerprint(vault_path: Path, override: PrivacyTierOverride) -> None
 def _resolve_voice_fingerprint(
     vault_path: Path,
     ai_style: AIStyleConfig,
+    *,
+    audience_weighting: VoiceAudienceWeightingConfig,
 ) -> VoiceFingerprint:
     """Return the vault's voice fingerprint, persisted-first then built.
 
@@ -4150,10 +4295,21 @@ def _resolve_voice_fingerprint(
     Args:
         vault_path: Vault root.
         ai_style: AI-style configuration (fingerprint path + weights).
+        audience_weighting: The vault's audience weighting, forwarded to
+            ``build_fingerprint`` on the fallback branch. Keyword-only and
+            **required, with no default**, because #1410 was precisely a
+            default going unnoticed: ``build_fingerprint``'s own parameter
+            defaults to ``None``, which means *disabled*, so this one caller
+            silently built the fallback fingerprint from the flat platform
+            average while every sibling honoured the vault's weighting. A
+            default here would let the next caller repeat that.
 
     Returns:
         A :class:`VoiceFingerprint`; its ``fragment_count`` is ``0`` when
-        neither a persisted artefact nor eligible fragments exist.
+        neither a persisted artefact nor eligible fragments exist — which
+        includes the case where *audience_weighting* zeroes the authority of
+        every tier the vault holds, since a zero weight drops a fragment from
+        the corpus rather than merely down-ranking it.
     """
     from creek.generate.ai_style.fingerprint import (
         build_fingerprint,
@@ -4163,7 +4319,11 @@ def _resolve_voice_fingerprint(
     fingerprint = load_fingerprint(vault_path, ai_style)
     if fingerprint.fragment_count > 0:
         return fingerprint
-    return build_fingerprint(vault_path, ai_style)
+    return build_fingerprint(
+        vault_path,
+        ai_style,
+        audience_weighting=audience_weighting,
+    )
 
 
 def _print_voice_check_summary(
@@ -4282,13 +4442,23 @@ def voice_check(
         raise typer.Exit(code=2)
 
     vault_path = _resolve_vault(vault)
-    ai_style = _load_config_for_vault(vault).ai_style
+    # From the RESOLVED root, not the raw ``--vault`` argument. With ``--vault``
+    # omitted, ``_load_config_for_vault(vault)`` falls through to the cwd while
+    # ``_resolve_vault`` has already named the vault the corpus comes from — so
+    # the config and the fragments would come from two different vaults. Same
+    # hazard ``_report_voice`` documents and re-resolves against.
+    config = _load_config_for_vault(vault_path)
+    ai_style = config.ai_style
     # Resolve the ceiling from THIS vault's config at call time so a per-vault
     # voice_distance_upper override is honoured; an explicit flag still wins.
     effective_max_distance = (
         max_distance if max_distance is not None else ai_style.voice_distance_upper
     )
-    fingerprint = _resolve_voice_fingerprint(vault_path, ai_style)
+    fingerprint = _resolve_voice_fingerprint(
+        vault_path,
+        ai_style,
+        audience_weighting=config.voice_audience_weighting,
+    )
 
     if fingerprint.fragment_count == 0:
         console.print(
@@ -4626,9 +4796,15 @@ def lint(
         None,
         "--check",
         help=(
+            # Kept in step with creek.lint.ALL_CHECKS by
+            # test_lint.py::test_the_check_help_string_lists_every_check.
+            # Restated rather than rendered because `creek.lint` is imported
+            # lazily inside the command bodies to keep CLI startup fast, and
+            # a module-level import here would undo that.
             "Run only this check (repeatable). Names: paradox, unnamed, "
             "synchronicity, compost, tags, broken-links, orphan-compiled, "
-            "skill-size."
+            "skill-size, draft-grounding, voice-fidelity, unparseable, "
+            "ancestry, root-hygiene."
         ),
     ),
     since: str | None = typer.Option(
@@ -5368,67 +5544,103 @@ def _build_seed_spec(
     )
 
 
-def _build_draft_llm(max_tokens: int | None = None) -> DraftLLM:
-    """Construct a :data:`DraftLLM` callable from the configured LLM provider.
+def _build_draft_llm_factory(
+    config: CreekConfig,
+    max_tokens: int | None = None,
+) -> DraftLLMFactory:
+    """Build the tier-keyed draft LLM factory for ``creek draft`` (#1031).
 
-    Uses the Ollama/Anthropic adapter already wired up for classification.
-    Reads the vault-resolved config via :func:`load_config` so the helper
-    keeps a stable signature; the ``draft`` command pre-warms
-    ``CREEK_CONFIG`` resolution by calling :func:`_load_config_for_vault`
-    upstream.
+    Returns a factory rather than a client because the tier this call must
+    be keyed with is not known here. ``creek draft`` resolves its source
+    fragments inside :class:`~creek.generate.drafts.DraftGenerator` — mined
+    seed, ``--seed-*`` spec, or per outline section — so the CLI has nothing
+    to hand :meth:`~creek.classify.llm.router.ModelRouter.resolve` at build
+    time, and the tier-less ``resolve`` it used to call switched off the
+    ``Intimate``-never-cloud gate (#647) on the one draft path that puts
+    whole fragment *bodies* in a prompt. The generator calls this back once
+    it knows what a prompt carries; see
+    :meth:`~creek.generate.drafts.DraftGenerator._bind_routing_tier`.
 
-    The returned callable yields a
-    :class:`~creek.generate.drafts.DraftLLMResponse` so the draft
-    generator can detect a ``max_tokens`` truncation via the provider's
-    stop reason instead of saving a silently cut-off essay.
+    The content tier alone, with no ceiling term — the CLI operator *is* the
+    vault owner, so unlike ``creek_mcp.tools.draft`` there is no caller
+    declaration to reconcile against. Modelling ``--include-tier all`` as a
+    ceiling would be actively wrong: ``creek_mcp.tier_ceiling``'s
+    ``CEILING_ROUTING_TIER[ALL]`` is ``INTIMATE``, which would pin every
+    such draft to the local model no matter what the prompt actually holds.
+
+    *config* is the **vault's** config, resolved by
+    :func:`_load_config_for_vault`. The bare ``load_config()`` this used to
+    call read the process's own config instead, so ``creek draft --vault
+    <v>`` routed on whatever config the current working directory happened
+    to expose and ignored the vault's routing policy entirely.
 
     Args:
+        config: The vault-resolved configuration supplying both the router
+            and the ``draft.max_tokens`` default, so the two cannot diverge.
         max_tokens: Explicit per-invocation token ceiling (the
             ``--max-tokens`` flag). ``None`` falls back to the loaded
             ``draft.max_tokens`` config, then to the provider's built-in
             default. The Ollama path ignores it.
 
     Returns:
-        A callable ``(prompt) -> DraftLLMResponse`` ready to feed to
-        :class:`DraftGenerator`.
-
-    Raises:
-        typer.Exit: If the configured LLM provider is not reachable.
+        A ``(tier) -> (prompt) -> DraftLLMResponse`` factory ready to feed
+        to :class:`DraftGenerator` as ``llm_factory``. Clients are cached
+        per tier so a multi-section draft pays one provider handshake per
+        distinct tier, not one per prompt. The
+        :class:`~creek.generate.drafts.DraftLLMResponse` return lets the
+        generator detect a ``max_tokens`` truncation via the provider's stop
+        reason instead of saving a silently cut-off essay.
     """
     from creek.classify.llm import LLMClassifier
+    from creek.classify.llm.router import IntimateRoutingError
     from creek.generate.drafts import DraftLLMResponse
 
-    config = load_config()
     # The explicit flag wins; otherwise honour the config default. Both
     # the provider settings and this ceiling come from the same loaded
     # config so they cannot diverge.
     effective_max_tokens = (
         max_tokens if max_tokens is not None else config.draft.max_tokens
     )
-    # Issue #1031: a real, unfixed tier leak — unlike the deliberate no-tier
-    # sites in this file, this client is fed vault fragment *bodies*, and
-    # `--include-tier intimate|all` lets intimate ones through untouched. Not a
-    # considered decision; tracked separately because the fix shape differs
-    # (the tier is per-fragment here, not per-call as in `creek compile` #962).
-    classifier = LLMClassifier(config.model_router.resolve("classification"))
-    if not classifier.available:
-        console.print(
-            "[red]LLM provider unavailable; cannot generate draft. "
-            "Check Ollama or ANTHROPIC_API_KEY configuration.[/red]",
-        )
-        raise typer.Exit(code=1)
+    clients: dict[PrivacyTier, DraftLLM] = {}
 
-    def _invoke(prompt: str) -> DraftLLMResponse:
-        completion = classifier.invoke_prompt_with_metadata(
-            prompt,
-            max_tokens=effective_max_tokens,
-        )
-        return DraftLLMResponse(
-            text=completion.text,
-            stop_reason=completion.stop_reason,
-        )
+    def _client_for(tier: PrivacyTier) -> DraftLLM:
+        """Return the draft client this *tier* may be sent to."""
+        cached = clients.get(tier)
+        if cached is not None:
+            return cached
+        try:
+            resolved = config.model_router.resolve("classification", tier)
+        except IntimateRoutingError as exc:
+            # The one refusal that must be legible, exactly as on ``creek
+            # compile`` (#962): keying the call by tier *introduces* this
+            # failure mode (all-cloud config + intimate sources), and a stack
+            # trace would read as a crash rather than as the privacy
+            # guarantee doing its job.
+            console.print(f"[red]{exc}[/red]")
+            raise typer.Exit(code=1) from exc
+        classifier = LLMClassifier(resolved)
+        if not classifier.available:
+            console.print(
+                "[red]LLM provider unavailable; cannot generate draft. "
+                "Check Ollama or ANTHROPIC_API_KEY configuration.[/red]",
+            )
+            raise typer.Exit(code=1)
 
-    return _invoke
+        def _invoke(prompt: str) -> DraftLLMResponse:
+            """Send *prompt* to the tier-routed provider."""
+            completion = classifier.invoke_prompt_with_metadata(
+                prompt,
+                max_tokens=effective_max_tokens,
+            )
+            return DraftLLMResponse(
+                text=completion.text,
+                stop_reason=completion.stop_reason,
+            )
+
+        clients[tier] = _invoke
+        return _invoke
+
+    return _client_for
 
 
 def _run_seeded_draft(
@@ -5456,6 +5668,13 @@ def _run_seeded_draft(
             vault_path=vault_path,
             current_phase=current_phase,
         )
+    except typer.Exit:
+        # `typer.Exit` subclasses `RuntimeError` (see
+        # `click.exceptions.Exit.__mro__`), so without this the handler below
+        # would swallow an exit raised *inside* the generator — the #1031
+        # tier refusal is one — print `str(Exit(1))`, which is the empty
+        # string, as a blank red line, and rewrite the exit code to 1.
+        raise
     except (SeedResolutionError, PluralitySourceError, RuntimeError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
@@ -5513,7 +5732,8 @@ def _build_ontology_detector(vault: Path | None) -> OntologyDetector:
         # `OutlineSection.seed_text`, i.e. operator-supplied `--seed-outline` /
         # `--seed-outline-text` copy. No fragment content reaches this provider,
         # so there is no classified tier for the router to enforce. Contrast
-        # `_build_draft_llm` above, which does see fragment bodies (#1031).
+        # `_build_draft_llm_factory` above, which does see fragment bodies and
+        # is therefore keyed by their tier (#1031).
         return detect_ontology(prompt, config.model_router.resolve("classification"))
 
     return _detect
@@ -5549,6 +5769,13 @@ def _run_outline_draft(
     except OutlineParseError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=2) from exc
+    except typer.Exit:
+        # `typer.Exit` subclasses `RuntimeError` (see
+        # `click.exceptions.Exit.__mro__`), so without this the handler below
+        # would swallow an exit raised *inside* the generator — the #1031
+        # tier refusal is one — print `str(Exit(1))`, which is the empty
+        # string, as a blank red line, and rewrite the exit code to 1.
+        raise
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=1) from exc
@@ -5796,12 +6023,14 @@ def draft(
         seed_spec=seed_spec,
         ontology_twist=ontology_twist,
     )
-    llm = _build_draft_llm(max_tokens)
+    llm_factory = _build_draft_llm_factory(vault_config, max_tokens)
     if bypass_compiled:
         _warn_bypass_compiled("draft")
 
     generator = DraftGenerator(
-        llm=llm,
+        # A factory, not a client: only the generator knows which fragments
+        # a prompt will carry, so only it can key the router by tier (#1031).
+        llm_factory=llm_factory,
         skills_root=skills_dir,
         voice_core=voice_text,
         style_preamble=style_preamble,
@@ -6495,12 +6724,18 @@ def _load_config_for_vault(
 ) -> CreekConfig:
     """Load :class:`CreekConfig`, auto-discovering ``--vault``'s config (issue #322).
 
-    Wraps :func:`creek.config.resolve_config_path` + :func:`load_config`
-    so every CLI command that accepts ``--vault <path>`` automatically
-    picks up ``<path>/00-Creek-Meta/creek_config.yaml`` when neither
-    ``--config`` nor ``CREEK_CONFIG`` is set. Explicit overrides still
-    take precedence; the helper is otherwise transparent to existing
-    callers.
+    The CLI's adapter over :func:`creek.config.load_vault_config`, which
+    #1409 made the single spelling of "resolve this vault's config". Every
+    command that accepts ``--vault <path>`` automatically picks up
+    ``<path>/00-Creek-Meta/creek_config.yaml`` when neither ``--config`` nor
+    ``CREEK_CONFIG`` is set. Explicit overrides still take precedence; the
+    helper is otherwise transparent to its callers.
+
+    It survives the convergence rather than being replaced at all thirty-odd
+    call sites because it flips the shared resolver's ``warn_on_missing``
+    default to ``True``: the CLI has an operator console to warn at, and most
+    of the resolver's other callers (MCP tools, the Writing Desk's agents) do
+    not.
 
     Args:
         vault: Vault root from the command's ``--vault`` flag, or
@@ -6514,8 +6749,7 @@ def _load_config_for_vault(
     Returns:
         A fully-validated :class:`CreekConfig`.
     """
-    config_path = resolve_config_path(vault, None)
-    return load_config(config_path, warn_on_missing=warn_on_missing)
+    return load_vault_config(vault, warn_on_missing=warn_on_missing)
 
 
 def _resolve_vault(vault: Path | None) -> Path:
@@ -6688,6 +6922,33 @@ carry ``deleted_files``, so there is no log to defer the operator to.
 """
 
 
+def _render_embeddings_purge_shortfall(result: PurgeResult) -> None:
+    """Say so, on screen, when the embeddings cache outlived the erasure.
+
+    The sibling shortfall — an undecodable body — already prints here, and an
+    erasure that fell short must say so where the operator is already looking.
+    Without this the only signals are a WARNING log line and the audit JSONL,
+    neither of which an operator running ``creek purge vault`` interactively
+    is reading, so a partial erasure would look complete on screen.
+
+    The cache matters specifically because its vectors are partially
+    invertible back to the purged content, so a surviving cache is a surviving
+    derivative, not merely untidy.
+
+    Args:
+        result: The completed purge result.
+    """
+    if not result.embeddings_cache_undeleted:
+        return
+    console.print(
+        "[red]The embeddings cache could not be deleted, so this erasure is "
+        "PARTIAL.[/red] It may still hold vectors derived from the purged "
+        "content. Remove "
+        "[bold]00-Creek-Meta/embeddings.parquet[/bold] by hand, then re-run "
+        "[bold]creek purge vault[/bold] to confirm."
+    )
+
+
 def _render_voice_purge_notes(result: PurgeResult) -> None:
     """Render the ``07-Voice`` sweep's count, follow-up, and any shortfall.
 
@@ -6754,6 +7015,7 @@ def _render_purge_result(result: PurgeResult) -> None:
             f"Meta artifacts removed: {result.meta_artifacts_removed}",
         )
     _render_voice_purge_notes(result)
+    _render_embeddings_purge_shortfall(result)
     _render_deleted_files(result.deleted_files)
 
 

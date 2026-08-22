@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -25,7 +26,7 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.fastmcp import FastMCP
 
 from creek.care.guardrail import acute_distress_guard
-from creek.config import CONFIG_PATH_ENV_VAR, load_config
+from creek.config import CONFIG_PATH_ENV_VAR, load_config, load_vault_config
 from creek_mcp.auth import ELEVATED_TOKEN_ENV
 from creek_mcp.policy import (
     Admission,
@@ -73,8 +74,10 @@ from creek_mcp.transport_posture import is_loopback, require_transport_confident
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    import uvicorn
     from mcp.server.auth.provider import AccessToken, TokenVerifier
     from mcp.types import ContentBlock
+    from starlette.types import ASGIApp
 
     from creek.author.client import AuthorLLMClient
     from creek.compile.engine import CompileLLM
@@ -204,7 +207,16 @@ class _BoundedFastMCP(FastMCP):
 
 
 def _resolve_vault(vault_path: Path | None) -> Path:
-    """Return the supplied path or fall back to ``load_config().vault_path``."""
+    """Return the supplied path or fall back to ``load_config().vault_path``.
+
+    The bare :func:`~creek.config.load_config` here is deliberate and is one of
+    the two sites #1409 left alone. This function is the bootstrap that
+    *answers* "which vault?"; it runs before any vault is known, so resolving
+    it through :func:`~creek.config.load_vault_config` would be circular. Every
+    consumer downstream of it has a vault and must use the shared resolver
+    instead — ``tests/test_vault_config_resolver.py`` enforces exactly that
+    split, and lists this function by name as an allowed exception.
+    """
     if vault_path is not None:
         return vault_path
     return load_config().vault_path
@@ -215,7 +227,7 @@ def _consumer_from_env() -> str:
     return os.environ.get("CREEK_MCP_CONSUMER", "unknown")
 
 
-def _build_draft_llm(tier: PrivacyTier) -> Callable[[str], str]:
+def _build_draft_llm(vault: Path, tier: PrivacyTier) -> Callable[[str], str]:
     """Return the draft-side LLM callable, routed for *tier* (#958).
 
     Mirrors :func:`_build_compile_llm`: the ``generation`` stage is resolved
@@ -233,6 +245,11 @@ def _build_draft_llm(tier: PrivacyTier) -> Callable[[str], str]:
     Anthropic key nor a running Ollama.
 
     Args:
+        vault: The served vault, whose own ``creek_config.yaml`` owns the
+            routing. Bound by ``build_server`` at construction time (#1409):
+            reading it from the process cwd instead let the operator's
+            per-vault routing — including which provider a stage egresses to —
+            be decided by wherever the server happened to be started.
         tier: The routing tier ``draft_tool`` computed from the caller's
             ceiling and the seed's source fragments' own classifications.
 
@@ -247,7 +264,7 @@ def _build_draft_llm(tier: PrivacyTier) -> Callable[[str], str]:
     """
     from creek.classify.llm.providers import build_provider
 
-    cfg = load_config().model_router.resolve("generation", tier)
+    cfg = load_vault_config(vault).model_router.resolve("generation", tier)
     provider = build_provider(cfg)
     if not provider.available:
         msg = (
@@ -258,7 +275,7 @@ def _build_draft_llm(tier: PrivacyTier) -> Callable[[str], str]:
     return lambda prompt: provider.complete(prompt).text
 
 
-def _build_compile_llm(tier: PrivacyTier) -> CompileLLM:
+def _build_compile_llm(vault: Path, tier: PrivacyTier) -> CompileLLM:
     """Return the compile-side LLM callable, routed for *tier* (#928/#929).
 
     Mirrors :func:`_build_reflect_llm_factory`'s inner factory: the
@@ -274,6 +291,11 @@ def _build_compile_llm(tier: PrivacyTier) -> CompileLLM:
     ``creek.compile`` call then fails, and it fails as a structured refusal.
 
     Args:
+        vault: The served vault, whose own ``creek_config.yaml`` owns the
+            routing. Bound by ``build_server`` at construction time (#1409):
+            reading it from the process cwd instead let the operator's
+            per-vault routing — including which provider a stage egresses to —
+            be decided by wherever the server happened to be started.
         tier: The routing tier, reconciled from two signals: since #962
             ``creek.compile.engine`` derives the source fragments' own
             classification (it is the layer that loaded them) and
@@ -291,7 +313,7 @@ def _build_compile_llm(tier: PrivacyTier) -> CompileLLM:
     """
     from creek.classify.llm.providers import build_provider
 
-    cfg = load_config().model_router.resolve("generation", tier)
+    cfg = load_vault_config(vault).model_router.resolve("generation", tier)
     provider = build_provider(cfg)
     if not provider.available:
         msg = (
@@ -302,7 +324,7 @@ def _build_compile_llm(tier: PrivacyTier) -> CompileLLM:
     return lambda prompt: provider.complete(prompt).text
 
 
-def _build_reflect_llm_factory() -> _LLMFactory:
+def _build_reflect_llm_factory(vault: Path) -> _LLMFactory:
     """Return a tier-keyed LLM factory for ``creek.reflect``.
 
     The returned ``factory(tier)`` resolves the ``generation`` stage through the
@@ -311,10 +333,17 @@ def _build_reflect_llm_factory() -> _LLMFactory:
     raises ``IntimateRoutingError`` rather than egressing). Lazy imports keep the
     server bootable without a provider — only a ``creek.reflect`` call then fails,
     surfacing as a structured refusal.
+
+    Args:
+        vault: The served vault, whose own config owns the routing (#1409).
+            Bound once here; the tier arrives per call.
+
+    Returns:
+        A tier → LLM-callable factory bound to *vault*'s router.
     """
     from creek.classify.llm.providers import build_provider
 
-    router = load_config().model_router
+    router = load_vault_config(vault).model_router
 
     def _factory(tier: PrivacyTier) -> _LLM:
         cfg = router.resolve("generation", tier)
@@ -330,7 +359,7 @@ def _build_reflect_llm_factory() -> _LLMFactory:
     return _factory
 
 
-def _build_author_llm(tier: PrivacyTier | None) -> AuthorLLMClient | None:
+def _build_author_llm(vault: Path, tier: PrivacyTier | None) -> AuthorLLMClient | None:
     """Return the Writing Desk's voice client, routed for *tier* (#658/#661).
 
     The author-side sibling of :func:`_build_draft_llm`, extracted from
@@ -347,6 +376,10 @@ def _build_author_llm(tier: PrivacyTier | None) -> AuthorLLMClient | None:
     failure, and the caller is told so in prose rather than by an exception.
 
     Args:
+        vault: The served vault. The one builder reading *two* config sections
+            — ``model_router`` and ``author`` — so resolving it from the
+            process cwd took both the routing and the desk's persona from
+            whichever vault the server's directory happened to name (#1409).
         tier: The run's content tier, or ``None`` when the evidence carries no
             classification to route on.
 
@@ -360,7 +393,7 @@ def _build_author_llm(tier: PrivacyTier | None) -> AuthorLLMClient | None:
     """
     from creek.author.client import AuthorLLMClient
 
-    config = load_config()
+    config = load_vault_config(vault)
     return AuthorLLMClient.for_voice_or_none(
         config.model_router,
         author=config.author,
@@ -415,10 +448,13 @@ def build_server(
     )
     vault = _resolve_vault(vault_path)
     consumer = _consumer_from_env()
-    factory = draft_llm_factory or _build_draft_llm
-    author_factory = author_llm_factory or _build_author_llm
-    compile_factory = compile_llm_factory or _build_compile_llm
-    reflect_factory = reflect_llm_factory or _build_reflect_llm_factory
+    # Each default builder is bound to the vault this server serves (#1409).
+    # They used to resolve their config from the process cwd, which silently
+    # routed one vault's text with another vault's model routing.
+    factory = draft_llm_factory or partial(_build_draft_llm, vault)
+    author_factory = author_llm_factory or partial(_build_author_llm, vault)
+    compile_factory = compile_llm_factory or partial(_build_compile_llm, vault)
+    reflect_factory = reflect_llm_factory or partial(_build_reflect_llm_factory, vault)
 
     @server.tool(name="creek.handshake")
     async def _handshake(
@@ -894,6 +930,57 @@ _is_loopback = is_loopback
 _require_transport_confidentiality = require_transport_confidentiality
 
 
+def build_network_uvicorn_config(
+    app: ASGIApp, args: argparse.Namespace, *, log_level: str
+) -> uvicorn.Config:
+    """Build the uvicorn configuration the MCP network transport serves under.
+
+    Extracted from :func:`_serve_network` for the same reason
+    :func:`creek_mcp.httpapi.cli.build_uvicorn_config` was extracted from its
+    own serve seam: the one decision in it that is a security promise —
+    ``access_log=False`` — is then reachable by a test without binding a socket.
+
+    **Why uvicorn's own access log is switched off here too (#1125).** uvicorn
+    ships an access logger that is on by default and writes one line per
+    request in the form ``client_addr - "METHOD /concrete/path?query
+    HTTP/1.1" status``. ``/v1`` has suppressed it since #1117; this call site
+    built its own :class:`uvicorn.Config` and kept the default, so one server
+    logged the **client address** of every request on one adapter and not on
+    the other. The MCP surface publishes no identifier-bearing path parameters,
+    so the exposure is narrower than the ``external_id`` republication that
+    motivated #1117 — but the two adapters are one process with one operator,
+    and a logging posture that differs between them is one nobody can reason
+    about. Suppression rather than filtering, again: a
+    :class:`logging.Filter` would be a second redaction rule free to drift from
+    the first.
+
+    Args:
+        app: The ASGI application to serve — the SDK's
+            ``streamable_http_app()``.
+        args: The parsed arguments, carrying host, port and TLS material. TLS
+            is required here: this factory is reached only from the branch that
+            has both a certificate and a key.
+        log_level: uvicorn's own log level, taken from the built server's
+            settings so the two do not drift.
+
+    Returns:
+        The configuration, carrying the bind address, the TLS material, and no
+        access log of uvicorn's own.
+    """
+    # Lazy import, matching FastMCP's own transport bootstrap pattern.
+    import uvicorn
+
+    return uvicorn.Config(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=log_level,
+        ssl_certfile=str(args.tls_cert),
+        ssl_keyfile=str(args.tls_key),
+        access_log=False,
+    )
+
+
 def _serve_network(server: FastMCP, args: argparse.Namespace) -> None:
     """Serve the streamable-http transport, with TLS when cert + key are given.
 
@@ -912,13 +999,10 @@ def _serve_network(server: FastMCP, args: argparse.Namespace) -> None:
         # Lazy import, matching FastMCP's own transport bootstrap pattern.
         import uvicorn
 
-        config = uvicorn.Config(
+        config = build_network_uvicorn_config(
             server.streamable_http_app(),
-            host=args.host,
-            port=args.port,
+            args,
             log_level=server.settings.log_level.lower(),
-            ssl_certfile=str(args.tls_cert),
-            ssl_keyfile=str(args.tls_key),
         )
         uvicorn.Server(config).run()
     else:

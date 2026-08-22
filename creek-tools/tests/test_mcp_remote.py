@@ -42,8 +42,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 import pytest
 import uvicorn
@@ -1189,15 +1190,79 @@ def test_network_transport_rejects_missing_tls_cert_file(
     assert "file not found" in capsys.readouterr().err.lower()
 
 
-def test_serve_network_uses_ssl_when_tls_configured(
-    vault: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With TLS configured, ``_serve_network`` hands uvicorn the cert + key files."""
-    cert = tmp_path / "cert.pem"
-    key = tmp_path / "key.pem"
-    cert.write_text("dummy-cert")  # fixture material, not a real credential
-    key.write_text("dummy-key")
+_UVICORN_ACCESS_LOGGER: Final[str] = "uvicorn.access"
+"""The logger uvicorn writes ``client_addr - "METHOD /path" status`` to.
 
+Its handler list is what ``access_log=False`` actually empties, and
+``h11_impl`` consults ``hasHandlers()`` to decide whether to log at all — so
+"no handlers" is the observable form of the promise, not the flag.
+"""
+
+_UVICORN_LOGGERS: Final[tuple[str, ...]] = (
+    "uvicorn",
+    "uvicorn.error",
+    _UVICORN_ACCESS_LOGGER,
+    "uvicorn.asgi",
+)
+"""Every logger :data:`uvicorn.config.LOGGING_CONFIG` reconfigures.
+
+``uvicorn.Config.__init__`` calls ``configure_logging()``, which calls
+:func:`logging.config.dictConfig` — a mutation of *global* interpreter state
+that would otherwise outlive the test and change what every later module in the
+session can observe.
+"""
+
+
+class _AnyASGIApp:
+    """A callable that satisfies :class:`uvicorn.Config` without being a server.
+
+    uvicorn only needs something callable; nothing here is ever awaited, because
+    no test in this module binds a socket.
+    """
+
+    async def __call__(self, scope: object, receive: object, send: object) -> None:
+        """Accept the ASGI three-tuple and do nothing with it."""
+
+
+@pytest.fixture
+def restored_uvicorn_logging() -> Iterator[None]:
+    """Snapshot and restore the four ``uvicorn`` loggers around one test.
+
+    Yields:
+        ``None``. The restoration happens on the way back out.
+    """
+    saved = {
+        name: (
+            list(logging.getLogger(name).handlers),
+            logging.getLogger(name).propagate,
+            logging.getLogger(name).level,
+        )
+        for name in _UVICORN_LOGGERS
+    }
+    try:
+        yield
+    finally:
+        for name, (handlers, propagate, level) in saved.items():
+            logger = logging.getLogger(name)
+            logger.handlers = handlers
+            logger.propagate = propagate
+            logger.setLevel(level)
+
+
+def _capture_uvicorn(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Substitute uvicorn's ``Config`` and ``Server`` so nothing binds a socket.
+
+    One helper rather than a copy per test: three tests now ask what
+    ``_serve_network`` hands uvicorn, and three hand-rolled fakes are three
+    chances for one of them to accept a keyword the real ``uvicorn.Config``
+    would reject.
+
+    Args:
+        monkeypatch: The active monkeypatch fixture.
+
+    Returns:
+        The dict the fake config records ``app`` and every keyword into.
+    """
     captured: dict[str, object] = {}
 
     class _CapturingConfig:
@@ -1232,6 +1297,19 @@ def test_serve_network_uses_ssl_when_tls_configured(
 
     monkeypatch.setattr(uvicorn, "Config", _CapturingConfig)
     monkeypatch.setattr(uvicorn, "Server", _IdleServer)
+    return captured
+
+
+def test_serve_network_uses_ssl_when_tls_configured(
+    vault: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With TLS configured, ``_serve_network`` hands uvicorn the cert + key files."""
+    cert = tmp_path / "cert.pem"
+    key = tmp_path / "key.pem"
+    cert.write_text("dummy-cert")  # fixture material, not a real credential
+    key.write_text("dummy-key")
+
+    captured = _capture_uvicorn(monkeypatch)
 
     server = _network_server(vault, _WIRE_TOKEN)
     server_mod._serve_network(
@@ -1239,6 +1317,121 @@ def test_serve_network_uses_ssl_when_tls_configured(
         _parsed_network_args(host="0.0.0.0", port=8443, tls_cert=cert, tls_key=key),
     )
 
+    assert str(captured["ssl_certfile"]) == str(cert)
+    assert str(captured["ssl_keyfile"]) == str(key)
+
+
+def test_serve_network_disables_uvicorns_own_access_log(
+    vault: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE INVARIANT (#1125) — the MCP adapter suppresses uvicorn's access logger too.
+
+    ``creek_mcp/httpapi/cli.py`` has switched it off since #1117, and
+    ``tests/test_v1_api_uvicorn_logging.py`` proves uvicorn honours the flag.
+    This call site built its own :class:`uvicorn.Config` and kept the default,
+    so the two adapters logged the client address of every request under two
+    different postures — and a posture that differs between two surfaces of one
+    server is one an operator cannot reason about at all.
+
+    Args:
+        vault: The seeded vault.
+        tmp_path: Where the TLS fixture material is written.
+        monkeypatch: Substitutes uvicorn's config and server so nothing binds.
+    """
+    cert = tmp_path / "cert.pem"
+    key = tmp_path / "key.pem"
+    cert.write_text("dummy-cert")  # fixture material, not a real credential
+    key.write_text("dummy-key")
+
+    captured = _capture_uvicorn(monkeypatch)
+
+    server = _network_server(vault, _WIRE_TOKEN)
+    server_mod._serve_network(
+        server,
+        _parsed_network_args(host="0.0.0.0", port=8443, tls_cert=cert, tls_key=key),
+    )
+
+    assert captured["access_log"] is False
+
+
+def test_the_mcp_config_leaves_uvicorns_access_logger_unhandled(
+    tmp_path: Path, restored_uvicorn_logging: None
+) -> None:
+    """A real config built the MCP way installs no handler on ``uvicorn.access``.
+
+    A flag is not a behaviour. ``uvicorn/config.py`` implements ``access_log=False``
+    by emptying ``logging.getLogger("uvicorn.access").handlers`` and setting
+    ``propagate = False``, and ``h11_impl`` then decides whether to log at all
+    with ``hasHandlers()`` — so an unhandled logger is the state that actually
+    keeps the client address out of the operator's stream. Built directly rather
+    than through ``_serve_network`` because the point is what uvicorn does with
+    the configuration, and binding a socket for it would be a second copy of
+    ``tests/test_v1_api_uvicorn_logging.py``.
+
+    Args:
+        tmp_path: Where the TLS fixture material is written.
+        restored_uvicorn_logging: Puts the four uvicorn loggers back afterwards;
+            constructing a config calls :func:`logging.config.dictConfig`, which
+            is a mutation of global interpreter state.
+    """
+    cert = tmp_path / "cert.pem"
+    key = tmp_path / "key.pem"
+    cert.write_text("dummy-cert")  # fixture material, not a real credential
+    key.write_text("dummy-key")
+    config = server_mod.build_network_uvicorn_config(
+        _AnyASGIApp(),
+        _parsed_network_args(host="0.0.0.0", port=8443, tls_cert=cert, tls_key=key),
+        log_level="info",
+    )
+    assert config.access_log is False
+    assert logging.getLogger(_UVICORN_ACCESS_LOGGER).handlers == []
+
+
+def test_the_unhandled_access_logger_assertion_is_not_vacuous(
+    tmp_path: Path, restored_uvicorn_logging: None
+) -> None:
+    """THE NON-VACUITY TWIN — with the flag on, uvicorn *does* install a handler.
+
+    Without this, the assertion above would pass on any uvicorn that stopped
+    configuring the logger at all, and the leak would come back green.
+
+    Args:
+        tmp_path: Unused beyond keeping the two tests symmetrical.
+        restored_uvicorn_logging: Restores the mutated loggers.
+    """
+    assert tmp_path.exists()
+    uvicorn.Config(_AnyASGIApp(), access_log=True)
+    assert logging.getLogger(_UVICORN_ACCESS_LOGGER).handlers != []
+
+
+def test_serve_network_still_carries_the_bind_and_tls_material(
+    vault: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extracting the factory must not drop what ``_serve_network`` already passed.
+
+    A factory that silenced the access log and lost the certificate would
+    satisfy the invariant above and serve bearer tokens in cleartext.
+
+    Args:
+        vault: The seeded vault.
+        tmp_path: Where the TLS fixture material is written.
+        monkeypatch: Substitutes uvicorn's config and server so nothing binds.
+    """
+    cert = tmp_path / "cert.pem"
+    key = tmp_path / "key.pem"
+    cert.write_text("dummy-cert")  # fixture material, not a real credential
+    key.write_text("dummy-key")
+
+    captured = _capture_uvicorn(monkeypatch)
+
+    server = _network_server(vault, _WIRE_TOKEN)
+    server_mod._serve_network(
+        server,
+        _parsed_network_args(host="0.0.0.0", port=8443, tls_cert=cert, tls_key=key),
+    )
+
+    assert captured["host"] == "0.0.0.0"
+    assert captured["port"] == 8443
     assert str(captured["ssl_certfile"]) == str(cert)
     assert str(captured["ssl_keyfile"]) == str(key)
 
