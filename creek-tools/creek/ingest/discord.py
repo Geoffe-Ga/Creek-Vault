@@ -831,7 +831,16 @@ def write_fragments(result: IngestResult, vault: Path) -> list[Path]:
     paths: list[Path] = []
     for parsed in result.fragments:
         assembled = assemble_ingested_fragment(parsed)
-        paths.append(writer.write_fragment(assembled.fragment, body=assembled.body))
+        # Forwarded even though this ingestor emits no passthrough keys today
+        # (#1392): every assemble->write chain carries the same contract, so
+        # Discord capture cannot silently diverge from `creek ingest`.
+        paths.append(
+            writer.write_fragment(
+                assembled.fragment,
+                body=assembled.body,
+                extra_frontmatter=assembled.extra_frontmatter,
+            )
+        )
     return paths
 
 

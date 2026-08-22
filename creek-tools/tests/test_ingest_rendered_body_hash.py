@@ -572,6 +572,43 @@ def test_workbook_frontmatter_carries_sheet_rows_and_columns(tmp_path: Path) -> 
     assert post.metadata["columns"] == 2
 
 
+def test_dimension_keys_survive_the_edited_rewrite(tmp_path: Path) -> None:
+    """The dimension keys outlive the ``updated`` branch that #1393 unlocked.
+
+    The one place the two fixes meet, and the only unguarded seam between
+    them. #1393 is what makes an edited workbook reach ``update_fragment`` at
+    all — before it, the run took the ``unchanged`` branch and this path was
+    dead. And ``update_fragment`` is the single write branch that is NOT
+    handed ``extra_frontmatter``: it reloads the post and rewrites only
+    ``post.content``, so ``sheet``/``rows``/``columns`` survive because they
+    are already on disk, not because they were passed in again.
+
+    That makes the durability an inherited property rather than a stated one,
+    which is precisely the kind of thing that breaks silently. Were
+    ``update_fragment`` ever changed to re-serialise from the model — a
+    reasonable-looking refactor — every edited workbook would quietly shed its
+    provenance on the *second* ingest, with the first still looking correct.
+    Asserted together with the edit landing, so neither half can regress
+    without the other being noticed.
+    """
+    vault = _vault(tmp_path)
+    source = tmp_path / "src"
+    source.mkdir()
+    workbook = source / "book.xlsx"
+    workbook.write_bytes(_workbook_bytes(tmp_path, _ORIGINAL_CELL))
+
+    _ingest_workbook(vault, source)
+    workbook.write_bytes(_workbook_bytes(tmp_path, _EDITED_CELL))
+    second = _ingest_workbook(vault, source)
+
+    assert second.updated == 1
+    post = frontmatter.load(str(_fragments(vault)[0]))
+    assert _EDITED_CELL in post.content
+    assert post.metadata["sheet"] == "Budget"
+    assert post.metadata["rows"] == 1
+    assert post.metadata["columns"] == 2
+
+
 def test_a_markdown_fragment_gains_no_dimension_keys(tmp_path: Path) -> None:
     """A fragment whose ingestor emitted no dimensions gains no keys.
 

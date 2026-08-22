@@ -729,6 +729,7 @@ def write_fragment_idempotent(
     fragment: Fragment,
     body: str,
     reclassify_threshold: float,
+    extra_frontmatter: dict[str, object] | None = None,
 ) -> str:
     """Write or update the fragment; return ``"created"``/``"updated"``/``"unchanged"``.
 
@@ -762,6 +763,10 @@ def write_fragment_idempotent(
         body: The Markdown body to write below the frontmatter.
         reclassify_threshold: Similarity below which a rewrite flags the
             fragment for re-classification.
+        extra_frontmatter: Unmodelled frontmatter keys to write alongside the
+            model fields (#1392). Only the ``write_fragment`` branches need
+            it; the ``update_fragment`` branches rewrite the body of a file
+            whose frontmatter already carries these keys and preserves them.
 
     Returns:
         ``"created"``, ``"updated"`` or ``"unchanged"``.
@@ -772,7 +777,7 @@ def write_fragment_idempotent(
     # below: the hash now comes from `ledger_body_hash(body)`, which is a
     # free function precisely so all three sites share one definition (#1393).
     if record is None:
-        writer.write_fragment(fragment, body=body)
+        writer.write_fragment(fragment, body=body, extra_frontmatter=extra_frontmatter)
         return "created"
     # The ledger is the authority on this unit's identity, on every branch
     # below. Do not push this back down into the branches (#1329).
@@ -784,7 +789,9 @@ def write_fragment_idempotent(
         )
         if restored is None:
             # Tombstone lost out of band: recreate under the preserved id.
-            writer.write_fragment(fragment, body=body)
+            writer.write_fragment(
+                fragment, body=body, extra_frontmatter=extra_frontmatter
+            )
         return "updated"
     if record.content_hash != new_hash:
         updated = writer.update_fragment(
@@ -792,14 +799,16 @@ def write_fragment_idempotent(
         )
         if updated is None:
             # File gone out of band: recreate under the preserved id.
-            writer.write_fragment(fragment, body=body)
+            writer.write_fragment(
+                fragment, body=body, extra_frontmatter=extra_frontmatter
+            )
         return "updated"
     # Known unit, content unchanged: idempotent no-op. The write resolves to
     # the existing file because `fragment.id` is now the *ledgered* id and the
     # writer's per-directory id index matches on it — the guarantee comes from
     # the ledger, not from trusting the derivation to reproduce (#1329).
     # Reported as unchanged so it never inflates the updated counter.
-    writer.write_fragment(fragment, body=body)
+    writer.write_fragment(fragment, body=body, extra_frontmatter=extra_frontmatter)
     return "unchanged"
 
 
@@ -1670,6 +1679,7 @@ def run_ingest(
                 assembled.fragment,
                 assembled.body,
                 reclassify_threshold,
+                assembled.extra_frontmatter,
             )
         except (OSError, KeyError) as exc:
             errors.append(

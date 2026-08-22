@@ -756,7 +756,13 @@ class VaultWriter:
             self._provenance_log,
         )
 
-    def write_fragment(self, fragment: Fragment, body: str = "") -> Path:
+    def write_fragment(
+        self,
+        fragment: Fragment,
+        body: str = "",
+        *,
+        extra_frontmatter: dict[str, object] | None = None,
+    ) -> Path:
         """Write a Fragment to the correct vault folder, stamping attribution.
 
         A *native* fragment (``source.author_slug`` is ``None``/empty) routes by
@@ -781,6 +787,12 @@ class VaultWriter:
                 Empty strings are accepted (e.g. for placeholder writes
                 in tests) but should be considered a code smell in
                 production callers.
+            extra_frontmatter: Unmodelled frontmatter keys to merge into the
+                YAML block, from an ingestor that emitted structured
+                provenance ``Fragment`` does not model (#1392). Gated
+                upstream by
+                :data:`~creek.ingest.base.PASSTHROUGH_FRONTMATTER_KEYS`;
+                ``None`` (the default) writes model fields only.
 
         Returns:
             Path to the written (or existing duplicate) markdown file.
@@ -793,8 +805,12 @@ class VaultWriter:
             # attribution (#470).
             manifest = load_author_manifest_or_default(self.vault_path, slug)
             stamped = _apply_other_author_attribution(fragment, manifest)
-            return self._write_model(stamped, target_dir, body=body)
-        return self._write_model(fragment, target_dir, body=body)
+            return self._write_model(
+                stamped, target_dir, body=body, extra_frontmatter=extra_frontmatter
+            )
+        return self._write_model(
+            fragment, target_dir, body=body, extra_frontmatter=extra_frontmatter
+        )
 
     def _fragment_target_dir(self, fragment: Fragment) -> Path:
         """Return the vault directory a fragment routes to (#673).

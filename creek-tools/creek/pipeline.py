@@ -1065,7 +1065,14 @@ class Pipeline:
 
         for item in classified:
             try:
-                writer.write_fragment(item.fragment, body=item.body)
+                # Forwarded so `creek process` writes the same frontmatter
+                # `creek ingest` does for the same source (#1392); the
+                # allowlist upstream decides which keys exist at all.
+                writer.write_fragment(
+                    item.fragment,
+                    body=item.body,
+                    extra_frontmatter=item.extra_frontmatter,
+                )
             except (OSError, KeyError) as exc:
                 # OSError covers filesystem-level failures (permissions,
                 # disk full). KeyError covers a missing platform mapping —
