@@ -192,21 +192,29 @@ satisfy an intimate-transit contract. That is entirely
 Every response `creek-tools-api` builds carries both of these, on every status:
 
 ```
-Vary: X-Creek-Tier-Ceiling, Authorization
+Vary: X-Creek-Tier-Ceiling, Authorization, X-Creek-Contract-Version
 Cache-Control: no-store
 ```
 
-Every `/v1` body is computed from two things a cache cannot see in the URL: the
-**declared tier ceiling** and the **authenticated consumer**. An entry keyed on
-neither — or on only one of them — may be handed to a caller the server would
-have answered differently. `Cache-Control: no-store` says do not keep it;
+Every `/v1` body is computed from three things a cache cannot see in the URL:
+the **declared tier ceiling**, the **authenticated consumer**, and the
+**declared contract minor**. An entry keyed on none of them — or on only some —
+may be handed to a caller the server would have answered differently. The
+version token is the concrete one to picture
+([#1144](https://github.com/Geoffe-Ga/Creek-Vault/issues/1144)):
+`GET /v1/capabilities` answers `status: ok` with the full capability list to a
+client declaring a served minor and `status: incompatible` with an empty list to
+one declaring a stale minor, from requests identical in every other respect —
+so without that token a cache may hand a current client the refusal minted for
+an outdated one, on the endpoint every client calls first.
+`Cache-Control: no-store` says do not keep it;
 `Vary` says that if you keep it anyway, these are the headers that decide
 whether it matches. The two answer different failure modes and neither replaces
 the other: drop the directive and a compliant cache is free to store, drop the
 tokens and a non-compliant one is free to mismatch.
 
 **These are unconditional, not "on authenticated responses".** Bearer
-authentication sits above the router, so all six routes are authenticated
+authentication sits above the router, so all nine operations are authenticated
 anyway; and refusals need the treatment as much as successes. A stored `404`
 is the concrete case — it is the one status this surface returns that both is
 reachable on any unrouted path and is *heuristically cacheable* under RFC 9110
@@ -388,6 +396,20 @@ enumerate the corpus one id at a time without reading a byte of it. Every
 vault-object non-answer collapses to `403 privacy_refused` with one fixed
 reason. A method mismatch (`PUT /v1/wheel`) also renders `404`, because `405` is
 not in the contract's published status set.
+
+**`HEAD` is not served, on any path (#1143).** `HEAD /v1/health`,
+`HEAD /v1/capabilities`, `HEAD /v1/wheel` and `HEAD /v1/connectors/drive`
+answered `200` up to this change and answer `404 not_found` after it. They were
+never declared: Starlette adds `HEAD` wherever `GET` is, so four operations
+existed on the wire with no route spec, no schema, no documentation and no
+test — and the set had already grown from two to four with nobody deciding to
+add them. **Use `GET`.** Nothing is lost by it: authentication sits above the
+router, so an anonymous `HEAD` probe already got `401` and was never usable as a
+credential-free liveness check, and any caller holding a token can read the
+whole of `GET /v1/health`, whose body is a single small object. `HEAD` was also
+not the cheap existence check it looks like — the framework runs the full
+handler and discards the body, so `HEAD /v1/capabilities` was taking the audit
+log's file lock and `fsync` for a response nobody read.
 
 **A trailing slash is `404`, not a redirect (#1369).** `GET /v1/health/` is not
 a path this server serves, and it is answered as one. The router's default
