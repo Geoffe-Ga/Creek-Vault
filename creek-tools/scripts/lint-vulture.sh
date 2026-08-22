@@ -17,15 +17,21 @@
 # with zero allowlist entries — see that module's docstring for the policy
 # and for the four things this gate deliberately cannot see.
 #
-# This wrapper is the ONE definition of the gate. check-all.sh, CI,
-# lint-extended.sh and the pre-commit hook all route through it so the
-# policy cannot drift back apart. It takes no positional arguments by
-# design: every *gate* call site therefore scans the same fixed scope,
-# and none of them can narrow it into a green run.
+# This wrapper is the ONE definition of the gate for creek-tools.
+# check-all.sh, CI, lint-extended.sh and the pre-commit hook all route
+# through it so the policy cannot drift back apart. It takes no positional
+# arguments by design: every *gate* call site therefore scans the same
+# fixed scope, and none of them can narrow it into a green run. It passes
+# no `--scope` either, so the module's default — the `CREEK_TOOLS` scope —
+# is the path production actually exercises.
 #
-# The module underneath does accept paths, deliberately — ad-hoc triage
-# (a production-only pass, or a sweep of crawdad/) needs them. That is
-# not a hole, because no gate reaches the module except through here.
+# crawdad/ has a twin of this script (#1472). It runs the SAME module with
+# `--scope crawdad` rather than a copy of the policy, so a floor change or
+# a new carve-out lands in both subprojects at once.
+#
+# The module underneath does accept explicit paths, deliberately — ad-hoc
+# triage (the production-only pass that sizes #1469) needs them. That is
+# not a hole, because no gate reaches the module except through a wrapper.
 
 set -euo pipefail
 
@@ -42,7 +48,8 @@ while [[ $# -gt 0 ]]; do
 Usage: $(basename "$0")
 
 Run the dead-code gate (vulture, per-type confidence floors) over
-creek/ and creek_mcp/, using tests/ as a reference source.
+creek/ and creek_mcp/, using tests/ as a reference source. The policy
+is shared with crawdad/scripts/lint-vulture.sh (#1472).
 
 Takes no positional arguments — the scan scope is fixed in
 scripts/lint_vulture.py so it cannot be narrowed at a call site.

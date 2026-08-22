@@ -172,29 +172,44 @@ class TestIngestSummary:
     def test_summary_counts(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """First ingest creates; an edit updates; a delete tombs."""
+        """First ingest creates; a no-op is unchanged; an edit updates; a delete tombs.
+
+        Updated deliberately for #1482, which inserted ``unchanged`` into the
+        summary line. All four assertions here are contiguous substrings of
+        that line, so all four had to move — and the honest way to move them
+        was to strengthen the no-op case, not to dodge the break.
+
+        The middle block is the one that matters. It used to assert
+        ``0 created, 0 updated, 0 tombed`` and pass, which is exactly the
+        defect #1482 reported: a run that writes a fragment printing nothing
+        but zeros. Appending ``unchanged`` to the END of the printed line
+        would have kept these substrings green while leaving that hole open —
+        green by accident. It now asserts the ``1 unchanged`` that explains
+        the run.
+        """
         vault = _make_vault(tmp_path)
         journal = vault / "personal" / "journal"
         entry = journal / "2026-06-26.md"
 
         entry.write_text("---\ndate: 2026-06-26\n---\nFirst entry.\n", encoding="utf-8")
         _ingest(vault, journal, print_summary=True)
-        assert "1 created, 0 updated, 0 tombed" in capsys.readouterr().out
+        assert "1 created, 0 updated, 0 unchanged, 0 tombed" in capsys.readouterr().out
 
-        # Re-run with NO changes: an unchanged no-op must not inflate any counter.
+        # Re-run with NO changes: the no-op must inflate no counter -- and must
+        # be REPORTED, rather than vanishing into four zeros (#1482).
         _ingest(vault, journal, print_summary=True)
-        assert "0 created, 0 updated, 0 tombed" in capsys.readouterr().out
+        assert "0 created, 0 updated, 1 unchanged, 0 tombed" in capsys.readouterr().out
 
         entry.write_text(
             "---\ndate: 2026-06-26\n---\nFirst entry, now meaningfully revised.\n",
             encoding="utf-8",
         )
         _ingest(vault, journal, print_summary=True)
-        assert "0 created, 1 updated, 0 tombed" in capsys.readouterr().out
+        assert "0 created, 1 updated, 0 unchanged, 0 tombed" in capsys.readouterr().out
 
         entry.unlink()
         _ingest(vault, journal, print_summary=True)
-        assert "0 created, 0 updated, 1 tombed" in capsys.readouterr().out
+        assert "0 created, 0 updated, 0 unchanged, 1 tombed" in capsys.readouterr().out
 
 
 # ---- Material rewrite re-derives the privacy tier (#922) ----------------

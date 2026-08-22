@@ -222,6 +222,29 @@ class TestLintModuleContract:
         }
         assert expected.issubset(set(ALL_CHECKS))
 
+    def test_the_check_help_string_lists_every_check(self) -> None:
+        """``creek lint --help`` names every registry entry, and no ghosts.
+
+        The string is restated in ``cli.py`` rather than rendered from
+        ``ALL_CHECKS``, because ``creek.lint`` is imported lazily inside the
+        command bodies to keep CLI startup fast. Restating is what let it
+        drift three checks behind the registry (#926 review); this is the
+        check that makes the restatement safe.
+
+        Asserted against the rendered help rather than the source string, so
+        it pins what an operator actually reads.
+        """
+        from typer.testing import CliRunner
+
+        from creek.cli import app
+
+        rendered = CliRunner().invoke(app, ["lint", "--help"]).output
+        # Typer wraps help text, so strip newlines before substring checks.
+        flat = " ".join(rendered.split())
+
+        missing = [name for name in ALL_CHECKS if name not in flat]
+        assert missing == [], f"--check help omits: {missing}"
+
     def test_semantic_checks_match_pre_decided_choices(self) -> None:
         """Pre-decided: paradox, synchronicity, unnamed are semantic."""
         assert set(SEMANTIC_CHECKS) == {"paradox", "synchronicity", "unnamed"}

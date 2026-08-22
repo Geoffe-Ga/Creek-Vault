@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING
 import yaml
 
 from creek.author.models import ReflectionFinding
-from creek.config import load_config, resolve_config_path
+from creek.config import load_vault_config
 from creek.generate.ai_style.scanner import scan
 from creek.generate.grounding import scan_biographical_sentences
 from creek.generate.jargon import detect_unglossed_jargon
@@ -41,7 +41,11 @@ from creek.models import (
     PHASE_LEGACY_ALIASES,
     PrivacyTier,
 )
-from creek.vault.reader import CORPUS_SUBDIRS, try_load_fragment
+from creek.vault.reader import (
+    CORPUS_SUBDIRS,
+    FRONTMATTER_LOAD_ERRORS,
+    try_load_fragment,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -296,9 +300,19 @@ def _scan_subtree_for_cited(
 
     Unreadable files and markdown that is not a Creek fragment are skipped with
     exactly the tolerance :func:`~creek.vault.reader.try_load_fragment` callers
-    already use. That parity is load-bearing now that the walk reaches beyond
-    ``01-Fragments``: the reference notes and the ``_author.md`` manifests
-    living in the other two subtrees must skip, not raise.
+    already use — :data:`~creek.vault.reader.FRONTMATTER_LOAD_ERRORS`. That
+    parity is load-bearing now that the walk reaches beyond ``01-Fragments``:
+    the reference notes and the ``_author.md`` manifests living in the other
+    two subtrees must skip, not raise.
+
+    The skip is logged at **WARNING**, not DEBUG, and that asymmetry with every
+    other walk in the tree is deliberate. A skip here is a fail-open: this gate
+    reports a leak only for fragments whose tier it managed to read, so a file
+    it cannot parse is a file it cannot police, and the draft reviews as PASS
+    on incomplete evidence. Before #1475 a non-string frontmatter key raised
+    ``TypeError`` and aborted the review — loud, and safe. Catching it is the
+    right trade (one hand-edited note must not disable the Writing Desk) only
+    if the operator can hear that it happened.
 
     Args:
         root: An existing corpus subtree to walk.
@@ -308,7 +322,19 @@ def _scan_subtree_for_cited(
     for md_file in sorted(root.rglob("*.md")):
         try:
             record = try_load_fragment(md_file)
-        except (OSError, ValueError, yaml.YAMLError):
+        except FRONTMATTER_LOAD_ERRORS:
+            # Loud on purpose. Everywhere else in the tree an unreadable note
+            # is a DEBUG-level skip, but this walk feeds a HARD leak gate: a
+            # fragment whose tier cannot be read is a fragment this gate
+            # cannot police, and the draft then reviews as PASS on incomplete
+            # evidence. Widening the tuple (#1475) makes that fail-open reachable
+            # from one hand-edited note, so the operator hears about it. #926 is
+            # the general fix — surfacing every silently-skipped fragment.
+            logger.warning(
+                "Cited-tier scan skipped an unreadable fragment file: %s. "
+                "The privacy_compliance gate could not read its tier.",
+                md_file,
+            )
             continue
         if record is None:
             continue
@@ -551,7 +577,7 @@ def _configured_max_reproduced_tier(vault: Path) -> PrivacyTier:
         :attr:`PrivacyTier.OPEN` when the config cannot be read.
     """
     try:
-        config = load_config(resolve_config_path(vault, None), warn_on_missing=False)
+        config = load_vault_config(vault)
     except (OSError, ValueError, yaml.YAMLError):
         logger.warning(
             "Could not read author.max_reproduced_tier from the config for "

@@ -214,7 +214,10 @@ constraint-dependencies = [
     # Fixed in 50.0.0 (#1167).
     "cryptography>=50.0.0",
     "pyjwt>=2.13.0",
-    "pip>=26.1.2",
+    # Security: pip arrives transitively via pip-api (a pip-audit dep).
+    # Floored above PYSEC-2026-3721, fixed in 26.2. Build/dev tooling
+    # only, never a runtime import.
+    "pip>=26.2.1",
     # Security: pin setuptools above PYSEC-2026-3447 (CVE-2026-59890,
     # path traversal in the PackageIndex download path) — build/dev
     # tooling only, never a runtime import. Fixed in 83.0.0 (#861), and

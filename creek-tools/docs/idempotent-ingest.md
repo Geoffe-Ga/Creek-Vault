@@ -224,11 +224,20 @@ Set it to `0.0` to always preserve classifications across edits.
 `creek ingest` prints a one-line summary of what changed:
 
 ```
-Ingest summary: 3 created, 1 updated, 1 tombed
+Ingest summary: 3 created, 1 updated, 2 unchanged, 1 tombed, 0 skipped
 ```
 
 - **created** — source units with no prior ledger record (new fragments).
 - **updated** — units whose content changed (in-place updates and restores).
-  Unchanged re-ingests are idempotent no-ops and are **not** counted here, so
-  the summary reflects only what actually changed.
+- **unchanged** — units re-ingested as idempotent no-ops. Reported since
+  #1482. They are still *written* (the write resolves to the existing file
+  via the ledgered id), so leaving them out could print four zeros directly
+  above `Ingested 2 fragment(s).` — most visibly after a `creek purge vault`,
+  where the ledger row still matches but the file is gone and the "unchanged"
+  branch recreates it.
 - **tombed** — units soft-tombed this run because their source vanished.
+- **skipped** — units the `--since`/`--incremental` filter did not process.
+
+`created + updated + unchanged` equals the `Ingested N fragment(s).` count:
+every one of those three is a write, and `skipped` units are the ones that
+never reached the writer.

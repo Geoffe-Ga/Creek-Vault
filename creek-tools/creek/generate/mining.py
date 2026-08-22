@@ -34,7 +34,6 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, TypeVar
 
 import frontmatter
-import yaml
 from pydantic import ValidationError
 
 from creek.classify.privacy_filter import (
@@ -48,7 +47,7 @@ from creek.generate.compile_routing import (
     CompiledPageIndex,
     empty_index,
     load_compiled_pages,
-    log_compile_gap,
+    record_compile_gap,
 )
 from creek.models import (
     Dosage,
@@ -63,6 +62,7 @@ from creek.models import (
     VoiceRegister,
 )
 from creek.vault.links import read_header_meta
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -343,7 +343,7 @@ def _safe_post(md_file: Path) -> frontmatter.Post | None:
     """Load a frontmatter post, returning ``None`` on parse errors."""
     try:
         return frontmatter.load(str(md_file))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         logger.debug("Skipping unreadable markdown: %s", md_file)
         return None
 
@@ -800,12 +800,12 @@ class IdeaMiner:
                 frag.id for frag, _body in fragments if thread.id in frag.threads
             )
             if not compiled.bypassed:
-                log_compile_gap(
+                record_compile_gap(
                     vault_path,
+                    compiled,
                     target_kind="thread",
                     target_id=thread.id,
                     surfaced_by="mine.thread_terminus",
-                    reason="missing",
                 )
         description = (
             f"Thread '{thread.id}' has accumulated {thread.fragment_count} "
@@ -1080,12 +1080,12 @@ class IdeaMiner:
         """
         if not synchronicities:
             if not compiled.bypassed:
-                log_compile_gap(
+                record_compile_gap(
                     vault_path,
+                    compiled,
                     target_kind="synchronicities",
                     target_id="10-Liminal/Synchronicities",
                     surfaced_by="mine.resonance_chain",
-                    reason="missing",
                 )
             return _NO_SYNCHRONICITIES
         if seeds_kept == 0:
@@ -1250,12 +1250,12 @@ class IdeaMiner:
             return True
         if primary not in gaps_logged:
             gaps_logged.add(primary)
-            log_compile_gap(
+            record_compile_gap(
                 vault_path,
+                compiled,
                 target_kind="frequency_index",
                 target_id=primary,
                 surfaced_by="mine.wavelength_window",
-                reason="missing",
             )
         return True
 
@@ -1395,12 +1395,12 @@ class IdeaMiner:
             return f"{compiled_eddy.title}\n{compiled_eddy.body}"
         if not compiled.bypassed and eddy.id not in gaps_logged:
             gaps_logged.add(eddy.id)
-            log_compile_gap(
+            record_compile_gap(
                 vault_path,
+                compiled,
                 target_kind="eddy",
                 target_id=eddy.id,
                 surfaced_by="mine.liminal_cross_eddy",
-                reason="missing",
             )
         return f"{eddy.title}\n{eddy.description}"
 

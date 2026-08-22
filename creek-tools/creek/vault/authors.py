@@ -11,11 +11,11 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import frontmatter
 import yaml
 from pydantic import ValidationError
 
 from creek.models import AuthorManifest
+from creek.vault.reader import load_post_or_raise
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ def load_author_manifest(path: Path) -> AuthorManifest:
     if not path.is_file():
         msg = f"Author manifest not found: {path}"
         raise FileNotFoundError(msg)
-    post = frontmatter.load(str(path))
+    post = load_post_or_raise(path)
     data: dict[str, object] = post.metadata.copy()
     # Slug authority: the folder name is the identity key (FEAT-041 §7.1).
     data["author_slug"] = path.parent.name

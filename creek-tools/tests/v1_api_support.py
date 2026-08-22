@@ -1,6 +1,6 @@
 """Shared scaffolding for the Adepthood ``/v1`` HTTP API suite (#1074).
 
-Eight ``tests/test_v1_api_*.py`` modules drive the same adapter, and every one
+Nine ``tests/test_v1_api_*.py`` modules drive the same adapter, and every one
 of them needs the same four things: a seeded vault, a bearer token that clears
 :data:`creek_mcp.token_policy.MIN_TOKEN_LEN`, a verifier over two consumers,
 and a :class:`~starlette.testclient.TestClient` over
@@ -22,6 +22,7 @@ glob is ``test_*.py``, so it is imported, never collected.
 
 from __future__ import annotations
 
+import base64
 import re
 from typing import TYPE_CHECKING, Any, Final
 
@@ -95,7 +96,7 @@ OTHER_TOKEN: Final[str] = "unit-test-other-token-" + "b" * 20
 UNKNOWN_TOKEN: Final[str] = "unit-test-unknown-token-" + "c" * 20
 
 # --------------------------------------------------------------------------- #
-# The five published routes
+# The six published routes
 # --------------------------------------------------------------------------- #
 
 CAPABILITIES_PATH: Final[str] = "/v1/capabilities"
@@ -113,6 +114,19 @@ REFLECTIONS_PATH: Final[str] = "/v1/reflections"
 WHEEL_PATH: Final[str] = "/v1/wheel"
 """The wheel endpoint."""
 
+UPLOAD_PATH: Final[str] = "/v1/uploads"
+"""The document-upload endpoint (contract 0.8, #1524)."""
+
+DRIVE_CONNECTOR_PATH: Final[str] = "/v1/connectors/drive"
+"""The Drive connector resource: ``GET`` reads its state, ``DELETE`` clears it.
+
+The first published template serving two methods (contract 0.9, #1527), which
+is why :data:`MOUNTED` below carries it twice.
+"""
+
+DRIVE_SYNC_PATH: Final[str] = "/v1/connectors/drive/syncs"
+"""The Drive incremental-sync endpoint (contract 0.9, #1527)."""
+
 HEALTH_PATH: Final[str] = "/v1/health"
 """The liveness probe."""
 
@@ -128,6 +142,18 @@ OP_REFLECTIONS: Final[str] = "createReflection"
 OP_WHEEL: Final[str] = "getWheel"
 """``operation_id`` of ``GET /v1/wheel``."""
 
+OP_UPLOAD: Final[str] = "uploadDocument"
+"""``operation_id`` of ``POST /v1/uploads``."""
+
+OP_DRIVE_STATUS: Final[str] = "getDriveConnector"
+"""``operation_id`` of ``GET /v1/connectors/drive``."""
+
+OP_DRIVE_SYNC: Final[str] = "syncDriveConnector"
+"""``operation_id`` of ``POST /v1/connectors/drive/syncs``."""
+
+OP_DRIVE_DISCONNECT: Final[str] = "disconnectDriveConnector"
+"""``operation_id`` of ``DELETE /v1/connectors/drive``."""
+
 OP_HEALTH: Final[str] = "getHealth"
 """``operation_id`` of ``GET /v1/health``."""
 
@@ -136,6 +162,10 @@ MOUNTED: Final[tuple[tuple[str, str], ...]] = (
     ("PUT", JOURNAL_PATH),
     ("POST", REFLECTIONS_PATH),
     ("GET", WHEEL_PATH),
+    ("POST", UPLOAD_PATH),
+    ("GET", DRIVE_CONNECTOR_PATH),
+    ("POST", DRIVE_SYNC_PATH),
+    ("DELETE", DRIVE_CONNECTOR_PATH),
     ("GET", HEALTH_PATH),
 )
 """Every ``(method, concrete path)`` pair a client can actually reach."""
@@ -145,6 +175,10 @@ MOUNTED_IDS: Final[tuple[str, ...]] = (
     "journal-upsert",
     "reflections",
     "wheel",
+    "upload",
+    "drive-status",
+    "drive-sync",
+    "drive-disconnect",
     "health",
 )
 """Stable parametrize ids for :data:`MOUNTED`, in the same order."""
@@ -153,10 +187,22 @@ VERSIONED: Final[tuple[tuple[str, str], ...]] = (
     ("PUT", JOURNAL_PATH),
     ("POST", REFLECTIONS_PATH),
     ("GET", WHEEL_PATH),
+    ("POST", UPLOAD_PATH),
+    ("GET", DRIVE_CONNECTOR_PATH),
+    ("POST", DRIVE_SYNC_PATH),
+    ("DELETE", DRIVE_CONNECTOR_PATH),
 )
-"""The three routes the contract-version gate applies to."""
+"""The seven routes the contract-version gate applies to."""
 
-VERSIONED_IDS: Final[tuple[str, ...]] = ("journal-upsert", "reflections", "wheel")
+VERSIONED_IDS: Final[tuple[str, ...]] = (
+    "journal-upsert",
+    "reflections",
+    "wheel",
+    "upload",
+    "drive-status",
+    "drive-sync",
+    "drive-disconnect",
+)
 """Stable parametrize ids for :data:`VERSIONED`."""
 
 STUB_METHOD: Final[str] = "POST"
@@ -211,6 +257,19 @@ VALID_REFLECTION_BODY: Final[dict[str, Any]] = {
     "max_notes": 2,
 }
 """A body that validates against ``ReflectionRequest``."""
+
+VALID_UPLOAD_BODY: Final[dict[str, Any]] = {
+    "filename": "note.md",
+    # base64 of b"a sentence the server must never echo\n", derived at import
+    # rather than pasted, so the fixture cannot drift from the plaintext the
+    # leak sweeps look for.
+    "content_base64": base64.b64encode(
+        b"a sentence the server must never echo\n"
+    ).decode("ascii"),
+    "external_id": "adepthood:doc:support",
+    "tier": "open",
+}
+"""A body that validates against ``UploadRequest``."""
 
 
 # --------------------------------------------------------------------------- #
@@ -476,8 +535,12 @@ def mounted_routes(app: Starlette) -> list[Route]:
 def mounted_method_paths(app: Starlette) -> set[tuple[str, str]]:
     """Return the ``(method, path template)`` pairs *app* actually serves.
 
-    ``HEAD`` is dropped: Starlette adds it implicitly alongside ``GET`` and it
-    is not a published operation.
+    Unfiltered on purpose. This helper used to drop ``HEAD`` on the grounds
+    that Starlette adds it implicitly alongside ``GET`` and it "is not a
+    published operation" — but a verb the server answers *is* served whether or
+    not anyone published it, and the filter is what let four undeclared ``HEAD``
+    operations accumulate behind a green suite (#1143). What the helper reports
+    is now the wire truth, and it is the route table's job to match it.
 
     Args:
         app: The application under test.
@@ -489,7 +552,6 @@ def mounted_method_paths(app: Starlette) -> set[tuple[str, str]]:
         (method, route.path)
         for route in mounted_routes(app)
         for method in (route.methods or set())
-        if method != "HEAD"
     }
 
 

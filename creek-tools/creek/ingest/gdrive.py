@@ -23,7 +23,9 @@ Architecture:
   as the Drive ``modified_time`` for incremental sync.
 * :func:`route_to_ingestor` — maps a downloaded file's extension to
   the canonical Creek ingestor key (``markdown``, ``document``,
-  ``image``, ``spreadsheet``, ``presentation``, or ``generic``).
+  ``image``, ``spreadsheet``, ``presentation``, or ``generic``), or
+  raises :class:`UnsupportedSourceError` for a structured format the
+  ``generic`` fallback would flatten into one blob (#1526).
 
 Optional dependencies (install separately to enable real downloads):
 
@@ -88,7 +90,45 @@ _NATIVE_EXPORT_TARGETS: dict[str, tuple[str, str]] = {
 """Per-native-mime: (export mime type, export filename suffix)."""
 
 
-_INGESTOR_BY_EXTENSION: dict[str, str] = {
+@dataclass(frozen=True)
+class _Refuse:
+    """A refusal route — an extension Creek must not flatten into one blob.
+
+    Attributes:
+        guidance: What the caller should do instead, in caller-facing prose.
+            It is the entire value of refusing over falling through to
+            ``generic``, so it names a concrete command or path rather than
+            merely reporting that the format is unsupported.
+    """
+
+    guidance: str
+
+
+STRUCTURED_EXPORT_GUIDANCE: Final[str] = (
+    "A conversation export holds many conversations, not one document, and "
+    "the generic fallback would file the whole file as a single "
+    "undifferentiated blob. Send the whole export as a .zip archive, which "
+    "Creek unpacks and reads with the matching ingestor, or run `creek "
+    "ingest --type <chatgpt|claude|discord|substack> --input <export-dir>` "
+    "against the unpacked directory."
+)
+
+ARCHIVE_GUIDANCE: Final[str] = (
+    "An export archive is a container of many files, not one document. Creek "
+    "unpacks .zip export archives, so re-pack this one as .zip and send that. "
+    "Unpack it and run `creek ingest --type "
+    "<chatgpt|claude|discord|substack> --input <unpacked-dir>` to ingest it "
+    "locally instead."
+)
+
+LEGACY_OFFICE_GUIDANCE: Final[str] = (
+    "Creek reads the Office Open XML formats. Re-save this document as "
+    ".docx, .xlsx or .pptx and send that instead."
+)
+
+
+_EXTENSION_ROUTES: dict[str, str | _Refuse] = {
+    # --- routed: an INGESTOR_REGISTRY key -----------------------------
     ".md": "markdown",
     ".markdown": "markdown",
     ".docx": "document",
@@ -107,7 +147,43 @@ _INGESTOR_BY_EXTENSION: dict[str, str] = {
     ".bmp": "image",
     ".tiff": "image",
     ".webp": "image",
+    # --- refused: structured formats `generic` would silently ruin -----
+    ".json": _Refuse(STRUCTURED_EXPORT_GUIDANCE),
+    ".jsonl": _Refuse(STRUCTURED_EXPORT_GUIDANCE),
+    ".ndjson": _Refuse(STRUCTURED_EXPORT_GUIDANCE),
+    ".zip": _Refuse(ARCHIVE_GUIDANCE),
+    ".tar": _Refuse(ARCHIVE_GUIDANCE),
+    ".tgz": _Refuse(ARCHIVE_GUIDANCE),
+    ".gz": _Refuse(ARCHIVE_GUIDANCE),
+    ".bz2": _Refuse(ARCHIVE_GUIDANCE),
+    ".xz": _Refuse(ARCHIVE_GUIDANCE),
+    ".7z": _Refuse(ARCHIVE_GUIDANCE),
+    ".rar": _Refuse(ARCHIVE_GUIDANCE),
+    ".doc": _Refuse(LEGACY_OFFICE_GUIDANCE),
+    ".xls": _Refuse(LEGACY_OFFICE_GUIDANCE),
+    ".ppt": _Refuse(LEGACY_OFFICE_GUIDANCE),
 }
+"""The single declaration of extension dispatch (#1526).
+
+One table, not an ingestor map beside a sibling refusal set: two lists
+drift, and the drift is invisible — an extension added to one and forgotten
+in the other fails silently, in exactly the direction this table exists to
+close. Every entry is either a :data:`creek.ingest.INGESTOR_REGISTRY` key
+(route it) or a :class:`_Refuse` (refuse it, with guidance), and
+:func:`route_to_ingestor` reads this table and nothing else.
+
+**Where the ``generic`` fallback keeps its mandate.** An extension absent
+from this table still falls through to ``generic``, deliberately:
+``generic`` remains the right answer for genuinely plain-text-ish content —
+``.yaml``, ``.log``, ``.org``, an extensionless ``README`` — which it
+decodes and files faithfully, and removing the fallback wholesale would
+reject that content for no gain. What it must never be handed is an
+*unrecognised structured* format, where one file is a container of many
+units: a conversation export, an archive, a legacy binary Office document.
+Flattening one of those into a single fragment is a silent wrong result,
+not a lossy-but-honest one, so each is enumerated above and refused with a
+remedy.
+"""
 
 
 # ---- Public dataclasses + protocol -------------------------------------
@@ -968,14 +1044,61 @@ def check_drive(
 # ---- Routing helper ----------------------------------------------------
 
 
-def route_to_ingestor(path: Path) -> str:
-    """Return the Creek ingestor key for *path* by file extension.
+class UnsupportedSourceError(ValueError):
+    """An extension naming a structured format ``generic`` would silently ruin.
 
-    Falls back to the ``generic`` ingestor for unrecognised
-    extensions, matching the existing :data:`INGESTOR_REGISTRY` keys
-    in :mod:`creek.ingest`.
+    Raised by :func:`route_to_ingestor` instead of returning ``"generic"``,
+    so a caller that uploads its ChatGPT ``conversations.json`` is told what
+    to do rather than handed a success response over one undifferentiated
+    blob (#1526).
+
+    Attributes:
+        suffix: The lower-cased extension that was refused.
+        guidance: The caller-facing remedy; also carried in ``str(self)``.
     """
-    return _INGESTOR_BY_EXTENSION.get(path.suffix.lower(), "generic")
+
+    def __init__(self, suffix: str, guidance: str) -> None:
+        """Compose the refusal message from *suffix* and its *guidance*.
+
+        Args:
+            suffix: The lower-cased extension that was refused.
+            guidance: What the caller should do instead.
+        """
+        self.suffix = suffix
+        self.guidance = guidance
+        super().__init__(
+            f"Creek cannot ingest a '{suffix}' file as a single document. {guidance}"
+        )
+
+
+def route_to_ingestor(path: Path) -> str:
+    """Return the Creek ingestor key for *path*, or refuse its extension.
+
+    Dispatch reads :data:`_EXTENSION_ROUTES` and nothing else — see that
+    table for why the routes and the refusals are one declaration, and for
+    where the ``generic`` fallback keeps its mandate.
+
+    Args:
+        path: The staged or downloaded file whose extension decides the
+            ingestor. Only the suffix is read; the file need not exist.
+
+    Returns:
+        The :data:`creek.ingest.INGESTOR_REGISTRY` key for a routed
+        extension, or ``"generic"`` for an extension the table does not
+        mention at all — still the honest answer for plain-text-ish content.
+
+    Raises:
+        UnsupportedSourceError: When the extension names a structured format
+            the table refuses (a conversation export, an archive, a legacy
+            binary Office document). Refusing beats routing to ``generic``,
+            which would report success over one undifferentiated blob
+            (#1526).
+    """
+    suffix = path.suffix.lower()
+    route = _EXTENSION_ROUTES.get(suffix)
+    if isinstance(route, _Refuse):
+        raise UnsupportedSourceError(suffix, route.guidance)
+    return route if route is not None else "generic"
 
 
 # ---- Downloader --------------------------------------------------------
@@ -1298,9 +1421,12 @@ def build_drive_connector(
 
 
 __all__ = [
+    "ARCHIVE_GUIDANCE",
     "GOOGLE_DOCS_MIME",
     "GOOGLE_SHEETS_MIME",
     "GOOGLE_SLIDES_MIME",
+    "LEGACY_OFFICE_GUIDANCE",
+    "STRUCTURED_EXPORT_GUIDANCE",
     "DownloadResult",
     "DriveClient",
     "DriveFile",
@@ -1308,6 +1434,7 @@ __all__ = [
     "GoogleApiUnavailableError",
     "GoogleDriveConnector",
     "GoogleDriveDownloader",
+    "UnsupportedSourceError",
     "build_drive_connector",
     "route_to_ingestor",
 ]

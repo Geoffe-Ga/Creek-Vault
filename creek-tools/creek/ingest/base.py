@@ -23,7 +23,7 @@ import logging
 from contextlib import suppress
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 from zoneinfo import ZoneInfo
 
 import chardet
@@ -184,6 +184,40 @@ class ProvenanceEntry(BaseModel):
     """Status of the ingest operation (e.g., 'success', 'error', 'skipped')."""
 
 
+PASSTHROUGH_FRONTMATTER_KEYS: Final[frozenset[str]] = frozenset(
+    {"sheet", "rows", "columns"}
+)
+"""Unmodelled frontmatter keys an ingestor may put on the vault file (#1392).
+
+``Fragment`` leaves pydantic's default ``extra="ignore"``, so any key an
+ingestor emits that the model does not declare is discarded by
+``Fragment.model_validate`` and never reaches disk. That is the right default
+— it is what stops an ingestor's typo from becoming permanent frontmatter —
+but it also silently dropped the spreadsheet ingestor's ``sheet``, ``rows``
+and ``columns``, which post-#1305 are the only structured record of *which
+sheet* a per-sheet fragment came from. #1305 pinned the drop as
+accepted-for-now and named #1392 as where to decide it; this is the decision.
+
+A key belongs here only when it is **structured provenance an automated
+consumer needs and ``Fragment`` deliberately does not model**. Everything else
+an ingestor emits is still dropped. The allowlist exists so that surfacing
+these three did not become ``extra="allow"``, where every future typo lands on
+disk in a thousand fragments before anyone notices.
+
+Deliberately a module-level constant rather than a per-ingestor class
+attribute: :func:`assemble_ingested_fragment` is the universal chokepoint and
+receives only a ``ParsedFragment``, with no ingestor instance in hand. One
+declaration site beats threading an instance through it.
+
+Note this is *not* a model field on ``Fragment`` or ``FragmentSource``.
+``_write_model`` dumps with ``model_dump(mode="json")`` and no
+``exclude_none``, so a nullable ``sheet`` field would print ``sheet: null`` on
+every fragment from every ingestor — the way ``author_name``, ``channel`` and
+``origin_key`` already do. Riding the writer's ``extra_frontmatter`` seam on
+*presence* keeps that structurally unreachable.
+"""
+
+
 class IngestedFragment(BaseModel):
     """A pipeline-ready fragment paired with its converted markdown body.
 
@@ -198,10 +232,16 @@ class IngestedFragment(BaseModel):
             metadata, classifications, and a deterministic ID.
         body: The converted Markdown body that will be written below
             the YAML frontmatter in the vault file.
+        extra_frontmatter: Unmodelled frontmatter keys, drawn from
+            :data:`PASSTHROUGH_FRONTMATTER_KEYS`, that this ingestor
+            actually emitted (#1392). Empty for every ingestor that
+            emitted none, so a fragment never gains a key its source
+            had nothing to say about.
     """
 
     fragment: Fragment
     body: str
+    extra_frontmatter: dict[str, Any] = Field(default_factory=dict)
 
 
 DISCOVERY_ERROR_PREFIX = "discover error: "
@@ -595,7 +635,15 @@ def assemble_ingested_fragment(parsed: ParsedFragment) -> IngestedFragment:
 
     fragment = Fragment.model_validate(frontmatter_dict)
     fragment = apply_tags(fragment, body)
-    return IngestedFragment(fragment=fragment, body=body)
+    # Keyed on PRESENCE, never on a nullable field: a fragment whose ingestor
+    # emitted no dimensions carries an empty dict and therefore gains no
+    # frontmatter line at all (#1392). See PASSTHROUGH_FRONTMATTER_KEYS.
+    extras = {
+        key: frontmatter_dict[key]
+        for key in PASSTHROUGH_FRONTMATTER_KEYS
+        if key in frontmatter_dict
+    }
+    return IngestedFragment(fragment=fragment, body=body, extra_frontmatter=extras)
 
 
 def file_modified_time(path: Path) -> datetime:
@@ -725,6 +773,25 @@ class Ingestor(abc.ABC):
     @abc.abstractmethod
     def generate_frontmatter(self, fragment: ParsedFragment) -> dict[str, Any]:
         """Generate YAML frontmatter metadata for a parsed fragment.
+
+        **What happens to a key ``Fragment`` does not model** (#1392) — the
+        rule, because returning a key here is not the same as writing it:
+
+        * A key ``Fragment`` declares is validated onto the model and written.
+        * A key in :data:`PASSTHROUGH_FRONTMATTER_KEYS` is *not* a model
+          field, but is carried around the model to the vault file via
+          ``IngestedFragment.extra_frontmatter`` and the writer's
+          ``extra_frontmatter`` seam. Today: ``sheet``, ``rows``, ``columns``.
+        * **Every other key is silently dropped.** ``Fragment`` leaves
+          pydantic's default ``extra="ignore"``, so ``model_validate``
+          discards it and ``_write_model`` serialises model fields only. It
+          will not reach disk and nothing will warn you.
+
+        So a new key needs either a ``Fragment`` field or an allowlist entry.
+        Emitting one and expecting it on disk is the mistake #1305 recorded
+        and #1392 fixed for the three spreadsheet dimensions; the allowlist is
+        deliberately narrow so that an ingestor's *typo* still gets dropped
+        rather than becoming permanent frontmatter.
 
         Args:
             fragment: The parsed fragment.

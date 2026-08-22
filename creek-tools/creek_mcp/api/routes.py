@@ -15,12 +15,14 @@ what lets the published OpenAPI document outlive whatever serves it.
 
 **Exposed versus implemented.** :data:`ROUTES` says which endpoints exist;
 :data:`IMPLEMENTED_CAPABILITIES` says which of them actually answer. #1075—#1077
-moved the last three capabilities from the first set into the second, so the two
-now coincide. The distinction is not obsolete: while a capability was unbuilt it
-was wired to an honest ``501`` rather than to a fabricated ``200``, because a
-stub that looks like success is one a consumer integrates against and only
-discovers in production. A fifth capability published before its handler exists
-gets exactly that treatment, from the same constant, with no code change.
+moved the last three capabilities from the first set into the second, and #1524
+(``upload``) and #1527 (``drive-connector``) both arrived already built, so the
+two still coincide. The distinction is
+not obsolete: while a capability was unbuilt it was wired to an honest ``501``
+rather than to a fabricated ``200``, because a stub that looks like success is
+one a consumer integrates against and only discovers in production. A seventh
+capability published before its handler exists gets exactly that treatment,
+from the same constant, with no code change.
 """
 
 from __future__ import annotations
@@ -31,10 +33,15 @@ from typing import TYPE_CHECKING, Final
 from creek_mcp.api.models import (
     CapabilitiesResponse,
     Capability,
+    DriveConnectorStatusResponse,
+    DriveDisconnectResponse,
+    DriveSyncResponse,
     JournalUpsertRequest,
     JournalUpsertResponse,
     ReflectionRequest,
     ReflectionResponse,
+    UploadRequest,
+    UploadResponse,
     WheelResponse,
 )
 
@@ -88,14 +95,81 @@ OP_REFLECTIONS: Final[str] = "createReflection"
 OP_WHEEL: Final[str] = "getWheel"
 """``operation_id`` of ``GET /v1/wheel``."""
 
+OP_UPLOAD: Final[str] = "uploadDocument"
+"""``operation_id`` of ``POST /v1/uploads``."""
+
+OP_DRIVE_STATUS: Final[str] = "getDriveConnector"
+"""``operation_id`` of ``GET /v1/connectors/drive``."""
+
+OP_DRIVE_SYNC: Final[str] = "syncDriveConnector"
+"""``operation_id`` of ``POST /v1/connectors/drive/syncs``."""
+
+OP_DRIVE_DISCONNECT: Final[str] = "disconnectDriveConnector"
+"""``operation_id`` of ``DELETE /v1/connectors/drive``."""
+
 OP_HEALTH: Final[str] = "getHealth"
 """``operation_id`` of ``GET /v1/health``.
 
-The five are named constants rather than bare literals in the table below
+The nine are named constants rather than bare literals in the table below
 because the adapter's handler map is keyed on them: a client generator's method
 name and a server's dispatch key have to be the same string, and two spellings
 of it are one rename away from a route mounted to nothing.
 """
+
+_UPLOAD_DECODED_CAP_BYTES: Final[int] = 10 * 1024 * 1024
+"""The decoded-document cap this route is sized to carry: 10 MiB.
+
+Equal to :data:`creek_mcp.tools.upload.MAX_UPLOAD_BYTES`, which is the limit
+that actually enforces it, and restated here rather than imported: this module
+is the framework-free half of the published surface and importing the tool
+would drag the whole ingest stack — ``creek.ingest``, the ledger, the
+ingestor registry — into the import graph of the OpenAPI generator. The two are
+pinned equal by a test, which is the cheaper end of that trade.
+"""
+
+_BASE64_NUMERATOR: Final[int] = 4
+"""Base64 emits four characters per three input bytes."""
+
+_BASE64_DENOMINATOR: Final[int] = 3
+"""…and three input bytes are what those four characters encode."""
+
+_UPLOAD_ENVELOPE_SLACK_BYTES: Final[int] = 64 * 1024
+"""Headroom for the JSON around the payload: keys, quoting, id, tier, filename.
+
+64 KiB is far more than the other four fields can occupy — ``external_id`` and
+``filename`` are bounded at 512 and 255 characters — and the surplus is
+deliberate: a cap that is *tight* against the encoding turns a legal 10 MiB
+document into a ``422`` for reasons the caller cannot see, which is a worse
+failure than a slightly generous buffer ceiling.
+"""
+
+UPLOAD_MAX_BODY_BYTES: Final[int] = (
+    _BASE64_NUMERATOR
+    * ((_UPLOAD_DECODED_CAP_BYTES + _BASE64_DENOMINATOR - 1) // _BASE64_DENOMINATOR)
+    + _UPLOAD_ENVELOPE_SLACK_BYTES
+)
+"""The request-body cap ``POST /v1/uploads`` is served under.
+
+**Why this route has its own cap at all.** The process-wide default is
+:data:`creek_mcp.httpapi.middleware.limits.DEFAULT_MAX_BODY_BYTES` — one
+mebibyte, which is comfortable for a journal entry and would silently cap
+uploads at roughly 750 KiB of document, refusing an ordinary PDF as a malformed
+request. Raising the *global* cap instead would have been the smaller diff and
+the worse change: every route would then be allowed to make the server buffer
+thirteen megabytes, and with
+:data:`~creek_mcp.httpapi.middleware.limits.DEFAULT_MAX_CONCURRENCY` in flight
+that is a memory commitment nothing on the reflection or journal path has any
+use for.
+
+Derived, never typed as a number: base64 of *N* bytes is exactly
+``4 * ceil(N / 3)`` characters, so this is the encoding of the tool's own
+decoded cap plus envelope slack. A literal here would drift the day either the
+document cap or the encoding assumption moved.
+"""
+
+
+_PATH_TEMPLATE_MARKER: Final[str] = "{"
+"""What makes a path a template rather than a literal one caller can be matched on."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +200,11 @@ class RouteSpec:
             does not declare a served contract minor.
         summary: One line of prose for the published document. Never empty — a
             blank summary publishes a blank cell.
+        max_body_bytes: A request-body cap for this route alone, or ``None`` to
+            be governed by the process-wide default. Declared on the route
+            rather than passed to the middleware so that "how big may this
+            endpoint's body be" is a published property of the endpoint, in the
+            same table the OpenAPI document and the handler map are read from.
     """
 
     path: str
@@ -136,6 +215,29 @@ class RouteSpec:
     response_model: type[BaseModel] | None
     requires_contract_version: bool
     summary: str
+    max_body_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        """Refuse a per-route body cap on a templated path.
+
+        The body-size middleware runs *above* the router — it has to, or an
+        unauthenticated caller could make the server buffer a large body before
+        anything decided whether the path even exists — so it can only match a
+        route by its literal ``scope["path"]``. A cap declared on
+        ``/v1/things/{id}`` would therefore never be found and the route would
+        quietly run under the global default, which is the failure mode where a
+        limit *looks* configured and is not. Raised at import so it is a build
+        failure rather than a surprise in production.
+
+        Raises:
+            ValueError: When a templated path declares its own cap.
+        """
+        if self.max_body_bytes is not None and _PATH_TEMPLATE_MARKER in self.path:
+            msg = (
+                f"{self.operation_id}: a per-route body cap cannot be matched on "
+                f"a templated path ({self.path})"
+            )
+            raise ValueError(msg)
 
 
 ROUTES: Final[tuple[RouteSpec, ...]] = (
@@ -180,6 +282,47 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         summary="Return the aggregate APTITUDE frequency distribution.",
     ),
     RouteSpec(
+        path="/v1/uploads",
+        method="POST",
+        operation_id=OP_UPLOAD,
+        capability=Capability.UPLOAD,
+        request_model=UploadRequest,
+        response_model=UploadResponse,
+        requires_contract_version=True,
+        summary="Ingest one uploaded document as a fragment, idempotently.",
+        max_body_bytes=UPLOAD_MAX_BODY_BYTES,
+    ),
+    RouteSpec(
+        path="/v1/connectors/drive",
+        method="GET",
+        operation_id=OP_DRIVE_STATUS,
+        capability=Capability.DRIVE_CONNECTOR,
+        request_model=None,
+        response_model=DriveConnectorStatusResponse,
+        requires_contract_version=True,
+        summary="Report the read-only Google Drive connector's state.",
+    ),
+    RouteSpec(
+        path="/v1/connectors/drive/syncs",
+        method="POST",
+        operation_id=OP_DRIVE_SYNC,
+        capability=Capability.DRIVE_CONNECTOR,
+        request_model=None,
+        response_model=DriveSyncResponse,
+        requires_contract_version=True,
+        summary="Run one incremental Google Drive sync and ingest what it fetched.",
+    ),
+    RouteSpec(
+        path="/v1/connectors/drive",
+        method="DELETE",
+        operation_id=OP_DRIVE_DISCONNECT,
+        capability=Capability.DRIVE_CONNECTOR,
+        request_model=None,
+        response_model=DriveDisconnectResponse,
+        requires_contract_version=True,
+        summary="Revoke the cached Drive credential and erase it from disk.",
+    ),
+    RouteSpec(
         path="/v1/health",
         method="GET",
         operation_id=OP_HEALTH,
@@ -196,10 +339,34 @@ A tuple rather than a list so the table is immutable at the container level as
 well as per entry: a list would let any import-time hook append a route after
 the document and the handshake had already been read off it.
 
+**Three entries share one capability**, and that is the first time the table
+has done so. ``drive-connector`` is one feature — a client that may read the
+connector's state may sync and disconnect it, and there is nothing useful it
+could negotiate in between — so it is published as one name over three verbs
+rather than as three names a server could half-implement. Nothing downstream
+assumed the mapping was injective: :data:`~creek_mcp.httpapi.handlers.HANDLERS`
+is keyed on ``operation_id``, the OpenAPI ``paths`` mapping is built with
+``setdefault`` per path, and the handshake advertises a *set*.
+
 ``/v1/health`` is the one entry with no capability. Liveness is infrastructure,
 not something a client negotiates, and it is exempt from the contract-version
 gate for the same reason — an operator debugging a version mismatch must not
 also lose their monitoring probe.
+"""
+
+ROUTE_BODY_CAPS: Final[dict[str, int]] = {
+    spec.path: spec.max_body_bytes for spec in ROUTES if spec.max_body_bytes is not None
+}
+"""Per-path request-body caps, for the one middleware that has to apply them.
+
+Derived from :data:`ROUTES` rather than written out beside the middleware, so a
+route that declares a cap cannot be mounted without it — and so the OpenAPI
+document, the handler map and the body limit are all read off one table.
+
+Keyed by the literal path because the middleware sits above the router and has
+only ``scope["path"]`` to match on; :meth:`RouteSpec.__post_init__` refuses a
+cap on a templated path for exactly that reason, which is what makes this
+comprehension total rather than lossy.
 """
 
 IMPLEMENTED_CAPABILITIES: Final[frozenset[Capability]] = frozenset(Capability)

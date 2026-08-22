@@ -32,6 +32,11 @@ an explicit ``unclassified`` only in the raw frontmatter — is ``INTIMATE``),
 :func:`max_source_tier` (the reduction over the tiers a call would carry,
 ``INTIMATE`` when empty).
 
+:func:`resolved_source_tiers` (#1031) is the identity-preserving sibling of
+:func:`source_tiers`: the same single walk, returning ``{id: tier}`` so the one
+caller that must tell a named-but-absent id from a named-but-filtered-out one
+(``creek.draft``) can. Everyone else wants the reduction and keeps the list.
+
 :func:`build_ancestor_index` / :class:`AncestorIndex` / :func:`ancestry_tiers`
 (#931) are the ancestry-aware sibling of :func:`source_tiers`, for the one
 caller — ``creek.compile`` — whose prompt renders a fragment's *ancestors*
@@ -591,14 +596,85 @@ def source_tiers(vault_path: Path, fragment_ids: Iterable[str]) -> list[PrivacyT
         calling (``creek.draft``) or fail closed to
         :attr:`~creek.models.PrivacyTier.INTIMATE` (``creek.compile``).
     """
-    requested = set(fragment_ids)
-    return [
-        fragment_tier(fragment, raw)
-        for _path, fragment, _body, raw in iter_vault_fragments(
-            vault_path / "01-Fragments",
-        )
-        if fragment.id in requested
-    ]
+    return [tier for _id, tier in _walk_source_tiers(vault_path, set(fragment_ids))]
+
+
+def _walk_source_tiers(
+    vault_path: Path,
+    requested: set[str],
+) -> Iterator[tuple[str, PrivacyTier]]:
+    """Yield ``(fragment_id, tier)`` for each *requested* file, in walk order.
+
+    The one shared walk behind :func:`source_tiers` and
+    :func:`resolved_source_tiers`, so the two can never come to inspect
+    different sets of files — the same reason the survey went through
+    :func:`creek.vault.reader.iter_vault_fragments` in the first place.
+
+    **Both callers must consume this generator to exhaustion**, and both do.
+    The uniform-cost property that :func:`source_tiers` documents at length —
+    the one that keeps ``creek compile``'s content-free refusal from leaking
+    *where* the offending fragment sits through timing — belongs to this loop
+    now, and a caller that broke out early would open exactly that channel.
+
+    Args:
+        vault_path: Vault root; fragments are read from ``01-Fragments``.
+        requested: The ids to report on, as a set so the cost is one walk.
+
+    Yields:
+        One pair per matching *file*: a vault holding two files with the
+        same ``fragment.id`` yields twice, and what to do about that is the
+        caller's policy.
+    """
+    for _path, fragment, _body, raw in iter_vault_fragments(
+        vault_path / "01-Fragments",
+    ):
+        if fragment.id in requested:
+            yield fragment.id, fragment_tier(fragment, raw)
+
+
+def resolved_source_tiers(
+    vault_path: Path,
+    fragment_ids: Iterable[str],
+) -> dict[str, PrivacyTier]:
+    """Return ``{id: tier}`` for the *fragment_ids* that resolve, in one walk.
+
+    The identity-preserving sibling of :func:`source_tiers`, for the one
+    caller that has to tell "this id resolved" from "this id did not":
+    :meth:`creek.generate.drafts.DraftGenerator._bind_routing_tier`, which
+    must route a named-but-**absent** id ``INTIMATE`` (fail closed; nothing
+    is known about it) while excluding a named-but-**filtered-out** one from
+    the survey entirely (the privacy filter already dropped it, so it
+    contributes no text to the prompt and must not raise the routing tier).
+    :func:`source_tiers`'s bare list collapses those two into one answer, and
+    collapsing them refuses drafts that leak nothing (#1031).
+
+    It is a second function rather than a flag on the first for the same
+    reason :func:`ancestry_tiers` is (#931): the two answer different
+    questions, and every existing caller wants the reduction, not the map.
+    They share ``_walk_source_tiers``, so there is one walk to keep correct.
+
+    Duplicate ids resolve to the **most sensitive** tier among the files
+    carrying them, so this cannot answer less cautiously than
+    ``max_source_tier(source_tiers(...))`` would on the same vault. A
+    last-wins map could: two files sharing an id, ``open`` written after
+    ``intimate``, would route the intimate one to the cloud.
+
+    Args:
+        vault_path: Vault root; fragments are read from ``01-Fragments``.
+        fragment_ids: The ids whose tiers the caller needs.
+
+    Returns:
+        A mapping from resolved id to tier, in vault walk order. An id that
+        does not resolve is **absent from the mapping** rather than an
+        error — so, unlike :func:`source_tiers`, "asked for nothing" and
+        "nothing asked for resolved" stay distinguishable by the caller.
+    """
+    resolved: dict[str, PrivacyTier] = {}
+    for fragment_id, tier in _walk_source_tiers(vault_path, set(fragment_ids)):
+        previous = resolved.get(fragment_id)
+        if previous is None or tier_sensitivity(tier) > tier_sensitivity(previous):
+            resolved[fragment_id] = tier
+    return resolved
 
 
 @dataclass(frozen=True)

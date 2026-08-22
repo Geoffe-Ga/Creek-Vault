@@ -302,13 +302,23 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     "creek.reflect": ToolPosture(
         posture=ReadPosture.GATED,
         rationale=(
-            "Two unsupplied reads, under two gates. (1) An entry_ref resolves "
-            "a fragment the caller did not supply; _above_ceiling refuses it "
-            "before the care seam, the grounding retrieval, or the model "
-            "(#846). (2) The grounding corpus walk, live since #964, is gated "
-            "by to_privacy_override -> tier_within_override's hard rank cutoff "
-            "inside RetrievalSpecialist: only within-ceiling fragments are "
-            "admitted, and they contribute their titles only."
+            "Three unsupplied reads, under three gates. (1) An entry_ref "
+            "resolves a fragment the caller did not supply; _above_ceiling "
+            "refuses it before the care seam, the grounding retrieval, or the "
+            "model (#846). (2) The grounding corpus walk, live since #964, is "
+            "gated by to_privacy_override -> tier_within_override's hard rank "
+            "cutoff inside RetrievalSpecialist: only within-ceiling fragments "
+            "are admitted, and they contribute their titles only. (3) The "
+            "compiled-layer lookup behind related_praxis / related_eddies "
+            "(#873) walks 01-Fragments unfiltered on purpose -- it must see "
+            "the above-ceiling fragments in order to notice that a page was "
+            "compiled from one -- and gates on the way out instead, in "
+            "creek_mcp.compiled_pages._provenance_admitted: an eddy or praxis "
+            "page reaches the response only when every fragment it was "
+            "compiled from ranks within the ceiling, and a page whose "
+            "provenance cannot be enumerated in full is withheld as opaque. "
+            "No fragment body, title or id from that walk is returned; only "
+            "the compiled page's own published fields are."
         ),
         gate_module="creek_mcp.tools.reflect",
         gate_symbol="_above_ceiling",

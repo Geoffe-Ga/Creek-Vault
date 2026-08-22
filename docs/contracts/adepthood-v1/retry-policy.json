@@ -7,5 +7,6 @@
   "temporarily_unavailable": "retry_with_backoff",
   "unauthenticated": "terminal",
   "unavailable": "retry_after_operator_action",
-  "unsupported_capability": "terminal"
+  "unsupported_capability": "terminal",
+  "unsupported_source": "terminal"
 }

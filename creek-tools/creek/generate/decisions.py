@@ -18,7 +18,6 @@ from datetime import date
 from typing import TYPE_CHECKING
 
 import frontmatter
-import yaml
 
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
@@ -35,7 +34,11 @@ from creek.models import (
     PrivacyTier,
     _generate_decision_id,
 )
-from creek.vault.reader import iter_vault_fragments
+from creek.vault.reader import (
+    FRONTMATTER_LOAD_ERRORS,
+    iter_vault_fragments,
+    load_post_or_raise,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -427,7 +430,7 @@ class DecisionDetector:
             raise ValueError(msg)
 
         # Update frontmatter
-        post = frontmatter.load(str(source_path))
+        post = load_post_or_raise(source_path)
         post["status"] = new_phase
         source_path.write_text(frontmatter.dumps(post), encoding="utf-8")
 
@@ -498,6 +501,17 @@ class DecisionDetector:
             decision_id: The decision ID to find.
             decisions_dir: The 08-Decisions directory path.
 
+        An unreadable neighbour costs itself, not the search: ``08-Decisions``
+        is an operator-editable folder, and this load was unguarded, so one
+        hand-edited note there — a non-string frontmatter key raises
+        ``TypeError`` out of ``frontmatter.load``'s ``**metadata`` splat —
+        aborted every lookup in the folder rather than being stepped over
+        (#924, #1475). Skipping is the same policy the module's other loader,
+        :func:`_load_post`, already applies, and it is safe here because the
+        skipped file could not have answered the query anyway: its ``id`` is
+        exactly what could not be read. The cost is the one #926 tracks — the
+        note is invisible, so a subsequent write may duplicate it.
+
         Returns:
             Path to the matching note, or None if not found.
         """
@@ -506,7 +520,11 @@ class DecisionDetector:
             if not search_dir.exists():
                 continue
             for md_file in search_dir.glob("*.md"):
-                post = frontmatter.load(str(md_file))
+                try:
+                    post = frontmatter.load(str(md_file))
+                except FRONTMATTER_LOAD_ERRORS:
+                    logger.debug("Skipping unreadable decision note: %s", md_file)
+                    continue
                 if post.get("id") == decision_id:
                     return md_file
         return None
@@ -674,7 +692,7 @@ def _load_post(path: Path) -> frontmatter.Post | None:
     """
     try:
         return frontmatter.load(str(path))
-    except (OSError, ValueError, yaml.YAMLError):
+    except FRONTMATTER_LOAD_ERRORS:
         return None
 
 
@@ -850,7 +868,7 @@ class DecisionContextGatherer:
         Returns:
             The path that was updated.
         """
-        post = frontmatter.load(str(decision_path))
+        post = load_post_or_raise(decision_path)
         body = post.content
         existing = re.search(r"\n## Context\b.*", body, flags=re.DOTALL)
         new_section = context_section.rstrip() + "\n"
@@ -1166,7 +1184,7 @@ def decision_from_note(note_path: Path) -> Decision:
         A :class:`~creek.models.Decision` built from the note's
         frontmatter. Missing fields fall back to the model defaults.
     """
-    post = frontmatter.load(str(note_path))
+    post = load_post_or_raise(note_path)
     metadata = post.metadata.copy()
     metadata["title"] = metadata.get("title") or note_path.stem
     metadata["id"] = metadata.get("id") or _generate_decision_id()

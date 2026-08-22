@@ -21,9 +21,11 @@ from creek.classify.privacy_filter import (
     ancestry_tiers,
     build_ancestor_index,
     filter_fragments_by_tier,
+    max_source_tier,
     override_elevates,
     parse_include_tier,
     record_privacy_override,
+    resolved_source_tiers,
     source_tiers,
     tier_within_override,
 )
@@ -608,3 +610,62 @@ def test_source_tiers_stays_ancestry_blind(tmp_path: Path) -> None:
 
     assert source_tiers(tmp_path, ["frag-kid"]) == [PrivacyTier.OPEN]
     assert PrivacyTier.INTIMATE in ancestry_tiers(tmp_path, ["frag-kid"])
+
+
+def _write_node(root: Path, frag_id: str, tier: PrivacyTier) -> None:
+    """Write one fragment file for *frag_id* at *tier* under *root*.
+
+    Args:
+        root: Directory to write into (created if needed).
+        frag_id: The fragment id, also the file stem.
+        tier: The declared privacy tier.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    fragment, _raw = _node(frag_id, tier=tier)
+    post = frontmatter.Post(content="body", **fragment.model_dump(mode="json"))
+    (root / f"{frag_id}.md").write_text(frontmatter.dumps(post), encoding="utf-8")
+
+
+def test_resolved_source_tiers_keeps_ids_and_omits_the_unresolved(
+    tmp_path: Path,
+) -> None:
+    """The map answers per id, which is what ``source_tiers`` cannot do (#1031).
+
+    ``creek draft`` has to route a named-but-absent id ``INTIMATE`` while
+    excluding a named-but-filtered-out one from its survey entirely, and a
+    bare list of tiers cannot say which requested id a tier came from. The
+    absent id being *missing from the mapping* — rather than present with a
+    fail-closed placeholder — is the load-bearing half: it leaves the policy
+    with the caller, as this module's contract requires.
+    """
+    _write_node(tmp_path / "01-Fragments" / "Notes", "frag-open", PrivacyTier.OPEN)
+    _write_node(tmp_path / "01-Fragments" / "Notes", "frag-int", PrivacyTier.INTIMATE)
+
+    resolved = resolved_source_tiers(tmp_path, ["frag-open", "frag-int", "frag-gone"])
+
+    assert resolved == {
+        "frag-open": PrivacyTier.OPEN,
+        "frag-int": PrivacyTier.INTIMATE,
+    }
+    assert "frag-gone" not in resolved
+
+
+def test_resolved_source_tiers_keeps_the_most_sensitive_duplicate(
+    tmp_path: Path,
+) -> None:
+    """Two files sharing an id resolve to the more sensitive of the two.
+
+    ``source_tiers`` yields one tier per *file*, so its callers' ``max``
+    reduction already sees both. A last-wins map would not: the ``open``
+    file sorts after the ``intimate`` one here, so a naive
+    ``resolved[id] = tier`` sends the intimate body to the cloud, and this
+    map would answer *less* cautiously than the list it sits beside.
+    """
+    _write_node(tmp_path / "01-Fragments" / "A", "frag-dup", PrivacyTier.INTIMATE)
+    _write_node(tmp_path / "01-Fragments" / "B", "frag-dup", PrivacyTier.OPEN)
+
+    resolved = resolved_source_tiers(tmp_path, ["frag-dup"])
+
+    assert resolved == {"frag-dup": PrivacyTier.INTIMATE}
+    # And it cannot disagree with the reduction over the list-returning twin.
+    assert max_source_tier(source_tiers(tmp_path, ["frag-dup"])) == resolved["frag-dup"]

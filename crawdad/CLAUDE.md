@@ -21,6 +21,7 @@ These mirror `creek-tools/CLAUDE.md` at a smaller scale:
    - Cyclomatic complexity ≤ 10 per function (Xenon `--max-absolute B`)
    - MyPy strict mode, zero violations
    - Ruff lint + format, zero violations
+   - Vulture, zero dead-code findings (shared policy, no allowlist)
    - Bandit, zero medium-or-above findings
    - pip-audit, zero known vulnerabilities across both the installed
      environment and the exported `uv.lock` — no suppression without
@@ -121,8 +122,11 @@ Four gates, each must pass before the next:
     (#1088). See [§5.3](#53-redaction-scan-gate-feat-027-1054).
   - `attachments.channel_privacy_tiers` — per-channel declared ceiling
     (`open` / `personal` / `intimate` / `all`), validated at
-    config-parse time. See [§5.2](#52-bot-capture-boundary) for how
-    bot-capture reads it.
+    config-parse time. A **thread** inherits its parent channel's entry:
+    `_channel_tier` resolves the most restrictive of the thread's own
+    entry and its `parent_id`'s, so declaring the parent is enough
+    (#1265). See [§5.2](#52-bot-capture-boundary) for how bot-capture
+    reads it.
 
 Both allowlists must be non-empty — an empty list is a configuration
 error, not "open to everyone".
@@ -163,9 +167,19 @@ later Tier-A ingest. A message is captured only when **both** hold:
    |---|---|
    | `open` | yes (narrower than needed once landed) |
    | `personal` | yes (exact match) |
-   | unset (no `channel_privacy_tiers` entry) | yes — `_channel_tier` falls back to `personal` |
+   | unset (no `channel_privacy_tiers` entry, and no parent with one) | yes — `_channel_tier` falls back to `personal` |
    | `intimate` | **no** |
    | `all` | **no** — admits intimate content by definition |
+
+   "Declared tier" is the **resolved** tier, not the raw entry for
+   `message.channel.id`. Inside a thread, `message.channel.id` is the
+   *thread's* id, so `_channel_tier` also looks up
+   `discord.Thread.parent_id` and takes the most restrictive of the two
+   by `crawdad.intents.CEILING_RANK` — the one tier-ordering table
+   (#1265). A thread in an `intimate` parent is therefore refused even
+   when the thread itself is unlisted, and a thread may declare itself
+   stricter than an `open` parent. A parent that cannot be determined
+   contributes nothing, so the fail-closed `personal` default stands.
 
    A capture record carries no tier field, and the creek-tools side
    that stages the capture dir drops channel metadata, so a captured
@@ -333,6 +347,7 @@ The bot does **not** exit on MCP subprocess failure. The pattern is:
 | Type checking | strict, zero | `mypy --strict` |
 | Lint + format | zero | `ruff check` + `ruff format` |
 | Security | zero medium+ | `bandit -r crawdad/ -ll` |
+| Dead code | zero findings | `./scripts/lint-vulture.sh` (creek-tools' shared policy, `--scope crawdad`) |
 | Dependency vulnerabilities | zero known | `pip-audit` (installed env + exported `uv.lock` — `./scripts/security.sh`) |
 
 `scripts/security.sh` runs `pip-audit` twice because crawdad has two

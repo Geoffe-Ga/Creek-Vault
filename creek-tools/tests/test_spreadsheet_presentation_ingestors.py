@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import frontmatter
 import pytest
@@ -32,7 +32,7 @@ from creek.vault.writer import VaultWriter
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from creek.ingest.base import IngestedFragment, Ingestor
+    from creek.ingest.base import IngestedFragment, Ingestor, ParsedFragment
 
 
 # ---- Stub backends -----------------------------------------------------
@@ -457,7 +457,17 @@ class TestSpreadsheetFrontmatter:
         self,
         tmp_path: Path,
     ) -> None:
-        """Frontmatter has source.platform=spreadsheet plus sheet/row/col counts."""
+        """The ingestor's RETURNED dict carries platform plus sheet/row/col counts.
+
+        Scope is the point of this docstring. This asserts the mapping
+        ``generate_frontmatter`` returns — no ``VaultWriter``, no file, no
+        disk. Until #1392 it read like coverage of the vault's frontmatter
+        and was not: all three keys were dropped on the way to disk by
+        ``Fragment``'s ``extra="ignore"``, and nothing here would have
+        noticed. The disk half is
+        ``TestMultiSheetWorkbookIdentity.test_sheet_rows_and_columns_survive_to_disk``;
+        read the two together or neither means what it appears to.
+        """
         from datetime import UTC, datetime
 
         from creek.ingest.base import ParsedFragment
@@ -1713,39 +1723,51 @@ class TestMultiSheetWorkbookIdentity:
         }
         assert [path for path in blank_files if path.stem.endswith("-")] == []
 
-    def test_sheet_rows_and_columns_do_not_survive_to_disk(
+    def test_sheet_rows_and_columns_survive_to_disk(
         self,
         tmp_path: Path,
     ) -> None:
-        """Sheet/rows/columns never reach disk; the title carries the sheet.
+        """Sheet/rows/columns reach the vault file, and so does the title (#1392).
 
-        A deliberate, accepted drop rather than an oversight worth
-        widening the model for. ``generate_frontmatter`` emits ``sheet``,
-        ``rows`` and ``columns``, but ``Fragment.model_config``
-        leaves pydantic's default ``extra="ignore"``,
-        so ``Fragment.model_validate`` discards all three and
-        ``_write_model`` serialises only model fields. Per-sheet identity
-        is therefore carried by ``title``, by the filename, by the body
-        heading, and — on the ledgered path — by ``source.origin_key``.
+        **This test is the deliberate inversion of the #1305 pin it
+        replaces.** That pin recorded the drop as accepted-for-now and said
+        in as many words: "Revisiting the drop is tracked in #1392. If that
+        issue decides to surface the fields, this test is the one to update
+        — deliberately, not incidentally." #1392 decided to surface them,
+        and this is that update. It is not an incidental loosening: the
+        assertions were flipped, not deleted, and the two guards that make
+        the decision safe live beside it —
+        :meth:`test_a_frontmatter_key_outside_the_allowlist_is_still_dropped`
+        here, and ``test_a_markdown_fragment_gains_no_dimension_keys`` in
+        ``tests/test_ingest_rendered_body_hash.py``, which pins that a
+        fragment whose ingestor emitted no dimensions gains no keys.
 
-        ``TestSpreadsheetFrontmatter.test_frontmatter_records_platform_and_dimensions``
-        (~line 451) asserts those three keys on the dict the *ingestor*
-        returns. That remains true and is left alone; this test pins the
-        other half of the story, which is that they never reach the vault.
+        The mechanism is the writer's existing ``extra_frontmatter`` seam
+        (used today for thread/eddy ``aliases``), gated by an explicit
+        allowlist — **not** ``extra="allow"`` on ``Fragment``, which would
+        let every ingestor typo become frontmatter, and **not** a nullable
+        model field, which ``_write_model``'s ``model_dump(mode="json")``
+        would print as ``sheet: null`` on every fragment in the vault.
 
-        The frontmatter-key assertions hold before and after the fix; the
-        ``title`` assertion is the RED one, since today every sheet's
-        fragment is titled ``book`` from the source-stem fallback in
-        ``assemble_ingested_fragment``.
+        Driven through ``run_ingest`` rather than ``_write_all``: the
+        passthrough is a property of the real write path, and a helper that
+        calls ``write_fragment`` directly steps over the seam under test.
 
-        Revisiting the drop is tracked in #1392. If that issue decides to
-        surface the fields, this test is the one to update — deliberately,
-        not incidentally.
+        RED today on the three dimension keys; the ``title`` assertion is
+        green and stays green.
         """
+        from creek.ingest.pipeline import run_ingest
+
         source = tmp_path / "book.xlsx"
         _write_real_workbook(source, ["Budget", "Notes", "Q3"])
         vault = _scaffold_vault(tmp_path)
-        _write_all(vault, _assemble_all(SpreadsheetIngestor(), source))
+        result = run_ingest(
+            ingestor_cls=SpreadsheetIngestor,
+            source_type="spreadsheet",
+            input_path=source,
+            vault_path=vault,
+        )
+        assert result.errors == [], result.errors
 
         budget = [
             path
@@ -1754,10 +1776,56 @@ class TestMultiSheetWorkbookIdentity:
         ]
         assert len(budget) == 1
         post = frontmatter.load(str(budget[0]))
-        assert "sheet" not in post.metadata
-        assert "rows" not in post.metadata
-        assert "columns" not in post.metadata
+        assert post.metadata["sheet"] == "Budget"
+        assert post.metadata["rows"] == 1
+        assert post.metadata["columns"] == 2
         assert post["title"] == "book — Budget"
+
+    def test_a_frontmatter_key_outside_the_allowlist_is_still_dropped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unlisted key an ingestor emits must never reach the vault (#1392).
+
+        GREEN today and the ratchet on the #1392 decision: the passthrough
+        is an explicit allowlist of structured provenance, so a misspelled
+        ``sheat`` — or any future key an ingestor grows — is still dropped.
+        This is what stops the fix from being implemented as
+        ``extra="allow"`` by the back door, where the mistake is invisible
+        until it is on disk in a thousand fragments.
+        """
+        from creek.ingest.pipeline import run_ingest
+
+        real = SpreadsheetIngestor.generate_frontmatter
+
+        def _with_stray_key(
+            self: SpreadsheetIngestor,
+            fragment: ParsedFragment,
+        ) -> dict[str, Any]:
+            """Return the real frontmatter plus one key no allowlist names."""
+            data = real(self, fragment)
+            data["sheat"] = 1
+            return data
+
+        monkeypatch.setattr(
+            SpreadsheetIngestor, "generate_frontmatter", _with_stray_key
+        )
+
+        source = tmp_path / "book.xlsx"
+        _write_real_workbook(source, ["Budget"])
+        vault = _scaffold_vault(tmp_path)
+        result = run_ingest(
+            ingestor_cls=SpreadsheetIngestor,
+            source_type="spreadsheet",
+            input_path=source,
+            vault_path=vault,
+        )
+        assert result.errors == [], result.errors
+
+        files = _fragment_files(vault)
+        assert len(files) == 1
+        assert "sheat" not in frontmatter.load(str(files[0])).metadata
 
 
 class TestSingleUnitIdentityIsUnchanged:

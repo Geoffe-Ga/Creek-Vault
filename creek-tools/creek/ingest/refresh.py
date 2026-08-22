@@ -53,7 +53,11 @@ from creek.ingest.turns import (
     split_conversation_body,
 )
 from creek.models import Authorship, Fragment
-from creek.vault.reader import try_load_fragment
+from creek.vault.reader import (
+    FRONTMATTER_LOAD_ERRORS,
+    load_post_or_raise,
+    try_load_fragment,
+)
 from creek.vault.writer import VaultWriter
 
 if TYPE_CHECKING:
@@ -96,8 +100,17 @@ class RefreshDatesResult:
 # Keeping this as a table (rather than nested if/elif) keeps the dispatch
 # loop's cyclomatic complexity flat as new formats are added.
 def _markdown_authored_at_from_file(path: Path) -> datetime | None:
-    """Re-run the markdown frontmatter chain against a single source file."""
-    post = frontmatter.load(str(path))
+    """Re-run the markdown frontmatter chain against a single source file.
+
+    Returns ``None`` for an unreadable source rather than raising: this is a
+    best-effort date probe over files the operator still owns and edits, and
+    a corrupt one should cost its own date, not the refresh run.
+    """
+    try:
+        post = frontmatter.load(str(path))
+    except FRONTMATTER_LOAD_ERRORS:
+        logger.debug("Skipping unreadable markdown source: %s", path)
+        return None
     return _extract_authored_at_from_frontmatter(post.metadata)
 
 
@@ -285,7 +298,7 @@ def _rewrite_frontmatter(md_file: Path, metadata: dict[str, object]) -> None:
     helper so YAML formatting stays consistent with the rest of the
     vault.
     """
-    post = frontmatter.load(str(md_file))
+    post = load_post_or_raise(md_file)
     post.metadata = metadata
     md_file.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
 

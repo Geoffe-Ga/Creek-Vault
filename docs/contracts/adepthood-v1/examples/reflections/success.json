@@ -8,6 +8,22 @@
       "quote": "I keep saying yes to things I do not want"
     }
   ],
+  "related_eddies": [
+    {
+      "description": "Synthetic example description of a topic cluster.",
+      "formed": "2026-03-04",
+      "fragment_count": 12,
+      "title": "Rest and Ruin"
+    }
+  ],
+  "related_praxis": [
+    {
+      "excerpt": "Synthetic example prose. A real excerpt is the praxis page's own opening lines, taken verbatim and capped.",
+      "praxis_type": "practice",
+      "status": "active",
+      "title": "Rest before the collapse"
+    }
+  ],
   "routed_tier": "personal",
   "status": "ok",
   "tier_ceiling": "personal"
