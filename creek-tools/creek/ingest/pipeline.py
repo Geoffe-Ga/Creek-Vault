@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path  # runtime use: resolving recorded source paths
 from typing import TYPE_CHECKING, Final, NamedTuple
@@ -150,6 +151,25 @@ would make every key unreadable for no additional safety.
 """
 
 
+_DERIVED_OUT_OF_VAULT_KEY_RE: Final = re.compile(
+    rf"^{_OUT_OF_VAULT_PREFIX}/[0-9a-f]{{{_PATH_DIGEST_CHARS}}}/[^/]+$",
+)
+"""Matches a string this module already minted as an out-of-vault key (#1575).
+
+Since ``source.original_file`` now *stores* the derived key rather than the
+host path, the recorded string is fed back through :func:`derive_source_key`
+by ``pin_ids`` and by the ledger's adoption proof. Without recognising its own
+output, that second derivation resolves ``external/<digest>/<name>`` against
+the current working directory and mints a *different* key — so the migration
+would write a ledger record the next ingest never looks up.
+
+Built from the same two constants the minting arm uses, so the recogniser and
+the writer cannot drift apart. An in-vault directory genuinely named
+``external/<16 hex>/`` is unaffected: the vault-relative arm produces exactly
+this string for it, so returning early is the same answer by a shorter route.
+"""
+
+
 def derive_source_key(source_path: str, vault_path: Path) -> str:
     """Return a stable ``source_key`` for a source file (#672, #953).
 
@@ -200,6 +220,8 @@ def derive_source_key(source_path: str, vault_path: Path) -> str:
     Returns:
         The vault-relative POSIX path, or the namespaced out-of-vault key.
     """
+    if _DERIVED_OUT_OF_VAULT_KEY_RE.match(source_path):
+        return source_path
     candidate = resolve_recorded_source(source_path, vault_path)
     try:
         return candidate.resolve().relative_to(vault_path.resolve()).as_posix()
@@ -404,6 +426,68 @@ def stamp_declared_tier(fragment: Fragment, declared: PrivacyTier | None) -> Non
     fragment.privacy_tier = escalate(fragment.privacy_tier, declared)
 
 
+def record_source_provenance(
+    parsed: ParsedFragment,
+    fragment: Fragment,
+    vault_path: Path,
+) -> None:
+    """Replace the host path on ``source.original_file`` with a vault key (#1575).
+
+    Every ingestor's ``parse`` records ``str(raw.path)`` verbatim, which for a
+    CLI ingest is the operator's absolute path — their account name, their
+    directory chain, and by implication the subject matter of the document.
+    Fragment frontmatter is not a private channel:
+    :mod:`creek.generate.indexes` renders ``source.original_file`` into a
+    generated vault index note, and a remote MCP caller reads fragments
+    through the tier ceiling.
+
+    **Two call sites, not eleven rewrites.** ``Ingestor.parse`` never receives
+    ``vault_path`` and therefore cannot answer "is this source inside the
+    vault", so the eleven ``parse`` implementations could not make this
+    decision even if each were edited. It is made instead at the
+    assemble-and-write boundary —
+    :func:`creek.ingest.base.assemble_ingested_fragment`, the only function
+    that turns a :class:`~creek.ingest.base.ParsedFragment` into a writable
+    :class:`~creek.models.Fragment`. That function has **three** callers, and
+    the population matters more than the sample: wiring only the first left
+    ``creek process`` writing absolute paths.
+
+    * :func:`establish_source_identity`, covering every ``run_ingest`` caller
+      — ``creek ingest``, ``creek sync``, the ``creek.ingest`` and
+      ``creek.upload`` MCP tools, and ``POST /v1/uploads``; **calls this**.
+    * :meth:`creek.pipeline.Pipeline._run_ingestion`, for ``creek process``;
+      **calls this**.
+    * :func:`creek.ingest.discord.write_fragments`, for all three Discord
+      ingest paths; **exempt** — ``DiscordIngestor`` emits no
+      ``source.original_file``, so there is no host path to redact, and
+      stamping one in would hand every fragment from one channel file the same
+      non-null key that
+      ``creek/generate/voice_authenticity.py::_conversation_key`` reads as a
+      sibling-pairing signal.
+
+    A fourth caller added without a call to this function re-opens the
+    disclosure, which is why the caller set is asserted from the source by
+    ``tests/test_ingest_source_path_privacy.py`` rather than left to a grep.
+    Doing it here also leaves
+    ``parsed.source_path`` — the *real* path — untouched in memory, which is
+    what :func:`legacy_source_key`, :func:`attach_origin_key` and the ledger's
+    adoption proof consume. The #1577 tombing behaviour is therefore preserved
+    by construction rather than by coincidence.
+
+    **The stored spelling is :func:`derive_source_key`'s**, which is already
+    what ``origin_key`` carries for ledgered sources: vault-relative under the
+    vault root, ``external/<digest>/<basename>`` outside it. Reusing it adds
+    no new class of disclosure and keeps one answer to "what is this source
+    called" instead of two that can disagree.
+
+    Args:
+        parsed: The unit about to be written, holding the real source path.
+        fragment: The assembled fragment, before it is written.
+        vault_path: Vault root.
+    """
+    fragment.source.original_file = derive_source_key(parsed.source_path, vault_path)
+
+
 def attach_origin_key(
     ledger: SourceLedger | None,
     parsed: ParsedFragment,
@@ -576,6 +660,16 @@ def establish_source_identity(
 ) -> set[str]:
     """Stamp the fragment's key, migrate it if needed, and report keys seen.
 
+    Also where :func:`record_source_provenance` runs for every caller of
+    :func:`run_ingest` — ``creek ingest``, ``creek sync``, the ``creek.ingest``
+    and ``creek.upload`` MCP tools, and ``POST /v1/uploads`` (#1575). It is
+    *not* the only place that call is needed:
+    :meth:`creek.pipeline.Pipeline._run_ingestion` assembles for
+    ``creek process`` without coming through here and makes the call itself.
+    :func:`record_source_provenance`'s docstring enumerates the whole caller
+    set and says why the third member is exempt; adding a fourth writer
+    without a call re-opens the disclosure.
+
     One call so :func:`run_ingest`'s loop gains no branch — and so the three
     things that must happen together cannot be done apart. Stamping without
     adopting re-mints an out-of-vault corpus; adopting without reporting the
@@ -586,10 +680,24 @@ def establish_source_identity(
     The legacy key is reported as seen whether or not anything was adopted.
     The set is only ever *subtracted* from the gone set, so reporting a key no
     record uses costs nothing, while omitting one that a record does use
-    relocates a live fragment. The one imprecision this admits is an in-vault
-    source at the vault root whose basename matches an out-of-vault source's:
-    its key is shielded from tombing for that run. That is a missed
-    soft-delete, never a destroyed fragment.
+    relocates a live fragment.
+
+    The imprecision this admits is broader than an earlier version of this
+    note claimed, and worth stating exactly (#1577). Because
+    :func:`legacy_source_key` derives the legacy key from ``candidate.name``
+    — the bare basename — **any** two sources sharing a basename share one
+    legacy key. So whenever one of them holds the legacy record and the other
+    is present in this pass, the survivor's seen-report shields that record
+    from the sweep. That covers the vault-root case named before, but also the
+    ordinary one: two out-of-vault directories each holding a ``notes.md``.
+    The cost is bounded to a *missed soft-delete* — never a destroyed or
+    mis-attributed fragment — and it self-corrects on the first run in which
+    the surviving namesake is absent too. Making it exact would mean reading
+    every fragment's ``source.original_file`` on every run to prove which file
+    a bare-basename record belongs to, which is the vault-wide scan #1367
+    declined. Both arms are pinned by
+    ``tests/test_ingest_legacy_key_adoption.py``'s parametrised
+    shared-vs-distinct basename pair.
 
     Args:
         ledger: The resolved ledger, or ``None`` for an unledgered run.
@@ -602,6 +710,7 @@ def establish_source_identity(
         Every ledger key this unit answers for, to be marked seen. Empty for
         an unledgered run, which has no keys and never tombs.
     """
+    record_source_provenance(parsed, fragment, vault_path)
     attach_origin_key(ledger, parsed, fragment, vault_path)
     origin_key = fragment.source.origin_key
     if ledger is None or origin_key is None:

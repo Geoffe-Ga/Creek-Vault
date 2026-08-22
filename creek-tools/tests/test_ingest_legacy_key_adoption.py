@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import frontmatter
+import pytest
 
 from creek.ingest import INGESTOR_REGISTRY, assemble_ingested_fragment
 from creek.ingest.ledger import SourceLedger
@@ -258,3 +259,69 @@ def test_pin_ids_and_ingest_converge_whichever_runs_first(tmp_path: Path) -> Non
     assert pinned.already_pinned == 1
     assert derive_source_key(str(source), vault) in _raw_ledger_keys(vault)
     assert len(_live_fragments(vault)) == 1
+
+
+@pytest.mark.parametrize(
+    ("rival_basename", "expected_tombed", "expected_live"),
+    [("notes.md", 0, 2), ("other.md", 1, 1)],
+)
+def test_a_shared_legacy_basename_shields_a_deleted_source_for_one_run(
+    tmp_path: Path,
+    rival_basename: str,
+    expected_tombed: int,
+    expected_live: int,
+) -> None:
+    """A live neighbour sharing a deleted file's basename defers its tombing.
+
+    PINNED AS INTENTIONAL, not filed as a defect (#1577).
+    :func:`creek.ingest.pipeline.establish_source_identity` reports a unit's
+    *legacy* key as seen unconditionally, and
+    :func:`creek.ingest.pipeline.legacy_source_key` derives that key from
+    ``candidate.name`` — the bare basename — for every out-of-vault source.
+    Two out-of-vault files therefore share one legacy key, so the survivor's
+    seen-report covers the deleted file's record and the tomb sweep passes
+    over it.
+
+    Making this exact would cost the vault-wide scan #1367 declined: proving
+    which file a bare-basename record belongs to means reading every
+    fragment's ``source.original_file`` on every run. The approximation is
+    correctly *scoped* rather than merely cheap — the second arm shows a
+    distinct basename still tombs on the very same run — and its cost is
+    bounded to a missed soft-delete that the next run without the neighbour
+    performs. Nothing is destroyed and nothing is mis-attributed.
+
+    The two arms are one test on purpose. An assertion on the shared arm
+    alone would still pass if tombing were disabled outright; the pair
+    cannot.
+    """
+    vault = _make_vault(tmp_path)
+    root = tmp_path / "drive" / "personal" / "journal"
+    (root / "x").mkdir(parents=True)
+    (root / "y").mkdir(parents=True)
+    deleted = root / "x" / "notes.md"
+    rival = root / "y" / rival_basename
+    deleted.write_text(_ORIGINAL, encoding="utf-8")
+    _pin_mtime(deleted)
+    _seed_legacy_state(vault, deleted, fragment_id=_LEGACY_ID, legacy_key="notes.md")
+    deleted.unlink()
+    rival.write_text(_RIVAL, encoding="utf-8")
+    _pin_mtime(rival)
+
+    result = run_ingest(
+        ingestor_cls=INGESTOR_REGISTRY["markdown"],
+        source_type="markdown",
+        input_path=root,
+        vault_path=vault,
+    )
+
+    # The full tuple, not just ``tombed``: a change in the *shape* of the
+    # seen-report — one that stopped creating the rival, or started erroring
+    # — would otherwise slip past an assertion on the sweep alone.
+    assert (result.tombed, result.created, result.errors) == (
+        expected_tombed,
+        1,
+        [],
+    )
+    live = _live_fragments(vault)
+    assert len(live) == expected_live, live
+    assert "MARKER-RIVAL" in _bodies(vault)

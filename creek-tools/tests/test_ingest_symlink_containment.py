@@ -266,7 +266,7 @@ def _spy_on_source_summary(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     """
     from creek import consent as consent_module
 
-    real_summary = consent_module._build_source_summary
+    real_summary = consent_module.build_source_summary
     calls: list[Path] = []
 
     def _recording_summary(source_path: Path, exclusions: list[str]) -> Any:
@@ -274,7 +274,7 @@ def _spy_on_source_summary(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
         calls.append(source_path)
         return real_summary(source_path, exclusions)
 
-    monkeypatch.setattr(consent_module, "_build_source_summary", _recording_summary)
+    monkeypatch.setattr(consent_module, "build_source_summary", _recording_summary)
     return calls
 
 
@@ -1020,7 +1020,7 @@ def test_cli_ingest_refuses_before_the_consent_gate_reads_the_source_tree(
     ``creek/cli.py``'s ingest handler calls ``_gate_consent`` before it
     calls ``_run_ingest``. For a first-time (unconsented) source that path
     runs ``ConsentManager.get_source_summary`` ->
-    ``creek/consent.py:134 _build_source_summary``, which walks
+    ``creek/consent.py:134 build_source_summary``, which walks
     ``source_path.rglob("*")`` and ``stat()``s every file it finds —
     following escaping links, and folding out-of-tree file counts and byte
     totals into the very summary the operator is asked to approve. That is
@@ -1111,7 +1111,7 @@ def test_cli_process_refuses_before_the_consent_gate_reads_the_source_tree(
     ``creek/cli.py``'s ``process`` handler calls ``_gate_consent`` at
     line 1211 with no containment check anywhere above it. For a first-time
     (unconsented) source that runs ``ConsentManager.get_source_summary`` ->
-    ``creek/consent.py:118 _build_source_summary``, whose ``rglob("*")`` /
+    ``creek/consent.py:118 build_source_summary``, whose ``rglob("*")`` /
     ``stat()`` pass counts the escaping link as a file and folds the
     out-of-tree target's byte total into the summary — the identical
     read-before-refuse this file already closed for ``ingest`` in section 7.
@@ -1199,7 +1199,7 @@ def test_cli_process_leaks_no_out_of_tree_filename_to_console_or_consent_log(
 
     The section-5 shape (#1360), on the ``process`` surface. When
     ``--source`` is *itself* a link to a directory outside its own parent,
-    ``_build_source_summary``'s ``rglob("*")`` runs over the target's tree
+    ``build_source_summary``'s ``rglob("*")`` runs over the target's tree
     directly — no descent into a link is needed, so this leak is
     interpreter-version-independent, unlike the descendant-link case pinned
     by ``test_rglob_does_not_descend_into_a_symlinked_directory``.

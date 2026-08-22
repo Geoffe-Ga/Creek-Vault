@@ -271,8 +271,8 @@ The fragment lands at
 `<vault>/01-Fragments/Notes/2026-08-21-Morning-Note.md`.
 
 A single file path works too — see
-[trap 2](#2-a-single-file-is-reported-as-found-0-files) for the confusing
-thing it prints while doing so.
+[trap 2](#2-a-single-file-used-to-be-reported-as-found-0-files) for the
+miscount it used to print while doing so.
 
 ### Spreadsheets, documents, presentations, images
 
@@ -618,8 +618,10 @@ format may be unrecognized.
 # exit status 1
 ```
 
-It stays silent when the ingestor discovered **nothing at all**, even though
-the consent preflight counted your files with a different scanner:
+Since #1574 it also fires on the shape it used to miss: the ingestor
+discovered **nothing at all** from a source that was not empty. The preflight
+and the ingestor now count with the same scanner, and the run says which
+files it did not read and what it would have read instead:
 
 ```console
 $ creek ingest --type substack --input ./src/sub --vault ~/Creek-Vault --yes --strict
@@ -627,23 +629,34 @@ Found: 1 file(s), 0.0 MB.
 Sample: on-silt.html
 Ingest summary: 0 created, 0 updated, 0 unchanged, 0 tombed, 0 skipped
 Ingested 0 fragment(s).
-# exit status 0
+WARNING: substack saw 1 file(s) under ./src/sub but discovered 0 input(s) —
+none of them is a file this ingestor reads.
+  substack reads post HTML named <post_id>.<slug>.html (e.g.
+  164523.on-silt.html), optionally alongside posts.csv.
+  Present but not read: on-silt.html
+# exit status 1
 ```
 
-"Found: 1 file(s)" and "Ingested 0 fragment(s)" in the same run means the
-file was skipped by the ingestor's own discovery rule — here, the missing
-Substack post-id prefix. **Read the `Ingested N fragment(s)` line, not the
-`Found` line.**
+Nine of the eleven ingestors could reach that shape, so this is not a
+Substack quirk. A genuinely *empty* input directory still exits 0 under
+`--strict` — nothing was skipped, so there is nothing to report.
 
-### 2. A single file is reported as `Found: 0 file(s)`
+`creek sync` prints the same advisory and never exits non-zero: a scheduled
+tick that aborted would fail the launchd unit and destroy the record that the
+tick ran at all.
 
-Passing one file directly works, but the preflight counter only walks
-directories, so it tells you nothing was found while a fragment is in fact
-about to be written:
+**Read the `Ingested N fragment(s)` line, not the `Found` line.**
+
+### 2. A single file used to be reported as `Found: 0 file(s)`
+
+Passing one file directly works. The preflight counter used to walk
+directories only, so it told you nothing was found while a fragment was in
+fact about to be written. Fixed in #1574 — the count below now reads
+`Found: 1 file(s)`:
 
 ```console
 $ creek ingest --type markdown --input ./src/solo/solo.md --vault ~/Creek-Vault --yes
-Found: 0 file(s), 0.0 MB.
+Found: 1 file(s), 0.0 MB.
 Consent auto-granted via --yes; recorded in consent log.
 Ingest summary: 1 created, 0 updated, 0 unchanged, 0 tombed, 0 skipped
 Ingested 1 fragment(s).
@@ -682,8 +695,8 @@ sits on disk after the markdown run above:
 id: frag-2b29e5ee28f8
 privacy_tier: unclassified
 source:
-  origin_key: note.md
-  original_file: /…/src/md/note.md
+  origin_key: external/d261fde4abdb50a7/note.md
+  original_file: external/d261fde4abdb50a7/note.md
   platform: markdown
 title: Morning Note
 ---
@@ -697,9 +710,22 @@ Three things to take from that:
    read your content yet.
 2. **The body is not encrypted and not redacted.** It is the file's prose,
    in the clear, inside the vault.
-3. **`source.original_file` records the absolute path of your original
-   file** — which leaks your directory structure and username to anyone who
-   later reads the fragment.
+3. **`source.original_file` no longer records your absolute path** (#1575).
+   It records the same vault key `origin_key` uses: the vault-relative path
+   for a source under your vault root, and `external/<digest>/<filename>` for
+   one outside it. Your account name and your directory chain do not travel
+   with the fragment; the filename still does. Before #1575 this field held
+   the full host path, and a vault seeded earlier still does — nothing
+   rewrites existing frontmatter. `creek purge source --source-path` accepts
+   either spelling, so a right-to-be-forgotten request keyed to your real
+   path keeps working across both.
+
+   One capability was traded for this: `creek ingest --refresh-dates` can no
+   longer reopen a source that lives **outside** the vault, because
+   `external/<digest>/<filename>` deliberately names nothing on disk. It
+   reports those fragments as `missing_source` rather than failing. Sources
+   inside the vault are unaffected, and in fact resolve more reliably than
+   before.
 
 ### `unclassified` is not `open` — a fresh vault is fail-closed
 

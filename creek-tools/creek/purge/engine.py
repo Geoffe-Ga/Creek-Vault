@@ -2013,7 +2013,9 @@ class PurgeEngine:
             ValueError: When *match* is unrecognised, or when
                 ``match="regex"`` and *source_path* is not a valid regex.
         """
-        predicate = _build_source_path_matcher(source_path, match=match)
+        predicate = _build_source_path_matcher(
+            source_path, match=match, vault_path=self.vault_path
+        )
         matches: list[tuple[Path, frontmatter.Post]] = []
         for frag_file in self._list_fragment_files():
             post = self._load_frontmatter_for_match(frag_file)
@@ -2694,12 +2696,31 @@ def _build_source_path_matcher(
     source_path: str,
     *,
     match: str,
+    vault_path: Path | None = None,
 ) -> Callable[[str], bool]:
     """Build a per-fragment predicate from *source_path* and *match* mode.
+
+    **``exact`` accepts either spelling of the same source (#1575).** Since
+    ingest stores :func:`creek.ingest.pipeline.derive_source_key`'s output
+    rather than the host path, an operator's right-to-be-forgotten command —
+    which names the path they know, the absolute one on their disk — would
+    otherwise match zero fragments and report success. No frontmatter
+    migration ships with that change, so a real vault holds both spellings at
+    once; reconciling only one direction would break whichever half the
+    operator happened to have. The derivation runs once, here, rather than
+    per fragment.
+
+    ``substring`` and ``regex`` are deliberately left alone: deriving a key
+    from a fragment of a path, or from a regex, is not a meaningful operation,
+    and an operator reaching for those modes is already asking for a literal
+    text match against what the vault stores.
 
     Args:
         source_path: Path string the operator passed.
         match: One of ``"exact"`` / ``"substring"`` / ``"regex"``.
+        vault_path: Vault root, enabling the derived-spelling arm of
+            ``exact``. ``None`` keeps the literal-only comparison, for a
+            caller with no vault in hand.
 
     Returns:
         A callable that takes a fragment's ``source.original_file`` and
@@ -2716,7 +2737,12 @@ def _build_source_path_matcher(
         )
         raise ValueError(msg)
     if match == "exact":
-        return lambda candidate: candidate == source_path
+        spellings = {source_path}
+        if vault_path is not None:
+            from creek.ingest.pipeline import derive_source_key
+
+            spellings.add(derive_source_key(source_path, vault_path))
+        return lambda candidate: candidate in spellings
     if match == "substring":
         return lambda candidate: source_path in candidate
     # match == "regex"

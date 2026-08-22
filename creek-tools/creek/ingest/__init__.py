@@ -7,6 +7,7 @@ literal below.
 
 Exports:
     INGESTOR_REGISTRY: A dict mapping ingestor names to their classes.
+    INGESTOR_INPUT_EXPECTATIONS: What each ingestor's discover() reads.
     RawDocument: Pydantic model for raw document data.
     ParsedFragment: Pydantic model for parsed fragment data.
     IngestResult: Pydantic model for ingest pipeline results.
@@ -70,8 +71,55 @@ INGESTOR_REGISTRY: dict[str, type[Ingestor]] = {
     "substack": SubstackIngestor,
 }
 
+INGESTOR_INPUT_EXPECTATIONS: dict[str, str] = {
+    "chatgpt": (
+        "a ChatGPT export JSON (conversations.json) sitting directly in the "
+        "source directory; nested copies are not searched"
+    ),
+    "claude": (
+        "a Claude export JSON (conversations.json) sitting directly in the "
+        "source directory; nested copies are not searched"
+    ),
+    "code": (
+        "README / CLAUDE.md / ADR notes and .py files anywhere under the "
+        "source directory"
+    ),
+    "discord": "a Discord export laid out as messages/<channel_id>/messages.json",
+    "document": (
+        "files ending .docx, .pdf, .html, .htm, .txt or .rtf; a directory that "
+        "looks like a Substack export is left for --type substack instead"
+    ),
+    "generic": (
+        "any readable text file whose extension no specialised ingestor claims "
+        "(.md and .json are claimed)"
+    ),
+    "image": "images ending .png, .jpg, .jpeg, .gif, .bmp, .tiff or .webp",
+    "markdown": "files ending .md",
+    "presentation": "presentations ending .pptx",
+    "spreadsheet": "spreadsheets ending .xlsx or .csv",
+    "substack": (
+        "post HTML named <post_id>.<slug>.html (e.g. 164523.on-silt.html), "
+        "optionally alongside posts.csv"
+    ),
+}
+"""What each registered ingestor's ``discover()`` will actually read (#1574).
+
+Read by ``creek.cli._warn_if_discovered_but_empty`` when the consent
+preflight counted files an ingestor discovered none of. Without it the
+operator is told only that zero fragments appeared, and the reason -- a
+Substack post filename missing its leading post id, a ChatGPT export one
+directory deeper than the walk looks -- stays in a ``logger.debug`` line no
+CLI run prints.
+
+Kept beside :data:`INGESTOR_REGISTRY` rather than on each ingestor class so
+the two are read together: a new ingestor whose entry is missing here is
+caught by the test asserting the two keysets are equal, not discovered later
+by an operator holding an advisory with nothing actionable in it.
+"""
+
 __all__ = [
     "ARCHIVE_GUIDANCE",
+    "INGESTOR_INPUT_EXPECTATIONS",
     "INGESTOR_REGISTRY",
     "LEGACY_OFFICE_GUIDANCE",
     "STRUCTURED_EXPORT_GUIDANCE",

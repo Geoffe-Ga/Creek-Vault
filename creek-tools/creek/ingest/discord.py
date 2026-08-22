@@ -831,6 +831,16 @@ def write_fragments(result: IngestResult, vault: Path) -> list[Path]:
     paths: list[Path] = []
     for parsed in result.fragments:
         assembled = assemble_ingested_fragment(parsed)
+        # No `record_source_provenance` call here, deliberately (#1575). This
+        # is the third caller of `assemble_ingested_fragment` and it does skip
+        # `run_ingest`, but `DiscordIngestor.parse` writes no
+        # `source.original_file` at all, so there is no host path to redact —
+        # and stamping one in would hand every fragment from a channel the
+        # same non-null source key, which is a grouping signal
+        # `creek/generate/voice_authenticity.py::_conversation_key` reads.
+        # `tests/test_ingest_source_path_privacy.py` pins both halves of that
+        # reasoning, so this exemption fails loudly if Discord ever starts
+        # recording a source path.
         # Forwarded even though this ingestor emits no passthrough keys today
         # (#1392): every assemble->write chain carries the same contract, so
         # Discord capture cannot silently diverge from `creek ingest`.

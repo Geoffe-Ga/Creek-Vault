@@ -45,6 +45,7 @@ from creek.ingest.documents import (
 from creek.ingest.html import extract_html_authored_at
 from creek.ingest.images import _extract_exif_authored_at
 from creek.ingest.markdown import _extract_authored_at_from_frontmatter
+from creek.ingest.pipeline import resolve_recorded_source
 from creek.ingest.presentations import _extract_pptx_authored_at
 from creek.ingest.spreadsheets import _extract_xlsx_authored_at
 from creek.ingest.turns import (
@@ -237,18 +238,25 @@ def refresh_authored_dates(vault_path: Path) -> RefreshDatesResult:
     for md_file in sorted(fragments_root.rglob("*.md")):
         result.scanned += 1
         try:
-            _process_fragment(md_file, result)
+            _process_fragment(md_file, result, vault_path)
         except Exception as exc:  # per-fragment isolation
             logger.exception("Backfill failed for %s", md_file)
             result.errors.append(f"{md_file}: {exc}")
     return result
 
 
-def _process_fragment(md_file: Path, result: RefreshDatesResult) -> None:
+def _process_fragment(
+    md_file: Path, result: RefreshDatesResult, vault_path: Path
+) -> None:
     """Inspect one fragment file, update its ``authored_at`` if possible.
 
     Each branch updates exactly one counter on *result* so the summary
     accurately reflects the disposition of every scanned fragment.
+
+    Args:
+        md_file: The fragment file to inspect.
+        result: The run summary, mutated in place.
+        vault_path: Vault root, used to anchor the recorded source path.
     """
     record = try_load_fragment(md_file)
     if record is None:
@@ -267,7 +275,15 @@ def _process_fragment(md_file: Path, result: RefreshDatesResult) -> None:
         result.missing_source += 1
         return
 
-    source_path = Path(source_path_str)
+    # Anchored the way every other reader anchors it (#1575). A bare
+    # ``Path`` of a *relative* record — which is what an in-vault source now
+    # stores, and what a vault ingested from its own root has stored all
+    # along — resolves against the current working directory, so the backfill
+    # answered a different question depending on where it was invoked from.
+    # An out-of-vault source stores ``external/<digest>/<name>``, which names
+    # nothing on disk by design; it lands in ``missing_source``, which is the
+    # counter built for exactly this reported downgrade.
+    source_path = resolve_recorded_source(source_path_str, vault_path)
     if not source_path.exists():
         result.missing_source += 1
         return

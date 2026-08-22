@@ -594,7 +594,7 @@ def _assert_ingest_source_contained(source_path: Path) -> None:
 
     **Every** ``_gate_consent`` caller must call this first, and it is not
     redundant with the gate inside ``Ingestor.ingest``. The consent prompt
-    runs ``creek/consent.py::_build_source_summary``, which walks
+    runs ``creek/consent.py::build_source_summary``, which walks
     ``rglob("*")`` and ``stat()``s every entry — following an escaping link
     and folding out-of-tree file counts and byte totals into the very
     summary the operator is asked to approve. When ``--source`` is itself a
@@ -620,6 +620,57 @@ def _assert_ingest_source_contained(source_path: Path) -> None:
         raise typer.Exit(code=1) from exc
 
 
+def _describe_unread_inputs(
+    *, source_path: Path, source_type: str, label: str
+) -> str | None:
+    """Say what the input tree held and what this ingestor would have read.
+
+    Runs :func:`creek.consent.build_source_summary` — the *same* scanner the
+    consent preflight shows the operator — so the count in this advisory and
+    the count in "Found: N file(s)" can never be two different questions
+    (#1574). It is called only on the path where nothing was discovered and
+    nothing was written, so a healthy run never pays for the walk. The
+    preflight itself cannot be reused: ``_gate_consent_unguarded`` returns
+    above ``get_source_summary`` once consent is recorded, so on every run
+    after the first there is no preflight number to reconcile against.
+
+    Args:
+        source_path: The ``--input`` / ``--source`` path, exactly as given.
+        source_type: Registry key of the ingestor that read nothing.
+        label: What to call the run in the message (see
+            :func:`_warn_if_discovered_but_empty`).
+
+    Returns:
+        The operator-facing advisory, or ``None`` when the source genuinely
+        held no files — an empty directory is not a silent rejection, and
+        #595's "nothing discovered, nothing to say" case must stay silent.
+    """
+    from creek.consent import build_source_summary
+    from creek.ingest import INGESTOR_INPUT_EXPECTATIONS
+
+    summary = build_source_summary(source_path, [])
+    if summary.file_count == 0:
+        return None
+    expectation = INGESTOR_INPUT_EXPECTATIONS.get(source_type)
+    lines = [
+        f"[yellow]WARNING: {label} saw {summary.file_count} file(s) under "
+        f"{escape(str(source_path))} but discovered 0 input(s) — none of them "
+        "is a file this ingestor reads.[/yellow]",
+    ]
+    if expectation is not None:
+        lines.append(f"[dim]  {source_type} reads {escape(expectation)}.[/dim]")
+    present = ", ".join(escape(name) for name in summary.sample_filenames)
+    # The summary samples at most ten names. Saying so is the difference
+    # between a list and a claim: an operator shown ten of five hundred
+    # filenames with no marker reads it as the whole population and concludes
+    # the other 490 were fine.
+    withheld = summary.file_count - len(summary.sample_filenames)
+    if withheld > 0:
+        present = f"{present}, and {withheld} more"
+    lines.append(f"[dim]  Present but not read: {present}[/dim]")
+    return "\n".join(lines)
+
+
 def _warn_if_discovered_but_empty(
     *,
     written: int,
@@ -627,13 +678,22 @@ def _warn_if_discovered_but_empty(
     source_type: str,
     strict: bool,
     label: str | None = None,
+    source_path: Path | None = None,
 ) -> None:
-    """Warn (and optionally exit non-zero) when inputs parsed to 0 fragments.
+    """Warn (and optionally exit non-zero) when inputs produced 0 fragments.
 
-    The silent ``Ingested 0 fragment(s)`` is the symptom that masked the
-    ChatGPT/Discord/Substack export-format bugs (#595): ``discover()`` found
-    inputs but none parsed, signalling an unrecognized format. ``--strict``
-    turns the warning into a non-zero exit for pipelines/CI.
+    Two silences, one symptom. The first is #595's: ``discover()`` found
+    inputs but none *parsed*, signalling an unrecognized format. The second
+    is #1574's: ``discover()`` found nothing at all, yet the source was not
+    empty — the consent preflight's ``rglob("*")`` counted files the
+    ingestor's own filter rejected wholesale, and this function returned
+    above its raise on ``discovered == 0`` and let ``--strict`` report
+    success. Nine of the eleven registered ingestors reach that shape from a
+    file an operator would plausibly point their ``--type`` at.
+
+    A genuinely empty source stays silent under both arms, which is what
+    keeps #595's "no inputs, no false alarm" rule intact: the second arm
+    fires on *files present*, never on ``discovered == 0`` alone.
 
     Args:
         written: Fragments the ingest actually produced.
@@ -648,17 +708,31 @@ def _warn_if_discovered_but_empty(
             a word that appears in neither the operator's ``sync.sources``
             toggles nor the scheduler's argv, and unattributable to any one
             source when a tick runs several.
+        source_path: The source the run read, enabling the second arm. A
+            caller that cannot name one (there is none today) keeps exactly
+            the #595 behaviour rather than guessing.
 
     Raises:
-        typer.Exit: With code ``1`` when *strict* and the condition holds.
+        typer.Exit: With code ``1`` when *strict* and either condition holds.
     """
-    if written > 0 or discovered == 0:
+    if written > 0:
         return
-    console.print(
-        f"[yellow]WARNING: discovered {discovered} {label or source_type} "
-        "input(s) but produced 0 fragments — the export format may be "
-        "unrecognized.[/yellow]",
-    )
+    named = label or source_type
+    if discovered > 0:
+        console.print(
+            f"[yellow]WARNING: discovered {discovered} {named} "
+            "input(s) but produced 0 fragments — the export format may be "
+            "unrecognized.[/yellow]",
+        )
+    else:
+        if source_path is None:
+            return
+        message = _describe_unread_inputs(
+            source_path=source_path, source_type=source_type, label=named
+        )
+        if message is None:
+            return
+        console.print(message)
     if strict:
         raise typer.Exit(code=1)
 
@@ -1174,6 +1248,7 @@ def _sync_ingest_source(
         source_type=ingest_type,
         label=f"{source} ({ingest_type})",
         strict=False,
+        source_path=input_path,
     )
     logger.info("sync.tier_a.ingest source=%s ingested=%d", source, written)
     return SourceRunRecord(ingested=written, failures=recorded)
@@ -2120,6 +2195,7 @@ def ingest(
         discovered=discovered,
         source_type=type,
         strict=strict,
+        source_path=input,
     )
 
 
