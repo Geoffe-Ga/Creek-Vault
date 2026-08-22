@@ -59,7 +59,6 @@ from creek_mcp.api.routes import IMPLEMENTED_CAPABILITIES, ROUTES
 from creek_mcp.contract import CONTRACT_VERSION, ONTOLOGY_VERSION
 from creek_mcp.httpapi import handlers as handlers_module
 from creek_mcp.httpapi import vault as vault_module
-from creek_mcp.tools import handshake as handshake_module
 from creek_mcp.tools.handshake import CREEK_MARKER, vault_available
 from tests.v1_api_support import (
     CAPABILITIES_PATH,
@@ -535,12 +534,14 @@ def test_vault_available_rejects_a_marker_that_is_a_file(tmp_path: Path) -> None
     assert vault_available(tmp_path) is False
 
 
-def test_the_private_marker_alias_is_preserved() -> None:
-    """``_CREEK_MARKER`` stays as an alias so nothing importing it breaks.
+def test_the_marker_is_the_literal_the_scaffolder_writes() -> None:
+    """The probe and ``creek init`` have to agree on one directory name.
 
-    Promoting the constant to a public name is an addition, not a rename.
+    The private ``_CREEK_MARKER`` alias this test used to also assert on is
+    gone with #1148: its only reference in the tree was that assertion, so the
+    name was kept alive by the test written to justify it. The literal pin is
+    the half that was ever load-bearing, and it stays.
     """
-    assert handshake_module._CREEK_MARKER is CREEK_MARKER
     assert Path("00-Creek-Meta") == CREEK_MARKER
 
 

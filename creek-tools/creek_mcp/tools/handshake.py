@@ -30,12 +30,6 @@ TOOL_NAME = "creek.handshake"
 CREEK_MARKER = Path("00-Creek-Meta")
 """The directory whose presence means "a vault has been scaffolded here"."""
 
-# Retained under the original private name: it predates #1074 and is referenced
-# by existing tests. The public name exists because the ``/v1`` capabilities
-# handler needs the same probe, and a second copy of the literal is a second
-# definition of "initialised" free to drift from this one.
-_CREEK_MARKER = CREEK_MARKER
-
 TRANSPORT = "stdio"
 
 
