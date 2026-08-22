@@ -56,6 +56,7 @@ from creek.ingest.base import (
     assemble_ingested_fragment,
 )
 from creek.ingest.ledger import LedgerRecord
+from creek.ingest.pipeline import record_source_provenance
 from creek.ingest.routing import SKIPPED_DIRECTORY_NAMES, Arbitration, arbitrate
 from creek.link.link_engine import LinkSummary, run_link
 from creek.models import Fragment, Frequency
@@ -487,7 +488,7 @@ class Pipeline:
             return result
 
         # Stage 2: Ingestion
-        ingested = self._run_ingestion(source_path, result)
+        ingested = self._run_ingestion(source_path, result, vault_path)
         result.fragments_created = len(ingested)
 
         # Stage 3: Classification
@@ -676,7 +677,7 @@ class Pipeline:
         raise RedactionRequiredError(len(matches), source_path)
 
     def _run_ingestion(
-        self, source_path: Path, result: PipelineResult
+        self, source_path: Path, result: PipelineResult, vault_path: Path
     ) -> list[IngestedFragment]:
         """Run every ingestor, then keep one ingestor's output per source file.
 
@@ -717,10 +718,21 @@ class Pipeline:
            failure is recorded on ``result.errors`` and skipped, rather
            than aborting the whole pipeline.
 
+        Step 4 also runs :func:`creek.ingest.pipeline.record_source_provenance`
+        (#1575). ``creek process`` assembles here rather than through
+        ``run_ingest``, so it does not pass through
+        ``establish_source_identity`` — without this call it stayed the one
+        CLI surface still writing the operator's absolute host path into
+        ``source.original_file``, which is exactly the disclosure #1575
+        closed everywhere else.
+
         Args:
             source_path: Directory containing source files.
             result: Pipeline result; mutated to collect error messages,
                 contested paths and unclaimed paths.
+            vault_path: Vault root, used to derive the recorded source key.
+                Taken as an argument rather than off ``self.config`` because
+                :meth:`run` is the authority on where this run writes.
 
         Returns:
             List of :class:`IngestedFragment` ready for classification
@@ -749,7 +761,9 @@ class Pipeline:
         for name, fragments in arbitration.winners.items():
             for parsed in fragments:
                 try:
-                    ingested.append(assemble_ingested_fragment(parsed))
+                    assembled = assemble_ingested_fragment(parsed)
+                    record_source_provenance(parsed, assembled.fragment, vault_path)
+                    ingested.append(assembled)
                 except (KeyError, ValueError) as exc:
                     # Surface contract / validation failures as user-visible
                     # errors instead of silently dropping the fragment.

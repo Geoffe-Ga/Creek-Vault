@@ -408,11 +408,21 @@ def test_ingest_refresh_dates_backfills_authored_at(tmp_path: Path) -> None:
     date on the source and re-run with ``--refresh-dates``. The
     fragment file in the vault should pick up the new ``authored_at``
     without re-ingesting the body.
+
+    The source lives **inside** the vault. Since #1575 an out-of-vault
+    source records ``external/<digest>/<basename>``, which by design names
+    nothing on disk, so the backfill can no longer reopen one and reports it
+    through ``RefreshDatesResult.missing_source`` instead. That downgrade is
+    pinned by ``test_refresh_dates_reports_an_out_of_vault_source_as_missing``
+    in ``tests/test_ingest_source_path_privacy.py`` rather than left to be
+    discovered, and restoring the out-of-vault half is tracked separately.
+    What this test is *about* — that the backfill rewrites ``authored_at``
+    without touching the body — is unchanged by where the source sits.
     """
     vault = tmp_path / "vault"
     for d in ["00-Creek-Meta", "01-Fragments/Notes"]:
         (vault / d).mkdir(parents=True)
-    src = tmp_path / "src"
+    src = vault / "00-Inbox"
     src.mkdir()
     note = src / "note.md"
     # Start without a frontmatter date — authored_at will be None.
@@ -6245,3 +6255,224 @@ class TestGdriveDownloadAccounting:
         )
 
         assert result.attempted == 6
+
+
+# ---- --strict must fire when the preflight saw files discover() never did (#1574) ----
+
+
+_SUBSTACK_POST_HTML = (
+    b"<html><body><h1>On Silt</h1><p>Silt is what the creek leaves behind.</p>"
+    b"</body></html>"
+)
+"""One plausible Substack post whose filename carries no leading post id."""
+
+_PLAIN_TEXT = (
+    b"# Notes\n\nA plain paragraph with enough words to read as a real body.\n"
+)
+"""Text that any ingestor willing to read the file will turn into a fragment."""
+
+_BINARY = bytes(range(256)) * 8
+"""Bytes no text ingestor will accept, for suffix-filter probes."""
+
+# One plausible file per registered ingestor: the shape an operator would
+# reasonably point that ``--type`` at. Nine of the eleven are rejected
+# wholesale by ``discover()`` even though the consent preflight counts them;
+# ``document`` and ``generic`` accept theirs, which is what keeps the
+# invariant below from being satisfiable by "always exit 1".
+_ONE_PLAUSIBLE_FILE: dict[str, tuple[str, bytes]] = {
+    "chatgpt": ("export.json", b"{}"),
+    "claude": ("export.json", b"{}"),
+    "code": ("bin.dat", _BINARY),
+    "discord": ("channel/messages.json", b"[]"),
+    "document": ("notes.txt", _PLAIN_TEXT),
+    "generic": ("notes.log", _PLAIN_TEXT),
+    "image": ("scan.heic", _BINARY),
+    "markdown": ("notes.txt", _PLAIN_TEXT),
+    "presentation": ("deck.key", _BINARY),
+    "spreadsheet": ("book.numbers", _BINARY),
+    "substack": ("posts/on-silt.html", _SUBSTACK_POST_HTML),
+}
+
+_INGESTED_COUNT_RE = re.compile(r"Ingested (\d+) fragment\(s\)")
+
+
+def _seed_substack_export_without_post_ids(tmp_path: Path) -> Path:
+    """Write a Substack-shaped export whose post HTML has no leading post id."""
+    src = tmp_path / "export"
+    (src / "posts").mkdir(parents=True)
+    (src / "posts" / "on-silt.html").write_bytes(_SUBSTACK_POST_HTML)
+    return src
+
+
+def _invoke_ingest(*, source_type: str, src: Path, vault: Path, strict: bool) -> object:
+    """Run ``creek ingest`` against *src*, optionally under ``--strict``."""
+    argv = [
+        "ingest",
+        "--type",
+        source_type,
+        "--input",
+        str(src),
+        "--vault",
+        str(vault),
+        "-y",
+    ]
+    if strict:
+        argv.append("--strict")
+    return runner.invoke(app, argv)
+
+
+def test_strict_fails_when_preflight_counted_files_but_discover_yielded_none(
+    tmp_path: Path,
+) -> None:
+    """A non-empty source the ingestor rejected wholesale must fail --strict (#1574).
+
+    The preflight counts files with ``rglob("*")`` while ``discover()`` applies
+    the ingestor's own filter, so a Substack post missing its leading post id
+    is counted by one scanner and invisible to the other. ``--strict`` used to
+    return before its raise on ``discovered == 0`` and report success.
+    """
+    vault = _scaffold_min_vault(tmp_path)
+    src = _seed_substack_export_without_post_ids(tmp_path)
+
+    result = _invoke_ingest(source_type="substack", src=src, vault=vault, strict=True)
+
+    assert result.exit_code == 1, result.output
+    assert "Ingested 0 fragment(s)" in _flat_output(result.output)
+
+
+def test_the_rejected_file_and_its_expected_shape_are_named_on_stdout(
+    tmp_path: Path,
+) -> None:
+    """The advisory names the unread file and the shape it should have had (#1574).
+
+    A generic "0 fragments" line leaves the operator with nowhere to go. The
+    reject reason lived only in ``logger.debug``, which no CLI run shows.
+    """
+    vault = _scaffold_min_vault(tmp_path)
+    src = _seed_substack_export_without_post_ids(tmp_path)
+
+    result = _invoke_ingest(source_type="substack", src=src, vault=vault, strict=False)
+
+    flat = _flat_output(result.output)
+    assert result.exit_code == 0, result.output
+    assert "on-silt.html" in flat
+    assert "<post_id>.<slug>.html" in flat
+
+
+def test_every_registered_ingestor_has_an_input_expectation() -> None:
+    """The expectation table covers the registry exactly (#1574).
+
+    Guards the parametrised invariant below against silently shrinking: an
+    ingestor added without an entry would otherwise get a warning with
+    nothing actionable in it.
+    """
+    from creek.ingest import INGESTOR_INPUT_EXPECTATIONS, INGESTOR_REGISTRY
+
+    assert len(INGESTOR_REGISTRY) == 11
+    assert set(INGESTOR_INPUT_EXPECTATIONS) == set(INGESTOR_REGISTRY)
+    assert set(_ONE_PLAUSIBLE_FILE) == set(INGESTOR_REGISTRY)
+
+
+@pytest.mark.parametrize("source_type", sorted(_ONE_PLAUSIBLE_FILE))
+def test_no_ingestor_reports_success_when_it_wrote_nothing_from_a_non_empty_source(
+    source_type: str,
+    tmp_path: Path,
+) -> None:
+    """Under ``--strict``, exit 0 iff the run actually wrote a fragment (#1574).
+
+    Substack is a sample, not the population: nine of the eleven registered
+    ingestors discover nothing from a file an operator would plausibly point
+    that ``--type`` at, and every one of them exited 0. The invariant is
+    stated over the whole registry so a fix that only patched Substack fails
+    here. ``document`` and ``generic`` do write from their fixture, so this
+    cannot be satisfied by failing unconditionally.
+    """
+    vault = _scaffold_min_vault(tmp_path)
+    relpath, payload = _ONE_PLAUSIBLE_FILE[source_type]
+    src = tmp_path / "in"
+    target = src / relpath
+    target.parent.mkdir(parents=True)
+    target.write_bytes(payload)
+
+    result = _invoke_ingest(source_type=source_type, src=src, vault=vault, strict=True)
+
+    match = _INGESTED_COUNT_RE.search(_flat_output(result.output))
+    assert match is not None, result.output
+    wrote = int(match.group(1))
+    assert result.exit_code == (0 if wrote else 1), (
+        f"{source_type}: wrote {wrote} fragment(s) but exited "
+        f"{result.exit_code}\n{result.output}"
+    )
+
+
+def test_a_single_file_source_is_counted_by_the_preflight_scanner(
+    tmp_path: Path,
+) -> None:
+    """``--input <file>`` counts as one file, not zero (#1574).
+
+    ``rglob("*")`` over a file yields nothing, so the consent prompt reported
+    "Found: 0 file(s)" for a source the run then read — the same scanner
+    disagreement, one directory level down.
+    """
+    from creek.consent import build_source_summary
+
+    single = tmp_path / "notes.md"
+    single.write_bytes(_PLAIN_TEXT)
+
+    summary = build_source_summary(single, [])
+
+    assert summary.file_count == 1
+    assert summary.sample_filenames == ["notes.md"]
+
+
+def test_sync_warns_about_unrecognised_inputs_without_failing_the_tick(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``creek sync`` reports the same reconciliation but never exits (#1574).
+
+    A scheduled tick that raised would both fail the launchd unit and destroy
+    the record that the tick ran at all, so sync keeps ``strict=False`` — it
+    must still say what it saw.
+    """
+    from creek.cli import _sync_ingest_source
+    from creek.config import CreekConfig, SyncConfig
+
+    monkeypatch.setattr("creek.cli._run_ingest", lambda **_kw: (0, [], 0))
+    src = tmp_path / "src"
+    journal = src / "personal" / "journal"
+    journal.mkdir(parents=True)
+    (journal / "notes.rst").write_bytes(_PLAIN_TEXT)
+    cfg = CreekConfig(
+        vault_path=tmp_path / "v",
+        source_drive=src,
+        sync=SyncConfig(sources={"journal": True}),
+    )
+
+    record = _sync_ingest_source("journal", cfg, tmp_path / "v")
+
+    flat = " ".join(_strip_ansi(capsys.readouterr().out).split())
+    assert record.ingested == 0
+    assert "notes.rst" in flat
+    assert "files ending .md" in flat
+
+
+def test_the_unread_input_advisory_says_when_it_sampled(tmp_path: Path) -> None:
+    """A truncated file list must announce itself as truncated (#1574).
+
+    The consent summary samples at most ten names. Ten names printed with no
+    marker read as the whole population, so an operator concludes the other
+    files were fine when in fact none of them was read.
+    """
+    vault = _scaffold_min_vault(tmp_path)
+    src = tmp_path / "export"
+    (src / "posts").mkdir(parents=True)
+    for index in range(14):
+        (src / "posts" / f"post-{index:02d}.html").write_bytes(_SUBSTACK_POST_HTML)
+
+    result = _invoke_ingest(source_type="substack", src=src, vault=vault, strict=False)
+
+    flat = _flat_output(result.output)
+    assert "saw 14 file(s)" in flat, result.output
+    assert "and 4 more" in flat, result.output

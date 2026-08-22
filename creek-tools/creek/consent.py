@@ -21,7 +21,7 @@ Exports:
     ConsentLog: Pydantic model wrapping the list of consent records.
     ConsentLogUnavailableError: Raised when the log cannot be read or written.
     SourceSummary: Pydantic model summarising a source directory's contents.
-    _build_source_summary: Build a SourceSummary from a directory path.
+    build_source_summary: Build a SourceSummary from a source path.
     _matches_any_glob: Check if a filename matches any glob pattern.
     _quarantine_corrupt_log: Move an unparsable log aside under a unique name.
 """
@@ -166,23 +166,39 @@ def _matches_any_glob(file_path: Path, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(name, pattern) for pattern in patterns)
 
 
-def _build_source_summary(source_path: Path, exclusions: list[str]) -> SourceSummary:
-    """Build a summary of files in a source directory.
+def build_source_summary(source_path: Path, exclusions: list[str]) -> SourceSummary:
+    """Summarise the files a source path offers, by name, count and size.
 
     Recursively walks ``source_path``, excluding files that match any
     pattern in ``exclusions``. Collects file counts by extension,
     total size, and a sample of filenames.
 
+    **Public because two callers must agree.** This is the scanner the
+    consent preflight shows the operator ("Found: N file(s)"), and it is
+    also the scanner ``creek.cli._warn_if_discovered_but_empty`` reconciles
+    an ingestor's ``discover()`` against (#1574). Those two numbers
+    disagreeing *is* the defect that made a wholly rejected export report
+    success, so they are answered by one function rather than by two that
+    happen to walk the same way today.
+
+    A source that is itself a file counts as one file. ``rglob("*")`` over
+    a non-directory yields nothing, so the older spelling reported "Found:
+    0 file(s)" for a single-file ``--input`` the run then went on to read —
+    the same scanner disagreement, one directory level down.
+
     Args:
-        source_path: The directory to summarise.
+        source_path: The directory, or single file, to summarise.
         exclusions: Glob patterns for files to exclude.
 
     Returns:
         A ``SourceSummary`` with aggregate statistics.
     """
+    candidates = (
+        [source_path] if source_path.is_file() else sorted(source_path.rglob("*"))
+    )
     files: list[Path] = [
         path
-        for path in sorted(source_path.rglob("*"))
+        for path in candidates
         if path.is_file() and not _matches_any_glob(path, exclusions)
     ]
 
@@ -365,7 +381,7 @@ class ConsentManager:
         Returns:
             A ``SourceSummary`` with file counts, sizes, and samples.
         """
-        return _build_source_summary(source_path, exclusions)
+        return build_source_summary(source_path, exclusions)
 
     def _load_log(self) -> ConsentLog:
         """Load the consent log from disk.

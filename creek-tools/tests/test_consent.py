@@ -22,8 +22,8 @@ from creek.consent import (
     ConsentManager,
     ConsentRecord,
     SourceSummary,
-    _build_source_summary,
     _matches_any_glob,
+    build_source_summary,
 )
 
 LA_TZ = ZoneInfo("America/Los_Angeles")
@@ -180,41 +180,41 @@ class TestMatchesAnyGlob:
         assert _matches_any_glob(Path("data.csv"), ["*.log", "*.csv"]) is True
 
 
-# ---- _build_source_summary Tests ----
+# ---- build_source_summary Tests ----
 
 
 class TestBuildSourceSummary:
-    """Tests for the _build_source_summary helper."""
+    """Tests for the build_source_summary helper."""
 
     def test_counts_files(self, source_dir: Path) -> None:
         """Should count all files in the source directory."""
-        summary = _build_source_summary(source_dir, exclusions=[])
+        summary = build_source_summary(source_dir, exclusions=[])
         assert summary.file_count == 5
 
     def test_excludes_files(self, source_dir: Path) -> None:
         """Should exclude files matching glob patterns."""
-        summary = _build_source_summary(source_dir, exclusions=["*.log"])
+        summary = build_source_summary(source_dir, exclusions=["*.log"])
         assert summary.file_count == 4
 
     def test_calculates_total_size(self, source_dir: Path) -> None:
         """Should calculate total file size in bytes."""
-        summary = _build_source_summary(source_dir, exclusions=[])
+        summary = build_source_summary(source_dir, exclusions=[])
         assert summary.total_size_bytes > 0
 
     def test_collects_content_types(self, source_dir: Path) -> None:
         """Should collect file extension counts."""
-        summary = _build_source_summary(source_dir, exclusions=[])
+        summary = build_source_summary(source_dir, exclusions=[])
         assert ".txt" in summary.content_types
         assert ".md" in summary.content_types
 
     def test_limits_sample_filenames(self, source_dir: Path) -> None:
         """Should include at most 10 sample filenames."""
-        summary = _build_source_summary(source_dir, exclusions=[])
+        summary = build_source_summary(source_dir, exclusions=[])
         assert len(summary.sample_filenames) <= 10
 
     def test_sample_filenames_are_strings(self, source_dir: Path) -> None:
         """Sample filenames should be strings."""
-        summary = _build_source_summary(source_dir, exclusions=[])
+        summary = build_source_summary(source_dir, exclusions=[])
         assert all(isinstance(f, str) for f in summary.sample_filenames)
 
 

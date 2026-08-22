@@ -701,12 +701,12 @@ class TestPipelinePrivateMethods:
         count = pipeline._run_redaction(tmp_path / "nope", result)
         assert count == 0
 
-    def test_run_ingestion_empty_registry(self, config, source_path):
+    def test_run_ingestion_empty_registry(self, config, source_path, tmp_path):
         """Test _run_ingestion returns empty list when registry is empty."""
         pipeline = Pipeline(config=config)
         result = PipelineResult()
         with patch("creek.pipeline.INGESTOR_REGISTRY", {}):
-            fragments = pipeline._run_ingestion(source_path, result)
+            fragments = pipeline._run_ingestion(source_path, result, tmp_path)
         assert fragments == []
 
     def test_run_classification_no_fragments(self, config, vault_path):

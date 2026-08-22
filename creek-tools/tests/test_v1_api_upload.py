@@ -41,6 +41,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import re
 import zipfile
 from typing import TYPE_CHECKING, Any, Final
 
@@ -1292,3 +1293,35 @@ def test_the_journal_route_imports_the_bound_rather_than_restating_it() -> None:
         if alias.name == "MAX_EXTERNAL_ID_CHARS"
     }
     assert imported_from == {models.__name__}
+
+
+def test_the_route_records_no_host_path_on_the_seeded_fragment(
+    tmp_path: Path,
+) -> None:
+    """A fragment seeded over HTTP must not carry a server filesystem path (#1575).
+
+    Asserted against the *route* rather than the tool for the reason this
+    module exists: the tool's own behaviour is pinned in
+    ``tests/test_ingest_source_path_privacy.py``, and a route that staged
+    uploads through some path of its own would pass those tests while
+    writing a server path into the vault the caller reads back.
+
+    The shape is asserted, never one fixture string. The staging directory is
+    ``<vault>/00-Creek-Meta/adepthood/uploads/``, so an absolute record here
+    would disclose wherever the server keeps its vaults.
+    """
+    vault = seed_vault(tmp_path)
+
+    response = _post(vault, _body())
+
+    assert response.status_code == _OK_STATUS, response.text
+    fragments = _fragments(vault)
+    assert len(fragments) == 1, fragments
+    source = frontmatter.load(str(fragments[0])).metadata["source"]
+    assert isinstance(source, dict)
+    recorded = source["original_file"]
+    assert isinstance(recorded, str)
+    assert not recorded.startswith("/"), recorded
+    assert not re.match(r"^[A-Za-z]:[\\/]", recorded), recorded
+    assert str(vault) not in recorded, recorded
+    assert recorded.startswith("00-Creek-Meta/adepthood/uploads/"), recorded
