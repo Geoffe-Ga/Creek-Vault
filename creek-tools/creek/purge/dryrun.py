@@ -17,7 +17,7 @@ only the first closes only half of it:
   disk, so a later pass finds an intimate stub, a staged source, a
   derived voice artifact or a sibling fragment that the apply run had
   already destroyed — and counts it a second time.
-* **Rewrite-driven.** A counted-only ``write_text`` leaves the *old
+* **Rewrite-driven.** A counted-only ``write_bytes`` leaves the *old
   bytes* on disk, so a later pass matches references the apply run had
   already scrubbed. Nothing is deleted anywhere in this case, which is
   why tracking removed paths alone cannot close it: two fragments
@@ -26,7 +26,7 @@ only the first closes only half of it:
   an apply that does two.
 
 :class:`DryRunLedger` records both — the paths an apply run *would* have
-removed and the text an apply run *would* have written. The engine
+removed and the bytes an apply run *would* have written. The engine
 populates it on **every** run but consults it **only** under
 ``dry_run``, so nothing recorded here can change what a real purge
 deletes or rewrites. That gate lives in
@@ -114,7 +114,7 @@ class DryRunLedger:
         into every operation that followed it on any engine.
         """
         self._removed: set[str] = set()
-        self._pending_text: dict[str, str] = {}
+        self._pending_bytes: dict[str, bytes] = {}
 
     def mark_removed(self, path: Path) -> None:
         """Record that an apply run would have unlinked *path* by now.
@@ -155,28 +155,35 @@ class DryRunLedger:
         # of every single-fragment purge's scrub walk.
         return bool(self._removed) and _key_for(path) in self._removed
 
-    def set_text(self, path: Path, text: str) -> None:
-        """Record the text an apply run would have written to *path*.
+    def set_bytes(self, path: Path, data: bytes) -> None:
+        """Record the bytes an apply run would have written to *path*.
+
+        Bytes, not text (#948). The reference scrub is a byte-level
+        substitution — it has to rewrite a file that is not valid UTF-8,
+        and it has to leave CRLF line endings alone — so a ledger that
+        could only hold ``str`` would force a second, text-only storage
+        path beside it, and a preview and an apply run that disagree
+        about which files they can rewrite at all.
 
         Args:
             path: The file the real run rewrites at this point.
-            text: The scrubbed text, exactly as an apply run would have
-                written it.
+            data: The scrubbed bytes, exactly as an apply run would have
+                written them.
         """
-        self._pending_text[_key_for(path)] = text
+        self._pending_bytes[_key_for(path)] = data
 
-    def text_for(self, path: Path) -> str | None:
-        """Return the text an apply run would already have written.
+    def bytes_for(self, path: Path) -> bytes | None:
+        """Return the bytes an apply run would already have written.
 
         Args:
             path: The file a later pass is about to read.
 
         Returns:
-            The pending text, or ``None`` when this operation has not
+            The pending bytes, or ``None`` when this operation has not
             rewritten *path* — in which case the caller must read the
             real bytes off disk.
         """
         # Same short-circuit as ``is_removed``, for the same reason.
-        if not self._pending_text:
+        if not self._pending_bytes:
             return None
-        return self._pending_text.get(_key_for(path))
+        return self._pending_bytes.get(_key_for(path))

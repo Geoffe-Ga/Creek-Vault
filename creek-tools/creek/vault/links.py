@@ -236,6 +236,31 @@ def _header_names(path: Path) -> list[str]:
     return declared_names(read_header_meta(path))
 
 
+def page_names(path: Path) -> list[str]:
+    """Return every exact-case name *path* can be linked by.
+
+    The filename stem **and** the declared names, which is the pairing
+    :func:`build_link_index` registers and the pairing a caller has to
+    reproduce to answer "does any page claim this spelling". Public
+    because ``creek purge`` needs exactly that question answered without
+    building a whole index: a wikilink scrub that knows only
+    ``post["title"]`` leaves a link written by the private *filename*
+    standing after a right-to-be-forgotten request (#903).
+
+    Only the header is read, never the body, so asking it of every file
+    in a large vault costs one short read apiece.
+
+    Args:
+        path: A vault markdown file.
+
+    Returns:
+        The stem first, then the declared names in declaration order.
+        Duplicates are not removed; the stem and a declared ``title``
+        are routinely the same string.
+    """
+    return [path.stem, *_header_names(path)]
+
+
 def _is_unsurveyed(relative: Path) -> bool:
     """Return whether *relative* lies under a withheld source directory.
 

@@ -430,3 +430,45 @@ def test_unsurveyed_prefixes_track_the_writers_own_constants() -> None:
 
     assert _PROCESSING_LOG in _UNSURVEYED_PREFIXES
     assert _STATE_SUBPATH in _UNSURVEYED_PREFIXES
+
+
+def test_page_names_pairs_the_filename_stem_with_the_declared_names(
+    vault: Path,
+) -> None:
+    """``page_names`` must report both halves of what the index registers.
+
+    :func:`build_link_index` registers a page under its filename stem
+    **and** under every declared name, so a caller answering "does any
+    page claim this spelling" without building the whole index has to
+    reproduce that pairing exactly. ``creek purge`` is that caller: the
+    stem half is what stops a right-to-be-forgotten scrub from eating a
+    live link to a page whose *filename* is the colliding spelling
+    (#903), and dropping it leaves every other test in this repository
+    green.
+
+    Args:
+        vault: Vault-root fixture shared by this module.
+    """
+    from creek.vault.links import page_names
+
+    path = _page(
+        vault,
+        "02-Threads/2023-03-30-Messages.md",
+        title="Long Walks",
+        aliases=["Walking"],
+    )
+
+    assert page_names(path) == ["2023-03-30-Messages", "Long Walks", "Walking"]
+
+
+def test_page_names_of_a_headerless_page_is_its_stem_alone(vault: Path) -> None:
+    """A page with no frontmatter still claims one spelling: its filename.
+
+    Args:
+        vault: Vault-root fixture shared by this module.
+    """
+    from creek.vault.links import page_names
+
+    path = _page(vault, "09-Reference/Plain Note.md")
+
+    assert page_names(path) == ["Plain Note"]
