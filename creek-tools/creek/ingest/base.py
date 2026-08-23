@@ -465,6 +465,40 @@ def parse_authored_at(value: object, source_tz: str | None = None) -> datetime |
     return _localize_naive_timestamp(parsed, source_tz)
 
 
+def safe_parse_authored_at(candidate: object) -> datetime | None:
+    """Parse one ``authored_at`` candidate, swallowing the parse failure.
+
+    Every format-specific ingestor walks an **ordered** candidate chain
+    — ``created`` before ``modified``, ``/CreationDate`` before
+    ``/ModDate``, ``\\creatim`` before ``\\revtim`` — and a candidate
+    that fails to parse must fall through to the next one rather than
+    take the whole file down with it. :func:`parse_authored_at` raises
+    :class:`ValueError` for an unrecognised non-empty string precisely
+    so a caller can make that decision; this is that decision, written
+    once.
+
+    It lived as a byte-identical private copy in
+    :mod:`creek.ingest.spreadsheets` and
+    :mod:`creek.ingest.presentations` before #855 promoted it here.
+    Note that no ``None`` guard is needed:
+    :func:`parse_authored_at` already returns ``None`` for ``None`` and
+    for blank strings, so one would be unreachable.
+
+    Args:
+        candidate: A raw value from core properties, an info
+            dictionary, EXIF, or frontmatter.
+
+    Returns:
+        A tz-aware datetime, or ``None`` when the candidate is absent,
+        blank, or unparseable. Never raises, and never guesses a date
+        the source did not supply.
+    """
+    try:
+        return parse_authored_at(candidate)
+    except ValueError:
+        return None
+
+
 def _parse_timestamp_string(ts_string: str) -> datetime:
     """Parse a timestamp string into a datetime object.
 

@@ -101,6 +101,27 @@ def _collect_meta_dates(html: str) -> dict[str, str]:
     return found
 
 
+def _json_ld_candidates(parsed: object) -> list[object]:
+    """Normalise a decoded JSON-LD payload into a list of entries to walk.
+
+    A JSON-LD body is legally *any* JSON value, so a page can hand us
+    ``null``, a bare number, or a string. The obvious ``list(parsed)``
+    raises :class:`TypeError` on every one of those, and the broad
+    ``except Exception`` in
+    :meth:`creek.ingest.base.Ingestor._parse_safe` turns that into a
+    silently **dropped document** — the whole page's content lost
+    because one ``<script>`` tag held a scalar. Anything that is
+    neither an object nor an array carries no ``datePublished``, so the
+    honest answer is "no candidates" and the caller moves on to the
+    next script block.
+    """
+    if isinstance(parsed, dict):
+        return [parsed]
+    if isinstance(parsed, list):
+        return list(parsed)
+    return []
+
+
 def _collect_json_ld_date(html: str) -> str | None:
     """Return the first ``datePublished`` found in any JSON-LD ``<script>``.
 
@@ -118,9 +139,7 @@ def _collect_json_ld_date(html: str) -> str | None:
             parsed = json.loads(body)
         except (ValueError, json.JSONDecodeError):
             continue
-        candidates: list[object] = (
-            [parsed] if isinstance(parsed, dict) else list(parsed)
-        )
+        candidates = _json_ld_candidates(parsed)
         for entry in candidates:
             if isinstance(entry, dict):
                 value = entry.get("datePublished") or entry.get("dateCreated")

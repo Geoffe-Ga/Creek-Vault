@@ -35,7 +35,7 @@ from creek.ingest.base import (
     ParsedFragment,
     RawDocument,
     file_modified_time,
-    parse_authored_at,
+    safe_parse_authored_at,
 )
 from creek.ingest.encoding import DEFAULT_CONFIDENCE_THRESHOLD, decode_bytes
 from creek.ingest.source_unit import sanitize_unit
@@ -342,7 +342,7 @@ def _extract_xlsx_authored_at(path: Path) -> datetime | None:
     try:
         props = workbook.properties
         for candidate in (props.created, props.modified):
-            parsed = _safe_parse_authored_at(candidate)
+            parsed = safe_parse_authored_at(candidate)
             if parsed is not None:
                 return parsed
     finally:
@@ -365,16 +365,6 @@ def _open_xlsx(path: Path) -> Any | None:
         return openpyxl.load_workbook(path, read_only=True)
     except Exception:  # BadZipFile / InvalidFile / OSError / KeyError
         logger.debug("Could not open XLSX core properties for %s", path)
-        return None
-
-
-def _safe_parse_authored_at(candidate: object) -> datetime | None:
-    """Wrapper that swallows :class:`ValueError` from ``parse_authored_at``."""
-    if candidate is None:
-        return None
-    try:
-        return parse_authored_at(candidate)
-    except ValueError:
         return None
 
 
