@@ -97,7 +97,7 @@ embeddings:
 | `cache_dir`            | `null`               | Override for the HuggingFace cache. |
 | `batch_size`           | `32`                 | Texts per encode batch. |
 
-## `ocr` — image / PDF OCR
+## `ocr` — image OCR
 
 ```yaml
 ocr:
@@ -107,25 +107,39 @@ ocr:
   min_confidence: 0.6
 ```
 
-**Every field in this block is dormant.** All four are on
-`DORMANT_CONFIG_FIELDS` in `tests/test_config_contract.py` — "declared
-dormant: OCR wire-in tracked by #1041" — and that allowlist is a ratchet
-which fails the moment a listed field *is* read, so their being on it is
-proof no production path consults them. `creek init` still writes the
-block, and it still loads, but **editing these values changes nothing
-today**: setting `enabled: false` does not stop `creek ingest --type
-image` from attempting OCR, and `languages` does not reach Tesseract.
+**Every field in this block is live** as of #1517. All four reached
+`creek ingest --type image` and `creek process` in that change, and all
+four left `DORMANT_CONFIG_FIELDS` in `tests/test_config_contract.py`.
+That allowlist is a ratchet: it fails the moment a *listed* field is
+read, and a separate assertion fails the moment an *unlisted* field is
+not — so their absence from it is machine-checked proof that production
+consults them, re-derived on every test run rather than asserted here.
 
-Read "dormant" precisely: it means *this key is not consulted*, **not**
-that the behaviour behind it is absent. The confidence threshold in
-particular is live — see the `min_confidence` row.
+Read the table below as describing **those two commands**, which are the
+only ones that reach the image ingestor with this block in hand. The MCP
+tools (`ingest`, `drive`, `upload`) reach the same ingestor without
+passing it, so an image arriving through one of them still runs the
+default `pytesseract` backend and still needs the `tesseract` binary
+even under `enabled: false`. Wiring the block through those surfaces is
+a separate decision, tracked apart from #1517. (`creek sync` never
+routes to the image ingestor at all — no entry in `sync.sources` maps to
+it and `SourcePaths` has no image field.)
 
-| Field            | Default        | Status |
+Note the registry key is **`image`**, singular: `creek ingest --type
+images` is not a valid invocation.
+
+Scanned PDFs are **not** covered by this block in practice.
+`ImageIngestor.ingest_pdf` exists and honours the same settings, but no
+production path calls it — `DocumentIngestor` does not route scanned
+PDFs there yet. Setting `enabled: false` therefore changes nothing about
+how a PDF is ingested today.
+
+| Field            | Default        | Effect |
 |------------------|----------------|-------|
-| `enabled`        | `true`         | **Dormant.** Intended as the master switch for the OCR pass. |
-| `engine`         | `pytesseract`  | **Dormant.** Custom engines are injected at the API level today — see `creek.ingest.images.OcrEngine`. |
-| `languages`      | `[eng]`        | **Dormant.** Intended for Tesseract language codes. |
-| `min_confidence` | `0.6`          | **Dormant — but the behaviour it names is live.** Editing this number changes nothing; the threshold in force is `_DEFAULT_MIN_CONFIDENCE` (`creek/ingest/images.py`). A low-confidence page really *is* tagged `review: pending_review` today — executed with an injected `OcrEngine` returning `0.42`, whose frontmatter came back `review: pending_review`. Range `[0.0, 1.0]`. No command filters on the resulting key. |
+| `enabled`        | `true`         | Master switch for the OCR pass. `false` means the image ingestor is not constructed and no OCR engine is created — so a vault with OCR off needs no `tesseract` binary, and an invalid `engine` name is never resolved. The run says so on the console rather than silently writing nothing. Only the image ingestor is affected; every other source type ingests as usual. |
+| `engine`         | `pytesseract`  | Selects a backend from `creek.ingest.images.OCR_ENGINES`. An unknown name **refuses the run** (exit 2) and lists the known names; it never falls back to the default. `pytesseract` is the only backend shipped — register another in `OCR_ENGINES` to add one. |
+| `languages`      | `[eng]`        | Tesseract language codes, in priority order. Joined with `+` into Tesseract's `lang` argument, so `[eng, fra]` becomes `eng+fra`. Blank entries are dropped; a list with no usable code refuses the run. |
+| `min_confidence` | `0.6`          | Range `[0.0, 1.0]`. A page whose OCR confidence falls below it is tagged `review: pending_review` in the fragment's frontmatter. #1517 also made that marker reach disk — before it, `Fragment`'s `extra="ignore"` dropped the key during the write, so the threshold decided nothing observable. No command filters on the resulting key; it is a marker for a human reader. |
 
 ## `linking` — resonance / thread / eddy thresholds
 

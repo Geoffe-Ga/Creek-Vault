@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from creek.author.conductor import VoiceClientFactory
     from creek.author.models import AuthoredDraft
     from creek.classify.prompt import PromptOntology
-    from creek.config import CreekConfig
+    from creek.config import CreekConfig, OCRConfig
     from creek.generate.ai_style.model import ScanReport, VoiceFingerprint
     from creek.generate.compost_embedding import CompostExemplar
     from creek.generate.compost_scan import CompostScanResult
@@ -517,6 +517,7 @@ def _run_ingest(
     print_summary: bool = False,
     since: datetime | None = None,
     incremental: bool = False,
+    ocr: OCRConfig | None = None,
 ) -> tuple[int, list[str], int]:
     """Run a single ingestor and persist its output to the vault.
 
@@ -535,6 +536,10 @@ def _run_ingest(
         incremental: Ledger-driven incremental mode (#677). When ``True`` and
             *since* is ``None``, units whose ledger content-hash is unchanged
             are skipped. Ignored for sources without a ledger.
+        ocr: The vault's ``ocr`` block (#1517), forwarded so ``ocr.enabled``,
+            ``ocr.engine``, ``ocr.languages`` and ``ocr.min_confidence``
+            reach the OCR that actually runs. ``None`` keeps an ingestor on
+            its own defaults.
 
     Returns:
         Tuple of ``(written_count, errors, discovered)`` where ``errors`` is a
@@ -550,6 +555,7 @@ def _run_ingest(
     Raises:
         typer.Exit: With code ``1`` when the vault cannot be opened.
     """
+    from creek.ingest.images import OcrConfigError
     from creek.ingest.pipeline import run_ingest
 
     try:
@@ -561,6 +567,7 @@ def _run_ingest(
             reclassify_threshold=reclassify_threshold,
             since=since,
             incremental=incremental,
+            ocr=ocr,
             on_warning=_print_ingest_warning,
         )
     except FileNotFoundError as exc:
@@ -569,6 +576,13 @@ def _run_ingest(
     except EscapingSymlinkError as exc:
         console.print(f"[red]Symlink containment: {exc}[/red]")
         raise typer.Exit(code=1) from exc
+    except OcrConfigError as exc:
+        # Exit 2, the CLI's "your input was wrong" code, not 1: an unknown
+        # `ocr.engine` or an empty `ocr.languages` is a config the operator
+        # can fix in one edit, and #1517 exists precisely because a bad value
+        # there used to be absorbed in silence.
+        console.print(f"[red]OCR configuration: {exc}[/red]")
+        raise typer.Exit(code=2) from exc
 
     if print_summary:
         # `unchanged` is printed beside the others, not appended after them
@@ -1234,6 +1248,7 @@ def _sync_ingest_source(
         vault_path=vault_path,
         reclassify_threshold=config.classification.reclassify_on_edit_threshold,
         incremental=True,
+        ocr=config.ocr,
     )
     recorded = _render_source_errors(source, errors)
     # There is no `creek sync --strict`, and there must not be one here by
@@ -2182,6 +2197,7 @@ def ingest(
         print_summary=True,
         since=since_dt,
         incremental=incremental,
+        ocr=config.ocr,
     )
 
     console.print(f"[bold green]Ingested {written} fragment(s).[/bold green]")
@@ -2190,13 +2206,23 @@ def ingest(
         for err in errors:
             console.print(f"  [dim]{err}[/dim]")
 
-    _warn_if_discovered_but_empty(
-        written=written,
-        discovered=discovered,
-        source_type=type,
-        strict=strict,
-        source_path=input,
-    )
+    # Skipped when OCR is switched off, and only then. That warning's whole
+    # claim is "files are present and this ingestor reads none of them" —
+    # which is false when the ingestor reads .png fine and was told not to
+    # look. Printed under the advisory naming `ocr.enabled`, it would send
+    # the operator to check file extensions instead of the one key that
+    # stopped the run, and under `--strict` it would fail the run for a
+    # deliberate configuration choice (#1517).
+    from creek.ingest.pipeline import ocr_is_disabled
+
+    if not ocr_is_disabled(ingestor_cls, config.ocr):
+        _warn_if_discovered_but_empty(
+            written=written,
+            discovered=discovered,
+            source_type=type,
+            strict=strict,
+            source_path=input,
+        )
 
 
 def _dispatch_ingest_migration(

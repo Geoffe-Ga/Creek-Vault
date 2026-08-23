@@ -185,7 +185,7 @@ class ProvenanceEntry(BaseModel):
 
 
 PASSTHROUGH_FRONTMATTER_KEYS: Final[frozenset[str]] = frozenset(
-    {"sheet", "rows", "columns"}
+    {"sheet", "rows", "columns", "review"}
 )
 """Unmodelled frontmatter keys an ingestor may put on the vault file (#1392).
 
@@ -208,6 +208,19 @@ Deliberately a module-level constant rather than a per-ingestor class
 attribute: :func:`assemble_ingested_fragment` is the universal chokepoint and
 receives only a ``ParsedFragment``, with no ingestor instance in hand. One
 declaration site beats threading an instance through it.
+
+``review`` joined in #1517, and its absence is why ``ocr.min_confidence``
+looked live and was not. :meth:`creek.ingest.images.ImageIngestor.parse` has
+always compared the engine's confidence to a threshold and stamped ``review:
+pending_review`` on the metadata dict — but ``Fragment`` does not model
+``review``, so ``model_validate`` dropped it here and **no vault file ever
+carried the marker**. The only way to observe it was to call
+``generate_frontmatter`` directly, which is what every test and the
+configuration doc did; through ``creek ingest`` the threshold decided
+nothing. It qualifies on the same terms as the three above: a structured
+marker the vault's reader needs, which ``Fragment`` deliberately does not
+model (a nullable field would print ``review: null`` on every fragment from
+every ingestor).
 
 Note this is *not* a model field on ``Fragment`` or ``FragmentSource``.
 ``_write_model`` dumps with ``model_dump(mode="json")`` and no

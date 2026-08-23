@@ -12,7 +12,7 @@ import json
 import logging
 import shutil
 from typing import TYPE_CHECKING
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -400,6 +400,35 @@ class TestPipelineStages:
 # ---------------------------------------------------------------------------
 
 
+def _stub_ingestor_class(ingest_result):
+    """Build a real ingestor *class* whose ``ingest`` returns *ingest_result*.
+
+    A class, not a ``MagicMock()`` standing in for one. ``INGESTOR_REGISTRY``
+    has always been declared ``dict[str, type[Ingestor]]``, and #1517's
+    ``build_ingestor`` now asks ``issubclass(entry, ImageIngestor)`` of every
+    entry so it can hand the OCR block to the one ingestor that reads pixels.
+    A mock *instance* cannot answer ``issubclass`` — these fixtures were the
+    only place in the suite standing an instance where the registry's own type
+    says a class goes.
+
+    Args:
+        ingest_result: The canned ``IngestResult`` every instance returns.
+
+    Returns:
+        A zero-argument-constructible ingestor class.
+    """
+
+    class _StubIngestor:
+        """Minimal ingestor returning one canned result."""
+
+        def ingest(self, source_path):
+            """Return the canned result, ignoring *source_path*."""
+            del source_path
+            return ingest_result
+
+    return _StubIngestor
+
+
 class TestPipelineWithFragments:
     """Tests for Pipeline.run() when fragments are produced by ingestion."""
 
@@ -436,8 +465,7 @@ class TestPipelineWithFragments:
         )
         ingest_result = IngestResult(fragments=[fragment])
 
-        mock_ingestor = MagicMock()
-        mock_ingestor.return_value.ingest.return_value = ingest_result
+        mock_ingestor = _stub_ingestor_class(ingest_result)
 
         return {"mock": mock_ingestor}
 
@@ -550,8 +578,7 @@ class TestPipelineErrorSurfacing:
             fragments=[good],
             errors=[f"parse error for {bad_path}: corrupt header"],
         )
-        mock_ingestor = MagicMock()
-        mock_ingestor.return_value.ingest.return_value = ingest_result
+        mock_ingestor = _stub_ingestor_class(ingest_result)
         return {"mock": mock_ingestor}, bad_path
 
     def test_errors_surface_on_pipeline_result(
@@ -623,8 +650,7 @@ class TestPipelineErrorSurfacing:
             timestamp=datetime.now(),
         )
         ingest_result = IngestResult(fragments=[broken])
-        mock_ingestor = MagicMock()
-        mock_ingestor.return_value.ingest.return_value = ingest_result
+        mock_ingestor = _stub_ingestor_class(ingest_result)
         registry = {"mock": mock_ingestor}
 
         pipeline = Pipeline(config=config)
@@ -661,8 +687,7 @@ class TestPipelineErrorSurfacing:
             timestamp=datetime.now(),
         )
         ingest_result = IngestResult(fragments=[good])
-        mock_ingestor = MagicMock()
-        mock_ingestor.return_value.ingest.return_value = ingest_result
+        mock_ingestor = _stub_ingestor_class(ingest_result)
         registry = {"mock": mock_ingestor}
 
         # Simulate the regression scenario the writer guard is defending
