@@ -46,6 +46,10 @@ from creek.classify.evidence import layer_determined_over
 # re-export isn't yet visible. Going to ``parsing.py`` directly side-
 # steps the cycle without leaking the layering.
 from creek.classify.llm.parsing import (
+    _TEXTURE_LIST_KEY,
+    _TEXTURE_SECTION_KEY,
+    _merge_textures,
+    _parse_emotional_texture,
     _split_reasoning_and_yaml,
     _strip_code_fences,
 )
@@ -53,6 +57,7 @@ from creek.classify.llm.prompts import (
     _COLOR_BLOCK,
     _FREQUENCY_BLOCK,
     _FREQUENCY_COLOR_BLOCK,
+    _TEXTURE_BLOCK,
     _sanitise_for_prompt,
 )
 from creek.models import (
@@ -121,9 +126,12 @@ class WeightedDimension(Generic[_DimT]):
 # or a prompt injection riding in on fragment text — from writing an
 # arbitrary :class:`~creek.models.Fragment` field, ``privacy_tier`` above
 # all, straight out of an LLM response. Widening it is always a deliberate
-# act; #1309 added exactly one key, ``confidences``, and like every other
-# member it is named after the *dimension* rather than the Fragment field
-# it eventually feeds (``voice.confidence``).
+# act; #1309 added exactly one key, ``confidences``, and #1208 added
+# exactly one more, ``texture``. Like every other member both are named
+# after the *dimension* rather than the Fragment field they eventually
+# feed (``voice.confidence``, ``emotional_texture``) — the field names
+# themselves stay rejected at top level, which is the property that makes
+# this boundary worth anything.
 _ALLOWED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
     {
         "frequencies",
@@ -133,6 +141,7 @@ _ALLOWED_TOP_LEVEL_KEYS: frozenset[str] = frozenset(
         "dosages",
         "voice_registers",
         "confidences",
+        _TEXTURE_SECTION_KEY,
         "overall_confidence",
     },
 )
@@ -256,6 +265,37 @@ def _parse_dimension(
     return tuple(parsed)
 
 
+def _parse_texture_section(data: dict[str, object]) -> list[str]:
+    """Parse the ``texture.emotional`` list out of a weighted response (#1208).
+
+    A thin adapter over
+    :func:`creek.classify.llm.parsing._parse_emotional_texture` rather
+    than a second implementation: the single-pick path has produced this
+    axis since #878, and two copies of the sanitiser would let the
+    :data:`~creek.classify.llm.parsing._MAX_TEXTURES` and
+    :data:`~creek.classify.llm.parsing._MAX_TEXTURE_CHARS` caps — and the
+    lowercase / whitespace-to-hyphen normalisation — drift apart between
+    the paths. They must not: :mod:`creek.link.temporal` scores exact
+    string intersection, so a fragment classified by one path and one
+    classified by the other only ever link if they spell a shared
+    texture identically.
+
+    Args:
+        data: Parsed top-level YAML dict.
+
+    Returns:
+        Up to :data:`~creek.classify.llm.parsing._MAX_TEXTURES` sanitised
+        tags. Empty when the section is missing or not a mapping — the
+        model said nothing about the axis, which
+        :meth:`WeightedFragmentClassification.merge_onto` reads as
+        "add nothing", never as "clear what is recorded".
+    """
+    section = data.get(_TEXTURE_SECTION_KEY)
+    if not isinstance(section, dict):
+        return []
+    return _parse_emotional_texture(section.get(_TEXTURE_LIST_KEY))
+
+
 def _load_yaml_dict(yaml_text: str) -> dict[str, object]:
     """Parse the YAML payload and assert the documented shape.
 
@@ -350,6 +390,25 @@ class WeightedFragmentClassification(BaseModel):
     dosages: tuple[WeightedDimension[Dosage], ...] = ()
     voice_registers: tuple[WeightedDimension[VoiceRegister], ...] = ()
     confidences: tuple[WeightedDimension[Confidence], ...] = ()
+    emotional_texture: tuple[str, ...] = ()
+    """Free-form texture tags this response named (issue #1208).
+
+    The one dimension here that is *not* weighted, because the axis is
+    not a pick from a vocabulary: ``emotional_texture`` is free-form
+    tags naming how a fragment feels, seeded by
+    :data:`~creek.classify.llm.prompts.EMOTIONAL_TEXTURE_VOCABULARY`
+    but not bounded by it. Sanitised and capped by
+    :func:`~creek.classify.llm.parsing._parse_emotional_texture`, the
+    same function the single-pick path uses, so the two paths cannot
+    normalise the same tag differently — which they must not, since the
+    consumer that pays for the axis
+    (:mod:`creek.link.temporal`) scores exact string intersection
+    across fragments classified by either path.
+
+    Like every other dimension here this holds *this response's* verdict,
+    not the fragment's accumulated record; :meth:`merge_onto` unions the
+    two.
+    """
     overall_confidence: float = 0.0
     reasoning: str = ""
 
@@ -525,6 +584,19 @@ class WeightedFragmentClassification(BaseModel):
                 determined=wave,
             ),
             "voice": layer_determined_over(prior=fragment.voice, determined=voice),
+            # Issue #1208: ``emotional_texture`` is a list, so it merges as a
+            # UNION rather than through ``layer_determined_over`` — a
+            # weighted run must never be able to delete a tag the
+            # single-pick run or the operator recorded. The union is
+            # ``_merge_textures``, the same function the single-pick path
+            # calls, which preserves the recorded side verbatim and caps
+            # only what a classification may *add*. A profile silent about
+            # the axis contributes an empty candidate list, which is a
+            # no-op rather than a clear.
+            "emotional_texture": _merge_textures(
+                fragment.emotional_texture.copy(),
+                list(self.emotional_texture),
+            ),
         }
         # THE FREQUENCY ASYMMETRY: frequency is replaced wholesale when
         # the profile has any frequencies (so stale secondaries from an
@@ -772,6 +844,16 @@ instructional, raw, conversational
    conviction). This is NOT your certainty about the classification —
    see ``overall_confidence`` below for that.
 
+8. **Emotional Texture**: up to three short tags naming how this
+   fragment *feels*, not what it is about. This dimension is NOT
+   weighted — emit a plain list of tags. Prefer this seed vocabulary,
+   so that tags recur across fragments instead of being unique to each
+   one: __TEXTURE_BLOCK__. A free-form tag is allowed when none of
+   these fit, but reach for the seed list first. Where the fragment
+   holds an unresolved contradiction, do NOT resolve it — tag it
+   ``paradox``. Omit the section entirely rather than inventing a tag
+   for a fragment with no clear texture.
+
 Wavelength Color (Spiral Dynamics) is anchored to the primary
 frequency for downstream visualisation only — you do not need to
 score it here. Canonical vocabulary, for reference: __COLOR_BLOCK__.
@@ -815,6 +897,8 @@ voice_registers:
 confidences:
   - value: exploring
     weight: 0.6
+texture:
+  emotional: [wonder, restlessness]
 overall_confidence: 0.7
 ```
 
@@ -842,6 +926,7 @@ FRAGMENT CONTENT:
 """.replace("__FREQUENCY_BLOCK__", _FREQUENCY_BLOCK)
     .replace("__COLOR_BLOCK__", _COLOR_BLOCK)
     .replace("__FREQUENCY_COLOR_BLOCK__", _FREQUENCY_COLOR_BLOCK)
+    .replace("__TEXTURE_BLOCK__", _TEXTURE_BLOCK)
 )
 """LLM prompt template for fragment-level weighted classification.
 
@@ -857,10 +942,14 @@ Placeholders:
 - ``{title}``: the (sanitised) fragment title.
 - ``{content}``: the (sanitised) fragment body.
 
-The Frequency / Colour / Frequency→Colour blocks are pulled directly
-from :mod:`creek.classify.llm.prompts` (the shared canonical source)
-so renames or re-glosses in one place reach both this template and
-the :data:`creek.classify.prompt.PROMPT_ONTOLOGY_TEMPLATE`.
+The Frequency / Colour / Frequency→Colour / emotional-texture blocks
+are pulled directly from :mod:`creek.classify.llm.prompts` (the shared
+canonical source) so renames or re-glosses in one place reach both this
+template and the :data:`creek.classify.prompt.PROMPT_ONTOLOGY_TEMPLATE`.
+The texture block matters most for that: the axis's only consumer scores
+exact string intersection between fragments, so a seed vocabulary that
+differed between the two prompts would quietly stop the weighted path's
+fragments from ever linking to the single-pick path's (#1208).
 """
 
 
@@ -937,6 +1026,7 @@ def parse_weighted_yaml(response: str) -> WeightedFragmentClassification:
         dosages=_parse_dimension(data, "dosages", Dosage),
         voice_registers=_parse_dimension(data, "voice_registers", VoiceRegister),
         confidences=_parse_dimension(data, "confidences", Confidence),
+        emotional_texture=tuple(_parse_texture_section(data)),
         overall_confidence=_coerce_weight(data.get("overall_confidence")),
         reasoning=reasoning,
     )

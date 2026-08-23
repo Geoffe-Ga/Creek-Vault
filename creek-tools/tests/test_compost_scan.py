@@ -129,6 +129,7 @@ def _write_fragment(
     title: str,
     body: str = "I have let this one go.",
     tags: list[str] | None = None,
+    emotional_texture: list[str] | None = None,
     privacy_tier: PrivacyTier = PrivacyTier.UNCLASSIFIED,
     created: datetime = _RECENT,
     threads: list[str] | None = None,
@@ -150,6 +151,9 @@ def _write_fragment(
         body: Note body text.
         tags: Tags carried by the fragment; each one is a project identity
             to :meth:`CompostTracker._group_fragments_by_tag`.
+        emotional_texture: Free-form texture tags. ``["paradox"]`` is what
+            withholds a fragment from compost detection (issue #1210); the
+            ``tags`` list no longer does.
         privacy_tier: Declared tier written into the frontmatter.
         created: Authoring timestamp, mirrored into ``ingested``.
         threads: ``[[Wikilink]]`` thread references.
@@ -180,6 +184,7 @@ def _write_fragment(
         praxis_potential=praxis_potential,
         threads=threads or [],
         tags=tags or [],
+        emotional_texture=emotional_texture or [],
         privacy_tier=privacy_tier,
     )
     metadata = fragment.model_dump(mode="json")
@@ -434,12 +439,16 @@ def test_intimate_fragment_is_skipped_even_without_a_verifier(vault: Path) -> No
 
 
 def test_paradox_fragment_is_skipped_when_configured(vault: Path) -> None:
-    """Paradox notes hold contradiction by design and are not compost."""
+    """Paradox fragments hold contradiction by design and are not compost.
+
+    Ported from ``tags`` to ``emotional_texture`` by issue #1210, which is
+    where the ontology spec puts the marker (line 715).
+    """
     _write_fragment(
         vault,
         frag_id="frag-paradox",
         title="Both true at once",
-        tags=["paradox"],
+        emotional_texture=["paradox"],
     )
     verifier = _StubVerifier()
 
@@ -498,7 +507,8 @@ def _write_withheld(
     Args:
         vault_path: Root of the vault to write into.
         kind: ``"intimate"`` (declares ``privacy_tier: intimate``) or
-            ``"paradox"`` (adds the ``paradox`` tag).
+            ``"paradox"`` (adds the ``paradox`` *emotional texture* — the
+            spec-mandated field since issue #1210, not the ``tags`` list).
         frag_id: Fragment ID, also the filename stem.
         title: Fragment title — the string that must not escape.
         tags: Additional tags; each is a project identity to the detector.
@@ -510,17 +520,18 @@ def _write_withheld(
     Returns:
         The written :class:`~creek.models.Fragment`.
     """
-    extra_tags = list(tags or [])
     privacy_tier = PrivacyTier.UNCLASSIFIED
+    texture: list[str] = []
     if kind == "intimate":
         privacy_tier = PrivacyTier.INTIMATE
     else:
-        extra_tags.append("paradox")
+        texture.append("paradox")
     return _write_fragment(
         vault_path,
         frag_id=frag_id,
         title=title,
-        tags=extra_tags,
+        tags=list(tags or []),
+        emotional_texture=texture,
         privacy_tier=privacy_tier,
         created=created,
         threads=threads,

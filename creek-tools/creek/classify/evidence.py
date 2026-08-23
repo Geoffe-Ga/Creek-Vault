@@ -31,7 +31,7 @@ inside a delicate import cycle: :mod:`creek.models` defers its import of
 this helper out of that reasoning entirely.
 
 To be accurate about how load-bearing that is: it is not the *only*
-workable placement. All three callers already import names straight from
+workable placement. Every caller already imports names straight from
 :mod:`creek.models` at module-load time, so defining this above line 1149
 there would have worked too. The standalone module is chosen because it
 is independently better — single-purpose, trivially unit-testable, and
@@ -52,16 +52,28 @@ Callers:
   (#1309).
 - ``creek.classify.llm.parsing._apply_voice``, the single-pick LLM
   path's voice block (#1331).
+- ``creek.classify.llm.calibration._apply_wavelength``, the single-pick
+  LLM path's wavelength block (#1421). This one was the last legacy
+  writer still rebuilding wholesale; routing it through here was
+  entangled with the FEAT-017 ``_biased_enum`` downgrade, which resets
+  mode/orientation/dosage on a low self-reported confidence *on
+  purpose*. #1421 settled that as "do not adopt the noisy pick" rather
+  than "erase what we knew", which this function then delivers for
+  free: the downgrade's ``unclassified`` result **is** the sentinel a
+  sparse dump omits. The reasoning is recorded on
+  ``calibration._BIASED_DIMENSIONS``.
 
-One writer of a legacy block is deliberately **not** a caller:
-``creek.classify.llm.calibration._apply_wavelength`` still rebuilds its
-block wholesale. Routing it through here is entangled with the FEAT-017
-``_biased_enum`` downgrade, which resets mode/orientation/dosage on a low
-self-reported confidence *on purpose*, so whether that should come to
-mean "do not adopt the noisy pick" or keep meaning "erase what we knew"
-is a design call tracked on its own issue. No wavelength axis feeds a
-privacy control, so unlike the voice block that one is metadata loss
-rather than a fail-open.
+One writer is still **not** a caller:
+``creek.classify.llm.parsing._apply_frequency`` rebuilds the frequency
+block wholesale, so a response whose ``frequency:`` block names no
+``primary`` replaces a recorded one with the sentinel. That is the same
+shape of defect, tracked on its own issue (#1637) rather than folded in
+here because frequency also carries a deliberate asymmetry the scalar
+axes do not — ``secondary`` is a list, and
+:meth:`~creek.classify.weighted.WeightedFragmentClassification.merge_onto`
+replaces it wholesale on purpose. No frequency axis feeds a privacy
+control either, so like the wavelength block it is metadata loss rather
+than a fail-open.
 """
 
 from __future__ import annotations

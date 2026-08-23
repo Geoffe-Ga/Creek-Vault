@@ -279,9 +279,15 @@ class LLMClassifier:
         """
         updates: dict[str, object] = {}
         _apply_frequency(data, updates)
+        # Issue #1421: the wavelength block merges axis-by-axis for the same
+        # reason the voice block does — a response naming only ``phase`` must
+        # not blank a recorded ``descriptor``/``color``/``mode``, and the
+        # FEAT-017 confidence downgrade must drop the model's noisy pick
+        # rather than the evidence a previous run established.
         _apply_wavelength(
             data,
             updates,
+            fragment.wavelength,
             unclassified_threshold=self.config.unclassified_threshold,
         )
         # Issue #1331: the voice block merges axis-by-axis, so it needs the

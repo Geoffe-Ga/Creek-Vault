@@ -130,6 +130,7 @@ def _fragment(
     praxis_potential: PraxisPotential = PraxisPotential.NONE,
     threads: list[str] | None = None,
     tags: list[str] | None = None,
+    emotional_texture: list[str] | None = None,
     privacy_tier: PrivacyTier = PrivacyTier.UNCLASSIFIED,
 ) -> Fragment:
     """Build a minimal fragment for testing.
@@ -152,6 +153,7 @@ def _fragment(
         praxis_potential=praxis_potential,
         threads=threads or [],
         tags=tags or [],
+        emotional_texture=emotional_texture or [],
         privacy_tier=privacy_tier,
     )
 
@@ -331,7 +333,15 @@ class TestDetectCompostCandidates:
         self,
         reference_now: datetime,
     ) -> None:
-        """Paradox-tagged fragments never reach the embedding gate."""
+        """Paradox-textured fragments never reach the embedding gate.
+
+        Ported from ``tags`` to ``emotional_texture`` by issue #1210. The
+        ontology spec is the authority and it is explicit
+        (``docs/Ontology/creek_ontology_agent_prompt.md`` line 715): "Do
+        not resolve paradoxes or contradictions — tag them with
+        ``paradox`` in emotional_texture". The classifier prompt has
+        implemented the spec side since #878; only this reader disagreed.
+        """
         called: list[str] = []
 
         def _record(text: str) -> float:
@@ -343,11 +353,39 @@ class TestDetectCompostCandidates:
             frag_id="frag-paradox",
             title="The thread holds two truths",
             created=datetime(2025, 6, 1, 8, 0, 0),
-            tags=["paradox"],
+            emotional_texture=["paradox"],
         )
         candidates = tracker.detect_compost_candidates([], [frag])
         assert candidates == []
         assert called == []
+
+    def test_a_paradox_tag_alone_no_longer_withholds(
+        self,
+        reference_now: datetime,
+    ) -> None:
+        """Issue #1210: the ``tags`` reading is dropped, not kept alongside.
+
+        The old predicate's only way to see a paradox was a literal
+        ``#paradox`` hashtag harvested out of body text, which nothing in
+        the pipeline produces deliberately for a *fragment* — the tag
+        belongs on the derived note in ``10-Liminal/Paradoxes/`` (spec
+        §10.2), which ``creek/generate/paradox.py`` writes and
+        ``tests/test_paradox.py`` guards. Honouring both fields would keep
+        a spec-divergent path alive forever with no producer behind it, so
+        this asserts the divergence deliberately: a tag-only fragment is
+        now admitted, and the detectors see it.
+        """
+        tracker = CompostTracker(now=reference_now, similarity_fn=_high_similarity)
+        frag = _fragment(
+            frag_id="frag-hashtag",
+            title="A note that merely mentions paradox",
+            created=datetime(2025, 6, 1, 8, 0, 0),
+            tags=["paradox"],
+        )
+
+        candidates = tracker.detect_compost_candidates([], [frag])
+
+        assert [c.source_id for c in candidates] == ["frag-hashtag"]
 
     def test_intimate_fragment_skipped(
         self,
@@ -1274,7 +1312,7 @@ class TestScreenedFragmentBoundary:
                 frag_id="f-paradox",
                 title="Both true at once",
                 created=datetime(2024, 5, 3, 9, 0, 0),
-                tags=["paradox"],
+                emotional_texture=["paradox"],
             ),
         ]
         tracker = _RecordingTracker(now=reference_now)

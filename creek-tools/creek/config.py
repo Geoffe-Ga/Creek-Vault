@@ -1119,9 +1119,15 @@ class CompostConfig(BaseModel):
     """
 
     skip_paradox: bool = True
-    """When ``True``, fragments tagged ``paradox`` or living under
-    ``10-Liminal/Paradoxes/`` are skipped — paradoxes are contradiction-
-    holding notes by design, not compost candidates.
+    """When ``True``, fragments carrying ``paradox`` in
+    ``emotional_texture`` are skipped — paradoxes are contradiction-
+    holding notes by design, not compost candidates. Issue #1210 moved
+    the marker off ``tags`` and onto ``emotional_texture``, which is
+    where the ontology spec puts it and where the classifier prompt has
+    written it since #878; a fragment carrying only a ``paradox`` *tag*
+    is no longer withheld. The derived notes under
+    ``10-Liminal/Paradoxes/`` are a different object entirely and never
+    enter compost detection — it reads ``01-Fragments/``.
     """
 
     exemplars_relpath: str | None = None

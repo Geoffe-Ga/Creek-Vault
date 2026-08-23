@@ -50,6 +50,7 @@ from creek.models import (
     SourcePlatform,
     VoiceClassification,
     VoiceRegister,
+    WavelengthClassification,
 )
 
 # ---- Helpers ----
@@ -96,6 +97,37 @@ def _make_praxis_fragment(potential: PraxisPotential) -> Fragment:
     """
     return _make_fragment().model_copy(
         update={"praxis_potential": potential.value},
+    )
+
+
+def _make_wavelength_fragment() -> Fragment:
+    """Create a Fragment already carrying evidence on every wavelength axis (#1421).
+
+    :func:`_make_fragment` leaves all six wavelength axes at their
+    ``unclassified`` / ``""`` sentinel defaults, which are exactly the
+    values a wholesale rebuild writes back. Any assertion built on it is
+    therefore structurally blind to erasure — prior and damage look the
+    same. Every axis here is set to a *distinct, non-default* value so a
+    response that is silent about it has something to lose.
+
+    ``phase`` is deliberately left ``unclassified``: it is the one axis
+    the #1421 fixtures let the response decide, so the tests can prove a
+    determined axis still wins while the silent five survive.
+
+    Returns:
+        A Fragment identical to :func:`_make_fragment`'s but carrying a
+        fully-populated wavelength block.
+    """
+    return _make_fragment().model_copy(
+        update={
+            "wavelength": WavelengthClassification(
+                mode=Mode.INHABIT,
+                orientation=Orientation.FEEL,
+                dosage=Dosage.TOXIC,
+                color=Color.GREEN,
+                descriptor="Social Anxiety",
+            ),
+        },
     )
 
 
@@ -809,20 +841,29 @@ class TestApplyClassification:
         assert result.wavelength.descriptor == "Gnosis"
 
     def test_applies_wavelength_unknown_color_falls_back(self) -> None:
-        """Issue #319: a free-form color value defaults to ``unclassified``.
+        """Issue #319: a free-form color value never becomes a stored value.
 
         Defends against a model that emits ``"blueish"`` or ``"#ff0000"``
         instead of one of the canonical Spiral Dynamics colors — the
         fragment should fail honestly rather than carry a junk value.
+
+        Fixtured on :func:`_make_wavelength_fragment` rather than
+        :func:`_make_fragment` because of #1421: once the block merges,
+        the fallback sentinel is *dropped from the update*, so a
+        default-fixtured fragment would satisfy
+        ``color == Color.UNCLASSIFIED`` whether the fallback ran or the
+        parser was deleted outright. Against a prior-bearing fragment the
+        assertion has teeth again — ``GREEN`` proves the junk was
+        rejected, and storing ``"blueish-not-real"`` would fail here.
         """
         config = LLMConfig()
         classifier = LLMClassifier(config=config)
-        frag = _make_fragment()
+        frag = _make_wavelength_fragment()
         data: dict[str, object] = {
             "wavelength": {"color": "blueish-not-real"},
         }
         result = classifier._apply_classification(frag, data)
-        assert result.wavelength.color == Color.UNCLASSIFIED
+        assert result.wavelength.color == Color.GREEN
 
     def test_applies_wavelength_non_string_descriptor_falls_back(self) -> None:
         """Issue #319: a non-string descriptor must not crash the parser.
@@ -830,15 +871,39 @@ class TestApplyClassification:
         Models occasionally emit ``descriptor: 42`` or ``descriptor:
         null`` — we coerce to empty string so the fragment is still
         writable rather than raising mid-batch.
+
+        Prior-bearing for the same #1421 reason as the colour case above:
+        the coerced ``""`` is the sentinel the merge drops, so the
+        surviving value is the recorded descriptor. A parser that stored
+        ``"None"`` or raised would fail this assertion; a
+        default-fixtured one could not tell the difference.
         """
         config = LLMConfig()
         classifier = LLMClassifier(config=config)
-        frag = _make_fragment()
+        frag = _make_wavelength_fragment()
         data: dict[str, object] = {
             "wavelength": {"descriptor": None},
         }
         result = classifier._apply_classification(frag, data)
-        assert result.wavelength.descriptor == ""
+        assert result.wavelength.descriptor == "Social Anxiety"
+
+    def test_empty_descriptor_no_longer_clears_a_recorded_one(self) -> None:
+        """Issue #1421 behaviour change: an empty descriptor cannot blank the record.
+
+        ``descriptor`` has ``""`` for both its "not determined" sentinel
+        and its "deliberately empty" value, and the merge cannot tell
+        them apart. Layering therefore costs the ability to clear a
+        descriptor by sending an empty one — a real, deliberate trade
+        recorded here so a future reader does not mistake it for a bug.
+        Clearing a descriptor is an operator edit to the frontmatter, not
+        something an LLM response can do.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"wavelength": {"descriptor": "   "}}
+
+        result = classifier._apply_classification(_make_wavelength_fragment(), data)
+
+        assert result.wavelength.descriptor == "Social Anxiety"
 
     def test_applies_wavelength_descriptor_caps_runaway_length(self) -> None:
         """Issue #319: an absurdly long descriptor is truncated, not dropped.
@@ -2738,6 +2803,29 @@ class TestUnclassifiedBias:
         assert result.frequency.primary == Frequency.F3
 
     @patch.object(LLMClassifier, "_invoke_llm")
+    def test_low_mode_confidence_leaves_a_recorded_mode_alone(
+        self,
+        mock_call: MagicMock,
+    ) -> None:
+        """Issue #1421: the downgrade drops the pick, it does not blank the record.
+
+        The sibling test above fixtures on a default fragment, where
+        "downgraded to unclassified" and "erased" are the same value.
+        This one runs the identical response against a fragment that
+        already carries ``mode: inhabit`` and asserts the two apart.
+        """
+        mock_call.return_value = self._yaml_with_scores(
+            mode=0.3,
+            orientation=0.9,
+            dosage=0.9,
+        )
+        classifier = _make_classifier_available(
+            LLMClassifier(config=LLMConfig(unclassified_threshold=0.55)),
+        )
+        result = classifier.classify(_make_wavelength_fragment())
+        assert result.wavelength.mode == Mode.INHABIT
+
+    @patch.object(LLMClassifier, "_invoke_llm")
     def test_high_confidence_preserves_pick(
         self,
         mock_call: MagicMock,
@@ -3895,3 +3983,217 @@ class TestClassifyEmitsEmotionalTexture:
 
         assert result.frequency.primary == Frequency.UNCLASSIFIED
         assert result.emotional_texture == []
+
+
+# ---- Wavelength merge: silence must not erase evidence (issue #1421) --------
+
+
+class TestWavelengthMergePreservesEvidence:
+    """Issue #1421: ``_apply_wavelength`` layers, it does not rebuild.
+
+    The wholesale ``WavelengthClassification(...)`` rebuild wrote a
+    sentinel into every axis the response did not name, so a model that
+    answered only ``phase`` erased the mode, orientation, dosage, colour
+    and descriptor a previous run (or the operator) had recorded. The
+    axes are asserted one per test on purpose: the recurring failure on
+    this defect has been partial coverage that fixes one axis and leaves
+    the other four silently blanked.
+    """
+
+    @staticmethod
+    def _phase_only_result() -> Fragment:
+        """Apply a response that names ``phase`` and nothing else.
+
+        Returns:
+            The fragment from :func:`_make_wavelength_fragment` after a
+            response whose wavelength block carries only ``phase``.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"wavelength": {"phase": "rising"}}
+        return classifier._apply_classification(_make_wavelength_fragment(), data)
+
+    def test_determined_phase_still_wins(self) -> None:
+        """The one axis the response *did* decide is still adopted."""
+        assert self._phase_only_result().wavelength.phase == Phase.RISING
+
+    def test_silent_response_keeps_mode(self) -> None:
+        """A response silent about ``mode`` leaves the recorded mode standing."""
+        assert self._phase_only_result().wavelength.mode == Mode.INHABIT
+
+    def test_silent_response_keeps_orientation(self) -> None:
+        """A response silent about ``orientation`` leaves it standing."""
+        assert self._phase_only_result().wavelength.orientation == Orientation.FEEL
+
+    def test_silent_response_keeps_dosage(self) -> None:
+        """A response silent about ``dosage`` leaves it standing."""
+        assert self._phase_only_result().wavelength.dosage == Dosage.TOXIC
+
+    def test_silent_response_keeps_color(self) -> None:
+        """A response silent about ``color`` leaves it standing."""
+        assert self._phase_only_result().wavelength.color == Color.GREEN
+
+    def test_silent_response_keeps_descriptor(self) -> None:
+        """A response silent about ``descriptor`` leaves it standing."""
+        assert self._phase_only_result().wavelength.descriptor == "Social Anxiety"
+
+    def test_absent_wavelength_block_is_still_a_no_op(self) -> None:
+        """No ``wavelength`` key at all writes no update, as before the merge.
+
+        ``_apply_classification`` reads an empty ``updates`` dict as
+        "this run marked nothing" and returns the *same object*. The
+        merge must not turn a missing block into a wholly-default verdict
+        that gets layered on (a no-op in value terms, but a new object).
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_wavelength_fragment()
+
+        assert classifier._apply_classification(frag, {}) is frag
+
+    def test_this_run_wins_every_axis_it_contests_with_the_record(self) -> None:
+        """The merge is directional: a fresh verdict beats a recorded one.
+
+        Every other test in this class fixtures an axis the response is
+        *silent* about, where "prior survives" and "the merge ran
+        backwards" are the same observation. Nothing here contested an
+        axis, and the direction is the one thing
+        :func:`~creek.classify.evidence.layer_determined_over` cannot
+        typecheck for itself: ``prior`` and ``determined`` have the same
+        type, so transposing the two keyword arguments compiles, passes
+        mypy, and silently makes classification unable to ever revise a
+        value — a re-run would be a permanent no-op on any fragment that
+        already carried a block.
+
+        The sibling call site in
+        :mod:`creek.classify.weighted` is pinned this way already
+        (``TestMergeOnto::test_determined_dimensions_win_over_prior``);
+        this is the same guard for the wavelength call site #1421 added.
+        No ``confidence_scores`` are reported, so the FEAT-017 gate does
+        not fire and all six picks are the run's own.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {
+            "wavelength": {
+                "phase": "peaking",
+                "mode": "express",
+                "orientation": "do",
+                "dosage": "medicine",
+                "color": "orange",
+                "descriptor": "Public Courage",
+            },
+        }
+
+        result = classifier._apply_classification(_make_wavelength_fragment(), data)
+
+        assert result.wavelength.phase == Phase.PEAKING
+        assert result.wavelength.mode == Mode.EXPRESS
+        assert result.wavelength.orientation == Orientation.DO
+        assert result.wavelength.dosage == Dosage.MEDICINE
+        assert result.wavelength.color == Color.ORANGE
+        assert result.wavelength.descriptor == "Public Courage"
+
+
+class TestFeat017BiasDoesNotAdoptOrErase:
+    """Issue #1421: a sub-threshold confidence overrides the *pick*, not the record.
+
+    FEAT-017's own wording at ``calibration.py`` is that a low reported
+    confidence "overrides the model's pick with ``default``". Under the
+    rebuild that also meant erasing whatever the fragment already knew,
+    because the sentinel was written straight onto the block. Under the
+    merge the sentinel is simply dropped from the update, which gives
+    "do not adopt the noisy pick" for free and leaves prior evidence
+    alone — the reading this lane adopts.
+    """
+
+    @staticmethod
+    def _low_confidence_result() -> Fragment:
+        """Apply a response whose mode/orientation/dosage scores are sub-threshold.
+
+        Returns:
+            The fragment from :func:`_make_wavelength_fragment` after a
+            response that picks all three biased axes at low confidence.
+        """
+        classifier = LLMClassifier(config=LLMConfig(unclassified_threshold=0.55))
+        data: dict[str, object] = {
+            "wavelength": {
+                "phase": "rising",
+                "mode": "express",
+                "orientation": "do",
+                "dosage": "medicine",
+            },
+            "confidence_scores": {"mode": 0.3, "orientation": 0.2, "dosage": 0.4},
+        }
+        return classifier._apply_classification(_make_wavelength_fragment(), data)
+
+    def test_noisy_mode_pick_is_not_adopted(self) -> None:
+        """The sub-threshold ``express`` pick does not reach the fragment."""
+        assert self._low_confidence_result().wavelength.mode != Mode.EXPRESS
+
+    def test_prior_mode_is_not_erased(self) -> None:
+        """The recorded ``inhabit`` survives the downgrade."""
+        assert self._low_confidence_result().wavelength.mode == Mode.INHABIT
+
+    def test_prior_orientation_is_not_erased(self) -> None:
+        """The recorded ``feel`` survives the downgrade."""
+        assert self._low_confidence_result().wavelength.orientation == Orientation.FEEL
+
+    def test_prior_dosage_is_not_erased(self) -> None:
+        """The recorded ``toxic`` survives the downgrade."""
+        assert self._low_confidence_result().wavelength.dosage == Dosage.TOXIC
+
+    def test_ungated_phase_is_still_adopted(self) -> None:
+        """``phase`` is not in ``_BIASED_DIMENSIONS``, so the pick stands."""
+        assert self._low_confidence_result().wavelength.phase == Phase.RISING
+
+    def test_bias_still_downgrades_when_there_is_no_prior(self) -> None:
+        """With nothing recorded, a low-confidence pick still yields the sentinel.
+
+        The merge must not accidentally re-admit the noisy pick when the
+        prior happens to be the default — that would silently retire
+        FEAT-017 rather than reinterpret it.
+        """
+        classifier = LLMClassifier(config=LLMConfig(unclassified_threshold=0.55))
+        data: dict[str, object] = {
+            "wavelength": {"mode": "express"},
+            "confidence_scores": {"mode": 0.3},
+        }
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert result.wavelength.mode == Mode.UNCLASSIFIED
+
+
+class TestWavelengthEvidenceReachesDisk:
+    """Issue #1421: the preserved axes must survive the round-trip to frontmatter.
+
+    An in-memory assertion alone would not have caught the reported
+    symptom, which was operators finding blanked wavelength blocks in
+    their vault files. This writes through :class:`VaultWriter` (read,
+    never edited here — PR #1636 is open on that module) and asserts the
+    bytes on disk.
+    """
+
+    def test_preserved_descriptor_is_written_to_frontmatter(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A descriptor the response never mentioned still lands in the file."""
+        from creek.scaffold import scaffold_vault
+        from creek.vault.writer import VaultWriter
+
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"wavelength": {"phase": "rising"}}
+        classified = classifier._apply_classification(
+            _make_wavelength_fragment(),
+            data,
+        )
+
+        scaffold_vault(tmp_path)
+        path = VaultWriter(vault_path=tmp_path).write_fragment(
+            classified,
+            body="body text",
+        )
+        written = path.read_text(encoding="utf-8")
+
+        assert "descriptor: Social Anxiety" in written
+        assert "mode: inhabit" in written
+        assert "phase: rising" in written

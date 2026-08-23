@@ -716,6 +716,56 @@ class TestReatomizeAcceptance:
         )
         assert _is_accepted(with_frequency, 1.0, 0.5) is True
 
+    def test_an_inherited_frequency_primary_also_counts_as_classified(self) -> None:
+        """Issue #1422's audit of the other half of the ``_is_accepted`` conjunction.
+
+        ``frequency.primary`` inherits exactly the way ``wavelength.phase``
+        does — a split child is a ``parent.model_copy`` that overrides only
+        identity and structure fields — so the provenance question is the
+        same question twice. The decision recorded in the ``_is_accepted``
+        docstring is that an inherited value counts, and this pins it for
+        frequency: a body that fires no rule matcher at all leaves both
+        required dimensions at their inherited values, and the fragment is
+        accepted.
+        """
+        seeded = _seeded_fragment(
+            frequency=FrequencyClassification(primary=Frequency.F3),
+        )
+        child = RuleClassifier().classify(seeded, content=_RULE_INERT_BODY)
+
+        assert child.frequency.primary == Frequency.F3.value
+        assert child.wavelength.phase == Phase.RISING.value
+        assert _is_accepted(child, 1.0, 0.5) is True
+
+    def test_a_wholly_inherited_child_is_still_gated_by_its_own_score(self) -> None:
+        """Issue #1422: the child-specific half of the bar is the confidence score.
+
+        This is the assertion that makes accepting inherited evidence
+        defensible rather than merely convenient, so it is stated
+        separately from the tests above. ``_is_accepted`` is a conjunction:
+        the dimension check is provenance-blind, but the score it is
+        ANDed with comes from
+        :meth:`~creek.classify.rules.RuleClassifier.confidence_score`, which
+        reads *this* fragment's title and body and nothing stored on it. A
+        child that understood nothing of itself therefore still fails,
+        inherited block or not — and a change that let a low-scoring child
+        through on inherited dimensions alone would fail here.
+        """
+        seeded = _seeded_fragment(
+            frequency=FrequencyClassification(primary=Frequency.F3),
+        )
+        child = RuleClassifier().classify(seeded, content=_RULE_INERT_BODY)
+
+        assert _is_accepted(child, 0.49, 0.5) is False
+        assert (
+            RuleClassifier().confidence_score(
+                child,
+                content=_RULE_INERT_BODY,
+                title=_TITLE,
+            )
+            < 0.5
+        )
+
 
 def _seed_vault(vault: Path) -> Path:
     """Write one fragment carrying full evidence into *vault*.

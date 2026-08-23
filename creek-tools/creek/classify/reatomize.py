@@ -352,6 +352,45 @@ def _is_accepted(fragment: Fragment, confidence: float, threshold: float) -> boo
     per-dimension floor (see
     :attr:`creek.config.LLMConfig.unclassified_threshold`), and forcing
     them through re-atomization would over-fire.
+
+    **Provenance: an inherited dimension counts, and that is deliberate
+    (issue #1422).** A split child is a ``parent.model_copy`` overriding
+    only identity and structure (``creek/atomize/split.py``), so both
+    required dimensions usually arrive already populated, from the
+    parent, before any classifier reads the child's own text. This
+    predicate cannot tell that apart from a value the pass just derived,
+    and it is not being taught to. Three reasons, in the order they
+    decided it:
+
+    1. **The bar is a conjunction, and its other half is
+       child-specific.** The score comes from
+       :meth:`~creek.classify.rules.RuleClassifier.confidence_score`,
+       which reads the fragment's title and body and nothing stored on
+       it. A child that understood nothing of itself scores low and is
+       rejected however complete its inherited block looks, so
+       provenance-blindness here does not make acceptance
+       evidence-free.
+    2. **Inheritance is evidence, just not evidence derived from the
+       child.** Phase and primary frequency describe the register a
+       passage was written in; a paragraph carved out of a rising-phase
+       document is, absent a signal of its own, still rising-phase.
+    3. **Requiring a derived value would invert the operator's intent.**
+       The rule pass derives phase only from keyword hits, which short
+       child atoms routinely lack, so a derived-only bar keeps splitting
+       until the splitter itself runs out of material. Measured on a
+       fixed three-paragraph document in
+       ``tests/test_reatomize.py::TestInheritedDimensionsBoundRecursion``
+       — everything held constant but this rule — one accepted node
+       becomes six, at depth two, and every leaf stops on
+       ``no_decomposition`` rather than on anything learned about the
+       text. The recursion buys no information and costs a 6x fragment
+       count.
+
+    Tracking provenance would need a marker that survives a whole-fragment
+    ``model_copy``, i.e. a new persisted ``Fragment`` field and its
+    frontmatter round-trip, spent on a knob that is off by default
+    (``ClassificationConfig.reatomize``). The decision above means no
+    such mechanism is required, and none is added.
     """
     if confidence < threshold:
         return False

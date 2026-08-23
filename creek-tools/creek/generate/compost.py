@@ -173,8 +173,27 @@ def _fragment_thread_titles(fragment: Fragment) -> list[str]:
 
 
 def _is_paradox(fragment: Fragment) -> bool:
-    """Return whether *fragment* is a paradox note (skipped by compost detection)."""
-    return "paradox" in fragment.tags
+    """Return whether *fragment* is marked paradoxical (issue #1210).
+
+    Reads ``emotional_texture``, which is where the ontology spec puts
+    it: "Do not resolve paradoxes or contradictions — tag them with
+    ``paradox`` in emotional_texture"
+    (``docs/Ontology/creek_ontology_agent_prompt.md`` line 715). That
+    line is a mandate rather than a suggestion, and the classifier
+    prompt has honoured it since #878 —
+    :data:`creek.classify.llm.prompts.EMOTIONAL_TEXTURE_VOCABULARY`
+    lists ``paradox`` and cites the same line. This reader was the last
+    place still looking somewhere else.
+
+    ``tags`` is deliberately **not** consulted as well. Nothing writes a
+    fragment-level ``paradox`` tag on purpose; the only way one appeared
+    was a literal ``#paradox`` hashtag harvested out of body text.
+    Spec §10.2 does put ``#paradox`` on a *note* — the derived note in
+    ``10-Liminal/Paradoxes/`` that
+    :mod:`creek.generate.paradox` writes — which is a different object
+    from the fragments it links, and is left alone.
+    """
+    return "paradox" in fragment.emotional_texture
 
 
 def _is_intimate(fragment: Fragment) -> bool:
@@ -400,7 +419,9 @@ class CompostTracker:
             embedding_threshold: Minimum cosine similarity (against the
                 exemplars) required for a fragment to advance to the
                 verifier. Defaults to 0.6 — deliberately wide-net.
-            skip_paradox: When ``True``, fragments tagged ``paradox``
+            skip_paradox: When ``True``, fragments carrying
+                ``paradox`` in ``emotional_texture`` — the field the
+                ontology spec mandates, read there since issue #1210 —
                 are excluded from compost detection. Defaults to
                 ``True``.
             skip_intimate: When ``True``, fragments with
@@ -440,7 +461,7 @@ class CompostTracker:
            been mentioned for more than :attr:`project_gap_days`.
 
         **Withheld fragments are screened out once, here, before any
-        detector runs.** Paradox-tagged fragments (``skip_paradox``) and
+        detector runs.** Paradox-textured fragments (``skip_paradox``) and
         intimate-tier fragments (``skip_intimate``) are removed by
         :meth:`_screen`, which is the single chokepoint: a withheld
         fragment contributes no ID, no title, no excerpt, no count and no
@@ -499,10 +520,11 @@ class CompostTracker:
         """Return whether *fragment* is excluded from compost detection.
 
         The single predicate behind both skip policies. Keeping the
-        ``paradox`` and ``intimate`` tests in one place means a change to
-        either — issue #1210 moves paradox detection from ``tags`` to
-        ``emotional_texture`` — is a change to one expression rather than
-        to every detector.
+        ``paradox`` and ``intimate`` tests in one place is what made
+        issue #1210 — which moved paradox detection from ``tags`` to
+        ``emotional_texture`` — a change to one expression rather than to
+        every detector. See :func:`_is_paradox` for why the old field is
+        not read alongside the new one.
         """
         if self._skip_paradox and _is_paradox(fragment):
             return True
