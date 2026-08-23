@@ -56,7 +56,7 @@ from creek.ingest.base import (
     assemble_ingested_fragment,
 )
 from creek.ingest.ledger import LedgerRecord
-from creek.ingest.pipeline import record_source_provenance
+from creek.ingest.pipeline import record_source_provenance, run_ingestor
 from creek.ingest.routing import SKIPPED_DIRECTORY_NAMES, Arbitration, arbitrate
 from creek.link.link_engine import LinkSummary, run_link
 from creek.models import Fragment, Frequency
@@ -749,7 +749,12 @@ class Pipeline:
         claims: dict[str, list[ParsedFragment]] = {}
         for name, ingestor_cls in INGESTOR_REGISTRY.items():
             logger.info("Running ingestor: %s", name)
-            ingest_result = ingestor_cls().ingest(source_path)
+            # ``self.config.ocr`` rather than nothing: ``creek process``
+            # reaches the image ingestor through this loop, so leaving it
+            # un-threaded would honour ``ocr.enabled`` on ``creek ingest``
+            # and ignore it here — half a fix, and the half that is silent
+            # (#1517).
+            ingest_result = run_ingestor(ingestor_cls, source_path, ocr=self.config.ocr)
             for err in ingest_result.errors:
                 result.errors.append(f"[{name}] {err}")
             claims[name] = ingest_result.fragments.copy()

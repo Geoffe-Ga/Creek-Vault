@@ -9,10 +9,17 @@ implementation; tests inject a deterministic stub. The default
 optional dependencies (and the ``tesseract``/``poppler`` system
 binaries) are not installed.
 
-The ingestor also exposes :meth:`ImageIngestor.ingest_pdf`, which the
-:class:`~creek.ingest.documents.DocumentIngestor` can call when it
-detects a scanned (image-only) PDF, routing the OCR work here instead
-of trying to extract text that does not exist.
+The ingestor also exposes :meth:`ImageIngestor.ingest_pdf`, intended for
+:class:`~creek.ingest.documents.DocumentIngestor` to call when it detects
+a scanned (image-only) PDF, routing the OCR work here instead of trying
+to extract text that does not exist. **That routing does not exist yet**:
+``ingest_pdf`` has no production caller, so a scanned PDF is not OCR'd
+today by any command. Callers can invoke it directly on a known-scanned
+PDF in the meantime.
+
+Which of the four ``ocr.*`` config keys reach this module, and how, is
+:meth:`ImageIngestor.from_ocr_config` — the one place the block becomes
+behaviour (#1517).
 
 Optional dependencies (install separately to enable real OCR):
 
@@ -32,8 +39,9 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 
+from creek.config import OCRConfig
 from creek.ingest.base import (
     Ingestor,
     ParsedFragment,
@@ -42,6 +50,9 @@ from creek.ingest.base import (
     parse_authored_at,
 )
 from creek.models import SourcePlatform
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -52,16 +63,80 @@ IMAGE_EXTENSIONS: frozenset[str] = frozenset(
 """File extensions handled by :class:`ImageIngestor`."""
 
 
-_DEFAULT_LANGUAGE: str = "eng"
-"""Default tesseract language code; override per-engine for multi-lang OCR."""
+class OcrConfigError(ValueError):
+    """Raised when the vault's ``ocr`` block cannot be turned into an engine.
+
+    One base class for every way the block can be unusable, so a surface can
+    translate "your OCR config is wrong" into its own refusal idiom with a
+    single ``except`` — without widening that ``except`` to bare
+    :class:`ValueError` and swallowing failures that have nothing to do with
+    configuration.
+    """
 
 
-_DEFAULT_MIN_CONFIDENCE: float = 0.6
-"""Default OCR confidence threshold for review-queue routing.
+def join_ocr_languages(languages: Sequence[str]) -> str:
+    """Render a configured language list the one way Tesseract accepts it.
 
-Mirrors :pyattr:`creek.config.OCRConfig.min_confidence` so the ingestor
-can be constructed standalone (e.g. in tests) without requiring callers
-to materialise an :class:`OCRConfig`.
+    :pyattr:`creek.config.OCRConfig.languages` is a **list** (``["eng",
+    "fra"]``) because that is the shape an operator can read and extend in
+    YAML. Tesseract's ``lang`` argument is a single ``+``-joined **string**
+    (``"eng+fra"``). Nothing bridged the two before #1517, which is a large
+    part of why ``ocr.languages`` never reached an engine: there was no
+    agreed spelling for the join, so no caller could have performed it
+    consistently. This function is that agreement, and it is the only place
+    the join is written.
+
+    Blank and whitespace-only codes are dropped rather than passed through,
+    because ``"eng+"`` makes Tesseract fail with a message that names the
+    engine rather than the config key the operator mistyped.
+
+    Args:
+        languages: Tesseract language codes, in the operator's order. Order
+            is preserved — Tesseract treats the first code as primary.
+
+    Returns:
+        The ``+``-joined language string.
+
+    Raises:
+        OcrConfigError: When *languages* contains no usable code. An empty
+            list cannot produce OCR, so it is refused here with a message
+            naming the config key, rather than handed to Tesseract as ``""``.
+    """
+    joined = "+".join(code.strip() for code in languages if code.strip())
+    if not joined:
+        msg = (
+            "`ocr.languages` must name at least one Tesseract language code "
+            "(e.g. `[eng]`); got no usable code."
+        )
+        raise OcrConfigError(msg)
+    return joined
+
+
+_OCR_DEFAULTS: Final[OCRConfig] = OCRConfig()
+"""The single authority for this module's standalone OCR defaults.
+
+Materialising the config model, rather than restating its numbers as module
+constants, is what keeps the two from drifting: before #1517 this module
+carried its own ``0.6`` and its own ``"eng"`` beside a docstring promising
+they mirrored :class:`~creek.config.OCRConfig`, and a promise in a docstring
+is not a mechanism. Changing a default in ``OCRConfig`` now changes it here
+by construction.
+"""
+
+
+_DEFAULT_LANGUAGE: Final[str] = join_ocr_languages(_OCR_DEFAULTS.languages)
+"""Tesseract language string used when no :class:`OCRConfig` is supplied.
+
+Derived from :data:`_OCR_DEFAULTS`, not restated.
+"""
+
+
+_DEFAULT_MIN_CONFIDENCE: Final[float] = _OCR_DEFAULTS.min_confidence
+"""OCR confidence threshold used when no :class:`OCRConfig` is supplied.
+
+Derived from :data:`_OCR_DEFAULTS`, not restated, so a direct
+``ImageIngestor()`` (tests, ad-hoc API use) and a config-driven
+``ImageIngestor.from_ocr_config`` agree by construction.
 """
 
 
@@ -325,6 +400,70 @@ class PytesseractOcrEngine:
         return text.strip(), confidence
 
 
+class UnknownOcrEngineError(OcrConfigError):
+    """Raised when ``ocr.engine`` names an engine no registry entry provides.
+
+    A distinct type rather than a bare :class:`OcrConfigError` so a caller
+    that wants to offer "did you mean pytesseract?" can, while a surface that
+    only needs to refuse the run catches the base class.
+    """
+
+
+OCR_ENGINES: Final[dict[str, Callable[[str], OcrEngine]]] = {
+    "pytesseract": PytesseractOcrEngine,
+}
+"""Name → constructor for every OCR backend ``ocr.engine`` may select.
+
+This registry is what makes ``ocr.engine`` mean something. Before #1517 the
+key parsed and was then discarded, because there was nothing to resolve a
+name *against*: :class:`PytesseractOcrEngine` was the only implementation and
+callers reached it by constructing it directly. A config key whose values
+cannot be distinguished is not a setting, it is decoration.
+
+Each value is called with the joined language string from
+:func:`join_ocr_languages` and must return an :class:`OcrEngine`. Keeping the
+entry a plain callable — rather than ``type[OcrEngine]``, which a Protocol
+cannot express — means a backend needing more setup can register a small
+factory without subclassing anything.
+
+Deliberately mutable: this is the seam a test (or a downstream package) uses
+to register a deterministic engine and then drive the **production**
+resolution path, instead of bypassing config with a hand-built ingestor.
+``creek_mcp.tools.upload`` recorded the absence of exactly this seam as the
+reason its image leg had no end-to-end test.
+"""
+
+
+def resolve_ocr_engine(name: str, language: str) -> OcrEngine:
+    """Build the OCR engine ``ocr.engine`` names, or refuse by name.
+
+    An unknown name **must not** fall back to the default engine. Silently
+    substituting pytesseract for a misspelled ``ocr.engine`` is the same
+    defect class #1517 exists to close — a config key the operator can set,
+    which the run then ignores — only worse, because the run would appear to
+    succeed under a setting that was never honoured.
+
+    Args:
+        name: The value of ``ocr.engine``.
+        language: Joined Tesseract language string, from
+            :func:`join_ocr_languages`.
+
+    Returns:
+        A freshly constructed :class:`OcrEngine`.
+
+    Raises:
+        UnknownOcrEngineError: When *name* is not in :data:`OCR_ENGINES`. The
+            message lists every known name, because the operator's next
+            action is to pick one.
+    """
+    factory = OCR_ENGINES.get(name)
+    if factory is None:
+        known = ", ".join(sorted(OCR_ENGINES))
+        msg = f"Unknown OCR engine {name!r} in `ocr.engine`. Known engines: {known}."
+        raise UnknownOcrEngineError(msg)
+    return factory(language)
+
+
 def _average_confidence(conf_values: list[Any]) -> float:
     """Compute mean confidence in ``[0, 1]`` from tesseract's per-word values.
 
@@ -408,11 +547,52 @@ class ImageIngestor(Ingestor):
                 its frontmatter. The tag is a marker for a human reader;
                 no command filters on it — in particular ``creek redact
                 --review`` selects by findings, not by this key (#1338).
-                Mirrors :pyattr:`creek.config.OCRConfig.min_confidence`.
+                Defaults to :data:`_DEFAULT_MIN_CONFIDENCE`, which is read
+                off :class:`~creek.config.OCRConfig` rather than restated.
         """
         self.engine = engine if engine is not None else PytesseractOcrEngine(language)
         self.language = language
         self.min_confidence = min_confidence
+
+    @classmethod
+    def from_ocr_config(cls, config: OCRConfig) -> ImageIngestor:
+        """Build an ingestor that honours every key in an ``ocr`` block.
+
+        The one place the four ``ocr.*`` keys turn into behaviour, so there
+        is a single answer to "what does this setting do":
+
+        * ``engine`` selects the backend through :func:`resolve_ocr_engine`,
+          which refuses an unknown name rather than falling back;
+        * ``languages`` is joined by :func:`join_ocr_languages` and reaches
+          both the engine (as Tesseract's ``lang``) and the fragment
+          metadata, so the two can never disagree about what was read;
+        * ``min_confidence`` becomes the review-tagging threshold.
+
+        ``enabled`` is **not** consulted here, and deliberately: a disabled
+        pass must not construct an engine at all, so that decision belongs
+        upstream of construction, at
+        :func:`creek.ingest.pipeline.run_ingestor`. Were it honoured here,
+        ``enabled: false`` would still have to resolve ``engine`` first — and
+        an operator turning OCR off would be refused for the name of a
+        backend they had just declared they did not want to run.
+
+        Args:
+            config: The vault's ``ocr`` block.
+
+        Returns:
+            An :class:`ImageIngestor` wired to the configured engine.
+
+        Raises:
+            UnknownOcrEngineError: When ``config.engine`` names no known
+                backend.
+            OcrConfigError: When ``config.languages`` holds no usable code.
+        """
+        language = join_ocr_languages(config.languages)
+        return cls(
+            engine=resolve_ocr_engine(config.engine, language),
+            language=language,
+            min_confidence=config.min_confidence,
+        )
 
     def discover(self, source_path: Path) -> list[RawDocument]:
         """Recursively find every supported image under *source_path*.

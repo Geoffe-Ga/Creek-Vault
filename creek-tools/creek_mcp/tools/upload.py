@@ -28,11 +28,16 @@ Three limits are stated here rather than left for a reader to discover:
    preserves the on-disk frontmatter by design and re-derives the tier
    escalate-only, so re-uploading at a *higher* tier does not rewrite the
    persisted tier through this path.
-3. **Image uploads are dispatched but not tested end to end.** ``.png`` and
-   friends route to the ``image`` ingestor, whose OCR engine needs the
-   tesseract system binary and has no injection seam through ``run_ingest``,
-   so an end-to-end test would be environment-dependent. Routing is tested;
-   the OCR leg is not.
+3. **Image uploads run OCR on whatever this host has.** ``.png`` and friends
+   route to the ``image`` ingestor. This surface passes no ``ocr`` block to
+   ``run_ingest``, so the ingestor stays on its own defaults — the
+   ``pytesseract`` backend, which needs the ``tesseract`` system binary and
+   fails the unit (recorded on ``errors``) when it is absent. The seam that
+   was missing when this note first said the OCR leg could not be tested end
+   to end now exists: ``creek.ingest.images.OCR_ENGINES`` maps
+   ``ocr.engine`` names to backends, and ``run_ingest(ocr=...)`` selects one
+   (#1517). Wiring a vault-configured block through *this* surface is a
+   separate decision, not an absent capability.
 
 Gate ordering, all of it load-bearing and asserted from outside:
 

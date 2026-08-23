@@ -6418,12 +6418,22 @@ def test_no_creek_ingestor_can_put_aliases_on_a_fragment(tmp_path: Path) -> None
     through ordinary ingest and the deliberate omission above turns into
     a leak that needs real work.
 
+    The exact-set assertion is a tripwire, not the guarantee: it fires on
+    *any* addition so that a human reads this docstring before widening the
+    hatch. ``review`` was added by #1517 — it carries an OCR-confidence
+    marker, names nothing and resolves to no page, so it cannot become a
+    link the purge would have to follow. The separate ``aliases``
+    assertion below is the guarantee itself, and it does not depend on the
+    set's exact contents.
+
     Args:
         tmp_path: Pytest temporary directory, unused but kept for parity
             with the suite's fixtures.
     """
     assert tmp_path.is_dir()
-    assert frozenset({"sheet", "rows", "columns"}) == PASSTHROUGH_FRONTMATTER_KEYS
+    assert "aliases" not in PASSTHROUGH_FRONTMATTER_KEYS
+    expected = frozenset({"sheet", "rows", "columns", "review"})
+    assert expected == PASSTHROUGH_FRONTMATTER_KEYS
 
     fragment = Fragment.model_validate(
         {

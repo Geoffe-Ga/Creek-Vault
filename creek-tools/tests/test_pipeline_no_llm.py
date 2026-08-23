@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from typing import TYPE_CHECKING
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -227,10 +227,37 @@ class TestPipelineResultYieldCounts:
         assert result.residue == 1
 
 
+def _stub_ingestor_class(ingest_result: IngestResult) -> type:
+    """Build a real ingestor *class* whose ``ingest`` returns *ingest_result*.
+
+    A class, not a ``MagicMock()`` standing in for one. ``INGESTOR_REGISTRY``
+    has always been declared ``dict[str, type[Ingestor]]``, and #1517's
+    ``build_ingestor`` now asks ``issubclass(entry, ImageIngestor)`` of every
+    entry so it can hand the OCR block to the one ingestor that reads pixels.
+    A mock *instance* cannot answer ``issubclass``.
+
+    Args:
+        ingest_result: The canned result every instance returns.
+
+    Returns:
+        A zero-argument-constructible ingestor class.
+    """
+
+    class _StubIngestor:
+        """Minimal ingestor returning one canned result."""
+
+        def ingest(self, source_path: Path) -> IngestResult:
+            """Return the canned result, ignoring *source_path*."""
+            del source_path
+            return ingest_result
+
+    return _StubIngestor
+
+
 class TestRunSummaryEmitted:
     """``Pipeline.run`` must persist a yield-summary JSONL line."""
 
-    def _make_mock_ingestor_registry(self, source_path: Path) -> dict[str, MagicMock]:
+    def _make_mock_ingestor_registry(self, source_path: Path) -> dict[str, type]:
         """Build a registry that returns one ``ParsedFragment`` for tests."""
         fragment = ParsedFragment(
             content="Test content about systems and patterns",
@@ -246,9 +273,7 @@ class TestRunSummaryEmitted:
             timestamp=datetime.now(),
         )
         ingest_result = IngestResult(fragments=[fragment])
-        mock_ingestor = MagicMock()
-        mock_ingestor.return_value.ingest.return_value = ingest_result
-        return {"mock": mock_ingestor}
+        return {"mock": _stub_ingestor_class(ingest_result)}
 
     def test_run_writes_run_summary_jsonl(
         self,

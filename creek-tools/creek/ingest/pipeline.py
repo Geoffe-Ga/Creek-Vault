@@ -22,7 +22,12 @@ from dataclasses import dataclass, field
 from pathlib import Path  # runtime use: resolving recorded source paths
 from typing import TYPE_CHECKING, Final, NamedTuple
 
-from creek.ingest.base import assemble_ingested_fragment, generate_fragment_id
+from creek.ingest.base import (
+    IngestResult,
+    assemble_ingested_fragment,
+    generate_fragment_id,
+)
+from creek.ingest.images import ImageIngestor
 from creek.ingest.source_unit import compose_source_unit
 
 logger = logging.getLogger(__name__)
@@ -31,7 +36,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
     from datetime import datetime
 
-    from creek.ingest.base import Ingestor, IngestResult, ParsedFragment
+    from creek.config import OCRConfig
+    from creek.ingest.base import Ingestor, ParsedFragment
     from creek.ingest.ledger import LedgerRecord, SourceLedger
     from creek.models import Fragment, PrivacyTier
     from creek.vault.writer import VaultWriter
@@ -1564,12 +1570,17 @@ def pre_write_advisories(
     writer: VaultWriter,
     ingest_result: IngestResult,
     input_path: Path,
+    ocr_disabled: bool = False,
 ) -> list[Advisory]:
     """Collect every advisory that must be raised BEFORE the first write.
 
     All three of these are checked before :func:`run_ingest`'s write loop,
     and each for its own reason:
 
+    * **OCR switched off.** Raised first, because it explains the emptiness
+      every later advisory would otherwise be read as evidence of. An image
+      pass under ``ocr.enabled: false`` writes nothing by design, and a
+      design that says nothing is indistinguishable from a bug (#1517).
     * **Incomplete discovery.** The run destroyed nothing on partial
       evidence, and a run that quietly writes little or nothing is
       indistinguishable from a run with nothing to do (#1444).
@@ -1594,12 +1605,22 @@ def pre_write_advisories(
         writer: The vault writer, consulted read-only.
         ingest_result: The completed ingest, before anything is written.
         input_path: The source the operator named, verbatim.
+        ocr_disabled: Whether :func:`ocr_is_disabled` refused to run this
+            pass. Passed in rather than re-derived, because this function
+            holds neither the ingestor class nor the config.
 
     Returns:
         The advisories that apply, in the order they should be delivered.
         Empty when the run has nothing to say.
     """
     advisories: list[Advisory] = []
+    if ocr_disabled:
+        advisories.append(
+            Advisory(
+                message=_OCR_DISABLED_ADVISORY,
+                ceiling_safe=_OCR_DISABLED_ADVISORY,
+            ),
+        )
     incomplete = incomplete_discovery_advisory(ingest_result, input_path)
     if incomplete is not None:
         advisories.append(incomplete)
@@ -1618,6 +1639,123 @@ def pre_write_advisories(
     return advisories
 
 
+_OCR_DISABLED_ADVISORY: Final[str] = (
+    "OCR is off (`ocr.enabled: false` in the vault config), so this image "
+    "pass read no images and wrote no fragments. Set `ocr.enabled: true` in "
+    "<vault>/00-Creek-Meta/creek_config.yaml to ingest images."
+)
+"""Told to the operator when a disabled OCR pass produces nothing.
+
+A run that silently ingests nothing looks exactly like a run with nothing to
+do. Honouring ``ocr.enabled`` without saying so would trade the #1517 defect
+(a key that does nothing) for its mirror image: a key that quietly eats the
+operator's input. The text is a fixed constant with no interpolation, so it
+names a config key rather than a fragment and travels verbatim across an MCP
+tier ceiling.
+"""
+
+
+def build_ingestor(
+    ingestor_cls: type[Ingestor],
+    *,
+    ocr: OCRConfig | None = None,
+) -> Ingestor:
+    """Construct one ingestor, handing it only the config it can use.
+
+    Both production construction sites are generic: they hold an
+    ``Ingestor`` subclass out of :data:`~creek.ingest.INGESTOR_REGISTRY` and
+    called it with no arguments. That genericity is worth keeping — adding an
+    ``ocr`` parameter to :class:`~creek.ingest.base.Ingestor` itself would
+    put an OCR concern on eleven classes, ten of which have no pixels to
+    read. So the narrow knowledge lives here instead, following the shape
+    already set by :class:`~creek.ingest.chatgpt.ChatGPTIngestor`'s
+    ``chatbot_filter`` and :class:`~creek.ingest.discord.DiscordIngestor`'s
+    ``discord_filter_config``: a per-ingestor keyword, supplied by the
+    caller that has it, and every other ingestor still constructed zero-arg.
+
+    Args:
+        ingestor_cls: Concrete ingestor class to construct.
+        ocr: The vault's ``ocr`` block, when the caller has one. ``None``
+            leaves every ingestor — image included — on its own defaults,
+            which is what an API caller with no vault config gets.
+
+    Returns:
+        A ready ingestor.
+
+    Raises:
+        UnknownOcrEngineError: When *ingestor_cls* reads images and
+            ``ocr.engine`` names no known backend.
+    """
+    if ocr is not None and issubclass(ingestor_cls, ImageIngestor):
+        return ImageIngestor.from_ocr_config(ocr)
+    return ingestor_cls()
+
+
+def ocr_is_disabled(ingestor_cls: type[Ingestor], ocr: OCRConfig | None) -> bool:
+    """Return whether this run must skip OCR entirely.
+
+    Both halves matter. ``ocr.enabled`` is only meaningful for an ingestor
+    whose work *is* OCR, so the class is checked too — otherwise a vault that
+    turned OCR off would stop ingesting its markdown as well, which is the
+    kind of blast radius a boolean should never have.
+
+    Args:
+        ingestor_cls: Concrete ingestor class about to run.
+        ocr: The vault's ``ocr`` block, or ``None`` when the caller has none.
+
+    Returns:
+        ``True`` when *ingestor_cls* reads images and OCR is switched off.
+    """
+    return (
+        ocr is not None and not ocr.enabled and issubclass(ingestor_cls, ImageIngestor)
+    )
+
+
+def run_ingestor(
+    ingestor_cls: type[Ingestor],
+    source_path: Path,
+    *,
+    ocr: OCRConfig | None = None,
+) -> IngestResult:
+    """Run one ingestor under the vault's config, or decline to run it.
+
+    The single chokepoint both ``creek ingest`` (via :func:`run_ingest`) and
+    ``creek process`` (via :meth:`creek.pipeline.Pipeline._run_ingestion`)
+    go through, so ``ocr.enabled`` cannot be honoured on one surface and
+    ignored on the other — which is precisely how #1517's sibling defects
+    survive a partial fix.
+
+    A disabled OCR pass returns an empty result **without constructing an
+    engine**, so a vault that has switched OCR off never needs a working
+    ``tesseract`` binary, and never resolves ``ocr.engine`` at all.
+
+    The empty result keeps ``discovery_complete`` at its ``True`` default and
+    reports ``discovered == 0``, which together say "this pass enumerated
+    nothing and claims nothing about what exists". That cannot arm the orphan
+    sweep: :func:`tombing_is_authorised` additionally requires the source type
+    to be in :data:`TOMBING_SOURCES`, and ``image`` is deliberately absent
+    from it — while this function short-circuits for no class other than
+    :class:`~creek.ingest.images.ImageIngestor`, so no tombable source type
+    can reach this branch.
+
+    Args:
+        ingestor_cls: Concrete ingestor class to run.
+        source_path: Source directory or file to hand it.
+        ocr: The vault's ``ocr`` block, when the caller has one.
+
+    Returns:
+        The ingestor's :class:`~creek.ingest.base.IngestResult`, or an empty
+        one when OCR is switched off.
+    """
+    if ocr_is_disabled(ingestor_cls, ocr):
+        logger.info(
+            "OCR disabled by config (ocr.enabled: false); skipping %s.",
+            ingestor_cls.__name__,
+        )
+        return IngestResult()
+    return build_ingestor(ingestor_cls, ocr=ocr).ingest(source_path)
+
+
 def run_ingest(
     *,
     ingestor_cls: type[Ingestor],
@@ -1630,6 +1768,7 @@ def run_ingest(
     ledger_source: str | None = None,
     privacy_tier: PrivacyTier | None = None,
     may_tomb: bool = True,
+    ocr: OCRConfig | None = None,
     on_warning: Callable[[str], None] | None = None,
 ) -> IngestRunResult:
     """Run one ingestor and persist its output idempotently to the vault.
@@ -1674,6 +1813,14 @@ def run_ingest(
             here would mean editing every existing call site, and every one of
             those surfaces (the CLI, ``creek.upload``, ``creek.drive``) keeps
             exactly its present behaviour under ``True``.
+        ocr: The vault's ``ocr`` block (#1517). An explicit parameter rather
+            than a ``load_vault_config`` call inside this function: the CLI
+            has already loaded a config by the time it gets here and already
+            forwards config-derived values down this same call
+            (``reclassify_threshold``), so a second load would be a second
+            source of truth for the same file. ``None`` — the default every
+            existing caller keeps — leaves the ingestor on its own defaults,
+            which is exactly the behaviour those callers had before.
         on_warning: Called with each operator advisory **at the moment it is
             detected**, which for the un-pinned-vault advisory is before the
             first fragment is written (#1329). Surfaces still get every warning
@@ -1694,7 +1841,7 @@ def run_ingest(
 
     writer = VaultWriter(vault_path=vault_path)
 
-    ingest_result = ingestor_cls().ingest(input_path)
+    ingest_result = run_ingestor(ingestor_cls, input_path, ocr=ocr)
     ledger = resolve_ledger(source_type, vault_path, ledger_source)
     filtering = since is not None or incremental
 
@@ -1745,6 +1892,7 @@ def run_ingest(
         writer=writer,
         ingest_result=ingest_result,
         input_path=input_path,
+        ocr_disabled=ocr_is_disabled(ingestor_cls, ocr),
     ):
         warn(advisory.message, ceiling_safe=advisory.ceiling_safe)
 

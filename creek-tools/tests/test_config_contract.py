@@ -85,10 +85,6 @@ _LLM_BATCH_SIZE: Final[str] = (
 )
 
 DORMANT_CONFIG_FIELDS: Final[dict[str, str]] = {
-    "ocr.enabled": "declared dormant: OCR wire-in tracked by #1041",
-    "ocr.engine": "declared dormant: OCR wire-in tracked by #1041",
-    "ocr.languages": "declared dormant: OCR wire-in tracked by #1041",
-    "ocr.min_confidence": "declared dormant: OCR wire-in tracked by #1041",
     "llm.default.batch_size": _LLM_BATCH_SIZE,
     "llm.classification.batch_size": _LLM_BATCH_SIZE,
     "llm.generation.batch_size": _LLM_BATCH_SIZE,
