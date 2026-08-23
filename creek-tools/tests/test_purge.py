@@ -6120,6 +6120,36 @@ def test_the_count_splice_keeps_the_quotes_it_found(
     assert _splice_fragment_count(before, 2) == after
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(b"3.5", id="float"),
+        pytest.param(b"3abc", id="digits-then-letters"),
+        pytest.param(b"3,4", id="digits-then-a-comma"),
+        pytest.param(b"0x10", id="hex-ish"),
+        pytest.param(b"'3' extra", id="quoted-then-junk"),
+    ],
+)
+def test_the_count_splice_declines_a_value_the_digits_only_partly_cover(
+    value: bytes,
+) -> None:
+    """Matching a digit run is not the same as parsing the scalar (#949).
+
+    The digit run is greedy but not anchored to the end of the value, so
+    ``fragment_count: 3.5`` matches with ``3`` as the digits and ``.5``
+    left over. Splicing that wrote ``2.5`` -- a corrupted number, from
+    the one function whose contract is that it declines what it cannot
+    edit in place, and whose caller has a reserialisation fallback
+    precisely for these. The trailer is accepted only when it carries no
+    value of its own: spacing, a comment, and the CRLF carriage return.
+
+    Raised in review on PR #1623.
+    """
+    data = b"---\nfragment_count: " + value + b"\n---\n"
+
+    assert _splice_fragment_count(data, 2) is None
+
+
 def test_the_count_splice_declines_a_lopsided_pair_of_quotes() -> None:
     """One quote is not a quoted scalar, so the splice will not guess (#949).
 

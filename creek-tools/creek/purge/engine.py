@@ -521,6 +521,14 @@ optional closing quote, and whatever follows — a trailing comment,
 trailing whitespace, and the ``\r`` of a CRLF line ending. Only the
 digits are replaced, so the other four come back byte-identical.
 
+Matching the fifth group is not the same as accepting it. The digit
+run is greedy but not anchored to the end of the scalar, so
+``fragment_count: 3.5`` matches with ``3`` as the digits and ``.5`` as
+the trailer — and splicing that writes ``2.5``, corrupting a value the
+function was supposed to decline. :data:`_INERT_TRAILER_RE` is what
+makes the digit run *the whole scalar*: the trailer is accepted only
+when it carries no value of its own.
+
 The quote characters are captured separately rather than swallowed into
 the value so they can be written back verbatim: a quoted
 ``fragment_count: '3'`` is a YAML *string*, and rewriting it as a bare
@@ -528,6 +536,16 @@ the value so they can be written back verbatim: a quoted
 it — an edit nobody asked for, in the one function whose whole contract
 is that it makes no such edit. Column zero is required: an indented
 ``fragment_count`` belongs to a nested mapping and is not this file's own.
+"""
+
+
+_INERT_TRAILER_RE: re.Pattern[bytes] = re.compile(rb"[ \t]*(?:#[^\n]*)?\r?")
+"""Everything a ``fragment_count`` line may carry after its value.
+
+Optional spacing, an optional trailing comment, and the ``\r`` of a CRLF
+line ending — none of which is part of the value. Anything else means the
+digits matched only a *prefix* of the scalar (``3.5``, ``3abc``), and the
+splice must decline rather than rewrite a number it did not fully parse.
 """
 
 
@@ -548,7 +566,8 @@ def _splice_fragment_count(data: bytes, new_count: int) -> bytes | None:
     as a quoted ``'2'``, because dropping the quotes would silently turn
     a YAML string into an integer. When the header holds no
     spliceable ``fragment_count`` — the key is absent, or it carries a
-    list, a null, a multi-line scalar, or a lopsided pair of quotes —
+    list, a null, a multi-line scalar, a lopsided pair of quotes, or a
+    value the digits only partly cover such as ``3.5`` —
     this returns ``None`` rather than guessing: inserting a key beside a
     value this function did not understand risks a duplicate key, and a
     corrupt header on a thread file is a worse outcome than a stale
@@ -561,7 +580,8 @@ def _splice_fragment_count(data: bytes, new_count: int) -> bytes | None:
 
     Returns:
         The spliced bytes, or ``None`` when *data* has no frontmatter
-        header or no integer ``fragment_count`` at its top level.
+        header, or no ``fragment_count`` at its top level whose value is
+        an integer *and nothing else*.
     """
     opening = _OPENING_FENCE_RE.match(data)
     if opening is None:
@@ -575,6 +595,9 @@ def _splice_fragment_count(data: bytes, new_count: int) -> bytes | None:
         return None
     opening_quote, closing_quote = match.group(2), match.group(4)
     if opening_quote != closing_quote:
+        return None
+    trailer = match.group(5)
+    if _INERT_TRAILER_RE.fullmatch(trailer) is None:
         return None
     spliced = (
         match.group(1)
