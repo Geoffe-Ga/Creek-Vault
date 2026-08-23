@@ -1,7 +1,13 @@
 # ADR-0012: Remote Google Drive authorisation keeps the redirect at the caller
 
-- **Status**: Accepted
+- **Status**: Proposed
 - **Date**: 2026-08-22
+- **Ratification**: this ADR changes what the vault host holds — a Google *public*
+  client's non-secret becomes a *confidential* client's secret — and requires the
+  operator to swap `credentials.json` to a **web** client before the remote grant
+  works at all. That is the operator's decision to make, not this change's. It moves
+  to Accepted when they say so; until then the routes exist but the deployment does
+  not, and `creek gdrive --download` remains the only working first grant.
 - **Driving issues**: #1568, closing the last unmet clause of the seeding epic
   #1523. Builds on #1527 (the three `drive-connector` routes) and #1524 (the
   `upload` capability those routes were shaped after).
