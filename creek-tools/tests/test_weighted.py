@@ -34,6 +34,8 @@ from pydantic import ValidationError
 
 from creek.classify import prompt as prompt_module
 from creek.classify import weighted as weighted_module
+from creek.classify.llm.parsing import _MAX_TEXTURE_CHARS, _MAX_TEXTURES
+from creek.classify.llm.prompts import EMOTIONAL_TEXTURE_VOCABULARY
 from creek.classify.privacy import PrivacyClassifier
 from creek.classify.privacy_pass import reassess
 from creek.classify.rules import RuleClassifier
@@ -211,12 +213,13 @@ class TestLoadYamlDict:
             "dosages: []\n"
             "voice_registers: []\n"
             "confidences: []\n"
+            "texture:\n  emotional: []\n"
             "overall_confidence: 0.5\n"
         )
         parsed = _load_yaml_dict(text)
         assert parsed["overall_confidence"] == 0.5
 
-    def test_allow_list_is_exactly_these_eight_keys(self) -> None:
+    def test_allow_list_is_exactly_these_nine_keys(self) -> None:
         """SEC-004: the allow-list is pinned exactly, as a forcing function.
 
         ``_ALLOWED_TOP_LEVEL_KEYS`` is the boundary that stops a model (or a
@@ -224,7 +227,11 @@ class TestLoadYamlDict:
         Fragment fields — ``privacy_tier`` above all — straight out of an LLM
         response. An equality assertion rather than a membership one means
         widening the schema is always a deliberate, reviewed act: #1309 added
-        exactly one key and this test is where that has to be admitted.
+        exactly one key, #1208 added exactly one more, and this test is where
+        each has to be admitted. Both are named after the *dimension*
+        (``confidences``, ``texture``) and neither after the Fragment field it
+        feeds (``voice.confidence``, ``emotional_texture``), so the field
+        spellings stay rejected — see the two tests below.
         """
         assert (
             frozenset(
@@ -236,6 +243,7 @@ class TestLoadYamlDict:
                     "dosages",
                     "voice_registers",
                     "confidences",
+                    "texture",
                     "overall_confidence",
                 },
             )
@@ -798,6 +806,7 @@ def _weighted_yaml_payload(
     dosages: str = "  - value: medicine\n    weight: 0.6",
     voice_registers: str = "  - value: analytical\n    weight: 0.5",
     confidences: str = "",
+    texture: str = "",
     overall_confidence: float = 0.7,
     reasoning: str = "The fragment lands at F3 / Red, rising into expression.",
 ) -> str:
@@ -822,6 +831,8 @@ def _weighted_yaml_payload(
         sections.extend(("voice_registers:", voice_registers))
     if confidences:
         sections.extend(("confidences:", confidences))
+    if texture:
+        sections.extend(("texture:", texture))
     sections.extend((f"overall_confidence: {overall_confidence}", "```"))
     return "\n".join(sections)
 
@@ -1953,3 +1964,262 @@ class TestWeightedDownstreamConsumers:
         )
         updated = _run_weighted(_essay_fragment(), llm_config)
         assert _is_fully_classified(updated) is True
+
+
+# ---- #1208: emotional_texture on the weighted path --------------------------
+
+
+class TestWeightedTextureSecurityBoundary:
+    """SEC-004: the allow-list grew by exactly one key, and it is not a field.
+
+    :data:`_ALLOWED_TOP_LEVEL_KEYS` is the injection boundary that stops a
+    model — or a prompt injection riding in on fragment text — from writing
+    an arbitrary :class:`~creek.models.Fragment` field straight out of a
+    response. Issue #1208 widens it, so the widening itself is asserted
+    rather than assumed: one key, named after the *dimension*, with the
+    Fragment field name still rejected.
+    """
+
+    def test_allow_list_gained_exactly_the_texture_key(self) -> None:
+        """The set is pinned whole, so a second key cannot slip in beside it."""
+        assert (
+            frozenset(
+                {
+                    "frequencies",
+                    "phases",
+                    "modes",
+                    "orientations",
+                    "dosages",
+                    "voice_registers",
+                    "confidences",
+                    "texture",
+                    "overall_confidence",
+                },
+            )
+            == _ALLOWED_TOP_LEVEL_KEYS
+        )
+
+    def test_the_fragment_field_name_is_still_rejected(self) -> None:
+        """``emotional_texture`` at top level is not the accepted spelling."""
+        with pytest.raises(ValueError, match="emotional_texture"):
+            _load_yaml_dict("emotional_texture:\n  - grief\n")
+
+    @pytest.mark.parametrize(
+        "field_name",
+        ["privacy_tier", "voice_weight", "representativeness", "id", "tags"],
+    )
+    def test_no_fragment_field_can_be_written_at_top_level(
+        self,
+        field_name: str,
+    ) -> None:
+        """The boundary still rejects the fields it exists to protect.
+
+        ``privacy_tier`` above all: it is a one-way ratchet everywhere else
+        in the pipeline, and a response that could set it directly would
+        route around every escalate-only writer.
+
+        Args:
+            field_name: A real :class:`~creek.models.Fragment` field name.
+        """
+        assert field_name in Fragment.model_fields
+        with pytest.raises(ValueError, match=field_name):
+            _load_yaml_dict(f"{field_name}: something\n")
+
+
+class TestWeightedTexturePrompt:
+    """The weighted prompt asks for the axis, from the canonical vocabulary."""
+
+    def test_prompt_carries_a_texture_section(self) -> None:
+        """The schema block the model copies from includes ``texture:``."""
+        prompt = build_weighted_classification_prompt(
+            "body",
+            unclassified_threshold=0.55,
+        )
+        assert "texture:" in prompt
+        assert "emotional:" in prompt
+
+    def test_seed_vocabulary_comes_from_the_shared_constant(self) -> None:
+        """Asserted against the constant, never a typed-in copy.
+
+        The same discipline ``_build_texture_block`` already applies for the
+        single-pick prompt: a vocabulary edit must reach both prompts or
+        neither, because the one consumer that pays for this axis scores
+        exact string intersection across fragments classified by either
+        path.
+        """
+        prompt = build_weighted_classification_prompt(
+            "body",
+            unclassified_threshold=0.55,
+        )
+        for tag in EMOTIONAL_TEXTURE_VOCABULARY:
+            assert tag in prompt
+
+    def test_the_paradox_mandate_reaches_the_weighted_prompt(self) -> None:
+        """Spec line 715 makes ``paradox`` a contract, not a suggestion."""
+        prompt = build_weighted_classification_prompt(
+            "body",
+            unclassified_threshold=0.55,
+        )
+        assert "paradox" in prompt
+
+
+class TestWeightedTextureParsing:
+    """Parsing reuses the single-pick primitives, caps and all."""
+
+    def test_texture_section_is_parsed_onto_the_profile(self) -> None:
+        """A ``texture.emotional`` list reaches the parsed profile."""
+        response = _weighted_yaml_payload(
+            texture="  emotional: [grief, wonder]",
+        )
+        assert parse_weighted_yaml(response).emotional_texture == ("grief", "wonder")
+
+    def test_a_missing_texture_section_yields_no_tags(self) -> None:
+        """Silence about the axis is not an empty verdict about it."""
+        assert parse_weighted_yaml(_weighted_yaml_payload()).emotional_texture == ()
+
+    def test_the_count_cap_is_the_shared_one(self) -> None:
+        """``_MAX_TEXTURES`` bounds the weighted path too, from one constant."""
+        tags = ", ".join(f"tag{n}" for n in range(_MAX_TEXTURES * 3))
+        response = _weighted_yaml_payload(texture=f"  emotional: [{tags}]")
+
+        parsed = parse_weighted_yaml(response).emotional_texture
+
+        assert len(parsed) == _MAX_TEXTURES
+
+    def test_the_length_cap_is_the_shared_one(self) -> None:
+        """``_MAX_TEXTURE_CHARS`` truncates a runaway tag rather than dropping it."""
+        runaway = "x" * (_MAX_TEXTURE_CHARS * 4)
+        response = _weighted_yaml_payload(texture=f"  emotional: [{runaway}]")
+
+        parsed = parse_weighted_yaml(response).emotional_texture
+
+        assert parsed == (runaway[:_MAX_TEXTURE_CHARS],)
+
+    def test_normalisation_matches_the_single_pick_path(self) -> None:
+        """Case-folding and whitespace-to-hyphen are applied identically.
+
+        Two fragments classified by different paths must produce the same
+        string for the same texture, or ``creek.link.temporal``'s exact
+        set-intersection never fires between them.
+        """
+        response = _weighted_yaml_payload(texture='  emotional: ["Deep   Grief"]')
+        assert parse_weighted_yaml(response).emotional_texture == ("deep-grief",)
+
+
+class TestWeightedTextureMergeIsAUnion:
+    """``merge_onto`` adds textures; it can never subtract one.
+
+    Note what makes these red before the fix and why: ``merge_onto``
+    does not mention ``emotional_texture`` at all today, so the field is
+    *untouched* rather than clobbered. These tests therefore fail on the
+    **addition** — the weighted path producing nothing — not on a
+    preservation regression. A future reader must not mistake them for
+    guards against a merge that deletes.
+    """
+
+    def test_a_weighted_run_adds_its_tags(self) -> None:
+        """The tags the profile carries land on the fragment."""
+        profile = WeightedFragmentClassification(emotional_texture=("wonder",))
+        merged = profile.merge_onto(_make_fragment())
+        assert merged.emotional_texture == ["wonder"]
+
+    def test_a_single_pick_tag_survives_a_later_weighted_run(self) -> None:
+        """A tag an earlier run recorded is still there afterwards."""
+        fragment = _make_fragment(emotional_texture=["grief"])
+        profile = WeightedFragmentClassification(emotional_texture=("wonder",))
+
+        merged = profile.merge_onto(fragment)
+
+        assert merged.emotional_texture == ["grief", "wonder"]
+
+    def test_a_texture_free_profile_deletes_nothing(self) -> None:
+        """A profile silent about the axis leaves the recorded list alone."""
+        fragment = _make_fragment(emotional_texture=["grief", "resolve"])
+
+        merged = WeightedFragmentClassification().merge_onto(fragment)
+
+        assert merged.emotional_texture == ["grief", "resolve"]
+
+    def test_the_recorded_list_is_a_prefix_however_long_it_is(self) -> None:
+        """Preservation is total; only *growth* is capped (``_MAX_TEXTURES``)."""
+        recorded = [f"kept{n}" for n in range(_MAX_TEXTURES * 2)]
+        fragment = _make_fragment(emotional_texture=recorded)
+        profile = WeightedFragmentClassification(emotional_texture=("wonder",))
+
+        merged = profile.merge_onto(fragment)
+
+        assert merged.emotional_texture == recorded
+
+    def test_repeated_weighted_runs_are_idempotent(self) -> None:
+        """Re-classifying does not churn the fragment's frontmatter."""
+        profile = WeightedFragmentClassification(emotional_texture=("wonder",))
+        once = profile.merge_onto(_make_fragment(emotional_texture=["grief"]))
+
+        assert profile.merge_onto(once).emotional_texture == once.emotional_texture
+
+    def test_the_input_fragments_list_is_never_mutated(self) -> None:
+        """The merge must not alias, and so mutate, the caller's list.
+
+        The second half is the half with teeth. Asserting only that
+        *recorded* is unchanged after the call cannot fail today —
+        ``_merge_textures`` builds a new list and mutates neither
+        argument, so the assertion holds even with the defensive
+        ``.copy()`` at the call site deleted (measured). The aliasing
+        this actually has to catch is the tempting shortcut of handing
+        the fragment's own list straight back when the profile is silent
+        about the axis: that returns a merged fragment whose list *is*
+        the caller's, and a later append reaches through into it.
+        """
+        recorded = ["grief"]
+        fragment = _make_fragment(emotional_texture=recorded)
+
+        merged = WeightedFragmentClassification(
+            emotional_texture=("wonder",),
+        ).merge_onto(fragment)
+
+        assert recorded == ["grief"]
+        assert merged.emotional_texture is not fragment.emotional_texture
+        merged.emotional_texture.append("appended-downstream")
+        assert recorded == ["grief"]
+
+    def test_a_silent_profile_still_hands_back_a_list_of_its_own(self) -> None:
+        """The no-op case is where aliasing is most tempting, so pin it there.
+
+        An empty candidate list makes ``_merge_textures`` a value-level
+        no-op, which invites "just reuse the fragment's list". Then two
+        fragments share one object and a downstream edit to either
+        rewrites both.
+        """
+        fragment = _make_fragment(emotional_texture=["grief"])
+
+        merged = WeightedFragmentClassification().merge_onto(fragment)
+
+        assert merged.emotional_texture is not fragment.emotional_texture
+        merged.emotional_texture.append("appended-downstream")
+        assert fragment.emotional_texture == ["grief"]
+
+
+class TestWeightedTextureEndToEnd:
+    """The axis survives the whole weighted call, not just the parser."""
+
+    def test_classify_weighted_carries_texture_through(
+        self,
+        llm_config: LLMConfig,
+        fake_invoke: list[str],
+    ) -> None:
+        """A response naming textures reaches the fragment via ``merge_onto``.
+
+        Args:
+            llm_config: Provider config fixture.
+            fake_invoke: Queue of canned provider responses.
+        """
+        fake_invoke[0] = _weighted_yaml_payload(texture="  emotional: [wonder]")
+        ingested = _make_ingested(body="Some body worth classifying.")
+
+        result = classify_weighted(ingested, llm_config)
+
+        assert result.succeeded is True
+        merged = result.classification.merge_onto(
+            ingested.fragment.model_copy(update={"emotional_texture": ["grief"]}),
+        )
+        assert merged.emotional_texture == ["grief", "wonder"]

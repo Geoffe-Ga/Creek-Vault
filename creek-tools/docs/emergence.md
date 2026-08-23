@@ -75,7 +75,7 @@ Output: `10-Liminal/Synchronicities/<id>.md` linking the pair, the cosine score,
 2. **Fragment abandonment (FEAT-018)** — an embedding-similarity gate against curated exemplars (`creek/generate/exemplars/compost.yaml`) followed by an optional LLM verifier. Replaces the legacy five-phrase `_ABANDONMENT_KEYWORDS` regex with a semantic surface diverse enough to recognize abandonment in the operator's own voice. The verifier returns `yes` / `no` / `ambiguous`; ambiguous verdicts route to `10-Liminal/Compost/Review/` for manual triage rather than the canonical compost folder.
 3. **Project silence** — a tag appears in at least `project_min_fragments` fragments but has not been mentioned for more than `project_gap_days`.
 
-Privacy: intimate-tier fragments are skipped by default (never sent to the embedding gate or the verifier), respecting the same policy as `creek.classify.privacy_filter`. Paradox-tagged fragments are skipped too — paradoxes are contradiction-holding notes by design, not compost candidates.
+Privacy: intimate-tier fragments are skipped by default (never sent to the embedding gate or the verifier), respecting the same policy as `creek.classify.privacy_filter`. Fragments carrying `paradox` in `emotional_texture` are skipped too — paradoxes are contradiction-holding notes by design, not compost candidates. Since [#1210](https://github.com/Geoffe-Ga/Creek-Vault/issues/1210) that is the only field consulted: `emotional_texture` is where the ontology spec puts the marker and where the classifier writes it, so a bare `paradox` entry in `tags` no longer withholds a fragment.
 
 Configuration lives under `compost:` in `creek_config.yaml`:
 

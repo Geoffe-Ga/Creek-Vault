@@ -501,3 +501,175 @@ def _ids(tree: ClassificationTree) -> list[str]:
     for child in tree.children:
         out.extend(_ids(child))
     return out
+
+
+# ---- Provenance decision: measured recursion cost (issue #1422) -------------
+
+
+_PROVENANCE_DOC: str = (
+    "# Root heading\n\n"
+    "First paragraph carries one idea, stated plainly and at length.\n\n"
+    "Second paragraph carries a different idea, also stated plainly.\n\n"
+    "Third paragraph closes the piece with a third idea entirely.\n"
+)
+"""A fixed document whose split is deterministic.
+
+The measurement below is a *comparison* of two acceptance semantics over
+one input, so the input must not vary: three sibling paragraphs under one
+heading, no sentence-level ambiguity, no chat platform to route the
+direction heuristic away from ``split``.
+"""
+
+
+def _inheriting_classifier(confidence: float = 0.95) -> Classifier:
+    """A classifier that leaves an already-classified fragment alone.
+
+    Models the decided semantics of issue #1422: a split child arrives
+    carrying the parent's ``frequency.primary`` and ``wavelength.phase``,
+    the pass adds nothing of its own, and ``_is_accepted`` counts the
+    inherited values.
+
+    Args:
+        confidence: Score to report for every fragment.
+
+    Returns:
+        A :data:`Classifier` that is a pass-through plus a score.
+    """
+
+    def _classify(ingested: IngestedFragment) -> tuple[IngestedFragment, float]:
+        return (ingested, confidence)
+
+    return _classify
+
+
+def _derived_only_classifier(confidence: float = 0.95) -> Classifier:
+    """A classifier that blanks the required dimensions it did not derive.
+
+    Models the semantics issue #1422 considered and rejected: only a value
+    this pass established may count toward acceptance. Blanking the two
+    required dimensions on the way out is the cheapest faithful stand-in,
+    because ``_is_accepted`` reads exactly those two.
+
+    Args:
+        confidence: Score to report for every fragment — held at the same
+            value the inheriting classifier reports, so the comparison
+            isolates provenance and nothing else.
+
+    Returns:
+        A :data:`Classifier` that returns dimensionless fragments.
+    """
+
+    def _classify(ingested: IngestedFragment) -> tuple[IngestedFragment, float]:
+        blanked = ingested.fragment.model_copy(
+            update={
+                "frequency": FrequencyClassification(),
+                "wavelength": WavelengthClassification(),
+            },
+        )
+        return (IngestedFragment(fragment=blanked, body=ingested.body), confidence)
+
+    return _classify
+
+
+def _max_depth(tree: ClassificationTree) -> int:
+    """Return the deepest ``depth`` value anywhere in *tree*.
+
+    Args:
+        tree: Root of the classification tree to walk.
+
+    Returns:
+        The maximum ``depth`` recorded on any node.
+    """
+    return max([tree.depth, *[_max_depth(c) for c in tree.children]])
+
+
+def _node_count(tree: ClassificationTree) -> int:
+    """Return the number of nodes in *tree*, root included.
+
+    Args:
+        tree: Root of the classification tree to walk.
+
+    Returns:
+        Total node count.
+    """
+    return 1 + sum(_node_count(c) for c in tree.children)
+
+
+class TestInheritedDimensionsBoundRecursion:
+    """Issue #1422: what accepting an inherited dimension actually costs.
+
+    The issue asked for the recursion-depth impact to be *measured, not
+    assumed*, on a real vault. No vault exists in this repository and
+    ``classification.reatomize`` is off by default, so nothing at scale
+    exercises the path; the substitute is this fixed synthetic tree with
+    stub classifiers, which measures the same quantity deterministically.
+    Both classifiers report the identical confidence, so the only variable
+    between the two runs is whether an inherited dimension counts.
+    """
+
+    _CONFIG = ReatomizeConfig(enabled=True, threshold=0.7, max_depth=4)
+
+    def _seeded_root(self) -> IngestedFragment:
+        """Return the fixed document with both required dimensions set.
+
+        Returns:
+            An :class:`IngestedFragment` a split child will inherit from.
+        """
+        ingested = _make_ingested(body=_PROVENANCE_DOC, level="document")
+        return IngestedFragment(
+            fragment=_classified(ingested.fragment),
+            body=ingested.body,
+        )
+
+    def test_inherited_acceptance_stops_at_the_root(self) -> None:
+        """The decided semantics: one node, depth 0, no split at all."""
+        tree = classify_reatomize(
+            self._seeded_root(),
+            _inheriting_classifier(),
+            config=self._CONFIG,
+        )
+
+        assert tree.stop_reason == "accepted"
+        assert _node_count(tree) == 1
+        assert _max_depth(tree) == 0
+
+    def test_derived_only_acceptance_splits_the_same_input_apart(self) -> None:
+        """The rejected semantics: the same input recurses until it cannot.
+
+        Recorded as exact numbers rather than an inequality — this is the
+        measurement issue #1422 asked for, and "deeper" would not say how
+        much. One accepted node becomes six, at depth two, on a
+        three-paragraph document; every leaf stops at
+        ``no_decomposition`` rather than on any judgement about the text,
+        which is the tell that the recursion was not buying information.
+        A larger document multiplies this, which is why the decision is
+        not left to the default.
+        """
+        tree = classify_reatomize(
+            self._seeded_root(),
+            _derived_only_classifier(),
+            config=self._CONFIG,
+        )
+
+        assert tree.stop_reason == "split"
+        assert _node_count(tree) == 6
+        assert _max_depth(tree) == 2
+        assert {leaf.stop_reason for leaf in _collect_leaves(tree)} == {
+            "no_decomposition",
+        }
+
+    def test_the_confidence_half_still_rejects_an_inherited_child(self) -> None:
+        """Provenance-blindness is bounded by the child's own score.
+
+        The same pass-through classifier, reporting a score below the
+        threshold, does not accept — so the decision recorded in
+        ``_is_accepted``'s docstring rests on a conjunction, not on the
+        dimension check alone.
+        """
+        tree = classify_reatomize(
+            self._seeded_root(),
+            _inheriting_classifier(0.2),
+            config=self._CONFIG,
+        )
+
+        assert tree.stop_reason != "accepted"
