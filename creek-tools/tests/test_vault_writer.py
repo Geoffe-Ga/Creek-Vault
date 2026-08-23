@@ -3946,6 +3946,72 @@ class TestIndexCompaction:
             model_id: after._find_existing(model_id, target_dir) for model_id in live
         } == live
 
+    def test_a_writer_that_compacted_does_not_resume_from_its_old_cursor(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """A writer that compacted still sees another writer's later appends.
+
+        This pins the BEHAVIOUR, and deliberately does not claim to kill
+        the ``.pop()`` mutant the review flagged — it does not, and
+        chasing that was how the real mechanism turned up. Removing the
+        cache-invalidation lines leaves this green because
+        :meth:`_read_index_tail` frames every record with a leading
+        newline: a resume into rewritten content lands mid-record,
+        ``_parse_index_text`` reports damage, and the caller falls back to
+        a full load. That framing is the protection; the ``.pop()`` calls
+        are redundancy.
+
+        The scenario is still worth pinning, because it is the one the
+        shrink guard does **not** cover. Once appends grow the file back
+        past the pre-compaction size, the stale offset looks valid again,
+        so nothing but the framing stands between this lookup and a
+        silently skipped record — and a skipped record here means the id
+        resolves to nothing and the next write mints a counter-suffixed
+        sibling for a fragment that already exists.
+
+        The second writer is load-bearing: this writer's own
+        ``write_fragment`` puts the mapping straight into its in-memory
+        cache, so the cursor is never consulted at all.
+
+        Args:
+            vault_path: The test vault root.
+        """
+        target_dir, _victim, _owner = self._seed_a_compactable_index(vault_path)
+        index_path = target_dir / INDEX_FILENAME
+        writer = VaultWriter(vault_path=vault_path)
+        # Populate THIS writer's cache and cursor at the pre-compaction size.
+        assert writer._find_existing("frag-victim001", target_dir) is not None
+        size_before = index_path.stat().st_size
+
+        assert writer.compact_index(target_dir) > 0
+
+        def _fragment(model_id: str) -> Fragment:
+            return Fragment(
+                id=model_id,
+                title=model_id,
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=datetime(2025, 1, 15, 10, 30, 0),
+            )
+
+        # A SEPARATE writer appends, which is the only way the cursor is
+        # consulted at all -- this writer's own write_fragment would put the
+        # mapping straight into its in-memory cache and never read the file.
+        other = VaultWriter(vault_path=vault_path)
+        other.write_fragment(
+            _fragment("frag-after0001"),
+            body="written after the compaction by another writer",
+        )
+        # Grow the file back past the old cursor so the shrink guard -- the
+        # only thing that would otherwise force a re-read -- stops firing.
+        filler = 0
+        while index_path.stat().st_size <= size_before:
+            filler += 1
+            other.write_fragment(_fragment(f"frag-filler{filler:04d}"), body="filler")
+        assert index_path.stat().st_size > size_before
+
+        assert writer._find_existing("frag-after0001", target_dir) is not None
+
     def test_compaction_refuses_a_rewrite_that_would_grow_the_file(
         self,
         vault_path: Path,

@@ -1636,6 +1636,17 @@ class VaultWriter:
     def compact_index(self, target_dir: Path) -> int:
         """Reclaim the dead records in *target_dir*'s id index (#1300).
 
+        **No production caller today, and that is tracked, not accepted.**
+        #1300 suggested hanging this off ``creek lint --fix``; that lands
+        in ``creek/cli.py``, which was held by another in-flight change
+        when this shipped, so the operator surface is #1631. Until that
+        closes, this method is reachable only from its tests — which is
+        precisely the shape ``scripts/lint-vulture.sh`` documents as its
+        own blind spot ("code kept alive only by its own tests"). If #1631
+        is still open when you read this, it has been dead code for
+        longer than intended: wire it up or delete it, but do not leave
+        it drifting.
+
         ``.id-index.jsonl`` is append-only, so nothing in it is ever
         reclaimed in the ordinary course of writing: a superseded mapping
         keeps its old line, an entry whose file has gone keeps its line,
@@ -1748,9 +1759,21 @@ class VaultWriter:
             return 0
         _atomic_write_text(index_path, rendered)
         # The cached mapping and its byte cursor both described the file
-        # this call just replaced. Dropping them is what makes the next
-        # load re-read rather than resume from an offset into content that
-        # no longer exists.
+        # this call just replaced. Dropping them is a cheap SECOND line of
+        # defence, not the mechanism -- and the difference matters, because
+        # an earlier draft of this comment claimed otherwise and a reviewer
+        # reasonably read it as load-bearing. What actually stops a stale
+        # cursor from being believed is the framing in
+        # ``_read_index_tail``: every record carries a leading newline, so
+        # resuming at an offset into rewritten content lands mid-record,
+        # ``_parse_index_text`` reports damage, and the caller falls back to
+        # a full load. Measured directly -- offsets 10 and 45 into a
+        # three-record file both return None, offsets 0 and 31 (record
+        # boundaries) parse. Removing these two lines therefore leaves the
+        # suite green; they are kept because resuming correctly by accident
+        # is worse than not resuming, and because the shrink guard in
+        # ``_refresh_index_locked`` stops firing once appends grow the file
+        # back past the old offset.
         self._dir_indexes.pop(target_dir, None)
         self._index_cursors.pop(target_dir, None)
         return before - after
