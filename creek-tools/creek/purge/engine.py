@@ -512,15 +512,22 @@ _CLOSING_FENCE_RE: re.Pattern[bytes] = re.compile(rb"^---[ \t]*\r?$", re.MULTILI
 """The ``---`` that closes it. Searched from the end of the opening fence."""
 
 _COUNT_SCALAR_RE: re.Pattern[bytes] = re.compile(
-    rb"(?m)^(fragment_count:[ \t]*)(['\"]?\d+['\"]?)([^\n]*)$"
+    rb"(?m)^(fragment_count:[ \t]*)(['\"]?)(\d+)(['\"]?)([^\n]*)$"
 )
-"""A top-level ``fragment_count`` holding an integer, in three pieces.
+"""A top-level ``fragment_count`` holding an integer, in five pieces.
 
-The key and its spacing, the value, and whatever follows it — a trailing
-comment, trailing whitespace, and the ``\r`` of a CRLF line ending. Only
-the middle group is replaced, so the other two come back byte-identical.
-Column zero is required: an indented ``fragment_count`` belongs to a
-nested mapping and is not this file's own.
+The key and its spacing, an optional opening quote, the digits, an
+optional closing quote, and whatever follows — a trailing comment,
+trailing whitespace, and the ``\r`` of a CRLF line ending. Only the
+digits are replaced, so the other four come back byte-identical.
+
+The quote characters are captured separately rather than swallowed into
+the value so they can be written back verbatim: a quoted
+``fragment_count: '3'`` is a YAML *string*, and rewriting it as a bare
+``2`` would change the scalar's type as a side effect of decrementing
+it — an edit nobody asked for, in the one function whose whole contract
+is that it makes no such edit. Column zero is required: an indented
+``fragment_count`` belongs to a nested mapping and is not this file's own.
 """
 
 
@@ -536,14 +543,17 @@ def _splice_fragment_count(data: bytes, new_count: int) -> bytes | None:
     about. It also could not run at all on a file whose *body* is not
     valid UTF-8, which left the count wrong there instead (#910).
 
-    Nothing is ever appended or deleted. When the header holds no
+    Nothing is ever appended, deleted, or retyped. Quoting is part of
+    that promise, not an incidental detail: a quoted ``'3'`` comes back
+    as a quoted ``'2'``, because dropping the quotes would silently turn
+    a YAML string into an integer. When the header holds no
     spliceable ``fragment_count`` — the key is absent, or it carries a
-    list, a null, a multi-line scalar — this returns ``None`` rather
-    than guessing: inserting a key beside a value this function did not
-    understand risks a duplicate key, and a corrupt header on a thread
-    file is a worse outcome than a stale count. The caller falls back to
-    a full reserialisation for those, which is what wrote them in the
-    first place.
+    list, a null, a multi-line scalar, or a lopsided pair of quotes —
+    this returns ``None`` rather than guessing: inserting a key beside a
+    value this function did not understand risks a duplicate key, and a
+    corrupt header on a thread file is a worse outcome than a stale
+    count. The caller falls back to a full reserialisation for those,
+    which is what wrote them in the first place.
 
     Args:
         data: The file's current bytes.
@@ -560,13 +570,20 @@ def _splice_fragment_count(data: bytes, new_count: int) -> bytes | None:
     if closing is None:
         return None
     header, body = data[: closing.start()], data[closing.start() :]
-    replacement = str(new_count).encode()
-    spliced, hits = _COUNT_SCALAR_RE.subn(
-        lambda match: match.group(1) + replacement + match.group(3),
-        header,
-        count=1,
+    match = _COUNT_SCALAR_RE.search(header)
+    if match is None:
+        return None
+    opening_quote, closing_quote = match.group(2), match.group(4)
+    if opening_quote != closing_quote:
+        return None
+    spliced = (
+        match.group(1)
+        + opening_quote
+        + str(new_count).encode()
+        + closing_quote
+        + match.group(5)
     )
-    return spliced + body if hits else None
+    return header[: match.start()] + spliced + header[match.end() :] + body
 
 
 def _apply_scrubs(

@@ -6084,6 +6084,56 @@ def test_the_count_splice_declines_anything_it_cannot_edit_in_place(
     assert _splice_fragment_count(data, 2) is None
 
 
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        pytest.param(
+            b"---\nfragment_count: '3'\n---\n",
+            b"---\nfragment_count: '2'\n---\n",
+            id="single-quoted",
+        ),
+        pytest.param(
+            b'---\nfragment_count: "3"\n---\n',
+            b'---\nfragment_count: "2"\n---\n',
+            id="double-quoted",
+        ),
+        pytest.param(
+            b"---\nfragment_count: '10'  # kept\n---\n",
+            b"---\nfragment_count: '2'  # kept\n---\n",
+            id="quoted-with-a-trailing-comment",
+        ),
+    ],
+)
+def test_the_count_splice_keeps_the_quotes_it_found(
+    before: bytes, after: bytes
+) -> None:
+    """A quoted count comes back quoted, because quoting is a type (#949).
+
+    ``fragment_count: '3'`` is a YAML *string*; ``fragment_count: 3`` is
+    an integer. Splicing bare digits into the first one decrements the
+    count and silently retypes the scalar in the same edit — exactly the
+    class of unasked-for header rewrite this splice replaced
+    ``frontmatter.dumps`` to stop doing. The assertion is byte-identity
+    of the whole file, so the quote characters, the two spaces before
+    the comment, and the comment itself all have to survive.
+    """
+    assert _splice_fragment_count(before, 2) == after
+
+
+def test_the_count_splice_declines_a_lopsided_pair_of_quotes() -> None:
+    """One quote is not a quoted scalar, so the splice will not guess (#949).
+
+    ``fragment_count: '3`` is malformed YAML however it is read. Writing
+    back either spelling — inventing the closing quote or dropping the
+    opening one — is a repair this function has no mandate to perform,
+    so it declines and lets the reserialisation fallback decide. Both
+    orientations are pinned because the regex captures the two quotes
+    independently and could plausibly have been written to check only one.
+    """
+    assert _splice_fragment_count(b"---\nfragment_count: '3\n---\n", 2) is None
+    assert _splice_fragment_count(b"---\nfragment_count: 3'\n---\n", 2) is None
+
+
 def test_the_count_splice_moves_only_the_digits(tmp_path: Path) -> None:
     """The positive control for the guard above, at the byte level (#949).
 
