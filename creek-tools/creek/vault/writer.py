@@ -972,6 +972,49 @@ class _IndexCursor(NamedTuple):
     incremental: bool
 
 
+class _IndexView(NamedTuple):
+    """A per-directory index load, and whether it declined a write (#1621).
+
+    Loading an index is not always read-only: a directory that has
+    ``.md`` files but no ``.id-index.jsonl`` yet is rebuilt by scan and
+    the result persisted, and that persist is a whole-file
+    rename-into-place. It therefore needs
+    ``vault_lock(<dir>/.id-index.lock)`` like every other index write —
+    but the lock cannot be taken from inside ``self._lock``, which is
+    where every load already runs.
+
+    So a load that is not allowed to write reports the fact instead of
+    doing it, and the caller — which holds neither lock by then — takes
+    the key and asks again. Nothing is cached on that path, deliberately:
+    a cached mapping plus a cursor would make the second, locked load
+    answer from the snapshot and skip the persist entirely.
+
+    Attributes:
+        entries: The ``{id: filename}`` mappings, complete either way.
+        owes_write: ``True`` when answering cost an index write this
+            load was not permitted to make.
+    """
+
+    entries: dict[str, str]
+    owes_write: bool
+
+
+class _Located(NamedTuple):
+    """The outcome of one directory lookup, plus any write it owes (#1621).
+
+    Attributes:
+        path: The file that genuinely declares the id, or ``None``.
+        owes_write: ``True`` when resolving the id would have written to
+            ``.id-index.jsonl`` — a mismatch repair, or the cold persist
+            of a freshly rebuilt index. ``path`` is always ``None`` then:
+            the answer is not yet trustworthy, because the write that
+            produces it has to happen under the directory lock.
+    """
+
+    path: Path | None
+    owes_write: bool
+
+
 def _is_material_change(old_body: str, new_body: str, threshold: float) -> bool:
     """Return ``True`` when an edit changed the body materially (#675).
 
@@ -1477,25 +1520,41 @@ class VaultWriter:
         # twice.
         return sorted({*declared, *on_disk})
 
-    def _find_in_fragments_locked(self, fragment_id: str) -> Path | None:
+    def _find_in_fragments(self, fragment_id: str) -> Path | None:
         """Return the live fragment file for *fragment_id* under 01-Fragments.
 
-        Caller must hold ``self._lock``. Scans each platform subfolder's id
+        Caller must hold **no** lock. Scans each platform subfolder's id
         index so a tomb does not need to know which subfolder a fragment
         landed in — including the nested ones, which is what
         :meth:`_fragment_search_dirs` is for.
+
+        Locking is per subfolder and lazy, via
+        :meth:`_find_existing_unlocked`: the scan takes
+        ``vault_lock(<subdir>/.id-index.lock)`` only for the one directory
+        whose index actually owes a write, and only once that is proven.
+        Holding ``self._lock`` across the whole sweep — which is what this
+        method used to require — is what made the index writes underneath
+        it unlockable, because the house order is
+        ``vault_lock``-then-``self._lock`` and the lock a repair needs is
+        not known until the sweep is already inside the inner one (#1621).
 
         This searches ``01-Fragments`` only. A *borrowed* fragment lives
         under ``11-Other-Authors/<slug>/`` (see :meth:`_fragment_target_dir`)
         and is deliberately out of reach here; that gap is tracked in #1424,
         and since #1332 a caller that cannot find a fragment is told so
         rather than assuming the fragment was dealt with.
+
+        Args:
+            fragment_id: The id to look for.
+
+        Returns:
+            The fragment's path, or ``None`` when no subfolder holds it.
         """
         fragments_root = self.vault_path / _FRAGMENTS_RELPART
         if not fragments_root.is_dir():
             return None
         for subdir in self._fragment_search_dirs(fragments_root):
-            found = self._find_existing_locked(fragment_id, subdir)
+            found = self._find_existing_unlocked(fragment_id, subdir)
             if found is not None:
                 return found
         return None
@@ -1503,18 +1562,30 @@ class VaultWriter:
     def find_fragment(self, fragment_id: str) -> Path | None:
         """Return the live fragment file for *fragment_id*, or ``None``.
 
-        The public read-only view of the per-directory id index that
+        The public lookup view of the per-directory id index that
         :meth:`tomb_fragment` and :meth:`update_fragment` already navigate
-        by. Exposed for #1305's un-migrated-vault advisory, which has to
-        answer "does this vault still hold the id the old derivation would
-        have minted?" without walking and parsing every fragment file.
+        by — "read-only" would overstate it; see below. Exposed for
+        #1305's un-migrated-vault advisory, which has to answer "does this
+        vault still hold the id the old derivation would have minted?"
+        without walking and parsing every fragment file.
 
-        Read-only and index-backed, so asking is cheap. Asking also no
-        longer *writes*: until #1332 a lookup over a directory with nothing
-        to index persisted a zero-byte ``.id-index.jsonl`` into the
-        operator's vault, which made this paragraph's promise false in
+        Index-backed, so asking is cheap, and it creates nothing: until
+        #1332 a lookup over a directory with nothing to index persisted a
+        zero-byte ``.id-index.jsonl`` into the operator's vault, in
         exactly the directories the nested-subfolder fix now visits. See
         :meth:`_load_index_locked`.
+
+        "Creates nothing" is the honest promise; "never writes" is not,
+        and #1621 stopped pretending otherwise. Two index writes were
+        always reachable from here — the repair of a mapping that names a
+        file belonging to a different id, and the first-time persist of an
+        index rebuilt by scan — and both are *self-healing*, so declining
+        to make them would leave the vault paying for the damage on every
+        later lookup. What changed is that they now happen under
+        ``vault_lock(<dir>/.id-index.lock)`` like every other index write,
+        taken lazily by :meth:`_find_existing_unlocked` and only for the
+        one directory that needs it, so a lookup that finds nothing to fix
+        still touches nothing at all.
 
         Args:
             fragment_id: The id to look for.
@@ -1528,9 +1599,14 @@ class VaultWriter:
             from the vault". That gap is tracked in #1424 — its fix needs a
             search set bounded by something other than the author count,
             which is a different shape from #1332's.
+
+        Raises:
+            creek._fslock.VaultLockTimeoutError: If a directory whose index
+                needs repairing is held by another writer for longer than
+                the lock timeout. Only on that path — an uncontended lookup
+                over an intact index takes no vault lock at all.
         """
-        with self._lock:
-            return self._find_in_fragments_locked(fragment_id)
+        return self._find_in_fragments(fragment_id)
 
     def find_tombed_fragment(self, fragment_id: str) -> Path | None:
         """Return the *tombed* file for *fragment_id*, or ``None`` (#1332).
@@ -1555,8 +1631,152 @@ class VaultWriter:
             this id.
         """
         orphan_dir = self.vault_path.joinpath(*_ORPHANED_RELPARTS)
-        with self._lock:
-            return self._find_existing_locked(fragment_id, orphan_dir)
+        return self._find_existing_unlocked(fragment_id, orphan_dir)
+
+    def compact_index(self, target_dir: Path) -> int:
+        """Reclaim the dead records in *target_dir*'s id index (#1300).
+
+        **No production caller today, and that is tracked, not accepted.**
+        #1300 suggested hanging this off ``creek lint --fix``; that lands
+        in ``creek/cli.py``, which was held by another in-flight change
+        when this shipped, so the operator surface is #1631. Until that
+        closes, this method is reachable only from its tests — which is
+        precisely the shape ``scripts/lint-vulture.sh`` documents as its
+        own blind spot ("code kept alive only by its own tests"). If #1631
+        is still open when you read this, it has been dead code for
+        longer than intended: wire it up or delete it, but do not leave
+        it drifting.
+
+        ``.id-index.jsonl`` is append-only, so nothing in it is ever
+        reclaimed in the ordinary course of writing: a superseded mapping
+        keeps its old line, an entry whose file has gone keeps its line,
+        and a record torn by a crash keeps its fragment of one. The first
+        two only cost bytes. The third costs work forever —
+        :meth:`_load_index_locked` routes a damaged parse into
+        :meth:`_recover_damaged_index`, which merges by directory scan and
+        deliberately never persists, and marks the cursor
+        non-incremental — so every fresh :class:`VaultWriter` opening that
+        directory pays a full scan, permanently.
+
+        **The lock is the whole answer, and it only became available with
+        #1621.** This is a whole-file rename-into-place from one process's
+        merged snapshot, which is exactly the write
+        :meth:`_repair_index_locked` and :meth:`_load_index_locked` refuse
+        to make: it destroys anything another writer appended in the
+        meantime. It is correct here, and only here, because
+        ``vault_lock(<dir>/.id-index.lock)`` is now held by *every* index
+        writer — the two lookup-side writers that used to escape it were
+        closed by #1621. The alternatives #1300 floated (an offline
+        maintenance window, or a scheme that tolerates losing a concurrent
+        append) are strictly worse answers to a question the module had
+        already answered.
+
+        **Precedence is scan-over-parsed**, the same direction
+        :meth:`_recover_damaged_index` uses: an id a live file declares
+        takes the directory's word for it, and a parsed entry survives only
+        where the scan has nothing to say — an id whose frontmatter the
+        scanner declines (a non-string ``id``, per #1291), for instance.
+        A parsed entry whose file is *gone* is dropped rather than kept,
+        which is the one deliberate divergence: that mapping can only ever
+        answer ``None``, :meth:`_lookup_locked` already deletes it from the
+        in-memory index on sight, and carrying it forward would defeat the
+        point of the pass.
+
+        **The rewrite is refused unless it shrinks the file.** A directory
+        holding notes the index never learned about would otherwise
+        *grow* it, and a longer file at an unchanged inode is precisely
+        what another process's incremental cursor (#1603) would splice
+        onto a stale mapping as if it were an append. Shrinking bounds
+        that: a reader that had consumed the *whole* pre-compaction file
+        finds a size below its cursor, hits the cursor's own shrink guard
+        and reloads, and compaction resolves every id exactly as the file
+        it replaced did, so the reload costs it nothing.
+
+        The guard bounds the hazard; it does **not** eliminate it, and a
+        caller must not read it as a proof of reader safety. A reader
+        whose cursor is *behind* the pre-compaction size — one that
+        cached the directory early and has not looked since — can find
+        the compacted file longer than its own cursor and resume from an
+        offset that no longer falls where it did. Nearly always that
+        offset lands inside a record, the tail fails to parse, and the
+        cursor's parse guard forces a full load anyway; the residual is
+        the alignment where it lands on a record boundary, which leaves
+        that reader holding whichever mappings compaction re-sorted ahead
+        of the offset — including one the file had since corrected.
+        Closing the residual needs a generation stamp on the cursor
+        rather than a byte offset. Nothing reaches it today, because this
+        method has no caller yet; wiring one is #1631, and that is the
+        work that has to weigh it.
+
+        Args:
+            target_dir: The fragment directory whose index to compact.
+
+        Returns:
+            Bytes reclaimed. ``0`` when the directory has no index, or
+            when compacting it would not make it smaller — in both cases
+            nothing is written.
+
+        Raises:
+            creek._fslock.VaultLockTimeoutError: If another holder keeps
+                the directory key for longer than the lock timeout.
+            OSError: If the replacement file cannot be written.
+        """
+        # Checked before the lock as well as inside it: ``vault_lock``
+        # creates its lock file and ``mkdir``s the parent, and a directory
+        # with no index has nothing to compact — so asking about one must
+        # not leave a ``.id-index.lock`` behind (#1332).
+        if not (target_dir / INDEX_FILENAME).exists():
+            return 0
+        with vault_lock(self._index_lock_path(target_dir)), self._lock:
+            return self._compact_index_locked(target_dir)
+
+    def _compact_index_locked(self, target_dir: Path) -> int:
+        """Do the compaction of *target_dir*'s index, both locks held.
+
+        Caller must hold ``vault_lock(self._index_lock_path(target_dir))``
+        **and** ``self._lock``, in that order. See :meth:`compact_index`
+        for why the merge runs in this direction and why a rewrite that
+        would not shrink the file is refused.
+
+        Args:
+            target_dir: The fragment directory whose index to compact.
+
+        Returns:
+            Bytes reclaimed, or ``0`` when nothing was written.
+        """
+        before = self._index_size(target_dir)
+        if before < 0:
+            return 0
+        index_path = target_dir / INDEX_FILENAME
+        load = self._read_index_records(index_path)
+        compacted = self._rebuild_index(target_dir)
+        for model_id, filename in load.entries.items():
+            if model_id not in compacted and (target_dir / filename).exists():
+                compacted[model_id] = filename
+        rendered = self._render_index(compacted)
+        after = len(rendered.encode("utf-8"))
+        if after >= before:
+            return 0
+        _atomic_write_text(index_path, rendered)
+        # The cached mapping and its byte cursor both described the file
+        # this call just replaced. Dropping them is a cheap SECOND line of
+        # defence, not the mechanism -- and the difference matters, because
+        # an earlier draft of this comment claimed otherwise and a reviewer
+        # reasonably read it as load-bearing. What actually stops a stale
+        # cursor from being believed is the framing in
+        # ``_read_index_tail``: every record carries a leading newline, so
+        # resuming at an offset into rewritten content lands mid-record,
+        # ``_parse_index_text`` reports damage, and the caller falls back to
+        # a full load. Measured directly -- offsets 10 and 45 into a
+        # three-record file both return None, offsets 0 and 31 (record
+        # boundaries) parse. Removing these two lines therefore leaves the
+        # suite green; they are kept because resuming correctly by accident
+        # is worse than not resuming, and because the shrink guard in
+        # ``_refresh_index_locked`` stops firing once appends grow the file
+        # back past the old offset.
+        self._dir_indexes.pop(target_dir, None)
+        self._index_cursors.pop(target_dir, None)
+        return before - after
 
     def _relocate_fragment_locked(
         self,
@@ -1701,8 +1921,7 @@ class VaultWriter:
         # (``_fragment_search_dirs``) — so locking around the search would
         # litter the operator's vault with directories and lock files on a
         # lookup that found nothing, undoing #1332.
-        with self._lock:
-            located = self._find_in_fragments_locked(fragment_id)
+        located = self._find_in_fragments(fragment_id)
         if located is None:
             return None
         origin_dir = located.parent
@@ -1783,9 +2002,8 @@ class VaultWriter:
         target_dir = self._fragment_target_dir(fragment)
         # Same shape as ``tomb_fragment``: probe unlocked so a miss creates no
         # lock file and no directory, then take both keys and re-resolve (#1611).
-        with self._lock:
-            if self._find_existing_locked(fragment.id, orphan_dir) is None:
-                return None
+        if self._find_existing_unlocked(fragment.id, orphan_dir) is None:
+            return None
         with (
             _index_locks(
                 self._index_lock_path(orphan_dir),
@@ -1983,7 +2201,17 @@ class VaultWriter:
         # threadpool. Measured before the fix, two overlapping ingests of
         # one six-unit corpus produced twelve notes carrying six ids.
         # Order is always vault_lock-then-self._lock, here and in
-        # ``_update_existing``, so the pair cannot invert.
+        # ``_update_existing``, so the pair cannot invert. Since #1621 the
+        # rule has a second clause, for the callers that cannot know which
+        # key they need until they are already inside ``self._lock``: a
+        # lookup probes write-forbidden, *releases* ``self._lock``, and only
+        # then takes the pair in order and asks again
+        # (``_find_existing_unlocked``). Reaching for ``vault_lock`` from
+        # inside ``self._lock`` instead does not deadlock — the polled lock
+        # resolves it by timing the loser out after
+        # ``DEFAULT_LOCK_TIMEOUT_SECONDS`` and raising
+        # ``VaultLockTimeoutError`` out of a read-only lookup — which is why
+        # the rule is "never invert", not "never invert or you will hang".
         with vault_lock(self._index_lock_path(target_dir)), self._lock:
             existing = self._find_existing_locked(model_id, target_dir)
             if existing is not None:
@@ -2038,10 +2266,18 @@ class VaultWriter:
     ) -> Path | None:
         """Return the path of an existing file for *model_id*, or ``None``.
 
-        Caller must hold ``self._lock``. Loads (and caches) the
-        per-directory index on first access; rebuilds it from a
-        directory scan if the index file is missing or corrupt so
-        existing vaults remain compatible.
+        Caller must hold ``vault_lock(self._index_lock_path(target_dir))``
+        **and** ``self._lock``, in that order. This is the write-permitted
+        locator: it may repair a mismatched entry and it may persist a
+        freshly rebuilt index, and since #1621 neither happens outside the
+        directory key. A caller that holds no lock — every lookup-shaped
+        entry point — uses :meth:`_find_existing_unlocked` instead, which
+        probes without writing and re-enters here only once a write is
+        proven necessary.
+
+        Loads (and caches) the per-directory index on first access;
+        rebuilds it from a directory scan if the index file is missing or
+        corrupt so existing vaults remain compatible.
 
         The index is a claim, not evidence: a stale or poisoned entry
         names a file belonging to a *different* id, and every caller of
@@ -2108,22 +2344,104 @@ class VaultWriter:
                 self-terminating, so a torn repair no longer damages the
                 index it was repairing.
         """
-        index = self._load_index_locked(target_dir)
+        return self._lookup_locked(model_id, target_dir, may_write=True).path
+
+    def _find_existing_unlocked(self, model_id: str, target_dir: Path) -> Path | None:
+        """Locate *model_id* in *target_dir* from a caller holding no lock (#1621).
+
+        The lookup half of the house order. ``vault_lock`` is not
+        reentrant and the order is always
+        ``vault_lock``-then-``self._lock``, so a lookup cannot simply take
+        the directory key from inside the index critical section — that
+        inverts the pair, and the inversion does not hang, it burns
+        :data:`creek._fslock.DEFAULT_LOCK_TIMEOUT_SECONDS` and then raises
+        :class:`~creek._fslock.VaultLockTimeoutError` out of a read-only
+        call. Instead the probe runs write-forbidden under ``self._lock``
+        alone; only if it reports a write is owed does this method drop
+        that lock, take both in the correct order, and ask again.
+
+        The laziness is load-bearing, not an optimisation.
+        :func:`creek._fslock.vault_lock` creates its lock file *and*
+        ``mkdir``s the parent, and :meth:`_fragment_search_dirs`
+        deliberately visits declared-but-absent platform subfolders — so
+        taking the key before a write is proven necessary would litter the
+        operator's vault with directories and lock files on a lookup that
+        found nothing, which is exactly what #1332 and #1611 closed.
+
+        The re-ask is not a formality either: between the two the index
+        may have been repaired by whoever held the key, so the locked pass
+        refreshes the cache (#1603) and re-verifies before writing
+        anything.
+
+        Args:
+            model_id: The ID to search for.
+            target_dir: The directory to search in.
+
+        Returns:
+            The path to the existing file, or ``None`` — same contract as
+            :meth:`_find_existing_locked`.
+
+        Raises:
+            creek._fslock.VaultLockTimeoutError: If another holder keeps
+                the directory key for longer than the lock timeout, and
+                only on the path where a write was owed.
+        """
+        with self._lock:
+            located = self._lookup_locked(model_id, target_dir, may_write=False)
+        if not located.owes_write:
+            return located.path
+        with vault_lock(self._index_lock_path(target_dir)), self._lock:
+            return self._find_existing_locked(model_id, target_dir)
+
+    def _lookup_locked(
+        self,
+        model_id: str,
+        target_dir: Path,
+        *,
+        may_write: bool,
+    ) -> _Located:
+        """Resolve *model_id* in *target_dir*, writing only if permitted.
+
+        Caller must hold ``self._lock``, and must additionally hold
+        ``vault_lock(self._index_lock_path(target_dir))`` when *may_write*
+        is ``True``. The single place that decides whether answering this
+        id costs an index write: a mismatched entry needs a repair append,
+        and an absent index file needs a cold persist. Both are declined
+        rather than deferred silently, so :meth:`_find_existing_unlocked`
+        can take the key and come back.
+
+        Args:
+            model_id: The ID to search for.
+            target_dir: The directory to search in.
+            may_write: Whether the caller holds the directory key and the
+                index may therefore be written.
+
+        Returns:
+            The located path, or the fact that a write is owed. Never both.
+        """
+        view = self._load_index_view_locked(target_dir, may_write=may_write)
+        if view.owes_write:
+            return _Located(None, owes_write=True)
+        index = view.entries
         filename = index.get(model_id)
         if filename is None:
-            return None
+            return _Located(None, owes_write=False)
         candidate = target_dir / filename
         if candidate.exists():
             if _file_declares_id(candidate, model_id):
-                return candidate
-            return self._repair_index_locked(index, model_id, target_dir)
+                return _Located(candidate, owes_write=False)
+            if not may_write:
+                return _Located(None, owes_write=True)
+            repaired = self._repair_index_locked(index, model_id, target_dir)
+            return _Located(repaired, owes_write=False)
         # Stale entry — drop it from the in-memory cache so the next
         # write reuses the slot. The on-disk JSONL still contains the
-        # stale line, but it is harmless: the next write appends a new
-        # mapping that overrides it on rebuild, and a future compaction
-        # pass (out of scope for this fix) can reclaim the space.
+        # stale line; it is harmless, because the next write appends a
+        # new mapping that overrides it on rebuild, and since #1300
+        # :meth:`compact_index` reclaims the space. Dropping it is a
+        # cache edit, not an index write, so it is allowed either way.
         del index[model_id]
-        return None
+        return _Located(None, owes_write=False)
 
     def _repair_index_locked(
         self,
@@ -2133,21 +2451,27 @@ class VaultWriter:
     ) -> Path | None:
         """Re-resolve *model_id* by scanning *target_dir*, and persist the fix.
 
-        Caller must hold ``self._lock``. Reached only when the indexed
-        file exists but declares a different id, so the scan is paid
-        once per poisoned entry rather than per lookup.
+        Caller must hold ``vault_lock(self._index_lock_path(target_dir))``
+        **and** ``self._lock``, in that order. Reached only when the
+        indexed file exists but declares a different id, so the scan is
+        paid once per poisoned entry rather than per lookup.
 
-        This append is the one remaining index writer that does **not**
-        hold ``vault_lock(<dir>/.id-index.lock)``. It runs inside
-        ``self._lock``, and the house order is vault-lock-then-``self._lock``
-        (see :meth:`_write_model`), so acquiring it here would invert the
-        pair and deadlock a :class:`VaultWriter` driven from several
-        threads. Latent rather than live — ``O_APPEND`` below
-        ``_PIPE_BUF_BYTES`` cannot interleave, and the index is
-        later-wins, so two unsynchronised repairs cost a redundant line
-        and not a wrong answer. It is tracked as #1621, which is a
-        prerequisite for the compaction pass in #1300: a whole-file
-        rewrite can only be correct once every appender takes the lock.
+        Until #1621 this append was reachable from a caller holding only
+        ``self._lock`` — every lookup-shaped entry point — and it was not
+        the only one: :meth:`_load_index_locked`'s cold persist was a
+        second, and a worse one, because a whole-file rename-into-place
+        can replace a file another process just finished writing where a
+        lost append costs a single line. Taking the key *here* was not
+        available: the house order is ``vault_lock``-then-``self._lock``
+        (see :meth:`_write_model`), and the naive inversion does not
+        deadlock — it burns
+        :data:`creek._fslock.DEFAULT_LOCK_TIMEOUT_SECONDS` and raises
+        :class:`~creek._fslock.VaultLockTimeoutError` out of a read-only
+        lookup, which is worse than the hazard it closes. So the decision
+        moved outward instead: :meth:`_lookup_locked` reports that a write
+        is owed and :meth:`_find_existing_unlocked` re-enters with both
+        locks held. That is what makes #1300's compaction pass correct — a
+        whole-file rewrite is only safe once every appender takes the key.
 
         The corrected mapping is persisted with
         :meth:`_append_index_entry`, never :meth:`_persist_full_index`:
@@ -2191,9 +2515,12 @@ class VaultWriter:
         """Return the path of an existing file for *model_id*, or ``None``.
 
         Retained for tests and tooling that introspect the writer
-        without going through ``_write_model``. Acquires ``self._lock``
-        and delegates to the locked variant so the caller does not have
-        to know about the lock invariant.
+        without going through ``_write_model``. Delegates to
+        :meth:`_find_existing_unlocked`, which takes whichever locks the
+        answer turns out to need, so the caller does not have to know
+        about the lock invariant — and, since #1621, so that a shim used
+        from a caller holding nothing cannot be the way an index write
+        escapes the directory key.
 
         Args:
             model_id: The ID to search for.
@@ -2202,8 +2529,7 @@ class VaultWriter:
         Returns:
             The path to the existing file, or ``None`` if not found.
         """
-        with self._lock:
-            return self._find_existing_locked(model_id, target_dir)
+        return self._find_existing_unlocked(model_id, target_dir)
 
     @staticmethod
     def _index_lock_path(target_dir: Path) -> Path:
@@ -2318,6 +2644,12 @@ class VaultWriter:
     def _load_index_locked(self, target_dir: Path) -> dict[str, str]:
         """Return the cached per-directory index, loading it if needed.
 
+        Caller must hold ``vault_lock(self._index_lock_path(target_dir))``
+        **and** ``self._lock``: this is the write-permitted spelling, and
+        the cold rebuild below persists. A caller holding only
+        ``self._lock`` uses
+        ``_load_index_view_locked(..., may_write=False)`` instead (#1621).
+
         On first access for *target_dir* the index is reconstructed from
         the JSONL file (later entries overwrite earlier ones, so the
         last successful write wins). If the JSONL file is missing the
@@ -2330,7 +2662,12 @@ class VaultWriter:
         empty directory was the tomb scan, which left a trail of zero-byte
         ``.id-index.jsonl`` files behind every miss. Re-globbing an empty
         directory once per :class:`VaultWriter` is the cheaper side of that
-        trade, and it keeps :meth:`find_fragment` genuinely read-only.
+        trade, and it keeps :meth:`find_fragment` from *creating* anything
+        in a directory it only asked about. It does not make that method
+        read-only — the persist below, and the repair in
+        :meth:`_repair_index_locked`, are both reachable from a lookup,
+        which is why #1621 put them under the directory key rather than
+        pretending they were not there.
         Pre-existing zero-byte index files stay valid: they parse to the
         same empty mapping a rescan produces.
 
@@ -2363,12 +2700,50 @@ class VaultWriter:
         directory per :class:`VaultWriter` instance — not once per
         process, since a caller that builds several writers pays it once
         for each.
+
+        Args:
+            target_dir: The directory whose index is wanted.
+
+        Returns:
+            The ``{id: filename}`` mapping, cached for this writer.
+        """
+        return self._load_index_view_locked(target_dir, may_write=True).entries
+
+    def _load_index_view_locked(
+        self,
+        target_dir: Path,
+        *,
+        may_write: bool,
+    ) -> _IndexView:
+        """Load *target_dir*'s index, declining the cold persist if forbidden.
+
+        Caller must hold ``self._lock``, and must additionally hold
+        ``vault_lock(self._index_lock_path(target_dir))`` when *may_write*
+        is ``True``. See :meth:`_load_index_locked` for what the load
+        itself does and why; this wrapper exists only to make the one
+        *write* on that path — the persist of a freshly rebuilt index —
+        conditional on holding the directory key (#1621).
+
+        Declining does **not** cache. That is the whole point: caching the
+        rebuilt mapping and its cursor would make the caller's second,
+        locked load answer from the snapshot with "nothing changed" and
+        skip the persist forever, which is the rejected
+        "just stop persisting from lookups" answer wearing a cache. The
+        cost of not caching is one extra directory scan, paid once, on a
+        directory that has no index file yet.
+
+        Args:
+            target_dir: The directory whose index is wanted.
+            may_write: Whether the caller holds the directory key.
+
+        Returns:
+            The mapping, and whether a persist was owed and declined.
         """
         cached = self._dir_indexes.get(target_dir)
         if cached is not None:
             refreshed = self._refresh_index_locked(target_dir, cached)
             if refreshed is not None:
-                return refreshed
+                return _IndexView(refreshed, owes_write=False)
         index_path = target_dir / INDEX_FILENAME
         incremental = True
         if index_path.exists():
@@ -2380,6 +2755,8 @@ class VaultWriter:
                 incremental = False
         else:
             index = self._rebuild_index(target_dir) if target_dir.is_dir() else {}
+            if index and not may_write:
+                return _IndexView(index, owes_write=True)
             if index:
                 self._persist_full_index(target_dir, index)
             # Measured *after* the optional persist, so the freshly
@@ -2388,7 +2765,7 @@ class VaultWriter:
             consumed = self._index_size(target_dir)
         self._dir_indexes[target_dir] = index
         self._index_cursors[target_dir] = _IndexCursor(consumed, incremental)
-        return index
+        return _IndexView(index, owes_write=False)
 
     @staticmethod
     def _recover_damaged_index(
@@ -2406,6 +2783,13 @@ class VaultWriter:
 
         Returns:
             The merged index, with the disk scan taking precedence.
+
+        Recovery is in-memory only: persisting it would be the whole-file
+        rewrite this module refuses everywhere else, so the damage — and
+        this scan — used to be permanent, paid by every process that
+        opened the directory. Since #1300 the fix is
+        :meth:`compact_index`, which makes the same merge durable because
+        it holds the directory key while it writes.
         """
         logger.warning(
             "index %s has %d unparseable line(s)%s; re-resolving by directory scan",
@@ -2560,14 +2944,45 @@ class VaultWriter:
         that predates the index file), and only when that scan found at
         least one id — see :meth:`_load_index_locked` for why an empty
         rebuild must not be memoised (#1332). Steady-state updates use
-        :meth:`_append_index_entry`, which is O(1) per write.
+        :meth:`_append_index_entry`, which is O(1) per write, and the
+        maintenance rewrite in :meth:`compact_index` shares this method's
+        serialiser rather than its ``mkdir``-and-write.
+
+        Args:
+            target_dir: The directory whose index file to write.
+            index: The mapping to serialise.
         """
         target_dir.mkdir(parents=True, exist_ok=True)
-        lines = "".join(
+        _atomic_write_text(
+            target_dir / INDEX_FILENAME,
+            VaultWriter._render_index(index),
+        )
+
+    @staticmethod
+    def _render_index(index: dict[str, str]) -> str:
+        """Serialise *index* as the entire content of a JSONL index file.
+
+        One serialiser for both whole-file writers —
+        :meth:`_persist_full_index` and :meth:`compact_index` — so a
+        compacted file is byte-identical to a freshly built one and the
+        two can never drift into disagreeing about the record shape.
+
+        Args:
+            index: The ``{id: filename}`` mapping to render.
+
+        Returns:
+            The file content: one sorted JSON object per line, each
+            newline-terminated. Unlike :meth:`_append_index_entry` there
+            is no *leading* newline per record — this content is written
+            by rename-into-place and can never tear, so it needs no
+            self-delimiting frame. Blank-line tolerance in
+            :meth:`_parse_index_text` is what lets the two shapes share
+            one parser.
+        """
+        return "".join(
             json.dumps({"id": mid, "filename": filename}, sort_keys=True) + "\n"
             for mid, filename in sorted(index.items())
         )
-        _atomic_write_text(target_dir / INDEX_FILENAME, lines)
 
     @staticmethod
     def _append_index_entry(target_dir: Path, model_id: str, filename: str) -> None:
