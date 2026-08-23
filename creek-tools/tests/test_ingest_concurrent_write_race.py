@@ -165,10 +165,16 @@ original = VaultWriter._write_model
 create = VaultWriter._atomic_create
 
 
-def _slow_create(target_dir, base_name, content):
-    """Pause between the id lookup and the file creation, then create."""
+def _slow_create(target_dir, base_name, content, **kwargs):
+    """Pause between the id lookup and the file creation, then create.
+
+    Forwards ``**kwargs`` verbatim so this stub cannot silently drift from
+    the real signature. ``_write_model`` passes ``expected_id`` (#1299), and
+    a stub that dropped it would quietly disarm the collision verification
+    this very test's overlap is most likely to trip.
+    """
     time.sleep(widen)
-    return create(target_dir, base_name, content)
+    return create(target_dir, base_name, content, **kwargs)
 
 
 VaultWriter._atomic_create = staticmethod(_slow_create)

@@ -473,24 +473,32 @@ def test_load_post_or_raise_returns_the_document(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("header_name", _HEADER_IDS)
-def test_corrupt_fragment_goes_invisible_rather_than_crashing(
+def test_corrupt_fragment_keeps_its_identity_and_is_reported(
     writer_vault: Path,
     header_name: str,
 ) -> None:
-    """Characterisation of the surviving behaviour, and of its known cost.
+    """A corrupt header costs a diagnostic, not the file's identity (#1543).
 
-    Before this change a fragment file carrying a non-string frontmatter key
-    took down :meth:`~creek.vault.writer.VaultWriter._rebuild_index`, and with
-    it every id lookup in that directory. Now the directory keeps working and
-    only the corrupt file is lost to the index.
+    The inversion of the characterisation this test used to hold. A fragment
+    whose header carries a non-string key was previously invisible to all four
+    lifecycle paths at once: ``find_fragment`` reported nothing,
+    ``update_fragment`` / ``tomb_fragment`` / ``restore_fragment`` each
+    silently declined, and the *next* ``write_fragment`` minted a duplicate
+    carrying the same id while the index moved to name the duplicate. The
+    original was then orphaned with no record that it had ever been the file
+    for that id — silent data loss dressed as a lookup miss.
 
-    "Lost to the index" is not a happy ending: the id it declares no longer
-    resolves, so the next ``write_fragment`` writes a duplicate. That is
-    **issue #1543**, deliberately not fixed here — the obvious remedy
-    (``read_header_meta`` in the verifier) is a measured 6x regression on a
-    per-index-hit path, and the right fix is the bounded byte-scan for ``id``
-    that ``_find_in_dir_locked``'s docstring already names. This test exists so
-    that behaviour cannot drift silently while #1543 is open.
+    The verifier now reads the ``id`` line with a bounded byte-scan
+    (:func:`creek.vault.writer._declared_id`) instead of asking the YAML
+    parser for the whole header, so a broken line elsewhere no longer hides
+    an id sitting in plain text. What each path does with the file it found
+    then follows its own contract:
+
+    * ``find_fragment`` needs only the header, and returns the path;
+    * the three write paths need the *body*, so they load through
+      :func:`creek.vault.reader.load_post_or_raise` and fail loudly, naming
+      the file — the operator is told which note to repair rather than being
+      handed a silent no-op.
     """
     writer = VaultWriter(vault_path=writer_vault)
     fragment = _good_fragment(0)
@@ -508,10 +516,16 @@ def test_corrupt_fragment_goes_invisible_rather_than_crashing(
         corrupt_header,
     )
 
-    assert writer.find_fragment(fragment.id) is None
-    assert writer.update_fragment(fragment, body="new") is None
-    assert writer.tomb_fragment(fragment.id) is None
-    assert writer.restore_fragment(fragment) is None
+    assert writer.find_fragment(fragment.id) == written
+    assert writer.find_tombed_fragment(fragment.id) == orphan
+    for act in (
+        lambda: writer.update_fragment(fragment, body="new"),
+        lambda: writer.tomb_fragment(fragment.id),
+    ):
+        with pytest.raises(ValueError, match=re.escape(str(written))):
+            act()
+    with pytest.raises(ValueError, match=re.escape(str(orphan))):
+        writer.restore_fragment(fragment)
     # ...and the tombstone really is sitting there, declaring the id in text.
     assert fragment.id in orphan.read_text(encoding="utf-8")
 
@@ -589,7 +603,7 @@ def _arm_vanishing_file(
     monkeypatch: pytest.MonkeyPatch,
     doomed_id: str,
 ) -> dict[str, bool]:
-    """Delete the located file for *doomed_id* the instant it is located.
+    """Delete the located file for *doomed_id* the instant before it is loaded.
 
     A genuine race, not a mocked exception: the file is really unlinked
     between the id verifier proving it and the write path loading it, so
@@ -597,22 +611,29 @@ def _arm_vanishing_file(
     That is the window :func:`creek.vault.writer.load_post_or_raise`'s
     docstring describes — an editor or sync client rewriting a live Obsidian
     vault under a running ingest.
+
+    Armed on the *load*, not on the locate. It used to wrap
+    ``_find_existing_locked`` and fire on the first resolution, which named
+    the same window while ``tomb_fragment`` resolved the id exactly once.
+    Since #1611 it resolves twice — an unlocked probe, then a re-resolve under
+    the directory lock — so a file deleted at the first resolution is caught by
+    the second and never reaches the loader at all. That narrowing is the
+    point of #1611 and must not be undone; firing here keeps the arming aimed
+    at the window that genuinely survives it, with the same assertions.
     """
-    real = VaultWriter._find_existing_locked
+    from creek.vault import writer as writer_module
+
+    real = writer_module.load_post_or_raise
     state = {"fired": False}
 
-    def racing(
-        self: VaultWriter,
-        model_id: str,
-        target_dir: Path,
-    ) -> Path | None:
-        found = real(self, model_id, target_dir)
-        if found is not None and model_id == doomed_id and not state["fired"]:
+    def racing(path: Path) -> frontmatter.Post:
+        """Unlink the doomed file, then load it and let the real error surface."""
+        if not state["fired"] and doomed_id in path.read_text(encoding="utf-8"):
             state["fired"] = True
-            found.unlink()
-        return found
+            path.unlink()
+        return real(path)
 
-    monkeypatch.setattr(VaultWriter, "_find_existing_locked", racing)
+    monkeypatch.setattr(writer_module, "load_post_or_raise", racing)
     return state
 
 

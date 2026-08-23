@@ -27,6 +27,9 @@ from creek.lint.checks import (
     draft_grounding as draft_grounding_check,
 )
 from creek.lint.checks import (
+    nonstring_id as nonstring_id_check,
+)
+from creek.lint.checks import (
     paradox as paradox_check,
 )
 from creek.lint.checks import (
@@ -95,6 +98,7 @@ DETERMINISTIC_CHECKS: tuple[str, ...] = (
     "draft-grounding",
     "voice-fidelity",
     "unparseable",
+    "nonstring-id",
     "ancestry",
     "root-hygiene",
 )
@@ -121,6 +125,7 @@ _REGISTRY: dict[str, _CheckCallable] = {
     "synchronicity": synchronicity_check.run,
     "unnamed": unnamed_check.run,
     "unparseable": unparseable_check.run,
+    "nonstring-id": nonstring_id_check.run,
     "ancestry": ancestry.run,
     "root-hygiene": root_hygiene.run,
 }

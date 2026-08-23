@@ -283,11 +283,13 @@ def load_post_or_raise(path: Path) -> frontmatter.Post:
     with no path anywhere in the traceback, leaving the operator to find the
     offending file by hand across a 35k-note vault (#1475).
 
-    The window this actually covers is verify-then-load. :func:`_file_declares_id`
-    now screens the same exception set, so a file already unreadable when the
-    id was resolved never reaches here — it resolves to "not found" instead,
-    which is its own defect and is tracked as #1543. What remains is the gap
-    between that verification and this load: the writer holds ``self._lock``,
+    The window this actually covers is now two things. The first is a file
+    whose header genuinely will not parse: since #1543
+    :func:`creek.vault.writer._file_declares_id` reads the ``id`` by bounded
+    byte-scan rather than by parsing the whole header, so such a file is
+    *located* instead of resolving to "not found", and reaching this loader is
+    how the operator learns which note to repair. The second is the original
+    verify-then-load gap: the writer holds ``self._lock``,
     which is a lock over *this process*, and a Creek vault is a live Obsidian
     folder. An editor, a sync client, or a sibling ``creek`` run can rewrite
     the file in between. That is exactly the class of race #1083 built the
