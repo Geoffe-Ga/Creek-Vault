@@ -24,6 +24,7 @@ import frontmatter
 import pytest
 from pydantic import BaseModel
 
+from creek._fslock import VaultLockTimeoutError, vault_lock
 from creek.models import (
     Decision,
     DecisionStatus,
@@ -39,9 +40,10 @@ from creek.models import (
     ThreadStatus,
 )
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
-from creek.vault.writer import INDEX_LOCK_FILENAME, VaultWriter
+from creek.vault.writer import INDEX_FILENAME, INDEX_LOCK_FILENAME, VaultWriter
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
     from conftest import ShortWriteController
@@ -62,6 +64,18 @@ in milliseconds. Only the serialised case pays the ceiling, and it pays it
 because there is nothing to see: the second caller is blocked on the lock.
 A fixed sleep would have had the opposite bias, passing vacuously on a
 loaded CI box where the second caller had simply not finished yet.
+"""
+
+_NO_STALL_CEILING_SECONDS: Final[float] = 5.0
+"""Longest the anti-inversion test lets a lookup and a write take together.
+
+Well under :data:`creek._fslock.DEFAULT_LOCK_TIMEOUT_SECONDS` (10 s) on
+purpose. The naive answer to #1621 — take ``vault_lock`` *inside*
+``self._lock`` — does not hang: it inverts the pair, burns the full
+lock timeout and then raises ``VaultLockTimeoutError`` out of a
+read-only lookup. A test that only waited for both callers to *finish*
+would pass on that implementation, so the assertion has to be a clock
+bound between the two.
 """
 
 
@@ -3326,3 +3340,654 @@ class TestIndexLockSpelling:
             pass
 
         assert taken == [str(plain)]
+
+
+# ---- Every index writer takes the directory lock (#1621) ----
+
+
+@contextlib.contextmanager
+def _index_lock_held_elsewhere(lock_path: Path) -> Iterator[None]:
+    """Hold *lock_path* on a helper thread for the body of the block.
+
+    ``vault_lock`` fronts ``flock`` with a plain :class:`threading.Lock`, so
+    the holder has to be a *different* thread for the lock to read as taken
+    to the code under test — taking it on this thread would make the
+    assertions measure re-entrancy instead of exclusion.
+
+    Args:
+        lock_path: The ``.id-index.lock`` to hold.
+
+    Yields:
+        Nothing. The block runs with the lock held by the helper thread.
+    """
+    held = threading.Event()
+    release = threading.Event()
+    failures: list[BaseException] = []
+
+    def _hold() -> None:
+        """Take the lock, announce it, and keep it until released."""
+        try:
+            with vault_lock(lock_path):
+                held.set()
+                release.wait(timeout=_WEDGE_TIMEOUT_SECONDS)
+        except BaseException as exc:  # recorded, then re-asserted
+            failures.append(exc)
+            held.set()
+
+    holder = threading.Thread(target=_hold)
+    holder.start()
+    try:
+        assert held.wait(timeout=_WEDGE_TIMEOUT_SECONDS), "the lock holder never armed"
+        assert failures == [], f"the lock holder raised: {failures}"
+        yield
+    finally:
+        release.set()
+        holder.join(timeout=_WEDGE_TIMEOUT_SECONDS)
+
+
+def _spawn(call: Callable[[], Any]) -> tuple[threading.Thread, dict[str, Any]]:
+    """Run *call* on its own thread, recording the outcome instead of raising.
+
+    Args:
+        call: The zero-argument callable to run.
+
+    Returns:
+        ``(thread, record)``. The record carries ``done`` once the call has
+        returned or raised, plus ``result`` or ``error``.
+    """
+    record: dict[str, Any] = {}
+
+    def _run() -> None:
+        """Invoke the callable, recording whichever way it ends."""
+        try:
+            record["result"] = call()
+        except BaseException as exc:  # recorded, then re-asserted
+            record["error"] = exc
+        finally:
+            record["done"] = True
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    return thread, record
+
+
+def _wait_for_an_effect(record: dict[str, Any]) -> None:
+    """Wait until the spawned call finishes, or the overlap ceiling elapses.
+
+    Not a sleep: an unserialised caller finishes in milliseconds and ends the
+    wait at once. Only the serialised case pays the ceiling, because there is
+    nothing to see while it is blocked on the lock.
+
+    Args:
+        record: The record returned by :func:`_spawn`.
+    """
+    deadline = time.monotonic() + _OVERLAP_CEILING_SECONDS
+    while time.monotonic() < deadline and not record.get("done"):
+        time.sleep(_POLL_SECONDS)
+
+
+def _index_records(index_path: Path) -> list[str]:
+    """Return the non-blank physical records *index_path* holds.
+
+    Args:
+        index_path: The ``.id-index.jsonl`` file to count.
+
+    Returns:
+        Every non-blank line, so a test can assert on *records on disk*
+        rather than on the mapping they collapse to — which is the whole
+        difference compaction makes.
+    """
+    raw = index_path.read_text(encoding="utf-8")
+    return [line for line in raw.splitlines() if line.strip()]
+
+
+class TestIndexWritesTakeTheDirectoryLock:
+    """No ``.id-index.jsonl`` write happens outside ``vault_lock`` (#1621).
+
+    Two writers used to escape the directory key, and both were reached
+    from *lookups*: ``_repair_index_locked``'s later-wins append, and the
+    whole-file ``_persist_full_index`` in ``_load_index_locked``'s
+    missing-file branch. The second is the worse of the pair — a
+    rename-into-place from one process's in-memory snapshot can replace a
+    file another process just rewrote, where a lost append costs one line.
+    Both had to be closed before #1300's compaction pass could be correct.
+    """
+
+    @staticmethod
+    def _poison(seed: VaultWriter, target_dir: Path, model_id: str, name: str) -> bytes:
+        """Point *model_id* at *name* on disk and return the index bytes after.
+
+        Args:
+            seed: The writer whose append helper writes the line.
+            target_dir: The directory whose index is being poisoned.
+            model_id: The id to mis-map.
+            name: The filename of a file that declares a *different* id.
+
+        Returns:
+            The whole index file as bytes, so a later comparison can prove
+            no further byte was written.
+        """
+        seed._append_index_entry(target_dir, model_id, name)
+        return (target_dir / INDEX_FILENAME).read_bytes()
+
+    def test_a_repair_append_waits_for_the_directory_lock(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """A mismatch repair may not append while another holder has the key."""
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+        edited = _edited_fragment()
+        owner_path = seed.write_fragment(edited, body="owner body")
+        before = self._poison(seed, target_dir, edited.id, victim_path.name)
+        index_path = target_dir / INDEX_FILENAME
+
+        fresh = VaultWriter(vault_path=vault_path)
+        with _index_lock_held_elsewhere(VaultWriter._index_lock_path(target_dir)):
+            thread, record = _spawn(
+                lambda: fresh._find_existing(edited.id, target_dir),
+            )
+            _wait_for_an_effect(record)
+            assert not record.get("done"), "the repair ran without the index lock"
+            assert index_path.read_bytes() == before
+
+        thread.join(timeout=_WEDGE_TIMEOUT_SECONDS)
+        assert not thread.is_alive()
+        assert record.get("error") is None, record.get("error")
+        assert record["result"] == owner_path
+        assert index_path.read_bytes() != before
+
+    def test_a_cold_index_persist_waits_for_the_directory_lock(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """A lookup over an index-less directory may not rewrite it unlocked.
+
+        The writer #1621's own text does not know about: with no
+        ``.id-index.jsonl`` present, a *read-only* ``find_fragment`` rebuilt
+        the mapping by scan and persisted it with ``_atomic_write_text`` —
+        a temp-file rename into place, holding only ``self._lock``.
+        """
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+        index_path = target_dir / INDEX_FILENAME
+        index_path.unlink()
+
+        fresh = VaultWriter(vault_path=vault_path)
+        with _index_lock_held_elsewhere(VaultWriter._index_lock_path(target_dir)):
+            thread, record = _spawn(
+                lambda: fresh.find_fragment("frag-victim001"),
+            )
+            _wait_for_an_effect(record)
+            assert not record.get("done"), "a lookup rewrote the index unlocked"
+            assert not index_path.exists()
+
+        thread.join(timeout=_WEDGE_TIMEOUT_SECONDS)
+        assert not thread.is_alive()
+        assert record.get("error") is None, record.get("error")
+        assert record["result"] == victim_path
+        assert index_path.exists()
+
+    def test_a_tomb_probe_repair_waits_for_the_directory_lock(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """``tomb_fragment``'s deliberately-unlocked probe repairs under the key.
+
+        The probe stays outside every vault lock (#1332/#1611) so a miss
+        litters nothing — but the moment it *does* have to write, it has to
+        take the key for the directory it is writing to.
+        """
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+        edited = _edited_fragment()
+        seed.write_fragment(edited, body="owner body")
+        before = self._poison(seed, target_dir, edited.id, victim_path.name)
+        index_path = target_dir / INDEX_FILENAME
+
+        fresh = VaultWriter(vault_path=vault_path)
+        with _index_lock_held_elsewhere(VaultWriter._index_lock_path(target_dir)):
+            thread, record = _spawn(lambda: fresh.tomb_fragment(edited.id))
+            _wait_for_an_effect(record)
+            assert not record.get("done"), "the tomb probe repaired unlocked"
+            assert index_path.read_bytes() == before
+
+        thread.join(timeout=_WEDGE_TIMEOUT_SECONDS)
+        assert not thread.is_alive()
+        assert record.get("error") is None, record.get("error")
+        tombed = record["result"]
+        assert tombed is not None
+        assert tombed.parent == vault_path / "10-Liminal" / "Orphaned"
+
+    def test_a_restore_probe_repair_waits_for_the_directory_lock(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """``restore_fragment``'s probe repairs the orphan index under the key."""
+        seed = VaultWriter(vault_path=vault_path)
+        _seed_victim(seed)
+        edited = _edited_fragment()
+        seed.write_fragment(edited, body="owner body")
+        tombed_victim = seed.tomb_fragment("frag-victim001")
+        assert tombed_victim is not None
+        assert seed.tomb_fragment(edited.id) is not None
+        orphan_dir = tombed_victim.parent
+        before = self._poison(seed, orphan_dir, edited.id, tombed_victim.name)
+        index_path = orphan_dir / INDEX_FILENAME
+
+        fresh = VaultWriter(vault_path=vault_path)
+        with _index_lock_held_elsewhere(VaultWriter._index_lock_path(orphan_dir)):
+            thread, record = _spawn(lambda: fresh.restore_fragment(edited))
+            _wait_for_an_effect(record)
+            assert not record.get("done"), "the restore probe repaired unlocked"
+            assert index_path.read_bytes() == before
+
+        thread.join(timeout=_WEDGE_TIMEOUT_SECONDS)
+        assert not thread.is_alive()
+        assert record.get("error") is None, record.get("error")
+        assert record["result"] is not None
+
+    def test_a_lookup_and_a_write_on_one_writer_do_not_stall(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """The pinning test for the *naive* answer to #1621.
+
+        Taking ``vault_lock`` inside ``self._lock`` inverts the house order,
+        and the inversion resolves the only way a polled lock can: the loser
+        waits out ``DEFAULT_LOCK_TIMEOUT_SECONDS`` and raises
+        ``VaultLockTimeoutError`` out of a read-only lookup. Both callers
+        still *return*, which is why this asserts a clock bound and the
+        absence of that exception rather than mere completion.
+        """
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+        rounds = 40
+        for i in range(rounds):
+            seed._append_index_entry(
+                target_dir, f"frag-poison{i:04d}", victim_path.name
+            )
+
+        shared = VaultWriter(vault_path=vault_path)
+        barrier = threading.Barrier(2)
+        errors: dict[str, BaseException] = {}
+
+        def _write_side() -> None:
+            """Hammer ``write_fragment``, which takes the key then ``self._lock``."""
+            try:
+                barrier.wait(timeout=_WEDGE_TIMEOUT_SECONDS)
+                for i in range(rounds):
+                    shared.write_fragment(
+                        Fragment(
+                            id=f"frag-newcomer{i:03d}",
+                            title=f"Newcomer {i}",
+                            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                            created=datetime(2025, 1, 15, 10, 30, 0),
+                        ),
+                        body="newcomer body",
+                    )
+            except BaseException as exc:  # recorded, then re-asserted
+                errors["write"] = exc
+
+        def _lookup_side() -> None:
+            """Hammer the lookup path, every id of which needs a repair."""
+            try:
+                barrier.wait(timeout=_WEDGE_TIMEOUT_SECONDS)
+                for i in range(rounds):
+                    shared._find_existing(f"frag-poison{i:04d}", target_dir)
+            except BaseException as exc:  # recorded, then re-asserted
+                errors["lookup"] = exc
+
+        writer_thread = threading.Thread(target=_write_side)
+        lookup_thread = threading.Thread(target=_lookup_side)
+        started = time.monotonic()
+        writer_thread.start()
+        lookup_thread.start()
+        writer_thread.join(timeout=_NO_STALL_CEILING_SECONDS * 3)
+        lookup_thread.join(timeout=_NO_STALL_CEILING_SECONDS * 3)
+        elapsed = time.monotonic() - started
+
+        assert not writer_thread.is_alive()
+        assert not lookup_thread.is_alive()
+        assert not [
+            exc for exc in errors.values() if isinstance(exc, VaultLockTimeoutError)
+        ], f"the lock pair inverted: {errors}"
+        assert errors == {}, f"a caller raised: {errors}"
+        assert elapsed < _NO_STALL_CEILING_SECONDS, (
+            f"lookup and write took {elapsed:.1f}s together — "
+            "the inverted pair burns the full lock timeout"
+        )
+
+
+# ---- Index compaction (#1300) ----
+
+
+def _int_id_note(target_dir: Path, stem: str) -> str:
+    """Write a note whose ``id`` YAML types as ``int``, and return its filename.
+
+    ``_rebuild_index`` deliberately declines a non-string id (#1291: report,
+    do not normalise), so the directory scan cannot see this mapping at all.
+    Only the JSONL knows it — which makes it the record that distinguishes a
+    compaction that merges the scan with the parsed entries from one that
+    simply overwrites the file with a scan.
+
+    Args:
+        target_dir: The directory to write the note into.
+        stem: The filename stem, without the ``.md`` suffix.
+
+    Returns:
+        The note's filename.
+    """
+    path = target_dir / f"{stem}.md"
+    path.write_text("---\nid: 12345\ntitle: Numeral\n---\n\nbody\n", encoding="utf-8")
+    return path.name
+
+
+class TestIndexCompaction:
+    """``.id-index.jsonl`` is append-only, and the dead lines are reclaimable (#1300).
+
+    Every superseded mapping, every entry whose file has gone, and every
+    torn record stays in the file forever. The torn one is the expensive
+    kind: ``_load_index_locked`` routes a damaged parse into
+    ``_recover_damaged_index``, which never persists and sets
+    ``incremental = False`` — so *every* fresh ``VaultWriter`` pays a full
+    directory scan of that directory, permanently.
+
+    The pass needs exclusion from every appender, which is why it could not
+    be written until #1621 put the last two index writers under
+    ``vault_lock(<dir>/.id-index.lock)``.
+    """
+
+    @staticmethod
+    def _seed_a_compactable_index(vault_path: Path) -> tuple[Path, Path, Path]:
+        """Build a directory whose index holds all three classes of dead record.
+
+        Args:
+            vault_path: The test vault root.
+
+        Returns:
+            ``(target_dir, victim_path, owner_path)`` — the directory under
+            test and the two files that must still resolve afterwards.
+        """
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+        owner_path = seed.write_fragment(_edited_fragment(), body="owner body")
+        ghost = Fragment(
+            id="frag-ghost0001",
+            title="Ghost",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+            created=datetime(2025, 1, 15, 10, 30, 0),
+        )
+        # 1. Superseded lines: the same two mappings, re-appended.
+        ghost_path = seed.write_fragment(ghost, body="ghost body")
+        for _ in range(3):
+            seed._append_index_entry(target_dir, "frag-victim001", victim_path.name)
+            seed._append_index_entry(target_dir, _edited_fragment().id, owner_path.name)
+        # 2. A mapping whose file is gone (the shape a tomb leaves behind).
+        ghost_path.unlink()
+        # 3. A torn record — a crash mid-append, with no exception in flight.
+        with (target_dir / INDEX_FILENAME).open("a", encoding="utf-8") as handle:
+            handle.write('\n{"id": "frag-torn0001", "filen')
+        return target_dir, victim_path, owner_path
+
+    def test_compaction_keeps_every_live_answer_and_drops_the_dead_records(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Same resolutions, fewer records, smaller file."""
+        target_dir, victim_path, owner_path = self._seed_a_compactable_index(
+            vault_path,
+        )
+        index_path = target_dir / INDEX_FILENAME
+        asked = ["frag-victim001", _edited_fragment().id, "frag-ghost0001"]
+        before_writer = VaultWriter(vault_path=vault_path)
+        before = {mid: before_writer._find_existing(mid, target_dir) for mid in asked}
+        assert before == {
+            "frag-victim001": victim_path,
+            _edited_fragment().id: owner_path,
+            "frag-ghost0001": None,
+        }
+        size_before = index_path.stat().st_size
+        records_before = len(_index_records(index_path))
+
+        reclaimed = VaultWriter(vault_path=vault_path).compact_index(target_dir)
+
+        assert reclaimed > 0
+        assert index_path.stat().st_size == size_before - reclaimed
+        assert len(_index_records(index_path)) < records_before
+        assert sorted(VaultWriter._load_index_file(index_path)) == sorted(
+            ["frag-victim001", _edited_fragment().id],
+        )
+        after_writer = VaultWriter(vault_path=vault_path)
+        assert {
+            mid: after_writer._find_existing(mid, target_dir) for mid in asked
+        } == before
+
+    def test_compaction_keeps_a_mapping_the_directory_scan_cannot_see(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """The parsed entries fill the gaps the scan leaves, as recovery does.
+
+        Rebuilding purely from the directory would silently drop every id
+        whose file the scanner declines. ``_recover_damaged_index`` already
+        merges scan-over-parsed for exactly that reason; compaction has to
+        use the same precedence or it is a data-losing rewrite wearing a
+        maintenance name.
+        """
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+        invisible = _int_id_note(target_dir, "2025-01-15-Numeral")
+        seed._append_index_entry(target_dir, "12345", invisible)
+        assert VaultWriter._rebuild_index(target_dir).get("12345") is None
+        for _ in range(3):
+            seed._append_index_entry(target_dir, "frag-victim001", victim_path.name)
+
+        assert VaultWriter(vault_path=vault_path).compact_index(target_dir) > 0
+
+        on_disk = VaultWriter._load_index_file(target_dir / INDEX_FILENAME)
+        assert on_disk["12345"] == invisible
+        assert on_disk["frag-victim001"] == victim_path.name
+
+    def test_a_compacted_index_no_longer_costs_a_scan_on_every_cold_load(
+        self,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The reason #1300 exists: a torn line taxes every future process.
+
+        ``_recover_damaged_index`` never persists, so the damage — and the
+        directory scan it forces — survives every load until something
+        rewrites the file.
+        """
+
+        def _no_rescan(target_dir: Path) -> dict[str, str]:
+            """Fail loudly instead of scanning the directory."""
+            msg = f"unexpected directory rescan of {target_dir}"
+            raise AssertionError(msg)
+
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+        with (target_dir / INDEX_FILENAME).open("a", encoding="utf-8") as handle:
+            handle.write('\n{"id": "frag-torn0001", "filen')
+
+        # Positive control: today every cold load of this directory rescans.
+        monkeypatch.setattr(VaultWriter, "_rebuild_index", staticmethod(_no_rescan))
+        with pytest.raises(AssertionError, match="unexpected directory rescan"):
+            VaultWriter(vault_path=vault_path)._find_existing(
+                "frag-victim001",
+                target_dir,
+            )
+        monkeypatch.undo()
+
+        assert VaultWriter(vault_path=vault_path).compact_index(target_dir) > 0
+
+        monkeypatch.setattr(VaultWriter, "_rebuild_index", staticmethod(_no_rescan))
+        healed = VaultWriter(vault_path=vault_path)
+        assert healed._find_existing("frag-victim001", target_dir) == victim_path
+
+    def test_compaction_waits_for_the_directory_lock(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """A whole-file rewrite is the one write that must never race an append."""
+        target_dir, _victim_path, _owner_path = self._seed_a_compactable_index(
+            vault_path,
+        )
+        index_path = target_dir / INDEX_FILENAME
+        before = index_path.read_bytes()
+
+        fresh = VaultWriter(vault_path=vault_path)
+        with _index_lock_held_elsewhere(VaultWriter._index_lock_path(target_dir)):
+            thread, record = _spawn(lambda: fresh.compact_index(target_dir))
+            _wait_for_an_effect(record)
+            assert not record.get("done"), "compaction rewrote the index unlocked"
+            assert index_path.read_bytes() == before
+
+        thread.join(timeout=_WEDGE_TIMEOUT_SECONDS)
+        assert not thread.is_alive()
+        assert record.get("error") is None, record.get("error")
+        assert record["result"] > 0
+        assert index_path.read_bytes() != before
+
+    def test_a_compaction_racing_repairs_and_writes_loses_no_record(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """The criterion #1621 had to land first to make achievable.
+
+        One ``VaultWriter``, three threads: appends, mismatch repairs, and
+        whole-file rewrites into one directory. Every appender now holds the
+        directory key, so the rewrite is exclusive with all of them.
+        """
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+        invisible = _int_id_note(target_dir, "2025-01-15-Numeral")
+        seed._append_index_entry(target_dir, "12345", invisible)
+        rounds = 20
+        live: dict[str, Path] = {"frag-victim001": victim_path}
+        for i in range(rounds):
+            fragment = Fragment(
+                id=f"frag-resident{i:03d}",
+                title=f"Resident {i}",
+                source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                created=datetime(2025, 1, 15, 10, 30, 0),
+            )
+            live[fragment.id] = seed.write_fragment(fragment, body=f"body {i}")
+            seed._append_index_entry(
+                target_dir, f"frag-poison{i:03d}", victim_path.name
+            )
+
+        shared = VaultWriter(vault_path=vault_path)
+        barrier = threading.Barrier(3)
+        errors: dict[str, BaseException] = {}
+
+        def _guarded(label: str, body: Callable[[int], None]) -> Callable[[], None]:
+            """Wrap one worker so a failure is recorded rather than swallowed."""
+
+            def _run() -> None:
+                try:
+                    barrier.wait(timeout=_WEDGE_TIMEOUT_SECONDS)
+                    for i in range(rounds):
+                        body(i)
+                except BaseException as exc:  # recorded, then re-asserted
+                    errors[label] = exc
+
+            return _run
+
+        def _append(i: int) -> None:
+            """Write a brand-new fragment into the directory under compaction."""
+            shared.write_fragment(
+                Fragment(
+                    id=f"frag-arrival{i:03d}",
+                    title=f"Arrival {i}",
+                    source=FragmentSource(platform=SourcePlatform.CLAUDE),
+                    created=datetime(2025, 1, 15, 10, 30, 0),
+                ),
+                body=f"arrival {i}",
+            )
+
+        def _repair(i: int) -> None:
+            """Resolve a poisoned id, which re-scans and appends the correction."""
+            shared._find_existing(f"frag-poison{i:03d}", target_dir)
+
+        def _compact(_i: int) -> None:
+            """Rewrite the whole file from a merged snapshot."""
+            shared.compact_index(target_dir)
+
+        threads = [
+            threading.Thread(target=_guarded("append", _append)),
+            threading.Thread(target=_guarded("repair", _repair)),
+            threading.Thread(target=_guarded("compact", _compact)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=_WEDGE_TIMEOUT_SECONDS * 4)
+
+        assert not [thread for thread in threads if thread.is_alive()]
+        assert errors == {}, f"a caller raised: {errors}"
+        index_path = target_dir / INDEX_FILENAME
+        assert not VaultWriter._read_index_records(index_path).damaged
+        on_disk = VaultWriter._load_index_file(index_path)
+        assert on_disk["12345"] == invisible
+        for i in range(rounds):
+            live[f"frag-arrival{i:03d}"] = target_dir / on_disk[f"frag-arrival{i:03d}"]
+        after = VaultWriter(vault_path=vault_path)
+        assert {
+            model_id: after._find_existing(model_id, target_dir) for model_id in live
+        } == live
+
+    def test_compaction_refuses_a_rewrite_that_would_grow_the_file(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """A longer file at the same path is the one shape a reader misreads.
+
+        ``_refresh_index_locked`` treats a file longer than its cursor as
+        *appended to* and splices the extra bytes onto the cached mapping.
+        A whole-file rewrite that grew the file would hand it unrelated
+        content at that offset. The shrink guard is what keeps a reader
+        that had consumed the whole file inside the shapes #1603's cursor
+        recovers from — so a directory holding notes the index never
+        learned about is left alone rather than rewritten. It bounds the
+        hazard rather than removing it; ``compact_index``'s docstring
+        names the residual a reader with an older cursor still has.
+        """
+        seed = VaultWriter(vault_path=vault_path)
+        victim_path = _seed_victim(seed)
+        target_dir = victim_path.parent
+        for i in range(5):
+            note = target_dir / f"2025-01-15-Unindexed-{i}.md"
+            note.write_text(
+                f"---\nid: frag-unindexed{i:02d}\ntitle: U{i}\n---\n\nbody\n",
+                encoding="utf-8",
+            )
+        index_path = target_dir / INDEX_FILENAME
+        before = index_path.read_bytes()
+        assert len(VaultWriter._rebuild_index(target_dir)) == 6  # positive control
+
+        assert VaultWriter(vault_path=vault_path).compact_index(target_dir) == 0
+
+        assert index_path.read_bytes() == before
+
+    def test_compacting_a_directory_with_no_index_writes_nothing(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Asking about an unindexed directory leaves no lock file behind (#1332)."""
+        bare = vault_path / "01-Fragments" / "Journal"
+        writer = VaultWriter(vault_path=vault_path)
+
+        assert writer.compact_index(bare) == 0
+
+        assert not (bare / INDEX_FILENAME).exists()
+        assert list(vault_path.rglob(INDEX_LOCK_FILENAME)) == []
