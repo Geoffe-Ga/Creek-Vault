@@ -29,7 +29,7 @@ from creek.ingest.base import (
     ParsedFragment,
     RawDocument,
     file_modified_time,
-    parse_authored_at,
+    safe_parse_authored_at,
 )
 from creek.models import SourcePlatform
 
@@ -182,7 +182,7 @@ def _extract_pptx_authored_at(path: Path) -> datetime | None:
         getattr(props, "created", None),
         getattr(props, "modified", None),
     ):
-        parsed = _safe_parse_authored_at(candidate)
+        parsed = safe_parse_authored_at(candidate)
         if parsed is not None:
             return parsed
     return None
@@ -207,16 +207,6 @@ def _open_pptx_core_properties(path: Path) -> Any | None:
     try:  # noqa: TRY101  # AttributeError is a distinct failure mode from file-open.
         return prs.core_properties
     except AttributeError:
-        return None
-
-
-def _safe_parse_authored_at(candidate: object) -> datetime | None:
-    """Wrapper that swallows :class:`ValueError` from ``parse_authored_at``."""
-    if candidate is None:
-        return None
-    try:
-        return parse_authored_at(candidate)
-    except ValueError:
         return None
 
 
