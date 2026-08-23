@@ -7072,6 +7072,7 @@ def _render_purge_result(result: PurgeResult) -> None:
     console.print(f"Target: {result.target}")
     console.print(f"Fragments affected: {result.fragments_affected}")
     console.print(f"Wiki-links removed: {result.wikilinks_removed}")
+    console.print(f"Markdown links removed: {result.markdown_links_removed}")
     console.print(f"Threads updated: {result.threads_updated}")
     console.print(f"Eddies updated: {result.eddies_updated}")
     if result.classifications_reset:

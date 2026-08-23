@@ -213,8 +213,15 @@ def _extract_wikilinks(content: str) -> list[str]:
     return _WIKILINK_PATTERN.findall(content)
 
 
-def _is_external_target(target: str) -> bool:
+def is_external_target(target: str) -> bool:
     """Determine whether a link target points outside the local filesystem.
+
+    Public because ``creek purge`` asks the same question of the same link
+    shape (#1622): a right-to-be-forgotten scrub must not rewrite
+    ``[Secret Title](https://example.com/...)``, which points at something
+    the purge never touched. Two copies of "is this target external" is
+    exactly how the scanner and the scrub would come to disagree about
+    what a vault link is.
 
     External targets are out of scope for a broken *local file* link scan:
     absolute URLs with a scheme (``https://``, ``mailto:``, ``ftp://``, ...)
@@ -254,7 +261,7 @@ def _extract_relative_links(content: str) -> list[str]:
         # is the first whitespace-delimited token, cut at any anchor/query.
         target = match[1].strip().split(maxsplit=1)[0] if match[1].strip() else ""
         target = target.partition("#")[0].partition("?")[0]
-        if not target or _is_external_target(target):
+        if not target or is_external_target(target):
             continue
         targets.append(target)
     return targets

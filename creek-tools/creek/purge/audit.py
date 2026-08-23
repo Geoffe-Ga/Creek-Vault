@@ -74,6 +74,12 @@ class PurgeAuditEntry(BaseModel):
         affected_fragments: Fragment IDs touched by the operation.
         fragments_deleted: Number of fragment files removed from disk.
         references_scrubbed: Number of wiki-link references removed.
+        markdown_links_removed: Number of ``[text](target)`` markdown
+            links removed because their target resolved to a purged page
+            (#1622). Kept apart from ``references_scrubbed``, which this
+            docstring defines as wiki-links, so that a compliance reader
+            can tell the two scrubs apart; a purge that removed neither
+            reports zero for both.
         embeddings_removed: Real number of rows dropped from
             ``<vault>/00-Creek-Meta/embeddings.parquet`` by the purge
             (GAP-001). Zero when the cache had not been built yet or
@@ -156,6 +162,7 @@ class PurgeAuditEntry(BaseModel):
     affected_fragments: list[str] = Field(default_factory=list)
     fragments_deleted: int = 0
     references_scrubbed: int = 0
+    markdown_links_removed: int = 0
     embeddings_removed: int = 0
     provenance_scrubbed: int = 0
     intimate_stubs_removed: int = 0
@@ -193,6 +200,7 @@ def _coerce_legacy_entry(raw: dict[str, Any]) -> dict[str, Any]:
         upgraded["fragments_deleted"] = int(raw.get("count", 0) or 0)
     upgraded.setdefault("affected_fragments", [])
     upgraded.setdefault("references_scrubbed", 0)
+    upgraded.setdefault("markdown_links_removed", 0)
     upgraded.setdefault("embeddings_removed", 0)
     upgraded.setdefault("provenance_scrubbed", 0)
     upgraded.setdefault("intimate_stubs_removed", 0)
