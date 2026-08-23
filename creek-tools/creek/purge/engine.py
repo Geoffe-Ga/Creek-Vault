@@ -36,11 +36,14 @@ import shutil
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
+from urllib.parse import unquote
 
 import frontmatter
 from pydantic import BaseModel, Field
 
+from creek.clean.hygiene import is_external_target
 from creek.ingest.journal_staging import ADEPTHOOD_STAGING_RELDIRS
 from creek.ingest.ledger import forget_fragment_ids
 from creek.ingest.source_unit import split_source_unit
@@ -420,6 +423,160 @@ Compiled against **bytes** because the whole scrub pipeline is (#948).
 """
 
 
+_MDLINK_RE: re.Pattern[bytes] = re.compile(rb"\[[^\]]*\]\((?!#)([^)]*)\)")
+"""A markdown link, capturing only its target.
+
+The bytes mirror of :data:`creek.clean.hygiene._RELATIVE_LINK_PATTERN`,
+which is what ``BrokenLinkScanner`` already counts a fragment's outgoing
+links with — so the vault's link graph has always regarded
+``[text](Secret Title.md)`` as a link to that page while the purge scrub
+did not (#1622). The display text is matched but deliberately *not*
+captured: only the target decides, and removing the whole link takes the
+text with it either way.
+
+``(?!#)`` drops same-file anchors (``[text](#Heading)``), which name no
+file to resolve, exactly as the hygiene pattern does.
+"""
+
+
+def _remove_matching_links(
+    pattern: re.Pattern[bytes],
+    decides: Callable[[bytes], bool],
+    data: bytes,
+) -> tuple[bytes, int]:
+    """Remove every link *pattern* finds whose captured target *decides* accepts.
+
+    Shared by both link syntaxes so the count means the same thing on
+    each: links actually removed, never links merely inspected —
+    ``re.subn`` would report the latter, since every link goes through
+    the replacement callback.
+
+    Args:
+        pattern: A bytes regex whose group 1 is the link target.
+        decides: Predicate on those target bytes.
+        data: One file's raw bytes.
+
+    Returns:
+        A ``(scrubbed_bytes, links_removed)`` pair.
+    """
+    removed = 0
+
+    def _replace(match: re.Match[bytes]) -> bytes:
+        """Blank a link that names the purged page, else keep it verbatim."""
+        nonlocal removed
+        if decides(match.group(1)):
+            removed += 1
+            return b""
+        return match.group(0)
+
+    return pattern.sub(_replace, data), removed
+
+
+_LINK_TITLE_RE: re.Pattern[str] = re.compile(r"^(?P<url>.*?)\s+(?:\"[^\"]*\"|'[^']*')$")
+"""A destination followed by a CommonMark link title, split at the title.
+
+Whether ``a b`` is one path or a destination plus a title is not a
+matter of taste: CommonMark only ends the destination at whitespace
+when what follows is a **title**, and a title is quote- or
+paren-delimited. ``Alpha Notes.md`` therefore has exactly one reading —
+a path — and splitting it anyway is what destroyed a link to a
+surviving page (see :func:`_link_target_urls`).
+
+Paren-delimited titles are deliberately absent: :data:`_MDLINK_RE` stops
+its capture at the first ``)``, so a ``(title)`` can never reach this
+pattern intact and a branch for it would be unreachable.
+
+The quotes are anchored to the END of the target, and ``url`` is
+non-greedy, so the split lands at the whitespace before the title
+rather than at the first whitespace anywhere. Splitting at the first
+whitespace only worked when the path had no internal space of its own:
+``Secret Title.md "note"`` cut into ``Secret`` and ``Title.md "note"``,
+the second half failed to look like a title, the whole string was kept
+as a single reading, and — because it ends in a quote rather than
+``.md`` — it never reduced to a page name. The link survived the purge
+while the audit certified it complete, which is the leak #1622 exists
+to close, reached through a different target shape.
+"""
+
+
+def _link_target_urls(target: str) -> tuple[str, ...]:
+    """Return the URLs a markdown link target could be read as.
+
+    Usually one. A second reading is offered only for the shape that
+    genuinely has two: CommonMark ends the destination at whitespace
+    when a ``"title"`` follows, so ``path.md "note"`` links to
+    ``path.md``, while Obsidian writes ``[t](Secret Title.md)`` and
+    means the whole thing. Reading only the first token there would
+    leave the private title on disk, so both readings are offered and
+    the caller removes the link if *either* resolves to the purged page
+    (#1622).
+
+    The second reading is **conditional on the remainder actually being
+    a title**, and that condition is load-bearing. Offered
+    unconditionally, the first-token reading resolves
+    ``[read them](Alpha Notes.md)`` to the page ``Alpha`` and deletes an
+    operator's live link to a page this purge never touched — the
+    over-match direction #903 exists to prevent, on a target shape
+    (an unencoded space) that this very function documents Obsidian as
+    writing routinely. :func:`creek.clean.hygiene._extract_relative_links`
+    does take the first token unconditionally, but it only *counts*
+    links; here the same guess destroys content.
+
+    A ``<...>``-wrapped target is unambiguous — the angle brackets exist
+    to let a URL contain spaces — so it yields exactly one reading.
+
+    Args:
+        target: The decoded text between ``(`` and ``)``.
+
+    Returns:
+        One or two candidate URLs, or none for an empty target.
+    """
+    raw = target.strip()
+    if not raw:
+        return ()
+    if raw.startswith("<"):
+        return (raw[1:].partition(">")[0],)
+    titled = _LINK_TITLE_RE.match(raw)
+    if titled is None:
+        return (raw,)
+    return (raw, titled.group("url"))
+
+
+def _link_target_page_name(url: str) -> str:
+    """Reduce a markdown link URL to the page name it resolves to.
+
+    A URL is a *path*; ``folded_names`` holds page *names*. Four things
+    stand between them, and every one of them is a shape Obsidian
+    actually writes (#1622): an ``#anchor`` or ``?query`` suffix, a
+    percent-encoded space, a folder prefix, and the ``.md`` extension —
+    which Obsidian omits as often as it writes it.
+
+    Percent-decoding is the one that matters most in practice: Obsidian
+    writes ``Secret%20Title.md`` whenever it generates the link itself,
+    so a scrub that skipped :func:`urllib.parse.unquote` would miss the
+    single most common real-world spelling.
+
+    The extension is stripped by name rather than by
+    :attr:`~pathlib.PurePosixPath.suffix`, because a page titled
+    ``Notes v1.2`` linked without its extension would otherwise be
+    reduced to ``Notes v1`` and never match.
+
+    Args:
+        url: One candidate URL from :func:`_link_target_urls`.
+
+    Returns:
+        The exact-case page name, or ``""`` for a target that names no
+        local page — an external URL, or nothing at all.
+    """
+    path = url.partition("#")[0].partition("?")[0].strip()
+    if not path or is_external_target(path):
+        return ""
+    name = PurePosixPath(unquote(path)).name
+    if name.casefold().endswith(".md"):
+        name = name[: -len(".md")]
+    return name
+
+
 @dataclass(frozen=True)
 class _WikilinkScrub:
     """Decide, link by link, whether a wikilink names the purged page.
@@ -441,9 +598,12 @@ class _WikilinkScrub:
 
     Attributes:
         folded_names: Case-folded names the purged page is linkable by —
-            its declared title *and* its filename stem, because this
-            vault's paths are title-derived and a link written by the
-            filename leaks the same private string (#903).
+            its declared title, its filename stem, *and* each of its
+            declared ``aliases``, because this vault's paths are
+            title-derived and a link written by the filename leaks the
+            same private string (#903), while an alias is a name the
+            operator chose precisely so it would be written instead of
+            the title (#1622).
         protected: Exact-case spellings that some **surviving** page
             claims *and the purged page does not*. A link spelled that
             way resolves to the survivor, so it is left alone whatever
@@ -455,6 +615,26 @@ class _WikilinkScrub:
 
     folded_names: frozenset[str]
     protected: frozenset[str]
+
+    def _claims(self, name: str) -> bool:
+        """Report whether *name* is a spelling that resolves to the purged page.
+
+        The single decision both link syntaxes route through, so the
+        exact-before-folded priority is stated once and cannot drift
+        between them (#1622). A second, case-blind copy of it on the
+        markdown path would delete the very link
+        :meth:`PurgeEngine._surviving_claimants` exists to shelter.
+
+        Args:
+            name: An exact-case page name a link resolved to, already
+                stripped of any suffix its syntax carries.
+
+        Returns:
+            ``True`` when a link spelled that way should be removed.
+        """
+        if not name or name in self.protected:
+            return False
+        return name.casefold() in self.folded_names
 
     def _names_the_purged_page(self, target: bytes) -> bool:
         """Report whether a wikilink target resolves to the purged page.
@@ -475,10 +655,36 @@ class _WikilinkScrub:
             decoded = target.decode("utf-8")
         except UnicodeDecodeError:
             return False
-        name = decoded.split("|", 1)[0].split("#", 1)[0].strip()
-        if not name or name in self.protected:
+        return self._claims(decoded.split("|", 1)[0].split("#", 1)[0].strip())
+
+    def _targets_the_purged_page(self, target: bytes) -> bool:
+        """Report whether a markdown link's *URL* resolves to the purged page.
+
+        The URL, never the display text. ``[Secret Title](https://…)``
+        points at something the purge did not touch, and rewriting it
+        would destroy the operator's own content while leaving the same
+        private string on disk as prose — which is exactly the shape
+        :func:`creek.clean.hygiene._extract_relative_links` already
+        discards the text of (#1622).
+
+        Decoding follows #948's discipline unchanged: a target that is
+        not valid UTF-8 cannot equal a page name, so it is refused
+        rather than repaired.
+
+        Args:
+            target: The raw bytes between ``(`` and ``)``.
+
+        Returns:
+            ``True`` when this link should be removed.
+        """
+        try:
+            decoded = target.decode("utf-8")
+        except UnicodeDecodeError:
             return False
-        return name.casefold() in self.folded_names
+        return any(
+            self._claims(_link_target_page_name(url))
+            for url in _link_target_urls(decoded)
+        )
 
     def apply(self, data: bytes) -> tuple[bytes, int]:
         """Remove every wikilink naming the purged page.
@@ -487,22 +693,20 @@ class _WikilinkScrub:
             data: One file's raw bytes.
 
         Returns:
-            A ``(scrubbed_bytes, wikilinks_removed)`` pair. The count is
-            of links actually removed, never of links merely inspected —
-            ``re.subn`` would report the latter, since every link goes
-            through the replacement callback.
+            A ``(scrubbed_bytes, wikilinks_removed)`` pair.
         """
-        removed = 0
+        return _remove_matching_links(_WIKILINK_RE, self._names_the_purged_page, data)
 
-        def _replace(match: re.Match[bytes]) -> bytes:
-            """Blank a link that names the purged page, else keep it verbatim."""
-            nonlocal removed
-            if self._names_the_purged_page(match.group(1)):
-                removed += 1
-                return b""
-            return match.group(0)
+    def apply_markdown(self, data: bytes) -> tuple[bytes, int]:
+        """Remove every markdown link targeting the purged page.
 
-        return _WIKILINK_RE.sub(_replace, data), removed
+        Args:
+            data: One file's raw bytes.
+
+        Returns:
+            A ``(scrubbed_bytes, markdown_links_removed)`` pair.
+        """
+        return _remove_matching_links(_MDLINK_RE, self._targets_the_purged_page, data)
 
 
 _OPENING_FENCE_RE: re.Pattern[bytes] = re.compile(rb"---[ \t]*\r?\n")
@@ -613,8 +817,8 @@ def _apply_scrubs(
     data: bytes,
     wiki_scrub: _WikilinkScrub | None,
     prov_pattern: re.Pattern[bytes] | None,
-) -> tuple[bytes, int, int]:
-    """Apply the wiki-link and provenance substitutions to one file's bytes.
+) -> tuple[bytes, int, int, int]:
+    """Apply the link and provenance substitutions to one file's bytes.
 
     Pure and mode-blind: the dry-run/apply distinction lives entirely in
     where :meth:`PurgeEngine._scrub_one_file` gets these bytes from and
@@ -628,24 +832,31 @@ def _apply_scrubs(
     it. There is one path here, and it moves no byte it was not asked
     to.
 
+    Both link syntaxes are driven by the one matcher, and the markdown
+    pass runs *before* the provenance one for the same reason the
+    wiki-link pass does: the provenance substitution rewrites a
+    fragment ID into ``[purged]``, and a link whose target is that ID
+    would stop being recognisable as a link to the purged page (#1622).
+
     Args:
         data: The file's current bytes.
-        wiki_scrub: Wiki-link matcher, or ``None`` to skip that pass.
+        wiki_scrub: Link matcher, or ``None`` to skip both link passes.
         prov_pattern: Fragment-ID regex, or ``None`` to skip that pass.
 
     Returns:
-        A ``(scrubbed_bytes, wikilinks_removed, provenance_scrubbed)``
-        triple.
+        A ``(scrubbed_bytes, wikilinks_removed, markdown_links_removed,
+        provenance_scrubbed)`` quadruple.
     """
-    wiki_count = prov_count = 0
+    wiki_count = md_count = prov_count = 0
     if wiki_scrub is not None:
         data, wiki_count = wiki_scrub.apply(data)
+        data, md_count = wiki_scrub.apply_markdown(data)
     if prov_pattern is not None:
         # NOTE: PURGED_MARKER is bracket-flavoured, so substituting it
         # inside a YAML flow sequence (source_fragments: [a, b]) nests
         # the scrubbed entry on re-parse — see PURGED_MARKER.
         data, prov_count = prov_pattern.subn(PURGED_MARKER.encode(), data)
-    return data, wiki_count, prov_count
+    return data, wiki_count, md_count, prov_count
 
 
 @dataclass(frozen=True)
@@ -688,6 +899,17 @@ class PurgeResult(BaseModel):
             path names none of it (#1340).
         fragments_affected: Number of fragments directly affected.
         wikilinks_removed: Number of wiki-link references scrubbed.
+        markdown_links_removed: Number of ``[text](target)`` markdown
+            links removed because their **target** resolved to a purged
+            page (#1622). Counted apart from
+            :attr:`wikilinks_removed` rather than added into it: that
+            field's name, its docstring, the CLI line that prints it and
+            the ``references_scrubbed`` key it is audited under all say
+            wiki-link, and three surfaces would start saying something
+            untrue. Matching is on the target only — an external link
+            whose display text happens to spell the purged title is left
+            byte-identical, as are prose mentions of the title, which
+            this scrub has never been in the business of removing.
         threads_updated: Thread files whose metadata changed.
         eddies_updated: Eddy files whose metadata changed.
         classifications_reset: Fragments whose classifications were wiped.
@@ -767,6 +989,7 @@ class PurgeResult(BaseModel):
     deleted_files: list[str] = Field(default_factory=list)
     fragments_affected: int = 0
     wikilinks_removed: int = 0
+    markdown_links_removed: int = 0
     threads_updated: int = 0
     eddies_updated: int = 0
     classifications_reset: int = 0
@@ -896,12 +1119,13 @@ class PurgeEngine:
             # sweep would be blind to exactly the notes quoting the body.
             self._purge_voice_artifacts(fragment_id, frag_file, result)
             # One vault walk applies both the wiki-link and provenance scrubs.
-            wiki_count, prov_count = self._scrub_references(
+            wiki_count, md_count, prov_count = self._scrub_references(
                 title=title,
                 fragment_id=fragment_id,
                 exclude=frag_file,
             )
             result.wikilinks_removed = wiki_count
+            result.markdown_links_removed = md_count
             result.provenance_scrubbed += prov_count
             result.threads_updated = self._decrement_counts(
                 "02-Threads",
@@ -1539,12 +1763,13 @@ class PurgeEngine:
             result,
         )
         # One vault walk applies both the wiki-link and provenance scrubs.
-        wiki_count, prov_count = self._scrub_references(
+        wiki_count, md_count, prov_count = self._scrub_references(
             title=title,
             fragment_id=frag_id if isinstance(frag_id, str) else "",
             exclude=frag_file,
         )
         result.wikilinks_removed += wiki_count
+        result.markdown_links_removed += md_count
         result.provenance_scrubbed += prov_count
         result.threads_updated += self._decrement_counts(
             "02-Threads",
@@ -2488,8 +2713,8 @@ class PurgeEngine:
         title: str,
         fragment_id: str,
         exclude: Path,
-    ) -> tuple[int, int]:
-        """Scrub wiki-links and fragment-ID provenance in a single vault walk.
+    ) -> tuple[int, int, int]:
+        """Scrub links and fragment-ID provenance in a single vault walk.
 
         Walks every ``.md`` file in the vault exactly once (instead of
         once per scrub type) and applies both substitutions in-memory
@@ -2501,6 +2726,11 @@ class PurgeEngine:
           answers to, in every case Obsidian resolves, without eating a
           spelling a surviving page claims. See :class:`_WikilinkScrub`
           for the whole of that decision (#903).
+        * Markdown links — ``[text](Secret%20Title.md)`` — pointing at
+          the deleted fragment are removed, matched on their **target**
+          and never on their display text (#1622). This is the shape
+          ``BrokenLinkScanner`` has always counted as a vault link while
+          this scrub did not.
         * Bare fragment-ID occurrences are replaced with the
           :data:`PURGED_MARKER` placeholder. This catches YAML
           provenance list entries (``source_fragments: [frag-…]`` in
@@ -2524,19 +2754,21 @@ class PurgeEngine:
             exclude: Path to skip (the file currently being deleted).
 
         Returns:
-            A ``(wikilinks_removed, provenance_scrubbed)`` count pair.
+            A ``(wikilinks_removed, markdown_links_removed,
+            provenance_scrubbed)`` count triple.
         """
         prov_pattern = _build_provenance_pattern(fragment_id) if fragment_id else None
         if not (title or exclude.stem or prov_pattern):
-            return 0, 0
+            return 0, 0, 0
         # One walk, reused twice: the claimant scan below reads only the
         # header of each file, and repeating the walk to get at them
         # would break this pass's pinned once-per-fragment property.
         md_files = self._list_vault_md_files()
         wiki_scrub = self._build_wikilink_scrub(title, exclude, md_files)
         if wiki_scrub is None is prov_pattern:
-            return 0, 0
+            return 0, 0, 0
         wiki_total = 0
+        md_total = 0
         prov_total = 0
         for md_file in md_files:
             # Two separate concerns: *exclude* is the file being deleted
@@ -2546,14 +2778,15 @@ class PurgeEngine:
             # therefore still on disk only because this is a preview.
             if md_file == exclude or self._skip_as_removed(md_file):
                 continue
-            wiki_count, prov_count = self._scrub_one_file(
+            wiki_count, md_count, prov_count = self._scrub_one_file(
                 md_file,
                 wiki_scrub,
                 prov_pattern,
             )
             wiki_total += wiki_count
+            md_total += md_count
             prov_total += prov_count
-        return wiki_total, prov_total
+        return wiki_total, md_total, prov_total
 
     def _build_wikilink_scrub(
         self,
@@ -2563,15 +2796,31 @@ class PurgeEngine:
     ) -> _WikilinkScrub | None:
         """Build the wikilink matcher for the fragment being purged.
 
-        Two names, not one (#903). A page is linkable by its declared
-        title *and* by its filename stem —
-        :func:`creek.vault.links.build_link_index` registers both — and
-        this vault's paths are title-derived, so
-        ``01-Fragments/Journal/2026-03-11 therapy session.md`` is itself
-        the private string a right-to-be-forgotten request is about. The
-        scrub knew only ``post["title"]``, so on every fragment whose
-        title and filename differ, a link written by the filename
-        survived the purge verbatim.
+        Every name, not one (#903, widened by #1622). A page is linkable
+        by its declared title, by its filename stem, *and* by each of its
+        declared ``aliases`` — :func:`creek.vault.links.build_link_index`
+        registers all three — and this vault's paths are title-derived,
+        so ``01-Fragments/Journal/2026-03-11 therapy session.md`` is
+        itself the private string a right-to-be-forgotten request is
+        about. The scrub knew only ``post["title"]``, so on every
+        fragment whose title and filename differ, a link written by the
+        filename survived the purge verbatim.
+
+        The name set is taken from :func:`creek.vault.links.page_names`
+        rather than assembled here, because that is the exact function
+        :meth:`_surviving_claimants` scans survivors with. Asking a
+        narrower question of the purged page than of every other page in
+        the vault is what left ``[[Codename Raven]]`` standing after a
+        purge of a fragment declaring that alias (#1622). One reader,
+        one answer, and a name creek adds to a page later is scrubbed
+        without touching this method again.
+
+        Reading the header is safe here: the whole scrub runs *before*
+        ``frag_file.unlink()``, and before the dry-run ledger marks the
+        file removed. A header that cannot be read yields
+        ``[stem]`` — a superset of the old behaviour, never a narrower
+        one, so a defeated parser cannot quietly shrink what a
+        compliance purge removes.
 
         The purged page's **own** exact-case spellings are subtracted
         from the shelter, and that subtraction is load-bearing. The
@@ -2587,8 +2836,10 @@ class PurgeEngine:
 
         Args:
             title: The purged fragment's declared title, or ``""``.
-            frag_file: The fragment file being deleted; its stem is the
-                page's other linkable name.
+            frag_file: The fragment file being deleted. Its stem and its
+                declared ``aliases`` are the page's other linkable
+                names, both read off it by
+                :func:`creek.vault.links.page_names`.
             md_files: The vault walk the caller has already performed,
                 reused rather than repeated — one walk per fragment is a
                 pinned property of this pass.
@@ -2597,7 +2848,7 @@ class PurgeEngine:
             A matcher, or ``None`` when the fragment has no linkable
             name at all and the wiki-link pass should be skipped.
         """
-        own = {name for name in (title, frag_file.stem) if name.strip()}
+        own = {name for name in (title, *page_names(frag_file)) if name.strip()}
         folded = frozenset(name.casefold() for name in own)
         if not folded:
             return None
@@ -2650,8 +2901,8 @@ class PurgeEngine:
         md_file: Path,
         wiki_scrub: _WikilinkScrub | None,
         prov_pattern: re.Pattern[bytes] | None,
-    ) -> tuple[int, int]:
-        """Apply the wiki-link and provenance scrubs to a single file.
+    ) -> tuple[int, int, int]:
+        """Apply the link and provenance scrubs to a single file.
 
         Split three ways — read, substitute, persist — because the two
         ends of it are where a dry run has to diverge from an apply run
@@ -2662,24 +2913,25 @@ class PurgeEngine:
 
         Args:
             md_file: Markdown file to scrub.
-            wiki_scrub: Wiki-link matcher, or ``None`` to skip that pass.
+            wiki_scrub: Link matcher, or ``None`` to skip both link passes.
             prov_pattern: Fragment-ID regex, or ``None`` to skip that pass.
 
         Returns:
-            A ``(wikilinks_removed, provenance_scrubbed)`` count pair for
-            this file. ``(0, 0)`` when the file cannot be read at all.
+            A ``(wikilinks_removed, markdown_links_removed,
+            provenance_scrubbed)`` count triple for this file. All zeros
+            when the file cannot be read at all.
         """
         data = self._scrub_input_bytes(md_file)
         if data is None:
-            return 0, 0
-        scrubbed, wiki_count, prov_count = _apply_scrubs(
+            return 0, 0, 0
+        scrubbed, wiki_count, md_count, prov_count = _apply_scrubs(
             data,
             wiki_scrub,
             prov_pattern,
         )
-        if wiki_count or prov_count:
+        if wiki_count or md_count or prov_count:
             self._persist_scrub(md_file, scrubbed)
-        return wiki_count, prov_count
+        return wiki_count, md_count, prov_count
 
     def _scrub_input_bytes(self, md_file: Path) -> bytes | None:
         """Return the bytes the scrub should operate on, or ``None`` to skip.
@@ -3056,6 +3308,7 @@ class PurgeEngine:
             affected_fragments=result.affected_fragment_ids.copy(),
             fragments_deleted=fragments_deleted,
             references_scrubbed=result.wikilinks_removed,
+            markdown_links_removed=result.markdown_links_removed,
             embeddings_removed=result.embeddings_removed,
             provenance_scrubbed=result.provenance_scrubbed,
             intimate_stubs_removed=result.intimate_stubs_removed,

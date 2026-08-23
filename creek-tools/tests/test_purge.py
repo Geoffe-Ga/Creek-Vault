@@ -8,6 +8,7 @@ corpora per test.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import re
@@ -20,12 +21,15 @@ import pytest
 from typer.testing import CliRunner
 
 from creek.cli import app
+from creek.ingest.base import PASSTHROUGH_FRONTMATTER_KEYS
+from creek.models import Fragment
 from creek.purge import PurgeAuditEntry, PurgeAuditLog, PurgeEngine, PurgeResult
 from creek.purge.engine import (
     VAULT_PURGE_CONFIRMATION,
     _splice_fragment_count,
     _str_list,
 )
+from creek.vault import writer as vault_writer
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -5713,6 +5717,7 @@ def _write_named_fragment(
     *,
     stem: str,
     title: str,
+    aliases: list[str] | None = None,
 ) -> Path:
     """Write a fragment whose filename stem and declared title differ.
 
@@ -5726,6 +5731,11 @@ def _write_named_fragment(
         frag_id: Fragment ID.
         stem: Filename stem, without the ``.md`` suffix.
         title: Declared ``title`` in the frontmatter.
+        aliases: Declared ``aliases``, or ``None`` to declare none. An
+            ``aliases`` entry names the page **it is written on**, so
+            these are further names *this* fragment is linkable by —
+            the third name in :func:`creek.vault.links.page_names` and
+            the one the scrub never knew about (#1622).
 
     Returns:
         Path to the written fragment file.
@@ -5741,6 +5751,8 @@ def _write_named_fragment(
         threads=[],
         eddies=[],
     )
+    if aliases is not None:
+        post["aliases"] = list(aliases)
     target.write_text(frontmatter.dumps(post), encoding="utf-8")
     return target
 
@@ -5845,6 +5857,608 @@ def test_wikilink_scrub_spares_a_case_variant_a_surviving_page_claims(
     assert (
         ref.read_text(encoding="utf-8") == "survivor link: [[ALPHA]]\ntarget link: \n"
     )
+
+
+# ---------------------------------------------------------------------------
+# The scrub knows every name the purged page answers to (#1622)
+# ---------------------------------------------------------------------------
+
+
+def test_wikilink_scrub_removes_a_link_naming_the_purged_pages_alias(
+    tmp_path: Path,
+) -> None:
+    """An ``aliases`` entry is a third linkable name, and it leaked (#1622).
+
+    :func:`creek.vault.links.page_names` — the very function
+    :meth:`creek.purge.engine.PurgeEngine._surviving_claimants` scans
+    *survivors* with — returns ``[stem, title, *aliases]``. The scrub
+    built its own, narrower set from ``title`` and the stem alone, so
+    the purged page's own alias was never a name the scrub looked for.
+    A vault where an operator wrote ``aliases: [Codename Raven]`` kept
+    ``[[Codename Raven]]`` on disk verbatim after a right-to-be-
+    forgotten request, inside the code path #903 documents as covering
+    "every spelling Obsidian resolves".
+
+    Byte-identity of the surrounding prose is asserted for the same
+    reason it is throughout the #903 block: over-matching on a
+    compliance path destroys the operator's unrelated text.
+    """
+    vault = _make_vault(tmp_path)
+    _write_named_fragment(
+        vault,
+        "frag-a",
+        stem="2026-03-11 session",
+        title="Session Notes",
+        aliases=["Codename Raven"],
+    )
+    ref = vault / "04-Praxis" / "note.md"
+    ref.write_text(
+        "a [[Session Notes]] b [[2026-03-11 session]] c [[Codename Raven]] d\n",
+        encoding="utf-8",
+    )
+
+    result = PurgeEngine(vault).purge_fragment("frag-a")
+
+    assert result.wikilinks_removed == 3
+    assert ref.read_text(encoding="utf-8") == "a  b  c  d\n"
+
+
+def test_wikilink_scrub_removes_a_case_variant_of_the_purged_pages_alias(
+    tmp_path: Path,
+) -> None:
+    """An alias folds exactly like the title does (#1622).
+
+    The widening puts the alias in the same ``folded_names`` set the
+    title and stem live in, so ``[[codename raven]]`` resolves to the
+    purged page and goes with it. Pinning the fold separately from the
+    exact spelling is what stops a later "simplification" from adding
+    the alias to an exact-case-only set.
+    """
+    vault = _make_vault(tmp_path)
+    _write_named_fragment(
+        vault,
+        "frag-a",
+        stem="2026-03-11 session",
+        title="Session Notes",
+        aliases=["Codename Raven"],
+    )
+    ref = vault / "04-Praxis" / "note.md"
+    ref.write_text("link: [[codename raven]]\nkept line\n", encoding="utf-8")
+
+    result = PurgeEngine(vault).purge_fragment("frag-a")
+
+    assert result.wikilinks_removed == 1
+    assert ref.read_text(encoding="utf-8") == "link: \nkept line\n"
+
+
+def test_alias_scrub_spares_a_case_variant_a_surviving_page_claims(
+    tmp_path: Path,
+) -> None:
+    """The over-match pin, carried onto the alias name (#1622).
+
+    Widening ``folded_names`` widens what the fold reaches, so the
+    exact-case shelter has to keep sheltering. A surviving page that
+    declares ``aliases: [CODENAME RAVEN]`` claims that exact spelling,
+    and ``LinkIndex.resolve`` consults its exact-case index first — so
+    ``[[CODENAME RAVEN]]`` names the survivor and must be left byte-
+    identical while ``[[Codename Raven]]`` goes.
+    """
+    vault = _make_vault(tmp_path)
+    _write_named_fragment(
+        vault,
+        "frag-a",
+        stem="alpha-one",
+        title="Alpha",
+        aliases=["Codename Raven"],
+    )
+    _write_named_fragment(
+        vault,
+        "frag-b",
+        stem="alpha-two",
+        title="Beta",
+        aliases=["CODENAME RAVEN"],
+    )
+    ref = vault / "04-Praxis" / "note.md"
+    ref.write_text(
+        "survivor: [[CODENAME RAVEN]]\ntarget: [[Codename Raven]]\n",
+        encoding="utf-8",
+    )
+
+    result = PurgeEngine(vault).purge_fragment("frag-a")
+
+    assert result.wikilinks_removed == 1
+    assert ref.read_text(encoding="utf-8") == "survivor: [[CODENAME RAVEN]]\ntarget: \n"
+
+
+def test_alias_scrub_is_not_switched_off_by_a_doomed_file_claiming_the_alias(
+    tmp_path: Path,
+) -> None:
+    """The #903 doomed-claimant pin, carried onto the alias name (#1622).
+
+    The exact-case shelter subtracts the purged page's *own* spellings,
+    and the widening has to put the alias on both sides of that
+    subtraction at once. If the alias joined ``folded_names`` but not
+    ``own``, an Adepthood staging file claiming the same alias — still
+    on disk when the claimant scan runs, deleted moments later by this
+    same purge — would shelter it and leave ``[[Codename Raven]]``
+    standing.
+    """
+    vault = _make_vault(tmp_path)
+    _write_named_fragment(
+        vault,
+        "frag-a",
+        stem="2026-03-11 session",
+        title="Session Notes",
+        aliases=["Codename Raven"],
+    )
+    staged = vault / "00-Creek-Meta" / "adepthood" / "uploads" / "upload-1.md"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_text(
+        "---\naliases:\n  - Codename Raven\n---\n\nthe uploaded document\n",
+        encoding="utf-8",
+    )
+    ref = vault / "04-Praxis" / "note.md"
+    ref.write_text("link: [[Codename Raven]]\nkept line\n", encoding="utf-8")
+
+    result = PurgeEngine(vault).purge_fragment("frag-a")
+
+    assert result.wikilinks_removed == 1
+    assert ref.read_text(encoding="utf-8") == "link: \nkept line\n"
+
+
+# ---------------------------------------------------------------------------
+# Markdown links are scrubbed by their target, never their text (#1622)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "Secret%20Title.md",
+        "<Secret Title.md>",
+        "Secret Title.md",
+        "./Secret Title.md",
+        "01-Fragments/Conversations/Secret%20Title.md",
+        "Secret Title",
+        "Secret%20Title.md#Heading",
+        "Secret%20Title.md?raw=1",
+        "secret%20title.md",
+        "SECRET TITLE.md",
+        'Secret%20Title.md "a link title"',
+        # The space is UNENCODED and a title follows -- the shape a person
+        # writes by hand. Splitting the target at its first whitespace cut
+        # this into 'Secret' + 'Title.md "a link title"', kept the whole
+        # string as one reading, and never reduced it to a page name,
+        # so the link survived a purge the audit called complete.
+        'Secret Title.md "a link title"',
+        "Secret Title.md 'a link title'",
+        'sub folder/Secret Title.md "a link title"',
+    ],
+)
+def test_markdown_link_scrub_removes_a_link_targeting_the_purged_page(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    """``[text](Secret Title.md)`` is a vault link and it survived (#1622).
+
+    creek already models this shape as a first-class vault link:
+    :data:`creek.clean.hygiene._RELATIVE_LINK_PATTERN` is what
+    ``BrokenLinkScanner`` counts a fragment's outgoing links with. So
+    the link graph counted markdown links while the right-to-be-
+    forgotten scrub — which ran exactly two passes, wiki-links and
+    fragment-IDs — did not, and the private title stayed on disk in a
+    file the audit log reported as scrubbed.
+
+    Every shape Obsidian actually writes is covered, and each needs a
+    different piece of the normalisation: percent-encoding of the space,
+    the ``<...>`` form for an unencoded one, a folder prefix, a ``./``
+    prefix, a missing ``.md``, an ``#anchor`` and a ``?query`` suffix, a
+    case variant, and a CommonMark ``"title"`` suffix.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-a", "Secret Title")
+    ref = vault / "04-Praxis" / "note.md"
+    ref.write_text(
+        f"before [display]({target}) after\nkept line\n",
+        encoding="utf-8",
+    )
+
+    result = PurgeEngine(vault).purge_fragment("frag-a")
+
+    assert result.markdown_links_removed == 1
+    assert result.wikilinks_removed == 0
+    assert ref.read_text(encoding="utf-8") == "before  after\nkept line\n"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "[Secret Title](https://example.com/unrelated)\n",
+        "[see it](https://example.com/Secret%20Title.md)\n",
+        "[mail](mailto:someone@example.com)\n",
+        "[proto](//example.com/Secret%20Title.md)\n",
+        "[anchor](#Heading)\n",
+        "[anchor](#Secret Title)\n",
+        "I wrote about Secret Title yesterday.\n",
+        "[Secret Title] is not a link at all.\n",
+    ],
+)
+def test_markdown_link_scrub_leaves_everything_it_does_not_target(
+    tmp_path: Path,
+    line: str,
+) -> None:
+    """The over-match pin: the *target* decides, never the text (#1622).
+
+    An external link whose display text happens to spell the purged
+    title points at something this purge never touched — deleting it
+    destroys the operator's content, and the string it leaves behind is
+    prose, no different from the sentence beside it. A same-file anchor
+    names no file at all. And a prose mention of the title has never
+    been in scope: ``docs/cleaning-and-purge.md`` scopes step 3 to links
+    plus word-boundary fragment-ID mentions, and widening it to bare
+    title text would make the scrub a redaction pass.
+
+    :func:`creek.clean.hygiene._extract_relative_links` already models
+    exactly this distinction — it reads the target and discards the
+    text — so matching on text here would put the purge and the link
+    scanner into disagreement about what a link even is.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-a", "Secret Title")
+    ref = vault / "04-Praxis" / "note.md"
+    before = f"{line}kept line\n"
+    ref.write_text(before, encoding="utf-8")
+
+    result = PurgeEngine(vault).purge_fragment("frag-a")
+
+    assert result.markdown_links_removed == 0
+    assert ref.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "Alpha Notes.md",
+        "Alpha Notes",
+        "Alpha Notes/index.md",
+        "Alpha (1).md",
+        "Alpha Notes.md 'a link title'",
+    ],
+)
+def test_markdown_link_scrub_keeps_a_target_that_merely_starts_with_the_name(
+    tmp_path: Path,
+    target: str,
+) -> None:
+    """An unencoded space is a path separator, not a destination end (#1622).
+
+    CommonMark ends a link destination at whitespace **only when a
+    title follows**, and a title is quote-delimited. So ``Alpha
+    Notes.md`` has exactly one reading — a path to the page
+    ``Alpha Notes``, which this purge never touched and which is still
+    on disk when the scrub runs.
+
+    Offering the first-token reading unconditionally made every one of
+    these resolve to ``Alpha`` and deleted the link: the over-match
+    direction #903 was built against, on the single target shape
+    :func:`creek.purge.engine._link_target_urls` documents Obsidian as
+    writing routinely. ``Alpha (1).md`` is worse than a deletion —
+    :data:`~creek.purge.engine._MDLINK_RE` stops at the first ``)``, so
+    the removal left the orphaned bytes ``.md)`` behind in the note.
+
+    The last parameter is the counterpart pin: it is the *same* target
+    with a real quoted title after it, so it keeps its second reading
+    and stays out of scope only because ``Alpha Notes`` is not the
+    purged page — the title-following branch is still live, and
+    ``test_markdown_link_scrub_removes_a_link_targeting_the_purged_page``
+    proves it still removes what it should.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-a", "Alpha")
+    _write_fragment(vault, "frag-b", "Alpha Notes")
+    ref = vault / "04-Praxis" / "note.md"
+    before = f"see [read them]({target}) now\nkept line\n"
+    ref.write_text(before, encoding="utf-8")
+
+    result = PurgeEngine(vault).purge_fragment("frag-a")
+
+    assert result.markdown_links_removed == 0
+    assert ref.read_text(encoding="utf-8") == before
+
+
+def test_markdown_link_scrub_spares_a_case_variant_a_surviving_page_claims(
+    tmp_path: Path,
+) -> None:
+    """The #903 exact-case shelter reaches the markdown shape too (#1622).
+
+    The new pass shares ``folded_names`` and ``protected`` with the
+    wiki-link one rather than carrying its own copy of the decision, so
+    when two pages differ only in case ``[x](ALPHA.md)`` names the
+    survivor and ``[x](Alpha.md)`` names the target — the same split the
+    wiki-link pass makes. A second, case-blind copy of the matcher would
+    delete both.
+    """
+    vault = _make_vault(tmp_path)
+    _write_named_fragment(vault, "frag-a", stem="alpha-one", title="Alpha")
+    _write_named_fragment(vault, "frag-b", stem="alpha-two", title="ALPHA")
+    ref = vault / "04-Praxis" / "note.md"
+    ref.write_text(
+        "survivor: [x](ALPHA.md)\ntarget: [x](Alpha.md)\n",
+        encoding="utf-8",
+    )
+
+    result = PurgeEngine(vault).purge_fragment("frag-a")
+
+    assert result.markdown_links_removed == 1
+    assert ref.read_text(encoding="utf-8") == "survivor: [x](ALPHA.md)\ntarget: \n"
+
+
+def test_a_markdown_target_that_is_not_utf8_is_left_exactly_as_it_is(
+    tmp_path: Path,
+) -> None:
+    """The new pass keeps #948's byte-native discipline (#1622).
+
+    Only the captured target is decoded, and a target that is not valid
+    UTF-8 cannot equal a page name — which is a ``str`` — so it is
+    refused rather than repaired, exactly as the wiki-link pass refuses
+    one. That is what lets the rewrite stay byte-exact while still
+    scrubbing the real reference on the same line.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    victim = vault / "04-Praxis" / "note.md"
+    victim.write_bytes(b"---\nid: p1\n---\n\n[t](\xff\xfe.md) and [t](Alpha.md)\n")
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    assert result.markdown_links_removed == 1
+    assert victim.read_bytes() == b"---\nid: p1\n---\n\n[t](\xff\xfe.md) and \n"
+
+
+def test_a_crlf_note_keeps_every_line_ending_the_markdown_scrub_touched(
+    tmp_path: Path,
+) -> None:
+    """Only the link's own bytes move, on CRLF and with no final newline.
+
+    The #948 property, asserted for the new pass: ``read_text`` would
+    translate every line ending in the file and ``write_text`` would add
+    the missing trailing newline back, rewriting bytes nobody asked to
+    change (#1622).
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    victim = vault / "04-Praxis" / "note.md"
+    victim.write_bytes(
+        b"---\r\nid: p1\r\n---\r\n\r\nsee [t](Alpha.md) here\r\ntail, no newline",
+    )
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    assert result.markdown_links_removed == 1
+    assert victim.read_bytes() == (
+        b"---\r\nid: p1\r\n---\r\n\r\nsee  here\r\ntail, no newline"
+    )
+
+
+def test_the_markdown_link_count_is_the_same_dry_or_applied(
+    tmp_path: Path,
+) -> None:
+    """The #1340 dry/apply agreement covers the new counter too (#1622).
+
+    A preview that under- or over-reports what an apply run would remove
+    is the failure #1340 closed for every other counter on
+    :class:`creek.purge.PurgeResult`; a counter added afterwards has to
+    arrive already holding that property, and it does because the new
+    pass lives inside the same pure ``_apply_scrubs`` both modes call.
+    """
+    previewed = _make_vault(tmp_path / "preview")
+    applied = _make_vault(tmp_path / "apply")
+    note = "link: [x](Alpha.md)\nkept line\n"
+    for vault in (previewed, applied):
+        _write_fragment(vault, "frag-A", "Alpha")
+        (vault / "04-Praxis" / "note.md").write_text(note, encoding="utf-8")
+
+    preview = PurgeEngine(previewed, dry_run=True).purge_fragment("frag-A")
+    result = PurgeEngine(applied).purge_fragment("frag-A")
+
+    assert preview.markdown_links_removed == result.markdown_links_removed == 1
+    assert (previewed / "04-Praxis" / "note.md").read_text(encoding="utf-8") == note
+
+
+def test_a_source_purge_accumulates_the_markdown_link_count(
+    tmp_path: Path,
+) -> None:
+    """The scoped purges report the new counter as a total (#1622).
+
+    ``purge_fragment`` assigns the count for its one fragment while
+    ``_purge_single`` accumulates across many, and a counter wired into
+    only one of them reports a source purge of ten fragments as if it
+    had scrubbed one.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    _write_fragment(vault, "frag-B", "Beta")
+    ref = vault / "04-Praxis" / "note.md"
+    ref.write_text("[x](Alpha.md) and [y](Beta.md)\n", encoding="utf-8")
+
+    result = PurgeEngine(vault).purge_source("claude")
+
+    assert result.markdown_links_removed == 2
+    assert ref.read_text(encoding="utf-8") == " and \n"
+
+
+def test_a_purge_result_reports_no_markdown_links_by_default(
+    tmp_path: Path,
+) -> None:
+    """The counter defaults to zero and stays off the wiki-link one (#1622).
+
+    ``wikilinks_removed`` is named, documented and audited (as
+    ``references_scrubbed``) as a count of *wiki-links*; folding a
+    second syntax into it would make three surfaces say something
+    untrue. A note holding one link of each shape must therefore report
+    one of each, not two of either.
+    """
+    assert (
+        PurgeResult(operation="fragment", target="frag-A").markdown_links_removed == 0
+    )
+
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    ref = vault / "04-Praxis" / "note.md"
+    ref.write_text("[[Alpha]] and [x](Alpha.md)\n", encoding="utf-8")
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    assert result.wikilinks_removed == 1
+    assert result.markdown_links_removed == 1
+    assert ref.read_text(encoding="utf-8") == " and \n"
+
+
+def test_the_audit_outcome_records_the_markdown_link_count(
+    tmp_path: Path,
+) -> None:
+    """A compliance log that omits a scrub cannot evidence it (#1622).
+
+    ``purge.jsonl`` is the record a right-to-be-forgotten request is
+    answered with. The outcome entry already carries every other count
+    the engine produces; the markdown-link removals need their own line
+    there rather than being added into ``references_scrubbed``, which
+    the audit's own docstring defines as wiki-links.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    ref = vault / "04-Praxis" / "note.md"
+    ref.write_text("[x](Alpha.md)\n", encoding="utf-8")
+
+    PurgeEngine(vault).purge_fragment("frag-A")
+
+    entries = PurgeAuditLog(vault).read()
+    outcomes = [entry for entry in entries if entry.phase == "outcome"]
+    assert len(outcomes) == 1
+    assert outcomes[0].markdown_links_removed == 1
+    assert outcomes[0].references_scrubbed == 0
+
+
+def test_cli_purge_reports_the_markdown_link_count(tmp_path: Path) -> None:
+    """The operator's own surface names the new scrub (#1622).
+
+    The CLI prints one line per counter; a removal that no surface
+    reports is indistinguishable from one that did not happen, which on
+    a compliance path is the whole question being asked.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    (vault / "04-Praxis" / "note.md").write_text(
+        "[x](Alpha.md)\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["purge", "fragment", "frag-A", "--vault", str(vault), "--yes"],
+    )
+
+    assert result.exit_code == 0
+    assert "Markdown links removed: 1" in result.output
+
+
+# ---------------------------------------------------------------------------
+# A surviving page's own aliases entry is deliberately left alone (#1622)
+# ---------------------------------------------------------------------------
+
+
+def test_purge_leaves_a_surviving_pages_aliases_entry_byte_identical(
+    tmp_path: Path,
+) -> None:
+    """Deleting a survivor's ``aliases`` entry would be the over-match (#1622).
+
+    An ``aliases`` entry names the page **it is written on**. A survivor
+    declaring ``aliases: [Secret Title]`` is therefore a live page whose
+    own declared identity is that string — not a reference to the purged
+    fragment — and erasing the entry destroys a page this purge never
+    targeted, which is the direction #903 was built against.
+
+    The *link* is a different matter and is removed, because the shelter
+    subtracts the purged page's own spellings: a survivor claiming the
+    purged page's exact name must not be able to switch the primary
+    scrub off. Both halves are asserted together so the distinction
+    cannot be collapsed by a later change in either direction.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-a", "Secret Title")
+    survivor = vault / "04-Praxis" / "keeper.md"
+    before = (
+        "---\ntitle: Keeper\naliases:\n  - Secret Title\n---\n\n"
+        "link: [[Secret Title]]\nkept line\n"
+    )
+    survivor.write_text(before, encoding="utf-8")
+
+    result = PurgeEngine(vault).purge_fragment("frag-a")
+
+    assert result.wikilinks_removed == 1
+    assert survivor.read_text(encoding="utf-8") == (
+        "---\ntitle: Keeper\naliases:\n  - Secret Title\n---\n\nlink: \nkept line\n"
+    )
+
+
+def test_no_creek_ingestor_can_put_aliases_on_a_fragment(tmp_path: Path) -> None:
+    """The schema-drift tripwire behind the decision above (#1622).
+
+    Leaving a survivor's ``aliases`` entry alone is safe only while no
+    creek writer puts an alias on a *fragment*. Two facts hold that up,
+    and both are asserted here so the day either changes this test
+    fails rather than the guarantee silently doing so:
+
+    * ``Fragment`` leaves pydantic's ``extra="ignore"``, so an
+      unmodelled ``aliases`` key from an import is discarded before it
+      can reach disk, and
+    * ``PASSTHROUGH_FRONTMATTER_KEYS`` — the one hatch through which an
+      ingestor may emit an unmodelled key — does not contain it.
+
+    If either stops holding, an alias becomes reachable on a fragment
+    through ordinary ingest and the deliberate omission above turns into
+    a leak that needs real work.
+
+    Args:
+        tmp_path: Pytest temporary directory, unused but kept for parity
+            with the suite's fixtures.
+    """
+    assert tmp_path.is_dir()
+    assert frozenset({"sheet", "rows", "columns"}) == PASSTHROUGH_FRONTMATTER_KEYS
+
+    fragment = Fragment.model_validate(
+        {
+            "id": "frag-a",
+            "title": "Secret Title",
+            "source": {"platform": "claude", "original_file": "frag-a.json"},
+            "aliases": ["Codename Raven"],
+        },
+    )
+
+    assert not hasattr(fragment, "aliases")
+    assert "aliases" not in fragment.model_dump()
+
+
+def test_the_only_creek_pages_declaring_aliases_declare_their_own_title() -> None:
+    """An alias is a page's own name, wherever creek writes one (#1622).
+
+    The issue this test closes read ``aliases:`` backwards — as a
+    reference *to* another page that the scrub should follow. It is the
+    opposite: ``build_link_index`` registers the entry so the page
+    carrying it becomes linkable by that string. creek writes exactly
+    two of them, on a thread and on an eddy, and each one repeats that
+    page's own title.
+
+    Asserted against the writer's source rather than by round-tripping a
+    thread, because the claim being pinned is about *how many* such
+    sites exist. A third one — especially on a fragment writer — is the
+    event that reopens this half of #1622, and only a count can notice
+    it arriving.
+    """
+    source = inspect.getsource(vault_writer)
+
+    assert source.count('"aliases"') == 2
+    assert 'extra_frontmatter={"aliases": [thread.title]}' in source
+    assert 'extra_frontmatter={"aliases": [eddy.title]}' in source
 
 
 # ---------------------------------------------------------------------------
