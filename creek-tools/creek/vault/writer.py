@@ -26,7 +26,7 @@ import tempfile
 import threading
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Final, NamedTuple
 
 import frontmatter
 
@@ -47,7 +47,7 @@ from creek.vault.authors import (
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS, load_post_or_raise
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from pydantic import BaseModel
 
@@ -437,6 +437,42 @@ def _extract_date_str(model: BaseModel) -> str:
     return date.today().isoformat()
 
 
+@contextlib.contextmanager
+def _index_locks(*lock_paths: Path) -> Iterator[None]:
+    """Hold several per-directory index locks at once, in a stable order (#1611).
+
+    A relocation touches *two* directories' indexes — it drops the origin's
+    mapping and appends the destination's — so it needs both keys, and two
+    callers taking them in opposite orders would deadlock. The order here is
+    the resolved path, which is a total order over the whole vault and
+    therefore the same order for every caller regardless of which direction
+    the fragment is moving. That extends the rule ``_write_model`` already
+    states: always ``vault_lock``-then-``self._lock``, and now always
+    lowest-path-first among the vault locks.
+
+    Duplicates collapse on the *resolved* path. No caller names one
+    directory twice today, but the guard is not decorative:
+    :func:`creek._fslock.vault_lock` fronts ``flock`` with a plain
+    :class:`threading.Lock` and is **not** reentrant, so the failure mode for
+    a future caller that did — or for two spellings of one directory, a
+    relative path and an absolute one — is a self-deadlock rather than an
+    error, and a self-deadlock is the kind of defect that ships.
+
+    Args:
+        *lock_paths: Lock files to hold for the block.
+
+    Yields:
+        Nothing. The block runs with every lock held.
+    """
+    ordered: dict[Path, Path] = {}
+    for path in lock_paths:
+        ordered.setdefault(path.resolve(strict=False), path)
+    with contextlib.ExitStack() as stack:
+        for _, path in sorted(ordered.items()):
+            stack.enter_context(vault_lock(path))
+        yield
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     """Atomically write *content* to *path* via a unique tempfile + ``os.replace``.
 
@@ -463,41 +499,415 @@ def _atomic_write_text(path: Path, content: str) -> None:
                 tmp_path.unlink()
 
 
+_ID_SCAN_HEAD_BYTES: Final[int] = 8192
+"""How much of a file the id byte-scan reads before giving up (#1543).
+
+A Creek frontmatter block is a few hundred bytes; 8 KiB is roughly an
+order of magnitude of headroom and still one page-sized ``read(2)``.
+A header that overflows it is not misread — the scan simply reports
+"uncertain" and the file falls back to ``frontmatter.load``.
+"""
+
+_FENCE_RE: Final[re.Pattern[str]] = re.compile(r"^-{3,}[ \t]*$")
+"""A frontmatter fence line.
+
+Matches python-frontmatter's own ``^-{3,}\\s*$`` boundary for the shapes
+that can appear on a single line, so ``----`` opens a block and a fence
+with trailing spaces still closes one.
+"""
+
+_PLAIN_STRING_SCALAR_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_.\-]*$",
+)
+"""An unquoted scalar this scanner is willing to call a ``str``.
+
+Deliberately far narrower than "everything YAML types as a string". It
+must start with a letter or underscore, which alone excludes every
+YAML 1.1 int, float, and timestamp (all of those start with a digit, a
+sign, or a dot), and it admits no whitespace, so a trailing ``# comment``
+or a flow collection cannot slip through either. Anything outside it is
+reported *uncertain* rather than guessed at — see :func:`_typed_scalar`.
+"""
+
+_YAML_BOOL_AND_NULL_WORDS: Final[tuple[str, ...]] = (
+    "yes",
+    "no",
+    "true",
+    "false",
+    "on",
+    "off",
+    "null",
+)
+"""The YAML 1.1 words ``SafeLoader`` resolves to a ``bool`` or to ``None``."""
+
+_YAML_WORD_SCALARS: Final[frozenset[str]] = frozenset(
+    spelling
+    for word in _YAML_BOOL_AND_NULL_WORDS
+    for spelling in (word, word.capitalize(), word.upper())
+)
+"""The non-``str`` word scalars :data:`_PLAIN_STRING_SCALAR_RE` would admit.
+
+The regex screens out every numeric and timestamp form by anchoring on a
+leading letter, but ``true``/``no``/``off``/``null`` are letters. PyYAML's
+``SafeLoader`` resolves each of these to a ``bool`` or ``None``, never a
+``str``, so an id spelled this way declares no id at all.
+
+Derived from the three casings PyYAML accepts rather than typed out, because
+a hand-written list gets this wrong in a specific direction: ``y`` and ``n``
+*look* like YAML 1.1 booleans and are **not** — PyYAML types them ``str``.
+Listing them would make the byte-scan answer ``None`` where
+``frontmatter.load`` answers ``"y"``, which is exactly the file-for-file
+disagreement #1543's third acceptance criterion forbids.
+``~`` is likewise absent: it is a null spelling, but it never reaches this
+set because it cannot match the leading-letter regex in the first place.
+"""
+
+
+class _ScannedId(NamedTuple):
+    """What the bounded byte-scan concluded about one file's ``id`` (#1543).
+
+    Attributes:
+        value: The declared id, or ``None`` for "this file declares no
+            ``str`` id" — which covers a missing key, an explicit YAML
+            null, and a scalar YAML would type as something other than a
+            string.
+        certain: Whether *value* is the answer ``frontmatter.load`` would
+            have given. ``False`` means the scanner met a shape it
+            declines to adjudicate (a block scalar, a ``!!str`` tag, a
+            flow collection, an unterminated header), and the caller must
+            fall back to the real YAML parser rather than trust *value*.
+    """
+
+    value: str | None
+    certain: bool
+
+
+def _read_head(path: Path, limit: int) -> tuple[str, bool] | None:
+    """Read at most *limit* bytes from the front of *path*.
+
+    Args:
+        path: The file to read.
+        limit: Maximum number of bytes to pull off the front.
+
+    Returns:
+        ``(decoded head, whole_file)``, where *whole_file* says the read
+        reached EOF and therefore saw the entire file. ``None`` when the
+        file could not be opened or read at all.
+    """
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(limit)
+    except OSError:
+        return None
+    # A truncated read can split a multi-byte character at the boundary;
+    # the replacement character it produces can only ever appear past the
+    # header, and a header carrying one fails the plain-scalar screen.
+    return raw.decode("utf-8", errors="replace"), len(raw) < limit
+
+
+def _frontmatter_block(head: str) -> tuple[list[str], bool]:
+    """Split *head* into its frontmatter lines and whether the block closed.
+
+    ``frontmatter.parse`` strips the text before looking for the opening
+    fence, so a blank line above ``---`` is tolerated there and is
+    tolerated here. A byte-order mark is *not* whitespace and is
+    therefore not stripped by either — a BOM'd file has no frontmatter as
+    far as python-frontmatter is concerned, and none as far as this
+    scanner is concerned.
+
+    Args:
+        head: The decoded head of the file.
+
+    Returns:
+        ``(header lines, closed)``. An unfenced file yields
+        ``([], True)`` — it certainly declares nothing. A file whose
+        opening fence is never closed within *head* yields ``closed``
+        ``False``, which the caller can only trust as "no frontmatter"
+        when it knows it read the whole file.
+    """
+    lines = head.lstrip().splitlines()
+    if not lines or not _FENCE_RE.match(lines[0]):
+        return [], True
+    for position, line in enumerate(lines[1:], start=1):
+        if _FENCE_RE.match(line):
+            return lines[1:position], True
+    return lines[1:], False
+
+
+def _is_ignorable_header_line(line: str) -> bool:
+    """Return ``True`` for a header line that cannot introduce a top-level key.
+
+    Args:
+        line: One raw line of the frontmatter block.
+
+    Returns:
+        ``True`` for a blank line, a comment, or an indented line. An
+        indented line belongs to the *previous* key — a nested mapping, a
+        sequence item, or the content of a block scalar — so an ``id:``
+        sitting inside a block value is correctly ignored rather than
+        mistaken for the document's own id.
+    """
+    stripped = line.strip()
+    return not stripped or line[0].isspace() or stripped.startswith("#")
+
+
+def _unquote(text: str) -> str:
+    """Strip one matching pair of surrounding quotes from *text*.
+
+    Args:
+        text: A YAML key as written.
+
+    Returns:
+        The key without its quotes, so ``"id"`` and ``id`` are one key.
+    """
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    return text
+
+
+def _quoted_scalar(value: str) -> _ScannedId:
+    """Resolve a scalar that opens with a quote character.
+
+    Args:
+        value: The raw value text, known to start with ``"`` or ``'``.
+
+    Returns:
+        The quoted contents when the quoting is trivial. Anything
+        needing real YAML rules — an escape sequence, an embedded or
+        doubled quote, a quote that never closes — is reported uncertain.
+    """
+    quote = value[0]
+    body = value[1:]
+    if not body.endswith(quote):
+        return _ScannedId(None, certain=False)
+    inner = body[:-1]
+    if "\\" in inner or quote in inner:
+        return _ScannedId(None, certain=False)
+    return _ScannedId(inner, certain=True)
+
+
+def _is_continued(block: list[str], position: int) -> bool:
+    """Return ``True`` when the line after *position* continues that line's value.
+
+    A YAML plain scalar may run over several lines: ``id: frag-a`` followed
+    by an indented ``more`` is the single string ``"frag-a more"``, and a
+    blank line in between only folds to a newline rather than ending it. The
+    walk in :func:`_scan_declared_id` skips indented lines because they
+    belong to the *previous* key — right for a nested mapping and for a
+    block scalar's content, wrong for a folded plain scalar, where skipping
+    them truncates the value and the scanner reports half an id.
+
+    Over-deferring here is free and under-deferring is not: an indented
+    comment is not a continuation, but treating it as one only sends the
+    file to ``frontmatter.load``, which gives the same answer.
+
+    Args:
+        block: The frontmatter block's lines.
+        position: Index within *block* of the line whose value is in question.
+
+    Returns:
+        ``True`` when the next non-blank line is indented.
+    """
+    for line in block[position + 1 :]:
+        if line.strip():
+            return line[:1].isspace()
+    return False
+
+
+def _typed_scalar(raw: str, *, continued: bool) -> _ScannedId:
+    """Resolve the text after ``id:`` the way ``SafeLoader`` would, or decline.
+
+    This is where #1291 is decided *deliberately* rather than by accident.
+    A byte-scan that reported ``id: 12345`` as the string ``"12345"``
+    would silently merge two identities the vault never said were the
+    same — widening identity matching inside a performance change. So an
+    unquoted scalar is only reported when it is one YAML itself types
+    ``str``; ``12345`` falls through to the parser, which types it
+    ``int``, and the file keeps declaring no string id.
+
+    Args:
+        raw: Everything after the first ``:`` on the ``id`` line.
+        continued: Whether an indented line follows, in which case the
+            value spans more than this line and only the parser can join
+            it — see :func:`_is_continued`.
+
+    Returns:
+        The declared id, ``None`` for a scalar that is not a string, or
+        an uncertain verdict for a shape needing the real parser —
+        including an empty value, which may be a null or may be a
+        multi-line plain scalar continued on the next line.
+    """
+    value = raw.strip()
+    if continued or not value:
+        # ``id:`` with nothing after it is *usually* a YAML null, but it is
+        # also how a multi-line plain scalar opens: ``id:`` on one line and
+        # an indented ``frag-...`` on the next, which YAML reads as the
+        # value and the line-walk above discards as continuation. Guessing
+        # "null" there would cost the file its identity — the very defect
+        # tracked in #1543 — so the parser settles it.
+        return _ScannedId(None, certain=False)
+    if value[0] in "\"'":
+        return _quoted_scalar(value)
+    if _PLAIN_STRING_SCALAR_RE.match(value) and value not in _YAML_WORD_SCALARS:
+        return _ScannedId(value, certain=True)
+    return _ScannedId(None, certain=False)
+
+
+def _top_level_key(line: str) -> str | None:
+    """Return the key *line* declares, or ``None`` when it declares none.
+
+    A YAML block-mapping entry is ``key:`` followed by whitespace or the
+    end of the line. ``id:frag-abc000001`` is **not** one — with no space
+    after the colon YAML reads the whole line as a plain scalar, so the
+    document is not a mapping and declares no ``id`` at all. Splitting on
+    the bare colon would have the scanner mint an identity the parser
+    denies, which is #1543's third acceptance criterion broken in the
+    direction that matters most: ``_file_declares_id`` is the #1083
+    guard against rewriting a stranger's file, and a verifier that says
+    "yes" where ``frontmatter.load`` says "no id here" widens exactly
+    that guard.
+
+    Args:
+        line: One non-ignorable line of the frontmatter block.
+
+    Returns:
+        The unquoted key, or ``None`` when the line is not ``key: value``.
+    """
+    key, separator, rest = line.partition(":")
+    if not separator or (rest and not rest[0].isspace()):
+        return None
+    return _unquote(key.strip())
+
+
+def _scan_declared_id(head: str, *, whole_file: bool) -> _ScannedId:
+    """Find the ``id`` a frontmatter block declares, without parsing YAML.
+
+    Args:
+        head: The decoded head of the file.
+        whole_file: Whether *head* is the entire file.
+
+    Returns:
+        The scan's verdict. A *later* ``id:`` key overwrites an earlier
+        one because that is what YAML does with a duplicate key, and a
+        naive first-match regex is one of the ways a hand-rolled scanner
+        silently disagrees with the parser it replaces.
+    """
+    block, closed = _frontmatter_block(head)
+    if not closed:
+        # The header ran past the bounded read, so a later ``id:`` may be
+        # out of sight. Certain only when the whole file was in hand, in
+        # which case there is genuinely no closing fence and therefore no
+        # frontmatter at all.
+        return _ScannedId(None, certain=whole_file)
+    found = _ScannedId(None, certain=True)
+    unparseable = False
+    for position, line in enumerate(block):
+        if _is_ignorable_header_line(line):
+            continue
+        key = _top_level_key(line)
+        if key is None:
+            unparseable = True
+        elif key == "id":
+            found = _typed_scalar(
+                line.partition(":")[2],
+                continued=_is_continued(block, position),
+            )
+    if unparseable and found.value is None:
+        # Something in the header is not ``key: value`` and no id turned
+        # up. It could be a flow collection opened on one line and holding
+        # the ``id`` on an indented next one, so defer rather than assert
+        # an absence.
+        return _ScannedId(None, certain=False)
+    return found
+
+
+def _declared_id(path: Path) -> str | None:
+    """Return the ``str`` id *path*'s own frontmatter declares, or ``None``.
+
+    The single reader behind both halves of the index contract — the
+    verifier :func:`_file_declares_id` and the scanner
+    :meth:`VaultWriter._rebuild_index`. They used to hold two copies of
+    the same guard-plus-``isinstance`` chain and a docstring warning that
+    widening one alone would make them disagree; sharing one function
+    makes disagreement structurally impossible instead.
+
+    A bounded byte-scan answers first, and the real parser is consulted
+    only when the scan declines. That ordering buys both halves of #1543:
+
+    - **Correctness.** A file whose header carries a non-string key (a
+      bare YAML date, ``true:``, ``1:``) or a syntax error elsewhere used
+      to resolve as "declares no id", so ``find_fragment`` reported
+      nothing, ``update_fragment`` / ``tomb_fragment`` /
+      ``restore_fragment`` all silently declined, and the next
+      ``write_fragment`` minted a duplicate carrying the same id — with
+      the index left naming the *duplicate*, orphaning the original. The
+      scan reads the ``id`` line beside the broken one and answers.
+    - **Cost.** Measured against *this* implementation on a 2622-byte
+      fragment with 20 header keys, best of five runs of 2000
+      iterations: ``frontmatter.load`` 94.1 us,
+      :func:`creek.vault.links.read_header_meta` 695.7 us, this scan
+      29.9 us. The rejected "obvious" fix — routing the verifier through
+      the splat-free header reader — is a 7.4x regression on a path that
+      runs once per index *hit*; the scan is a 3.1x improvement, about
+      2.2 s off a 35 000-fragment sweep. Absolute microseconds are a
+      property of the box and will not reproduce exactly; the ratios
+      held across a loaded box and an idle one.
+
+    The fallback is what keeps the two readers honest about the exotic
+    shapes. ``!!str 12345``, a block scalar, a quoted string carrying
+    escapes, a header larger than :data:`_ID_SCAN_HEAD_BYTES`, an ``id``
+    folded over two lines, and a line that is not ``key: value`` at all
+    are reported *uncertain* by the scan and settled by
+    ``frontmatter.load``, so the answer stays identical to the pre-#1543
+    one on every file that parser can read. That equivalence is asserted
+    shape by shape over the corpus in
+    ``tests/test_vault_writer.py::TestDeclaredIdByteScan`` — deferring
+    too often only costs a parse, while deferring too rarely is either a
+    lost identity or an invented one.
+
+    Args:
+        path: The markdown file to read.
+
+    Returns:
+        The declared id, or ``None`` when the file declares no ``str``
+        id — including when it cannot be read at all.
+    """
+    head = _read_head(path, _ID_SCAN_HEAD_BYTES)
+    if head is None:
+        return None
+    scanned = _scan_declared_id(head[0], whole_file=head[1])
+    if scanned.certain:
+        return scanned.value
+    try:
+        post = frontmatter.load(str(path))
+    except FRONTMATTER_LOAD_ERRORS:
+        return None
+    declared = post.get("id")
+    return declared if isinstance(declared, str) else None
+
+
 def _file_declares_id(path: Path, model_id: str) -> bool:
     """Return ``True`` only when *path*'s own frontmatter declares *model_id*.
 
     The verifier behind the id index (#1083): an index entry is a *claim*
     about a file, and this is the only thing that turns that claim into
-    evidence. A missing ``id`` key, a non-``str`` id, and an unparseable
-    file all answer ``False``.
+    evidence. A missing ``id`` key, a non-``str`` id, and a file that
+    declares some *other* id all answer ``False``.
 
-    The guarded exception set and the ``isinstance(..., str)`` gate are
-    deliberately identical to the ones
-    :meth:`VaultWriter._rebuild_index` applies while scanning, so the
-    verifier and the scanner can never disagree about which files
-    declare an id — a file this function rejects is exactly a file the
-    rebuild would decline to index. Both now name
-    :data:`~creek.vault.reader.FRONTMATTER_LOAD_ERRORS`, and they must keep
-    naming the *same* thing: widening one alone reintroduces the disagreement
-    #1083 closed.
+    Both this and :meth:`VaultWriter._rebuild_index` read the file
+    through :func:`_declared_id`, so "a file this function rejects is
+    exactly a file the rebuild would decline to index" is now true by
+    construction rather than by two implementations agreeing to keep the
+    same guard tuple and the same ``isinstance`` gate.
 
-    Routing this through the splat-free
-    :func:`creek.vault.links.read_header_meta` — it reads only ``id``, so it
-    could — was measured and rejected. On a 1.9 KB fragment with ~20 header
-    keys ``frontmatter.load`` costs 66 us against ``read_header_meta``'s 424 us,
-    because the former resolves libyaml's C loader while the latter runs
-    ``yaml.safe_load`` on the pure-Python one. This runs once per index *hit*,
-    so on a 35k-fragment sweep that is ~2.3 s against ~14.8 s. The consequence
-    — a file whose header will not parse resolves as "not found" rather than
-    being reported — is issue #1543, whose fix is the bounded byte-scan for
-    ``id`` that :meth:`VaultWriter._find_in_dir_locked` already names.
+    Args:
+        path: The file the index claims holds *model_id*.
+        model_id: The id being verified.
+
+    Returns:
+        ``True`` when the file's own frontmatter says so.
     """
-    try:
-        post = frontmatter.load(str(path))
-    except FRONTMATTER_LOAD_ERRORS:
-        return False
-    declared = post.get("id")
-    return isinstance(declared, str) and declared == model_id
+    return _declared_id(path) == model_id
 
 
 class _IndexLoad(NamedTuple):
@@ -976,8 +1386,11 @@ class VaultWriter:
             Path to the rewritten file, or ``None`` when no existing file
             maps to the id — including the case where the mapped file
             exists but declares a different id and re-resolution finds no
-            live file declaring this one, and the case where the mapped file's
-            frontmatter will not parse at all (#1543).
+            live file declaring this one. A mapped file whose header will
+            not parse is no longer one of those cases — since #1543 the
+            id is read by byte-scan, so such a file is located and then
+            reported by the ``ValueError`` below rather than silently
+            declining the update.
 
         Raises:
             OSError: If the located file cannot be read — the vanished or
@@ -1281,8 +1694,31 @@ class VaultWriter:
         out of scope to widen here. Tracked in #1325.
         """
         orphan_dir = self.vault_path.joinpath(*_ORPHANED_RELPARTS)
+        # Locate first, *outside* any vault lock, and take the locks only once
+        # there is something to move (#1611). ``vault_lock`` creates its lock
+        # file and the parent directory, and the search visits every *declared*
+        # platform subfolder whether or not it exists on disk
+        # (``_fragment_search_dirs``) — so locking around the search would
+        # litter the operator's vault with directories and lock files on a
+        # lookup that found nothing, undoing #1332.
         with self._lock:
-            existing = self._find_in_fragments_locked(fragment_id)
+            located = self._find_in_fragments_locked(fragment_id)
+        if located is None:
+            return None
+        origin_dir = located.parent
+        with (
+            _index_locks(
+                self._index_lock_path(origin_dir),
+                self._index_lock_path(orphan_dir),
+            ),
+            self._lock,
+        ):
+            # Re-resolved under the lock: the unlocked search above is a
+            # *hint*, and between it and here another process may have tombed
+            # this very fragment. Acting on the stale hint is what produced two
+            # tombstones for one id and then failed to unlink a file the winner
+            # had already moved.
+            existing = self._find_existing_locked(fragment_id, origin_dir)
             if existing is None:
                 return None
             post = load_post_or_raise(existing)
@@ -1345,7 +1781,18 @@ class VaultWriter:
         """
         orphan_dir = self.vault_path.joinpath(*_ORPHANED_RELPARTS)
         target_dir = self._fragment_target_dir(fragment)
+        # Same shape as ``tomb_fragment``: probe unlocked so a miss creates no
+        # lock file and no directory, then take both keys and re-resolve (#1611).
         with self._lock:
+            if self._find_existing_locked(fragment.id, orphan_dir) is None:
+                return None
+        with (
+            _index_locks(
+                self._index_lock_path(orphan_dir),
+                self._index_lock_path(target_dir),
+            ),
+            self._lock,
+        ):
             existing = self._find_existing_locked(fragment.id, orphan_dir)
             if existing is None:
                 return None
@@ -1553,7 +2000,12 @@ class VaultWriter:
             post = frontmatter.Post(content=body, **data)
             content = frontmatter.dumps(post)
 
-            file_path = self._atomic_create(target_dir, base_name, content)
+            file_path = self._atomic_create(
+                target_dir,
+                base_name,
+                content,
+                expected_id=model_id,
+            )
 
             # Update the in-memory + on-disk index transactionally with
             # the file write so a follow-up call (or a fresh process)
@@ -1603,23 +2055,28 @@ class VaultWriter:
 
         Cost and the rejected memo:
 
-        - Exactly one :func:`frontmatter.load` per index **hit**, none
-          per miss, so no directory scan enters the steady-state path.
+        - Exactly one :func:`_declared_id` per index **hit**, none per
+          miss, so no directory scan enters the steady-state path.
           Measured by call-counting a real unchanged re-ingest: 400
-          units produced 400 loads before this verification existed and
-          400 after — one per hit, not one per lookup. Each load costs
-          ~180 us on a real fragment (1.6 KB, ~20 frontmatter keys),
-          which is roughly +8% on the steady-state unchanged re-ingest
-          and about +6 s on a full 35 000-fragment sweep. That is the
-          price of not move-and-unlinking a stranger's file, and it is
-          paid only where the index claims a hit.
-        - Parsing *only* the frontmatter block by hand was measured and
-          rejected: ``frontmatter.load`` resolves libyaml's C loader,
-          while a hand-rolled ``yaml.safe_load`` of the same block runs
-          on the pure-Python loader and measured several times slower.
-          Reducing the cost further needs a bounded byte-scan for the
-          single ``id`` key, which is tracked as a follow-up rather
-          than smuggled into a data-loss fix.
+          units produced 400 reads before this verification existed and
+          400 after — one per hit, not one per lookup.
+        - That read is the bounded byte-scan #1543 called for, and it is
+          now the cheapest of the three candidates rather than the
+          middle one. Measured on a 2622-byte fragment with 20 header
+          keys, best of five runs of 2000 iterations:
+          ``frontmatter.load`` 94.1 us,
+          :func:`creek.vault.links.read_header_meta` 695.7 us, the
+          byte-scan 29.9 us. Verification therefore costs about 2.2 s
+          *less* on a full 35 000-fragment sweep than it did when it
+          parsed the whole header, and it no longer loses a file whose
+          header carries one unparseable line.
+        - Re-parsing the header with ``yaml.safe_load`` remains rejected:
+          ``frontmatter.load`` resolves libyaml's C loader, while a
+          hand-rolled ``safe_load`` of the same block runs on the
+          pure-Python one and measured several times slower. The scan
+          beats both by not invoking YAML at all on the common shapes,
+          and defers to ``frontmatter.load`` on the exotic ones so the
+          two readers keep agreeing file for file.
         - An mtime/size memo of the verification result was deliberately
           **rejected**: memoising the check reintroduces "trust a cache
           instead of the artifact" one level down — the exact defect
@@ -1679,6 +2136,18 @@ class VaultWriter:
         Caller must hold ``self._lock``. Reached only when the indexed
         file exists but declares a different id, so the scan is paid
         once per poisoned entry rather than per lookup.
+
+        This append is the one remaining index writer that does **not**
+        hold ``vault_lock(<dir>/.id-index.lock)``. It runs inside
+        ``self._lock``, and the house order is vault-lock-then-``self._lock``
+        (see :meth:`_write_model`), so acquiring it here would invert the
+        pair and deadlock a :class:`VaultWriter` driven from several
+        threads. Latent rather than live — ``O_APPEND`` below
+        ``_PIPE_BUF_BYTES`` cannot interleave, and the index is
+        later-wins, so two unsynchronised repairs cost a redundant line
+        and not a wrong answer. It is tracked as #1621, which is a
+        prerequisite for the compaction pass in #1300: a whole-file
+        rewrite can only be correct once every appender takes the lock.
 
         The corrected mapping is persisted with
         :meth:`_append_index_entry`, never :meth:`_persist_full_index`:
@@ -2048,24 +2517,38 @@ class VaultWriter:
 
     @staticmethod
     def _rebuild_index(target_dir: Path) -> dict[str, str]:
-        """Scan *target_dir* for ``.md`` files and rebuild the ID index."""
+        """Scan *target_dir* for ``.md`` files and rebuild the ID index.
+
+        Reads each file through :func:`_declared_id`, the same reader
+        :func:`_file_declares_id` uses. That is what makes the scanner
+        and the verifier agree by construction rather than by keeping
+        two guard tuples in step, and it is why a note whose header the
+        YAML parser rejects is now *re-resolvable* rather than lost:
+        the id line beside the broken one is still readable text (#1543).
+
+        A sibling that genuinely declares no id — a non-fragment, a
+        corrupt ``_author.md`` manifest — is still skipped rather than
+        crashing the rebuild for the whole directory (#470, #1475).
+
+        A file whose ``id`` YAML types as something *other* than ``str``
+        (``id: 12345`` resolves to an ``int``) is also skipped, and that
+        is a decision rather than an omission: normalising it to
+        ``"12345"`` would merge two identities the vault never said were
+        the same. #1291 settled it as "report, do not normalise", and
+        the report is :mod:`creek.lint.checks.nonstring_id`.
+
+        Args:
+            target_dir: The directory to scan.
+
+        Returns:
+            The ``{id: filename}`` mapping the directory's own files declare.
+        """
         index: dict[str, str] = {}
         if not target_dir.is_dir():
             return index
         for md_file in target_dir.glob("*.md"):
-            try:
-                post = frontmatter.load(str(md_file))
-            except FRONTMATTER_LOAD_ERRORS:
-                # A non-fragment or unparseable sibling (e.g. a corrupt
-                # ``_author.md`` manifest) must not crash the index rebuild —
-                # it simply has no fragment id to index (#470). The tuple
-                # includes ``TypeError`` because one hand-edited note with a
-                # bare-date frontmatter key used to take down ``find_fragment``
-                # / ``write_fragment`` / ``tomb_fragment`` for the whole
-                # directory (#1475).
-                continue
-            mid = post.get("id")
-            if isinstance(mid, str):
+            mid = _declared_id(md_file)
+            if mid is not None:
                 index[mid] = md_file.name
         return index
 
@@ -2122,10 +2605,20 @@ class VaultWriter:
         This method does **not** ``fsync``, unlike
         :meth:`creek.audit.AuditLog.append`. The index is a
         reconstructible cache, not a ledger: losing an unsynced tail to
-        a power cut costs a directory scan, not data. That is defensible
-        only because :meth:`_load_index_locked` now supplies the paired
-        recovery — a damaged or short index re-derives its mappings by
-        scanning the directory instead of reporting them as absent.
+        a power cut costs a directory scan, not data.
+
+        That claim needs **two** paired recoveries, and until #1299 it
+        only had one. :meth:`_load_index_locked` covers the *torn* append
+        — an unparseable line makes the load re-derive by scanning the
+        directory. It does not cover the *stalled* one: the ``O_CREAT``
+        below runs before :func:`~creek._fsio.write_all`, so a drain that
+        makes no progress leaves an index that is present, parses
+        cleanly and carries no torn line. It looks intact and is merely
+        short one mapping, so no recovery keyed on
+        :attr:`_IndexLoad.damaged` fires. The second recovery is in
+        :meth:`_atomic_create`, which verifies a colliding filename
+        against the id being written rather than assuming a collision
+        means a different fragment — see its *expected_id* argument.
 
         ``ftruncate``-back remains the rejected alternative: under
         concurrent ``O_APPEND`` writers the write offset is chosen
@@ -2178,7 +2671,13 @@ class VaultWriter:
         return f"{date_str}-{sanitized}" if sanitized else date_str
 
     @staticmethod
-    def _atomic_create(target_dir: Path, base_name: str, content: str) -> Path:
+    def _atomic_create(
+        target_dir: Path,
+        base_name: str,
+        content: str,
+        *,
+        expected_id: str | None = None,
+    ) -> Path:
         """Create ``target_dir/{base_name}.md`` atomically; retry with a counter.
 
         Uses ``O_CREAT | O_EXCL`` so two concurrent callers picking the
@@ -2192,13 +2691,48 @@ class VaultWriter:
         which writes the whole body even when ``write(2)`` goes short
         and unlinks the file if it cannot (#987).
 
+        *expected_id* turns the collision into a **last check of the
+        artifact** before a sibling is minted (#1299). The index is the
+        only thing that normally answers "does this id already have a
+        file?", and it can be silently short one mapping without ever
+        looking damaged: :meth:`_append_index_entry` opens with
+        ``O_CREAT`` before it writes, so a stalled drain leaves an index
+        that is present, parses cleanly and carries no torn line — every
+        recovery in :meth:`_load_index_locked` keys off
+        :attr:`_IndexLoad.damaged`, which such a file is not. The id then
+        resolves as "not indexed", this method finds the note already
+        sitting on disk under the stem it wants, and the counter suffix
+        turns a lost *cache line* into a duplicate *fragment* — with the
+        fresh append leaving the index naming the duplicate and the
+        original orphaned for good.
+
+        So when the colliding file already declares the id being
+        written, it *is* the file for that id and is returned as-is; the
+        caller's normal post-create append then restores the missing
+        mapping. Verification is confined to that case: a caller passing
+        no *expected_id* — :meth:`_relocate_fragment_locked` — keeps the
+        unconditional suffix stacking, because tombstones arriving in one
+        flat sink from several platform subfolders collide as
+        *strangers*, and reusing a stranger's file is the same data loss
+        pointing the other way.
+
+        Deliberately **not** a directory rescan: the check reads one
+        candidate path that the failed create just proved exists, so the
+        O(1) lookup stands and the everyday vanished-file miss still
+        resolves without a scan.
+
         Args:
             target_dir: Directory the file will live in.
             base_name: Filename stem (without ``.md``).
             content: Full file contents to write.
+            expected_id: The id the content declares, when the caller
+                wants a colliding file that already declares it treated
+                as a recovery rather than a collision. ``None`` keeps the
+                pure allocate-a-fresh-name behaviour.
 
         Returns:
-            The path of the created file.
+            The path of the created file, or of the pre-existing file
+            that already declares *expected_id*.
 
         Raises:
             RuntimeError: If a unique filename cannot be obtained within
@@ -2214,6 +2748,8 @@ class VaultWriter:
             try:
                 create_exclusive(candidate, encoded)
             except FileExistsError:
+                if expected_id is not None and _declared_id(candidate) == expected_id:
+                    return candidate
                 continue
             return candidate
         msg = (

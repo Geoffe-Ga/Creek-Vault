@@ -9,12 +9,16 @@ via write_any.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import logging
 import os
+import re
+import threading
+import time
 from datetime import date, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 import frontmatter
 import pytest
@@ -34,12 +38,31 @@ from creek.models import (
     Thread,
     ThreadStatus,
 )
-from creek.vault.writer import VaultWriter
+from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
+from creek.vault.writer import INDEX_LOCK_FILENAME, VaultWriter
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     from conftest import ShortWriteController
+
+
+_POLL_SECONDS: Final[float] = 0.02
+"""Granularity of the overlap test's wait-for-an-effect loop."""
+
+_WEDGE_TIMEOUT_SECONDS: Final[float] = 5.0
+"""Ceiling on any wait in the overlap test, so a regression fails instead of hanging."""
+
+_OVERLAP_CEILING_SECONDS: Final[float] = 2.0
+"""Longest the overlap test waits for an unserialised second caller to act.
+
+Not a sleep. The wait ends the instant the second caller produces its
+side effect, so the unserialised case — the one that must go red — finishes
+in milliseconds. Only the serialised case pays the ceiling, and it pays it
+because there is nothing to see: the second caller is blocked on the lock.
+A fixed sleep would have had the opposite bias, passing vacuously on a
+loaded CI box where the second caller had simply not finished yet.
+"""
 
 
 # ---- Fixtures ----
@@ -1654,10 +1677,16 @@ class TestIdIndexVerification:
         assert result != int_id_path
         assert frontmatter.load(str(result))["id"] == "12345"
         assert int_id_path.read_bytes() == before
-        # ``_rebuild_index`` only indexes ids where ``isinstance(mid, str)``, so
-        # the int-typed file is invisible to re-resolution. The honest outcome
-        # is therefore two files carrying the same *logical* id — declining the
-        # foreign file cannot also deduplicate an id the index cannot see.
+        # Both readers go through ``_declared_id``, which reports an unquoted
+        # scalar only when YAML itself types it ``str`` — so the int-typed file
+        # stays invisible to re-resolution and the honest outcome is two files
+        # carrying the same *logical* id. That strictness is a decision, not an
+        # oversight (#1291 option (a), normalise-on-read, was rejected: it
+        # merges two identities the vault never said were the same). The
+        # bounded byte-scan #1543 added would have implemented (a) by accident
+        # if it had read ``12345`` as text, which is why ``_typed_scalar``
+        # defers a bare numeral to the parser. The hazard is no longer silent:
+        # ``creek lint --check nonstring-id`` reports this file by name.
         assert _files_declaring(target_dir, "12345") == sorted([int_id_path, result])
 
     def test_vanished_file_does_not_trigger_a_rescan(
@@ -2395,3 +2424,905 @@ class TestVaultWriterScaling:
         early = statistics.median(durations[10:60])
         late = statistics.median(durations[-50:])
         assert late < 3 * early, f"Per-write grew: early={early:.4f}s late={late:.4f}s"
+
+
+# ---- The bounded id byte-scan (#1543) ----
+
+_SCAN_ID: Final[str] = "frag-scan000001"
+"""The id every readable shape in the agreement corpus declares."""
+
+_ID_SCAN_AGREEMENT_CORPUS: Final[dict[str, str]] = {
+    "bare": f"---\nid: {_SCAN_ID}\n---\nbody\n",
+    "single_quoted": f"---\nid: '{_SCAN_ID}'\n---\nbody\n",
+    "double_quoted": f'---\nid: "{_SCAN_ID}"\n---\nbody\n',
+    "yaml_str_tag": "---\nid: !!str 12345\n---\nbody\n",
+    "block_scalar": f"---\nid: >-\n  {_SCAN_ID}\n---\nbody\n",
+    "crlf": f"---\r\nid: {_SCAN_ID}\r\n---\r\nbody\r\n",
+    "byte_order_mark": f"﻿---\nid: {_SCAN_ID}\n---\nbody\n",
+    "fence_not_on_line_one": f"\n\n---\nid: {_SCAN_ID}\n---\nbody\n",
+    "four_dash_fence": f"----\nid: {_SCAN_ID}\n----\nbody\n",
+    "fence_with_trailing_space": f"---   \nid: {_SCAN_ID}\n---\nbody\n",
+    "duplicate_id_keys": f"---\nid: frag-decoy00001\nid: {_SCAN_ID}\n---\nbody\n",
+    "id_inside_a_block_value": (
+        f"---\ntitle: |\n  id: frag-decoy00001\nid: {_SCAN_ID}\n---\nbody\n"
+    ),
+    "id_below_the_fence": f"---\ntitle: t\n---\nid: {_SCAN_ID}\n",
+    "no_fence_at_all": f"id: {_SCAN_ID}\nbody\n",
+    "unterminated_fence": f"---\nid: {_SCAN_ID}\nbody with no closing fence\n",
+    "empty_frontmatter": "---\n---\nbody\n",
+    "no_id_key": "---\ntitle: t\n---\nbody\n",
+    "null_id": "---\nid:\n---\nbody\n",
+    "int_id": "---\nid: 12345\n---\nbody\n",
+    "bool_id": "---\nid: true\n---\nbody\n",
+    "date_id": "---\nid: 2024-05-01\n---\nbody\n",
+    "float_id": "---\nid: 1.5\n---\nbody\n",
+    "trailing_comment": f"---\nid: {_SCAN_ID}  # the id\n---\nbody\n",
+    "quoted_key": f'---\n"id": {_SCAN_ID}\n---\nbody\n',
+    "nested_mapping_first": (
+        f"---\nsource:\n  platform: claude\nid: {_SCAN_ID}\n---\nbody\n"
+    ),
+    "comment_line": f"---\n# a comment\nid: {_SCAN_ID}\n---\nbody\n",
+    "huge_body": f"---\nid: {_SCAN_ID}\n---\n" + ("x" * 100_000),
+    "escaped_double_quoted": '---\nid: "a\\tb"\n---\nbody\n',
+    "blank_line_in_header": f"---\n\nid: {_SCAN_ID}\n\n---\nbody\n",
+    "header_past_the_scan_bound": (
+        "---\n" + ("pad: x\n" * 2000) + f"id: {_SCAN_ID}\n---\nbody\n"
+    ),
+    "no_space_after_the_colon": f"---\nid:{_SCAN_ID}\n---\nbody\n",
+    "multiline_plain_scalar": f"---\nid:\n  {_SCAN_ID}\n---\nbody\n",
+    "flow_mapping_header": f"---\n{{\n  id: {_SCAN_ID}\n}}\n---\nbody\n",
+    "block_scalar_below_the_real_id": (
+        f"---\nid: {_SCAN_ID}\ntitle: |\n  id: frag-decoy00001\n---\nbody\n"
+    ),
+    "folded_onto_the_next_line": f"---\nid: {_SCAN_ID}\n  and more\n---\nbody\n",
+    "folded_across_a_blank_line": f"---\nid: {_SCAN_ID}\n\n  and more\n---\nbody\n",
+}
+"""Header shapes ``frontmatter.load`` reads, where the two readers must agree.
+
+Acceptance criterion 3 of #1543: the byte-scan and ``frontmatter.load``
+must still answer identically, *file for file*, on every file the latter
+can read. A naive ``^id:`` regex diverges on most of these — quoted
+scalars, ``!!str``, block scalars, a fence below line 1, duplicate keys
+(YAML takes the last, a regex takes the first), and a bare int (which
+YAML types ``int``, not ``str``).
+
+Four shapes pin divergences a line-oriented scan invites in *both*
+directions, and each one was a live defect before it was listed here:
+
+- ``no_space_after_the_colon`` — ``id:frag-1`` is not a mapping entry at
+  all; YAML reads the line as one plain scalar and the document declares
+  nothing. Splitting on the bare colon had the scanner assert an identity
+  the parser denies, which widens the #1083 guard against rewriting a
+  stranger's file.
+- ``multiline_plain_scalar`` — ``id:`` with the value indented on the next
+  line. Reading the empty remainder as a null lost the file's identity,
+  which is the #1543 defect reintroduced inside its own fix.
+- ``flow_mapping_header`` — a header opened as a flow mapping, whose
+  ``id`` sits on an *indented* line the walk skips as continuation. Only
+  the "something here is not ``key: value``, so defer" arm saves it.
+- ``block_scalar_below_the_real_id`` — a decoy ``id:`` inside a block
+  value, placed *after* the genuine one so that last-key-wins cannot mask
+  a scanner that forgets to skip indented lines.
+- ``folded_onto_the_next_line`` / ``folded_across_a_blank_line`` — the
+  mirror of the shape above, and the one a differential fuzz surfaces
+  first: skipping indented lines is right for a nested mapping and wrong
+  for a plain scalar folded over two lines, where it truncates the id to
+  its first line. A blank line between them folds to a newline rather
+  than ending the scalar, so it is not an escape from the rule.
+"""
+
+_ID_SCAN_UNREADABLE_CORPUS: Final[dict[str, str]] = {
+    "bare_date_key": (
+        f"---\nid: {_SCAN_ID}\ntype: fragment\n2024-05-01: reflection\n---\nbody\n"
+    ),
+    "bool_key": f"---\nid: {_SCAN_ID}\ntype: fragment\ntrue: yes\n---\nbody\n",
+    "int_key": f"---\nid: {_SCAN_ID}\ntype: fragment\n1: x\n---\nbody\n",
+    "invalid_yaml": (f"---\nid: {_SCAN_ID}\ntitle: [unterminated\n---\nbody\n"),
+}
+"""Headers ``frontmatter.load`` cannot read, whose ``id`` line is still plain.
+
+These are the files #1543 is about: the id is sitting in the header in
+readable text, and the verifier used to answer "no id here" because a
+*different* line of the same header would not parse.
+"""
+
+
+def _expected_declared_id(path: Path) -> str | None:
+    """Return what ``frontmatter.load`` says *path*'s ``id`` is, str-typed only."""
+    declared = frontmatter.load(str(path)).get("id")
+    return declared if isinstance(declared, str) else None
+
+
+class TestDeclaredIdByteScan:
+    """The bounded byte-scan that replaces ``frontmatter.load`` in the verifier.
+
+    ``_file_declares_id`` and ``_rebuild_index`` are bound by an explicit
+    contract — "a file this function rejects is exactly a file the rebuild
+    would decline to index" — so they are routed through one helper and can
+    never disagree by construction. What these tests pin is the *other* half:
+    that the helper agrees with ``frontmatter.load`` wherever ``frontmatter.load``
+    has an answer, and answers where it does not.
+    """
+
+    @pytest.mark.parametrize("shape", sorted(_ID_SCAN_AGREEMENT_CORPUS))
+    def test_byte_scan_agrees_with_frontmatter_load_on_every_readable_shape(
+        self,
+        tmp_path: Path,
+        shape: str,
+    ) -> None:
+        """The byte-scan answers exactly what a str-typed ``frontmatter.load`` does."""
+        from creek.vault.writer import _declared_id
+
+        note = tmp_path / f"{shape}.md"
+        note.write_bytes(_ID_SCAN_AGREEMENT_CORPUS[shape].encode("utf-8"))
+
+        assert _declared_id(note) == _expected_declared_id(note)
+
+    def test_the_agreement_corpus_exercises_both_answers(self, tmp_path: Path) -> None:
+        """Positive control: the corpus is neither all-``None`` nor all-found.
+
+        An agreement assertion over a corpus where every shape resolves to
+        ``None`` passes for any implementation that always returns ``None``.
+        """
+        answers = {}
+        for shape, text in _ID_SCAN_AGREEMENT_CORPUS.items():
+            note = tmp_path / f"{shape}.md"
+            note.write_bytes(text.encode("utf-8"))
+            answers[shape] = _expected_declared_id(note)
+
+        assert len(answers) == len(_ID_SCAN_AGREEMENT_CORPUS)
+        assert sum(1 for value in answers.values() if value is not None) >= 10
+        assert sum(1 for value in answers.values() if value is None) >= 5
+
+    @pytest.mark.parametrize("shape", sorted(_ID_SCAN_UNREADABLE_CORPUS))
+    def test_byte_scan_reads_an_id_frontmatter_load_cannot(
+        self,
+        tmp_path: Path,
+        shape: str,
+    ) -> None:
+        """A header line that will not parse no longer hides the ``id`` beside it."""
+        from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
+        from creek.vault.writer import _declared_id
+
+        note = tmp_path / f"{shape}.md"
+        note.write_bytes(_ID_SCAN_UNREADABLE_CORPUS[shape].encode("utf-8"))
+
+        # Positive control: this really is a file the old reader cannot read,
+        # and it fails with exactly the exception set the verifier swallowed.
+        with pytest.raises(FRONTMATTER_LOAD_ERRORS):
+            frontmatter.load(str(note))
+
+        assert _declared_id(note) == _SCAN_ID
+
+    def test_byte_scan_declines_an_id_that_is_itself_unparseable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A broken ``id`` line stays "no id", rather than yielding raw YAML text."""
+        from creek.vault.writer import _declared_id
+
+        note = tmp_path / "broken-id.md"
+        note.write_text(
+            "---\nid: [unterminated\ntitle: Broken\n---\nbroken body\n",
+            encoding="utf-8",
+        )
+
+        assert _declared_id(note) is None
+
+    def test_byte_scan_reads_a_bounded_prefix(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The scan reads a bounded head, not the whole fragment.
+
+        Landmine 2 of #1543: the obvious fix — routing the verifier through
+        ``creek.vault.links.read_header_meta`` — is a measured 7.4x regression
+        on a per-index-hit path (94.1 us for ``frontmatter.load`` against
+        695.7 us; the byte-scan is 29.9 us). The byte-scan is only a win while
+        it stays bounded, and a wall-clock assertion on a shared CI runner
+        would be a flake generator — so the *bound* is asserted directly, in
+        bytes, which is the property the speed follows from.
+        """
+        import pathlib
+
+        from creek.vault.writer import _ID_SCAN_HEAD_BYTES, _declared_id
+
+        note = tmp_path / "huge.md"
+        body = "x" * (_ID_SCAN_HEAD_BYTES * 40)
+        note.write_text(f"---\nid: {_SCAN_ID}\n---\n{body}", encoding="utf-8")
+        assert note.stat().st_size > _ID_SCAN_HEAD_BYTES * 30  # positive control
+
+        read_sizes: list[int] = []
+        real_open = pathlib.Path.open
+
+        class _CountingHandle:
+            """A binary handle that records how many bytes each read returned."""
+
+            def __init__(self, inner: Any) -> None:
+                """Wrap *inner*, the real file object."""
+                self._inner = inner
+
+            def read(self, *args: Any) -> bytes:
+                """Delegate the read and record the size of the result."""
+                data: bytes = self._inner.read(*args)
+                read_sizes.append(len(data))
+                return data
+
+            def __enter__(self) -> _CountingHandle:
+                """Enter the wrapped handle's context."""
+                self._inner.__enter__()
+                return self
+
+            def __exit__(self, *args: Any) -> None:
+                """Exit the wrapped handle's context."""
+                self._inner.__exit__(*args)
+
+        def _counting_open(self: Path, *args: Any, **kwargs: Any) -> Any:
+            """Stand in for ``Path.open``, wrapping the handle in a counter."""
+            return _CountingHandle(real_open(self, *args, **kwargs))
+
+        monkeypatch.setattr(pathlib.Path, "open", _counting_open)
+
+        assert _declared_id(note) == _SCAN_ID
+
+        assert read_sizes, "the scan never opened the file"
+        assert max(read_sizes) <= _ID_SCAN_HEAD_BYTES
+        assert sum(read_sizes) <= _ID_SCAN_HEAD_BYTES
+
+    def test_the_word_scalar_screen_agrees_with_pyyaml_word_for_word(self) -> None:
+        """The bool/null word list is checked against the parser, not remembered.
+
+        ``y`` and ``n`` are the trap, and a hand-written list walked into it:
+        they *look* like the YAML 1.1 booleans and are not — PyYAML types both
+        ``str``. Screening them out would make the byte-scan answer ``None``
+        where ``frontmatter.load`` answers ``"y"``, which is the file-for-file
+        disagreement #1543's third acceptance criterion forbids. Asserted
+        against ``yaml.safe_load`` in both directions so neither a missing
+        spelling nor a spurious one can survive.
+        """
+        import yaml
+
+        from creek.vault.writer import (
+            _PLAIN_STRING_SCALAR_RE,
+            _YAML_WORD_SCALARS,
+        )
+
+        probes = [
+            "y",
+            "Y",
+            "n",
+            "N",
+            "yes",
+            "Yes",
+            "YES",
+            "no",
+            "No",
+            "NO",
+            "true",
+            "True",
+            "TRUE",
+            "false",
+            "False",
+            "FALSE",
+            "on",
+            "On",
+            "ON",
+            "off",
+            "Off",
+            "OFF",
+            "null",
+            "Null",
+            "NULL",
+            "NaN",
+            "inf",
+            "Inf",
+            "nulls",
+            "Yes_no",
+            "frag-abc000001",
+        ]
+        admitted = [word for word in probes if _PLAIN_STRING_SCALAR_RE.match(word)]
+
+        # Positive control: the regex really does admit these words, so the
+        # word list is the only thing standing between them and being read
+        # as ids.
+        assert len(admitted) >= len(_YAML_WORD_SCALARS)
+
+        for word in admitted:
+            parsed = yaml.safe_load(f"k: {word}")["k"]
+            screened = word in _YAML_WORD_SCALARS
+            assert screened is not isinstance(parsed, str), (
+                f"{word!r}: screened={screened} but YAML gave {type(parsed).__name__}"
+            )
+
+        # And no member is unreachable: every entry is a word the regex admits,
+        # so the set carries no spelling that could never have been consulted.
+        assert set(admitted) >= _YAML_WORD_SCALARS
+
+    def test_byte_scan_declines_an_unclosed_quoted_scalar(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An ``id`` whose quote never closes is deferred, not half-read.
+
+        ``id: "frag-a`` is a YAML error, so the honest answer is the one the
+        parser gives — no id. Reporting ``frag-a`` by stripping the leading
+        quote would be the scanner inventing an identity out of a broken line,
+        which is the failure mode a hand-rolled reader exists to avoid.
+        """
+        from creek.vault.writer import _declared_id
+
+        note = tmp_path / "unclosed.md"
+        note.write_text(f'---\nid: "{_SCAN_ID}\n---\nbody\n', encoding="utf-8")
+
+        with pytest.raises(FRONTMATTER_LOAD_ERRORS):
+            frontmatter.load(str(note))
+        assert _declared_id(note) is None
+
+    def test_byte_scan_returns_none_for_an_unreadable_path(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An ``OSError`` answers "no id", exactly as the guarded load did."""
+        from creek.vault.writer import _declared_id
+
+        missing = tmp_path / "nope" / "gone.md"
+
+        assert _declared_id(missing) is None
+
+
+def _raw_index_records(target_dir: Path, model_id: str) -> list[dict[str, Any]]:
+    """Return the ``.id-index.jsonl`` records naming *model_id*, read as raw bytes.
+
+    Never goes through ``_load_index_file`` or ``find_fragment``. The writer
+    *self-heals* a bad index on lookup — ``_find_existing_locked`` repairs a
+    mismatch and ``_load_index_locked`` re-derives a damaged file by scan — so
+    an assertion made through a reader is vacuous by construction: it measures
+    the repair, not the file the repair was meant to avoid needing.
+    """
+    from creek.vault.writer import INDEX_FILENAME
+
+    records: list[dict[str, Any]] = []
+    raw = (target_dir / INDEX_FILENAME).read_bytes().decode("utf-8")
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            entry = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict) and entry.get("id") == model_id:
+            records.append(entry)
+    return records
+
+
+class TestPoisonedHeaderIdentity:
+    """A header the YAML parser rejects must not cost the file its identity (#1543).
+
+    The index is the vault's identity oracle. Before this fix, one
+    hand-edited note with a bare-date frontmatter key — ``2024-05-01:``,
+    valid ``SafeLoader`` output and entirely plausible in an Obsidian vault —
+    made ``frontmatter.load`` raise ``TypeError: keywords must be strings``,
+    which the verifier swallowed as "this file declares no id". The file was
+    then invisible to every lifecycle path at once, and the next write minted
+    a second file carrying the same id while the index moved to point at the
+    duplicate. That is silent data loss, not a cosmetic lookup miss.
+    """
+
+    @pytest.mark.parametrize(
+        "poison",
+        ["2024-05-01: reflection\n", "true: yes\n", "1: x\n", "title: [unterminated\n"],
+    )
+    def test_a_poisoned_header_does_not_mint_a_duplicate(
+        self,
+        vault_path: Path,
+        poison: str,
+    ) -> None:
+        """The id still resolves to its own file, and no sibling is created."""
+        edited = _edited_fragment()
+        seed = VaultWriter(vault_path=vault_path)
+        written = seed.write_fragment(edited, body="the original body")
+        target_dir = written.parent
+        written.write_text(
+            f"---\nid: {edited.id}\ntype: fragment\n{poison}---\nthe original body\n",
+            encoding="utf-8",
+        )
+        before = _raw_index_records(target_dir, edited.id)
+        assert len(before) == 1  # positive control: one mapping to start with.
+
+        fresh = VaultWriter(vault_path=vault_path)
+        result = fresh.write_fragment(edited, body="a second body")
+
+        assert result == written
+        assert sorted(path.name for path in target_dir.glob("*.md")) == [written.name]
+        after = _raw_index_records(target_dir, edited.id)
+        assert len(after) == 1, f"the index gained a second record: {after}"
+        assert after[0]["filename"] == written.name
+
+    def test_a_poisoned_header_still_resolves_through_every_lifecycle_path(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """``find`` locates it; ``update``/``tomb``/``restore`` name it when they fail.
+
+        The four paths used to answer ``None`` in unison, each one silently
+        declining to act on a file that is sitting right there declaring the
+        id. They now find it — and the three that need the *body* fail loudly
+        through :func:`creek.vault.reader.load_post_or_raise`, naming the path
+        so the operator can repair the header instead of hunting for it.
+        """
+        edited = _edited_fragment()
+        seed = VaultWriter(vault_path=vault_path)
+        written = seed.write_fragment(edited, body="the original body")
+        written.write_text(
+            f"---\nid: {edited.id}\ntype: fragment\n2024-05-01: reflection\n"
+            "---\nthe original body\n",
+            encoding="utf-8",
+        )
+
+        fresh = VaultWriter(vault_path=vault_path)
+
+        assert fresh.find_fragment(edited.id) == written
+        with pytest.raises(ValueError, match=re.escape(str(written))):
+            fresh.update_fragment(edited, body="new body")
+
+    def test_the_scanner_and_the_verifier_agree_on_a_poisoned_file(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Acceptance criterion 3: the two readers answer identically.
+
+        ``_file_declares_id`` and ``_rebuild_index`` carry an explicit
+        contract — "a file this function rejects is exactly a file the rebuild
+        would decline to index". A fix that taught only the verifier to read a
+        poisoned header would break it: the verifier would accept the file and
+        a later rebuild would still drop it, so the id would flip between
+        resolved and unresolved depending on which reader ran.
+        """
+        from creek.vault.writer import _file_declares_id
+
+        edited = _edited_fragment()
+        seed = VaultWriter(vault_path=vault_path)
+        written = seed.write_fragment(edited, body="the original body")
+        target_dir = written.parent
+        written.write_text(
+            f"---\nid: {edited.id}\ntype: fragment\n2024-05-01: reflection\n"
+            "---\nthe original body\n",
+            encoding="utf-8",
+        )
+
+        rebuilt = VaultWriter._rebuild_index(target_dir)
+
+        assert _file_declares_id(written, edited.id) is True
+        assert rebuilt.get(edited.id) == written.name
+
+
+class TestStalledIndexAppend:
+    """A lost index append must not become a duplicate fragment (#1299).
+
+    ``_append_index_entry`` opens with ``O_CREAT`` before it writes, so a
+    stalled drain leaves an index file that is *present, parseable and
+    undamaged* — it simply lacks one mapping. Every recovery
+    ``_load_index_locked`` owns keys off ``.damaged``, which such a file is
+    not, so no rescan fires: the id resolves to "not indexed", the next write
+    mints a sibling, and the fresh append then points the index at the
+    sibling. The original file is orphaned permanently.
+    """
+
+    @staticmethod
+    def _stall_the_next_append(
+        monkeypatch: pytest.MonkeyPatch,
+        short_write: ShortWriteController,
+    ) -> None:
+        """Arm ``short_write.stall()`` around exactly one index append.
+
+        Stalling for the whole write would take down ``_atomic_create``'s own
+        drain and leave no fragment file at all, which is a different failure.
+        The case #1299 is about is the one where the note reached disk and only
+        its index line did not.
+        """
+        real_append = VaultWriter._append_index_entry
+        armed = [True]
+
+        def _appending(target_dir: Path, model_id: str, filename: str) -> None:
+            """Delegate to the real append, stalling the first call only."""
+            if not armed[0]:
+                real_append(target_dir, model_id, filename)
+                return
+            armed[0] = False
+            short_write.stall()
+            try:
+                real_append(target_dir, model_id, filename)
+            finally:
+                short_write.passthrough()
+
+        monkeypatch.setattr(
+            VaultWriter, "_append_index_entry", staticmethod(_appending)
+        )
+
+    def test_a_stalled_append_does_not_mint_a_duplicate(
+        self,
+        vault_path: Path,
+        short_write: ShortWriteController,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The id whose mapping was lost re-attaches to its own file.
+
+        The stall is staged against a **non-empty** index on purpose. A
+        zero-byte index is the easy case and invites the fix "treat an empty
+        index as absent and rebuild", which passes such a test and does
+        nothing for the real one: a stall on the *N*-th append leaves an
+        (N-1)-entry index that is perfectly valid and simply short one line.
+        """
+        seed = VaultWriter(vault_path=vault_path)
+        first = _seed_victim(seed)
+        target_dir = first.parent
+        edited = _edited_fragment()
+        assert len(_raw_index_records(target_dir, "frag-victim001")) == 1
+
+        self._stall_the_next_append(monkeypatch, short_write)
+        with pytest.raises(OSError) as excinfo:
+            seed.write_fragment(edited, body="the original body")
+        assert excinfo.value.errno == errno.EIO
+
+        # The note reached disk; only its index line did not. The index is
+        # present, parses cleanly, and is *not* damaged — so nothing rescans.
+        survivor = next(
+            path for path in target_dir.glob("*.md") if path.name != first.name
+        )
+        assert _raw_index_records(target_dir, edited.id) == []
+        assert len(_raw_index_records(target_dir, "frag-victim001")) == 1
+
+        fresh = VaultWriter(vault_path=vault_path)
+        result = fresh.write_fragment(edited, body="a second body")
+
+        assert result == survivor
+        assert sorted(path.name for path in target_dir.glob("*.md")) == sorted(
+            [first.name, survivor.name],
+        )
+        recovered = _raw_index_records(target_dir, edited.id)
+        assert len(recovered) == 1, f"expected one mapping, got {recovered}"
+        assert recovered[0]["filename"] == survivor.name
+
+    def test_a_stem_collision_between_different_ids_still_suffixes(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Two ids sharing a filename stem keep getting distinct files.
+
+        The counterweight to the test above: the collision retry exists
+        because two *different* fragments can compute the same
+        ``{date}-{title}`` stem, and reusing the first file for the second
+        would be the very data loss this class is trying to prevent — in the
+        opposite direction.
+        """
+        seed = VaultWriter(vault_path=vault_path)
+        shared = {
+            "title": "Same Title",
+            "source": FragmentSource(platform=SourcePlatform.CLAUDE),
+            "created": datetime(2025, 1, 15, 10, 30, 0),
+        }
+        first = seed.write_fragment(
+            Fragment(id="frag-collide001", **shared),
+            body="one",
+        )
+        second = seed.write_fragment(
+            Fragment(id="frag-collide002", **shared),
+            body="two",
+        )
+
+        assert first != second
+        assert second.name.endswith("-1.md")
+
+    def test_relocation_still_stacks_suffixes_for_a_colliding_tombstone(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """``_relocate_fragment_locked`` keeps the un-verified create path.
+
+        Tombstones from different ``01-Fragments/<platform>/`` subfolders land
+        in one flat sink, so a stem collision there is between *strangers* and
+        must stack a suffix. That caller passes no expected id, which is what
+        keeps the verification confined to the duplicate-detection path.
+        """
+        seed = VaultWriter(vault_path=vault_path)
+        orphan_dir = vault_path / "10-Liminal" / "Orphaned"
+        orphan_dir.mkdir(parents=True, exist_ok=True)
+        squatter = orphan_dir / "2025-01-15-Victim.md"
+        squatter.write_text(
+            "---\nid: frag-squatter01\ntype: fragment\n---\nsquatter\n",
+            encoding="utf-8",
+        )
+        _seed_victim(seed)
+
+        tombed = seed.tomb_fragment("frag-victim001")
+
+        assert tombed is not None
+        assert tombed != squatter
+        assert tombed.name.endswith("-1.md")
+        assert squatter.read_text(encoding="utf-8").startswith(
+            "---\nid: frag-squatter01"
+        )
+
+
+class TestConcurrentRelocation:
+    """Tomb and restore must serialise on the index lock, like every write (#1611).
+
+    ``_write_model`` and ``_update_existing`` take
+    ``vault_lock(<dir>/.id-index.lock)`` around their check-then-act; the
+    relocation paths took only ``self._lock``, which belongs to *one*
+    ``VaultWriter`` instance. ``run_ingest`` builds a fresh writer per call and
+    the ``/v1`` routes each get their own, so two overlapping tombs of one id
+    never shared a lock at all — each located the same live file, each created
+    its own tombstone in the flat orphan sink, and the loser's ``unlink``
+    then failed on a file the winner had already moved.
+    """
+
+    @staticmethod
+    def _wedge_after_locating(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[threading.Event, threading.Event]:
+        """Hold the *first* relocation between locating its file and moving it.
+
+        The wedge sits on ``load_post_or_raise``, which every relocation calls
+        after it has resolved the id and before it creates the destination —
+        i.e. squarely inside the window a directory lock has to cover. Putting
+        it there is what makes the test decide the lock question rather than
+        the scheduler: without the lock the second caller sails through, with
+        it the second caller blocks.
+
+        Returns:
+            ``(inside, release)`` — set by the wedged caller when it is in the
+            window, and set by the test when it may proceed.
+        """
+        from creek.vault import writer as writer_module
+
+        inside = threading.Event()
+        release = threading.Event()
+        real_load = writer_module.load_post_or_raise
+        armed = [True]
+
+        def _wedged(path: Path) -> Any:
+            """Load as usual, pausing the first caller inside the window."""
+            post = real_load(path)
+            if armed[0]:
+                armed[0] = False
+                inside.set()
+                release.wait(timeout=_WEDGE_TIMEOUT_SECONDS)
+            return post
+
+        monkeypatch.setattr(writer_module, "load_post_or_raise", _wedged)
+        return inside, release
+
+    def test_two_writers_tombing_one_id_produce_one_tombstone(
+        self,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Overlapping tombs of one fragment leave one tombstone and no error."""
+        seed = VaultWriter(vault_path=vault_path)
+        victim = _seed_victim(seed)
+        origin_dir = victim.parent
+        orphan_dir = vault_path / "10-Liminal" / "Orphaned"
+        first = VaultWriter(vault_path=vault_path)
+        second = VaultWriter(vault_path=vault_path)
+
+        inside, release = self._wedge_after_locating(monkeypatch)
+        results: dict[str, Path | None] = {}
+        errors: dict[str, BaseException] = {}
+
+        def _tomb(label: str, actor: VaultWriter) -> None:
+            """Run one tomb, recording its outcome instead of raising."""
+            try:
+                results[label] = actor.tomb_fragment("frag-victim001")
+            except BaseException as exc:  # recorded, then re-asserted
+                errors[label] = exc
+
+        leader = threading.Thread(target=_tomb, args=("leader", first))
+        leader.start()
+        assert inside.wait(timeout=_WEDGE_TIMEOUT_SECONDS), "the wedge never armed"
+
+        follower = threading.Thread(target=_tomb, args=("follower", second))
+        follower.start()
+        # Wait for the follower to *do* something rather than for a clock. An
+        # unserialised follower relocates the file, so a tombstone appears and
+        # the wait ends at once; a serialised one is blocked on the index lock
+        # and there is nothing to wait for, so the ceiling elapses.
+        deadline = time.monotonic() + _OVERLAP_CEILING_SECONDS
+        while time.monotonic() < deadline and not any(orphan_dir.glob("*.md")):
+            time.sleep(_POLL_SECONDS)
+        release.set()
+        leader.join(timeout=_WEDGE_TIMEOUT_SECONDS)
+        follower.join(timeout=_WEDGE_TIMEOUT_SECONDS)
+
+        assert not leader.is_alive()
+        assert not follower.is_alive()
+        assert errors == {}, f"a relocation raised: {errors}"
+        tombstones = _files_declaring(orphan_dir, "frag-victim001")
+        assert len(tombstones) == 1, f"two tombstones for one id: {tombstones}"
+        assert _files_declaring(origin_dir, "frag-victim001") == []
+        assert sorted(results) == ["follower", "leader"]
+        assert [path for path in results.values() if path is not None] == tombstones
+
+    @staticmethod
+    def _record_lock_order(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Record the vault-lock paths, in acquisition order, as vault-relative text."""
+        from creek.vault import writer as writer_module
+
+        real_lock = writer_module.vault_lock
+        taken: list[str] = []
+
+        @contextlib.contextmanager
+        def _recording(lock_path: Path, **kwargs: Any) -> Any:
+            """Record the lock, then hold it for real."""
+            taken.append(str(lock_path))
+            with real_lock(lock_path, **kwargs):
+                yield
+
+        monkeypatch.setattr(writer_module, "vault_lock", _recording)
+        return taken
+
+    def test_a_restore_takes_its_two_locks_in_resolved_path_order(
+        self,
+        vault_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Both keys, lowest path first — the same order in both directions.
+
+        A restore moves ``10-Liminal/Orphaned`` -> ``01-Fragments/...`` and a
+        tomb moves the other way, so an implementation that locked
+        origin-then-destination would take the same pair in opposite orders
+        and two overlapping callers could each hold the key the other needs.
+        Sorting by resolved path makes the order a property of the *vault*,
+        not of the direction of travel — which is why this asserts against a
+        restore, where sorted order is the reverse of the argument order.
+        """
+        seed = VaultWriter(vault_path=vault_path)
+        victim = _seed_victim(seed)
+        origin_dir = victim.parent
+        restorable = Fragment(
+            id="frag-victim001",
+            title="Victim",
+            source=FragmentSource(platform=SourcePlatform.CLAUDE),
+            created=datetime(2025, 1, 15, 10, 30, 0),
+            privacy_tier=PrivacyTier.INTIMATE,
+        )
+        assert seed.tomb_fragment("frag-victim001") is not None
+
+        taken = self._record_lock_order(monkeypatch)
+        assert seed.restore_fragment(restorable) is not None
+
+        assert len(taken) == 2, taken
+        assert taken == sorted(taken)
+        # Positive control: sorted order really is the *reverse* of the order
+        # a naive origin-then-destination implementation would have used.
+        assert taken[0].startswith(str(origin_dir))
+
+    def test_a_lookup_creates_no_lock_file_and_no_directory(
+        self,
+        vault_path: Path,
+    ) -> None:
+        """Asking where a fragment is stays genuinely read-only (#1332).
+
+        ``vault_lock`` creates its lock file *and* ``mkdir``s the parent, and
+        ``_fragment_search_dirs`` deliberately visits declared-but-absent
+        platform subfolders. Taking the lock around the search — rather than
+        after something has been located — would therefore materialise a
+        directory and a ``.id-index.lock`` in the operator's vault for every
+        declared platform, on a lookup that found nothing.
+
+        ``restore_fragment`` is asserted beside the other three because it is
+        the path where the guard is easiest to drop: its destination directory
+        is computed from the *fragment* rather than from anything located, so
+        an implementation that took both keys before probing would ``mkdir``
+        the target platform folder and lay a lock file in it for a fragment
+        that was never tombed.
+        """
+        seed = VaultWriter(vault_path=vault_path)
+        _seed_victim(seed)
+        for stale in vault_path.rglob(INDEX_LOCK_FILENAME):
+            stale.unlink()
+        before = sorted(path for path in vault_path.rglob("*") if path.is_dir())
+        never_tombed = Fragment(
+            id="frag-nowhere0001",
+            title="Nowhere",
+            source=FragmentSource(platform=SourcePlatform.CHATGPT),
+            created=datetime(2025, 1, 15, 10, 30, 0),
+        )
+
+        probe = VaultWriter(vault_path=vault_path)
+
+        assert probe.find_fragment("frag-nowhere0001") is None
+        assert probe.find_tombed_fragment("frag-nowhere0001") is None
+        assert probe.tomb_fragment("frag-nowhere0001") is None
+        assert probe.restore_fragment(never_tombed) is None
+        assert list(vault_path.rglob(INDEX_LOCK_FILENAME)) == []
+        assert sorted(path for path in vault_path.rglob("*") if path.is_dir()) == before
+
+
+class TestIndexLockSpelling:
+    """``_index_locks`` orders and de-duplicates on the *resolved* path (#1611).
+
+    The helper's whole job is to make two callers moving a fragment in
+    opposite directions take the same pair of keys in the same sequence. That
+    only holds if the sort key is a canonical name for the directory: a vault
+    reached as ``/vault/01-Fragments`` and as ``/vault/10-Liminal/../01-Fragments``
+    is one directory with one ``flock``, but two strings, and two strings sort
+    independently of what they denote.
+
+    Asserting through ``tomb_fragment`` cannot see this — both of its paths are
+    already spelled canonically, so ``.resolve()`` is a no-op there and can be
+    deleted with the whole suite still green. These probe the helper directly.
+    """
+
+    @staticmethod
+    def _record_lock_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Record every ``vault_lock`` path without taking a real lock.
+
+        The real lock is deliberately *not* delegated to. A regression that
+        stops collapsing two spellings of one directory takes ``flock`` on the
+        same file twice from one process, which blocks rather than fails — and
+        a test that hangs reports nothing. Recording turns that deadlock into
+        a visible extra entry.
+        """
+        from creek.vault import writer as writer_module
+
+        taken: list[str] = []
+
+        @contextlib.contextmanager
+        def _recording(lock_path: Path, **_kwargs: Any) -> Any:
+            """Record the requested lock and yield without acquiring it."""
+            taken.append(str(lock_path))
+            yield
+
+        monkeypatch.setattr(writer_module, "vault_lock", _recording)
+        return taken
+
+    def test_locks_are_ordered_by_resolved_path_not_by_spelling(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two spellings sort by what they denote, not by how they are written."""
+        from creek.vault.writer import _index_locks
+
+        for name in ("a", "m", "z"):
+            (tmp_path / name).mkdir()
+        zed_via_a = tmp_path / "a" / ".." / "z" / INDEX_LOCK_FILENAME
+        emm = tmp_path / "m" / INDEX_LOCK_FILENAME
+
+        # Positive controls: the raw spellings sort one way and the resolved
+        # paths the other, so the two orderings are genuinely distinguishable.
+        assert sorted([str(zed_via_a), str(emm)]) == [str(zed_via_a), str(emm)]
+        assert zed_via_a.resolve(strict=False) > emm.resolve(strict=False)
+
+        taken = self._record_lock_calls(monkeypatch)
+        with _index_locks(zed_via_a, emm):
+            pass
+
+        assert taken == [str(emm), str(zed_via_a)]
+
+    def test_two_spellings_of_one_directory_take_one_lock(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The de-duplication the docstring promises is on the resolved path.
+
+        ``vault_lock`` is explicitly non-reentrant, so a caller that named one
+        directory twice would self-deadlock rather than raise — the failure
+        mode that ships.
+        """
+        from creek.vault.writer import _index_locks
+
+        (tmp_path / "d" / "sub").mkdir(parents=True)
+        plain = tmp_path / "d" / INDEX_LOCK_FILENAME
+        round_about = tmp_path / "d" / "sub" / ".." / INDEX_LOCK_FILENAME
+        assert str(plain) != str(round_about)  # positive control
+
+        taken = self._record_lock_calls(monkeypatch)
+        with _index_locks(plain, round_about):
+            pass
+
+        assert taken == [str(plain)]

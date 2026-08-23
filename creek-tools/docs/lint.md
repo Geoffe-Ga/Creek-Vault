@@ -67,6 +67,19 @@ Deterministic (always run by default):
   invisible under any of them. The exception *class name* is reported and
   never the parser's message: the file's `privacy_tier` is unknown precisely
   because it would not parse, so nothing from inside it is quoted back.
+- `nonstring-id` — corpus files whose `id` YAML types as something other
+  than a string. `id: 12345` reads to a human as an id and resolves under
+  `SafeLoader` to an `int`, and every reader of the per-directory id index
+  requires `isinstance(id, str)` — so the file is invisible to *identity*:
+  never indexed, never resolved by `find_fragment`, and the next write for
+  the logical id `"12345"` quietly mints a second file beside it (#1291).
+  Normalising it away with `str(id)` was rejected, because that merges two
+  identities the vault never said were the same; the writer stays strict and
+  this check makes the hazard visible instead. Reports the path and the type
+  the id resolved to, never the id's own text — same reasoning as
+  `unparseable` above. The remedy is one character each side: quote it.
+  A file whose header will not parse at all is `unparseable`'s finding, not
+  this one, so a single broken file is reported once.
 - `orphan-compiled` — Threads / Eddies / Praxis pages that nothing in
   that same surveyed set links to (a page's link to itself does not
   count). A page is never a candidate when its frontmatter `type` is

@@ -4880,7 +4880,7 @@ def lint(
             "Run only this check (repeatable). Names: paradox, unnamed, "
             "synchronicity, compost, tags, broken-links, orphan-compiled, "
             "skill-size, draft-grounding, voice-fidelity, unparseable, "
-            "ancestry, root-hygiene."
+            "nonstring-id, ancestry, root-hygiene."
         ),
     ),
     since: str | None = typer.Option(
