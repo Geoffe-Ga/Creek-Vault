@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Final
 import pytest
 
 from creek_mcp.api.models import ERROR_MESSAGES, ErrorCode
+from creek_mcp.api.routes import ROUTES
 from creek_mcp.httpapi.auth import build_verifier
 from creek_mcp.remote_auth import CONSUMER_TOKENS_ENV
 from creek_mcp.token_policy import MIN_TOKEN_LEN
@@ -73,6 +74,27 @@ _PROBE_PATHS: Final[tuple[str, ...]] = (
 )
 
 _PROBE_METHODS: Final[tuple[str, ...]] = ("GET", "POST", "PUT", "DELETE")
+
+# The three spellings an OAuth redirect handler would plausibly be mounted at.
+# None of them is a route today, and none of them may become an anonymous one:
+# see ``test_no_path_is_exempt_from_the_bearer_gate``.
+_CALLBACK_SHAPED_PATHS: Final[tuple[str, ...]] = (
+    "/v1/connectors/drive/callback",
+    "/oauth/callback",
+    "/oauth2callback",
+)
+
+# A concrete value for every path parameter ``ROUTES`` declares, so the sweep
+# below probes paths the router really matches rather than literal templates.
+_PATH_PARAMETER_VALUES: Final[dict[str, str]] = {
+    "external_id": "abc",
+    "state": "abc",
+}
+
+# Contract 0.11 publishes thirteen operations. Stated as a floor rather than an
+# equality so an additive minor does not have to edit this file, while an
+# emptied ``ROUTES`` still fails the vacuity guard above.
+_MINIMUM_PUBLISHED_ROUTES: Final[int] = 13
 
 # Every word a capability-disclosing 401 would carry. ``0.5``, ``0.4``,
 # ``0.3`` and ``0.2`` cover all four served contract minors, ``capabilit``
@@ -239,6 +261,87 @@ def test_the_unauthenticated_body_carries_no_path(vault: Path) -> None:
         )
     assert str(vault) not in response.text
     assert not contains_a_path(response.text)
+
+
+# --------------------------------------------------------------------------- #
+# No path is exempt -- the invariant that decides how Drive is authorised
+# --------------------------------------------------------------------------- #
+
+
+def _concrete(template: str) -> str:
+    """Return *template* with every path parameter filled in.
+
+    Every one of them, and asserted rather than best-effort: a template probed
+    with its braces still in it is a path the router cannot match, so an
+    exemption written against the *real* path — the shape a future OAuth
+    callback lane would add — would sail past the sweep below untouched.
+
+    Args:
+        template: A route path, possibly carrying ``{name}`` segments.
+
+    Returns:
+        A concrete path.
+    """
+    path = template
+    for name in _PATH_PARAMETER_VALUES:
+        path = path.replace("{" + name + "}", _PATH_PARAMETER_VALUES[name])
+    assert "{" not in path, f"{template} has a path parameter with no test value"
+    return path
+
+
+def test_no_path_is_exempt_from_the_bearer_gate(vault: Path) -> None:
+    """Every published route, and every callback-shaped path, ``401``s.
+
+    :class:`~creek_mcp.httpapi.auth.BearerAuthMiddleware` has no path
+    allowlist: it sits above the router in the stack ``create_app`` builds and
+    authenticates the whole ``http`` scope. That is why ``/`` and
+    ``/v1/health`` refuse an anonymous caller as flatly as ``/v1/wheel`` does,
+    and :func:`~creek_mcp.httpapi.auth.build_verifier` refuses to *start* a
+    deployment with no consumer configured — "/v1 has no anonymous access" is
+    the sentence it raises.
+
+    This test exists because that invariant decides an architecture, not
+    merely a status code (#1568, ADR-0012). A server-owned OAuth callback is a
+    browser navigation arriving from Google with no ``Authorization`` header,
+    so mounting one would require the first anonymous exemption this gate has
+    ever had. Three such shapes are probed alongside the real route table —
+    ``/v1/connectors/drive/callback``, ``/oauth/callback``, ``/oauth2callback``
+    — so a future lane cannot punch that hole quietly: it has to come here and
+    change a test that says, in its name, what it is giving up.
+
+    Derived from :data:`~creek_mcp.api.routes.ROUTES` rather than from a hand
+    list, so a route added without a thought about authentication is covered
+    the day it lands.
+
+    Args:
+        vault: A seeded vault, so nothing here refuses for want of one.
+    """
+    probes = [(spec.method, spec.path) for spec in ROUTES]
+    probes += [("GET", path) for path in _CALLBACK_SHAPED_PATHS]
+    with client(vault_path=vault) as test_client:
+        for method, template in probes:
+            path = _concrete(template)
+            response = test_client.request(
+                method, path, headers=headers(token=None, minor=None)
+            )
+            assert response.status_code == _UNAUTHENTICATED_STATUS, (
+                f"{method} {path} was reachable without a bearer token"
+            )
+            body = envelope(response)
+            assert body["code"] == ErrorCode.UNAUTHENTICATED.value, (
+                f"{method} {path} refused with {body['code']!r}"
+            )
+
+
+def test_the_exemption_sweep_covers_the_whole_route_table() -> None:
+    """The sweep above really walks every route, not a shrunken remnant.
+
+    A loop-built guard fails open when its input empties. Pin both halves: the
+    route table is non-trivial, and the callback shapes are still listed.
+    """
+    assert len(ROUTES) >= _MINIMUM_PUBLISHED_ROUTES
+    assert "/v1/health" in {spec.path for spec in ROUTES}
+    assert "/oauth/callback" in _CALLBACK_SHAPED_PATHS
 
 
 # --------------------------------------------------------------------------- #

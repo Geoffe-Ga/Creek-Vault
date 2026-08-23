@@ -2470,9 +2470,15 @@ status, while the sync and disconnect routes beside it write.
 """
 
 _WRITE_DISPATCH_MODULES: Final[frozenset[str]] = frozenset(
-    {"drive", "journal", "pipeline", "upload"}
+    {"drive", "drive_grant", "journal", "pipeline", "upload"}
 )
-"""Modules serving at least one route that mutates the vault."""
+"""Modules serving at least one route that mutates the vault.
+
+``drive_grant`` is on this side even though *beginning* an authorization only
+writes a nonce: completing one writes the token file, and shedding that
+mid-flight to meet a deadline would report a failure for a credential that in
+fact landed — the #1109 tear, in the one place it would be hardest to notice.
+"""
 
 
 def _module_imports(path: Path) -> set[str]:

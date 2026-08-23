@@ -20,8 +20,39 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.10.0"
+CONTRACT_VERSION: Final[str] = "0.11.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.11.0 (#1568): two more routes under the **existing** ``drive-connector``
+capability — ``POST /v1/connectors/drive/authorizations`` and ``POST
+/v1/connectors/drive/authorizations/{state}``. The minor moves because the
+route set widened; the capability list does not, because a consumer cannot
+usefully negotiate "may I sync" apart from "may I connect", and a server
+advertising sync-without-connect would be advertising half a connector.
+
+**What it closes.** The last unmet clause of the seeding epic (#1523).
+``/v1`` could sync Drive and disconnect it and could not *connect* it: the
+first authorisation was ``creek gdrive --download`` on the host, whose
+``InstalledAppFlow.run_local_server(port=0)`` opens a browser on the server.
+With these two routes a user connects Drive over the network, with no CLI and
+no shell access on the vault host.
+
+**How, and why it is shaped that way.** ADR-0012 option C: Creek holds the
+Google **web** client secret and mints the authorization URL; the *caller* owns
+the redirect URI and the browser leg; the authorization code comes back over
+the caller's existing bearer. The alternative — a callback endpoint on this
+server — would need the first anonymous path
+:class:`creek_mcp.httpapi.auth.BearerAuthMiddleware` has ever had, because a
+Google redirect is a browser navigation carrying no ``Authorization`` header.
+Option C needs no such exemption, no public hostname and no TLS this server
+controls.
+
+**Three wire models ride along** (``DriveAuthorizationRequest``,
+``DriveAuthorizationResponse``, ``DriveAuthorizationExchangeRequest``) and **no
+new error code**: an unknown, expired, consumed or Google-refused
+authorization is the published ``unavailable``, all four identical, because
+telling them apart would describe which authorizations this server has
+outstanding.
 
 0.10.0 (#1570): a seventh capability, ``pipeline``, served by two routes —
 ``POST /v1/classifications`` and ``POST /v1/links``. Additive in exactly the
