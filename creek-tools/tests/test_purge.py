@@ -6025,6 +6025,14 @@ def test_alias_scrub_is_not_switched_off_by_a_doomed_file_claiming_the_alias(
         "secret%20title.md",
         "SECRET TITLE.md",
         'Secret%20Title.md "a link title"',
+        # The space is UNENCODED and a title follows -- the shape a person
+        # writes by hand. Splitting the target at its first whitespace cut
+        # this into 'Secret' + 'Title.md "a link title"', kept the whole
+        # string as one reading, and never reduced it to a page name,
+        # so the link survived a purge the audit called complete.
+        'Secret Title.md "a link title"',
+        "Secret Title.md 'a link title'",
+        'sub folder/Secret Title.md "a link title"',
     ],
 )
 def test_markdown_link_scrub_removes_a_link_targeting_the_purged_page(

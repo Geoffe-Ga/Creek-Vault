@@ -472,8 +472,8 @@ def _remove_matching_links(
     return pattern.sub(_replace, data), removed
 
 
-_LINK_TITLE_RE: re.Pattern[str] = re.compile(r"\"[^\"]*\"|'[^']*'")
-"""A CommonMark link title, the only thing that may follow a destination.
+_LINK_TITLE_RE: re.Pattern[str] = re.compile(r"^(?P<url>.*?)\s+(?:\"[^\"]*\"|'[^']*')$")
+"""A destination followed by a CommonMark link title, split at the title.
 
 Whether ``a b`` is one path or a destination plus a title is not a
 matter of taste: CommonMark only ends the destination at whitespace
@@ -485,6 +485,17 @@ surviving page (see :func:`_link_target_urls`).
 Paren-delimited titles are deliberately absent: :data:`_MDLINK_RE` stops
 its capture at the first ``)``, so a ``(title)`` can never reach this
 pattern intact and a branch for it would be unreachable.
+
+The quotes are anchored to the END of the target, and ``url`` is
+non-greedy, so the split lands at the whitespace before the title
+rather than at the first whitespace anywhere. Splitting at the first
+whitespace only worked when the path had no internal space of its own:
+``Secret Title.md "note"`` cut into ``Secret`` and ``Title.md "note"``,
+the second half failed to look like a title, the whole string was kept
+as a single reading, and — because it ends in a quote rather than
+``.md`` — it never reduced to a page name. The link survived the purge
+while the audit certified it complete, which is the leak #1622 exists
+to close, reached through a different target shape.
 """
 
 
@@ -525,10 +536,10 @@ def _link_target_urls(target: str) -> tuple[str, ...]:
         return ()
     if raw.startswith("<"):
         return (raw[1:].partition(">")[0],)
-    parts = raw.split(maxsplit=1)
-    if len(parts) == 1 or not _LINK_TITLE_RE.fullmatch(parts[1].strip()):
+    titled = _LINK_TITLE_RE.match(raw)
+    if titled is None:
         return (raw,)
-    return (raw, parts[0])
+    return (raw, titled.group("url"))
 
 
 def _link_target_page_name(url: str) -> str:
