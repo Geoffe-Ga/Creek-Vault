@@ -30,6 +30,7 @@ every purge; it is deferred to a future hardening pass.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import uuid
@@ -46,6 +47,7 @@ from creek.ingest.source_unit import split_source_unit
 from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog, PurgeOutcomeStatus
 from creek.purge.dryrun import DryRunLedger
 from creek.purge.meta import META_RELDIR, prune_empty_meta_dirs, sweep_unkept_meta
+from creek.vault.links import page_names, read_header_meta
 from creek.vault.reader import FRONTMATTER_LOAD_ERRORS
 
 if TYPE_CHECKING:
@@ -308,35 +310,342 @@ def _regular_files_under(entry: Path) -> list[str]:
     return sorted(str(path) for path in entry.rglob("*") if path.is_file())
 
 
-def _apply_scrubs(
-    text: str,
-    wiki_pattern: re.Pattern[str] | None,
-    prov_pattern: re.Pattern[str] | None,
-) -> tuple[str, int, int]:
-    """Apply the wiki-link and provenance substitutions to one file's text.
+_MAX_LINK_HOPS: int = 40
+"""How many symlink hops :func:`_chain_enters_wiped_content` will follow.
 
-    Pure and mode-blind: the dry-run/apply distinction lives entirely in
-    where :meth:`PurgeEngine._scrub_one_file` gets this text from and
-    what it does with the result.
+A symlink loop has no end, and this walk cannot lean on the kernel's
+``ELOOP`` because it never dereferences anything — it reads one link at
+a time. The cap is the termination condition, and exhausting it answers
+"not broken", the fail-open direction the predicate's caller documents.
+Forty is the same order as the kernel's own limit (Linux allows 40,
+macOS 32), so no chain a filesystem can resolve is cut short by it.
+"""
+
+
+def _same_directory(left: Path, right: Path) -> bool:
+    """Report whether two paths name the same directory on disk.
+
+    ``Path.samefile`` compares device and inode, so it sees through a
+    symlinked prefix, a ``..`` that has not been normalised, and — the
+    case that motivated it (#1562) — a filesystem that treats
+    ``01-fragments`` and ``01-Fragments`` as one directory while a
+    string comparison treats them as two.
 
     Args:
-        text: The file's current contents.
-        wiki_pattern: Wiki-link regex, or ``None`` to skip that pass.
+        left: One path.
+        right: The other path.
+
+    Returns:
+        ``True`` when both exist and are the same directory entry, or —
+        when either cannot be stat'ed — when they are textually equal.
+    """
+    try:
+        return left.samefile(right)
+    except OSError:
+        return left == right
+
+
+def _inside_a_wiped_folder(path: Path, roots: list[Path]) -> bool:
+    """Report whether *path* names something strictly inside a content folder.
+
+    Every ancestor of *path* is compared, which is what makes an
+    un-normalised target work: ``01-Fragments/Journal/sub/../../..``
+    climbs back out of the vault, so its *destination* is untouched by
+    the wipe, but resolving it needs ``sub`` to exist and the wipe
+    removes it. Naming any component the wipe destroys is enough.
+
+    The folder root itself is deliberately not a match: the wipe empties
+    the ten content folders without removing them, so a link *to*
+    ``01-Fragments`` outlives the purge while a link *into* it does not.
+
+    Args:
+        path: A symlink target, absolute but not necessarily normalised.
+        roots: The ten vault content folders.
+
+    Returns:
+        ``True`` when some proper ancestor of *path* is a content folder.
+    """
+    return any(
+        _same_directory(ancestor, root) for ancestor in path.parents for root in roots
+    )
+
+
+def _chain_enters_wiped_content(link: Path, roots: list[Path]) -> bool:
+    """Report whether resolving *link* passes through a wiped content folder.
+
+    Walks the chain one hop at a time with ``os.readlink`` rather than
+    asking ``Path.resolve()`` for the destination. ``resolve()``
+    collapses every hop and every ``..`` into a single final path, which
+    answers "survives" for three chains the content wipe really does
+    break (#1562): one reached through an intermediate alias that lives
+    inside a content folder, one whose target *path* traverses a content
+    directory before climbing back out, and one naming a content folder
+    in a case only the filesystem accepts.
+
+    Args:
+        link: A symlink under ``00-Creek-Meta/``.
+        roots: The ten vault content folders.
+
+    Returns:
+        ``True`` when any hop of the chain names something the wipe
+        destroys; ``False`` on an ``OSError`` or an exhausted hop cap,
+        because this predicate only ever widens what the sweep destroys.
+    """
+    current = link
+    for _ in range(_MAX_LINK_HOPS):
+        try:
+            if not current.is_symlink():
+                return False
+            target = os.readlink(current)
+        except OSError:
+            return False
+        current = current.parent / target
+        if _inside_a_wiped_folder(current, roots):
+            return True
+    return False
+
+
+_WIKILINK_RE: re.Pattern[bytes] = re.compile(rb"\[\[([^\[\]]*)\]\]")
+"""Any wikilink at all, capturing everything between the brackets.
+
+Stage one of a two-stage matcher (#903). A single regex built from the
+purged title cannot express the relation Obsidian resolves links by:
+``re.escape(title)`` is exact-case and misses ``[[secret title]]``,
+while ``re.IGNORECASE`` is neither ``str.casefold`` (they disagree on
+``ß``/``SS`` and on the Turkish dotted I) nor the exact-before-folded
+priority :meth:`creek.vault.links.LinkIndex.resolve` applies. So the
+regex only *finds* links; :class:`_WikilinkScrub` decides about them.
+
+Compiled against **bytes** because the whole scrub pipeline is (#948).
+"""
+
+
+@dataclass(frozen=True)
+class _WikilinkScrub:
+    """Decide, link by link, whether a wikilink names the purged page.
+
+    Stage two of the #903 matcher, and the single place the decision is
+    auditable. It reproduces
+    :meth:`creek.vault.links.LinkIndex.resolve` rather than approximating
+    it: the ``#heading``/``|alias`` suffixes are stripped exactly as that
+    method documents its caller doing, an **exact-case** spelling some
+    surviving page claims wins outright, and only then does the
+    ``casefold()`` fallback apply.
+
+    That exact-first guard is what keeps the fix from over-matching. Two
+    vault pages may differ only in case, and when one of them is being
+    purged, ``[[ALPHA]]`` names the survivor while ``[[Alpha]]`` names
+    the target. A case-blind scrub deletes an operator's live link to a
+    page this purge never touched — the mirror failure of leaving the
+    private title behind, and just as unacceptable on a compliance path.
+
+    Attributes:
+        folded_names: Case-folded names the purged page is linkable by —
+            its declared title *and* its filename stem, because this
+            vault's paths are title-derived and a link written by the
+            filename leaks the same private string (#903).
+        protected: Exact-case spellings that some **surviving** page
+            claims *and the purged page does not*. A link spelled that
+            way resolves to the survivor, so it is left alone whatever
+            its fold. The purged page's own spellings are excluded by
+            :meth:`PurgeEngine._build_wikilink_scrub`: sheltering those
+            would let any doomed sibling, stub or staging file claiming
+            the same string switch the primary scrub off.
+    """
+
+    folded_names: frozenset[str]
+    protected: frozenset[str]
+
+    def _names_the_purged_page(self, target: bytes) -> bool:
+        """Report whether a wikilink target resolves to the purged page.
+
+        Only the captured *target* is decoded, and a failure to decode
+        it is answered ``False`` rather than repaired (#948). A link
+        target that is not valid UTF-8 cannot equal a title, which is a
+        ``str``; refusing it here is what lets the surrounding rewrite
+        stay byte-exact without ever constructing a U+FFFD.
+
+        Args:
+            target: The raw bytes between ``[[`` and ``]]``.
+
+        Returns:
+            ``True`` when this link should be removed.
+        """
+        try:
+            decoded = target.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        name = decoded.split("|", 1)[0].split("#", 1)[0].strip()
+        if not name or name in self.protected:
+            return False
+        return name.casefold() in self.folded_names
+
+    def apply(self, data: bytes) -> tuple[bytes, int]:
+        """Remove every wikilink naming the purged page.
+
+        Args:
+            data: One file's raw bytes.
+
+        Returns:
+            A ``(scrubbed_bytes, wikilinks_removed)`` pair. The count is
+            of links actually removed, never of links merely inspected —
+            ``re.subn`` would report the latter, since every link goes
+            through the replacement callback.
+        """
+        removed = 0
+
+        def _replace(match: re.Match[bytes]) -> bytes:
+            """Blank a link that names the purged page, else keep it verbatim."""
+            nonlocal removed
+            if self._names_the_purged_page(match.group(1)):
+                removed += 1
+                return b""
+            return match.group(0)
+
+        return _WIKILINK_RE.sub(_replace, data), removed
+
+
+_OPENING_FENCE_RE: re.Pattern[bytes] = re.compile(rb"---[ \t]*\r?\n")
+"""The ``---`` that opens a frontmatter header, matched at offset zero."""
+
+_CLOSING_FENCE_RE: re.Pattern[bytes] = re.compile(rb"^---[ \t]*\r?$", re.MULTILINE)
+"""The ``---`` that closes it. Searched from the end of the opening fence."""
+
+_COUNT_SCALAR_RE: re.Pattern[bytes] = re.compile(
+    rb"(?m)^(fragment_count:[ \t]*)(['\"]?)(\d+)(['\"]?)([^\n]*)$"
+)
+"""A top-level ``fragment_count`` holding an integer, in five pieces.
+
+The key and its spacing, an optional opening quote, the digits, an
+optional closing quote, and whatever follows — a trailing comment,
+trailing whitespace, and the ``\r`` of a CRLF line ending. Only the
+digits are replaced, so the other four come back byte-identical.
+
+Matching the fifth group is not the same as accepting it. The digit
+run is greedy but not anchored to the end of the scalar, so
+``fragment_count: 3.5`` matches with ``3`` as the digits and ``.5`` as
+the trailer — and splicing that writes ``2.5``, corrupting a value the
+function was supposed to decline. :data:`_INERT_TRAILER_RE` is what
+makes the digit run *the whole scalar*: the trailer is accepted only
+when it carries no value of its own.
+
+The quote characters are captured separately rather than swallowed into
+the value so they can be written back verbatim: a quoted
+``fragment_count: '3'`` is a YAML *string*, and rewriting it as a bare
+``2`` would change the scalar's type as a side effect of decrementing
+it — an edit nobody asked for, in the one function whose whole contract
+is that it makes no such edit. Column zero is required: an indented
+``fragment_count`` belongs to a nested mapping and is not this file's own.
+"""
+
+
+_INERT_TRAILER_RE: re.Pattern[bytes] = re.compile(rb"[ \t]*(?:#[^\n]*)?\r?")
+"""Everything a ``fragment_count`` line may carry after its value.
+
+Optional spacing, an optional trailing comment, and the ``\r`` of a CRLF
+line ending — none of which is part of the value. Anything else means the
+digits matched only a *prefix* of the scalar (``3.5``, ``3abc``), and the
+splice must decline rather than rewrite a number it did not fully parse.
+"""
+
+
+def _splice_fragment_count(data: bytes, new_count: int) -> bytes | None:
+    """Return *data* with its header ``fragment_count`` set to *new_count*.
+
+    A byte-level splice of one scalar, replacing the
+    ``frontmatter.dumps`` round trip this path used to perform (#949).
+    That round trip rewrote the operator's whole header on every purge
+    that touched the file: PyYAML drops comments, alphabetises keys,
+    normalises quoting and strips trailing whitespace, so decrementing
+    one integer silently reformatted metadata the purge was never asked
+    about. It also could not run at all on a file whose *body* is not
+    valid UTF-8, which left the count wrong there instead (#910).
+
+    Nothing is ever appended, deleted, or retyped. Quoting is part of
+    that promise, not an incidental detail: a quoted ``'3'`` comes back
+    as a quoted ``'2'``, because dropping the quotes would silently turn
+    a YAML string into an integer. When the header holds no
+    spliceable ``fragment_count`` — the key is absent, or it carries a
+    list, a null, a multi-line scalar, a lopsided pair of quotes, or a
+    value the digits only partly cover such as ``3.5`` —
+    this returns ``None`` rather than guessing: inserting a key beside a
+    value this function did not understand risks a duplicate key, and a
+    corrupt header on a thread file is a worse outcome than a stale
+    count. The caller falls back to a full reserialisation for those,
+    which is what wrote them in the first place.
+
+    Args:
+        data: The file's current bytes.
+        new_count: The value to write.
+
+    Returns:
+        The spliced bytes, or ``None`` when *data* has no frontmatter
+        header, or no ``fragment_count`` at its top level whose value is
+        an integer *and nothing else*.
+    """
+    opening = _OPENING_FENCE_RE.match(data)
+    if opening is None:
+        return None
+    closing = _CLOSING_FENCE_RE.search(data, opening.end())
+    if closing is None:
+        return None
+    header, body = data[: closing.start()], data[closing.start() :]
+    match = _COUNT_SCALAR_RE.search(header)
+    if match is None:
+        return None
+    opening_quote, closing_quote = match.group(2), match.group(4)
+    if opening_quote != closing_quote:
+        return None
+    trailer = match.group(5)
+    if _INERT_TRAILER_RE.fullmatch(trailer) is None:
+        return None
+    spliced = (
+        match.group(1)
+        + opening_quote
+        + str(new_count).encode()
+        + closing_quote
+        + match.group(5)
+    )
+    return header[: match.start()] + spliced + header[match.end() :] + body
+
+
+def _apply_scrubs(
+    data: bytes,
+    wiki_scrub: _WikilinkScrub | None,
+    prov_pattern: re.Pattern[bytes] | None,
+) -> tuple[bytes, int, int]:
+    """Apply the wiki-link and provenance substitutions to one file's bytes.
+
+    Pure and mode-blind: the dry-run/apply distinction lives entirely in
+    where :meth:`PurgeEngine._scrub_one_file` gets these bytes from and
+    what it does with the result.
+
+    Byte-native throughout (#948). Decoding first would be lossy on a
+    file that is not valid UTF-8 — the scrub used to skip those
+    entirely, leaving the purged title and ID standing — and lossy in a
+    quieter way on one that *is*: ``read_text`` translates newlines, so
+    removing one wikilink from a CRLF note rewrote every line ending in
+    it. There is one path here, and it moves no byte it was not asked
+    to.
+
+    Args:
+        data: The file's current bytes.
+        wiki_scrub: Wiki-link matcher, or ``None`` to skip that pass.
         prov_pattern: Fragment-ID regex, or ``None`` to skip that pass.
 
     Returns:
-        A ``(scrubbed_text, wikilinks_removed, provenance_scrubbed)``
+        A ``(scrubbed_bytes, wikilinks_removed, provenance_scrubbed)``
         triple.
     """
     wiki_count = prov_count = 0
-    if wiki_pattern is not None:
-        text, wiki_count = wiki_pattern.subn("", text)
+    if wiki_scrub is not None:
+        data, wiki_count = wiki_scrub.apply(data)
     if prov_pattern is not None:
         # NOTE: PURGED_MARKER is bracket-flavoured, so substituting it
         # inside a YAML flow sequence (source_fragments: [a, b]) nests
         # the scrubbed entry on re-parse — see PURGED_MARKER.
-        text, prov_count = prov_pattern.subn(PURGED_MARKER, text)
-    return text, wiki_count, prov_count
+        data, prov_count = prov_pattern.subn(PURGED_MARKER.encode(), data)
+    return data, wiki_count, prov_count
 
 
 @dataclass(frozen=True)
@@ -1155,29 +1464,38 @@ class PurgeEngine:
         folders without removing them — so the comparison excludes the
         folder root.
 
-        ``resolve()`` is non-strict and answers for a dangling link too,
-        which matters because it is consulted on both sides. An
-        ``OSError`` (a symlink loop, an unreadable parent) answers
-        ``False``: this predicate can only ever *widen* what the sweep
-        destroys, so failing it closed would destroy a link on the
-        strength of an error rather than a fact.
+        The question is asked of the **whole resolution chain**, not of
+        where it ends (#1562). ``Path.resolve()`` collapses every hop
+        and every ``..`` into one final path, and three chains this
+        purge really does break survive that collapse looking innocent:
+        one whose last hop is an out-of-vault directory but whose
+        *intermediate alias* lives in ``01-Fragments/``; one whose
+        target path walks through ``01-Fragments/Journal/sub/../../..``
+        before landing outside; and one naming ``01-fragments`` in a
+        case the filesystem accepts and a string comparison does not.
+        All three previewed ``0`` and applied ``1``.
+        :func:`_chain_enters_wiped_content` walks the hops instead, and
+        compares each one to the content folders by ``Path.samefile``
+        rather than by text.
+
+        An ``OSError`` (an unreadable parent) and an exhausted hop cap
+        (a symlink loop) both answer ``False``: this predicate can only
+        ever *widen* what the sweep destroys, so failing it closed would
+        destroy a link on the strength of an error rather than a fact. A
+        dangling link needs no answer here at all —
+        :func:`~creek.purge.meta._sweep_destroys_link` has already
+        claimed it for its target string (#1485).
 
         Args:
             link: A symlink under ``00-Creek-Meta/``.
 
         Returns:
-            ``True`` when *link* resolves to something strictly inside a
-            vault content folder, which this purge is about to wipe.
+            ``True`` when resolving *link* passes through anything
+            strictly inside a vault content folder, which this purge is
+            about to wipe.
         """
-        try:
-            target = link.resolve()
-            roots = [
-                (self.vault_path / folder).resolve()
-                for folder in _VAULT_CONTENT_FOLDERS
-            ]
-        except OSError:
-            return False
-        return any(target != root and target.is_relative_to(root) for root in roots)
+        roots = [self.vault_path / folder for folder in _VAULT_CONTENT_FOLDERS]
+        return _chain_enters_wiped_content(link, roots)
 
     def _remove_meta_artifact(self, path: Path) -> None:
         """Destroy one swept ``00-Creek-Meta/`` file, or pretend to.
@@ -2177,9 +2495,12 @@ class PurgeEngine:
         once per scrub type) and applies both substitutions in-memory
         before writing:
 
-        * Wiki-links pointing at the deleted fragment's *title*
-          (``[[title]]`` / ``[[title|alias]]``) are removed. They match
-          by name, not by ID, so the title-based pass is still needed.
+        * Wiki-links pointing at the deleted fragment are removed. They
+          match by *name*, not by ID, so this pass is still needed
+          alongside the provenance one — and by every name the page
+          answers to, in every case Obsidian resolves, without eating a
+          spelling a surviving page claims. See :class:`_WikilinkScrub`
+          for the whole of that decision (#903).
         * Bare fragment-ID occurrences are replaced with the
           :data:`PURGED_MARKER` placeholder. This catches YAML
           provenance list entries (``source_fragments: [frag-…]`` in
@@ -2205,13 +2526,19 @@ class PurgeEngine:
         Returns:
             A ``(wikilinks_removed, provenance_scrubbed)`` count pair.
         """
-        wiki_pattern = _build_wikilink_pattern(title) if title else None
         prov_pattern = _build_provenance_pattern(fragment_id) if fragment_id else None
-        if wiki_pattern is None is prov_pattern:
+        if not (title or exclude.stem or prov_pattern):
+            return 0, 0
+        # One walk, reused twice: the claimant scan below reads only the
+        # header of each file, and repeating the walk to get at them
+        # would break this pass's pinned once-per-fragment property.
+        md_files = self._list_vault_md_files()
+        wiki_scrub = self._build_wikilink_scrub(title, exclude, md_files)
+        if wiki_scrub is None is prov_pattern:
             return 0, 0
         wiki_total = 0
         prov_total = 0
-        for md_file in self._list_vault_md_files():
+        for md_file in md_files:
             # Two separate concerns: *exclude* is the file being deleted
             # right now, while the ledger names the files an apply run
             # would already have deleted earlier in this operation — a
@@ -2221,18 +2548,108 @@ class PurgeEngine:
                 continue
             wiki_count, prov_count = self._scrub_one_file(
                 md_file,
-                wiki_pattern,
+                wiki_scrub,
                 prov_pattern,
             )
             wiki_total += wiki_count
             prov_total += prov_count
         return wiki_total, prov_total
 
+    def _build_wikilink_scrub(
+        self,
+        title: str,
+        frag_file: Path,
+        md_files: list[Path],
+    ) -> _WikilinkScrub | None:
+        """Build the wikilink matcher for the fragment being purged.
+
+        Two names, not one (#903). A page is linkable by its declared
+        title *and* by its filename stem —
+        :func:`creek.vault.links.build_link_index` registers both — and
+        this vault's paths are title-derived, so
+        ``01-Fragments/Journal/2026-03-11 therapy session.md`` is itself
+        the private string a right-to-be-forgotten request is about. The
+        scrub knew only ``post["title"]``, so on every fragment whose
+        title and filename differ, a link written by the filename
+        survived the purge verbatim.
+
+        The purged page's **own** exact-case spellings are subtracted
+        from the shelter, and that subtraction is load-bearing. The
+        shelter exists for a *case variant* a surviving page claims;
+        letting it cover the purged page's own spelling means any other
+        ``.md`` in the vault naming the same string — a sibling fragment
+        titled the same thing, an intimate stub, an Adepthood staging
+        file this very purge is about to delete a moment later — turns
+        the primary scrub off entirely, leaving ``[[Secret Title]]``
+        standing after a right-to-be-forgotten request. That is a
+        *regression* on the exact-case link the scrub removed before
+        #903 widened it, so the widening must never cost it.
+
+        Args:
+            title: The purged fragment's declared title, or ``""``.
+            frag_file: The fragment file being deleted; its stem is the
+                page's other linkable name.
+            md_files: The vault walk the caller has already performed,
+                reused rather than repeated — one walk per fragment is a
+                pinned property of this pass.
+
+        Returns:
+            A matcher, or ``None`` when the fragment has no linkable
+            name at all and the wiki-link pass should be skipped.
+        """
+        own = {name for name in (title, frag_file.stem) if name.strip()}
+        folded = frozenset(name.casefold() for name in own)
+        if not folded:
+            return None
+        return _WikilinkScrub(
+            folded_names=folded,
+            protected=self._surviving_claimants(folded, frag_file, md_files) - own,
+        )
+
+    def _surviving_claimants(
+        self,
+        folded: frozenset[str],
+        exclude: Path,
+        md_files: list[Path],
+    ) -> frozenset[str]:
+        """Return the exact-case spellings some surviving page claims.
+
+        ``LinkIndex.resolve`` consults its exact-case index *before* the
+        folded one, so a link spelled the way a surviving page spells
+        itself names that page and no other. Scrubbing it would destroy
+        an operator's live link on the strength of a case-insensitive
+        near-miss — the over-matching direction, and the one a bare
+        ``re.IGNORECASE`` fix takes (#903).
+
+        Only names that could collide are collected, and only the
+        **header** of each file is read, so this costs one short read
+        per vault file rather than a second full pass.
+
+        Args:
+            folded: The case-folded names the purge is about to scrub.
+            exclude: The fragment file being deleted, which claims
+                nothing once the purge completes.
+            md_files: Every markdown file in the vault.
+
+        Returns:
+            Exact-case names claimed by pages that outlive this purge.
+            The caller subtracts the purged page's own spellings from
+            this set before sheltering anything by it.
+        """
+        claimed: set[str] = set()
+        for md_file in md_files:
+            if md_file == exclude or self._skip_as_removed(md_file):
+                continue
+            claimed.update(
+                name for name in page_names(md_file) if name.casefold() in folded
+            )
+        return frozenset(claimed)
+
     def _scrub_one_file(
         self,
         md_file: Path,
-        wiki_pattern: re.Pattern[str] | None,
-        prov_pattern: re.Pattern[str] | None,
+        wiki_scrub: _WikilinkScrub | None,
+        prov_pattern: re.Pattern[bytes] | None,
     ) -> tuple[int, int]:
         """Apply the wiki-link and provenance scrubs to a single file.
 
@@ -2245,28 +2662,27 @@ class PurgeEngine:
 
         Args:
             md_file: Markdown file to scrub.
-            wiki_pattern: Wiki-link regex, or ``None`` to skip that pass.
+            wiki_scrub: Wiki-link matcher, or ``None`` to skip that pass.
             prov_pattern: Fragment-ID regex, or ``None`` to skip that pass.
 
         Returns:
             A ``(wikilinks_removed, provenance_scrubbed)`` count pair for
-            this file. ``(0, 0)`` when the file cannot be read or is not
-            valid UTF-8.
+            this file. ``(0, 0)`` when the file cannot be read at all.
         """
-        text = self._scrub_input_text(md_file)
-        if text is None:
+        data = self._scrub_input_bytes(md_file)
+        if data is None:
             return 0, 0
         scrubbed, wiki_count, prov_count = _apply_scrubs(
-            text,
-            wiki_pattern,
+            data,
+            wiki_scrub,
             prov_pattern,
         )
         if wiki_count or prov_count:
             self._persist_scrub(md_file, scrubbed)
         return wiki_count, prov_count
 
-    def _scrub_input_text(self, md_file: Path) -> str | None:
-        """Return the text the scrub should operate on, or ``None`` to skip.
+    def _scrub_input_bytes(self, md_file: Path) -> bytes | None:
+        """Return the bytes the scrub should operate on, or ``None`` to skip.
 
         In a dry run the ledger wins when it holds a pending rewrite for
         *md_file*: an apply run would have written those bytes on an
@@ -2275,28 +2691,33 @@ class PurgeEngine:
         scrubbed. In an apply run the ledger is never consulted at all,
         which is what keeps its contents unable to affect a real purge.
 
+        ``read_bytes`` rather than ``read_text`` (#948). The text read
+        raised ``UnicodeDecodeError`` on a file that is not valid UTF-8,
+        and the only safe response *then* was to skip it — the caller
+        writes the result back, so an ``errors="replace"`` read would
+        have persisted U+FFFD over the operator's bytes. That left the
+        purged title and fragment ID standing inside such a file after a
+        right-to-be-forgotten request. Reading bytes removes both the
+        exception and the trade-off, and takes the newline translation
+        ``read_text`` performed with it.
+
         Args:
             md_file: Markdown file about to be scrubbed.
 
         Returns:
-            The text to scrub, or ``None`` when the file cannot be read.
+            The bytes to scrub, or ``None`` when the file cannot be read.
         """
         if self.dry_run:
-            pending = self._ledger.text_for(md_file)
+            pending = self._ledger.bytes_for(md_file)
             if pending is not None:
                 return pending
         try:
-            return md_file.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            # Skipping is the only safe response to an undecodable file:
-            # the caller writes ``text`` back, so an ``errors="replace"``
-            # read here would persist U+FFFD over the operator's bytes.
-            # A reference living inside such a file therefore survives
-            # unscrubbed: an accepted trade-off, since the alternative is
-            # corrupting the file — and far better than raising, which
-            # would abort the purge before the target is even unlinked.
-            # Type name only, never str(exc): the message can quote file
-            # content (possibly the very secret being purged).
+            return md_file.read_bytes()
+        except OSError as exc:
+            # Never raise: aborting here would leave the purge target
+            # unlinked-but-still-referenced. Type name only, never
+            # str(exc): the message can quote file content (possibly the
+            # very secret being purged).
             logger.warning(
                 "Skipping unreadable file during reference scrub: %s (%s)",
                 md_file,
@@ -2304,23 +2725,28 @@ class PurgeEngine:
             )
             return None
 
-    def _persist_scrub(self, md_file: Path, text: str) -> None:
-        """Write the scrubbed text, or record it as a dry run's pretence.
+    def _persist_scrub(self, md_file: Path, data: bytes) -> None:
+        """Write the scrubbed bytes, or record them as a dry run's pretence.
 
         The two branches are mutually exclusive by construction, and
-        that matters beyond tidiness: buffering text in an apply run
-        would hold the full contents of every rewritten file for the
-        lifetime of the operation, which at 35k fragments is a memory
-        blow-up in exchange for something no apply run ever reads.
+        that matters beyond tidiness: buffering contents in an apply run
+        would hold every rewritten file for the lifetime of the
+        operation, which at 35k fragments is a memory blow-up in
+        exchange for something no apply run ever reads.
+
+        ``write_bytes`` rather than ``write_text`` (#948): the scrub is
+        a substitution, so every byte it was not asked about — an
+        invalid sequence, a CRLF line ending, a missing final newline —
+        has to come back exactly as it went in.
 
         Args:
             md_file: Markdown file that was scrubbed.
-            text: Its scrubbed contents.
+            data: Its scrubbed contents.
         """
         if self.dry_run:
-            self._ledger.set_text(md_file, text)
+            self._ledger.set_bytes(md_file, data)
             return
-        md_file.write_text(text, encoding="utf-8")
+        md_file.write_bytes(data)
 
     def _decrement_counts(
         self,
@@ -2344,19 +2770,93 @@ class PurgeEngine:
         id_set = set(ids)
         updated = 0
         for md_file in folder.rglob("*.md"):
-            post = self._load_frontmatter(md_file)
-            if post is None or post.get("id") not in id_set:
+            meta = read_header_meta(md_file)
+            if meta.get("id") not in id_set:
                 continue
-            raw_count = post.get("fragment_count", 0)
+            raw_count = meta.get("fragment_count", 0)
             current = int(raw_count) if isinstance(raw_count, (int, float, str)) else 0
-            post["fragment_count"] = max(0, current - 1)
-            updated += 1
-            if not self.dry_run:
-                md_file.write_text(
-                    frontmatter.dumps(post),
-                    encoding="utf-8",
-                )
+            if self._rewrite_fragment_count(md_file, max(0, current - 1)):
+                updated += 1
         return updated
+
+    def _rewrite_fragment_count(self, md_file: Path, new_count: int) -> bool:
+        """Splice *new_count* into *md_file*'s header, or report that it cannot.
+
+        The read is header-only and the write is a byte splice, so a
+        thread whose *body* is not valid UTF-8 gets its count corrected
+        like any other (#949) — the header is clean ASCII, which is
+        exactly why the old whole-file round trip failing on it was a
+        loss rather than a necessity (#910).
+
+        The dry-run branch is deliberately not the scrub path's: no
+        ledger is involved here, because nothing later in a purge reads
+        a thread's fragment count back. It still performs the splice, so
+        a preview counts a rewrite only when the apply run could really
+        make it.
+
+        Args:
+            md_file: Thread or eddy file to update.
+            new_count: The decremented count.
+
+        Returns:
+            ``True`` when the count was written (or, in a dry run, could
+            have been), ``False`` when the file was left alone.
+        """
+        try:
+            data = md_file.read_bytes()
+        except OSError as exc:
+            # Type name only, never str(exc): the message can quote file
+            # content (possibly the very secret being purged).
+            logger.warning(
+                "Skipping unreadable file during count update: %s (%s)",
+                md_file,
+                type(exc).__name__,
+            )
+            return False
+        spliced = _splice_fragment_count(data, new_count)
+        if spliced is None:
+            return self._reserialise_fragment_count(md_file, new_count)
+        if not self.dry_run:
+            md_file.write_bytes(spliced)
+        return True
+
+    def _reserialise_fragment_count(self, md_file: Path, new_count: int) -> bool:
+        """Write the count by rewriting the whole header, the last resort.
+
+        Reached only when :func:`_splice_fragment_count` declined — the
+        key is missing, or holds something that is not a plain integer
+        (a list, a null, a multi-line scalar). Such a header is already
+        not in the shape a splice can preserve, and setting the count is
+        the repair; this path is what wrote it before #949, and the
+        contract that a non-numeric ``fragment_count`` becomes ``0``
+        rather than a crash predates that issue.
+
+        The cost is real and is why it is a fallback and not the
+        default: PyYAML drops comments, alphabetises keys, normalises
+        quoting and strips trailing whitespace, so a file that lands
+        here comes back reformatted. It is logged for that reason.
+
+        Args:
+            md_file: Thread or eddy file to update.
+            new_count: The decremented count.
+
+        Returns:
+            ``True`` when the header was rewritten (or, in a dry run,
+            could have been); ``False`` when it could not be read
+            losslessly, which is #910's rule and still holds here.
+        """
+        post = self._load_frontmatter(md_file)
+        if post is None:
+            return False
+        logger.warning(
+            "Reserialising %s to set fragment_count: its existing value is not a "
+            "plain integer, so the header cannot be updated in place",
+            md_file,
+        )
+        post["fragment_count"] = new_count
+        if not self.dry_run:
+            md_file.write_text(frontmatter.dumps(post), encoding="utf-8")
+        return True
 
     def _reset_classifications(self, post: frontmatter.Post) -> bool:
         """Reset classification fields on a frontmatter post.
@@ -2754,26 +3254,14 @@ def _build_source_path_matcher(
     return lambda candidate: pattern.search(candidate) is not None
 
 
-def _build_wikilink_pattern(title: str) -> re.Pattern[str]:
-    """Build a regex matching every wikilink form targeting ``title``.
-
-    Matches ``[[title]]`` and ``[[title|alias]]``, plus heading
-    (``[[title#Heading]]``), block-reference (``[[title#^id]]``), and
-    heading+alias (``[[title#Heading|alias]]``) variants, so a purge
-    removes all links that leak the title.
-
-    Args:
-        title: The target title to match exactly.
-
-    Returns:
-        A compiled regex pattern.
-    """
-    escaped = re.escape(title)
-    return re.compile(rf"\[\[{escaped}(?:#[^\]|]*)?(?:\|[^\]]*)?\]\]")
-
-
-def _build_provenance_pattern(fragment_id: str) -> re.Pattern[str]:
+def _build_provenance_pattern(fragment_id: str) -> re.Pattern[bytes]:
     """Build a regex matching a bare ``fragment_id`` but not hyphen-suffixed IDs.
+
+    Compiled against **bytes**, like the rest of the scrub (#948), which
+    switches ``\\w`` from Unicode to ASCII semantics. A fragment ID is an
+    ASCII slug and so is every character that can continue one, so the
+    "is this the prefix of a longer ID" question the lookarounds exist to
+    ask is unchanged.
 
     A plain ``\\b`` word boundary treats the hyphen as a word/non-word
     boundary, so ``\\bfrag-01\\b`` would match the ``frag-01`` prefix
@@ -2787,8 +3275,8 @@ def _build_provenance_pattern(fragment_id: str) -> re.Pattern[str]:
     Returns:
         A compiled regex pattern.
     """
-    escaped = re.escape(fragment_id)
-    return re.compile(rf"(?<![\w-]){escaped}(?![\w-])")
+    escaped = re.escape(fragment_id.encode())
+    return re.compile(rb"(?<![\w-])" + escaped + rb"(?![\w-])")
 
 
 def _coerce_date(value: object) -> date | None:

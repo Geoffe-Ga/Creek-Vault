@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-_LEDGER_TEXT = "the text an apply run would have written"
+_LEDGER_BYTES = b"the bytes an apply run would have written"
 """Stand-in for a scrubbed file body handed to the ledger."""
 
 _NUL_NAME = "bad\x00name.md"
@@ -91,14 +91,14 @@ def test_a_path_marked_under_its_resolved_spelling_answers_for_the_other(
 def test_recorded_text_round_trips_through_either_path_spelling(
     tmp_path: Path,
 ) -> None:
-    """``set_text`` / ``text_for`` share the ledger's path identity rule."""
+    """``set_bytes`` / ``bytes_for`` share the ledger's path identity rule."""
     ledger = DryRunLedger()
     direct, indirect = _two_spellings(tmp_path)
 
-    ledger.set_text(indirect, _LEDGER_TEXT)
+    ledger.set_bytes(indirect, _LEDGER_BYTES)
 
-    assert ledger.text_for(indirect) == _LEDGER_TEXT
-    assert ledger.text_for(direct) == _LEDGER_TEXT
+    assert ledger.bytes_for(indirect) == _LEDGER_BYTES
+    assert ledger.bytes_for(direct) == _LEDGER_BYTES
 
 
 def test_recorded_text_set_by_the_resolved_spelling_reads_back_by_the_other(
@@ -108,10 +108,10 @@ def test_recorded_text_set_by_the_resolved_spelling_reads_back_by_the_other(
     ledger = DryRunLedger()
     direct, indirect = _two_spellings(tmp_path)
 
-    ledger.set_text(direct, _LEDGER_TEXT)
+    ledger.set_bytes(direct, _LEDGER_BYTES)
 
-    assert ledger.text_for(direct) == _LEDGER_TEXT
-    assert ledger.text_for(indirect) == _LEDGER_TEXT
+    assert ledger.bytes_for(direct) == _LEDGER_BYTES
+    assert ledger.bytes_for(indirect) == _LEDGER_BYTES
 
 
 def test_an_unresolvable_path_is_recorded_under_its_literal_form(
@@ -128,10 +128,10 @@ def test_an_unresolvable_path_is_recorded_under_its_literal_form(
     hostile = tmp_path / _NUL_NAME
 
     ledger.mark_removed(hostile)
-    ledger.set_text(hostile, _LEDGER_TEXT)
+    ledger.set_bytes(hostile, _LEDGER_BYTES)
 
     assert ledger.is_removed(hostile) is True
-    assert ledger.text_for(hostile) == _LEDGER_TEXT
+    assert ledger.bytes_for(hostile) == _LEDGER_BYTES
 
 
 def test_an_unresolvable_path_does_not_match_an_unrelated_one(
@@ -156,7 +156,7 @@ def test_a_fresh_ledger_knows_nothing(tmp_path: Path) -> None:
     unknown = tmp_path / "never-seen.md"
 
     assert ledger.is_removed(unknown) is False
-    assert ledger.text_for(unknown) is None
+    assert ledger.bytes_for(unknown) is None
 
 
 def test_two_ledgers_do_not_share_state(tmp_path: Path) -> None:
@@ -172,7 +172,7 @@ def test_two_ledgers_do_not_share_state(tmp_path: Path) -> None:
     target = tmp_path / "note.md"
 
     first.mark_removed(target)
-    first.set_text(target, _LEDGER_TEXT)
+    first.set_bytes(target, _LEDGER_BYTES)
 
     assert second.is_removed(target) is False
-    assert second.text_for(target) is None
+    assert second.bytes_for(target) is None

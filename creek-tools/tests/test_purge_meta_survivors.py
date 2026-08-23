@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Final, NamedTuple
 import pytest
 
 from creek.purge import PurgeAuditEntry, PurgeAuditLog, PurgeEngine
-from creek.purge.engine import VAULT_PURGE_CONFIRMATION
+from creek.purge.engine import VAULT_PURGE_CONFIRMATION, _same_directory
 from creek.purge.meta import META_PURGE_KEEP, SWEEP_EXEMPT, MetaKeep
 
 if TYPE_CHECKING:
@@ -987,10 +987,103 @@ def _build_link_to_a_surviving_directory(root: Path) -> tuple[Path, Path]:
     return vault, probe
 
 
+def _build_link_through_a_wiped_alias(root: Path) -> tuple[Path, Path]:
+    """Seed a meta link whose *final* target survives but whose second hop does not.
+
+    ``00-Creek-Meta/via-alias -> 01-Fragments/Journal/alias -> <outside>``.
+    ``Path.resolve()`` collapses the whole chain and answers
+    ``<outside>``, which the content wipe never touches — so the old
+    single-shot predicate said "survives". The wipe destroys the
+    *alias*, though, so the apply run met a dangling link and unlinked
+    it: preview ``0``, apply ``1`` (#1562).
+
+    Args:
+        root: A private directory to build the vault under.
+
+    Returns:
+        The vault root and the link whose fate is the disposition.
+    """
+    vault = _minimal_vault(root)
+    journal = vault / "01-Fragments" / "Journal"
+    journal.mkdir(parents=True)
+    outside = root / "elsewhere"
+    outside.mkdir(parents=True)
+    (outside / "keep-me.md").write_text("untouched\n", encoding="utf-8")
+    alias = journal / "alias"
+    alias.symlink_to(outside, target_is_directory=True)
+    probe = vault / "00-Creek-Meta" / "via-alias"
+    probe.symlink_to(alias, target_is_directory=True)
+    return vault, probe
+
+
+def _build_link_traversing_a_wiped_directory(root: Path) -> tuple[Path, Path]:
+    """Seed a meta link whose target *path* walks through a content folder.
+
+    The target climbs back out again with ``..``, so ``resolve()``
+    normalises the content folder away entirely and reports a surviving
+    out-of-vault directory. Resolution still needs every component on
+    the way to exist: once the wipe removes ``01-Fragments/Journal/sub``
+    the link dangles (#1562).
+
+    Args:
+        root: A private directory to build the vault under.
+
+    Returns:
+        The vault root and the link whose fate is the disposition.
+    """
+    vault = _minimal_vault(root)
+    (vault / "01-Fragments" / "Journal" / "sub").mkdir(parents=True)
+    outside = root / "elsewhere"
+    outside.mkdir(parents=True)
+    (outside / "keep-me.md").write_text("untouched\n", encoding="utf-8")
+    probe = vault / "00-Creek-Meta" / "traverse"
+    probe.symlink_to(
+        Path("../01-Fragments/Journal/sub/../../../../elsewhere"),
+        target_is_directory=True,
+    )
+    return vault, probe
+
+
+def _build_link_named_in_another_case(root: Path) -> tuple[Path, Path]:
+    """Seed a meta link naming a content folder in a different case.
+
+    On a case-**insensitive** filesystem — macOS's default, and the one
+    an Obsidian vault most often lives on — ``../01-fragments/Journal``
+    reaches the very directory the wipe empties, while a string
+    comparison against ``01-Fragments`` misses it. On a case-sensitive
+    filesystem the same link simply never resolves. The disposition is
+    ``unlinked`` either way, which is why this row needs no filesystem
+    probe to assert: a dangling link is destroyed for the target string
+    it still carries (#1485), and a live one for the wipe that is about
+    to break it (#1562). Only the *reason* differs, and
+    :func:`test_a_case_variant_link_is_destroyed_for_the_right_reason`
+    pins that half.
+
+    Args:
+        root: A private directory to build the vault under.
+
+    Returns:
+        The vault root and the link whose fate is the disposition.
+    """
+    vault = _minimal_vault(root)
+    journal = vault / "01-Fragments" / "Journal"
+    journal.mkdir(parents=True)
+    (journal / f"{_PRIVATE}.md").write_text(
+        "---\nid: frag-x\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    probe = vault / "00-Creek-Meta" / "cased"
+    probe.symlink_to(Path("../01-fragments/Journal"), target_is_directory=True)
+    return vault, probe
+
+
 _EDGE_BUILDERS: Final[dict[str, Callable[[Path], tuple[Path, Path]]]] = {
     "directory-at-a-shelter": _build_directory_at_a_shelter,
     "link-the-purge-breaks": _build_link_the_purge_breaks,
     "link-to-a-surviving-directory": _build_link_to_a_surviving_directory,
+    "link-through-a-wiped-alias": _build_link_through_a_wiped_alias,
+    "link-traversing-a-wiped-directory": _build_link_traversing_a_wiped_directory,
+    "link-named-in-another-case": _build_link_named_in_another_case,
 }
 """One executable vault per documented edge case, keyed by its doc slug."""
 
@@ -1053,6 +1146,106 @@ def test_each_documented_edge_gets_exactly_the_disposition_the_doc_states(
         f"{preview.meta_artifacts_removed} and the apply run performed "
         f"{applied.meta_artifacts_removed}"
     )
+
+
+def test_a_meta_link_whose_whole_chain_avoids_the_vault_is_left_alone(
+    tmp_path: Path,
+) -> None:
+    """The over-match pin on the #1562 widening.
+
+    Walking the chain instead of resolving it makes the predicate see
+    *more* paths, and a predicate that sees more paths is a predicate
+    that can claim more links. This is the direction that would destroy
+    an operator's own alias: a three-hop chain that never touches a
+    content folder must survive both runs with its target string intact,
+    and the tree behind it must not be touched at all.
+    """
+    vault = _minimal_vault(tmp_path)
+    (vault / "01-Fragments" / "Journal").mkdir(parents=True)
+    outside = tmp_path / "elsewhere" / "notes"
+    outside.mkdir(parents=True)
+    kept = outside / "keep-me.md"
+    kept.write_bytes(b"untouched\n")
+    first = tmp_path / "hop-one"
+    first.symlink_to(outside, target_is_directory=True)
+    second = tmp_path / "hop-two"
+    second.symlink_to(first, target_is_directory=True)
+    probe = vault / "00-Creek-Meta" / "external-chain"
+    probe.symlink_to(second, target_is_directory=True)
+
+    preview = PurgeEngine(vault, dry_run=True).purge_vault(VAULT_PURGE_CONFIRMATION)
+    applied = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert preview.meta_artifacts_removed == 0
+    assert applied.meta_artifacts_removed == 0
+    assert probe.is_symlink(), "the widened predicate ate an out-of-vault alias"
+    assert probe.readlink() == second
+    assert kept.read_bytes() == b"untouched\n"
+
+
+def test_a_case_variant_link_is_destroyed_for_the_right_reason(
+    tmp_path: Path,
+) -> None:
+    """Name which mechanism destroys ``link-named-in-another-case``.
+
+    The doc-driven row asserts the disposition, and that disposition
+    holds on both kinds of filesystem — but for different reasons, so
+    the row alone would pass vacuously on the one where the defect
+    cannot occur. This test probes the filesystem at runtime and asserts
+    the mechanism rather than skipping half of the matrix:
+
+    * case-**insensitive** (macOS's default, and where #1562 was
+      reproduced) — ``../01-fragments/Journal`` reaches the live
+      directory the wipe is about to empty, so the link is *resolvable*
+      when the preview classifies it and only chain-awareness catches
+      it;
+    * case-**sensitive** (Linux CI) — the same target names nothing, so
+      the link is already dangling and #1485's rule claims it.
+
+    Either way the preview must promise exactly what the apply run
+    performs.
+    """
+    vault, probe = _build_link_named_in_another_case(tmp_path / "preview")
+    case_insensitive = probe.exists()
+
+    preview = PurgeEngine(vault, dry_run=True).purge_vault(VAULT_PURGE_CONFIRMATION)
+    applied_vault, applied_probe = _build_link_named_in_another_case(tmp_path / "apply")
+    applied = PurgeEngine(applied_vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    if case_insensitive:
+        assert probe.resolve().is_relative_to(vault), (
+            "the fixture no longer reaches the content folder it is about"
+        )
+    else:
+        assert not probe.exists(), "expected a dangling link on a case-sensitive FS"
+    assert preview.meta_artifacts_removed == 1
+    assert applied.meta_artifacts_removed == 1
+    assert not applied_probe.is_symlink()
+
+
+def test_a_symlink_loop_under_meta_terminates_and_is_unlinked(
+    tmp_path: Path,
+) -> None:
+    """The hop cap is a termination condition, not a tuning knob.
+
+    The chain walk never dereferences anything, so the kernel's
+    ``ELOOP`` cannot stop it; only :data:`creek.purge.engine._MAX_LINK_HOPS`
+    can. A loop under ``00-Creek-Meta/`` must therefore finish the purge
+    rather than hang, and it is unlinked for its target string exactly
+    as any other unresolvable link is.
+    """
+    vault = _minimal_vault(tmp_path)
+    (vault / "01-Fragments" / "Journal").mkdir(parents=True)
+    left = vault / "00-Creek-Meta" / "loop-a"
+    right = vault / "00-Creek-Meta" / "loop-b"
+    left.symlink_to(right)
+    right.symlink_to(left)
+
+    applied = PurgeEngine(vault).purge_vault(VAULT_PURGE_CONFIRMATION)
+
+    assert applied.meta_artifacts_removed == 2
+    assert not left.is_symlink()
+    assert not right.is_symlink()
 
 
 def test_a_meta_link_to_a_content_directory_previews_the_removal_it_performs(
@@ -1205,3 +1398,28 @@ def test_the_documented_directory_verdicts_are_the_ones_the_purge_reaches(
     assert (vault / "00-Creek-Meta" / "audit" / "purge.jsonl").is_file(), "survives"
     assert (vault / "00-Creek-Meta").is_dir(), "the meta root is never removed"
     assert _PRIVATE not in _residue(vault)
+
+
+def test_same_directory_falls_back_to_text_when_a_path_cannot_be_stated(
+    tmp_path: Path,
+) -> None:
+    """The ``OSError`` arm of the identity test is a decision, not a shrug.
+
+    ``Path.samefile`` compares device and inode, which is what lets the
+    chain walk see through a symlinked prefix, an un-normalised ``..``
+    and a case-insensitive filesystem (#1562) — but it raises the moment
+    either side does not exist, and the chain walk asks about targets
+    that routinely do not: a vault whose content folders were never
+    created, and a hop the wipe is about to break. Falling back to
+    string equality is what keeps a link naming a missing content folder
+    claimable; returning ``False`` there would silently narrow the sweep
+    on a right-to-be-forgotten path, and no other test in this
+    repository notices the difference.
+    """
+    missing = tmp_path / "01-Fragments"
+    other = tmp_path / "03-Eddies"
+
+    assert not missing.exists()
+    assert _same_directory(missing, tmp_path / "01-Fragments") is True
+    assert _same_directory(missing, other) is False
+    assert _same_directory(tmp_path, tmp_path) is True

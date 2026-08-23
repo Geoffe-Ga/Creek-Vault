@@ -21,7 +21,11 @@ from typer.testing import CliRunner
 
 from creek.cli import app
 from creek.purge import PurgeAuditEntry, PurgeAuditLog, PurgeEngine, PurgeResult
-from creek.purge.engine import VAULT_PURGE_CONFIRMATION, _str_list
+from creek.purge.engine import (
+    VAULT_PURGE_CONFIRMATION,
+    _splice_fragment_count,
+    _str_list,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -4473,19 +4477,78 @@ def test_decrement_counts_does_not_corrupt_undecodable_thread_file(
 ) -> None:
     """A thread file with an undecodable body survives a purge intact (#910).
 
-    ``_decrement_counts`` is the second in-place rewrite path. An
-    unreadable thread file must be skipped (count not decremented)
-    rather than crashing the purge or being re-encoded lossily, while
-    the fragment itself is still deleted.
+    ``_decrement_counts`` is the second in-place rewrite path, and the
+    assertion #910 actually bought is the **second** one below: whatever
+    else happens, the file's other bytes — the invalid ``\\xff\\xfe``
+    included — must come back exactly as the operator left them. That
+    assertion survives here unchanged in meaning and *tightened* in
+    reach: it is now byte equality against the original with only the
+    count digit different, rather than byte equality against an
+    untouched file.
+
+    Only the first assertion flips, ``0`` → ``1``. #910 could not
+    decrement the count because the rewrite went through
+    ``frontmatter.dumps`` + ``write_text``, which cannot round-trip a
+    file it cannot decode; skipping was the least-bad option available
+    to it. #949 replaced that round-trip with a byte-level splice of the
+    one scalar, which makes the skip unnecessary rather than making the
+    corruption acceptable — so the fragment count is now correct *and*
+    the bytes are still intact.
+
+    Its sibling :func:`test_classifications_purge_does_not_corrupt_undecodable_fragment`
+    guards ``purge_classifications``, a different rewrite path that
+    still uses the full round-trip and is deliberately left alone.
+
+    One fixture correction came with the tightening. ``_write_thread``
+    writes an empty body, so ``frontmatter.dumps`` ends the file at the
+    closing ``---`` with no trailing newline — appending the invalid
+    bytes straight onto it produced ``---\\xff\\xfe``, a *corrupted
+    fence*, not the "undecodable body" this test's name and docstring
+    describe. The newline below puts the bad bytes where they were
+    always meant to be. The fence-corruption shape is not lost: it is
+    pinned, with its original assertions, by
+    :func:`test_decrement_counts_leaves_a_thread_with_a_corrupt_fence_alone`.
+    """
+    vault = _make_vault(tmp_path)
+    thread = _write_thread(vault, "thread-1", "Waves", fragment_count=3)
+    thread_bytes = thread.read_bytes() + b"\n" + _UNDECODABLE_BYTES + b"\n"
+    thread.write_bytes(thread_bytes)
+    frag = _write_fragment(vault, "frag-A", "Alpha", threads=["thread-1"])
+    engine = PurgeEngine(vault)
+
+    result = engine.purge_fragment("frag-A")
+
+    assert result.fragments_affected == 1
+    assert not frag.exists()
+    assert result.threads_updated == 1
+    assert thread.read_bytes() == thread_bytes.replace(
+        b"fragment_count: 3",
+        b"fragment_count: 2",
+    )
+
+
+def test_decrement_counts_leaves_a_thread_with_a_corrupt_fence_alone(
+    tmp_path: Path,
+) -> None:
+    """A header the reader cannot terminate is never rewritten (#910, #949).
+
+    This is the fixture
+    :func:`test_decrement_counts_does_not_corrupt_undecodable_thread_file`
+    used to build, kept verbatim with its original assertions: the
+    invalid bytes land on the closing ``---`` itself, so the file has no
+    parseable frontmatter at all rather than an unreadable body. Neither
+    the header-only reader nor the byte splice can make sense of it, so
+    the count is not decremented and not one byte moves. Failing closed
+    is the right answer here — the alternative is guessing where a
+    header ends on a right-to-be-forgotten path.
     """
     vault = _make_vault(tmp_path)
     thread = _write_thread(vault, "thread-1", "Waves", fragment_count=3)
     thread_bytes = thread.read_bytes() + _UNDECODABLE_BYTES + b"\n"
     thread.write_bytes(thread_bytes)
     frag = _write_fragment(vault, "frag-A", "Alpha", threads=["thread-1"])
-    engine = PurgeEngine(vault)
 
-    result = engine.purge_fragment("frag-A")
+    result = PurgeEngine(vault).purge_fragment("frag-A")
 
     assert result.fragments_affected == 1
     assert not frag.exists()
@@ -4911,12 +4974,12 @@ def test_an_apply_run_ignores_the_dry_run_ledger_entirely(
     assert len(ledgers) == 1, "the engine must hold exactly one DryRunLedger"
     ledgers[0].mark_removed(frag)
     ledgers[0].mark_removed(note)
-    ledgers[0].set_text(note, _POISONED_LEDGER_TEXT)
+    ledgers[0].set_bytes(note, _POISONED_LEDGER_TEXT.encode())
     monkeypatch.setattr(DryRunLedger, "is_removed", lambda _self, _path: True)
     monkeypatch.setattr(
         DryRunLedger,
-        "text_for",
-        lambda _self, _path: _POISONED_LEDGER_TEXT,
+        "bytes_for",
+        lambda _self, _path: _POISONED_LEDGER_TEXT.encode(),
     )
 
     result = engine.purge_fragment("frag-A")
@@ -5637,3 +5700,517 @@ def test_the_meta_sweep_keeps_its_roster_out_of_the_surviving_record(
     assert result.deleted_files == [
         str(vault / "01-Fragments" / "Conversations" / "Recorded.md"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# Wikilink scrubbing matches the fold Obsidian resolves with (#903)
+# ---------------------------------------------------------------------------
+
+
+def _write_named_fragment(
+    vault: Path,
+    frag_id: str,
+    *,
+    stem: str,
+    title: str,
+) -> Path:
+    """Write a fragment whose filename stem and declared title differ.
+
+    :func:`_write_fragment` derives the filename from the title, so it
+    cannot build the shape #903's fourth leak needs: a page linkable by
+    two distinct names, only one of which the purge has ever been told
+    about.
+
+    Args:
+        vault: Vault root.
+        frag_id: Fragment ID.
+        stem: Filename stem, without the ``.md`` suffix.
+        title: Declared ``title`` in the frontmatter.
+
+    Returns:
+        Path to the written fragment file.
+    """
+    target = vault / "01-Fragments" / "Conversations" / f"{stem}.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    post = frontmatter.Post(
+        content="Body.\n",
+        id=frag_id,
+        title=title,
+        type="fragment",
+        source={"platform": "claude", "original_file": f"{frag_id}.json"},
+        threads=[],
+        eddies=[],
+    )
+    target.write_text(frontmatter.dumps(post), encoding="utf-8")
+    return target
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        "[[Secret Title]]",
+        "[[secret title]]",
+        "[[SECRET TITLE]]",
+        "[[Secret Title#Heading]]",
+        "[[SECRET TITLE#Heading]]",
+        "[[secret title#Heading|display text]]",
+        "[[  Secret Title  ]]",
+    ],
+)
+def test_wikilink_scrub_removes_every_spelling_obsidian_resolves(
+    tmp_path: Path,
+    link: str,
+) -> None:
+    """A right-to-be-forgotten purge removes the title in any case (#903).
+
+    Obsidian resolves ``[[secret title]]`` to ``Secret Title.md``, and
+    :meth:`creek.vault.links.LinkIndex.resolve` reproduces that by
+    falling back to a ``casefold()`` index. The scrub compiled
+    ``re.escape(title)`` with no flags at all, so every spelling but the
+    exact one survived the purge — leaving the private title in the
+    vault, in a file the audit log reports as scrubbed.
+
+    Byte-identity of everything else is asserted, not just the absence
+    of the link: an over-broad scrub on a compliance path destroys the
+    operator's unrelated prose.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-a", "Secret Title")
+    ref = vault / "01-Fragments" / "Conversations" / "Other.md"
+    prefix = "before "
+    suffix = " after\nsecond line kept\n"
+    ref.write_text(f"{prefix}{link}{suffix}", encoding="utf-8")
+
+    result = PurgeEngine(vault).purge_fragment("frag-a")
+
+    assert result.wikilinks_removed == 1
+    assert ref.read_text(encoding="utf-8") == f"{prefix}{suffix}"
+
+
+def test_wikilink_scrub_removes_a_link_naming_the_private_filename(
+    tmp_path: Path,
+) -> None:
+    """The filename is private text too, and it was never scrubbed (#903).
+
+    ``creek``'s paths are title-derived —
+    ``01-Fragments/Journal/2026-03-11 therapy session.md`` is itself the
+    private string — and :func:`creek.vault.links.build_link_index`
+    registers a page under its **stem** as well as its declared names.
+    The scrub was told only ``post["title"]``, so on any fragment whose
+    declared title differs from its filename a link written by the
+    filename survived a purge verbatim.
+    """
+    vault = _make_vault(tmp_path)
+    stem = "2026-03-11 therapy session"
+    _write_named_fragment(vault, "frag-a", stem=stem, title="Session notes")
+    ref = vault / "01-Fragments" / "Conversations" / "Other.md"
+    ref.write_text(f"see [[{stem}]] and [[Session notes]] here\n", encoding="utf-8")
+
+    result = PurgeEngine(vault).purge_fragment("frag-a")
+
+    assert result.wikilinks_removed == 2
+    assert ref.read_text(encoding="utf-8") == "see  and  here\n"
+    assert stem not in ref.read_text(encoding="utf-8")
+
+
+def test_wikilink_scrub_spares_a_case_variant_a_surviving_page_claims(
+    tmp_path: Path,
+) -> None:
+    """The over-match pin: case-blindness must not eat a live link (#903).
+
+    ``re.IGNORECASE`` — the fix the issue itself suggests — is not the
+    relation :class:`creek.vault.links.LinkIndex` uses. ``resolve`` tries
+    the **exact-case** index first and only then the folded one, so when
+    two pages differ only in case, ``[[ALPHA]]`` names the survivor and
+    ``[[Alpha]]`` names the fragment being purged. A bare-IGNORECASE
+    scrub deletes both, destroying an operator's link to a page the
+    purge did not touch.
+
+    Distinct filename stems are deliberate: a fixture whose two pages
+    differ only in filename case collapses to one file on a
+    case-insensitive filesystem and the test stops testing anything.
+    """
+    vault = _make_vault(tmp_path)
+    _write_named_fragment(vault, "frag-a", stem="alpha-one", title="Alpha")
+    _write_named_fragment(vault, "frag-b", stem="alpha-two", title="ALPHA")
+    ref = vault / "01-Fragments" / "Conversations" / "Other.md"
+    ref.write_text(
+        "survivor link: [[ALPHA]]\ntarget link: [[Alpha]]\n",
+        encoding="utf-8",
+    )
+
+    result = PurgeEngine(vault).purge_fragment("frag-a")
+
+    assert result.wikilinks_removed == 1
+    assert (
+        ref.read_text(encoding="utf-8") == "survivor link: [[ALPHA]]\ntarget link: \n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The reference scrub rewrites files byte for byte (#948)
+# ---------------------------------------------------------------------------
+
+_UNDECODABLE_REFERRER = (
+    b"---\nid: p1\ntype: praxis\n---\n\nsee [[Alpha]] and frag-A here\n\xff\xfe\n"
+)
+"""A note that references the purged fragment and is not valid UTF-8.
+
+The invalid bytes sit in the body, after the closing fence, exactly as
+:data:`_UNDECODABLE_BYTES` is injected elsewhere in this module: the
+frontmatter stays byte-clean ASCII, so nothing but the *read encoding*
+stands between the scrub and the reference it has to remove.
+"""
+
+_SCRUBBED_UNDECODABLE_REFERRER = (
+    b"---\nid: p1\ntype: praxis\n---\n\nsee  and [purged] here\n\xff\xfe\n"
+)
+"""What :data:`_UNDECODABLE_REFERRER` must look like after the purge."""
+
+
+def test_scrub_removes_references_from_a_file_that_is_not_valid_utf8(
+    tmp_path: Path,
+) -> None:
+    """An undecodable file is scrubbed, not skipped (#948).
+
+    ``read_text(encoding="utf-8")`` raised on the file and the scrub
+    logged a warning and moved on, so a wikilink naming the purged title
+    and a bare fragment ID both survived a right-to-be-forgotten purge in
+    a file the audit log reported as clean. Skipping was the only safe
+    response *while the pipeline was text-native* — an
+    ``errors="replace"`` read would have persisted U+FFFD over the
+    operator's bytes on write-back. Working in bytes removes the choice
+    entirely.
+
+    The invalid bytes must come back byte-identical: this is a
+    substitution, not a transcoding.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    victim = vault / "04-Praxis" / "note.md"
+    victim.write_bytes(_UNDECODABLE_REFERRER)
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    assert result.wikilinks_removed == 1
+    assert result.provenance_scrubbed == 1
+    assert victim.read_bytes() == _SCRUBBED_UNDECODABLE_REFERRER
+
+
+def test_scrub_leaves_crlf_line_endings_exactly_as_it_found_them(
+    tmp_path: Path,
+) -> None:
+    """Removing one link must not rewrite every line ending (#948).
+
+    ``read_text`` applies universal-newline translation and
+    ``write_text`` writes ``\\n`` back, so scrubbing a single wikilink out
+    of a Windows-authored or Obsidian-synced note silently converted the
+    whole file from CRLF to LF. That is the "nothing else moved" promise
+    broken on the *decodable* path — the reason the byte-native rewrite
+    is the right implementation for every file rather than a fallback
+    for the undecodable ones.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    victim = vault / "04-Praxis" / "note.md"
+    before = b"---\r\nid: p1\r\n---\r\nsee [[Alpha]] here\r\nsecond CRLF line\r\n"
+    victim.write_bytes(before)
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    after = victim.read_bytes()
+    assert result.wikilinks_removed == 1
+    assert after == b"---\r\nid: p1\r\n---\r\nsee  here\r\nsecond CRLF line\r\n"
+    assert after.count(b"\r\n") == before.count(b"\r\n")
+
+
+def test_a_dry_run_predicts_the_scrub_it_performs_on_an_undecodable_file(
+    tmp_path: Path,
+) -> None:
+    """The preview and the apply must agree about an undecodable file (#948).
+
+    The dry-run ledger buffers the rewrite an apply run would have made,
+    so widening the scrub to bytes has to widen the ledger with it. A
+    ledger that could only hold ``str`` would force a second, text-only
+    storage path — and a preview and an apply run that disagree about
+    which files they can even rewrite is exactly the divergence #1340
+    closed.
+    """
+    previewed = _make_vault(tmp_path / "preview")
+    _write_fragment(previewed, "frag-A", "Alpha")
+    previewed_victim = previewed / "04-Praxis" / "note.md"
+    previewed_victim.write_bytes(_UNDECODABLE_REFERRER)
+
+    applied = _make_vault(tmp_path / "apply")
+    _write_fragment(applied, "frag-A", "Alpha")
+    applied_victim = applied / "04-Praxis" / "note.md"
+    applied_victim.write_bytes(_UNDECODABLE_REFERRER)
+
+    preview = PurgeEngine(previewed, dry_run=True).purge_fragment("frag-A")
+    result = PurgeEngine(applied).purge_fragment("frag-A")
+
+    assert preview.wikilinks_removed == result.wikilinks_removed == 1
+    assert preview.provenance_scrubbed == result.provenance_scrubbed == 1
+    assert previewed_victim.read_bytes() == _UNDECODABLE_REFERRER
+    assert applied_victim.read_bytes() == _SCRUBBED_UNDECODABLE_REFERRER
+
+
+# ---------------------------------------------------------------------------
+# fragment_count is decremented without reserialising the header (#949)
+# ---------------------------------------------------------------------------
+
+_HANDWRITTEN_THREAD = (
+    b"---\n"
+    b"# the operator's own note, which no serialiser will keep\n"
+    b"type: thread\n"
+    b"id: thread-1\n"
+    b"title: 'Waves'\n"
+    b"fragment_count: 3\n"
+    b"aaa_after_the_count: kept\n"
+    b"---\n"
+    b"\n"
+    b"Body line one.\n"
+    b"\n"
+    b"Body line two with trailing spaces   \n"
+)
+"""A thread file written by hand rather than by ``frontmatter.dumps``.
+
+Every property here is one PyYAML destroys on a round trip: a comment,
+a key order that is not alphabetical, an explicitly quoted scalar, and
+trailing whitespace on the last body line.
+"""
+
+
+def test_decrement_counts_leaves_the_operators_yaml_exactly_as_written(
+    tmp_path: Path,
+) -> None:
+    """Decrementing one integer must move one integer (#949).
+
+    ``_decrement_counts`` re-serialised the whole file through
+    ``frontmatter.dumps``, so purging a single fragment silently
+    rewrote unrelated metadata on every thread and eddy it touched:
+    comments deleted, keys alphabetised, quoting normalised, trailing
+    whitespace stripped. That is this repository's own byte-identity
+    mandate broken on the **default** path, not on a rare undecodable
+    one — which is why #949's fix is applied unconditionally rather than
+    as a fallback.
+    """
+    vault = _make_vault(tmp_path)
+    thread = vault / "02-Threads" / "Active" / "Waves.md"
+    thread.write_bytes(_HANDWRITTEN_THREAD)
+    _write_fragment(vault, "frag-A", "Alpha", threads=["thread-1"])
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    assert result.threads_updated == 1
+    assert thread.read_bytes() == _HANDWRITTEN_THREAD.replace(
+        b"fragment_count: 3",
+        b"fragment_count: 2",
+    )
+
+
+def test_decrement_counts_previews_the_rewrite_it_performs(
+    tmp_path: Path,
+) -> None:
+    """A dry run counts the decrement it declines to write (#949).
+
+    The splice replaces a load-and-dump pair with a read-and-write pair,
+    and the dry-run branch here does **not** go through the ledger the
+    scrub path uses. Preview and apply must still agree on the number,
+    and the preview must still touch nothing.
+    """
+    previewed = _make_vault(tmp_path / "preview")
+    previewed_thread = previewed / "02-Threads" / "Active" / "Waves.md"
+    previewed_thread.write_bytes(_HANDWRITTEN_THREAD)
+    _write_fragment(previewed, "frag-A", "Alpha", threads=["thread-1"])
+
+    applied = _make_vault(tmp_path / "apply")
+    applied_thread = applied / "02-Threads" / "Active" / "Waves.md"
+    applied_thread.write_bytes(_HANDWRITTEN_THREAD)
+    _write_fragment(applied, "frag-A", "Alpha", threads=["thread-1"])
+
+    preview = PurgeEngine(previewed, dry_run=True).purge_fragment("frag-A")
+    result = PurgeEngine(applied).purge_fragment("frag-A")
+
+    assert preview.threads_updated == result.threads_updated == 1
+    assert previewed_thread.read_bytes() == _HANDWRITTEN_THREAD
+
+
+def test_a_wikilink_target_that_is_not_utf8_is_left_exactly_as_it_is(
+    tmp_path: Path,
+) -> None:
+    """The byte-native scrub still never guesses at a bad sequence (#948).
+
+    Only the captured link *target* is decoded, and a target that is not
+    valid UTF-8 cannot equal a title — which is a ``str`` — so it is
+    refused rather than repaired. That is what keeps the rewrite from
+    ever constructing a U+FFFD while still scrubbing the real reference
+    two characters away in the same file.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-A", "Alpha")
+    victim = vault / "04-Praxis" / "note.md"
+    before = b"---\nid: p1\n---\n\n[[\xff\xfe]] and [[Alpha]] here\n"
+    victim.write_bytes(before)
+
+    result = PurgeEngine(vault).purge_fragment("frag-A")
+
+    assert result.wikilinks_removed == 1
+    assert victim.read_bytes() == b"---\nid: p1\n---\n\n[[\xff\xfe]] and  here\n"
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        pytest.param(b"no header at all\nfragment_count: 3\n", id="no-opening-fence"),
+        pytest.param(b"---\nid: t\nfragment_count: 3\n", id="unterminated-header"),
+        pytest.param(b"---\nid: t\n---\nfragment_count: 3\n", id="count-in-the-body"),
+        pytest.param(b"---\nid: t\n  fragment_count: 3\n---\n", id="indented-count"),
+        pytest.param(b"---\nid: t\nfragment_count: null\n---\n", id="non-integer"),
+    ],
+)
+def test_the_count_splice_declines_anything_it_cannot_edit_in_place(
+    data: bytes,
+) -> None:
+    """The splice never guesses where a header ends or what a value means (#949).
+
+    Each case is a shape a byte-level edit cannot make safely: no header,
+    no closing fence, a ``fragment_count`` that lives in the body or
+    inside a nested mapping rather than at the top level, and a value
+    that is not a plain integer. Declining hands the file to the
+    reserialisation fallback, which is the path that wrote it; guessing
+    would corrupt a thread's frontmatter for the whole vault.
+    """
+    assert _splice_fragment_count(data, 2) is None
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        pytest.param(
+            b"---\nfragment_count: '3'\n---\n",
+            b"---\nfragment_count: '2'\n---\n",
+            id="single-quoted",
+        ),
+        pytest.param(
+            b'---\nfragment_count: "3"\n---\n',
+            b'---\nfragment_count: "2"\n---\n',
+            id="double-quoted",
+        ),
+        pytest.param(
+            b"---\nfragment_count: '10'  # kept\n---\n",
+            b"---\nfragment_count: '2'  # kept\n---\n",
+            id="quoted-with-a-trailing-comment",
+        ),
+    ],
+)
+def test_the_count_splice_keeps_the_quotes_it_found(
+    before: bytes, after: bytes
+) -> None:
+    """A quoted count comes back quoted, because quoting is a type (#949).
+
+    ``fragment_count: '3'`` is a YAML *string*; ``fragment_count: 3`` is
+    an integer. Splicing bare digits into the first one decrements the
+    count and silently retypes the scalar in the same edit — exactly the
+    class of unasked-for header rewrite this splice replaced
+    ``frontmatter.dumps`` to stop doing. The assertion is byte-identity
+    of the whole file, so the quote characters, the two spaces before
+    the comment, and the comment itself all have to survive.
+    """
+    assert _splice_fragment_count(before, 2) == after
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(b"3.5", id="float"),
+        pytest.param(b"3abc", id="digits-then-letters"),
+        pytest.param(b"3,4", id="digits-then-a-comma"),
+        pytest.param(b"0x10", id="hex-ish"),
+        pytest.param(b"'3' extra", id="quoted-then-junk"),
+    ],
+)
+def test_the_count_splice_declines_a_value_the_digits_only_partly_cover(
+    value: bytes,
+) -> None:
+    """Matching a digit run is not the same as parsing the scalar (#949).
+
+    The digit run is greedy but not anchored to the end of the value, so
+    ``fragment_count: 3.5`` matches with ``3`` as the digits and ``.5``
+    left over. Splicing that wrote ``2.5`` -- a corrupted number, from
+    the one function whose contract is that it declines what it cannot
+    edit in place, and whose caller has a reserialisation fallback
+    precisely for these. The trailer is accepted only when it carries no
+    value of its own: spacing, a comment, and the CRLF carriage return.
+
+    Raised in review on PR #1623.
+    """
+    data = b"---\nfragment_count: " + value + b"\n---\n"
+
+    assert _splice_fragment_count(data, 2) is None
+
+
+def test_the_count_splice_declines_a_lopsided_pair_of_quotes() -> None:
+    """One quote is not a quoted scalar, so the splice will not guess (#949).
+
+    ``fragment_count: '3`` is malformed YAML however it is read. Writing
+    back either spelling — inventing the closing quote or dropping the
+    opening one — is a repair this function has no mandate to perform,
+    so it declines and lets the reserialisation fallback decide. Both
+    orientations are pinned because the regex captures the two quotes
+    independently and could plausibly have been written to check only one.
+    """
+    assert _splice_fragment_count(b"---\nfragment_count: '3\n---\n", 2) is None
+    assert _splice_fragment_count(b"---\nfragment_count: 3'\n---\n", 2) is None
+
+
+def test_the_count_splice_moves_only_the_digits(tmp_path: Path) -> None:
+    """The positive control for the guard above, at the byte level (#949).
+
+    Args:
+        tmp_path: Pytest temporary directory, unused but kept for parity
+            with the suite's fixtures.
+    """
+    assert tmp_path.is_dir()
+    data = b"---\r\nfragment_count: 3  # a note\r\nid: t\r\n---\r\nbody\r\n"
+
+    assert _splice_fragment_count(data, 2) == (
+        b"---\r\nfragment_count: 2  # a note\r\nid: t\r\n---\r\nbody\r\n"
+    )
+
+
+def test_wikilink_scrub_is_not_switched_off_by_a_doomed_file_claiming_the_title(
+    tmp_path: Path,
+) -> None:
+    """A file this purge also destroys must not shelter the title (#903).
+
+    The exact-case shelter exists for a *case variant* a **surviving**
+    page claims. Extending it to the purged page's own spelling makes
+    the scrub self-defeating: any other ``.md`` in the vault naming the
+    same string switches the primary substitution off, and several of
+    them are files this very purge deletes moments later — an Adepthood
+    staging document (swept after the scrub, by design, so it is still
+    on disk when the claimant scan runs), an intimate-body stub, or a
+    sibling fragment titled the same thing.
+
+    The regression that direction causes is total: ``[[Secret Title]]``
+    is the link the scrub removed *before* #903 widened it, so widening
+    must never cost it. Byte-identity of the rest of the note is
+    asserted for the same reason it is on the widening tests.
+    """
+    vault = _make_vault(tmp_path)
+    _write_fragment(vault, "frag-a", "Secret Title")
+    staged = vault / "00-Creek-Meta" / "adepthood" / "uploads" / "upload-1.md"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_text(
+        "---\ntitle: Secret Title\n---\n\nthe uploaded document\n",
+        encoding="utf-8",
+    )
+    ref = vault / "04-Praxis" / "note.md"
+    ref.parent.mkdir(parents=True, exist_ok=True)
+    ref.write_text("link: [[Secret Title]]\nkept line\n", encoding="utf-8")
+
+    result = PurgeEngine(vault).purge_fragment("frag-a")
+
+    assert result.wikilinks_removed == 1
+    assert ref.read_text(encoding="utf-8") == "link: \nkept line\n"
