@@ -112,8 +112,14 @@ done
 cd "$PROJECT_ROOT"
 
 # Stale bytecode in local test runs can cause false greens when mtime and size
-# are preserved (issue #1187). Setting PYTHONDONTWRITEBYTECODE=1 ensures pytest
-# always executes live sources directly, matching CI's clean-tree behaviour.
+# are preserved (issue #1187). PYTHONDONTWRITEBYTECODE alone only stops new
+# .pyc files from being *written*; it does not stop the import system from
+# *reading* an existing stale .pyc from __pycache__/. Redirecting the bytecode
+# cache to a fresh per-run temp directory means there is nothing stale to read,
+# so pytest always executes against live sources.
+PYCACHE_TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$PYCACHE_TMPDIR"' EXIT
+export PYTHONPYCACHEPREFIX="$PYCACHE_TMPDIR"
 export PYTHONDONTWRITEBYTECODE=1
 
 # Fail fast with an actionable message if the Python toolchain is missing
