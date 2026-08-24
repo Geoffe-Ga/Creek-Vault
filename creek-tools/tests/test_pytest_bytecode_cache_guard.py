@@ -1,4 +1,4 @@
-"""Static and behavioural guards ensuring scripts/test.sh prevents stale bytecode false greens.
+"""Static and behavioural guards for scripts/test.sh's stale-bytecode false-green fix.
 
 Issue #1187: CPython's .pyc invalidation is keyed on (mtime, size). When a source
 file changes while both are preserved (e.g. tar -x, rsync -t, same-length edits),
@@ -16,9 +16,12 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from tests.shell_command_support import SCRIPTS_DIR, non_comment_lines
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 _ORIGINAL_SOURCE = "VALUE = 1\n"
 _REWRITTEN_SOURCE = "VALUE = 9\n"
@@ -45,7 +48,9 @@ def test_test_script_redirects_pycache_to_a_fresh_tmpdir() -> None:
     )
 
 
-def _seed_and_reimport(module_dir: Path, pycache_dir: Path | None) -> subprocess.CompletedProcess[str]:
+def _seed_and_reimport(
+    module_dir: Path, pycache_dir: Path | None
+) -> subprocess.CompletedProcess[str]:
     """Import target_mod once (seeding any bytecode cache), then import it again
     after the source has been rewritten in place with mtime and size preserved,
     returning the result of the second import's assertion on the observed value.
@@ -78,9 +83,8 @@ def _seed_and_reimport(module_dir: Path, pycache_dir: Path | None) -> subprocess
     run_cmd = [
         sys.executable,
         "-c",
-        "import sys; sys.path.insert(0, r'{}'); import target_mod; print(target_mod.VALUE)".format(
-            module_dir
-        ),
+        f"import sys; sys.path.insert(0, r'{module_dir}'); "
+        "import target_mod; print(target_mod.VALUE)",
     ]
     return subprocess.run(run_cmd, env=seed_env, capture_output=True, text=True)
 
