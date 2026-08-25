@@ -1,6 +1,19 @@
 version: 2
 updates:
-  - package-ecosystem: "pip"
+  # `uv`, not `pip` (issue #1085). `creek-tools/uv.lock` is the canonical
+  # environment: every CI job provisions with `uv export --locked`
+  # (ci.yml, deslop.yml, _claude-scan.yml), which aborts when the lock
+  # disagrees with pyproject.toml. The pip ecosystem reads declared
+  # specifiers only -- GitHub scopes it to requirements `.txt` files and
+  # PEP 621 `pyproject.toml`, and gives uv its own ecosystem value -- so
+  # a pip entry here edited pyproject.toml alone and every dependency PR
+  # arrived with a stale lock that reddened the whole matrix before a
+  # single test ran. `versioning-strategy: lockfile-only` does not
+  # rescue pip: pip never opens uv.lock, so the pairing yields no PRs at
+  # all. `uv` is a first-class ecosystem (supported since v0.11) and
+  # accepts every option below. Guarded by
+  # creek-tools/tests/test_dependabot_lock_awareness.py.
+  - package-ecosystem: "uv"
     directory: "/creek-tools"
     schedule:
       interval: "weekly"

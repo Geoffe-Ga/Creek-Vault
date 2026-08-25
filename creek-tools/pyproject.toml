@@ -197,13 +197,19 @@ dev = [
     # .pre-commit-config.yaml's ruff-pre-commit rev so the three install
     # paths (uv sync, pip install -e '.[dev]', pre-commit) run the same
     # ruff version. Bumping requires updating all three together
-    # (issues #206, #409).
-    "ruff>=0.15.13,<0.16",
+    # (issues #206, #409). Both ends move together: taking a ceiling
+    # widening alone leaves the band spanning two minor lines, which is
+    # the drift this pin exists to prevent. 0.15.13 -> 0.16.4 (#1440);
+    # the agreement is asserted by
+    # tests/test_dependency_pins.py::_LOCKSTEP_TOOLS.
+    "ruff>=0.16.4,<0.17",
     # Pinned to the same major.minor as uv.lock and
     # .pre-commit-config.yaml's mirrors-mypy rev so the three install
     # paths (uv sync, pip install -e '.[dev]', pre-commit) run the same
-    # mypy version. Bumping requires updating all three together.
-    "mypy>=2.1.0,<2.2.0",
+    # mypy version. Bumping requires updating all three together, both
+    # ends at once, for the reason on the ruff pin above.
+    # 2.1.0 -> 2.3.1 (#1440).
+    "mypy>=2.3.1,<2.4.0",
     "pylint>=4.0.7",
     # Pinned to the same version as uv.lock and .pre-commit-config.yaml's
     # PyCQA/bandit rev so the three install paths run the same bandit
@@ -418,7 +424,13 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 warn_no_return = true
 strict_equality = true
-strict_concatenate = true
+# `extra_checks`, not the `strict_concatenate` this replaced: mypy 2.3
+# prints "--strict-concatenate is deprecated; use --extra-checks instead"
+# on every run, and a deprecated flag is removed at some major. The
+# replacement is a superset — it keeps the Concatenate[] prefix check and
+# adds the TypedDict and overload-signature checks — so this tightens the
+# gate rather than trading it away (#1440).
+extra_checks = true
 
 [[tool.mypy.overrides]]
 # vulture ships no py.typed marker, so its Vulture/Item surface is Any.
@@ -483,6 +495,14 @@ disallow_untyped_defs = false
 [tool.ruff]
 line-length = 88
 target-version = "py311"
+# ruff 0.16 added "*.md" to the default `include`, so the formatter began
+# rewriting Python fenced blocks inside prose. Declined deliberately: the
+# samples in docs/ are illustrative, not executable — several are
+# deliberately aligned into comment tables, and one is a bare continuation
+# fragment that is not valid standalone Python — so reformatting them makes
+# the documentation harder to read without making any shipped code safer.
+# Markdown prose is a docs concern, not a lint surface (#1440).
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = [
