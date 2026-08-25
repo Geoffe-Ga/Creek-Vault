@@ -144,16 +144,32 @@ done
 
 cd "$PROJECT_ROOT"
 
-# Stale bytecode in local test runs can cause false greens when mtime and size
-# are preserved (issue #1187). PYTHONDONTWRITEBYTECODE alone only stops new
-# .pyc files from being *written*; it does not stop the import system from
-# *reading* an existing stale .pyc from __pycache__/. Redirecting the bytecode
-# cache to a fresh per-run temp directory means there is nothing stale to read,
-# so pytest always executes against live sources.
-PYCACHE_TMPDIR="$(mktemp -d)"
+# Stale bytecode makes this gate lie. CPython invalidates a cached .pyc on
+# (mtime, size), so a source rewrite that preserves both — `tar -x`, `rsync -t`,
+# `cp -p`, a same-length edit, a branch switch onto an older-but-same-size file —
+# leaves the old bytecode looking valid, and the suite runs code that is no
+# longer on disk (issue #1187).
+#
+# PYTHONDONTWRITEBYTECODE=1 (equivalently `python -B`) does NOT close this. It
+# stops Python *writing* new .pyc files; it does not stop the import system
+# *reading* the stale one that is already in __pycache__/, which is every tree
+# that has run the suite once. That is not an argument from the docs: it is
+# asserted against the running interpreter by
+# tests/test_pytest_bytecode_cache_guard.py.
+#
+# Pointing PYTHONPYCACHEPREFIX at a fresh per-run temp directory is what
+# actually closes it — the cache lookup goes somewhere that starts empty, so
+# there is nothing stale to read and every module is compiled from live source.
+# It costs ~7s on this tree (everything recompiles once per run, measured on
+# collection alone: 2.8s warm vs 10.3s with a fresh prefix) and the trap
+# reclaims the ~50MB afterwards.
+#
+# The template is explicit for two reasons: BSD mktemp (macOS) ignores TMPDIR
+# without one, and a stray `creek-pycache.*` left by a killed run is traceable
+# where a bare `tmp.XXXXXX` is not.
+PYCACHE_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/creek-pycache.XXXXXX")"
 trap 'rm -rf "$PYCACHE_TMPDIR"' EXIT
 export PYTHONPYCACHEPREFIX="$PYCACHE_TMPDIR"
-export PYTHONDONTWRITEBYTECODE=1
 
 # Fail fast with an actionable message if the Python toolchain is missing
 # (fresh checkout, never ran dev-setup) rather than an opaque ImportError.
