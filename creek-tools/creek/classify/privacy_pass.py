@@ -17,8 +17,10 @@ close that hole:
   fragment's voice signals; escalate-only, and only on new evidence.
   Both entry points call it, each as its last mutation before the write
   (#974).
+* :func:`edit_added_evidence` — did an in-place *rewrite* introduce a
+  privacy signal the old body lacked? (#1136)
 
-Three rules hold across every function here:
+Four rules hold across every function here:
 
 **Never auto-downgrade.** Lowering a tier is the only direction that
 leaks content, so both the ``--force`` merge and the post-classification
@@ -34,6 +36,22 @@ That is why the pass needs no notion of *who* wrote the tier (the
 frontmatter carries no such provenance): it acts only on evidence that
 did not exist when the tier was written, so a settled decision cannot be
 overturned by a re-run over unchanged input.
+
+**A changed body is new evidence only where it differs** (#1136). The
+rule above assumes the input is unchanged; in-place re-ingest (#673)
+breaks that assumption, and :func:`edit_added_evidence` restores it by
+asking what the *edit* introduced rather than what the fragment as a
+whole now scores. The aggregate comparison :func:`reassess` uses is
+necessary but not sufficient here: on a self-authored journal entry the
+platform axis pins the verdict at ``intimate`` for any body at all, so an
+aggregate gate saturates and can never fire — burying the operator's own
+weaker tier on the first benign edit and never letting it back out
+(issue #1136). The extra half is
+:meth:`~creek.classify.privacy.PrivacyClassifier.body_evidence_tier`,
+which reports what the body *alone* proves and so sees past the
+saturated axes. Both halves are one-directional: they license an
+escalation and never a downgrade, and the merge behind them is still
+:func:`escalate`.
 
 **Never yield ``unclassified``.**
 :meth:`~creek.classify.privacy.PrivacyClassifier.classify_tier` always
@@ -317,3 +335,78 @@ def reassess(
     if merged is current:
         return fragment
     return classifier.enforce_tier(fragment, merged)
+
+
+def edit_added_evidence(
+    fragment: Fragment,
+    *,
+    old_body: str,
+    new_body: str,
+    classifier: PrivacyClassifier,
+) -> bool:
+    """Return whether a rewrite introduced privacy evidence the old body lacked.
+
+    The gate for the in-place-rewrite re-tier (#1136). An automatic
+    re-classification may raise a tier already on disk **only on evidence
+    the edit itself introduced** — never on authorship or platform, which
+    the edit cannot have changed and which the operator has already
+    overruled by writing a weaker tier by hand.
+
+    Two disjuncts, either of which is sufficient:
+
+    1. **The aggregate moved.** ``escalate`` the classifier's verdict on
+       the old body against its verdict on the new one; a strictly more
+       restrictive result means this edit changed the answer. This is the
+       same shape as :func:`reassess`'s gate, and it self-maintains: a
+       future body-derived rule whose verdict moves is caught here
+       without touching this function.
+    2. **The body's own claim strengthened.** The aggregate verdict
+       saturates whenever a body-independent axis already pins it at
+       ``intimate`` — self-authored journal entries, which are the
+       *primary* population of the in-place update path (#673). There
+       disjunct 1 is silent for every possible edit, so this disjunct
+       asks
+       :meth:`~creek.classify.privacy.PrivacyClassifier.body_evidence_tier`
+       what the body alone proves and fires when the new body proves
+       something the old one did not.
+
+    Without disjunct 2 this gate would trade a fail-*closed* bug for a
+    fail-*open* one on exactly the fragments the fix is for: a journal
+    entry the operator marked ``open``, later rewritten to contain
+    recovery material, would keep its ``open`` tier and stay readable at
+    an OPEN ceiling. With it, that rewrite still escalates.
+
+    The comparison is one-directional by construction. Both disjuncts
+    test for a *strengthening*, so an edit that *removes* evidence
+    returns ``False`` — and even a ``True`` only licenses the caller's
+    :func:`escalate` merge, which cannot lower anything.
+
+    Residual, stated plainly: an edit that adds intimate material using
+    none of :data:`~creek.classify.privacy.RECOVERY_KEYWORDS` does not
+    fire either disjunct on a saturated fragment, so it will not escalate
+    over an operator's tier. Nor would it have before this gate existed —
+    the classifier's verdict is identical on both bodies there, so the
+    old code's escalation came purely from the platform axis, which is
+    not evidence about the edit. This gate never suppresses an escalation
+    that new-body evidence would have produced.
+
+    Pure: no vault, no I/O, no LLM — two keyword/metadata classifications.
+
+    Args:
+        fragment: The fragment being rewritten, supplying the authorship,
+            platform and voice axes. Never mutated.
+        old_body: The body currently on disk, before the rewrite.
+        new_body: The body about to replace it.
+        classifier: The shared :class:`PrivacyClassifier`.
+
+    Returns:
+        ``True`` when the edit introduced evidence that licenses raising
+        a tier already on record.
+    """
+    before = classifier.classify_tier(fragment, content=old_body)
+    after = classifier.classify_tier(fragment, content=new_body)
+    if escalate(before, after) is not before:
+        return True
+    old_evidence = classifier.body_evidence_tier(fragment, old_body)
+    new_evidence = classifier.body_evidence_tier(fragment, new_body)
+    return new_evidence is not None and old_evidence is None
