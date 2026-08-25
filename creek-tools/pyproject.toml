@@ -97,7 +97,7 @@ creek-tools-api = "creek_mcp.httpapi.cli:main"
 # `openai<3.0.0` (#1479) already hold open, so all three move together
 # or not at all. The LLM SDK line is issue #999's. Floor is the release
 # uv.lock resolves. Vetting tracked in #1593.
-anthropic = ["anthropic>=0.125.0,<1.0.0"]
+anthropic = ["anthropic>=0.125.0,<2.0.0"]
 # Transport hold, not a CVE (OSV reports no advisories for openai):
 # openai 3.0.0 swapped `httpx<1,>=0.23.0` for `httpx2<3,>=2.7.0` — a
 # separate distribution, not a version bump — dragging httpcore2,
