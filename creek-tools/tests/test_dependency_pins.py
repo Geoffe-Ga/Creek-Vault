@@ -222,6 +222,8 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
+from tests.shell_command_support import PRE_COMMIT_CONFIG, load_yaml
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -1808,4 +1810,168 @@ def test_locked_rpds_py_is_on_the_calver_line() -> None:
     assert locked.major >= _RPDS_PY_CALVER_FLOOR.major, (
         f"uv.lock pins rpds-py {locked}, whose leading component "
         f"{locked.major} is not a CalVer year; the 0.x line is abandoned"
+    )
+
+
+@dataclass(frozen=True)
+class _LockstepTool:
+    """One gate tool whose version must agree across all three install paths.
+
+    Attributes:
+        distribution: Distribution name, as declared and as locked.
+        pre_commit_repo: ``repo:`` URL of the hook that runs the tool.
+        superseded_version: The version the current band replaced. Probed
+            to prove the *floor* moved and not only the ceiling: a
+            ceiling-only widening leaves the band spanning two minor
+            lines, so the three paths can silently resolve differently
+            again.
+        rationale: Why this tool is version-locked, quoted into failures.
+    """
+
+    distribution: str
+    pre_commit_repo: str
+    superseded_version: Version
+    rationale: str
+
+
+#: Every tool whose version is asserted across pyproject.toml, uv.lock and
+#: .pre-commit-config.yaml at once (issue #1440). Only tools whose band is
+#: meant to admit a *single* minor line belong here: ``bandit`` is pinned
+#: three ways too, but its ``<2`` band deliberately admits the whole 1.x
+#: series, so a one-minor-line assertion would be wrong for it.
+#: Emptying this table would make the guard vanish behind a green gate, so
+#: ``test_every_lockstep_tool_is_guarded`` asserts the membership rather
+#: than trusting the parametrisation.
+_LOCKSTEP_TOOLS: tuple[_LockstepTool, ...] = (
+    _LockstepTool(
+        distribution="ruff",
+        pre_commit_repo="https://github.com/astral-sh/ruff-pre-commit",
+        superseded_version=Version("0.15.13"),
+        rationale=(
+            "ruff is both the linter and the formatter for this "
+            "repository; two minor lines disagree about formatting, so a "
+            "pre-commit run and ./scripts/check-all.sh would rewrite each "
+            "other's output forever"
+        ),
+    ),
+    _LockstepTool(
+        distribution="mypy",
+        pre_commit_repo="https://github.com/pre-commit/mirrors-mypy",
+        superseded_version=Version("2.1.0"),
+        rationale=(
+            "mypy runs under --strict here, and inference sharpens "
+            "between minor releases; a commit hook on an older mypy "
+            "passes code that ./scripts/typecheck.sh and CI reject"
+        ),
+    ),
+)
+
+
+def _pre_commit_rev(repo: str) -> Version:
+    """Return the version a ``.pre-commit-config.yaml`` hook repo is pinned to.
+
+    Args:
+        repo: The ``repo:`` URL to find.
+
+    Returns:
+        The parsed ``rev``, with any leading ``v`` stripped. Parsing the
+        YAML (rather than scanning text) is what keeps the explanatory
+        comment above each ``rev`` from satisfying the assertion.
+    """
+    config = load_yaml(PRE_COMMIT_CONFIG)
+    for entry in config["repos"]:
+        if entry.get("repo") == repo:
+            return Version(str(entry["rev"]).lstrip("v"))
+    pre_commit_name = PRE_COMMIT_CONFIG.name
+    pytest.fail(f"{pre_commit_name} declares no hook repo {repo!r}")
+
+
+def _declared_floor(specifier: SpecifierSet, distribution: str) -> Version:
+    """Return the single ``>=`` floor of a declared specifier set.
+
+    Args:
+        specifier: The specifier set declared in ``pyproject.toml``.
+        distribution: Distribution the specifier belongs to, for messages.
+
+    Returns:
+        The floor version. Fails the calling test when the declaration
+        carries no floor or more than one, either of which makes
+        "the declared version" ambiguous.
+    """
+    floors = [Version(spec.version) for spec in specifier if spec.operator == ">="]
+    if len(floors) != 1:
+        pytest.fail(
+            f"{distribution} declares {specifier!r}, which has "
+            f"{len(floors)} `>=` floors; exactly one is required for the "
+            "three install paths to name the same version"
+        )
+    return floors[0]
+
+
+@pytest.mark.parametrize("tool", _LOCKSTEP_TOOLS, ids=lambda t: t.distribution)
+def test_pin_agrees_across_pyproject_lock_and_precommit(tool: _LockstepTool) -> None:
+    """A gate tool resolves to one version on all three install paths.
+
+    ``uv sync``, ``pip install -e '.[dev]'`` and ``pre-commit`` each
+    provision the tool independently. Nothing but this assertion keeps
+    them together: bumping the Dependabot-facing specifier without the
+    hook ``rev`` leaves the commit gate and CI running different builds
+    of the same tool, which is how a hook passes code CI then rejects.
+    """
+    declared = _declared_floor(
+        _extra_specifier("dev", tool.distribution), tool.distribution
+    )
+    locked = _locked_distribution_version(tool.distribution)
+    hooked = _pre_commit_rev(tool.pre_commit_repo)
+    assert declared == locked == hooked, (
+        f"{tool.distribution} disagrees across the three install paths: "
+        f"pyproject.toml declares >={declared}, uv.lock resolves {locked}, "
+        f"and .pre-commit-config.yaml pins rev v{hooked}. {tool.rationale}. "
+        f"Move all three together, then re-run `uv lock`"
+    )
+
+
+@pytest.mark.parametrize("tool", _LOCKSTEP_TOOLS, ids=lambda t: t.distribution)
+def test_lockstep_band_admits_one_minor_line(tool: _LockstepTool) -> None:
+    """A gate tool's band spans exactly the minor line it is pinned to.
+
+    Adopting a Dependabot ceiling widening on its own -- taking
+    ``<0.17`` while the floor stays at ``0.15.13`` -- reads like a bump
+    and is not one: the band then admits two minor lines, so the three
+    install paths are free to resolve differently again the moment one
+    of them refreshes. The superseded version must be excluded from
+    below and the next minor from above.
+    """
+    specifier = _extra_specifier("dev", tool.distribution)
+    floor = _declared_floor(specifier, tool.distribution)
+    next_minor = Version(f"{floor.major}.{floor.minor + 1}.0")
+    assert str(floor) in specifier, (
+        f"{tool.distribution} declares {specifier!r}, which rejects its "
+        f"own floor {floor}"
+    )
+    assert str(tool.superseded_version) not in specifier, (
+        f"{tool.distribution} declares {specifier!r}, which still admits "
+        f"the superseded {tool.superseded_version}; the floor must move "
+        f"with the ceiling, or the band spans two minor lines"
+    )
+    assert str(next_minor) not in specifier, (
+        f"{tool.distribution} declares {specifier!r}, which admits "
+        f"{next_minor}; a gate tool must not cross a minor line without "
+        f"the hook rev and the lock moving with it. {tool.rationale}"
+    )
+
+
+def test_every_lockstep_tool_is_guarded() -> None:
+    """Both three-way-pinned gate tools are present in the table.
+
+    Deleting a row would empty its parametrisation, and pytest reports
+    zero cases as a pass -- so the guard would disappear behind a green
+    gate rather than fail. Asserting the membership is what makes that
+    impossible.
+    """
+    guarded = {tool.distribution for tool in _LOCKSTEP_TOOLS}
+    assert guarded == {"ruff", "mypy"}, (
+        f"_LOCKSTEP_TOOLS guards {sorted(guarded)!r}; ruff and mypy are "
+        "both pinned in pyproject.toml, uv.lock and "
+        ".pre-commit-config.yaml, and both must stay guarded"
     )

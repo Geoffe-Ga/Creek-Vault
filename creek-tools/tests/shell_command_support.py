@@ -34,6 +34,7 @@ CI_WORKFLOW = WORKFLOWS_DIR / "ci.yml"
 RALPH_WORKFLOW = WORKFLOWS_DIR / "ralph-recap-tests.yml"
 RALPH_SCRIPTS_DIR = REPO_ROOT / "scripts" / "ralph"
 PRE_COMMIT_CONFIG = CREEK_TOOLS_DIR / ".pre-commit-config.yaml"
+DEPENDABOT_CONFIG = REPO_ROOT / ".github" / "dependabot.yml"
 
 
 def non_comment_lines(script: Path) -> list[str]:
