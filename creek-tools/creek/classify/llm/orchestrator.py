@@ -278,7 +278,14 @@ class LLMClassifier:
             changed it, which callers read as "this run marked nothing".
         """
         updates: dict[str, object] = {}
-        _apply_frequency(data, updates)
+        # Issue #1637: the frequency block needs the one the fragment already
+        # carries — a response whose ``frequency:`` mapping names no ``primary``
+        # (or names junk) must not replace a recorded one with the sentinel. It
+        # is the last legacy writer on this path to stop rebuilding wholesale;
+        # unlike its siblings it cannot route through
+        # ``evidence.layer_determined_over``, because ``secondary`` is a list
+        # whose empty default is a deliberate clear rather than a silence.
+        _apply_frequency(data, updates, fragment.frequency)
         # Issue #1421: the wavelength block merges axis-by-axis for the same
         # reason the voice block does — a response naming only ``phase`` must
         # not blank a recorded ``descriptor``/``color``/``mode``, and the

@@ -63,17 +63,28 @@ Callers:
   sparse dump omits. The reasoning is recorded on
   ``calibration._BIASED_DIMENSIONS``.
 
-One writer is still **not** a caller:
-``creek.classify.llm.parsing._apply_frequency`` rebuilds the frequency
-block wholesale, so a response whose ``frequency:`` block names no
-``primary`` replaces a recorded one with the sentinel. That is the same
-shape of defect, tracked on its own issue (#1637) rather than folded in
-here because frequency also carries a deliberate asymmetry the scalar
-axes do not — ``secondary`` is a list, and
+One writer implements the same rule without calling this function, and
+that is deliberate rather than an oversight:
+``creek.classify.llm.parsing._apply_frequency`` (#1637). It used to
+rebuild the frequency block wholesale — a response whose ``frequency:``
+block named no ``primary`` replaced a recorded one with the sentinel —
+and #1637 closed that. It stayed a *sibling* of this function rather
+than becoming a caller because the frequency block breaks the
+``exclude_defaults`` invariant above:
+:attr:`~creek.models.FrequencyClassification.secondary` is a list, and
+its empty default is a **deliberate clear**, not a "not determined"
+sentinel. A named primary is supposed to replace the secondaries
+wholesale so stale ones from an earlier verdict do not accumulate — the
+asymmetry
 :meth:`~creek.classify.weighted.WeightedFragmentClassification.merge_onto`
-replaces it wholesale on purpose. No frequency axis feeds a privacy
-control either, so like the wavelength block it is metadata loss rather
-than a fail-open.
+and ``creek.classify.rules.RuleClassifier._layer_over_fragment`` both
+spell out. Dumping such a verdict with ``exclude_defaults=True`` would
+drop that empty list and let the stale secondaries survive, inverting
+the intended behaviour. So ``_apply_frequency`` carries bespoke
+key-presence logic: primary layered, secondary replaced. Do not "tidy"
+it into a call to this function; the four places that reasoning is
+written down (here, that function, ``merge_onto``, and
+``_layer_over_fragment``) must stay in sync.
 """
 
 from __future__ import annotations

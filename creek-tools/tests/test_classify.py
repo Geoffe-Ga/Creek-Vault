@@ -131,6 +131,34 @@ def _make_wavelength_fragment() -> Fragment:
     )
 
 
+def _make_frequency_fragment() -> Fragment:
+    """Create a Fragment already carrying a recorded frequency block (#1637).
+
+    :func:`_make_fragment` leaves ``frequency`` at the model default,
+    ``primary=unclassified`` with an empty ``secondary`` — which is
+    byte-identical to what a wholesale rebuild writes back. Any assertion
+    built on it is therefore structurally blind to erasure, exactly as
+    :func:`_make_wavelength_fragment` and :func:`_make_praxis_fragment`
+    document for their own axes.
+
+    Both fields are non-default so each has something distinct to lose: a
+    response that names no ``primary`` must leave ``F3`` standing, and a
+    response that names one must still clear ``[F5, F7]``.
+
+    Returns:
+        A Fragment identical to :func:`_make_fragment`'s but carrying a
+        populated frequency block.
+    """
+    return _make_fragment().model_copy(
+        update={
+            "frequency": FrequencyClassification(
+                primary=Frequency.F3,
+                secondary=[Frequency.F5, Frequency.F7],
+            ),
+        },
+    )
+
+
 # ---- Module __init__ re-exports ----
 
 
@@ -4197,3 +4225,195 @@ class TestWavelengthEvidenceReachesDisk:
         assert "descriptor: Social Anxiety" in written
         assert "mode: inhabit" in written
         assert "phase: rising" in written
+
+
+# ---- Frequency merge: silence must not erase evidence (issue #1637) ---------
+
+
+class TestFrequencyMergePreservesEvidence:
+    """Issue #1637: a frequency-silent response must not blank the record.
+
+    ``_apply_frequency`` was the last legacy writer on the single-pick LLM
+    path still rebuilding its block wholesale: any ``frequency:`` mapping
+    at all, however empty, wrote a fresh
+    :class:`~creek.models.FrequencyClassification` whose ``primary`` fell
+    back to the ``unclassified`` sentinel. A response naming only
+    ``secondary`` — or an empty ``frequency: {}`` — therefore replaced a
+    recorded primary with the sentinel.
+
+    The deliberate asymmetry is pinned here too, because the tempting
+    over-correction (routing this through
+    :func:`~creek.classify.evidence.layer_determined_over`) would break
+    it: ``secondary`` defaults to ``[]``, so an ``exclude_defaults`` dump
+    omits it and stale secondaries would survive a primary that replaced
+    them on purpose. The axes are asserted one per test for the same
+    reason #1421 did it — the recurring failure on this defect class is
+    partial coverage that fixes one axis and leaves the other blanked.
+    """
+
+    @staticmethod
+    def _apply(block: object) -> Fragment:
+        """Apply a response whose ``frequency`` key holds *block*.
+
+        Args:
+            block: The value to send under the ``frequency`` key.
+
+        Returns:
+            The fragment from :func:`_make_frequency_fragment` after the
+            response is applied.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"frequency": block}
+        return classifier._apply_classification(_make_frequency_fragment(), data)
+
+    def test_determined_primary_still_wins(self) -> None:
+        """The primary the response *did* name is still adopted."""
+        assert self._apply({"primary": "F6"}).frequency.primary == Frequency.F6
+
+    def test_determined_primary_still_clears_stale_secondaries(self) -> None:
+        """THE ASYMMETRY: a named primary replaces ``secondary`` wholesale.
+
+        ``secondary`` is a list and cannot be merged field-wise, so a
+        fresh primary carries a fresh secondary set with it — including
+        the empty one. Preserving ``[F5, F7]`` here would mean stale
+        secondaries accumulate across runs, which is the behaviour
+        :meth:`~creek.classify.weighted.WeightedFragmentClassification.merge_onto`
+        exists to prevent on the weighted path.
+        """
+        assert self._apply({"primary": "F6"}).frequency.secondary == []
+
+    def test_secondary_only_response_keeps_recorded_primary(self) -> None:
+        """A response silent about ``primary`` leaves the recorded one standing."""
+        assert self._apply({"secondary": ["F9"]}).frequency.primary == Frequency.F3
+
+    def test_secondary_only_response_adopts_the_named_secondary(self) -> None:
+        """The secondaries the response *did* name are still adopted."""
+        assert self._apply({"secondary": ["F9"]}).frequency.secondary == [Frequency.F9]
+
+    def test_empty_frequency_block_keeps_the_recorded_primary(self) -> None:
+        """An empty ``frequency: {}`` decides nothing, so it erases nothing."""
+        assert self._apply({}).frequency.primary == Frequency.F3
+
+    def test_empty_frequency_block_keeps_the_recorded_secondaries(self) -> None:
+        """An empty block leaves the recorded secondaries alone as well."""
+        assert self._apply({}).frequency.secondary == [Frequency.F5, Frequency.F7]
+
+    def test_empty_frequency_block_writes_no_key(self) -> None:
+        """A block that decides nothing writes no update at all.
+
+        ``_apply_classification`` reads an empty ``updates`` dict as
+        "this run marked nothing" and returns the *same object*. A
+        value-equal copy would be a no-op in value terms while still
+        blurring the object-identity signal callers read.
+        """
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_frequency_fragment()
+
+        assert classifier._apply_classification(frag, {"frequency": {}}) is frag
+
+    def test_unparseable_primary_is_not_adopted(self) -> None:
+        """Junk in ``primary`` is not adopted as ``unclassified``.
+
+        Parsing through the *optional* helper is what makes "the model
+        named nothing" and "the model named junk" indistinguishable at
+        the write site — both surface as "not determined". #1421 settled
+        this same shape as "do not adopt the noisy pick".
+        """
+        assert self._apply({"primary": "nonsense"}).frequency.primary != (
+            Frequency.UNCLASSIFIED
+        )
+
+    def test_unparseable_primary_does_not_erase(self) -> None:
+        """Junk in ``primary`` leaves the recorded primary standing."""
+        assert self._apply({"primary": "nonsense"}).frequency.primary == Frequency.F3
+
+    def test_explicit_unclassified_primary_does_not_erase(self) -> None:
+        """A model that literally answers ``unclassified`` decides nothing.
+
+        The sentinel is the "not determined" value for this axis, so a
+        response carrying it is silence spelled out, not a verdict that
+        the recorded ``F3`` was wrong.
+        """
+        assert self._apply({"primary": "unclassified"}).frequency.primary == (
+            Frequency.F3
+        )
+
+    def test_non_list_secondary_does_not_erase(self) -> None:
+        """A malformed scalar ``secondary`` leaves the recorded list standing."""
+        assert self._apply({"secondary": "F9"}).frequency.secondary == [
+            Frequency.F5,
+            Frequency.F7,
+        ]
+
+    def test_all_unclassified_secondary_entries_do_not_erase(self) -> None:
+        """A ``secondary`` list that parses to nothing decides nothing.
+
+        The loop already drops ``unclassified`` and unparseable entries,
+        so such a list is indistinguishable from silence — and silence
+        must not clear the recorded secondaries.
+        """
+        assert self._apply({"secondary": ["unclassified", "junk"]}).frequency == (
+            _make_frequency_fragment().frequency
+        )
+
+    def test_absent_frequency_key_is_still_a_no_op(self) -> None:
+        """No ``frequency`` key at all writes no update, as before the merge."""
+        classifier = LLMClassifier(config=LLMConfig())
+        frag = _make_frequency_fragment()
+
+        assert classifier._apply_classification(frag, {}) is frag
+
+    def test_a_full_response_wins_every_axis_it_contests(self) -> None:
+        """The merge is directional: a fresh verdict beats a recorded one.
+
+        Every other preservation test fixtures an axis the response is
+        *silent* about, where "prior survives" and "the merge ran
+        backwards" are the same observation. This contests both axes.
+        """
+        result = self._apply({"primary": "F6", "secondary": ["F9", "F1"]})
+
+        assert result.frequency.primary == Frequency.F6
+        assert result.frequency.secondary == [Frequency.F9, Frequency.F1]
+
+    def test_a_determined_primary_still_lands_with_no_prior(self) -> None:
+        """With nothing recorded, the response's pick is adopted as before."""
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"frequency": {"primary": "F6"}}
+
+        result = classifier._apply_classification(_make_fragment(), data)
+
+        assert result.frequency.primary == Frequency.F6
+
+
+class TestFrequencyEvidenceReachesDisk:
+    """Issue #1637: the preserved primary must survive the round-trip to disk.
+
+    An in-memory assertion alone would not have caught the reported
+    symptom, which was operators finding blanked frequency blocks in
+    their vault files.
+    """
+
+    def test_preserved_primary_is_written_to_frontmatter(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A primary the response never mentioned still lands in the file."""
+        from creek.scaffold import scaffold_vault
+        from creek.vault.writer import VaultWriter
+
+        classifier = LLMClassifier(config=LLMConfig())
+        data: dict[str, object] = {"frequency": {"secondary": ["F9"]}}
+        classified = classifier._apply_classification(
+            _make_frequency_fragment(),
+            data,
+        )
+
+        scaffold_vault(tmp_path)
+        path = VaultWriter(vault_path=tmp_path).write_fragment(
+            classified,
+            body="body text",
+        )
+        written = path.read_text(encoding="utf-8")
+
+        assert "primary: F3" in written
+        assert "- F9" in written
