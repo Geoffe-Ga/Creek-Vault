@@ -114,7 +114,7 @@ embeddings = [
     # `uv lock --upgrade` crossed the major three days later. Floor is
     # the release uv.lock resolves; `<6.0.0` holds the major for the
     # vetting pass #1592 tracks.
-    "sentence-transformers>=5.7.0,<6.0.0",
+    "sentence-transformers>=5.7.0,<7.0.0",
     # Interpreter-matrix hold, not a CVE. numpy 2.5.x declares
     # `requires-python >=3.12` while this project declares >=3.11, so an
     # unbounded floor makes the lock resolve *two* numpys — 2.4.6 for
