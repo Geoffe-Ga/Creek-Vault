@@ -355,33 +355,110 @@ def validate_response(response_text: str) -> dict[str, object]:
     return {str(k): v for k, v in parsed.items()}
 
 
+def _determined_secondaries(raw: object) -> list[Frequency]:
+    """Collect the secondary frequencies a response actually decided (#1637).
+
+    Anything that is not a recognisable, non-sentinel :class:`Frequency`
+    is dropped: a non-list ``secondary:`` (a bare scalar, ``null``, a
+    mapping), an entry that matches no member, and the
+    ``unclassified`` sentinel itself. The result is therefore "the
+    secondaries this response determined", and an empty result means the
+    response determined none — which :func:`_apply_frequency` reads as
+    silence rather than as an instruction to clear.
+
+    Args:
+        raw: The response's ``secondary`` value, unvalidated.
+
+    Returns:
+        The determined secondary frequencies, in response order.
+    """
+    if not isinstance(raw, list):
+        return []
+    determined: list[Frequency] = []
+    for item in raw:
+        parsed = _parse_optional_enum(item, Frequency)
+        if parsed is not None and parsed != Frequency.UNCLASSIFIED:
+            determined.append(parsed)
+    return determined
+
+
 def _apply_frequency(
     data: dict[str, object],
     updates: dict[str, object],
+    current: FrequencyClassification,
 ) -> None:
-    """Extract frequency classification from parsed data.
+    """Layer the response's frequency verdict over the recorded one (#1637).
+
+    Before #1637 this rebuilt the block wholesale: any ``frequency:``
+    mapping at all, however empty, wrote a fresh
+    :class:`~creek.models.FrequencyClassification` whose ``primary`` fell
+    back to the ``unclassified`` sentinel. A response naming only
+    ``secondary``, an empty ``frequency: {}``, or a ``primary`` the
+    parser could not recognise therefore replaced a recorded primary with
+    the sentinel. This was the last legacy writer on the single-pick LLM
+    path still doing that (#1331 fixed voice, #1421 wavelength).
+
+    The rule, stated in full:
+
+    - **A determined primary wins, and takes its secondaries with it.**
+      ``primary`` is parsed through :func:`_parse_optional_enum` rather
+      than :func:`_parse_enum` precisely so "the model named nothing",
+      "the model named junk", and "the model named ``unclassified``" all
+      collapse to the same answer — *not determined* — instead of being
+      laundered into a sentinel that then overwrites the record. This is
+      the reading #1421 settled for the FEAT-017 downgrade: do not adopt
+      the noisy pick, rather than erase what we knew.
+    - **THE DELIBERATE ASYMMETRY.** When the primary *is* determined,
+      ``secondary`` is replaced wholesale with whatever this response
+      parsed — including the empty list.
+      :attr:`~creek.models.FrequencyClassification.secondary` is a list,
+      and a list cannot be merged field-wise the way the scalar
+      wavelength and voice axes can, so stale secondaries from an earlier
+      verdict are cleared rather than accumulated. The identical
+      asymmetry is spelled out on the weighted path at
+      :meth:`~creek.classify.weighted.WeightedFragmentClassification.merge_onto`
+      and on the rules path at
+      ``creek.classify.rules.RuleClassifier._layer_over_fragment``; keep
+      the three in sync.
+    - **That asymmetry is why this axis cannot use**
+      :func:`~creek.classify.evidence.layer_determined_over`. That helper
+      dumps with ``exclude_defaults=True``, and ``secondary``'s default
+      *is* the empty list — so a primary-only response would have its
+      deliberate clearing silently dropped and the stale secondaries
+      would survive. Frequency is a sibling of the layering rule, not a
+      caller of it.
+    - **A response that determines neither axis writes no key at all**,
+      because
+      :meth:`~creek.classify.llm.orchestrator.LLMClassifier._apply_classification`
+      returns the input fragment itself when ``updates`` is empty and
+      callers read that object identity as "this run marked nothing". A
+      value-equal copy would blur that signal.
+
+    One deliberate cost, the mirror of the one ``descriptor`` carries in
+    :func:`~creek.classify.llm.calibration._apply_wavelength`: a response
+    can no longer clear a recorded primary back to ``unclassified``, nor
+    clear the secondaries without also naming a primary. Un-classifying
+    a fragment is an operator edit to the frontmatter, not something a
+    model response is entitled to do by falling silent.
 
     Args:
         data: Parsed LLM response.
-        updates: Dict to populate with frequency updates.
+        updates: Dict to populate with the merged frequency block. Left
+            untouched unless this response determined at least one axis.
+        current: The frequency block already on the fragment. Supplies
+            the primary when this response names none. Never mutated.
     """
     freq_data = data.get("frequency")
     if not isinstance(freq_data, dict):
         return
-    primary = _parse_enum(
-        freq_data.get("primary"),
-        Frequency,
-        Frequency.UNCLASSIFIED,
-    )
-    raw_secondary = freq_data.get("secondary")
-    secondary: list[Frequency] = []
-    if isinstance(raw_secondary, list):
-        for item in raw_secondary:
-            parsed = _parse_optional_enum(item, Frequency)
-            if parsed is not None and parsed != Frequency.UNCLASSIFIED:
-                secondary.append(parsed)
+    primary = _parse_optional_enum(freq_data.get("primary"), Frequency)
+    if primary == Frequency.UNCLASSIFIED:
+        primary = None
+    secondary = _determined_secondaries(freq_data.get("secondary"))
+    if primary is None and not secondary:
+        return
     updates["frequency"] = FrequencyClassification(
-        primary=primary,
+        primary=current.primary if primary is None else primary,
         secondary=secondary,
     )
 
