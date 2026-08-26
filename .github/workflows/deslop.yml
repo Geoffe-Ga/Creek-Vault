@@ -25,9 +25,11 @@ name: De-Slop
 #   secret  CLAUDE_CODE_OAUTH_TOKEN  - same token the other Claude workflows use.
 
 on:
-  schedule:
-    # Mondays at 08:00 UTC. (cron is UTC; GitHub may delay under load.)
-    - cron: "0 8 * * 1"
+  # PAUSED 2026-08-26: automated issue inflow paused by owner request.
+  # Re-enable by uncommenting; workflow_dispatch still allows manual runs.
+  # schedule:
+  # # Mondays at 08:00 UTC. (cron is UTC; GitHub may delay under load.)
+  # - cron: "0 8 * * 1"
   workflow_dispatch:
     inputs:
       area:
