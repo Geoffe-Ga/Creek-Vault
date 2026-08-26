@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Final, Protocol
 
 import yaml
 
+from creek._schema import coerce_optional_list
 from creek.models import (
     Authorship,
     Fragment,
@@ -205,13 +206,14 @@ def load_fixture(path: Path) -> tuple[CalibrationEntry, ...]:
             any entry is missing a required key.
     """
     raw = path.read_text(encoding="utf-8")
-    parsed = yaml.safe_load(raw) or []
-    if not isinstance(parsed, list):
+    document = yaml.safe_load(raw)
+    parsed = coerce_optional_list(document)
+    if parsed is None:
         msg = (
             "calibration fixture must be a YAML list at top level, "
-            f"got {type(parsed).__name__}"
+            f"got {type(document).__name__}"
         )
-        raise ValueError(msg)  # noqa: TRY004  # public API contract: tests assert ValueError
+        raise ValueError(msg)
     return tuple(starmap(_coerce_entry, enumerate(parsed)))
 
 

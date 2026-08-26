@@ -384,6 +384,25 @@ class TestFixtureLoadErrors:
         with pytest.raises(ValueError, match="must be a YAML list"):
             load_fixture(path)
 
+    def test_falsy_non_list_top_level_raises(self, tmp_path: Path) -> None:
+        """An empty YAML mapping is a structural error, not an empty fixture.
+
+        ``yaml.safe_load(raw) or []`` coerced every *falsy* wrong type —
+        ``{}``, ``0``, ``false``, ``''`` — to the empty list before the
+        guard ran, so a structurally wrong fixture calibrated against
+        zero entries and reported success (#1004).
+        """
+        path = tmp_path / "bad.yaml"
+        path.write_text("{}\n", encoding="utf-8")
+        with pytest.raises(ValueError, match=r"must be a YAML list.*got dict"):
+            load_fixture(path)
+
+    def test_empty_file_loads_as_no_entries(self, tmp_path: Path) -> None:
+        """An empty file stays tolerated: ``null`` genuinely means no entries."""
+        path = tmp_path / "empty.yaml"
+        path.write_text("", encoding="utf-8")
+        assert load_fixture(path) == ()
+
     def test_missing_required_key_raises(self, tmp_path: Path) -> None:
         """An entry missing `expected` raises with the index reported."""
         path = tmp_path / "bad.yaml"
