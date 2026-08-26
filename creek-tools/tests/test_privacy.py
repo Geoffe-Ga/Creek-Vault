@@ -403,6 +403,100 @@ class TestReviewQueueIntegration:
         assert generator.needs_review(frag) is False
 
 
+# ---- body_evidence_tier (#1136) ---------------------------------------
+
+
+class TestBodyEvidenceTier:
+    """``body_evidence_tier`` reports what the body *alone* proves.
+
+    The aggregate ``classify_tier`` verdict saturates: on a self-authored
+    journal entry the platform axis pins it at INTIMATE for every possible
+    body, so comparing that verdict across an edit can never reveal that the
+    edit added privacy-relevant material. This narrower question is what
+    ``privacy_pass.edit_added_evidence`` uses to see past the saturation.
+    """
+
+    def test_self_authored_recovery_body_is_intimate(self) -> None:
+        """Recovery vocabulary in the body is INTIMATE evidence."""
+        classifier = PrivacyClassifier()
+        frag = _make_fragment(platform=SourcePlatform.ESSAY)
+        assert (
+            classifier.body_evidence_tier(frag, "my sponsor called about my relapse")
+            is PrivacyTier.INTIMATE
+        )
+
+    def test_benign_body_proves_nothing(self) -> None:
+        """``None`` is not OPEN — it means the body makes no claim at all.
+
+        Reporting OPEN here would be a *claim* that the body is publishable,
+        which a caller merging tiers could act on. The distinction is the
+        whole point of the return type.
+        """
+        classifier = PrivacyClassifier()
+        frag = _make_fragment(platform=SourcePlatform.JOURNAL)
+        assert (
+            classifier.body_evidence_tier(frag, "bread, water, salt, patience") is None
+        )
+        assert (
+            classifier.classify_tier(frag, content="bread, water, salt, patience")
+            is PrivacyTier.INTIMATE
+        )
+
+    def test_recovery_in_the_title_counts(self) -> None:
+        """The scan covers title + body, matching ``classify_tier``'s check 1."""
+        classifier = PrivacyClassifier()
+        frag = _make_fragment(title="Notes on sobriety", platform=SourcePlatform.ESSAY)
+        assert (
+            classifier.body_evidence_tier(frag, "a plain day") is PrivacyTier.INTIMATE
+        )
+
+    def test_ai_authored_recovery_body_proves_nothing(self) -> None:
+        """The Authorship.SELF gate lives here, not in the callers.
+
+        A body-evidence question that ignored authorship would license
+        escalating an AI-authored fragment to INTIMATE on content signals,
+        which the ``PrivacyTier`` model docstring forbids.
+        """
+        classifier = PrivacyClassifier()
+        frag = _make_fragment(platform=SourcePlatform.CHATGPT, author=Authorship.AI)
+        assert classifier.body_evidence_tier(frag, "notes on my relapse") is None
+
+    def test_honours_a_custom_keyword_set(self) -> None:
+        """It reads ``self.recovery_keywords``, not the module constant."""
+        classifier = PrivacyClassifier(recovery_keywords=frozenset({"weathervane"}))
+        frag = _make_fragment(platform=SourcePlatform.ESSAY)
+        assert classifier.body_evidence_tier(frag, "the weathervane turned") is (
+            PrivacyTier.INTIMATE
+        )
+        assert classifier.body_evidence_tier(frag, "notes on my relapse") is None
+
+    @pytest.mark.parametrize("platform", list(SourcePlatform))
+    @pytest.mark.parametrize("author", list(Authorship))
+    def test_bodies_agreeing_on_evidence_classify_alike(
+        self, platform: SourcePlatform, author: Authorship
+    ) -> None:
+        """Two bodies with the same evidence verdict get the same tier.
+
+        The invariant ``edit_added_evidence``'s second disjunct rests on:
+        ``body_evidence_tier`` is the *only* body-derived input to
+        ``classify_tier``. If someone adds a second rule that reads
+        ``content`` without routing it through ``body_evidence_tier``, the
+        gate would silently stop detecting that rule's evidence — and this
+        parametrised sweep over every platform x authorship pair fails
+        loudly on the day that happens, rather than at the next privacy
+        incident.
+        """
+        classifier = PrivacyClassifier()
+        frag = _make_fragment(platform=platform, author=author, channel="general")
+        left = "a plain note about the walk to the shops"
+        right = "an entirely different note concerning bread and its patience"
+        assert classifier.body_evidence_tier(frag, left) is None
+        assert classifier.body_evidence_tier(frag, right) is None
+        assert classifier.classify_tier(frag, content=left) is classifier.classify_tier(
+            frag, content=right
+        )
+
+
 # ---- Module exports --------------------------------------------------
 
 
