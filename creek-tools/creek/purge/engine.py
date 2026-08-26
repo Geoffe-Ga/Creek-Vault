@@ -313,17 +313,59 @@ def _regular_files_under(entry: Path) -> list[str]:
     return sorted(str(path) for path in entry.rglob("*") if path.is_file())
 
 
+def _contained_leaf(candidate: Path, resolved_vault: Path) -> bool:
+    """Report whether a walked leaf stays inside the vault, logging a refusal.
+
+    The module's single leaf verdict, shared by :func:`_contained_md_files`
+    and :meth:`PurgeEngine._voice_profiles_quoting` so the two walks
+    cannot drift into disagreeing about what "inside" means — the same
+    argument :func:`creek._containment.escaping_child` records one level
+    down.
+
+    The warning names *candidate* exactly as walked. The resolved target
+    is never logged: that is the exfiltration oracle #1087 closed, and a
+    purge run that printed where a planted link pointed would hand back
+    precisely the path it had just refused to read.
+
+    Args:
+        candidate: A path the walk produced, exactly as walked.
+        resolved_vault: The vault root, already resolved once by the caller.
+
+    Returns:
+        ``True`` when the leaf may be read; ``False`` — refuse — when it is
+        a symlink whose target is not inside the vault, or whose
+        containment cannot be established at all.
+    """
+    if not escaping_child(candidate, resolved_vault):
+        return True
+    logger.warning(
+        "Skipping a vault file whose symlink leaves the vault: %s",
+        candidate,
+    )
+    return False
+
+
 def _contained_md_files(root: Path, *, vault_path: Path) -> list[Path]:
     """List every ``.md`` file under *root* that does not leave the vault.
 
-    The engine's one walk primitive (#1454), replacing ``rglob("*.md")``
-    on both vault walks — the fragment census
-    (:meth:`PurgeEngine._list_fragment_files`) and the vault-wide
-    reference scrub (:meth:`PurgeEngine._list_vault_md_files`). Until this
-    existed they were the module's two unguarded walks, while every
+    The engine's one walk primitive (#1454), replacing every
+    ``rglob("*.md")`` in the module — the fragment census
+    (:meth:`PurgeEngine._list_fragment_files`), the vault-wide reference
+    scrub (:meth:`PurgeEngine._list_vault_md_files`), the thread/eddy
+    count update (:meth:`PurgeEngine._decrement_counts`) and the voice
+    lexicon sweep (:meth:`PurgeEngine._voice_lexicon_notes`). Until this
+    existed those were the module's unguarded walks, while every
     pointer-following path beside them (``_resolve_pointer_in_vault``,
     ``_in_any_staging_root``, ``_contained_voice_artifact``) was already
-    fail-closed.
+    fail-closed. The count update is why the walks kept mattering more
+    than they looked: it is the one whose match ends in a
+    ``write_bytes``, which follows a link and writes the target, so the
+    "purge only ever ``unlink``s, and ``unlink`` drops the alias" reading
+    of #1454 was never true of the whole module.
+
+    New callers belong here rather than beside here. Three separate
+    misses, each declaring the population closed, is what a per-site
+    check costs.
 
     Two link shapes, and the glob mishandled both:
 
@@ -366,20 +408,27 @@ def _contained_md_files(root: Path, *, vault_path: Path) -> list[Path]:
         logger.warning("Refusing a purge walk root that leaves the vault: %s", root)
         return []
     kept: list[Path] = []
-    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in dirnames:
+            # ``followlinks=False`` already stops the walk descending an
+            # escaping directory link, so this changes nothing about what
+            # is returned — it only stops the refusal being silent, which
+            # is what let a directory link out of the vault sit in a
+            # tree with no trace in the run's log. The same entries
+            # :func:`creek._containment.inspect_tree` reports.
+            candidate = Path(dirpath) / name
+            if escaping_child(candidate, resolved_vault):
+                logger.warning(
+                    "Not descending a vault directory whose symlink leaves "
+                    "the vault: %s",
+                    candidate,
+                )
         for name in filenames:
             if not name.endswith(".md"):
                 continue
             candidate = Path(dirpath) / name
-            if escaping_child(candidate, resolved_vault):
-                # Named as walked. The resolved target is never logged:
-                # that is the exfiltration oracle #1087 closed.
-                logger.warning(
-                    "Skipping a vault file whose symlink leaves the vault: %s",
-                    candidate,
-                )
-                continue
-            kept.append(candidate)
+            if _contained_leaf(candidate, resolved_vault):
+                kept.append(candidate)
     return sorted(kept)
 
 
@@ -2469,6 +2518,13 @@ class PurgeEngine:
         on exactly that fixture. Pinned by
         ``test_the_voice_sweep_matches_the_same_way_dry_or_applied``.
 
+        Walked through :func:`_contained_md_files` rather than ``rglob``.
+        Nothing outside the vault is written or deleted on this path —
+        :meth:`_contained_voice_artifact` runs before any ``unlink`` — but
+        the match itself read the bytes of whatever a planted link pointed
+        at, and "we only read it" is not a property an RTBF sweep should
+        have to argue. The guard makes the read never happen.
+
         Args:
             fragment_id: Id of the fragment being purged.
 
@@ -2481,7 +2537,7 @@ class PurgeEngine:
         if not lexicon_root.is_dir():
             return
         needle = f"[[{fragment_id}]]".encode()
-        for note in sorted(lexicon_root.rglob("*.md")):
+        for note in _contained_md_files(lexicon_root, vault_path=self.vault_path):
             if needle in _read_bytes_for_match(note):
                 yield note
 
@@ -2497,6 +2553,13 @@ class PurgeEngine:
         substring. Reaching it still starts from the id: the caller
         resolved the id to the fragment file that supplied this body.
 
+        The pattern glob stays — it is deliberately non-recursive, and
+        :func:`_contained_md_files` would widen the sweep to every
+        ``*-profile.md`` anywhere under ``07-Voice`` — so containment is
+        applied per leaf instead, through the same
+        :func:`_contained_leaf` verdict that walk uses. Judged *before*
+        the read, for the reason :meth:`_voice_lexicon_notes` records.
+
         Args:
             body: The purged fragment's body text.
 
@@ -2508,7 +2571,10 @@ class PurgeEngine:
             return
         voice_root = self.vault_path / _VOICE_RELDIR
         needle = stripped.encode()
+        resolved_vault = self.vault_path.resolve(strict=False)
         for profile in sorted(voice_root.glob(_VOICE_PROFILE_GLOB)):
+            if not _contained_leaf(profile, resolved_vault):
+                continue
             if needle in _read_bytes_for_match(profile):
                 yield profile
 
@@ -3083,6 +3149,21 @@ class PurgeEngine:
     ) -> int:
         """Decrement ``fragment_count`` on thread/eddy files.
 
+        The engine's **third** vault walk, and the one with the sharpest
+        edge (#1454 follow-up): a match here ends in
+        :meth:`_rewrite_fragment_count`'s ``write_bytes``, which follows
+        a symlink and writes the *target*. A planted
+        ``02-Threads/alias.md -> /elsewhere/file.md`` whose ``id`` a
+        purged fragment declares in ``threads``/``eddies`` therefore got
+        an arbitrary out-of-vault file overwritten. The issue reasoned
+        that purge cannot write outside the vault because ``unlink``
+        drops the alias rather than its target — true of the delete
+        paths, and false of this one.
+
+        So the walk goes through :func:`_contained_md_files`, the same
+        fail-closed primitive the fragment census and the reference
+        scrub use, rather than a second hand-rolled containment check.
+
         Args:
             subfolder: ``02-Threads`` or ``03-Eddies``.
             ids: IDs of files whose counts should decrement.
@@ -3097,7 +3178,7 @@ class PurgeEngine:
             return 0
         id_set = set(ids)
         updated = 0
-        for md_file in folder.rglob("*.md"):
+        for md_file in _contained_md_files(folder, vault_path=self.vault_path):
             meta = read_header_meta(md_file)
             if meta.get("id") not in id_set:
                 continue
