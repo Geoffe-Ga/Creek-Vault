@@ -83,26 +83,71 @@ jobs:
         run: |
           set -euo pipefail
 
+          # The open-issue window the dedup scans. It must exceed the number
+          # of open issues in the repo or the scan silently misses the older
+          # end of the list and re-files — so `issue_exists_for_pr` refuses to
+          # answer when the API returns a full page rather than guessing.
+          ISSUE_SCAN_LIMIT=500
+
+          # ---8<--- BEGIN bridge helpers (extracted by tests; keep pure) ---
+          # Everything between these sentinels must be free of side effects at
+          # definition time: tests/test_dependabot_bridge_dedup.py sources this
+          # region with a stubbed `gh` on PATH to exercise the guards for real
+          # rather than only reading them. Do not move executable statements in.
+
           # Marker linking an issue back to its Dependabot PR. Hidden HTML
           # comment in the issue body; the dedup check greps for it so re-runs
-          # never double-file.
+          # never double-file. The trailing ` -->` is part of the match, so
+          # `dependabot-pr:94` cannot collide with `dependabot-pr:943`.
           marker_for() { printf '<!-- dependabot-pr:%s -->' "$1"; }
 
           # True if a PR body already links an issue via Closes/Fixes/Resolves.
+          #
+          # This is a cheap early-out, NOT a guarantee: the body belongs to
+          # Dependabot, which rewrites it on every rebase and erases the
+          # appended `Closes` line (#1019). When that happens this returns
+          # false and `issue_exists_for_pr` below is the only thing standing
+          # between a rebase and a duplicate issue.
           body_links_issue() {
             printf '%s' "$1" | grep -qiE '(closes|fixes|resolves)[[:space:]]+#[0-9]+'
           }
 
-          # True if an open `dependencies` issue already carries this PR's
-          # marker. Idempotency keystone: a second run finds the marker and
-          # files nothing.
+          # True if ANY open issue already carries this PR's marker.
+          #
+          # Idempotency keystone. It used to scan `--label dependencies` only,
+          # which made the guard depend on a label the grooming pass strips:
+          # once `dependencies` was replaced with a priority label the issue
+          # became invisible here, and since Dependabot had also erased the
+          # `Closes` line from the PR body, BOTH guards failed together and the
+          # next reconciler run filed a duplicate — one per PR per week (#1439).
+          # The marker is in the issue body and no process rewrites it, so the
+          # scan is now label-independent and the label is only a picker
+          # concern.
+          #
+          # `gh search` is deliberately not used: it token-matches rather than
+          # matching exactly, so it returns issues that merely *quote* a marker
+          # — the issue describing this very bug is one — and a false positive
+          # here means never filing an issue that is genuinely absent.
           issue_exists_for_pr() {
-            local pr="$1" marker
+            local pr="$1" marker issues found
             marker="$(marker_for "$pr")"
-            gh issue list --repo "$REPO" --label dependencies --state open \
-              --limit 200 --json number,body \
-              --jq '.[].body' 2>/dev/null | grep -qF "$marker"
+
+            issues="$(gh issue list --repo "$REPO" --state open \
+              --limit "$ISSUE_SCAN_LIMIT" --json number,body)"
+
+            # A full page means the window may have cut off older issues, so a
+            # "not found" here would be unproven. Fail the run rather than mint
+            # a duplicate on an answer the scan could not actually support.
+            if [ "$(printf '%s' "$issues" | jq 'length')" -ge "$ISSUE_SCAN_LIMIT" ]; then
+              echo "::error::Open-issue scan hit its ${ISSUE_SCAN_LIMIT}-issue window, so the marker dedup for PR #${pr} cannot be trusted. Raise ISSUE_SCAN_LIMIT in .github/workflows/dependabot-to-ralph-issue.yml." >&2
+              exit 1
+            fi
+
+            found=1
+            printf '%s' "$issues" | jq -r '.[].body' | grep -qF "$marker" && found=0
+            return "$found"
           }
+          # ---8<--- END bridge helpers ---
 
           # The working contract, stated verbatim, with a `{PR}` placeholder.
           # Kept on one source line so it stays indented inside the YAML block
@@ -162,9 +207,11 @@ jobs:
             echo "Linked PR #$pr → issue #$issue_num via Closes."
 
             # The REST create endpoint silently drops labels when the token
-            # lacks push/triage access — which would break the marker dedup
-            # above (it filters on the `dependencies` label). Re-apply the
-            # label with a dedicated call (that endpoint errors instead of
+            # lacks push/triage access. Since #1439 this no longer breaks the
+            # marker dedup above — that scan is label-independent — but the
+            # label is still how `pick-next.sh` sees the issue at all, so a
+            # dropped one leaves a filed issue no lane will ever pick up.
+            # Re-apply with a dedicated call (that endpoint errors instead of
             # dropping) and verify it stuck, so a permission gap fails loudly
             # rather than leaving an unlabeled, picker-invisible issue.
             # Swallow this call's own error: the read-back verification below is
