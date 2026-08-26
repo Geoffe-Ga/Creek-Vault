@@ -32,6 +32,7 @@ from creek.models import (
     Frequency,
     FrequencyClassification,
     SourcePlatform,
+    Thread,
 )
 from creek.time import now_la
 from tests.helpers import write_fragment_file
@@ -231,3 +232,121 @@ def test_link_threads_cli_reports_pages(tmp_path: Path) -> None:
     assert "Threads linker" in result.output
     assert "02-Threads" in result.output
     assert "page(s) written" in result.output
+
+
+def _two_thread_corpus(vault: Path) -> None:
+    """Seed two separable thread groups so exactly one page write can fail.
+
+    Companion to :func:`_thread_corpus`, which seeds one thread. The
+    groups are kept apart twice over — different primary frequencies
+    (no topic overlap) and ~200 days apart (outside the 30-day pairing
+    window) — so detection reliably yields two threads.
+
+    Args:
+        vault: Vault root.
+    """
+    (vault / "00-Creek-Meta").mkdir(parents=True, exist_ok=True)
+    groups = (
+        ("recent", Frequency.F5, 1, "Ceramics studio glazing"),
+        ("older", Frequency.F1, 200, "Bicycle drivetrain overhaul"),
+    )
+    for prefix, frequency, base_days, title in groups:
+        base = now_la() - timedelta(days=base_days)
+        for i in range(3):
+            write_fragment_file(
+                vault=vault,
+                fragment=Fragment(
+                    id=f"frag-1382-{prefix}-{i:03d}",
+                    title=title,
+                    source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+                    authored_at=base - timedelta(days=i),
+                    frequency=FrequencyClassification(primary=frequency),
+                ),
+                body=f"{title}, entry {i}.",
+            )
+
+
+def _fragment_files(vault: Path) -> list[Path]:
+    """Return every fragment markdown file under ``01-Fragments``.
+
+    Args:
+        vault: Vault root.
+
+    Returns:
+        The fragment files, path-sorted.
+    """
+    return sorted(
+        p for p in (vault / "01-Fragments").rglob("*.md") if not p.name.startswith(".")
+    )
+
+
+def test_link_threads_failed_page_write_leaves_members_unstamped(
+    tmp_path: Path,
+) -> None:
+    """A failed thread-page write must not stamp its wikilink onto members (#1382).
+
+    Two threads are detected and exactly one page write fails. The
+    surviving thread's members must carry its link; the failed thread's
+    members must stay byte-identical on disk. Asserted against real vault
+    state — a count-only assertion is satisfied by a vault full of
+    dangling links.
+    """
+    from unittest.mock import patch
+
+    from creek.vault.writer import VaultWriter
+
+    vault = tmp_path / "vault"
+    _two_thread_corpus(vault)
+    before = {path: path.read_bytes() for path in _fragment_files(vault)}
+
+    real_write_thread = VaultWriter.write_thread
+    failed_titles: list[str] = []
+
+    def _fail_first(writer: VaultWriter, thread: Thread) -> Path:
+        if not failed_titles:
+            failed_titles.append(thread.title)
+            raise OSError("disk full")
+        return real_write_thread(writer, thread)
+
+    with patch(
+        "creek.link.link_engine.VaultWriter.write_thread",
+        autospec=True,
+        side_effect=_fail_first,
+    ):
+        summary = run_link(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="threads",
+            rebuild=False,
+        )
+
+    assert failed_titles, "the injected write failure never fired"
+    assert summary.threads_detected == 2
+    assert summary.threads_written == 1
+
+    pages = _thread_pages(vault)
+    assert len(pages) == 1
+    surviving = str(frontmatter.load(pages[0]).metadata.get("title", ""))
+    assert surviving and surviving not in failed_titles
+
+    linked: list[Path] = []
+    unlinked: list[Path] = []
+    for path in _fragment_files(vault):
+        links = [
+            str(link) for link in frontmatter.load(path).metadata.get("threads", [])
+        ]
+        for link in links:
+            assert link == f"[[{surviving}]]", (
+                f"{path.name} cites {link!r}, but the only thread page on disk "
+                f"is {surviving!r} — that is a dangling wikilink"
+            )
+        (linked if links else unlinked).append(path)
+
+    assert len(linked) == 3
+    assert len(unlinked) == 3
+    assert summary.member_fragments_updated == 3
+    for path in unlinked:
+        assert path.read_bytes() == before[path], (
+            f"{path.name} belongs only to the failed thread and must not have "
+            f"been rewritten at all"
+        )

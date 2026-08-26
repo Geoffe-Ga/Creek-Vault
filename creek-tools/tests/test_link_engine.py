@@ -578,6 +578,8 @@ def test_run_link_eddies_write_oserror_does_not_crash(tmp_path: Path) -> None:
     """
     from unittest.mock import patch
 
+    import frontmatter
+
     vault = tmp_path / "vault"
     _embedded_eddy_fragments(vault)
 
@@ -596,6 +598,162 @@ def test_run_link_eddies_write_oserror_does_not_crash(tmp_path: Path) -> None:
     # write failed.
     assert summary.eddies_detected >= 1
     assert summary.eddies_written == 0
+    # #1382: no page landed, so no member may cite one.
+    assert not _cluster_page_titles(vault / "03-Eddies")
+    for path in _fragment_files(vault):
+        assert not (frontmatter.load(str(path)).get("eddies") or [])
+
+
+def _two_cluster_eddy_fragments(vault: Path) -> None:
+    """Seed *vault* with two dense, mutually-distant eddy clusters.
+
+    Companion to :func:`_embedded_eddy_fragments`, which seeds a single
+    cluster. Issue #1382 needs *two* so exactly one page write can be
+    made to fail. The two groups get orthogonal vectors (cosine distance
+    ``1.0``, far above the default ``eddy_eps`` of ``0.3``) so DBSCAN
+    cannot merge them, and each group spans two years so neither is
+    filtered out as thread-like.
+
+    Args:
+        vault: Vault root.
+    """
+    from datetime import timedelta
+
+    base = datetime(2026, 4, 1)
+    day_offsets = [600, 45, 400, 120, 500, 15]
+    groups = {
+        "a": ("Ceramics studio glazing", [1.0, 0.0, 0.0]),
+        "b": ("Bicycle drivetrain overhaul", [0.0, 1.0, 0.0]),
+    }
+    fragments: list[Fragment] = []
+    vectors: dict[str, list[float]] = {}
+    for prefix, (title, vector) in groups.items():
+        for i, offset in enumerate(day_offsets):
+            frag = Fragment(
+                id=f"frag-issue1382-{prefix}-{i:03d}",
+                title=title,
+                source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+                created=base - timedelta(days=offset),
+            )
+            _write_fragment(vault=vault, fragment=frag, body="body")
+            fragments.append(frag)
+            vectors[frag.id] = vector
+
+    config = CreekConfig()
+    linker = EmbeddingLinker(config=config.embeddings)
+    cache_path = embeddings_cache_path(vault)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    linker.save_cache(linker.build_cache_entries(fragments, vectors), cache_path)
+
+
+def _fragment_files(vault: Path) -> list[Path]:
+    """Return every fragment markdown file under ``01-Fragments``.
+
+    Args:
+        vault: Vault root.
+
+    Returns:
+        The fragment files, path-sorted.
+    """
+    return sorted(
+        p for p in (vault / "01-Fragments").rglob("*.md") if not p.name.startswith(".")
+    )
+
+
+def _cluster_page_titles(page_dir: Path) -> set[str]:
+    """Return the frontmatter ``title`` of every page under *page_dir*.
+
+    Args:
+        page_dir: ``03-Eddies`` or ``02-Threads``.
+
+    Returns:
+        The set of titles that a wiki-link could legitimately resolve to.
+    """
+    import frontmatter
+
+    titles: set[str] = set()
+    for path in page_dir.rglob("*.md"):
+        if path.name.startswith("."):
+            continue
+        title = frontmatter.load(str(path)).get("title")
+        assert isinstance(title, str)
+        titles.add(title)
+    return titles
+
+
+def test_run_link_eddies_failed_page_write_leaves_members_unstamped(
+    tmp_path: Path,
+) -> None:
+    """A failed eddy-page write must not stamp its wikilink onto members (#1382).
+
+    Detection produced two eddies and exactly one page write fails, so the
+    surviving eddy's members must carry its link while the failed eddy's
+    members stay byte-identical on disk. Asserted against real vault state:
+    a count-only assertion is satisfied by a vault full of dangling links.
+    """
+    from unittest.mock import patch
+
+    import frontmatter
+
+    from creek.models import Eddy
+    from creek.vault.writer import VaultWriter
+
+    vault = tmp_path / "vault"
+    _two_cluster_eddy_fragments(vault)
+    before = {path: path.read_bytes() for path in _fragment_files(vault)}
+
+    real_write_eddy = VaultWriter.write_eddy
+    failed_titles: list[str] = []
+
+    def _fail_first(writer: VaultWriter, eddy: Eddy) -> Path:
+        if not failed_titles:
+            failed_titles.append(eddy.title)
+            raise OSError("disk full")
+        return real_write_eddy(writer, eddy)
+
+    with patch(
+        "creek.link.link_engine.VaultWriter.write_eddy",
+        autospec=True,
+        side_effect=_fail_first,
+    ):
+        summary = run_link(
+            vault_path=vault,
+            config=CreekConfig(),
+            method="eddies",
+            rebuild=False,
+        )
+
+    assert failed_titles, "the injected write failure never fired"
+    assert summary.eddies_detected == 2
+    assert summary.eddies_written == 1
+
+    page_titles = _cluster_page_titles(vault / "03-Eddies")
+    assert len(page_titles) == 1
+    surviving = next(iter(page_titles))
+    assert surviving not in failed_titles
+    resolvable = {f"[[{title}]]" for title in page_titles}
+
+    linked: list[Path] = []
+    unlinked: list[Path] = []
+    for path in _fragment_files(vault):
+        links = frontmatter.load(str(path)).get("eddies") or []
+        for link in links:
+            assert link in resolvable, (
+                f"{path.name} cites {link!r}, but the only eddy page on disk "
+                f"is {surviving!r} — that is a dangling wikilink"
+            )
+        (linked if links else unlinked).append(path)
+        if links:
+            assert links == [f"[[{surviving}]]"]
+
+    assert len(linked) == 6
+    assert len(unlinked) == 6
+    assert summary.member_fragments_updated == 6
+    for path in unlinked:
+        assert path.read_bytes() == before[path], (
+            f"{path.name} belongs only to the failed eddy and must not have "
+            f"been rewritten at all"
+        )
 
 
 def test_run_link_eddies_skips_missing_vault_scaffold(tmp_path: Path) -> None:
