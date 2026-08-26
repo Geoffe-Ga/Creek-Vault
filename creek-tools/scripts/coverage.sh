@@ -109,7 +109,22 @@ fi
 
 # Default to running unit tests only — keeps coverage runs aligned with
 # the rest of the local toolchain (CI-003).
-PYTEST_ARGS+=(-m "not integration and not e2e")
+#
+# This expression must stay byte-identical to the one `scripts/test.sh`
+# builds for its unit lane (issue #1670). The two lanes both run inside
+# `check-all.sh`, back to back, and a contributor reads "the unit lane
+# passed" as saying something about the coverage lane — which it only
+# does while both lanes run the same set of tests.
+#
+# `live` in particular: those tests reach real provider APIs and local
+# services, so a coverage lane that ran them failed on any machine with
+# no Ollama listening on localhost:11434, for a reason unrelated to the
+# code under test. `slow` is excluded for the same reason test.sh
+# excludes it — benchmarks are not a correctness gate.
+#
+# `./scripts/test.sh --all` still deliberately reaches every marker,
+# live smokes included; that lane is unchanged and must stay that way.
+PYTEST_ARGS+=(-m "not integration and not e2e and not slow and not live")
 
 # Run tests with coverage
 python -m pytest "${PYTEST_ARGS[@]}" tests/ || {
