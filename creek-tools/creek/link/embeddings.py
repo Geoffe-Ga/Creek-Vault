@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Final, cast
 
 from pydantic import BaseModel
 
+from creek._fsio import atomic_replace_path
+
 # FragmentLevel is a Literal alias that Pydantic resolves at class-creation
 # time when building ``Resonance``'s field schema; moving it under
 # TYPE_CHECKING would leave the symbol undefined and crash the import.
@@ -179,6 +181,10 @@ def purge_fragment_ids_from_cache(
     has not been built yet) rather than an error, so the purge engine
     can call this unconditionally without first probing the filesystem.
 
+    The surviving rows are staged beside *cache_path* and committed with
+    ``os.replace``, so a scrub that fails part-way leaves the cache it
+    was scrubbing byte-intact (#1441).
+
     Args:
         cache_path: Embeddings parquet path (typically the result of
             :func:`embeddings_cache_path`).
@@ -206,11 +212,15 @@ def purge_fragment_ids_from_cache(
 
     if not dry_run:
         keep_array = pa.array(keep_mask, type=pa.bool_())
-        pq.write_table(
-            table.filter(keep_array),
-            cache_path,
-            compression="snappy",
-        )
+        # Staged and swapped in, not rewritten in place: a scrub that
+        # dies part-way must not destroy the cache it was scrubbing
+        # (#1441).
+        with atomic_replace_path(cache_path) as staged:
+            pq.write_table(
+                table.filter(keep_array),
+                staged,
+                compression="snappy",
+            )
         logger.info(
             "Purged %d row(s) from embeddings cache %s",
             removed,
@@ -818,6 +828,10 @@ class EmbeddingLinker:
         can revalidate per fragment rather than treating the file as
         opaque.
 
+        The parquet is staged beside *path* and committed with
+        ``os.replace``, so a write that fails part-way leaves any
+        previous cache byte-intact (#1441).
+
         Args:
             entries: Mapping of fragment ID to :class:`CachedEmbedding`.
             path: Destination parquet path; parent dirs must already exist.
@@ -850,7 +864,11 @@ class EmbeddingLinker:
                 ),
             },
         )
-        pq.write_table(table, path, compression="snappy")
+        # Staged beside the target and swapped in, so a write that dies
+        # part-way — full disk, ``SIGKILL`` — leaves the previous cache
+        # intact rather than destroying a corpus-wide embed (#1441).
+        with atomic_replace_path(path) as staged:
+            pq.write_table(table, staged, compression="snappy")
         logger.info("Saved %d embedding cache row(s) to %s", len(rows), path)
 
     def load_cache(self, path: Path) -> dict[str, CachedEmbedding]:
