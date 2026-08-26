@@ -929,6 +929,45 @@ def test_classify_refuses_when_llm_provider_unavailable(vault: Path) -> None:
     assert "unavailable" in result["reason"]
 
 
+def test_classify_reports_rule_skips_and_llm_failures_as_separate_fields(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #1356: the tool publishes both skip reasons, not one merged count.
+
+    The counters are stubbed because what is under test is this wrapper's
+    projection of the summary onto the wire dict; the engine's counting is
+    pinned in :mod:`tests.test_classify_failed_llm_provenance`.
+    """
+    from creek.classify.classify_engine import ClassifySummary
+    from creek_mcp.tools import classify as classify_mod
+
+    monkeypatch.setattr(
+        classify_mod,
+        "run_classify",
+        lambda **_kwargs: ClassifySummary(
+            total=10,
+            classified=10,
+            preserved_manual=0,
+            preserved_llm=0,
+            skipped_high_confidence=3,
+            errors=(),
+            llm_call_failed=7,
+        ),
+    )
+
+    result = classify_tool(
+        vault_path=vault,
+        method="llm",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="crawdad",
+    )
+
+    assert result["status"] == "ok"
+    assert result["skipped_high_confidence"] == 3
+    assert result["llm_call_failed"] == 7
+
+
 # ---------------------------------------------------------------------------
 # link
 # ---------------------------------------------------------------------------

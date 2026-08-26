@@ -581,3 +581,44 @@ def test_whitespace_body_is_not_stamped_llm(
     assert meta.get("classification_method") == "rules"
     assert CLASSIFICATION_PROVIDER_KEY not in meta
     assert meta.get("weighted") is None
+
+
+# ---- T7 (#1356): the weighted failure is counted as a failure, not a skip ----
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["provider_unavailable", "transport_error", "malformed_yaml"],
+)
+def test_failed_weighted_call_is_counted_as_an_llm_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    """A soft weighted failure lands on ``llm_call_failed``, not the rule counter.
+
+    The weighted twin of the #1356 discrimination pinned on the single-pick
+    path in :mod:`tests.test_classify_failed_llm_provenance`: reporting a
+    provider outage as a rule short-circuit tells the operator the run went
+    well when the corpus is in fact under-classified.
+
+    Args:
+        tmp_path: Pytest-provided scratch directory.
+        monkeypatch: Used to swap the engine's classifier for a stub.
+        failure_mode: Which of the three soft-failure paths to trigger.
+    """
+    monkeypatch.setattr(_ENGINE_CLASSIFIER, _EngineStub)
+    vault = tmp_path / "vault"
+    _seed(vault, F3_BODY)
+
+    with _failing_weighted_provider(failure_mode):
+        summary = run_classify(
+            vault_path=vault,
+            config=_weighted_config(),
+            method="llm",
+            force=True,
+        )
+
+    assert summary.classified == 1, "positive control: the fragment is still written"
+    assert summary.llm_call_failed == 1
+    assert summary.skipped_high_confidence == 0

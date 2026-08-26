@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from creek.classify import few_shot
@@ -200,6 +202,41 @@ class TestLoaderResilience:
             loaded = few_shot._load_all_examples()
             for dim in DIMENSIONS:
                 assert loaded[dim] == ()
+        finally:
+            few_shot._load_all_examples.cache_clear()
+
+    def test_falsy_non_list_yaml_is_reported_not_silently_empty(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An empty YAML mapping warns rather than passing as "no examples".
+
+        ``yaml.safe_load(raw) or []`` turned every falsy wrong type into
+        the empty list before the guard ran, so a malformed fixture was
+        indistinguishable from a deliberately empty one (#1004).
+        """
+        few_shot._load_all_examples.cache_clear()
+        try:
+
+            class _EmptyMappingResource:
+                def joinpath(self, name: str) -> _EmptyMappingResource:
+                    self.name = name
+                    return self
+
+                def read_text(self, encoding: str) -> str:
+                    return "{}\n"
+
+            monkeypatch.setattr(
+                few_shot.resources,
+                "files",
+                lambda _pkg: _EmptyMappingResource(),
+            )
+            with caplog.at_level(logging.WARNING, logger=few_shot.__name__):
+                loaded = few_shot._load_all_examples()
+            for dim in DIMENSIONS:
+                assert loaded[dim] == ()
+                assert f"{dim}.yaml is not a list" in caplog.text
         finally:
             few_shot._load_all_examples.cache_clear()
 

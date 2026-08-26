@@ -2834,7 +2834,13 @@ def classify(
         f"{summary.total} fragment(s) "
         f"({summary.preserved_manual} manual preserved, "
         f"{summary.preserved_llm} previously LLM-classified preserved, "
-        f"{summary.skipped_high_confidence} skipped, "
+        # Issue #1356: one "N skipped" number used to cover both reasons the
+        # LLM did not classify a fragment. They call for opposite next moves —
+        # a rule-confident skip means the run went well, a failed call means
+        # the corpus is under-classified — so each is labelled and reported
+        # even at zero.
+        f"{summary.skipped_high_confidence} skipped (rules confident), "
+        f"{summary.llm_call_failed} skipped (LLM call failed), "
         # Issue #876: tier assignment is orthogonal to the classification
         # method — preserved fragments get one too — so it is reported as
         # its own count rather than folded into "classified".
