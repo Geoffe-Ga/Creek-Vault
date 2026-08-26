@@ -377,3 +377,18 @@ lock`, never dropping `--locked`. Do not add `--strict` to either
 `pip-audit` call: the local `crawdad` package isn't published to PyPI,
 so pip-audit always reports it as a benign SKIP, and `--strict` would
 turn that permanent skip into a permanent false failure.
+
+Both calls run as `python -m pip_audit`, never as a bare `pip-audit`
+(#1671). A bare executable name is resolved by `PATH`, and when this
+project's environment carries no pip-audit of its own `PATH` does not
+fail — it supplies another copy, which then audits *that* interpreter.
+The observed symptom was an audit of `/opt/homebrew/opt/python@3.13`
+reporting CVEs belonging to Homebrew's Python while `crawdad/.venv` went
+uninspected. `scripts/_lib.sh::crawdad_require_python_module` probes for
+the module first so an under-provisioned environment fails with `uv sync
+--all-extras` named, rather than silently checking the wrong one; the
+same guard fronts the vulture step, whose shared policy imports vulture
+rather than shelling out to it. `tests/test_gate_tool_resolution.py`
+pins both the invocation form and the guard's behaviour — note that
+`tests/test_dependency_pins.py` cannot: its assertions are about which
+*surfaces* are audited and stay green when the invocation reverts.
