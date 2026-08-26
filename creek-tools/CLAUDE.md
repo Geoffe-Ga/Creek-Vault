@@ -409,8 +409,14 @@ All code must meet these standards before merging to main:
   mtime-only, so a local gate must never trust a cache CI doesn't
   have. Costs ~0.05s on this tree (477 files); don't drop it for
   speed. Issue #1119; enforced by `tests/test_ruff_cache_poisoning.py`
-  and `tests/test_ruff_gate_parity.py`. Same hazard is open for mypy's
-  cache (#1186) and `__pycache__` (#1187).
+  and `tests/test_ruff_gate_parity.py`. The same hazard is now closed
+  for mypy's cache (#1186 — `scripts/typecheck.sh` passes
+  `--no-incremental` by default, `--fast`/`--incremental` opts out;
+  enforced by `tests/test_mypy_gate_cache.py`) and for `__pycache__`
+  (#1187 — `scripts/test.sh` mints a per-run `PYTHONPYCACHEPREFIX`;
+  enforced by `tests/test_pytest_bytecode_cache_guard.py`).
+  `PYTHONDONTWRITEBYTECODE` is NOT the remedy for the latter: it stops
+  Python writing bytecode, not reading a stale `.pyc`.
 - **Pylint**: ≥9.0 (`pylint creek/ creek_mcp/ --fail-under=9.0`, in CI
   and `lint-extended.sh`; CI-002).
 - **Bandit**: zero medium-or-above findings
