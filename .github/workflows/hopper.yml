@@ -18,8 +18,10 @@ name: "Hopper: queue-depth refill"
 # No Claude token needed — pure gh + jq queue arithmetic.
 
 on:
-  schedule:
-    - cron: "23 * * * *"        # hourly, off the :00 mark to spread API load
+  # PAUSED 2026-08-26: automated issue inflow paused by owner request.
+  # Re-enable by uncommenting; workflow_dispatch still allows manual runs.
+  # schedule:
+  # - cron: "23 * * * *"        # hourly, off the :00 mark to spread API load
   workflow_dispatch:
 
 permissions:

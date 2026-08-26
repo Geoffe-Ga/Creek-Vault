@@ -23,13 +23,17 @@ on:
   # Real-time: a Dependabot PR opens or reopens. pull_request_target so the run
   # has the base-repo token (issues:write / pull-requests:write). Gated to
   # Dependabot only below.
-  pull_request_target:
-    types: [opened, reopened]
+  # PAUSED 2026-08-26: automated issue inflow paused by owner request.
+  # Re-enable by uncommenting; workflow_dispatch still allows manual runs.
+  # pull_request_target:
+  # types: [opened, reopened]
   # Backfill + safety net: clears the existing Dependabot backlog on first
   # dispatch and re-links any PR whose body was overwritten. Scheduled a few
   # hours after Dependabot's weekly Monday window so freshly-opened PRs exist.
-  schedule:
-    - cron: "0 12 * * 1"
+  # PAUSED 2026-08-26: automated issue inflow paused by owner request.
+  # Re-enable by uncommenting; workflow_dispatch still allows manual runs.
+  # schedule:
+  # - cron: "0 12 * * 1"
   workflow_dispatch:
 
 # Limit the token to exactly what the bridge needs: file issues, edit PR
