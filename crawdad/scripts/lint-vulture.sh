@@ -59,6 +59,16 @@ EOF
     esac
 done
 
+# shellcheck source=scripts/_lib.sh
+source "$SCRIPT_DIR/_lib.sh"
+
+# The policy module imports vulture rather than shelling out to it, so a
+# missing distribution surfaces as a traceback from `from vulture import
+# Vulture` with no pointer to the fix (#1671). Probe first and say what to
+# run. Skipping is not on the table: a dead-code gate that did not scan
+# looks exactly like one that found nothing.
+crawdad_require_python_module vulture || exit 2
+
 if [[ ! -f "$POLICY_ROOT/scripts/lint_vulture.py" ]]; then
     echo "Error: shared dead-code policy not found at $POLICY_ROOT/scripts/lint_vulture.py" >&2
     echo "This gate runs creek-tools' policy module; the sibling checkout must be present." >&2

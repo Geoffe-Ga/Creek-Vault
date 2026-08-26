@@ -346,6 +346,20 @@ _OPENAI_PRE_BOUND_FLOOR = Version("1.0")
 #: audit.
 _LOOKUP_BUILTINS = frozenset({"command", "hash", "type", "which"})
 
+#: Helpers that *probe* for a tool without running it. ``security.sh``
+#: guards its audits with ``crawdad_require_python_module pip_audit
+#: pip-audit`` (#1671), and that line mentions pip-audit by name — so
+#: without this exclusion the probe itself would satisfy the
+#: "an environment audit exists" assertion below while the real audit
+#: had been deleted. Same reasoning as ``_LOOKUP_BUILTINS``.
+_PROBE_COMMANDS = frozenset({"crawdad_require_python_module"})
+
+#: The module name ``pip-audit`` is imported and executed under. The
+#: gate invokes it as ``python -m pip_audit`` rather than by bare name,
+#: so that the audit runs in the interpreter under audit instead of
+#: whichever copy PATH resolves first (#1671).
+_PIP_AUDIT_MODULE = "pip_audit"
+
 
 def _mcp_specifier() -> SpecifierSet:
     """Return the ``mcp`` specifier set from ``[project].dependencies``."""
@@ -855,7 +869,32 @@ def _is_pip_audit_command(tokens: list[str]) -> bool:
     """
     if any(token in _LOOKUP_BUILTINS for token in tokens):
         return False
-    return any(token.rsplit("/", maxsplit=1)[-1] == "pip-audit" for token in tokens)
+    if tokens and tokens[0] in _PROBE_COMMANDS:
+        return False
+    if any(token.rsplit("/", maxsplit=1)[-1] == "pip-audit" for token in tokens):
+        return True
+    return _runs_python_module(tokens, _PIP_AUDIT_MODULE)
+
+
+def _runs_python_module(tokens: list[str], module: str) -> bool:
+    """Return whether a tokenized command is ``python -m <module>``.
+
+    Args:
+        tokens: Shell tokens of a single command.
+        module: The importable module name, e.g. ``pip_audit``.
+
+    Returns:
+        ``True`` when the command executes ``module`` through the active
+        interpreter. Any ``python``-prefixed argv[0] counts, so
+        ``python3`` and an absolute interpreter path are both
+        recognised.
+    """
+    if len(tokens) < 3:
+        return False
+    interpreter = tokens[0].rsplit("/", maxsplit=1)[-1]
+    return (
+        interpreter.startswith("python") and tokens[1] == "-m" and tokens[2] == module
+    )
 
 
 def _pip_audit_invocations() -> list[list[str]]:
@@ -1483,8 +1522,14 @@ def test_security_script_audits_installed_environment() -> None:
     honours neither ``uv.lock`` nor
     ``[tool.uv].constraint-dependencies``, so if a future edit ever
     reintroduces a live resolve, this is the pass that would notice —
-    the lock export below cannot. Only a bare ``pip-audit`` (one with no
-    ``-r`` / ``--requirement``) inspects what is actually installed.
+    the lock export below cannot. Only an audit with no ``-r`` /
+    ``--requirement`` inspects what is actually installed.
+
+    "Bare" here means bare of a requirements file, not bare of an
+    interpreter. Since #1671 the invocation is ``python -m pip_audit``:
+    a bare *executable* name is resolved by PATH, which silently
+    supplied Homebrew's copy when this project's environment had none,
+    auditing that interpreter instead of this one.
     """
     invocations = _pip_audit_invocations()
     assert invocations, (
