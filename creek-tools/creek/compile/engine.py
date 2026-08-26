@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek._fsio import atomic_write_text
+from creek._schema import coerce_optional_list
 from creek.audit import AuditLog
 from creek.care.guardrail import CARE_POLICY
 from creek.classify.privacy_filter import (
@@ -140,7 +142,8 @@ def compile_fragments(
         target_id: Stable ID of the synthesis target.
         target_title: Human-readable title for the rendered page.
         existing_provenance: Provenance already on the target page, used
-            to enforce idempotent re-runs.
+            to enforce idempotent re-runs. Only the entries this run
+            reproduces are carried forward — see :func:`_build_provenance`.
         compiled_at: Override the run timestamp; defaults to ``now(UTC)``.
         level_policy: FEAT-025 level policy applied to the input pairs.
             ``"leaves"`` (default) keeps the most-atomic representation
@@ -172,9 +175,10 @@ def compile_fragments(
     )
     payload = _parse_llm_payload(llm(prompt))
     valid_claims = _filter_valid_claims(payload["claims"])
-    provenance = merge_provenance(
+    provenance = _build_provenance(
         existing_provenance or [],
-        _claims_to_provenance(valid_claims, timestamp),
+        valid_claims,
+        timestamp,
     )
     page = CompiledPage(
         target_kind=target_kind,
@@ -249,6 +253,36 @@ def _claims_to_provenance(
         )
         for claim in claims
     ]
+
+
+def _build_provenance(
+    existing: list[ProvenanceEntry],
+    claims: list[dict[str, object]],
+    timestamp: datetime,
+) -> list[ProvenanceEntry]:
+    """Merge *existing* provenance into this run's, dropping orphaned entries.
+
+    Provenance may never outlive the body it describes. Compile
+    regenerates the whole body from the claims it was just handed, so an
+    existing entry this run did not re-emit records sources for a claim
+    the new body no longer contains — the state that let an empty
+    compile publish a title-only page still asserting the previous run's
+    fragments. Entries for claims this run *did* make keep merging
+    unchanged, so idempotent re-runs still accumulate ``fragment_ids``.
+
+    Args:
+        existing: Provenance already on the target page.
+        claims: The current run's claims, post-:func:`_filter_valid_claims`.
+        timestamp: The current run's compile timestamp.
+
+    Returns:
+        Merged entries, one per claim in *claims*, each stamped with
+        *timestamp*.
+    """
+    current = _claims_to_provenance(claims, timestamp)
+    claim_ids = {entry.claim_id for entry in current}
+    retained = [entry for entry in existing if entry.claim_id in claim_ids]
+    return merge_provenance(retained, current)
 
 
 def _payload_to_paradox_entries(
@@ -584,15 +618,58 @@ def _parse_llm_payload(raw: str) -> dict[str, list[dict[str, object]]]:
     if not isinstance(decoded, dict):
         msg = "Compile LLM payload must be a JSON object."
         raise ValueError(msg)  # noqa: TRY004  # ValueError unifies all LLM-payload schema errors with the JSONDecodeError branch above.
-    claims = decoded.get("claims") or []
-    paradoxes = decoded.get("paradoxes") or []
-    if not isinstance(claims, list) or not isinstance(paradoxes, list):
+    claims = _require_array(decoded.get("claims"))
+    paradoxes = _require_array(decoded.get("paradoxes"))
+    return {
+        "claims": _require_object_array(claims),
+        "paradoxes": _require_object_array(paradoxes),
+    }
+
+
+def _require_array(value: object) -> list[object]:
+    """Return *value* as a list, tolerating only an absent key or ``null``.
+
+    Args:
+        value: The raw ``claims`` / ``paradoxes`` value from the payload.
+
+    Returns:
+        The list *value* denotes; ``[]`` when it is absent or ``null``.
+
+    Raises:
+        ValueError: When *value* is any other non-list — the falsy ones
+            (``0``, ``""``, ``false``, ``{}``) included, which the old
+            ``or []`` coerced away before the guard could see them.
+    """
+    items = coerce_optional_list(value)
+    if items is None:
         msg = "Compile LLM payload claims/paradoxes must be arrays."
-        raise ValueError(msg)  # noqa: TRY004  # ValueError unifies all LLM-payload schema errors with the JSONDecodeError branch above.
-    if any(not isinstance(item, dict) for item in (*claims, *paradoxes)):
+        raise ValueError(msg)
+    return items
+
+
+def _require_object_array(items: list[object]) -> list[dict[str, object]]:
+    """Return *items* once every element is a JSON object.
+
+    Rejects the array whole rather than dropping the bad elements: a
+    salvaged payload writes a hollowed-out body over a good page, which
+    is worse than a failure the operator can retry.
+
+    Args:
+        items: An already-validated list of raw payload elements.
+
+    Returns:
+        The same elements, typed as JSON objects.
+
+    Raises:
+        ValueError: When any element is not a JSON object.
+    """
+    objects: list[dict[str, object]] = [
+        item for item in items if isinstance(item, dict)
+    ]
+    if len(objects) != len(items):
         msg = "Compile LLM payload claims/paradoxes must contain JSON objects."
         raise ValueError(msg)
-    return {"claims": list(claims), "paradoxes": list(paradoxes)}
+    return objects
 
 
 def _render_body(title: str, claims: list[dict[str, object]]) -> str:
@@ -728,10 +805,18 @@ def _load_existing_provenance(target_path: Path) -> list[ProvenanceEntry]:
 
 
 def _write_compiled_page(target_path: Path, page: CompiledPage) -> None:
-    """Serialise *page* to *target_path* with YAML frontmatter."""
+    """Serialise *page* to *target_path* with YAML frontmatter.
+
+    Commits through :func:`creek._fsio.atomic_write_text` rather than
+    ``Path.write_text``, which truncates the target before it writes: an
+    interrupted re-compile would otherwise destroy the previously
+    compiled page and leave a stub under its name. The staged commit
+    also narrows the page to ``mkstemp``'s owner-only 0o600, matching
+    what :mod:`creek.vault.writer` already produces for vault notes.
+    """
     metadata = page.model_dump(mode="json", exclude={"body"})
     post = frontmatter.Post(content=page.body, **metadata)
-    target_path.write_text(frontmatter.dumps(post), encoding="utf-8")
+    atomic_write_text(target_path, frontmatter.dumps(post))
 
 
 def _append_paradox_log(vault_path: Path, entries: list[ParadoxLogEntry]) -> None:
