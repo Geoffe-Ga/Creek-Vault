@@ -115,6 +115,12 @@ def classify_tool(
         # consumers can present the two reasons distinctly.
         "preserved_llm": summary.preserved_llm,
         "skipped_high_confidence": summary.skipped_high_confidence,
+        # Issue #1356: the LLM-failed skips used to roll into the field above,
+        # so a run against a downed provider reported itself as a run in which
+        # the rules were confident. Surfaced separately because only this one
+        # tells the consumer the corpus is under-classified and the pass is
+        # worth repeating.
+        "llm_call_failed": summary.llm_call_failed,
         # Issue #876: how many fragments this run gave a real privacy
         # tier. Surfaced separately from ``classified`` because the tier
         # pass also runs on fragments the resume short-circuit preserved.
