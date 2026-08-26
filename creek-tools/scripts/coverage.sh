@@ -48,8 +48,10 @@ OPTIONS:
     --help      Display this help message
 
 EXIT CODES:
-    0           Coverage threshold met
-    1           Coverage below threshold
+    0           Tests passed and coverage met the threshold
+    1           A test failed, OR coverage is below the threshold — pytest
+                exits 1 for both and this script cannot tell them apart, so
+                it does not guess. Read the pytest summary.
     2           Error running coverage
 
 EXAMPLES:
