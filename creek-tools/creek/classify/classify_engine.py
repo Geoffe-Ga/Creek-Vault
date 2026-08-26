@@ -237,6 +237,7 @@ from creek.classify.privacy_pass import (
     outranks_recorded_tier,
     reassess,
 )
+from creek.classify.provenance_pass import has_unearned_llm_stamp
 from creek.classify.reatomize import (
     ClassificationTree,
     Classifier,
@@ -436,6 +437,13 @@ class ClassifySummary:
             Escalate-only, so a second run over an unchanged vault reports
             ``0``. Like :attr:`privacy_tiers_assigned` this counts the
             decision, not the bytes.
+        healed_unearned_llm: Fragments this run refused to preserve because
+            their ``classification_method: llm`` was written by the pre-#1358
+            weighted soft-failure path and no LLM ever ran (issue #1357).
+            Counted whether or not ``--force`` was passed, since the
+            fabricated ``weighted`` block is cleared either way. Not a subset
+            of :attr:`preserved_llm` but its complement: these are exactly the
+            fragments that stamp would otherwise have stranded.
     """
 
     total: int
@@ -452,6 +460,7 @@ class ClassifySummary:
     tags_extracted: int = 0
     retiered: int = 0
     llm_call_failed: int = 0
+    healed_unearned_llm: int = 0
 
 
 @dataclass
@@ -472,6 +481,7 @@ class _RunCounts:
     praxis_marked: int = 0
     tags_extracted: int = 0
     retiered: int = 0
+    healed_unearned_llm: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -685,6 +695,7 @@ def run_classify(
         tags_extracted=counts.tags_extracted,
         retiered=counts.retiered,
         llm_call_failed=counts.llm_call_failed,
+        healed_unearned_llm=counts.healed_unearned_llm,
     )
 
 
@@ -789,6 +800,46 @@ def _record_if_preserved(
         counts.preserved_llm += 1
         return True
     return False
+
+
+def _resolve_resume(
+    fragment: Fragment,
+    raw: dict[str, object],
+    counts: _RunCounts,
+    *,
+    force: bool,
+) -> tuple[Fragment, bool]:
+    """Decide whether the resume short-circuit owns this fragment (#1357).
+
+    The unearned-stamp check comes *first* and is not conditioned on
+    ``force``: an ``llm`` stamp the pre-#1358 weighted soft-failure path
+    wrote is not a resume point, it is a lie, and honouring it is what
+    strands the fragment permanently — no ordinary run ever revisits a
+    fragment :func:`_record_if_preserved` skipped. Refusing it here is what
+    lets a plain ``creek classify --method llm`` heal the vault without
+    ``--force``, which would re-pay for every already-good fragment.
+
+    The fabricated all-zero ``weighted`` block is dropped here rather than
+    left for the classifier to overwrite, because the classifier may not get
+    the chance: if the provider is still down the write path stamps
+    ``rules``, and carrying the block across would trade the false claim "an
+    LLM classified this" for the equally false "a weighted detection ran".
+
+    Args:
+        fragment: The fragment as loaded (already tiered by the caller).
+        raw: Its frontmatter dict, carrying the provenance keys.
+        counts: Mutable per-run counters; mutated in place.
+        force: Whether this run re-derives settled classifications.
+
+    Returns:
+        ``(fragment, preserved)``. *preserved* is ``True`` when the caller
+        must short-circuit; the returned fragment has the fabricated profile
+        cleared when an unearned stamp was found.
+    """
+    if has_unearned_llm_stamp(fragment, raw):
+        counts.healed_unearned_llm += 1
+        return fragment.model_copy(update={"weighted": None}), False
+    return fragment, not force and _record_if_preserved(raw, counts)
 
 
 def _record_praxis(
@@ -1085,7 +1136,11 @@ def _prepare_fragment(
     # (issue #321). The free, non-destructive passes — the tier assigned
     # above (#876) and the hashtag backfill (#1207) — still land, each
     # through a narrow writer that touches nothing else.
-    if not force and _record_if_preserved(raw, counts):
+    # #1357: the resume decision also refuses an ``llm`` stamp no LLM earned.
+    # Resolved *after* the tier work above so a healed fragment carries the
+    # same tier it would have had anyway.
+    fragment, preserved = _resolve_resume(fragment, raw, counts, force=force)
+    if preserved:
         _backfill_preserved(
             md_file=md_file,
             fragment=fragment,

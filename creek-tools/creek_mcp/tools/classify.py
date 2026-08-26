@@ -141,5 +141,11 @@ def classify_tool(
         # until #878, and an invisible producer is how that bug survived
         # 35,330 fragments and an empty Tag Garden.
         "tags_extracted": summary.tags_extracted,
+        # Issue #1357: how many fragments this run refused to treat as
+        # already-LLM-classified because the pre-#1358 weighted soft-failure
+        # path stamped them without any LLM running. Surfaced here for the
+        # same reason as on the CLI: every other field on this payload counts
+        # such a fragment as done.
+        "healed_unearned_llm": summary.healed_unearned_llm,
         "errors": list(summary.errors),
     }
