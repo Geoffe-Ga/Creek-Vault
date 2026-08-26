@@ -126,12 +126,19 @@ fi
 # live smokes included; that lane is unchanged and must stay that way.
 PYTEST_ARGS+=(-m "not integration and not e2e and not slow and not live")
 
-# Run tests with coverage
+# Run tests with coverage.
+#
+# pytest exits 1 both for a failing test and for --cov-fail-under, so this
+# handler cannot tell the two apart and must not claim to. It used to say
+# "Coverage below threshold" unconditionally, which printed a false cause
+# on every run where a test failed and coverage was fine — the same shape
+# of misreporting gate this script was fixed for in #1670.
 python -m pytest "${PYTEST_ARGS[@]}" tests/ || {
-    echo "✗ Coverage below threshold" >&2
+    echo "✗ Coverage lane failed: a test failed, or coverage is below" >&2
+    echo "  the threshold. The pytest summary above says which." >&2
     exit 1
 }
 
-echo "✓ Coverage threshold met"
+echo "✓ Coverage lane passed (tests green, coverage at or above threshold)"
 
 exit 0
