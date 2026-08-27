@@ -649,6 +649,29 @@ def test_ingest_refuses_unknown_source_type(vault: Path) -> None:
     assert "unknown source_type" in result["reason"]
 
 
+def test_ingest_refuses_a_nul_byte_path_without_raising(vault: Path) -> None:
+    """An unresolvable path becomes a refusal, not an exception (#1089).
+
+    ``resolve_within_vault``'s ``candidate.resolve()`` used to sit outside its
+    own ``try``, so an embedded NUL in a caller-supplied ``input_path`` raised
+    ``ValueError`` straight out of the MCP boundary instead of taking the
+    ordinary outside-the-vault exit. A tool that raises where it should refuse
+    hands the caller a stack trace in place of a structured answer.
+
+    ``pytest.raises`` is deliberately absent: the assertion is that calling
+    this at all returns rather than raises, which the call itself makes.
+    """
+    result = ingest_tool(
+        vault_path=vault,
+        source_type="markdown",
+        input_path="staging/no\x00pe.md",
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+    assert result["status"] == "refused", (
+        f"a NUL-byte input_path did not produce a structured refusal: {result}"
+    )
+
+
 def test_ingest_refuses_missing_path(vault: Path) -> None:
     """A non-existent input path returns a structured refusal."""
     result = ingest_tool(

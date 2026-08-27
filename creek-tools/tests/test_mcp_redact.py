@@ -322,6 +322,24 @@ def test_scan_refuses_absolute_path_outside_vault(
     )
 
 
+def test_scan_refuses_a_nul_byte_path_without_raising(vault: Path) -> None:
+    """The scan tool refuses an unresolvable path rather than raising (#1089).
+
+    The companion to the ingest case. Both tools route caller-supplied paths
+    through the same ``resolve_within_vault``, so one unguarded ``resolve()``
+    was a raise on both surfaces; both are asserted so a future edit that
+    guards only one call site is caught.
+    """
+    result = redact_scan_tool(
+        vault_path=vault,
+        input_path="00-Creek-Meta/Inbound/no\x00pe",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "refused", (
+        f"a NUL-byte input_path did not produce a structured refusal: {result}"
+    )
+
+
 def test_scan_refuses_missing_path(vault: Path) -> None:
     """A non-existent vault-relative path is refused cleanly."""
     result = redact_scan_tool(
