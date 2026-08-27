@@ -54,6 +54,7 @@ fix, after which the prefix can be dropped.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -123,6 +124,41 @@ class LinkIndex:
     def __contains__(self, target: object) -> bool:
         """Return whether *target* is a string naming some page in the vault."""
         return isinstance(target, str) and self.resolve(target) is not None
+
+
+WIKILINK_PATTERN: re.Pattern[str] = re.compile(
+    r"\[\[([^\]|#]+?)(?:[#|][^\]]*?)?\]\]",
+)
+"""Matches Obsidian wiki-links, capturing only the file portion of the target.
+
+Heading anchors (``[[Note#Heading]]``) and aliases (``[[Note|alias]]``) are
+excluded from the captured target, and same-file anchors (``[[#Heading]]``)
+produce no target at all -- they name no file to resolve (issue #835).
+
+This lives beside :class:`LinkIndex` because the two are one contract:
+:meth:`LinkIndex.resolve` documents that its argument arrives with any
+``#heading`` or ``|display`` suffix already stripped, and this is the pattern
+that strips them. A caller that pairs a looser regex with this index gets
+false "broken link" reports for every anchor and alias in the vault, which is
+exactly what #1518 found in ``creek/clean/filters/markdown.py``.
+"""
+
+
+def extract_wikilinks(content: str) -> list[str]:
+    """Extract wiki-link targets from markdown content.
+
+    Targets are the file portions only: heading anchors and aliases are
+    stripped by the pattern, and same-file anchor links (``[[#Heading]]``)
+    yield no target (issue #835).
+
+    Args:
+        content: Raw markdown text.
+
+    Returns:
+        List of wiki-link target strings, ready to hand to
+        :meth:`LinkIndex.resolve`.
+    """
+    return WIKILINK_PATTERN.findall(content)
 
 
 def _read_header_block(path: Path) -> str | None:

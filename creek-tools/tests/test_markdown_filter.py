@@ -17,9 +17,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from creek.clean.filters import FilterResult, MarkdownFilter
+from creek.clean.filters import markdown as markdown_module
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
+
+    from creek.vault.links import LinkIndex
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +296,122 @@ class TestMarkdownFilterBrokenLinks:
         f = MarkdownFilter()
         result = f.filter(content, vault_path=vault)
         assert not any("existing-note" in w for w in result.warnings)
+
+    def test_an_alias_resolves_and_warns_about_nothing(self, tmp_path: Path) -> None:
+        """A link naming a page's alias is not broken (#1518).
+
+        The filter used to answer this by globbing for ``<target>.md``, so a
+        page whose *filename* differs from the name it is linked by looked
+        dangling. ``build_link_index`` has resolved exactly this since #887 --
+        the filter was carrying a second, worse copy of link resolution and
+        reproducing the bugs #835/#887/#1225 had already removed from
+        ``hygiene.py``.
+        """
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "my-note.md").write_text(
+            "---\ntitle: My Note\naliases: [My Note]\n---\n# My Note\n",
+            encoding="utf-8",
+        )
+        content = (
+            "---\ntitle: T\n---\n"
+            "See [[My Note]] and [[My Note|the note]] and [[My Note#Heading]]."
+        )
+        result = MarkdownFilter().filter(content, vault_path=vault)
+        broken = [w for w in result.warnings if "Broken wiki-link" in w]
+        assert broken == [], (
+            "a page reachable by title and alias was reported broken; the "
+            f"filter is not using the shared link index. Warnings: {broken}"
+        )
+
+    def test_a_same_file_anchor_names_no_page(self, tmp_path: Path) -> None:
+        """``[[#Heading]]`` points inside this file and cannot be broken (#835).
+
+        The naive pattern captured ``#Heading`` as a target and then failed to
+        resolve it, which is the false warning #835 removed from
+        ``hygiene.py``'s copy.
+        """
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        content = "---\ntitle: T\n---\nJump to [[#Section Two]] further down."
+        result = MarkdownFilter().filter(content, vault_path=vault)
+        assert [w for w in result.warnings if "Broken wiki-link" in w] == []
+
+    def test_a_genuinely_dangling_link_is_still_reported(self, tmp_path: Path) -> None:
+        """Delegating must not silence real breakage.
+
+        The companion that stops the fix from degenerating into "warn about
+        nothing" -- every assertion above is satisfied by a filter that
+        reports no broken links at all.
+        """
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "real.md").write_text("# Real\n", encoding="utf-8")
+        content = "---\ntitle: T\n---\nSee [[nowhere-at-all]] for details here."
+        result = MarkdownFilter().filter(content, vault_path=vault)
+        assert any("nowhere-at-all" in w for w in result.warnings), (
+            f"a genuinely dangling link was not reported: {result.warnings}"
+        )
+
+    def test_the_link_index_is_built_once_per_vault(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Filtering many files must not re-walk the vault for each one (#1518).
+
+        The replaced implementation ran one ``rglob`` per *link*, so cost grew
+        with files x links. Counting builds is the assertion; a wall-clock
+        comparison would be flaky on a shared runner and is not acceptable
+        evidence for this.
+        """
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / "target.md").write_text("# Target\n", encoding="utf-8")
+
+        calls: list[Path] = []
+        real_build = markdown_module.build_link_index
+
+        def _counting_build(vault_path: Path) -> LinkIndex:
+            calls.append(vault_path)
+            return real_build(vault_path)
+
+        monkeypatch.setattr(markdown_module, "build_link_index", _counting_build)
+
+        markdown_filter = MarkdownFilter()
+        body = "---\ntitle: T\n---\nSee [[target]] and [[target]] again here now."
+        for _ in range(3):
+            markdown_filter.filter(body, vault_path=vault)
+
+        assert len(calls) == 1, (
+            f"the vault index was built {len(calls)} times across 3 files with "
+            "2 links each; it must be built once per vault"
+        )
+
+    def test_a_second_vault_gets_its_own_index(self, tmp_path: Path) -> None:
+        """Caching must key on the vault, not collapse two vaults into one.
+
+        A cache that ignored the vault path would answer the first vault's
+        index for every later one — resolving links against the wrong tree,
+        which is worse than the bug being fixed.
+        """
+        first = tmp_path / "one"
+        first.mkdir()
+        (first / "only-in-one.md").write_text("# One\n", encoding="utf-8")
+        second = tmp_path / "two"
+        second.mkdir()
+
+        markdown_filter = MarkdownFilter()
+        body = "---\ntitle: T\n---\nSee [[only-in-one]] for the details here."
+
+        assert not [
+            w
+            for w in markdown_filter.filter(body, vault_path=first).warnings
+            if "Broken wiki-link" in w
+        ]
+        assert [
+            w
+            for w in markdown_filter.filter(body, vault_path=second).warnings
+            if "Broken wiki-link" in w
+        ], "the second vault resolved a page that exists only in the first"
 
     def test_no_vault_path_skips_link_check(self) -> None:
         """When vault_path is None, broken links should not be checked."""

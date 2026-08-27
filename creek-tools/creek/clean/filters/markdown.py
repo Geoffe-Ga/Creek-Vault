@@ -22,9 +22,12 @@ import re
 from typing import TYPE_CHECKING
 
 from creek.clean.filters._result import FilterResult
+from creek.vault.links import build_link_index, extract_wikilinks
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from creek.vault.links import LinkIndex
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +49,6 @@ _TEMPLATE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("FIXME:", re.compile(r"FIXME:")),
 ]
 """Template residue patterns with human-readable labels."""
-
-_WIKI_LINK_PATTERN: re.Pattern[str] = re.compile(r"\[\[([^\]]+)\]\]")
-"""Matches Obsidian-style wiki-links ``[[target]]`` or ``[[target|alias]]``."""
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +75,28 @@ class MarkdownFilter:
                 body (after frontmatter) to pass the stub check.
         """
         self.min_body_length = min_body_length
+        self._indexed_vault: Path | None = None
+        self._link_index: LinkIndex | None = None
+
+    def _index_for(self, vault_path: Path) -> LinkIndex:
+        """Return the link index for *vault_path*, building it at most once.
+
+        The previous implementation ran one ``rglob`` per wiki-link, so a run
+        over a large vault re-walked the tree for every link in every file.
+        The index is built once per filter instance per vault instead, which
+        is what makes an ingest run pay for the walk a single time.
+
+        Args:
+            vault_path: Root of the Obsidian vault.
+
+        Returns:
+            The cached :class:`~creek.vault.links.LinkIndex`.
+        """
+        resolved = vault_path.resolve()
+        if self._link_index is None or self._indexed_vault != resolved:
+            self._link_index = build_link_index(resolved)
+            self._indexed_vault = resolved
+        return self._link_index
 
     def filter(
         self,
@@ -170,11 +192,15 @@ class MarkdownFilter:
         return warnings
 
     def _detect_broken_links(self, body: str, vault_path: Path) -> list[str]:
-        """Detect wiki-links whose target files do not exist in the vault.
+        """Detect wiki-links that resolve to no page in the vault.
 
-        Searches for ``[[target]]`` and ``[[target|alias]]`` patterns,
-        extracts the target name (before any ``|``), and checks whether
-        a corresponding ``.md`` file exists anywhere under *vault_path*.
+        Resolution is delegated to
+        :func:`~creek.vault.links.build_link_index`, the same primitive
+        ``hygiene.py`` uses. This module used to carry its own stem-matching
+        copy, which re-created all three defects #835/#887/#1225 had already
+        removed from that one: a same-file anchor was treated as a target, a
+        page reachable only by its ``title`` or an ``aliases`` entry looked
+        dangling, and case-folded matches were missed (#1518).
 
         Args:
             body: The stripped markdown body text.
@@ -183,25 +209,9 @@ class MarkdownFilter:
         Returns:
             A list of warning strings for each broken link.
         """
-        warnings: list[str] = []
-        matches = _WIKI_LINK_PATTERN.findall(body)
-        for raw_target in matches:
-            target = raw_target.split("|")[0].strip()
-            if not self._link_target_exists(target, vault_path):
-                warnings.append(f"Broken wiki-link: [[{target}]]")
-        return warnings
-
-    def _link_target_exists(self, target: str, vault_path: Path) -> bool:
-        """Check whether a wiki-link target resolves to a file in the vault.
-
-        Searches recursively for ``<target>.md`` under *vault_path*.
-
-        Args:
-            target: The wiki-link target name (without extension).
-            vault_path: Root path of the Obsidian vault.
-
-        Returns:
-            ``True`` if a matching ``.md`` file is found, ``False`` otherwise.
-        """
-        filename = f"{target}.md"
-        return any(vault_path.rglob(filename))
+        index = self._index_for(vault_path)
+        return [
+            f"Broken wiki-link: [[{target}]]"
+            for target in extract_wikilinks(body)
+            if index.resolve(target) is None
+        ]
