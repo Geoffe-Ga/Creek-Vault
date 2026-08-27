@@ -23,7 +23,11 @@ from typing import TYPE_CHECKING
 import frontmatter
 from pydantic import BaseModel, Field
 
-from creek.vault.links import build_link_index, iter_link_sources
+from creek.vault.links import (
+    WIKILINK_PATTERN,
+    build_link_index,
+    iter_link_sources,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -146,15 +150,11 @@ def _parse_datetime(value: object) -> datetime | None:
     return None
 
 
-_WIKILINK_PATTERN: re.Pattern[str] = re.compile(
-    r"\[\[([^\]|#]+?)(?:[#|][^\]]*?)?\]\]",
-)
-"""Matches Obsidian wiki-links, capturing only the file portion of the target.
-
-Heading anchors (``[[Note#Heading]]``) and aliases (``[[Note|alias]]``) are
-excluded from the captured target, and same-file anchors (``[[#Heading]]``)
-produce no target at all — they name no file to resolve (issue #835).
-"""
+#: Re-exported from :mod:`creek.vault.links`, which owns the pattern now
+#: (#1518). It was defined here and copied verbatim into two other modules;
+#: a copy is how #835's anchor bug reached a second call site in the first
+#: place. The name is kept so this module's existing references still read.
+_WIKILINK_PATTERN = WIKILINK_PATTERN
 
 _RELATIVE_LINK_PATTERN: re.Pattern[str] = re.compile(
     r"\[([^\]]*)\]\((?!#)([^)]+)\)",
