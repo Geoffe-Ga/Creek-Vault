@@ -16,7 +16,7 @@ remembering to extend a list of axes.
 to say, and it is false as literally worded: ``run_classify`` adds
 ``classification_method`` and ``classified_at``, which are not
 :class:`~creek.models.Fragment` model fields at all (see
-``_write_fragment``, ``creek/classify/classify_engine.py:1564-1583``),
+``_write_fragment``, ``creek/classify/classify_engine.py:2137``),
 and YAML key ordering plus timestamp round-tripping make a bytes
 comparison meaningless anyway. The true, stronger, testable contract is:
 
@@ -39,19 +39,28 @@ comparison meaningless anyway. The true, stronger, testable contract is:
    resulting delta would be correct behaviour rather than a wiring hole.
 3. Compare *parsed metadata*, not bytes — see above.
 
-**Known limitation (#974).** The claim above that this module "fails
-automatically on a fourth instance" is true only of the deterministic
-path: precondition 1 scopes every assertion here to ``no_llm=True`` /
-``--method rules``, and the fourth instance — ``creek process`` never
-calling :func:`creek.classify.privacy_pass.reassess`, so an LLM verdict
-of ``confessional`` + ``conviction`` never escalates the tier the way
-``creek classify`` does — structurally cannot manifest with no LLM in
-the run, so it went uncaught here. Extending the detector past that
-scope needs a deterministic stubbed model driving *both* orchestrators
-(tracked in #1107); until then, an axis wired into only one of them
-**behind an LLM verdict** is outside this module's reach, and
-``tests/test_pipeline.py::TestPipelinePrivacyReassess`` is what pins
-that particular hole.
+**The scope gap, and how it was closed (#974 → #1107).** The claim above
+that this module "fails automatically on a fourth instance" was for a long
+time true only of the deterministic path: precondition 1 scoped every
+assertion to ``no_llm=True`` / ``--method rules``, and the fourth instance —
+``creek process`` not calling :func:`creek.classify.privacy_pass.reassess`,
+so an LLM verdict of ``confessional`` + ``conviction`` never escalated the
+tier the way ``creek classify`` does — could not manifest with no LLM in the
+run, so it went uncaught here.
+
+Two things have changed since that paragraph was written, and both matter to
+a reader deciding what this module does and does not cover.
+
+*The #974 defect itself is fixed.* ``creek process`` now calls ``reassess``
+last and escalate-only at ``creek/pipeline.py:1001``, mirroring
+``classify_engine.py:1297``. The comment there names the issue.
+
+*The scope gap is closed too.* The LLM-path scenario at the foot of this
+module (#1107) runs the same parity comparison with one stubbed model driving
+both orchestrators, so an axis wired into only one of them **behind an LLM
+verdict** now fails here rather than escaping to
+``tests/test_pipeline.py::TestPipelinePrivacyReassess``, which remains the
+narrower unit-level pin on the reassess behaviour itself.
 
 The comparison is over the whole parsed frontmatter dict minus a small
 documented exclusion set, never a hand-enumerated list of axes. That is
@@ -66,15 +75,24 @@ import frontmatter
 import pytest
 
 from creek.classify.classify_engine import run_classify
+from creek.classify.llm.orchestrator import (
+    LLMClassificationResult,
+    LLMClassifier,
+)
 from creek.config import CreekConfig
 from creek.ingest.base import IngestedFragment
 from creek.models import (
     Authorship,
+    Confidence,
     Fragment,
     FragmentSource,
+    Frequency,
+    FrequencyClassification,
     PraxisPotential,
     PrivacyTier,
     SourcePlatform,
+    VoiceClassification,
+    VoiceRegister,
 )
 from creek.pipeline import Pipeline, PipelineResult
 
@@ -92,13 +110,13 @@ VAULT_DIRS: list[str] = [
 _CLASSIFY_ONLY_KEYS = frozenset({"classification_method", "classified_at"})
 """The only non-``Fragment`` keys a rules classify run adds to frontmatter.
 
-``_write_fragment`` (``creek/classify/classify_engine.py:1564-1583``)
+``_write_fragment`` (``creek/classify/classify_engine.py:2137``)
 starts from the raw on-disk mapping, overlays ``fragment.model_dump()``,
 then stamps exactly these two provenance keys. The two sibling
 provenance keys are *not* additions on this path: ``classification_provider``
 and ``classification_reasoning`` are explicitly popped for anything other
 than an ``llm`` write with a provider and a non-empty trace
-(``classify_engine.py:1572-1579``). Everything else in the mapping comes
+(``classify_engine.py:2175-2184``). Everything else in the mapping comes
 from the ``Fragment`` model, which is precisely what must not move.
 """
 
@@ -267,3 +285,183 @@ def test_rules_classify_after_process_changes_no_fragment_field(
             if key not in _CLASSIFY_ONLY_KEYS
         } == before_meta
         assert set(after_meta) - set(before_meta) == _CLASSIFY_ONLY_KEYS
+
+
+# ---------------------------------------------------------------------------
+# The LLM path (#1107)
+# ---------------------------------------------------------------------------
+
+_LLM_ONLY_KEYS = _CLASSIFY_ONLY_KEYS | {
+    "classification_provider",
+    "classification_reasoning",
+}
+"""Keys ``run_classify`` adds on the LLM path but ``creek process`` does not.
+
+``_write_fragment`` (``creek/classify/classify_engine.py:2137``) stamps
+``classification_provider`` whenever ``method == LLM_METHOD`` and a provider is
+set, and ``classification_reasoning`` whenever the trace is non-empty. Neither
+is a :class:`~creek.models.Fragment` field, so both belong in the exclusion set
+for the same reason the two rules-path stamps do.
+"""
+
+_STUB_REASONING = "stubbed trace: confessional register, held with conviction"
+
+
+def _stub_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give BOTH orchestrators the same deterministic model verdict.
+
+    **One seam, patched on the class.** ``LLMClassifier.classify_with_reasoning``
+    is where every LLM verdict enters, and both orchestrators construct their
+    classifiers through
+    :func:`~creek.classify.classify_engine.build_tier_classifiers` -- so a
+    single class-level patch reaches both without either being special-cased.
+    Stubbing per-orchestrator seams instead would let the two sides diverge in
+    the stub rather than in the code under test, which is the failure mode this
+    module exists to detect.
+
+    ``available`` is patched alongside it because
+    ``classify_engine.py:912`` raises
+    :class:`~creek.classify.llm.LLMProviderUnavailableError` for an
+    unavailable classifier before any call is made.
+
+    The verdict is ``confessional`` + ``conviction``: on a self-authored
+    fragment that is ``PrivacyClassifier.classify_tier``'s third INTIMATE
+    trigger (``creek/classify/privacy.py:265-274``), so it drives the
+    escalate-only ``reassess`` pass both orchestrators run last. That is the
+    exact axis #974 was about, and the reason this scenario is worth having
+    rather than any arbitrary stub.
+
+    Args:
+        monkeypatch: Pytest's patching fixture.
+    """
+
+    def _classify_with_reasoning(
+        _self: LLMClassifier,
+        fragment: Fragment,
+        content: str = "",
+    ) -> LLMClassificationResult:
+        """Return a fixed off-default verdict for *fragment*.
+
+        Args:
+            _self: The classifier instance; unused.
+            fragment: The fragment to classify.
+            content: Unused; the verdict does not depend on the body.
+
+        Returns:
+            The fragment with voice and frequency moved off their defaults.
+        """
+        updated = fragment.model_copy(
+            update={
+                "voice": VoiceClassification(
+                    voice_register=VoiceRegister.CONFESSIONAL,
+                    confidence=Confidence.CONVICTION,
+                ),
+                "frequency": FrequencyClassification(primary=Frequency.F7),
+            }
+        )
+        return LLMClassificationResult(
+            fragment=updated, reasoning=_STUB_REASONING, succeeded=True
+        )
+
+    monkeypatch.setattr(
+        LLMClassifier, "classify_with_reasoning", _classify_with_reasoning
+    )
+    monkeypatch.setattr(LLMClassifier, "available", property(lambda _self: True))
+
+
+def test_llm_classify_after_llm_process_changes_no_fragment_field(
+    vault_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The parity invariant must hold on the LLM path too (#1107).
+
+    Everything above this scenario is scoped to ``no_llm=True`` /
+    ``--method rules``, so an axis wired into one orchestrator and not the
+    other **behind an LLM verdict** was outside the detector's reach. This
+    closes that scope gap with one stubbed model driving both sides, so the
+    only thing that can differ is the orchestrator code.
+
+    The platform is ``markdown``, not ``journal``, deliberately:
+    ``Pipeline._needs_llm`` (``creek/pipeline.py:1055``) returns ``False`` for
+    any platform in ``human_review_sources``, whose default is
+    ``["journal"]`` -- a journal fixture would skip the LLM entirely on the
+    process side and the scenario would silently test the rules path twice.
+    """
+    _stub_llm(monkeypatch)
+
+    items = [
+        _ingested("frag-llmparity01", "The long way round", _RICH_BODY, "markdown"),
+        _ingested("frag-llmparity02", "Walking notes", _NEUTRAL_BODY, "markdown"),
+    ]
+    pipeline = Pipeline(config=CreekConfig(), no_llm=False)
+    result = PipelineResult()
+
+    classified = pipeline._run_classification(items, vault_path, result)
+    pipeline._write_to_vault(classified, vault_path, result)
+
+    assert result.errors == []
+
+    before = _snapshot(vault_path)
+    assert set(before) == {"frag-llmparity01", "frag-llmparity02"}
+
+    # Anti-vacuity: the stub must actually have reached both fragments and
+    # moved them off their model defaults. Without this, a run where the LLM
+    # was never dispatched would leave both snapshots agreeing at the
+    # defaults and the parity assertion below would compare nothing.
+    for frag_id, meta in before.items():
+        assert meta["frequency"]["primary"] == Frequency.F7.value, (
+            f"{frag_id}: the stubbed verdict never reached the process side, "
+            f"so this scenario is testing the rules path twice: {meta}"
+        )
+        assert meta["voice"]["voice_register"] == VoiceRegister.CONFESSIONAL.value
+        assert meta["privacy_tier"] == PrivacyTier.INTIMATE.value, (
+            f"{frag_id}: confessional + conviction on a self-authored fragment "
+            "did not escalate the tier, so the reassess pass #974 added to "
+            f"creek process is not running: {meta}"
+        )
+
+    summary = run_classify(
+        vault_path=vault_path,
+        config=CreekConfig(),
+        method="llm",
+        force=True,
+    )
+
+    assert summary.errors == ()
+    assert summary.total == len(items)
+
+    after = _snapshot(vault_path)
+    assert set(after) == set(before)
+
+    # KNOWN DIVERGENCE, pinned rather than excluded (#1689). This scenario
+    # found a real defect on its first run: `creek process` scores `audience`
+    # BEFORE the escalate-only `reassess` that ends both orchestrators
+    # (pipeline.py:1001, classify_engine.py:1297), so on a freshly-ingested
+    # fragment it is computed against the pre-escalation tier. A re-classify
+    # then reads `intimate` off disk and answers differently.
+    #
+    # It is asserted here as an equality, not dropped from the comparison, for
+    # two reasons. Excluding the key would blind this detector to any FUTURE
+    # audience wiring defect — the one thing the module exists to catch. And
+    # pinning it means the day #1689 is fixed this assertion fails, forcing
+    # whoever fixes it to delete the pin rather than leaving a stale
+    # exclusion behind. Its acceptance criteria say exactly that.
+    known_divergence = {"frag-llmparity02": ("audience", "mixed", "private")}
+
+    for frag_id, before_meta in before.items():
+        after_meta = after[frag_id]
+        ignore = set(_LLM_ONLY_KEYS)
+        if frag_id in known_divergence:
+            key, want_before, want_after = known_divergence[frag_id]
+            assert (before_meta[key], after_meta[key]) == (want_before, want_after), (
+                f"{frag_id}: the #1689 divergence changed shape — expected "
+                f"{key} {want_before!r} -> {want_after!r}, got "
+                f"{before_meta[key]!r} -> {after_meta[key]!r}. If #1689 is "
+                "fixed, delete this pin instead of updating it."
+            )
+            ignore.add(key)
+        assert {
+            key: value for key, value in after_meta.items() if key not in ignore
+        } == {key: value for key, value in before_meta.items() if key not in ignore}, (
+            f"{frag_id}: a Fragment field moved between the two orchestrators"
+        )
