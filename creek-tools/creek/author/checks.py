@@ -112,48 +112,6 @@ _LEGACY_ALIASES: dict[str, str] = (
 )
 
 
-ZERO_EVIDENCE_WARNING = (
-    "No grounded evidence was found for this query, so the draft stands on "
-    "nothing from your vault. The usual cause is an unclassified corpus: at "
-    "the default `open` ceiling a fragment with no concrete privacy_tier is "
-    "excluded from evidence gathering (#1079), so a freshly-ingested vault "
-    "reads as empty. Run `creek classify` over the vault and author again, "
-    "or raise the ceiling with --include-tier if you intend to draft from "
-    "unclassified material."
-)
-"""Warning emitted when evidence gathering returns zero grounded claims.
-
-Issue #1261. The filter itself is correct and is deliberately unchanged --
-#1079 settled that a missing tier resolves restrictively, and reopening that
-is a privacy-posture decision, not a UX one. What was wrong is that the
-command said nothing: an operator with a freshly-ingested vault got a
-confident-looking artefact built on no evidence, with the only hint being a
-lowercase ``(no grounded evidence)`` fallback inside the body itself
-(``creek/author/voice.py:222``).
-
-Defined once and shared by both surfaces so the CLI and its MCP twin cannot
-drift into describing the same condition differently.
-"""
-
-
-def has_zero_evidence(draft: object) -> bool:
-    """Return whether *draft* gathered no grounded provenance at all.
-
-    Keyed on provenance rather than on ``verdict``: escalation is routine on
-    this surface (an empty vault escalates, and any unresolved soft finding
-    escalates once the round budget runs out), so a verdict test would fire on
-    ordinary drafts. Zero provenance is the precise condition #1261 is about.
-
-    Args:
-        draft: An :class:`~creek.author.models.AuthoredDraft`; typed loosely to
-            keep this module free of an import cycle with the models it serves.
-
-    Returns:
-        ``True`` when the draft cites no provenance entries.
-    """
-    return not getattr(draft, "provenance", None)
-
-
 def check_citation_completeness(evidence: EvidenceBundle) -> list[ReflectionFinding]:
     """Flag any claim that asserts something without a source fragment (HARD).
 

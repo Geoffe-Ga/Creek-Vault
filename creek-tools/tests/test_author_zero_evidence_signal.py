@@ -26,8 +26,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from creek.author.checks import ZERO_EVIDENCE_WARNING, has_zero_evidence
-from creek.author.models import AuthoredDraft
+from creek.author.models import (
+    ZERO_EVIDENCE_WARNING,
+    AuthoredDraft,
+    has_zero_evidence,
+)
 from creek.cli import _emit_author_result
 from creek.compile.provenance import ProvenanceEntry
 from creek_mcp.tier_ceiling import TierCeiling

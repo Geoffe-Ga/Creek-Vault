@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from creek.author import plan_author, require_supported_medium, run_author
-from creek.author.checks import ZERO_EVIDENCE_WARNING, has_zero_evidence
+from creek.author.models import ZERO_EVIDENCE_WARNING, has_zero_evidence
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response, to_privacy_override
 

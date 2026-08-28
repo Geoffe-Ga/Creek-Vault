@@ -20,7 +20,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from creek._containment import EscapingSymlinkError, assert_source_contained
-from creek.author.checks import ZERO_EVIDENCE_WARNING, has_zero_evidence
+from creek.author.models import ZERO_EVIDENCE_WARNING, has_zero_evidence
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     override_elevates,
