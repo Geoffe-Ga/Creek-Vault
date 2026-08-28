@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from creek.author import plan_author, require_supported_medium, run_author
+from creek.author.checks import ZERO_EVIDENCE_WARNING, has_zero_evidence
 from creek_mcp.audit import MCPAuditLog
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response, to_privacy_override
 
@@ -236,6 +237,12 @@ def _draft_response(
             {"claim": entry.claim_excerpt, "source_fragments": entry.fragment_ids}
             for entry in draft.provenance
         ],
+        # #1261: the same signal the CLI prints, carried on the wire so an MCP
+        # consumer is not the one surface left guessing why a draft cites
+        # nothing. A LIST rather than a bool: it extends without a contract
+        # change if a second advisory is ever added, and no existing test
+        # makes an exact-key claim on this envelope.
+        "warnings": ([ZERO_EVIDENCE_WARNING] if has_zero_evidence(draft) else []),
     }
 
 
