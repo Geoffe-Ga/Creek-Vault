@@ -144,7 +144,9 @@ def test_both_surfaces_quote_one_shared_string() -> None:
 
     Two hand-written messages describing one condition is how the four
     unlinked copies in #1362 happened. The constant is defined once in
-    ``creek.author.checks`` and both surfaces render it.
+    ``creek.author.models``, beside the :class:`AuthoredDraft` it describes,
+    and both surfaces render that one object -- which is why the assertion
+    below is an identity check, not an equality one.
     """
     envelope = _draft_response(_draft(grounded=False), tier_ceiling=TierCeiling.OPEN)
     assert envelope["warnings"][0] is ZERO_EVIDENCE_WARNING
