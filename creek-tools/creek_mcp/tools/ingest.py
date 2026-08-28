@@ -83,13 +83,31 @@ def ingest_tool(
         A dict with ``status`` (``ok`` / ``refused``), the count and ids of
         written fragments, and any per-fragment errors.
     """
+    # Audit the ATTEMPT, unconditionally, before any gate can refuse it
+    # (#885). Four refusal arms below used to return with no entry at all --
+    # unknown source_type, the confinement refusal, not-found, and the
+    # escaping-symlink refusal -- so a remote consumer could probe this
+    # vault's boundary and leave nothing behind.
+    #
+    # This is the discipline ``read_gate.py:20-23`` already states, and the
+    # shape ``creek.redact.scan`` has used since #972 (``redact.py:179``).
+    # Two deliberate omissions, both required by that record: the entry
+    # carries no outcome, so the trail cannot answer "was this refused?"
+    # either way; and it echoes the caller's own ``input_path`` string, never
+    # the resolved path -- which for a staged symlink IS an intimate
+    # fragment's path (``read_gate.py:651-657``).
+    #
+    # The success append near the end of this function stays: it carries
+    # write-side facts (created_tier, affected_fragment_ids) that an attempt
+    # entry cannot know. A completed ingest therefore writes two rows.
+    MCPAuditLog(vault_path).append(
+        tool=TOOL_NAME,
+        args={"source_type": source_type, "input_path": input_path},
+        tier_ceiling=privacy_tier_ceiling,
+        consumer=consumer,
+    )
+
     if not write_tier_allowed(DEFAULT_INGEST_TIER, privacy_tier_ceiling):
-        MCPAuditLog(vault_path).append(
-            tool=TOOL_NAME,
-            args={"source_type": source_type, "input_path": input_path},
-            tier_ceiling=privacy_tier_ceiling,
-            consumer=consumer,
-        )
         return refusal_response(
             tool=TOOL_NAME,
             ceiling=privacy_tier_ceiling,
