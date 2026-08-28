@@ -20,6 +20,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from creek._containment import EscapingSymlinkError, assert_source_contained
+from creek.author.models import ZERO_EVIDENCE_WARNING, has_zero_evidence
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     override_elevates,
@@ -6641,6 +6642,13 @@ def _emit_author_result(draft: AuthoredDraft) -> None:
         f"medium={draft.medium} verdict={draft.verdict} "
         f"rounds={draft.rounds} provenance={len(draft.provenance)}",
     )
+    # #1261: `provenance=0` above is technically a signal and practically not
+    # one -- it names a count, not a cause, and the only other hint was a
+    # lowercase `(no grounded evidence)` fallback inside the body. Say plainly
+    # what happened and what to do about it. The filter is unchanged: #1079
+    # settled that a missing tier resolves restrictively.
+    if has_zero_evidence(draft):
+        console.print(f"[yellow]{ZERO_EVIDENCE_WARNING}[/yellow]")
     leaks = [hit for hit in draft.findings if hit.dimension == _PRIVACY_DIMENSION]
     if not leaks:
         console.print(draft.body)
