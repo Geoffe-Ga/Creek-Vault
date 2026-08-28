@@ -147,6 +147,29 @@ def _severity_rank(pattern_name: str) -> int:
     return _SEVERITY_RANKS.get(info.severity, _UNKNOWN_SEVERITY_RANK)
 
 
+def _iter_lines_with_offsets(content: str) -> list[tuple[int, str]]:
+    """Yield each line of *content* with its document offset.
+
+    Mirrors ``RedactionScanner``'s ``text.splitlines()`` walk exactly -- the
+    line bodies are what ``splitlines()`` would return, terminators excluded --
+    while also reporting where each line begins, so a per-line match can be
+    stored in document coordinates (#900).
+
+    Args:
+        content: The original, untouched text.
+
+    Returns:
+        ``(offset, line)`` pairs in document order.
+    """
+    windows: list[tuple[int, str]] = []
+    offset = 0
+    for raw in content.splitlines(keepends=True):
+        bodies = raw.splitlines()
+        windows.append((offset, bodies[0] if bodies else ""))
+        offset += len(raw)
+    return windows
+
+
 def _merge_spans(spans: list[_Span]) -> list[_MergedSpan]:
     """Union truly overlapping spans into maximal merged regions.
 
@@ -373,17 +396,67 @@ class Redactor:
             Spans for every match that survives the allowlist and the
             pattern-specific post-validator (e.g. Luhn for
             ``credit_card``), in collection order.
+
+        Two passes, unioned, because the scanner and the redactor were
+        matching different things (#900). ``RedactionScanner.scan_file``
+        walks ``text.splitlines()`` and matches **per line**; this method
+        matched the **whole document**. Any pattern whose whitespace can
+        cross a newline diverges between the two, and the divergence leaks:
+        on ``"password =\\npassword = s3cret"`` the built-in ``password``
+        pattern matches ``"password =\\npassword"`` whole-document -- the
+        span ENDS before the secret -- so ``--scan`` reported a critical
+        finding that ``--apply`` then wrote straight back out.
+
+        It is a union rather than a swap. A per-line walk alone cannot see a
+        match that legitimately spans a newline, so replacing the
+        whole-document pass would trade this parity gap for the mirror-image
+        one, in the direction that leaks. Duplicate matches (any single-line
+        match is found by both passes) are dropped by offset+name, and
+        genuine overlaps are already unioned downstream by
+        :func:`_merge_spans`.
         """
         spans: list[_Span] = []
-        for name, pattern in patterns.items():
-            for match in pattern.finditer(content):
-                text = match.group()
-                if self._is_allowlisted(text):
-                    continue
-                if not post_validate(name, text):
-                    continue
-                spans.append(_Span(match.start(), match.end(), name, len(spans)))
+        seen: set[tuple[int, int, str]] = set()
+        self._record_matches(spans, seen, content, patterns, offset=0)
+        for offset, line in _iter_lines_with_offsets(content):
+            self._record_matches(spans, seen, line, patterns, offset=offset)
         return spans
+
+    def _record_matches(
+        self,
+        spans: list[_Span],
+        seen: set[tuple[int, int, str]],
+        text: str,
+        patterns: dict[str, re.Pattern[str]],
+        *,
+        offset: int,
+    ) -> None:
+        """Append every surviving match in *text* to *spans*, shifted by *offset*.
+
+        Args:
+            spans: Accumulator, mutated in place.
+            seen: ``(start, end, name)`` keys already recorded, so the
+                whole-document and per-line passes cannot double-count the
+                same match.
+            text: The window to search -- the whole document, or one line.
+            patterns: In-scope mapping of pattern name to compiled regex.
+            offset: Document offset of *text*, added to every match position
+                so a per-line match is stored in document coordinates.
+        """
+        for name, pattern in patterns.items():
+            for match in pattern.finditer(text):
+                start = offset + match.start()
+                end = offset + match.end()
+                key = (start, end, name)
+                if key in seen:
+                    continue
+                matched = match.group()
+                if self._is_allowlisted(matched):
+                    continue
+                if not post_validate(name, matched):
+                    continue
+                seen.add(key)
+                spans.append(_Span(start, end, name, len(spans)))
 
     def _splice_markers(self, content: str, merged: list[_MergedSpan]) -> str:
         """Replace each merged span in *content* with its winning marker.

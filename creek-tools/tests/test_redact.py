@@ -2244,6 +2244,91 @@ class TestPatternOrderLeak:
         assert "other@example.com" not in result
         assert "123-45-6789" not in result
 
+    def test_a_newline_straddling_password_survives_apply(self, tmp_path: Path) -> None:
+        """A credential the scan reports must not survive the apply (#900).
+
+        The scanner walks ``text.splitlines()`` and matches per line
+        (``scanner.py:332``); the redactor matches the whole document
+        (``redactor.py:379``). ``password``'s ``\\s*`` matches a newline, so on
+        this input the whole-document pass matches ``'password =\npassword'``
+        -- the span ENDS before the secret -- while the per-line pass matches
+        ``'password = supersecret123'``.
+
+        So ``--scan`` reports a critical finding and ``--apply`` writes the
+        secret straight back out. Measured at HEAD before the fix.
+        """
+        content = "password =\npassword = supersecret123\n"
+        leaky = tmp_path / "creds.txt"
+        leaky.write_text(content, encoding="utf-8")
+
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        matches = scanner.scan_file(leaky)
+        assert [m.match_type for m in matches] == ["password"], (
+            f"fixture no longer reproduces the scan finding: {matches}"
+        )
+
+        redactor = Redactor(config=config, salt=scanner.salt)
+        result = redactor.redact_content(content)
+
+        assert "supersecret123" not in result, (
+            "the scan reported a critical `password` finding and the apply "
+            f"left the secret in the output: {result!r}"
+        )
+
+    def test_a_custom_line_anchored_pattern_survives_apply(
+        self, tmp_path: Path
+    ) -> None:
+        """The issue's original framing: a custom per-line pattern.
+
+        ``$`` is not multiline by default, so a custom pattern anchored to
+        end-of-line matches on every line under the scanner's per-line walk
+        but only at the very end of the document under a whole-content pass.
+        """
+        content = "token: aaaa-secret-one\ntoken: bbbb-secret-two\n"
+        leaky = tmp_path / "tokens.txt"
+        leaky.write_text(content, encoding="utf-8")
+
+        config = RedactionConfig(custom_patterns={"line_token": r"token: \S+$"})
+        scanner = RedactionScanner(config=config)
+        matches = scanner.scan_file(leaky)
+        assert len(matches) == 2, f"the scanner should report both lines, got {matches}"
+
+        redactor = Redactor(config=config, salt=scanner.salt)
+        result = redactor.redact_content(content)
+
+        assert "aaaa-secret-one" not in result, (
+            f"the first line's token survived the apply: {result!r}"
+        )
+        assert "bbbb-secret-two" not in result, (
+            f"the second line's token survived the apply: {result!r}"
+        )
+
+    def test_a_whole_document_match_is_not_lost_by_the_per_line_pass(
+        self,
+    ) -> None:
+        """Adding per-line collection must not remove whole-document coverage.
+
+        This is the companion that stops the fix being a *replacement* rather
+        than a union. A pattern whose match legitimately spans a newline is
+        invisible to a per-line walk, so if the whole-content pass were
+        dropped the coverage would silently narrow -- trading one parity gap
+        for another, in the direction that leaks.
+        """
+        config = RedactionConfig(
+            custom_patterns={"multi_line_secret": r"BEGIN-SECRET\s+\S+"},
+        )
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        content = "BEGIN-SECRET\nspanning-secret-value\n"
+        result = redactor.redact_content(content)
+
+        assert "spanning-secret-value" not in result, (
+            "a match that legitimately spans a newline is no longer redacted; "
+            f"the whole-document pass was dropped instead of unioned: {result!r}"
+        )
+
     def test_standalone_email_still_marked_email(self) -> None:
         """A bare email with no password suffix keeps the email marker."""
         config = RedactionConfig()
