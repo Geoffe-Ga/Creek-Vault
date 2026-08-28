@@ -19,6 +19,8 @@ is still purged, so the guard cannot quietly become "drop every symlink".
 
 from __future__ import annotations
 
+import logging
+import os
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -515,6 +517,93 @@ def test_a_thread_alias_that_stays_inside_the_vault_is_still_decremented(
 
     assert result.threads_updated == 1
     assert "fragment_count: 4" in real.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# The voice sweeps: the refusal arm for a path the OS will not resolve
+# ---------------------------------------------------------------------------
+
+
+def test_an_unresolvable_voice_artifact_is_refused_not_deleted(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A candidate ``resolve()`` rejects must refuse, never fall through (#1446).
+
+    ``_contained_voice_artifact`` guards its ``candidate.resolve()`` with
+    ``except (OSError, ValueError)``, and that arm was the only untested
+    refusal in the RTBF sweep. It matters because the caller
+    (``_purge_voice_artifacts``) treats a non-``None`` return as a licence to
+    ``unlink``: every path out of this method that is not ``None`` deletes a
+    file. An unresolvable path is not a path inside ``07-Voice``, so it takes
+    the refusal exit.
+
+    The candidate carries an embedded NUL, which makes ``Path.resolve`` raise
+    ``ValueError: lstat: embedded null character in path``. No monkeypatching
+    is involved deliberately: patching ``Path.resolve`` wholesale would die at
+    the caller's own ``voice_root.resolve()`` before ever reaching the line
+    under test, which is the trap #1089 hit.
+    """
+    contained_root = (tmp_path / "07-Voice").resolve()
+    contained_root.mkdir(parents=True)
+    candidate = contained_root / "Lexicon\x00alias.md"
+
+    with caplog.at_level(logging.WARNING):
+        verdict = engine.PurgeEngine._contained_voice_artifact(
+            candidate, contained_root
+        )
+
+    assert verdict is None, (
+        "an unresolvable candidate was returned as a deletion target; "
+        "_purge_voice_artifacts unlinks whatever this method hands back"
+    )
+    assert caplog.records, "the refusal was silent; an operator sees nothing"
+
+
+def test_a_refused_voice_artifact_is_not_named_by_its_resolved_target(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The warning must not turn the log into a filesystem oracle.
+
+    The sibling arm below it already withholds the resolved victim on
+    purpose -- ``engine.py`` says so in a comment: "The resolved victim is
+    deliberately left out of the message: naming it would turn the log into a
+    filesystem oracle." This pins that the unresolvable arm keeps the same
+    posture, since it is the arm a caller can most easily provoke.
+    """
+    contained_root = (tmp_path / "07-Voice").resolve()
+    contained_root.mkdir(parents=True)
+    outside = tmp_path / "secret-elsewhere.md"
+    outside.write_text("# private\n", encoding="utf-8")
+    link = contained_root / "alias.md"
+    os.symlink(outside, link)
+
+    with caplog.at_level(logging.WARNING):
+        verdict = engine.PurgeEngine._contained_voice_artifact(link, contained_root)
+
+    assert verdict is None, "a symlink out of 07-Voice was returned for deletion"
+    logged = " ".join(record.getMessage() for record in caplog.records)
+    assert "secret-elsewhere" not in logged, (
+        f"the warning names the resolved target outside the vault: {logged!r}"
+    )
+
+
+def test_a_contained_voice_artifact_is_still_returned(tmp_path: Path) -> None:
+    """The refusal arms must not swallow the ordinary case.
+
+    Companion to the two above: every assertion there is satisfied by a
+    method that returns ``None`` unconditionally, which would silently
+    disable the whole voice sweep.
+    """
+    contained_root = (tmp_path / "07-Voice").resolve()
+    contained_root.mkdir(parents=True)
+    real = contained_root / "profile.md"
+    real.write_text("# voice\n", encoding="utf-8")
+
+    verdict = engine.PurgeEngine._contained_voice_artifact(real, contained_root)
+
+    assert verdict == real.resolve()
 
 
 # ---------------------------------------------------------------------------
