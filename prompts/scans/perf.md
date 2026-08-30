@@ -58,6 +58,8 @@ speculative list. A run that finds none is a valid, successful, zero-issue run.
 ## Output Format
 Findings as a JSON list, one object per finding:
 
+**`symbol` is mandatory whenever the finding names a function, method or class** (#1651). Declare it as a field — `symbol: "name"` or `symbols: ["a", "b"]` — never only inside the title string, and never a name paraphrased from surrounding code. Every declared symbol is verified against the scan SHA's blob by `creek-tools/scripts/verify-scan-citations.sh` before any issue is filed, and a name that has no definition at that SHA blocks the create. A finding that legitimately names no symbol (a whole-module or config finding) simply omits the field. A symbol you are PROPOSING to create — a refactor target — belongs in `fix_strategy`, not in `symbol`.
+
 ```json
 {
   "slug": "perf-link-pairwise-similarity",
@@ -65,6 +67,7 @@ Findings as a JSON list, one object per finding:
   "severity": 4,
   "file": "creek-tools/creek/link/resonance.py",
   "lines": "142-160",
+  "symbol": "score_resonance",
   "evidence": "nested for-loop over all fragment pairs calling cosine per pair; 35k fragments = ~600M pairs (observed kill at 35k per repo memory)",
   "before_after_sketch": "pairwise loop → normalized embedding matrix + single numpy matmul with top-k selection"
 }

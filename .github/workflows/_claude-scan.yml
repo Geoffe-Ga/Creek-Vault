@@ -230,3 +230,16 @@ jobs:
             issue. A clean scan that files ZERO issues is a valid success — do
             not invent work. End with the run summary the skill specifies,
             appended to $GITHUB_STEP_SUMMARY.
+
+            MANDATORY, before any `gh issue create` (#1651): every finding that
+            names a code symbol must declare it in a `symbol` (or `symbols`)
+            field, and you must verify it by piping the findings as
+            newline-delimited JSON through:
+
+                SCAN_SHA=$GITHUB_SHA creek-tools/scripts/verify-scan-citations.sh
+
+            That script exits non-zero and names each phantom. A citation it
+            rejects MUST NOT be filed: re-resolve the symbol against the scan
+            SHA and cite the real name, or drop the symbol from the finding.
+            Do not paraphrase a name from surrounding code — that is exactly
+            the failure this gate exists to stop.
