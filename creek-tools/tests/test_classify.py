@@ -1,6 +1,8 @@
 """Tests for the creek.classify classification pipeline."""
 
 import logging
+import sys
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -25,6 +27,7 @@ from creek.classify.llm import (
 )
 from creek.classify.llm import LLMClassifier as LLMClassifierDirect
 from creek.classify.llm.parsing import _apply_praxis, _merge_textures
+from creek.classify.llm.providers import _extract_anthropic_usage
 from creek.classify.review import ReviewQueueGenerator as ReviewQueueGeneratorDirect
 from creek.classify.rules import (
     CONFIDENCE_SIGNALS,
@@ -1495,6 +1498,44 @@ def _set_anthropic_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(AnthropicProvider.CONSENT_ENV, "1")
 
 
+def _make_mock_anthropic_response(
+    *blocks: MagicMock,
+    stop_reason: str = "end_turn",
+) -> MagicMock:
+    """Build a mock Anthropic response the provider can read completely.
+
+    Every attribute :mod:`creek.classify.llm.providers` reads off a real SDK
+    response is set explicitly. Leaving one unset hands back a lazily-created
+    child mock, and ``str()`` on such a child races with ``MagicProxy`` (#1625).
+
+    Args:
+        *blocks: The content blocks the response carries.
+        stop_reason: The SDK stop reason, always a real ``str``.
+
+    Returns:
+        A ``MagicMock`` shaped like an ``anthropic`` message response.
+    """
+    response = MagicMock()
+    response.content = list(blocks)
+    response.stop_reason = stop_reason
+    response.usage = None
+    return response
+
+
+def _make_mock_anthropic_block(text: str) -> MagicMock:
+    """Build a single mock content block carrying *text*.
+
+    Args:
+        text: The block's text payload.
+
+    Returns:
+        A ``MagicMock`` with a real ``str`` ``text`` attribute.
+    """
+    block = MagicMock()
+    block.text = text
+    return block
+
+
 def _make_mock_anthropic_client(response_text: str) -> MagicMock:
     """Build a mock anthropic.Anthropic client returning *response_text*.
 
@@ -1504,13 +1545,98 @@ def _make_mock_anthropic_client(response_text: str) -> MagicMock:
     Returns:
         A ``MagicMock`` whose ``messages.create`` returns a response.
     """
-    mock_block = MagicMock()
-    mock_block.text = response_text
-    mock_response = MagicMock()
-    mock_response.content = [mock_block]
     mock_client = MagicMock()
-    mock_client.messages.create.return_value = mock_response
+    mock_client.messages.create.return_value = _make_mock_anthropic_response(
+        _make_mock_anthropic_block(response_text),
+    )
     return mock_client
+
+
+# The #1625 race was measured at ~38% per trial with 8 threads at a 1e-6
+# switch interval; 20 trials makes a red run essentially certain.
+_RACE_THREADS = 8
+_RACE_TRIALS = 20
+
+
+class TestAnthropicResponseMockContract:
+    """The Anthropic response mock must not rely on MagicMock auto-attributes.
+
+    Regression cover for #1625: ``_make_mock_anthropic_client`` configured only
+    ``content``, so ``providers.py`` read ``stop_reason`` and ``usage`` off
+    lazily-created child mocks. ``str()`` on such a child races with
+    ``MagicProxy.create_mock`` installing ``__str__`` before its return value,
+    which reddened CI on unrelated PRs.
+    """
+
+    def test_factory_configures_every_attribute_the_provider_reads(self) -> None:
+        """stop_reason is a real str and usage is a real dict or None (#1625)."""
+        response = _make_mock_anthropic_client("body").messages.create.return_value
+        assert isinstance(response.stop_reason, str)
+        usage = _extract_anthropic_usage(response)
+        assert usage is None or all(isinstance(v, int) for v in usage.values())
+
+    def test_shared_response_survives_concurrent_reads(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One mock response read by many threads must never raise (#1625)."""
+        _set_anthropic_env(monkeypatch)
+        previous = sys.getswitchinterval()
+        errors: list[Exception] = []
+        try:
+            sys.setswitchinterval(1e-6)
+            for _ in range(_RACE_TRIALS):
+                response = _make_mock_anthropic_client(
+                    _VALID_YAML_RESPONSE,
+                ).messages.create.return_value
+                barrier = threading.Barrier(_RACE_THREADS)
+
+                def read_metadata(
+                    shared: MagicMock = response,
+                    gate: threading.Barrier = barrier,
+                ) -> None:
+                    """Read the shared response the way the provider does."""
+                    gate.wait()
+                    try:
+                        str(shared.stop_reason)
+                        _extract_anthropic_usage(shared)
+                    except Exception as exc:
+                        errors.append(exc)
+
+                threads = [
+                    threading.Thread(target=read_metadata) for _ in range(_RACE_THREADS)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+        finally:
+            sys.setswitchinterval(previous)
+        assert not errors, f"concurrent reads raised: {errors[:3]}"
+
+    def test_classify_batch_is_stable_under_concurrency(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """classify_batch over a shared mock never degrades to UNCLASSIFIED."""
+        _set_anthropic_env(monkeypatch)
+        previous = sys.getswitchinterval()
+        try:
+            sys.setswitchinterval(1e-6)
+            for _ in range(_RACE_TRIALS):
+                mock_client = _make_mock_anthropic_client(_VALID_YAML_RESPONSE)
+                with (
+                    patch("anthropic.Anthropic", return_value=mock_client),
+                    patch("creek.classify.llm.time.sleep"),
+                ):
+                    classifier = LLMClassifier(
+                        config=LLMConfig(provider="anthropic", max_concurrent=8),
+                    )
+                    fragments = [_make_fragment() for _ in range(16)]
+                    results = classifier.classify_batch(fragments, progress=False)
+                assert [r.frequency.primary for r in results] == [Frequency.F3] * 16
+        finally:
+            sys.setswitchinterval(previous)
 
 
 class TestAnthropicProviderInit:
@@ -1703,14 +1829,11 @@ class TestAnthropicProviderCall:
     ) -> None:
         """Multiple content blocks should be concatenated in order."""
         _set_anthropic_env(monkeypatch)
-        block_a = MagicMock()
-        block_a.text = "part-a"
-        block_b = MagicMock()
-        block_b.text = "part-b"
-        response = MagicMock()
-        response.content = [block_a, block_b]
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = response
+        mock_client.messages.create.return_value = _make_mock_anthropic_response(
+            _make_mock_anthropic_block("part-a"),
+            _make_mock_anthropic_block("part-b"),
+        )
         with patch("anthropic.Anthropic", return_value=mock_client):
             provider = AnthropicProvider(LLMConfig(provider="anthropic"))
             result = provider.call("prompt")
@@ -1722,13 +1845,12 @@ class TestAnthropicProviderCall:
     ) -> None:
         """Blocks without a string ``text`` attribute should be skipped."""
         _set_anthropic_env(monkeypatch)
-        text_block = MagicMock()
-        text_block.text = "keep"
         tool_block = MagicMock(spec=[])  # no text attribute
-        response = MagicMock()
-        response.content = [tool_block, text_block]
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = response
+        mock_client.messages.create.return_value = _make_mock_anthropic_response(
+            tool_block,
+            _make_mock_anthropic_block("keep"),
+        )
         with patch("anthropic.Anthropic", return_value=mock_client):
             provider = AnthropicProvider(LLMConfig(provider="anthropic"))
             result = provider.call("prompt")
@@ -2003,10 +2125,9 @@ class TestLLMClassifierAnthropicDispatch:
         """classify should retry when the provider raises RuntimeError."""
         _set_anthropic_env(monkeypatch)
         mock_client = MagicMock()
-        good_block = MagicMock()
-        good_block.text = _VALID_YAML_RESPONSE
-        good_response = MagicMock()
-        good_response.content = [good_block]
+        good_response = _make_mock_anthropic_response(
+            _make_mock_anthropic_block(_VALID_YAML_RESPONSE),
+        )
         import anthropic
 
         mock_client.messages.create.side_effect = [
