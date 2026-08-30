@@ -18,7 +18,10 @@ to locate the originating commit for any reference below.
   `intimate-1.md`, `intimate-2.md`, … — raising at `_MAX_COLLISION_RETRIES`
   on the 1001st save and **losing that save entirely**, because the stub is
   written before the vault note. An untitled save is now addressed by a
-  base32 digest of its own body: `intimate-<digest>.md`.
+  base32 digest of its own body: `intimate-<digest>.md`. The gate is on the
+  **slug**, not the raw title, so an all-punctuation title like `"!!!"` —
+  non-empty but slugifying to `""` — is body-addressed too rather than
+  falling back to the bare stem.
 
   **On-disk naming change.** Existing stub files are never renamed and
   nothing migrates, so `intimate_body_pointer` values already written into

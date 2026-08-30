@@ -2536,3 +2536,37 @@ def test_a_pre_change_intimate_stub_is_neither_renamed_nor_clobbered(
 
     assert legacy.exists(), "the pre-change stub was renamed away"
     assert legacy.read_bytes() == legacy_bytes, "the pre-change stub was rewritten"
+
+
+def test_a_title_that_slugifies_to_nothing_is_also_body_addressed(
+    vault: Path,
+) -> None:
+    """An all-punctuation title must not land back on the bare stem (#1509).
+
+    ``"!!!"`` is non-empty after ``.strip().lower()`` but ``slugify_filename``
+    reduces it to ``""``, so gating on the raw title left this input falling
+    through to the bare ``intimate`` stem — the same collision, through a
+    narrower door. Found in review of the first fix.
+
+    Args:
+        vault: Minimal vault scaffold.
+    """
+    for punctuation in ("!!!", "---", "..."):
+        save_to_vault(
+            _make_request(
+                SaveTarget.THREAD,
+                body=f"{_UNTITLED_SECRET} body for {punctuation}.\n",
+                title=punctuation,
+                tier=PrivacyTier.INTIMATE,
+            ),
+            vault_path=vault,
+        )
+
+    names = sorted(p.name for p in _stub_files(vault))
+    assert len(names) == 3, f"expected three distinct stubs, found {names}"
+    assert "intimate.md" not in names, (
+        f"a punctuation-only title landed on the bare stem: {names}"
+    )
+    assert not any(_UNTITLED_COUNTER_SUFFIX_RE.search(n) for n in names), (
+        f"a punctuation-only title fell back to the counter ladder: {names}"
+    )

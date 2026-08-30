@@ -1082,9 +1082,13 @@ def _stub_relpath_for(title: str | None, body: str = "") -> Path:
     from creek.save._slug import slugify_filename
 
     raw = (title or "").strip().lower()
-    if not raw:
+    # An all-punctuation title such as "!!!" is non-empty here but slugifies
+    # to "", which used to fall back to the bare stem — the same collision
+    # this function exists to avoid, reached through a narrower door. Gate on
+    # the SLUG, not on the raw title, so both paths are body-addressed.
+    slug = slugify_filename(raw) if raw else ""
+    if not slug:
         return INTIMATE_STUB_RELPATH / f"{_untitled_stub_stem(body)}.md"
-    slug = slugify_filename(raw) or _UNTITLED_STUB_STEM
     return INTIMATE_STUB_RELPATH / f"{slug}.md"
 
 
