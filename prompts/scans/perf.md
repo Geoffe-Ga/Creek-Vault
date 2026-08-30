@@ -68,6 +68,7 @@ Findings as a JSON list, one object per finding:
   "severity": 4,
   "file": "creek-tools/creek/link/resonance.py",
   "lines": "142-160",
+  "symbol": "score_resonance",
   "evidence": "nested for-loop over all fragment pairs calling cosine per pair; 35k fragments = ~600M pairs (observed kill at 35k per repo memory)",
   "before_after_sketch": "pairwise loop → normalized embedding matrix + single numpy matmul with top-k selection"
 }

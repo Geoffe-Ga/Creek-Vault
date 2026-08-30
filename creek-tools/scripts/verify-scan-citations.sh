@@ -20,6 +20,12 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCAN_SHA="${SCAN_SHA:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
 PYTHON="${PYTHON:-python3}"
+RESOLVER="$REPO_ROOT/creek-tools/scripts/scan_citations.py"
+
+if [ ! -f "$RESOLVER" ]; then
+    echo "::error::resolver not found at $RESOLVER; refusing to report citations as verified"
+    exit 1
+fi
 
 failures=0
 checked=0
@@ -30,7 +36,13 @@ while IFS= read -r line; do
         [ -z "${symbol:-}" ] && continue
         [ -z "${file:-}" ] && continue
         checked=$((checked + 1))
-        if ! out=$("$PYTHON" -m scripts.scan_citations \
+        # Invoked by absolute path, never as `-m scripts.scan_citations`: the
+        # documented usage is from the REPO ROOT, where `scripts` resolves to
+        # the repo-root ./scripts/ (Ralph tooling) rather than to
+        # creek-tools/scripts/, and creek-tools/pyproject.toml's package-find
+        # never puts creek-tools/scripts on sys.path either. As a module this
+        # reported every citation -- including real ones -- as a failure.
+        if ! out=$("$PYTHON" "$RESOLVER" \
                 --repo "$REPO_ROOT" --sha "$SCAN_SHA" \
                 --path "$file" --symbol "$symbol" 2>&1); then
             echo "::error::$out"

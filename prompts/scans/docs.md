@@ -67,6 +67,7 @@ Findings as a JSON list, one object per drift:
   "severity": 3,
   "file": "creek-tools/creek/link/resonance.py",
   "lines": "48-72",
+  "symbol": "score_resonance",
   "evidence": "docstring lists args (fragment, threshold); signature at HEAD is score_resonance(fragment, top_k) — threshold removed in <SHA>",
   "before_after_sketch": "docstring Args section → match the real (fragment, top_k) signature and describe top_k"
 }

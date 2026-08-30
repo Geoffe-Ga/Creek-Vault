@@ -68,6 +68,7 @@ Findings as a JSON list, one object per finding (or tightly related cluster):
   "severity": 2,
   "file": "creek-tools/creek/classify/wavelength.py",
   "lines": "58-74",
+  "symbol": "_parse_wavelength",
   "evidence": "vulture: unused function '_parse_wavelength' (confidence 90%); no import or registry reference in creek/ or creek_mcp/",
   "remediation": "delete",
   "refactor_strategy": "remove the function and its now-orphaned helpers; run ./scripts/check-all.sh"

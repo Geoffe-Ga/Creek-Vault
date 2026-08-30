@@ -352,6 +352,28 @@ class TestTheGuardIsActuallyWired:
 
         assert not missing, f"scan prompts with no symbol field: {missing}"
 
+    def test_every_json_example_declares_a_literal_symbol_key(self) -> None:
+        """Prose is not enough where the prompt ships a copyable example.
+
+        Found in review: seven prompts illustrate the schema with a fenced
+        ``json`` block, and mentioning ``symbol`` only in the paragraph
+        above left every concrete template without the key. Models pattern
+        -match against examples at least as strongly as against prose, so
+        the gap sat precisely where a literal template matters most.
+        """
+        prompts = sorted((_REPO_ROOT / "prompts" / "scans").glob("*.md"))
+        offenders = []
+        for path in prompts:
+            text = path.read_text(encoding="utf-8")
+            if "```json" not in text or path.name == "groom.md":
+                continue
+            if '"symbol"' not in text:
+                offenders.append(path.name)
+
+        assert not offenders, (
+            f"these prompts ship a JSON example with no symbol key: {offenders}"
+        )
+
     def test_the_issue_template_scopes_citations_to_the_scan_sha(self) -> None:
         """A reader must be told the cites are revision-specific."""
         template = (
@@ -512,3 +534,82 @@ class TestCommandLineInterface:
 
         assert code == 0
         assert capsys.readouterr().out.strip() == "<module level>"
+
+
+class TestTheShellWrapperFromItsRealWorkingDirectory:
+    """The wrapper must work from the CWD it is documented to run in.
+
+    Found in review of the first fix. The wrapper originally invoked the
+    resolver as ``python -m scripts.scan_citations``, which works from
+    ``creek-tools/`` and **fails from the repository root** --- where
+    ``scripts`` resolves to the repo-root ``./scripts/`` (Ralph tooling),
+    and where ``creek-tools/pyproject.toml``'s package-find never puts
+    ``creek-tools/scripts`` on ``sys.path``.
+
+    Both the skill and the workflow prompt invoke it as
+    ``creek-tools/scripts/verify-scan-citations.sh``, i.e. from the repo
+    root, and ``_claude-scan.yml``'s scan job sets no
+    ``working-directory``. So the gate was broken in its own documented
+    usage --- and worse than absent: every citation, *including real
+    ones*, came back a failure.
+
+    Every test above missed it, because they all call ``main()`` through a
+    Python import while pytest runs with CWD ``creek-tools``. Only running
+    the shell wrapper as a subprocess, from the repo root, exercises what
+    CI actually does.
+    """
+
+    def _run(self, findings: str) -> subprocess.CompletedProcess[str]:
+        """Run the wrapper from the repo root, as CI does.
+
+        Args:
+            findings: Newline-delimited JSON findings for stdin.
+
+        Returns:
+            The completed process.
+        """
+        return subprocess.run(
+            ["creek-tools/scripts/verify-scan-citations.sh"],
+            cwd=_REPO_ROOT,
+            input=findings,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                "PATH": "/usr/bin:/bin:/usr/local/bin",
+                "SCAN_SHA": _SCAN_SHA,
+                "PYTHON": str(_REPO_ROOT / "creek-tools" / ".venv" / "bin" / "python"),
+            },
+        )
+
+    def test_a_real_symbol_passes_from_the_repo_root(self) -> None:
+        """The documented invocation must verify a real name, not error."""
+        result = self._run(
+            '{"file":"creek-tools/creek/audit/log.py","symbol":"verify"}\n'
+        )
+
+        assert result.returncode == 0, (
+            f"the wrapper failed on a REAL symbol from the repo root, so the "
+            f"gate rejects every citation:\n{result.stdout}\n{result.stderr}"
+        )
+        assert "No module named" not in result.stdout + result.stderr
+        assert "1 symbol citation(s) verified" in result.stdout
+
+    def test_a_phantom_is_rejected_from_the_repo_root(self) -> None:
+        """And it must still catch the thing it exists to catch."""
+        result = self._run(
+            '{"file":"creek-tools/creek/audit/log.py","symbol":"verify_chain"}\n'
+        )
+
+        assert result.returncode == 1
+        assert "PHANTOM" in result.stdout + result.stderr
+
+    def test_a_findings_list_reports_every_phantom(self) -> None:
+        """A `symbols` list is checked element by element."""
+        result = self._run(
+            '{"file":"creek-tools/creek/audit/log.py",'
+            '"symbols":["read","verify","iter_entries"]}\n'
+        )
+
+        assert result.returncode == 1
+        assert "iter_entries" in result.stdout + result.stderr

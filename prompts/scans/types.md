@@ -51,6 +51,7 @@ Findings as a JSON list, one object per site (or tightly related cluster):
   "severity": 3,
   "file": "creek-tools/creek/classify/frequency.py",
   "lines": "72",
+  "symbol": "compute_scores",
   "evidence": "mypy --strict: 'Returning Any from function declared to return \"float\"' [no-any-return]",
   "fix_strategy": "type the dict payload with a TypedDict so the indexed access is float, not Any"
 }

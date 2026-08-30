@@ -52,6 +52,7 @@ Findings as a JSON list, one object per marker (or marker cluster):
   "severity": 3,
   "file": "creek-tools/creek/link/resonance.py",
   "lines": "142",
+  "symbol": "score_resonance",
   "marker": "TODO",
   "evidence": "the grep hit plus 3–5 lines of surrounding code",
   "goal": "one measurable sentence for the issue's Goal component"

@@ -52,6 +52,7 @@ Findings as a JSON list, one object per function:
   "severity": 4,
   "file": "creek-tools/creek/classify/frequency.py",
   "lines": "40-118",
+  "symbol": "resolve_fragment_frequency",
   "evidence": "radon cc -s: 'resolve_fragment_frequency' - B (9); one function, five branches on frequency band",
   "refactor_strategy": "strategy pattern: table of band handlers keyed by Frequency, replacing the if/elif ladder"
 }

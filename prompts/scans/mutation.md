@@ -56,6 +56,7 @@ Findings as a JSON list, one object per surviving-mutant cluster:
   "severity": 4,
   "file": "creek-tools/creek/link/resonance.py",
   "lines": "31-38",
+  "symbol": "score_resonance",
   "evidence": "mutmut: mutant 47 survived — '<=' -> '<' at line 34; no test asserts the exact similarity-threshold edge",
   "kill_strategy": "add a boundary test asserting a resonance is created at exactly the threshold and not one epsilon below it"
 }
