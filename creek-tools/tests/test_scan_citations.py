@@ -29,6 +29,7 @@ of that exact name exists there.
 
 from __future__ import annotations
 
+import io
 import subprocess
 import sys
 from pathlib import Path
@@ -759,3 +760,123 @@ class TestExtractCitations:
         """
         with pytest.raises(MalformedFindingError):
             extract_citations(payload)
+
+
+class TestExtractModeCLI:
+    """`--extract` is the entry point the shell wrapper actually calls."""
+
+    def test_extract_prints_tab_separated_triples(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Blank lines are skipped; each symbol gets its own row.
+
+        Args:
+            monkeypatch: Used to feed stdin.
+            capsys: Captures stdout.
+        """
+        monkeypatch.setattr(
+            sys,
+            "stdin",
+            io.StringIO(
+                '{"file":"a.py","symbol":"f","lines":"1-2"}\n'
+                "\n"
+                '{"file":"b.py","symbols":["g","h"]}\n'
+            ),
+        )
+
+        assert main(["--extract"]) == 0
+        assert capsys.readouterr().out.splitlines() == [
+            "a.py\tf\t1-2",
+            "b.py\tg\t",
+            "b.py\th\t",
+        ]
+
+    def test_extract_reports_a_malformed_line_and_exits_two(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """One bad line taints the run but does not hide the good ones.
+
+        Args:
+            monkeypatch: Used to feed stdin.
+            capsys: Captures stdout.
+        """
+        monkeypatch.setattr(
+            sys,
+            "stdin",
+            io.StringIO('[1,2,3]\n{"file":"a.py","symbol":"f"}\n'),
+        )
+
+        assert main(["--extract"]) == 2
+        out = capsys.readouterr().out
+        assert "MALFORMED" in out
+        assert "a.py\tf\t" in out
+
+    def test_extract_needs_neither_sha_nor_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """They are required for the other modes, not this one.
+
+        Args:
+            monkeypatch: Used to feed stdin.
+        """
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+
+        assert main(["--extract"]) == 0
+
+    def test_the_other_modes_still_require_sha_and_path(self) -> None:
+        """Making them optional must not make them skippable."""
+        with pytest.raises(SystemExit):
+            main(["--symbol", "f"])
+
+    def test_unparseable_source_is_uncheckable_not_a_phantom(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A blob that will not parse exits 2, never 1.
+
+        Reporting broken source as a phantom would send someone hunting
+        for a symbol that may well be there.
+
+        Args:
+            tmp_path: Pytest-provided temporary directory.
+            capsys: Captures stderr.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        def git(*args: str) -> None:
+            subprocess.run(
+                ["git", *args],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+
+        git("init", "-q")
+        git("config", "user.email", "t@example.com")
+        git("config", "user.name", "t")
+        (repo / "broken.py").write_text("def (((\n", encoding="utf-8")
+        git("add", "broken.py")
+        git("commit", "-qm", "broken")
+
+        code = main(
+            [
+                "--repo",
+                str(repo),
+                "--sha",
+                "HEAD",
+                "--path",
+                "broken.py",
+                "--symbol",
+                "anything",
+            ]
+        )
+
+        assert code == 2
+        assert "UNCHECKABLE" in capsys.readouterr().err
