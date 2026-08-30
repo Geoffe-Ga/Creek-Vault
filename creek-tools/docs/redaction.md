@@ -108,6 +108,12 @@ It rewrites more than fragment bodies. Every file whose extension is in
 quietly change its meaning. Three paths are excluded unconditionally —
 `00-Creek-Meta/audit/`, the legacy purge log, and
 `<vault>/00-Creek-Meta/creek_config.yaml` (#1398) — and nothing else is.
+"Unconditionally" covers the vault *root* as well as the extension and
+exclude lists: the protected set is anchored on every vault reachable
+from `--source`, not on `--vault` alone. Before #1561 a run without
+`--vault` anchored on the process working directory, so `--source
+<vault>` from a neighbouring directory rewrote that vault's own config
+and purge log.
 Your own structured files are still in scope, so point `--source` at the
 narrowest tree that needs cleaning rather than at a whole vault.
 
@@ -267,6 +273,9 @@ independent of `supported_extensions` and `exclude_patterns`:
 - the whole of `00-Creek-Meta/audit/`
 - the legacy `00-Creek-Meta/Processing-Log/purge-log.json`
 - `00-Creek-Meta/creek_config.yaml`
+
+This holds whether or not you pass `--vault`: the roots are derived from
+`--source` itself (#1561).
 
 Detection is unaffected: `--scan` and `--review` still report matches there.
 
