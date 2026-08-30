@@ -9,6 +9,23 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+### Fixed
+
+- **Untitled intimate saves no longer collide onto one stub file (#1509).**
+  `_stub_relpath_for` read the raw `title`, which is `None` for an untitled
+  save, so every untitled intimate save in a vault's lifetime targeted the
+  single stem `intimate` and climbed `_atomic_create`'s counter ladder —
+  `intimate-1.md`, `intimate-2.md`, … — raising at `_MAX_COLLISION_RETRIES`
+  on the 1001st save and **losing that save entirely**, because the stub is
+  written before the vault note. An untitled save is now addressed by a
+  base32 digest of its own body: `intimate-<digest>.md`.
+
+  **On-disk naming change.** Existing stub files are never renamed and
+  nothing migrates, so `intimate_body_pointer` values already written into
+  vault notes keep resolving and purge's stub sweep still deletes them. Two
+  byte-identical untitled bodies still collide and still use the counter, so
+  the retry guard stays reachable.
+
 ### Tooling
 
 - **`./scripts/check-all.sh` now matches CI gate-for-gate (GAP-007).**

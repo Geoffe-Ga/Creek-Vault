@@ -171,6 +171,8 @@ saved_from:
   saved_at: 2026-05-06T17:35:00Z
   saved_by: <operator-or-mcp-client>
   intimate_body_pointer: 10-Liminal/Compost/intimate-stubs/<slug>.md  # intimate only
+  #   titled   -> <slug>.md, the slugified title
+  #   untitled -> intimate-<digest>.md, a base32 digest of the body (#1509)
 ```
 
 Combined with the per-target model frontmatter (Thread / Eddy /
@@ -221,7 +223,11 @@ Coverage lives in `tests/test_save.py`:
 
 * Each destination type produces a note in the correct directory.
 * `pre_save_filter(body, tier=intimate)` returns title-only and the
-  stub-relpath under `10-Liminal/Compost/intimate-stubs/`.
+  stub-relpath under `10-Liminal/Compost/intimate-stubs/`. A titled save
+  uses the slugified title; an **untitled** save is addressed by a base32
+  digest of its own body (`intimate-<digest>.md`), so untitled saves do
+  not all pile onto one stem. Existing stubs are never renamed, so
+  pointers already written into vault notes keep resolving (#1509).
 * An 8-row (every `PrivacyTier` × `--full-body`) table declares
   `pre_save_filter`'s whole decision by hand — vault body, stub body and
   stub path per row — and its size is asserted separately, so deleting a

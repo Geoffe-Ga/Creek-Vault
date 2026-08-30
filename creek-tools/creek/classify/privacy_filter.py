@@ -79,6 +79,8 @@ writing an entry to the privacy audit log via
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -1027,13 +1029,62 @@ def _title_only_summary(title: str | None) -> str:
     return f"[Tier-redacted summary: {safe_title}]\n"
 
 
-def _stub_relpath_for(title: str | None) -> Path:
-    """Compose the gitignored stub path for an intimate body."""
+_UNTITLED_STUB_STEM = "intimate"
+"""The stem an untitled intimate save is disambiguated *under*.
+
+Kept as the prefix rather than replaced, so an operator listing the
+gitignored stub directory still sees what these files are.
+"""
+
+_UNTITLED_DIGEST_CHARS = 8
+"""Base32 characters of body digest appended to :data:`_UNTITLED_STUB_STEM`.
+
+Base32's alphabet is ``a-z2-7``, so a stem can never be mistaken for the
+``-<counter>`` ladder ``_atomic_create`` appends on a genuine clash.
+"""
+
+
+def _untitled_stub_stem(body: str) -> str:
+    """Derive a stable, body-addressed stem for an untitled intimate save.
+
+    Reading the raw ``title`` meant every untitled save in a vault's
+    lifetime targeted the single stem ``intimate`` and climbed
+    ``_atomic_create``'s counter ladder, raising at
+    ``_MAX_COLLISION_RETRIES`` and losing the save outright, because the
+    stub is written before the vault note (#1509).
+
+    The digest is taken from *body* — which ``pre_save_filter`` already
+    holds — rather than from a derived title, so the vault note's
+    title-only summary is untouched.
+
+    Args:
+        body: The intimate body being routed to a stub.
+
+    Returns:
+        A stem of the form ``intimate-<digest>``.
+    """
+    digest = hashlib.sha256(body.encode("utf-8")).digest()
+    encoded = base64.b32encode(digest).decode("ascii").lower()
+    return f"{_UNTITLED_STUB_STEM}-{encoded[:_UNTITLED_DIGEST_CHARS]}"
+
+
+def _stub_relpath_for(title: str | None, body: str = "") -> Path:
+    """Compose the gitignored stub path for an intimate body.
+
+    Args:
+        title: The operator's title, or ``None`` for an untitled save.
+        body: The intimate body, used to disambiguate untitled saves.
+
+    Returns:
+        The vault-relative path of the stub file.
+    """
     from creek.save._constants import INTIMATE_STUB_RELPATH
     from creek.save._slug import slugify_filename
 
-    raw = (title or "intimate").strip().lower() or "intimate"
-    slug = slugify_filename(raw) or "intimate"
+    raw = (title or "").strip().lower()
+    if not raw:
+        return INTIMATE_STUB_RELPATH / f"{_untitled_stub_stem(body)}.md"
+    slug = slugify_filename(raw) or _UNTITLED_STUB_STEM
     return INTIMATE_STUB_RELPATH / f"{slug}.md"
 
 
@@ -1098,7 +1149,7 @@ def pre_save_filter(
         return PreSaveFilterResult(
             vault_body=_title_only_summary(title),
             stub_body=body,
-            stub_relpath=_stub_relpath_for(title),
+            stub_relpath=_stub_relpath_for(title, body),
         )
     if rank > _TIER_RANK[PrivacyTier.OPEN] and not full_body:
         return PreSaveFilterResult(

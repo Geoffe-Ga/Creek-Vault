@@ -2296,22 +2296,19 @@ def test_untitled_intimate_still_lands_the_full_body_in_the_stub(
     save that wrote nothing at all. So the body is asserted **present**, in
     full, at the one place it is allowed to be.
 
-    The stub path is asserted as a literal ``intimate.md`` rather than
-    globbed, because ``_stub_relpath_for`` reads the **raw** title — ``None``
-    here, hence its ``"intimate"`` default — and the fix must not start
-    feeding it the new fallback. If it did, the stub filename would become
-    ``untitled-thread-<digest>.md``: harmless in itself, but it would silently
-    orphan every ``intimate_body_pointer`` already written into existing vault
-    notes, which is the compatibility promise ``creek/save/_slug.py``'s module
-    docstring was written to protect.
+    The stub stem is ``intimate-<digest>`` rather than a bare ``intimate``:
+    since #1509 an untitled save is addressed by a digest of its own body,
+    because reading the raw title made **every** untitled save in a vault
+    land on one stem and climb ``_atomic_create``'s counter ladder until
+    ``_MAX_COLLISION_RETRIES`` raised — losing the save outright, since the
+    stub is written before the vault note. Nothing renames existing stubs,
+    so pointers already written into vault notes still resolve; that
+    compatibility promise is pinned by
+    :func:`test_a_pre_change_intimate_stub_is_neither_renamed_nor_clobbered`.
 
-    That constant name has its own defect, and this assertion is deliberately
-    not a claim that it is *good*: because ``_stub_relpath_for`` reads the raw
-    title, **every** untitled intimate save in a vault lands on this one stem
-    and ladders ``intimate-1.md``, ``intimate-2.md``, … until
-    ``_MAX_COLLISION_RETRIES`` raises. That is tracked as **#1509** and needs a
-    pointer-migration story, so it is out of scope here. Whoever fixes it will
-    have to change this assertion on purpose, which is the point.
+    The assertion is deliberately made against the note's own pointer
+    rather than a hardcoded digest, so it states the contract that matters
+    — the note resolves to its body — without pinning the hash function.
 
     Args:
         vault: Minimal vault scaffold.
@@ -2326,15 +2323,21 @@ def test_untitled_intimate_still_lands_the_full_body_in_the_stub(
         vault_path=vault,
     )
 
-    stub = vault / INTIMATE_STUB_RELPATH / "intimate.md"
     present = _stub_files(vault)
-    assert stub.exists(), f"no intimate stub at {stub}; found {present}"
+    assert len(present) == 1, f"expected exactly one stub, found {present}"
+    stub = present[0]
+    assert stub.name.startswith("intimate-"), (
+        f"the untitled stub is not body-addressed: {stub.name}"
+    )
+    assert not _UNTITLED_COUNTER_SUFFIX_RE.search(stub.name), (
+        f"the untitled save fell back to the counter ladder: {stub.name}"
+    )
     assert _UNTITLED_SECRET in stub.read_text(encoding="utf-8"), (
         "the intimate body reached neither the vault note nor the stub — the "
         "operator's answer was lost rather than protected"
     )
     pointer = frontmatter.load(str(path))["saved_from"].get("intimate_body_pointer")
-    assert pointer == str(INTIMATE_STUB_RELPATH / "intimate.md"), (
+    assert pointer == str(INTIMATE_STUB_RELPATH / stub.name), (
         f"the note points at {pointer!r}, which is not where the body went"
     )
 
@@ -2389,3 +2392,147 @@ def test_operator_title_is_still_written_verbatim_at_every_tier(
         "the operator's title must still slugify into the filename"
     )
     assert _UNTITLED_SECRET not in path.name
+
+
+# ---- untitled intimate stubs are body-addressed, not counter-laddered (#1509) ----
+
+
+_UNTITLED_COUNTER_SUFFIX_RE = re.compile(r"-\d+\.md$")
+"""Matches the ``_atomic_create`` counter ladder (``intimate-1.md``).
+
+Untitled saves must not reach it: before #1509 every untitled intimate
+save in a vault's lifetime targeted the single stem ``intimate`` and
+climbed this ladder until ``_MAX_COLLISION_RETRIES`` raised, losing the
+save entirely at attempt 1000 (``writer.py:117`` writes the stub before
+the vault note, so that abort is lossy).
+"""
+
+
+def test_two_untitled_intimate_saves_land_in_distinct_stubs(vault: Path) -> None:
+    """Different untitled bodies get different stub filenames (#1509).
+
+    Asserts the FILENAMES, not merely pointer resolution: the pointer
+    already resolves correctly today, because ``save_to_vault`` derives
+    it from ``_atomic_create``'s returned path. What was broken is the
+    naming, so a test that only checked pointers would be vacuous.
+
+    Args:
+        vault: Minimal vault scaffold.
+    """
+    first = save_to_vault(
+        _make_request(
+            SaveTarget.THREAD,
+            body=f"{_UNTITLED_SECRET} first body.\n",
+            title=None,
+            tier=PrivacyTier.INTIMATE,
+        ),
+        vault_path=vault,
+    )
+    second = save_to_vault(
+        _make_request(
+            SaveTarget.THREAD,
+            body=f"{_UNTITLED_SECRET} a wholly different body.\n",
+            title=None,
+            tier=PrivacyTier.INTIMATE,
+        ),
+        vault_path=vault,
+    )
+
+    stubs = sorted(p.name for p in _stub_files(vault))
+    assert len(stubs) == 2, f"expected two distinct stubs, found {stubs}"
+    assert not any(_UNTITLED_COUNTER_SUFFIX_RE.search(name) for name in stubs), (
+        f"an untitled save fell back to the counter ladder: {stubs}"
+    )
+    pointers = {
+        frontmatter.load(str(path))["saved_from"].get("intimate_body_pointer")
+        for path in (first, second)
+    }
+    assert len(pointers) == 2, f"both notes point at the same stub: {pointers}"
+    for pointer in pointers:
+        assert (vault / str(pointer)).exists(), f"dangling pointer {pointer!r}"
+
+
+def test_many_untitled_intimate_saves_never_reach_the_counter_ladder(
+    vault: Path,
+) -> None:
+    """N distinct untitled bodies produce N stubs, none counter-suffixed.
+
+    Args:
+        vault: Minimal vault scaffold.
+    """
+    count = 12
+    for index in range(count):
+        save_to_vault(
+            _make_request(
+                SaveTarget.THREAD,
+                body=f"{_UNTITLED_SECRET} body number {index}.\n",
+                title=None,
+                tier=PrivacyTier.INTIMATE,
+            ),
+            vault_path=vault,
+        )
+
+    names = sorted(p.name for p in _stub_files(vault))
+    assert len(names) == count, f"expected {count} stubs, found {names}"
+    laddered = [n for n in names if _UNTITLED_COUNTER_SUFFIX_RE.search(n)]
+    assert not laddered, f"these untitled saves laddered onto one stem: {laddered}"
+
+
+def test_byte_identical_untitled_bodies_still_ladder(vault: Path) -> None:
+    """Identical bodies are a genuine clash and must still use the counter.
+
+    Body-addressed naming must not make ``_MAX_COLLISION_RETRIES``
+    unreachable — that guard is what stops an unbounded scan, and its own
+    test would go vacuous if nothing could ever collide again (#1509).
+
+    Args:
+        vault: Minimal vault scaffold.
+    """
+    for _ in range(2):
+        save_to_vault(
+            _make_request(
+                SaveTarget.THREAD,
+                body=_UNTITLED_BODY,
+                title=None,
+                tier=PrivacyTier.INTIMATE,
+            ),
+            vault_path=vault,
+        )
+
+    names = sorted(p.name for p in _stub_files(vault))
+    assert len(names) == 2, f"expected a stem and its -1 ladder step, got {names}"
+    assert any(_UNTITLED_COUNTER_SUFFIX_RE.search(n) for n in names), (
+        f"identical bodies did not collide, so the retry guard is unreachable: {names}"
+    )
+
+
+def test_a_pre_change_intimate_stub_is_neither_renamed_nor_clobbered(
+    vault: Path,
+) -> None:
+    """An existing ``intimate.md`` stub survives a new untitled save (#1509).
+
+    Nothing migrates pointers, so a stub written before this change must
+    keep its name and its bytes: purge resolves stored pointer strings
+    literally.
+
+    Args:
+        vault: Minimal vault scaffold.
+    """
+    legacy_dir = vault / INTIMATE_STUB_RELPATH
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    legacy = legacy_dir / "intimate.md"
+    legacy.write_text("a body saved before #1509\n", encoding="utf-8")
+    legacy_bytes = legacy.read_bytes()
+
+    save_to_vault(
+        _make_request(
+            SaveTarget.THREAD,
+            body=f"{_UNTITLED_SECRET} brand new body.\n",
+            title=None,
+            tier=PrivacyTier.INTIMATE,
+        ),
+        vault_path=vault,
+    )
+
+    assert legacy.exists(), "the pre-change stub was renamed away"
+    assert legacy.read_bytes() == legacy_bytes, "the pre-change stub was rewritten"
