@@ -668,3 +668,40 @@ class TestTheShellWrapperFromItsRealWorkingDirectory:
 
         assert result.returncode == 0
         assert "checked 0 symbols" in result.stdout + result.stderr
+
+    def test_malformed_findings_json_is_a_hard_failure(self) -> None:
+        """A payload that will not parse is a broken producer, not "no symbol".
+
+        Degrading it to the same "checked 0" signal would hide it behind
+        the benign case.
+        """
+        result = self._run("not json at all\n")
+
+        assert result.returncode == 1
+        assert "malformed findings JSON" in result.stdout + result.stderr
+
+    def test_a_symbol_far_from_its_cited_lines_is_warned_about(self) -> None:
+        """A real name in the wrong place still misdirects a reader.
+
+        Warned rather than failed: a finding may legitimately cite a
+        helper *called* from those lines rather than defined in them.
+        """
+        result = self._run(
+            '{"file":"creek-tools/creek/audit/log.py","symbol":"verify",'
+            '"lines":"145-150"}\n'
+        )
+
+        assert result.returncode == 0
+        combined = result.stdout + result.stderr
+        assert "::warning::" in combined
+        assert "_last_line" in combined
+
+    def test_a_citation_pointing_where_it_claims_is_silent(self) -> None:
+        """The location check must not fire on a correct citation."""
+        result = self._run(
+            '{"file":"creek-tools/creek/audit/log.py","symbol":"_last_line",'
+            '"lines":"141-150"}\n'
+        )
+
+        assert result.returncode == 0
+        assert "::warning::" not in result.stdout + result.stderr
