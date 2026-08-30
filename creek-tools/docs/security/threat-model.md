@@ -246,7 +246,9 @@ from most to least likely:
   the legacy `Processing-Log/purge-log.json` from its rewrite set
   **unconditionally** — independent of `redaction.supported_extensions`
   and `redaction.exclude_patterns`, both of which are operator-editable
-  and neither of which mentioned `00-Creek-Meta`. Before #1308 the log
+  and neither of which mentioned `00-Creek-Meta`, and independent of
+  whether `--vault` was passed: the protected roots are derived from the
+  tree `--source` actually walks (#1561). Before #1308 the log
   survived only because `.jsonl` happened to be absent from the default
   extension list; adding it made a vault-wide run rewrite its own first
   entry, after which `verify()` still passed because the entries

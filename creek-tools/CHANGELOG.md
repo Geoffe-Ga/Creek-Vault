@@ -9,6 +9,27 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+### Fixed
+
+- **`redact --apply` no longer rewrites the vault it walks when `--vault` is
+  omitted (#1561).** `run_apply` anchored its never-rewrite set on
+  `config.vault_path`, which defaults to `Path()` — the process CWD — while
+  `_exclude_audit_artifacts` was never told about `source`, the tree actually
+  being walked. Run from a neighbouring directory, `--apply --source <vault>`
+  rewrote 3 files instead of 1, including the vault's own
+  `00-Creek-Meta/creek_config.yaml` and `Processing-Log/purge-log.json`:
+  redaction silently reconfiguring redaction, and mutating legacy records that
+  get chain-signed into `purge.jsonl` on next use.
+
+  A second half: `_ApplyAudit` took the same defaulted root, so a destructive
+  run against `<vault>` wrote its compliance record into a fabricated
+  `<CWD>/00-Creek-Meta/audit/redact.jsonl` while the vault's own trail stayed
+  empty. The successor to #1398, #1306, #1337 and #1338.
+
+  The protected set and the audit log now derive from every vault root
+  reachable from `--source`. Detection is unchanged: `--scan` and `--review`
+  still report matches inside `00-Creek-Meta/`.
+
 ### Tooling
 
 - **`./scripts/check-all.sh` now matches CI gate-for-gate (GAP-007).**
