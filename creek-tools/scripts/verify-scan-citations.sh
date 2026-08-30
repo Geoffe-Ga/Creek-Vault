@@ -58,9 +58,21 @@ while IFS= read -r line; do
         # creek-tools/scripts/, and creek-tools/pyproject.toml's package-find
         # never puts creek-tools/scripts on sys.path either. As a module this
         # reported every citation -- including real ones -- as a failure.
+        # Pass --line when the finding carries one: the resolver then appends
+        # "the lines cited hold X" to the PHANTOM message, which is the whole
+        # remedy. Without it the common case gets the generic error.
+        # ${arr[@]+"${arr[@]}"} rather than "${arr[@]}": macOS ships bash 3.2,
+        # where an empty array expansion under `set -u` is an unbound-variable
+        # error. The subprocess tests run with a restricted PATH whose bash is
+        # that 3.2, which is how this was caught.
+        line_args=()
+        first="${lines%%-*}"
+        if [ -n "${first:-}" ] && [ "$first" -eq "$first" ] 2>/dev/null; then
+            line_args=(--line "$first")
+        fi
         if ! out=$("$PYTHON" "$RESOLVER" \
                 --repo "$REPO_ROOT" --sha "$SCAN_SHA" \
-                --path "$file" --symbol "$symbol" 2>&1); then
+                --path "$file" --symbol "$symbol" ${line_args[@]+"${line_args[@]}"} 2>&1); then
             echo "::error::$out"
             failures=$((failures + 1))
         elif [ -n "${lines:-}" ]; then

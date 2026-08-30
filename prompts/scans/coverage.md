@@ -41,7 +41,6 @@ branch, boundary) that would cover them.
 
 **`symbol` is mandatory whenever the finding names a function, method or class** (#1651). Declare it as a field — `symbol: "name"` or `symbols: ["a", "b"]` — never only inside the title string, and never a name paraphrased from surrounding code. Every declared symbol is verified against the scan SHA's blob by `creek-tools/scripts/verify-scan-citations.sh` before any issue is filed, and a name that has no definition at that SHA blocks the create. A finding that legitimately names no symbol (a whole-module or config finding) simply omits the field. A symbol you are PROPOSING to create — a refactor target — belongs in `fix_strategy`, not in `symbol`.
 
-
 ## Examples
 - `[scan:coverage] creek/link/eddies.py: 12 uncovered branches in the cluster
   merge path` — severity 3; evidence = term-missing ranges; test_plan lists

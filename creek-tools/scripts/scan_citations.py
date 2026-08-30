@@ -23,6 +23,16 @@ Two operations, deliberately separate:
 * :func:`verify_symbol` answers "does this exact name exist here at all",
   which is the cheap gate a filing pipeline can run per citation.
 
+  **Residual risk, stated plainly:** that is "exists somewhere in this
+  file", not "this citation is correct". Matching is by bare name over
+  the whole blob, and a dotted citation is reduced to its last segment,
+  so a citation naming the wrong class while reusing a leaf name that
+  exists elsewhere in the same file verifies as ``True``. It catches
+  every phantom in the real ground-truth table because invented names
+  exist nowhere in the file, which is the observed failure mode --- but
+  a caller wanting "is it where the citation says" must pair this with
+  :func:`resolve_enclosing_symbol`, as ``verify-scan-citations.sh`` does.
+
 Both read the blob **at the recorded SHA**, never the working tree. A
 citation is a claim about a specific revision, and checking it against
 whatever happens to be checked out is how a stale claim passes.

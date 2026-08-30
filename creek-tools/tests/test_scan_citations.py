@@ -672,6 +672,25 @@ class TestTheShellWrapperFromItsRealWorkingDirectory:
         assert result.returncode == 0
         assert "checked 0 symbols" in result.stdout + result.stderr
 
+    def test_a_phantom_error_names_what_the_cited_lines_really_hold(
+        self,
+    ) -> None:
+        """The gate's own error must carry the remedy, not just the verdict.
+
+        The resolver appends "the lines cited hold X" only when given
+        ``--line``; the wrapper originally omitted it on the primary
+        call, so the common case got the generic message and the richer
+        one fired only on the separate location pass.
+        """
+        result = self._run(
+            '{"file":"creek-tools/creek/audit/log.py","symbol":"verify_chain",'
+            '"lines":"145-150"}\n'
+        )
+
+        combined = result.stdout + result.stderr
+        assert result.returncode == 1
+        assert "the lines cited hold '_last_line'" in combined
+
     def test_malformed_findings_json_is_a_hard_failure(self) -> None:
         """A payload that will not parse is a broken producer, not "no symbol".
 
