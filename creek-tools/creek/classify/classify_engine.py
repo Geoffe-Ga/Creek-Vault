@@ -1258,18 +1258,12 @@ def _process_file(
             weighted_classification=classification_config.weighted_classification,
         )
 
-    # Stamp the #634 audience axis on every (re)classified fragment. It is a
-    # deterministic heuristic independent of the frequency/phase method above,
-    # so it runs on both the rules and LLM paths and stays idempotent.
-    new_fragment = audience.classify_and_enforce(new_fragment, body)
-
     # #877: score the praxis axis from the free keyword pass. Unconditional
     # by design — the purity of ``apply_praxis`` absorbs the decision (it
     # returns the same object when nothing escalates), so this adds no
     # branch to this function. It runs AFTER ``_classify_one`` so the
     # escalate-only merge already sees any LLM verdict, and BEFORE the
-    # reassess below so the #876 privacy pass stays the last mutation
-    # before the write.
+    # reassess below.
     praxis_before = new_fragment.praxis_potential
     new_fragment = apply_praxis(new_fragment, body)
 
@@ -1300,6 +1294,19 @@ def _process_file(
         baseline=prepared.tier_baseline,
         classifier=privacy,
     )
+
+    # Stamp the #634 audience axis on every (re)classified fragment. It is a
+    # deterministic heuristic independent of the frequency/phase method above,
+    # so it runs on both the rules and LLM paths and stays idempotent.
+    #
+    # #1689: it runs AFTER ``reassess``, not before. The score reads
+    # ``privacy_tier`` (INTIMATE weighs -3 against PERSONAL's -1), and
+    # ``reassess`` can escalate exactly that tier — so scoring first stamped an
+    # audience the same run then superseded, and the next pass read the
+    # escalated tier off disk and answered differently. Still BEFORE the
+    # ``with lock`` below, so ``_maybe_reatomize_and_persist`` children derived
+    # by ``parent.model_copy`` inherit the corrected value.
+    new_fragment = audience.classify_and_enforce(new_fragment, body)
 
     with lock:
         _record_praxis(praxis_before, new_fragment, counts)

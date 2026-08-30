@@ -433,35 +433,91 @@ def test_llm_classify_after_llm_process_changes_no_fragment_field(
     after = _snapshot(vault_path)
     assert set(after) == set(before)
 
-    # KNOWN DIVERGENCE, pinned rather than excluded (#1689). This scenario
-    # found a real defect on its first run: `creek process` scores `audience`
-    # BEFORE the escalate-only `reassess` that ends both orchestrators
-    # (pipeline.py:1001, classify_engine.py:1297), so on a freshly-ingested
-    # fragment it is computed against the pre-escalation tier. A re-classify
-    # then reads `intimate` off disk and answers differently.
-    #
-    # It is asserted here as an equality, not dropped from the comparison, for
-    # two reasons. Excluding the key would blind this detector to any FUTURE
-    # audience wiring defect — the one thing the module exists to catch. And
-    # pinning it means the day #1689 is fixed this assertion fails, forcing
-    # whoever fixes it to delete the pin rather than leaving a stale
-    # exclusion behind. Its acceptance criteria say exactly that.
-    known_divergence = {"frag-llmparity02": ("audience", "mixed", "private")}
-
+    # #1689 is fixed: `audience` is now scored AFTER the escalate-only
+    # `reassess` in both orchestrators, so it is compared like every other
+    # key here. The pin this replaces was deliberately written as an
+    # equality so that fixing the defect would fail it and force its
+    # deletion rather than leave a stale exclusion behind.
     for frag_id, before_meta in before.items():
         after_meta = after[frag_id]
         ignore = set(_LLM_ONLY_KEYS)
-        if frag_id in known_divergence:
-            key, want_before, want_after = known_divergence[frag_id]
-            assert (before_meta[key], after_meta[key]) == (want_before, want_after), (
-                f"{frag_id}: the #1689 divergence changed shape — expected "
-                f"{key} {want_before!r} -> {want_after!r}, got "
-                f"{before_meta[key]!r} -> {after_meta[key]!r}. If #1689 is "
-                "fixed, delete this pin instead of updating it."
-            )
-            ignore.add(key)
         assert {
             key: value for key, value in after_meta.items() if key not in ignore
         } == {key: value for key, value in before_meta.items() if key not in ignore}, (
             f"{frag_id}: a Fragment field moved between the two orchestrators"
+        )
+
+
+def test_llm_classify_converges_in_one_pass_on_an_untiered_vault(
+    vault_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second identical ``classify --method llm --force`` changes nothing.
+
+    This binds the ENGINE's ordering specifically, which the process↔classify
+    parity scenario above cannot: by the time that scenario runs
+    ``run_classify``, ``creek process`` has already written ``intimate`` to
+    disk, so the engine's audience pass reads the escalated tier whether it
+    runs before or after ``reassess`` and its ordering is unobservable there.
+
+    Here the vault is written **untiered**, so this run's own ``reassess`` is
+    what escalates. Scoring ``audience`` before it stamps a verdict computed
+    against the superseded tier, and the next identical pass — reading the
+    escalated tier off disk — answers differently. That is the #1689
+    idempotence break, seen from the engine side alone.
+
+    Args:
+        vault_path: Minimal vault scaffold.
+        monkeypatch: Used to stub the LLM provider.
+    """
+    _stub_llm(monkeypatch)
+    items = [
+        _ingested("frag-converge01", "Walking notes", _NEUTRAL_BODY, "markdown"),
+    ]
+    Pipeline(config=CreekConfig(), no_llm=True)._write_to_vault(
+        items,
+        vault_path,
+        PipelineResult(),
+    )
+
+    seeded = _snapshot(vault_path)["frag-converge01"]
+    assert seeded.get("privacy_tier") != PrivacyTier.INTIMATE.value, (
+        "the vault was seeded already-intimate, so this run's own reassess "
+        f"cannot be what escalates and the test proves nothing: {seeded}"
+    )
+
+    run_classify(
+        vault_path=vault_path,
+        config=CreekConfig(),
+        method="llm",
+        force=True,
+    )
+    first = _snapshot(vault_path)
+
+    assert first["frag-converge01"]["privacy_tier"] == PrivacyTier.INTIMATE.value, (
+        "this pass did not escalate the tier, so an audience scored before "
+        f"reassess would be indistinguishable from one scored after: {first}"
+    )
+
+    run_classify(
+        vault_path=vault_path,
+        config=CreekConfig(),
+        method="llm",
+        force=True,
+    )
+    second = _snapshot(vault_path)
+
+    for frag_id, first_meta in first.items():
+        second_meta = second[frag_id]
+        assert {
+            key: value
+            for key, value in second_meta.items()
+            if key not in _CLASSIFY_ONLY_KEYS
+        } == {
+            key: value
+            for key, value in first_meta.items()
+            if key not in _CLASSIFY_ONLY_KEYS
+        }, (
+            f"{frag_id}: a second identical classify pass changed a field, so "
+            "one pass does not converge"
         )

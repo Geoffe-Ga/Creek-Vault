@@ -15,8 +15,10 @@ close that hole:
 * :func:`apply_tier` — stamp a tier, honouring a manual override.
 * :func:`reassess` — re-run the check after classification hardened the
   fragment's voice signals; escalate-only, and only on new evidence.
-  Both entry points call it, each as its last mutation before the write
-  (#974).
+  Both entry points call it as their last *tier* mutation (#974). It is
+  no longer the last mutation of any kind: the #634 audience axis is
+  scored after it, because that score reads ``privacy_tier`` and must see
+  the tier this run actually persists (#1689).
 * :func:`edit_added_evidence` — did an in-place *rewrite* introduce a
   privacy signal the old body lacked? (#1136)
 
