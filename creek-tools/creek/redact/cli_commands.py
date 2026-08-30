@@ -1053,7 +1053,8 @@ def _exclude_audit_artifacts(
 
     Args:
         files: Candidate files the apply would rewrite.
-        vault_path: Vault root owning the compliance artifacts.
+        vault_paths: Every vault root owning compliance artifacts that this
+            walk can reach, from :func:`_reachable_vault_roots`.
         console: Rich console sink for the one-line notice.
 
     Returns:

@@ -1257,7 +1257,7 @@ def test_a_relative_source_resolves_before_ancestors_are_enumerated(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A relative ``--source`` two levels below the vault root is protected.
+    """A relative ``--source`` below the vault root is protected.
 
     ``Path('sub').parents`` is ``(Path('.'),)``, so enumerating ancestors
     of an unresolved relative path can never climb to the vault root. The
