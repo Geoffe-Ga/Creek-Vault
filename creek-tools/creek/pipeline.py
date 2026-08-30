@@ -979,18 +979,9 @@ class Pipeline:
                     frag = classifier.classify(frag, content=item.body)
             else:
                 result.deterministic_classified += 1
-            # Issue #937: stamp the #634 audience axis here, after ``apply_tier``
-            # above — the score reads ``privacy_tier``, and a fragment still
-            # ``unclassified`` contributes nothing, so an earlier call would
-            # return a different verdict than ``creek classify`` does. This
-            # placement mirrors the engine's (classify -> audience -> praxis)
-            # so the two entry points agree fragment for fragment.
-            frag = self.audience_classifier.classify_and_enforce(frag, item.body)
             # Issue #877: score the praxis axis after the optional LLM dispatch
             # above, so the escalate-only merge sees whatever the model
-            # produced, and before the reassess below, so the #876 privacy
-            # pass stays the last mutation before the write (mirrors the
-            # engine's ordering).
+            # produced (mirrors the engine's ordering).
             frag = apply_praxis(frag, item.body)
             # Issue #974: the tier pass above had to run before the LLM, so it
             # never saw the voice axes Pass 3 just filled in. Look once more,
@@ -1004,6 +995,17 @@ class Pipeline:
                 baseline=baseline,
                 classifier=self.privacy_classifier,
             )
+            # Issue #937: stamp the #634 audience axis after ``apply_tier`` —
+            # the score reads ``privacy_tier``, and a fragment still
+            # ``unclassified`` contributes nothing. Issue #1689: it must run
+            # after ``reassess`` too, not before it. ``reassess`` can escalate
+            # the tier this score is computed FROM (INTIMATE weighs -3 against
+            # PERSONAL's -1), so scoring first wrote an audience the same run
+            # then superseded — and the next ``creek classify`` read the
+            # escalated tier off disk and answered differently, breaking
+            # idempotence. This placement mirrors the engine's, so the two
+            # entry points agree fragment for fragment.
+            frag = self.audience_classifier.classify_and_enforce(frag, item.body)
             # ``extra_frontmatter`` is carried through, not rebuilt: this bundle
             # is a re-wrap of ``item`` around a classified ``Fragment``, and the
             # passthrough keys are provenance the ingestor already resolved
