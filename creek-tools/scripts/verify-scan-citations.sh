@@ -80,24 +80,7 @@ while IFS= read -r line; do
                 esac
             fi
         fi
-    done < <(printf '%s' "$line" | "$PYTHON" -c '
-import json, sys
-try:
-    finding = json.load(sys.stdin)
-except json.JSONDecodeError as exc:
-    # Distinct from "declared no symbol": a payload that will not parse is a
-    # broken producer, and degrading it to the same "checked 0" signal hides
-    # that. Exit 2 so the caller can tell the two apart.
-    print(f"MALFORMED\t{exc}")
-    sys.exit(2)
-path = finding.get("file", "")
-lines = finding.get("lines", "")
-symbols = finding.get("symbol") or finding.get("symbols") or []
-if isinstance(symbols, str):
-    symbols = [symbols]
-for name in symbols:
-    print(f"{path}\t{name}\t{lines}")
-')
+    done < <(printf '%s' "$line" | "$PYTHON" "$RESOLVER" --extract)
 done
 
 if [ "$failures" -gt 0 ]; then

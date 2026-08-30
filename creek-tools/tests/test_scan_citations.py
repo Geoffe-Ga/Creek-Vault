@@ -37,6 +37,8 @@ import pytest
 
 from scripts.scan_citations import (
     CitationError,
+    MalformedFindingError,
+    extract_citations,
     main,
     resolve_enclosing_symbol,
     verify_symbol,
@@ -705,3 +707,55 @@ class TestTheShellWrapperFromItsRealWorkingDirectory:
 
         assert result.returncode == 0
         assert "::warning::" not in result.stdout + result.stderr
+
+
+class TestExtractCitations:
+    """Findings parsing is a unit, not an inline shell heredoc.
+
+    Moved out of the wrapper so the malformed cases are directly testable
+    --- and so the shell stays free of an embedded program.
+    """
+
+    def test_a_single_symbol_is_extracted_with_its_lines(self) -> None:
+        """The common shape."""
+        assert extract_citations('{"file":"a.py","symbol":"f","lines":"1-2"}') == [
+            ("a.py", "f", "1-2")
+        ]
+
+    def test_a_symbols_list_yields_one_triple_each(self) -> None:
+        """`symbols` is the plural spelling the schema also allows."""
+        assert extract_citations('{"file":"a.py","symbols":["f","g"]}') == [
+            ("a.py", "f", ""),
+            ("a.py", "g", ""),
+        ]
+
+    def test_a_finding_with_no_symbol_is_empty_not_an_error(self) -> None:
+        """A whole-module or config finding legitimately names none."""
+        assert extract_citations('{"file":"a.py"}') == []
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param("not json at all", id="unparseable"),
+            pytest.param("[1,2,3]", id="list"),
+            pytest.param("null", id="null"),
+            pytest.param('"a string"', id="string"),
+            pytest.param("42", id="int"),
+        ],
+    )
+    def test_anything_that_is_not_an_object_is_malformed(
+        self,
+        payload: str,
+    ) -> None:
+        """Parses-but-wrong-shape must not degrade into "declared no symbol".
+
+        A bare list or ``null`` previously reached ``.get`` and raised
+        ``AttributeError``, so the citations went unchecked with no
+        sentinel — the same silent-pass failure this module refuses
+        everywhere else.
+
+        Args:
+            payload: A findings line that is not a JSON object.
+        """
+        with pytest.raises(MalformedFindingError):
+            extract_citations(payload)

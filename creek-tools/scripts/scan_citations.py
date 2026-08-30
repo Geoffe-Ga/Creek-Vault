@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -197,6 +198,46 @@ def verify_symbol(*, repo: Path, sha: str, path: str, symbol: str) -> bool:
     )
 
 
+class MalformedFindingError(ValueError):
+    """A findings line is not a usable JSON object.
+
+    Distinct from a wrong citation. A payload that will not parse, or that
+    parses to something other than an object, means a broken producer --
+    and degrading it into "no symbol declared" would hide it behind the
+    benign case, which is the "gate reports nothing wrong when it did
+    nothing" failure this module exists to refuse.
+    """
+
+
+def extract_citations(line: str) -> list[tuple[str, str, str]]:
+    """Extract ``(file, symbol, lines)`` triples from one findings line.
+
+    Args:
+        line: One newline-delimited JSON finding.
+
+    Returns:
+        One triple per declared symbol; empty when the finding declares
+        none, which is legal for a whole-module or config finding.
+
+    Raises:
+        MalformedFindingError: If *line* is not a JSON object.
+    """
+    try:
+        finding = json.loads(line)
+    except json.JSONDecodeError as exc:
+        msg = str(exc)
+        raise MalformedFindingError(msg) from exc
+    if not isinstance(finding, dict):
+        msg = f"finding is {type(finding).__name__}, expected an object"
+        raise MalformedFindingError(msg)
+    symbols = finding.get("symbol") or finding.get("symbols") or []
+    if isinstance(symbols, str):
+        symbols = [symbols]
+    path = str(finding.get("file", ""))
+    lines = str(finding.get("lines", ""))
+    return [(path, str(name), lines) for name in symbols]
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build the command-line parser.
 
@@ -207,19 +248,91 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Verify a scan issue's symbol citation against its scan SHA.",
     )
     parser.add_argument("--repo", type=Path, default=Path.cwd())
-    parser.add_argument("--sha", required=True)
-    parser.add_argument("--path", required=True)
+    parser.add_argument("--sha")
+    parser.add_argument("--path")
     parser.add_argument("--symbol", help="Verify this exact name exists.")
     parser.add_argument(
         "--line",
         type=int,
         help="Resolve the innermost definition enclosing this line instead.",
     )
+    parser.add_argument(
+        "--extract",
+        action="store_true",
+        help="Read newline-delimited JSON findings on stdin and print "
+        "tab-separated file/symbol/lines triples.",
+    )
     return parser
 
 
+def _extract_mode() -> int:
+    """Print ``file\tsymbol\tlines`` for every citation on stdin.
+
+    Returns:
+        ``0`` when every line parsed, ``2`` when any did not.
+    """
+    status = 0
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            triples = extract_citations(line)
+        except MalformedFindingError as exc:
+            print(f"MALFORMED\t{exc}\t")
+            status = 2
+            continue
+        for path, symbol, lines in triples:
+            print(f"{path}\t{symbol}\t{lines}")
+    return status
+
+
+def _verify_mode(args: argparse.Namespace) -> int:
+    """Verify one symbol citation and report the verdict.
+
+    Args:
+        args: Parsed arguments carrying repo, sha, path, symbol and line.
+
+    Returns:
+        ``0`` when the symbol exists at that revision, ``1`` when it does not.
+    """
+    if verify_symbol(repo=args.repo, sha=args.sha, path=args.path, symbol=args.symbol):
+        print(f"OK {args.symbol} exists in {args.path} at {args.sha[:12]}")
+        return 0
+    actual = (
+        resolve_enclosing_symbol(
+            repo=args.repo, sha=args.sha, path=args.path, line=args.line
+        )
+        if args.line
+        else None
+    )
+    suffix = f"; the lines cited hold {actual!r}" if actual else ""
+    print(
+        f"PHANTOM {args.symbol!r} has no definition in {args.path} "
+        f"at {args.sha[:12]}{suffix}",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def _resolve_mode(args: argparse.Namespace) -> int:
+    """Print the innermost definition enclosing the requested line.
+
+    Args:
+        args: Parsed arguments carrying repo, sha, path and line.
+
+    Returns:
+        ``0`` always; an unresolvable blob raises :class:`CitationError`.
+    """
+    resolved = resolve_enclosing_symbol(
+        repo=args.repo, sha=args.sha, path=args.path, line=args.line or 1
+    )
+    print(resolved if resolved else "<module level>")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Verify one citation, or resolve one line, and report.
+    """Dispatch to extract, verify or resolve, and report.
 
     Args:
         argv: Command-line arguments, defaulting to ``sys.argv[1:]``.
@@ -228,36 +341,17 @@ def main(argv: list[str] | None = None) -> int:
         ``0`` when the citation holds, ``1`` when it does not, ``2`` when
         it could not be checked at all.
     """
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.extract:
+        return _extract_mode()
+    if not args.sha or not args.path:
+        parser.error("--sha and --path are required unless --extract is given")
     try:
-        if args.symbol:
-            if verify_symbol(
-                repo=args.repo, sha=args.sha, path=args.path, symbol=args.symbol
-            ):
-                print(f"OK {args.symbol} exists in {args.path} at {args.sha[:12]}")
-                return 0
-            actual = (
-                resolve_enclosing_symbol(
-                    repo=args.repo, sha=args.sha, path=args.path, line=args.line
-                )
-                if args.line
-                else None
-            )
-            suffix = f"; the lines cited hold {actual!r}" if actual else ""
-            print(
-                f"PHANTOM {args.symbol!r} has no definition in {args.path} "
-                f"at {args.sha[:12]}{suffix}",
-                file=sys.stderr,
-            )
-            return 1
-        resolved = resolve_enclosing_symbol(
-            repo=args.repo, sha=args.sha, path=args.path, line=args.line or 1
-        )
-        print(resolved if resolved else "<module level>")
+        return _verify_mode(args) if args.symbol else _resolve_mode(args)
     except CitationError as exc:
         print(f"UNCHECKABLE {exc}", file=sys.stderr)
         return 2
-    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover
