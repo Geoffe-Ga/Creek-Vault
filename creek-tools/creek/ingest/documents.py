@@ -27,6 +27,7 @@ import contextlib
 import io
 import logging
 import re
+import string
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -365,12 +366,28 @@ def _extract_pdf_metadata_from_bytes(pdf_bytes: bytes) -> dict[str, Any]:
 # timezone, then hand the result to ``datetime.strptime`` with two
 # format candidates (with-tz and without). Returning ``None`` rather
 # than guessing matches the FEAT-031 contract.
-_PDF_DATE_FORMATS: tuple[str, ...] = (
-    "%Y%m%d%H%M%S%z",
-    "%Y%m%d%H%M%S",
-    "%Y%m%d%H%M",
-    "%Y%m%d",
+_PDF_DATE_FORMATS: tuple[tuple[str, int], ...] = (
+    ("%Y%m%d%H%M%S%z", 14),
+    ("%Y%m%d%H%M%S", 14),
+    ("%Y%m%d%H%M", 12),
+    ("%Y%m%d", 8),
 )
+"""Each unseparated format paired with the digit count it accepts.
+
+The count is load-bearing, not documentation. ``datetime.strptime`` lets
+every numeric directive match one *or* two digits, so an ungated
+``%Y%m%d%H%M%S`` re-segments a malformed run into a plausible-looking but
+**wrong** date rather than rejecting it: ``D:20241345`` became
+2024-01-03 04:05 and ``D:99999999`` became 9999-09-09 09:09, both then
+written to ``authored_at`` with no signal (#1632). A wrong date
+propagates into threads, eddies and temporal linking, so guessing is the
+one thing the FEAT-031 contract forbids.
+
+The count covers only the leading digit run. The ``%z`` suffix is
+variable-length (``+0500``, ``+05``, ``Z``), so gating on the total
+string length would reject the canonical
+``D:YYYYMMDDHHmmSS+HH'mm'`` form.
+"""
 
 
 def _parse_pdf_date(raw: str) -> datetime | None:
@@ -387,7 +404,10 @@ def _parse_pdf_date(raw: str) -> datetime | None:
     cleaned = cleaned.replace("'", "")
     if cleaned.endswith(("z", "Z")):
         cleaned = cleaned[:-1] + "+0000"
-    for fmt in _PDF_DATE_FORMATS:
+    digits = len(cleaned) - len(cleaned.lstrip(string.digits))
+    for fmt, expected_digits in _PDF_DATE_FORMATS:
+        if digits != expected_digits:
+            continue
         try:
             parsed = datetime.strptime(cleaned, fmt)
         except ValueError:

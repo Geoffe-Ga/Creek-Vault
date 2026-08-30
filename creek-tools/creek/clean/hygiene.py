@@ -432,6 +432,15 @@ class OrphanScanner:
         return (now - mtime).days >= self.age_days
 
 
+_REVIEW_QUEUE_STEM_RE = re.compile(r"\d{4}-\d{2}-\d{2}_\d{6}")
+"""The exact shape ``review-queue-<timestamp>.md`` stems must have.
+
+``%H%M%S`` is unseparated, so without this gate ``strptime`` re-segments a
+short time run into a wrong-but-plausible time instead of rejecting it
+(#1632).
+"""
+
+
 class StaleReviewScanner:
     """Find review queue items older than a configurable threshold.
 
@@ -515,6 +524,13 @@ class StaleReviewScanner:
         if not stem.startswith(prefix):
             return None
         ts_part = stem[len(prefix) :]
+        # The date half is delimited and cannot re-segment, but ``%H%M%S`` is
+        # not: ``strptime`` lets each numeric directive match one *or* two
+        # digits, so ``2024-03-15_0830`` silently parsed as 08:**03**:00 —
+        # aging a queue by 27 minutes it never had. Same defect as the PDF
+        # date parser's (#1632); gate the shape before parsing it.
+        if not _REVIEW_QUEUE_STEM_RE.fullmatch(ts_part):
+            return None
         try:
             return datetime.strptime(ts_part, "%Y-%m-%d_%H%M%S").replace(
                 tzinfo=UTC,
