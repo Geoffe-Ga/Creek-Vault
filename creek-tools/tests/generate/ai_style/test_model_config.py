@@ -81,3 +81,100 @@ class TestAIStyleConfig:
         """The length cap is constrained to be non-negative."""
         with pytest.raises(ValidationError):
             AIStyleConfig(preamble_max_chars=-1)
+
+
+class TestAIStyleWeightsRejectNonFiniteAndNegative:
+    """Every AIStyleConfig weight must be finite and non-negative (#1615).
+
+    These maps feed the voice fingerprint's weighted aggregation. The
+    three bad values fail in three different ways, and none is detectable
+    downstream:
+
+    * ``+inf`` **poisons** — every feature ``rate`` becomes NaN and
+      ``save_fingerprint`` writes a literal ``NaN`` token into
+      ``voice-fingerprint.json``, which is not valid JSON for strict
+      parsers.
+    * ``NaN`` and **negative** weights are silently *dropped* by
+      ``fingerprint.py``'s ``if weight > 0.0`` gate, shrinking the corpus
+      with no warning (measured: ``fragment_count`` 2 → 1).
+
+    Mirrors the #1412 validator on the authority maps.
+    """
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            pytest.param(float("nan"), id="nan"),
+            pytest.param(float("inf"), id="positive-infinity"),
+            pytest.param(float("-inf"), id="negative-infinity"),
+            pytest.param(-1.0, id="negative"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "field",
+        [
+            pytest.param("authorship_weights", id="authorship_weights"),
+            pytest.param("feature_weights", id="feature_weights"),
+        ],
+    )
+    def test_weight_maps_reject_bad_values(self, field: str, bad: float) -> None:
+        """Each str-keyed weight map refuses NaN, infinities and negatives.
+
+        Args:
+            field: The weight map under test.
+            bad: The value that must be refused.
+        """
+        with pytest.raises(ValidationError):
+            AIStyleConfig(**{field: {"journal": bad}})
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            pytest.param(float("nan"), id="nan"),
+            pytest.param(float("inf"), id="positive-infinity"),
+            pytest.param(float("-inf"), id="negative-infinity"),
+            pytest.param(-1.0, id="negative"),
+        ],
+    )
+    def test_authorship_default_weight_rejects_bad_values(self, bad: float) -> None:
+        """The scalar fallback is gated too.
+
+        Its ``ge=0.0`` bound admits ``+inf`` — a range check rejects NaN
+        only as an accident of ``<`` always being ``False``, and does not
+        reject infinity at all.
+
+        Args:
+            bad: The value that must be refused.
+        """
+        with pytest.raises(ValidationError):
+            AIStyleConfig(authorship_default_weight=bad)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            pytest.param(float("nan"), id="nan"),
+            pytest.param(float("inf"), id="positive-infinity"),
+            pytest.param(-1.0, id="negative"),
+        ],
+    )
+    def test_category_weights_reject_bad_values(self, bad: float) -> None:
+        """The enum-keyed sibling map has the identical gap.
+
+        Kept separate from the str-keyed maps because its keys are
+        ``AIStyleCategory`` literals, not free strings.
+
+        Args:
+            bad: The value that must be refused.
+        """
+        with pytest.raises(ValidationError):
+            AIStyleConfig(category_weights={"mechanical": bad})
+
+    def test_zero_stays_legal(self) -> None:
+        """Zero means "contributes nothing", which is a real setting."""
+        config = AIStyleConfig(authorship_weights={"journal": 0.0})
+        assert config.authorship_weights["journal"] == 0.0
+
+    def test_the_error_names_the_offending_key(self) -> None:
+        """A config error must be actionable without bisecting the YAML."""
+        with pytest.raises(ValidationError, match="chatgpt"):
+            AIStyleConfig(authorship_weights={"journal": 1.0, "chatgpt": float("nan")})

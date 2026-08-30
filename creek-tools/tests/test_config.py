@@ -34,6 +34,7 @@ from creek.config import (
     SourcePaths,
     ValidationConfig,
     VoiceAudienceWeightingConfig,
+    _default_authorship_weights,
     generate_default_config,
     load_config,
 )
@@ -1506,3 +1507,48 @@ class TestAuthorMaxReproducedTier:
 
         data = yaml.safe_load(output.read_text(encoding="utf-8"))
         assert data["author"]["max_reproduced_tier"] == "open"
+
+
+class TestAIStyleWeightsAtLoad:
+    """The weight guard must bite on the real YAML path (#1615)."""
+
+    def test_a_non_finite_weight_is_refused_at_load(self, tmp_path: Path) -> None:
+        """``ai_style.authorship_weights`` with ``.nan`` fails to load.
+
+        Args:
+            tmp_path: Pytest-provided temporary directory.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(
+            "ai_style:\n  authorship_weights:\n    journal: .nan\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValidationError):
+            load_config(config_file)
+
+    def test_the_issues_path_would_have_been_vacuous(self, tmp_path: Path) -> None:
+        """``author.authorship_weights`` is silently discarded, not validated.
+
+        #1615's own Premise names ``author.authorship_weights``, but the
+        field lives on :class:`AIStyleConfig`. Nested models do not forbid
+        extras — only top-level ``CreekConfig`` does — so this YAML loads
+        **clean** and the key vanishes. Pinned so a future reader does not
+        rediscover it by writing a test that passes for the wrong reason.
+
+        Args:
+            tmp_path: Pytest-provided temporary directory.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(
+            "author:\n  authorship_weights:\n    journal: .nan\n",
+            encoding="utf-8",
+        )
+
+        config = load_config(config_file)
+
+        assert not hasattr(config.author, "authorship_weights"), (
+            "author.authorship_weights now exists; #1615's premise was "
+            "right after all and this pin should become a real assertion"
+        )
+        assert config.ai_style.authorship_weights == _default_authorship_weights()

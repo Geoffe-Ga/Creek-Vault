@@ -1426,6 +1426,35 @@ class AuthorConfig(BaseModel):
         return PrivacyTier.OPEN.value
 
 
+def _validate_weight(value: float, *, label: str) -> None:
+    """Refuse a non-finite or negative voice weight, naming the offender.
+
+    Shared by the AIStyleConfig weight validators so the map case and the
+    scalar case cannot drift apart (#1615).
+
+    Args:
+        value: The weight to check.
+        label: How to name the offending field in the error.
+
+    Raises:
+        ValueError: If *value* is NaN, infinite, or negative.
+    """
+    if not math.isfinite(value):
+        msg = (
+            f"{label} must be a finite number, got {value}; a non-finite "
+            "weight makes every fingerprint rate NaN and writes a literal "
+            "NaN token into voice-fingerprint.json"
+        )
+        raise ValueError(msg)
+    if value < 0.0:
+        msg = (
+            f"{label} must be >= 0.0, got {value}; a negative weight is "
+            "silently dropped by the fingerprint's weight > 0.0 gate, "
+            "shrinking the corpus with no warning"
+        )
+        raise ValueError(msg)
+
+
 class AIStyleConfig(BaseModel):
     """Configuration for the FEAT-040 AI-style / voice-fidelity subsystem.
 
@@ -1529,6 +1558,67 @@ class AIStyleConfig(BaseModel):
     authorship_default_weight: float = Field(default=0.75, ge=0.0)
     """Weight for a source platform not listed in
     :attr:`authorship_weights`."""
+
+    @field_validator(
+        "category_weights",
+        "feature_weights",
+        "authorship_weights",
+    )
+    @classmethod
+    def validate_weight_maps(cls, v: dict[object, float]) -> dict[object, float]:
+        """Validate every weight is finite and non-negative.
+
+        Issue #1615. These maps feed the voice fingerprint's weighted
+        aggregation, and the three bad values fail in three different
+        ways — none of them detectable downstream:
+
+        * ``+inf`` **poisons**: every feature ``rate`` becomes NaN and
+          ``save_fingerprint`` writes a literal ``NaN`` token into
+          ``voice-fingerprint.json``, which strict JSON parsers reject.
+        * ``NaN`` and negative weights are silently *dropped* by
+          ``fingerprint.py``'s ``if weight > 0.0`` gate, shrinking the
+          corpus with no warning rather than inverting anything.
+
+        ``math.isfinite`` is explicit rather than relying on a range
+        check: a range check rejects NaN only as an accident of ``<``
+        always being ``False``, which a later refactor can silently lose,
+        and it does not reject ``+inf`` at all.
+
+        Zero stays legal — it is the real way to say a source contributes
+        nothing to the voice.
+
+        Args:
+            v: One weight map to validate.
+
+        Returns:
+            The validated map, unchanged.
+
+        Raises:
+            ValueError: If any value is NaN, infinite, or negative.
+        """
+        for key, value in v.items():
+            _validate_weight(value, label=f"weight for {key!r}")
+        return v
+
+    @field_validator("authorship_default_weight")
+    @classmethod
+    def validate_authorship_default_weight(cls, v: float) -> float:
+        """Validate the scalar fallback weight is finite and non-negative.
+
+        Issue #1615. Its ``ge=0.0`` bound already refuses negatives but
+        admits ``+inf``, which is the value that poisons the fingerprint.
+
+        Args:
+            v: The default weight.
+
+        Returns:
+            The validated weight, unchanged.
+
+        Raises:
+            ValueError: If the value is NaN or infinite.
+        """
+        _validate_weight(v, label="authorship_default_weight")
+        return v
 
     fingerprint_path: str = "00-Creek-Meta/voice-fingerprint.json"
     """Vault-relative path where the voice fingerprint is persisted."""
