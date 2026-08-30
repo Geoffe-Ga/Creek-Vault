@@ -27,11 +27,22 @@ if [ ! -f "$RESOLVER" ]; then
     exit 1
 fi
 
+# Prove the interpreter runs BEFORE trusting any verdict it produces. $PYTHON
+# also parses the findings JSON below, so an unusable one parses nothing,
+# checks nothing, and exits 0 -- a gate reporting that it did nothing, which
+# reads identically to a clean pass.
+if ! "$PYTHON" -c "import ast, json" >/dev/null 2>&1; then
+    echo "::error::interpreter '$PYTHON' is unusable; refusing to report citations as verified"
+    exit 1
+fi
+
 failures=0
 checked=0
+lines_read=0
 
 while IFS= read -r line; do
     [ -z "$line" ] && continue
+    lines_read=$((lines_read + 1))
     while IFS=$'\t' read -r file symbol; do
         [ -z "${symbol:-}" ] && continue
         [ -z "${file:-}" ] && continue
@@ -68,7 +79,11 @@ if [ "$failures" -gt 0 ]; then
     exit 1
 fi
 
-# Distrust a gate that reports it did nothing: say so explicitly rather than
-# letting an empty run read as a pass.
+# Distrust a gate that reports it did nothing. Findings arrived but nothing was
+# checked means the JSON never parsed, not that no finding named a symbol --
+# and a silent 0 there is indistinguishable from a clean pass.
+if [ "$lines_read" -gt 0 ] && [ "$checked" -eq 0 ]; then
+    echo "::warning::verify-scan-citations: read $lines_read finding(s) but checked 0 symbols. If any finding names a function, class or method, it MUST declare a symbol field."
+fi
 echo "verify-scan-citations: $checked symbol citation(s) verified at ${SCAN_SHA:0:12}"
 exit 0

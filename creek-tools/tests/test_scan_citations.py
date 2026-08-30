@@ -30,6 +30,7 @@ of that exact name exists there.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -578,7 +579,13 @@ class TestTheShellWrapperFromItsRealWorkingDirectory:
             env={
                 "PATH": "/usr/bin:/bin:/usr/local/bin",
                 "SCAN_SHA": _SCAN_SHA,
-                "PYTHON": str(_REPO_ROOT / "creek-tools" / ".venv" / "bin" / "python"),
+                # sys.executable, never a hardcoded .venv path: CI provisions
+                # with `uv pip install --system` and creates no
+                # creek-tools/.venv (ci.yml's tests job), so pinning that path
+                # would make every citation fail with "No such file or
+                # directory" -- green locally, red in CI, and failing in
+                # exactly the way this class exists to catch.
+                "PYTHON": sys.executable,
             },
         )
 
@@ -613,3 +620,51 @@ class TestTheShellWrapperFromItsRealWorkingDirectory:
 
         assert result.returncode == 1
         assert "iter_entries" in result.stdout + result.stderr
+
+    def test_an_unusable_interpreter_fails_instead_of_passing_silently(
+        self,
+    ) -> None:
+        """A gate that cannot run must not report a clean pass.
+
+        ``$PYTHON`` parses the findings JSON as well as running the
+        resolver, so an unusable one parsed nothing, checked nothing and
+        exited **0** --- indistinguishable from "every citation verified".
+        Surfaced while proving the CI-path fix mattered.
+        """
+        result = subprocess.run(
+            ["creek-tools/scripts/verify-scan-citations.sh"],
+            cwd=_REPO_ROOT,
+            input='{"file":"creek-tools/creek/audit/log.py","symbol":"verify"}\n',
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                "PATH": "/usr/bin:/bin:/usr/local/bin",
+                "SCAN_SHA": _SCAN_SHA,
+                "PYTHON": "/nonexistent/python",
+            },
+        )
+
+        assert result.returncode == 1, (
+            "an unusable interpreter reported success; the gate is decorative"
+        )
+        assert "unusable" in result.stdout + result.stderr
+
+    def test_findings_that_declare_no_symbol_are_announced(self) -> None:
+        """Reading findings but checking nothing must not look like a pass."""
+        result = subprocess.run(
+            ["creek-tools/scripts/verify-scan-citations.sh"],
+            cwd=_REPO_ROOT,
+            input='{"file":"creek-tools/creek/audit/log.py"}\n',
+            capture_output=True,
+            text=True,
+            check=False,
+            env={
+                "PATH": "/usr/bin:/bin:/usr/local/bin",
+                "SCAN_SHA": _SCAN_SHA,
+                "PYTHON": sys.executable,
+            },
+        )
+
+        assert result.returncode == 0
+        assert "checked 0 symbols" in result.stdout + result.stderr
