@@ -903,7 +903,7 @@ def test_an_unresolvable_candidate_is_treated_as_protected(
 
     kept = cli_commands._exclude_audit_artifacts(
         [doomed, tmp_path / "fine.md"],
-        tmp_path / "vault",
+        (tmp_path / "vault",),
         console=Console(),
     )
     assert kept == [tmp_path / "fine.md"]
@@ -947,7 +947,7 @@ def test_an_unresolvable_audit_root_refuses_the_whole_run(
     with pytest.raises(typer.Exit) as excinfo:
         cli_commands._exclude_audit_artifacts(
             [tmp_path / "fine.md"],
-            vault,
+            (vault,),
             console=Console(),
         )
     assert excinfo.value.exit_code == 1
@@ -1134,7 +1134,7 @@ def test_the_protected_set_covers_the_vault_config_by_its_owning_constant(
 
     kept = cli_commands._exclude_audit_artifacts(
         [config_path, ordinary],
-        vault,
+        (vault,),
         console=Console(),
     )
 
@@ -1142,3 +1142,184 @@ def test_the_protected_set_covers_the_vault_config_by_its_owning_constant(
         "the exclusion kept the vault config in the rewrite set (or dropped "
         f"the ordinary file with it).\n\nkept={kept}"
     )
+
+
+def _seed_protected_artifacts(vault: Path) -> dict[str, bytes]:
+    """Write the three compliance artifacts ``--apply`` must never rewrite.
+
+    Each carries a secret-shaped token, so a run that walks them WILL
+    rewrite them unless the protected set is anchored on this vault.
+
+    Args:
+        vault: Vault root to seed.
+
+    Returns:
+        Mapping of label to the original bytes, for byte-identity asserts.
+    """
+    config_path = vault / "00-Creek-Meta" / "creek_config.yaml"
+    config_path.write_text(_CONFIG_WITH_SECRET_SHAPED_TOKEN, encoding="utf-8")
+    legacy = vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(f'{{"ssn": "{SECRET_SSN}"}}\n', encoding="utf-8")
+    audit_artifact = vault / "00-Creek-Meta" / "audit" / "purge.json"
+    audit_artifact.write_text(f'{{"ssn": "{SECRET_SSN}"}}\n', encoding="utf-8")
+    return {
+        "config": config_path.read_bytes(),
+        "legacy": legacy.read_bytes(),
+        "audit": audit_artifact.read_bytes(),
+    }
+
+
+def test_apply_without_a_vault_flag_protects_the_vault_it_walks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--source <vault>`` with no ``--vault`` still protects the vault.
+
+    ``CreekConfig.vault_path`` defaults to ``Path()`` — the process CWD —
+    so the protected set was built from wherever the operator happened to
+    be standing rather than from the tree actually being rewritten. Run
+    from a neighbouring directory this rewrote the vault's own config and
+    its legacy purge log: redaction silently reconfiguring redaction, and
+    mutating records that get chain-signed on next use (#1561).
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        monkeypatch: Used to stand the process outside the vault.
+    """
+    vault = _make_vault(tmp_path)
+    original = _seed_protected_artifacts(vault)
+    fragment = vault / "notes.md"
+    _write_secret_file(fragment)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--apply", "--source", str(vault), "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert fragment.read_text(encoding="utf-8") != f"contact: {SECRET_SSN}\n", (
+        "the ordinary in-vault fragment was not redacted, so this run "
+        "rewrote nothing and every byte-identity assertion below is "
+        f"vacuous.\n\n{result.output}"
+    )
+    assert (vault / "00-Creek-Meta" / "creek_config.yaml").read_bytes() == original[
+        "config"
+    ], "creek_config.yaml was rewritten by the run it governs"
+    assert (
+        vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    ).read_bytes() == original["legacy"], "the legacy purge log was rewritten"
+    assert (vault / "00-Creek-Meta" / "audit" / "purge.json").read_bytes() == original[
+        "audit"
+    ], "an audit-directory artifact was rewritten"
+
+
+def test_apply_without_a_vault_flag_logs_into_the_vault_not_the_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compliance record lands in the vault that was rewritten.
+
+    ``_ApplyAudit`` was handed the same CWD-defaulted root, so a
+    destructive run against a vault wrote its own evidence into a
+    fabricated ``00-Creek-Meta/`` beside the operator while the vault's
+    trail stayed empty (#1561).
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        monkeypatch: Used to stand the process outside the vault.
+    """
+    vault = _make_vault(tmp_path)
+    fragment = vault / "notes.md"
+    _write_secret_file(fragment)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--apply", "--source", str(vault), "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert not (elsewhere / "00-Creek-Meta").exists(), (
+        "a fake 00-Creek-Meta was created beside the operator, so the "
+        "compliance record for a destructive run is not in the vault"
+    )
+    phases = [e.phase for e in RedactionAuditLog(vault).read()]
+    assert "intent" in phases, f"the vault's own audit trail is empty: {phases}"
+
+
+def test_a_relative_source_resolves_before_ancestors_are_enumerated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relative ``--source`` two levels below the vault root is protected.
+
+    ``Path('sub').parents`` is ``(Path('.'),)``, so enumerating ancestors
+    of an unresolved relative path can never climb to the vault root. The
+    resolution must happen first (#1561).
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        monkeypatch: Used to stand the process inside the vault.
+    """
+    vault = _make_vault(tmp_path)
+    original = _seed_protected_artifacts(vault)
+    # Stand OUTSIDE the vault, so the CWD default cannot accidentally supply
+    # the right root and make this pass for the wrong reason.
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--apply", "--source", "vault/00-Creek-Meta", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (vault / "00-Creek-Meta" / "creek_config.yaml").read_bytes() == original[
+        "config"
+    ], "a relative --source could not climb to its own vault root"
+    assert (
+        vault / "00-Creek-Meta" / "Processing-Log" / "purge-log.json"
+    ).read_bytes() == original["legacy"], "the legacy purge log was rewritten"
+
+
+def test_a_source_symlinked_into_a_vault_is_refused_before_any_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A link outside the vault pointing into it is refused, not followed.
+
+    Recorded because it bounds :func:`_reachable_vault_roots`: a source
+    whose own ancestors sit outside the vault is the one shape where
+    enumerating unresolved ancestors would find no vault root and leave
+    the compliance artifacts unprotected. It cannot arise, because
+    ``_assert_no_escaping_symlinks`` refuses the invocation first. The
+    ``resolve()`` there is therefore redundant defence rather than the
+    last line holding this case, and a future relaxation of the symlink
+    guard must not silently make it load-bearing without a test.
+
+    Args:
+        tmp_path: Pytest-provided temporary directory.
+        monkeypatch: Used to stand the process outside the vault.
+    """
+    vault = _make_vault(tmp_path)
+    original = _seed_protected_artifacts(vault)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = outside / "into-vault"
+    link.symlink_to(vault, target_is_directory=True)
+    monkeypatch.chdir(outside)
+
+    result = runner.invoke(
+        app,
+        ["redact", "--apply", "--source", str(link), "--yes"],
+    )
+
+    assert "escapes the source root" in result.output, result.output
+    assert (vault / "00-Creek-Meta" / "creek_config.yaml").read_bytes() == original[
+        "config"
+    ], "the refused run still rewrote the vault's config"

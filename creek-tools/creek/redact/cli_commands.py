@@ -951,9 +951,81 @@ restated here, so a future relocation cannot silently unprotect them.
 """
 
 
+_VAULT_META_DIRNAME = VAULT_CONFIG_RELPATH.parent
+"""The vault's meta directory name, derived from its owning constant.
+
+Deriving rather than restating it keeps this in step with
+:data:`creek.config.VAULT_CONFIG_RELPATH` if the layout ever moves.
+"""
+
+
+def _render_meta_dirs(vault_paths: tuple[Path, ...]) -> str:
+    """Render the meta directories of *vault_paths* for an operator message.
+
+    Args:
+        vault_paths: The vault roots being protected.
+
+    Returns:
+        A comma-separated list of ``<root>/00-Creek-Meta`` paths.
+    """
+    return ", ".join(str(path / _VAULT_META_DIRNAME) for path in vault_paths)
+
+
+def _resolve_or_self(path: Path) -> Path:
+    """Resolve *path*, falling back to it unchanged when that is impossible.
+
+    A symlink loop or a permission error must not drop the protection
+    guard entirely: an unresolvable path still contributes its declared
+    form, so :func:`_reachable_vault_roots` fails closed rather than
+    returning nothing.
+
+    Args:
+        path: The path to resolve.
+
+    Returns:
+        The resolved path, or *path* itself if resolution failed.
+    """
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        return path
+
+
+def _reachable_vault_roots(source: Path, vault_path: Path) -> tuple[Path, ...]:
+    """Vault roots whose compliance artifacts *source* could rewrite.
+
+    ``CreekConfig.vault_path`` defaults to ``Path()`` — the process CWD —
+    so anchoring the protected set on it alone protected wherever the
+    operator happened to be standing rather than the tree actually being
+    walked. A ``--apply --source <vault>`` run from a neighbouring
+    directory rewrote that vault's own ``creek_config.yaml`` and legacy
+    purge log (#1561).
+
+    *source* is resolved **before** its ancestors are enumerated:
+    ``Path("sub").parents`` is ``(Path("."),)``, so an unresolved
+    relative path can never climb to the vault root above it.
+
+    Args:
+        source: The tree ``--apply`` walks.
+        vault_path: The explicit ``--vault``, or the config default.
+
+    Returns:
+        Every distinct vault root to protect, nearest ancestor first.
+    """
+    roots: list[Path] = []
+    resolved_source = _resolve_or_self(source)
+    for anchor in (resolved_source, *resolved_source.parents):
+        if (anchor / _VAULT_META_DIRNAME).is_dir() and anchor not in roots:
+            roots.append(anchor)
+    declared = _resolve_or_self(vault_path)
+    if declared not in roots:
+        roots.append(declared)
+    return tuple(roots)
+
+
 def _exclude_audit_artifacts(
     files: list[Path],
-    vault_path: Path,
+    vault_paths: tuple[Path, ...],
     *,
     console: Console,
 ) -> list[Path]:
@@ -989,7 +1061,9 @@ def _exclude_audit_artifacts(
     """
     try:
         protected = tuple(
-            (vault_path / relpath).resolve() for relpath in PROTECTED_AUDIT_RELPATHS
+            (vault_path / relpath).resolve()
+            for vault_path in vault_paths
+            for relpath in PROTECTED_AUDIT_RELPATHS
         )
     except (OSError, RuntimeError) as exc:
         # The candidate side of the comparison fails closed (see
@@ -999,7 +1073,7 @@ def _exclude_audit_artifacts(
         # traceback. Nothing has been rewritten at this point.
         console.print(
             f"[red]Cannot resolve the vault's compliance artifacts under "
-            f"{vault_path / '00-Creek-Meta'}: {_safe_error_detail(exc)}. "
+            f"{_render_meta_dirs(vault_paths)}: {_safe_error_detail(exc)}. "
             f"Refusing to redact anything, because the audit trail cannot "
             f"be reliably excluded. No files were modified.[/red]"
         )
@@ -1014,7 +1088,7 @@ def _exclude_audit_artifacts(
     if dropped:
         console.print(
             f"[yellow]Skipped {dropped} protected file(s) under "
-            f"{vault_path / '00-Creek-Meta'}: the audit trail, the legacy "
+            f"{_render_meta_dirs(vault_paths)}: the audit trail, the legacy "
             f"purge log and the config that governs redaction are never "
             f"rewritten in place.[/yellow]"
         )
@@ -1286,7 +1360,11 @@ def run_apply(
     if source.is_dir():
         _assert_no_escaping_symlinks(source, console=console, label="source")
     config = load_vault_config(vault, warn_on_missing=True)
-    vault_path = vault if vault is not None else config.vault_path
+    declared_vault = vault if vault is not None else config.vault_path
+    # Anchor on the vault actually being walked, not on the process CWD that
+    # ``CreekConfig.vault_path`` falls back to (#1561).
+    protected_roots = _reachable_vault_roots(source, declared_vault)
+    vault_path = vault if vault is not None else protected_roots[0]
     scanner, summary = _scan_source(
         source,
         config,
@@ -1300,7 +1378,7 @@ def run_apply(
 
     files = _exclude_audit_artifacts(
         _files_from_summary(summary),
-        vault_path,
+        protected_roots,
         console=console,
     )
     if not files:
