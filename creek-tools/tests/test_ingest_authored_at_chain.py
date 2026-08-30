@@ -487,44 +487,96 @@ class TestPdfDateParsing:
         assert _parse_pdf_date(raw) is None
 
     @pytest.mark.parametrize(
-        ("raw", "expected"),
+        "raw",
         [
-            pytest.param(
-                "D:202403150830",
-                datetime(2024, 3, 15, 8, 3, tzinfo=UTC),
-                id="twelve-digits-reads-as-8:03:00",
-            ),
-            pytest.param(
-                "D:2024031",
-                datetime(2024, 3, 1, tzinfo=UTC),
-                id="nine-digits-loses-a-digit",
-            ),
-            pytest.param(
-                "D:20241345",
-                datetime(2024, 1, 3, 4, 5, tzinfo=UTC),
-                id="impossible-month-reparsed-as-january",
-            ),
+            pytest.param("D:2024031", id="nine-digits"),
+            pytest.param("D:2024031508300", id="thirteen-digits"),
+            pytest.param("D:20241345", id="impossible-month"),
+            pytest.param("D:99999999", id="all-nines"),
+            pytest.param("D:202403150", id="ten-digits"),
+            pytest.param("D:2024031508", id="eleven-digits"),
         ],
     )
-    def test_odd_digit_counts_currently_yield_a_wrong_date(
-        self, raw: str, expected: datetime
-    ) -> None:
-        """Pin the loose-``strptime`` hazard as it behaves **today**.
+    def test_malformed_digit_counts_yield_none(self, raw: str) -> None:
+        """A digit run of the wrong length is rejected, never re-segmented.
 
         ``datetime.strptime`` lets each numeric directive match one *or*
-        two digits, so ``%Y%m%d%H%M%S`` re-segments a malformed run of
-        digits into a plausible-looking but **wrong** date instead of
-        rejecting it: ``D:20241345`` becomes 2024-01-03 04:05. That
-        contradicts the FEAT-031 "never guess" contract, but tightening
-        the grammar risks rejecting real-world PDFs that parse correctly
-        today, so it is deliberately **not** changed here — see the
-        follow-up issue referenced in the PR body.
+        two digits, so an ungated ``%Y%m%d%H%M%S`` re-segmented a
+        malformed run into a plausible-looking but **wrong** date:
+        ``D:20241345`` became 2024-01-03 04:05, ``D:2024031`` became
+        2024-03-01, and ``D:99999999`` became 9999-09-09 09:09. That
+        contradicted the FEAT-031 "never guess" contract.
 
-        These assertions exist so that a future tightening shows up as a
-        deliberate, reviewed change to this table rather than as silent
-        drift.
+        Each unseparated format now declares the exact digit count it
+        accepts, so a run of any other length matches nothing (#1632).
+        This table replaces the pinning table that recorded the old
+        behaviour deliberately, so that the tightening would show up as
+        a reviewed change rather than silent drift.
+
+        Args:
+            raw: A malformed ``/CreationDate`` value.
         """
-        assert _parse_pdf_date(raw) == expected
+        assert _parse_pdf_date(raw) is None
+
+    def test_twelve_digits_reads_as_hours_and_minutes(self) -> None:
+        """A genuine 12-digit date parses as ``%Y%m%d%H%M`` (#1632).
+
+        Explicitly chosen over rejecting it. Twelve digits is
+        unambiguous once the 14-digit format can no longer claim it, and
+        ``D:202403150830`` is a real truncation producers emit. Before
+        the length gate this silently returned 08:**03**:00 — the
+        seconds directive stealing a digit from the minutes.
+        """
+        assert _parse_pdf_date("D:202403150830") == datetime(
+            2024, 3, 15, 8, 30, tzinfo=UTC
+        )
+
+
+class TestMalformedPdfDateReachesBothProductionCallers:
+    """A malformed ``/CreationDate`` must not mint a date on either path.
+
+    ``_parse_pdf_date`` has two production callers, not one:
+    ``DocumentIngestor._extract_authored_at`` on the ingest path and
+    ``_pdf_authored_at_from_file`` on the ``creek refresh --refresh-dates``
+    path. Testing the parser alone would leave either wiring free to
+    regress (#1632).
+    """
+
+    def test_document_ingestor_falls_through_on_a_malformed_date(self) -> None:
+        """The ingest path returns None rather than a re-segmented date."""
+        ingestor = documents.DocumentIngestor()
+
+        result = ingestor._extract_authored_at(
+            ".pdf",
+            b"",
+            "",
+            {"creationdate": "D:20241345"},
+        )
+
+        assert result is None
+
+    def test_refresh_dates_falls_through_on_a_malformed_date(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The ``creek refresh --refresh-dates`` path does too.
+
+        Args:
+            tmp_path: Pytest-provided temporary directory.
+            monkeypatch: Used to stub PDF metadata extraction.
+        """
+        from creek.ingest import refresh
+
+        monkeypatch.setattr(
+            refresh,
+            "_extract_pdf_metadata",
+            lambda _: {"creationdate": "D:99999999"},
+        )
+        pdf = tmp_path / "scan.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n")
+
+        assert refresh._pdf_authored_at_from_file(pdf) is None
 
 
 class TestPdfCandidateChain:

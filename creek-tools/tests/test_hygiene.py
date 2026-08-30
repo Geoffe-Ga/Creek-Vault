@@ -389,6 +389,32 @@ class TestStaleReviewScanner:
         result = scanner.scan(vault)
         assert result.total_review_files == 1
 
+    def test_a_short_time_run_is_rejected_not_re_segmented(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A 4-digit time must not parse as a wrong-but-plausible time.
+
+        ``%H%M%S`` is unseparated, so ``strptime`` let each directive match
+        one *or* two digits and read ``2024-03-15_0830`` as 08:**03**:00 —
+        aging the queue by 27 minutes it never had, with no signal. Same
+        re-segmentation defect as the PDF date parser's (#1632).
+
+        Args:
+            tmp_path: Pytest-provided temporary directory.
+        """
+        scanner = StaleReviewScanner(age_days=0)
+        short = tmp_path / "review-queue-2024-03-15_0830.md"
+        full = tmp_path / "review-queue-2024-03-15_083000.md"
+
+        assert scanner._parse_filename_timestamp(short) is None, (
+            "a 4-digit time run was re-segmented into a wrong time instead "
+            "of being rejected"
+        )
+        assert scanner._parse_filename_timestamp(full) == datetime(
+            2024, 3, 15, 8, 30, tzinfo=UTC
+        )
+
 
 # ---------------------------------------------------------------------------
 # BrokenLinkScanner tests
