@@ -135,6 +135,7 @@ jobs:
           bash scripts/ralph/test_watch_pr.sh
           bash scripts/ralph/test_main_health.sh
           bash scripts/ralph/test_review_quota.sh
+          bash scripts/ralph/test_verdict_wake.sh
           bash scripts/ralph/test_exec_bits.sh
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0

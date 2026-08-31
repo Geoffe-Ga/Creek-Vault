@@ -54,11 +54,15 @@
 #                    RE-RUN THE FAILED REVIEW (`gh run rerun --failed <id>` on the
 #                    `claude-review` run), then re-classify. Explicitly do NOT
 #                    dispatch a fix worker; that is the whole bug this token
-#                    exists to stop (#1200). Caveat: #1201 is still open, so
-#                    code-review.yml has no `workflow_dispatch` and `gh run rerun`
-#                    replays the OLD workflow file — fine for a rate-limit retry,
-#                    not for a re-review after the workflow itself changed, where
-#                    the fallback is an empty commit.
+#                    exists to stop (#1200). Since #1201, code-review.yml has a
+#                    `workflow_dispatch` taking a `pr_number`, so the better
+#                    remedy after the workflow ITSELF changed is
+#                    `gh workflow run code-review.yml -f pr_number=<PR>`:
+#                    `gh run rerun` replays the OLD workflow file from the commit
+#                    that run was launched from, which is fine for a rate-limit
+#                    retry and useless for a fixed workflow. Neither costs a push,
+#                    and that matters — a push is what invalidates the verdict the
+#                    lane is waiting on.
 #                    Fails closed as a REFINEMENT of `ci-failed`, never a
 #                    replacement — see the fourth-polarity note below. This token
 #                    is a strict narrowing of `ci-failed` and must not be
@@ -800,10 +804,21 @@ done
 # verdict line — which sits at the END of a multi-line `## Summary …` body, not
 # at string start), prefix-tolerant, and keyed to the verdict LINE (a stray
 # "LGTM" in prose must not count). This mirrors the canonical parser in
-# `.claude/skills/await-claude-review/SKILL.md`. Backslashes are doubled because
-# this text is spliced into a jq string literal, where `\s` is an invalid escape
-# and must reach the regex engine as `\\s`.
-readonly VERDICT_RE='(?im)^\\s*(?:#{1,6}\\s+|\\*\\*)?verdict[:*\\s]'
+# `.claude/skills/await-claude-review/SKILL.md`.
+#
+# ONE BACKSLASH, NOT TWO, AND THE COUNT IS LOAD-BEARING. This text used to be
+# spliced into a jq STRING LITERAL, where jq's own string parser collapses `\\s`
+# to `\s` before the regex engine ever sees it — so it had to be written
+# doubled. It is now handed to `scripts/ralph/lib/verdict-select.jq` as a raw
+# value (through `$ENV` here, through `--arg` in the unit tests), and neither
+# route performs that unescaping. A doubled backslash would therefore reach the
+# engine as `\\s`: a pattern matching a literal backslash followed by `s`, which
+# matches NO verdict comment ever posted. That failure is silent — exit 0, no
+# error, no diagnostic — and it is simultaneous across every lane in the fleet,
+# which is why `creek-tools/tests/test_verdict_select_filter.py` runs THESE
+# CONSTANTS, read out of this file, through the shared filter rather than
+# testing the filter against a hand-written copy of them.
+readonly VERDICT_RE='(?im)^\s*(?:#{1,6}\s+|\*\*)?verdict[:*\s]'
 readonly VERDICT_LGTM_RE="${VERDICT_RE}+lgtm"
 
 # The provenance marker `.github/workflows/code-review.yml` PREPENDS to every
@@ -813,9 +828,9 @@ readonly VERDICT_LGTM_RE="${VERDICT_RE}+lgtm"
 # block in the header for why a second scan of the thread would prove nothing.
 #
 # Written with literal spaces, `[0-9]` and a POSIX class only: not one backslash
-# appears here, so the doubled-escape hazard documented three lines up (this text
-# is spliced into a jq string literal, where `\s` is invalid and must arrive as
-# `\\s`) cannot arise by construction.
+# appears here, so the escaping hazard documented three lines up (the exact
+# backslash count VERDICT_RE has to carry to survive the route it takes to the
+# regex engine) cannot arise by construction.
 #
 # `(?m)` IS LOAD-BEARING AND IS WRITTEN INLINE ON PURPOSE, exactly as it is in
 # VERDICT_RE. Under the PRODUCTION engine (Go's `regexp`; see the note below) the
@@ -906,8 +921,8 @@ readonly MARKER_MALFORMED='malformed'
 # with jq: VERDICT_RE true, VERDICT_LGTM_RE true, `creek-review` marker NONE.
 #
 # IT IS NOT A VERDICT, IT IS A REPORT OF ONE. That workflow SELECTS the review
-# comment (`[.[] | select(.body | test("(^|\\n)## Verdict:"))] | last`) and
-# copies the verdict line out of it. It cannot carry `<!-- creek-review pr=N -->`
+# comment — through the SAME selector this file uses, `verdict-select.jq`, since
+# #1266 — and copies the verdict line out of it. It cannot carry `<!-- creek-review pr=N -->`
 # and must not: that marker attests the CODE-REVIEW pipeline produced the
 # comment, and this one is posted by a workflow that never read a diff.
 #
@@ -947,9 +962,9 @@ readonly MARKER_MALFORMED='malformed'
 #
 # `(?m)` IS SPELLED OUT rather than relied upon, and the pattern is restricted to
 # the constructs gojq/RE2 (production) and Oniguruma (the suite) share. Not one
-# backslash appears in it, so the jq-string-literal hazard documented at
-# VERDICT_RE (`\s` is invalid there and must arrive as `\\s`) cannot arise by
-# construction. Those are MARKER_RE's rules for MARKER_RE's reasons — read its
+# backslash appears in it, so the escaping hazard documented at VERDICT_RE (the
+# exact backslash count that survives the route to the regex engine) cannot
+# arise by construction. Those are MARKER_RE's rules for MARKER_RE's reasons — read its
 # engine note above before changing a byte here. The tighter `^` alone, anchoring
 # to the START OF THE BODY where the emitter always puts it, is rejected for the
 # reason recorded there: it would rest on a flag DEFAULT, and a confident claim
@@ -1114,17 +1129,81 @@ readonly ITER_SUMMARY_RE='(?m)^<!-- iteration-trigger -->[[:space:]]*$'
 #     owner and nothing distinguishes the two. They can also merge directly and
 #     rewrite this file, so they are not the threat model; the threat model is
 #     everybody else, and everybody else is now out.
-#   * AN ACCOUNT WITH WRITE/TRIAGE CAN EDIT AN ACCEPTED AUTHOR'S COMMENT BODY.
-#     GitHub exposes that (`includesCreatedEdit`), and refusing every edited
-#     comment was considered and rejected here: a typo fix on a real review would
-#     wedge that lane with no self-heal, which is the wrong trade for a
-#     capability that already implies write access. Filed as a follow-up (#1263)
-#     rather than solved inline, because the fix is a policy question about
-#     edited reviews and not a parser change — and the shape that would actually
-#     close it (refuse only an edit made by an account OTHER than the author, via
-#     the `userContentEdits` history) is a different API call, not a stricter
-#     predicate on the payload this `--jq` already has.
+#   * A SELF-EDIT IS ADMITTED, DELIBERATELY. #1263 is CLOSED: the selector now
+#     refuses a comment any of whose revisions was written by an account other
+#     than its author, read from `userContentEdits` in
+#     `scripts/ralph/lib/pr-comments.graphql`. What it does NOT refuse is an
+#     accepted author editing their own comment — refusing that (the naive
+#     `includesCreatedEdit` check) would wedge a lane over a typo fix with no
+#     self-heal, and it would close nothing: an attacker holding that account can
+#     post a fresh LGTM instead of editing an old one, so the refusal costs the
+#     fleet and buys the attacker nothing to work around.
+#   * AN EDIT WHOSE AUTHOR CANNOT BE ESTABLISHED FAILS CLOSED, not open: a
+#     deleted account leaves `editor: null`, which equals no allowlisted login,
+#     so the comment is skipped. That is a wait, which is always the safe answer
+#     here.
 readonly VERDICT_AUTHORS_JQ='["Geoffe-Ga","github-actions"]'
+
+# The shared verdict machinery, named by its repo-relative path so the coupling
+# is greppable from either end: `creek-tools/tests/test_verdict_clearance_parity.py`
+# asserts that BOTH clearance paths — this file and
+# `.github/workflows/iteration-trigger.yml` — reference the same filter, which
+# is the only assertion that catches HALF a delegation (one path migrated, one
+# still carrying its own copy). Half a delegation looks fixed: every behavioural
+# test of the filter passes and the hole simply sits in the file nobody moved.
+#
+# SPELLED REPO-RELATIVE, RESOLVED SCRIPT-RELATIVE, and the basenames are taken
+# from the repo-relative constants so the two spellings cannot drift apart. The
+# repo-relative form is the one the coupling test greps out of BOTH files; the
+# script-relative resolution is what lets a copy of this script — a worktree, or
+# the planted sibling-seam fixtures in `scripts/ralph/test_pr_ready.sh` — find
+# the lib that ships beside it. A copy that has no lib beside it dies loudly a
+# few lines below rather than classifying with no selector, which is the whole
+# point: "no verdict found" and "no filter to look with" must never be the same
+# answer.
+readonly VERDICT_FILTER_REL='scripts/ralph/lib/verdict-select.jq'
+readonly VERDICT_QUERY_REL='scripts/ralph/lib/pr-comments.graphql'
+# Declared and assigned separately: `readonly X="$(cmd)"` makes the assignment
+# the `readonly` builtin's status, which masks a failing `cd` (SC2155).
+RALPH_LIB_DIR="$(cd "$(dirname "$0")" && pwd)/lib" ||
+  die "could not resolve this script's own directory to find its lib/"
+readonly RALPH_LIB_DIR
+readonly VERDICT_FILTER="$RALPH_LIB_DIR/${VERDICT_FILTER_REL##*/}"
+readonly VERDICT_QUERY="$RALPH_LIB_DIR/${VERDICT_QUERY_REL##*/}"
+
+# The prelude that binds the shared filter's parameters when it runs inside
+# `gh --jq`, which has no `--arg`. Reading them out of `$ENV` rather than
+# splicing them into the program text is what removes the doubled-backslash trap
+# VERDICT_RE's comment describes: `$ENV.X` yields the value byte for byte, which
+# is precisely what `--arg` does in the unit tests, so the two routes cannot
+# disagree about escaping. The trailing `|` joins straight onto the filter file.
+#
+# THERE IS NO RESHAPE HERE ANY MORE, and its absence is load-bearing. This
+# prelude used to end by projecting the GraphQL answer down to
+# `{comments: (.data.repository.pullRequest.comments.nodes // [])}`, and
+# `.github/workflows/iteration-trigger.yml` carried a second copy of the same
+# projection in a `--jq` of its own — two hand-parallel reshapes feeding one
+# shared selector, which is the very shape #1266 came out of. It was also
+# UNTESTABLE from where the filter's own tests stand: every one of them hands the
+# filter a hand-built `{"comments": […]}` envelope, so a projection narrowed to
+# `{body, createdAt, author}` strips `userContentEdits`, reopens #1263 in full,
+# and leaves the whole suite green. `scripts/ralph/lib/verdict-select.jq` now
+# takes the raw answer (or the legacy envelope) itself, so there is ONE intake,
+# it lives in the program that reads the fields, and the `COMMENTS_JSON` cases in
+# `scripts/ralph/test_pr_ready.sh` run through it end to end.
+#
+# The trailing `|` joins straight onto the filter file.
+#
+# shellcheck disable=SC2016  # single-quoted on purpose: `$ENV` and the `$name`
+# bindings are jq syntax and must NOT be expanded by the shell.
+readonly VERDICT_ENV_BINDINGS='($ENV.CREEK_VERDICT_AUTHORS | fromjson) as $authors
+  | $ENV.CREEK_VERDICT_RE          as $verdict_re
+  | $ENV.CREEK_VERDICT_LGTM_RE     as $verdict_lgtm_re
+  | $ENV.CREEK_ITER_SUMMARY_RE     as $iter_summary_re
+  | $ENV.CREEK_MARKER_RE           as $marker_re
+  | $ENV.CREEK_MARKER_ANY_RE       as $marker_any_re
+  | $ENV.CREEK_MARKER_MALFORMED    as $marker_malformed
+  | '
 
 # `${arr[@]+"${arr[@]}"}` expands to nothing when the array is empty instead of
 # tripping `set -u` on bash 3.2 (stock /bin/bash on macOS).
@@ -1359,7 +1438,8 @@ merge_line="$(gh pr view "${gh_args[@]}" \
 IFS='|' read -r merge_state head_date head_author merge_rest <<<"$merge_line"
 [[ -z "$merge_rest" ]] || { merge_state=""; head_date=""; head_author=""; }
 
-# FOUR fields now: "<createdAt>|<isLGTM>|<marker pr= value>|<refused author>".
+# FIVE fields now:
+# "<createdAt>|<isLGTM>|<marker pr= value>|<refused author>|<databaseId>".
 # The marker is captured from `$v` — the SAME comment the VERDICT_RE selector
 # above already picked — because a whole-thread question ("does this PR have a
 # matching marker anywhere?") answers yes for every PR that was ever reviewed
@@ -1431,28 +1511,107 @@ IFS='|' read -r merge_state head_date head_author merge_rest <<<"$merge_line"
 # iteration-trigger.yml already uses for its own label membership
 # (`[.labels[].name] | index("do-not-auto-merge")`), so the two clearance paths
 # read the same way as well as accepting the same set.
-verdict_line="$(gh pr view "${gh_args[@]}" \
-  --json comments \
-  --jq "[.comments[] | select(.body != null
-                              and ((.body | test(\"$ITER_SUMMARY_RE\")) | not)
-                              and (.body | test(\"$VERDICT_RE\")))] as \$vc
-        | ($VERDICT_AUTHORS_JQ | map(ascii_downcase)) as \$authors
-        | (\$vc | map(select(((.author.login // \"\") | ascii_downcase) as \$a
-                             | \$authors | index(\$a))) | last) as \$v
-        | ((\$vc | last | .author.login) // \"\") as \$latest_login
-        | (if ((\$latest_login | ascii_downcase) as \$a | \$authors | index(\$a))
-           then \"\" else \$latest_login end) as \$refused
-        | (\$v.body // \"\") as \$b
-        | ((\$b | [scan(\"$MARKER_RE\")] | flatten | first)
-           // (if (\$b | test(\"$MARKER_ANY_RE\")) then \"$MARKER_MALFORMED\" else \"\" end)) as \$mk
-        | ((\$v.createdAt // \"\") + \"|\" + ((\$b | test(\"$VERDICT_LGTM_RE\")) | tostring) + \"|\" + \$mk + \"|\" + \$refused)")"
+#
+# THE SELECTOR ITSELF NOW LIVES IN ONE FILE, READ BY BOTH CLEARANCE PATHS
+# (#1266, #1263). It used to be written out here and hand-mirrored inside
+# `.github/workflows/iteration-trigger.yml`, with about forty lines of comments
+# across the two files warning that the copies had to stay parallel but not
+# identical. That warning was the smell: #1266 IS the `.body != null` guard
+# existing in this copy and not the other, and #1199's allowlist had to be added
+# to each copy separately for the same reason. Neither payload the two copies
+# read could answer #1263 either — `--json comments` returns
+# `includesCreatedEdit` (THAT a body was edited) and never the editor, and the
+# REST issue-comments endpoint carries no edit history at all — so both paths
+# had to move to `gh api graphql` regardless, and once they read the same bytes
+# the `.user.login`/`.author.login` and `github-actions[bot]`/`github-actions`
+# divergence trap the old comments spent so long describing simply ceases to
+# exist.
+#
+# THE PARAMETERS ARRIVE THROUGH `$ENV`, NOT SPLICED INTO THE PROGRAM TEXT.
+# `gh --jq` has no `--arg`, and the alternative — interpolating the constants
+# into jq string literals, as the expression this replaces did — is what forced
+# VERDICT_RE to be written with doubled backslashes and what would silently
+# unmark the whole fleet the day somebody "tidied" them back to one. `$ENV`
+# hands the value over verbatim, which is also exactly what `--arg` does in
+# `creek-tools/tests/test_verdict_select_filter.py`, so the unit tests exercise
+# the same bytes the production path does. The exports live inside this command
+# substitution's subshell, so nothing downstream inherits them.
+#
+# ONE `gh` CALL, NOT A PIPELINE INTO `jq`. The filter runs inside `gh --jq`
+# (gojq), which is the PRODUCTION regex engine this file's engine notes are
+# about, and keeps the API answer and its parse in a single process — so a
+# transient `gh` failure is one non-zero exit under `set -e` rather than a
+# half-consumed pipeline.
+verdict_repo="$repo_slug"
+if [[ -z "$verdict_repo" ]]; then
+  # `gh api graphql` resolves nothing for you: unlike a REST endpoint, the
+  # `{owner}`/`{repo}` placeholders are NOT substituted inside `-f` values
+  # (measured — they arrive at the API literally and it answers
+  # `Could not resolve to a Repository with the name '{owner}/{repo}'`). So when
+  # no `--repo` was given, ask `gh` for the same repository it would have
+  # resolved on its own. One extra call, and it is on the DEFAULT invocation:
+  # neither production caller passes `--repo` (`.claude/commands/ralph-tick.md`
+  # Step 1 runs `pr-ready.sh "$PR_NUM"`, and `scripts/ralph/watch-pr.sh` runs
+  # `bash "$READY" "$pr"`), so every poll of every lane now depends on it.
+  verdict_repo="$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null || true)"
+fi
+if [[ "$verdict_repo" != */* ]]; then
+  # A WAIT, NOT A `die` — and the distinction is #1270's, not a preference. An
+  # unresolvable repository here is TRANSIENT GitHub weather on the default
+  # invocation: a rate-limit blip, a 5xx, a token that expired mid-window. `die`
+  # exits 2 with EMPTY STDOUT, and `watch-pr.sh` swallows a non-zero
+  # `pr-ready.sh` by design (`|| true`) — so the lane's poll produces no token,
+  # no state transition, and the whole window ends `WATCH <PR> timeout unknown`
+  # with nothing anywhere saying why. That silence is exactly what #1270 exists
+  # to close, and a new fatal path on the path every lane takes reopens it.
+  #
+  # This file's own convention is already the tolerant one everywhere else a
+  # `gh` probe can flake — `|| ci_ec=$?`, `|| health=""`, `|| quota=""` — and
+  # the answer is safe in the only direction that matters: `awaiting-review` is
+  # an IN_FLIGHT token, so the lane keeps polling and the very next poll that CAN
+  # name the repository classifies normally. Nothing is merged on a repository we
+  # could not name. The reason goes to stderr, which `watch-pr.sh` now surfaces
+  # once per transition.
+  printf 'pr-ready: could not resolve the repository for PR #%s (no --repo given and `gh repo view` did not answer).\n' "$pr" >&2
+  printf 'pr-ready: treating this as a WAIT rather than a tooling error — the verdict thread is unreadable, not absent.\n' >&2
+  printf 'pr-ready: pass --repo OWNER/NAME to skip the lookup, or re-run from inside a checkout of the repository.\n' >&2
+  echo "awaiting-review"; exit 0
+fi
+[[ -s "$VERDICT_FILTER" ]] ||
+  die "the shared verdict filter is missing or empty ($VERDICT_FILTER); refusing to classify with no selector"
+[[ -s "$VERDICT_QUERY" ]] ||
+  die "the shared comment query is missing or empty ($VERDICT_QUERY); refusing to classify with no payload"
+verdict_line="$(
+  export CREEK_VERDICT_AUTHORS="$VERDICT_AUTHORS_JQ"
+  export CREEK_VERDICT_RE="$VERDICT_RE"
+  export CREEK_VERDICT_LGTM_RE="$VERDICT_LGTM_RE"
+  export CREEK_ITER_SUMMARY_RE="$ITER_SUMMARY_RE"
+  export CREEK_MARKER_RE="$MARKER_RE"
+  export CREEK_MARKER_ANY_RE="$MARKER_ANY_RE"
+  export CREEK_MARKER_MALFORMED="$MARKER_MALFORMED"
+  gh api graphql \
+    -f query="$(cat "$VERDICT_QUERY")" \
+    -f owner="${verdict_repo%%/*}" \
+    -f name="${verdict_repo##*/}" \
+    -F number="$pr" \
+    --jq "$VERDICT_ENV_BINDINGS$(cat "$VERDICT_FILTER")"
+)"
 # Split by FIELD COUNT, exactly like the mergeState answer above and the rollup
-# answer below: an RFC3339 stamp, a jq boolean, a PR number and a login can none
-# of them contain `|`, so a FIFTH field means the answer is not the shape we asked
-# for and every branch below must fail closed on it. The two-expansion split this
-# replaces (`%%|*` / `#*|`) read `true|100` into the LGTM flag the moment the
-# answer grew its third field — the `|`-seeking class this file has already
-# proven exploitable once.
+# answer below: an RFC3339 stamp, a jq boolean, a PR number, a login and a
+# decimal comment id can none of them contain `|`, so a SIXTH field means the
+# answer is not the shape we asked for and every branch below must fail closed on
+# it. The two-expansion split this replaces (`%%|*` / `#*|`) read `true|100` into
+# the LGTM flag the moment the answer grew its third field — the `|`-seeking
+# class this file has already proven exploitable once.
+#
+# THE FIFTH FIELD IS THE SELECTED COMMENT'S `databaseId`, and this file does not
+# read it: it exists for `.github/workflows/iteration-trigger.yml`, which needs
+# to address the one comment the filter selected without looking it up again by
+# its second-granular `createdAt` (two comments in the same second are ordinary,
+# and `last` over the unfiltered list could hand back a comment the filter
+# REFUSED). It is parsed here rather than left to fall into `verdict_rest`
+# because the surplus-field guard below is what would otherwise blank a perfectly
+# good answer on every lane at once.
 #
 # THE LOGIN IS THE ONE FIELD HERE THAT IS USER-CHOSEN TEXT, so it is the one
 # worth saying WHY about rather than asserting alongside the others: GitHub
@@ -1461,8 +1620,13 @@ verdict_line="$(gh pr view "${gh_args[@]}" \
 # GitHub, and this parser deliberately does not rely on it: a surplus field
 # blanks the whole answer, including the new field, so an attacker who somehow
 # did smuggle a separator buys a wait rather than a shifted field.
-IFS='|' read -r verdict_date verdict_lgtm verdict_pr verdict_refused_author verdict_rest <<<"$verdict_line"
-[[ -z "$verdict_rest" ]] || { verdict_date=""; verdict_lgtm=""; verdict_pr=""; verdict_refused_author=""; }
+IFS='|' read -r verdict_date verdict_lgtm verdict_pr verdict_refused_author verdict_id verdict_rest <<<"$verdict_line"
+[[ -z "$verdict_rest" ]] || { verdict_date=""; verdict_lgtm=""; verdict_pr=""; verdict_refused_author=""; verdict_id=""; }
+# `verdict_id` is deliberately unread by this script — see the note above. Named
+# and blanked with the others so the surplus guard covers it, and referenced here
+# so a reader (and shellcheck) can see the omission is intentional rather than a
+# dropped consumer.
+: "${verdict_id:=}"
 
 # --- the skipped-author diagnostic: stderr ONLY (#1199) ---------------------
 # WITHOUT THIS, FILTERING AT SELECTION MAKES AN UNMARKED VERDICT INVISIBLE. That
@@ -1503,20 +1667,23 @@ IFS='|' read -r verdict_date verdict_lgtm verdict_pr verdict_refused_author verd
 # line, matching the provenance guard's block below: the operator reads this in a
 # log and the suite greps it line by line.
 #
-# WHO ACTUALLY SEES IT, STATED EXACTLY, BECAUSE THE PARAGRAPH ABOVE OVERCLAIMS IF
-# LEFT ALONE. `ralph-tick.md` Step 1 runs `STATUS=$(scripts/ralph/pr-ready.sh
-# "$PR_NUM")`, which captures stdout and lets stderr through — the orchestrator
-# sees this. `watch-pr.sh` does NOT: it calls `bash "$READY" "$pr" 2>/dev/null`,
-# so on the polling path these lines are discarded, and the same is already true
-# of the provenance guard's diagnostic below. That is a real gap in the "be LOUD"
-# argument and it is named rather than papered over — but simply deleting the
-# `2>/dev/null` is the wrong fix and is deliberately NOT done here: that watcher
-# re-runs this script every 30s for up to 30 minutes, so an unconditional
-# passthrough reprints four lines ~60 times per wedged lane, on every lane at
-# once, which is how a message stops being read. Surfacing it once per token
-# CHANGE is the shape that works, it belongs in watch-pr.sh rather than here, and
-# it is filed as #1270. Until then: a rotated PAT is loud in the orchestrator's
-# log and silent in the watcher's.
+# WHO ACTUALLY SEES IT, STATED EXACTLY. BOTH consumers now do (#1270).
+# `ralph-tick.md` Step 1 runs `STATUS=$(scripts/ralph/pr-ready.sh "$PR_NUM")`,
+# which captures stdout and lets stderr through. `watch-pr.sh` used to discard
+# it — `bash "$READY" "$pr" 2>/dev/null` — so a rotated PAT was loud in the
+# orchestrator's log and silent in the watcher's, on the one path that runs for
+# the full 30-minute hold.
+#
+# IT CAPTURES THE STREAM AND EMITS IT ONCE PER TOKEN TRANSITION, and the
+# de-duplication is not decoration: the watcher re-runs this script every 30s for
+# up to 30 minutes, and this block plus the provenance guard's below are FIVE
+# printf lines, so unconditional passthrough is ~300 lines per wedged lane per
+# window, on every lane at once — which is how a message stops being read. The
+# reason the de-duplication exists is written down here so a later
+# "simplification" back to unconditional passthrough has an argument to answer
+# rather than only a diff to revert. The rule is emit on state CHANGE; a monitor
+# that re-reports the same condition every interval buries the signal it exists
+# to surface.
 #
 # It says SKIPPED rather than refused on purpose. A refused verdict (the
 # provenance guard) blanks fields that were selected; a skipped one was never
@@ -1529,14 +1696,32 @@ IFS='|' read -r verdict_date verdict_lgtm verdict_pr verdict_refused_author verd
 # sends them to change the wrong thing. `$VERDICT_AUTHORS_JQ` prints as the jq
 # array it is, which is also the exact text to paste when the set really must
 # change.
+#
+# TWO CAUSES, TOLD APART BY STRUCTURE, NOT BY PROSE. The shared filter answers
+# a bare `<login>` when the latest verdict-bearing comment came from an account
+# the allowlist does not name, and `<login> edited-by:<editor>` when it came
+# from an accepted author whose BODY somebody else rewrote (#1263). Those are
+# different situations with different remedies, and an operator told the wrong
+# one goes and changes the wrong thing — so the separator is a literal the
+# filter's own contract defines, matched here as a fixed string, never a
+# substring of a sentence.
 if [[ -n "$verdict_refused_author" ]]; then
   {
-    printf 'pr-ready: the latest verdict-bearing comment on PR #%s was posted by `%s`, which is not an account this review pipeline can post as — it was SKIPPED, not refused (#1199).\n' \
-      "$pr" "$verdict_refused_author"
-    printf 'pr-ready:   The accepted verdict authors are %s: the PAT identity when the GEOFFE_GA_PAT secret exists, and the Actions bot when it does not — the two outcomes of code-review.yml Post-review GH_TOKEN.\n' \
-      "$VERDICT_AUTHORS_JQ"
-    printf 'pr-ready:   If that login IS the review pipeline, the PAT has been rotated to an account VERDICT_AUTHORS_JQ does not name, and every lane in the fleet will read `awaiting-review` until it does.\n'
-    printf 'pr-ready:   If it is not, nothing is wrong with this lane: a verdict-shaped comment from an outsider is inert here, and any earlier verdict from an accepted author still decides.\n'
+    if [[ "$verdict_refused_author" == *" edited-by:"* ]]; then
+      printf 'pr-ready: the latest verdict-bearing comment on PR #%s was posted by `%s` but its BODY was last rewritten by `%s` — it was SKIPPED, not refused (#1263).\n' \
+        "$pr" "${verdict_refused_author%% edited-by:*}" "${verdict_refused_author##* edited-by:}"
+      printf 'pr-ready:   An account with write/triage access can open a genuine `## Verdict: CHANGES_REQUESTED` and retype it as `LGTM`. The author, the timestamp and the `<!-- creek-review pr=N -->` marker all survive that edit untouched, so only the edit history disagrees — and this gate believes the edit history.\n'
+      printf 'pr-ready:   If the edit was legitimate (an operator fixing the reviewer'"'"'s markdown, say), the remedy is a FRESH verdict rather than a re-edit: re-run the review with `gh workflow run code-review.yml -f pr_number=%s`. An edit by the comment'"'"'s own author is admitted and is not what fired this.\n' \
+        "$pr"
+      printf 'pr-ready:   Until then this lane reads `awaiting-review`, and any EARLIER verdict from an accepted author still decides — the tampered comment is inert, not authoritative.\n'
+    else
+      printf 'pr-ready: the latest verdict-bearing comment on PR #%s was posted by `%s`, which is not an account this review pipeline can post as — it was SKIPPED, not refused (#1199).\n' \
+        "$pr" "$verdict_refused_author"
+      printf 'pr-ready:   The accepted verdict authors are %s: the PAT identity when the GEOFFE_GA_PAT secret exists, and the Actions bot when it does not — the two outcomes of code-review.yml Post-review GH_TOKEN.\n' \
+        "$VERDICT_AUTHORS_JQ"
+      printf 'pr-ready:   If that login IS the review pipeline, the PAT has been rotated to an account VERDICT_AUTHORS_JQ does not name, and every lane in the fleet will read `awaiting-review` until it does.\n'
+      printf 'pr-ready:   If it is not, nothing is wrong with this lane: a verdict-shaped comment from an outsider is inert here, and any earlier verdict from an accepted author still decides.\n'
+    fi
   } >&2
 fi
 

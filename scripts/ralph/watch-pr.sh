@@ -175,7 +175,22 @@ if [[ -f "$pidfile" ]]; then
   # Dead pid → stale file (a rebooted machine, a killed session). Take over.
 fi
 echo "$$" > "$pidfile"
-trap 'rm -f "$pidfile"' EXIT
+
+# Scratch file for ONE poll's worth of pr-ready.sh stderr (#1270). The two
+# diagnostics that script emits — the skipped-author block (#1199) and the
+# provenance guard (#1181) — are stderr-only because neither is expressible in
+# the single token it prints, and this watcher used to send them to /dev/null.
+# Both refusals print `awaiting-review`, which is in IN_FLIGHT_TOKENS and is
+# deliberately not in LONG_HOLD_TOKENS, so the lane sleeps for the full window:
+# 60 polls, 60 discarded explanations, and one line of output saying only that
+# nothing happened. Rotate the PAT to an account the allowlist does not name and
+# that is every lane in the fleet at once, silently.
+#
+# `> "$diag"` truncates per poll, so nothing leaks between polls, and the file
+# is folded into the SAME trap as the pidfile so a killed watcher leaves neither
+# behind.
+diag="$(mktemp "${TMPDIR:-/tmp}/ralph-watch-diag-XXXXXX")"
+trap 'rm -f "$pidfile" "$diag"' EXIT
 
 long_hold() { # long_hold <token> — is this a wait measured in hours or days?
   local t
@@ -205,6 +220,16 @@ in_flight() { # in_flight <token> — is this a keep-waiting token?
 
 start="$(date +%s)"
 last_token="unknown"
+# The previous poll's DIAGNOSTIC key — the token, or `unclassified` when
+# pr-ready.sh produced none. Separate from `last_token` on purpose; see the
+# emission block below. `unknown` to start, so the very first poll is itself a
+# transition and its reason prints.
+last_diag_key="unknown"
+# First line of the reason the lane is being held, carried so the timeout
+# summary can say WHY the window elapsed rather than only that it did. Empty
+# whenever the last classification came with no diagnostic, which is every poll
+# of a healthy lane.
+last_reason=""
 
 while :; do
   # A merged/closed PR would sit in the poll forever (pr-ready.sh classifies
@@ -220,7 +245,66 @@ while :; do
   # `|| true` twice over: pr-ready.sh exits 2 on a tooling error (with nothing
   # on stdout), and under `set -e` an unguarded call would kill the watcher —
   # exactly the die-on-transient-failure this script exists to avoid.
-  token="$(bash "$READY" "$pr" 2>/dev/null || true)"
+  #
+  # Stderr is CAPTURED, not discarded (#1270). See the $diag comment above.
+  token="$(bash "$READY" "$pr" 2>"$diag" || true)"
+
+  # THE EMISSION IS OUTSIDE THE `-n "$token"` TEST, and that placement is the
+  # half of #1270 that a token-gated version cannot cover. pr-ready.sh exits 2
+  # with EMPTY STDOUT on a tooling error — a rate-limit blip, a 5xx, an expired
+  # token — and its reason goes to stderr, which is precisely the poll whose
+  # explanation is worth having. Gate the emission on a token and that poll is
+  # the one that prints nothing at all: the window ends
+  # `WATCH <PR> timeout unknown` on stdout with an EMPTY stderr, which is the
+  # exact silence this fix exists to close, reached by the one path most likely
+  # to produce it.
+  #
+  # A SEPARATE TRANSITION KEY, not `last_token`. `last_token` is a stdout
+  # contract — `WATCH <PR> timeout <last_token>` is byte-asserted in sixty
+  # places and routed on by ralph-tick.md — and it deliberately KEEPS the last
+  # good classification across a failed poll so `poll_pause` does not lose the
+  # brisk interval a lane earned. `diag_key` answers a different question ("is
+  # this poll's state the same as the previous poll's?") and so must have a value
+  # for the unclassifiable poll, which `last_token` must not.
+  diag_key="${token:-unclassified}"
+  if [[ "$diag_key" != "$last_diag_key" ]]; then
+    # ONE EMISSION PER TOKEN TRANSITION, and the de-duplication is the point of
+    # the fix rather than a nicety: pr-ready.sh reprints its whole refusal block
+    # on EVERY poll (five printf lines for the #1181 provenance guard, four for
+    # #1199), so an unconditional passthrough is ~300 lines per wedged lane per
+    # window, on every lane at once — which is how a message stops being read.
+    # A monitor should emit on state CHANGE.
+    #
+    # `last_diag_key` starts at `unknown`, so the first classification is itself
+    # a transition and the reason prints on the very first poll; and because the
+    # key is the transition rather than a fire-once latch, a lane that flaps
+    # away from a held state and back re-reports the second hold.
+    #
+    # `if [[ -s … ]]; then … fi`, NEVER `[[ -s "$diag" ]] && cat "$diag" >&2`,
+    # and the reason is stated precisely because the loose version of it is
+    # wrong. MEASURED under bash 5.3 with `set -euo pipefail`:
+    #
+    #   f=/dev/null; [[ -s "$f" ]] && cat "$f"; echo ALIVE   -> ALIVE, rc 0
+    #   g() { [[ -s "$f" ]] && cat "$f"; }; g; echo ALIVE     -> dies, rc 1
+    #
+    # A failing AND-list MID-SCRIPT does not trip errexit (bash exempts every
+    # command in a `&&` list except the last, and the list's own status is not
+    # itself a trigger there). It becomes fatal the moment the same two lines are
+    # the LAST command of a function or a `{ }` group — which is exactly the
+    # refactor this file invites, since every other predicate here is already a
+    # helper. An empty `$diag` is every poll of every healthy lane, so that
+    # refactor would kill the watcher on its first poll and turn a diagnostics
+    # improvement into total loss of the wake signal. The `if` form cannot do
+    # that in any position, so it is used unconditionally rather than because the
+    # AND form provably dies where it stands today.
+    last_reason=""
+    if [[ -s "$diag" ]]; then
+      cat "$diag" >&2
+      last_reason="$(head -n 1 "$diag")"
+    fi
+  fi
+  last_diag_key="$diag_key"
+
   if [[ -n "$token" ]]; then
     last_token="$token"
     if ! in_flight "$token"; then
@@ -231,7 +315,16 @@ while :; do
 
   now="$(date +%s)"
   if (( now - start >= timeout )); then
+    # STDOUT IS A PARSED CONTRACT and this line is byte-frozen: test_watch_pr.sh
+    # asserts equality on it in sixty places and ralph-tick.md routes on it. The
+    # reason goes to STDERR, one line only, so a lane that burned its whole
+    # window has the explanation next to the summary without either stream
+    # growing a field the other parses.
     echo "WATCH $pr timeout $last_token"
+    if [[ -n "$last_reason" ]]; then
+      printf 'watch-pr: PR %s held on `%s` for the whole window; last reason: %s\n' \
+        "$pr" "$last_token" "$last_reason" >&2
+    fi
     exit 0
   fi
   # Keyed on last_token, so a lane that has not yet been classified (or whose

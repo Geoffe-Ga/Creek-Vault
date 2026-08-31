@@ -93,8 +93,13 @@ Snapshot **every in-flight Ralph PR** with its mergeability, CI, and verdict:
 ```bash
 gh pr list --state open --author "@me" \
   --json number,headRefName,body,mergeable,mergeStateStatus \
-  --jq '.[] | select(.body | test("(?i)(closes|fixes|resolves)\\s+#[0-9]+"))'
+  --jq '.[] | select(.body != null and (.body | test("(?i)(closes|fixes|resolves)\\s+#[0-9]+")))'
 ```
+The `.body != null` conjunct is FIRST and is not decoration (#1266): jq's `and`
+short-circuits left to right, and feeding `null` to `test()` is
+`null (null) cannot be matched, as it is not a string` — an error that ends the
+whole listing, so one PR with an unreadable body hides every other lane in the
+pool rather than only itself.
 Each in-flight PR is a lane in Gate 3/4; each occupied worktree without a PR yet
 is a lane still building (its worker is running in the background). Together they
 are the pool.
@@ -376,10 +381,11 @@ Then act on `$STATUS`:
   the exact bug this token exists to stop. Instead re-run the failed review —
   `gh run list --workflow code-review.yml --branch <branch>` to find the run,
   then `gh run rerun --failed <id>` — and re-classify on the next poll.
-  Caveat (#1201 is still open): `code-review.yml` has no `workflow_dispatch`, so
-  `gh run rerun` replays the **old** workflow file. That is fine for a
-  rate-limit retry, but not for a re-review after the workflow itself changed —
-  there the fallback is an empty commit. If the same run fails repeatedly for a
+  `gh run rerun` replays the **old** workflow file from the commit that run was
+  launched from, so it is fine for a rate-limit retry and useless once the
+  workflow itself has changed. For that case use the dispatch #1201 added:
+  `gh workflow run code-review.yml -f pr_number=<PR>`. Neither path costs a
+  push, which matters — a push invalidates the verdict the lane is waiting on. If the same run fails repeatedly for a
   non-transient reason, treat it as a reviewer/infra defect and file an issue
   rather than editing this PR.
 - **`changes-requested`** — CI is green and a **fresh** verdict (posted after
