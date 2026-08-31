@@ -59,6 +59,8 @@ from creek_mcp.api.routes import (
     IMPLEMENTED_CAPABILITIES,
     OP_CAPABILITIES,
     OP_CLASSIFY,
+    OP_DRIVE_AUTHORIZE,
+    OP_DRIVE_AUTHORIZE_COMPLETE,
     OP_DRIVE_DISCONNECT,
     OP_DRIVE_STATUS,
     OP_DRIVE_SYNC,
@@ -76,6 +78,10 @@ from creek_mcp.httpapi.drive import (
     handle_drive_disconnect,
     handle_drive_status,
     handle_drive_sync,
+)
+from creek_mcp.httpapi.drive_grant import (
+    handle_drive_authorize,
+    handle_drive_authorize_complete,
 )
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
 from creek_mcp.httpapi.journal import handle_journal_upsert
@@ -184,6 +190,8 @@ async def handle_health(_request: Request) -> Response:
 _IMPLEMENTED_HANDLERS: Final[dict[str, Handler]] = {
     OP_CAPABILITIES: handle_capabilities,
     OP_CLASSIFY: handle_classification,
+    OP_DRIVE_AUTHORIZE: handle_drive_authorize,
+    OP_DRIVE_AUTHORIZE_COMPLETE: handle_drive_authorize_complete,
     OP_DRIVE_DISCONNECT: handle_drive_disconnect,
     OP_DRIVE_STATUS: handle_drive_status,
     OP_DRIVE_SYNC: handle_drive_sync,

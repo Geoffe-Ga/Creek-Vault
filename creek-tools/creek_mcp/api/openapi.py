@@ -198,10 +198,17 @@ and five copies are five places for one to be dropped or to acquire an
 """
 
 EXTERNAL_ID_PARAM: Final[str] = "external_id"
-"""The one path parameter ``/v1`` publishes today.
+"""The journal route's path parameter.
 
 Named so :data:`_PATH_PARAMETER_SCHEMAS` is keyed on a constant rather than on
 a string that also appears in ``routes.py``'s path template.
+"""
+
+STATE_PARAM: Final[str] = "state"
+"""The Drive-authorization path parameter (#1568).
+
+The single-use value ``POST /v1/connectors/drive/authorizations`` issued. Named
+here for the same reason :data:`EXTERNAL_ID_PARAM` is.
 """
 
 EXTERNAL_ID_PATTERN: Final[str] = "^[^\u0000-\u001f\u007f/]+$"
@@ -232,12 +239,38 @@ on it.
 _MIN_EXTERNAL_ID_CHARS: Final[int] = 1
 """An empty path segment does not match the route at all, let alone identify one."""
 
+_STATE_PATTERN: Final[str] = "^[A-Za-z0-9_-]+$"
+"""What a published ``{state}`` may be made of (#1568).
+
+``secrets.token_urlsafe`` emits exactly the base64url alphabet, so this is the
+server's own output shape rather than a guess at it. Published for the reason
+:data:`EXTERNAL_ID_PATTERN` is: Starlette's default converter admits a NUL byte
+and an unbounded length, and a consumer pins this bundle.
+"""
+
+_MIN_STATE_CHARS: Final[int] = 1
+"""An empty path segment does not match the route at all."""
+
+_MAX_STATE_CHARS: Final[int] = 128
+"""Comfortably above what ``token_urlsafe(32)`` emits (43 characters).
+
+A bound rather than the exact length, so raising
+:data:`creek_mcp.tools.drive_grant.STATE_BYTES` does not silently publish a
+pattern no state can match.
+"""
+
 _PATH_PARAMETER_SCHEMAS: Final[dict[str, dict[str, Any]]] = {
     EXTERNAL_ID_PARAM: {
         "type": "string",
         "minLength": _MIN_EXTERNAL_ID_CHARS,
         "maxLength": MAX_EXTERNAL_ID_CHARS,
         "pattern": EXTERNAL_ID_PATTERN,
+    },
+    STATE_PARAM: {
+        "type": "string",
+        "minLength": _MIN_STATE_CHARS,
+        "maxLength": _MAX_STATE_CHARS,
+        "pattern": _STATE_PATTERN,
     },
 }
 """The published schema for each path parameter, keyed by parameter name.
@@ -250,6 +283,19 @@ directly, so a parameter added to a route template without an entry here fails
 the document build rather than being published unconstrained — the same
 fail-loud posture :meth:`~creek_mcp.api.routes.RouteSpec.__post_init__` takes
 for a body cap on a templated path.
+"""
+
+_PATH_PARAMETER_DESCRIPTIONS: Final[dict[str, str]] = {
+    EXTERNAL_ID_PARAM: "Consumer-side identifier for this entry.",
+    STATE_PARAM: "The single-use value the authorization was issued under.",
+}
+"""What each path parameter *means*, keyed by parameter name.
+
+A table for the reason :data:`_PATH_PARAMETER_SCHEMAS` is one. Until #1568
+there was one path parameter and the description was a literal in
+:func:`_path_parameter`; a second parameter inheriting "consumer-side
+identifier for this entry" would have published a plain untruth about a
+server-minted nonce.
 """
 
 _HEALTH_RESPONSE_SCHEMA: Final[dict[str, Any]] = {
@@ -435,7 +481,7 @@ def _path_parameter(name: str) -> dict[str, Any]:
         "name": name,
         "in": "path",
         "required": True,
-        "description": "Consumer-side identifier for this entry.",
+        "description": _PATH_PARAMETER_DESCRIPTIONS[name],
         "schema": _PATH_PARAMETER_SCHEMAS[name],
     }
 

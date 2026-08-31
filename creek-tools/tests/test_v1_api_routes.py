@@ -42,6 +42,9 @@ from creek_mcp.api.models import (
     Capability,
     ClassificationRequest,
     ClassificationResponse,
+    DriveAuthorizationExchangeRequest,
+    DriveAuthorizationRequest,
+    DriveAuthorizationResponse,
     DriveConnectorStatusResponse,
     DriveDisconnectResponse,
     DriveSyncResponse,
@@ -142,6 +145,24 @@ _EXPECTED: Final[
         True,
     ),
     (
+        "/v1/connectors/drive/authorizations",
+        "POST",
+        "createDriveAuthorization",
+        Capability.DRIVE_CONNECTOR,
+        DriveAuthorizationRequest,
+        DriveAuthorizationResponse,
+        True,
+    ),
+    (
+        "/v1/connectors/drive/authorizations/{state}",
+        "POST",
+        "completeDriveAuthorization",
+        Capability.DRIVE_CONNECTOR,
+        DriveAuthorizationExchangeRequest,
+        DriveConnectorStatusResponse,
+        True,
+    ),
+    (
         "/v1/connectors/drive",
         "DELETE",
         "disconnectDriveConnector",
@@ -187,13 +208,15 @@ _EXPECTED_IDS: Final[tuple[str, ...]] = (
     "upload",
     "drive-status",
     "drive-sync",
+    "drive-authorize",
+    "drive-authorize-complete",
     "drive-disconnect",
     "classifications",
     "links",
     "health",
 )
 
-_EXPECTED_ROUTE_COUNT: Final[int] = 11
+_EXPECTED_ROUTE_COUNT: Final[int] = 13
 
 
 def _by_operation(operation_id: str) -> RouteSpec:
@@ -228,11 +251,11 @@ def _by_operation(operation_id: str) -> RouteSpec:
 # --------------------------------------------------------------------------- #
 
 
-def test_routes_declares_exactly_eleven_specs() -> None:
-    """``/v1`` publishes eleven endpoints and no twelfth.
+def test_routes_declares_exactly_thirteen_specs() -> None:
+    """``/v1`` publishes thirteen endpoints and no fourteenth.
 
-    A twelfth would be an endpoint no fixture, no OpenAPI response set and no
-    capability entry describes — reachable, undocumented surface.
+    A fourteenth would be an endpoint no fixture, no OpenAPI response set and
+    no capability entry describes — reachable, undocumented surface.
     """
     assert len(ROUTES) == _EXPECTED_ROUTE_COUNT
 
@@ -246,7 +269,7 @@ def test_routes_is_a_tuple() -> None:
     assert isinstance(ROUTES, tuple)
 
 
-def test_route_paths_and_methods_are_the_published_eleven() -> None:
+def test_route_paths_and_methods_are_the_published_thirteen() -> None:
     """Every ``(path, method)`` pair matches the ADR, in order."""
     assert [(spec.path, spec.method) for spec in ROUTES] == [
         (path, method) for path, method, *_rest in _EXPECTED

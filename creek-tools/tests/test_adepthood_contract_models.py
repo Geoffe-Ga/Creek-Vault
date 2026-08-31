@@ -85,6 +85,9 @@ from creek_mcp.api.models import (
     CareSignal,
     ClassificationRequest,
     ClassificationResponse,
+    DriveAuthorizationExchangeRequest,
+    DriveAuthorizationRequest,
+    DriveAuthorizationResponse,
     DriveConnectorStatusResponse,
     DriveDisconnectResponse,
     DriveSyncResponse,
@@ -227,6 +230,26 @@ DRIVE_STATUS_RESPONSE_PAYLOAD: dict[str, Any] = {
     "can_sync": True,
 }
 
+DRIVE_AUTHORIZATION_REQUEST_PAYLOAD: dict[str, Any] = {
+    "redirect_uri": "https://adepthood.example/connectors/drive/return",
+}
+
+DRIVE_AUTHORIZATION_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "ok",
+    "tier_ceiling": "open",
+    "authorization_url": (
+        "https://accounts.google.com/o/oauth2/auth?response_type=code"
+        "&client_id=example.apps.googleusercontent.com"
+        "&scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly"
+        "&state=synthetic-example-state"
+    ),
+    "state": "synthetic-example-state",
+}
+
+DRIVE_AUTHORIZATION_EXCHANGE_REQUEST_PAYLOAD: dict[str, Any] = {
+    "code": "synthetic-example-authorization-code",
+}
+
 DRIVE_SYNC_RESPONSE_PAYLOAD: dict[str, Any] = {
     "status": "ok",
     "tier_ceiling": "open",
@@ -367,6 +390,11 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     CareSignal.__name__: CARE_SIGNAL,
     ClassificationRequest.__name__: CLASSIFICATION_REQUEST_PAYLOAD,
     ClassificationResponse.__name__: CLASSIFICATION_RESPONSE_PAYLOAD,
+    DriveAuthorizationExchangeRequest.__name__: (
+        DRIVE_AUTHORIZATION_EXCHANGE_REQUEST_PAYLOAD
+    ),
+    DriveAuthorizationRequest.__name__: DRIVE_AUTHORIZATION_REQUEST_PAYLOAD,
+    DriveAuthorizationResponse.__name__: DRIVE_AUTHORIZATION_RESPONSE_PAYLOAD,
     DriveConnectorStatusResponse.__name__: DRIVE_STATUS_RESPONSE_PAYLOAD,
     DriveDisconnectResponse.__name__: DRIVE_DISCONNECT_RESPONSE_PAYLOAD,
     DriveSyncResponse.__name__: DRIVE_SYNC_RESPONSE_PAYLOAD,
@@ -1696,13 +1724,14 @@ def test_the_committed_success_reflection_fixture_shows_the_populated_shape() ->
 
 
 def test_the_previous_minor_is_still_served() -> None:
-    """0.10 widened the compatibility window rather than shifting it.
+    """0.11 widened the compatibility window rather than shifting it.
 
-    A ``0.9`` client's ``/v1`` traffic is unaffected by two additive routes it
-    is not told about and cannot reach, so refusing it outright would be a
-    break invented by the bump. ``0.8`` is checked alongside because the
-    window only ever widens.
+    A ``0.10`` client's ``/v1`` traffic is unaffected by two additive routes it
+    does not know exist, so refusing it outright would be a break invented by
+    the bump. ``0.9`` and ``0.8`` are checked alongside because the window only
+    ever widens.
     """
+    assert "0.10" in SUPPORTED_CONTRACT_MINORS
     assert "0.9" in SUPPORTED_CONTRACT_MINORS
     assert "0.8" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.10"
+    assert CONTRACT_MINOR == "0.11"
