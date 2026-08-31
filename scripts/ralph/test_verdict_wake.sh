@@ -701,7 +701,7 @@ check "query: userContentEdits takes first: 100, NOT a smaller number — edit h
 # The shared filter really does read every revision, which is the half of the
 # argument the query cannot make on its own: `first: 100` buys nothing if the
 # selector only looks at the newest edit.
-if grep -vE '^[[:space:]]*#' "$FILTER_FILE" | grep -qF 'all(. == $a)'; then
+if grep -qF 'all(. == $a)' <<<"$(grep -vE '^[[:space:]]*#' "$FILTER_FILE" || true)"; then
   ok 'filter: the edit check is jq all() over EVERY revision, so the query 100-deep window is actually used'
 else
   bad 'the shared filter no longer tests every revision with jq all() — an attacker rewrites the body, the author edits again for any reason, and a last-only check waves the tampered text through (#1263)'

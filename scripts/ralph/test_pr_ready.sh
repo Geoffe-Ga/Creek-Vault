@@ -3614,7 +3614,7 @@ ITER_WAKE="$(dirname "$READY")/verdict-wake.sh"
 ITER_WAKE_REL='scripts/ralph/verdict-wake.sh'
 if [[ ! -s "$ITER_WAKE" ]]; then
   bad "$ITER_WAKE_REL is missing or empty — the second merge-clearance path has no implementation, and every assertion below about its clearance chain is vacuous (#1685)"
-elif grep -vE '^[[:space:]]*#' "$ITER_WORKFLOW" | grep -qF -- "$ITER_WAKE_REL"; then
+elif grep -qF -- "$ITER_WAKE_REL" <<<"$(grep -vE '^[[:space:]]*#' "$ITER_WORKFLOW" || true)"; then
   ok "iteration-trigger.yml invokes $ITER_WAKE_REL on a line that runs"
 else
   bad "iteration-trigger.yml never calls $ITER_WAKE_REL outside its comments — the wake logic was extracted but the workflow still runs its own copy, so the executable suite asserts about code production does not execute (#1685)"
@@ -4307,22 +4307,22 @@ for authz_file in "$READY" "$ITER_WAKE"; do
     *)            bad "no verdict-filter invocation pattern is declared for $authz_file"
                   continue ;;
   esac
-  if authz_live_lines "$authz_file" | grep -qF -- "$AUTHZ_FILTER_PATH"; then
+  if grep -qF -- "$AUTHZ_FILTER_PATH" <<<"$(authz_live_lines "$authz_file" || true)"; then
     ok "$(basename "$authz_file") reads the shared verdict selector on a line that runs"
   else
     bad "$(basename "$authz_file") does not reference ${AUTHZ_FILTER_PATH} outside its comments — it still carries its own copy of the verdict selector, which is exactly how the null-body guard (#1266) and the edit-provenance check (#1263) end up in one clearance path and not the other"
   fi
-  if authz_command_lines "$authz_file" | grep -qE -- "$authz_invoke_re"; then
+  if grep -qE -- "$authz_invoke_re" <<<"$(authz_command_lines "$authz_file" || true)"; then
     ok "$(basename "$authz_file") actually INVOKES the shared verdict selector"
   else
     bad "$(basename "$authz_file") never runs ${AUTHZ_FILTER_PATH} — no command line matches /${authz_invoke_re}/. A log message that NAMES the filter satisfies a substring grep while invoking nothing, and an inline selector behind one reopens #1266, #1199 and #1263 at once"
   fi
-  if authz_live_lines "$authz_file" | grep -qF -- "$AUTHZ_QUERY_PATH"; then
+  if grep -qF -- "$AUTHZ_QUERY_PATH" <<<"$(authz_live_lines "$authz_file" || true)"; then
     ok "$(basename "$authz_file") fetches the comment thread with the shared query"
   else
     bad "$(basename "$authz_file") does not reference ${AUTHZ_QUERY_PATH} outside its comments — two paths that fetch different payloads cannot be made to check the same things (#1263)"
   fi
-  if authz_command_lines "$authz_file" | grep -qE -- "$authz_fetch_re"; then
+  if grep -qE -- "$authz_fetch_re" <<<"$(authz_command_lines "$authz_file" || true)"; then
     ok "$(basename "$authz_file") actually SENDS the shared comment query"
   else
     bad "$(basename "$authz_file") never sends ${AUTHZ_QUERY_PATH} — no command line matches /${authz_fetch_re}/. Naming the query file is not fetching with it, and a payload without userContentEdits makes #1263's check unanswerable"
@@ -4337,12 +4337,12 @@ AUTHZ_FILTER_FILE="$(cd "$(dirname "$0")/../.." && pwd)/$AUTHZ_FILTER_PATH"
 if [[ ! -s "$AUTHZ_FILTER_FILE" ]]; then
   bad "$AUTHZ_FILTER_PATH is missing or empty — both clearance paths delegate to it, so an empty program is a fleet-wide unmark (#1266, #1263)"
 else
-  if authz_live_lines "$AUTHZ_FILTER_FILE" | grep -qF -- '.body != null'; then
+  if grep -qF -- '.body != null' <<<"$(authz_live_lines "$AUTHZ_FILTER_FILE" || true)"; then
     ok "the shared verdict selector guards against a null comment body (#1266)"
   else
     bad "the shared verdict selector has lost its '.body != null' conjunct — one null-bodied comment aborts the wake step under set -euo pipefail and the lane never hears anything again (#1266)"
   fi
-  if authz_live_lines "$AUTHZ_FILTER_FILE" | grep -qF -- 'userContentEdits'; then
+  if grep -qF -- 'userContentEdits' <<<"$(authz_live_lines "$AUTHZ_FILTER_FILE" || true)"; then
     ok "the shared verdict selector checks who actually wrote the body (#1263)"
   else
     bad "the shared verdict selector no longer reads userContentEdits — an account with write/triage access can retype a CHANGES_REQUESTED as an LGTM and both clearance paths clear the merge (#1263)"
