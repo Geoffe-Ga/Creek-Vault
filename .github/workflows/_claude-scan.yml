@@ -23,6 +23,19 @@ name: Claude Scan (reusable)
 # itself is stated once, in that script, so this core and hopper cannot drift
 # apart. `backlog_ceiling` raises it for a single deliberate catch-up run.
 #
+# CITATION BACKSTOP (issue #1700). `verify-scan-citations.sh` (#1651) resolves
+# every cited symbol against the scan SHA, but until now it ran ONLY because
+# the `prompt:` below asks the agent to run it. The agent holds `Bash`,
+# `issues: write` and a `--max-turns 40` budget it can exhaust AFTER
+# `gh issue create` and BEFORE the verification — so a phantom was blocked
+# when the agent complied, not made unrepresentable, and nothing downstream
+# re-read what was filed. Two steps close that: a snapshot of the label's
+# existing issues taken BEFORE the agent runs, and an `if: always()` step
+# AFTER it that re-reads the issues this run actually filed and pipes their
+# own `File(s):`/`Symbol(s):` citations back through the same verifier. The
+# prompt sentence stays as defence in depth: a rejected citation should never
+# be filed in the first place, and the backstop is what catches it when it is.
+#
 # Required configuration:
 #   secret  CLAUDE_CODE_OAUTH_TOKEN  - same token the other Claude workflows use.
 
@@ -192,6 +205,57 @@ jobs:
               || echo "::warning::optional analyzer '$tool' is not installed; scans that rely on it should fail loudly, not report clean"
           done
 
+      # The BASELINE for the post-agent backstop. Taken before the agent runs,
+      # so "what this run filed" is a set difference over issue numbers rather
+      # than a question anyone has to ask the agent.
+      - name: Snapshot the scan issues that already exist
+        id: filed_issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # DATA, not shell source — same discipline as BACKLOG_CEILING above.
+          SCAN_LABEL: "scan:${{ inputs.scan_name }}"
+        run: |
+          set -uo pipefail
+          # NOT `--search "created:>=<run start>"`. That path goes through
+          # GitHub's SEARCH INDEX, which lags issue creation by seconds to
+          # minutes — so an issue filed moments ago by the very run being
+          # checked is the document most likely to be missing from it. The
+          # backstop would then enumerate ZERO issues, verify nothing and
+          # exit 0: a gate reporting that it did nothing, indistinguishable
+          # from a clean pass. `gh issue list --label` is the REST issues
+          # listing and has no such lag.
+          started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          before=""
+          ok=false
+          if before="$(gh issue list --repo "$GITHUB_REPOSITORY" \
+              --label "$SCAN_LABEL" --state all --limit 200 \
+              --json number --jq '[.[].number] | join(",")')"; then
+            ok=true
+          else
+            echo "::warning::could not snapshot '$SCAN_LABEL' issues; the post-run backstop will fail closed"
+          fi
+          # The backstop checks its OWN listing for truncation, but that is a
+          # separate query and this one must check itself too. A label that
+          # ever reached the limit would otherwise hand the backstop a
+          # silently short baseline, and every issue missing from it would
+          # look newly filed — which is how an automated correction comment
+          # lands on somebody else's issue.
+          if [ "$ok" = "true" ]; then
+            snapshot_count=$(printf '%s' "$before" | tr ',' '\n' | grep -c '[0-9]' || true)
+            if [ "${snapshot_count:-0}" -ge 200 ]; then
+              ok=false
+              echo "::warning::the '$SCAN_LABEL' snapshot returned $snapshot_count issues at --limit 200 and may be truncated; the backstop will fail closed rather than treat pre-existing issues as newly filed"
+            fi
+          fi
+          # Always written, even on failure: the backstop reads `ok` and
+          # refuses to run without a baseline, which is a louder and more
+          # honest signal than a step that dies before recording anything.
+          {
+            printf 'before=%s\n' "$before"
+            printf 'started_at=%s\n' "$started_at"
+            printf 'ok=%s\n' "$ok"
+          } >>"$GITHUB_OUTPUT"
+
       - name: Run Claude scan
         uses: anthropics/claude-code-action@24dcd50c0568f0fc9e9211213a4fd2d9eb15c4e0  # v1.0.200
         env:
@@ -243,3 +307,33 @@ jobs:
             SHA and cite the real name, or drop the symbol from the finding.
             Do not paraphrase a name from surrounding code — that is exactly
             the failure this gate exists to stop.
+
+            Note that this is no longer the only check: a `run:` step after
+            this one re-reads every issue you file and re-verifies its
+            citations independently (#1700). Skipping the pre-create run does
+            not hide a phantom, it just turns a fixable draft into a red run
+            and a correction comment on a filed issue.
+
+      # THE BACKSTOP (#1700). Asks the agent for nothing: it re-reads the
+      # issues this run actually filed and re-verifies their citations.
+      #
+      # `if: always()`, with NO `steps.*.conclusion` clause. The agent step
+      # failing — after it has already created issues — is precisely the
+      # scenario this exists for, and so is a failed snapshot: gating on
+      # either would skip the check exactly when it is needed and leave the
+      # job green with zero citations verified. The script fails closed on a
+      # missing baseline instead.
+      - name: Re-verify the citations this run filed (independent of the agent)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SCAN_LABEL: "scan:${{ inputs.scan_name }}"
+          ISSUES_BEFORE: ${{ steps.filed_issues.outputs.before }}
+          ISSUES_SNAPSHOT_OK: ${{ steps.filed_issues.outputs.ok }}
+          RUN_STARTED_AT: ${{ steps.filed_issues.outputs.started_at }}
+          # DATA in the environment. A `${{ … }}` in the `run:` body is
+          # substituted into the shell SOURCE before bash ever sees it, which
+          # is the injection class the scan_name charset guard above exists
+          # for; the run body below is therefore one bare token.
+          SCAN_SHA: ${{ github.sha }}
+        run: creek-tools/scripts/recheck-filed-scan-citations.sh
