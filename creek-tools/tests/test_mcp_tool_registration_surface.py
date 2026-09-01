@@ -41,9 +41,41 @@ the live server**:
   closure names, and the live property shapes include ``$ref``, ``anyOf``,
   ``items`` and bare ``type`` — which no hand-rolled projection covers
   reliably.
-* :data:`_EXPECTED_DESCRIPTIONS` — the summary line FastMCP takes from
-  each closure docstring. A reflowed docstring during a "pure move" is
+* :data:`_EXPECTED_DESCRIPTIONS` — the prose FastMCP takes from each
+  closure docstring. A reflowed docstring during a "pure move" is
   precisely the silent edit this pin exists to exclude.
+
+  **This one is interpreter-dependent and is normalised for that reason.**
+  CPython 3.13 strips a docstring's common leading indentation at compile
+  time; 3.11 and 3.12 hand back the source indentation verbatim. FastMCP
+  publishes ``fn.__doc__`` unmodified, so the two multi-line descriptions
+  (``creek.author`` and ``creek.redact.scan`` — the other 22 are
+  single-line and identical everywhere) differ by whitespace across the
+  versions this project supports, and a table captured on any one of them
+  fails on the others. Measured on all three:
+
+  .. code-block:: text
+
+      3.11  '...Desk.\n\n        ``max_rounds`` ... (3).\n        '
+      3.12  '...Desk.\n\n        ``max_rounds`` ... (3).\n        '
+      3.13  '...Desk.\n\n``max_rounds`` ... (3).\n'
+
+  Both sides therefore go through :func:`inspect.cleandoc`, whose output
+  is byte-identical on 3.11, 3.12 and 3.13 and is idempotent. It
+  normalises **indentation only** — wording and line breaks survive it —
+  so the pin still fails on a genuinely rewritten or rewrapped docstring;
+  :func:`test_description_is_pinned` is mutation-proved on real prose, not
+  just on whitespace.
+
+  Pinning the 3.13 form raw would merely have inverted which CI jobs fail.
+
+The other two tables need no such treatment, which was verified rather
+than assumed. ``title`` is derived from the closure ``__name__`` and the
+order is a list of tool names, neither of which involves ``__doc__``. The
+one docstring that reaches :data:`_EXPECTED_SCHEMAS` — ``TierCeiling``'s,
+embedded in ``$defs`` — is already run through :func:`inspect.cleandoc`
+by pydantic before it lands in the schema (asserted below), so it is
+stable across interpreters for the same reason.
 
 **Known, deliberate fragility.** 19 of the 24 schemas embed
 ``$defs.TierCeiling`` carrying :class:`~creek_mcp.policy.TierCeiling`'s own
@@ -65,6 +97,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import importlib
+import inspect
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -847,9 +880,9 @@ _EXPECTED_DESCRIPTIONS: Final[dict[str, str]] = {
     "creek.mine": "Mine essay seeds from the vault.",
     "creek.draft": "Generate an essay draft from a mined idea.",
     "creek.author": (
-        "Author a draft for a query via the Writing Desk.\n\n        "
+        "Author a draft for a query via the Writing Desk.\n\n"
         "``max_rounds`` defaults to the vault's "
-        "``author.max_author_rounds`` (3).\n        "
+        "``author.max_author_rounds`` (3)."
     ),
     "creek.save": (
         "Save a Discord/Claude answer back into the vault; ``tier`` required."
@@ -857,11 +890,10 @@ _EXPECTED_DESCRIPTIONS: Final[dict[str, str]] = {
     "creek.ingest": "Ingest a single source into the vault.",
     "creek.redact.scan": (
         "Read-only PII / secret scan of the FEAT-027 staging subtree.\n\n"
-        "        Scoped to ``00-Creek-Meta/Inbound/``, which every "
-        "ceiling admits. The\n        scan reads no per-file privacy "
-        "tier, so any other vault path is ranked\n        as intimate "
-        "content and needs privacy_tier_ceiling=intimate or all.\n      "
-        "  "
+        "Scoped to ``00-Creek-Meta/Inbound/``, which every "
+        "ceiling admits. The\nscan reads no per-file privacy "
+        "tier, so any other vault path is ranked\nas intimate "
+        "content and needs privacy_tier_ceiling=intimate or all."
     ),
     "creek.classify": "Re-classify existing fragments via rules or LLM.",
     "creek.link": "Run a single linker stage.",
@@ -991,6 +1023,62 @@ def test_input_schema_is_pinned(registered_tools: list[Tool], tool_name: str) ->
     assert live[tool_name].inputSchema == _EXPECTED_SCHEMAS[tool_name]
 
 
+def test_the_pinned_prose_is_interpreter_independent(
+    registered_tools: list[Tool],
+) -> None:
+    """No pinned string carries indentation that only some interpreters emit.
+
+    The recurrence guard for the defect this module shipped with. The
+    tables were originally captured from a live 3.12 probe, which hands
+    back ``fn.__doc__`` with its source indentation intact; CPython 3.13
+    strips that at compile time, so the two multi-line descriptions were
+    pinned in a form that could only ever pass on 3.11 and 3.12.
+
+    :func:`test_description_is_pinned` now normalises both sides, which
+    fixes the comparison — but it would *also* silently accept a table
+    regenerated on 3.12 in raw indented form, and the next reader would
+    have no signal that the literals had drifted back into an
+    interpreter-specific shape. This asserts the literals themselves are
+    already normalised, so the table stays canonical no matter which
+    interpreter regenerated it.
+
+    The same invariant is asserted for the one docstring that reaches
+    :data:`_EXPECTED_SCHEMAS` — ``TierCeiling``'s, embedded in ``$defs``.
+    That one is normalised by pydantic rather than by this module, so the
+    assertion is really a check that pydantic still does so; if it ever
+    stops, this fails loudly instead of the schema pins failing on 3.13
+    only.
+
+    Args:
+        registered_tools: The live tool surface, in registration order.
+    """
+    unnormalised = {
+        name: text
+        for name, text in _EXPECTED_DESCRIPTIONS.items()
+        if inspect.cleandoc(text) != text
+    }
+    assert not unnormalised, (
+        "these pinned descriptions carry interpreter-dependent leading "
+        f"indentation and would fail on CPython 3.13: {sorted(unnormalised)} "
+        "- re-pin them as inspect.cleandoc(...) of the published text"
+    )
+
+    embedded = {
+        name: schema["$defs"]["TierCeiling"]["description"]
+        for name, schema in _EXPECTED_SCHEMAS.items()
+        if "$defs" in schema
+    }
+    assert len(embedded) == 19
+    still_normalised = {
+        name for name, text in embedded.items() if inspect.cleandoc(text) != text
+    }
+    assert not still_normalised, (
+        "pydantic no longer normalises the TierCeiling docstring it embeds "
+        f"in $defs, so these schema pins are now interpreter-dependent: "
+        f"{sorted(still_normalised)}"
+    )
+
+
 @pytest.mark.parametrize("tool_name", _EXPECTED_ORDER)
 def test_description_is_pinned(registered_tools: list[Tool], tool_name: str) -> None:
     """Each tool publishes byte-identical prose to its consumers.
@@ -999,12 +1087,20 @@ def test_description_is_pinned(registered_tools: list[Tool], tool_name: str) -> 
     docstring, so it is the cheapest available detector of a docstring
     reflowed during a supposedly pure move.
 
+    Both sides are passed through :func:`inspect.cleandoc` because
+    CPython 3.13 strips a docstring's leading indentation at compile time
+    while 3.11 and 3.12 do not (see the module docstring). ``cleandoc``
+    normalises indentation and nothing else, so this still fails on
+    changed wording or changed line breaks.
+
     Args:
         registered_tools: The live tool surface, in registration order.
         tool_name: The tool under test.
     """
     live = {tool.name: tool for tool in registered_tools}
-    assert live[tool_name].description == _EXPECTED_DESCRIPTIONS[tool_name]
+    published = live[tool_name].description
+    assert published is not None
+    assert inspect.cleandoc(published) == _EXPECTED_DESCRIPTIONS[tool_name]
 
 
 def test_the_handshake_still_names_the_server(tmp_path: Path) -> None:
