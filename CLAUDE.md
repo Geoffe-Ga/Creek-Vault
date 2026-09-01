@@ -90,6 +90,17 @@ pytest tests/test_main.py::test_main_runs -v
 ### The Creek Ontology (docs/Ontology/)
 The ontology prompt defines a complete system for organizing personal data into an Obsidian vault using five ontological primitives: **Fragments** (atomic content units), **Resonances** (semantic connections), **Threads** (narrative currents), **Eddies** (topic clusters), and **Praxis** (actionable insights). Content is classified along the 10-frequency APTITUDE system and the 6-phase Archetypal Wavelength cycle. This prompt is reference material for building the creek-tools pipeline (ingestion, classification, linking, voice proxy generation).
 
+## Backlog Inflow Moratorium (2026-09-01)
+
+Until the Adepthood MVP ships, do not file new issues about the development
+loop itself — `scripts/ralph/**`, `.github/workflows/**`, scan/lint/pre-commit
+tooling, dependency hygiene. Record such findings in the PR thread (or report
+them to the user) instead. Sole exception: a finding that breaks a required
+check on `main` or blocks a merge may be filed, labeled by real severity.
+Product and seam work — the `/v1` contract, per-user provisioning (#1724),
+privacy correctness — is unaffected. Context: adepthood
+`prompts/claude-comms/backlog-prioritization-audit-2026-09-01.md`.
+
 ## Workflow: Stay Green
 
 Follow the 4-gate process:
