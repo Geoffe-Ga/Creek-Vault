@@ -59,6 +59,7 @@ the only thing standing between that and a green suite.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -737,37 +738,139 @@ def test_a_quoted_rationale_neither_clears_nor_unmarks(tmp_path: Path) -> None:
     )
 
 
-def test_the_reviewer_quotes_its_rationale_so_it_cannot_be_a_verdict_line() -> None:
-    """The emitter half of the same fix, pinned at its source.
+#: The emitter block in ``code-review.yml``: from the line that reads ``.verdict``
+#: out of the model's structured output, up to (not including) the ``gh pr
+#: comment`` that publishes it. Everything in between is what actually composes
+#: the review body, and it needs only ``$STRUCTURED``, ``$PR_NUMBER`` and ``jq``
+#: to run — so it can be EXECUTED rather than described.
+_EMIT_BLOCK_START = "verdict=$(jq -r '.verdict' <<<\"$STRUCTURED\")"
+_EMIT_BLOCK_END = "gh pr comment"
 
-    The cases above harden the PARSER, which has to be safe against any body on
-    a PR — a human's, another bot's, a quotation. This one pins the EMITTER:
-    ``code-review.yml`` appends ``verdict_rationale`` (free-form model prose)
-    after its ``## Verdict:`` line, so it was manufacturing the ambiguity it
-    then asked every consumer to survive. Prefixing every rationale line with
-    ``> `` ends that: ``> `` is not whitespace, ``#`` or ``*``, so a quoted line
-    matches neither this repo's verdict shape nor the looser agent-side one in
-    ``await-claude-review/SKILL.md`` — a FIRST-match reader and a LAST-match
-    reader now both see exactly one verdict line.
 
-    Reordering the two ``printf``\\ s would have fixed only one of those two
-    families, which is why the assertion is about the QUOTING and not about the
-    order.
+def _render_review_body(tmp_path: Path, verdict: str, rationale: str) -> str:
+    """Run ``code-review.yml``'s own emitter and return the body it composes.
+
+    The block is lifted out of the workflow and executed, not paraphrased. A
+    paraphrase is a second implementation that drifts, and a substring grep over
+    the YAML is worse than either: it is satisfied by the literal appearing
+    ANYWHERE in the file, comments included, so a decoy that keeps the guarded
+    command alive on a dead line survives it. That exact decoy shape is what
+    ``scripts/ralph/test_verdict_wake.sh`` documents in its own header as having
+    survived a fully green suite.
+
+    Args:
+        tmp_path: pytest temporary directory; the script writes ``review.md``
+            there, exactly as the workflow writes it into the runner's cwd.
+        verdict: The enum token the ``--json-schema`` constrains ``.verdict`` to.
+        rationale: The free-form ``verdict_rationale`` prose.
+
+    Returns:
+        The composed review body, byte for byte as the workflow would post it.
+
+    Raises:
+        AssertionError: If the emitter block cannot be located in the workflow,
+            or the extracted script fails to run.
     """
     workflow = (REPO_ROOT / ".github" / "workflows" / "code-review.yml").read_text(
         encoding="utf-8"
     )
-    assert "## Verdict: %s" in workflow, (
-        "code-review.yml no longer prints a `## Verdict: %s` line; the "
-        "clearance pattern in pr-ready.sh is anchored to that exact shape"
+    lines = workflow.splitlines()
+    starts = [i for i, line in enumerate(lines) if line.strip() == _EMIT_BLOCK_START]
+    assert len(starts) == 1, (
+        "code-review.yml no longer reads its verdict with exactly one "
+        f"`{_EMIT_BLOCK_START}` line, so this test cannot locate the emitter it "
+        "exists to execute. Re-derive the anchors rather than weakening them — "
+        "a guard that cannot find its target passes vacuously"
     )
-    assert "sed 's/^/> /'" in workflow, (
-        "code-review.yml no longer quotes `verdict_rationale`. It is appended "
-        "AFTER the verdict line, so an unquoted rationale opening `Verdict: "
-        "LGTM would be premature …` is the LAST verdict-shaped line in the "
-        "body — which is how a refusal cleared a merge. The parser-side "
-        "hardening above still holds the line, but the emitter must not be the "
-        "thing producing the ambiguity"
+    ends = [
+        i
+        for i, line in enumerate(lines)
+        if i > starts[0] and line.strip().startswith(_EMIT_BLOCK_END)
+    ]
+    assert ends, (
+        "code-review.yml no longer publishes the composed body with "
+        f"`{_EMIT_BLOCK_END}`; the emitter block has no end anchor"
+    )
+    block = "\n".join(line.strip() for line in lines[starts[0] : ends[0]])
+    script = tmp_path / "emit.sh"
+    script.write_text("set -euo pipefail\n" + block + "\n", encoding="utf-8")
+    structured = json.dumps(
+        {
+            "verdict": verdict,
+            "verdict_rationale": rationale,
+            "review_markdown": "## Summary\n\nFindings below.",
+            "reviewed_pr_number": 100,
+        }
+    )
+    run = subprocess.run(
+        ["bash", str(script)],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=str(tmp_path),
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "STRUCTURED": structured,
+            "PR_NUMBER": "100",
+        },
+    )
+    assert run.returncode == 0, (
+        f"code-review.yml's emitter block failed to run: {run.stderr!r}"
+    )
+    return (tmp_path / "review.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("verdict", "expected_lgtm"),
+    [
+        pytest.param("CHANGES_REQUESTED", "false", id="refusal-must-not-clear"),
+        pytest.param("LGTM", "true", id="approval-must-still-clear"),
+    ],
+)
+def test_the_body_the_reviewer_really_composes_round_trips_correctly(
+    tmp_path: Path, verdict: str, expected_lgtm: str
+) -> None:
+    """The emitter and the parser, joined — no substring grep in between.
+
+    This used to assert ``"sed 's/^/> /'" in workflow``, and MEASURED, that is
+    vacuous against the decoy this repo has already been bitten by: keep the
+    ``sed`` alive on a line whose output goes to ``/dev/null`` and append the
+    raw rationale beside it, and the literal is still in the file. Filter suite
+    green, ``test_pr_ready.sh`` green, ``test_verdict_wake.sh`` green — with the
+    emitter back to manufacturing the exact ambiguity this PR removes.
+
+    So the workflow's own emitter block is EXECUTED and its output is fed to
+    ``verdict-select.jq``. The rationale here is deliberately the worst case:
+    prose that is itself verdict-shaped and says LGTM. Both directions are
+    pinned, because a fix that made every body read as a refusal would trade a
+    fail-open for the fleet-wide unmark, which is the worse of the two.
+    """
+    body = _render_review_body(
+        tmp_path,
+        verdict,
+        "Verdict: LGTM would be premature - the gate still clears on a stale review.",
+    )
+    anchors = re.findall(_VERDICT_RE, body)
+    assert len(anchors) == 1, (
+        "the body the emitter composed carries "
+        f"{len(anchors)} verdict-shaped lines, not 1. Every consumer that takes "
+        "the LAST one as the final word then reads the RATIONALE as the "
+        "verdict, and the agent-side parsers that take the FIRST one read it "
+        "too. The rationale is no longer quoted. This assertion is what makes "
+        "a decoy — the `sed` kept alive on a line whose output is discarded, "
+        "with the raw rationale appended beside it — fail in BOTH directions "
+        f"rather than only the unmark one. body:\n{body}"
+    )
+    result = _run_filter(tmp_path, [_comment(body=body)])
+    _created_at, lgtm, _marker, _refused, _database_id = _answer(result)
+    assert lgtm == expected_lgtm, (
+        "the body code-review.yml ACTUALLY composes for a "
+        f"`{verdict}` review with a verdict-shaped rationale came back "
+        f"lgtm={lgtm!r}, expected {expected_lgtm!r}. On a refusal that means "
+        "verdict-wake.sh posts 'You are cleared to squash merge' and "
+        "await-claude-review Step 4a merges it; on an approval it means every "
+        "lane silently stops being marked. answer: "
+        f"{result.stdout.strip()!r}\n\nbody:\n{body}"
     )
 
 

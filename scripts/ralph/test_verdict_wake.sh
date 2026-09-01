@@ -642,6 +642,52 @@ lacks "dissent: a body whose own ## Verdict: line refuses does not clear" \
 lacks "dissent: …and the VERDICT field carries no LGTM for Step 4a to merge on" \
       '^\*\*VERDICT\*\*: LGTM$' "$disputed"
 
+# TWO `lacks` ARE NOT A PIN, AND THIS BRANCH IS THE ONE THAT PROVES IT. Every
+# other refusal value in this file is asserted by EXACT VALUE — `NOT ATTESTED`,
+# `HELD`, `NOT CURRENT`, `STALE` all have a `says '^\*\*VERDICT\*\*: X$'`. The
+# dissent branch shipped with only the two negatives above, and MEASURED, both of
+# these renames left the whole suite green:
+#
+#   VERDICT='LGTM_PENDING'  no `^\*\*VERDICT\*\*: LGTM$` line, no clearance —
+#                           both `lacks` satisfied. It CONTAINS `LGTM`, so a
+#                           `*LGTM*` glob or a downstream `test("LGTM")` matches
+#                           it and the refusal is defeated (#1202).
+#   VERDICT='COMMENTS'      also satisfies both `lacks` — AND IT MERGES THE PR.
+#                           SKILL.md Step 4a item 4 routes `COMMENTS` into
+#                           `address-feedback`, which files follow-ups and then
+#                           squash-merges. A review the reviewer DISPUTED would
+#                           be merged.
+#
+# So three assertions, not one. The exact value catches a rename; the two BYTE
+# PROPERTIES catch a rename that also updates this literal, because they are
+# about what the value MEANS to the merge path rather than how it is spelled.
+# The value is read back OUT OF THE POSTED SUMMARY — the bytes Step 4a parses —
+# not out of the script's source, so a decoy assignment beside a live one cannot
+# satisfy them.
+#
+# This branch is invisible to `test_pr_ready.sh`'s structural walk of the
+# clearance chain: that walk keys on `ACTION="NOT cleared to merge`, and the
+# dissent happens ABOVE the chain (it falls through to the chain's own `else`,
+# which sets the "pull comment N" action). Nothing else in the tree covers it.
+disputed_verdict="$(sed -n 's/^\*\*VERDICT\*\*: //p' <<<"$disputed" | tail -n 1)"
+check "dissent: the VERDICT field names the refusal exactly" \
+      "DISPUTED" "$disputed_verdict"
+if [[ "$disputed_verdict" == *LGTM* ]]; then
+  bad "dissent: the VERDICT field is '$disputed_verdict', which CONTAINS 'LGTM' — a '*LGTM*' glob or a downstream test(\"LGTM\") matches it and the refusal is defeated (#1202)"
+else
+  ok "dissent: the VERDICT field carries no 'LGTM' substring for a glob to match"
+fi
+if [[ "$disputed_verdict" =~ ^(LGTM|CHANGES[_\ ]REQUESTED|COMMENTS)$ ]]; then
+  bad "dissent: the VERDICT field is '$disputed_verdict', one of the three verdicts await-claude-review SKILL.md RECOGNISES — 'COMMENTS' in particular routes to Step 4a item 4, which hands the PR to address-feedback and SQUASH-MERGES it. A refusal must be unrecognisable so Step 4a falls to item 5 and surfaces to a human (#1202)"
+else
+  ok "dissent: the VERDICT field is none of the three verdicts SKILL.md recognises, so Step 4a cannot read it as permission"
+fi
+if grep -qF -- "$disputed_verdict" "$ROOT/.claude/skills/await-claude-review/SKILL.md"; then
+  ok "dissent: await-claude-review SKILL.md names '$disputed_verdict' in its refusal vocabulary"
+else
+  bad "dissent: await-claude-review SKILL.md never mentions '$disputed_verdict', which this script emits — Step 4a would treat it as merely malformed, and the two files disagree about the emitter's refusal vocabulary (#1202)"
+fi
+
 # THE DISSENT CHECK MUST NOT VETO THE LEGACY SHAPE. `## Verdict\nLGTM` carries no
 # `^## Verdict:` line at all, so an empty grep result is "this file could not see
 # one", not a disagreement. Treating it as a veto would unmark every lane posting
