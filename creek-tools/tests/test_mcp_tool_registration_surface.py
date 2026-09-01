@@ -13,9 +13,20 @@ closure would pass all of them.
 
 This module is the missing lock, and it exists because #1385 moves those
 24 registrations out of ``build_server`` into four module-level
-``_register_*_tools`` helpers. It was written and proven green against
-the *unrefactored* server so that the move has something to be measured
-against.
+``_register_*_tools`` helpers. The three characterisation suites below --
+order, ``inputSchema`` and ``description`` -- were written and proven
+green against the *unrefactored* server, in a commit of their own, so
+that the move had something to be measured against.
+
+:func:`test_no_top_level_function_nests_more_than_eight_defs` at the foot
+of the module is the one exception and is deliberately the opposite: it
+was added second and was **red** against the unrefactored server, which
+is what made it a real guard rather than a restatement of the status quo.
+It cannot pass pre-refactor, because pre-refactor ``build_server`` is
+itself the thing it refuses and the four registrars do not yet exist.
+That is why its registrar probes use :func:`hasattr` rather than a
+module-level import -- so it could go red without turning this whole file
+into a collection error and destroying the evidence above.
 
 Three literal tables are the pin, and **nothing here recomputes them from
 the live server**:
