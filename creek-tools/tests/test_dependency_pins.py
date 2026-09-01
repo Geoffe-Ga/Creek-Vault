@@ -77,6 +77,28 @@ edge (mcp → pyjwt[crypto]) cannot pull a lower build into the graph.
 Both surfaces are guarded independently below: dropping either one
 re-opens the regression.
 
+``python-multipart`` (issue #1328): python-multipart 0.0.29 carries
+*four* advisories — PYSEC-2026-3036 (CVE-2026-53539), PYSEC-2026-3037
+(CVE-2026-53538), PYSEC-2026-3041 (CVE-2026-53537) and PYSEC-2026-3040
+(CVE-2026-53540). 0.0.30 clears three of them and leaves
+PYSEC-2026-3040 open, so the floor is 0.0.31, the first fully patched
+release. Count the advisories before trusting a summary: the older
+crawdad comment names three and omits PYSEC-2026-3041, and both design
+passes on #1328 inherited that undercount.
+
+python-multipart is transitive-only, arriving through mcp →
+python-multipart, so the floor lives in
+``[tool.uv].constraint-dependencies``. This project's own ``/v1``
+routes never parse multipart — uploads are JSON + base64 by design —
+so the reachable surface is the MCP SDK's Starlette app that
+``creek_mcp.server`` mounts under the streamable-http transport.
+
+The durable lesson is the *pair*, not the version. crawdad floored
+this package and creek-tools did not, and nothing failed, because
+until #1328 no test compared the two manifests. The parity guard at
+the end of this module does that now, in both directions, and reports
+every gap in one message.
+
 ``rpds-py`` (issue #1185): not a CVE. rpds-py abandoned SemVer for
 CalVer at 2026.5.1 — the release line runs 0.29.0, 0.30.0, then
 2026.5.1 with no 0.31 or 1.0 in between — and raised its
@@ -210,6 +232,7 @@ not load — so it is a hard requirement and belongs in the manifest.
 from __future__ import annotations
 
 import ast
+import re
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -222,7 +245,7 @@ from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
-from tests.shell_command_support import PRE_COMMIT_CONFIG, load_yaml
+from tests.shell_command_support import PRE_COMMIT_CONFIG, REPO_ROOT, load_yaml
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -232,6 +255,17 @@ if TYPE_CHECKING:
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _PYPROJECT = _PACKAGE_ROOT / "pyproject.toml"
 _UV_LOCK = _PACKAGE_ROOT / "uv.lock"
+
+#: The sibling subproject's manifests. A DEP-003 floor is a property of
+#: the *pair* of manifests, not of either one alone, so the parity guard
+#: at the end of this module reads both. Cross-subproject reads have
+#: precedent here: tests/test_vulture_gate_wiring.py reaches
+#: ``REPO_ROOT / "crawdad" / "scripts"`` the same way, and the repo-root
+#: CI job carries no ``paths:`` filter, so this file runs on
+#: crawdad-only pull requests too.
+_CRAWDAD_ROOT = REPO_ROOT / "crawdad"
+_CRAWDAD_PYPROJECT = _CRAWDAD_ROOT / "pyproject.toml"
+_CRAWDAD_UV_LOCK = _CRAWDAD_ROOT / "uv.lock"
 
 #: First mcp release containing the fixes for CVE-2026-52869,
 #: CVE-2026-52870, and CVE-2026-59950.
@@ -302,6 +336,17 @@ _TORCH_PATCHED_VERSION = Version("2.13.0")
 #: (CVE-2026-69247 / GHSA-g6cj-pr64-35w5); the advisory range opens at
 #: 44.0.0, so every release from 44.0.0 up to 49.x is vulnerable.
 _CRYPTOGRAPHY_PATCHED_VERSION = Version("50.0.0")
+
+#: First python-multipart release with all FOUR advisories fixed.
+#: 0.0.29 carries PYSEC-2026-3036 (CVE-2026-53539), PYSEC-2026-3037
+#: (CVE-2026-53538), PYSEC-2026-3041 (CVE-2026-53537) and
+#: PYSEC-2026-3040 (CVE-2026-53540). 0.0.30 clears three of the four,
+#: leaving PYSEC-2026-3040 open until 0.0.31 — so the floor is 0.0.31,
+#: the first fully patched release. The count matters: the four-advisory
+#: record was verified against OSV while closing #1328, and the
+#: three-advisory framing carried by the older crawdad comment omits
+#: PYSEC-2026-3041.
+_PYTHON_MULTIPART_PATCHED_VERSION = Version("0.0.31")
 
 #: The anyio floor. No CVE here — the floor simply records the version
 #: the lock resolves, the same rule the neighbouring uvicorn
@@ -566,6 +611,44 @@ def _locked_distribution_version(distribution: str) -> Version:
         if package["name"] == distribution:
             return Version(str(package["version"]))
     pytest.fail(f"{distribution} has no [[package]] entry in uv.lock")
+
+
+def _python_multipart_constraint_specifier() -> SpecifierSet:
+    """Return the ``python-multipart`` specifier from uv constraints.
+
+    Reads ``[tool.uv].constraint-dependencies`` in ``pyproject.toml``,
+    the home for floors on transitive-only packages (DEP-003).
+
+    Returns:
+        The specifier set attached to the ``python-multipart``
+        constraint entry. Fails the calling test if the ``[tool.uv]``
+        table or the ``python-multipart`` entry is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    constraints: list[str] = (
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in constraints:
+        requirement = Requirement(entry)
+        if requirement.name == "python-multipart":
+            return requirement.specifier
+    pytest.fail(
+        "python-multipart has no entry in [tool.uv].constraint-dependencies "
+        "of pyproject.toml"
+    )
+
+
+def _locked_python_multipart_version() -> Version:
+    """Return the resolved ``python-multipart`` version in ``uv.lock``.
+
+    Returns:
+        The ``python-multipart`` version resolved in the lockfile.
+        Fails the calling test with ``python-multipart has no
+        [[package]] entry in uv.lock`` if the lock has no entry, which
+        would mean the mcp edge stopped resolving it at all.
+    """
+    return _locked_distribution_version("python-multipart")
 
 
 def _pyasn1_constraint_specifier() -> SpecifierSet:
@@ -1451,6 +1534,58 @@ def test_locked_cryptography_at_or_above_patched_release() -> None:
     )
 
 
+def test_python_multipart_constraint_rejects_vulnerable_releases() -> None:
+    """The uv constraint excludes 0.0.29 and the partial-fix 0.0.30.
+
+    python-multipart 0.0.29 carries four advisories: PYSEC-2026-3036,
+    PYSEC-2026-3037, PYSEC-2026-3041 and PYSEC-2026-3040. 0.0.30 clears
+    the first three, so stopping the floor at ``>=0.0.30`` would still
+    ship PYSEC-2026-3040 (CVE-2026-53540) on a parser this project
+    *serves* — the streamable-http transport and the
+    ``creek_mcp.httpapi`` Starlette ``/v1`` app both feed it. The floor
+    has to be ``>=0.0.31``.
+    """
+    specifier = _python_multipart_constraint_specifier()
+    assert "0.0.29" not in specifier, (
+        f"python-multipart constraint {specifier!r} admits 0.0.29, the "
+        "release carrying PYSEC-2026-3036 / PYSEC-2026-3037 / "
+        "PYSEC-2026-3041 / PYSEC-2026-3040; the floor must be >=0.0.31"
+    )
+    assert "0.0.30" not in specifier, (
+        f"python-multipart constraint {specifier!r} admits 0.0.30, which "
+        "still carries PYSEC-2026-3040 (CVE-2026-53540); the floor must be "
+        ">=0.0.31, not >=0.0.30"
+    )
+
+
+def test_python_multipart_constraint_accepts_patched_release() -> None:
+    """The uv constraint accepts 0.0.31, the first fully patched release."""
+    specifier = _python_multipart_constraint_specifier()
+    assert "0.0.31" in specifier, (
+        f"python-multipart constraint {specifier!r} rejects 0.0.31; the "
+        "patched release itself must satisfy the constraint"
+    )
+
+
+def test_locked_python_multipart_at_or_above_patched_release() -> None:
+    """``uv.lock`` resolves python-multipart to >= 0.0.31.
+
+    The lockfile is what CI installs and what pip-audit inspects, so a
+    correct constraint floor over a stale lock still ships the
+    vulnerable build. This one is green before the constraint exists —
+    mcp already pulls 0.0.32 — which makes it a regression guard rather
+    than red-first evidence: it is what stops a future relock walking
+    back down.
+    """
+    locked = _locked_python_multipart_version()
+    assert locked >= _PYTHON_MULTIPART_PATCHED_VERSION, (
+        f"uv.lock pins python-multipart {locked}, below the patched "
+        f"{_PYTHON_MULTIPART_PATCHED_VERSION} (PYSEC-2026-3036 / "
+        "PYSEC-2026-3037 / PYSEC-2026-3041 / PYSEC-2026-3040); pip-audit "
+        "inspects the lock, so relock after adding the constraint"
+    )
+
+
 def _anyio_specifier() -> SpecifierSet:
     """Return the ``anyio`` specifier from ``[project].dependencies``.
 
@@ -1975,3 +2110,434 @@ def test_every_lockstep_tool_is_guarded() -> None:
         "both pinned in pyproject.toml, uv.lock and "
         ".pre-commit-config.yaml, and both must stay guarded"
     )
+
+
+#: An advisory identifier as manifest comments write them. Nothing in a
+#: requirement string separates a security floor from an ordinary
+#: compatibility floor, so the comment justifying the entry is what
+#: classifies it. ``anyio>=4.14.2`` and ``uvicorn>=0.52.4`` record the
+#: resolution this project runs and name no advisory; they are not
+#: parity obligations and this pattern deliberately misses them.
+_ADVISORY_ID = re.compile(r"\b(?:CVE|PYSEC|GHSA)-[A-Za-z0-9]+-[A-Za-z0-9-]+\b")
+
+#: A ``"<requirement>",`` element of a TOML dependency array. The
+#: optional trailing ``# ...`` matters: without it an entry written with
+#: a same-line comment would not match, and an unmatched entry is a
+#: floor this guard cannot see — a FALSE NEGATIVE, the one direction a
+#: security guard must not fail in. The same allowance is made on the
+#: table and array-opening patterns below, and
+#: ``test_the_manifest_scanner_sees_every_declared_requirement``
+#: cross-checks the whole scan against ``tomllib`` so a formatting the
+#: patterns still miss fails a test instead of silently shrinking the
+#: population.
+_MANIFEST_ENTRY = re.compile(r'^\s*"(?P<requirement>[^"]+)",?\s*(?:#.*)?$')
+
+#: A ``[table.header]`` line. The optional doubled brackets match an
+#: array-of-tables header: both manifests carry several
+#: ``[[tool.mypy.overrides]]`` blocks, and a pattern that did not
+#: recognise them would leave the preceding table in scope across the
+#: whole run, attributing their inline ``module = [...]`` arrays to
+#: whatever table came last.
+_MANIFEST_TABLE = re.compile(r"^\s*\[\[?(?P<table>[^\[\]]+)\]\]?\s*(?:#.*)?$")
+
+#: A ``key = [`` line opening a multi-line array.
+_MANIFEST_ARRAY = re.compile(r"^\s*(?P<key>[A-Za-z0-9_.-]+)\s*=\s*\[\s*(?:#.*)?$")
+
+#: A whole array on one line — ``openai = ["openai>=2.41.0,<3.0.0"]``.
+#: creek-tools writes five of its extras this way, and the first
+#: version of this scanner understood only the multi-line form and so
+#: could not see any of them. The cross-check against ``tomllib`` is
+#: what caught that; the lesson is in that test's docstring.
+_MANIFEST_INLINE_ARRAY = re.compile(
+    r"^\s*(?P<key>[A-Za-z0-9_.-]+)\s*=\s*\[(?P<body>.*?)\]\s*,?\s*(?:#.*)?$"
+)
+
+#: A double-quoted string, for pulling requirements out of an inline array.
+_QUOTED = re.compile(r'"([^"]+)"')
+
+#: The table this repo reserves for DEP-003 floors on transitive-only
+#: packages. Membership alone marks an entry as a security floor, which
+#: is what covers creek-tools' comment-less ``pyjwt>=2.13.0``.
+_CONSTRAINT_ARRAY = "tool.uv.constraint-dependencies"
+
+#: Arrays a floor may be declared in, by exact name and by prefix. The
+#: extras and dependency-group prefixes are load-bearing: crawdad
+#: declares ``setuptools`` and ``wheel`` in its ``dev`` extra rather
+#: than in a constraint table, and a union that skipped them would
+#: manufacture two asymmetries for packages crawdad already floors at
+#: an equal and a higher bound respectively (#1328).
+_FLOOR_ARRAYS = ("project.dependencies", _CONSTRAINT_ARRAY)
+_FLOOR_ARRAY_PREFIXES = ("project.optional-dependencies.", "dependency-groups.")
+
+
+@dataclass(frozen=True)
+class _Manifest:
+    """One subproject's pair of dependency manifests.
+
+    Attributes:
+        project: Directory name, as failure messages spell it.
+        pyproject: That subproject's ``pyproject.toml``.
+        lockfile: That subproject's ``uv.lock``.
+    """
+
+    project: str
+    pyproject: Path
+    lockfile: Path
+
+
+@dataclass(frozen=True)
+class _AdvisoryFloor:
+    """One security floor a manifest declares against a published advisory.
+
+    Attributes:
+        distribution: Canonicalised distribution name.
+        requirement: The requirement string exactly as the manifest
+            spells it, so a failure message quotes what a reader will
+            find in the file.
+        advisories: Advisory identifiers named by the comment block
+            justifying the floor. Empty for a constraint-table entry
+            carrying no comment.
+    """
+
+    distribution: str
+    requirement: str
+    advisories: tuple[str, ...]
+
+
+#: The two manifests DEP-003 holds in parity. No third exists:
+#: ``requirements.txt`` and ``requirements-dev.txt`` are pointer files
+#: carrying zero pins and naming pyproject.toml as the source of truth.
+_MANIFESTS = (
+    _Manifest("creek-tools", _PYPROJECT, _UV_LOCK),
+    _Manifest("crawdad", _CRAWDAD_PYPROJECT, _CRAWDAD_UV_LOCK),
+)
+
+#: Advisory floors deliberately declared on one side only, each with the
+#: reason. Every row is a suppression, so every row has to keep earning
+#: its place: ``test_every_documented_asymmetry_is_still_asymmetric``
+#: reds on a row whose package the sibling has since floored. That guard
+#: is the whole point. The scan that filed #1328 asserted crawdad
+#: omitted ``pip`` months after crawdad floored it at
+#: crawdad/pyproject.toml (#1527) — the failure mode a hand-maintained
+#: prose table has and an executable one does not.
+#:
+#: **It is empty, and empty is the goal.** #1328 planned to exempt
+#: ``("crawdad", "urllib3")`` on the reading that crawdad reaches
+#: urllib3 only through pip-audit. That reading is false: crawdad
+#: declares ``google-genai`` in ``[project].dependencies``, and
+#: google-genai and google-auth both pull ``requests``, which pulls
+#: urllib3 — a runtime path, not a dev-only one. The package was
+#: floored instead of exempted. An exemption whose reason does not
+#: survive a read of the lock is the defect this module exists to
+#: catch, so prefer mirroring the floor every time.
+_DOCUMENTED_ASYMMETRIES: dict[tuple[str, str], str] = {}
+
+
+def _cited_advisories(block: list[str]) -> tuple[str, ...]:
+    """Return the advisory ids named by a comment block, de-duplicated.
+
+    Args:
+        block: The comment lines immediately above a manifest entry.
+
+    Returns:
+        Identifiers in first-seen order.
+    """
+    return tuple(dict.fromkeys(_ADVISORY_ID.findall(" ".join(block))))
+
+
+def _table_transition(line: str, table: str, array: str) -> tuple[str, str]:
+    """Apply a structural line's effect on the current table and array.
+
+    Args:
+        line: A manifest line that is neither a comment nor an entry.
+        table: The table header currently in scope.
+        array: The array currently being read, or ``""``.
+
+    Returns:
+        The updated ``(table, array)`` pair.
+    """
+    header = _MANIFEST_TABLE.match(line)
+    if header is not None:
+        return header.group("table"), ""
+    opening = _MANIFEST_ARRAY.match(line)
+    if opening is not None:
+        return table, f"{table}.{opening.group('key')}"
+    if line.strip().startswith("]"):
+        return table, ""
+    return table, array
+
+
+def _manifest_entries(pyproject: Path) -> Iterator[tuple[str, str, tuple[str, ...]]]:
+    """Yield each dependency-array entry with the comment block above it.
+
+    The manifest is read as text rather than through ``tomllib``
+    because the justification for a floor lives in its comment and a
+    TOML parser discards comments.
+
+    Args:
+        pyproject: Manifest to scan.
+
+    Yields:
+        ``(array, requirement, advisories)`` per entry, where *array* is
+        the fully qualified array name (``project.dependencies``,
+        ``tool.uv.constraint-dependencies``, ...) and *advisories* holds
+        the identifiers named by the comment block immediately above the
+        entry. The block resets on any blank or non-comment line, so an
+        entry inherits only its own justification and never its
+        neighbour's.
+    """
+    table = ""
+    array = ""
+    block: list[str] = []
+    for line in pyproject.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            block.append(stripped)
+            continue
+        entry = _MANIFEST_ENTRY.match(line)
+        if entry is not None and array:
+            yield array, entry.group("requirement"), _cited_advisories(block)
+            block = []
+            continue
+        inline = _MANIFEST_INLINE_ARRAY.match(line)
+        if inline is not None:
+            advisories = _cited_advisories(block)
+            inline_array = f"{table}.{inline.group('key')}"
+            for requirement in _QUOTED.findall(inline.group("body")):
+                yield inline_array, requirement, advisories
+            block = []
+            continue
+        table, array = _table_transition(line, table, array)
+        block = []
+
+
+def _advisory_floors(pyproject: Path) -> dict[str, _AdvisoryFloor]:
+    """Return the security floors *pyproject* declares, by distribution.
+
+    A floor answers an advisory when either it lives in
+    ``[tool.uv].constraint-dependencies`` — the table this repo reserves
+    for DEP-003 floors — or its justifying comment names a CVE, PYSEC,
+    or GHSA identifier.
+
+    Args:
+        pyproject: Manifest to read.
+
+    Returns:
+        A mapping from canonicalised distribution name to its floor.
+    """
+    floors: dict[str, _AdvisoryFloor] = {}
+    for array, requirement, advisories in _manifest_entries(pyproject):
+        declared_here = array in _FLOOR_ARRAYS or array.startswith(
+            _FLOOR_ARRAY_PREFIXES
+        )
+        if not declared_here:
+            continue
+        if array != _CONSTRAINT_ARRAY and not advisories:
+            continue
+        name = canonicalize_name(Requirement(requirement).name)
+        floors[name] = _AdvisoryFloor(name, requirement, advisories)
+    return floors
+
+
+def _declared_floor_names(pyproject: Path) -> set[str]:
+    """Return every distribution *pyproject* declares a requirement for.
+
+    Unions ``[project].dependencies``, every
+    ``[project.optional-dependencies]`` table, every
+    ``[dependency-groups]`` table, and
+    ``[tool.uv].constraint-dependencies``. Which table a floor lives in
+    is a per-project convention, so parity has to read all of them.
+
+    Args:
+        pyproject: Manifest to read.
+
+    Returns:
+        Canonicalised distribution names.
+    """
+    with pyproject.open("rb") as handle:
+        data = tomllib.load(handle)
+    project = data.get("project", {})
+    arrays: list[list[str]] = [project.get("dependencies", [])]
+    arrays.extend(project.get("optional-dependencies", {}).values())
+    arrays.extend(data.get("dependency-groups", {}).values())
+    uv_table = data.get("tool", {}).get("uv", {})
+    arrays.append(uv_table.get("constraint-dependencies", []))
+    return {
+        canonicalize_name(Requirement(entry).name)
+        for array in arrays
+        for entry in array
+    }
+
+
+def _locked_versions(lockfile: Path) -> dict[str, str]:
+    """Return every package *lockfile* resolves, by canonical name.
+
+    Args:
+        lockfile: A ``uv.lock`` to read.
+
+    Returns:
+        A mapping from canonicalised distribution name to the resolved
+        version string.
+    """
+    with lockfile.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    return {
+        canonicalize_name(str(package["name"])): str(package["version"])
+        for package in packages
+    }
+
+
+def _scanned_floor_names(pyproject: Path) -> set[str]:
+    """Return the floor-array names the *text scanner* finds.
+
+    The counterpart to :func:`_declared_floor_names`, which reads the
+    same arrays through ``tomllib``. Comparing the two is what makes
+    the hand-rolled parser auditable.
+
+    Args:
+        pyproject: Manifest to scan.
+
+    Returns:
+        Canonicalised distribution names.
+    """
+    names: set[str] = set()
+    for array, requirement, _ in _manifest_entries(pyproject):
+        if array in _FLOOR_ARRAYS or array.startswith(_FLOOR_ARRAY_PREFIXES):
+            names.add(canonicalize_name(Requirement(requirement).name))
+    return names
+
+
+def _advisory_floor_gaps() -> dict[tuple[str, str], str]:
+    """Return every advisory floor one manifest declares and its sibling lacks.
+
+    A gap needs all three of: the declaring side floors the package
+    against an advisory, the other side declares no requirement for it
+    at all, and the other side's own lock nonetheless resolves it. The
+    third condition is what keeps ``torch``, ``aiohttp`` and ``pillow``
+    out — each is absent from the sibling's graph entirely, so there is
+    nothing there to floor.
+
+    Returns:
+        A mapping from ``(lacking project, distribution)`` to a one-line
+        explanation naming the declaring project's requirement string,
+        the advisories it answers, and the version the lacking project
+        already resolves.
+    """
+    first, second = _MANIFESTS
+    gaps: dict[tuple[str, str], str] = {}
+    for declaring, lacking in ((first, second), (second, first)):
+        declared = _declared_floor_names(lacking.pyproject)
+        locked = _locked_versions(lacking.lockfile)
+        for name, floor in sorted(_advisory_floors(declaring.pyproject).items()):
+            if name in declared or name not in locked:
+                continue
+            cited = f" ({', '.join(floor.advisories)})" if floor.advisories else ""
+            gaps[lacking.project, name] = (
+                f"{lacking.project} lacks {name} - {declaring.project} "
+                f'declares "{floor.requirement}"{cited} and '
+                f"{lacking.project}/uv.lock resolves {name} {locked[name]}"
+            )
+    return gaps
+
+
+def test_every_advisory_floor_is_mirrored_or_documented() -> None:
+    """Neither manifest floors an advisory the other silently ignores.
+
+    creek-tools and crawdad resolve overlapping graphs — most of the
+    overlap arrives through the shared ``mcp`` dependency — but each
+    carries its own floors, and nothing made the two sets agree. So a
+    floor added on one side stayed there: creek-tools *serves* the
+    ``python-multipart`` parser, through the streamable-http transport
+    and the ``creek_mcp.httpapi`` Starlette app, with no floor at all,
+    while crawdad — an MCP client — floored it (#1328).
+
+    This is the guard whose absence is the defect. A prose sweep table
+    goes stale the day after it is written; this derives both sides from
+    the manifests on every run and names every gap at once.
+    """
+    gaps = _advisory_floor_gaps()
+    undocumented = sorted(set(gaps) - set(_DOCUMENTED_ASYMMETRIES))
+    assert not undocumented, (
+        "advisory floors declared in one manifest and missing from the "
+        "sibling that resolves the package:\n"
+        + "\n".join(f"  {gaps[key]}" for key in undocumented)
+        + "\nMirror the floor into the sibling manifest, or add a reasoned "
+        "_DOCUMENTED_ASYMMETRIES row (#1328)"
+    )
+
+
+def test_every_documented_asymmetry_is_still_asymmetric() -> None:
+    """Every exemption still describes a gap that is really there.
+
+    An exemption is a suppression, and a stale suppression is worse
+    than none: it hides its package from the parity guard permanently.
+    Requiring each row to still reproduce as a gap means a row for a
+    package the sibling has since floored fails here rather than
+    quietly widening the hole.
+    """
+    gaps = _advisory_floor_gaps()
+    resolved = sorted(set(_DOCUMENTED_ASYMMETRIES) - set(gaps))
+    assert not resolved, (
+        "_DOCUMENTED_ASYMMETRIES rows that are no longer asymmetric — the "
+        "sibling now declares the floor, or no longer resolves the "
+        "package, so the exemption suppresses nothing and must be "
+        "deleted:\n"
+        + "\n".join(
+            f"  {project} / {name}: {_DOCUMENTED_ASYMMETRIES[project, name]}"
+            for project, name in resolved
+        )
+    )
+
+
+def test_no_advisory_floor_is_currently_exempted() -> None:
+    """``_DOCUMENTED_ASYMMETRIES`` is empty, and that is the goal state.
+
+    An empty table makes the test above trivially true, and a
+    collection-driven test that passes on an empty collection is how a
+    guard disappears behind a green gate. Asserting the emptiness keeps
+    it a fact rather than an accident: adding the first suppression has
+    to edit this test and say why here, which is exactly the review
+    conversation a security suppression deserves.
+
+    #1328 closed the one candidate exemption by *flooring* the package
+    rather than exempting it — see the note on
+    ``_DOCUMENTED_ASYMMETRIES`` for why its proposed reason was false.
+    """
+    assert not _DOCUMENTED_ASYMMETRIES, (
+        f"_DOCUMENTED_ASYMMETRIES now suppresses "
+        f"{sorted(_DOCUMENTED_ASYMMETRIES)}; every row is a hole in the "
+        "parity guard. Mirror the floor instead if you can; if the "
+        "exemption really is right, update this test and record the "
+        "reason with it (#1328)"
+    )
+
+
+def test_the_manifest_scanner_sees_every_declared_requirement() -> None:
+    """The text scanner and ``tomllib`` agree on every manifest.
+
+    :func:`_manifest_entries` hand-parses TOML because the justification
+    for a floor lives in a comment and ``tomllib`` discards comments.
+    That trade buys a real risk: a formatting the patterns do not match
+    — an inline single-line array, an entry carrying a same-line
+    comment, an unusual table header — yields *fewer* entries, and a
+    floor the scanner cannot see is a floor the parity guard cannot
+    require of the sibling. That is a false negative, the one direction
+    a security guard must not fail in, and nothing about it is visible:
+    every other test in this module still passes.
+
+    So the parser is held to the real one. ``tomllib`` reads the same
+    arrays with no regexes at all, and the two populations must match
+    exactly. A regex that stops matching fails here, loudly, naming the
+    entries it dropped.
+    """
+    for manifest in _MANIFESTS:
+        scanned = _scanned_floor_names(manifest.pyproject)
+        parsed = _declared_floor_names(manifest.pyproject)
+        assert scanned == parsed, (
+            f"the text scanner and tomllib disagree about "
+            f"{manifest.project}/pyproject.toml. Missed by the scanner: "
+            f"{sorted(parsed - scanned)}; seen only by the scanner: "
+            f"{sorted(scanned - parsed)}. A floor the scanner cannot see "
+            "is one the parity guard cannot require of the sibling"
+        )

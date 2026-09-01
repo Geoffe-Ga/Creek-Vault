@@ -18,6 +18,7 @@ constraints = [
     { name = "pip", specifier = ">=26.2.1" },
     { name = "pyasn1", specifier = ">=0.6.4" },
     { name = "pyjwt", specifier = ">=2.13.0" },
+    { name = "python-multipart", specifier = ">=0.0.31" },
     { name = "rpds-py", specifier = ">=2026.6.3" },
     { name = "setuptools", specifier = ">=83.0.0,<85.0.0" },
     { name = "torch", specifier = ">=2.13.0" },
