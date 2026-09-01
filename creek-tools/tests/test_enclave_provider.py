@@ -385,10 +385,12 @@ def test_a_non_object_attestation_quote_refuses_and_sends_no_prompt(
 ) -> None:
     """A quote that is not a JSON object refuses — no prompt egress.
 
-    The message is asserted with ``==`` against the literal rather than
-    ``pytest.raises(match=...)``: the sibling ``from exc`` transport arm emits
-    the identical string, so a regex search would be satisfied by the wrong
-    raiser.
+    The message is asserted with ``==`` against the literal so the FULL refusal
+    text is pinned — a later widening of the message cannot slip past. What
+    pins this to the non-dict arm specifically (rather than the sibling
+    ``from exc`` transport arm, which emits an identical string) is the
+    fixture: ``raise_for_status`` returns ``None``, so no ``httpx.HTTPError``
+    is reachable here.
     """
     client_cls, ctx = _patched_client(quote_json=quote)
     with (

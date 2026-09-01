@@ -390,9 +390,24 @@ class TestOpenAIDegenerateResponse:
         assert _extract_openai_text(response) == ""
 
     def test_extract_text_returns_empty_string_when_choices_absent(self) -> None:
-        """No ``choices`` attribute at all yields "" via the ``or []`` normalisation."""
+        """No ``choices`` attribute at all yields "".
+
+        ``getattr`` falls back to ``None``, which the ``if not choices`` guard
+        treats as empty — the same arm the empty-list case reaches.
+        """
         response = _make_mock_openai_response(choices=_ABSENT)
         assert _extract_openai_text(response) == ""
+
+    def test_the_absent_sentinel_really_deletes_the_attribute(self) -> None:
+        """Guard the fake itself: ``_ABSENT`` must remove the attribute outright.
+
+        Without this, a silent regression in ``_set_or_delete`` would leave
+        MagicMock's auto-created attribute in place and every ``_ABSENT`` case
+        would still pass — for the wrong reason.
+        """
+        response = _make_mock_openai_response(choices=_ABSENT, usage=_ABSENT)
+        assert not hasattr(response, "choices")
+        assert not hasattr(response, "usage")
 
     def test_stop_reason_is_end_turn_for_empty_choices(self) -> None:
         """Zero choices maps to "end_turn" — never an IndexError."""
@@ -457,10 +472,16 @@ class TestOpenAIClientMemoization:
     """The lazily-built SDK client is constructed once and then reused."""
 
     def test_client_is_constructed_once_and_reused(self, openai_env: None) -> None:
-        """A second ``.client`` access returns the same object, not a new client."""
-        with patch("openai.OpenAI", return_value=MagicMock()) as ctor:
+        """A second ``.client`` access returns the same object, not a new client.
+
+        ``side_effect`` hands out two DISTINCT clients, so ``first is second``
+        is a real assertion: a broken memoization would return the second one.
+        """
+        built = [MagicMock(), MagicMock()]
+        with patch("openai.OpenAI", side_effect=built) as ctor:
             provider = OpenAIProvider(LLMConfig(provider="openai"))
             first = provider.client
             second = provider.client
         assert first is second
+        assert first is built[0]
         assert ctor.call_count == 1

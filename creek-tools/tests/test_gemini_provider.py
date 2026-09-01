@@ -390,9 +390,24 @@ class TestGeminiDegenerateResponse:
         assert _extract_gemini_text(response) == ""
 
     def test_extract_text_returns_empty_string_when_candidates_absent(self) -> None:
-        """No ``candidates`` attribute at all yields "" via the ``or []``."""
+        """No ``candidates`` attribute at all yields "".
+
+        ``getattr`` falls back to ``None``, which the ``if not candidates``
+        guard treats as empty — the same arm the empty-list case reaches.
+        """
         response = _make_mock_genai_response(candidates=_ABSENT)
         assert _extract_gemini_text(response) == ""
+
+    def test_the_absent_sentinel_really_deletes_the_attribute(self) -> None:
+        """Guard the fake itself: ``_ABSENT`` must remove the attribute outright.
+
+        Without this, a silent regression in ``_set_or_delete`` would leave
+        MagicMock's auto-created attribute in place and every ``_ABSENT`` case
+        would still pass — for the wrong reason.
+        """
+        response = _make_mock_genai_response(candidates=_ABSENT, usage_metadata=_ABSENT)
+        assert not hasattr(response, "candidates")
+        assert not hasattr(response, "usage_metadata")
 
     @pytest.mark.parametrize("content", [None, _ABSENT], ids=["null", "absent"])
     def test_extract_text_is_empty_when_the_candidate_carries_no_content(
@@ -462,10 +477,16 @@ class TestGeminiClientMemoization:
     """The lazily-built SDK client is constructed once and then reused."""
 
     def test_client_is_constructed_once_and_reused(self, gemini_env: None) -> None:
-        """A second ``.client`` access returns the same object, not a new client."""
-        with patch("google.genai.Client", return_value=MagicMock()) as ctor:
+        """A second ``.client`` access returns the same object, not a new client.
+
+        ``side_effect`` hands out two DISTINCT clients, so ``first is second``
+        is a real assertion: a broken memoization would return the second one.
+        """
+        built = [MagicMock(), MagicMock()]
+        with patch("google.genai.Client", side_effect=built) as ctor:
             provider = GeminiProvider(LLMConfig(provider="gemini"))
             first = provider.client
             second = provider.client
         assert first is second
+        assert first is built[0]
         assert ctor.call_count == 1
