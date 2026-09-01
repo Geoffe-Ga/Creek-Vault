@@ -49,7 +49,7 @@ one.
 | Gate | Check | On pass | On fail |
 | --- | --- | --- | --- |
 | 1 | **TDD** (Red→Green→Refactor, `stay-green`) | → Gate 2 | — |
-| 2 | **`cd creek-tools && ./scripts/check-all.sh`** | → push → Gate 3 | **drop to Gate 1** |
+| 2 | **`cd creek-tools && VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" ./scripts/check-all.sh`** | → push → Gate 3 | **drop to Gate 1** |
 | 3 | **CI** all green | → Gate 4 | **drop to Gate 1** (via `ci-debugging`) |
 | 4 | **Claude review `Verdict:`** | `LGTM` + green + up-to-date → **merge + mark issue done + refill** | **drop to Gate 1** (via `address-feedback`) |
 
@@ -489,6 +489,9 @@ while [ "$(scripts/ralph/fleet.sh free)" -gt 0 ]; do
   echo "assigned issue $ISSUE_N → $WT"
 done
 ```
+`assign` also provisions each lane's `creek-tools/.venv` (`uv sync --all-extras`),
+so a cold refill loop is slower per lane. The lane's Gate 2 exports select that
+interpreter; the lane must not run its own `uv sync`.
 **Do not set `RALPH_EXCLUDE_LABELS`.** It **replaces** the picker's default
 exclusion list rather than adding to it, so setting it silently re-admits
 `epic`, `blocked`, `wontfix`, `do-not-auto-merge`, and the rest. A bridged

@@ -38,8 +38,11 @@ as the **documentation-dimension reviewer**.
 3. Update any README/module doc whose described behavior changed; add a short
    usage example for new public APIs.
 4. Verify docstring coverage holds ≥95% (`interrogate`, part of
-   `cd creek-tools && ./scripts/check-all.sh`); keep markdown clean for the
-   pre-commit hooks.
+   `cd creek-tools && VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" ./scripts/check-all.sh`);
+   keep markdown clean for the pre-commit hooks. In a fleet lane the venv is
+   already provisioned by `fleet.sh` — do NOT run your own `uv sync`. The exports
+   are still mandatory: they govern which interpreter is RESOLVED
+   (`creek-tools/scripts/_lib.sh` probes a bare `python`), not whether one exists.
 5. Ensure docs match the implementation **exactly** — a wrong doc is worse than
    none. Hand back the Handoff block below.
 

@@ -35,6 +35,9 @@ from creek_mcp.api.models import (
     Capability,
     ClassificationRequest,
     ClassificationResponse,
+    DriveAuthorizationExchangeRequest,
+    DriveAuthorizationRequest,
+    DriveAuthorizationResponse,
     DriveConnectorStatusResponse,
     DriveDisconnectResponse,
     DriveSyncResponse,
@@ -111,6 +114,12 @@ OP_DRIVE_SYNC: Final[str] = "syncDriveConnector"
 OP_DRIVE_DISCONNECT: Final[str] = "disconnectDriveConnector"
 """``operation_id`` of ``DELETE /v1/connectors/drive``."""
 
+OP_DRIVE_AUTHORIZE: Final[str] = "createDriveAuthorization"
+"""``operation_id`` of ``POST /v1/connectors/drive/authorizations``."""
+
+OP_DRIVE_AUTHORIZE_COMPLETE: Final[str] = "completeDriveAuthorization"
+"""``operation_id`` of ``POST /v1/connectors/drive/authorizations/{state}``."""
+
 OP_CLASSIFY: Final[str] = "createClassification"
 """``operation_id`` of ``POST /v1/classifications``."""
 
@@ -120,7 +129,7 @@ OP_LINK: Final[str] = "createLink"
 OP_HEALTH: Final[str] = "getHealth"
 """``operation_id`` of ``GET /v1/health``.
 
-The eleven are named constants rather than bare literals in the table below
+The operation ids are named constants rather than bare literals in the table below
 because the adapter's handler map is keyed on them: a client generator's method
 name and a server's dispatch key have to be the same string, and two spellings
 of it are one rename away from a route mounted to nothing.
@@ -321,6 +330,26 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         response_model=DriveSyncResponse,
         requires_contract_version=True,
         summary="Run one incremental Google Drive sync and ingest what it fetched.",
+    ),
+    RouteSpec(
+        path="/v1/connectors/drive/authorizations",
+        method="POST",
+        operation_id=OP_DRIVE_AUTHORIZE,
+        capability=Capability.DRIVE_CONNECTOR,
+        request_model=DriveAuthorizationRequest,
+        response_model=DriveAuthorizationResponse,
+        requires_contract_version=True,
+        summary="Begin a Google Drive authorization for a caller-owned redirect.",
+    ),
+    RouteSpec(
+        path="/v1/connectors/drive/authorizations/{state}",
+        method="POST",
+        operation_id=OP_DRIVE_AUTHORIZE_COMPLETE,
+        capability=Capability.DRIVE_CONNECTOR,
+        request_model=DriveAuthorizationExchangeRequest,
+        response_model=DriveConnectorStatusResponse,
+        requires_contract_version=True,
+        summary="Complete a Google Drive authorization with the relayed code.",
     ),
     RouteSpec(
         path="/v1/connectors/drive",

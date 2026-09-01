@@ -674,9 +674,15 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
             "reach this tool's caller. What remains to know: existence "
             "probing *within* Inbound/ still works, which is the tool's "
             "job rather than a leak; and the decline is counted on "
-            "ScanSummary.files_skipped_symlink and rendered into "
-            "report_markdown, but is not yet a typed key on the "
-            "statistics object returned here (#1292)."
+            "ScanSummary.files_skipped_symlink, rendered into "
+            "report_markdown when non-zero, and published as the typed "
+            "files_skipped_symlink key on the statistics object returned "
+            "here, unconditionally, since contract 0.12.0 (#1292). That "
+            "count is a bare integer naming no path, no filename and no "
+            "target, and it never reaches a refusal: an out-of-scope "
+            "caller gets the canonical four keys and no statistics block "
+            "at all, so the counter cannot become a skip-count oracle "
+            "over a subtree they were refused."
         ),
         gate_module="creek_mcp.tools.redact",
         gate_symbol="_refuse_outside_scan_scope",

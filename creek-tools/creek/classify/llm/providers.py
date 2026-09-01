@@ -1346,6 +1346,8 @@ def _extract_openai_usage(response: object) -> dict[str, int] | None:
     Returns:
         A dict with ``input_tokens`` / ``output_tokens`` mirroring the
         Anthropic usage shape, or ``None`` when the SDK omitted usage.
+        Non-integer or missing fields are skipped so a partial usage object
+        never raises.
     """
     usage = getattr(response, "usage", None)
     if usage is None:
@@ -1604,6 +1606,8 @@ def _extract_gemini_usage(response: object) -> dict[str, int] | None:
     Returns:
         A dict with ``input_tokens`` / ``output_tokens`` mirroring the other
         providers' usage shape, or ``None`` when the SDK omitted usage.
+        Non-integer or missing fields are skipped so a partial usage object
+        never raises.
     """
     usage = getattr(response, "usage_metadata", None)
     if usage is None:

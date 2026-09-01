@@ -9,6 +9,43 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+### Added
+
+- **`creek.redact.scan` publishes the escaping-symlink skip count (#1292).**
+  The tool's `statistics` object gains a fifth typed key,
+  `files_skipped_symlink`: the number of symlinked children the scan declined
+  unopened because their target resolves outside the scanned root. #1087 added
+  that counter to `ScanSummary` and taught two of the three surfaces that
+  render a scan about it — `generate_markdown_summary` and the `creek redact`
+  stats table — and missed the third. A consumer was therefore told how many
+  files were skipped as binary and by extension and never how many were
+  declined for pointing out of the subtree, which is the one skip reason that
+  means something tried to aim the scan somewhere it was not pointed.
+
+  **The wire key is unconditional; the markdown row stays conditional on being
+  non-zero.** That asymmetry is deliberate: a report line that fires on every
+  scan is noise for a human reader, while a typed field whose presence varies
+  is a second contract for a machine one.
+
+  A tool's return shape moved, so the contract minor moves with it: **`0.11.0`
+  → `0.12.0`**. No `/v1` route, capability, wire model, error code or status
+  moves, so `SUPPORTED_CONTRACT_MINORS` **widens** rather than shifting and a
+  `0.11` client keeps being served byte-identically on every route it calls.
+  Nothing new is disclosed — the counter is a bare integer naming no path, no
+  filename and no target; the identical count already reached the identical
+  audience through `report_markdown`; and a refusal still carries the canonical
+  four keys with no `statistics` block at all.
+
+  The same change adds the guard #1087 lacked: `tests/test_mcp_redact.py`
+  now holds a *census* mapping every non-`matches` field of `ScanSummary` to
+  `published` or `withheld`, asserted total over the dataclass, so a future
+  counter cannot reach — or fail to reach — a consumer without somebody
+  recording which it is. `tests/test_adepthood_contract_models.py` gains
+  `test_every_minor_below_the_current_one_is_still_served`, which derives the
+  whole served range from the running minor instead of restating it by hand;
+  the two hand-typed guards beside it had between them stopped covering `0.7`
+  four bumps ago.
+
 ### Fixed
 
 - **`redact --apply` no longer rewrites the vault it walks when `--vault` is

@@ -20,8 +20,61 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.10.0"
+CONTRACT_VERSION: Final[str] = "0.12.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.12.0 (#1292): ``creek.redact.scan``'s ``statistics`` object gains a fifth
+typed key, ``files_skipped_symlink`` — the count of symlinked children the
+scan declined unopened because their target resolves outside the scanned
+root. The counter has existed on ``ScanSummary`` since #1087 and has been
+rendered into ``report_markdown`` ever since; it simply never reached the
+wire, so a consumer was told how many files were skipped as binary and by
+extension and never how many were declined for pointing out of the subtree.
+A tool's return shape moved, so the minor moves: it cannot be a patch,
+because a client validating the payload closed meets a key it never
+negotiated. **No ``/v1`` route, capability, wire model, error code or status
+moves**, so this is a pure MCP-surface bump of the 0.3/0.4/0.6/0.7 kind and
+:data:`creek_mcp.api.models.SUPPORTED_CONTRACT_MINORS` widens to keep
+``0.11`` served. The key is **unconditional** on the wire — it renders at
+zero — while the markdown row stays conditional on being non-zero, which is
+deliberate: a report line that fires on every scan is noise, while a typed
+field whose presence varies is a second contract. Nothing new is disclosed:
+the counter is a bare integer carrying no path, filename, target name or PII
+type; the identical count already reached the identical audience through
+``report_markdown``; and a refusal still carries the canonical four keys
+with no ``statistics`` block at all, so it cannot become a skip-count oracle
+over a subtree the caller was refused.
+
+0.11.0 (#1568): two more routes under the **existing** ``drive-connector``
+capability — ``POST /v1/connectors/drive/authorizations`` and ``POST
+/v1/connectors/drive/authorizations/{state}``. The minor moves because the
+route set widened; the capability list does not, because a consumer cannot
+usefully negotiate "may I sync" apart from "may I connect", and a server
+advertising sync-without-connect would be advertising half a connector.
+
+**What it closes.** The last unmet clause of the seeding epic (#1523).
+``/v1`` could sync Drive and disconnect it and could not *connect* it: the
+first authorisation was ``creek gdrive --download`` on the host, whose
+``InstalledAppFlow.run_local_server(port=0)`` opens a browser on the server.
+With these two routes a user connects Drive over the network, with no CLI and
+no shell access on the vault host.
+
+**How, and why it is shaped that way.** ADR-0012 option C: Creek holds the
+Google **web** client secret and mints the authorization URL; the *caller* owns
+the redirect URI and the browser leg; the authorization code comes back over
+the caller's existing bearer. The alternative — a callback endpoint on this
+server — would need the first anonymous path
+:class:`creek_mcp.httpapi.auth.BearerAuthMiddleware` has ever had, because a
+Google redirect is a browser navigation carrying no ``Authorization`` header.
+Option C needs no such exemption, no public hostname and no TLS this server
+controls.
+
+**Three wire models ride along** (``DriveAuthorizationRequest``,
+``DriveAuthorizationResponse``, ``DriveAuthorizationExchangeRequest``) and **no
+new error code**: an unknown, expired, consumed or Google-refused
+authorization is the published ``unavailable``, all four identical, because
+telling them apart would describe which authorizations this server has
+outstanding.
 
 0.10.0 (#1570): a seventh capability, ``pipeline``, served by two routes —
 ``POST /v1/classifications`` and ``POST /v1/links``. Additive in exactly the

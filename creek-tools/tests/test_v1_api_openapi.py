@@ -82,6 +82,8 @@ from tests.v1_api_support import (
     CAPABILITIES_PATH,
     CLASSIFICATIONS_PATH,
     CONTRACT_VERSION_HEADER,
+    DRIVE_AUTHORIZATION_PATH,
+    DRIVE_AUTHORIZATION_TEMPLATE,
     DRIVE_CONNECTOR_PATH,
     DRIVE_SYNC_PATH,
     HEALTH_PATH,
@@ -413,9 +415,9 @@ def test_documented_paths_equal_the_mounted_routes(vault: Path) -> None:
 
 
 def test_every_published_route_is_documented() -> None:
-    """All ten paths appear, named explicitly so a silent drop is visible.
+    """All twelve paths appear, named explicitly so a silent drop is visible.
 
-    Ten paths over eleven operations since #1570: ``/v1/connectors/drive``
+    Twelve paths over thirteen operations since #1568: ``/v1/connectors/drive``
     serves both ``GET`` and ``DELETE``, which is why this is a set of paths
     while ``test_documented_routes_are_the_mounted_ones`` above compares
     ``(method, path)`` pairs.
@@ -428,6 +430,8 @@ def test_every_published_route_is_documented() -> None:
         UPLOAD_PATH,
         DRIVE_CONNECTOR_PATH,
         DRIVE_SYNC_PATH,
+        DRIVE_AUTHORIZATION_PATH,
+        DRIVE_AUTHORIZATION_TEMPLATE,
         CLASSIFICATIONS_PATH,
         LINKS_PATH,
         HEALTH_PATH,

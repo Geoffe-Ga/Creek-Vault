@@ -53,6 +53,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from typing import Final, Literal, Self
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -78,6 +79,8 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.11",
+    "0.10",
     "0.9",
     "0.8",
     "0.7",
@@ -149,6 +152,17 @@ outright, not ignore. So the fields are gated on the declared minor via
 shape, byte-for-byte, whether or not a neighbour qualified. ``0.8`` is retained
 for the same reason ``0.4`` was retained at 0.5 — refusing it outright is
 strictly worse — but retention alone was not enough here.
+
+Contract 0.12 (#1292) is a pure MCP-surface move again, of the 0.3/0.4/0.6/0.7
+kind and the plainest one in the list. ``creek.redact.scan``'s ``statistics``
+object gains a fifth typed key, ``files_skipped_symlink``, the count of
+symlinked children the scan declined because their target resolves outside the
+scanned root — a counter that has been on ``ScanSummary`` and in
+``report_markdown`` since #1087 and never reached the wire. No ``/v1`` route,
+capability, wire model, error code or status moves and ``CONTRACT_MODELS`` is
+unchanged, so a ``0.11`` client is answered byte-identically on every ``/v1``
+route it calls and there is nothing for it to be refused over. ``0.11`` is
+therefore retained here.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
@@ -769,6 +783,31 @@ wire from a caller who discovers that "filename" is an unbounded free-text
 field nobody reads.
 """
 
+_MAX_REDIRECT_URI_CHARS: Final[int] = 2048
+"""Inclusive upper bound on a Drive-authorization ``redirect_uri`` (#1568).
+
+The de-facto URL ceiling every browser and proxy already enforces. Like
+:data:`MAX_FILENAME_CHARS` it is not protecting a downstream call — the URI is
+parsed, never dereferenced by this server — it is protecting the audit log and
+the store from an unbounded caller-supplied string.
+"""
+
+_MAX_AUTHORIZATION_CODE_CHARS: Final[int] = 2048
+"""Inclusive upper bound on a relayed OAuth authorization code (#1568).
+
+Google's codes are a few hundred characters. The bound exists so a caller
+cannot use the exchange body as an unbounded write channel into a request this
+server has to buffer and log around.
+"""
+
+_REDIRECT_URI_SCHEME: Final[str] = "https"
+"""The only redirect scheme a Drive authorization may be issued for.
+
+Not a preference. The authorization code travels back to the caller over this
+URI, and that code plus the client secret this host holds is a Drive
+credential; over plain ``http`` it would cross the network in the clear.
+"""
+
 
 # --------------------------------------------------------------------------
 # Models
@@ -1292,6 +1331,111 @@ class DriveDisconnectResponse(_WireModel):
     tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
     connection: DriveConnectionState = Field(description="State after the call.")
     remote_revoked: bool = Field(description="Google confirmed the revocation.")
+
+
+class DriveAuthorizationRequest(_WireModel):
+    """Begin a Drive authorization for a redirect URI the *caller* owns (#1568).
+
+    The one field is the whole of ADR-0012's option C. Creek mints the
+    authorization URL and holds the client secret; the caller owns the public
+    address Google redirects the user's browser to, and relays the resulting
+    code back over the bearer credential it already holds. That is why there is
+    no callback route on this server, and therefore no anonymous path through
+    :class:`~creek_mcp.httpapi.auth.BearerAuthMiddleware`.
+
+    Attributes:
+        redirect_uri: The caller's own redirect URI. Absolute, ``https``, and
+            fragment-free — validated here rather than left to Google, because
+            a plain-``http`` redirect would carry the authorization code in the
+            clear and RFC 6749 §3.1.2 forbids the fragment outright. Never a
+            URI on this server.
+    """
+
+    redirect_uri: str = Field(
+        min_length=1,
+        max_length=_MAX_REDIRECT_URI_CHARS,
+        description="Caller-owned absolute https redirect URI, no fragment.",
+    )
+
+    @field_validator("redirect_uri")
+    @classmethod
+    def _validate_redirect_uri(cls, value: str) -> str:
+        """Reject any redirect URI the grant cannot be issued for.
+
+        Args:
+            value: The submitted URI.
+
+        Returns:
+            The URI, unchanged.
+
+        Raises:
+            ValueError: When the URI is relative, not ``https``, or carries a
+                fragment. The message names the requirement and never echoes
+                the value, which is caller-supplied text — a validation error
+                is rendered into a ``422`` a remote caller reads.
+        """
+        parsed = urlparse(value)
+        if parsed.scheme != _REDIRECT_URI_SCHEME:
+            msg = "redirect_uri must be an absolute https URI"
+            raise ValueError(msg)
+        if not parsed.netloc:
+            msg = "redirect_uri must name a host"
+            raise ValueError(msg)
+        if parsed.fragment:
+            msg = "redirect_uri must not carry a fragment"
+            raise ValueError(msg)
+        return value
+
+
+class DriveAuthorizationResponse(_WireModel):
+    """The URL to send a user to, and the state binding the code (#1568).
+
+    **Carries no secret.** The client secret stays on this host; the
+    authorization URL is a public value by construction — it is what a browser
+    address bar shows — and ``state`` is a server-minted nonce that is useless
+    without an authorization code.
+
+    Attributes:
+        status: Always ``"ok"``. A refusal is an :class:`ErrorEnvelope`.
+        tier_ceiling: The ceiling the call ran at, echoed for correlation.
+        authorization_url: Where the caller sends its user. Built by
+            ``google_auth_oauthlib`` from this deployment's client description
+            and the config's read-only scope list, re-validated by
+            :func:`creek_mcp.tools.drive_grant._readonly_scopes` on the way out
+            so a remote connect button cannot widen the grant.
+        state: The single-use, expiring value the eventual code must be
+            presented under. It binds a relayed code to an authorization *this*
+            server issued; it is not a CSRF token, because Creek never sees the
+            browser.
+    """
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    authorization_url: str = Field(description="Where to send the user's browser.")
+    state: str = Field(description="Single-use value the code must be relayed under.")
+
+
+class DriveAuthorizationExchangeRequest(_WireModel):
+    """The authorization code, relayed back to Creek (#1568).
+
+    **One field, and the absence of the second is deliberate.** The
+    ``redirect_uri`` is *not* re-supplied here: it is read from the record the
+    ``state`` was issued under. A caller able to vary it between the two legs
+    could complete an authorization against an address the first leg never
+    named, which is exactly what binding the code to a stored authorization
+    exists to prevent.
+
+    Attributes:
+        code: Google's authorization code, as the caller's redirect handler
+            received it. Single-use and short-lived at Google's end too; it is
+            worthless without the client secret this server holds.
+    """
+
+    code: str = Field(
+        min_length=1,
+        max_length=_MAX_AUTHORIZATION_CODE_CHARS,
+        description="The authorization code Google handed the caller.",
+    )
 
 
 class ClassificationMethod(StrEnum):
@@ -1891,6 +2035,9 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "CareSignal": CareSignal,
     "ClassificationRequest": ClassificationRequest,
     "ClassificationResponse": ClassificationResponse,
+    "DriveAuthorizationExchangeRequest": DriveAuthorizationExchangeRequest,
+    "DriveAuthorizationRequest": DriveAuthorizationRequest,
+    "DriveAuthorizationResponse": DriveAuthorizationResponse,
     "DriveConnectorStatusResponse": DriveConnectorStatusResponse,
     "DriveDisconnectResponse": DriveDisconnectResponse,
     "DriveSyncResponse": DriveSyncResponse,

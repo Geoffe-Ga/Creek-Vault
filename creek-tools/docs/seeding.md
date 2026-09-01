@@ -81,7 +81,7 @@ Here is every source, its shape, and how to seed it:
 | Claude history | Export archive | `creek ingest --type claude` on the **unpacked** folder | `POST /v1/uploads` with the `.zip` |
 | Discord history | Export archive | `creek ingest --type discord` on the **unpacked** folder | `POST /v1/uploads` with the `.zip` |
 | Substack archive | Export archive | `creek ingest --type substack` on the **unpacked** folder | `POST /v1/uploads` with the `.zip` |
-| Google Drive | OAuth connector | `creek gdrive --download`, then ingest the staging folder | Status / sync / disconnect only — **you cannot finish connecting over the network yet ([#1568](https://github.com/Geoffe-Ga/Creek-Vault/issues/1568))** |
+| Google Drive | OAuth connector | `creek gdrive --download`, then ingest the staging folder | Connect, status, sync and disconnect — the full connector, since [#1568](https://github.com/Geoffe-Ga/Creek-Vault/issues/1568). **Requires a Google *web* client** in `credentials.json` |
 
 These are the eleven `--type` values `creek ingest` accepts. There is no
 twelfth, and there is no `--type gdrive`:
@@ -336,7 +336,7 @@ here:
 ## Seeding over the network
 
 The `/v1` API is how an application seeds a vault it does not share a
-filesystem with. It publishes exactly eleven routes:
+filesystem with. It publishes exactly thirteen routes:
 
 <!-- capability-set: v1-routes -->
 
@@ -349,6 +349,8 @@ filesystem with. It publishes exactly eleven routes:
 | `POST` | `/v1/uploads` |
 | `GET` | `/v1/connectors/drive` |
 | `POST` | `/v1/connectors/drive/syncs` |
+| `POST` | `/v1/connectors/drive/authorizations` |
+| `POST` | `/v1/connectors/drive/authorizations/{state}` |
 | `DELETE` | `/v1/connectors/drive` |
 | `POST` | `/v1/classifications` |
 | `POST` | `/v1/links` |
@@ -356,7 +358,7 @@ filesystem with. It publishes exactly eleven routes:
 
 <!-- /capability-set -->
 
-Two of those eleven were observed writing a fragment into `01-Fragments/`
+Two of those thirteen were observed writing a fragment into `01-Fragments/`
 here — `POST /v1/uploads` and `PUT /v1/journal-entries/{external_id}`:
 
 ```console
@@ -637,19 +639,48 @@ DELETE /v1/connectors/drive      200 {"status":"ok","connection":"not_connected"
                                       "remote_revoked":false}
 ```
 
-**A user cannot complete a Drive connection over the network today.** There
-is no route that begins the OAuth grant — the first authorisation is still
-`creek gdrive --download` on the host machine, because the installed-app
-loopback flow needs a browser on the machine holding the client secret. That
-is tracked as
-[#1568](https://github.com/Geoffe-Ga/Creek-Vault/issues/1568) and was
-deliberately cut from #1527, not overlooked. Until it lands, `sync` against a
-disconnected connector refuses (the `503` above); the remedy is a CLI command
-the wire message does not name.
+**A user can now complete a Drive connection over the network** ([#1568](https://github.com/Geoffe-Ga/Creek-Vault/issues/1568),
+[ADR-0012](./architecture/ADR/0012-remote-google-drive-authorisation.md)).
+Two more routes close what #1527 deliberately left open, and they are the
+reason the `503` above is no longer a dead end:
 
-Anything about Drive beyond those three responses — a real grant, a token
-exchange, an actual sync that ingests files — is
-[not verified here](#what-was-not-verified-here).
+```console
+POST /v1/connectors/drive/authorizations
+  {"redirect_uri": "https://your-app.example/drive/return"}
+  200 {"status":"ok","authorization_url":"https://accounts.google.com/o/oauth2/auth?...",
+       "state":"<opaque, single-use, expires in 15 minutes>"}
+
+POST /v1/connectors/drive/authorizations/<state>
+  {"code": "<the code Google handed your redirect handler>"}
+  200 {"status":"ok","connection":"connected",
+       "scopes":["https://www.googleapis.com/auth/drive.readonly"],
+       "can_sync":true}
+```
+
+**The redirect URI is yours, not Creek's.** Creek mints the authorization URL
+and holds the client secret; your application owns the public address Google
+sends the user's browser back to, and relays the resulting `code` to Creek over
+the bearer token it already holds. That is why there is no callback endpoint on
+this server: `/v1` has no anonymous path — every route, `/v1/health` and `/`
+included, answers `401` without a bearer — and a Google redirect is a browser
+navigation carrying no `Authorization` header. Keeping the redirect at the
+caller means no exemption had to be carved into that gate.
+
+**Two deployment requirements.** `credentials.json` must be a Google **web**
+client (an installed-app client cannot complete a redirect-based exchange), and
+that file is now a genuinely confidential secret rather than the
+non-confidential one an installed-app client ships with — keep it owner-only
+and outside the vault. The CLI path, `creek gdrive --download`, is unchanged and
+still works either way.
+
+A `state` is single-use and expires. An unknown, replayed, expired or
+Google-refused authorization all answer the same `503 unavailable`, with
+byte-identical bodies but for the correlation id: telling them apart would
+describe which authorizations the server has outstanding. Neither route reads
+the token file, so neither refusal reveals whether a credential already exists.
+
+A real grant against live Google credentials, and an actual sync that ingests
+files, remain [not verified here](#what-was-not-verified-here).
 
 ## Four traps that silently cost you fragments
 
@@ -866,8 +897,8 @@ not mistake silence for a working feature.
 
 | Not verified | Why | Tracking |
 |--------------|-----|----------|
-| A real Google Drive OAuth grant, token exchange, or successful sync | No client secret and no browser; `creek gdrive --check` reported credentials `MISSING`. `POST /v1/connectors/drive/syncs` could only be observed refusing. | [#1568](https://github.com/Geoffe-Ga/Creek-Vault/issues/1568) |
-| Whether a connected Drive sync ingests anything | Its success path is unreachable without live credentials. | [#1568](https://github.com/Geoffe-Ga/Creek-Vault/issues/1568) |
+| A real Google Drive OAuth grant against live Google credentials | No web client secret and no browser; `creek gdrive --check` reported credentials `MISSING`. The two authorization routes are exercised end-to-end in `tests/test_v1_api_drive_authorisation.py` — the URL leg against the real `google_auth_oauthlib`, the token exchange against a substituted flow — but no code was ever presented to Google. | — |
+| Whether a connected Drive sync ingests anything | Its success path is unreachable without live credentials. | — |
 | LLM classification (`creek classify --method llm`) moving a fragment out of `unclassified` | No API key and no cloud consent were set. Every tier reported above is the tier **ingest itself** wrote. | — |
 | Real `.pdf` and `.xlsx` documents | `.md`, `.txt`, `.csv`, `.py`, `.html`, `.rtf`, `.docx`, `.pptx`, `.json` and a `.zip` were all run. `.pdf` and `.xlsx` were not: no PDF library is installed in this environment (`pypdf`, `pdfplumber` and `pdfminer` all fail to import), so those two rows are enumerated from the routing table, not run. | — |
 | Real OCR text extraction | `creek ingest --type image` over a real PNG fails here: *"The `tesseract` system binary was not found on PATH. The pytesseract Python package is a thin wrapper that shells out to it, so OCR cannot run without it."* The `platform: image_ocr` stamp and the low-confidence `review: pending_review` marker **were** executed, by injecting a stub `OcrEngine` (the documented extension point); the text extraction itself was not. | — |

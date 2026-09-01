@@ -25,6 +25,7 @@ attestation material is hardcoded.
 
 from __future__ import annotations
 
+from typing import Final
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -35,6 +36,7 @@ from creek.classify.llm.base import LLMProvider
 from creek.classify.llm.completion import Completion
 from creek.classify.llm.providers import (
     DEFAULT_MODELS,
+    EnclaveAttestationError,
     EnclaveProvider,
     _attestation_signed_payload,
     build_provider,
@@ -49,6 +51,9 @@ from creek.models import PrivacyTier
 _ENCLAVE_URL = "https://enclave.internal:8443"
 _MEASUREMENT = "sha384:attested-measurement-abc123"  # test literal, not real
 _PATCH_TARGET = "creek.classify.llm.providers.httpx.Client"
+
+_UNSET: Final[object] = object()
+"""Sentinel: serve the builder's well-formed default JSON body."""
 
 # The genuine enclave's attestation keypair; its public half is the trust root.
 _TRUSTED_KEY = Ed25519PrivateKey.generate()
@@ -80,6 +85,8 @@ def _patched_client(
     attest_error: Exception | None = None,
     gen_text: str = "grounded voice output",
     gen_error: Exception | None = None,
+    quote_json: object = _UNSET,
+    gen_json: object = _UNSET,
 ) -> tuple[MagicMock, MagicMock]:
     """Return a patched ``httpx.Client`` class and the shared request ctx mock.
 
@@ -89,6 +96,10 @@ def _patched_client(
     ``tamper_nonce`` makes the enclave echo a stale nonce (replay). ``.post``
     serves the generate response, so a test can assert ``ctx.post`` was never
     called when attestation refuses.
+
+    ``quote_json`` and ``gen_json`` replace the decoded JSON body of the
+    attestation and generate responses respectively, for the malformed-envelope
+    cases; left at ``_UNSET`` the well-formed bodies above are served unchanged.
     """
     key = sign_key or _TRUSTED_KEY
     ctx = MagicMock()
@@ -104,11 +115,15 @@ def _patched_client(
             echoed = "stale-nonce-deadbeef" if tamper_nonce else sent
             signature = key.sign(_attestation_signed_payload(measurement, echoed)).hex()
             resp = MagicMock(status_code=200)
-            resp.json.return_value = {
-                "measurement": measurement,
-                "nonce": echoed,
-                "signature": signature,
-            }
+            resp.json.return_value = (
+                {
+                    "measurement": measurement,
+                    "nonce": echoed,
+                    "signature": signature,
+                }
+                if quote_json is _UNSET
+                else quote_json
+            )
             resp.raise_for_status.return_value = None
             return resp
 
@@ -118,7 +133,9 @@ def _patched_client(
         ctx.post.side_effect = gen_error
     else:
         gen = MagicMock(status_code=200)
-        gen.json.return_value = {"response": gen_text}
+        gen.json.return_value = (
+            {"response": gen_text} if gen_json is _UNSET else gen_json
+        )
         gen.raise_for_status.return_value = None
         ctx.post.return_value = gen
 
@@ -351,3 +368,74 @@ def test_enclave_can_be_local_default_rescue_for_intimate() -> None:
         )
     )
     assert router.resolve("generation", PrivacyTier.INTIMATE).provider == "enclave"
+
+
+# --------------------------------------------------------------------------- #
+# Degenerate enclave envelopes: attestation shape + generate payload (#1449)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [[], ["not", "an", "object"], "a bare string", 42, 3.5, True],
+    ids=["empty-list", "list", "string", "int", "float", "bool"],
+)
+def test_a_non_object_attestation_quote_refuses_and_sends_no_prompt(
+    quote: object,
+) -> None:
+    """A quote that is not a JSON object refuses — no prompt egress.
+
+    The message is asserted with ``==`` against the literal so the FULL refusal
+    text is pinned — a later widening of the message cannot slip past. What
+    pins this to the non-dict arm specifically (rather than the sibling
+    ``from exc`` transport arm, which emits an identical string) is the
+    fixture: ``raise_for_status`` returns ``None``, so no ``httpx.HTTPError``
+    is reachable here.
+    """
+    client_cls, ctx = _patched_client(quote_json=quote)
+    with (
+        patch(_PATCH_TARGET, client_cls),
+        pytest.raises(EnclaveAttestationError) as exc,
+    ):
+        build_provider(_config()).complete("intimate journal entry")
+    assert str(exc.value) == (
+        "enclave attestation could not be verified; refusing to send data"
+    )
+    ctx.post.assert_not_called()
+
+
+def test_max_tokens_and_system_are_forwarded_in_the_generate_body() -> None:
+    """Optional ``max_tokens`` / ``system`` land as keys in the posted payload."""
+    client_cls, ctx = _patched_client()
+    with patch(_PATCH_TARGET, client_cls):
+        build_provider(_config()).complete("p", max_tokens=256, system="be terse")
+    body = ctx.post.call_args.kwargs["json"]
+    assert body["max_tokens"] == 256
+    assert body["system"] == "be terse"
+
+
+def test_omitted_options_leave_the_generate_body_minimal() -> None:
+    """Neither optional key appears when the caller omits both.
+
+    A regression guard, not a newly-closed branch: the false arms of the two
+    ``is not None`` guards are already covered by the ten existing
+    ``.complete()`` call sites in this module.
+    """
+    client_cls, ctx = _patched_client()
+    with patch(_PATCH_TARGET, client_cls):
+        build_provider(_config()).complete("p")
+    body = ctx.post.call_args.kwargs["json"]
+    assert set(body) == {"model", "prompt", "stream"}
+
+
+def test_a_generate_body_without_a_response_key_yields_empty_text() -> None:
+    """A generate body missing ``"response"`` degrades to "" — never a KeyError.
+
+    This arm is a ``dict.get`` default, so it carries **no branch** and no
+    coverage percentage will ever flag it as missing.
+    """
+    client_cls, _ = _patched_client(gen_json={"unexpected": "shape"})
+    with patch(_PATCH_TARGET, client_cls):
+        result = build_provider(_config()).complete("draft this")
+    assert isinstance(result, Completion)
+    assert result.text == ""
