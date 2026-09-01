@@ -43,9 +43,13 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import keyword
+import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 class CitationError(RuntimeError):
@@ -248,6 +252,297 @@ def extract_citations(line: str) -> list[tuple[str, str, str]]:
     return [(path, str(name), lines) for name in symbols]
 
 
+# --- Reading citations back out of a FILED issue body (issue #1700) --------
+#
+# `extract_citations` above reads what a producer is ABOUT to file. These
+# read what it actually DID file, so the backstop in `_claude-scan.yml`
+# never has to ask the agent whether it verified itself.
+
+_SOURCE_SUFFIXES = (
+    ".py",
+    ".pyi",
+    ".sh",
+    ".yml",
+    ".yaml",
+    ".toml",
+    ".cfg",
+    ".ini",
+    ".json",
+    ".md",
+    ".txt",
+)
+"""Extensions a backticked span must carry to be read as a file path."""
+
+_EXTENSION_SEGMENTS = frozenset(suffix.lstrip(".") for suffix in _SOURCE_SUFFIXES)
+"""The same extensions as bare dotted segments, for the bare-file-name rule."""
+
+_RANGE_RE = re.compile(r"^:(\d+(?:-\d+)?)$")
+"""A standalone line span, e.g. ``:133-134`` -- never an identifier."""
+
+_TRAILING_RANGE_RE = re.compile(r":(\d+(?:-\d+)?)$")
+"""The ``:120-164`` suffix a path span may carry."""
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
+"""A bare or dotted Python identifier."""
+
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+"""A recorded scan SHA. The floor is 7, not 40: #869 records ``82f9b89``."""
+
+_NOT_SYMBOLS = frozenset(keyword.kwlist) | {"None", "True", "False"}
+"""Identifier-shaped spans that are never a citation."""
+
+
+def _context_block(body: str) -> str:
+    """Return the ``## Context`` section of an issue body.
+
+    Args:
+        body: The full issue body.
+
+    Returns:
+        Every line between the ``## Context`` heading and the next ``## ``
+        heading; empty when the body has no Context section.
+    """
+    collected: list[str] = []
+    inside = False
+    for line in body.splitlines():
+        if line.startswith("## "):
+            if inside:
+                break
+            inside = line.strip() == "## Context"
+            continue
+        if inside:
+            collected.append(line)
+    return "\n".join(collected)
+
+
+def _bullet_block(context: str, label: str) -> str:
+    """Return the ``- <label>:`` bullet plus its continuation lines.
+
+    A scan issue wraps a long citation bullet across several indented
+    lines (#1449 spans four), so a single-line read would drop most of
+    the citations. Collection stops at the next top-level ``- ``, the
+    next heading, or a blank line.
+
+    Args:
+        context: The ``## Context`` section.
+        label: The bullet label, e.g. ``File(s)`` or ``Symbol(s)``.
+
+    Returns:
+        The bullet text, or the empty string when absent.
+    """
+    prefix = f"- {label}:"
+    collected: list[str] = []
+    for line in context.splitlines():
+        if not collected:
+            if line.startswith(prefix):
+                collected.append(line)
+            continue
+        if line.startswith(("- ", "#")) or not line.strip():
+            break
+        collected.append(line)
+    return "\n".join(collected)
+
+
+def _backtick_spans(text: str) -> list[str]:
+    """Return the contents of every backticked span, in order.
+
+    Only backticked text is ever read as a path, range or symbol. That is
+    the anti-false-positive rule: #1449's bullet names ``enclave payload
+    options`` in bare prose beside real backticked names, and inventing a
+    citation from prose is the very failure this module exists to refuse.
+
+    Args:
+        text: Any markdown fragment.
+
+    Returns:
+        The span contents, stripped, in source order.
+    """
+    return [span.strip() for span in re.findall(r"`([^`]*)`", text)]
+
+
+def _split_path_range(span: str) -> tuple[str, str]:
+    """Split a trailing ``:<lines>`` off a path span.
+
+    Args:
+        span: A backticked span, e.g. ``a/b.py:120-164``.
+
+    Returns:
+        ``(path, lines)``; ``lines`` is empty when the span carries none.
+    """
+    match = _TRAILING_RANGE_RE.search(span)
+    if match:
+        return span[: match.start()], match.group(1)
+    return span, ""
+
+
+def _classify_span(span: str, current_file: str) -> tuple[str, str]:
+    """Classify one backticked span against the file in force.
+
+    Symbol recognition is **gated on the current file being Python**. A
+    ``.yml`` blob reaching the ast resolver raises
+    :class:`CitationError`, which ``verify-scan-citations.sh`` counts as
+    a phantom -- so an ungated parser would redden a run for a citation
+    that was correct.
+
+    A span shaped like a **bare file name** -- ``README.md``,
+    ``conftest.py`` -- is identifier-shaped and carries no directory, so
+    it satisfies neither the path rule nor any useful reading. It returns
+    ``PATH`` with an **empty** value, which clears the file in force.
+    Both alternatives manufacture a citation the issue never made:
+    reading it as a symbol sends ``verify_symbol`` hunting for a
+    definition named ``md`` (it strips to the last dotted segment), which
+    exists nowhere, so a correct issue is reported as citing a phantom
+    and gets an automated correction comment; and leaving the previous
+    path in force would attribute every later name in the same bullet to
+    a file the issue may not have meant. The cost is a real dotted
+    citation whose last segment collides with an extension --
+    ``Response.json`` -- going unchecked. That is the right side to err
+    on: a missed check is silent, an invented one is a red run against
+    correct work.
+
+    Args:
+        span: The span contents.
+        current_file: The path in force for this bullet, if any.
+
+    Returns:
+        ``(kind, value)`` where kind is ``PATH``, ``RANGE``, ``SYMBOL``
+        or ``IGNORE``. A ``PATH`` value is the span verbatim, still
+        carrying any trailing range -- or empty, for an unresolvable
+        file reference.
+    """
+    if not span:
+        return ("IGNORE", "")
+    span_range = _RANGE_RE.match(span)
+    if span_range:
+        return ("RANGE", span_range.group(1))
+    path, _ = _split_path_range(span)
+    if "." in path and path.rsplit(".", 1)[-1] in _EXTENSION_SEGMENTS:
+        return ("PATH", span if "/" in path else "")
+    if not current_file.endswith(".py"):
+        return ("IGNORE", "")
+    if _IDENTIFIER_RE.match(span) and span not in _NOT_SYMBOLS:
+        return ("SYMBOL", span)
+    return ("IGNORE", "")
+
+
+@dataclass
+class _BlockState:
+    """The path and default line range carried across a bullet's clauses.
+
+    Attributes:
+        file: The repository-relative path in force.
+        lines: The range the path itself declared, used when a clause
+            names a symbol but no range of its own.
+    """
+
+    file: str = ""
+    lines: str = ""
+
+
+def _citations_from_block(block: str, state: _BlockState) -> list[tuple[str, str, str]]:
+    """Extract ``(file, symbol, lines)`` triples from one citation bullet.
+
+    The bullet is split on commas into clauses; ``state`` carries the
+    path across them. A clause's range attaches to that clause's symbols
+    **regardless of order** -- #993 writes ``:266-277`` before
+    ``iter_entries`` and #1447 writes the range after the name -- falling
+    back to the range the path itself declared.
+
+    Args:
+        block: The bullet text, continuation lines included.
+        state: Mutated in place as the bullet names paths.
+
+    Returns:
+        One triple per symbol named, in source order.
+    """
+    citations: list[tuple[str, str, str]] = []
+    for clause in block.split(","):
+        symbols: list[str] = []
+        clause_lines = ""
+        for span in _backtick_spans(clause):
+            kind, value = _classify_span(span, state.file)
+            if kind == "PATH":
+                state.file, state.lines = _split_path_range(value)
+            elif kind == "RANGE":
+                clause_lines = value
+            elif kind == "SYMBOL":
+                symbols.append(value)
+        lines = clause_lines or state.lines
+        citations.extend((state.file, name, lines) for name in symbols)
+    return citations
+
+
+def _distinct_python_paths(block: str) -> int:
+    """Count the distinct ``.py`` paths a bullet names.
+
+    Args:
+        block: A citation bullet.
+
+    Returns:
+        How many different Python files it cites.
+    """
+    paths = set()
+    for span in _backtick_spans(block):
+        candidate, _ = _split_path_range(span)
+        if "/" in candidate and candidate.endswith(".py"):
+            paths.add(candidate)
+    return len(paths)
+
+
+def citations_from_body(body: str) -> list[tuple[str, str, str]]:
+    """Extract every verifiable citation from a filed scan issue body.
+
+    Two shapes, both live. The template's forward-looking form puts the
+    path on a ``- File(s):`` bullet and the name on a ``- Symbol(s):``
+    bullet (``prompts/templates/scan-issue-body.md``, landed in 8160ed0);
+    every issue filed before that inlines the names in the ``File(s)``
+    bullet itself.
+
+    **When the ``File(s)`` bullet names more than one Python file, the
+    ``Symbol(s)`` identifiers are dropped rather than attached to the
+    first.** Attaching them would manufacture a citation the issue never
+    made, and a manufactured citation is the exact thing this pipeline
+    refuses. The cost is a missed check; the alternative is a false
+    phantom that reddens a correct run.
+
+    Args:
+        body: The full issue body.
+
+    Returns:
+        ``(file, symbol, lines)`` triples; empty when the body cites no
+        symbol, which is legal for a whole-module finding.
+    """
+    context = _context_block(body)
+    files_block = _bullet_block(context, "File(s)")
+    state = _BlockState()
+    citations = _citations_from_block(files_block, state)
+    symbol_block = _bullet_block(context, "Symbol(s)")
+    if symbol_block and _distinct_python_paths(files_block) <= 1:
+        inherited = _BlockState(file=state.file, lines=state.lines)
+        citations.extend(_citations_from_block(symbol_block, inherited))
+    return citations
+
+
+def sha_from_body(body: str) -> str | None:
+    """Return the scan SHA an issue body records for its citations.
+
+    Args:
+        body: The full issue body.
+
+    Returns:
+        The first hex span on the ``- Scanned at commit:`` line, or
+        ``None`` when the body records none -- including a body that
+        still carries the template's ``<SHA>`` placeholder.
+    """
+    for line in body.splitlines():
+        if not line.lstrip().startswith("- Scanned at commit:"):
+            continue
+        for span in _backtick_spans(line):
+            if _SHA_RE.match(span):
+                return span
+    return None
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build the command-line parser.
 
@@ -272,7 +567,141 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Read newline-delimited JSON findings on stdin and print "
         "tab-separated file/symbol/lines triples.",
     )
+    parser.add_argument(
+        "--from-issues",
+        action="store_true",
+        help="Read a `gh issue list --json number,body,createdAt` array on "
+        "stdin and print the citations the filed bodies carry.",
+    )
+    parser.add_argument(
+        "--exclude",
+        default="",
+        help="Issue numbers that existed before the run, comma- or "
+        "space-separated. Everything else is treated as newly filed.",
+    )
+    parser.add_argument(
+        "--created-after",
+        default="",
+        help="ISO-8601 instant; issues created before it are skipped. A "
+        "secondary filter only -- --exclude is the selector.",
+    )
+    parser.add_argument(
+        "--default-sha",
+        default="",
+        help="Scan SHA to use for an issue whose body records none.",
+    )
     return parser
+
+
+def _number_set(raw: str) -> set[int]:
+    """Parse a comma- or space-separated list of issue numbers.
+
+    Args:
+        raw: The ``--exclude`` value; may be empty.
+
+    Returns:
+        The numbers named.
+
+    Raises:
+        ValueError: If any token is not an integer. A malformed baseline
+            must be an error, never a silently empty set -- an empty set
+            makes every pre-existing issue look newly filed.
+    """
+    return {int(token) for token in re.split(r"[,\s]+", raw) if token}
+
+
+def _is_newly_filed(issue: dict[str, Any], excluded: set[int], after: str) -> bool:
+    """Whether this issue was filed by the run under examination.
+
+    Args:
+        issue: One ``gh issue list`` record.
+        excluded: Issue numbers present in the pre-agent snapshot.
+        after: ISO-8601 instant; empty disables the secondary filter.
+
+    Returns:
+        ``True`` when the issue is outside the snapshot and not older
+        than the run.
+    """
+    number = issue.get("number")
+    if number in excluded:
+        return False
+    created = str(issue.get("createdAt") or "")
+    if after and created and created < after:
+        print(
+            f"::notice::issue #{number} was created at {created}, before this "
+            f"run started at {after}; skipping",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _print_issue_citations(issue: dict[str, Any], default_sha: str) -> int:
+    """Print one ``CITATION`` record per symbol the issue body cites.
+
+    Each record's JSON payload is the exact ``{"file","symbol","lines"}``
+    shape :func:`extract_citations` consumes, so the backstop pipes it
+    straight into ``verify-scan-citations.sh`` rather than reimplementing
+    symbol resolution.
+
+    Args:
+        issue: One ``gh issue list`` record.
+        default_sha: Fallback when the body records no scan SHA.
+
+    Returns:
+        How many citation records were printed.
+    """
+    number = issue.get("number")
+    body = str(issue.get("body") or "")
+    sha = sha_from_body(body) or default_sha
+    citations = citations_from_body(body)
+    for path, symbol, lines in citations:
+        payload = json.dumps(
+            {"file": path, "symbol": symbol, "lines": lines}, sort_keys=True
+        )
+        print(f"CITATION\t{number}\t{sha}\t{payload}")
+    return len(citations)
+
+
+def _from_issues_mode(args: argparse.Namespace) -> int:
+    """Turn a ``gh issue list`` payload into citation records.
+
+    Prints ``RETURNED<TAB>n`` (how many issues the listing held, so the
+    caller can detect a truncated page), ``ISSUES<TAB>n`` (how many of
+    them this run filed), then one ``CITATION`` line per symbol.
+
+    Args:
+        args: Parsed arguments carrying exclude, created_after and
+            default_sha.
+
+    Returns:
+        ``0`` on success, ``2`` when stdin or ``--exclude`` is malformed.
+    """
+    try:
+        issues = json.loads(sys.stdin.read())
+        excluded = _number_set(str(args.exclude))
+    except (json.JSONDecodeError, ValueError) as exc:
+        print(f"UNCHECKABLE --from-issues input: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(issues, list) or not all(
+        isinstance(item, dict) for item in issues
+    ):
+        print(
+            "UNCHECKABLE --from-issues input: expected a JSON array of issue "
+            "objects from `gh issue list --json number,body,createdAt`",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"RETURNED\t{len(issues)}")
+    selected = [
+        issue
+        for issue in issues
+        if _is_newly_filed(issue, excluded, str(args.created_after))
+    ]
+    print(f"ISSUES\t{len(selected)}")
+    for issue in selected:
+        _print_issue_citations(issue, str(args.default_sha))
+    return 0
 
 
 def _extract_mode() -> int:
@@ -355,8 +784,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.extract:
         return _extract_mode()
+    if args.from_issues:
+        return _from_issues_mode(args)
     if not args.sha or not args.path:
-        parser.error("--sha and --path are required unless --extract is given")
+        parser.error(
+            "--sha and --path are required unless --extract or --from-issues is given"
+        )
     try:
         return _verify_mode(args) if args.symbol else _resolve_mode(args)
     except CitationError as exc:

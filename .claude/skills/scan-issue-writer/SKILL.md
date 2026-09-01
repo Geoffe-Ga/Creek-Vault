@@ -89,6 +89,16 @@ A symbol you are *proposing to create* — a refactor target like "extract a
 helper named `_reject_seed_conflicts`" — is not a citation. It belongs in
 `fix_strategy`, never in `symbol`, or the gate will correctly reject it.
 
+**This pre-create run is no longer the only check (#1700).** A `run:` step in
+`.github/workflows/_claude-scan.yml`, placed after the agent and guarded by
+`if: always()`, re-reads every issue the run actually filed, parses each body's
+own `File(s):` / `Symbol(s):` citations and its own `Scanned at commit:` SHA,
+and pipes them back through this same verifier — asking you for nothing. So
+skipping the step above does not hide a phantom. It turns something you could
+have fixed in a draft into a red workflow run and a public correction comment
+on an issue that is already filed, which is strictly worse for everyone. Run it
+before every create.
+
 ### Step 5 — Write the issue
 Fill the canonical `prompts/templates/scan-issue-body.md` completely — all six
 components, no placeholders left. (It is the single source of truth;
