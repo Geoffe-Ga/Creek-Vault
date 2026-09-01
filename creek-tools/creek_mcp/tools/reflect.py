@@ -104,8 +104,12 @@ class _Grounding(NamedTuple):
     Attributes:
         lines: The grounding snippets fed to :func:`_build_prompt` — corpus
             fragment *titles* under the default grounder, never body text.
-        source_ids: The ids of the fragments those lines were drawn from, in
-            retrieval order. Carried so :mod:`creek_mcp.compiled_pages` can
+        source_ids: The ids of the fragments the compiled-layer lookup may
+            *select* from. :func:`_default_retrieve` populates this with the
+            fragments its own lines were drawn from, in retrieval order;
+            :func:`_gather_grounding` returns the same list led by the
+            reflected entry's own ``entry_ref`` when it resolved a fragment.
+            Carried so :mod:`creek_mcp.compiled_pages` can
             *select* candidate eddy and praxis pages from the same pass rather
             than running a second embedding sweep (issue #873's constraint).
             They select only: every candidate page's provenance is re-checked
@@ -372,6 +376,183 @@ def _resolve_entry(
     return "", None
 
 
+def _admit_entry(
+    *,
+    content: str | None,
+    entry_ref: str | None,
+    vault_path: Path,
+    ceiling: TierCeiling,
+    care_guard: Callable[[str], str | None] | None,
+) -> tuple[str, PrivacyTier | None] | dict[str, Any]:
+    """Resolve the entry and run the three admission gates, in source order.
+
+    The order is load-bearing, and keeping the three gates in one function
+    is what keeps it reviewable in one screen: resolve-and-empty-check,
+    then the read-side ceiling gate (#846), then the care seam (#753). The
+    ceiling gate sits *above* the care seam on purpose -- see the comment
+    on it below.
+
+    The audit append deliberately stays in :func:`reflect_tool`, above the
+    call to this function, so a refused above-ceiling attempt is still
+    recorded and there is still exactly one append per call.
+
+    Args:
+        content: The raw entry text, or ``None`` to resolve *entry_ref*.
+        entry_ref: A fragment id whose body is the entry, when *content*
+            is absent.
+        vault_path: Vault root, for fragment resolution.
+        ceiling: The caller's declared ceiling.
+        care_guard: ``(entry) -> reason | None``; the #753 seam, or
+            ``None`` when no guard is wired.
+
+    Returns:
+        Either a ``dict``, which **is** the terminal response for the whole
+        call and must be returned to the caller verbatim with nothing added
+        to it, or the ``(entry, entry_tier)`` pair of an admitted entry.
+    """
+    entry, entry_tier = _resolve_entry(content, entry_ref, vault_path)
+    if not entry.strip():
+        reason = "entry_ref not found" if entry_ref else "no entry content supplied"
+        return refusal_response(tool=TOOL_NAME, ceiling=ceiling, reason=reason)
+
+    # The read-side ceiling gate (#846). It sits *above* the care seam on
+    # purpose: an ``escalate`` response is a one-bit oracle telling a caller who
+    # is not admitted to this fragment that it carries acute-distress markers.
+    # Care still runs for every raw-``content`` call and every within-ceiling
+    # ``entry_ref`` — only unadmitted reads skip it, and they skip the model too.
+    if _above_ceiling(entry_tier, ceiling):
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=ceiling,
+            # Unlike ``save``'s refusal, this reason does NOT echo the offending
+            # tier. There the tier came from the caller's own input, so echoing
+            # it tells them nothing new; here it is derived from content the
+            # caller is not admitted to, so echoing it would turn the refusal
+            # into a tier-classification oracle over the corpus.
+            #
+            # ACCEPTED RESIDUAL RISK: keeping this reason distinct from
+            # "entry_ref not found" is itself a coarse existence-and-rank oracle
+            # across repeated probes (refused at ``open`` implies tier >=
+            # personal; refused at ``personal`` implies intimate). Accepted
+            # because fragment ids are unguessable (``frag-`` + 12 hex), are only
+            # learnable from content already admitted to the caller, and each
+            # probe costs a vault scan — while the distinct not-found reason is
+            # what makes a legitimate client's bug debuggable. If the two reasons
+            # are ever unified, the scan must be equalised too: the not-found
+            # path attempts to parse every fragment file whereas this path
+            # early-returns at the match, so the timing difference would preserve
+            # the oracle as a side channel.
+            reason="entry_ref tier exceeds ceiling",
+        )
+
+    if care_guard is not None:
+        care_reason = care_guard(entry)
+        if care_reason:
+            return {
+                "status": "escalate",
+                "tool": TOOL_NAME,
+                "tier_ceiling": ceiling.value,
+                "reason": care_reason,
+                "care_signal": CARE_SIGNAL,
+            }
+
+    return entry, entry_tier
+
+
+def _gather_grounding(
+    *,
+    entry: str,
+    entry_ref: str | None,
+    entry_tier: PrivacyTier | None,
+    vault_path: Path,
+    ceiling: TierCeiling,
+    retrieve: Callable[[str, Path, PrivacyTierOverride], list[str]] | None,
+) -> _Grounding:
+    """Run one grounding pass and compose the compiled-layer seed list.
+
+    Args:
+        entry: The admitted entry text, used as the retrieval query.
+        entry_ref: The reflected fragment's id, or ``None`` for raw
+            ``content``. Leads the seed list when it resolved a fragment.
+        entry_tier: That fragment's classified tier, or ``None`` for raw
+            ``content`` -- which contributes no seed because it is not a
+            corpus fragment.
+        vault_path: Vault root.
+        ceiling: The caller's declared ceiling, converted to the grounder's
+            privacy override.
+        retrieve: The injected grounder, or ``None`` for
+            :func:`_default_retrieve`. An injected callable *replaces* the
+            default outright and returns no fragment ids, so it contributes
+            no seeds.
+
+    Returns:
+        The grounding lines for the prompt, and the seed ids that select
+        candidate compiled pages.
+    """
+    override = to_privacy_override(ceiling)
+    if retrieve is not None:
+        grounding, retrieved_ids = _Grounding(retrieve(entry, vault_path, override), [])
+    else:
+        grounding, retrieved_ids = _default_retrieve(entry, vault_path, override)
+    # Seeds *select* candidate compiled pages; they never authorize one. An
+    # ``entry_ref`` seed is admitted by the #846 gate above, and a retrieval
+    # seed by the grounder's hard tier cutoff — but neither fact is relied on
+    # here, because ``related_compiled`` re-checks the tier of every fragment
+    # each candidate page was compiled from.
+    from_entry = [entry_ref] if entry_ref and entry_tier is not None else []
+    return _Grounding(grounding, from_entry + retrieved_ids)
+
+
+def _reflection_response(
+    *,
+    notes: list[dict[str, str]],
+    essay: str | None,
+    related: RelatedCompiled,
+    ceiling: TierCeiling,
+    tier: PrivacyTier,
+) -> dict[str, Any]:
+    """Render the answered-reflection response, omitting what does not qualify.
+
+    Only the ``ok`` / ``empty`` paths render through here. A ``refused`` or
+    ``escalate`` response is built by :func:`_admit_entry` (or by the
+    provider-unavailable handler) and deliberately carries a *smaller* key
+    set -- no ``routed_tier``, ``notes`` or ``essay_grounded`` -- because it
+    never reached the model. Routing an escalation through this function
+    would invent all three.
+
+    Args:
+        notes: The cleaned, verbatim-verified notes; empty means ``empty``.
+        essay: The model's free prose, or ``None`` when it offered none.
+        related: The admitted compiled structures; empty on both axes when
+            nothing qualifies.
+        ceiling: The caller's declared ceiling, echoed back.
+        tier: The tier the model call was actually routed at.
+
+    Returns:
+        The ``ok`` / ``empty`` response dict.
+    """
+    result: dict[str, Any] = {
+        "status": "ok" if notes else "empty",
+        "tool": TOOL_NAME,
+        "tier_ceiling": ceiling.value,
+        "routed_tier": tier.value,
+        "notes": notes,
+        # ``essay`` is free model prose and is NOT verbatim/grounding-checked the
+        # way ``notes[].quote`` is — a client must not treat it as grounded.
+        "essay_grounded": False,
+    }
+    if essay is not None:
+        result["essay"] = essay
+    # Both keys are OMITTED when nothing qualifies, never present-and-empty: a
+    # consumer written before #873 must parse a reflection with no compiled
+    # neighbours byte-for-byte as it did before.
+    if related.praxis:
+        result["related_praxis"] = related.praxis
+    if related.eddies:
+        result["related_eddies"] = related.eddies
+    return result
+
+
 def reflect_tool(
     *,
     vault_path: Path,
@@ -449,8 +630,8 @@ def reflect_tool(
         provenance cannot be enumerated in full is withheld
         (:mod:`creek_mcp.compiled_pages`).
     """
-    # Logged unconditionally, above the ceiling gate below, so a refused
-    # above-ceiling attempt is still recorded (tool, ceiling, consumer,
+    # Logged unconditionally, above the ceiling gate in :func:`_admit_entry`, so
+    # a refused above-ceiling attempt is still recorded (tool, ceiling, consumer,
     # has_entry_ref, timestamp) — this is the only append for this call; no
     # second append happens on refusal. The probed entry_ref itself and the
     # call's outcome are deliberately NOT logged, so this record cannot
@@ -464,71 +645,30 @@ def reflect_tool(
         consumer=consumer,
     )
 
-    entry, entry_tier = _resolve_entry(content, entry_ref, vault_path)
-    if not entry.strip():
-        reason = "entry_ref not found" if entry_ref else "no entry content supplied"
-        return refusal_response(
-            tool=TOOL_NAME, ceiling=privacy_tier_ceiling, reason=reason
-        )
-
-    # The read-side ceiling gate (#846). It sits *above* the care seam on
-    # purpose: an ``escalate`` response is a one-bit oracle telling a caller who
-    # is not admitted to this fragment that it carries acute-distress markers.
-    # Care still runs for every raw-``content`` call and every within-ceiling
-    # ``entry_ref`` — only unadmitted reads skip it, and they skip the model too.
-    if _above_ceiling(entry_tier, privacy_tier_ceiling):
-        return refusal_response(
-            tool=TOOL_NAME,
-            ceiling=privacy_tier_ceiling,
-            # Unlike ``save``'s refusal, this reason does NOT echo the offending
-            # tier. There the tier came from the caller's own input, so echoing
-            # it tells them nothing new; here it is derived from content the
-            # caller is not admitted to, so echoing it would turn the refusal
-            # into a tier-classification oracle over the corpus.
-            #
-            # ACCEPTED RESIDUAL RISK: keeping this reason distinct from
-            # "entry_ref not found" is itself a coarse existence-and-rank oracle
-            # across repeated probes (refused at ``open`` implies tier >=
-            # personal; refused at ``personal`` implies intimate). Accepted
-            # because fragment ids are unguessable (``frag-`` + 12 hex), are only
-            # learnable from content already admitted to the caller, and each
-            # probe costs a vault scan — while the distinct not-found reason is
-            # what makes a legitimate client's bug debuggable. If the two reasons
-            # are ever unified, the scan must be equalised too: the not-found
-            # path attempts to parse every fragment file whereas this path
-            # early-returns at the match, so the timing difference would preserve
-            # the oracle as a side channel.
-            reason="entry_ref tier exceeds ceiling",
-        )
-
-    if care_guard is not None:
-        care_reason = care_guard(entry)
-        if care_reason:
-            return {
-                "status": "escalate",
-                "tool": TOOL_NAME,
-                "tier_ceiling": privacy_tier_ceiling.value,
-                "reason": care_reason,
-                "care_signal": CARE_SIGNAL,
-            }
+    admitted = _admit_entry(
+        content=content,
+        entry_ref=entry_ref,
+        vault_path=vault_path,
+        ceiling=privacy_tier_ceiling,
+        care_guard=care_guard,
+    )
+    if isinstance(admitted, dict):
+        return admitted
+    entry, entry_tier = admitted
 
     tier = _routing_tier(privacy_tier_ceiling, entry_tier)
-    override = to_privacy_override(privacy_tier_ceiling)
-    if retrieve is not None:
-        grounding, retrieved_ids = _Grounding(retrieve(entry, vault_path, override), [])
-    else:
-        grounding, retrieved_ids = _default_retrieve(entry, vault_path, override)
-    # Seeds *select* candidate compiled pages; they never authorize one. An
-    # ``entry_ref`` seed is admitted by the #846 gate above, and a retrieval
-    # seed by the grounder's hard tier cutoff — but neither fact is relied on
-    # here, because ``related_compiled`` re-checks the tier of every fragment
-    # each candidate page was compiled from.
-    from_entry = [entry_ref] if entry_ref and entry_tier is not None else []
-    seeds = from_entry + retrieved_ids
+    grounding = _gather_grounding(
+        entry=entry,
+        entry_ref=entry_ref,
+        entry_tier=entry_tier,
+        vault_path=vault_path,
+        ceiling=privacy_tier_ceiling,
+        retrieve=retrieve,
+    )
 
     try:
         llm = llm_factory(tier)
-        response_text = llm(_build_prompt(entry, grounding))
+        response_text = llm(_build_prompt(entry, grounding.lines))
     except RuntimeError as exc:
         # Covers a missing/unavailable provider AND ``IntimateRoutingError``
         # (a RuntimeError subclass) — the router raises the latter rather than
@@ -541,27 +681,16 @@ def reflect_tool(
 
     raw_notes, essay = _parse_notes(response_text)
     notes = _clean_notes(raw_notes, entry, max_notes=max_notes)
-    related = _related(seeds, vault_path, privacy_tier_ceiling, related_lookup)
-    result: dict[str, Any] = {
-        "status": "ok" if notes else "empty",
-        "tool": TOOL_NAME,
-        "tier_ceiling": privacy_tier_ceiling.value,
-        "routed_tier": tier.value,
-        "notes": notes,
-        # ``essay`` is free model prose and is NOT verbatim/grounding-checked the
-        # way ``notes[].quote`` is — a client must not treat it as grounded.
-        "essay_grounded": False,
-    }
-    if essay is not None:
-        result["essay"] = essay
-    # Both keys are OMITTED when nothing qualifies, never present-and-empty: a
-    # consumer written before #873 must parse a reflection with no compiled
-    # neighbours byte-for-byte as it did before.
-    if related.praxis:
-        result["related_praxis"] = related.praxis
-    if related.eddies:
-        result["related_eddies"] = related.eddies
-    return result
+    related = _related(
+        grounding.source_ids, vault_path, privacy_tier_ceiling, related_lookup
+    )
+    return _reflection_response(
+        notes=notes,
+        essay=essay,
+        related=related,
+        ceiling=privacy_tier_ceiling,
+        tier=tier,
+    )
 
 
 def _related(
