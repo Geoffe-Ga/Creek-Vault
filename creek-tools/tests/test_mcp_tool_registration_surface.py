@@ -51,7 +51,10 @@ transports (#1583).
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import importlib
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
@@ -60,8 +63,6 @@ from creek_mcp.policy import Transport
 from creek_mcp.server import build_server
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from mcp.types import Tool
 
 _TIER_CEILING_DEFS: Final[dict[str, Any]] = {
@@ -1030,3 +1031,86 @@ def test_the_handshake_still_names_the_server(tmp_path: Path) -> None:
     )
     assert server.name == "creek-tools-mcp"
     assert structured["server"] == "creek-tools-mcp"
+
+
+_MAX_NESTED_DEFS: Final[int] = 8
+
+_REGISTRARS: Final[tuple[str, ...]] = (
+    "_register_conversation_tools",
+    "_register_authoring_tools",
+    "_register_pipeline_tools",
+    "_register_purge_tools",
+)
+
+
+def _nested_def_counts() -> dict[str, int]:
+    """Count nested ``def``\\ s per module-level function in ``creek_mcp.server``.
+
+    Parses the shipped source rather than introspecting objects, which is
+    the idiom already used at ``tests/test_mcp_auth.py``,
+    ``tests/test_mcp_read_gate.py`` and
+    ``tests/test_vault_config_resolver.py``.
+
+    Returns:
+        Every module-level function name mapped to the number of
+        ``def``/``async def`` nodes anywhere inside its body.
+    """
+    server_mod = importlib.import_module("creek_mcp.server")
+    source = Path(server_mod.__file__ or "").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    counts: dict[str, int] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        counts[node.name] = (
+            sum(
+                isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
+                for child in ast.walk(node)
+            )
+            - 1
+        )
+    return counts
+
+
+def test_no_top_level_function_nests_more_than_eight_defs() -> None:
+    """Tool registration lives in module-level registrars, not in the constructor.
+
+    This is the guard for #1385 and it stands in for a C901 gate the repo
+    does not have: ``[tool.ruff.lint] select`` in ``pyproject.toml`` omits
+    ``C901`` (adding it is deferred to a follow-up because two *test*
+    files would fail it immediately), and ``scripts/complexity.sh`` runs
+    ``xenon`` over ``creek/`` only, never ``creek_mcp/``. So the class of
+    defect had no gate at all.
+
+    A nested ``def`` is exactly what ruff's mccabe adds one for, which is
+    why this counts the growth mechanism rather than a derived score:
+    ``build_server`` scored ``26 = 1 base + 24 nested defs + 1 if``.
+
+    The registrar probes use :func:`hasattr` rather than a module-level
+    ``from creek_mcp.server import _register_...``. A top-of-module import
+    of a not-yet-existing symbol turns this whole file into a collection
+    error, which would have destroyed the evidence that the
+    characterisation tables above were green against unrefactored code.
+
+    The sum -- not the per-registrar vector -- is asserted: the sum catches
+    a dropped or duplicated registration without freezing today's grouping
+    into a permanent test that a fifth registrar would have to edit.
+    """
+    counts = _nested_def_counts()
+    offenders = {
+        name: count for name, count in counts.items() if count > _MAX_NESTED_DEFS
+    }
+    assert not offenders, (
+        f"creek_mcp/server.py: {offenders} nests more than "
+        f"{_MAX_NESTED_DEFS} defs - registration belongs in a module-level "
+        "_register_*_tools helper, not in the constructor; split the group "
+        "or add a registrar rather than raising this ceiling"
+    )
+
+    server_mod = importlib.import_module("creek_mcp.server")
+    missing = [name for name in _REGISTRARS if not hasattr(server_mod, name)]
+    assert not missing, f"creek_mcp.server is missing registrars: {missing}"
+    assert sum(counts[name] for name in _REGISTRARS) == 24, (
+        "the four registrars must between them hold exactly the 24 tool "
+        f"closures, got {[(n, counts[n]) for n in _REGISTRARS]}"
+    )
