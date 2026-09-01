@@ -819,7 +819,58 @@ done
 # CONSTANTS, read out of this file, through the shared filter rather than
 # testing the filter against a hand-written copy of them.
 readonly VERDICT_RE='(?im)^\s*(?:#{1,6}\s+|\*\*)?verdict[:*\s]'
-readonly VERDICT_LGTM_RE="${VERDICT_RE}+lgtm"
+
+# THE CLEARANCE PATTERN, AND IT IS DELIBERATELY NO LONGER `"${VERDICT_RE}+lgtm"`.
+#
+# The two patterns answer two different questions and want OPPOSITE polarities.
+# VERDICT_RE answers "is this comment a verdict at all", and it is loose ON
+# PURPOSE: a selector that refuses too much is indistinguishable from "no verdict
+# has been posted yet", which unmarks every lane in the fleet at once, silently.
+# VERDICT_LGTM_RE answers "may this comment clear a merge", and that one must
+# fail CLOSED — an absent, malformed or merely AMBIGUOUS verdict has to read as
+# "not cleared", because the only thing on the other side of this pattern is
+# `verdict-wake.sh` posting "You are cleared to squash merge" and
+# `.claude/skills/await-claude-review/SKILL.md` Step 4a merging on it. Deriving
+# the second pattern from the first forced one polarity onto both, and the loose
+# one won.
+#
+# MEASURED, against a body `.github/workflows/code-review.yml` CONSTRUCTS ITSELF.
+# That workflow writes `## Verdict: <verdict>` and then APPENDS
+# `verdict_rationale` — free-form model prose — AFTER it. A refusal whose
+# rationale opens
+#
+#     Verdict: LGTM would be premature - the gate still clears on a stale review.
+#
+# carries a verdict-shaped LAST line saying LGTM, so the last-verdict-line rule in
+# `scripts/ralph/lib/verdict-select.jq` answered `true` on a review that REFUSED
+# the PR. `**Verdict**: LGTM …` does it too, and so does an INDENTED quotation of
+# an earlier verdict placed after the real one — the mirror image of the
+# quote-BEFORE case that last-wins already closes. Two tightenings, each pinned by
+# a case in `creek-tools/tests/test_verdict_select_filter.py`:
+#
+#   NO `^\s*`. Column 0 only. Leading whitespace in markdown is a code block or a
+#   quotation, never the emitter's own verdict: code-review.yml prints the line
+#   with `printf '\n\n## Verdict: %s\n'`, at column 0, and prepends its provenance
+#   marker at column 0 for the same "no indentation rule can swallow it" reason.
+#
+#   `[*\s]*$`. The line must END at the token, so a verdict is an ENUM and not a
+#   prose opener. That is safe precisely because the emitter constrains it to one:
+#   code-review.yml's `--json-schema` declares
+#   `"verdict":{"enum":["CHANGES_REQUESTED","COMMENTS","LGTM"]}`, so the real line
+#   is the token and nothing else. Anything with prose after the token is a
+#   sentence ABOUT a verdict, and this repo has already shipped one control-flow
+#   bug (`wontfix` appearing inside a rationale) by branching on such a substring.
+#
+# Both tightenings can only ever turn a `true` into a `false`. The comment is
+# still SELECTED by VERDICT_RE — so it still governs, its refusal is still
+# reported, and the lane blocks rather than the verdict vanishing.
+#
+# `**VERDICT**: LGTM` — `.github/workflows/iteration-trigger.yml`'s own summary
+# line — still matches (the `\*\*` alternative, then `[:*\s]+` over `**: `), which
+# is why ITER_SUMMARY_RE excluding that comment from the selector remains
+# load-bearing rather than incidental. So does the legacy `## Verdict\nLGTM`
+# shape, because `[:*\s]+` spans the newline and `LGTM` then sits at column 0.
+readonly VERDICT_LGTM_RE='(?im)^(?:#{1,6}[ \t]+|\*\*)?verdict[:*\s]+lgtm[*\s]*$'
 
 # The provenance marker `.github/workflows/code-review.yml` PREPENDS to every
 # review comment it posts, with N interpolated by the WORKFLOW from

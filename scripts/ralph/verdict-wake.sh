@@ -44,7 +44,8 @@
 #             exactly one author. Read by `gh`, never by this script.
 #   REPO      `owner/name`.
 #   PR        the pull request number.
-#   SHA       the head SHA whose check-runs are tallied.
+#   SHA       the head SHA whose check-runs are tallied and whose commit date
+#             the selected verdict must postdate.
 #   MARKER    the summary's own first line, `<!-- iteration-trigger -->`. It is
 #             both the self-post cap's needle and the bytes `pr-ready.sh`'s
 #             ITER_SUMMARY_RE excludes from its verdict selector.
@@ -65,17 +66,20 @@
 # `scripts/ralph/lib/verdict-select.jq`, which this script and `pr-ready.sh`
 # both run over the payload `scripts/ralph/lib/pr-comments.graphql` both fetch.
 # What this file still owns is the CLEARANCE CHAIN: the `do-not-auto-merge`
-# hold, the marker-names-THIS-PR check, the base-currency check, and which
-# blocker to name. All fail closed.
+# hold, the marker-names-THIS-PR check, the base-currency check, the
+# verdict-postdates-the-head check, and which blocker to name. All fail closed.
 #
 # AND EVERY BRANCH THAT REFUSES REWRITES `VERDICT`, NOT JUST `ACTION` (#1202).
 # `VERDICT` is computed from the review comment ABOVE the chain, so a branch
 # that refuses while leaving it alone still posts `**VERDICT**: LGTM` +
 # `**CI**: N/N Green` — the only two fields the merge path reads. `ACTION` is
 # diagnostic; `VERDICT` is the gate. The refusal values are chosen for their
-# BYTES — `HELD`, `NOT ATTESTED`, `NOT CURRENT` — none containing an `LGTM`
-# substring and none being one of the three verdicts SKILL.md recognises, so
-# Step 4a falls to its item 5 and surfaces to a human instead of merging.
+# BYTES — `HELD`, `NOT ATTESTED`, `NOT CURRENT`, `STALE`, `DISPUTED` — none
+# containing an `LGTM` substring and none being one of the three verdicts
+# SKILL.md recognises, so Step 4a falls to its item 5 and surfaces to a human
+# instead of merging. `scripts/ralph/test_pr_ready.sh` checks that property
+# STRUCTURALLY, over every branch of the chain including ones added later, and
+# separately that SKILL.md names each value this file can emit.
 #
 # Run:  REPO=owner/name PR=123 SHA=abc MARKER='<!-- iteration-trigger -->' \
 #         bash scripts/ralph/verdict-wake.sh
@@ -183,7 +187,7 @@ fi
 ANSWER=$(jq -r \
   --argjson authors '["Geoffe-Ga","github-actions"]' \
   --arg verdict_re '(?im)^\s*(?:#{1,6}\s+|\*\*)?verdict[:*\s]' \
-  --arg verdict_lgtm_re '(?im)^\s*(?:#{1,6}\s+|\*\*)?verdict[:*\s]+lgtm' \
+  --arg verdict_lgtm_re '(?im)^(?:#{1,6}[ \t]+|\*\*)?verdict[:*\s]+lgtm[*\s]*$' \
   --arg iter_summary_re '(?m)^<!-- iteration-trigger -->[[:space:]]*$' \
   --arg marker_re '(?m)^<!-- creek-review pr=([0-9]+) -->[[:space:]]*$' \
   --arg marker_any_re 'creek-review' \
@@ -276,10 +280,33 @@ BODY=$(jq -r '.body // ""' <<<"$SELECTED")
 # these very files that is not a hypothetical. The flag is computed off the LAST
 # verdict-shaped line in scripts/ralph/lib/verdict-select.jq now, so both
 # clearance paths and stats.py's normalize_verdict agree by construction.
+#
+# AND THE STRICT GREP IS NOW COMPUTED FOR BOTH ARMS SO IT CAN DISSENT. It used to
+# run only inside the `else`, which meant the one line in this file spelled the
+# way `.github/workflows/code-review.yml` ACTUALLY WRITES a verdict
+# (`printf '\n\n## Verdict: %s\n'`, column 0, enum-constrained token) could never
+# contradict the flag — it was consulted only once the flag had already conceded.
+# It is a cross-check, not a formatter, so it is read first and the two must
+# agree before anything says LGTM. An EMPTY `$VLINE` is not a disagreement: the
+# legacy `## Verdict\nLGTM` shape carries no `^## Verdict:` line at all, and
+# treating "this file could not see one" as a veto would unmark those lanes.
+VLINE=$(grep -E '^## Verdict:' <<<"$BODY" | tail -n 1 || true)
 if [ "$VLGTM" = "true" ]; then
-  VERDICT='LGTM'
+  case "$VLINE" in
+    *CHANGES_REQUESTED*|*COMMENTS*)
+      # The filter cleared a body whose own last `## Verdict:` line refuses.
+      # `DISPUTED` carries no `LGTM` substring and is none of the three verdicts
+      # `.claude/skills/await-claude-review/SKILL.md` recognises, so Step 4a
+      # falls to its item 5 and surfaces to a human — the same fail-closed
+      # destination as `HELD`, `NOT ATTESTED` and `NOT CURRENT`, and the
+      # enclosing `[ "$VERDICT" = "LGTM" ]` below therefore never fires.
+      VERDICT='DISPUTED' ;;
+    ''|*LGTM*)
+      VERDICT='LGTM' ;;
+    *)
+      VERDICT='DISPUTED' ;;
+  esac
 else
-  VLINE=$(grep -E '^## Verdict:' <<<"$BODY" | tail -n 1 || true)
   case "$VLINE" in
     *CHANGES_REQUESTED*) VERDICT='CHANGES REQUESTED' ;;
     *)                   VERDICT='COMMENTS' ;;
@@ -314,6 +341,32 @@ HELD=$(jq -r 'if .labels == null then "unknown"
 # this compare call can see it. Anything but a literal "0", including the empty
 # string a failed or malformed compare leaves, is "not current".
 BEHIND=$(gh api "repos/$REPO/compare/$BASE...$SHA?per_page=1" --jq '.behind_by' 2>/dev/null || true)
+
+# THE VERDICT MUST POSTDATE THE HEAD IT IS CLEARING, and nothing here compared
+# them. `pr-ready.sh` has enforced this since #1181 (`[[ "$verdict_date" >
+# "$head_date" ]]`, its stale-verdict guard); this path — the one
+# await-claude-review Step 3 says SHORT-CIRCUITS per-event classification, so it
+# is the one that wins when the two disagree — cleared on `$VLGTM` and CI colour
+# alone. `code-review.yml` normally hides that: every push cancels the in-flight
+# review and starts a new one, so a verdict is almost always newer than HEAD by
+# construction. `workflow_dispatch` breaks the "almost": an operator dispatches a
+# review onto a Dependabot PR, it posts an approving verdict, Dependabot then
+# rebases, and the summary cleared the NEW head on the OLD head's review — while
+# CI, re-run on the new head, is green and says nothing about it.
+#
+# The comparison is the same one pr-ready.sh makes and for the same reason it
+# makes it that way: both stamps are RFC3339 in UTC with a literal `Z`, a
+# fixed-width format whose lexical order IS its chronological order, so a string
+# compare needs no date parsing (and `date -d` is not portable to the BSD `date`
+# on a developer's macOS anyway). `committer.date` is the field that moves on a
+# rebase or an amend; `author.date` can be carried over from the original commit
+# and would read as unchanged across exactly the force-push this guard exists for.
+#
+# FAILS CLOSED: an unreadable commit leaves HEAD_DATE empty, and the guard below
+# refuses on an empty HEAD_DATE rather than comparing against it — `>` against
+# the empty string is true for every non-empty stamp, which would have made an
+# API hiccup clear the merge.
+HEAD_DATE=$(gh api "repos/$REPO/commits/$SHA" --jq '.commit.committer.date' 2>/dev/null || true)
 
 if [ "$GREEN" = "$TOTAL" ] && [ "$VERDICT" = "LGTM" ]; then
   if [ "$HELD" != "no" ]; then
@@ -372,6 +425,16 @@ if [ "$GREEN" = "$TOTAL" ] && [ "$VERDICT" = "LGTM" ]; then
     # verdict SKILL.md recognises.
     VERDICT='NOT CURRENT'
     ACTION="NOT cleared to merge: this head is not current with ${BASE:-its base} (behind_by='${BEHIND}'). Run scripts/ralph/fleet.sh sync and let CI re-run first."
+  elif [ -z "$HEAD_DATE" ] || ! [[ "$VDATE" > "$HEAD_DATE" ]]; then
+    # Same rule, same reason (#1202). `[[ ]]`, not `[ ]`: inside `[ ]` a bare `>`
+    # is a REDIRECTION, so `[ "$VDATE" > "$HEAD_DATE" ]` would test one argument
+    # for non-emptiness and silently create a file named after the head stamp —
+    # true on every run, which is a guard that reads as present and is not.
+    # `! [[ … ]]` rather than `<=`, so an EQUAL pair (a verdict posted in the same
+    # second as the commit it is clearing) refuses: at second granularity that
+    # ordering is unknowable, and unknowable must not clear.
+    VERDICT='STALE'
+    ACTION="NOT cleared to merge: the verdict (${VDATE}) does not postdate this head ${SHA} (${HEAD_DATE:-unreadable}) - it reviewed code that has since been replaced. Push or re-run the review workflow on the current head and wait for the fresh verdict."
   else
     ACTION="You are cleared to squash merge, delete the branch, clean any worktrees, and unsubscribe from webhooks. Please proceed."
   fi

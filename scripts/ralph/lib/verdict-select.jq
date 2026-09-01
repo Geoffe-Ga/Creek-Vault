@@ -248,13 +248,32 @@
 # `$verdict_re`'s internals assumed. `.offset` would be the obvious alternative
 # and is avoided on purpose: this program also runs under gojq (via `gh --jq`),
 # whose codepoint/byte offset semantics this repo has not measured, whereas
-# `match`, `.string` and `splits` are core builtins in both engines. Testing
-# that slice with `$verdict_lgtm_re` — which is `$verdict_re` plus `+lgtm`, so
-# the anchor is re-matched rather than assumed — keeps the two regexes coupled
-# exactly as their definitions already are.
+# `match`, `.string` and `splits` are core builtins in both engines.
 #
-# The legacy `## Verdict\nLGTM` shape survives: `[:*\s]` consumes the newline,
-# so the anchor spans it and the rebuilt slice still carries the token.
+# LAST-WINS IS NECESSARY AND NOT SUFFICIENT, and `$verdict_lgtm_re` is where the
+# rest lives. It is NOT `$verdict_re + "+lgtm"` any more, deliberately: the two
+# patterns want opposite polarities (see the block above
+# `readonly VERDICT_LGTM_RE` in `scripts/ralph/pr-ready.sh` for the full
+# argument). SELECTION must be loose, because a selector that refuses too much is
+# indistinguishable from "nothing has been posted" and unmarks the whole fleet at
+# once. CLEARANCE must fail closed, because the only thing downstream of it is
+# `verdict-wake.sh` posting "You are cleared to squash merge".
+#
+# The case that forced them apart is one `.github/workflows/code-review.yml`
+# BUILDS ITSELF: it writes `## Verdict: <verdict>` and then APPENDS
+# `verdict_rationale`, free-form model prose, AFTER it. A refusal whose rationale
+# opens `Verdict: LGTM would be premature …` puts a verdict-shaped LGTM line LAST,
+# so last-wins selected the rationale and this filter answered `true` on a review
+# that refused the PR. `$verdict_lgtm_re` therefore requires column 0 (an indented
+# verdict is a markdown quotation or code block, and a quotation placed AFTER the
+# real verdict is the exact mirror of the quote-BEFORE case last-wins closes) and
+# requires the line to END at the token (a verdict is an enum — code-review.yml's
+# own `--json-schema` says so — while anything with prose after it is a sentence
+# ABOUT a verdict).
+#
+# The legacy `## Verdict\nLGTM` shape survives both: `[:*\s]+` consumes the
+# newline, so the anchor spans it, the rebuilt slice still carries the token, and
+# `LGTM` sits at column 0 on the line of its own that the shape gives it.
 | ( [ $b | match($verdict_re; "g") ] ) as $vmatches
 | ( if ($vmatches | length) == 0 then ""
     else (($vmatches | last | .string) + ([ $b | splits($verdict_re) ] | last))

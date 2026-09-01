@@ -404,11 +404,45 @@ jobs:
           printf '<!-- creek-review pr=%s -->\n\n' "$PR_NUMBER" > review.md
           jq -r '.review_markdown' <<<"$STRUCTURED" >> review.md
           # Keep the "## Verdict: <verdict>" line exactly — downstream skills
-          # (address-feedback, await-claude-review) parse it. The rationale goes
-          # on the following line so the verdict is never ambiguous.
+          # (address-feedback, await-claude-review) parse it, as does
+          # `scripts/ralph/lib/verdict-select.jq`, which every merge clearance
+          # runs through. `$verdict` itself is safe by construction: the
+          # `--json-schema` above declares it an ENUM of exactly
+          # CHANGES_REQUESTED / COMMENTS / LGTM, so this line is the token and
+          # nothing else.
           printf '\n\n## Verdict: %s\n' "$verdict" >> review.md
+          # THE RATIONALE IS QUOTED, EVERY LINE, AND THAT IS A CORRECTNESS FIX.
+          # `verdict_rationale` is free-form model prose appended AFTER the
+          # verdict, so a refusal whose rationale opened
+          #
+          #     Verdict: LGTM would be premature - the gate still clears.
+          #
+          # put a verdict-shaped LGTM line LAST in the body. Every consumer that
+          # takes the LAST verdict line as the final word — verdict-select.jq,
+          # and `scripts/ralph/stats.py`'s normalize_verdict — then read this
+          # comment as an approval, and `scripts/ralph/verdict-wake.sh` posted
+          # "You are cleared to squash merge" on a review that refused the PR.
+          # The consumers are hardened against that independently (the clearance
+          # pattern now requires column 0 and an end-of-line anchor), but the
+          # EMITTER should not be manufacturing the ambiguity in the first
+          # place.
+          #
+          # `> ` is the right prefix because it defeats BOTH parser families at
+          # once. It is not whitespace, `#` or `*`, so a quoted line satisfies
+          # neither the repo's `^\s*(?:#{1,6}\s+|\*\*)?verdict[:*\s]` shape
+          # nor the agent-side `^\s*(?:##\s+|\*\*)?Verdict[:\*\s]+` one in
+          # await-claude-review/SKILL.md — so a FIRST-match reader and a
+          # LAST-match reader now both see exactly one verdict line, the real
+          # one. Reordering the two printfs would have fixed one family and
+          # broken the other.
+          #
+          # `sed`, not a shell loop: the rationale is multi-line, every line
+          # needs the prefix (a `> ` on line one only leaves lines two onward at
+          # column 0), and an empty line must become `> ` rather than be
+          # dropped, which `s/^/> /` does.
           if [ -n "$rationale" ]; then
-            printf '\n%s\n' "$rationale" >> review.md
+            printf '\n' >> review.md
+            printf '%s\n' "$rationale" | sed 's/^/> /' >> review.md
           fi
           gh pr comment "$PR_NUMBER" -R "$REPO" --body-file review.md
           echo "Posted review with verdict: ${verdict}"

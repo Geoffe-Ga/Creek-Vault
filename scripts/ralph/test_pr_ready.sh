@@ -3887,16 +3887,19 @@ ITER_CLEARANCE_GUARD="[ \"\$MARKER_PR\" != \"\$PR\" ]"
 # iteration-trigger.yml's `--arg` list, so a change on either side turns CI red
 # on the PR that makes it rather than on the fleet that inherits it.
 #
-# VERDICT_LGTM_RE is derived, exactly as pr-ready.sh derives it
-# (`"${VERDICT_RE}+lgtm"`), rather than being read: it is the one constant
-# declared by reference, so reading it literally would pin the reference and not
-# the value.
+# VERDICT_LGTM_RE IS READ LITERALLY, AND IT USED TO BE DERIVED HERE AS
+# `"${VERDICT_RE}+lgtm"` because that is how pr-ready.sh declared it. It is not
+# derived any more, on either side: SELECTION (`VERDICT_RE`) has to be loose or a
+# fleet-wide unmark follows, while CLEARANCE (`VERDICT_LGTM_RE`) has to fail
+# closed or a rationale that merely SAYS "Verdict: LGTM would be premature"
+# clears a merge the reviewer refused. Deriving the second from the first forced
+# one polarity onto both. Reading the constant pins the value the production path
+# actually passes, which is what this loop is for.
 iter_param_value() { # iter_param_value <CONSTANT NAME>
   sed -n "s/^readonly $1='\(.*\)'\$/\1/p" "$READY"
 }
-ITER_VERDICT_RE_VALUE="$(iter_param_value VERDICT_RE)"
-for iter_param in "verdict_re|$ITER_VERDICT_RE_VALUE" \
-                  "verdict_lgtm_re|${ITER_VERDICT_RE_VALUE}+lgtm" \
+for iter_param in "verdict_re|$(iter_param_value VERDICT_RE)" \
+                  "verdict_lgtm_re|$(iter_param_value VERDICT_LGTM_RE)" \
                   "iter_summary_re|$(iter_param_value ITER_SUMMARY_RE)" \
                   "marker_re|$(iter_param_value MARKER_RE)" \
                   "marker_any_re|$(iter_param_value MARKER_ANY_RE)" \

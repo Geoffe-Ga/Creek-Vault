@@ -82,7 +82,10 @@ _AUTHORS = ["Geoffe-Ga", "github-actions"]
 #: The regexes in their *effective* form — one backslash, because ``--arg``
 #: performs no jq string-literal unescaping. See the module docstring.
 _VERDICT_RE = r"(?im)^\s*(?:#{1,6}\s+|\*\*)?verdict[:*\s]"
-_VERDICT_LGTM_RE = _VERDICT_RE + "+lgtm"
+#: NOT ``_VERDICT_RE + "+lgtm"``. Selection is loose on purpose (refusing too
+#: much unmarks the whole fleet); clearance must fail closed. See the block above
+#: ``readonly VERDICT_LGTM_RE`` in ``pr-ready.sh``.
+_VERDICT_LGTM_RE = r"(?im)^(?:#{1,6}[ \t]+|\*\*)?verdict[:*\s]+lgtm[*\s]*$"
 _ITER_SUMMARY_RE = r"(?m)^<!-- iteration-trigger -->[[:space:]]*$"
 _MARKER_RE = r"(?m)^<!-- creek-review pr=([0-9]+) -->[[:space:]]*$"
 _MARKER_ANY_RE = "creek-review"
@@ -599,6 +602,172 @@ def test_the_legacy_header_and_token_on_separate_lines_still_reads_lgtm(
     assert lgtm == "true", (
         "the legacy `## Verdict` / `LGTM`-on-the-next-line shape stopped being "
         f"recognised: {result.stdout.strip()!r}"
+    )
+
+
+#: Bodies whose LAST verdict-shaped line sits AFTER a real refusal — the order
+#: ``.github/workflows/code-review.yml`` itself constructs, and the direction
+#: last-wins alone cannot close. Each is (id, the trailing text).
+_TRAILING_LGTM_SHAPES = [
+    pytest.param(
+        "Verdict: LGTM would be premature - the gate still clears on a stale review.",
+        id="plain-rationale-opener",
+    ),
+    pytest.param(
+        "**Verdict**: LGTM was my first read, but the wake path fails open.",
+        id="bold-rationale-opener",
+    ),
+    pytest.param(
+        "The review under discussion closed with:\n\n    ## Verdict: LGTM",
+        id="indented-quotation-after-the-verdict",
+    ),
+]
+
+
+@pytest.mark.parametrize("trailer", _TRAILING_LGTM_SHAPES)
+def test_text_after_the_verdict_cannot_clear_the_merge(
+    tmp_path: Path, trailer: str
+) -> None:
+    """The direction the emitter itself writes, and it was untested.
+
+    ``code-review.yml`` prints ``## Verdict: <verdict>`` and then APPENDS
+    ``verdict_rationale`` — free-form model prose — after it. So on every review
+    this pipeline posts, the last verdict-shaped line in the body is the
+    RATIONALE, not the verdict. A refusal whose rationale opens ``Verdict: LGTM
+    would be premature …`` came out of this filter as ``true``:
+    ``verdict-wake.sh`` then posts "You are cleared to squash merge" and
+    await-claude-review Step 4a merges on exactly that.
+
+    Last-wins closes the quote-BEFORE direction (pinned above) and nothing
+    closed this one. The fix is in ``VERDICT_LGTM_RE``: column 0, and the line
+    must END at the token.
+    """
+    body = (
+        "<!-- creek-review pr=100 -->\n\nFindings below.\n\n"
+        "## Verdict: CHANGES_REQUESTED\n\n" + trailer + "\n"
+    )
+    result = _run_filter(tmp_path, [_comment(body=body)])
+    created_at, lgtm, marker, _refused, _database_id = _answer(result)
+    assert created_at == _STAMP, (
+        "the comment must still be SELECTED — refusing it outright would be a "
+        f"fleet-wide unmark, not a fix. answer: {result.stdout.strip()!r}"
+    )
+    assert lgtm == "false", (
+        "text after the body's own `## Verdict: CHANGES_REQUESTED` set the LGTM "
+        "flag. That is the order code-review.yml constructs every review in, so "
+        "this is not a hypothetical body — it is the ordinary one. answer: "
+        f"{result.stdout.strip()!r}"
+    )
+    assert marker == "100", (
+        f"the #1181 provenance marker was lost: {result.stdout.strip()!r}"
+    )
+
+
+@pytest.mark.parametrize("trailer", _TRAILING_LGTM_SHAPES)
+def test_the_production_constants_also_refuse_text_after_the_verdict(
+    tmp_path: Path, trailer: str
+) -> None:
+    """The same cases through the constants ``pr-ready.sh`` really declares.
+
+    The module-level copies above could be tightened while the shipped ones stay
+    open — which is the whole reason this file reads the constants out of the
+    script for the selection case too.
+    """
+    body = (
+        "<!-- creek-review pr=100 -->\n\nFindings below.\n\n"
+        "## Verdict: CHANGES_REQUESTED\n\n" + trailer + "\n"
+    )
+    result = _run_filter(
+        tmp_path,
+        [_comment(body=body)],
+        verdict_re=_shell_constant("VERDICT_RE"),
+        verdict_lgtm_re=_shell_constant("VERDICT_LGTM_RE"),
+    )
+    created_at, lgtm, _marker, _refused, _database_id = _answer(result)
+    assert created_at == _STAMP, (
+        "pr-ready.sh's own VERDICT_RE stopped SELECTING a genuine review body: "
+        f"{result.stdout.strip()!r}"
+    )
+    assert lgtm == "false", (
+        "pr-ready.sh's own VERDICT_LGTM_RE clears a merge on a body whose "
+        "verdict line refuses it. This is the pattern the production path "
+        f"passes, so this is the one that decides. answer: {result.stdout.strip()!r}"
+    )
+
+
+def test_a_quoted_rationale_neither_clears_nor_unmarks(tmp_path: Path) -> None:
+    """Both polarities of the emitter fix, in one place.
+
+    The quoting must not become "never LGTM": a genuine approval whose
+    rationale happens to open with a verdict-shaped phrase has to keep
+    clearing, or the fix trades a fail-open for the fleet-wide unmark that is
+    the worse of the two failures.
+    """
+    quoted = "> Verdict: LGTM would be premature - the gate still clears.\n"
+    refusal = _run_filter(
+        tmp_path,
+        [
+            _comment(
+                body="<!-- creek-review pr=100 -->\n\nfindings\n\n"
+                "## Verdict: CHANGES_REQUESTED\n\n" + quoted
+            )
+        ],
+    )
+    _c, refusal_lgtm, _m, _r, _d = _answer(refusal)
+    assert refusal_lgtm == "false", (
+        f"a quoted rationale re-opened the fail-open: {refusal.stdout.strip()!r}"
+    )
+
+    approval = _run_filter(
+        tmp_path,
+        [
+            _comment(
+                body="<!-- creek-review pr=100 -->\n\nfindings\n\n"
+                "## Verdict: LGTM\n\n"
+                "> Verdict: LGTM - no blockers found on this head.\n"
+            )
+        ],
+    )
+    _c2, approval_lgtm, _m2, _r2, _d2 = _answer(approval)
+    assert approval_lgtm == "true", (
+        "a genuine LGTM stopped clearing because its own quoted rationale "
+        "mentioned a verdict. The quoting exists so the real `## Verdict:` "
+        "line is the only verdict-shaped line in the body — it must not make "
+        f"the body verdictless. answer: {approval.stdout.strip()!r}"
+    )
+
+
+def test_the_reviewer_quotes_its_rationale_so_it_cannot_be_a_verdict_line() -> None:
+    """The emitter half of the same fix, pinned at its source.
+
+    The cases above harden the PARSER, which has to be safe against any body on
+    a PR — a human's, another bot's, a quotation. This one pins the EMITTER:
+    ``code-review.yml`` appends ``verdict_rationale`` (free-form model prose)
+    after its ``## Verdict:`` line, so it was manufacturing the ambiguity it
+    then asked every consumer to survive. Prefixing every rationale line with
+    ``> `` ends that: ``> `` is not whitespace, ``#`` or ``*``, so a quoted line
+    matches neither this repo's verdict shape nor the looser agent-side one in
+    ``await-claude-review/SKILL.md`` — a FIRST-match reader and a LAST-match
+    reader now both see exactly one verdict line.
+
+    Reordering the two ``printf``\\ s would have fixed only one of those two
+    families, which is why the assertion is about the QUOTING and not about the
+    order.
+    """
+    workflow = (REPO_ROOT / ".github" / "workflows" / "code-review.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "## Verdict: %s" in workflow, (
+        "code-review.yml no longer prints a `## Verdict: %s` line; the "
+        "clearance pattern in pr-ready.sh is anchored to that exact shape"
+    )
+    assert "sed 's/^/> /'" in workflow, (
+        "code-review.yml no longer quotes `verdict_rationale`. It is appended "
+        "AFTER the verdict line, so an unquoted rationale opening `Verdict: "
+        "LGTM would be premature …` is the LAST verdict-shaped line in the "
+        "body — which is how a refusal cleared a merge. The parser-side "
+        "hardening above still holds the line, but the emitter must not be the "
+        "thing producing the ambiguity"
     )
 
 

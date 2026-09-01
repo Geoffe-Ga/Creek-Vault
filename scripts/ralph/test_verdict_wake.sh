@@ -142,6 +142,9 @@ export POSTED
 #                   with `-`, not `:-`, so `BEHIND_BY=''` reproduces an EMPTY
 #                   answer, which must fail closed rather than compare equal.
 #   COMPARE_EC      its exit code; non-zero plays a failed freshness probe.
+#   HEAD_DATE       the head commit's `committer.date`. Defaulted with `-` so
+#                   `HEAD_DATE=''` reproduces an unreadable commit.
+#   HEAD_DATE_EC    its exit code; non-zero plays a failed commit lookup.
 cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 args="$*"
@@ -181,6 +184,14 @@ case "$args" in
   *compare/*)
     printf '%s\n' "${BEHIND_BY-0}"
     exit "${COMPARE_EC:-0}" ;;
+  *"/commits/"*)
+    # AFTER the check-runs arm on purpose: that URL is this one plus a suffix.
+    # Defaulted with `-`, not `:-`, so `HEAD_DATE=''` reproduces an UNREADABLE
+    # commit, which must fail closed rather than compare as older than anything.
+    # The default is an hour BEFORE $FRESH, so every fixture that does not care
+    # about staleness carries a verdict that legitimately postdates its head.
+    printf '%s\n' "${HEAD_DATE-2026-08-30T09:00:00Z}"
+    exit "${HEAD_DATE_EC:-0}" ;;
   *"/pulls/"*)
     if [[ -n "${PR_JSON+set}" ]]; then
       printf '%s' "$PR_JSON"
@@ -487,6 +498,48 @@ says "behind: an unreadable compare fails closed to NOT CURRENT" \
      '^\*\*VERDICT\*\*: NOT CURRENT$' "$(posted)"
 
 # ===========================================================================
+# STALENESS — the verdict must POSTDATE the head it is clearing
+# ===========================================================================
+# `pr-ready.sh` has compared these two stamps since #1181; this path cleared on
+# the LGTM flag and CI colour alone. The gap is reachable through the
+# `workflow_dispatch` trigger: an operator dispatches a review onto a Dependabot
+# PR, it posts an approving verdict, Dependabot force-pushes a rebase, CI re-runs
+# green on the new head — and nothing compared the verdict to the head it was
+# about to clear.
+wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$LGTM_LINE")")")" \
+     CHECK_RUNS="$GREEN_RUNS" HEAD_DATE='2026-08-30T11:00:00Z'
+stale="$(posted)"
+says  "stale: a verdict OLDER than the head it clears neutralises the VERDICT field" \
+      '^\*\*VERDICT\*\*: STALE$' "$stale"
+lacks "stale: …and nothing says cleared to squash merge" \
+      'cleared to squash merge' "$stale"
+says  "stale: the Action names both stamps so an operator can see the gap" \
+      "$FRESH" "$stale"
+
+# EQUAL IS NOT NEWER. GitHub's stamps are second-granular, so a verdict sharing
+# its second with the commit is of UNKNOWABLE order — and unknowable must not
+# clear. `<=` written as `! [[ > ]]` is what makes this case refuse.
+wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$LGTM_LINE")")")" \
+     CHECK_RUNS="$GREEN_RUNS" HEAD_DATE="$FRESH"
+says "stale: a verdict in the SAME SECOND as the head does not clear" \
+     '^\*\*VERDICT\*\*: STALE$' "$(posted)"
+
+# AN UNREADABLE COMMIT FAILS CLOSED. `>` against the empty string is true for
+# every non-empty stamp, so an API hiccup would otherwise clear the merge — the
+# same shape as the empty-compare case above.
+wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$LGTM_LINE")")")" \
+     CHECK_RUNS="$GREEN_RUNS" HEAD_DATE='' HEAD_DATE_EC=1
+says "stale: an unreadable head commit fails closed to STALE" \
+     '^\*\*VERDICT\*\*: STALE$' "$(posted)"
+
+# AND THE POLARITY. A verdict that genuinely postdates its head still clears —
+# the guard must not become "never clear", which would wedge every lane at once.
+wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$LGTM_LINE")")")" \
+     CHECK_RUNS="$GREEN_RUNS" HEAD_DATE='2026-08-30T09:59:59Z'
+says "stale: a verdict one second NEWER than its head still clears" \
+     'cleared to squash merge' "$(posted)"
+
+# ===========================================================================
 # THE NON-CLEARING PATHS — CI not green, and the two non-LGTM verdicts
 # ===========================================================================
 wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "$(marked 100 "$LGTM_LINE")")")" \
@@ -527,6 +580,84 @@ quoted="$(posted)"
 says  "a QUOTED LGTM above a real CHANGES_REQUESTED does not clear" \
       '^\*\*VERDICT\*\*: CHANGES REQUESTED$' "$quoted"
 lacks "…and the summary carries no clearance" 'cleared to squash merge' "$quoted"
+
+# AND THE OTHER DIRECTION — THE ONE code-review.yml ACTUALLY CONSTRUCTS.
+# That workflow prints `## Verdict: <verdict>` and then APPENDS
+# `verdict_rationale`, free-form model prose, AFTER it. So on every review this
+# pipeline posts, the LAST verdict-shaped line in the body is the RATIONALE. A
+# refusal whose rationale opens `Verdict: LGTM would be premature …` satisfied
+# the old `"${VERDICT_RE}+lgtm"` clearance pattern, the filter answered `true`,
+# and THIS STEP posted "You are cleared to squash merge" on a review that refused
+# the PR — which await-claude-review Step 4a merges on. The quoted case above
+# covers the quote-BEFORE direction, which last-wins already closed; nothing
+# covered this one, which last-wins cannot close on its own.
+#
+# Three shapes, because the emitter's own line is not the only verdict-shaped
+# thing a rationale can open with.
+wake_trailer_case() { # wake_trailer_case <label> <trailing text>
+  wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "<!-- creek-review pr=100 -->
+
+## Summary
+fine
+
+$CR_LINE
+
+$2")")" \
+       CHECK_RUNS="$GREEN_RUNS"
+  local body
+  body="$(posted)"
+  says  "$1: the summary reports the refusal, not the trailing LGTM" \
+        '^\*\*VERDICT\*\*: CHANGES REQUESTED$' "$body"
+  lacks "$1: …and nothing says cleared to squash merge" \
+        'cleared to squash merge' "$body"
+}
+wake_trailer_case "rationale after the verdict" \
+  'Verdict: LGTM would be premature - the gate still clears on a stale review.'
+wake_trailer_case "bold rationale after the verdict" \
+  '**Verdict**: LGTM was my first read, but the wake path fails open.'
+wake_trailer_case "quotation after the verdict" \
+  'The prior review closed with:
+
+    ## Verdict: LGTM'
+
+# THE STRICT `^## Verdict:` GREP MUST BE ABLE TO DISSENT. It used to run only in
+# the `else` arm, so the one line in verdict-wake.sh spelled the way
+# code-review.yml really writes a verdict could never contradict the filter's
+# flag — it was consulted only once the flag had already conceded. Here the flag
+# says LGTM (a bold `**Verdict**: LGTM` IS a legitimate whole-line verdict and is
+# the last verdict line) while the body's own `## Verdict:` line refuses. The two
+# disagree, so nothing clears.
+wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "<!-- creek-review pr=100 -->
+
+## Summary
+fine
+
+$CR_LINE
+
+**Verdict**: LGTM")")" \
+     CHECK_RUNS="$GREEN_RUNS"
+disputed="$(posted)"
+lacks "dissent: a body whose own ## Verdict: line refuses does not clear" \
+      'cleared to squash merge' "$disputed"
+lacks "dissent: …and the VERDICT field carries no LGTM for Step 4a to merge on" \
+      '^\*\*VERDICT\*\*: LGTM$' "$disputed"
+
+# THE DISSENT CHECK MUST NOT VETO THE LEGACY SHAPE. `## Verdict\nLGTM` carries no
+# `^## Verdict:` line at all, so an empty grep result is "this file could not see
+# one", not a disagreement. Treating it as a veto would unmark every lane posting
+# that shape — the fleet-wide-unmark polarity, in the safe-looking direction.
+wake COMMENTS_NODES="$(nodes "$(node 111 "$FRESH" "$PAT_LOGIN" "<!-- creek-review pr=100 -->
+
+## Summary
+fine
+
+## Verdict
+LGTM")")" \
+     CHECK_RUNS="$GREEN_RUNS"
+legacy="$(posted)"
+says "legacy: the \`## Verdict\` / \`LGTM\`-on-its-own-line shape still clears" \
+     '^\*\*VERDICT\*\*: LGTM$' "$legacy"
+says "legacy: …and the Action still says so" 'cleared to squash merge' "$legacy"
 
 # ===========================================================================
 # THE databaseId ADDRESSING — two comments in the SAME SECOND
