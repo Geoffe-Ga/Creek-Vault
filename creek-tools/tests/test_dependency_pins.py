@@ -2132,8 +2132,13 @@ _ADVISORY_ID = re.compile(r"\b(?:CVE|PYSEC|GHSA)-[A-Za-z0-9]+-[A-Za-z0-9-]+\b")
 #: population.
 _MANIFEST_ENTRY = re.compile(r'^\s*"(?P<requirement>[^"]+)",?\s*(?:#.*)?$')
 
-#: A ``[table.header]`` line.
-_MANIFEST_TABLE = re.compile(r"^\s*\[(?P<table>[^\]]+)\]\s*(?:#.*)?$")
+#: A ``[table.header]`` line. The optional doubled brackets match an
+#: array-of-tables header: both manifests carry several
+#: ``[[tool.mypy.overrides]]`` blocks, and a pattern that did not
+#: recognise them would leave the preceding table in scope across the
+#: whole run, attributing their inline ``module = [...]`` arrays to
+#: whatever table came last.
+_MANIFEST_TABLE = re.compile(r"^\s*\[\[?(?P<table>[^\[\]]+)\]\]?\s*(?:#.*)?$")
 
 #: A ``key = [`` line opening a multi-line array.
 _MANIFEST_ARRAY = re.compile(r"^\s*(?P<key>[A-Za-z0-9_.-]+)\s*=\s*\[\s*(?:#.*)?$")
