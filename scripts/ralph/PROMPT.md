@@ -15,9 +15,14 @@ only tracker.
 
 ## The four gates (this is the whole game)
 1. **Gate 1 — TDD.** Red→Green→Refactor via the **`stay-green`** skill.
-2. **Gate 2 — Local quality.** `cd creek-tools && ./scripts/check-all.sh`
+2. **Gate 2 — Local quality.**
+   `cd creek-tools && VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" ./scripts/check-all.sh`
    exits 0. **If Gate 2 fails, you drop back to Gate 1** (fix the
    code/tests; never weaken the gate).
+   `fleet.sh assign`/`adopt` has already provisioned `creek-tools/.venv` — do NOT
+   run your own `uv sync`. The exports are still mandatory: they govern which
+   interpreter is RESOLVED (`creek-tools/scripts/_lib.sh` probes a bare
+   `python`), not whether one exists.
    - **Gate 2.5 — Pre-push self-review.** Once Gate 2 is green and before you
      push, dispatch the **code-review-orchestrator** over the diff; fix every
      blocking finding (drop to Gate 1 via the owning specialist) until it returns
@@ -85,8 +90,11 @@ drives Gates 3–4. The taxonomy you dispatch is mapped in
    `shared/house-rules.md`): ≥90% branch coverage (pytest-cov), per-file ≥80%,
    ≥95% docstring (interrogate), complexity ≤10 (xenon), mypy strict, ruff
    zero violations, pylint ≥9.0.
-7. **Gate 2 → Gate 2.5.** Run `cd creek-tools && ./scripts/check-all.sh` until
-   exit 0 (`./scripts/fix-all.sh` for autofixable lint/format — never bypass).
+7. **Gate 2 → Gate 2.5.** Run
+   `cd creek-tools && VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" ./scripts/check-all.sh`
+   until exit 0 (`./scripts/fix-all.sh` for autofixable lint/format — never
+   bypass). The lane's venv is pre-provisioned by `fleet.sh`; the exports select
+   that interpreter, they do not create it.
    Then dispatch **`Agent(code-review-orchestrator)`** over the diff and fix every
    blocking finding (drop to Gate 1 via the owning specialist) until `CLEAN`.
 8. **Stay scoped.** Implement exactly the issue. Found an unrelated bug?
@@ -155,7 +163,8 @@ drives Gates 3–4. The taxonomy you dispatch is mapped in
 - [ ] chief-architect produced the plan; you dispatched the specialists it named
       (and only those).
 - [ ] PR open against `main`; body contains `Closes #$RALPH_ISSUE`.
-- [ ] `cd creek-tools && ./scripts/check-all.sh` exits 0 (Gate 2 green).
+- [ ] `cd creek-tools && VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" ./scripts/check-all.sh`
+      exits 0 (Gate 2 green).
 - [ ] code-review-orchestrator returned `CLEAN` before push (Gate 2.5).
 - [ ] New tests pass; existing tests still pass; thresholds met.
 - [ ] PR has a `## Test plan`.
