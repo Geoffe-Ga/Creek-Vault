@@ -46,6 +46,7 @@ from creek_mcp.api.models import (
     Capability,
     DriveConnectionState,
     ErrorCode,
+    minor_at_least,
 )
 from creek_mcp.api.openapi import build_openapi
 from creek_mcp.api.routes import ROUTES
@@ -400,8 +401,33 @@ def test_the_contract_minor_moved_because_the_route_set_widened() -> None:
     Additive, exactly as ``upload`` (0.8), ``drive-connector`` (0.9) and
     ``pipeline`` (0.10) were: a client pinned below 0.11 keeps everything it
     had.
+
+    Asserted against the **window** rather than against the head. This test
+    used to read ``CONTRACT_MINOR == _GRANT_MINOR``, which was true only for
+    as long as ``0.11`` happened to be the running minor: it conflated "the
+    minor the grant shipped at" -- history, which never moves -- with "the
+    current contract minor", which moves at every bump. It went red at the
+    very next one (0.12, #1292) on a change that touches neither this route
+    set nor any ``/v1`` shape at all.
+
+    What the test is actually about survives that, and is stronger for being
+    said directly: the grant's own minor is **still served**, so a client
+    pinned at ``0.11`` keeps reaching these routes however far the head
+    advances, and the head has not regressed below the minor that published
+    them. :func:`minor_at_least` compares componentwise as integers, for the
+    reason its own docstring gives -- read as text, ``"0.10"`` sorts below
+    ``"0.8"``.
     """
-    assert CONTRACT_MINOR == _GRANT_MINOR
+    assert _GRANT_MINOR in SUPPORTED_CONTRACT_MINORS, (
+        "the minor the drive grant shipped at has fallen out of the "
+        "compatibility window, so a client pinned at it can no longer reach "
+        "the routes this file tests.\n\n"
+        f"served: {list(SUPPORTED_CONTRACT_MINORS)}"
+    )
+    assert minor_at_least(CONTRACT_MINOR, _GRANT_MINOR), (
+        "the running contract minor is below the minor that published the "
+        f"grant.\n\ncurrent: {CONTRACT_MINOR!r}, grant: {_GRANT_MINOR!r}"
+    )
     assert _PREVIOUS_MINOR in SUPPORTED_CONTRACT_MINORS
 
 

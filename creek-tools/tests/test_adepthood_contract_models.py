@@ -1577,8 +1577,22 @@ def test_the_compatibility_window_only_ever_widens() -> None:
     ``creek.upload`` has no ``/v1`` route, so a ``0.6``-pinned ``/v1`` client
     was already sending exactly what the new contract demands — shifting the
     window would refuse it over a change it cannot express.
+
+    ``0.7`` joins at the 0.12 bump (#1292), and it is here as a **repair**
+    rather than as that bump's own pin: it was retired at 0.8 and named by
+    neither this test nor
+    :func:`test_the_previous_minor_is_still_served`, which asserted only
+    ``0.10``/``0.9``/``0.8``. Four bumps passed with nothing checking it.
+    That gap is the reason
+    :func:`test_every_minor_below_the_current_one_is_still_served` now
+    derives the whole range instead of trusting either hand-typed list.
+
+    ``0.11`` joins at the same bump as its own per-bump pin. #1292 adds one
+    typed integer key to one MCP tool's ``statistics`` object and moves no
+    ``/v1`` shape whatsoever, so a ``0.11`` client meets nothing new on any
+    route it calls.
     """
-    for retired_minor in ("0.2", "0.3", "0.4", "0.5", "0.6"):
+    for retired_minor in ("0.2", "0.3", "0.4", "0.5", "0.6", "0.7", "0.11"):
         assert retired_minor in SUPPORTED_CONTRACT_MINORS
 
 
@@ -1724,14 +1738,56 @@ def test_the_committed_success_reflection_fixture_shows_the_populated_shape() ->
 
 
 def test_the_previous_minor_is_still_served() -> None:
-    """0.11 widened the compatibility window rather than shifting it.
+    """0.12 widened the compatibility window rather than shifting it.
 
-    A ``0.10`` client's ``/v1`` traffic is unaffected by two additive routes it
-    does not know exist, so refusing it outright would be a break invented by
-    the bump. ``0.9`` and ``0.8`` are checked alongside because the window only
-    ever widens.
+    A ``0.11`` client's ``/v1`` traffic is not touched at all by #1292: the
+    bump adds one typed integer key to one **MCP** tool's response, and no
+    ``/v1`` route, capability, wire model, error code or status moves, so
+    refusing a ``0.11`` caller would be a break invented entirely by the
+    version number. ``0.10``, ``0.9`` and ``0.8`` are checked alongside
+    because the window only ever widens.
+
+    The head entry of :data:`SUPPORTED_CONTRACT_MINORS` is *derived* from
+    :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the version
+    without adding the outgoing minor by hand evicts it silently — which is
+    what this test's first line is for, and why it is added at every bump
+    rather than only when somebody suspects a problem.
     """
+    assert "0.11" in SUPPORTED_CONTRACT_MINORS
     assert "0.10" in SUPPORTED_CONTRACT_MINORS
     assert "0.9" in SUPPORTED_CONTRACT_MINORS
     assert "0.8" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.11"
+    assert CONTRACT_MINOR == "0.12"
+
+
+def test_every_minor_below_the_current_one_is_still_served() -> None:
+    """No minor from ``0.2`` up to the running one has fallen out of the window.
+
+    The two hand-typed guards above are per-bump pins: each names the minors
+    somebody remembered to write down, so each is only as complete as the
+    author of that bump was. That is not a hypothetical failure mode —
+    ``0.7`` was named by neither of them until #1292 went looking, because
+    the bump that retired it did not extend either list.
+
+    This one cannot fall behind, because it derives the range from
+    :data:`CONTRACT_MINOR` instead of restating it: every bump automatically
+    widens what it demands. Comparison is componentwise **as integers**, for
+    the same reason :func:`minor_at_least` is — read as text, ``"0.10"``
+    sorts below ``"0.8"``, so a lexical range would silently stop covering
+    the double-digit minors at exactly the point they started existing.
+
+    Subset rather than equality: the window may legitimately hold entries
+    this range does not generate, and narrowing it is the thing being
+    guarded against, not widening it.
+    """
+    highest = int(CONTRACT_MINOR.split(".")[1])
+    expected = {f"0.{minor}" for minor in range(2, highest + 1)}
+
+    assert expected <= set(SUPPORTED_CONTRACT_MINORS), (
+        "a minor that was once the current one has fallen out of the "
+        "compatibility window, so every client still sending it is now "
+        "answered incompatible_version. Dropping a minor is a deliberate "
+        "breaking change; it must never happen by omission at a bump.\n\n"
+        f"missing: {sorted(expected - set(SUPPORTED_CONTRACT_MINORS))}\n"
+        f"served: {list(SUPPORTED_CONTRACT_MINORS)}"
+    )

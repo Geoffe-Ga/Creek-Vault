@@ -177,10 +177,10 @@ PII types, line numbers, and existence — is closed. `scan_batch`'s one
 filesystem walk (`_scannable_candidates`) now resolves the scan root once
 and declines any symlinked child whose resolved target lands outside it,
 using the same predicate as the shipped SEC-003 write guard; a declined
-child is counted on `ScanSummary.files_skipped_symlink` and rendered into
-`report_markdown`, but that counter is not yet a typed key on this tool's
-`statistics` object — tracked by #1292, deferred so the security fix did not
-also carry a contract bump. `rglob` does not descend into symlinked
+child is counted on `ScanSummary.files_skipped_symlink`, rendered into
+`report_markdown` when non-zero, and — since contract `0.12.0` (#1292) —
+published as the typed `files_skipped_symlink` key on this tool's
+`statistics` object. `rglob` does not descend into symlinked
 *directories*, so a link to `01-Fragments/` staged as a directory was never
 reachable either way.
 
@@ -323,6 +323,24 @@ reimplements nothing. See [`docs/api.md`](./api.md) for the wire shape and for
 how a client pinned below `0.8` is neither told about the capability nor served
 it. `SUPPORTED_CONTRACT_MINORS` widens again rather than shifting, so every
 minor back to `0.2` is still served.
+
+Contract `0.12.0` (#1292) moves the MCP surface again, by one key.
+`creek.redact.scan`'s `statistics` object now publishes
+`files_skipped_symlink`: the number of symlinked children the scan declined
+unopened because their target resolves outside the scanned root. #1087 has
+counted that decline on `ScanSummary` and rendered it into `report_markdown`
+since it closed the walk; it simply never reached the typed response, so a
+consumer could see how many files were skipped as binary and by extension and
+not how many were declined for pointing out of the subtree. **The wire key is
+unconditional — it renders at zero — while the markdown row stays omitted at
+zero**, which is deliberate rather than an inconsistency: a report line that
+fires on every scan is noise for a human, while a typed field whose presence
+varies is a second contract for a machine. The counter is a bare integer
+carrying no path, filename or target name, the same count already reached the
+same audience through `report_markdown`, and a refusal still carries the
+canonical four keys with no `statistics` block at all. No `/v1` shape moved,
+and `SUPPORTED_CONTRACT_MINORS` widens to keep `0.11` and everything below it
+served.
 
 Every tool requires a `privacy_tier_ceiling` parameter
 (`open` | `personal` | `intimate` | `all`); default is `open`. Note

@@ -81,10 +81,14 @@ read: its PII types, line numbers, and existence never reach this tool's
 response. The bound that used to be incidental is now a pinned property:
 ``rglob`` does not descend into symlinked directories, so a link to
 ``01-Fragments/`` staged as a directory was never reachable either way.
-The decline is counted on ``ScanSummary.files_skipped_symlink`` and
-rendered into ``report_markdown``, but it is not yet a typed key on this
-tool's ``statistics`` object — that wire change is deliberately deferred
-so a security fix does not also carry a contract bump (#1292).
+The decline is counted on ``ScanSummary.files_skipped_symlink``, rendered
+into ``report_markdown`` when non-zero, and — since contract ``0.12.0``
+(#1292) — published as the typed ``files_skipped_symlink`` key on this
+tool's ``statistics`` object. The wire key is **unconditional**: it renders
+at zero, unlike the markdown row, because a consumer branching on a typed
+field must not have to handle its absence. The count is a bare integer
+carrying no path, filename or target name, and the identical number already
+reached the identical audience through ``report_markdown``.
 """
 
 from __future__ import annotations
@@ -234,6 +238,7 @@ def redact_scan_tool(
             "files_scanned": scanned.files_scanned,
             "files_skipped_binary": scanned.files_skipped_binary,
             "files_skipped_extension": scanned.files_skipped_extension,
+            "files_skipped_symlink": scanned.files_skipped_symlink,
             "total_findings": len(scanned.matches),
         },
         "findings": [_finding_to_dict(match) for match in scanned.matches],
