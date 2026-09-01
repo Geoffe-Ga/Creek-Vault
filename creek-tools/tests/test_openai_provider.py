@@ -7,6 +7,7 @@ usage mapping, error redaction, and a mocked end-to-end classify call.
 
 from __future__ import annotations
 
+from typing import Final
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -16,6 +17,9 @@ from creek.classify.llm.completion import Completion
 from creek.classify.llm.consent import CLOUD_CONSENT_ENV, LEGACY_CONSENT_ENV
 from creek.classify.llm.providers import (
     OpenAIProvider,
+    _extract_openai_text,
+    _extract_openai_usage,
+    _map_openai_stop_reason,
     build_provider,
     provider_is_cloud,
 )
@@ -36,6 +40,71 @@ def openai_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(CLOUD_CONSENT_ENV, "1")
 
 
+_DEFAULT: Final[object] = object()
+"""Sentinel: build the well-formed default value for this response attribute."""
+
+_ABSENT: Final[object] = object()
+"""Sentinel: omit the attribute, so ``getattr(response, name, None)`` is ``None``."""
+
+
+def _set_or_delete(
+    target: MagicMock, name: str, value: object, default: object
+) -> None:
+    """Apply the ``_DEFAULT`` / ``_ABSENT`` / explicit-value dispatch to *target*.
+
+    Args:
+        target: The mock to mutate.
+        name: The attribute name.
+        value: ``_DEFAULT``, ``_ABSENT``, or the literal value to set.
+        default: The well-formed value used when *value* is ``_DEFAULT``.
+    """
+    if value is _ABSENT:
+        delattr(target, name)
+        return
+    setattr(target, name, default if value is _DEFAULT else value)
+
+
+def _make_mock_openai_response(
+    content: object = "hello world",
+    *,
+    finish_reason: object = "stop",
+    prompt_tokens: object = 11,
+    completion_tokens: object = 7,
+    choices: object = _DEFAULT,
+    usage: object = _DEFAULT,
+) -> MagicMock:
+    """Build a mock chat-completion response, degenerate envelopes included.
+
+    ``choices`` and ``usage`` each accept ``_DEFAULT`` (the well-formed value
+    built from the other arguments), ``_ABSENT`` (the attribute is deleted, so
+    ``getattr(response, name, None)`` returns ``None``), or an explicit value
+    such as ``[]`` or ``None``.
+
+    Args:
+        content: The first choice's message content.
+        finish_reason: The first choice's raw ``finish_reason``.
+        prompt_tokens: The usage object's ``prompt_tokens``.
+        completion_tokens: The usage object's ``completion_tokens``.
+        choices: Sentinel or explicit override for ``response.choices``.
+        usage: Sentinel or explicit override for ``response.usage``.
+
+    Returns:
+        The mock response object.
+    """
+    message = MagicMock()
+    message.content = content
+    choice = MagicMock()
+    choice.message = message
+    choice.finish_reason = finish_reason
+    default_usage = MagicMock()
+    default_usage.prompt_tokens = prompt_tokens
+    default_usage.completion_tokens = completion_tokens
+    response = MagicMock()
+    _set_or_delete(response, "choices", choices, [choice])
+    _set_or_delete(response, "usage", usage, default_usage)
+    return response
+
+
 def _make_mock_openai_client(
     content: str,
     *,
@@ -44,17 +113,12 @@ def _make_mock_openai_client(
     completion_tokens: int = 7,
 ) -> MagicMock:
     """Build a mock ``openai.OpenAI`` client returning one chat completion."""
-    message = MagicMock()
-    message.content = content
-    choice = MagicMock()
-    choice.message = message
-    choice.finish_reason = finish_reason
-    usage = MagicMock()
-    usage.prompt_tokens = prompt_tokens
-    usage.completion_tokens = completion_tokens
-    response = MagicMock()
-    response.choices = [choice]
-    response.usage = usage
+    response = _make_mock_openai_response(
+        content,
+        finish_reason=finish_reason,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
     client = MagicMock()
     client.chat.completions.create.return_value = response
     return client
@@ -310,3 +374,93 @@ def test_openai_end_to_end_classify(
     assert isinstance(completion, Completion)
     assert completion.text == "response body"
     assert completion.usage == {"input_tokens": 11, "output_tokens": 7}
+
+
+# --------------------------------------------------------------------------- #
+# Degenerate SDK envelopes: the fallback arms (#1449)
+# --------------------------------------------------------------------------- #
+
+
+class TestOpenAIDegenerateResponse:
+    """A malformed or partial SDK envelope degrades to a fixed value, never raises."""
+
+    def test_extract_text_returns_empty_string_for_empty_choices(self) -> None:
+        """A response with zero choices yields "" — never an IndexError."""
+        response = _make_mock_openai_response(choices=[])
+        assert _extract_openai_text(response) == ""
+
+    def test_extract_text_returns_empty_string_when_choices_absent(self) -> None:
+        """No ``choices`` attribute at all yields "" via the ``or []`` normalisation."""
+        response = _make_mock_openai_response(choices=_ABSENT)
+        assert _extract_openai_text(response) == ""
+
+    def test_stop_reason_is_end_turn_for_empty_choices(self) -> None:
+        """Zero choices maps to "end_turn" — never an IndexError."""
+        response = _make_mock_openai_response(choices=[])
+        assert _map_openai_stop_reason(response) == "end_turn"
+
+    @pytest.mark.parametrize(
+        "reason",
+        [2, None, b"length", 3.5, ["stop"]],
+        ids=["int", "none", "bytes", "float", "unhashable-list"],
+    )
+    def test_stop_reason_is_end_turn_for_a_non_str_finish_reason(
+        self, reason: object
+    ) -> None:
+        """A non-``str`` ``finish_reason`` maps to "end_turn".
+
+        The unhashable ``["stop"]`` case is the one that proves the
+        ``isinstance`` guard is load-bearing: deleting the guard makes every
+        hashable case (``2`` and ``None`` included) still return "end_turn" via
+        ``dict.get``'s default, but an unhashable key raises ``TypeError``.
+        """
+        response = _make_mock_openai_response(finish_reason=reason)
+        assert _map_openai_stop_reason(response) == "end_turn"
+
+    @pytest.mark.parametrize("usage", [None, _ABSENT], ids=["null", "absent"])
+    def test_extract_usage_is_none_when_the_sdk_omitted_usage(
+        self, usage: object
+    ) -> None:
+        """A null or missing ``usage`` object yields ``None``, not an empty dict."""
+        response = _make_mock_openai_response(usage=usage)
+        assert _extract_openai_usage(response) is None
+
+    def test_extract_usage_keeps_only_an_int_prompt_tokens(self) -> None:
+        """A non-int ``completion_tokens`` is skipped, leaving exactly one key."""
+        response = _make_mock_openai_response(
+            prompt_tokens=11, completion_tokens="not-an-int"
+        )
+        result = _extract_openai_usage(response)
+        assert result is not None
+        assert result == {"input_tokens": 11}
+        assert "output_tokens" not in result
+
+    def test_extract_usage_keeps_only_an_int_completion_tokens(self) -> None:
+        """A non-int ``prompt_tokens`` is skipped, leaving exactly one key."""
+        response = _make_mock_openai_response(
+            prompt_tokens="not-an-int", completion_tokens=7
+        )
+        result = _extract_openai_usage(response)
+        assert result is not None
+        assert result == {"output_tokens": 7}
+        assert "input_tokens" not in result
+
+    def test_extract_usage_is_none_not_empty_dict_when_no_field_is_an_int(self) -> None:
+        """A usage object carrying no int field collapses to ``None``, not ``{}``."""
+        response = _make_mock_openai_response(
+            prompt_tokens="not-an-int", completion_tokens=None
+        )
+        assert _extract_openai_usage(response) is None
+
+
+class TestOpenAIClientMemoization:
+    """The lazily-built SDK client is constructed once and then reused."""
+
+    def test_client_is_constructed_once_and_reused(self, openai_env: None) -> None:
+        """A second ``.client`` access returns the same object, not a new client."""
+        with patch("openai.OpenAI", return_value=MagicMock()) as ctor:
+            provider = OpenAIProvider(LLMConfig(provider="openai"))
+            first = provider.client
+            second = provider.client
+        assert first is second
+        assert ctor.call_count == 1

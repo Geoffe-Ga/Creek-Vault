@@ -28,6 +28,7 @@ from creek.classify.llm.providers import (
     AnthropicProvider,
     GeminiProvider,
     OpenAIProvider,
+    _read_key_env,
 )
 from creek.classify.llm.router import ModelRouter
 from creek.config import LLMConfig, LLMRoutingConfig
@@ -261,3 +262,71 @@ def test_api_key_env_rejects_a_pasted_key_value(pasted: str) -> None:
     """A value that looks like a key (not a var name) fails at config-load."""
     with pytest.raises(ValidationError, match="environment variable NAME"):
         LLMConfig(provider="anthropic", api_key_env=pasted)
+
+
+# --------------------------------------------------------------------------- #
+# _read_key_env: the lazy client-build key gate (#1449)
+# --------------------------------------------------------------------------- #
+
+_MISSING_KEY_SUFFIX = "; required for the"
+"""The extra clause the CONSTRUCTOR's message carries but ``_read_key_env`` does not."""
+
+
+class TestReadKeyEnv:
+    """``_read_key_env`` refuses an unset or blank var, naming only the var."""
+
+    def test_strips_surrounding_whitespace_from_the_value(
+        self, _clean_keys: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A padded value is returned stripped — the ``.strip()`` shapes the result."""
+        monkeypatch.setenv(_BYOK_OPENAI, "  padded-value  ")
+        assert _read_key_env(_BYOK_OPENAI) == "padded-value"
+
+    def test_raises_naming_the_variable_when_unset(self, _clean_keys: None) -> None:
+        """An unset variable raises ``RuntimeError`` naming it — and no key value."""
+        with pytest.raises(RuntimeError) as exc:
+            _read_key_env(_BYOK_OPENAI)
+        assert str(exc.value) == f"{_BYOK_OPENAI} environment variable is not set"
+
+    def test_raises_when_the_variable_is_whitespace_only(
+        self, _clean_keys: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A whitespace-only value counts as blank — ``.strip()`` is load-bearing."""
+        monkeypatch.setenv(_BYOK_OPENAI, "   ")
+        with pytest.raises(RuntimeError) as exc:
+            _read_key_env(_BYOK_OPENAI)
+        assert str(exc.value) == f"{_BYOK_OPENAI} environment variable is not set"
+
+
+def test_openai_key_cleared_after_construction_refuses_before_building_the_client(
+    _clean_keys: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A var set at construction but cleared before first use refuses at ``.client``.
+
+    The message is asserted with ``==`` (never ``match=``, which is a regex
+    *search*): the constructor's own missing-key message is a strict superstring
+    of this one, so a search would be satisfied by the wrong raiser. The patched
+    SDK constructor proves the refusal precedes any client build.
+    """
+    monkeypatch.setenv(_BYOK_OPENAI, "sk-openai-user")  # fake test literal
+    provider = OpenAIProvider(LLMConfig(provider="openai", api_key_env=_BYOK_OPENAI))
+    monkeypatch.delenv(_BYOK_OPENAI)
+    with patch("openai.OpenAI") as ctor, pytest.raises(RuntimeError) as exc:
+        _ = provider.client
+    assert str(exc.value) == f"{_BYOK_OPENAI} environment variable is not set"
+    assert _MISSING_KEY_SUFFIX not in str(exc.value)
+    ctor.assert_not_called()
+
+
+def test_gemini_key_cleared_after_construction_refuses_before_building_the_client(
+    _clean_keys: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Gemini twin: a cleared BYOK var refuses before ``genai.Client`` is built."""
+    monkeypatch.setenv(_BYOK_GEMINI, "g-user-byok")  # fake test literal
+    provider = GeminiProvider(LLMConfig(provider="gemini", api_key_env=_BYOK_GEMINI))
+    monkeypatch.delenv(_BYOK_GEMINI)
+    with patch("google.genai.Client") as ctor, pytest.raises(RuntimeError) as exc:
+        _ = provider.client
+    assert str(exc.value) == f"{_BYOK_GEMINI} environment variable is not set"
+    assert _MISSING_KEY_SUFFIX not in str(exc.value)
+    ctor.assert_not_called()
