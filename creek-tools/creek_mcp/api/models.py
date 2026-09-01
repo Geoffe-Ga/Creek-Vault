@@ -79,6 +79,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.11",
     "0.10",
     "0.9",
     "0.8",
@@ -151,6 +152,17 @@ outright, not ignore. So the fields are gated on the declared minor via
 shape, byte-for-byte, whether or not a neighbour qualified. ``0.8`` is retained
 for the same reason ``0.4`` was retained at 0.5 — refusing it outright is
 strictly worse — but retention alone was not enough here.
+
+Contract 0.12 (#1292) is a pure MCP-surface move again, of the 0.3/0.4/0.6/0.7
+kind and the plainest one in the list. ``creek.redact.scan``'s ``statistics``
+object gains a fifth typed key, ``files_skipped_symlink``, the count of
+symlinked children the scan declined because their target resolves outside the
+scanned root — a counter that has been on ``ScanSummary`` and in
+``report_markdown`` since #1087 and never reached the wire. No ``/v1`` route,
+capability, wire model, error code or status moves and ``CONTRACT_MODELS`` is
+unchanged, so a ``0.11`` client is answered byte-identically on every ``/v1``
+route it calls and there is nothing for it to be refused over. ``0.11`` is
+therefore retained here.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the

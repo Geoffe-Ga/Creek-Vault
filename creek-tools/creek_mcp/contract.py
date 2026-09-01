@@ -20,8 +20,30 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.11.0"
+CONTRACT_VERSION: Final[str] = "0.12.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.12.0 (#1292): ``creek.redact.scan``'s ``statistics`` object gains a fifth
+typed key, ``files_skipped_symlink`` — the count of symlinked children the
+scan declined unopened because their target resolves outside the scanned
+root. The counter has existed on ``ScanSummary`` since #1087 and has been
+rendered into ``report_markdown`` ever since; it simply never reached the
+wire, so a consumer was told how many files were skipped as binary and by
+extension and never how many were declined for pointing out of the subtree.
+A tool's return shape moved, so the minor moves: it cannot be a patch,
+because a client validating the payload closed meets a key it never
+negotiated. **No ``/v1`` route, capability, wire model, error code or status
+moves**, so this is a pure MCP-surface bump of the 0.3/0.4/0.6/0.7 kind and
+:data:`creek_mcp.api.models.SUPPORTED_CONTRACT_MINORS` widens to keep
+``0.11`` served. The key is **unconditional** on the wire — it renders at
+zero — while the markdown row stays conditional on being non-zero, which is
+deliberate: a report line that fires on every scan is noise, while a typed
+field whose presence varies is a second contract. Nothing new is disclosed:
+the counter is a bare integer carrying no path, filename, target name or PII
+type; the identical count already reached the identical audience through
+``report_markdown``; and a refusal still carries the canonical four keys
+with no ``statistics`` block at all, so it cannot become a skip-count oracle
+over a subtree the caller was refused.
 
 0.11.0 (#1568): two more routes under the **existing** ``drive-connector``
 capability — ``POST /v1/connectors/drive/authorizations`` and ``POST

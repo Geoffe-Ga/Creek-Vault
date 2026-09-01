@@ -303,7 +303,8 @@ header, a full patch version like `0.2.0`, or anything unrecognised is `409
 incompatible_version`, refused before any vault read.
 
 That set is a **window, and it widens before it narrows**. It currently holds
-`0.11`, `0.10`, `0.9`, `0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and `0.2`. The `0.3.0`, `0.4.0` and `0.6.0` moves all
+`0.12`, `0.11`, `0.10`, `0.9`, `0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and `0.2`. The
+`0.3.0`, `0.4.0` and `0.6.0` moves all
 came from the MCP surface and changed no `/v1` shape — `0.3.0` added
 `creek.upload` (#1023), `0.4.0` gave `creek.purge.*` its `partial` status
 (#1246), and `0.6.0` gave `creek.purge.*` the `ledger_rows_removed` and
@@ -353,6 +354,22 @@ epic's last clause: connecting Drive with no CLI and no shell access on the
 host. The redirect URI belongs to the **caller**, which is what keeps `/v1`
 free of any anonymous path — see
 [ADR-0012](./architecture/ADR/0012-remote-google-drive-authorisation.md).
+
+`0.12.0` (#1292) is the mirror of `0.6.0`: a bump that moves **nothing on this
+surface at all**. The MCP tool `creek.redact.scan` gained one typed integer key
+on its `statistics` object, `files_skipped_symlink` — the count of symlinked
+children a scan declined because their target resolved outside the scanned
+root. No `/v1` route, capability, wire model, error code or status moves, and
+`CONTRACT_MODELS` is unchanged, so a client pinned at `0.11` is answered
+byte-identically on every route it calls and `SUPPORTED_CONTRACT_MINORS` widens
+to keep serving it. The only thing an HTTP consumer sees is the bundle:
+`manifest.json`'s `contract_version` and the two `sha256` rows for
+`examples/capabilities/success.json` and `examples/capabilities/empty.json`,
+which carry `supported_contract_minors`. No *field* moves on either, and
+`schemas/CapabilitiesResponse.schema.json` does not move — that field is an
+unconstrained array of strings, so a longer window is not a schema change. A
+consumer that hash-pins the manifest must re-pin; one that does not sees
+nothing.
 
 Read the window off `GET /v1/capabilities` rather than assuming the newest
 minor is the only one accepted.
@@ -703,8 +720,8 @@ is not hash-pinned the way the fixture bundle is; only its schema content is
 pinned, by the tests above.
 
 **The revisit trigger, because "at the next contract minor" already came and
-went twice.** Minors `0.8.0` (#1524), `0.9.0` (#1527/#873) and `0.10.0`
-(#1570) have each
+went twice.** Minors `0.8.0` (#1524), `0.9.0` (#1527/#873), `0.10.0`
+(#1570), `0.11.0` (#1568) and `0.12.0` (#1292) have each
 re-published the bundle since #1111 was filed, so waiting for a free moment is
 not a plan. The trigger is recorded in
 [`docs/decisions/2026-07-31-adepthood-http-application-api.md`](../../docs/decisions/2026-07-31-adepthood-http-application-api.md)
