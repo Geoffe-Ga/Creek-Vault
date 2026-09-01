@@ -32,6 +32,67 @@ check() { # check <desc> <expected> <actual>
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
+# Stub directory, shared with the fake `gh` written further down. Defined up here
+# because the fake `uv` below must be on PATH before the FIRST assign (#1478).
+BIN="$WORK/bin"; mkdir -p "$BIN"
+
+# --- a knob-driven fake `uv` (#1478) ----------------------------------------
+# assign/adopt provision the lane with `uv sync --all-extras`. A real sync needs
+# the network and minutes of wall clock, and the CI job that runs this suite
+# (.github/workflows/ralph-recap-tests.yml) never installs uv — so the suite
+# stubs it and stays hermetic in both directions.
+cat > "$BIN/uv" <<'STUB'
+#!/usr/bin/env bash
+# Fake `uv` for test_fleet.sh. fleet.sh runs it as `uv sync --all-extras` from
+# inside <worktree>/creek-tools, so $PWD is the project.
+#   UV_FAIL=1    exit non-zero, create NOTHING          (failure path)
+#   UV_PARTIAL=1 create .venv/bin/python, THEN fail     (half-synced tree)
+#   UV_EMPTY=1   exit 0 creating NOTHING                (liar; postcondition)
+#   UV_SLEEP=<s> sleep, then succeed                    (lock-contention case)
+#   UV_STDOUT=1  also chatter on STDOUT                 (proves fleet.sh's >&2)
+# Refusing any subcommand but `sync` keeps this from being a blanket success.
+[ "${1:-}" = "sync" ] || { echo "fake uv: unexpected invocation: $*" >&2; exit 64; }
+echo "fake uv: $*" >&2
+[ -n "${UV_STDOUT:-}" ] && echo "fake uv: resolved 412 packages"
+[ -n "${UV_SLEEP:-}" ] && sleep "$UV_SLEEP"
+if [ "${UV_FAIL:-}" = "1" ]; then echo "fake uv: sync failed" >&2; exit 1; fi
+if [ "${UV_EMPTY:-}" = "1" ]; then exit 0; fi
+make_interpreter() {
+  mkdir -p "$PWD/.venv/bin"
+  printf '#!/bin/sh\nexec /usr/bin/env python3 "$@"\n' > "$PWD/.venv/bin/python"
+  chmod +x "$PWD/.venv/bin/python"
+}
+# Real uv writes .venv/bin/python BEFORE it installs anything, so an interrupted
+# sync leaves a tree that LOOKS provisioned but has no dependencies in it.
+if [ "${UV_PARTIAL:-}" = "1" ]; then
+  make_interpreter
+  echo "fake uv: sync failed after creating the interpreter" >&2
+  exit 1
+fi
+make_interpreter
+STUB
+chmod +x "$BIN/uv"
+# Only a DEDICATED single-entry directory goes on the global PATH. Putting $BIN
+# itself there would falsify the "run() has no gh at all on PATH" invariant the
+# adopt section documents, and would globally expose the ls-remote-breaking
+# $BIN/git shim written near the end of this file.
+UVBIN="$WORK/bin-uv"; mkdir -p "$UVBIN"
+ln -s "$BIN/uv" "$UVBIN/uv"
+export PATH="$UVBIN:$PATH"
+
+# A PATH with every uv-carrying directory stripped, for the tooling-missing case.
+# No arrays and no `cond && continue` (errexit-hostile as a loop body's last
+# command), so this stays shellcheck-clean at --severity=warning.
+nouv_path() {
+  local out="" d
+  while IFS= read -r d; do
+    if [[ -z "$d" || -x "$d/uv" ]]; then continue; fi
+    out="${out:+$out:}$d"
+  done < <(printf '%s\n' "${PATH//:/$'\n'}")
+  printf '%s\n' "$out"
+}
+NOUV_PATH="$(nouv_path)"
+
 # --- build an upstream + working clone -------------------------------------
 git init -q -b main "$WORK/upstream"
 (
@@ -39,6 +100,16 @@ git init -q -b main "$WORK/upstream"
   git config user.email t@t.t && git config user.name t
   mkdir -p scripts/ralph
   printf '{"max_workers": 4, "parallel_enabled": true}\n' > scripts/ralph/state.json
+  # A lane is a checkout of the creek-tools/ project, and provisioning acts on it
+  # (#1478). Without this the fixture has nothing for `uv sync` to sync, and the
+  # provisioning cases would fail on a missing project rather than on the defect.
+  mkdir -p creek-tools
+  printf '[project]\nname = "creek-tools-fixture"\nversion = "0.0.0"\n' > creek-tools/pyproject.toml
+  # Mirrors the real repo's .gitignore (`**/.venv/`). Load-bearing, not decoration:
+  # the sync-conflict case and the #1180 round trip below both run `git add -A`
+  # INSIDE a lane (the latter also pushes), and would otherwise commit a
+  # provisioned venv into the fixture upstream.
+  printf '.venv/\n**/.venv/\n' > .gitignore
   git add -A && git commit -qm init
 )
 git clone -q "$WORK/upstream" "$WORK/repo"
@@ -124,7 +195,6 @@ fi
 # healthy workers.
 run assign 105 'keep me open' >/dev/null 2>&1
 check "two workers before reconcile" "2" "$(run count)"
-BIN="$WORK/bin"; mkdir -p "$BIN"
 cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 # real gh applies --jq, so emit the already-extracted scalar — branch-aware.
@@ -612,6 +682,191 @@ fi
 [[ -d "$LOCKDIR" ]] && bad "the unreadable-remote refusal left the assign lock behind" \
   || ok "the unreadable-remote refusal leaves no assign lock behind"
 rm -f "$BIN/git"
+
+# =============================================================================
+# assign/adopt must hand back a RUNNABLE lane, not just a checked-out one (#1478)
+# =============================================================================
+# A worker's first gate is `cd creek-tools && ./scripts/check-all.sh`, and every
+# script under creek-tools/scripts/ resolves a BARE `python`
+# (creek-tools/scripts/_lib.sh). A lane with no .venv fails Gate 2 on missing dev
+# deps — never on its own change.
+#
+# The section raises max_workers for its own lanes and restores the baseline at
+# the end, so the two closing invariants below still see exactly 105 and 201.
+printf '{"max_workers": 8, "parallel_enabled": true}\n' > "$REPO/scripts/ralph/state.json"
+
+# fleet.sh derives every lane path from `git worktree list`, which reports the
+# PHYSICAL path. On macOS `mktemp -d` hands back /var/... — a symlink to
+# /private/var/... — so a path built by hand from $REPO would differ from
+# fleet.sh's answer by that prefix alone. Existing cases never hit this because
+# they compare fleet.sh output against fleet.sh output; the discriminators below
+# are the first to construct an expected lane path independently.
+REPO_P="$(cd "$REPO" && pwd -P)"
+
+# --- assign must hand the lane a usable Python interpreter -------------------
+D601="$(run assign 601 'provisioned lane' 2>/dev/null || true)"
+D601="${D601:-$WORK/assign-missing-601}"
+
+# DISCRIMINATORS. If EITHER of these fails, the case below is a harness error,
+# not the defect — fix the harness before believing the RED.
+check "the lane worktree was created at the expected path" \
+  "$REPO_P/.ralph/worktrees/issue-601" "$D601"
+check "the fake uv is on PATH for lane assigns" "$UVBIN/uv" "$(command -v uv)"
+[[ -f "$D601/creek-tools/pyproject.toml" ]] \
+  && ok  "the lane worktree carries creek-tools/pyproject.toml" \
+  || bad "the lane worktree carries creek-tools/pyproject.toml"
+
+# THE assertion.
+[[ -x "$D601/creek-tools/.venv/bin/python" ]] \
+  && ok  "assign provisions the lane venv (creek-tools/.venv/bin/python)" \
+  || bad "assign provisions the lane venv (creek-tools/.venv/bin/python)"
+
+# --- STDOUT DISCIPLINE ------------------------------------------------------
+# ralph-tick.md captures BOTH `assign` and `adopt` stdout as the worktree path
+# (`WT=$(scripts/ralph/fleet.sh assign …)`). One byte of provisioning chatter on
+# stdout and the orchestrator dispatches a worker at a garbage path. UV_STDOUT=1
+# makes the stub chatter on stdout too, so a dropped `>&2` is caught here.
+run release 601 >/dev/null 2>&1
+OUT601="$( (cd "$REPO" && UV_STDOUT=1 "$FLEET" assign 601 'provisioned lane') 2>/dev/null )"
+check "assign prints ONLY the worktree path on stdout" \
+  "$REPO_P/.ralph/worktrees/issue-601" "$OUT601"
+run release 601 >/dev/null 2>&1
+ERR601="$( (cd "$REPO" && "$FLEET" assign 601 'provisioned lane') 2>&1 1>/dev/null || true )"
+case "$ERR601" in
+  *"provisioning"*) ok  "provisioning chatter goes to stderr" ;;
+  *)                bad "provisioning chatter goes to stderr" ;;
+esac
+run release 601 >/dev/null 2>&1
+
+# --- SWEEP: adopt creates lanes by the same mechanism and runs the same gate --
+ADIRV="$( ( export HEAD_REF="$BOT_BRANCH"; run_gh adopt 602 921 ) 2>/dev/null || true)"
+ADIRV="${ADIRV:-$WORK/adopt-missing-602}"
+[[ -x "$ADIRV/creek-tools/.venv/bin/python" ]] \
+  && ok  "adopt provisions the lane venv too" \
+  || bad "adopt provisions the lane venv too"
+check "adopt prints ONLY the worktree path on stdout" \
+  "$REPO_P/.ralph/worktrees/issue-602" "$ADIRV"
+run release 602 >/dev/null 2>&1
+
+# --- FAILURE PATH: refuse rather than hand back a half-built lane ------------
+rc=0
+OUT603="$( (cd "$REPO" && UV_FAIL=1 "$FLEET" assign 603 'failing provision') 2>/dev/null )" || rc=$?
+[[ "$rc" -ne 0 ]] && ok "a failed provision makes assign exit non-zero" \
+  || bad "a failed provision makes assign exit non-zero"
+check "a failed provision prints nothing on stdout" "" "$OUT603"
+ERR603="$( (cd "$REPO" && UV_FAIL=1 "$FLEET" assign 603 'failing provision') 2>&1 1>/dev/null || true )"
+case "$ERR603" in
+  *"$REPO_P/.ralph/worktrees/issue-603"*) ok  "the failure diagnostic names the worktree path" ;;
+  *)                                      bad "the failure diagnostic names the worktree path" ;;
+esac
+case "$ERR603" in
+  *"uv sync --all-extras"*) ok  "the failure diagnostic names the remediation" ;;
+  *)                        bad "the failure diagnostic names the remediation" ;;
+esac
+# A leaked lock would wedge every later assign, not just this one.
+[[ -d "$LOCKDIR" ]] && bad "a failed provision left the assign lock behind" \
+  || ok "a failed provision releases the assign lock"
+
+# --- FAILURE PATH must be NON-DESTRUCTIVE ------------------------------------
+# ralph-tick.md re-assigns an EXISTING lane ("re-attach a worktree with
+# `fleet.sh assign` if reconcile removed it"), and the refill loop re-invokes
+# assign every pass. A lane holds a worker's uncommitted implementation, so a
+# transient uv failure must never remove it. Removing it would also stop
+# `fleet.sh free` decrementing, spinning the refill loop forever.
+touch "$REPO/.ralph/worktrees/issue-603/WORKER_WIP.txt"
+(cd "$REPO" && UV_FAIL=1 "$FLEET" assign 603 'failing provision') >/dev/null 2>&1 || true
+[[ -f "$REPO/.ralph/worktrees/issue-603/WORKER_WIP.txt" ]] \
+  && ok  "a failed provision leaves the lane worktree (and its uncommitted work) alone" \
+  || bad "a failed provision leaves the lane worktree (and its uncommitted work) alone"
+
+# --- A HALF-SYNCED TREE must not be left looking healthy ---------------------
+# Real uv writes .venv/bin/python before it installs anything, so an interrupted
+# sync leaves a tree that satisfies the readiness check while carrying none of
+# the dev deps the gate needs. Left in place it would poison every later assign:
+# the lane reads as provisioned forever and is never repaired, silently.
+rc=0
+(cd "$REPO" && UV_PARTIAL=1 "$FLEET" assign 604 'half-synced provision') >/dev/null 2>&1 || rc=$?
+[[ "$rc" -ne 0 ]] && ok "a half-synced provision still exits non-zero" \
+  || bad "a half-synced provision still exits non-zero"
+[[ -e "$REPO/.ralph/worktrees/issue-604/creek-tools/.venv" ]] \
+  && bad "a failed provision left a PARTIAL .venv behind (the readiness check now lies)" \
+  || ok "a failed provision removes the partial .venv"
+# ...and because it was removed, the next assign genuinely re-provisions.
+D604="$(run assign 604 'half-synced provision' 2>/dev/null || true)"
+D604="${D604:-$WORK/assign-missing-604}"
+[[ -x "$D604/creek-tools/.venv/bin/python" ]] \
+  && ok  "the next assign re-provisions a lane whose sync was interrupted" \
+  || bad "the next assign re-provisions a lane whose sync was interrupted"
+run release 604 >/dev/null 2>&1
+
+# --- a `uv` that exits 0 without creating anything must NOT pass -------------
+# Without a postcondition re-check, fleet.sh would trust the exit status and
+# hand back an unrunnable lane while reporting success.
+rc=0
+(cd "$REPO" && UV_EMPTY=1 "$FLEET" assign 606 'lying provision') >/dev/null 2>&1 || rc=$?
+[[ "$rc" -ne 0 ]] && ok "a uv that exits 0 creating nothing is still refused" \
+  || bad "a uv that exits 0 creating nothing is still refused"
+run release 606 >/dev/null 2>&1
+
+# --- RE-ENTRANCY: a lane whose first provision failed must be REPAIRED --------
+# The re-entrant early return is `[[ -d "$dir" ]]`, so without a readiness
+# re-check a lane that failed to provision once is handed back unprovisioned
+# forever — the defect, merely deferred by one call.
+D603="$(run assign 603 'failing provision' 2>/dev/null || true)"
+D603="${D603:-$WORK/assign-missing-603}"
+[[ -x "$D603/creek-tools/.venv/bin/python" ]] \
+  && ok  "a later assign repairs a lane whose first provision failed" \
+  || bad "a later assign repairs a lane whose first provision failed"
+
+# --- IDEMPOTENCY: a healthy lane's venv is never clobbered -------------------
+# mkdir -p so the sentinel can be planted even against an unprovisioned lane —
+# otherwise this setup step aborts the whole suite under `set -e` while the fix
+# is still absent, and the RED transcript stops here. The assertion is unchanged
+# either way: the sentinel must survive a re-assign of a HEALTHY lane.
+mkdir -p "$D603/creek-tools/.venv"
+touch "$D603/creek-tools/.venv/SENTINEL"
+rc=0
+D603B="$(run assign 603 'failing provision' 2>/dev/null)" || rc=$?
+check "re-assigning a healthy lane exits 0" "0" "$rc"
+check "re-assigning a healthy lane returns the same path" "$D603" "$D603B"
+[[ -f "$D603/creek-tools/.venv/SENTINEL" ]] \
+  && ok  "re-assigning a healthy lane does not clobber its venv" \
+  || bad "re-assigning a healthy lane does not clobber its venv"
+run release 603 >/dev/null 2>&1
+
+# --- TOOLING MISSING: uv absent from PATH is exit 2, like the gh refusal -----
+# Self-check first: on a runner that never had uv, nouv_path() is a no-op and
+# this case would otherwise pass for a reason unrelated to the assertion.
+check "NOUV_PATH really has no uv on it" "" "$( PATH="$NOUV_PATH" command -v uv || true)"
+rc=0
+(cd "$REPO" && PATH="$NOUV_PATH" "$BASH" "$FLEET" assign 605 'no uv') >/dev/null 2>&1 || rc=$?
+check "assign without uv exits 2 (tooling missing)" "2" "$rc"
+run release 605 >/dev/null 2>&1
+
+# --- LOCK SAFETY: provisioning runs OUTSIDE the assign critical section ------
+# FLEET_LOCK_TIMEOUT defaults to 10s and a cold `uv sync` runs for MINUTES, so
+# provisioning inside the lock would make every concurrent lane start die on a
+# false stale lock. FLEET_LOCK_TIMEOUT=2 against UV_SLEEP=5 is a STRICTER bound
+# than the 10s default and proves the same thing in less wall clock.
+( cd "$REPO" && UV_SLEEP=5 "$FLEET" assign 607 'slow provision' ) >"$WORK/slow.out" 2>"$WORK/slow.err" &
+SLOWPID=$!
+# Poll until the slow lane's worktree exists — a fixed sleep would make the case
+# insensitive to the mutation, since whether the two calls overlap would depend
+# on whether `git worktree add` happened to finish inside that window.
+waited=0
+while [[ ! -d "$REPO/.ralph/worktrees/issue-607" && "$waited" -lt 25 ]]; do
+  sleep 0.2
+  waited=$((waited + 1))
+done
+rc=0
+(cd "$REPO" && FLEET_LOCK_TIMEOUT=2 "$FLEET" assign 608 'concurrent start') >/dev/null 2>&1 || rc=$?
+check "a slow provision does not block a concurrent lane start" "0" "$rc"
+wait "$SLOWPID" || true
+run release 607 >/dev/null 2>&1
+run release 608 >/dev/null 2>&1
+
+# Restore the baseline the two closing invariants below are written against.
+printf '{"max_workers": 4, "parallel_enabled": true}\n' > "$REPO/scripts/ralph/state.json"
 
 # `usage()` prints a FIXED LINE RANGE of fleet.sh's header comment. Documenting
 # the reattachment above grew that header, and a range left behind truncates
