@@ -57,6 +57,7 @@ from creek_mcp.tier_ceiling import TierCeiling, to_privacy_override
 from creek_mcp.tools.reflect import TOOL_NAME, _routing_tier, reflect_tool
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     from creek.author.models import EvidenceBundle
@@ -2368,3 +2369,395 @@ def test_a_retrieval_seed_alone_selects_the_compiled_layer(
 
     assert result.get("status") != "refused", result
     assert [row["title"] for row in result["related_praxis"]] == [_PRAXIS_873], result
+
+
+# --- Exit-path characterisation (#1386) ----------------------------------------------
+
+# ``reflect_tool`` has **seven** terminal exit paths, not the six its issue body
+# claimed. Before #1386's extract-method, only two of the seven had their key
+# set pinned anywhere (:2125 and :2160) and none had its *values* pinned, so a
+# restructuring could have rerouted the ``escalate`` path through the ok-path
+# renderer -- silently adding ``routed_tier``/``notes``/``essay_grounded`` to a
+# care escalation -- with the whole suite green. These tests pin every path's
+# complete response dict by ``==``, so a stray added or dropped key fails.
+
+_CHAR_NOTE = {"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"}
+_CHAR_ESSAY = "a paragraph of free model prose"
+_CHAR_INTIMATE_REF = "frag-1386intim01"
+_CHAR_MISSING_REF = "frag-1386absent1"
+
+_CHAR_PRAXIS = [
+    {
+        "title": "Rest before the collapse",
+        "praxis_type": "practice",
+        "status": "active",
+        "excerpt": "Rest is the practice.",
+    }
+]
+_CHAR_EDDIES = [
+    {
+        "title": "Rest and Ruin",
+        "description": "Where rest and ruin keep meeting.",
+        "fragment_count": 2,
+        "formed": "2026-03-04",
+    }
+]
+
+
+class _CountingLookup:
+    """A compiled-layer lookup that records how many times it was consulted.
+
+    "A non-answer costs no corpus walk" is asserted here by **non-invocation**,
+    not merely by the optional keys being absent: a refactor that ran the
+    lookup and then discarded its result would satisfy every absent-key
+    assertion in this file while still paying the walk -- and, on the
+    above-ceiling path, walking the corpus on behalf of a caller the #846 gate
+    just refused.
+    """
+
+    def __init__(self) -> None:
+        """Init the consultation counter."""
+        self.calls = 0
+
+    def __call__(
+        self, seeds: Sequence[str], vault: Path, ceiling: TierCeiling
+    ) -> RelatedCompiled:
+        """Record the consultation and return nothing qualifying."""
+        del seeds, vault, ceiling
+        self.calls += 1
+        return RelatedCompiled([], [])
+
+
+def _char_unavailable_factory(tier: PrivacyTier):
+    """Refuse the way a missing/unavailable provider does."""
+    del tier
+    raise RuntimeError("no provider configured")
+
+
+def _exit_ok(vault: Path, lookup: _CountingLookup) -> dict[str, Any]:
+    """Drive the ``ok`` path: one verbatim note, no essay, no neighbours."""
+    return reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=_RecordingFactory(_notes_payload(_CHAR_NOTE)),
+        retrieve=_no_retrieval,
+        related_lookup=lookup,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _exit_empty(vault: Path, lookup: _CountingLookup) -> dict[str, Any]:
+    """Drive the ``empty`` path: the model returned no usable note."""
+    return reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=_RecordingFactory(_notes_payload()),
+        retrieve=_no_retrieval,
+        related_lookup=lookup,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _exit_escalate(vault: Path, lookup: _CountingLookup) -> dict[str, Any]:
+    """Drive the ``escalate`` path through the #753 care seam."""
+    return reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=_RecordingFactory(_notes_payload(_CHAR_NOTE)),
+        retrieve=_no_retrieval,
+        related_lookup=lookup,
+        care_guard=lambda _entry: "acute_distress_markers",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _exit_no_content(vault: Path, lookup: _CountingLookup) -> dict[str, Any]:
+    """Drive the blank-``content`` refusal."""
+    return reflect_tool(
+        vault_path=vault,
+        content="   ",
+        llm_factory=_RecordingFactory(_notes_payload(_CHAR_NOTE)),
+        retrieve=_no_retrieval,
+        related_lookup=lookup,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _exit_not_found(vault: Path, lookup: _CountingLookup) -> dict[str, Any]:
+    """Drive the unresolvable-``entry_ref`` refusal."""
+    return reflect_tool(
+        vault_path=vault,
+        entry_ref=_CHAR_MISSING_REF,
+        llm_factory=_RecordingFactory(_notes_payload(_CHAR_NOTE)),
+        retrieve=_no_retrieval,
+        related_lookup=lookup,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _exit_above_ceiling(vault: Path, lookup: _CountingLookup) -> dict[str, Any]:
+    """Drive the #846 read-gate refusal: an INTIMATE ref under an OPEN ceiling."""
+    _write_fragment(vault, _CHAR_INTIMATE_REF, _INTIMATE_BODY, tier="intimate")
+    return reflect_tool(
+        vault_path=vault,
+        entry_ref=_CHAR_INTIMATE_REF,
+        llm_factory=_RecordingFactory(_notes_payload(_CHAR_NOTE)),
+        retrieve=_no_retrieval,
+        related_lookup=lookup,
+        care_guard=lambda _entry: "acute_distress_markers",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _exit_unavailable(vault: Path, lookup: _CountingLookup) -> dict[str, Any]:
+    """Drive the provider-unavailable refusal."""
+    return reflect_tool(
+        vault_path=vault,
+        content=_ENTRY,
+        llm_factory=_char_unavailable_factory,
+        retrieve=_no_retrieval,
+        related_lookup=lookup,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+_EXIT_PATHS = {
+    "ok": (
+        _exit_ok,
+        {
+            "status": "ok",
+            "tool": TOOL_NAME,
+            "tier_ceiling": "open",
+            "routed_tier": "open",
+            "notes": [{"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"}],
+            "essay_grounded": False,
+        },
+    ),
+    "empty": (
+        _exit_empty,
+        {
+            "status": "empty",
+            "tool": TOOL_NAME,
+            "tier_ceiling": "open",
+            "routed_tier": "open",
+            "notes": [],
+            "essay_grounded": False,
+        },
+    ),
+    # Deliberately asymmetric: a care escalation carries **no** ``routed_tier``,
+    # ``notes`` or ``essay_grounded``. It is care and nothing else -- it never
+    # reached the model, so there is no routing or grounding to report, and
+    # rendering it through the ok-path renderer would invent all three.
+    "escalate": (
+        _exit_escalate,
+        {
+            "status": "escalate",
+            "tool": TOOL_NAME,
+            "tier_ceiling": "open",
+            "reason": "acute_distress_markers",
+            "care_signal": CARE_SIGNAL,
+        },
+    ),
+    # The four refusal reasons are byte-pinned here. They are deliberately
+    # distinct from one another (see the ACCEPTED RESIDUAL RISK comment in
+    # ``_admit_entry``), and "no entry content supplied" was, before #1386,
+    # the one of the four that no assertion anywhere in the repository
+    # sourced from the tool.
+    "no_content": (
+        _exit_no_content,
+        {
+            "status": "refused",
+            "tool": TOOL_NAME,
+            "tier_ceiling": "open",
+            "reason": "no entry content supplied",
+        },
+    ),
+    "not_found": (
+        _exit_not_found,
+        {
+            "status": "refused",
+            "tool": TOOL_NAME,
+            "tier_ceiling": "open",
+            "reason": "entry_ref not found",
+        },
+    ),
+    "above_ceiling": (
+        _exit_above_ceiling,
+        {
+            "status": "refused",
+            "tool": TOOL_NAME,
+            "tier_ceiling": "open",
+            "reason": "entry_ref tier exceeds ceiling",
+        },
+    ),
+    "unavailable": (
+        _exit_unavailable,
+        {
+            "status": "refused",
+            "tool": TOOL_NAME,
+            "tier_ceiling": "open",
+            "reason": "reflection unavailable: RuntimeError",
+        },
+    ),
+}
+
+
+@pytest.mark.parametrize("path", sorted(_EXIT_PATHS))
+def test_the_seven_exit_paths_are_exactly_these_dicts(
+    tmp_path: Path, path: str
+) -> None:
+    """Every terminal response of ``reflect_tool`` equals its pinned dict (#1386).
+
+    Whole-dict ``==`` equality, never a subset check and never a series of
+    ``in`` checks, so an extraction that adds a key to one path or drops one
+    from another fails here rather than reaching a consumer. The
+    ``above_ceiling`` row additionally passes a flagging ``care_guard``: its
+    absence from the response is what pins the ceiling gate above the care
+    seam from the response side.
+    """
+    driver, expected = _EXIT_PATHS[path]
+    lookup = _CountingLookup()
+
+    result = driver(_vault(tmp_path), lookup)
+
+    assert result == expected
+
+
+_ESSAY_KEY = frozenset({"essay"})
+_PRAXIS_KEY = frozenset({"related_praxis"})
+_EDDIES_KEY = frozenset({"related_eddies"})
+_BASE_OK_KEYS = frozenset(
+    {"status", "tool", "tier_ceiling", "routed_tier", "notes", "essay_grounded"}
+)
+
+
+@pytest.mark.parametrize("has_essay", [False, True], ids=["no-essay", "essay"])
+@pytest.mark.parametrize("has_praxis", [False, True], ids=["no-praxis", "praxis"])
+@pytest.mark.parametrize("has_eddies", [False, True], ids=["no-eddies", "eddies"])
+def test_the_optional_keys_are_omitted_not_empty(
+    tmp_path: Path, has_essay: bool, has_praxis: bool, has_eddies: bool
+) -> None:
+    """The full 2x2x2 lattice of the three conditional keys (#1386).
+
+    ``essay``, ``related_praxis`` and ``related_eddies`` are each **absent**
+    when they do not qualify, never present-and-empty -- the compatibility
+    claim a pre-#873 consumer relies on. The 0-of-3 corner is already pinned by
+    ``test_the_fields_are_absent_not_empty_when_nothing_qualifies`` and the
+    3-of-3 corner by
+    ``test_compiled_pages_reach_a_caller_admitted_to_every_contributor``;
+    the mixed corners existed nowhere, and they are exactly what a
+    ``if related.praxis or related.eddies:`` collapse in the extracted
+    response builder would silently break.
+    """
+    praxis = _CHAR_PRAXIS if has_praxis else []
+    eddies = _CHAR_EDDIES if has_eddies else []
+
+    result = reflect_tool(
+        vault_path=_vault(tmp_path),
+        content=_ENTRY,
+        llm_factory=_RecordingFactory(
+            _notes_payload(_CHAR_NOTE, essay=_CHAR_ESSAY if has_essay else None)
+        ),
+        retrieve=_no_retrieval,
+        related_lookup=lambda *_args: RelatedCompiled(praxis, eddies),
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    expected_keys = set(_BASE_OK_KEYS)
+    if has_essay:
+        expected_keys |= _ESSAY_KEY
+    else:
+        assert "essay" not in result
+    if has_praxis:
+        expected_keys |= _PRAXIS_KEY
+    else:
+        assert "related_praxis" not in result
+    if has_eddies:
+        expected_keys |= _EDDIES_KEY
+    else:
+        assert "related_eddies" not in result
+    assert set(result) == expected_keys
+
+
+@pytest.mark.parametrize("path", ["above_ceiling", "escalate", "unavailable"])
+def test_a_non_answer_costs_no_compiled_layer_walk(tmp_path: Path, path: str) -> None:
+    """A refusal, an escalation and an unavailable provider walk no corpus (#1386).
+
+    ``_related`` runs *after* the model call on purpose. Pinned by
+    non-invocation rather than by absent keys, because a hoisted lookup whose
+    result is discarded leaves the response identical while still paying the
+    walk -- and on the ``above_ceiling`` row, paying it for a caller the #846
+    gate has just refused.
+    """
+    driver, _expected = _EXIT_PATHS[path]
+    lookup = _CountingLookup()
+
+    driver(_vault(tmp_path), lookup)
+
+    assert lookup.calls == 0
+
+
+@pytest.mark.parametrize(
+    "path", ["ok", "empty", "escalate", "not_found", "unavailable"]
+)
+def test_every_exit_path_appends_exactly_one_audit_entry(
+    tmp_path: Path, path: str
+) -> None:
+    """One ``creek.reflect`` audit append per call, on every exit path (#1386).
+
+    The append is deliberately the first statement of ``reflect_tool``, above
+    the ceiling gate, so a refused above-ceiling probe is still recorded -- and
+    it is the *only* append, so the log cannot answer "did consumer X read
+    fragment F?" by cardinality either. The ``above_ceiling`` path is already
+    pinned by ``test_entry_ref_above_ceiling_is_refused_not_reflected`` and the
+    ``not_found`` path end-to-end by
+    ``tests/test_api_reflect.py::test_the_audit_record_names_the_consumer_and_stays_a_non_oracle``;
+    these are the five paths nothing pinned.
+    """
+    driver, _expected = _EXIT_PATHS[path]
+    vault = _vault(tmp_path)
+
+    driver(vault, _CountingLookup())
+
+    assert [e for e in _audit(vault) if e["tool"] == TOOL_NAME] != []
+    assert len([e for e in _audit(vault) if e["tool"] == TOOL_NAME]) == 1
+
+
+# --- Complexity budget (#1386) -------------------------------------------------------
+
+# ``creek_mcp/`` sits outside ``scripts/complexity.sh``'s xenon gate (which
+# targets ``creek/`` only), so nothing else in the repo stands between this
+# function and its next silent complexity regression -- which is exactly how
+# ``reflect_tool`` reached radon C (14) in one commit with every gate green.
+
+_COMPLEXITY_BUDGET = 6
+_BUDGETED = frozenset(
+    {"reflect_tool", "_admit_entry", "_gather_grounding", "_reflection_response"}
+)
+
+
+def test_reflect_tool_and_its_helpers_stay_within_the_complexity_budget() -> None:
+    """No function in ``reflect_tool``'s own decomposition exceeds radon CC 6 (#1386).
+
+    Scored with radon's own ``cc_visit`` -- the same engine
+    ``scripts/complexity.sh`` drives -- so this test cannot drift from the
+    numbers quoted in review. ``_parse_notes`` (C 11) and ``_clean_notes``
+    (B 9) are deliberately outside the budget: they are #826's, and naming
+    the budgeted functions rather than asserting a module maximum is what
+    keeps this test from either failing on their behalf or silently
+    tightening their scope.
+    """
+    from pathlib import Path as _Path
+
+    from radon.complexity import cc_visit
+
+    import creek_mcp.tools.reflect as _reflect_module
+
+    source = _Path(_reflect_module.__file__).read_text(encoding="utf-8")
+    scored = {block.name: block.complexity for block in cc_visit(source)}
+    over = {
+        name: cc
+        for name, cc in scored.items()
+        if name in _BUDGETED and cc > _COMPLEXITY_BUDGET
+    }
+    assert over == {}
