@@ -832,6 +832,14 @@ check "re-assigning a healthy lane returns the same path" "$D603" "$D603B"
 [[ -f "$D603/creek-tools/.venv/SENTINEL" ]] \
   && ok  "re-assigning a healthy lane does not clobber its venv" \
   || bad "re-assigning a healthy lane does not clobber its venv"
+# The SENTINEL check above cannot on its own prove the idempotency short-circuit
+# exists: the stub only ever WRITES .venv/bin/python, so a sentinel planted
+# beside it survives a redundant sync too. This is the discriminator — with a uv
+# that would FAIL if it ran at all, a healthy lane must still exit 0, which is
+# only possible if provisioning was skipped outright.
+rc=0
+(cd "$REPO" && UV_FAIL=1 "$FLEET" assign 603 'failing provision') >/dev/null 2>&1 || rc=$?
+check "re-assigning a healthy lane never re-invokes uv (exits 0 under UV_FAIL=1)" "0" "$rc"
 run release 603 >/dev/null 2>&1
 
 # --- TOOLING MISSING: uv absent from PATH is exit 2, like the gh refusal -----
