@@ -167,8 +167,8 @@ back to the one-issue-at-a-time loop with zero other changes.
 | `active` | Active issue numbers, space-separated. |
 | `count` / `free` | Active count / remaining capacity (honors `parallel_enabled`). |
 | `path <N>` | Worktree path for issue N (exit 1 if none). |
-| `assign <N> <slug>` | Create/reuse a worktree off `origin/main`; prints its path; refuses when full. |
-| `adopt <N> <PR>` | The bot-PR variant of `assign`: create/reuse a worktree for issue N attached to PR `<PR>`'s **existing** head branch (e.g. Dependabot's), so fixes push there instead of opening a second PR. Refuses a fork PR (its branch is not pushable), a local branch diverged from `origin/<ref>`, and a full fleet. |
+| `assign <N> <slug>` | Create/reuse a worktree off `origin/main`; prints its path; refuses when full. Provisions the lane's `creek-tools/.venv` (`uv sync --all-extras`, idempotent) so the worker's first gate runs against real dev deps; refuses non-zero on a provisioning failure, leaving the worktree in place so a retry repairs it. |
+| `adopt <N> <PR>` | The bot-PR variant of `assign`: create/reuse a worktree for issue N attached to PR `<PR>`'s **existing** head branch (e.g. Dependabot's), so fixes push there instead of opening a second PR. Refuses a fork PR (its branch is not pushable), a local branch diverged from `origin/<ref>`, and a full fleet. Provisions the lane's venv exactly as `assign` does. |
 | `sync <N>` | Merge latest `origin/main` into issue N's branch (no force-push); exit 3 on conflict (aborted, left clean). |
 | `release <N>` | Remove issue N's worktree + delete its branch. |
 | `reconcile` | Release worktrees whose PR merged/closed or whose issue is closed; prune. |
@@ -250,7 +250,14 @@ pre-commit hook alone, i.e. not at all for anyone who bypassed it.)
   refusal (including a `|` smuggled into the branch name, with a legal
   same-repo twin so the guard is not just "reject every `|`"), a local branch
   diverged from `origin/<ref>`, both malformed head-lookup shapes, the cap, and
-  a tag that shadows the branch name.
+  a tag that shadows the branch name. Lane **provisioning** is covered against a
+  knob-driven fake `uv` (the CI job never installs the real one): the success
+  path, stdout/stderr discipline on both `assign` and `adopt`, the failure path
+  (non-zero, empty stdout, an actionable diagnostic, the lock released, the
+  worktree and its uncommitted work left alone, a partial `.venv` removed), a
+  `uv` that exits 0 creating nothing, repair of a lane whose first provision
+  failed, idempotency over a healthy lane, a missing `uv` (exit 2), and that a
+  slow sync does not block a concurrent lane start.
 - `scripts/ralph/test_pick_next.sh` stubs `gh` and exercises the picker's
   parallel-awareness: first-worker-lowest, worktree exclusion, in-flight-PR
   exclusion, the `solo` guard (candidate and active), the same-epic guard, the

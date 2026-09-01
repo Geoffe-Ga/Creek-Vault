@@ -44,8 +44,13 @@ Opus 5. You also serve as the **correctness/maintainability reviewer**.
 4. **Refactor** — remove duplication, name the magic numbers, keep functions
    xenon A-grade / radon MI ≥ B, satisfy mypy strict. Comment
    intent, not syntax. Run `./scripts/fix-all.sh` for format/lint autofix.
-5. Confirm the full local check (`cd creek-tools && ./scripts/check-all.sh`) is
-   on track before handing back the Handoff block below. Stay strictly within scope.
+5. Confirm the full local check
+   (`cd creek-tools && VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" ./scripts/check-all.sh`)
+   is on track before handing back the Handoff block below. Stay strictly within
+   scope. In a fleet lane the venv is already provisioned by `fleet.sh` — do NOT
+   run your own `uv sync`. The exports are still mandatory: they govern which
+   interpreter is RESOLVED (`creek-tools/scripts/_lib.sh` probes a bare
+   `python`), not whether one exists.
 
 ## Handoff (return this — terse; the conductor consumes it, not a human)
 
@@ -79,7 +84,9 @@ gates, thresholds, anti-bypass, and minimal-change rules.
 **Issue #812**: in `creek-tools/creek/link/eddies.py`, correct the
 window-bucket math at the boundary using the existing window helper; no
 template change. Turn the regression test green, refactor the boundary branch
-for clarity, confirm `cd creek-tools && ./scripts/check-all.sh` passes.
+for clarity, confirm
+`cd creek-tools && VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" ./scripts/check-all.sh`
+passes.
 
 ---
 
