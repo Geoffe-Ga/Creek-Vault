@@ -3,7 +3,7 @@
 <!-- capability-set: contract-versions -->
 - **Status**: Draft — pending agreement
 - **Date**: 2026-06-30 (surface truthed-up 2026-08-21, #875/#1094)
-- **Contract version**: `0.12.0`
+- **Contract version**: `0.13.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23` (see [Ontology version](#ontology-version))
 <!-- /capability-set -->
 - **Driving issues**: [#748](https://github.com/Geoffe-Ga/Creek-Vault/issues/748) (epic), [#749](https://github.com/Geoffe-Ga/Creek-Vault/issues/749) (this doc), [#875](https://github.com/Geoffe-Ga/Creek-Vault/issues/875) (truth-up), [#1094](https://github.com/Geoffe-Ga/Creek-Vault/issues/1094) (cross-repo reconciliation)
@@ -18,7 +18,7 @@
 > `0.4.0 (draft)` while the change log's own top row said `0.9.0`; that was a
 > **stale header, not five unrecorded contract events**. `creek_mcp/contract.py`
 > has always been the runtime source of truth, and each minor between `0.1.0`
-> and `0.12.0` is now recorded in the [change log](#change-log) with the change
+> and `0.13.0` is now recorded in the [change log](#change-log) with the change
 > that earned it — four of those rows (`0.5.0`–`0.8.0`) were written by the
 > 2026-08-21 truth-up, which found them missing.
 > `test_the_change_log_has_a_row_for_every_minor_up_to_the_current_one` asserts
@@ -174,6 +174,7 @@ registered.
 | Ingest one source **file path** into fragments | `creek.ingest` | **Ships** | — |
 | Upload one document's bytes, staged and ingested | `creek.upload` | **Ships** | [#1023](https://github.com/Geoffe-Ga/Creek-Vault/issues/1023) (contract `0.3.0`) |
 | Classify existing fragments | `creek.classify` | **Ships** | — |
+| Read one fragment's persisted classification (frequency, phase, tier, provenance) | `creek.classify.entry` | **Ships** | [#874](https://github.com/Geoffe-Ga/Creek-Vault/issues/874) (contract `0.13.0`) |
 | Reflect — Higher-Self margin notes on one entry | `creek.reflect` | **Ships** | [#751](https://github.com/Geoffe-Ga/Creek-Vault/issues/751) |
 | Wheel — per-frequency balance read for the Map | `creek.wheel` | **Ships** | [#752](https://github.com/Geoffe-Ga/Creek-Vault/issues/752) |
 <!-- /capability-set -->
@@ -221,7 +222,7 @@ which.
   "server": "creek-tools-mcp",
   "transport": "stdio",
   "available": true,
-  "contract_version": "0.12.0",
+  "contract_version": "0.13.0",
   "ontology_version": "aptitude-wavelength/2026-05-23",
   "tiers": ["open", "personal", "intimate"],
   "tier_model": { "ceilings": ["open", "personal", "intimate", "all"],
@@ -286,13 +287,70 @@ refused before anything is staged, ingested or audited, with the shared
 alongside its counts since contract `0.5.0` (#1372) — the same ceiling-safe
 advisory channel described under [`creek.journal`](#journal-entry--creekjournal).
 
-### Classify — `creek.classify`
+### Classify — `creek.classify` and `creek.classify.entry`
 
-`creek.classify(method="rules", force=False, privacy_tier_ceiling)` re-classifies
-existing fragments (`rules` is offline/local; `llm` requires consent) and returns
-counts: `{total, classified, preserved_manual, preserved_llm, skipped_high_confidence, errors[]}`.
-Classification assigns ontology coordinates (frequency, phase, …) but creates no
-new privacy tier.
+Two tools, deliberately kept apart. **`creek.classify` is the corpus-maintenance
+pass**: whole-vault, idempotent, resumable, and it takes no fragment selector.
+**`creek.classify.entry` is the per-entry read**: it addresses one fragment by id
+and computes nothing. Folding the read into the pass would blur an operation that
+rewrites every fragment's frontmatter into a lookup that rewrites none.
+
+`creek.classify(method="rules", force=False, retier=False, privacy_tier_ceiling)`
+re-classifies existing fragments (`rules` is offline/local; `llm` requires
+consent). `retier`, added at contract `0.10.0` (#1570), re-derives the privacy
+tier of fragments that already carry a concrete one and persists it only when the
+new verdict is *stricter*. It returns counts:
+
+```
+{total, classified, preserved_manual, preserved_llm, skipped_high_confidence,
+ llm_call_failed, privacy_tiers_assigned, retiered, praxis_marked,
+ tags_extracted, healed_unearned_llm, errors[]}
+```
+
+Classification assigns ontology coordinates (frequency, phase, …). It does not
+*create* a privacy tier out of nothing, but the tier pass does run: it assigns a
+tier where none was recorded and, under `retier`, replaces a recorded one with a
+stricter verdict. The ratchet is escalate-only in both directions of use — a run
+can move a fragment out of a remote consumer's reach and never into it.
+
+`creek.classify.entry(entry_ref, privacy_tier_ceiling)` returns the
+classification the named fragment **already carries on disk**, as exactly eight
+keys: `{status, tool, tier_ceiling, entry_ref, frequency, phase, privacy_tier,
+classification_method}`. Every value is a non-null string; `frequency`, `phase`
+and `privacy_tier` read the literal `"unclassified"` when unset, never null and
+never omitted.
+
+**Ingest does not classify, and this is where a consumer finds that out.**
+`creek.ingest` and `creek.journal` write fragments; neither runs the
+frequency/phase classifier. A freshly written entry therefore reads
+`frequency: "unclassified"`, `phase: "unclassified"`,
+`classification_method: "none"` until a pass runs. That is an honest answer, not
+a failure, and the remedy is one call: run `creek.classify` (or
+`POST /v1/classifications`, published at contract `0.10.0`), then read again.
+
+`classification_method` ∈ `rules | llm | manual | none` is what makes the answer
+legible without out-of-band knowledge. The provenance stamp is written
+*unconditionally* by any classify write, even when the verdict is
+`unclassified` — so `rules` alongside `frequency: "unclassified"` means *a pass
+ran and genuinely could not classify this*, while `none` means *no pass has
+run*. The sentinel is `none` and not `unclassified` precisely so those two do
+not collapse into one word.
+
+Refusals carry the canonical four keys and one of three reasons, no others:
+`entry_ref must not be blank` (a malformed call, refused before any vault read
+and without an audit append), `entry_ref not found`, and the generic
+above-ceiling reason. The gate compares the fragment's **current persisted**
+tier — read through the shared source-tier walk, never a caller-declared tier —
+and fails closed to `intimate` both for a fragment whose `privacy_tier` key is
+missing entirely and for an id that resolves to nothing. Note that an explicit
+`unclassified` tier ranks with `personal` (#961), so it is admitted at
+`privacy_tier_ceiling=personal` and refused at `open`.
+
+There is **no per-fragment classify-and-write**, and that is a decision rather
+than an omission: it would be a new mutation surface sitting awkwardly beside
+the whole-vault, no-selector commitment above, and it would need its own
+escalate-only privacy argument. The pass remains the only way to *change* a
+classification.
 
 ### Reflect — `creek.reflect`
 
@@ -714,6 +772,7 @@ not upgrade it to a semantic identity.
 |---|---|---|
 | *(no contract change)* | 2026-08-21 | **The handshake stops misreporting the channel (#1583).** `creek.handshake` held `TRANSPORT = "stdio"` as a module-level literal and emitted it unconditionally, so a consumer connected over authenticated streamable-HTTP was told `"transport": "stdio"`; and `tier_model.ceilings` published all four `TierCeiling` members to that same consumer, advertising `intimate` and `all` when `REMOTE_ADMITTED_CEILINGS` refuses both before dispatch. Both now answer from the channel the server was actually started on: `creek_mcp.policy.Transport` is the single place the two channel names are written down, `--transport`'s argparse choices read it, `build_server(transport=...)` requires it with no default, and a `token_verifier` on a non-network transport is refused at build time rather than served. **No minor.** Nothing was added, removed or renamed — two values that were already published stopped being false, and this document said in the same breath that neither could be trusted ('`transport` is the hardcoded literal … and must not be trusted'), so no conforming consumer could have depended on the old answers. `docs/contracts/adepthood-v1/manifest.json` does not carry the handshake payload at all, so a hash-pinned `/v1` consumer sees nothing move. Resolves [Open question 5](#open-questions-resolve-before-accepted). |
 | *(no contract change)* | 2026-08-21 | **Documentation truth-up (#875/#1094).** The Creek copy now describes the shipped surface. No tool, shape, status, error code or version moved — this row records a doc catching up, not a contract event. The header's `Contract version` was corrected from a stale `0.4.0` to `0.9.0`; `creek_mcp/contract.py` has always been the runtime source of truth, so **the five-minor jump in the header is one stale string being fixed, not five contract events landing at once**. Four of the intervening minors had no row below either, and this truth-up writes them: `0.5.0` (#1372), `0.6.0` (#1453) and `0.7.0` (#1494) each moved the MCP tool surface and belonged in this document all along, while `0.8.0` (#1524) is `/v1`-only and is recorded because the minor is shared. Substantively: the *Planned* labels on `creek.reflect` (#751), `creek.wheel` (#752), the Adepthood-journal path (now `creek.journal`, #754) and the Creek-side care guardrail (#753) are replaced by statements of fact, all four issues being closed; the network transport and per-consumer bearer auth (#755, closed) replace "out of scope for this contract version"; `creek.upload` and `drive-connector` join the capability record; and the **remote tier cap** — `REMOTE_ADMITTED_CEILINGS`, which admits only `open`/`personal` for a network caller and was absent from this document entirely — is now written down, under its real name and module. Status stays `Draft`: the intimate-transit divergence in [Open questions](#open-questions-resolve-before-accepted) blocks `Accepted` on both sides. Five machine-checked fences now pin the version strings, the capability→tool table, the handshake example, the transport table and the remote-ceiling constant against live code. |
+| `0.13.0` | 2026-09-01 | **One new read-only MCP tool, `creek.classify.entry` (#874).** `creek.classify.entry(entry_ref, privacy_tier_ceiling)` reports the classification a named fragment **already carries on disk** — `frequency`, `phase`, `privacy_tier` and `classification_method` — and computes nothing: no rule classifier on demand, no LLM, no persisted verdict. The tool surface widened, so the minor moves; it cannot be a patch, because a consumer negotiating capabilities meets a tool name it never agreed to. **No `/v1` route, capability, wire model, error code, status or schema moves**, which makes this the same kind of pure MCP-surface bump as `0.3.0`, `0.4.0`, `0.6.0`, `0.7.0` and `0.12.0`. `SUPPORTED_CONTRACT_MINORS` widens to keep `0.12` and everything below it served. **What it closes**: a consumer could write a journal entry and could not ask what the ontology made of it. `creek.journal` already returns `fragment_id` as a required field on both transports, so `journal → fragment_id → creek.classify.entry` is a complete round trip with zero change to the journal surface — which is why the capability landed as a sibling tool rather than as an inline field on `creek.journal`, where it would have been a constant in disguise: ingest never runs the frequency/phase classifier, so the answer would have read `unclassified` on every call forever. That fact is now **published** rather than merely true, and `classification_method` is what makes it legible — the stamp is written unconditionally by any classify write, so `rules` with `frequency: unclassified` means *a pass ran and could not classify this*, while `none` means *no pass has run*, whose remedy is the `0.10.0` route: run `creek.classify` or `POST /v1/classifications`, then read. Nothing new is disclosed — the four published values are bounded enum-valued strings already served at strictly broader granularity by `creek.state.render`, `creek.wheel` and the compiled layer, and strictly less than `creek.reflect`, which returns model-generated prose grounded in the fragment *body*, already publishes over the same id namespace. The tool is `GATED` on the shared `refuse_above_ceiling` primitive against the fragment's current **persisted** tier, never a caller-declared one, failing closed to `intimate` both for a missing `privacy_tier` key and for an id that resolves to nothing; and `classification_method` is clamped to the three published methods rather than echoed, because raw frontmatter is arbitrary user-controlled bytes. |
 | `0.12.0` | 2026-09-01 | **`creek.redact.scan`'s `statistics` object gains a fifth key, `files_skipped_symlink` (#1292).** It is the count of symlinked children the scan declined unopened because their target resolves outside the scanned root — the counter #1087 added to `ScanSummary` and rendered into `report_markdown`, which never reached the wire, so a consumer was told how many files were skipped as binary and by extension and never how many were declined for pointing out of the subtree. A tool's return shape moved, so the minor moves; it cannot be a patch, because a client validating the payload closed meets a key it never negotiated. **No `/v1` route, capability, wire model, error code or status moves**, which makes this the same kind of pure MCP-surface bump as `0.3.0`, `0.4.0`, `0.6.0` and `0.7.0`. `SUPPORTED_CONTRACT_MINORS` widens to keep `0.11` and everything below it served. **The key is unconditional on the wire while the markdown row stays conditional on being non-zero, deliberately**: a report line that fires on every scan is noise for a human reader, while a typed field whose presence varies is a second contract for a machine one. Nothing new is disclosed — the counter is a bare integer carrying no path, filename, target name or PII type; the identical count already reached the identical audience through `report_markdown`; and a refusal still carries the canonical four keys with no `statistics` block at all, so it cannot become a skip-count oracle over a subtree the caller was refused. |
 | `0.11.0` | 2026-08-22 | **No MCP surface moved.** The shared minor advances because `/v1` publishes two more routes under the existing `drive-connector` capability — `POST /v1/connectors/drive/authorizations` and `POST /v1/connectors/drive/authorizations/{state}` (#1568) — which close the last unmet clause of the seeding epic: connecting Google Drive over the network, with no CLI and no shell access on the vault host. Until now the first authorisation was `creek gdrive --download`, whose `InstalledAppFlow.run_local_server(port=0)` opens a browser **on the server**. No new capability name, for the reason `drive-connector` already bundles status with sync: a consumer cannot usefully negotiate "may I sync" apart from "may I connect". `SUPPORTED_CONTRACT_MINORS` widens to keep `0.10` and everything below it served. See ADR-0012 for why the OAuth redirect stays at the caller rather than becoming a callback route here. |
 | `0.10.0` | 2026-08-22 | `creek.classify` gains a `retier` argument and a `retiered` counter on its result, and the shared minor moves with it (#1570). `retier` re-derives the privacy tier of a fragment that already carries a concrete one and persists the new verdict only when it is **stricter** — the escalate-only merge `creek classify --retier` has had since #1106, now reachable from an adapter. It is the only way a caller who declared the wrong tier at write time can be corrected, which matters because `creek.upload` and `POST /v1/uploads` have required an explicit `tier` since #1494/#1497 and never re-derive it. The same minor publishes the seventh `/v1` capability, `pipeline`, over `POST /v1/classifications` and `POST /v1/links`, closing the seeding gap where a network-seeded vault could be ingested but never classified or linked; it is additive for the same reason every capability bump since `0.8.0` has been, because both halves read `CAPABILITY_SINCE_MINOR`. `SUPPORTED_CONTRACT_MINORS` widens to keep `0.9` served. **The first double-digit minor**: `minor_at_least` compares componentwise as integers, because read as text `"0.10"` sorts below `"0.8"`. |
@@ -727,7 +786,7 @@ not upgrade it to a semantic identity.
 | `0.2.0` | 2026-07-30 | `unclassified` (untiered) content now ranks with `personal`, not `open`, on the MCP ceiling — matching `creek.classify.privacy_filter` since #876 (#961). `open`-ceiling consumers no longer read untiered content; remedy is `creek classify`. See the amendment note under [Tier ceiling semantics](#tier-ceiling-semantics). |
 | `0.1.0` | 2026-06-30 | Initial draft, mirroring `adepthood#950`. Enumerates capabilities, maps to existing (`creek.ingest`, `creek.classify`) and planned (`creek.handshake`/`reflect`/`wheel`) tools, fixes tier/care/auth/transport semantics, pins ontology version. |
 
-> **Every minor from `0.1.0` to `0.12.0` has a row above**, including the four
+> **Every minor from `0.1.0` to `0.13.0` has a row above**, including the four
 > — `0.5.0`, `0.6.0`, `0.7.0`, `0.8.0` — that this document omitted until
 > 2026-08-21. Three of them moved the MCP surface and belonged here all along:
 > `0.5.0` changed `creek.link` / `creek.journal` / `creek.upload` return

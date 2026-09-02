@@ -49,6 +49,7 @@ from creek_mcp.tools import (
     author_tool,
     classify_tool,
     compile_tool,
+    entry_classification_tool,
     handshake_tool,
     ingest_tool,
     journal_ingest_tool,
@@ -792,12 +793,21 @@ def _register_pipeline_tools(
     consumer: str,
     compile_factory: CompileLLMFactory,
 ) -> None:
-    """Register the seven corpus-pipeline tools on *server*.
+    """Register the eight corpus-pipeline tools on *server*.
 
     ``creek.ingest``, ``creek.redact.scan``, ``creek.classify``,
-    ``creek.link``, ``creek.report``, ``creek.skills.refresh`` and
-    ``creek.compile`` -- the verbs that move content through the ontology
-    rather than converse about it.
+    ``creek.classify.entry``, ``creek.link``, ``creek.report``,
+    ``creek.skills.refresh`` and ``creek.compile`` -- the verbs that move
+    content through the ontology rather than converse about it.
+    ``creek.classify.entry`` is the one read among them: it reports what one
+    named fragment already carries and writes nothing, which is why it sits
+    beside the corpus pass rather than inside it.
+
+    **This registrar is now at the nested-def ceiling.** Eight closures is
+    exactly ``_MAX_NESTED_DEFS`` in
+    ``tests/test_mcp_tool_registration_surface.py``, whose predicate is
+    ``count > 8``, so there is zero headroom left. The next pipeline tool
+    splits this function -- it does not raise the ceiling.
 
     Args:
         server: The :class:`FastMCP` instance to register on.
@@ -852,6 +862,19 @@ def _register_pipeline_tools(
             vault_path=vault,
             method=method,
             force=force,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=_effective_consumer(consumer),
+        )
+
+    @server.tool(name="creek.classify.entry")
+    def _classify_entry(
+        entry_ref: str,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Report one fragment's persisted classification; computes nothing."""
+        return entry_classification_tool(
+            vault_path=vault,
+            entry_ref=entry_ref,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
         )

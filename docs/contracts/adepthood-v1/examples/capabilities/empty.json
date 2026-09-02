@@ -1,10 +1,11 @@
 {
   "capabilities": [],
-  "contract_minor": "0.12",
-  "contract_version": "0.12.0",
+  "contract_minor": "0.13",
+  "contract_version": "0.13.0",
   "ontology_version": "aptitude-wavelength/2026-05-23",
   "status": "uninitialized",
   "supported_contract_minors": [
+    "0.13",
     "0.12",
     "0.11",
     "0.10",

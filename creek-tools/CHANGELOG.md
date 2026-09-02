@@ -11,6 +11,64 @@ to locate the originating commit for any reference below.
 
 ### Added
 
+- **`creek.classify.entry` — read one fragment's persisted classification
+  (#874).** A new read-only MCP tool. It takes an `entry_ref` and a
+  `privacy_tier_ceiling` and returns exactly eight keys — `status`, `tool`,
+  `tier_ceiling`, `entry_ref`, `frequency`, `phase`, `privacy_tier`,
+  `classification_method` — every one a non-null string. It **computes
+  nothing**: no rule classifier on demand, no LLM, no persisted verdict. It is
+  a sibling of `creek.classify` rather than an addition to it, because the pass
+  is whole-vault and rewrites frontmatter while this addresses one fragment and
+  writes none.
+
+  **Why it is not an inline field on `creek.journal`, which is what the issue
+  asked for.** `run_ingest` never runs the frequency/phase classifier — the
+  only `creek.classify` symbol the ingest pipeline touches is
+  `privacy_pass.escalate` — so an inline field would have returned
+  `{frequency: "unclassified", phase: "unclassified", privacy_tier: <the tier
+  the caller itself just sent>}` on every call, forever, with every one of its
+  tests passing. A constant in disguise.
+  `test_a_journal_ingested_fragment_carries_no_classification_on_disk` pins
+  that pre-state so the claim stays executable. The sanctioned composition
+  needs no journal change at all: journal already returns `fragment_id` as a
+  required field, so `journal → fragment_id → creek.classify.entry` is a
+  complete round trip.
+
+  **Ingest does not classify, and the tool says so honestly.** A freshly
+  written entry reads `frequency: "unclassified"`, `phase: "unclassified"`,
+  `classification_method: "none"` until a pass runs; the remedy is the route
+  that shipped at contract `0.10.0` — run `creek.classify` or
+  `POST /v1/classifications`, then read again. `classification_method` ∈
+  `rules | llm | manual | none` is what makes that legible: the provenance
+  stamp is written unconditionally by any classify write, so `rules` alongside
+  `frequency: "unclassified"` means *a pass ran and could not classify this*,
+  while `none` means *no pass has run*. The sentinel is `none` and not
+  `unclassified` deliberately — that word is already a frequency, a phase and a
+  privacy tier — and the value is **clamped** to the three published methods
+  rather than echoed, because raw frontmatter is arbitrary user-controlled
+  bytes.
+
+  **Privacy: strictly narrowing.** The tool is `GATED` on the shared
+  `read_gate.refuse_above_ceiling` primitive — `creek.state.read`'s shape, not
+  `creek.reflect`'s, because an `entry_ref` is caller-*addressed* and singular
+  and there is nothing to partially admit. The tier compared is the fragment's
+  current **persisted** one, read through the shared `source_tiers` walk, never
+  a caller-declared or staged tier. It fails closed twice: a missing
+  `privacy_tier` key ranks `intimate` distinctly from an explicit
+  `unclassified`, and an id resolving to nothing ranks `intimate` too. The
+  resolution walk is exhaustive and sits *below* the gate, so a refused id and
+  a not-found id cost the same and the refusal leaks no position through
+  timing. Nothing becomes reachable that was not already reachable at strictly
+  broader granularity through `creek.state.render`, `creek.wheel` and the
+  compiled layer.
+
+  **Contract `0.12.0` → `0.13.0`**, a pure MCP-surface bump of the
+  `0.3`/`0.4`/`0.6`/`0.7`/`0.12` kind. No `/v1` route, capability, wire model,
+  error code, status or schema moves. `SUPPORTED_CONTRACT_MINORS` **widens** to
+  keep `0.12` served — without that one line every client still sending
+  `X-Creek-Contract-Version: 0.12` would be refused `incompatible_version`,
+  which is the only genuinely breaking change this change could have made.
+
 - **`creek.redact.scan` publishes the escaping-symlink skip count (#1292).**
   The tool's `statistics` object gains a fifth typed key,
   `files_skipped_symlink`: the number of symlinked children the scan declined

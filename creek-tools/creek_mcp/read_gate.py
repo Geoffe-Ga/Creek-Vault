@@ -612,6 +612,34 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
         posture=ReadPosture.METADATA_ONLY,
         rationale=_COUNTS_ONLY_RATIONALE,
     ),
+    "creek.classify.entry": ToolPosture(
+        posture=ReadPosture.GATED,
+        rationale=(
+            "One unsupplied read: an entry_ref names a fragment the caller "
+            "did not supply, and the tool hands back that fragment's "
+            "frequency, phase, privacy tier and classification provenance. "
+            "The tier the gate compares is the fragment's CURRENT PERSISTED "
+            "one, read through the shared "
+            "privacy_filter.source_tiers walk and reduced by "
+            "max_source_tier -- never the caller's own declared tier, which "
+            "is not a gate at all, and never a staged-frontmatter tier, "
+            "which is stale the moment creek classify escalates the "
+            "fragment. It fails closed twice over: a MISSING privacy_tier "
+            "key ranks INTIMATE distinctly from an explicit unclassified "
+            "(the #1033 reason iter_admitted_fragments is NOT the primitive "
+            "here -- it reads the tier off the validated Fragment, whose "
+            "default fails open), and an id resolving to nothing reduces to "
+            "INTIMATE as well, so every locator divergence is refused rather "
+            "than answered. It REFUSES rather than excluding, on "
+            "state_read's rule: the target is caller-addressed and singular, "
+            "so there is nothing to partially admit. The resolution walk is "
+            "exhaustive and sits BELOW the gate, so a refused id and a "
+            "not-found id cost the same and the refusal leaks no position "
+            "through timing."
+        ),
+        gate_module="creek_mcp.tools.classify_entry",
+        gate_symbol="refuse_above_ceiling",
+    ),
     "creek.redact.scan": ToolPosture(
         posture=ReadPosture.GATED,
         rationale=(

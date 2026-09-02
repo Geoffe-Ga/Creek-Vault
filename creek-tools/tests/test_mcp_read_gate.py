@@ -180,6 +180,7 @@ from creek_mcp.read_gate import (
 from creek_mcp.server import build_server
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 from creek_mcp.tools.author import author_tool
+from creek_mcp.tools.classify_entry import entry_classification_tool
 from creek_mcp.tools.compile import _ABOVE_CEILING_REASON, compile_tool
 from creek_mcp.tools.draft import draft_tool
 from creek_mcp.tools.journal import journal_ingest_tool
@@ -210,7 +211,7 @@ if TYPE_CHECKING:
 # METADATA_ONLY (or upgrades a tracked gap to a gate it never grew) fails.
 # ---------------------------------------------------------------------------
 
-_EXPECTED_TOOL_COUNT = 24
+_EXPECTED_TOOL_COUNT = 25
 
 _EXPECTED_PRIMITIVES = frozenset({"refuse_above_ceiling", "iter_admitted_fragments"})
 
@@ -247,6 +248,20 @@ _PINNED_GATE_ROWS = [
     # reflect, read one level up: read's target is not caller-*named* but it is
     # caller-*addressed* and singular, which is the property that matters.
     ("creek.state.read", "creek_mcp.tools.state_read", "refuse_above_ceiling"),
+    # #874's ``creek.classify.entry`` is born gated, and it is the third
+    # adopter of ``refuse_above_ceiling`` on ``creek.state.read``'s exact
+    # argument rather than a fourth shape: an ``entry_ref`` is caller-ADDRESSED
+    # and singular, so there is nothing to partially admit — you cannot return
+    # half a fragment's frequency. Pinned as its own row because the pair is
+    # the checkable part: the tool also imports ``source_tiers`` and
+    # ``max_source_tier``, and a manifest re-pointed at either of those would
+    # read as a gate while naming a function that only *reads a tier* and
+    # decides nothing.
+    (
+        "creek.classify.entry",
+        "creek_mcp.tools.classify_entry",
+        "refuse_above_ceiling",
+    ),
     ("creek.state.render", "creek_mcp.tools.state", "to_privacy_override"),
     # #970 closed the journal gap, and this row is a *re-point* of the same
     # kind #968 made for ``report`` and #969 made for the two ``state.*``
@@ -699,7 +714,7 @@ def test_tool_postures_cover_every_registered_tool(
 
 
 def test_registered_tool_count_is_pinned(registered_tools: dict[str, Tool]) -> None:
-    """The MCP surface is 24 tools; growing it is a deliberate act.
+    """The MCP surface is 25 tools; growing it is a deliberate act.
 
     A bare count is a cheap tripwire against the one edit the set-equality test
     above cannot see: adding a tool *and* a matching posture entry in a single
@@ -2181,6 +2196,36 @@ def _fragment_bytes(vault: Path) -> dict[Path, bytes]:
     }
 
 
+def _probe_classify_entry(vault: Path) -> dict[str, Any]:
+    """Address the *intimate* canary fragment at the open ceiling.
+
+    **The shared envelope sweep is near-vacuous for this tool, and saying so
+    is the point** — the same honesty ``_probe_skills_refresh`` records.
+    ``entry_classification_tool`` publishes four bounded enum-valued strings
+    plus the caller's own echoed input; it returns no title, tag or body, so
+    its envelope would be canary-free even with the gate deleted outright. The
+    sweep still earns its place as a tripwire against a future response shape
+    that does carry content.
+
+    The real weight for this tool is carried by
+    :func:`test_classify_entry_probe_refuses_the_fragment_it_is_not_admitted_to`
+    below, which asserts the *verdict* rather than the envelope — refused for
+    the intimate fragment, ``ok`` for the open one, at the same ceiling.
+
+    Args:
+        vault: The seeded canary vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return entry_classification_tool(
+        vault_path=vault,
+        entry_ref=_RUNTIME_INTIMATE_ID,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="read-gate-probe",
+    )
+
+
 _RUNTIME_PROBES: dict[str, Callable[[Path], dict[str, Any]]] = {
     "creek.wheel": _probe_wheel,
     "creek.mine": _probe_mine,
@@ -2193,6 +2238,7 @@ _RUNTIME_PROBES: dict[str, Callable[[Path], dict[str, Any]]] = {
     "creek.upload": _probe_upload,
     "creek.redact.scan": _probe_redact_scan,
     "creek.skills.refresh": _probe_skills_refresh,
+    "creek.classify.entry": _probe_classify_entry,
 }
 """``GATED`` tool → a callable that invokes it at ``ceiling=open``.
 
@@ -2339,6 +2385,45 @@ def test_gated_tools_leak_no_above_ceiling_content_at_the_open_ceiling(
         f"route to the corpus inside {entry.gate_module}. Find that route and "
         "remove it; adding another gate call leaves the first one standing."
     )
+
+
+def test_classify_entry_probe_refuses_the_fragment_it_is_not_admitted_to(
+    canary_vault: Path,
+) -> None:
+    """``creek.classify.entry``'s probe is not passing by publishing nothing.
+
+    The layer-(f) envelope sweep cannot carry this tool: its response holds no
+    title, tag or body, so it is canary-free with or without a gate. The
+    checkable claim is the *verdict* under one fixed ceiling, and it needs both
+    directions to mean anything.
+
+    Negative control: the ``intimate`` fragment at ``ceiling=open`` must be
+    ``refused``, carrying the generic reason and naming neither the fragment
+    nor its tier. Positive control: the ``open`` fragment at the *same* ceiling
+    must come back ``ok`` with a real classification — without it, a tool that
+    refused unconditionally, or that had stopped reading the vault at all,
+    would pass the negative half on its own.
+    """
+    refused = entry_classification_tool(
+        vault_path=canary_vault,
+        entry_ref=_RUNTIME_INTIMATE_ID,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert refused == {
+        "status": "refused",
+        "tool": "creek.classify.entry",
+        "tier_ceiling": "open",
+        "reason": GENERIC_ABOVE_CEILING_REASON,
+    }
+
+    admitted = entry_classification_tool(
+        vault_path=canary_vault,
+        entry_ref=_RUNTIME_OPEN_ID,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert admitted["status"] == "ok"
+    assert admitted["entry_ref"] == _RUNTIME_OPEN_ID
+    assert admitted["privacy_tier"] == "open"
 
 
 def test_wheel_probe_still_counts_the_fragment_it_is_admitted_to(

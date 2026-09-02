@@ -1738,13 +1738,14 @@ def test_the_committed_success_reflection_fixture_shows_the_populated_shape() ->
 
 
 def test_the_previous_minor_is_still_served() -> None:
-    """0.12 widened the compatibility window rather than shifting it.
+    """0.13 widened the compatibility window rather than shifting it.
 
-    A ``0.11`` client's ``/v1`` traffic is not touched at all by #1292: the
-    bump adds one typed integer key to one **MCP** tool's response, and no
-    ``/v1`` route, capability, wire model, error code or status moves, so
-    refusing a ``0.11`` caller would be a break invented entirely by the
-    version number. ``0.10``, ``0.9`` and ``0.8`` are checked alongside
+    A ``0.12`` client's ``/v1`` traffic is not touched at all by #874: the
+    bump adds one read-only **MCP** tool, and no ``/v1`` route, capability,
+    wire model, error code, status or schema moves, so refusing a ``0.12``
+    caller would be a break invented entirely by the version number. The same
+    was true of ``0.11`` under #1292, whose one typed integer key also moved
+    nothing on ``/v1``. ``0.10``, ``0.9`` and ``0.8`` are checked alongside
     because the window only ever widens.
 
     The head entry of :data:`SUPPORTED_CONTRACT_MINORS` is *derived* from
@@ -1753,11 +1754,12 @@ def test_the_previous_minor_is_still_served() -> None:
     what this test's first line is for, and why it is added at every bump
     rather than only when somebody suspects a problem.
     """
+    assert "0.12" in SUPPORTED_CONTRACT_MINORS
     assert "0.11" in SUPPORTED_CONTRACT_MINORS
     assert "0.10" in SUPPORTED_CONTRACT_MINORS
     assert "0.9" in SUPPORTED_CONTRACT_MINORS
     assert "0.8" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.12"
+    assert CONTRACT_MINOR == "0.13"
 
 
 def test_every_minor_below_the_current_one_is_still_served() -> None:
