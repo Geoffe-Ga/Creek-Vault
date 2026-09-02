@@ -380,9 +380,12 @@ def test_call_tool_save_through_mcp_refuses_without_tier(vault: Path) -> None:
 def test_call_tool_journal_through_mcp_refuses_without_tier(vault: Path) -> None:
     """``creek.journal`` must refuse an omitted ``tier``, not default it to open.
 
-    The wrapper default at ``creek_mcp/server.py:470`` is a SECOND, independent
-    default: ``_journal`` declares its own ``tier: str = "open"`` and forwards
-    it explicitly, so it is what a caller who omits the key actually gets.
+    The ``creek.journal`` wrapper ``_journal``, registered by
+    ``creek_mcp.server._register_conversation_tools``, carries a SECOND,
+    independent default. Before #1494 it declared its own ``tier: str =
+    "open"`` and forwarded it explicitly, so the wrapper — not the tool —
+    was what a caller who omitted the key actually got. It declares
+    ``tier: str | None = None`` today; this test is what keeps it that way.
     Reverting only that wrapper — while keeping the fix in
     ``creek_mcp/tools/journal.py`` — was measured through this same transport
     to restore ``status: ok`` with ``privacy_tier: open`` stamped on the
@@ -436,10 +439,12 @@ def test_call_tool_upload_through_mcp_refuses_without_tier(vault: Path) -> None:
     """``creek.upload`` must refuse an omitted ``tier``, not default it to open.
 
     The twin of the journal case, and it needs its own test because the
-    defaults are its own: ``creek_mcp/server.py:490`` carries a ``tier: str =
-    "open"`` that is independent both of ``creek_mcp/tools/upload.py``'s and of
-    the journal wrapper's. Fixing three of the four and shipping is how this
-    defect survives, so all four are pinned separately (#1494).
+    defaults are its own: the ``creek.upload`` wrapper ``_upload``, also
+    registered by ``creek_mcp.server._register_conversation_tools``, carried a
+    pre-#1494 ``tier: str = "open"`` independent both of
+    ``creek_mcp/tools/upload.py``'s and of the journal wrapper's, and declares
+    ``tier: str | None = None`` today. Fixing three of the four and shipping is
+    how this defect survives, so all four are pinned separately (#1494).
 
     ``"tier is required"`` is asserted rather than only ``refused`` because
     ``PrivacyTier(None)`` raises, so the guard's absence still produces a

@@ -15,7 +15,9 @@ tokens at all for :data:`LOCKOUT_SECONDS`.
 
 **The lockout is non-blocking.** Sleeping is the obvious way to rate
 limit and it is the wrong one here. The five purge tools are registered
-as *sync* functions (``creek_mcp/server.py:731``), and the MCP SDK
+by ``creek_mcp.server._register_purge_tools``, whose five
+``@server.tool(name="creek.purge.*")`` wrappers are each declared ``def``
+and not ``async def`` — they are *sync* functions — and the MCP SDK
 invokes a sync tool function inline on the asyncio event loop
 (``mcp/server/fastmcp/utilities/func_metadata.py:96``). A blocking
 backoff in this module would therefore freeze the entire server — every
