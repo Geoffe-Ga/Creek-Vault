@@ -557,6 +557,18 @@ class TestIngestPdf:
         assert fragments[0].content == "Page 1 body"
         assert fragments[1].metadata["page"] == 2
         assert fragments[0].metadata["image_type"] == "scanned_pdf_page"
+        # Minted here, at the one place pages are made, so every caller
+        # inherits it. ``document`` is a ledgered source type and without a
+        # discriminator its three pages share one origin key and one ledger
+        # record — measured, that collapses them to a single file holding the
+        # last page's body under the first page's name (#1305 / #1639).
+        assert [fragment.source_unit for fragment in fragments] == [
+            "page-1",
+            "page-2",
+        ]
+        # The page rides ``source_unit``; ``source_path`` stays the whole
+        # file, because ``routing.arbitrate`` groups on exactly that string.
+        assert {fragment.source_path for fragment in fragments} == {str(pdf_path)}
 
     def test_ingest_pdf_skips_pages_without_text(self, tmp_path: Path) -> None:
         """Pages with empty OCR are skipped."""

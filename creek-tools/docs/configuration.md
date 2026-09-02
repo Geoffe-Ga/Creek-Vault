@@ -97,7 +97,7 @@ embeddings:
 | `cache_dir`            | `null`               | Override for the HuggingFace cache. |
 | `batch_size`           | `32`                 | Texts per encode batch. |
 
-## `ocr` — image OCR
+## `ocr` — image / PDF OCR
 
 ```yaml
 ocr:
@@ -116,30 +116,62 @@ not — so their absence from it is machine-checked proof that production
 consults them, re-derived on every test run rather than asserted here.
 
 Read the table below as describing **those two commands**, which are the
-only ones that reach the image ingestor with this block in hand. The MCP
-tools (`ingest`, `drive`, `upload`) reach the same ingestor without
-passing it, so an image arriving through one of them still runs the
-default `pytesseract` backend and still needs the `tesseract` binary
-even under `enabled: false`. Wiring the block through those surfaces is
-a separate decision, tracked apart from #1517. (`creek sync` never
-routes to the image ingestor at all — no entry in `sync.sources` maps to
-it and `SourcePaths` has no image field.)
+only ones that reach the ingestors with this block in hand. The MCP
+tools (`ingest`, `drive`, `upload`) reach the same ingestors without
+passing it, and the two paths answer that omission in deliberately
+opposite ways:
+
+- **Images fail open.** An image arriving through an MCP tool still runs
+  the default `pytesseract` backend and still needs the `tesseract`
+  binary even under `enabled: false`. That is the #1517 gap, tracked
+  apart from it.
+- **Scanned PDFs fail closed.** A PDF arriving through an MCP tool is
+  **not** OCR'd, whatever the vault config says, because the tool passes
+  no block for the ingestor to consult. Mirroring the image default here
+  would have let a remote caller obtain OCR in a vault whose operator had
+  written `ocr.enabled: false` — a default that grants a capability is not
+  the same kind of default as one that picks a language. The PDF is
+  ingested as it was before #1639: one fragment, empty body, and
+  `scanned: true` in its frontmatter to say why.
+
+(`creek sync` never routes to either ingestor — no entry in
+`sync.sources` maps to the image ingestor and `SourcePaths` has no image
+field, and `_SYNC_INGEST_TYPE` has no `document` entry.)
 
 Note the registry key is **`image`**, singular: `creek ingest --type
 images` is not a valid invocation.
 
-Scanned PDFs are **not** covered by this block in practice.
-`ImageIngestor.ingest_pdf` exists and honours the same settings, but no
-production path calls it — `DocumentIngestor` does not route scanned
-PDFs there yet. Setting `enabled: false` therefore changes nothing about
-how a PDF is ingested today.
+Scanned PDFs **are** covered by this block as of #1639, on
+`creek ingest --type document` and `creek process` — the same two commands
+as the rest of the table, and no others. `DocumentIngestor` detects an
+image-only PDF and routes it to `ImageIngestor.ingest_pdf`, which honours
+`engine`, `languages` and `min_confidence` exactly as it does for a
+standalone image. Note the command: the route lives on `--type document`,
+not `--type image`, because `.pdf` is not in `IMAGE_EXTENSIONS` and the
+image ingestor never discovers one.
+
+`enabled: false` behaves differently on the two paths, and the difference
+is intentional. For images it declines the **whole pass** — OCR is all
+that pass does. For documents it declines only the scanned-PDF leg: DOCX,
+TXT, HTML and RTF ingest normally and the console names the config key,
+the file count and what to change. Stopping every document ingest because
+OCR was switched off would be a blast radius a boolean should not have.
+
+**Migration note.** A scanned PDF ingested *before* #1639 wrote one
+fragment keyed `<source_key>`; after it, the same file writes N fragments
+keyed `<source_key>#page-1…N`. The old key matches nothing, so the
+original fragment is neither updated nor tombed — `document` is
+deliberately absent from `TOMBING_SOURCES`, and an ingest run does not get
+to delete vault content on a heuristic. The stranded artifact is the
+empty-bodied fragment the old path produced. Delete it yourself once you
+are satisfied the new per-page fragments are right.
 
 | Field            | Default        | Effect |
 |------------------|----------------|-------|
-| `enabled`        | `true`         | Master switch for the OCR pass. `false` means the image ingestor is not constructed and no OCR engine is created — so a vault with OCR off needs no `tesseract` binary, and an invalid `engine` name is never resolved. The run says so on the console rather than silently writing nothing. Only the image ingestor is affected; every other source type ingests as usual. |
+| `enabled`        | `true`         | Master switch for the OCR pass. `false` means no OCR engine is created — so a vault with OCR off needs no `tesseract` binary, and an invalid `engine` name is never resolved. For `--type image` the whole pass is skipped; for `--type document` only the scanned-PDF leg is skipped and every other document still ingests. Either way the run says so on the console rather than silently writing nothing. No other source type is affected. |
 | `engine`         | `pytesseract`  | Selects a backend from `creek.ingest.images.OCR_ENGINES`. An unknown name **refuses the run** (exit 2) and lists the known names; it never falls back to the default. `pytesseract` is the only backend shipped — register another in `OCR_ENGINES` to add one. |
 | `languages`      | `[eng]`        | Tesseract language codes, in priority order. Joined with `+` into Tesseract's `lang` argument, so `[eng, fra]` becomes `eng+fra`. Blank entries are dropped; a list with no usable code refuses the run. |
-| `min_confidence` | `0.6`          | Range `[0.0, 1.0]`. A page whose OCR confidence falls below it is tagged `review: pending_review` in the fragment's frontmatter. #1517 also made that marker reach disk — before it, `Fragment`'s `extra="ignore"` dropped the key during the write, so the threshold decided nothing observable. No command filters on the resulting key; it is a marker for a human reader. |
+| `min_confidence` | `0.6`          | Range `[0.0, 1.0]`. An image, or a scanned-PDF page, whose OCR confidence falls below it is tagged `review: pending_review` in the fragment's frontmatter. #1517 also made that marker reach disk — before it, `Fragment`'s `extra="ignore"` dropped the key during the write, so the threshold decided nothing observable. No command filters on the resulting key; it is a marker for a human reader. |
 
 ## `linking` — resonance / thread / eddy thresholds
 

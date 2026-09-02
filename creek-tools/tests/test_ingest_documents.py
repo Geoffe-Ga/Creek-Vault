@@ -689,8 +689,26 @@ class TestDocumentIngestorFrontmatter:
         fm = doc_ingestor.generate_frontmatter(fragment)
         assert fm["title"] == "My Document"
 
-    def test_frontmatter_scanned_flag(self, doc_ingestor: DocumentIngestor) -> None:
-        """Frontmatter includes scanned flag when PDF is scanned."""
+    def test_the_scanned_flag_survives_assembly_instead_of_being_dropped(
+        self, doc_ingestor: DocumentIngestor
+    ) -> None:
+        """The scanned marker must reach the writer, not just the generator.
+
+        This test used to call ``generate_frontmatter`` directly and assert
+        ``fm["source"]["scanned"] is True``. It passed — and the key reached
+        **no vault file whatsoever**, because ``FragmentSource`` does not
+        model ``scanned``, ``Fragment`` leaves pydantic's ``extra="ignore"``
+        in place, and ``PASSTHROUGH_FRONTMATTER_KEYS`` is a *top-level*
+        allowlist that cannot rescue a key nested under ``source``. Measured
+        at HEAD before #1639: an operator's scanned PDF produced an empty
+        fragment carrying no indication of any kind.
+
+        So the assertion now runs the real assembly chokepoint,
+        ``assemble_ingested_fragment``, which is where the drop happened, and
+        reads ``extra_frontmatter`` — the seam that actually carries a key to
+        the writer. The end-to-end proof on written bytes lives in
+        ``tests/test_ocr_config_wiring.py``.
+        """
         fragment = _make_fragment(
             "Content.",
             "/path/test.pdf",
@@ -700,8 +718,33 @@ class TestDocumentIngestorFrontmatter:
                 "scanned": True,
             },
         )
-        fm = doc_ingestor.generate_frontmatter(fragment)
-        assert fm["source"]["scanned"] is True
+        fragment.metadata["markdown"] = doc_ingestor.convert_to_markdown(fragment)
+        fragment.metadata["frontmatter"] = doc_ingestor.generate_frontmatter(fragment)
+
+        assembled = assemble_ingested_fragment(fragment)
+
+        assert assembled.extra_frontmatter["scanned"] is True
+
+    def test_an_unscanned_document_gains_no_scanned_key_at_all(
+        self, doc_ingestor: DocumentIngestor
+    ) -> None:
+        """The marker rides on presence, so a normal PDF stays unmarked.
+
+        The control for the test above: without it, "scanned reaches the
+        writer" would be satisfied by a change that stamped every document in
+        the vault as a scan.
+        """
+        fragment = _make_fragment(
+            "Content.",
+            "/path/test.pdf",
+            {"file_type": ".pdf", "source_encoding": "utf-8"},
+        )
+        fragment.metadata["markdown"] = doc_ingestor.convert_to_markdown(fragment)
+        fragment.metadata["frontmatter"] = doc_ingestor.generate_frontmatter(fragment)
+
+        assembled = assemble_ingested_fragment(fragment)
+
+        assert "scanned" not in assembled.extra_frontmatter
 
 
 # ---- Full Pipeline Integration Tests ----
