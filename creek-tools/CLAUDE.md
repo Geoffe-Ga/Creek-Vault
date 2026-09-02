@@ -42,8 +42,10 @@ Always invoke tools through `./scripts/*` instead of directly.
 |------|----------|-----------|
 | Format code | `ruff format .` | `./scripts/format.sh` |
 | Run tests | `pytest` | `./scripts/test.sh` |
-| Type check | `mypy .` | `./scripts/lint.sh` (includes mypy) |
+| Type check | `mypy .` | `./scripts/typecheck.sh` |
 | Lint code | `ruff check .` | `./scripts/lint.sh` |
+| Pylint score | `pylint creek/` | `./scripts/pylint.sh` |
+| Docstring coverage | `interrogate creek/` | `./scripts/lint-interrogate.sh` |
 | Modernisation hints | `refurb creek/` | `./scripts/lint-refurb.sh` |
 | Exception hygiene | `tryceratops creek/` | `./scripts/lint-tryceratops.sh` |
 | Dead-code detection | `vulture creek/` | `./scripts/lint-vulture.sh` |
@@ -59,8 +61,8 @@ See [`scripts/`](scripts/) and the gate list in `scripts/check-all.sh` for the c
 Never duplicate content. Always reference the canonical source.
 
 **Examples**:
-- ✅ Workflow documentation → `/docs/workflows/` (single source)
-- ✅ Other files → Link to workflow docs
+- ✅ Development workflow → [`../.claude/agents/shared/house-rules.md`](../.claude/agents/shared/house-rules.md) (single source)
+- ✅ Other files → link to it rather than restating it
 - ❌ Copy workflow steps into multiple files
 
 **Why**: Duplicated docs get out of sync, causing confusion and errors.
@@ -73,14 +75,19 @@ Never bypass quality checks or suppress errors without justification.
 
 **Forbidden Shortcuts**:
 - ❌ Commenting out failing tests
-- ❌ Adding `# noqa` without issue reference
+- ❌ Skipping a failing test — `@pytest.mark.skip` is forbidden outright by
+  the anti-bypass record in
+  [`../.claude/agents/shared/house-rules.md`](../.claude/agents/shared/house-rules.md),
+  with no issue-reference carve-out
+- ❌ Adding `# noqa` without issue reference, or a bare `# noqa` that names no
+  rule and so suppresses every one of them
 - ❌ Lowering quality thresholds to pass builds
 - ❌ Using `git commit --no-verify` to skip pre-commit
 - ❌ Deleting code to reduce complexity metrics
 
 **Required Approach**:
-- ✅ Fix the failing test or mark with `@pytest.mark.skip(reason="Issue #N")`
-- ✅ Refactor code to pass linting (or justify with issue: `# noqa  # Issue #N: reason`)
+- ✅ Fix the failing test
+- ✅ Refactor code to pass linting (or justify with issue: `# noqa: RULE  # Issue #N: reason`)
 - ✅ Write tests to reach 90% coverage
 - ✅ Always run pre-commit checks
 - ✅ Refactor complex functions into smaller ones
@@ -133,7 +140,8 @@ Use relative paths from project root. Never `cd` into subdirectories.
 **Why**: Ensures commands work in any environment (local, CI, scripts).
 
 **Examples**:
-- ✅ `./scripts/test.sh tests/unit/test_vault.py`
+- ✅ `./scripts/test.sh --unit` (add `-k test_vault` to select by name; the
+  script takes flags only, never a positional path)
 - ❌ `cd tests/unit && pytest test_vault.py`
 
 **CI Note**: CI always runs from project root. Commands that use `cd` will break in CI.
@@ -312,37 +320,59 @@ Before creating/updating a PR:
 
 ### 5.2 Component Structure
 
+Directories are shown one level deep, **except `scripts/`, which is
+enumerated in full** — `tests/test_claude_md_gate_facts_drift.py` asserts that
+enumeration equals `git ls-files -- creek-tools/scripts/`, so adding a script
+without listing it here fails the gate. The top-level `test_*.py` modules of
+`tests/` are not listed, and no count is quoted anywhere: a number in prose is
+the drift this section was repaired for.
+
 ```
 creek-tools/
 ├── docs/
 │   └── architecture/
 │       └── ADR/                      # Architecture Decision Records
 ├── scripts/
-│   ├── dev-setup.sh                  # One-shot CI-equivalent dev environment (issue #206)
+│   ├── _lib.sh                       # Shared shell helpers sourced by the gates
 │   ├── check-all.sh                  # Run every quality gate (single source of truth)
-│   ├── test.sh                       # Run test suite (--unit / --integration / --e2e / --all)
-│   ├── lint.sh                       # Ruff lint
-│   ├── lint-extended.sh              # pylint, refurb, tryceratops, vulture, interrogate
-│   ├── lint-vulture.sh               # Dead-code gate wrapper — the one entrypoint (issue #1395)
-│   ├── lint_vulture.py               # Dead-code gate policy; see its module docstring
-│   ├── format.sh                     # Ruff format
-│   ├── typecheck.sh                  # MyPy strict (CI-001)
-│   ├── security.sh                   # Bandit + pip-audit (with documented ignores; DEP-003)
 │   ├── complexity.sh                 # Radon + Xenon (CI-002)
-│   ├── coverage.sh                   # pytest --cov-fail-under (90% aggregate)
 │   ├── coverage-per-file.sh          # Per-file gate (80% strict, 65% waiver floor; TEST-002)
 │   ├── coverage-waivers.txt          # Documented waivers for the per-file gate
-│   └── pr-status.sh                  # CI/PR status helpers
+│   ├── coverage.sh                   # pytest --cov-fail-under (90% aggregate)
+│   ├── dev-setup.sh                  # One-shot CI-equivalent dev environment (issue #206)
+│   ├── fix-all.sh                    # Auto-fix the lint + format gates
+│   ├── format.sh                     # Ruff format
+│   ├── lint-extended.sh              # OPTIONAL — not invoked by check-all.sh or CI
+│   ├── lint-interrogate.sh           # Docstring-coverage gate over creek/
+│   ├── lint-refurb.sh                # Modernisation-hint gate
+│   ├── lint-tryceratops.sh           # Exception-hygiene gate
+│   ├── lint-vulture.sh               # Dead-code gate wrapper — the one entrypoint (issue #1395)
+│   ├── lint.sh                       # Ruff lint
+│   ├── lint_vulture.py               # Dead-code gate policy; see its module docstring
+│   ├── pr-status.sh                  # CI/PR status helpers
+│   ├── pylint.sh                     # Pylint score gate (CI-002)
+│   ├── recheck-filed-scan-citations.sh  # Re-verify citations on filed scan issues
+│   ├── scan_citations.py             # Scan-citation verification policy
+│   ├── security.sh                   # Bandit + pip-audit (with documented ignores; DEP-003)
+│   ├── state-budget.sh               # Ralph state-file budget report
+│   ├── test.sh                       # Run test suite (--unit / --integration / --e2e / --live / --all)
+│   ├── typecheck.sh                  # MyPy strict (CI-001)
+│   └── verify-scan-citations.sh      # Verify scan symbol citations against the scan SHA
 ├── creek/                            # Main package
-│   ├── __init__.py
-│   └── ...                           # Package modules
+│   └── __init__.py
+├── creek_mcp/                        # MCP server package (also on --cov)
+│   └── __init__.py
 ├── tests/
-│   ├── unit/                         # Unit tests
-│   ├── integration/                  # Integration tests
-│   ├── e2e/                          # End-to-end tests
-│   └── fixtures/                     # Test fixtures
-│       └── conftest.py
+│   ├── conftest.py                   # Suite-wide fixtures
+│   ├── e2e/                          # End-to-end journeys (marker: e2e)
+│   │   └── conftest.py
+│   ├── factories/                    # Test-data factories
+│   ├── fixtures/                     # Static test fixtures
+│   └── generate/                     # Generation-stage test support
+├── .claude/                          # Subproject slash commands
 ├── .pre-commit-config.yaml           # Pre-commit hooks
+├── .secrets.baseline                 # detect-secrets baseline
+├── CHANGELOG.md                      # Release notes
 ├── pyproject.toml                    # Project configuration
 ├── uv.lock                           # Canonical pinned lockfile (uv sync)
 ├── requirements.txt                  # Unpinned pip fallback (production)
@@ -384,10 +414,19 @@ All code must meet these standards before merging to main:
   `scripts/coverage-waivers.txt` (enforced by
   `coverage-per-file.sh`; see TEST-002).
 - **Docstring**: ≥95% (`interrogate --fail-under=95`, in
-  `lint-extended.sh` and the `interrogate` pre-commit hook).
-- **Test markers**: `unit` (default), `integration`, `e2e`. Local
-  `./scripts/test.sh` and CI both default to `not integration and
-  not e2e` (CI-003).
+  `lint-interrogate.sh` — which `check-all.sh` runs, and which targets
+  `creek/` only — and the `interrogate` pre-commit hook).
+- **Test markers**: `integration`, `e2e`, `live`, `slow` — the four
+  registered in the markers table of `pyproject.toml`. There is no unit
+  marker: anything unmarked is a unit test. Strictness is set as an ini
+  option rather than only in addopts, because under pytest 9 the addopts
+  form is not honoured, so a typo'd marker name is a collection error
+  rather than a warning on a run that still exits 0.
+- **Default lane**: `not integration and not e2e and not slow and not live`
+  — what `./scripts/test.sh` and CI both run (CI-003). The live lane is
+  excluded by name: those tests skip themselves when a key is absent, so
+  omitting it would look fine in CI and quietly bill a real API on a
+  developer's machine.
 
 #### Type Checking
 - **MyPy**: Strict mode (configured in `pyproject.toml`; enforced by
@@ -418,7 +457,7 @@ All code must meet these standards before merging to main:
   `PYTHONDONTWRITEBYTECODE` is NOT the remedy for the latter: it stops
   Python writing bytecode, not reading a stale `.pyc`.
 - **Pylint**: ≥9.0 (`pylint creek/ creek_mcp/ --fail-under=9.0`, in CI
-  and `lint-extended.sh`; CI-002).
+  and `pylint.sh`, which `check-all.sh` runs; CI-002).
 - **Bandit**: zero medium-or-above findings
   (`bandit -r creek/ creek_mcp/ -ll`).
 - **pip-audit**: zero vulnerabilities except documented unfixable
@@ -506,9 +545,10 @@ repository's initial commit and every revision since ended on that same
 line. Rather than invent standards nobody agreed to, those entries were
 retired in favour of pointers to the artifacts that actually define each
 topic. A restatement is a second copy, and per §1.2 second copies drift
-from their source. Existing drift between this file and the sources
-below is tracked in issue #1194; this section only points, it does not
-describe.
+from their source. Drift between this file and the sources below is now
+gated by `tests/test_claude_md_gate_facts_drift.py`, which asserts this
+file's gate facts against the artifacts themselves; this section only
+points, it does not describe.
 
 - **Development workflow**: [`../.claude/agents/shared/house-rules.md`](../.claude/agents/shared/house-rules.md)
   (the four gates, commit/PR conventions); [`.pre-commit-config.yaml`](.pre-commit-config.yaml).
