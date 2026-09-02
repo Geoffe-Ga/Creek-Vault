@@ -143,6 +143,30 @@ to locate the originating commit for any reference below.
   byte-identical untitled bodies still collide and still use the counter, so
   the retry guard stays reachable.
 
+- **The connector guide and the `RemoteSourceConnector` protocol no longer
+  describe `route_to_ingestor` as total (#1544).** Since #1526/#1541 it
+  refuses a conversation export (`.json`, `.jsonl`, `.ndjson`), a legacy
+  binary Office document (`.doc`, `.xls`, `.ppt`) and a non-`.zip` archive
+  (`.tar`, `.tgz`, `.gz`, `.bz2`, `.xz`, `.7z`, `.rar`), raising
+  `UnsupportedSourceError` rather than filing the whole export as one
+  undifferentiated `generic` blob — over the network that surfaces as a `415`
+  carrying `ErrorCode.UNSUPPORTED_SOURCE` and the remedy naming
+  `creek ingest --type`. `docs/connectors/adding-a-remote-connector.md` and
+  `creek/ingest/connectors.py` still taught the pre-#1526 contract, so a
+  connector author would have written a caller with no `except` and let one
+  refused file abort an entire fetch. Both now name the exception, the
+  caller's two responses (skip the item, or surface `exc.guidance`) and the
+  reference handler, and the guide's refused-family table is machine-checked
+  against the live routing table in both directions by
+  `tests/test_connector_docs_drift.py`.
+
+  `.zip` is **not** refused on the upload surface: the archive fork of #1525
+  claims it above that gate and unpacks it. `docs/mcp.md` had listed it among
+  the extensions `creek.upload` turns away, and now records the carve-out. An
+  extension the routing table never names still falls through to `generic` —
+  #1526 narrowed the fallback, it did not retire it. No behaviour changed
+  here; this records what shipped in #1541.
+
 ### Tooling
 
 - **`./scripts/check-all.sh` now matches CI gate-for-gate (GAP-007).**
