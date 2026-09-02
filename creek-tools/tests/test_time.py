@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import re
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Final
 from zoneinfo import ZoneInfo
@@ -370,6 +370,58 @@ class TestEffectiveAuthoredDate:
         assert effective_authored_date(frag) == ingested.date()
 
 
+class OffsetlessTimezone(tzinfo):
+    """A ``tzinfo`` that declares itself but yields no offset.
+
+    ``datetime`` treats a value carrying this as *naive* when comparing —
+    ``utcoffset()`` returning ``None`` is the condition CPython actually
+    tests — even though ``tzinfo is None`` is false. The gap between those
+    two spellings is what ``creek/clean/validator.py``'s own anchor missed
+    before #1115 consolidated it onto :func:`creek.time.ensure_aware`.
+
+    Public rather than private because ``tests/test_validator.py`` probes
+    the same widened contract at the validator layer and imports it from
+    here; the double belongs with the contract it exercises.
+    """
+
+    def utcoffset(self, dt: datetime | None) -> timedelta | None:
+        """Return no offset at all.
+
+        Args:
+            dt: The datetime being interrogated; deliberately ignored.
+
+        Returns:
+            ``None``, always — which is what makes a value carrying this
+            zone compare as naive.
+        """
+        del dt
+        return None
+
+    def tzname(self, dt: datetime | None) -> str | None:
+        """Return the zone's name.
+
+        Args:
+            dt: The datetime being interrogated; deliberately ignored.
+
+        Returns:
+            A fixed placeholder name.
+        """
+        del dt
+        return "offsetless"
+
+    def dst(self, dt: datetime | None) -> timedelta | None:
+        """Return the daylight-saving adjustment.
+
+        Args:
+            dt: The datetime being interrogated; deliberately ignored.
+
+        Returns:
+            ``None``, always.
+        """
+        del dt
+        return None
+
+
 class TestEnsureAware:
     """``ensure_aware`` makes any datetime safe to compare (issue #938).
 
@@ -442,6 +494,34 @@ class TestEnsureAware:
         assert future >= reference
         assert reference >= past
         assert reference < future
+
+    def test_tzinfo_whose_utcoffset_is_none_is_anchored_to_la(self) -> None:
+        """A declared-but-offsetless zone is repaired, not passed through.
+
+        The helper tests ``value.utcoffset() is not None`` rather than
+        ``value.tzinfo is None`` on purpose, and this pins that choice as
+        deliberate rather than incidental. CPython calls a value naive for
+        comparison when its *offset* is ``None``, which includes the rarer
+        case of a ``tzinfo`` object that declines to produce one — so
+        testing ``tzinfo`` alone would hand such a value straight through
+        and raise at the first comparison.
+
+        ``creek/clean/validator.py`` used the narrower spelling until
+        #1115 consolidated it onto this helper, which widens its repair to
+        cover exactly this case; the validator-level counterpart is
+        ``test_validator.py::TestNaiveTimestamp::
+        test_tzinfo_without_an_offset_is_anchored_rather_than_raising``.
+        """
+        value = datetime(2026, 7, 28, 23, 0, 0, 123456, tzinfo=OffsetlessTimezone())
+
+        result = ensure_aware(value)
+
+        assert result.utcoffset() is not None
+        assert result.utcoffset() == LA_TZ.utcoffset(result)
+        # Attach, never convert — the wall clock is untouched even though
+        # the incoming value already carried a (useless) tzinfo.
+        assert (result.hour, result.minute, result.microsecond) == (23, 0, 123456)
+        assert result < now_la()
 
 
 class TestFragmentTimestampNormalisation:

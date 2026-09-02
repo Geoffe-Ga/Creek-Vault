@@ -10,6 +10,14 @@ Validation checks:
 - **ISO 8601 timestamps** — rejects future dates and pre-2000 dates
 - **Author field** — interlocutor present and non-empty
 - **Content length** — configurable minimum character threshold
+
+A timestamp that arrives naive is anchored to America/Los_Angeles through
+:func:`creek.time.ensure_aware`, the pipeline's single anchor helper. The
+ontology (§8.3) normalises every timestamp Creek writes to LA, so an
+offsetless value is an LA wall clock that lost its offset in transit — not
+a UTC one. This module carried its own UTC-anchoring copy of that helper
+until #1115 consolidated the two; they agreed on aware inputs and
+disagreed by the LA offset on every naive one.
 """
 
 from __future__ import annotations
@@ -19,6 +27,8 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, Field
+
+from creek.time import ensure_aware
 
 if TYPE_CHECKING:
     from creek.models import Fragment
@@ -217,6 +227,24 @@ class FragmentValidator:
 
         Rejects future dates and dates before 2000-01-01.
 
+        A naive timestamp is anchored through
+        :func:`creek.time.ensure_aware`, which attaches
+        America/Los_Angeles — the ontology's anchor (§8.3) for every
+        timestamp Creek writes, so an offsetless value is an LA wall clock
+        that lost its offset in transit. This module used to anchor to UTC
+        with a local copy of the helper, which read the same wall clock
+        7-8 h earlier than the rest of the pipeline did (#1115).
+
+        The two verdicts move differently under that correction, and both
+        directions are safe:
+
+        * ``future_date`` **tightens**. An LA-anchored wall clock is a
+          later absolute instant than the same clock read as UTC, so
+          strictly more values exceed ``now``. Never fewer.
+        * ``pre_2000`` is **unchanged**. ``ensure_aware`` attaches without
+          converting, and ``ts_aware.year`` reads a wall-clock field, so
+          the year is identical under either anchor.
+
         Args:
             fragment: The fragment to check.
 
@@ -228,7 +256,7 @@ class FragmentValidator:
 
         for field_name in ("created", "ingested"):
             ts: datetime = getattr(fragment, field_name)
-            ts_aware = _ensure_aware(ts)
+            ts_aware = ensure_aware(ts)
 
             if ts_aware > now:
                 violations.append(
@@ -309,22 +337,3 @@ class FragmentValidator:
             )
 
         return violations
-
-
-# ---------------------------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------------------------
-
-
-def _ensure_aware(dt: datetime) -> datetime:
-    """Ensure a datetime is timezone-aware, assuming UTC if naive.
-
-    Args:
-        dt: A datetime that may or may not have timezone info.
-
-    Returns:
-        A timezone-aware datetime (UTC if the input was naive).
-    """
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=UTC)
-    return dt

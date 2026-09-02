@@ -95,6 +95,32 @@ class TestUnitIsChanged:
             datetime(2026, 6, 2), "h", None, datetime(2026, 6, 1, tzinfo=UTC)
         )
 
+    def test_since_naive_timestamp_is_utc_not_la(self) -> None:
+        """The ``--since`` anchor is UTC, and that is a deliberate deferral.
+
+        ``creek/pipeline.py``'s ``_as_aware`` is the one naive anchor #1115
+        deliberately leaves assuming UTC rather than folding onto
+        :func:`creek.time.ensure_aware`: ``--since`` is an operator-typed
+        CLI value rather than a Creek-written wall clock, and
+        ``creek/cli.py`` — where the argument is parsed — is uncommitted
+        operator WIP this change may not touch.
+
+        The sibling test above cannot pin that, because its naive
+        ``2026-06-02`` beats a ``2026-06-01`` cutoff under *either* anchor;
+        it proves only that a naive value is not rejected. This probe sits
+        inside the 7-8 h LA band instead: 02:00 naive reads as 02:00 Z
+        under the UTC anchor, comfortably before the 05:00 Z cutoff, and
+        would read as 09:00 Z — after it — if anyone flipped the anchor to
+        LA. A future lane "finishing the sweep" therefore turns this red
+        rather than silently reversing the deferral.
+        """
+        assert not unit_is_changed(
+            datetime(2026, 6, 1, 2, 0),
+            "h",
+            None,
+            datetime(2026, 6, 1, 5, 0, tzinfo=UTC),
+        )
+
     def test_ledger_hash_differs_is_changed(self) -> None:
         """Without a cutoff, a differing content hash is a change."""
         rec = LedgerRecord("k", "frag-a", "oldhash", "t")
