@@ -7,6 +7,16 @@ media-only attachments, below-minimum-length text, and link dumps.
 All rules are individually configurable via :class:`DiscordFilterConfig`
 and enabled by default.  Contextually valuable short messages (replies)
 are preserved even when they fall below the minimum length threshold.
+
+:class:`DiscordFilterConfig` is imported from :mod:`creek.config` rather
+than declared here (#1519). It used to be declared in both places, and the
+two copies drifted — ``cleaning.discord`` advertised a minimum message
+length of 10 while this filter ran on 3. The model has to live in
+``creek.config`` rather than the other way round because that module cannot
+import :mod:`creek.clean`, which imports back out of it. The name is still
+bound in this module's namespace, so every existing import of
+``creek.clean.filters.discord.DiscordFilterConfig`` resolves to the same
+object it always did.
 """
 
 from __future__ import annotations
@@ -18,6 +28,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from creek.clean.filters._result import FilterResult
+from creek.config import DiscordFilterConfig
 
 logger = logging.getLogger(__name__)
 
@@ -89,33 +100,6 @@ class FilterStats(BaseModel):
             self.skipped += 1
             if result.reason:
                 self.reasons[result.reason] = self.reasons.get(result.reason, 0) + 1
-
-
-class DiscordFilterConfig(BaseModel):
-    """Configuration for Discord pre-ingestion filtering.
-
-    All filter rules are enabled by default.  Set individual flags to
-    ``False`` to disable specific rules.
-
-    Attributes:
-        skip_bots: Skip messages where ``author.isBot`` is true.
-        skip_emoji_only: Skip messages consisting exclusively of emoji.
-        skip_commands: Skip messages starting with a command prefix.
-        skip_media_only: Skip attachment-only messages lacking text.
-        skip_below_min_length: Skip messages shorter than ``min_length``.
-        flag_link_dumps: Skip messages that are exclusively URLs.
-        min_length: Minimum content length in characters (default 3).
-        command_prefixes: Characters that indicate a command invocation.
-    """
-
-    skip_bots: bool = True
-    skip_emoji_only: bool = True
-    skip_commands: bool = True
-    skip_media_only: bool = True
-    skip_below_min_length: bool = True
-    flag_link_dumps: bool = True
-    min_length: int = 3
-    command_prefixes: list[str] = Field(default_factory=lambda: ["/", "!", "."])
 
 
 # ---------------------------------------------------------------------------

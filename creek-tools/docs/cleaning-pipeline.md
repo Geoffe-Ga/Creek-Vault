@@ -31,10 +31,10 @@ Each filter receives raw source data **before** the ingestor turns it into a Fra
 
 | Module | What it does | Config section | Failure mode |
 |---|---|---|---|
-| [`filters/chatbot.py`](../creek/clean/filters/chatbot.py) (`ChatbotFilter`) | Strips system prompts, tool-call outputs, regeneration loops, abandoned conversations, short human turns from Claude / ChatGPT exports. | `cleaning.chatbot` | If too aggressive, real human turns disappear. Lower `min_human_turn_chars` or disable specific `skip_*` flags. |
+| [`filters/chatbot.py`](../creek/clean/filters/chatbot.py) (`ChatbotFilter`) | Strips system prompts, tool-call outputs, regeneration loops, abandoned conversations, short human turns from Claude / ChatGPT exports. | `cleaning.chatbot` | If too aggressive, real human turns disappear. Lower `min_human_turn_length` or disable specific `skip_*` flags. |
 | [`filters/discord.py`](../creek/clean/filters/discord.py) (`DiscordFilter`) | Skips bot messages, emoji-only / sticker-only posts, command invocations, link dumps, below-min-length text. Reply chains preserved even when short. | `cleaning.discord` | If your guild's `?cmd` prefix is non-standard, set `command_prefixes` so commands are still recognised. |
-| [`filters/google_drive.py`](../creek/clean/filters/google_drive.py) (`GoogleDriveFilter`) | Skips "Copy of …" duplicates, empty docs, multi-author files, oversized exports. | `cleaning.google_drive` | A "Copy of" file you actually want kept needs `prefer_newest=False` or a manual rename. |
-| [`filters/markdown.py`](../creek/clean/filters/markdown.py) (`MarkdownFilter`) | Skips empty / frontmatter-only / template-residue markdown files. | `cleaning.markdown` | Lower `min_body_chars` if short notes are being dropped. |
+| [`filters/google_drive.py`](../creek/clean/filters/google_drive.py) (`GoogleDriveFilter`) | Skips "Copy of …" duplicates, empty docs, multi-author files, oversized exports. | `cleaning.google_drive` | A "Copy of" file you actually want kept needs a manual rename — the newest-wins rule is unconditional and has no toggle. |
+| [`filters/markdown.py`](../creek/clean/filters/markdown.py) (`MarkdownFilter`) | Skips empty / frontmatter-only / template-residue markdown files. | `cleaning.markdown` | Lower `min_body_length` if short notes are being dropped. |
 
 A filter never raises on bad input — it returns a `FilterResult` with `keep=False` and a reason, so the ingest pipeline can record "filtered N files" without crashing.
 
@@ -56,7 +56,7 @@ Sets `Fragment.source.author` to one of `self | ai | other | collaborative`. Sou
 
 ### [`context.py`](../creek/clean/context.py) — `ContextExtractor`
 
-Decides what to do with non-self content. Three configurable modes (set `cleaning.context.mode` or pass programmatically):
+Decides what to do with non-self content. Three configurable modes (set `context.mode` — a top-level block, not one under `cleaning` — or pass programmatically):
 
 | Mode | Behaviour |
 |---|---|
@@ -81,9 +81,9 @@ Failure mode: a fragment with mojibake (e.g. CSV decoded as cp1252 by mistake �
 
 ### [`quality.py`](../creek/clean/quality.py) — `QualityScorer`
 
-Computes a 0.0 – 1.0 score from Shannon entropy, stop-word ratio, length, URL-only / emoji-only detection, and alphanumeric presence. Recommends `accept`, `review`, or `skip` (`cleaning.quality.skip_threshold` / `review_threshold`).
+Computes a 0.0 – 1.0 score from Shannon entropy, stop-word ratio, length, URL-only / emoji-only detection, and alphanumeric presence. Recommends `accept`, `review`, or `skip` (`cleaning.quality.accept_threshold` / `review_threshold`; below `review_threshold` is `skip`).
 
-Failure mode: legitimate short notes scored `skip`. Lower `min_chars` or `min_words`.
+Failure mode: legitimate short notes scored `skip`. Lower `cleaning.quality.min_words`.
 
 ### [`dedup.py`](../creek/clean/dedup.py) — `Deduplicator`
 
@@ -119,7 +119,7 @@ These run only via the CLI (`creek clean orphans`, …); they are **not** part o
 
 ## Disabling a step
 
-Most config sections have a `enabled: bool` (or per-rule `skip_*` toggles). To disable a step entirely, set the matching `enabled` flag to `false` and re-run ingestion. Where no `enabled` flag exists, the rules can be neutralised individually (`min_chars: 0`, empty `command_prefixes: []`, etc.). See `creek/config.py` for the authoritative shape.
+Most config sections have a `enabled: bool` (or per-rule `skip_*` toggles). To disable a step entirely, set the matching `enabled` flag to `false` and re-run ingestion. Where no `enabled` flag exists, the rules can be neutralised individually (`cleaning.discord.min_length: 0`, empty `cleaning.discord.command_prefixes: []`, etc.). See `creek/config.py` for the authoritative shape.
 
 ---
 
@@ -127,9 +127,9 @@ Most config sections have a `enabled: bool` (or per-rule `skip_*` toggles). To d
 
 | Symptom | Likely culprit | Knob to turn |
 |---|---|---|
-| 30 % of fragments dropped silently | `QualityScorer` skip threshold too high | `cleaning.quality.skip_threshold` |
-| Real human turns missing from chatbot exports | `ChatbotFilter` over-aggressive | `cleaning.chatbot.min_human_turn_chars`, `skip_short_human` |
-| Discord short replies missing | `DiscordFilter` short-text rule | `cleaning.discord.min_chars`, `preserve_replies` |
+| 30 % of fragments dropped silently | `QualityScorer` review threshold too high | `cleaning.quality.review_threshold` |
+| Real human turns missing from chatbot exports | `ChatbotFilter` over-aggressive | `cleaning.chatbot.min_human_turn_length` |
+| Discord short replies missing | `DiscordFilter` short-text rule | `cleaning.discord.min_length` (replies below it are preserved unconditionally — there is no toggle) |
 | Mojibake in CSV-derived fragments | `cp1252` fallback fired (`BUG-010`) | Re-ingest with explicit encoding; check the WARNING log line for the offending file |
 | Voice-proxy eligibility wrong | Stale `voice_proxy_eligible` field | Pull from a build that includes `BUG-009` — the field is now a derived property |
 | Duplicate fragments accepted | Stale `dedup-manifest.json` from earlier run | Delete `<vault>/00-Creek-Meta/dedup-manifest.json` and re-ingest |
