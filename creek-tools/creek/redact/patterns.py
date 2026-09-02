@@ -235,8 +235,12 @@ PATTERN_METADATA: dict[str, PatternInfo] = {
         description="Stripe API keys (sk_live/sk_test/pk_live/pk_test/rk_*).",
         severity="critical",
         false_positive_notes=(
-            "The api_key pattern overlaps for the `sk_test_` prefix; both "
-            "would fire, which is acceptable since the action is the same."
+            "The api_key pattern also reaches the `sk_live_` and `sk_test_` "
+            "prefixes; `pk_` and `rk_` keys match stripe_key alone. Where "
+            "both match, the two spans are identical and are unioned into "
+            "one region (#832). Both are `critical` and the widths tie, so "
+            "the label falls to PATTERN_METADATA declaration order and the "
+            "single marker written is [REDACTED:api_key]."
         ),
     ),
     "anthropic_key": PatternInfo(
@@ -247,7 +251,9 @@ PATTERN_METADATA: dict[str, PatternInfo] = {
         severity="critical",
         false_positive_notes=(
             "Already covered by the generic api_key pattern but the explicit "
-            "entry surfaces clearer telemetry in the report."
+            "entry surfaces clearer telemetry in the report. On `--apply` "
+            "the two identical spans merge and the single marker written is "
+            "[REDACTED:api_key]."
         ),
     ),
     "openai_project_key": PatternInfo(
@@ -258,7 +264,9 @@ PATTERN_METADATA: dict[str, PatternInfo] = {
         severity="critical",
         false_positive_notes=(
             "Like anthropic_key, partially overlaps with the generic api_key "
-            "pattern; the explicit entry distinguishes provider in reports."
+            "pattern; the explicit entry distinguishes provider in reports. "
+            "On `--apply` the two identical spans merge and the single "
+            "marker written is [REDACTED:api_key]."
         ),
     ),
     "ipv4": PatternInfo(
