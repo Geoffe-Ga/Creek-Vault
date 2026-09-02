@@ -758,23 +758,31 @@ class CompostTracker:
 
         Both sides of the silence comparison are timezone-aware before
         they meet: ``cutoff`` derives from the aware clock, and each
-        fragment timestamp is passed through
-        :func:`creek.time.ensure_aware`. A vault mixing naive and aware
-        fragment timestamps — the ordinary result of round-tripping
-        frontmatter without an offset — therefore ranks and compares
-        instead of raising ``TypeError`` (issue #938; the underlying
-        model-level normalisation is issue #976).
+        fragment timestamp comes back aware from
+        :func:`creek.time.effective_authored_at`, which anchors a naive
+        value to America/Los_Angeles at the read (#1116). A vault mixing
+        naive and aware fragment timestamps — the ordinary result of
+        round-tripping frontmatter without an offset — therefore ranks
+        and compares instead of raising ``TypeError`` (issue #938; the
+        model-level normalisation this backs up is issue #976).
+
+        This method used to wrap that call in its own
+        :func:`creek.time.ensure_aware`, because the chokepoint did not
+        repair. It now does, so the wrapper was dropped as a
+        value-for-value no-op — both applied the same LA anchor, so no
+        candidate's ``last_seen`` moves. The guarantee still has to hold
+        *inside* the generator, because ``max`` compares its own
+        candidates and one unrepaired naive timestamp raises before
+        ``cutoff`` is ever consulted; that is what
+        ``tests/test_compost.py::TestTimezoneAwareClock::
+        test_bypass_naive_fragment_still_ranks`` pins.
         """
         if len(frags) < self.project_min_fragments:
             return None
         # FEAT-031: measure silence against the authored-date precedence
         # so a project whose fragments were merely *ingested* recently
         # but authored long ago is still recognised as silent.
-        # ``max`` compares its own candidates, so the normalisation has to
-        # happen inside the generator rather than around it: without it a
-        # single naive timestamp in the group raises before ``cutoff`` is
-        # ever consulted.
-        last_seen = max(ensure_aware(effective_authored_at(frag)) for frag in frags)
+        last_seen = max(effective_authored_at(frag) for frag in frags)
         if last_seen >= cutoff:
             return None
         days = (self._now - last_seen).days

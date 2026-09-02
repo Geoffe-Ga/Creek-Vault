@@ -741,3 +741,292 @@ def test_fragment_defaults_independent_of_host_tz(
     # Regardless of host TZ, the offset matches LA.
     la_offset = ZoneInfo("America/Los_Angeles").utcoffset(frag.created)
     assert frag.created.utcoffset() == la_offset
+
+
+_BYPASS_NAIVE: Final[datetime] = datetime(2026, 7, 28, 23, 0, 0, 123456)
+"""A naive probe with a day-boundary hour and microseconds intact.
+
+23:00 plus microseconds is the shape that separates *attaching* a zone
+from *converting* to one: an ``astimezone`` implementation slides this
+value across the day boundary and loses the wall clock, while passing an
+offset-only assertion.
+"""
+
+
+def _bypass_base() -> Fragment:
+    """Build a normally-constructed fragment to mutate through a bypass.
+
+    Returns:
+        A fragment whose timestamps have already been LA-anchored by
+        ``Fragment``'s own field validator, so a test can prove the
+        bypass — not the fixture — is what loses the offset.
+    """
+    return Fragment(
+        id="frag-normal0001",
+        title="t",
+        source=FragmentSource(platform=SourcePlatform.OTHER),
+    )
+
+
+class TestFragmentTimestampBypassPaths:
+    """The three documented bypasses stay open, deliberately (#1116).
+
+    ``Fragment._normalise_timestamp`` is a Pydantic field validator, and
+    three construction paths do not run field validators:
+    ``model_construct``, ``model_copy(update=...)``, and direct attribute
+    assignment on an existing instance. Every method here is
+    **characterisation**: it passes before and after #1116, because
+    #1116 is closed at the *read* chokepoint rather than by making these
+    paths validate.
+
+    Closing them was considered and rejected. ``validate_assignment=True``
+    would re-enter the fail-closed ``_coerce_*`` validators on every
+    attribute write — ``clean/context.py`` does one deep copy plus an
+    attribute write per fragment at 35k scale — and four production sites
+    reason explicitly about ``model_copy`` skipping ``use_enum_values``
+    coercion. ``model_post_init`` is not a middle road either: Pydantic
+    v2 *does* invoke it from ``model_construct``, so it would close one
+    bypass of three at full per-construction cost.
+    """
+
+    def test_model_construct_leaves_naive_ingested_naive(self) -> None:
+        """``model_construct`` runs no field validators, by design."""
+        frag = Fragment.model_construct(
+            id="frag-bypass0001",
+            title="t",
+            source=FragmentSource(platform=SourcePlatform.OTHER),
+            ingested=_BYPASS_NAIVE,
+        )
+        assert frag.ingested.utcoffset() is None
+
+    def test_model_copy_update_leaves_naive_ingested_naive(self) -> None:
+        """``model_copy(update=...)`` writes the value straight through."""
+        base = _bypass_base()
+        # Prove the fixture is sound before blaming the copy: the base
+        # fragment really did get anchored on the constructor path.
+        assert base.ingested.utcoffset() is not None
+
+        copied = base.model_copy(update={"ingested": _BYPASS_NAIVE})
+
+        assert copied.ingested.utcoffset() is None
+
+    def test_direct_assignment_leaves_naive_ingested_naive(self) -> None:
+        """Attribute assignment bypasses validation — no ``validate_assignment``.
+
+        This is the exact shape ``creek/clean/context.py`` uses in
+        production: ``model_copy(deep=True)`` followed by one or two
+        attribute writes, once per fragment.
+        """
+        copied = _bypass_base().model_copy(deep=True)
+        copied.ingested = _BYPASS_NAIVE
+        assert copied.ingested.utcoffset() is None
+
+    def test_model_construct_leaves_naive_authored_at_naive(self) -> None:
+        """``authored_at`` bypasses too — the only ``datetime | None`` field.
+
+        Covered separately because a guard written for the two required
+        timestamps can silently miss the optional one.
+        """
+        frag = Fragment.model_construct(
+            id="frag-bypass0002",
+            title="t",
+            source=FragmentSource(platform=SourcePlatform.OTHER),
+            authored_at=_BYPASS_NAIVE,
+        )
+        assert frag.authored_at is not None
+        assert frag.authored_at.utcoffset() is None
+
+    def test_model_copy_update_leaves_naive_authored_at_naive(self) -> None:
+        """``model_copy(update=...)`` bypasses for ``authored_at`` as well."""
+        copied = _bypass_base().model_copy(update={"authored_at": _BYPASS_NAIVE})
+        assert copied.authored_at is not None
+        assert copied.authored_at.utcoffset() is None
+
+    def test_direct_assignment_leaves_naive_authored_at_naive(self) -> None:
+        """Attribute assignment bypasses for ``authored_at`` as well."""
+        copied = _bypass_base().model_copy(deep=True)
+        copied.authored_at = _BYPASS_NAIVE
+        assert copied.authored_at is not None
+        assert copied.authored_at.utcoffset() is None
+
+    def test_direct_assignment_leaves_naive_created_naive(self) -> None:
+        """``created`` bypasses identically — same validator, same three paths.
+
+        ``created`` is deliberately outside
+        :func:`effective_authored_at`'s precedence chain, so the read
+        chokepoint does not repair it. What protects it instead is
+        ``clean/validator.py``, which anchors through
+        :func:`creek.time.ensure_aware` (#1115) — pinned by
+        ``test_validator.py::TestNaiveTimestamp::
+        test_naive_timestamp_is_anchored_to_la_not_utc``.
+        """
+        copied = _bypass_base().model_copy(deep=True)
+        copied.created = _BYPASS_NAIVE
+        assert copied.created.utcoffset() is None
+
+    def test_validate_assignment_stays_disabled(self) -> None:
+        """``validate_assignment`` is off, and must stay off (#1116).
+
+        A guard rather than an observation. Turning it on re-enters the
+        fail-closed ``_coerce_voice_weight`` / ``_coerce_representativeness``
+        / ``_coerce_audience`` validators on **every** attribute write,
+        and four production sites document depending on ``model_copy``
+        *not* re-running ``use_enum_values`` coercion:
+        ``classify/classify_engine.py``, ``classify/llm/parsing.py``,
+        ``classify/praxis_pass.py`` and ``generate/voice.py``. The hot
+        path is ``clean/context.py``, which copies and assigns once per
+        fragment across a 35k-fragment vault.
+
+        Nothing in the repo sets the flag today, so this test is the only
+        thing standing between a future edit and that regression. The
+        two-argument ``.get`` keeps the result typed ``bool`` under mypy
+        strict, so no cast or suppression is needed.
+        """
+        assert not Fragment.model_config.get("validate_assignment", False)
+
+
+class TestBypassedTimestampsAreRepairedAtTheReadChokepoint:
+    """``effective_authored_at`` repairs what the bypasses let through (#1116).
+
+    The invariant #1116 is really about is not "no naive value is ever on
+    a ``Fragment`` field" — the three bypass paths make that
+    unenforceable without unacceptable cost. It is the narrower and
+    achievable one: **a Fragment timestamp never reaches arithmetic
+    without the LA repair**.
+
+    :func:`creek.time.effective_authored_at` is the single production read
+    of ``ingested`` / ``authored_at`` that does arithmetic — verified by an
+    AST scan over ``creek/`` and ``creek_mcp/``, whose only other hits are
+    an existence guard in ``ingest/refresh.py`` and an ``int`` counter in
+    ``cli.py`` that merely shares the name. Repairing there covers the
+    ~30 call sites that sort, subtract, ``min`` and ``max`` on its result
+    without any of them re-repairing.
+    """
+
+    def test_repairs_ingested_from_model_construct(self) -> None:
+        """A ``model_construct`` fragment reads back aware and unmoved."""
+        frag = Fragment.model_construct(
+            id="frag-choke00001",
+            title="t",
+            source=FragmentSource(platform=SourcePlatform.OTHER),
+            authored_at=None,
+            ingested=_BYPASS_NAIVE,
+            created=_BYPASS_NAIVE,
+        )
+        assert frag.ingested.utcoffset() is None
+
+        result = effective_authored_at(frag)
+
+        assert result.utcoffset() is not None
+        assert result.utcoffset() == LA_TZ.utcoffset(result)
+        # Attach, never convert: an astimezone implementation passes the
+        # offset assertions above and fails both of these.
+        assert result.replace(tzinfo=None) == _BYPASS_NAIVE
+        assert result.microsecond == 123456
+
+    def test_repairs_ingested_from_model_copy_update(self) -> None:
+        """A ``model_copy(update=...)`` fragment reads back aware and unmoved."""
+        frag = _bypass_base().model_copy(
+            update={"ingested": _BYPASS_NAIVE, "authored_at": None},
+        )
+        assert frag.ingested.utcoffset() is None
+
+        result = effective_authored_at(frag)
+
+        assert result.utcoffset() == LA_TZ.utcoffset(result)
+        assert result.replace(tzinfo=None) == _BYPASS_NAIVE
+        assert result.microsecond == 123456
+
+    def test_repairs_ingested_from_direct_assignment(self) -> None:
+        """A directly-assigned fragment reads back aware and unmoved.
+
+        The ``clean/context.py`` shape.
+        """
+        frag = _bypass_base().model_copy(deep=True)
+        frag.ingested = _BYPASS_NAIVE
+        frag.authored_at = None
+        assert frag.ingested.utcoffset() is None
+
+        result = effective_authored_at(frag)
+
+        assert result.utcoffset() == LA_TZ.utcoffset(result)
+        assert result.replace(tzinfo=None) == _BYPASS_NAIVE
+        assert result.microsecond == 123456
+
+    def test_repairs_authored_at_from_direct_assignment(self) -> None:
+        """The ``authored_at`` branch is repaired too, not just the fallback.
+
+        Exercises the *other* return in the precedence chain, so a fix
+        that wrapped only one of the two cannot survive: ``ingested`` here
+        is already aware, so the assertion can only be satisfied by the
+        ``authored_at`` branch itself being repaired.
+        """
+        frag = _bypass_base().model_copy(deep=True)
+        frag.authored_at = _BYPASS_NAIVE
+        assert frag.ingested.utcoffset() is not None
+        assert frag.authored_at is not None
+        assert frag.authored_at.utcoffset() is None
+
+        result = effective_authored_at(frag)
+
+        assert result.utcoffset() == LA_TZ.utcoffset(result)
+        assert result.replace(tzinfo=None) == _BYPASS_NAIVE
+
+    def test_bypassed_ingested_is_comparable_with_now_la(self) -> None:
+        """The production crash the invariant exists to prevent.
+
+        Without the repair this raises ``TypeError: can't compare
+        offset-naive and offset-aware datetimes`` — the same signature
+        ``TestEnsureAware::test_result_is_always_comparable_with_now_la``
+        pins one layer down for the helper itself.
+        """
+        frag = _bypass_base().model_copy(deep=True)
+        frag.ingested = _BYPASS_NAIVE
+        frag.authored_at = None
+
+        assert effective_authored_at(frag) < now_la()
+
+    def test_mixed_bypass_and_normal_fragments_sort_without_typeerror(self) -> None:
+        """A vault mixing bypassed and normal fragments still sorts.
+
+        This is the consumer-level shape the repair exists for. Seven
+        production sites sort on this key —
+        ``link/eddies.py``, ``link/segments.py``, ``link/threads.py`` and
+        ``link/temporal.py`` — and any one naive fragment in the input
+        made the whole pass raise before the sort produced anything.
+        """
+        bypassed = Fragment.model_construct(
+            id="frag-choke00001",
+            title="t",
+            source=FragmentSource(platform=SourcePlatform.OTHER),
+            authored_at=None,
+            ingested=_BYPASS_NAIVE,
+            created=_BYPASS_NAIVE,
+        )
+        normal = _bypass_base()
+
+        ordered = sorted([normal, bypassed], key=effective_authored_at)
+
+        assert [frag.id for frag in ordered] == [
+            "frag-choke00001",
+            "frag-normal0001",
+        ]
+
+    def test_effective_authored_date_inherits_the_repair(self) -> None:
+        """The date wrapper inherits the repair rather than re-implementing it.
+
+        Three assertions with different jobs. The first is **red** against
+        unfixed code. The second and third are **pins**, green either way:
+        they hold the delegation in place so a future re-implementation
+        cannot regress only the date wrapper, and they fail against the
+        plausible wrong implementation ``astimezone(LA_TZ)``, which moves
+        a 23:00 value back across the day boundary to the 28th's
+        predecessor.
+        """
+        frag = _bypass_base().model_copy(deep=True)
+        frag.ingested = _BYPASS_NAIVE
+        frag.authored_at = None
+
+        assert effective_authored_at(frag).utcoffset() is not None
+        assert effective_authored_date(frag) == effective_authored_at(frag).date()
+        assert effective_authored_date(frag).isoformat() == "2026-07-28"

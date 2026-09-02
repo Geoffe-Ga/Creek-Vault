@@ -1163,6 +1163,44 @@ class TestTimezoneAwareClock:
         candidates = tracker.detect_compost_candidates([], self._frags(mixed))
         self._assert_single_project_candidate(candidates)
 
+    def test_bypass_naive_fragment_still_ranks(self) -> None:
+        """A fragment built by a validator bypass still ranks (#1116).
+
+        A **guard**, not a red test: it is green before and after, and
+        that is the point. The sibling tests above all build through
+        ``_tz_fragment``, i.e. the ordinary ``Fragment(...)`` constructor,
+        whose field validator has LA-anchored their "naive" inputs since
+        #976 — so none of them can reach a genuinely naive ``ingested``.
+        This one uses ``model_copy(deep=True)`` plus an attribute write,
+        which Pydantic does not route through field validators, and is
+        therefore the only test here exercising the case ``compost.py``
+        needed a local ``ensure_aware`` wrapper for.
+
+        That wrapper is now redundant, because
+        :func:`creek.time.effective_authored_at` repairs at the read. This
+        test is what makes *removing* it safe: it goes red only when the
+        chokepoint repair and the wrapper are both absent, with
+        ``TypeError: can't compare offset-naive and offset-aware
+        datetimes`` out of the ``max(...)`` generator.
+        """
+        aware = [
+            datetime(2020, 1, 1, 12, 0, tzinfo=_LA_ZONE) + timedelta(days=offset)
+            for offset in range(3)
+        ]
+        frags = self._frags(aware)
+        bypassed = frags[0].model_copy(deep=True)
+        bypassed.ingested = datetime(2020, 1, 1, 12, 0)
+        # Assert the bypass took, so the fixture cannot silently stop
+        # exercising the naive path.
+        assert bypassed.ingested.utcoffset() is None
+        frags[0] = bypassed
+
+        tracker = CompostTracker(project_gap_days=30, project_min_fragments=3)
+
+        self._assert_single_project_candidate(
+            tracker.detect_compost_candidates([], frags),
+        )
+
     def test_default_clock_is_tz_aware_and_la(self, vault_path: Path) -> None:
         """The default clock stamps the LA date on a note, not the UTC one.
 
