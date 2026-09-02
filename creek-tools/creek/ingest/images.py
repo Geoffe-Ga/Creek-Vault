@@ -780,7 +780,7 @@ class ImageIngestor(Ingestor):
         """
         results = self.engine.extract_pdf_pages(pdf_path)
         fragments: list[ParsedFragment] = []
-        for result in results:
+        for position, result in enumerate(results, start=1):
             if not result.text.strip():
                 continue
             metadata: dict[str, Any] = {
@@ -800,11 +800,50 @@ class ImageIngestor(Ingestor):
                     # owns a file, so the page discriminator rides
                     # ``source_unit`` and never this (base.py's contract).
                     source_path=str(pdf_path),
-                    source_unit=f"page-{result.page}",
+                    source_unit=_page_unit(result.page, position),
                     timestamp=_modified_time(pdf_path),
                 ),
             )
         return fragments
+
+
+def _page_unit(page: int, position: int) -> str:
+    """Return the ``source_unit`` discriminator for one OCR'd PDF page.
+
+    :class:`OcrEngine` documents ``extract_pdf_pages`` as returning a **1-based**
+    ``page`` index, and :class:`PytesseractOcrEngine` honours it. But ``page`` is
+    an :class:`OcrResult` field defaulting to ``0``, so a third-party backend
+    registered in :data:`OCR_ENGINES` can report ``0`` for every page — and under
+    the ``document`` ledger a shared unit is a shared
+    ``source.origin_key``, a shared ledger record, and
+    :func:`~creek.ingest.pipeline.write_fragment_idempotent` reassigning each
+    page's id to that record's, overwriting its predecessor. Measured against
+    such an engine before this guard: three OCR'd pages, **one** surviving file
+    holding page 3's body, one ledger key, and the run reporting ``1 created,
+    2 updated`` with no errors. Silent loss that reports success — the exact
+    failure this whole routing change exists to prevent, so leaving one way in
+    would be fixing the defect for conforming callers only.
+
+    The fallback keys on the result's **position**, in its own ``page-at-``
+    namespace rather than reusing ``page-N``. Sharing the namespace would let a
+    mixed response — say pages ``[2, 0]`` — put the second result's positional
+    ``2`` on top of the first result's genuine page ``2``, reintroducing the
+    collision one case further out.
+
+    Position is a fallback and never the primary, because ``ingest_pdf`` skips
+    pages OCR recovered nothing from: for a PDF whose page 2 came back blank,
+    positions run ``1, 2`` while the real pages are ``1, 3``, so keying on
+    position would mislabel every page after the first gap.
+
+    Args:
+        page: The 1-based page index the engine reported; ``0`` when it
+            reported none.
+        position: The result's 1-based position in the returned list.
+
+    Returns:
+        A discriminator unique across the pages of one PDF.
+    """
+    return f"page-{page}" if page else f"page-at-{position}"
 
 
 def _modified_time(path: Path) -> datetime:

@@ -416,6 +416,27 @@ class _PageOcrEngine:
         ]
 
 
+class _ZeroPageOcrEngine(_PageOcrEngine):
+    """A backend that ignores the protocol's 1-based ``page`` contract.
+
+    ``OcrResult.page`` defaults to ``0``, so this is what a third-party engine
+    registered in ``OCR_ENGINES`` looks like when it simply never sets the
+    field. Not hypothetical in shape: it is the field's own default.
+    """
+
+    def extract_pdf_pages(self, pdf_path: Path) -> list[OcrResult]:
+        """Return one canned result per page, all claiming to be page 0.
+
+        Args:
+            pdf_path: PDF the ingestor asked about.
+
+        Returns:
+            One :class:`OcrResult` per entry in :data:`SCAN_PAGES`, each with
+            ``page=0``.
+        """
+        return [OcrResult(text=text, confidence=0.9) for text in SCAN_PAGES]
+
+
 def _make_scan_source(tmp_path: Path) -> Path:
     """Write a pinned-mtime three-page image-only PDF into a source dir."""
     source = tmp_path / "scans"
@@ -528,3 +549,48 @@ def test_re_ingesting_the_same_scan_updates_nothing_and_orphans_nothing(
         )
         == ids_after_first
     )
+
+
+def test_an_engine_that_reports_no_page_number_still_cannot_collapse_the_pages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A contract-violating backend must not be able to lose pages silently.
+
+    ``OcrEngine`` documents ``extract_pdf_pages`` as returning a 1-based
+    ``page``, and the shipped ``PytesseractOcrEngine`` honours it — but ``page``
+    is an ``OcrResult`` field defaulting to ``0``, so an engine registered in
+    ``OCR_ENGINES`` that never sets it reports ``0`` for every page. Deriving
+    the ``source_unit`` straight from that number gave all three pages the same
+    unit, hence one ``origin_key``, one ledger record, and each page
+    overwriting the last.
+
+    Measured before the guard, against this exact engine: three pages OCR'd,
+    **one** file on disk holding page 3's body, one ledger key, and the run
+    reporting ``1 created, 2 updated`` with an empty ``errors`` list. Fixing
+    the collision only for engines that follow the contract would have left
+    the defect this change exists to close reachable from one file away.
+    """
+    monkeypatch.setitem(OCR_ENGINES, "pageocr", _ZeroPageOcrEngine)
+    vault = _make_vault(tmp_path)
+    source = _make_scan_source(tmp_path)
+
+    result = _ingest_scan(source, vault)
+
+    assert result.errors == []
+    assert len(_live_fragments(vault)) == 3
+    assert len(set(_raw_ledger_keys(vault, "document"))) == 3
+    assert len(set(_origin_keys(vault))) == 3
+    # The positional fallback lives in its own namespace, so a mixed response
+    # cannot land a positional index on top of a real page number.
+    assert sorted(
+        key.rsplit("#", 1)[-1] for key in set(_raw_ledger_keys(vault, "document"))
+    ) == ["page-at-1", "page-at-2", "page-at-3"]
+    # Every page's body survived; nothing was overwritten. No ``#page=N``
+    # embed, and correctly so: with no page number there is no anchor to
+    # write, so ``convert_to_markdown`` falls back to the document renderer
+    # rather than inventing one. The OCR text is what mattered and it is here.
+    assert sorted(
+        frontmatter.loads(path.read_text(encoding="utf-8")).content.strip()
+        for path in _live_fragments(vault)
+    ) == sorted(SCAN_PAGES)
