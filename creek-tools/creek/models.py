@@ -948,18 +948,28 @@ class Fragment(BaseModel):
         and AI / collaborator / other-authored content is excluded per
         the universal-constraints rule in :mod:`creek.clean.context`.
 
-        The bare ``!=`` is deliberate and permanent. Every other tier
-        decision in ``creek`` reads through
+        The bare ``!=`` is deliberate and permanent. Tier decisions in
+        ``creek`` should read through
         :func:`creek.classify.privacy_filter.tier_of`, which fails closed
         on an unrecognised tier; this one cannot, because
         ``creek.classify.privacy_filter`` imports :class:`PrivacyTier`
         from this module and the reverse import would be a cycle. A tier
         string the enum does not recognise therefore reads as *eligible*
-        here. That residual is accepted rather than overlooked (#1489):
-        the two consumers that matter re-screen through the canonical
-        reader — :func:`creek.generate.skills._is_snapshot_fragment` for
-        the skill tree, and the voice corpus loader for voice proxy — so
-        do not re-open this in the next sweep.
+        here. That residual is accepted rather than overlooked (#1489),
+        but it is **not** fully covered downstream, and the difference
+        matters to anyone auditing this property:
+
+        * The skill tree re-screens canonically —
+          :func:`creek.generate.skills._is_snapshot_fragment` reads
+          through ``tier_of`` (#1489).
+        * The voice corpus does **not**.
+          ``creek.generate.voice._eligible_register`` still compares the
+          bare attribute, so it shares this property's fail-open on an
+          unrecognised tier. Tracked by issue #1743; that file was
+          out of scope for #1489.
+
+        So do not re-open the cycle argument in the next sweep — but do
+        not read this docstring as a claim that every consumer is safe.
         """
         return (
             self.privacy_tier != PrivacyTier.INTIMATE
