@@ -30,7 +30,7 @@ Like the rest of :mod:`creek_mcp.api`, this module imports no web framework.
 from __future__ import annotations
 
 import re
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from creek_mcp.api.models import (
     CONTRACT_MODELS,
@@ -49,6 +49,9 @@ from creek_mcp.api.routes import (
     RouteSpec,
 )
 from creek_mcp.contract import CONTRACT_VERSION
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
 
 OPENAPI_VERSION: Final[str] = "3.1.0"
 """The OpenAPI dialect the document declares.
@@ -97,14 +100,18 @@ _DEFS_KEY: Final[str] = "$defs"
 _JSON_MEDIA_TYPE: Final[str] = "application/json"
 """The single media type ``/v1`` speaks, in both directions."""
 
-_SUCCESS_STATUS: Final[str] = "200"
-"""The one success status any operation documents."""
-
 _PATH_PARAMETER: Final[re.Pattern[str]] = re.compile(r"{(\w+)}")
 """Matches a ``{name}`` placeholder in a route template."""
 
 _ERROR_ENVELOPE_NAME: Final[str] = "ErrorEnvelope"
-"""The component every non-``200`` response references."""
+"""The component every non-success response references.
+
+"Non-success" rather than "non-``200``" since #1605: which statuses count as a
+success is declared per route now, on
+:attr:`~creek_mcp.api.routes.RouteSpec.success_responses`, so the rule is
+"everything the route did not declare as a success" rather than "everything but
+one literal".
+"""
 
 _UNIVERSAL_ERROR_CODES: Final[tuple[ErrorCode, ...]] = (
     ErrorCode.UNAUTHENTICATED,
@@ -391,20 +398,24 @@ def _json_content(schema: dict[str, Any]) -> dict[str, Any]:
     return {_JSON_MEDIA_TYPE: {"schema": schema}}
 
 
-def _success_response(spec: RouteSpec) -> dict[str, Any]:
-    """Return the ``200`` response object for *spec*.
+def _success_response(spec: RouteSpec, model: type[BaseModel] | None) -> dict[str, Any]:
+    """Return one success response object for *spec*.
 
     Args:
         spec: The route under consideration.
+        model: The wire model governing this success status' body, or ``None``
+            when the body is outside the published contract. Passed rather
+            than read off ``spec.response_model`` because a route may document
+            more than one success status, each with its own body — the reason
+            :attr:`~creek_mcp.api.routes.RouteSpec.success_responses` is a
+            status-to-model mapping rather than a tuple of statuses.
 
     Returns:
-        A reference to the route's published response model, or the inline
-        liveness shape for the one route that has none.
+        A reference to the named response model, or the inline liveness shape
+        for the one route that has none.
     """
     schema: dict[str, Any] = (
-        _HEALTH_RESPONSE_SCHEMA
-        if spec.response_model is None
-        else _component_ref(spec.response_model.__name__)
+        _HEALTH_RESPONSE_SCHEMA if model is None else _component_ref(model.__name__)
     )
     return {"description": spec.summary, "content": _json_content(schema)}
 
@@ -433,9 +444,13 @@ def _responses(spec: RouteSpec) -> dict[str, Any]:
         spec: The route under consideration.
 
     Returns:
-        The success response plus one entry per reachable refusal.
+        Every success the route declares, in declaration order, plus one entry
+        per reachable refusal.
     """
-    responses: dict[str, Any] = {_SUCCESS_STATUS: _success_response(spec)}
+    responses: dict[str, Any] = {
+        str(status): _success_response(spec, model)
+        for status, model in spec.published_success_responses
+    }
     for code in _error_codes(spec):
         responses[str(ERROR_STATUS[code])] = _error_response(code)
     return responses

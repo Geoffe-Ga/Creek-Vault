@@ -574,8 +574,12 @@ def test_the_long_running_methods_are_not_expressible(
 ) -> None:
     """``llm`` and ``embeddings`` are refused by the schema, not by a runtime check.
 
-    Both are minutes-to-hours of work behind a 30-second request deadline the
-    timeout middleware cannot cancel once the call is inside a worker thread.
+    Both are minutes-to-hours of work, and the reason is **not** that a
+    deadline would shed the call: these are write routes, so the deadline is
+    not enforced on them and no ``503`` is synthesized while a pass carries on
+    (``docs/api.md``, limits table). A caller who triggered one would simply
+    wait, holding a connection and one of its eight per-consumer concurrency
+    slots, with no progress, no cancellation and no restart visibility.
     Excluding them from the wire enums makes them unreachable in the *type*,
     which is also what publishes the exclusion to a consumer reading the
     schemas.

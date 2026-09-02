@@ -67,7 +67,11 @@ from starlette.responses import JSONResponse
 from creek.audit import log as audit_log_module
 from creek_mcp import httpapi as httpapi_package
 from creek_mcp.api.models import ERROR_MESSAGES, ERROR_STATUS, ErrorCode
-from creek_mcp.api.routes import AUTHORIZATION_HEADER, ROUTE_BODY_CAPS
+from creek_mcp.api.routes import (
+    AUTHORIZATION_HEADER,
+    PUBLISHED_SUCCESS_STATUSES,
+    ROUTE_BODY_CAPS,
+)
 from creek_mcp.audit import MCP_AUDIT_RELPATH, verify_mcp_audit_chain
 from creek_mcp.httpapi import capabilities as capabilities_module
 from creek_mcp.httpapi import handlers as handlers_module
@@ -142,7 +146,7 @@ _FORBIDDEN_STATUS: Final[int] = 403
 _BAD_GATEWAY_STATUS: Final[int] = 502
 
 ALLOWED_HTTP_STATUSES: Final[frozenset[int]] = frozenset(
-    set(ERROR_STATUS.values()) | {_OK_STATUS}
+    set(ERROR_STATUS.values()) | PUBLISHED_SUCCESS_STATUSES
 )
 """The closed status set the contract publishes, derived not restated.
 

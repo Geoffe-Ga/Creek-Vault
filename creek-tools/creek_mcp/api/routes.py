@@ -53,6 +53,8 @@ from creek_mcp.api.models import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from pydantic import BaseModel
 
 CONTRACT_VERSION_HEADER: Final[str] = "X-Creek-Contract-Version"
@@ -191,6 +193,39 @@ _PATH_TEMPLATE_MARKER: Final[str] = "{"
 """What makes a path a template rather than a literal one caller can be matched on."""
 
 
+_DEFAULT_SUCCESS_STATUS: Final[int] = 200
+"""What a route documents as its success when it declares nothing else.
+
+Every route on the table takes this today. It lives here rather than in the
+OpenAPI generator (where it was ``_SUCCESS_STATUS`` until #1605) because
+"which statuses does this endpoint answer on success" is a property of the
+endpoint, in the same table the document, the handler map and the handshake are
+all read from — the reason ``max_body_bytes`` is declared here too.
+"""
+
+
+PUBLISHABLE_SUCCESS_STATUSES: Final[frozenset[int]] = frozenset({200, 202})
+"""The only statuses a route may declare as a *success*.
+
+Deliberately not "anything that is not an error". The set is closed for two
+reasons, and the second is the load-bearing one:
+
+* The contract publishes a closed status set, and a client maps anything
+  outside it to "unreachable". A ``201`` or a ``204`` invented on one route
+  would be a status no consumer has handling for.
+* A success status is *exempt* from the one-error-shape rule
+  (``test_every_non_success_response_is_the_error_envelope``). Were a refusal
+  status declarable as a success, a route could publish a bespoke body on a
+  ``404`` — and a second error shape is where a field echoing request or vault
+  material eventually appears.
+
+``202`` is admitted ahead of its first user (#1605's job surface) so that the
+guard, the generator and every derivation of the published set land and are
+verified in one reviewable change, while the generated document is provably
+unmoved.
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class RouteSpec:
     """One published endpoint, in the vocabulary every consumer of the table needs.
@@ -224,6 +259,16 @@ class RouteSpec:
             rather than passed to the middleware so that "how big may this
             endpoint's body be" is a published property of the endpoint, in the
             same table the OpenAPI document and the handler map are read from.
+        success_responses: The success statuses this route documents, each
+            paired with the wire model governing that status' body (``None``
+            for a body outside the published contract), or ``None`` to document
+            the single default of :data:`_DEFAULT_SUCCESS_STATUS` carrying
+            :attr:`response_model`. Read through
+            :attr:`published_success_responses`, never directly. A *mapping*
+            rather than a tuple of statuses because the generator derives each
+            response's schema from a model: a route answering two success
+            statuses answers with two different bodies, and a bare tuple of
+            ints would carry the statuses without them.
     """
 
     path: str
@@ -235,6 +280,25 @@ class RouteSpec:
     requires_contract_version: bool
     summary: str
     max_body_bytes: int | None = None
+    success_responses: tuple[tuple[int, type[BaseModel] | None], ...] | None = None
+
+    @property
+    def published_success_responses(
+        self,
+    ) -> tuple[tuple[int, type[BaseModel] | None], ...]:
+        """Return the success statuses and bodies this route publishes.
+
+        Resolves the ``None`` default rather than making every consumer of the
+        table repeat the same two-line fallback — which is how three consumers
+        end up disagreeing about what a route with no declaration means.
+
+        Returns:
+            One ``(status, model)`` pair per documented success, in the order
+            the document publishes them.
+        """
+        if self.success_responses is None:
+            return ((_DEFAULT_SUCCESS_STATUS, self.response_model),)
+        return self.success_responses
 
     def __post_init__(self) -> None:
         """Refuse a per-route body cap on a templated path.
@@ -257,6 +321,57 @@ class RouteSpec:
                 f"a templated path ({self.path})"
             )
             raise ValueError(msg)
+        self._refuse_an_unpublishable_success_declaration()
+
+    def _refuse_an_unpublishable_success_declaration(self) -> None:
+        """Refuse a ``success_responses`` the document could not honestly carry.
+
+        Raised at import for the reason the body-cap guard above is: a route
+        table is read once, at start-up, by three consumers, so a declaration
+        none of them could honour must be a build failure rather than a
+        document that quietly disagrees with the table it came from.
+
+        Raises:
+            ValueError: When the declaration is empty, repeats a status, or
+                names a status outside :data:`PUBLISHABLE_SUCCESS_STATUSES`.
+        """
+        if self.success_responses is None:
+            return
+        if not self.success_responses:
+            msg = (
+                f"{self.operation_id}: a route must document at least one "
+                f"success response"
+            )
+            raise ValueError(msg)
+        seen: set[int] = set()
+        for status, _model in self.success_responses:
+            if status not in PUBLISHABLE_SUCCESS_STATUSES:
+                msg = (
+                    f"{self.operation_id}: {status} is not a publishable success "
+                    f"status ({sorted(PUBLISHABLE_SUCCESS_STATUSES)})"
+                )
+                raise ValueError(msg)
+            if status in seen:
+                msg = f"{self.operation_id}: declares status {status} twice"
+                raise ValueError(msg)
+            seen.add(status)
+
+
+def published_success_statuses(routes: Iterable[RouteSpec]) -> frozenset[int]:
+    """Return every success status *routes* documents.
+
+    Args:
+        routes: The route table to read. Taken as an argument rather than
+            closing over :data:`ROUTES` so a test can prove the derivation is
+            a derivation — a function that only ever sees the live table is
+            indistinguishable from one returning a hardcoded set.
+
+    Returns:
+        The union of every route's declared success statuses.
+    """
+    return frozenset(
+        status for spec in routes for status, _model in spec.published_success_responses
+    )
 
 
 ROUTES: Final[tuple[RouteSpec, ...]] = (
@@ -412,6 +527,18 @@ not something a client negotiates, and it is exempt from the contract-version
 gate for the same reason — an operator debugging a version mismatch must not
 also lose their monitoring probe.
 """
+
+PUBLISHED_SUCCESS_STATUSES: Final[frozenset[int]] = published_success_statuses(ROUTES)
+"""Every success status ``/v1`` documents, read off the table.
+
+Half of the contract's closed status set; the error table
+(:data:`~creek_mcp.api.models.ERROR_STATUS`) is the other half. Derived rather
+than listed so that the day a route documents a second success, every consumer
+of the closed set grows with it — before #1605 the success half was the literal
+``200``, restated in five test modules and one generator constant, so widening
+it meant remembering six places.
+"""
+
 
 ROUTE_BODY_CAPS: Final[dict[str, int]] = {
     spec.path: spec.max_body_bytes for spec in ROUTES if spec.max_body_bytes is not None
