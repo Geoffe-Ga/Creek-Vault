@@ -934,127 +934,485 @@ class GoogleDriveConfig(BaseModel):
         return v
 
 
-class DiscordCleaningConfig(BaseModel):
-    """Discord message cleaning configuration."""
+class DiscordFilterConfig(BaseModel):
+    """Configuration for Discord pre-ingestion filtering.
 
-    filter_bot_messages: bool = True
-    """Whether to filter out messages from bots."""
+    This is the class :class:`creek.clean.filters.discord.DiscordFilter`
+    actually runs on — that module imports it from here rather than
+    declaring its own (#1519). It used to declare its own, and the two
+    drifted: this block said ``min_message_length = 10`` while the filter
+    ran on ``min_length = 3``, so an operator reading the config saw a
+    threshold three times the real one.
 
-    strip_emoji: bool = False
-    """Whether to strip emoji characters from messages."""
+    The direction of the dependency is forced. ``creek/config.py`` cannot
+    import ``creek.clean``: ``creek/clean/__init__.py`` reaches
+    ``creek.clean.context``, which imports :class:`ContextConfig` back out
+    of this module. The canonical model therefore lives here and the filter
+    imports it, which is the shape :class:`ContextConfig` and
+    :class:`OCRConfig` already use.
 
-    filter_commands: bool = True
-    """Whether to filter out bot command messages (e.g. ``!help``)."""
-
-    min_message_length: int = 10
-    """Minimum character length for a message to be kept."""
-
-
-class ChatbotCleaningConfig(BaseModel):
-    """Chatbot export cleaning configuration.
-
-    Controls which noise types are filtered from chatbot conversation
-    exports before fragment extraction.
+    All filter rules are enabled by default. Set individual flags to
+    ``False`` to disable specific rules.
     """
 
-    filter_system_prompts: bool = True
-    """Whether to filter out system prompt content."""
+    skip_bots: bool = True
+    """Skip messages whose author is flagged ``isBot``."""
 
-    filter_tool_outputs: bool = True
-    """Whether to filter out tool/function call outputs."""
+    skip_emoji_only: bool = True
+    """Skip messages consisting exclusively of emoji."""
 
-    filter_regenerations: bool = True
-    """Whether to filter out regenerated responses."""
+    skip_commands: bool = True
+    """Skip messages starting with a :attr:`command_prefixes` character."""
 
-    min_human_turn_length: int = 20
+    skip_media_only: bool = True
+    """Skip attachment-only messages that carry no text."""
+
+    skip_below_min_length: bool = True
+    """Skip messages shorter than :attr:`min_length`."""
+
+    flag_link_dumps: bool = True
+    """Skip messages that are exclusively URLs."""
+
+    min_length: int = 3
+    """Minimum content length in characters.
+
+    Three, not the 10 this block claimed before #1519. Ten would drop every
+    3-to-9 character Discord message, which is a data-retention change
+    rather than a tidy-up, so the value that actually runs wins.
+    """
+
+    command_prefixes: list[str] = Field(default_factory=lambda: ["/", "!", "."])
+    """Characters that mark a message as a command invocation."""
+
+    strip_emoji: bool = False
+    """Whether to strip emoji characters out of a message Creek keeps.
+
+    Declared, not implemented — the wire-in is tracked by #1041. Distinct
+    from :attr:`skip_emoji_only`, which drops a message that is *nothing
+    but* emoji: this one would edit a message Creek keeps. Different
+    operations with opposite defaults, so #1519 kept both rather than
+    merging them.
+    """
+
+
+class ChatbotFilterConfig(BaseModel):
+    """Configuration for the chatbot pre-ingestion filter.
+
+    The class :class:`creek.clean.filters.chatbot.ChatbotFilter` runs on;
+    that module imports it from here (#1519). See
+    :class:`DiscordFilterConfig` for why the dependency points this way.
+
+    All thresholds are configurable to tune filtering behaviour per
+    deployment without modifying code.
+    """
+
+    min_human_turn_length: int = Field(default=20, ge=0)
     """Minimum character count for human turns (below = skip)."""
 
-    code_block_threshold: float = 0.9
+    code_block_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
     """Code-block ratio above which a response is flagged as code-only."""
 
-    max_abandoned_turns: int = 2
+    max_abandoned_turns: int = Field(default=2, ge=0)
     """Max turn pairs for abandoned conversation detection."""
+
+    skip_system_prompts: bool = True
+    """Whether to skip system prompt messages."""
+
+    skip_tool_outputs: bool = True
+    """Whether to skip tool/function output messages."""
+
+    collapse_regenerations: bool = True
+    """Whether to collapse consecutive assistant messages to the final one."""
 
 
 class MarkdownCleaningConfig(BaseModel):
-    """Markdown file cleaning configuration."""
+    """Markdown file cleaning configuration.
+
+    No filter-side config class exists to collapse into:
+    :class:`creek.clean.filters.markdown.MarkdownFilter` takes bare scalar
+    keywords. The values below are pinned equal to that constructor's
+    defaults by ``tests/test_config.py``.
+    """
 
     skip_empty_files: bool = True
-    """Whether to skip files with no meaningful body content."""
+    """Whether to skip files with no meaningful body content.
 
-    min_body_length: int = 50
-    """Minimum character length for the body to be considered non-empty."""
+    No live counterpart — ``MarkdownFilter`` runs its stub check
+    unconditionally. Wire-in tracked by #1041.
+    """
+
+    min_body_length: int = 10
+    """Minimum character length for the body to be considered non-empty.
+
+    Ten, matching ``MarkdownFilter(min_body_length=10)`` — the value that
+    runs. This block said 50 before #1519.
+    """
 
 
 class GoogleDriveCleaningConfig(BaseModel):
-    """Google Drive document cleaning configuration."""
+    """Google Drive document cleaning configuration.
+
+    :class:`creek.clean.filters.google_drive.GoogleDriveFilter` takes bare
+    scalar keywords, so there is no filter-side model to collapse into.
+    """
 
     deduplicate: bool = True
-    """Whether to deduplicate downloaded documents."""
+    """Whether to deduplicate downloaded documents.
+
+    No live counterpart — ``GoogleDriveFilter.filter_batch`` always
+    deduplicates. Wire-in tracked by #1041.
+    """
 
     filter_empty_docs: bool = True
-    """Whether to filter out empty or placeholder documents."""
+    """Whether to filter out empty or placeholder documents.
 
-    max_collaboration_ratio: float = 0.9
-    """Maximum ratio of non-owner edits before a doc is flagged as collaborative."""
+    No live counterpart — the empty check is unconditional. Tracked by
+    #1041.
+    """
+
+    multi_author_threshold: float = 0.5
+    """Non-owner contribution ratio above which a doc is flagged for review.
+
+    Named and valued after ``GoogleDriveFilter(multi_author_threshold=0.5)``,
+    the value that runs. This block called it ``max_collaboration_ratio``
+    and said 0.9 before #1519.
+    """
 
 
 class ValidationConfig(BaseModel):
-    """Content validation configuration."""
+    """Content validation configuration.
 
-    min_characters: int = 20
-    """Minimum character count for valid content."""
+    Scoped to what :class:`creek.clean.validator.FragmentValidator`
+    actually checks. Its whole surface is required fields, encoding,
+    timestamps, author and content length — there is no word count and no
+    stop-word check anywhere in it, so #1519 moved ``min_words`` and
+    ``max_stop_word_ratio`` out of this block into :class:`QualityConfig`,
+    whose consumer does own them.
+    """
 
-    min_words: int = 5
-    """Minimum word count for valid content."""
+    min_content_length: int = 20
+    """Minimum character count for valid content.
 
-    max_stop_word_ratio: float = 0.8
-    """Maximum ratio of stop words before content is flagged as low-quality."""
+    Named after ``FragmentValidator(min_content_length=20)``. Both sides
+    already agreed on 20, so this row is a pure rename.
+    """
 
     require_metadata: bool = True
-    """Whether to require metadata fields (title, date, source)."""
+    """Whether to require metadata fields (title, date, source).
+
+    No live counterpart — ``_check_required_fields`` is unconditional.
+    Wire-in tracked by #1041.
+    """
 
 
 class QualityConfig(BaseModel):
-    """Quality scoring configuration."""
+    """Quality scoring configuration.
 
-    accept_threshold: float = 0.7
-    """Minimum quality score to automatically accept content."""
+    Every field mirrors a :class:`creek.clean.quality.QualityScorer`
+    constructor default. ``QualityScorer`` also carries ``min_length`` and
+    ``entropy_threshold``, deliberately not surfaced here: adding operator
+    knobs to a block nothing reads is scope #1519 does not need, and #1041
+    tracks wiring the block in at all.
+    """
 
-    skip_threshold: float = 0.3
-    """Quality score below which content is automatically skipped."""
+    accept_threshold: float = 0.6
+    """Minimum quality score to automatically accept content.
+
+    Six tenths, matching ``QualityScorer(accept_threshold=0.6)``. This
+    block said 0.7 before #1519.
+    """
+
+    review_threshold: float = 0.3
+    """Score at or above which content is queued for review, not skipped.
+
+    Named after ``QualityScorer(review_threshold=0.3)``. This block called
+    it ``skip_threshold`` and phrased it as the ceiling below which content
+    is skipped — the same boundary described from the other side. Both
+    sides already agreed on 0.3, so this row is a pure rename.
+    """
+
+    min_words: int = 10
+    """Minimum word count before a length penalty is applied.
+
+    Relocated from ``cleaning.validation.min_words`` (which said 5) by
+    #1519: ``FragmentValidator`` has no word-count check at all, so the
+    knob was describing a consumer in a different block.
+    """
+
+    stop_word_threshold: float = 0.7
+    """Stop-word ratio above which a penalty is applied.
+
+    Relocated from ``cleaning.validation.max_stop_word_ratio`` (which said
+    0.8) for the same reason as :attr:`min_words`.
+    """
 
 
-class DeduplicationConfig(BaseModel):
-    """Deduplication configuration."""
+class DedupCleaningConfig(BaseModel):
+    """Deduplication configuration for the hash-based deduplicator.
+
+    Renamed from ``DeduplicationConfig`` by #1519 — that name was also
+    taken by :class:`creek.clean.semantic_dedup.DeduplicationConfig`, a
+    model with a completely disjoint field set. Two classes sharing one
+    name is how this block came to describe neither: a reader who found one
+    had no signal the other existed. The YAML block is still
+    ``cleaning.deduplication`` and both leaf paths keep their names, so
+    nothing operator-visible moved.
+
+    The two models are deliberately **not** unified. This one describes
+    :class:`creek.clean.dedup.Deduplicator`, whose ``__init__`` takes no
+    arguments at all; the semantic one describes cosine thresholds over
+    embeddings. They are different subsystems that collided on a name.
+    """
 
     strategy: str = "fuzzy"
-    """Matching strategy — ``exact`` or ``fuzzy``."""
+    """Matching strategy — ``exact`` or ``fuzzy``.
+
+    No live counterpart: ``Deduplicator.__init__`` takes no arguments and
+    holds no strategy field. Wire-in tracked by #1041.
+    """
 
     similarity_threshold: float = 0.85
-    """Minimum similarity score for fuzzy deduplication."""
+    """Minimum similarity score for fuzzy deduplication.
+
+    No live counterpart, for the same reason as :attr:`strategy`. Not the
+    same knob as the semantic deduplicator's ``duplicate_threshold``.
+    """
 
 
 class HygieneConfig(BaseModel):
-    """Data hygiene configuration."""
+    """Data hygiene configuration.
+
+    ``staleness_days`` used to be one knob at 90 describing two scanners
+    running at two different values, neither of which was 90. #1519 split
+    it, using the names ``docs/cleaning-pipeline.md`` already promised.
+    """
 
     track_orphans: bool = True
-    """Whether to track orphaned fragments with no connections."""
+    """Whether to track orphaned fragments with no connections.
 
-    staleness_days: int = 90
-    """Number of days before a fragment is considered stale."""
+    No live counterpart — ``OrphanScanner.__init__`` takes only
+    ``age_days``. Wire-in tracked by #1041.
+    """
+
+    orphan_age_days: int = 30
+    """Minimum age in days before an unlinked fragment counts as an orphan.
+
+    Matches ``OrphanScanner(age_days=30)``. ``creek/cli.py`` and
+    ``HygieneReporter`` carry their own copies of this literal; #1519 does
+    not edit either, and
+    ``tests/test_cleaning_defaults_characterisation.py`` pins them
+    behaviourally instead.
+    """
+
+    stale_review_days: int = 14
+    """Maximum age in days before a review queue counts as stale.
+
+    Matches ``StaleReviewScanner(age_days=14)``, with the same residual
+    copies as :attr:`orphan_age_days`.
+    """
+
+
+_LegacyCleaningTarget = tuple[str, str, object]
+"""Where a pre-#1519 cleaning key goes: ``(block, key, its old default)``."""
+
+_LEGACY_CLEANING_KEYS: dict[tuple[str, str], _LegacyCleaningTarget] = {
+    ("discord", "filter_bot_messages"): ("discord", "skip_bots", True),
+    ("discord", "filter_commands"): ("discord", "skip_commands", True),
+    ("discord", "min_message_length"): ("discord", "min_length", 10),
+    ("chatbot", "filter_system_prompts"): ("chatbot", "skip_system_prompts", True),
+    ("chatbot", "filter_tool_outputs"): ("chatbot", "skip_tool_outputs", True),
+    ("chatbot", "filter_regenerations"): ("chatbot", "collapse_regenerations", True),
+    ("markdown", "min_body_length"): ("markdown", "min_body_length", 50),
+    ("google_drive", "max_collaboration_ratio"): (
+        "google_drive",
+        "multi_author_threshold",
+        0.9,
+    ),
+    ("validation", "min_characters"): ("validation", "min_content_length", 20),
+    ("validation", "min_words"): ("quality", "min_words", 5),
+    ("validation", "max_stop_word_ratio"): ("quality", "stop_word_threshold", 0.8),
+    ("quality", "accept_threshold"): ("quality", "accept_threshold", 0.7),
+    ("quality", "skip_threshold"): ("quality", "review_threshold", 0.3),
+}
+"""Every cleaning key #1519 renamed, relocated, or re-valued.
+
+Note the two rows whose replacement has the **same name**
+(``markdown.min_body_length``, ``quality.accept_threshold``). They are here
+because :func:`generate_default_config` dumps the whole model, so every
+``creek_config.yaml`` ``creek init`` has ever written carries the old *value*
+under that name. A migration keyed on renames alone would leave those two
+drifted values in place on every installed vault — the precise regression
+this table exists to prevent.
+"""
+
+_LEGACY_STALENESS_DEFAULT: int = 90
+"""The pre-#1519 default of the ``hygiene.staleness_days`` knob."""
+
+_STALENESS_REPLACEMENTS: tuple[str, ...] = ("orphan_age_days", "stale_review_days")
+"""The two hygiene knobs ``staleness_days`` fanned out into."""
+
+
+def _carry_cleaning_value(
+    blocks: dict[str, object],
+    block: str,
+    key: str,
+    value: object,
+) -> bool:
+    """Write *value* into ``blocks[block][key]`` unless something is there.
+
+    Args:
+        blocks: The mutable copy of the ``cleaning`` mapping.
+        block: Destination sub-block name.
+        key: Destination key within that sub-block.
+        value: The operator's value to carry forward.
+
+    Returns:
+        ``True`` if the value was written.
+    """
+    destination = blocks.setdefault(block, {})
+    if not isinstance(destination, dict) or key in destination:
+        return False
+    destination[key] = value
+    return True
+
+
+def _migrate_cleaning_key(
+    blocks: dict[str, object],
+    source_block: str,
+    old_key: str,
+    target: _LegacyCleaningTarget,
+) -> None:
+    """Resolve one pre-#1519 cleaning key in place.
+
+    The rule is that a value equal to the **old default** was never chosen
+    by anyone — it is what :func:`generate_default_config` wrote — so it is
+    dropped and the corrected default applies. A different value was typed
+    deliberately, so it is carried to the new name.
+
+    Args:
+        blocks: The mutable copy of the ``cleaning`` mapping.
+        source_block: Sub-block the legacy key was written under.
+        old_key: The legacy key name.
+        target: Where it goes and what its old default was.
+    """
+    source = blocks.get(source_block)
+    if not isinstance(source, dict) or old_key not in source:
+        return
+    new_block, new_key, old_default = target
+    value = source.pop(old_key)
+    if value == old_default:
+        logger.warning(
+            "Your Creek config sets `cleaning.%s.%s`, which #1519 replaced "
+            "with `cleaning.%s.%s`. The value found (%r) is the old default, "
+            "not a deliberate choice, so Creek is adopting the corrected "
+            "default instead. Delete the line from your config file.",
+            source_block,
+            old_key,
+            new_block,
+            new_key,
+            value,
+        )
+        return
+    if (new_block, new_key) == (source_block, old_key):
+        source[old_key] = value
+        return
+    _carry_cleaning_value(blocks, new_block, new_key, value)
+    logger.warning(
+        "Your Creek config sets `cleaning.%s.%s`, which #1519 renamed to "
+        "`cleaning.%s.%s`. Your value (%r) has been carried across; please "
+        "rename the key in your config file.",
+        source_block,
+        old_key,
+        new_block,
+        new_key,
+        value,
+    )
+
+
+def _fan_out_staleness_days(blocks: dict[str, object]) -> None:
+    """Split the pre-#1519 ``hygiene.staleness_days`` knob into its two heirs.
+
+    One knob described two scanners running at 30 and 14 days, and its own
+    default of 90 was neither. An operator who left it at 90 therefore chose
+    nothing, so it is dropped; any other value was deliberate and is applied
+    to both heirs.
+
+    Args:
+        blocks: The mutable copy of the ``cleaning`` mapping.
+    """
+    hygiene = blocks.get("hygiene")
+    if not isinstance(hygiene, dict) or "staleness_days" not in hygiene:
+        return
+    value = hygiene.pop("staleness_days")
+    if value == _LEGACY_STALENESS_DEFAULT:
+        logger.warning(
+            "Your Creek config sets `cleaning.hygiene.staleness_days`, which "
+            "#1519 split into `orphan_age_days` and `stale_review_days`. The "
+            "value found (%r) is the old default, which matched neither "
+            "scanner, so Creek is adopting the corrected defaults (30 and 14) "
+            "instead. Delete the line from your config file.",
+            value,
+        )
+        return
+    for replacement in _STALENESS_REPLACEMENTS:
+        _carry_cleaning_value(blocks, "hygiene", replacement, value)
+    logger.warning(
+        "Your Creek config sets `cleaning.hygiene.staleness_days`, which "
+        "#1519 split into `orphan_age_days` and `stale_review_days`. Your "
+        "value (%r) has been applied to both; please replace the key with "
+        "whichever of the two you meant.",
+        value,
+    )
 
 
 class CleaningConfig(BaseModel):
     """Top-level cleaning pipeline configuration."""
 
-    discord: DiscordCleaningConfig = Field(
-        default_factory=DiscordCleaningConfig,
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_cleaning_keys(cls, data: object) -> object:
+        """Migrate pre-#1519 cleaning keys, loudly (#1519).
+
+        A shim is required because :func:`generate_default_config` dumps the
+        whole model with no hand-written key list, so every
+        ``creek_config.yaml`` ``creek init`` has ever written carries all of
+        this block's old key names *and* old values. The sub-models here are
+        plain ``BaseModel``, whose ``extra`` default is ``ignore``, so
+        without this a renamed key would be silently dropped rather than
+        migrated — and, worse, an unrenamed key carrying a drifted value
+        would be silently honoured, re-installing on every existing vault the
+        very drift this change resolves.
+
+        Shaped like :meth:`CreekConfig._drop_obsolete_timezone`: anything
+        that is not a ``dict`` passes straight through so pydantic raises its
+        own ``ValidationError``, and the input is copied rather than mutated.
+
+        Args:
+            data: The raw input to validation — a ``dict`` for YAML loads,
+                but any object when a caller hands one to ``model_validate``.
+
+        Returns:
+            *data* unchanged when it is not a mapping, else a new ``dict``
+            with every legacy key resolved.
+        """
+        if not isinstance(data, dict):
+            return data
+        blocks: dict[str, object] = {
+            name: dict(block) if isinstance(block, dict) else block
+            for name, block in data.items()
+        }
+        for (source_block, old_key), target in _LEGACY_CLEANING_KEYS.items():
+            _migrate_cleaning_key(blocks, source_block, old_key, target)
+        _fan_out_staleness_days(blocks)
+        return blocks
+
+    discord: DiscordFilterConfig = Field(
+        default_factory=DiscordFilterConfig,
     )
     """Discord message cleaning settings."""
 
-    chatbot: ChatbotCleaningConfig = Field(
-        default_factory=ChatbotCleaningConfig,
+    chatbot: ChatbotFilterConfig = Field(
+        default_factory=ChatbotFilterConfig,
     )
     """Chatbot export cleaning settings."""
 
@@ -1078,8 +1436,8 @@ class CleaningConfig(BaseModel):
     )
     """Quality scoring settings."""
 
-    deduplication: DeduplicationConfig = Field(
-        default_factory=DeduplicationConfig,
+    deduplication: DedupCleaningConfig = Field(
+        default_factory=DedupCleaningConfig,
     )
     """Deduplication settings."""
 

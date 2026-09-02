@@ -336,41 +336,66 @@ For the broader picture of what is and isn't protected, see
 ```yaml
 cleaning:
   discord:
-    filter_bot_messages: true
-    strip_emoji: false
-    filter_commands: true
-    min_message_length: 10
+    skip_bots: true
+    skip_emoji_only: true       # drops emoji-ONLY messages
+    skip_commands: true
+    skip_media_only: true
+    skip_below_min_length: true
+    flag_link_dumps: true
+    min_length: 3
+    command_prefixes: ["/", "!", "."]
+    strip_emoji: false          # edits a kept message; not yet implemented (#1041)
   chatbot:
-    filter_system_prompts: true
-    filter_tool_outputs: true
-    filter_regenerations: true
     min_human_turn_length: 20
     code_block_threshold: 0.9
     max_abandoned_turns: 2
+    skip_system_prompts: true
+    skip_tool_outputs: true
+    collapse_regenerations: true
   markdown:
     skip_empty_files: true
-    min_body_length: 50
+    min_body_length: 10
   google_drive:
     deduplicate: true
     filter_empty_docs: true
-    max_collaboration_ratio: 0.9
+    multi_author_threshold: 0.5
   validation:
-    min_characters: 20
-    min_words: 5
-    max_stop_word_ratio: 0.8
+    min_content_length: 20
     require_metadata: true
   quality:
-    accept_threshold: 0.7
-    skip_threshold: 0.3
+    accept_threshold: 0.6
+    review_threshold: 0.3
+    min_words: 10
+    stop_word_threshold: 0.7
   deduplication:
-    strategy: fuzzy           # exact | fuzzy | semantic
+    strategy: fuzzy             # exact | fuzzy
     similarity_threshold: 0.85
   hygiene:
     track_orphans: true
-    staleness_days: 90
+    orphan_age_days: 30
+    stale_review_days: 14
 ```
 
-The cleaning sub-tree controls source-specific filters that run **during** ingestion (not just on demand). Tune these when an export is too noisy or too sparse.
+The cleaning sub-tree describes the source-specific filters. **Nothing reads it
+yet** — wiring it into `creek ingest` is tracked by
+[#1041](https://github.com/Geoffe-Ga/creek-tools/issues/1041); until then the
+filters run on the defaults shown above, which are the values written here.
+
+The values *are* the live ones. Before
+[#1519](https://github.com/Geoffe-Ga/creek-tools/issues/1519) this sample was a
+second, drifted copy: it advertised `min_message_length: 10` where the Discord
+filter ran on 3, `accept_threshold: 0.7` where the quality scorer used 0.6, and
+`staleness_days: 90` for two scanners running at 30 and 14. The block above is
+now generated from the model itself, so it cannot drift again without the tests
+noticing.
+
+If you have a `creek_config.yaml` written before #1519, it still loads: Creek
+migrates the old key names on the way in and logs a warning naming the
+replacement. Where the old key merely carried the old *default*, Creek adopts
+the corrected default rather than preserving a value nobody chose — so, for
+example, a `min_message_length: 10` you never edited becomes `min_length: 3`
+rather than silently arming a stricter Discord filter. A value you did change is
+carried across unchanged.
 
 ## `sources` — default input directories
 
