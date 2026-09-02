@@ -248,6 +248,38 @@ class AuditLog:
         ``_last_line`` rescan. The size check correctly invalidates the
         cache when a different process or another :class:`AuditLog`
         instance has appended in between.
+
+        The size comparison is deliberately partial, and that is a
+        settled decision, not an open question. The one thing it cannot
+        see is a byte-length-preserving out-of-band rewrite of the last
+        line between two appends of one long-lived instance.
+
+        That blind spot is load-bearing **detection**, not a defect.
+        Because the cache still holds the hash of the original bytes,
+        the next append stamps ``prev_hash`` from a line that is no
+        longer on disk, so :meth:`verify` raises at the FOLLOWING
+        line's index. The staleness is precisely what converts an
+        otherwise invisible rewrite into detectable tampering.
+
+        Invalidating on ``st_mtime_ns``, inode or a tail hash is
+        therefore REJECTED. Any of those would notice the rewrite,
+        rescan via ``_last_line``, and re-anchor the chain onto the
+        mutated line — after which the whole log verifies clean. That
+        is the "undetectable tampering with a tamper-evidence log"
+        failure already recorded in ``docs/security/threat-model.md``
+        under the ``#1308``/``#1561`` bullet, so the change would trade
+        a real detection away for a plausible-looking simplification.
+
+        For ``mcp.jsonl`` the residual is narrower still:
+        :func:`creek_mcp.audit.verify_mcp_audit_chain` runs
+        ``_verify_prev_hash`` then ``_verify_entry_hash`` on each line,
+        so a rewrite leaving ``entry_hash`` stale is already caught at
+        its own index. Only a rewriter that also recomputes
+        ``entry_hash`` reaches the one-line-late chain break — exactly
+        the case where this cache is the sole surviving detection.
+
+        Pinned by the same-length-rewrite tests in
+        ``tests/test_audit_log.py`` and ``tests/test_mcp_audit.py``.
         """
         on_disk_size = self.path.stat().st_size if self.path.exists() else 0
         if (

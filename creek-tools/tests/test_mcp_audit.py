@@ -10,13 +10,17 @@ from pathlib import Path
 import pytest
 
 from creek_mcp.audit import (
+    ENTRY_HASH_FIELD,
     MCP_AUDIT_RELPATH,
     MCPAuditChainBrokenError,
     MCPAuditLog,
+    _content_hash,
+    _shared_audit_log,
     summarise_args,
     verify_mcp_audit_chain,
 )
 from creek_mcp.tier_ceiling import TierCeiling
+from tests.audit_tamper_support import rewrite_last_line_preserving_size
 
 
 def test_summarise_args_keeps_short_scalars() -> None:
@@ -257,3 +261,83 @@ def test_concurrent_process_appends_do_not_corrupt_log(tmp_path: Path) -> None:
     lines = (tmp_path / MCP_AUDIT_RELPATH).read_text(encoding="utf-8").splitlines()
     assert len(lines) == 4
     verify_mcp_audit_chain(tmp_path)
+
+
+def test_same_length_rewrite_without_entry_hash_is_reported_at_its_own_line(
+    tmp_path: Path,
+) -> None:
+    """A stale ``entry_hash`` is reported at the rewritten line's own index.
+
+    Falsifies the claim that an ``mcp.jsonl`` tamper is always reported one
+    line late. ``verify_mcp_audit_chain`` runs ``_verify_prev_hash``
+    then ``_verify_entry_hash`` *per line*, so a rewrite that does not recompute
+    ``entry_hash`` trips the content invariant at its own index -- the right
+    one. Only a rewriter that also recomputes ``entry_hash`` reaches the
+    one-line-late chain-break report.
+    """
+    _shared_audit_log.cache_clear()
+    log = MCPAuditLog(tmp_path)
+    for tool_name in ("creek.lint", "creek.mine"):
+        log.append(
+            tool=tool_name,
+            args={"x": 1},
+            tier_ceiling=TierCeiling.OPEN,
+            consumer="claude-code",
+        )
+
+    rewrite_last_line_preserving_size(
+        tmp_path / MCP_AUDIT_RELPATH,
+        lambda entry: entry | {"consumer": "claude-c0de"},
+    )
+
+    with pytest.raises(MCPAuditChainBrokenError) as excinfo:
+        verify_mcp_audit_chain(tmp_path)
+    message = str(excinfo.value)
+    assert "MCP audit entry_hash mismatch at line 1" in message
+    assert "chain broken" not in message
+
+
+def test_recomputed_entry_hash_rewrite_is_caught_only_by_the_warm_cache(
+    tmp_path: Path,
+) -> None:
+    """Only the stale size-keyed cache catches a fully recomputed rewrite.
+
+    The sophisticated case: the rewriter preserves byte length AND recomputes
+    ``entry_hash``, so both stateless invariants fall silent and the log
+    verifies clean on inspection. What still catches it is the process-lifetime
+    shared ``AuditLog`` (#1117): its cache is keyed on file size alone, the size
+    did not change, so the next append stamps ``prev_hash`` from the ORIGINAL
+    bytes and the chain breaks at the following line.
+
+    ``cache_clear()`` runs in SETUP ONLY. Clearing it after the rewrite would
+    discard the very cache under test and prove the opposite of the claim.
+    """
+    _shared_audit_log.cache_clear()
+    log = MCPAuditLog(tmp_path)
+    for tool_name in ("creek.lint", "creek.mine"):
+        log.append(
+            tool=tool_name,
+            args={"x": 1},
+            tier_ceiling=TierCeiling.OPEN,
+            consumer="claude-code",
+        )
+    assert MCPAuditLog(tmp_path)._audit is log._audit
+
+    def _recompute(entry: dict[str, object]) -> dict[str, object]:
+        rewritten = entry | {"consumer": "claude-c0de"}
+        return rewritten | {ENTRY_HASH_FIELD: _content_hash(rewritten)}
+
+    rewrite_last_line_preserving_size(tmp_path / MCP_AUDIT_RELPATH, _recompute)
+
+    verify_mcp_audit_chain(tmp_path)
+
+    log.append(
+        tool="creek.state.read",
+        args={"x": 3},
+        tier_ceiling=TierCeiling.OPEN,
+        consumer="claude-code",
+    )
+
+    with pytest.raises(MCPAuditChainBrokenError) as excinfo:
+        verify_mcp_audit_chain(tmp_path)
+    assert str(excinfo.value).startswith("MCP audit chain broken at line 2:")
