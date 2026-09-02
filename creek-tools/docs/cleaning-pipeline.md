@@ -1,6 +1,6 @@
 # Cleaning pipeline
 
-The `creek/clean/` package contains the modules that decide *which* content survives ingestion and *what shape* it takes once it does. They run inline during `creek ingest` (and again, against the saved vault, during `creek clean *`). Every module is wired to a `cleaning.*` section in [`configuration.md`](configuration.md) so the same knobs that this doc names also appear in `~/.config/creek/config.yaml`.
+The `creek/clean/` package contains the modules that decide *which* content survives ingestion and *what shape* it takes once it does. Most run inline during `creek ingest` (and again, against the saved vault, during `creek clean *`); the exception is `FragmentValidator`, which is written and tested but not currently called from the pipeline — see its section below. Every module is wired to a `cleaning.*` section in [`configuration.md`](configuration.md) so the same knobs that this doc names also appear in `~/.config/creek/config.yaml`.
 
 This page is the missing manual: what each module does, when it runs, what failure looks like, and which knob to turn when something is off.
 
@@ -15,7 +15,7 @@ raw bytes → pre-ingestion filter (per source)
           → ingestor (parse + frontmatter)
           → AuthorshipTagger
           → ContextExtractor
-          → FragmentValidator
+          → FragmentValidator   (designed stage — not currently wired; see below)
           → QualityScorer
           → Deduplicator + SemanticDeduplicator
           → privacy classifier  (then: vault writer)
@@ -72,6 +72,10 @@ Universal constraints applied across all modes:
 ### [`validator.py`](../creek/clean/validator.py) — `FragmentValidator`
 
 Checks required fields, UTF-8 encoding, ISO-8601 timestamps, and a configurable minimum content length. Invalid fragments are routed to the review queue rather than discarded — see `cleaning.validation`.
+
+A naive timestamp is anchored to **America/Los_Angeles** via `creek.time.ensure_aware`, matching the ontology (§8.3): an offsetless timestamp in a Creek vault is an LA wall clock that lost its offset in serialisation, not a UTC one. The module anchored to UTC with its own local copy of that helper until #1115 consolidated the two. The anchor *attaches* rather than converts, so `pre_2000` verdicts are unaffected; `future_date` fires on strictly more values, never fewer.
+
+> **Not currently wired.** `FragmentValidator` has no production caller — `creek/clean/__init__.py` re-exports it and nothing else references it, and its `cleaning.validation` config block (`ValidationConfig`) is defined and defaulted but read nowhere. The stage above describes the *intended* design; today validation of an ingested fragment happens through `Fragment`'s own field validators rather than here. Anything below about when it runs is therefore aspirational until it is wired in.
 
 Failure mode: a fragment with mojibake (e.g. CSV decoded as cp1252 by mistake — see `BUG-010`; use `git log --grep='BUG-010'` for the origin commit) lands in review, where you can re-ingest with the right encoding.
 

@@ -19,6 +19,7 @@ from creek.clean.validator import (
     Violation,
 )
 from creek.models import Fragment, FragmentSource, SourcePlatform
+from tests.test_time import OffsetlessTimezone
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -413,10 +414,89 @@ class TestReviewRouting:
 class TestNaiveTimestamp:
     """Tests for naive datetime handling in timestamp validation."""
 
-    def test_naive_datetime_treated_as_utc(self) -> None:
-        """Naive datetimes should be treated as UTC for validation."""
+    def test_naive_timestamp_is_anchored_to_la_not_utc(self) -> None:
+        """A bypassed naive timestamp ages as an LA wall clock (#1115, #1116).
+
+        This replaces a test that could not fail. It built its fragment
+        through ``Fragment(...)``, whose ``_normalise_timestamp`` validator
+        anchors ``created`` / ``ingested`` to LA before the validator's own
+        anchor is ever consulted — so the naive branch was unreachable — and
+        it asserted about ``2024-06-15``, a date comfortably past under
+        either anchor. Reaching the branch requires one of the documented
+        bypasses (``models.py``'s ``_normalise_timestamp`` names all three);
+        post-construction attribute assignment is the shape
+        ``clean/context.py`` uses in production.
+
+        The probe sits 3 h the past side of ``now`` measured in UTC, which
+        is inside the LA offset band in both DST regimes: anchored to UTC it
+        is in the past and clean, anchored to LA it is 4-5 h in the future
+        and must be flagged. That direction is the tightening this
+        consolidation is required to demonstrate — ``future_date`` fires on
+        strictly more values, never fewer.
+        """
         validator = FragmentValidator()
-        naive_dt = datetime(2024, 6, 15)
-        fragment = _make_fragment(created=naive_dt, ingested=naive_dt)
+        fragment = _make_fragment().model_copy(deep=True)
+        naive_recent = datetime.now(tz=UTC).replace(tzinfo=None) - timedelta(hours=3)
+        fragment.created = naive_recent
+        fragment.ingested = naive_recent
+
+        # Assert the bypass first: if pydantic ever gains
+        # ``validate_assignment`` this test must fail loudly rather than
+        # quietly go vacuous the way its predecessor did.
+        assert fragment.created.tzinfo is None
+        assert fragment.ingested.tzinfo is None
+
         result = validator.validate(fragment)
+
+        assert any(
+            v.code == "future_date" and v.field == "created" for v in result.violations
+        )
+
+    def test_pre_2000_verdict_is_offset_independent(self) -> None:
+        """Moving the anchor cannot move the ``pre_2000`` verdict (#1115).
+
+        The year is read off the *attached* value, and attaching a zone
+        never moves a wall-clock field, so ``2000-01-01T00:30`` is year 2000
+        under UTC and under LA alike. The property is already pinned one
+        level down at
+        ``test_time.py::TestEnsureAware::test_naive_input_keeps_its_wall_clock_fields``;
+        this is the thin validator-level extension that keeps the guard
+        honest at the surface an operator actually sees. It would fail
+        against the plausible *wrong* implementation — ``astimezone``,
+        which converts from host-local and on a UTC host renders
+        ``1999-12-31T16:30``.
+        """
+        validator = FragmentValidator()
+        fragment = _make_fragment().model_copy(deep=True)
+        fragment.created = datetime(2000, 1, 1, 0, 30)
+
+        assert fragment.created.tzinfo is None
+
+        result = validator.validate(fragment)
+
+        assert not any(v.code == "pre_2000" for v in result.violations)
+
+    def test_tzinfo_without_an_offset_is_anchored_rather_than_raising(self) -> None:
+        """A tzinfo whose ``utcoffset()`` is ``None`` is repaired (#1115).
+
+        The validator's own anchor tested ``dt.tzinfo is None``, which is
+        strictly narrower than the condition CPython uses when comparing:
+        a value carrying a ``tzinfo`` that yields no offset is *also*
+        naive, passed straight through unrepaired, and raised
+        ``TypeError: can't compare offset-naive and offset-aware
+        datetimes`` out of the comparison against ``now``. Consolidating
+        onto ``creek.time.ensure_aware``, which tests the offset itself,
+        deliberately widens the repair to cover it. This is a repair valve
+        widening, not an admission gate: strictly more values are made
+        well-formed, and no verdict is suppressed.
+        """
+        validator = FragmentValidator()
+        fragment = _make_fragment().model_copy(deep=True)
+        fragment.created = datetime(2024, 6, 15, tzinfo=OffsetlessTimezone())
+
+        assert fragment.created.utcoffset() is None
+
+        result = validator.validate(fragment)
+
         assert not any(v.code == "future_date" for v in result.violations)
+        assert not any(v.code == "pre_2000" for v in result.violations)

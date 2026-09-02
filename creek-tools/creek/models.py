@@ -747,8 +747,11 @@ class Fragment(BaseModel):
         created: When the fragment came into being on the vault side.
             Normalised like every timestamp below.
         ingested: The wall-clock moment the vault wrote the fragment.
-            Never naive when the fragment was built through the normal
-            constructor or ``model_validate`` path.
+            Anchored to LA when the fragment was built through the normal
+            constructor or ``model_validate`` path; on the three bypass
+            paths the field itself may still hold a naive value, and it
+            is :func:`creek.time.effective_authored_at` that guarantees
+            time-bucketing consumers never see one (#1116).
         authored_at: The timestamp the source itself records, or ``None``
             when none is extractable — the model never invents one.
             ``created`` / ``ingested`` / ``authored_at`` are all
@@ -866,14 +869,40 @@ class Fragment(BaseModel):
         ``model_validate`` — is what lets the downstream surfaces
         (synchronicity, temporal linking, wavelength bucketing) treat
         "never naive" as an invariant on those paths, instead of
-        re-repairing it site by site. The invariant does not reach
-        ``Fragment.model_construct``, ``model_copy(update=...)``, or a
-        direct attribute assignment on an existing ``Fragment``: none
-        of those routes through Pydantic field validators, so a caller
-        that builds or mutates a fragment that way can still hand a
-        naive datetime downstream. No production caller assigns a
-        timestamp that way today, but a future one should not assume
-        this validator ran.
+        re-repairing it site by site.
+
+        **Three construction paths bypass this validator, and they stay
+        open deliberately** (#1116): ``Fragment.model_construct``,
+        ``model_copy(update=...)``, and a direct attribute assignment on
+        an existing ``Fragment``. None routes through Pydantic field
+        validators, so each can still leave a naive datetime *on the
+        field* — do not read a value off one of these paths and assume it
+        is aware.
+
+        What protects consumers is a second repair at the *read* rather
+        than a tighter write. Every FEAT-031 time-bucketing surface goes
+        through :func:`creek.time.effective_authored_at`, which anchors
+        ``authored_at`` / ``ingested`` on the way out, and
+        :mod:`creek.clean.validator` anchors ``created`` where it checks
+        it — so the ~30 sites that sort, subtract, ``min`` and ``max``
+        these values are safe without any of them re-repairing.
+
+        ``validate_assignment=True`` was considered and **rejected**.
+        It would re-enter the fail-closed ``_coerce_voice_weight`` /
+        ``_coerce_representativeness`` / ``_coerce_audience`` validators
+        on every attribute write, and four production sites reason
+        explicitly about ``model_copy`` *not* re-running
+        ``use_enum_values`` coercion (``classify/classify_engine.py``,
+        ``classify/llm/parsing.py``, ``classify/praxis_pass.py``,
+        ``generate/voice.py``). The hot path is ``clean/context.py``,
+        which deep-copies and then assigns once per fragment across a
+        35k-fragment vault. ``model_post_init`` is not a middle road
+        either: Pydantic v2 *does* invoke it from ``model_construct``, so
+        it would close one bypass of three at full per-construction cost.
+        ``tests/test_time.py::TestFragmentTimestampBypassPaths::
+        test_validate_assignment_stays_disabled`` guards the flag, and
+        the sibling tests in that class pin each bypass as intended
+        behaviour rather than an oversight.
 
         ``mode="after"`` is load-bearing rather than stylistic: a
         before-validator sees the raw input, which on the
