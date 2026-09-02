@@ -947,6 +947,19 @@ class Fragment(BaseModel):
         are eligible. INTIMATE content is excluded per ontology §13.2,
         and AI / collaborator / other-authored content is excluded per
         the universal-constraints rule in :mod:`creek.clean.context`.
+
+        The bare ``!=`` is deliberate and permanent. Every other tier
+        decision in ``creek`` reads through
+        :func:`creek.classify.privacy_filter.tier_of`, which fails closed
+        on an unrecognised tier; this one cannot, because
+        ``creek.classify.privacy_filter`` imports :class:`PrivacyTier`
+        from this module and the reverse import would be a cycle. A tier
+        string the enum does not recognise therefore reads as *eligible*
+        here. That residual is accepted rather than overlooked (#1489):
+        the two consumers that matter re-screen through the canonical
+        reader — :func:`creek.generate.skills._is_snapshot_fragment` for
+        the skill tree, and the voice corpus loader for voice proxy — so
+        do not re-open this in the next sweep.
         """
         return (
             self.privacy_tier != PrivacyTier.INTIMATE

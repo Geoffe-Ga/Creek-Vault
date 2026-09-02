@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek.classify.privacy_filter import tier_of
 from creek.generate.compost_verifier import CompostVerdict
 from creek.models import (
     Confidence,
@@ -197,8 +198,46 @@ def _is_paradox(fragment: Fragment) -> bool:
 
 
 def _is_intimate(fragment: Fragment) -> bool:
-    """Return whether *fragment* carries the intimate privacy tier."""
-    return fragment.privacy_tier == PrivacyTier.INTIMATE
+    """Return whether *fragment* carries the intimate privacy tier.
+
+    Reads through :func:`~creek.classify.privacy_filter.tier_of`, the
+    canonical model-side tier reader, rather than comparing the raw
+    ``privacy_tier`` attribute. ``tier_of`` fails closed: a tier string
+    the enum does not recognise is reported as ``INTIMATE`` and so is
+    withheld here, where a bare equality would report ``False`` and
+    admit the fragment into every detector.
+
+    ``tier_of`` is the reader this screen can use.
+    :func:`~creek.classify.privacy_filter.fragment_tier` and
+    :func:`~creek.classify.privacy_filter.raw_privacy_tier` both need the
+    note's raw frontmatter, and no raw dict crosses into the tracker —
+    :meth:`CompostTracker.detect_compost_candidates` receives validated
+    :class:`~creek.models.Fragment` objects only.
+    :func:`creek.generate.compost_scan._load_fragments` already narrows
+    the complementary case, re-deriving a *missing* ``privacy_tier`` key
+    through ``raw_privacy_tier`` before the tracker sees a fragment.
+
+    Neither divergence issue #1489 reported was reachable in production:
+    the missing-key case is closed by that loader, and an unrecognised
+    tier never survives ``Fragment.model_validate`` so
+    :func:`creek.vault.reader.try_load_fragment` drops the note. This
+    reader is nonetheless canonical now so the screen no longer *borrows*
+    its safety from invariants held in
+    :mod:`creek.generate.compost_scan` and :mod:`creek.vault.reader`. A
+    chokepoint that cannot hold on its own is not a chokepoint.
+
+    The comparison is ``is`` rather than ``==`` because
+    :class:`~creek.models.Fragment` sets ``use_enum_values=True`` — the
+    attribute holds a plain ``str`` at runtime, while ``tier_of`` returns
+    a real :class:`~creek.models.PrivacyTier` member.
+
+    Args:
+        fragment: The fragment to screen.
+
+    Returns:
+        ``True`` when the fragment must be withheld from every detector.
+    """
+    return tier_of(fragment) is PrivacyTier.INTIMATE
 
 
 @dataclass(frozen=True)

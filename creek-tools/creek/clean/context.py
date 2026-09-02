@@ -228,6 +228,14 @@ def _enforce_constraints(fragment: Fragment) -> Fragment:
     """
     updated = fragment.model_copy(deep=True)
 
+    # DO NOT swap this for ``tier_of`` (#1489). Everywhere else a bare
+    # ``==`` against a tier is a fail-OPEN bug, because ``False`` admits.
+    # Here ``False`` *leaves the tier alone*, which is the restrictive
+    # outcome, and the branch body writes a LOWER tier to disk. Reading
+    # an unrecognised tier as INTIMATE — what ``tier_of`` does — would
+    # therefore rewrite it down to ``personal`` permanently, widening
+    # access for the subject. Privacy tiers escalate only; this site
+    # fails closed precisely because it is a bare equality.
     if updated.privacy_tier == PrivacyTier.INTIMATE:
         updated.privacy_tier = PrivacyTier.PERSONAL
 

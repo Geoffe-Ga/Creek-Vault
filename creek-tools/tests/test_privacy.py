@@ -402,6 +402,30 @@ class TestReviewQueueIntegration:
         )
         assert generator.needs_review(frag) is False
 
+    def test_an_unrecognised_tier_still_needs_review(self) -> None:
+        """A tier the enum does not know must fail closed to review (#1489).
+
+        Every other ``needs_review`` branch is deliberately neutralised —
+        ``ESSAY`` is outside the default ``human_review_sources``, the
+        frequency is classified, and ``SETTLED`` is not a low-confidence
+        level — so the tier is the only thing left that can flag this
+        fragment. Without that isolation the assertion would pass on the
+        confidence branch and prove nothing about the tier reader.
+
+        ``model_construct`` plants the tier without validation, the way a
+        hand-edited vault note would.
+        """
+        generator = ReviewQueueGenerator()
+        frag = Fragment.model_construct(
+            id="frag-000000000019",
+            title="Hand-edited note",
+            source=FragmentSource(platform=SourcePlatform.ESSAY),
+            frequency=FrequencyClassification(primary=Frequency.F3),
+            voice=VoiceClassification(confidence=Confidence.SETTLED),
+            privacy_tier="super-secret",
+        )
+        assert generator.needs_review(frag) is True
+
 
 # ---- body_evidence_tier (#1136) ---------------------------------------
 
