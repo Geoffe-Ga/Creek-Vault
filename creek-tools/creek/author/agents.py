@@ -168,33 +168,39 @@ def _cosine(left: list[float], right: list[float]) -> float:
     return float(a @ b / denom) if denom else 0.0
 
 
-def _fragment_vector(
+def _cached_vector(
     fragment: Fragment,
-    linker: EmbeddingLinker,
     cache: dict[str, CachedEmbedding],
-) -> list[float]:
-    """Return *fragment*'s embedding, reusing a fresh cached vector when present.
+) -> list[float] | None:
+    """Return *fragment*'s cached embedding, or ``None`` when none is fresh.
 
     A cached vector is trusted only when the fragment id is in *cache* and its
     stored ``content_hash`` still equals the SHA-256 of the fragment's current
     :func:`fragment_embedding_text` — the exact freshness key
     :meth:`EmbeddingLinker.build_cache_entries` writes. A miss or a stale hash
-    falls back to a live :meth:`EmbeddingLinker.generate_embedding`, so the
-    result is identical to embedding from scratch.
+    yields ``None``, and the caller falls back to a live
+    :meth:`EmbeddingLinker.generate_embedding`, so the result is identical to
+    embedding from scratch.
+
+    **Why this returns ``None`` instead of embedding.** Deciding to spend a live
+    embed is the caller's call, because only :func:`_rank_fragments` knows how
+    many are left in the per-call budget. Folding the fallback in here would
+    make the spend invisible to the counter.
 
     Args:
-        fragment: The corpus fragment to embed.
-        linker: The reused embedding linker (live-embed fallback).
+        fragment: The corpus fragment whose vector is wanted.
         cache: Persisted, model-filtered cache keyed by fragment id.
 
     Returns:
-        The fragment's embedding vector.
+        The fragment's cached vector, or ``None`` on a miss or a stale hash.
     """
-    text = fragment_embedding_text(fragment)
     cached = cache.get(fragment.id)
-    if cached is not None and cached.content_hash == content_hash_for_text(text):
-        return cached.vector
-    return linker.generate_embedding(text)
+    if cached is None:
+        return None
+    fresh_hash = content_hash_for_text(fragment_embedding_text(fragment))
+    if cached.content_hash != fresh_hash:
+        return None
+    return cached.vector
 
 
 def _rank_fragments(
@@ -202,6 +208,7 @@ def _rank_fragments(
     corpus: list[tuple[Fragment, str]],
     linker: EmbeddingLinker,
     cache: dict[str, CachedEmbedding],
+    max_live_embeds: int | None = None,
 ) -> list[Fragment]:
     """Rank *corpus* fragments by semantic similarity to *query* (descending).
 
@@ -212,19 +219,45 @@ def _rank_fragments(
     Raises :class:`EmbeddingModelUnavailableError` when the embedding model
     cannot load.
 
+    **The live-embed budget.** *max_live_embeds* bounds how many cache misses
+    this one call may embed from scratch; ``None`` (the default) is unbounded,
+    i.e. byte-for-byte today's behaviour, which is what keeps
+    :func:`default_specialists` and the Writing Desk unchanged. When the budget
+    runs out the remaining un-cached fragments are **dropped from the ranking**
+    rather than embedded. That is a strict *narrowing*: a dropped fragment
+    yields no title, no id and no body, and the budget is applied only to a
+    corpus that ``_load_corpus`` has already filtered by the caller's override,
+    so it can never admit a fragment the ceiling excluded.
+
+    **Spend order is deterministic and vault-layout independent.** The corpus is
+    walked in fragment-id order, not in ``CORPUS_SUBDIRS``/directory order, so
+    *which* fragments spend a bounded budget does not depend on filesystem
+    traversal. The unbounded path is provably unaffected by this: the final
+    ``scored.sort`` keys on ``(-score, id)``, a total order, so the input
+    iteration order cannot change the output when nothing is dropped.
+
     Args:
         query: The user query to rank fragments against.
         corpus: ``(fragment, body)`` records to score.
         linker: The reused embedding linker.
         cache: Persisted, model-filtered embedding cache keyed by fragment id.
+        max_live_embeds: Maximum cache misses this call may embed live, or
+            ``None`` for unbounded (the default, and today's behaviour).
 
     Returns:
         Fragments ordered by cosine similarity descending, id tie-break.
     """
     query_vec = linker.generate_embedding(query)
+    remaining = max_live_embeds
     scored: list[tuple[float, str, Fragment]] = []
-    for fragment, _body in corpus:
-        vec = _fragment_vector(fragment, linker, cache)
+    for fragment, _body in sorted(corpus, key=lambda record: record[0].id):
+        vec = _cached_vector(fragment, cache)
+        if vec is None:
+            if remaining is not None and remaining <= 0:
+                continue
+            if remaining is not None:
+                remaining -= 1
+            vec = linker.generate_embedding(fragment_embedding_text(fragment))
         scored.append((_cosine(query_vec, vec), fragment.id, fragment))
     scored.sort(key=lambda item: (-item[0], item[1]))
     return [fragment for _score, _id, fragment in scored]
@@ -238,21 +271,67 @@ class RetrievalSpecialist:
     sentence-transformer model only once. The linker is instance-level (never a
     module global) so a fresh ``RetrievalSpecialist()`` per test starts cold and
     the conftest model mock cannot leak across tests.
+
+    **Owner-scoped lifetime is not a violation of that (#1034).** "Never a
+    module global" bounds the *scope*, not the *lifetime*: an instance owned by
+    one ``build_server`` / one ``create_app`` and reused for that owner's calls
+    is still per-owner state that a fresh test constructs cold. What is
+    forbidden is a process-global or an ``lru_cache``, either of which would
+    carry one test's mocked model into the next.
+    :class:`creek_mcp.tools.reflect.GroundingSession` is that owner-scoped
+    holder, and it keeps exactly one specialist at a time.
+
+    **What may and may not be shared across calls.** Only the two memo slots —
+    the model handle and the parquet id→vector map — are call-independent. The
+    parquet is read unfiltered and is already tier-blind, and the map is only
+    ever *read* for ids the current call independently admitted, so sharing it
+    changes **when** it is read, never **what** it contains. Everything
+    override-derived — the corpus record list, the ranked order, the top-k
+    slice, the returned bundle and the live-embed counter — is a local of
+    :meth:`gather` and must stay one, because ``_load_config`` and
+    ``_load_corpus`` re-decide admission on every call from *that* call's
+    override. An override-derived instance attribute would be a privacy leak,
+    not an optimisation, and
+    ``test_a_warmed_specialist_mutates_nothing_across_calls_at_any_ceiling``
+    fails on the instance key set the moment one is added.
+
+    **Two consequences of the longer lifetime, decided rather than discovered.**
+
+    - :meth:`_get_linker` binds ``config.embeddings`` at first use, so an
+      operator editing ``embeddings.model`` under a running server is picked up
+      at restart rather than on the next call. Keying by vault does not close
+      this: the vault path is unchanged.
+    - A re-run of ``creek link`` no longer lands on the next reflection. This is
+      harmless because :func:`_cached_vector` validates ``content_hash`` against
+      the fragment's current text, so a stale map entry can only cause a live
+      re-embed — never a wrong vector.
     """
 
     name = "retrieval"
 
-    def __init__(self, *, linker: EmbeddingLinker | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        linker: EmbeddingLinker | None = None,
+        max_live_embeds: int | None = None,
+    ) -> None:
         """Initialise the specialist with an optional pre-built linker.
 
         Args:
             linker: An embedding linker to reuse; when ``None`` (the default,
                 as in :func:`default_specialists`) one is created lazily on
                 first :meth:`gather` and cached on the instance.
+            max_live_embeds: Maximum cache misses any one :meth:`gather` may
+                embed live, or ``None`` (the default) for unbounded — today's
+                behaviour, which is what keeps the Writing Desk unchanged. This
+                is a fixed ceiling, not a counter: the counter is a local of
+                :func:`_rank_fragments`, so one call's spend never bounds the
+                next one's.
         """
         self._linker = linker
         self._cache: dict[str, CachedEmbedding] | None = None
         self._cache_vault: Path | None = None
+        self._max_live_embeds = max_live_embeds
 
     def _get_linker(self, config: CreekConfig) -> EmbeddingLinker:
         """Return the instance's linker, creating and caching it on first use.
@@ -276,7 +355,7 @@ class RetrievalSpecialist:
 
         The parquet is loaded on first use for a given vault and reused across
         later :meth:`gather` calls so the desk does not re-read it every call.
-        Staleness is harmless: ``_fragment_vector`` validates each entry's
+        Staleness is harmless: ``_cached_vector`` validates each entry's
         ``content_hash`` against the fragment's current text, so a fragment
         re-embedded into the parquet after this instance cached the dict simply
         falls back to a live embed — never a wrong vector. A different *vault*
@@ -294,6 +373,41 @@ class RetrievalSpecialist:
             self._cache_vault = vault
         return self._cache
 
+    def warm(self, vault: Path) -> None:
+        """Fill both memo slots for *vault* now, so no :meth:`gather` has to.
+
+        Exists for the concurrency case (#1034). ``/v1`` serves reads in anyio
+        worker threads with several per-consumer slots, so two first requests
+        can be inside :meth:`gather` at once; both would find ``self._linker``
+        and ``self._cache`` empty and each would construct a linker and read the
+        parquet. Atomic rebinding prevents corruption, not duplication. Doing
+        every instance mutation **once, before the instance is shared**, is what
+        makes "one construction, one parquet read, one model load" true rather
+        than merely likely — and what lets
+        ``test_a_warmed_specialist_mutates_nothing_across_calls_at_any_ceiling``
+        assert that a warmed specialist is thereafter read-only.
+
+        The one mutation left inside a concurrent :meth:`gather` is
+        :meth:`EmbeddingLinker.load_model`'s lazy ``self._model`` assignment,
+        reached on the first live embed. It is idempotent and rebinds
+        atomically, so the worst case is two model loads with one winner —
+        never a wrong vector. Callers wanting even that bounded should warm
+        before sharing, which
+        :class:`creek_mcp.tools.reflect.GroundingSession` does.
+
+        **This does slightly more than :meth:`gather` alone would.** ``gather``
+        returns early on an empty corpus *before* touching either memo, so a
+        vault with no admitted corpus never reads the parquet path today; after
+        ``warm`` it does. Benign — ``load_cache`` returns ``{}`` for a missing
+        path — but it is a real behaviour change, named here rather than
+        discovered. No admission decision is involved: ``warm`` reads the
+        model-filtered map, which is tier-blind, and takes no override.
+
+        Args:
+            vault: The vault whose config, linker and embeddings cache to load.
+        """
+        self._get_cache(self._get_linker(_load_config(vault)), vault)
+
     def gather(
         self,
         query: str,
@@ -308,6 +422,13 @@ class RetrievalSpecialist:
         The persisted embeddings cache is loaded once and used to skip
         re-embedding fragments whose text is unchanged. Fragments above
         *override* are excluded from the corpus (#660).
+
+        ``_load_config`` and ``_load_corpus`` run on **every** call, before
+        either memo is consulted, so admission is re-decided per call from
+        *this* caller's override — a memo can never carry admitted content
+        across calls. When the instance was built with ``max_live_embeds``,
+        that ceiling bounds how many cache misses this call embeds live; the
+        counter is a local of :func:`_rank_fragments`, never instance state.
         """
         config = _load_config(vault)
         corpus = _load_corpus(vault, override)
@@ -316,7 +437,9 @@ class RetrievalSpecialist:
         linker = self._get_linker(config)
         cache = self._get_cache(linker, vault)
         try:
-            ranked = _rank_fragments(query, corpus, linker, cache)
+            ranked = _rank_fragments(
+                query, corpus, linker, cache, self._max_live_embeds
+            )
         except EmbeddingModelUnavailableError:
             return EvidenceBundle()
         top = ranked[: config.author.retrieval_top_k]
