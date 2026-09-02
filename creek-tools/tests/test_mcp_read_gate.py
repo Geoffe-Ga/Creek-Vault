@@ -33,7 +33,12 @@ A manifest is only worth having if it cannot lie. Seven layers keep it honest:
     appear nowhere in the JSON-serialised response. Driven off a manifest of
     its own (:data:`_RUNTIME_PROBES` / :data:`_PROBE_EXEMPT`) so a newly
     ``GATED`` tool must either grow a probe or record a justified exemption —
-    the same forcing function as layer (a), one level deeper.
+    the same forcing function as layer (a), one level deeper. That forcing
+    function cannot tell probing from excusing, so two assertions stand behind
+    it (#1279): the exemption set's membership is **pinned**, and every
+    exemption must name a test in :data:`_PROBE_EXEMPT_GUARDS` that
+    **executes** its reason. Both were missing while ``creek.author`` sat here
+    on a reason whose every load-bearing clause was false.
 (g) **Prompt-channel canary probe** — layer (f) at the other end of the wire.
     Every ``GATED`` tool that can hand corpus text to a model is driven all
     the way *to* the provider with a recording factory, and the gated
@@ -90,7 +95,8 @@ personal-summary residue shape, pinned as live behaviour by
 whose only security assertion were "intimate not in prompt" would therefore be
 green forever over the one channel shape this repo already knows leaks.
 
-Injection drill (each step is expected to turn exactly one layer red):
+Injection drill. Steps 1-4 each turn exactly one layer red; step 5 turns
+two, and which two is the whole of what it measures:
 
 1. Add a ``@server.tool(name="creek.dummy")`` to ``build_server`` → layer (a)
    fails.
@@ -124,17 +130,34 @@ Injection drill (each step is expected to turn exactly one layer red):
            lambda *_a, **_k: True,
        )
 
-   → layer (g) fails, and **only** layer (g). Measured against this worktree:
-   (g)'s ``[creek.reflect]`` and ``[creek.author]`` both go red, while (f)'s
-   ``[creek.reflect]`` passes and so do all ten of its response probes.
-   Layer (f) stays green for the reason given above — its reflect probe is
-   refused at the #846 entry gate and never reaches the grounding walk this
-   mutation opens, so the second corpus read is not exercised whether or not
-   it admits everything. A second, independent injection was run to check
-   that this is a property of the channel rather than of one mutation:
-   forcing ``creek_mcp.tools.reflect``'s ``to_privacy_override`` to return
+   → layers (f) and (g) both fail. Re-measured on this worktree after #1279
+   gave ``creek.author`` a layer-(f) probe of its own: (g)'s
+   ``[creek.reflect]`` and ``[creek.author]`` go red, and so do (f)'s
+   ``[creek.author]`` — on the intimate canary — and
+   ``test_author_probe_still_cites_the_corpus_it_is_admitted_to``, whose
+   ``factory.tiers`` reads ``[PrivacyTier.INTIMATE]`` instead of ``[OPEN]``.
+   **Every other response probe in** :data:`_RUNTIME_PROBES` **passes**,
+   ``[creek.reflect]`` included, and that survivor is what this step is
+   really measuring. Layer (f) cannot see this mutation *for reflect*
+   specifically: ``_probe_reflect`` is refused at the #846 entry gate and
+   never reaches the grounding walk the mutation opens, so the second corpus
+   read is not exercised whether or not it admits everything.
+   ``creek.author`` reaches that same walk with no gate above it, which is
+   why its probe does see it — and why (f) covering one consumer of a shared
+   cutoff says nothing about the others.
+
+   Until #1279 this step read "and **only** layer (g)", with every layer-(f)
+   probe green. That was true only because ``creek.author`` was exempt from
+   (f) on a reason whose every load-bearing clause was false. The sentence is
+   corrected here from a fresh measurement rather than renumbered.
+
+   A second, independent injection was run to check that the *reflect*
+   observation is a property of the channel rather than of one mutation, and
+   it is scoped to reflect's own module: forcing
+   ``creek_mcp.tools.reflect``'s ``to_privacy_override`` to return
    ``PrivacyTierOverride.ALL`` reddens (g)'s ``[creek.reflect]`` and leaves
-   every layer-(f) probe passing in exactly the same way.
+   **every** layer-(f) probe passing — ``[creek.author]`` and its positive
+   control included, measured.
 
 Deliberately absent: any runtime probe asserting that a known gap *still
 leaks*. Such a test passes because the bug exists and breaks when it is fixed.
@@ -1195,7 +1218,9 @@ def test_refuse_above_ceiling_never_echoes_the_content_tier(
     """The refusal leaks no bit about the tier of content the caller cannot read.
 
     This is the load-bearing property, and the reason
-    ``creek_mcp/tools/reflect.py`` carries the comment block at lines 403-431:
+    :func:`creek_mcp.tools.reflect._admit_entry` carries a comment block at its
+    ``_above_ceiling`` refusal saying so (cited by symbol per #1103; the line
+    span this sentence used to name had drifted onto a different function):
     the offending tier is derived from content the caller is *not* admitted to,
     so echoing it turns every refusal into a tier-classification oracle over
     the corpus — probe an id, read the tier back out of the error.
@@ -1536,23 +1561,20 @@ _UPLOAD_REPLACEMENT_CANARY = "CANARY-RUNTIME-UPLOAD-REPLACEMENT-8f52"
 
 _PROBE_EXEMPT: dict[str, str] = {
     "creek.draft": (
-        "draft_tool needs a DraftGenerator driven over a deployed skills tree; "
-        "on a bare fixture it answers from generator scaffolding "
-        "(status='empty' / a RuntimeError refusal) before the response shape a "
-        "probe wants to inspect exists, so a canary-free result would be "
-        "evidence about the scaffolding, not about the ceiling. Its corpus "
-        "walk is IdeaMiner(privacy_override=to_privacy_override(ceiling)) — "
+        "draft_tool DOES answer status='ok' on a bare fixture, so nothing "
+        "about the response shape is what excuses it. The reason is upstream "
+        "of the envelope: on any fixture this small the IdeaMiner falls back "
+        "to MiningStrategy.UNEXPLORED_ONTOLOGY, whose seed is built from "
+        "ontology enum labels rather than from the corpus, so the response "
+        "comes back with source_fragments == [] and no fragment title, tag or "
+        "body of ANY tier in it. A canary assertion over that envelope would "
+        "be vacuous in both directions — the intimate exclusion could not "
+        "fail and the open positive control could not pass. Its corpus walk "
+        "is IdeaMiner(privacy_override=to_privacy_override(ceiling)) — "
         "byte-for-byte the walk creek.mine is probed through below — so the "
-        "read path is covered even though draft's own envelope is not."
-    ),
-    "creek.author": (
-        "author_tool calls load_config() and drives the Writing Desk, and it "
-        "wraps that whole span in `except Exception` returning status='error'. "
-        "On any unconfigured-provider or missing-contract failure it therefore "
-        "returns an envelope with no corpus content in it at all, so the "
-        "canary assertion would pass for the wrong reason — the desk never "
-        "started. A real probe needs a configured desk and belongs beside the "
-        "other author tests."
+        "read path is covered even though draft's own envelope is not. "
+        "test_the_draft_response_exemption_is_still_true executes this reason "
+        "rather than trusting it."
     ),
 }
 """``GATED`` tools that cannot be probed *here*, each with the reason why.
@@ -1560,17 +1582,50 @@ _PROBE_EXEMPT: dict[str, str] = {
 Read these as claims, not as boilerplate: an exemption is the one way a
 ``GATED`` tool escapes layer (f), so a reason that does not survive being
 checked against the tool's source is a hole in the layer.
+
+``creek.author`` was the second entry here until **#1279**. Every
+load-bearing clause of its reason was false — ``author_tool`` calls no
+``load_config``, its ``except Exception`` span is never entered on the canary
+fixture, and the desk answers ``status='ok'`` with cited corpus content on a
+vault with no config file, no credential and no skills tree. It is probed by
+:func:`_probe_author` now. Two things kept that claim alive for as long as it
+stood, and both are closed above: nothing pinned the *membership* of this
+dict, and nothing *executed* any reason in it. See
+:func:`test_the_response_probe_exemption_set_is_pinned` and
+:data:`_PROBE_EXEMPT_GUARDS`.
+"""
+
+_PROBE_EXEMPT_GUARDS: dict[str, str] = {
+    "creek.draft": "test_the_draft_response_exemption_is_still_true",
+}
+"""Layer-(f) exemption → the test that *executes* its stated reason.
+
+Kept as a second dict rather than folded into :data:`_PROBE_EXEMPT`, and the
+difference is exactly the one this issue is about. An exemption reason may
+*mention* its guard — the entry above does — but a mention is prose, and
+nothing resolves it; that is how ``creek.author``'s reason could name a
+``load_config`` call the tool does not make. A key here is a name
+:func:`test_every_response_probe_exemption_has_an_executable_guard` looks up
+in module globals and asserts callable, in both directions. Folding the two
+together would put that name inside the string the prose grader measures for
+length and specificity, which is how a registry entry starts counting as an
+argument.
 """
 
 
 def _forbidden_llm_factory(tier: PrivacyTier) -> Any:
     """Fail loudly instead of returning an LLM — the gate must never reach here.
 
-    Both probed write-side tools build their model client *below* the ceiling
-    gate, so on an above-ceiling request this factory must not be invoked at
-    all. A stub that quietly returned ``"{}"`` would let a broken gate look
-    clean: the tool would call the model, get nothing quotable back, and answer
-    with a canary-free envelope. Raising turns that same path into a failure
+    Both probed tools that take it — ``creek.reflect`` and ``creek.compile`` —
+    build their model client *below* the ceiling gate, so on an above-ceiling
+    request this factory must not be invoked at all. It is deliberately **not**
+    given to :func:`_probe_author`, which addresses no above-ceiling target and
+    therefore reaches the model legitimately at ``ceiling=open``; that probe's
+    docstring gives the argument.
+
+    A stub that quietly returned ``"{}"`` would let a broken gate look clean:
+    the tool would call the model, get nothing quotable back, and answer with
+    a canary-free envelope. Raising turns that same path into a failure
     that names what happened.
 
     Args:
@@ -2226,6 +2281,77 @@ def _probe_classify_entry(vault: Path) -> dict[str, Any]:
     )
 
 
+def _probe_author(
+    vault: Path,
+    factory: _RecordingAuthorFactory | None = None,
+) -> dict[str, Any]:
+    """Run the Writing Desk at the open ceiling and return its envelope (#1279).
+
+    ``creek.author`` carried a layer-(f) *exemption* until #1279, on a reason
+    whose every load-bearing clause was false: ``author_tool`` calls no
+    ``load_config``, the blanket ``except Exception`` span it named is never
+    entered here, and the desk does not "never start". Called on the two-
+    fragment :func:`canary_vault` with no ``creek_config.yaml``, no credential
+    in the environment and no deployed skills tree, it answers ``status="ok"``
+    with the admitted fragment cited in its provenance. There was never
+    anything to excuse.
+
+    Four choices in the call below are load-bearing, and each is a way this
+    probe could quietly become vacuous:
+
+    * ``dry_run=False``. A dry run returns ``plan_author``'s plan and evidence
+      summary *before* the desk speaks, so the envelope a dry-run probe swept
+      would never have been through the voice seam at all.
+    * :class:`_RecordingAuthorFactory`, **not**
+      :func:`_forbidden_llm_factory`. That factory is the right one for
+      ``creek.reflect`` and ``creek.compile``, which refuse an above-ceiling
+      request above the point a client is built, so reaching it is the bug it
+      reports. ``creek.author`` addresses no above-ceiling target: it takes a
+      free-text ``query`` and ranks the corpus behind
+      :func:`~creek.classify.privacy_filter.tier_within_override`, so at
+      ``ceiling=open`` it *legitimately* reaches the model and
+      :func:`_forbidden_llm_factory` would raise on correct behaviour.
+    * ``llm_factory`` is passed at all. ``llm_factory=None`` is a supported
+      call and would keep this probe hermetic, but the conductor's factory
+      branch falls through to a ``None`` client, so the desk runs its
+      deterministic renderer instead of the #1254/#1260 voice seam — a
+      different code path, measurably so: three rounds against this fixture
+      where the recorder takes one. The seam the real tool uses would go
+      unexercised. It also leaves
+      :func:`test_author_probe_still_cites_the_corpus_it_is_admitted_to`
+      nothing to inspect: with no factory object there is no record of whether
+      the desk reached a model, nor of which tier it routed by.
+    * ``_RecordingAuthorFactory`` and :data:`_AUTHOR_PROMPT_PROBE_QUERY` are
+      both defined **below** this function, with layer (g)'s constants. The
+      forward reference is deliberate and resolves at call time. Hoisting the
+      recorder would drag ``_CANNED_LLM_RESPONSE``, ``_RECORDING_MODEL_ID`` and
+      ``_RECORDING_USAGE`` up with it and split the block it shares with
+      :class:`_RecordingLLMFactory`; registering this probe into
+      :data:`_RUNTIME_PROBES` later, from below the recorder, is not an option
+      because the parametrisation over that dict is evaluated at import. Do
+      not "tidy" the order: moving this definition below the dict is a
+      ``NameError`` at collection.
+
+    Args:
+        vault: The seeded canary vault.
+        factory: An optional recorder to drive the desk through, so a caller
+            that wants to assert on what crossed to the model uses the *same*
+            call site the sweep runs rather than a second one that could drift
+            from it. Defaults to a fresh recorder.
+
+    Returns:
+        The tool's response envelope.
+    """
+    recorder = factory if factory is not None else _RecordingAuthorFactory()
+    return author_tool(
+        vault_path=vault,
+        query=_AUTHOR_PROMPT_PROBE_QUERY,
+        llm_factory=recorder,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        dry_run=False,
+    )
+
+
 _RUNTIME_PROBES: dict[str, Callable[[Path], dict[str, Any]]] = {
     "creek.wheel": _probe_wheel,
     "creek.mine": _probe_mine,
@@ -2239,6 +2365,7 @@ _RUNTIME_PROBES: dict[str, Callable[[Path], dict[str, Any]]] = {
     "creek.redact.scan": _probe_redact_scan,
     "creek.skills.refresh": _probe_skills_refresh,
     "creek.classify.entry": _probe_classify_entry,
+    "creek.author": _probe_author,
 }
 """``GATED`` tool → a callable that invokes it at ``ceiling=open``.
 
@@ -2343,6 +2470,78 @@ def test_probe_exemptions_are_specific_to_their_tool(tool: str) -> None:
         f"{tool}'s probe exemption is too short to be a reason: {reason!r}. "
         "State what specifically makes the tool unprobeable here."
     )
+
+
+def test_the_response_probe_exemption_set_is_pinned() -> None:
+    """Only ``creek.draft`` escapes layer (f) through the exemption hatch.
+
+    The forcing function above is satisfied by probing a tool *or* excusing
+    it, so it cannot tell the two apart: moving ``creek.wheel`` out of
+    :data:`_RUNTIME_PROBES` into :data:`_PROBE_EXEMPT` with any
+    sixty-character string containing ``"wheel"`` would delete a probe and
+    leave every layer-(f) test green.
+    :func:`test_probe_exemptions_are_specific_to_their_tool` cannot catch it
+    either -- it grades the prose, not the membership, and its own docstring
+    concedes it cannot judge whether a reason is true.
+
+    That is not hypothetical: it is how ``creek.author``'s exemption sat
+    unchallenged while every load-bearing clause of it was false (#1279).
+    Layer (g) has had this pin since #1036
+    (:func:`test_the_prompt_probe_exemption_set_is_pinned`); layer (f) did
+    not, and this is the counterpart. Pinned in the direction that matters:
+    a tool moving *into* the exemption set is a real weakening and has to be
+    argued for in a diff a reviewer can see.
+    """
+    assert set(_PROBE_EXEMPT) == {"creek.draft"}, (
+        "the layer-(f) exemption set changed. Adding a tool here REMOVES "
+        "the only assertion watching its response channel, so the change "
+        "needs the same scrutiny as deleting a test: state in the PR what "
+        "specifically stops the tool being called on a bare fixture, and "
+        "update this pin deliberately. Currently exempt: "
+        f"{sorted(_PROBE_EXEMPT)}."
+    )
+
+
+def test_every_response_probe_exemption_has_an_executable_guard() -> None:
+    """Every layer-(f) exemption names a test that *runs* its stated reason.
+
+    The pin above stops the set growing unnoticed; it says nothing about
+    whether the reason in a new entry is true. That gap is the whole of
+    #1279: ``creek.author``'s exemption was graded for prose by
+    :func:`test_probe_exemptions_are_specific_to_their_tool`, pronounced
+    specific and long enough, and was false in every load-bearing clause for
+    as long as it stood, because nothing ever executed it.
+
+    So the registry is the forcing function one level in from membership. An
+    exemption is a claim about what happens when the tool is called; this
+    requires that somebody actually call it and assert the claim's *cause*,
+    the way :func:`test_the_draft_prompt_exemption_is_still_true` does for
+    layer (g). Both directions are checked. A new exemption with no guard is
+    an unexecuted claim -- the defect this issue exists to close. A guard
+    entry naming a test that no longer exists (renamed, or deleted along with
+    the probe it excused) leaves the exemption looking supervised while
+    nothing runs, which is the same failure wearing a registry entry.
+    """
+    assert set(_PROBE_EXEMPT_GUARDS) == set(_PROBE_EXEMPT), (
+        "every layer-(f) exemption needs a test that EXECUTES its reason, and "
+        "the two manifests disagree. Exempt without a guard: "
+        f"{sorted(set(_PROBE_EXEMPT) - set(_PROBE_EXEMPT_GUARDS))}; guards for "
+        "tools that are not exempt: "
+        f"{sorted(set(_PROBE_EXEMPT_GUARDS) - set(_PROBE_EXEMPT))}. A reason "
+        "nobody runs is how creek.author's exemption stayed false through "
+        "every review it passed (#1279): write the guard, or delete the "
+        "exemption and write a probe."
+    )
+    for tool, guard in sorted(_PROBE_EXEMPT_GUARDS.items()):
+        assert guard in globals(), (
+            f"{tool}'s exemption guard {guard!r} does not resolve in this "
+            "module, so the exemption is supervised on paper and unexecuted "
+            "in fact. Point the entry at the test that runs the reason."
+        )
+        assert callable(globals()[guard]), (
+            f"{tool}'s exemption guard {guard!r} resolves to something that "
+            "is not callable, so no test runs the reason."
+        )
 
 
 @pytest.mark.parametrize("tool", sorted(_RUNTIME_PROBES))
@@ -2977,6 +3176,147 @@ def test_redact_scan_probe_refuses_and_is_not_vacuous(
         )
 
 
+def test_author_probe_still_cites_the_corpus_it_is_admitted_to(
+    canary_vault: Path,
+) -> None:
+    """``creek.author``'s probe is not passing by never reaching the corpus.
+
+    The response-side positive control for the Writing Desk, and until #1279
+    it existed on **neither** channel: layer (f) excused the tool, and layer
+    (g)'s probe asserts reachability of the open canary in the *prompt*, not
+    in the envelope. An exemption can never carry a control like this, because
+    an exemption's whole claim is that nothing worth asserting comes back.
+
+    ``response["status"] == "ok"`` is asserted here rather than relying on the
+    ``tool`` echo the shared sweep checks, and the difference is not
+    cosmetic. ``creek.author`` is the one probed tool that wraps its whole
+    span in a blanket ``except Exception``, and the envelope it answers with
+    on that path -- :func:`creek_mcp.tools.author._error_response` -- sets
+    ``"tool": TOOL_NAME`` itself. So the echo is satisfied by a crash. Only
+    ``status`` separates a desk that ran from a desk that fell over, and a
+    crashed desk would sail through every exclusion in
+    ``test_gated_tools_leak_no_above_ceiling_content_at_the_open_ceiling``
+    while proving nothing at all.
+
+    The factory assertions are the second half, and they are about *routing*
+    as much as about invocation. ``prompts`` non-empty says the desk reached a
+    model rather than short-circuiting; every recorded tier being ``OPEN``
+    says which tier it routed the corpus by, so a broken rank cutoff that
+    admitted the intimate fragment is caught here — as ``PrivacyTier.INTIMATE``
+    in ``factory.tiers`` — even before the canary assertions are consulted.
+
+    ``all(...)`` over a non-empty ``tiers`` rather than ``tiers ==
+    [PrivacyTier.OPEN]``, deliberately. The exact-list form additionally pins
+    that the desk voices in exactly **one** round, which is true today and is
+    not this test's claim: a future revision round would redden a security
+    assertion for a reason that has nothing to do with the tier cutoff. The
+    security property is "no tier above the ceiling was ever routed", and it
+    holds for any number of calls. The non-emptiness half is belt-and-braces
+    rather than a demonstrated tripwire: ``all()`` over an empty list is
+    ``True``, so a desk that never reached a model would satisfy the tier
+    clause by vacuity — but the assertion above it,
+    ``len(factory.prompts) >= 1``, is the one that actually fires first in
+    every such case reachable today.
+    """
+    factory = _RecordingAuthorFactory()
+    response = _probe_author(canary_vault, factory)
+
+    assert response["status"] == "ok", (
+        "creek.author did not author on the canary fixture, so the shared "
+        "layer-(f) canary sweep for this tool is asserting over an envelope "
+        "the desk never filled. Note that the sweep's `tool` echo does NOT "
+        "catch this: creek_mcp.tools.author._error_response sets "
+        '"tool": TOOL_NAME on the failure path, so an error envelope '
+        f"satisfies the echo and every exclusion beside it.\n\n{response}"
+    )
+    serialised = json.dumps(response, default=str)
+    assert _RUNTIME_OPEN_CANARY in serialised, (
+        "creek.author returned an envelope with no admitted corpus content in "
+        f"it — the open canary {_RUNTIME_OPEN_CANARY!r} is absent — so the "
+        "intimate exclusion in the shared sweep is vacuous for this tool. "
+        "This is what a tier filter broken in the drop-everything direction "
+        f"looks like: leak-free, and useless.\n\n{serialised}"
+    )
+    assert len(factory.prompts) >= 1, (
+        "creek.author's probe reached no model at all, so the desk never ran "
+        "the voice seam this probe exists to drive. Whatever the envelope "
+        "says, it was not produced by the path the real tool takes."
+    )
+    assert factory.tiers and all(tier is PrivacyTier.OPEN for tier in factory.tiers), (
+        "creek.author routed its corpus by "
+        f"{factory.tiers!r} at privacy_tier_ceiling=open. Anything above OPEN "
+        "here means the rank cutoff in creek.author.agents._load_corpus "
+        "admitted content the caller was not entitled to, and the model "
+        "client was built for that tier. An empty list fails too: it would "
+        "mean the desk built no client at all, and every tier assertion over "
+        "it would be vacuously true."
+    )
+
+
+def test_the_draft_response_exemption_is_still_true(
+    canary_vault: Path,
+) -> None:
+    """``creek.draft``'s layer-(f) exemption is executed, not taken on trust.
+
+    The layer-(g) counterpart of
+    :func:`test_the_draft_prompt_exemption_is_still_true`, and it has to be
+    written again rather than inherited: the two exemptions are claims about
+    two different channels, over two different fixtures. This one runs over
+    :func:`canary_vault` — the two-fragment vault layer (f) actually probes —
+    and **not** over :func:`prompt_canary_vault`. The two agree today; a guard
+    for a layer-(f) exemption run on layer (g)'s corpus would go on agreeing
+    after they stopped, and would then be evidence about an environment this
+    layer never enters.
+
+    What is asserted is the reason's stated *cause*, not its conclusion: that
+    draft answers ``ok`` (so the guard is on the path the exemption describes
+    rather than on a crash), that the ontology-tuple fallback is the strategy
+    that fired, that the seed cites no corpus fragment, and that the **open**
+    canary is absent from the envelope. That last absence is the load-bearing
+    one, exactly as it is on the prompt channel. Asserting only that the
+    *gated* canaries are missing would leave the exemption green on the day
+    draft starts putting corpus text in its response — the day it stops being
+    true and starts needing a real probe.
+
+    When this goes red the fix is never to edit the reason. It is to delete
+    the entry from :data:`_PROBE_EXEMPT` and write ``_probe_draft``.
+    """
+    response = draft_tool(
+        vault_path=canary_vault,
+        llm_factory=_RecordingLLMFactory(),
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert response["status"] == "ok", (
+        "creek.draft did not draft on the layer-(f) canary fixture, so this "
+        "guard is asserting over a path the exemption does not describe. The "
+        "exemption's claim is about what a successful draft leaves out of its "
+        f"envelope, not about a failure.\n\n{response}"
+    )
+    assert response["idea_strategy"] == MiningStrategy.UNEXPLORED_ONTOLOGY.value, (
+        "creek.draft drafted from a strategy other than unexplored-ontology: "
+        f"{response['idea_strategy']!r}. The exemption rests on the "
+        "ontology-tuple seed being the only one this fixture can produce. "
+        "Delete the exemption from _PROBE_EXEMPT and write a real probe."
+    )
+    assert response["source_fragments"] == [], (
+        "creek.draft's seed now cites corpus fragments: "
+        f"{response['source_fragments']}. The exemption claims no corpus text "
+        "of any tier reaches the envelope; a cited fragment is how that stops "
+        "being true. Delete the exemption from _PROBE_EXEMPT and write a real "
+        "probe."
+    )
+    serialised = json.dumps(response, default=str)
+    for canary in (_RUNTIME_OPEN_CANARY, _RUNTIME_INTIMATE_CANARY):
+        assert canary not in serialised, (
+            f"creek.draft's response now carries {canary!r}. The exemption "
+            "says no corpus text of any tier reaches this envelope, which is "
+            "the whole reason a canary probe over it would be vacuous — and "
+            "it is no longer true. Delete the exemption from _PROBE_EXEMPT "
+            f"and add a probe to _RUNTIME_PROBES.\n\n{serialised}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Layer (g) — prompt-channel canary probe (#1036)
 #
@@ -3265,11 +3605,20 @@ class _RecordingLLMFactory:
 class _RecordingAuthorFactory:
     """A ``creek.author`` voice-client factory recording tiers and prompts.
 
+    **Two probes depend on this class, and one of them is defined far above
+    it.** Layer (f)'s :func:`_probe_author` resolves this name at call time,
+    which is why it can sit beside the other response probes while the
+    recorder stays here with :class:`_RecordingLLMFactory` and the layer-(g)
+    constants. Moving this class *below* :data:`_RUNTIME_PROBES` is fine;
+    deleting or renaming it without following the reference up is a
+    ``NameError`` at probe time, not at import, so the failure arrives as a
+    red parametrised case rather than as a collection error.
+
     ``creek.author``'s seam (#1254/#1260) is a different protocol from the one
     :class:`_RecordingLLMFactory` serves:
     :class:`~creek_mcp.tools.author.AuthorLLMFactory` answers with an
     :class:`~creek.author.client.AuthorLLMClient`, which
-    ``creek/author/voice.py:106`` consumes as
+    :meth:`creek.author.voice.VoiceAgent.render` consumes as
     ``client.complete_with_usage(dynamic, system=static)`` and whose result must
     expose ``.text`` and ``.usage``. So this class does **not** fake the client:
     it doubles as an :class:`~creek.classify.llm.base.LLMProvider` and hands
@@ -3419,6 +3768,17 @@ def _assert_prompt_channel_clean(tool: str, capture: _PromptCapture) -> None:
     separate one, which is the property :class:`_PromptCapture` exists to
     provide.
 
+    **The ``tool`` echo before that sweep is weaker than it looks, and #1279
+    corrected the claim that used to be made for it here.** It catches an
+    envelope nobody can identify — ``{}`` from a swallowed exception, or a
+    different tool's response through a mis-wired probe. It does *not* catch
+    ``creek.author`` crashing: :func:`creek_mcp.tools.author._error_response`
+    sets ``"tool": TOOL_NAME`` on the failure path, so an ``status='error'``
+    envelope satisfies the echo, and a crash after the first voice call
+    satisfies both positive controls above as well. The assertion that
+    separates them is on ``status``, and it lives one layer over, in
+    :func:`test_author_probe_still_cites_the_corpus_it_is_admitted_to`.
+
     Args:
         tool: The probed tool's registered name, for the failure messages.
         capture: The probe's paired prompt/response evidence.
@@ -3465,12 +3825,14 @@ def _assert_prompt_channel_clean(tool: str, capture: _PromptCapture) -> None:
         )
     assert capture.response.get("tool") == tool, (
         f"{tool}'s probe came back with no tool echo, so the response half of "
-        "this assertion is about an envelope nobody can identify. The live "
-        "case is author_tool, which wraps the whole desk span in "
-        "`except Exception` and answers status='error': a crash after the "
-        "first voice call still satisfies both positive controls above while "
-        "silently narrowing a multi-round probe to one round. Layer (f) makes "
-        f"the same check for the same reason.\n\n{capture.response}"
+        "this assertion is about an envelope nobody can identify — an empty "
+        "dict from a swallowed exception, or a different tool's envelope "
+        "through a mis-wired probe. Note the case it does NOT catch: "
+        'creek_mcp.tools.author._error_response sets "tool": TOOL_NAME '
+        "itself, so an author crash answering status='error' satisfies this "
+        "echo. Only a status assertion separates the two, and layer (f)'s "
+        "test_author_probe_still_cites_the_corpus_it_is_admitted_to makes it "
+        f"(#1279).\n\n{capture.response}"
     )
     serialised = json.dumps(capture.response, default=str)
     folded_response = serialised.lower()
@@ -3572,7 +3934,7 @@ def _prompt_probe_compile(vault: Path) -> _PromptCapture:
 
     * a **named** above-ceiling id — ``_survey_sources`` refuses with
       :data:`~creek_mcp.tools.compile._ABOVE_CEILING_REASON`;
-    * an admitted child's **ancestry** — ``creek/compile/engine.py:451-459``
+    * an admitted child's **ancestry** — :func:`creek.compile.engine._build_prompt`
       emits a ``structural_path:`` breadcrumb of parent titles, and
       :func:`creek.hierarchy.structural_path_context` returns the *persisted*
       frontmatter field before it walks ``parent_id`` at all, so no ancestor
@@ -3625,18 +3987,17 @@ def _prompt_probe_author(vault: Path) -> _PromptCapture:
     :class:`~creek.author.client.AuthorLLMClient` through
     ``complete_with_usage``, not a bare ``(str) -> str``.
 
-    **This contradicts ``creek.author``'s layer-(f) exemption, which is
-    wrong.** :data:`_PROBE_EXEMPT` claims the desk "never started" on an
-    unconfigured fixture and therefore returns a content-free error envelope.
-    Run it: on this fixture ``author_tool`` answers ``status="ok"``, the factory
-    is invoked once with ``PrivacyTier.OPEN``, and a real multi-kilobyte prompt
-    carrying the admitted canary crosses to the recorder — no config file, no
-    live provider, no skills tree. The exemption is not edited here: it belongs
-    to layer (f), it is out of scope for #1036, and quietly repairing a
-    neighbouring layer's reason inside this commit would be exactly the kind of
-    unreviewed change these manifests exist to prevent. Filed as follow-up
-    **#1279**; recorded here so the contradiction is discoverable from either
-    end.
+    This probe used to contradict a standing ``creek.author`` entry in
+    :data:`_PROBE_EXEMPT`, which claimed the desk "never started" on an
+    unconfigured fixture and returned a content-free error envelope. Running
+    it refuted every clause, and **#1279 resolved the contradiction in layer
+    (f)'s favour**: the exemption is gone and :func:`_probe_author` took its
+    place. The tool is now probed on both channels, and they are not
+    redundant. This one reads the bytes that already left for the provider;
+    :func:`_probe_author` reads the envelope that came back, and carries the
+    response-side positive control — ``status``, the admitted canary, and the
+    tier the desk routed by — which no prompt probe can make and which an
+    exemption, by construction, can never carry at all.
 
     Args:
         vault: The seeded three-tier canary vault.
@@ -3697,8 +4058,13 @@ _PROMPT_PROBE_EXEMPT: dict[str, str] = {
 Kept separate from :data:`_PROBE_EXEMPT` deliberately. "The envelope is not
 worth inspecting on a bare fixture" is a claim about the response, so a
 layer-(f) exemption buys a tool nothing on this channel; the prompt is
-assembled before the envelope exists, and the two can disagree — ``creek.author``
-is exempt from layer (f) and probed by layer (g) for exactly that reason.
+assembled before the envelope exists, and the two can disagree.
+``creek.draft`` is the standing illustration: it is exempt on **both**
+channels, for two different reasons, each executed by its own guard —
+:func:`test_the_draft_response_exemption_is_still_true` for the envelope and
+:func:`test_the_draft_prompt_exemption_is_still_true` for the prompt. Sharing
+one reason across the two would have been the shortcut, and it would have
+carried draft's response-side claim onto a channel it says nothing about.
 """
 
 

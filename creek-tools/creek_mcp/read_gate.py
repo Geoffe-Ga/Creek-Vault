@@ -134,7 +134,10 @@ rather than per tool. Named on that axis, the surface is:
 
 1. **JSON response** — layer (f), driven off ``_RUNTIME_PROBES`` /
    ``_PROBE_EXEMPT``. Forced: a newly ``GATED`` tool must grow a probe or
-   record a justified exemption.
+   record a justified exemption. Since #1279 the exemption set's *membership*
+   is pinned as well, and every exemption must name a test that executes its
+   reason — a reason nobody runs is how ``creek.author``'s stayed false
+   through every review it passed.
 2. **Model prompt** — layer (g), driven off ``_PROMPT_PROBES`` /
    ``_PROMPT_PROBE_EXEMPT``, over a set derived from the tools' own
    signatures. Forced the same way, plus a non-emptiness assertion on the
@@ -156,19 +159,29 @@ dataclass records one, so the obvious repair is a second
 ``(gate_module, gate_symbol)`` pair. It was not taken. A second pair is only
 ever checkable at the strength layers (c)/(e) can offer — the symbol exists in
 the named module and is called there — and for reflect's grounding gate that
-check is green *by construction*: ``creek/author/agents.py`` imports
-``tier_within_override`` at line 28 and calls it in ``_load_corpus`` at line
-115 for every Writing Desk consumer. It would stay green if
+check is green *by construction*: ``creek.author.agents`` imports
+``creek.classify.privacy_filter.tier_within_override`` and calls it inside
+``creek.author.agents._load_corpus`` for every Writing Desk consumer. (Named
+by symbol rather than by line, per #1103: the line numbers this sentence used
+to carry had already drifted off the import.) It would stay green if
 ``creek_mcp.tools.reflect._default_retrieve`` stopped passing ``override``,
 stopped being called, or reflect dropped grounding altogether — three ways to
 lose the gate entirely without disturbing the evidence for it. Layer (g)
 checks that gate's *effect* instead, which is strictly stronger, and the
-injection drill at the top of ``tests/test_mcp_read_gate.py`` is the evidence:
-the two independent mutations that neutralise the grounding cutoff turn (g)
-red and leave every structural layer and all ten response probes green.
-Revisit predicate: **a tool whose second gate's effect no runtime probe can
-observe.** For that tool the structural check is the only one available, and a
-weak check is better than none.
+injection drill at the top of ``tests/test_mcp_read_gate.py`` is the evidence
+— **narrowed to reflect by #1279**, and re-measured there rather than
+restated. Neutralising the shared grounding cutoff turns (g) red and leaves
+every response probe in ``_RUNTIME_PROBES`` green *except*
+``[creek.author]``, which since #1279 reaches that walk under a probe of its
+own and does catch it. The claim this paragraph rests on survives with
+``creek.reflect`` as its subject: reflect's layer-(f) probe is refused at the
+#846 entry gate before the grounding walk, so no response probe of *reflect*
+observes that gate's effect. The second injection, scoped to
+``creek_mcp.tools.reflect``'s own ``to_privacy_override``, leaves every
+response probe green including ``[creek.author]``. Revisit predicate: **a
+tool whose second gate's effect no runtime probe can observe.** For that tool
+the structural check is the only one available, and a weak check is better
+than none.
 
 **``creek.classify`` is a known prompt-channel egress outside both probe
 manifests.** Its posture is ``METADATA_ONLY`` on a rationale about its
