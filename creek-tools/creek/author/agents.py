@@ -12,6 +12,7 @@ with their ``source_fragments`` (and an ``author_slug`` for borrowed evidence).
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import Counter
 from typing import TYPE_CHECKING, Protocol, TypeVar, runtime_checkable
@@ -54,6 +55,8 @@ if TYPE_CHECKING:
     from creek.config import CreekConfig
     from creek.link.embeddings import CachedEmbedding
     from creek.models import Fragment
+
+logger = logging.getLogger(__name__)
 
 _DimT = TypeVar("_DimT", bound="StrEnum")
 
@@ -229,6 +232,18 @@ def _rank_fragments(
     corpus that ``_load_corpus`` has already filtered by the caller's override,
     so it can never admit a fragment the ceiling excluded.
 
+    **What the cap costs, stated plainly.** Because the budget is spent walking
+    ids in order, a bounded pass on a cold cache ranks an **id-ordered prefix of
+    the corpus, not the corpus** — so the genuinely best matches can be dropped
+    unscored, and the caller gets fewer and lower-ranked results. That is a
+    quality loss, not merely a work saving, and it is *invisible in the return
+    value*: a truncated pass and a thin vault produce the same shape. So budget
+    exhaustion emits one ``WARNING`` per call carrying the counts (ranked,
+    admitted, embedded, skipped). Counts only — no fragment id, title or body —
+    because this logger carries no tier. The durable fix for an operator seeing
+    it is ``creek link --method embeddings``, which fills the cache so nothing
+    needs a live embed at all.
+
     **Spend order is deterministic and vault-layout independent.** The corpus is
     walked in fragment-id order, not in ``CORPUS_SUBDIRS``/directory order, so
     *which* fragments spend a bounded budget does not depend on filesystem
@@ -249,16 +264,38 @@ def _rank_fragments(
     """
     query_vec = linker.generate_embedding(query)
     remaining = max_live_embeds
+    embedded = 0
+    skipped = 0
     scored: list[tuple[float, str, Fragment]] = []
     for fragment, _body in sorted(corpus, key=lambda record: record[0].id):
         vec = _cached_vector(fragment, cache)
         if vec is None:
             if remaining is not None and remaining <= 0:
+                skipped += 1
                 continue
             if remaining is not None:
                 remaining -= 1
+            embedded += 1
             vec = linker.generate_embedding(fragment_embedding_text(fragment))
         scored.append((_cosine(query_vec, vec), fragment.id, fragment))
+    if skipped:
+        # Once per call, never per fragment: this is the only runtime signal that
+        # the ranking universe was a prefix of the corpus rather than the corpus.
+        # Without it a capped pass is indistinguishable from a genuinely thin
+        # vault -- the caller sees fewer, lower-ranked results and nothing says
+        # why. Counts only: no fragment id, title or body, because this logger
+        # carries no tier and is not covered by the caller's ceiling.
+        logger.warning(
+            "Live-embed budget exhausted: ranked %d of %d admitted fragment(s) "
+            "(%d embedded live, %d skipped for budget %s). Ranking used an "
+            "id-ordered prefix, so the best matches may not have been scored. "
+            "Run 'creek link --method embeddings' to fill the cache.",
+            len(scored),
+            len(corpus),
+            embedded,
+            skipped,
+            max_live_embeds,
+        )
     scored.sort(key=lambda item: (-item[0], item[1]))
     return [fragment for _score, _id, fragment in scored]
 

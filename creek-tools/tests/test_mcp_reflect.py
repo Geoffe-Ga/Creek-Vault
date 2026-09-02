@@ -59,6 +59,7 @@ from creek_mcp.compiled_pages import RelatedCompiled
 from creek_mcp.server import Transport, build_server
 from creek_mcp.tier_ceiling import TierCeiling, to_privacy_override
 from creek_mcp.tools.reflect import (
+    _MAX_LIVE_EMBEDS,
     TOOL_NAME,
     GroundingSession,
     _default_retrieve,
@@ -3366,3 +3367,79 @@ def test_benchmark_grounding_setup_is_paid_once_per_process_not_per_call(
                 # The unbounded pre-fix shape: every admitted fragment, every call.
                 assert len(embeds) == calls * (len(ids) + 1), f"{label}: {len(embeds)}"
             monkeypatch.undo()
+
+
+def test_the_published_cap_reaches_the_specialist_the_session_builds(
+    tmp_path: Path,
+) -> None:
+    """The production cap is wired, is a real bound, and is read at call time.
+
+    Guards the *upward* direction, which the cap's other tests could not.
+    ``_MAX_LIVE_EMBEDS`` is 256 and the largest fixture vault in this suite is
+    40 fragments, so no test that merely runs a reflection ever crosses the
+    budget — deleting the plumbing entirely, or setting the constant to
+    ``None``, left the whole suite green. Three separate mutations did.
+
+    The key-set guard does not catch it either: ``_max_live_embeds`` is assigned
+    unconditionally in ``__init__``, so under mutation the attribute survives
+    with value ``None`` and an identity comparison of ``None`` to ``None``
+    passes. Only naming the expected *value* closes that.
+
+    Both halves are load-bearing. The `isinstance`/`> 0` half fails if the
+    published constant stops being a bound; the equality half fails if the
+    session stops handing it to the specialist it builds.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+
+    specialist = GroundingSession().specialist(vault)
+
+    assert isinstance(_MAX_LIVE_EMBEDS, int), "the published cap is not a bound"
+    assert _MAX_LIVE_EMBEDS > 0, "the published cap does not cap"
+    assert specialist._max_live_embeds == _MAX_LIVE_EMBEDS, (
+        "the session did not hand the published cap to its specialist"
+    )
+
+
+def test_the_production_cap_bounds_a_cold_gather_and_says_so(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Crossing the budget on the production path truncates ranking, and warns.
+
+    The behavioural twin of the wiring test above, driven through
+    ``GroundingSession`` — the way production reaches the cap — rather than a
+    directly constructed ``RetrievalSpecialist``. The constant is monkeypatched
+    down instead of building a >256-fragment fixture, which is why
+    :meth:`GroundingSession.specialist` reads it at call time.
+
+    The log assertion is the point. A truncated pass returns the same *shape* as
+    a genuinely thin vault, so without a runtime signal an operator on a large
+    cold vault would ground against an id-ordered prefix forever with nothing to
+    reveal it. The record must carry the counts and must **not** carry any
+    fragment id, title or body: this logger has no tier and is not covered by
+    the caller's ceiling.
+    """
+    monkeypatch.setattr("creek_mcp.tools.reflect._MAX_LIVE_EMBEDS", 2)
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    session = GroundingSession()
+
+    with caplog.at_level(logging.WARNING, logger="creek.author.agents"):
+        grounding = _default_retrieve(
+            _ENTRY, vault, to_privacy_override(TierCeiling.ALL), session=session
+        )
+
+    assert len(grounding.lines) == 2, (
+        f"budget 2 over 4 admitted fragments ranked {len(grounding.lines)}"
+    )
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, f"expected one budget warning, got {len(warnings)}"
+    message = warnings[0].getMessage()
+    assert "budget" in message.lower(), message
+    assert "2 skipped" in message, message
+    for marks in _CORPUS.values():
+        assert marks.title not in message, "the warning names a fragment title"
+        assert marks.frag_id not in message, "the warning names a fragment id"
+        assert marks.body not in message, "the warning names a fragment body"

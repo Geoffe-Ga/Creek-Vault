@@ -166,20 +166,11 @@ class GroundingSession:
     call independently admitted.
     """
 
-    def __init__(self, *, max_live_embeds: int | None = _MAX_LIVE_EMBEDS) -> None:
-        """Create an empty session; the first :meth:`specialist` call fills it.
-
-        Args:
-            max_live_embeds: The per-call live-embed ceiling handed to every
-                specialist this session builds. Defaults to
-                :data:`_MAX_LIVE_EMBEDS`; ``None`` restores the unbounded
-                behaviour, which is what a plain ``RetrievalSpecialist()``
-                (and therefore the Writing Desk) still gets.
-        """
+    def __init__(self) -> None:
+        """Create an empty session; the first :meth:`specialist` call fills it."""
         self._lock = threading.Lock()
         self._specialist: RetrievalSpecialist | None = None
         self._vault: Path | None = None
-        self._max_live_embeds = max_live_embeds
 
     def specialist(self, vault: Path) -> RetrievalSpecialist:
         """Return this session's warmed specialist for *vault*, building once.
@@ -194,6 +185,15 @@ class GroundingSession:
         left as it was, and the next call retries rather than caching a broken
         session for the life of the process.
 
+        :data:`_MAX_LIVE_EMBEDS` is read **here, at construction time**, not
+        captured as a parameter default when this class was defined. That is
+        deliberate and load-bearing for testability: a default argument binds
+        once at import, so the published cap could not be reached from a test
+        without passing it explicitly — which would have tested a value the
+        production path never uses. Reading the module constant at call time
+        means a test can monkeypatch it and exercise the real production path,
+        and it is why this method takes no budget argument at all.
+
         Args:
             vault: The vault this grounding pass will read.
 
@@ -206,7 +206,7 @@ class GroundingSession:
         with self._lock:
             if self._specialist is not None and self._vault == vault:
                 return self._specialist
-            built = RetrievalSpecialist(max_live_embeds=self._max_live_embeds)
+            built = RetrievalSpecialist(max_live_embeds=_MAX_LIVE_EMBEDS)
             built.warm(vault)
             self._specialist = built
             self._vault = vault
