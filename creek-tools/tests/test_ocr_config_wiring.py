@@ -77,6 +77,8 @@ from creek.ingest.images import (
 )
 from creek.ingest.pipeline import (
     _SCANNED_PDF_OCR_DECLINED_ADVISORY,
+    _SUPERSEDED_SCAN_SAFE_TEMPLATE,
+    IngestRunResult,
     build_ingestor,
     ocr_is_disabled,
     run_ingest,
@@ -1361,3 +1363,196 @@ class TestTheScannedRouteDegradesWithoutCrashing:
         )
 
         assert len(calls) == 1
+
+
+class TestTurningOcrOnAfterAScanWasAlreadyIngested:
+    """The off->on upgrade must not silently duplicate the fragment.
+
+    This is the transition every existing user takes by default, not an
+    opt-in: ``CreekConfig().ocr`` defaults to ``enabled=True`` and ``creek
+    ingest`` passes it unconditionally at both call sites. Anyone who
+    ingested a scanned PDF before the OCR route existed holds one fragment
+    keyed ``external/<hash>/Scan.pdf`` with an empty body. Their next
+    ordinary run writes three more under ``…Scan.pdf#page-1/2/3`` and leaves
+    the original untouched — four live fragments for one PDF, permanently,
+    because ``document`` is not in ``TOMBING_SOURCES`` so nothing sweeps it.
+
+    ``collapsed_unit_warning`` exists for exactly this "one fragment
+    superseded by N" shape and **cannot** fire here: it recomputes the legacy
+    id from ``parsed.content``, and content is precisely what the OCR
+    changed, so it computes an id no vault ever held. Detection has to key on
+    the one identifier OCR does not change — the ledger's ``source_key``.
+
+    Left alone rather than tombed, following the answer #1305 and #1304
+    ratified for this shape: an ingest run does not delete vault content,
+    because it cannot know whether the operator has since edited, linked or
+    curated that fragment. Tombing would additionally require adding
+    ``document`` to ``TOMBING_SOURCES``, which reverses #1329's deliberate
+    split of identity from deletion authority.
+    """
+
+    def _ingest(
+        self,
+        source: Path,
+        vault: Path,
+        ocr: OCRConfig | None,
+        seen: list[str] | None = None,
+    ) -> IngestRunResult:
+        """Run one document ingest, optionally capturing the warning stream.
+
+        Args:
+            source: Directory to ingest.
+            vault: Vault root to write into.
+            ocr: The ``ocr`` block for this run, or ``None``.
+            seen: When given, collects every advisory as the operator sees it.
+
+        Returns:
+            The run's result.
+        """
+        return run_ingest(
+            ingestor_cls=DocumentIngestor,
+            source_type="document",
+            input_path=source,
+            vault_path=vault,
+            ocr=ocr,
+            on_warning=None if seen is None else seen.append,
+        )
+
+    def test_the_operator_is_told_which_fragment_the_pages_superseded(
+        self,
+        tmp_path: Path,
+        spy_engine: type[SpyOcrEngine],
+    ) -> None:
+        """Turning OCR on must name the stale fragment, not write in silence."""
+        vault = _make_vault(tmp_path)
+        source, _pdf = _scan_source(tmp_path)
+        spy_engine.pdf_pages = SCAN_PAGES
+
+        first = self._ingest(source, vault, OCRConfig(enabled=False))
+        assert first.created == 1
+        (stale,) = _vault_fragments(vault)
+        stale_post = frontmatter.loads(stale.read_text(encoding="utf-8"))
+        stale_id = str(stale_post["id"])
+        assert stale_post.content.strip() == ""
+
+        seen: list[str] = []
+        second = self._ingest(
+            source, vault, OCRConfig(enabled=True, engine="spy"), seen
+        )
+
+        assert second.created == 3
+        # The advisory names the superseded fragment, so the operator can act
+        # in one step instead of finding a duplicate months later.
+        assert any(stale_id in message for message in second.warnings)
+        assert any(stale_id in message for message in seen)
+        # The ceiling-safe rendering carries the count and no fragment id,
+        # because an id is vault content and must not cross an MCP ceiling.
+        assert _SUPERSEDED_SCAN_SAFE_TEMPLATE.format(count=1) in (
+            second.ceiling_safe_warnings
+        )
+        assert not any(stale_id in message for message in second.ceiling_safe_warnings)
+
+    def test_the_advisory_reaches_the_operator_through_the_real_cli(
+        self,
+        tmp_path: Path,
+        spy_engine: type[SpyOcrEngine],
+    ) -> None:
+        """Asserted on the console, not on ``result.warnings``.
+
+        An advisory that only ever appears in a dataclass field is one the
+        operator never sees. This drives the real Typer app, so
+        ``creek ingest``'s ``on_warning=_print_ingest_warning`` seam and the
+        vault's own ``creek_config.yaml`` are both in the path — the half of
+        the fix the operator actually experiences.
+        """
+        from typer.testing import CliRunner
+
+        from creek.cli import app
+
+        vault = _make_vault(tmp_path)
+        source, _pdf = _scan_source(tmp_path)
+        spy_engine.pdf_pages = SCAN_PAGES
+        config = vault / "00-Creek-Meta" / "creek_config.yaml"
+
+        def invoke() -> object:
+            """Run ``creek ingest --type document`` against the fixture."""
+            return CliRunner().invoke(
+                app,
+                [
+                    "ingest",
+                    "--type",
+                    "document",
+                    "--input",
+                    str(source),
+                    "--vault",
+                    str(vault),
+                    "--yes",
+                ],
+            )
+
+        config.write_text(
+            f"vault_path: {vault}\nocr:\n  enabled: false\n  engine: spy\n",
+            encoding="utf-8",
+        )
+        assert invoke().exit_code == 0
+        (stale,) = _vault_fragments(vault)
+        stale_id = str(frontmatter.loads(stale.read_text(encoding="utf-8"))["id"])
+
+        # The operator turns OCR on -- the default next run for an upgrade.
+        config.write_text(
+            f"vault_path: {vault}\nocr:\n  enabled: true\n  engine: spy\n",
+            encoding="utf-8",
+        )
+        result = invoke()
+
+        assert result.exit_code == 0, result.output
+        # Rich wraps the console at the pinned terminal width, so the id can
+        # land across a line break; compare on the whitespace-collapsed text.
+        printed = " ".join(result.output.split())
+        assert stale_id in printed
+        assert "superseded" in printed
+
+    def test_the_advisory_is_silent_when_there_was_no_earlier_ingest(
+        self,
+        tmp_path: Path,
+        spy_engine: type[SpyOcrEngine],
+    ) -> None:
+        """The control: a first-ever OCR'd ingest supersedes nothing.
+
+        Without it, "the operator is warned" would be satisfied by an
+        advisory that fired on every scanned PDF anyone ever ingested.
+        """
+        vault = _make_vault(tmp_path)
+        source, _pdf = _scan_source(tmp_path)
+        spy_engine.pdf_pages = SCAN_PAGES
+
+        result = self._ingest(source, vault, OCRConfig(enabled=True, engine="spy"))
+
+        assert result.created == 3
+        assert not any("superseded" in message for message in result.warnings)
+
+    def test_the_advisory_clears_once_the_stale_fragment_is_removed(
+        self,
+        tmp_path: Path,
+        spy_engine: type[SpyOcrEngine],
+    ) -> None:
+        """It is self-clearing, so acting on it makes the run go quiet.
+
+        An advisory that survives the fix it asks for is one the operator
+        learns to ignore, which is how a real warning becomes console noise.
+        """
+        vault = _make_vault(tmp_path)
+        source, _pdf = _scan_source(tmp_path)
+        spy_engine.pdf_pages = SCAN_PAGES
+
+        self._ingest(source, vault, OCRConfig(enabled=False))
+        (stale,) = _vault_fragments(vault)
+        self._ingest(source, vault, OCRConfig(enabled=True, engine="spy"))
+        assert len(_vault_fragments(vault)) == 4
+
+        # The operator does what the advisory asked.
+        stale.unlink()
+        third = self._ingest(source, vault, OCRConfig(enabled=True, engine="spy"))
+
+        assert len(_vault_fragments(vault)) == 3
+        assert not any("superseded" in message for message in third.warnings)

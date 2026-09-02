@@ -1572,6 +1572,7 @@ def pre_write_advisories(
     ingest_result: IngestResult,
     input_path: Path,
     ocr_disabled: bool = False,
+    ledger: SourceLedger | None = None,
 ) -> list[Advisory]:
     """Collect every advisory that must be raised BEFORE the first write.
 
@@ -1597,6 +1598,10 @@ def pre_write_advisories(
     * **Scanned PDF left un-OCR'd.** A document pass under ``ocr.enabled:
       false`` still ingests every other file, so the one under-read PDF would
       otherwise vanish into a run that reports success (#1639).
+    * **An un-OCR'd predecessor superseded.** Turning OCR on re-mints a
+      previously-ingested scan per page and strands the original, which is the
+      **default** next run for anyone upgrading, so it cannot be left silent
+      (#1639).
 
     Gathering them here keeps :func:`run_ingest` — already at the project's
     complexity ceiling — from growing a branch per advisory, and makes the
@@ -1612,6 +1617,11 @@ def pre_write_advisories(
         ocr_disabled: Whether :func:`ocr_is_disabled` refused to run this
             pass. Passed in rather than re-derived, because this function
             holds neither the ingestor class nor the config.
+        ledger: The resolved ledger for this run, or ``None``. Passed for the
+            same reason *writer* is — it is resolved vault state this function
+            reads rather than derives — and needed because the #1639 advisory
+            keys on a recorded ``source_key`` rather than on anything
+            recomputable from the fragments in hand.
 
     Returns:
         The advisories that apply, in the order they should be delivered.
@@ -1643,6 +1653,11 @@ def pre_write_advisories(
     declined = scanned_pdf_declined_warning(ingest_result.fragments)
     if declined is not None:
         advisories.append(declined)
+    superseded = superseded_scan_warning(
+        ledger, writer, ingest_result.fragments, vault_path
+    )
+    if superseded is not None:
+        advisories.append(superseded)
     return advisories
 
 
@@ -1660,6 +1675,127 @@ operator's input. The text is a fixed constant with no interpolation, so it
 names a config key rather than a fragment and travels verbatim across an MCP
 tier ceiling.
 """
+
+
+_SUPERSEDED_SCAN_WARNING_TEMPLATE = (
+    "This vault holds {count} fragment(s) written by an earlier ingest of the "
+    "same scanned PDF(s), before OCR was switched on — each one empty-bodied, "
+    "because the pages are images. Each is now superseded by the per-page "
+    "fragments this run writes, and is left in place: {sample}. Nothing is "
+    "deleted automatically — inspect with `creek purge source --source-path "
+    "<path> --match exact --dry-run`, and purge only what you recognise. "
+    "Links pointing at a superseded fragment keep resolving to it until you do."
+)
+"""Advisory for a vault upgrading from an un-OCR'd scan to per-page fragments.
+
+The #1639 sibling of :data:`_COLLAPSED_UNIT_WARNING_TEMPLATE`, and a separate
+advisory because the *detection* has to be different — see
+:func:`superseded_scan_warning`. The operator-facing shape is deliberately the
+same, down to the inspection command, because the situation is the same one
+:data:`_COLLAPSED_UNIT_WARNING_TEMPLATE` describes: one fragment superseded by
+N, detected, reported, and left alone.
+
+Interpolates fragment ids, which are vault content, so it must not leave this
+process for a caller whose ceiling has not admitted it. See
+:data:`_SUPERSEDED_SCAN_SAFE_TEMPLATE`.
+"""
+
+_SUPERSEDED_SCAN_SAFE_TEMPLATE = (
+    "This vault holds {count} fragment(s) written by an earlier ingest of the "
+    "same scanned PDF(s), before OCR was switched on — each one empty-bodied, "
+    "because the pages are images. Each is now superseded by the per-page "
+    "fragments this run writes, and is left in place. Run the same ingest at a "
+    "terminal to see which fragments. Nothing is deleted automatically — "
+    "inspect with `creek purge source --source-path <path> --match exact "
+    "--dry-run`, and purge only what you recognise. Links pointing at a "
+    "superseded fragment keep resolving to it until you do."
+)
+"""The content-free twin of :data:`_SUPERSEDED_SCAN_WARNING_TEMPLATE` (#1372).
+
+Interpolates a count and nothing else: no fragment id, no path, no body.
+"""
+
+
+def superseded_scan_warning(
+    ledger: SourceLedger | None,
+    writer: VaultWriter,
+    fragments: Sequence[ParsedFragment],
+    vault_path: Path,
+) -> Advisory | None:
+    """Return the un-OCR'd-predecessor advisory, or ``None`` (#1639).
+
+    Before the scanned-PDF OCR route existed, a scanned PDF ingested as
+    **one** fragment with an empty body, keyed on the bare file key. It now
+    ingests as N fragments keyed ``<base_key>#page-1…N``. The bare key matches
+    none of those, so the original is neither updated nor tombed —
+    ``document`` is deliberately absent from :data:`TOMBING_SOURCES` — and an
+    operator who merely re-runs their usual ingest silently acquires a
+    duplicate. That transition is the **default** next run, not an opt-in:
+    ``CreekConfig().ocr`` defaults to ``enabled=True``.
+
+    **Why this cannot reuse :func:`collapsed_unit_warning`.** That function
+    finds its superseded fragment by recomputing
+    ``generate_fragment_id(source_path, timestamp, parsed.content)`` — and on
+    this path ``content`` is exactly what changed, from the empty extraction
+    to the OCR'd text. The recomputed id is one no vault ever held, so the
+    lookup misses and the advisory is structurally silent here. Measured: the
+    recomputation yields three ids absent from the index while the stale
+    fragment sits in it under a fourth. The detection therefore keys on the
+    **ledger's own ``source_key``**, which is the one identifier the OCR does
+    not touch.
+
+    **Detected, reported, and left alone**, which is the answer #1305 and
+    #1304 ratified for this shape. The detection here is exact rather than
+    heuristic — the ledger *records* that this fragment came from this key —
+    but the second half of their reasoning is untouched by that: an ingest run
+    cannot know whether the operator has since edited that fragment, linked to
+    it, or curated it into a thread. Tombing it would also require adding
+    ``document`` to :data:`TOMBING_SOURCES`, reversing the #1329 split of
+    identity from deletion authority, which is not a call a bug fix gets to
+    make.
+
+    Self-clearing, like its sibling: once the operator purges the superseded
+    fragment the ``find_fragment`` lookup misses and the run goes quiet. Also
+    silent on a fresh vault, and on every source that mints no ``source_unit``.
+
+    Args:
+        ledger: The resolved ledger for this run, or ``None`` when the source
+            type is unledgered — in which case there is no recorded
+            predecessor to supersede and nothing to say.
+        writer: The vault writer, consulted read-only via
+            :meth:`~creek.vault.writer.VaultWriter.find_fragment`, so a record
+            whose fragment the operator already deleted stays quiet.
+        fragments: This run's parsed fragments, before any are written.
+        vault_path: Vault root, needed to derive the same source key the
+            ledger recorded.
+
+    Returns:
+        The advisory in both disclosure forms, or ``None`` when this run
+        supersedes nothing.
+    """
+    if ledger is None:
+        return None
+    superseded: list[str] = []
+    for parsed in fragments:
+        if parsed.source_unit is None:
+            continue
+        record = ledger.get(derive_source_key(parsed.source_path, vault_path))
+        if record is None or record.tombed:
+            continue
+        if record.fragment_id in superseded:
+            continue
+        if writer.find_fragment(record.fragment_id) is not None:
+            superseded.append(record.fragment_id)
+    if not superseded:
+        return None
+    sample = ", ".join(sorted(superseded)[:_COLLAPSED_UNIT_SAMPLE])
+    if len(superseded) > _COLLAPSED_UNIT_SAMPLE:
+        sample = f"{sample}, …"
+    count = len(superseded)
+    return Advisory(
+        message=_SUPERSEDED_SCAN_WARNING_TEMPLATE.format(count=count, sample=sample),
+        ceiling_safe=_SUPERSEDED_SCAN_SAFE_TEMPLATE.format(count=count),
+    )
 
 
 _SCANNED_PDF_OCR_DECLINED_ADVISORY: Final[str] = (
@@ -1986,6 +2122,7 @@ def run_ingest(
         ingest_result=ingest_result,
         input_path=input_path,
         ocr_disabled=ocr_is_disabled(ingestor_cls, ocr),
+        ledger=ledger,
     ):
         warn(advisory.message, ceiling_safe=advisory.ceiling_safe)
 
