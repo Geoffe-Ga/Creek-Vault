@@ -189,8 +189,10 @@ The **unreachable** row is distinguished purely by transport outcome:
 connection refused, a DNS/TLS failure, a timeout, a non-JSON body, or an HTTP
 status outside the closed set the contract publishes — `{200, 401, 403, 404,
 409, 415, 422, 500, 501, 503}` (`ALLOWED_HTTP_STATUSES` in the contract test
-suite, derived from `ERROR_STATUS`'s range plus `200`; `415` joined it at
-contract `0.8.0` with `unsupported_source`). A conforming client MUST map it to
+suite, derived on both halves: the refusals from `ERROR_STATUS`'s range, the
+successes from the route table's `RouteSpec.success_responses`, which every
+route currently leaves at the default single `200` (#1605). `415` joined the
+set at contract `0.8.0` with `unsupported_source`). A conforming client MUST map it to
 a distinct local state and MUST NOT synthesize a capabilities body, and MUST
 NOT fold it into "uninitialized" — those are different facts an operator
 needs to act on differently.

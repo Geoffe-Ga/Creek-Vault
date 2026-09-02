@@ -32,9 +32,10 @@ Three properties carry most of the weight:
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, fields
-from typing import TYPE_CHECKING, Final
+from typing import Final
 
 import pytest
+from pydantic import BaseModel
 
 from creek_mcp.api.models import (
     CONTRACT_MODELS,
@@ -60,15 +61,15 @@ from creek_mcp.api.models import (
 )
 from creek_mcp.api.routes import (
     IMPLEMENTED_CAPABILITIES,
+    PUBLISHABLE_SUCCESS_STATUSES,
+    PUBLISHED_SUCCESS_STATUSES,
     ROUTE_BODY_CAPS,
     ROUTES,
     UPLOAD_MAX_BODY_BYTES,
     RouteSpec,
+    published_success_statuses,
 )
 from creek_mcp.tools.upload import MAX_UPLOAD_BYTES
-
-if TYPE_CHECKING:
-    from pydantic import BaseModel
 
 # --------------------------------------------------------------------------- #
 # The published table, restated here rather than imported
@@ -299,6 +300,150 @@ def test_every_route_carries_a_summary() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Per-route success responses (#1605)
+#
+# Until this landed, "the one success status any operation documents" was a
+# module constant in the generator (``openapi.py``'s ``_SUCCESS_STATUS``) and a
+# literal ``200`` in five test modules. A route that answers a second success
+# status could not be expressed at all, and the closed status set the contract
+# publishes was derived from the error table alone. The declaration now lives
+# on the route, beside the request and response models it belongs with, and
+# every derivation of the published set reads it from the table.
+#
+# Every route currently keeps the default, so the generated document is
+# byte-identical — pinned by the golden file in ``test_v1_api_openapi.py``.
+# --------------------------------------------------------------------------- #
+
+
+def test_every_route_declares_its_published_success_responses() -> None:
+    """Each route resolves to a non-empty status-to-model mapping.
+
+    A *mapping*, not a bare tuple of statuses, because the generator derives
+    each success response's schema from a model: one route documenting two
+    success statuses documents two different bodies, and a tuple of ints
+    carries the statuses without the bodies.
+    """
+    for spec in ROUTES:
+        declared = spec.published_success_responses
+        assert declared, spec.operation_id
+        for status, model in declared:
+            assert status in PUBLISHABLE_SUCCESS_STATUSES, spec.operation_id
+            assert model is None or issubclass(model, BaseModel), spec.operation_id
+
+
+def test_every_route_still_declares_the_single_200_default() -> None:
+    """Nothing on the published table has moved off the default yet.
+
+    This is the assertion that makes the diff reviewable: the mechanism is
+    landed and inert, so the whole of its effect on the published document is
+    "no change". The first route to declare a second success status has to
+    edit this test on purpose.
+    """
+    assert all(spec.success_responses is None for spec in ROUTES)
+    assert all(
+        spec.published_success_responses == ((200, spec.response_model),)
+        for spec in ROUTES
+    )
+
+
+def test_the_published_success_statuses_are_derived_from_the_table() -> None:
+    """The published success set is read off the routes, not restated.
+
+    Derived, so the day a route declares a ``202`` the closed status set the
+    contract publishes grows with it in every module that consumes it, rather
+    than in the five that remembered to be edited.
+    """
+    published = PUBLISHED_SUCCESS_STATUSES
+    assert published == published_success_statuses(ROUTES)
+    assert published == frozenset({200})
+
+
+def test_a_second_success_status_reaches_the_derived_set() -> None:
+    """A route declaring ``202`` widens the derived set — the mutation proof.
+
+    Built from a local route tuple rather than by mutating ``ROUTES``, which
+    is frozen data three other modules read. Without this the derivation above
+    would be indistinguishable from a hardcoded ``{200}``.
+    """
+    accepting = RouteSpec(
+        path="/v1/things",
+        method="POST",
+        operation_id="createThing",
+        capability=None,
+        request_model=None,
+        response_model=WheelResponse,
+        requires_contract_version=True,
+        summary="A route that answers two success statuses.",
+        success_responses=((200, WheelResponse), (202, CapabilitiesResponse)),
+    )
+    assert published_success_statuses((*ROUTES, accepting)) == frozenset({200, 202})
+
+
+def test_a_route_may_not_declare_an_empty_success_response_set() -> None:
+    """An operation documenting no success at all is a build failure.
+
+    Refused at import, like the templated-path body cap, because the failure
+    it prevents is an operation published with only refusals in it — a
+    document telling a consumer the route can never succeed.
+    """
+    with pytest.raises(ValueError, match="at least one success response"):
+        _spec_with_success_responses(())
+
+
+def test_a_route_may_not_declare_the_same_success_status_twice() -> None:
+    """Two entries for one status would silently drop one of the two bodies.
+
+    ``_responses`` keys on the status, so the second entry would overwrite the
+    first and the document would publish one body while the table declared
+    two.
+    """
+    with pytest.raises(ValueError, match="declares status 200 twice"):
+        _spec_with_success_responses(((200, WheelResponse), (200, WheelResponse)))
+
+
+@pytest.mark.parametrize("status", [201, 204, 404, 503], ids=str)
+def test_a_route_may_not_publish_a_success_status_outside_the_closed_pair(
+    status: int,
+) -> None:
+    """Only ``200`` and ``202`` may be declared as a success.
+
+    The two refusal statuses in this list are the sharp cases. Declaring a
+    ``404`` as a *success* would exempt it from
+    ``test_every_non_success_response_is_the_error_envelope``, so a route
+    could publish a bespoke body on a refusal status — which is exactly how a
+    second error shape, and then a field echoing vault material, is born.
+    ``201`` and ``204`` are refused because the contract publishes a closed
+    status set and neither is in it.
+    """
+    with pytest.raises(ValueError, match="not a publishable success status"):
+        _spec_with_success_responses(((status, WheelResponse),))
+
+
+def _spec_with_success_responses(
+    declared: tuple[tuple[int, type[BaseModel] | None], ...],
+) -> RouteSpec:
+    """Build a throwaway route declaring *declared*, for the guard tests.
+
+    Args:
+        declared: The ``success_responses`` value under test.
+
+    Returns:
+        The constructed spec, when the guard admits it.
+    """
+    return RouteSpec(
+        path="/v1/things",
+        method="POST",
+        operation_id="createThing",
+        capability=None,
+        request_model=None,
+        response_model=WheelResponse,
+        requires_contract_version=True,
+        summary="A route built only to exercise the success-response guard.",
+        success_responses=declared,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # The contract-version gate, per route
 # --------------------------------------------------------------------------- #
 
@@ -504,7 +649,7 @@ def test_every_route_model_is_a_published_contract_model() -> None:
 
 
 def test_route_spec_declares_the_published_fields() -> None:
-    """``RouteSpec`` carries exactly the nine fields the adapter consumes."""
+    """``RouteSpec`` carries exactly the ten fields the adapter consumes."""
     assert {field.name for field in fields(RouteSpec)} == {
         "path",
         "method",
@@ -515,6 +660,7 @@ def test_route_spec_declares_the_published_fields() -> None:
         "requires_contract_version",
         "summary",
         "max_body_bytes",
+        "success_responses",
     }
 
 
