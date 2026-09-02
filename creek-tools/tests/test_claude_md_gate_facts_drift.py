@@ -655,7 +655,9 @@ def test_component_tree_declares_its_unenumerated_packages() -> None:
             )
         )
     )
-    undeclared = [f"{name}/" for name in _UNENUMERATED_PACKAGES if f"{name}/" not in spans]
+    undeclared = [
+        f"{name}/" for name in _UNENUMERATED_PACKAGES if f"{name}/" not in spans
+    ]
     assert not undeclared, (
         "creek-tools/CLAUDE.md §5.2 shows only __init__.py for "
         f"{undeclared} while its lead-in no longer says so -- a reader is told "
