@@ -3170,6 +3170,95 @@ class TestEmittedMarkerCarveOut:
         assert result == "[REDACTED:[REDACTED:api_key]]"
         assert _AWS_EXAMPLE_KEY not in result
 
+    def test_a_multi_line_template_is_not_inert_to_the_per_line_scanner(
+        self, tmp_path: Path
+    ) -> None:
+        """CHARACTERISATION of a known limit, green from the start.
+
+        The redactor walks the whole document; ``_scan_high_entropy``
+        walks ``text.splitlines()``. A ``replacement_template``
+        containing a line break — which the config validator accepts,
+        since it checks placeholders only — therefore renders a marker
+        the scanner can never see intact: it meets the run at offset 0
+        while the map says the run sits at offset 11, so the literal
+        check fails and the run is yielded.
+
+        The direction is **fail-closed**: ``--scan`` over-reports rather
+        than under-reports, and no secret escapes. But the report is
+        *unclearable* — ``--apply`` correctly treats the marker as a
+        fixed point — so ``creek process``, whose redaction stage is
+        fail-loud, stays blocked on a count no re-run can reduce. That is
+        the #945 availability failure surviving on one non-default
+        configuration, pinned here rather than left to be rediscovered.
+
+        Closing it means either giving the scanner document coordinates
+        or rejecting such a template at config load. Both change which
+        walk owns coordinates — the trade-off #900 already litigated for
+        ``_collect_spans`` — and neither belongs in this fix.
+        """
+        config = RedactionConfig(
+            min_confidence=0.0, replacement_template="[REDACTED:\n{name}]"
+        )
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+        marker = f"[REDACTED:\n{_COMBO_MARKER_RUN}]"
+        target = tmp_path / "split.md"
+        target.write_text(f"{marker}\n", encoding="utf-8")
+
+        assert redactor.redact_content(marker) == marker
+        assert [(m.match_type, m.line_number) for m in scanner.scan_file(target)] == [
+            ("high_entropy_string", 2)
+        ]
+
+    def test_a_delimiter_free_template_exempts_its_bare_pattern_names(self) -> None:
+        """CHARACTERISATION of the exemption's true scope, green from the start.
+
+        The carve-out is described as two conditions — byte-equality AND
+        the marker literal at the run's exact offset. The second carries
+        information only when the marker has a delimiter. Under a template
+        like ``'{name}'`` the rendered marker *is* one whole candidate
+        run, so ``offset`` is 0 and the literal check is true by
+        construction: the exemption degenerates to matching that config
+        string anywhere.
+
+        The consequence, pinned so it cannot change silently: under such a
+        template a ``custom_patterns`` **key** of 20+ token characters
+        acts as a ``false_positive_allowlist`` entry for its own name.
+        This IS a reduction in what gets redacted for that configuration.
+        It is bounded to operator-supplied bytes — the map is built only
+        from names fixed at config load, so nothing in a scanned document
+        can enter it — and ``false_positive_allowlist`` already grants the
+        identical power in one step.
+
+        It is kept rather than closed because requiring an *interior* run
+        would cost marker inertness under every delimiter-free template
+        (``'{name}'``, ``'REDACTED_{name}_END'``), reinstating the #945
+        nesting for operators who chose one. The second assertion is the
+        containment: under the default template the same string is still
+        redacted, so the exposure is scoped to the degenerate template and
+        never reaches the shipped default.
+        """
+        name = "EXAMPLE_NOT_A_SECRET_TOKEN_XYZ"  # pragma: allowlist secret
+        content = f"token: {name}"
+        configs = (
+            RedactionConfig(
+                min_confidence=0.0,
+                replacement_template="{name}",
+                custom_patterns={name: "zzz-never-matches"},
+            ),
+            RedactionConfig(
+                min_confidence=0.0, custom_patterns={name: "zzz-never-matches"}
+            ),
+        )
+
+        results = []
+        for config in configs:
+            scanner = RedactionScanner(config=config)
+            redactor = Redactor(config=config, salt=scanner.salt)
+            results.append(redactor.redact_content(content))
+
+        assert results == [content, "token: [REDACTED:high_entropy_string]"]
+
     def test_marker_data_is_built_once_from_the_full_pattern_set(self) -> None:
         """The exempt set must not depend on the caller's ``pattern_types``.
 

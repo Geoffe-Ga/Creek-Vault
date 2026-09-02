@@ -151,11 +151,21 @@ For every match found by the scan:
    exemption is matched as a *literal at its own offset*, never by shape:
    a forged `[REDACTED:<a real secret>]` is still redacted, a bare
    pattern name in prose is still redacted, and the regex detectors keep
-   firing inside marker text. It holds for any template whose `{name}` is
-   delimited on both sides by a character outside `[A-Za-z0-9+/=_-]` —
-   the default `[REDACTED:{name}]` is. A degenerate template can splice a
-   marker flush against neighbouring token characters, forming a *new*,
-   longer run that is correctly not exempt.
+   firing inside marker text. The guarantee holds for a single-line
+   `replacement_template` whose `{name}` is delimited on both sides by a
+   character outside `[A-Za-z0-9+/=_-]` — the default `[REDACTED:{name}]`
+   is. Two caveats apply to other templates, and neither affects the
+   default. **Delimiter-free** templates (`{name}`, `REDACTED_{name}_END`)
+   render a marker that is *itself* one candidate run, so the exemption
+   reduces to matching that literal anywhere; a `custom_patterns` **key**
+   of 20+ token characters then acts as a `false_positive_allowlist` entry
+   for its own name, and a marker spliced flush against neighbouring token
+   characters forms a *new*, longer run that is correctly not exempt.
+   **Multi-line** templates are worse: `--apply` still treats the marker as
+   inert, but `--scan` walks line by line and cannot see a marker that
+   straddles the break, so it reports a finding that no `--apply` can
+   clear — which also blocks `creek process`. Keep the template on one
+   line.
 2. Refuses to write through symlinks (path-traversal guard): before any
    file is read or rewritten the source tree is walked and the run is
    aborted if any descendant symlink resolves outside the source root.

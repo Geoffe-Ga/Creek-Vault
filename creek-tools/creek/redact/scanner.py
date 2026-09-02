@@ -1010,7 +1010,36 @@ def iter_unmarked_candidates(
     matches maximally, so a secret written flush against a marker forms a
     *longer* run than the marker's own, fails byte-equality, and stays a
     candidate. The exempt bytes are always a pattern *name* inside a
-    literal marker at an exact offset, never operator data.
+    literal marker at an exact offset, never content the tool was asked to
+    scan.
+
+    Two limits of that argument, stated because they are easy to overread:
+
+    - **The literal-presence conjunct only carries information when the
+      marker has a delimiter.** If a rendered marker is *itself* one whole
+      candidate run — the case for a template like ``'{name}'`` or
+      ``'REDACTED_{name}_END'``, where nothing outside
+      ``[A-Za-z0-9+/=_-]`` brackets the name — then ``offset`` is 0 and
+      ``text.startswith(marker, candidate.start())`` is true by
+      construction, since the candidate group already *is* that marker.
+      The gate degenerates to bare byte-equality against a config string,
+      matched anywhere. Under such a template a ``custom_patterns`` key
+      that is 20+ token characters therefore becomes a global exemption
+      for that literal — the same power ``false_positive_allowlist``
+      already grants in one step, and equally operator-supplied: the map
+      is built only from names fixed at config load, so nothing in a
+      scanned document can enter it. It is kept rather than closed
+      because requiring an interior run would cost marker inertness under
+      exactly those delimiter-free templates, reinstating the #945
+      nesting for operators who chose one.
+    - **A marker that is not intact on the line being scanned is not
+      exempt.** ``RedactionScanner._scan_high_entropy`` walks lines while
+      the redactor walks the whole document, so a template containing a
+      ``str.splitlines()`` boundary makes the scanner see a run at
+      offset 0 against a non-zero ``offset`` and yield it. That direction
+      is fail-closed — ``--scan`` over-reports rather than under-reports —
+      but the report is *unclearable*, because ``--apply`` correctly
+      leaves such a marker alone. Prefer a single-line template.
 
     Cost is one dict lookup per candidate run — nothing when the map is
     empty, which is the case for any template whose markers hold no run
