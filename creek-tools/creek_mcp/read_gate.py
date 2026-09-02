@@ -190,15 +190,31 @@ enforced" — and ``creek_mcp/tools/classify.py`` says the same in its own
 words: the ceiling "is recorded for the audit trail; it does not gate
 execution". Both are true of the envelope and beside the point on this
 channel. With ``method="llm"`` the whole corpus, every tier of it, goes
-through a provider, defended only by
+through a provider. Three controls stand between it and a cloud endpoint,
+and **none of them is the caller's ceiling**:
 :class:`creek.classify.llm.router.ModelRouter`'s Intimate-never-cloud gate —
 which ``creek/classify/classify_engine.py`` reaches by resolving a second,
-intimate-only classifier config, and which says nothing about ``personal``.
-Layer (g) structurally cannot enrol it: the derivation looks for a
-function taking both ``llm_factory`` and ``privacy_tier_ceiling``, and
-``classify_tool`` takes no factory — so the reason this tool is absent from
-the prompt manifest is a fact about its signature, not a finding about its
-safety. Tracked in **#1274**.
+intimate-only classifier config, and which is never even *asked* about
+``personal``: the engine's split is binary (``build_tier_classifiers``
+resolves tier-less and ``INTIMATE`` only; ``TierClassifiers.for_tier`` is
+``if tier is not PrivacyTier.INTIMATE``), so a redirect added to the router
+alone would be inert —
+plus two **host-operator** gates that answer "may this machine talk to a
+cloud at all" rather than "may this caller, at this ceiling":
+``creek.classify.llm.consent.has_cloud_consent`` (folded in by
+``AnthropicProvider.available``) and ``_assert_classifiers_available``, which
+refuses before a single fragment is read. Layer (g) cannot enrol it, for
+**two** reasons and not one: the derivation runs over ``_GATED_TOOLS``, and
+this tool is ``METADATA_ONLY``, so it never enters the candidate set at all;
+and separately the derivation looks for a function taking both
+``llm_factory`` and ``privacy_tier_ceiling``, and ``classify_tool`` takes no
+factory. Adding a factory parameter alone would therefore enrol nothing. Its
+absence from the prompt manifest is a fact about its posture and its
+signature, not a finding about its safety — and it is no longer an
+unrecorded one: see :data:`_CLASSIFY_PROMPT_CHANNEL_RATIONALE` for the
+per-tool statement and
+``tests/test_mcp_read_gate.py::test_classify_hands_every_tier_to_the_provider_its_router_resolves``
+for the probe that executes it (#1274).
 """
 
 from __future__ import annotations
@@ -295,6 +311,52 @@ to an attribute of this module.
 _COUNTS_ONLY_RATIONALE = (
     "Returns counts only and produces no new tiered content; the ceiling is "
     "audited for the trail, not enforced."
+)
+
+_CLASSIFY_PROMPT_CHANNEL_RATIONALE = (
+    "METADATA_ONLY is a claim about the RESPONSE envelope only, and on that "
+    "channel it holds: classify returns counts, never fragment text, and "
+    "rewrites frontmatter in place rather than producing new tiered content, "
+    "so the ceiling is audited for the trail and not enforced. The prompt "
+    "channel is a different question and the answer is different. With "
+    "method='llm', creek.classify.classify_engine.run_classify walks every "
+    "'.md' under 01-Fragments -- every tier of it, at every ceiling including "
+    "open -- and hands each fragment's TITLE AND BODY to the configured "
+    "classification provider. Both, not just the body: "
+    "build_classification_prompt interpolates title= and content= alike, each "
+    "passed through _sanitise_for_prompt, which neutralises YAML/HTML-comment "
+    "injection vectors and caps EACH at _MAX_PROMPT_CONTENT_CHARS (8192). The "
+    "title is called out because this module already treats it as a "
+    "first-class leak vector everywhere else -- creek.report and "
+    "creek.skills.refresh both argue that a '[Personal-tier summary: <title>]' "
+    "stub leaks the title it claims to protect, and creek.redact.scan rests on "
+    "fragment filenames being slugified titles. A statement of this channel "
+    "that said 'body' and stopped would understate it in exactly the dimension "
+    "this file has already decided is load-bearing. "
+    "The caller's ceiling is not one of the controls on that walk. Three "
+    "things are. (1) ModelRouter._enforce_local_for_intimate (#647/#666) "
+    "redirects an INTIMATE fragment to the local default or raises "
+    "IntimateRoutingError. It is the only tier gate, and the split it sits "
+    "behind is BINARY, decided in the engine rather than in the router: "
+    "build_tier_classifiers asks the router exactly twice -- once tier-less "
+    "and once for PrivacyTier.INTIMATE -- and TierClassifiers.for_tier is "
+    "'if tier is not PrivacyTier.INTIMATE: return self.non_intimate'. So "
+    "PERSONAL is never presented to the router at all; it takes the tier-less "
+    "classifier and reaches the configured cloud provider unchanged. Widening "
+    "the router's redirect to cover PERSONAL would therefore be INERT -- "
+    "verified by mutation, and the reason any real fix has to move for_tier "
+    "and build_tier_classifiers, not just _enforce_local_for_intimate. "
+    "(2) creek.classify.llm.consent.has_cloud_consent, folded in by "
+    "AnthropicProvider.available. (3) _assert_classifiers_available, which "
+    "refuses before a single fragment is read. (2) and (3) are HOST-OPERATOR "
+    "gates: they answer 'may this machine talk to a cloud at all', never 'may "
+    "this caller, at this ceiling'. Executed by "
+    "test_classify_hands_every_tier_to_the_provider_its_router_resolves. "
+    "Gating the walk on the caller's ceiling is deliberately NOT done: "
+    "creek_mcp/httpapi/pipeline.py records that _TIER_RANK ranks unclassified "
+    "equal to personal, so refusing to classify above the ceiling would leave "
+    "those fragments unclassified and still inside a personal consumer's "
+    "reach -- preserving an exposure rather than preventing one (#1274)."
 )
 
 _PURGE_RATIONALE = (
@@ -623,7 +685,7 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.classify": ToolPosture(
         posture=ReadPosture.METADATA_ONLY,
-        rationale=_COUNTS_ONLY_RATIONALE,
+        rationale=_CLASSIFY_PROMPT_CHANNEL_RATIONALE,
     ),
     "creek.classify.entry": ToolPosture(
         posture=ReadPosture.GATED,

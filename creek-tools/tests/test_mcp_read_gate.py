@@ -187,12 +187,15 @@ import frontmatter
 import pytest
 
 from creek.author.client import AuthorLLMClient
+from creek.classify.llm import LLMClassificationResult
 from creek.classify.llm.completion import Completion
-from creek.config import CreekConfig
+from creek.classify.llm.prompts import build_classification_prompt
+from creek.config import CreekConfig, LLMConfig
 from creek.generate.mining import MiningStrategy
-from creek.models import PrivacyTier
+from creek.models import Fragment, PrivacyTier
 from creek_mcp.policy import Transport
 from creek_mcp.read_gate import (
+    _COUNTS_ONLY_RATIONALE,
     CANONICAL_GATE_PRIMITIVES,
     GENERIC_ABOVE_CEILING_REASON,
     TOOL_POSTURES,
@@ -203,6 +206,7 @@ from creek_mcp.read_gate import (
 from creek_mcp.server import build_server
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 from creek_mcp.tools.author import author_tool
+from creek_mcp.tools.classify import classify_tool
 from creek_mcp.tools.classify_entry import entry_classification_tool
 from creek_mcp.tools.compile import _ABOVE_CEILING_REASON, compile_tool
 from creek_mcp.tools.draft import draft_tool
@@ -418,6 +422,112 @@ _AUTH_TOKEN_TOOLS = sorted(
     for name, entry in TOOL_POSTURES.items()
     if entry.posture is ReadPosture.AUTH_TOKEN
 )
+
+# The one tool ``_COUNTS_ONLY_RATIONALE`` is true of. Kept as a set rather than
+# an insertion-ordered tuple because this is a claim about *membership*: a
+# future reordering of TOOL_POSTURES would false-red a tuple comparison while
+# nothing about the egress profile of any tool had changed.
+_COUNTS_ONLY_RATIONALE_USERS = frozenset({"creek.link"})
+
+
+def test_the_counts_only_rationale_is_not_reused_by_a_provider_reaching_tool() -> None:
+    """The shared counts-only sentence stays on the one tool it is true of.
+
+    This is the chokepoint #1274 actually failed at. ``creek.classify`` did not
+    acquire a response-shaped posture note by being written carelessly; it
+    acquired one by *borrowing* ``creek.link``'s. One string shared across two
+    tools with different egress profiles is how a true statement becomes a
+    false one with nobody editing it.
+
+    The repair is a second constant, never an edit to this one.
+    ``creek/link/link_engine.py`` reaches no provider -- 0 matches for
+    ``llm``/``provider``/``anthropic``/``openai``/``complete(`` across its 787
+    lines, and its vectors come from a local sentence-transformer
+    (``creek/link/embeddings.py``, ADR-0004). The same grep over
+    ``creek/classify`` hits ten files, so that zero is a real zero and not a
+    broken pattern. Editing the shared sentence would hang an egress caveat on
+    a tool that has no egress.
+
+    Compared by ``==`` rather than ``is``: a verbatim copy-paste of the
+    sentence into a third entry is the same defect as a reference reuse, and an
+    identity check would miss it.
+    """
+    users = frozenset(
+        name
+        for name, entry in TOOL_POSTURES.items()
+        if entry.rationale == _COUNTS_ONLY_RATIONALE
+    )
+    assert users == _COUNTS_ONLY_RATIONALE_USERS, (
+        f"_COUNTS_ONLY_RATIONALE is claimed by {sorted(users)}, not "
+        f"{sorted(_COUNTS_ONLY_RATIONALE_USERS)}. It says a tool 'produces no "
+        "new tiered content' and that the ceiling is 'audited for the trail, "
+        "not enforced' -- both claims about the JSON envelope, made by a tool "
+        "whose engine constructs no provider. A tool that hands corpus text to "
+        "a model needs its own rationale saying so (see "
+        "_CLASSIFY_PROMPT_CHANNEL_RATIONALE and #1274). Do NOT repair this by "
+        "editing the shared constant: that puts an egress caveat on "
+        "creek.link, which has no egress."
+    )
+
+    # The replacement rationale must name symbols that RESOLVE, not prose that
+    # reads well -- the idiom this module already uses for
+    # CANONICAL_GATE_PRIMITIVES, whose names are likewise consumed as strings.
+    classify = TOOL_POSTURES["creek.classify"].rationale
+    for module_path, attr in (
+        ("creek.classify.classify_engine", "run_classify"),
+        ("creek.classify.classify_engine", "build_tier_classifiers"),
+        ("creek.classify.classify_engine", "TierClassifiers"),
+        ("creek.classify.classify_engine", "_assert_classifiers_available"),
+        ("creek.classify.llm.router", "ModelRouter"),
+        ("creek.classify.llm.router", "IntimateRoutingError"),
+        ("creek.classify.llm.consent", "has_cloud_consent"),
+        ("creek.classify.llm.prompts", "_MAX_PROMPT_CONTENT_CHARS"),
+        ("creek.classify.llm.prompts", "_sanitise_for_prompt"),
+        ("creek.classify.llm.prompts", "build_classification_prompt"),
+    ):
+        assert attr in classify, (
+            f"the creek.classify rationale never names {attr}, so a reader "
+            "cannot follow it to the code that does the work."
+        )
+        assert hasattr(importlib.import_module(module_path), attr), (
+            f"the rationale names {attr}, but {module_path}.{attr} does not "
+            "resolve -- the prose has drifted from the code it describes."
+        )
+    # Resolved as an ATTRIBUTE of ModelRouter, not merely found as a substring:
+    # the rationale names a specific method, and naming a method that no longer
+    # exists is the drift this whole check exists to catch.
+    assert "_enforce_local_for_intimate" in classify, (
+        "the rationale must name the specific method that redirects INTIMATE, "
+        "not just the class that holds it."
+    )
+    router_cls = importlib.import_module("creek.classify.llm.router").ModelRouter
+    assert hasattr(router_cls, "_enforce_local_for_intimate"), (
+        "the rationale names ModelRouter._enforce_local_for_intimate, but that "
+        "attribute no longer resolves -- the prose has drifted from the code."
+    )
+    # The rationale quotes for_tier's body verbatim. A behaviour-PRESERVING
+    # refactor (a dict lookup, a match statement) would leave that quote stale
+    # and this file green, so pin the quoted source itself.
+    for_tier_src = inspect.getsource(
+        importlib.import_module(
+            "creek.classify.classify_engine"
+        ).TierClassifiers.for_tier
+    )
+    assert "if tier is not PrivacyTier.INTIMATE" in for_tier_src, (
+        "_CLASSIFY_PROMPT_CHANNEL_RATIONALE quotes TierClassifiers.for_tier as "
+        "'if tier is not PrivacyTier.INTIMATE: return self.non_intimate', and "
+        "that is no longer what the source says. If for_tier was refactored "
+        "without changing behaviour, update the quote. If the tier split is no "
+        "longer binary, the rationale's central claim -- that PERSONAL is "
+        "never presented to the router, so widening the router alone is inert "
+        "-- needs rechecking (#1274)."
+    )
+    # #658/#661 (the issue body's citation) appear NOWHERE in the routing code.
+    # router.py says #647 and classify_engine.py says #666/#664.
+    assert "#647" in classify and "#658" not in classify, (
+        "cite #647/#666 -- the issues the routing code itself names. #658/#661 "
+        "have zero matches under creek/classify/llm/."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4355,3 +4465,402 @@ def test_the_draft_prompt_exemption_is_still_true(
             "are no longer vacuous. Delete the exemption from "
             f"_PROMPT_PROBE_EXEMPT and add a probe to _PROMPT_PROBES.\n\n{prompt}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Layer (g), fourth probe: creek.classify — a prompt-channel egress that the
+# derivation above cannot reach.
+#
+# The three probes above are parametrised off _PROMPT_PROBES, which is derived
+# from _GATED_TOOLS ∩ has-both-params. ``creek.classify`` fails that derivation
+# twice over (METADATA_ONLY posture, no llm_factory), and both exclusions are
+# correct: there is no gate to name, and there is no factory to inject. What
+# was missing was not enrolment but a *statement* — nothing in this file said
+# the exclusion was deliberate, and nothing anywhere executed the claim that
+# the ceiling is not a control on this tool's prompt channel (#1274).
+#
+# It cannot share _assert_prompt_channel_clean. That helper asserts the
+# intimate canary reaches NO prompt; here the intimate body legitimately
+# reaches one — the LOCAL one — and the whole point is which provider each
+# tier's body was handed to. Opposite contract, so a separate test rather than
+# a widening of the derivation.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _ClassifyEgress:
+    """One fragment's dispatch to a classification provider.
+
+    ``provider`` is read off the *resolved* :class:`LLMConfig` the engine built
+    the classifier with, so it is the router's verdict for that fragment's
+    tier, not the value the config file asked for. Those two differing is the
+    redirect working.
+    """
+
+    provider: str
+    fragment_id: str
+    title: str
+    content: str
+    prompt: str
+
+
+_CLASSIFY_EGRESS_CALLS: list[_ClassifyEgress] = []
+
+
+class _ClassifyEgressRecorder:
+    """Stands in for ``LLMClassifier`` and records what was dispatched to whom.
+
+    Mirrors the seam ``tests/test_classify_tier_routing.py`` already proves:
+    ``creek.classify.classify_engine.LLMClassifier`` is resolved at call time
+    inside ``build_tier_classifiers``, so monkeypatching the name reaches both
+    the intimate and the non-intimate classifier without any production seam
+    being added for the test's benefit.
+
+    Two attributes are load-bearing rather than decorative. ``config`` must be
+    a real :class:`LLMConfig` because ``_build_classify_throttle`` reads
+    ``classifier.config.max_concurrent``, and ``TierClassifiers.distinct()``
+    compares instances by identity. ``available`` must be ``True`` because
+    ``_assert_classifiers_available`` refuses the whole run before reading a
+    single fragment otherwise — which would make every assertion below vacuous
+    in the quiet direction.
+    """
+
+    def __init__(self, config: LLMConfig) -> None:
+        """Capture the resolved config; its ``provider`` is the assertion."""
+        self.config = config
+
+    @property
+    def available(self) -> bool:
+        """Reachable. The availability gate is a host-operator gate, not this."""
+        return True
+
+    def classify_with_reasoning(
+        self, fragment: Fragment, content: str
+    ) -> LLMClassificationResult:
+        """Record ``(provider, id, title, content)`` and echo the fragment back.
+
+        These are the exact arguments the real
+        ``LLMClassifier.classify_with_reasoning`` passes to ``_build_prompt``
+        →``build_classification_prompt``, which interpolates **both**
+        ``title=`` and ``content=`` into the outgoing prompt — each through
+        ``_sanitise_for_prompt``, which caps each at
+        ``_MAX_PROMPT_CONTENT_CHARS`` — before ``_invoke_llm`` sends it.
+        Recording them here is therefore a record of the payload at the
+        provider boundary, not of a helper's return value.
+
+        The title is captured separately from the body precisely so the two
+        can be asserted apart. The fixture writes the canary into title, body
+        and tags alike, so a single ``canary in content`` assertion could not
+        tell title-egress from body-egress — and the title is the vector this
+        module treats as first-class everywhere else.
+        """
+        # Build the prompt with the PRODUCTION builder, from the same
+        # (config, fragment, content) triple the engine just dispatched --
+        # this is verbatim what the real
+        # LLMClassifier.classify_with_reasoning does on its next line
+        # (orchestrator.py: `prompt = self._build_prompt(fragment, content)`,
+        # and _build_prompt is `return build_classification_prompt(...)`).
+        # It lets the probe assert on real prompt BYTES rather than on the
+        # arguments alone. Stated precisely, because the distinction matters:
+        # prompts.build_classification_prompt is genuinely executed here; the
+        # one link NOT executed is orchestrator's own call to it, which is a
+        # straight line with no branch between them.
+        _CLASSIFY_EGRESS_CALLS.append(
+            _ClassifyEgress(
+                provider=self.config.provider,
+                fragment_id=fragment.id,
+                title=fragment.title,
+                content=content,
+                prompt=build_classification_prompt(self.config, fragment, content),
+            )
+        )
+        return LLMClassificationResult(fragment=fragment, reasoning="")
+
+
+@pytest.fixture
+def classify_egress_vault(tmp_path: Path) -> Path:
+    """A three-tier vault plus the ``creek_config.yaml`` classify will read.
+
+    Its own fixture rather than ``prompt_canary_vault``. Not because writing a
+    config into that one would leak — both fixtures are function-scoped over
+    ``tmp_path``, so it could not — but because this probe's config
+    requirements are specific to it, and hanging them off a fixture whose
+    docstring documents a different contract would read as a property of that
+    contract.
+
+    ``classify_tool`` calls ``load_vault_config(vault_path)``, so the routing
+    under test has to come from the vault's own file at
+    ``00-Creek-Meta/creek_config.yaml``. An ambient ``CREEK_CONFIG`` would win
+    over it, and is already deleted for every test by conftest's autouse
+    ``_isolate_creek_config_env`` (#1354), so no ``delenv`` is needed here.
+
+    ``confidence_threshold: 2.0`` is accepted because
+    ``ClassificationConfig.confidence_threshold`` carries no ``le=`` bound
+    (contrast ``reclassify_on_edit_threshold``, which has both), and it makes
+    the rules short-circuit at ``_classify_one`` unreachable. Measured, not
+    assumed: at the default ``0.7`` these three bodies produce the identical
+    three calls, so the override is not load-bearing today. It is here to keep
+    a future rules-classifier tuning from silently turning this probe into a
+    test of nothing — and the call-count assertion is what would catch it if
+    it did.
+    """
+    vault = tmp_path / "classify-egress-vault"
+    for frag_id, tier, canary in (
+        (_RUNTIME_OPEN_ID, "open", _RUNTIME_OPEN_CANARY),
+        (_RUNTIME_PERSONAL_ID, "personal", _RUNTIME_PERSONAL_CANARY),
+        (_RUNTIME_INTIMATE_ID, "intimate", _RUNTIME_INTIMATE_CANARY),
+    ):
+        _write_fragment(
+            vault,
+            frag_id=frag_id,
+            # "canary title" / "canary body" are deliberately DISJOINT
+            # substrings. Both strings also carry the shared canary, but an
+            # assertion on the bare canary alone would be satisfied by either
+            # channel -- mutation M5 (dropping title= from the prompt) proved
+            # exactly that, and stayed green until these tokens were split.
+            title=f"{tier} canary title {canary}",
+            body=f"{tier} canary body {canary} a reflection worth keeping",
+            privacy_tier=tier,
+            tags=[canary],
+        )
+    meta = vault / "00-Creek-Meta"
+    meta.mkdir(parents=True, exist_ok=True)
+    (meta / "creek_config.yaml").write_text(
+        "classification:\n"
+        "  confidence_threshold: 2.0\n"
+        # Pins the path this probe actually tests. weighted_classification
+        # already defaults to False (config.py), but if it were True,
+        # _classify_one would take the _classify_one_weighted branch, which
+        # builds its own provider and never calls classify_with_reasoning --
+        # so the recorder would see nothing while bodies still reached a model.
+        "  weighted_classification: false\n"
+        "llm:\n"
+        "  default:\n"
+        "    provider: ollama\n"
+        "    model: qwen3:8b\n"
+        "  classification:\n"
+        "    provider: anthropic\n"
+        "    model: claude-haiku-4-5\n",
+        encoding="utf-8",
+    )
+    return vault
+
+
+def _classify_egress_provider_for(fragment_id: str) -> str:
+    """The provider that classified *fragment_id*, asserting exactly one call.
+
+    A count, not a clock. Exactly one is the only answer that distinguishes
+    working routing from the two ways this probe could be green about nothing:
+    a rules short-circuit that dispatched zero calls, and a double dispatch
+    whose second call went somewhere else.
+    """
+    hits = [
+        call.provider
+        for call in _CLASSIFY_EGRESS_CALLS
+        if call.fragment_id == fragment_id
+    ]
+    assert len(hits) == 1, (
+        f"expected exactly one classification dispatch for {fragment_id}, got "
+        f"{hits}. Zero has TWO explanations and they are not the same: either "
+        "nothing reached a provider at all (a rules short-circuit -- every "
+        "routing assertion below is then vacuous), or classification took the "
+        "_classify_one_weighted branch, which builds its own provider and "
+        "never calls classify_with_reasoning, so bodies DID reach a model "
+        "while this recorder saw none of it. Check "
+        "classification.weighted_classification before assuming the former. "
+        "More than one means the fragment was dispatched twice and 'which "
+        "provider saw it' has no single answer."
+    )
+    return hits[0]
+
+
+@pytest.mark.parametrize("ceiling", list(TierCeiling))
+def test_classify_hands_every_tier_to_the_provider_its_router_resolves(
+    ceiling: TierCeiling,
+    classify_egress_vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``creek.classify(method="llm")`` sends every tier out at EVERY ceiling.
+
+    Parametrised over the whole of :class:`TierCeiling` rather than run once at
+    ``open``, because "at every ceiling" is the load-bearing half of the claim
+    and an argued half is what #1274 was filed about. Structurally the ceiling
+    never reaches ``run_classify`` at all — ``classify_tool`` passes it only to
+    ``refusal_response`` and to ``MCPAuditLog.append`` — and this makes that
+    executable instead of a thing the reader has to go and check.
+
+    This is the executable half of
+    :data:`~creek_mcp.read_gate._CLASSIFY_PROMPT_CHANNEL_RATIONALE`, and it is
+    **green at HEAD by design**. #1274 is an un-executed claim, not broken
+    routing: ``personal → configured cloud provider`` is live, intended
+    behaviour that no test in this repo pinned. ``test_classify_tier_routing``
+    pins ``open`` and ``unclassified`` against the cloud and ``personal`` only
+    under an all-local config, where every tier resolves local and the router
+    is not exercised at all. The value here is characterisation; the
+    non-vacuity comes from mutation, never from redness.
+
+    Driven through ``classify_tool`` rather than ``run_classify`` because the
+    claim is about the MCP surface: the ceiling this call declares is ``open``,
+    the narrowest there is, and it changes nothing about where the bodies go.
+
+    ``force=False`` is load-bearing and was measured, not reasoned. With
+    ``force=True`` the tier pass re-derives every fragment's tier through
+    ``apply_tier``'s escalate-merge; on this fixture the heuristic escalates
+    **all three** fragments to ``intimate``, which routes all three local and
+    turns the personal assertion into a false red about a leak that did not
+    happen. With ``force=False`` and a concrete tier already on disk,
+    ``apply_tier`` returns the fragment untouched and the declared tier is what
+    the router reads. The resume short-circuit does not fire either, because
+    ``_write_fragment`` writes no ``classification_method`` key.
+    """
+    _CLASSIFY_EGRESS_CALLS.clear()
+    monkeypatch.setattr(
+        "creek.classify.classify_engine.LLMClassifier", _ClassifyEgressRecorder
+    )
+
+    response = classify_tool(
+        vault_path=classify_egress_vault,
+        method="llm",
+        force=False,
+        privacy_tier_ceiling=ceiling,
+    )
+
+    assert response["status"] == "ok", (
+        f"the probe never reached the provider at all: {response}. Every "
+        "assertion below would be vacuous."
+    )
+    assert response["total"] == 3, (
+        f"at ceiling={ceiling.value} classify walked {response['total']} "
+        "fragments, not the 3 the fixture wrote. The walk is "
+        "sorted(fragments_root.rglob('*.md')) with no ceiling filter, so a "
+        "different number means the fixture changed -- or that the ceiling "
+        "started bounding the walk, which would be a NARROWING worth keeping."
+    )
+    assert len(_CLASSIFY_EGRESS_CALLS) == 3, (
+        f"at ceiling={ceiling.value}, {len(_CLASSIFY_EGRESS_CALLS)} fragments "
+        "were dispatched to a classification provider, not 3. The ceiling does "
+        "not bound this walk at ANY of its values; if that changed, this is "
+        "the assertion that should say so."
+    )
+
+    # INTIMATE is redirected local, and 'ollama' is NOT the provider the config
+    # names for the classification stage -- it can only be produced by
+    # ModelRouter._enforce_local_for_intimate actually firing.
+    assert _classify_egress_provider_for(_RUNTIME_INTIMATE_ID) == "ollama", (
+        "creek.classify sent an INTIMATE fragment to the cloud instead of the "
+        "local default. ModelRouter._enforce_local_for_intimate (#647/#666) is "
+        "the ONLY tier gate on this path -- the caller's ceiling is not one, "
+        "and the consent and availability gates are host-operator gates that "
+        "cannot tell one caller from another."
+    )
+
+    # PERSONAL is not redirected. This pins a live exposure, not a guarantee.
+    assert _classify_egress_provider_for(_RUNTIME_PERSONAL_ID) == "anthropic", (
+        "a PERSONAL fragment no longer egresses to the configured cloud "
+        "provider. This assertion pins a live exposure, NOT a guarantee: if it "
+        "went red because PERSONAL is now redirected local too, that is an "
+        "IMPROVEMENT -- update this assertion and "
+        "_CLASSIFY_PROMPT_CHANNEL_RATIONALE together, and do not restore the "
+        "old routing to make it green (#1274)."
+    )
+    assert _classify_egress_provider_for(_RUNTIME_OPEN_ID) == "anthropic", (
+        "an OPEN fragment should reach the configured classification provider "
+        "unchanged; anything else means the stage config is not being used."
+    )
+
+    # The bodies really are the payload -- not merely that a call happened.
+    # Title and body are asserted SEPARATELY: build_classification_prompt
+    # interpolates both, and the fixture puts the canary in both, so a single
+    # combined check could not tell which channel carried it.
+    bodies = {call.fragment_id: call.content for call in _CLASSIFY_EGRESS_CALLS}
+    titles = {call.fragment_id: call.title for call in _CLASSIFY_EGRESS_CALLS}
+
+    assert "personal canary body" in bodies[_RUNTIME_PERSONAL_ID], (
+        "the personal fragment was dispatched, but its BODY was not the "
+        "payload. Without this the routing assertions would hold even if the "
+        "provider were handed an empty string, which is not the egress the "
+        "rationale describes. Asserted on the body-only substring, not the "
+        "bare canary, which also appears in the title."
+    )
+    assert "personal canary title" in titles[_RUNTIME_PERSONAL_ID], (
+        "the personal fragment's TITLE did not reach the provider. This is a "
+        "separate egress channel from the body: build_classification_prompt "
+        "interpolates title= as well as content=, and read_gate treats titles "
+        "as a first-class leak vector everywhere else (the "
+        "'[Personal-tier summary: <title>]' argument under creek.report and "
+        "creek.skills.refresh). If this ever goes green-to-red because titles "
+        "stopped being sent, that is a NARROWING -- update "
+        "_CLASSIFY_PROMPT_CHANNEL_RATIONALE with it (#1274)."
+    )
+    # ...and both really land in the PROMPT TEXT, not merely in the arguments.
+    prompts = {call.fragment_id: call.prompt for call in _CLASSIFY_EGRESS_CALLS}
+    personal_prompt = prompts[_RUNTIME_PERSONAL_ID]
+    assert "personal canary body" in personal_prompt, (
+        "the personal body did not survive into the formatted prompt that "
+        "would go on the wire."
+    )
+    assert "personal canary title" in personal_prompt, (
+        "the personal TITLE did not survive into the formatted prompt. "
+        "build_classification_prompt interpolates title= alongside content=; "
+        "if it stopped, _CLASSIFY_PROMPT_CHANNEL_RATIONALE's 'title and body' "
+        "claim is now wrong and must be narrowed to match (#1274)."
+    )
+
+    assert "intimate canary body" in bodies[_RUNTIME_INTIMATE_ID], (
+        "the intimate fragment's body is not in what was dispatched to the "
+        "local provider. The intimate body reaching a LOCAL prompt is correct "
+        "and expected -- this asserts the redirect carries the work rather "
+        "than dropping it."
+    )
+
+    # AC14: a tripwire, not evidence. classify's envelope is ints plus
+    # ``errors``, so no cheap mutation makes it carry a canary -- the same
+    # honest framing docs/mcp.md already uses for creek.skills.refresh and
+    # creek.classify.entry. It is here so that both halves of the rationale
+    # (response clean, prompt not) are executable rather than only asserted.
+    serialised = json.dumps(response, default=str)
+    for canary in (
+        _RUNTIME_OPEN_CANARY,
+        _RUNTIME_PERSONAL_CANARY,
+        _RUNTIME_INTIMATE_CANARY,
+    ):
+        assert canary not in serialised, (
+            f"creek.classify's response now carries {canary!r}. Its posture is "
+            "METADATA_ONLY on the strength of that envelope being counts only; "
+            f"that is no longer true.\n\n{serialised}"
+        )
+
+
+def test_creek_classify_is_deliberately_outside_the_layer_g_derivation() -> None:
+    """``creek.classify``'s absence from the prompt manifest is asserted, not assumed.
+
+    Asserting the two *reasons* rather than the bare absence is the point. A
+    future change that flips either one — a posture change, or an
+    ``llm_factory`` parameter added to ``classify_tool`` — fails here with a
+    message saying what to do, instead of silently enrolling the tool into a
+    derivation whose shared assertion is the opposite of this tool's contract.
+    """
+    assert "creek.classify" not in _LLM_BACKED_GATED_TOOLS, (
+        "creek.classify has entered the layer-(g) derivation. It must NOT "
+        "inherit _assert_prompt_channel_clean: that helper asserts the "
+        "intimate canary reaches no prompt, and for classify the intimate "
+        "body legitimately reaches the LOCAL prompt. Keep the tool-specific "
+        "probe (test_classify_hands_every_tier_to_the_provider_its_router_"
+        "resolves) and reconcile the two contracts deliberately (#1274)."
+    )
+    assert TOOL_POSTURES["creek.classify"].posture is ReadPosture.METADATA_ONLY, (
+        "reason 1 for the exclusion has changed: _GATED_TOOLS is derived from "
+        "posture is GATED, so a METADATA_ONLY tool never enters the candidate "
+        "set. If classify is now GATED it needs a real gate call site (which "
+        "it has not got) and a prompt probe of its own -- it must not inherit "
+        "'response-probed, prompt-unchecked' (#1274)."
+    )
+    assert not _LLM_PROMPT_SIGNATURE_PARAMS.issubset(
+        inspect.signature(classify_tool).parameters
+    ), (
+        "reason 2 for the exclusion has changed: classify_tool now takes both "
+        "llm_factory and privacy_tier_ceiling. Note that adding the factory "
+        "ALONE would still enrol nothing, because the derivation runs over "
+        "_GATED_TOOLS first -- so if this fires, check which of the two "
+        "reasons is still standing before assuming the tool is covered."
+    )
