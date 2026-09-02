@@ -543,10 +543,10 @@ def _seed_with_sources(source_fragments: tuple[str, ...]) -> object:
 def _unexplored_ontology_seed() -> object:
     """Return the real ``UNEXPLORED_ONTOLOGY`` seed shape: no vault content.
 
-    ``creek/generate/mining.py::_seed_from_ontology_tuple`` (line 1511) builds
-    the title and description purely from ontology enum labels and leaves
-    ``source_fragments`` / ``threads`` / ``eddies`` empty (line 1529), so no
-    fragment, thread, or eddy text reaches the prompt at all.
+    ``creek.generate.mining._seed_from_ontology_tuple`` builds the title and
+    description purely from ontology enum labels, and returns an ``IdeaSeed``
+    whose ``source_fragments``, ``threads`` and ``eddies`` are all empty
+    tuples, so no fragment, thread, or eddy text reaches the prompt at all.
     """
     from creek.generate.mining import IdeaSeed, MiningStrategy
 
@@ -624,16 +624,16 @@ def test_draft_routes_personal_sources_above_the_open_ceiling(
 ) -> None:
     """A ``personal`` source outranks an ``open`` ceiling for LLM routing.
 
-    ``creek/generate/drafts.py::_render_fragment_section`` (line 2604) emits
-    ``### {fid}: {fragment.title}`` unconditionally, and at an ``open``
-    ceiling ``filter_fragments_by_tier`` replaces a personal body with
-    ``[Personal-tier summary: {title}]`` rather than dropping the fragment —
-    so the personal fragment's id *and* title reach the prompt even though its
-    body was redacted. The ceiling-derived tier alone therefore understates
-    what reaches the model: an implementation that routed on
-    ``routing_tier(ceiling, None)`` would hand personal titles to the cloud
-    ``generation`` stage on the caller's say-so. The tier must be the more
-    sensitive of the ceiling and the sources' own classifications.
+    ``creek.generate.drafts._render_fragment_section`` emits ``### {fid}:
+    {fragment.title}`` for every fragment it renders, with no tier check of
+    any kind, and at an ``open`` ceiling ``filter_fragments_by_tier`` replaces
+    a personal body with ``[Personal-tier summary: {title}]`` rather than
+    dropping the fragment — so the personal fragment's id *and* title reach
+    the prompt even though its body was redacted. The ceiling-derived tier
+    alone therefore understates what reaches the model: an implementation
+    that routed on ``routing_tier(ceiling, None)`` would hand personal titles
+    to the cloud ``generation`` stage on the caller's say-so. The tier must be
+    the more sensitive of the ceiling and the sources' own classifications.
     """
     _write_fragment(
         vault,

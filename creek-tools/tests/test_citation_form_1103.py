@@ -40,12 +40,24 @@ from typing import Final
 
 import pytest
 
-_CITATION_RE: Final = re.compile(r"[A-Za-z_][\w/.]*\.py:\d+(?:-\d+)?|``:\d+(?:-\d+)?``")
-"""A source citation by line: ``pkg/mod.py:12``, ``mod.py:30-39``, or ``:278``.
+_CITATION_RE: Final = re.compile(
+    # ``pkg/mod.py:12``, ``mod.py:30-39`` -- the colon-suffixed form.
+    r"[A-Za-z_][\w/.]*\.py:\d+(?:-\d+)?"
+    # ``:278`` -- the bare continuation a paragraph uses once it has already
+    # named the file. Invisible to any filename-anchored pattern, and two of
+    # the converted spans were exactly this.
+    r"|``:\d+(?:-\d+)?``"
+    # The parenthesised prose form -- "(line N)" / "(lines N-M)". A separate
+    # branch because it shares no syntax with the other two: the number is
+    # not adjacent to the filename, so a reader sees a symbol reference and
+    # assumes it is durable while a line number rides along behind it.
+    r"|\(lines?\s+\d+(?:\s*[-\u2013]\s*\d+)?\)"
+)
+"""Every way this codebase writes "the code is at line N".
 
-The second alternative catches the bare continuation form a paragraph uses
-when it has already named the file -- invisible to any filename-anchored
-pattern, and two of the ten converted spans were exactly that.
+Three forms, because a guard that knows only one form makes a *false*
+cleanliness assertion about the files it covers -- which is worse than not
+covering them, since the allow-set then reads as a verified inventory.
 """
 
 _PACKAGE_ROOT: Final = Path(__file__).resolve().parents[1]
