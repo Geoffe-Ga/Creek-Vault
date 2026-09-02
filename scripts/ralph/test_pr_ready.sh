@@ -415,6 +415,56 @@ cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 args="$*"
 case "$args" in
+  "repo view"*)
+    # pr-ready.sh asks `gh` which repository it is in when no `--repo` was
+    # given, because `gh api graphql` does NOT substitute the `{owner}`/`{repo}`
+    # placeholders a REST endpoint would (measured: they reach the API
+    # literally). Answering here keeps every existing case running without a
+    # `--repo`, exactly as it did before the GraphQL move.
+    # `-`, NOT `:-`: a case that sets GH_REPO_SLUG='' is modelling `gh repo
+    # view` answering NOTHING (a rate-limit blip, a checkout with no remote),
+    # and `:-` would quietly substitute the default and hand pr-ready.sh a
+    # perfectly good slug — the assertion would then pass for the wrong reason,
+    # which is how a fail-closed pin stops pinning anything.
+    printf '%s\n' "${GH_REPO_SLUG-owner/repo}"
+    exit "${GH_REPO_SLUG_EC:-0}" ;;
+  "api graphql"*)
+    # THE VERDICT PAYLOAD (#1263, #1266). Placed FIRST, ahead of the
+    # `"api "*"compare"*` arm below: `gh api graphql …` also begins with `api `,
+    # so a `compare` appearing anywhere in the query or the filter program —
+    # both of which land in "$args" — would silently hijack this call and feed
+    # it a `behind_by` fixture. Ordering, not a spelling, is what forecloses
+    # that.
+    #
+    # TWO MODES, exactly as the `--json comments` arm this replaces had:
+    #   * COMMENTS_JSON set — the fixture path. It is already in the
+    #     `{"comments": [ … ]}` shape the shared filter's contract names, so it
+    #     is wrapped back into a GraphQL response envelope and the REAL `--jq`
+    #     (pr-ready.sh's `$ENV` prelude plus scripts/ralph/lib/verdict-select.jq)
+    #     is run over it. The filter's parameters arrive through the exported
+    #     CREEK_* variables this process inherits, so these cases exercise the
+    #     production selector rather than a restatement of it.
+    #   * otherwise — the fabricated path: the four-field answer a case dictates
+    #     directly, which is how the malformed/surplus-field shapes the filter
+    #     cannot itself emit are still fed to pr-ready.sh's parser.
+    if [[ -n "${COMMENTS_JSON:-}" ]]; then
+      expr="" prev=""
+      for a in "$@"; do [[ "$prev" == "--jq" ]] && expr="$a"; prev="$a"; done
+      printf '%s' "$COMMENTS_JSON" \
+        | jq -c '{data:{repository:{pullRequest:{comments:{nodes:.comments}}}}}' \
+        | jq -r "$expr"
+    else
+      # FIVE fields, matching the shared filter's answer: the fifth is the
+      # selected comment's `databaseId`. The fabricated arm grew a field when the
+      # answer did, for the same reason the two surplus-field fixtures below did
+      # NOT have to change: they inject their surplus past the last LEGITIMATE
+      # field, so a stub that still emitted four would have turned both of them
+      # from "malformed, fail closed" into "well formed, id happens to read
+      # `x`" — a pin that silently stops pinning.
+      printf '%s|%s|%s|%s\n' "${VERDICT:-|false}" "${VERDICT_PR-100}" \
+        "${VERDICT_REFUSED_AUTHOR-}" "${VERDICT_ID-4242}"
+    fi
+    exit "${VERDICT_EC:-0}" ;;
   "run list"*"--workflow code-review.yml"*)
     # review-quota.sh's list call (issue #1160). It MUST be told apart from
     # main-health.sh's by the --workflow value: both siblings call `gh run
@@ -543,13 +593,15 @@ case "$args" in
   *"--json mergeStateStatus"*)
     printf '%s|%s|%s\n' "${MERGE_STATE:-CLEAN}" "${HEAD_DATE:-}" "${HEAD_AUTHOR-dependabot[bot]}" ;;
   *"--json comments"*)
-    if [[ -n "${COMMENTS_JSON:-}" ]]; then
-      expr="" prev=""
-      for a in "$@"; do [[ "$prev" == "--jq" ]] && expr="$a"; prev="$a"; done
-      printf '%s' "$COMMENTS_JSON" | jq -rc "$expr"
-    else
-      printf '%s|%s|%s\n' "${VERDICT:-|false}" "${VERDICT_PR-100}" "${VERDICT_REFUSED_AUTHOR-}"
-    fi ;;
+    # A REGRESSION TRAP, not a service. pr-ready.sh read the verdict thread this
+    # way until #1263: `--json comments` returns `includesCreatedEdit` (THAT a
+    # body was edited) and never the editor's identity, so no tightening of the
+    # jq on top of it can tell a reviewer's own typo fix from somebody else
+    # retyping a CHANGES_REQUESTED as an LGTM. Going back to it would leave every
+    # behavioural test of the shared filter passing while the gate read a payload
+    # that cannot answer the question. Fail LOUD instead of quietly serving it.
+    echo "stub gh: pr-ready.sh must not read the verdict thread through '--json comments' — that payload carries no edit provenance (#1263); use scripts/ralph/lib/pr-comments.graphql" >&2
+    exit 90 ;;
   *)                        echo '' ;;
 esac
 STUB
@@ -1551,11 +1603,83 @@ one blocking issue
     ok "A13 an ordinary lane with no verdict prints no refused-author diagnostic"
   fi
 
-  # A14 — THE NEW FIELD IS A NEW INJECTION POINT. The verdict answer is now FOUR
-  # fields and is split `IFS='|' read -r date lgtm pr refused_author rest`, so a
-  # FIFTH field is the malformed shape — and this one arrives through a value that
-  # is, uniquely among the four, a piece of USER-CONTROLLED text: a login, chosen
-  # by whoever posted the comment. Real GitHub logins cannot contain `|`; the
+  # A15 — EDIT PROVENANCE, END TO END THROUGH THE REAL PRELUDE (#1263, #1685).
+  # Every other test of the #1263 conjunct runs `jq -f verdict-select.jq` on a
+  # HAND-BUILT `{"comments": […]}` fixture, so none of them ever executes the
+  # code path that turns a `gh api graphql` answer into that shape. That path
+  # used to be a projection written TWICE — once in pr-ready.sh's `$ENV` prelude,
+  # once in iteration-trigger.yml's own `--jq` — and narrowing either copy to
+  # `{body, createdAt, author}` deletes `userContentEdits`, reopens #1263 in
+  # full, and leaves the entire suite green: MEASURED, 362 shell + 21 pytest all
+  # passing while a body rewritten by `mallory` cleared the merge.
+  #
+  # This case goes through the whole production path — the stub wraps the
+  # fixture in a real GraphQL envelope and runs pr-ready.sh's OWN `--jq`
+  # (prelude + shared filter) over it — so the intake is covered by behaviour
+  # rather than by a static assertion about a file.
+  #
+  # The fixture is otherwise PERFECT: accepted author, marked for this PR, fresh,
+  # LGTM, CI green, CLEAN, not behind. Only `userContentEdits` disagrees.
+  authz_edited='{"createdAt":"'"$FRESH"'","author":{"login":"'"$AUTHZ_PAT_LOGIN"'"},"userContentEdits":{"nodes":[{"editor":{"login":"'"$AUTHZ_FORGER"'"}}]},"body":'"$(printf '%s' "$AUTHZ_LGTM_BODY" | jq -Rs .)"'}'
+  authz_edited_token="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
+                        COMMENTS_JSON="$(cj "$authz_edited")" run 100)"
+  if [[ "$authz_edited_token" == "ready" ]]; then
+    bad "A15 a verdict whose body '$AUTHZ_FORGER' rewrote cleared the merge END TO END (token '$authz_edited_token') — userContentEdits did not survive the payload intake (#1263)"
+  else
+    ok "A15 a verdict rewritten by another account does not reach 'ready' through the real GraphQL intake"
+  fi
+
+  # …AND THE SELF-EDIT STILL MERGES, through the same path. Without this the
+  # cheapest way to pass A15 is to refuse every edited comment, which wedges the
+  # reviewer's own typo fix with no self-heal and unmarks lanes fleet-wide.
+  authz_selfedit='{"createdAt":"'"$FRESH"'","author":{"login":"'"$AUTHZ_PAT_LOGIN"'"},"userContentEdits":{"nodes":[{"editor":{"login":"geoffe-ga"}}]},"body":'"$(printf '%s' "$AUTHZ_LGTM_BODY" | jq -Rs .)"'}'
+  check "A15b a verdict its own author edited still reaches ready" "ready" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
+       COMMENTS_JSON="$(cj "$authz_selfedit")" run 100)"
+
+  # A16 — THE LAST VERDICT LINE IS THE FINAL WORD (#1685), end to end.
+  # `VERDICT_RE` admits leading whitespace, so an INDENTED quote of a verdict
+  # line satisfies it. The LGTM flag used to be a WHOLE-BODY test — "does ANY
+  # line say LGTM" — so a review that quotes `    ## Verdict: LGTM` while itself
+  # concluding `## Verdict: CHANGES_REQUESTED` classified `ready`. A PR that
+  # touches these very files is exactly where such a body gets written.
+  # `scripts/ralph/stats.py`'s `normalize_verdict` is the reference contract and
+  # it takes the LAST verdict line; this asserts the token, not the filter's
+  # field, so the whole chain is pinned.
+  authz_quoted_body='<!-- creek-review pr=100 -->
+
+The reviewer under discussion posted:
+
+    ## Verdict: LGTM
+
+which is the bug being fixed here. Not merging.
+
+## Verdict: CHANGES_REQUESTED
+'
+  check "A16 a quoted LGTM under a closing CHANGES_REQUESTED → changes-requested" "changes-requested" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
+       COMMENTS_JSON="$(cj "$(authored "$FRESH" "$AUTHZ_PAT_LOGIN" "$authz_quoted_body")")" run 100)"
+
+  # …and the inverse, so the rule is last-wins rather than never-LGTM. Inverting
+  # it would unmark every lane whose reviewer re-verdicted inside one comment —
+  # the worse of the two polarities, because it is silent.
+  authz_reverdict_body='<!-- creek-review pr=100 -->
+
+## Verdict: CHANGES_REQUESTED
+
+Re-reviewed after the push:
+
+## Verdict: LGTM
+'
+  check "A16b a closing LGTM after an earlier CHANGES_REQUESTED → ready" "ready" \
+    "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
+       COMMENTS_JSON="$(cj "$(authored "$FRESH" "$AUTHZ_PAT_LOGIN" "$authz_reverdict_body")")" run 100)"
+
+  # A14 — THE NEW FIELD IS A NEW INJECTION POINT. The verdict answer is now FIVE
+  # fields and is split `IFS='|' read -r date lgtm pr refused_author id rest`, so
+  # a SIXTH field is the malformed shape — and this one arrives through a value
+  # that is, uniquely among the five, a piece of USER-CONTROLLED text: a login,
+  # chosen by whoever posted the comment. Real GitHub logins cannot contain `|`; the
   # point is that this parser must not be the thing relying on that. A surplus
   # field blanks the answer and the lane waits, exactly as the three-field version
   # did — never `ready` (merge on a garbage parse) and never `changes-requested`
@@ -1565,7 +1689,7 @@ one blocking issue
   # comment thread's; the sibling case in the field-count section injects its
   # surplus through the marker field instead, so the two cover both ends of the
   # widened split.
-  check "A14 a fifth field in the verdict answer → awaiting-review" "awaiting-review" \
+  check "A14 a surplus field in the verdict answer → awaiting-review" "awaiting-review" \
     "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
        VERDICT="$FRESH|true" VERDICT_PR=100 VERDICT_REFUSED_AUTHOR='mallory|x' run 100)"
 
@@ -1588,7 +1712,7 @@ one blocking issue
   # jq: VERDICT_RE true, VERDICT_LGTM_RE true, `creek-review` marker NONE.
   #
   # IT IS NOT A VERDICT. It is a REPORT OF one: that workflow selects the review
-  # comment with `jq '[.[] | select(.body | test("(^|\\n)## Verdict:"))] | last'`
+  # comment with the shared `scripts/ralph/lib/verdict-select.jq` selector
   # and copies the verdict out of it. It cannot carry `<!-- creek-review pr=N -->`
   # and must not — the marker attests that the CODE-REVIEW pipeline produced the
   # comment, and this one is posted by a workflow that never read the diff. So
@@ -1858,13 +1982,14 @@ The wedge is that a ${ITER_MARKER} summary matches VERDICT_RE, so the selector p
     "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H COMMENTS_JSON="$w7_json" run 100)"
 }
 
-# The verdict answer is now FOUR fields —
-# `<createdAt>|<isLGTM>|<markerPr>|<refusedAuthor>` — and it is split by FIELD
-# COUNT for the same reason the mergeState answer at
+# The verdict answer is now FIVE fields —
+# `<createdAt>|<isLGTM>|<markerPr>|<refusedAuthor>|<databaseId>` — and it is split
+# by FIELD COUNT for the same reason the mergeState answer at
 # pr-ready.sh:720-721 (`merge_rest`) and the rollup answer at :917-918 (`rest`,
 # inside `review_gate_absent`) are — cited by variable name as well as by line,
 # because pr-ready.sh moves: an RFC3339 stamp, a
-# jq boolean, a PR number and a login can none of them contain `|`, so a fifth
+# jq boolean, a PR number, a login and a decimal comment id can none of them
+# contain `|`, so a sixth
 # field means the answer is not the shape we asked for. Blank it and wait, rather
 # than seek one end of the string and merge on whatever lands in the flag — the
 # `|`-injection class this file has already proven exploitable once.
@@ -1877,11 +2002,65 @@ The wedge is that a ${ITER_MARKER} summary matches VERDICT_RE, so the selector p
 # hazard of widening a field-count split, so the surplus is pushed out past the
 # new field rather than the case being deleted or its expectation relaxed. It
 # stays green on BOTH sides of the widening, which is what a regression pin owes.
-# A14 in the authorship block above injects through the new field instead, so both
-# ends of the widened split are covered.
+# A14 in the authorship block above injects through the refused-author field
+# instead, so both ends of the widened split are covered.
+#
+# THE SAME ARGUMENT APPLIED AGAIN WHEN #1685 ADDED THE `databaseId` FIELD, and
+# this time the fixture did NOT change: what grew a field was the STUB (the
+# `api graphql` fabricated arm above), which models the answer's shape. Both
+# surplus cases inject past the last legitimate field either way, so both stayed
+# malformed — but only because the stub moved with the contract. Had it not,
+# `extra`/`surplus` would have landed in refused-author and databaseId and this
+# case would once again have asserted `ready`.
 check "surplus field in the verdict answer → awaiting-review" "awaiting-review" \
   "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
      VERDICT="$FRESH|true|100" VERDICT_PR=extra VERDICT_REFUSED_AUTHOR=surplus run 100)"
+
+# --- an unresolvable repository is a WAIT, not a tooling error (#1270/#1685) -
+# `gh api graphql` does not substitute `{owner}`/`{repo}`, so a run with no
+# `--repo` asks `gh repo view` for the slug first. NEITHER PRODUCTION CALLER
+# PASSES `--repo` — `.claude/commands/ralph-tick.md` Step 1 runs
+# `pr-ready.sh "$PR_NUM"` and `scripts/ralph/watch-pr.sh` runs
+# `bash "$READY" "$pr"` — so that extra call sits on the DEFAULT invocation of
+# every poll of every lane, and this case therefore uses the default invocation
+# too. A rate-limit blip there used to `die`: exit 2 with EMPTY STDOUT, which
+# watch-pr.sh swallows by design, so the lane's whole window ended
+# `WATCH <PR> timeout unknown` with no token and (before the sibling fix in
+# watch-pr.sh) no stderr either — the exact silence #1270 exists to close,
+# reached by a new fatal path on the hottest code path in the file.
+#
+# `awaiting-review` is the right answer for the same reason `ci-unreadable` is
+# right for an unreadable rollup: it is an IN_FLIGHT token, so the lane keeps
+# polling and the next poll that CAN name the repository classifies normally.
+# Nothing is merged on a repository we could not name — `ready` is not reachable
+# from here.
+check "an unresolvable repo on the default invocation → awaiting-review" "awaiting-review" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
+     GH_REPO_SLUG='' GH_REPO_SLUG_EC=1 run 100)"
+
+rc=0
+CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
+  GH_REPO_SLUG='' GH_REPO_SLUG_EC=1 run 100 >/dev/null 2>&1 || rc=$?
+check "…and it exits 0, not the tooling-error 2" "0" "$rc"
+
+# …and it is LOUD about it, because a wait that says nothing is the failure mode
+# #1199's diagnostic block already argues at length. watch-pr.sh surfaces this
+# line once per transition.
+verdict_repo_err="$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
+                    GH_REPO_SLUG='' GH_REPO_SLUG_EC=1 run_err 100)"
+if grep -qF -- 'could not resolve the repository' <<<"$verdict_repo_err"; then
+  ok "an unresolvable repo prints its reason on stderr"
+else
+  bad "an unresolvable repo waits SILENTLY — the lane sleeps its whole window with nothing saying why (#1270): '$verdict_repo_err'"
+fi
+
+# …and a run that WAS given --repo never pays for the lookup at all, so a broken
+# `gh repo view` cannot hold a lane that named its repository explicitly.
+check "an explicit --repo classifies normally even when gh repo view is broken" "ready" \
+  "$(CHECKS_EC=0 MERGE_STATE=CLEAN HEAD_DATE=$H BEHIND_BY=0 \
+     GH_REPO_SLUG='' GH_REPO_SLUG_EC=1 \
+     COMMENTS_JSON="$(cj '{"createdAt":"'"$FRESH"'","body":"<!-- creek-review pr=100 -->\n\n## Verdict: LGTM\n"}')" \
+     run 100 --repo owner/repo)"
 
 # --- opt-out: a human hold beats every other signal ------------------------
 # `do-not-auto-merge` is the kill switch a human reaches for when a lane is green
@@ -2581,6 +2760,10 @@ plant_lane() { # plant_lane <name> <review-quota body, or "" for no helper> [mod
   mkdir -p "$dir"
   cp "$READY" "$dir/pr-ready.sh"
   chmod +x "$dir/pr-ready.sh"
+  # The shared verdict machinery ships BESIDE pr-ready.sh, so a planted copy
+  # needs it too — and must, because a copy without it refuses to classify
+  # rather than reading `awaiting-review` off a missing selector (#1263).
+  cp -R "$(dirname "$READY")/lib" "$dir/lib"
   printf '#!/usr/bin/env bash\necho green\n' > "$dir/main-health.sh"
   chmod +x "$dir/main-health.sh"
   if [[ -n "$2" ]]; then
@@ -3410,6 +3593,32 @@ fi
 # anyone can post to clear it.
 RECAP_WORKFLOW="$WF_DIR/ralph-recap-tests.yml"
 ITER_WORKFLOW="$WF_DIR/iteration-trigger.yml"
+# THE SECOND CLEARANCE PATH IS A SCRIPT NOW (#1685), and every coupling check
+# below that used to read the workflow's `run:` body reads that file instead.
+# The move is what makes those checks a SECOND line of defence rather than the
+# only one: a `run:` body is never EXECUTED by any test, so a per-line grep was
+# all that could ever guard it — and a static guard on code nobody runs is
+# evadable by keeping the guarded line alive and making it dead. Three such
+# mutants survived a fully green suite. `scripts/ralph/test_verdict_wake.sh`
+# now drives the script end to end; these greps stay because they are cheap and
+# they name the drift precisely, not because they are sufficient.
+#
+# WHAT STAYS ON THE WORKFLOW is the half only the workflow can hold: the
+# `MARKER:` literal (read in the verdict block above), the summary step's
+# GH_TOKEN identity, the checkout, and — asserted immediately below — the fact
+# that the workflow actually CALLS the script. Extracting the logic and leaving
+# the workflow running an inline copy is "half a delegation" in its purest
+# form: every behavioural case in the new suite would pass against code
+# production never executes.
+ITER_WAKE="$(dirname "$READY")/verdict-wake.sh"
+ITER_WAKE_REL='scripts/ralph/verdict-wake.sh'
+if [[ ! -s "$ITER_WAKE" ]]; then
+  bad "$ITER_WAKE_REL is missing or empty — the second merge-clearance path has no implementation, and every assertion below about its clearance chain is vacuous (#1685)"
+elif grep -qF -- "$ITER_WAKE_REL" <<<"$(grep -vE '^[[:space:]]*#' "$ITER_WORKFLOW" || true)"; then
+  ok "iteration-trigger.yml invokes $ITER_WAKE_REL on a line that runs"
+else
+  bad "iteration-trigger.yml never calls $ITER_WAKE_REL outside its comments — the wake logic was extracted but the workflow still runs its own copy, so the executable suite asserts about code production does not execute (#1685)"
+fi
 
 # The shared bytes, written out once. The prefix is what a READER of the marker
 # matches on; the full format is what the emitter's `printf` carries.
@@ -3655,28 +3864,66 @@ done
 # string also appears in that file's COMMENTS, so the entire `MARKER_PR`
 # extraction and the `elif` consuming it could be deleted and the check would
 # stay green — the "shared-substring grep" this whole block exists to be better
-# than. Two literals instead, both lifted from the code that runs.
-ITER_MARKER_ERE='^'"$MARKER_PREFIX"'[0-9]+ -->[[:space:]]*$'
+# than.
+#
+# THE COUPLING GOT STRONGER WITH #1266/#1263 AND THIS ASSERTION FOLLOWED IT.
+# iteration-trigger.yml used to re-implement the extraction with its own
+# `grep -oE`, and all this file could check was that the two patterns were
+# spelled the same. Both clearance paths now run
+# `scripts/ralph/lib/verdict-select.jq`, so the extraction is literally one
+# implementation — and what can drift is the PATTERN each path hands it. So the
+# assertion is byte equality between pr-ready.sh's own `MARKER_RE` constant and
+# the `--arg marker_re` iteration-trigger.yml passes. A pattern that drifts here
+# matches nothing, which unmarks every lane at once, silently.
 # Written with `\$` inside double quotes rather than as a single-quoted literal:
 # the bytes are identical (`[ "$MARKER_PR" != "$PR" ]`) and it carries no
 # single-quoted `$…` for a linter to read as a lost expansion.
 ITER_CLEARANCE_GUARD="[ \"\$MARKER_PR\" != \"\$PR\" ]"
 
-if grep -qF -- "$ITER_MARKER_ERE" "$ITER_WORKFLOW"; then
-  ok "iteration-trigger.yml extracts the marker with the same anchored pattern"
-else
-  bad "iteration-trigger.yml no longer greps '$ITER_MARKER_ERE' — its extraction has drifted from pr-ready.sh's MARKER_RE"
-fi
+# EVERY parameter, not just the marker. A drift in ANY of them matches nothing,
+# and a filter that matches nothing is indistinguishable from "no verdict has
+# been posted yet" — so the failure is fleet-wide, simultaneous and silent. Read
+# out of pr-ready.sh's own `readonly` constants and required verbatim in
+# iteration-trigger.yml's `--arg` list, so a change on either side turns CI red
+# on the PR that makes it rather than on the fleet that inherits it.
+#
+# VERDICT_LGTM_RE IS READ LITERALLY, AND IT USED TO BE DERIVED HERE AS
+# `"${VERDICT_RE}+lgtm"` because that is how pr-ready.sh declared it. It is not
+# derived any more, on either side: SELECTION (`VERDICT_RE`) has to be loose or a
+# fleet-wide unmark follows, while CLEARANCE (`VERDICT_LGTM_RE`) has to fail
+# closed or a rationale that merely SAYS "Verdict: LGTM would be premature"
+# clears a merge the reviewer refused. Deriving the second from the first forced
+# one polarity onto both. Reading the constant pins the value the production path
+# actually passes, which is what this loop is for.
+iter_param_value() { # iter_param_value <CONSTANT NAME>
+  sed -n "s/^readonly $1='\(.*\)'\$/\1/p" "$READY"
+}
+for iter_param in "verdict_re|$(iter_param_value VERDICT_RE)" \
+                  "verdict_lgtm_re|$(iter_param_value VERDICT_LGTM_RE)" \
+                  "iter_summary_re|$(iter_param_value ITER_SUMMARY_RE)" \
+                  "marker_re|$(iter_param_value MARKER_RE)" \
+                  "marker_any_re|$(iter_param_value MARKER_ANY_RE)" \
+                  "marker_malformed|$(iter_param_value MARKER_MALFORMED)"; do
+  iter_param_name="${iter_param%%|*}"
+  iter_param_val="${iter_param#*|}"
+  if [[ -z "$iter_param_val" ]]; then
+    bad "could not read the pr-ready.sh constant behind --arg $iter_param_name — the parameter contract between the two clearance paths is unverified"
+  elif grep -qF -- "--arg $iter_param_name '$iter_param_val'" "$ITER_WAKE"; then
+    ok "verdict-wake.sh hands the shared filter pr-ready.sh's own $iter_param_name, byte for byte"
+  else
+    bad "verdict-wake.sh does not pass --arg $iter_param_name '$iter_param_val' — the two merge-clearance paths hand the SAME selector different parameters, and a pattern that drifts matches nothing on every lane at once (#1181, #1199)"
+  fi
+done
 
 # Extracting the marker and never consulting it is the same bug with an extra
 # step. That `elif` is the ONLY thing between an unattested verdict and a
 # "cleared to squash merge" comment — and .claude/skills/await-claude-review
 # says this summary SHORT-CIRCUITS per-event classification, so when the two
 # paths disagree it is this one that wins over pr-ready.sh's `awaiting-review`.
-if grep -qF -- "$ITER_CLEARANCE_GUARD" "$ITER_WORKFLOW"; then
-  ok "iteration-trigger.yml refuses to clear a merge on a marker that is not this PR"
+if grep -qF -- "$ITER_CLEARANCE_GUARD" "$ITER_WAKE"; then
+  ok "verdict-wake.sh refuses to clear a merge on a marker that is not this PR"
 else
-  bad "iteration-trigger.yml has lost its '$ITER_CLEARANCE_GUARD' clearance guard — it would clear a merge on a verdict pr-ready.sh refuses"
+  bad "verdict-wake.sh has lost its '$ITER_CLEARANCE_GUARD' clearance guard — it would clear a merge on a verdict pr-ready.sh refuses"
 fi
 
 # And rewriting `ACTION` is NOT what stops the merge — this is the assertion the
@@ -3692,10 +3939,10 @@ fi
 # its item 5 — surface to the user, nobody merges).
 ITER_UNATTESTED_VERDICT="VERDICT='NOT ATTESTED'"
 
-if grep -qF -- "$ITER_UNATTESTED_VERDICT" "$ITER_WORKFLOW"; then
-  ok "iteration-trigger.yml also neutralises the VERDICT field, not just ACTION"
+if grep -qF -- "$ITER_UNATTESTED_VERDICT" "$ITER_WAKE"; then
+  ok "verdict-wake.sh also neutralises the VERDICT field, not just ACTION"
 else
-  bad "iteration-trigger.yml no longer sets $ITER_UNATTESTED_VERDICT — its summary would still say '**VERDICT**: LGTM' and await-claude-review Step 4a would merge on it (#1202)"
+  bad "verdict-wake.sh no longer sets $ITER_UNATTESTED_VERDICT — its summary would still say '**VERDICT**: LGTM' and await-claude-review Step 4a would merge on it (#1202)"
 fi
 
 # --- EVERY not-cleared branch, not just the provenance one (#1202) -----------
@@ -3729,7 +3976,7 @@ iter_not_cleared_verdicts() {
       sub(/[[:space:]]*$/, "", v)
     }
     /ACTION="NOT cleared to merge/ { print (v == "" ? "<UNSET>" : v) }
-  ' "$ITER_WORKFLOW"
+  ' "$ITER_WAKE"
 }
 
 # The three verdicts SKILL.md's recognition rule accepts. A refusal spelled as
@@ -3866,64 +4113,60 @@ fi
 # them from there rather than restating them is the same discipline `$ITER_MARKER`
 # is used with at the block above: one definition, so a change to the set cannot
 # satisfy half of this file and not the other.
-# THE TWO LITERALS ARE THE SAME SET AND DIFFERENT BYTES, AND THAT IS THE WHOLE
-# TRAP THIS PAIR OF CASES EXISTS TO HOLD OPEN. `gh` renders one bot account three
-# ways depending on which payload you ask for — measured live on PR #943 and
-# recorded at `$AUTHZ_BOT_LOGIN` above:
+# THE DIVERGENCE THIS BLOCK USED TO POLICE IS GONE, AND THAT IS THE FIX (#1263).
+# `gh` renders one bot account differently depending on which payload you ask
+# for — measured live on PR #943 and recorded at `$AUTHZ_BOT_LOGIN` above:
 #
 #   gh pr view 943 --json comments      -> .comments[].author.login  dependabot
 #   gh api repos/../issues/943/comments -> .[].user.login            dependabot[bot]
 #
-# pr-ready.sh reads the first and iteration-trigger.yml reads the second, so each
-# must name the bot in ITS OWN payload's spelling. A single shared literal is
-# therefore WRONG, however much it looks like the right kind of coupling — and it
-# is what this suite asserted until the spellings were measured. Copying either
-# file's array into the other is the natural "cleanup", and it breaks whichever
-# file receives it: a filter that matches nothing skips every verdict, fleet-wide,
-# fail-closed and silent apart from the diagnostic. So the assertion is set
-# equality MODULO the per-payload spelling of the bot, and the divergence itself
-# is pinned below so the cleanup fails a test instead of a fleet.
+# pr-ready.sh read the first and iteration-trigger.yml read the second, so each
+# had to name the bot in ITS OWN payload's spelling, and this suite asserted the
+# two literals were the same SET and different BYTES. Both paths now read one
+# GraphQL payload (`scripts/ralph/lib/pr-comments.graphql`) — they had to, because
+# neither of the old payloads carries edit provenance and #1263 cannot be answered
+# without it — so there is ONE spelling, and the trap that made a shared literal
+# wrong no longer exists.
+#
+# THE REST SPELLING IS STILL FORBIDDEN IN BOTH FILES, for the reason it was
+# always dangerous rather than out of habit: `["Geoffe-Ga","github-actions[bot]"]`
+# in a selector reading `.author.login` is a member that matches nothing, so the
+# PAT-absent half of the allowlist is silently dead and no bot-authored verdict
+# ever clears. Re-introducing either the literal or the REST payload it belongs
+# to must fail here rather than in the fleet.
 AUTHZ_ALLOWLIST_GRAPHQL='["Geoffe-Ga","github-actions"]'
 AUTHZ_ALLOWLIST_REST='["Geoffe-Ga","github-actions[bot]"]'
 
-# C1 — EACH FILE CARRIES ITS OWN PAYLOAD'S LITERAL, BY THE BYTES. A jq array
-# literal is the one form both selectors can hold verbatim, so the coupling is
-# checkable with `grep -qF` instead of being inferred from two expressions that
-# "look equivalent". Separate ok/bad pairs, because the whole value of this check
-# is that the failure NAMES WHICH FILE DRIFTED: the two have opposite consequences
+# C1 — BOTH FILES CARRY THE SAME LITERAL, BY THE BYTES. A jq array literal is the
+# one form both selectors can hold verbatim, so the coupling is checkable with
+# `grep -qF` instead of being inferred from two expressions that "look
+# equivalent". Separate ok/bad pairs, because the whole value of this check is
+# that the failure NAMES WHICH FILE DRIFTED: the two have opposite consequences
 # (pr-ready.sh refusing an identity holds lanes; iteration-trigger.yml accepting
 # one clears merges) and an operator reading one combined message would have to
 # open both files to find out which way round they are today.
-authz_expect_graphql="$READY|$AUTHZ_ALLOWLIST_GRAPHQL"
-authz_expect_rest="$ITER_WORKFLOW|$AUTHZ_ALLOWLIST_REST"
-for authz_pair in "$authz_expect_graphql" "$authz_expect_rest"; do
-  authz_file="${authz_pair%|*}"
-  authz_literal="${authz_pair#*|}"
-  if grep -qF -- "$authz_literal" "$authz_file"; then
-    ok "$(basename "$authz_file") carries the verdict-author allowlist in its own payload's spelling"
+for authz_file in "$READY" "$ITER_WAKE"; do
+  if grep -qF -- "$AUTHZ_ALLOWLIST_GRAPHQL" "$authz_file"; then
+    ok "$(basename "$authz_file") carries the verdict-author allowlist in the shared payload's spelling"
   else
-    bad "$(basename "$authz_file") does not carry the allowlist literal ${authz_literal} — either the two merge-clearance paths no longer admit the same accounts, or one of them was 'unified' onto the other's login spelling and now matches nothing at all (#1199)"
+    bad "$(basename "$authz_file") does not carry the allowlist literal ${AUTHZ_ALLOWLIST_GRAPHQL} — the two merge-clearance paths no longer admit the same accounts (#1199)"
   fi
 done
 
-# …AND NEITHER FILE MAY CARRY THE OTHER'S SPELLING. Without this, the cleanup the
-# block above warns about passes C1: adding the REST array to pr-ready.sh
-# ALONGSIDE its own leaves both greps satisfied while the parser quietly admits a
-# login `--json comments` can never emit — a dead member, and the dead member is
-# precisely the PAT-absent hedge. The check is one-directional on purpose: it
-# forbids the foreign array literal, not the foreign login, because both files
-# legitimately DISCUSS the other spelling in prose (this trap needs explaining
-# wherever it is met) and a bare-login grep would make that prose unwritable.
-if grep -qF -- "$AUTHZ_ALLOWLIST_REST" "$READY"; then
-  bad "pr-ready.sh carries iteration-trigger.yml's REST-spelled allowlist ${AUTHZ_ALLOWLIST_REST} — '.comments[].author.login' renders the bot as the bare slug, so that member matches nothing and the PAT-absent half of the allowlist is dead (#1199)"
-else
-  ok "pr-ready.sh does not carry the REST spelling of the allowlist"
-fi
-if grep -qF -- "$AUTHZ_ALLOWLIST_GRAPHQL" "$ITER_WORKFLOW"; then
-  bad "iteration-trigger.yml carries pr-ready.sh's GraphQL-spelled allowlist ${AUTHZ_ALLOWLIST_GRAPHQL} — the REST endpoint spells the bot '${AUTHZ_BOT_LOGIN_REST}', so that member matches nothing and no bot-authored verdict would ever clear this path (#1199)"
-else
-  ok "iteration-trigger.yml does not carry the GraphQL spelling of the allowlist"
-fi
+# …AND NEITHER FILE MAY CARRY THE DEAD REST SPELLING. Adding it ALONGSIDE the
+# live array leaves the grep above satisfied while the parser quietly admits a
+# login the shared payload can never emit — a dead member, and the dead member is
+# precisely the PAT-absent hedge. The check forbids the foreign ARRAY LITERAL,
+# not the foreign login, because both files legitimately DISCUSS the old spelling
+# in prose (the trap needs explaining wherever it is met) and a bare-login grep
+# would make that prose unwritable.
+for authz_file in "$READY" "$ITER_WAKE"; do
+  if grep -qF -- "$AUTHZ_ALLOWLIST_REST" "$authz_file"; then
+    bad "$(basename "$authz_file") carries the REST-spelled allowlist ${AUTHZ_ALLOWLIST_REST} — the shared GraphQL payload renders the bot as the bare slug '${AUTHZ_BOT_LOGIN}', so that member matches nothing and the PAT-absent half of the allowlist is dead (#1199)"
+  else
+    ok "$(basename "$authz_file") does not carry the dead REST spelling of the allowlist"
+  fi
+done
 
 # The name the rest of this section uses for "how many identities the allowlist
 # admits". Either literal answers it — that is what "same set" means — so it is
@@ -4016,34 +4259,96 @@ done
 # author filter in pr-ready.sh alone would therefore not close #1199 at all; it
 # would move it one file over, onto the path that wins.
 #
-# THE SELECTOR, not the file: `grep -F` over the whole workflow is the
-# "shared-substring grep" the ITER_MARKER_ERE block above was rewritten to stop
-# being — this file's own C1 already put those bytes somewhere in that workflow,
-# and a mention in a comment would satisfy it. So the `CLAUDE=` assignment is cut
-# out and both properties are asserted against THAT. The REST payload
-# (`repos/.../issues/N/comments`) spells the author `.user.login`, not
-# `.author.login`, which is the one place these two selectors legitimately differ
-# in bytes — and a copy-paste of pr-ready.sh's expression would silently match
-# nothing, so the field name is pinned separately from the set.
-iter_claude_selector="$(awk '/^[[:space:]]*CLAUDE=/ {c = 1}
-                             c {print; if ($0 ~ /comments\.json/) exit}' "$ITER_WORKFLOW")"
-if [[ -z "$iter_claude_selector" ]]; then
-  bad "could not extract iteration-trigger.yml's CLAUDE= verdict selector — the second merge-clearance path is unverified (#1199)"
-else
-  if grep -qF -- '.user.login' <<<"$iter_claude_selector"; then
-    ok "iteration-trigger.yml's verdict selector reads the comment author (.user.login)"
+# THE SELECTOR, not the file. Both clearance paths now delegate to ONE selector,
+# `scripts/ralph/lib/verdict-select.jq`, so what this has to catch is no longer
+# "did the two hand-written expressions drift" but the failure that replaced it:
+# HALF A DELEGATION. Migrate pr-ready.sh and leave iteration-trigger.yml holding
+# its own copy (or the reverse) and every behavioural test of the filter passes,
+# a sweep table reads clean, and the hole simply sits in the file nobody moved.
+# Only an assertion that BOTH files name the shared path catches that, and it is
+# not a nicety.
+#
+# `grep -F` over the whole workflow would be the "shared-substring grep" the
+# marker block above was rewritten to stop being — a mention in a comment would
+# satisfy it. So each file's NON-COMMENT lines are the haystack.
+AUTHZ_FILTER_PATH='scripts/ralph/lib/verdict-select.jq'
+AUTHZ_QUERY_PATH='scripts/ralph/lib/pr-comments.graphql'
+authz_live_lines() { # authz_live_lines <file> — lines that are not comments
+  grep -vE '^[[:space:]]*#' "$1"
+}
+
+# …AND NAMING THE FILTER IS NOT INVOKING IT. This is the exact hazard the
+# marker block above was rewritten to stop being, one level up: stripping
+# COMMENTS is not enough, because `iteration-trigger.yml` also prints the path
+# in an operator-facing diagnostic —
+#   echo "::warning::… See scripts/ralph/lib/verdict-select.jq for the two
+#         refusal shapes."
+# — which is a LIVE line that names the filter while running nothing. Replace
+# the real `-f scripts/ralph/lib/verdict-select.jq comments.json` with a
+# four-line inline selector carrying no `.body != null` guard, no author
+# allowlist and no edit check, and every assertion in this suite went on
+# passing off that one echo: #1266, #1199 and #1263 all reopened at once behind
+# a green gate. So log statements are stripped too, and what is asserted is the
+# INVOCATION.
+#
+# THE INVOCATION SHAPE IS PER-FILE, and it has to be: the two consumers run the
+# filter differently on purpose. `pr-ready.sh` splices it into `gh --jq` (gojq,
+# the production regex engine) so the API answer and its parse stay in one
+# process; `iteration-trigger.yml` has already written the payload to disk and
+# runs system `jq -f` over it. A single pattern covering both would have to be
+# loose enough to match either, which is how a guard stops discriminating.
+# Deleting either real invocation makes its own pattern fail.
+authz_command_lines() { # authz_command_lines <file> — live lines that are not logs
+  authz_live_lines "$1" | grep -vE '^[[:space:]]*(echo|printf)[[:space:]]'
+}
+for authz_file in "$READY" "$ITER_WAKE"; do
+  case "$authz_file" in
+    "$READY")     authz_invoke_re='--jq.*cat "\$VERDICT_FILTER"'
+                  authz_fetch_re='-f query=.*cat "\$VERDICT_QUERY"' ;;
+    "$ITER_WAKE") authz_invoke_re='-f "\$VERDICT_FILTER"'
+                  authz_fetch_re='-f query=.*cat "\$VERDICT_QUERY"' ;;
+    *)            bad "no verdict-filter invocation pattern is declared for $authz_file"
+                  continue ;;
+  esac
+  if grep -qF -- "$AUTHZ_FILTER_PATH" <<<"$(authz_live_lines "$authz_file" || true)"; then
+    ok "$(basename "$authz_file") reads the shared verdict selector on a line that runs"
   else
-    bad "iteration-trigger.yml's CLAUDE= selector does not read .user.login — it clears merges off the latest verdict-shaped comment whoever wrote it, so a forged LGTM still posts 'You are cleared to squash merge' (#1199)"
+    bad "$(basename "$authz_file") does not reference ${AUTHZ_FILTER_PATH} outside its comments — it still carries its own copy of the verdict selector, which is exactly how the null-body guard (#1266) and the edit-provenance check (#1263) end up in one clearance path and not the other"
   fi
-  # The REST-spelled literal, NOT pr-ready.sh's — see the divergence block at C1.
-  # C1 already proves this file carries these bytes SOMEWHERE; what this adds is
-  # that they are in the expression that PICKS THE VERDICT. The two halves are
-  # both needed: an allowlist sitting in an `env:` entry or a comment while the
-  # selector goes unguarded is the shape a partial edit leaves behind.
-  if grep -qF -- "$AUTHZ_ALLOWLIST_REST" <<<"$iter_claude_selector"; then
-    ok "iteration-trigger.yml's verdict selector carries the allowlist in the REST spelling its payload returns"
+  if grep -qE -- "$authz_invoke_re" <<<"$(authz_command_lines "$authz_file" || true)"; then
+    ok "$(basename "$authz_file") actually INVOKES the shared verdict selector"
   else
-    bad "iteration-trigger.yml's CLAUDE= selector does not carry ${AUTHZ_ALLOWLIST_REST} — the allowlist bytes may be elsewhere in that file, but they are not in the expression that picks the verdict (#1199)"
+    bad "$(basename "$authz_file") never runs ${AUTHZ_FILTER_PATH} — no command line matches /${authz_invoke_re}/. A log message that NAMES the filter satisfies a substring grep while invoking nothing, and an inline selector behind one reopens #1266, #1199 and #1263 at once"
+  fi
+  if grep -qF -- "$AUTHZ_QUERY_PATH" <<<"$(authz_live_lines "$authz_file" || true)"; then
+    ok "$(basename "$authz_file") fetches the comment thread with the shared query"
+  else
+    bad "$(basename "$authz_file") does not reference ${AUTHZ_QUERY_PATH} outside its comments — two paths that fetch different payloads cannot be made to check the same things (#1263)"
+  fi
+  if grep -qE -- "$authz_fetch_re" <<<"$(authz_command_lines "$authz_file" || true)"; then
+    ok "$(basename "$authz_file") actually SENDS the shared comment query"
+  else
+    bad "$(basename "$authz_file") never sends ${AUTHZ_QUERY_PATH} — no command line matches /${authz_fetch_re}/. Naming the query file is not fetching with it, and a payload without userContentEdits makes #1263's check unanswerable"
+  fi
+done
+
+# …AND THE SHARED FILTER MUST STILL CARRY BOTH GUARDS. The delegation assertions
+# above are satisfied by a filter file that has been gutted, and a gutted filter
+# fails in the direction nobody notices: it selects nothing, every lane reads
+# `awaiting-review`, and that is indistinguishable from "no verdict posted yet".
+AUTHZ_FILTER_FILE="$(cd "$(dirname "$0")/../.." && pwd)/$AUTHZ_FILTER_PATH"
+if [[ ! -s "$AUTHZ_FILTER_FILE" ]]; then
+  bad "$AUTHZ_FILTER_PATH is missing or empty — both clearance paths delegate to it, so an empty program is a fleet-wide unmark (#1266, #1263)"
+else
+  if grep -qF -- '.body != null' <<<"$(authz_live_lines "$AUTHZ_FILTER_FILE" || true)"; then
+    ok "the shared verdict selector guards against a null comment body (#1266)"
+  else
+    bad "the shared verdict selector has lost its '.body != null' conjunct — one null-bodied comment aborts the wake step under set -euo pipefail and the lane never hears anything again (#1266)"
+  fi
+  if grep -qF -- 'userContentEdits' <<<"$(authz_live_lines "$AUTHZ_FILTER_FILE" || true)"; then
+    ok "the shared verdict selector checks who actually wrote the body (#1263)"
+  else
+    bad "the shared verdict selector no longer reads userContentEdits — an account with write/triage access can retype a CHANGES_REQUESTED as an LGTM and both clearance paths clear the merge (#1263)"
   fi
 fi
 
