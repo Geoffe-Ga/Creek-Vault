@@ -72,6 +72,7 @@ from creek_mcp.tools import (
     wheel_tool,
 )
 from creek_mcp.tools.draft import draft_tool
+from creek_mcp.tools.reflect import GroundingSession
 from creek_mcp.transport_posture import is_loopback, require_transport_confidentiality
 
 if TYPE_CHECKING:
@@ -490,12 +491,17 @@ def build_server(
     compile_factory = compile_llm_factory or partial(_build_compile_llm, vault)
     reflect_factory = reflect_llm_factory or partial(_build_reflect_llm_factory, vault)
 
+    # One grounding session per server (#1034): ``creek.reflect``'s retrieval
+    # specialist is built and warmed once here rather than per call, so the
+    # sentence-transformer load and the embeddings-parquet read are paid once
+    # for this server's lifetime. Owner-scoped, never a module global.
     _register_conversation_tools(
         server,
         vault=vault,
         consumer=consumer,
         transport=transport,
         reflect_factory=reflect_factory,
+        grounding_session=GroundingSession(),
     )
     _register_authoring_tools(
         server,
@@ -522,6 +528,7 @@ def _register_conversation_tools(
     consumer: str,
     transport: Transport,
     reflect_factory: Callable[[], _LLMFactory],
+    grounding_session: GroundingSession,
 ) -> None:
     """Register the five conversational tools on *server*.
 
@@ -546,6 +553,11 @@ def _register_conversation_tools(
             re-derived so it cannot be dropped silently.
         reflect_factory: Thunk returning the tier-keyed LLM factory for
             ``creek.reflect``. Invoked lazily per call.
+        grounding_session: The server-scoped :class:`GroundingSession` whose
+            warmed retrieval specialist every ``creek.reflect`` call reuses
+            (#1034). Constructed by ``build_server`` and threaded in rather
+            than built here, so one server has exactly one, and a test can
+            observe or replace it.
     """
 
     @server.tool(name="creek.handshake")
@@ -576,6 +588,7 @@ def _register_conversation_tools(
             content=content,
             entry_ref=entry_ref,
             care_guard=acute_distress_guard,
+            session=grounding_session,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
         )

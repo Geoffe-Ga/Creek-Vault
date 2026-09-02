@@ -67,7 +67,7 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
     from creek_mcp.httpapi.context import RequestContext
-    from creek_mcp.tools.reflect import _LLMFactory
+    from creek_mcp.tools.reflect import GroundingSession, _LLMFactory
 
 _NOT_FOUND_REASON: Final[str] = "entry_ref not found"
 """The tool's unresolvable-``entry_ref`` refusal, verbatim."""
@@ -185,6 +185,7 @@ def _reflect(
     parsed: ReflectionRequest,
     context: RequestContext,
     build_factory: Callable[[], _LLMFactory] | None,
+    session: GroundingSession | None,
 ) -> dict[str, Any] | None:
     """Resolve the vault and run the reflect tool, both off the event loop.
 
@@ -207,6 +208,11 @@ def _reflect(
             the failure lands in the same structured vocabulary as every other
             provider failure, and — since #1409 — so the production default can
             see the vault it must route for.
+        session: The app-scoped :class:`~creek_mcp.tools.reflect.GroundingSession`
+            whose warmed retrieval specialist the default grounder reuses
+            (#1034), or ``None`` to build a cold one per call. Passed
+            positionally through :func:`read_off_loop`, which takes ``*args``
+            and forbids keywords by design.
 
     Returns:
         The tool's return dict, a synthetic refusal when the factory itself
@@ -234,6 +240,7 @@ def _reflect(
         # Adepthood also gates pre-call: two independent gates is the design,
         # not redundancy to trim.
         care_guard=acute_distress_guard,
+        session=session,
         privacy_tier_ceiling=context.ceiling,
         consumer=context.consumer,
         max_notes=parsed.max_notes,
@@ -432,6 +439,7 @@ async def handle_reflection(request: Request) -> Response:
         parsed,
         context,
         request.app.state.reflect_llm_factory,
+        request.app.state.reflect_grounding_session,
     )
     if result is None:
         return error_response(ErrorCode.UNAVAILABLE, context)

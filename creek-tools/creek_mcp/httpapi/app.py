@@ -549,4 +549,14 @@ def create_app(
     app.router.redirect_slashes = REDIRECT_SLASHES
     app.state.vault_path = vault_path
     app.state.reflect_llm_factory = reflect_llm_factory
+    # One grounding session per app (#1034), so ``POST /v1/reflections`` builds
+    # and warms its retrieval specialist once for this process rather than once
+    # per request. Set on ``app.state`` rather than taken as a ``create_app``
+    # parameter: the production entry point never needs to configure it, and a
+    # test replaces the attribute directly. Imported here rather than at module
+    # scope to keep this module's import graph free of the author agents that
+    # ``GroundingSession.specialist`` pulls in lazily.
+    from creek_mcp.tools.reflect import GroundingSession
+
+    app.state.reflect_grounding_session = GroundingSession()
     return app

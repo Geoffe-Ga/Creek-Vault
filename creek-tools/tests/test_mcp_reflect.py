@@ -37,8 +37,10 @@ The LLM and retrieval are injected — no live calls.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -49,12 +51,21 @@ import pytest
 from creek.author.agents import RetrievalSpecialist
 from creek.care.guardrail import CARE_SIGNAL
 from creek.classify.llm.router import IntimateRoutingError
+from creek.link.embeddings import EmbeddingLinker
 from creek.models import PrivacyTier
 from creek_mcp import tier_ceiling
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.compiled_pages import RelatedCompiled
+from creek_mcp.server import Transport, build_server
 from creek_mcp.tier_ceiling import TierCeiling, to_privacy_override
-from creek_mcp.tools.reflect import TOOL_NAME, _routing_tier, reflect_tool
+from creek_mcp.tools.reflect import (
+    _MAX_LIVE_EMBEDS,
+    TOOL_NAME,
+    GroundingSession,
+    _default_retrieve,
+    _routing_tier,
+    reflect_tool,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -2761,3 +2772,674 @@ def test_reflect_tool_and_its_helpers_stay_within_the_complexity_budget() -> Non
         if name in _BUDGETED and cc > _COMPLEXITY_BUDGET
     }
     assert over == {}
+
+
+# --- Owner-scoped grounding session (#1034) ------------------------------------------
+
+# The #1034 defect is one of **lifetime**, not of memoisation. That the
+# specialist's two memo slots work is already proven three times over in
+# ``tests/test_real_agents.py`` -- ``test_retrieval_reuses_linker_across_gather_
+# calls`` (one model load per instance), ``test_retrieval_loads_cache_once_
+# across_gather_calls`` (one parquet read per instance + vault) and
+# ``test_retrieval_cache_hit_avoids_re_embedding``. What was missing is an owner
+# to hold the instance: ``_default_retrieve`` built one inline in the call
+# expression and dropped it, so every reflection started cold. These tests
+# observe the lifetime through the wiring, never by calling the memo directly.
+
+_SESSION_NOTE = {"quote": _GROUNDED_QUOTE, "kind": "reframe", "note": "yours"}
+
+
+def _session_factory() -> _RecordingFactory:
+    """Return a recording LLM factory that answers with one grounded note."""
+    return _RecordingFactory(_notes_payload(_SESSION_NOTE))
+
+
+def _count_specialist_builds(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Count ``RetrievalSpecialist`` constructions while still constructing them.
+
+    Wraps and delegates rather than stubbing: a stubbed ``__init__`` would leave
+    the instance without its memo slots, so the parquet and model-load counts
+    beside it would be measuring a different object than production uses.
+
+    Args:
+        monkeypatch: The builtin fixture; restores the real ``__init__``.
+
+    Returns:
+        A list that gains one entry per construction.
+    """
+    built: list[object] = []
+    real_init = RetrievalSpecialist.__init__
+
+    def _counting_init(self: Any, **kwargs: Any) -> None:
+        """Record the construction, then run the real initialiser."""
+        built.append(self)
+        real_init(self, **kwargs)
+
+    monkeypatch.setattr(RetrievalSpecialist, "__init__", _counting_init)
+    return built
+
+
+def _count_cache_reads(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Count ``EmbeddingLinker.load_cache`` parquet reads, still performing them.
+
+    Args:
+        monkeypatch: The builtin fixture; restores the real ``load_cache``.
+
+    Returns:
+        A list that gains one entry per parquet read.
+    """
+    reads: list[object] = []
+    real_load = EmbeddingLinker.load_cache
+
+    def _counting_load(self: Any, path: Path) -> Any:
+        """Record the read, then perform the real one."""
+        reads.append(path)
+        return real_load(self, path)
+
+    monkeypatch.setattr(EmbeddingLinker, "load_cache", _counting_load)
+    return reads
+
+
+def test_one_server_builds_one_retrieval_specialist_for_many_reflections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_sentence_transformer: Any,
+) -> None:
+    """Three ``creek.reflect`` calls through one server pay the setup once (#1034).
+
+    The MCP half of the defect, driven through ``server.call_tool`` rather than
+    ``reflect_tool`` directly -- otherwise the test stops observing the wiring,
+    which is the entire subject. Against unfixed code all three counts read
+    ``3``: ``_default_retrieve`` evaluated ``RetrievalSpecialist().gather(...)``
+    inline, so ``_get_cache``'s ``if self._cache is None`` guard and
+    ``load_model``'s ``if self._model is None`` guard were both cold every call.
+
+    The model-load count is the headline. It is corpus-size independent and is
+    paid even on this four-fragment vault, because ``_load_sentence_transformer``
+    carries no ``lru_cache`` and ``EmbeddingLinker._model`` is a per-instance
+    slot -- so a per-call construction meant a model load from disk per call.
+
+    The ``status`` assertion passes *today*, which is the point: the defect was
+    invisible to every existing assertion in this file. The grounding assertion
+    is what stops the counts from going green because grounding silently died.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    builds = _count_specialist_builds(monkeypatch)
+    reads = _count_cache_reads(monkeypatch)
+    factory = _session_factory()
+
+    server = build_server(
+        transport=Transport.STDIO,
+        vault_path=vault,
+        reflect_llm_factory=lambda: factory,
+    )
+    results = [
+        _structured_reflect(server, TierCeiling.PERSONAL.value) for _ in range(3)
+    ]
+
+    assert [row["status"] for row in results] == ["ok", "ok", "ok"], results
+    assert len(builds) == 1, f"{len(builds)} specialists built, expected 1"
+    assert len(reads) == 1, f"{len(reads)} parquet reads, expected 1"
+    assert mock_sentence_transformer.call_count == 1, "model loaded more than once"
+    assert _tiers_grounded_in(factory.prompt or "") == {
+        "open",
+        "personal",
+        "unclassified",
+    }, "the counts went green because grounding died"
+
+
+def _structured_reflect(server: Any, ceiling: str) -> dict[str, Any]:
+    """Call ``creek.reflect`` on *server* and return its structured content.
+
+    Args:
+        server: The :class:`FastMCP` instance from ``build_server``.
+        ceiling: The declared ``privacy_tier_ceiling`` value.
+
+    Returns:
+        The tool's structured result dict.
+    """
+    result = asyncio.run(
+        server.call_tool(
+            "creek.reflect",
+            {"content": _ENTRY, "privacy_tier_ceiling": ceiling},
+        )
+    )
+    return result[1] if isinstance(result, tuple) else result
+
+
+def test_a_warmed_specialist_mutates_nothing_across_calls_at_any_ceiling(
+    tmp_path: Path,
+) -> None:
+    """A shared specialist gains no instance state, at any ceiling (#1034).
+
+    **The structural privacy guard**, and the one that makes the dangerous
+    variant of this change unrepresentable rather than merely unwritten. Sharing
+    a specialist is safe *only* because everything it holds is override-blind:
+    the model handle and the tier-blind parquet id→vector map. The corpus record
+    list, the ranked order, the top-k slice, the returned bundle, the caller's
+    override and the live-embed counter are all locals of ``gather`` and must
+    stay locals -- any one of them memoised on the instance would carry one
+    caller's *admitted content* into the next caller's call, which is a privacy
+    leak wearing an optimisation's clothes.
+
+    So this asserts the instance **key set** by equality, not just the values: a
+    future ``self._ranked = ranked`` fails here by name the moment it is written,
+    without anyone having to think of the leak it would cause. The identity
+    checks catch the other half -- a re-assignment of an existing slot, which
+    would mean a second model load or a second parquet read.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    session = GroundingSession()
+    specialist = session.specialist(vault)
+    before = dict(vars(specialist))
+
+    for ceiling in TierCeiling:
+        _default_retrieve(_ENTRY, vault, to_privacy_override(ceiling), session=session)
+
+    after = dict(vars(specialist))
+    assert set(after) == {
+        "_linker",
+        "_cache",
+        "_cache_vault",
+        "_max_live_embeds",
+    }, "a gather added or removed an instance attribute"
+    assert after["_linker"] is before["_linker"], "the linker was rebuilt"
+    assert after["_cache"] is before["_cache"], "the parquet map was rebuilt"
+    assert after["_cache_vault"] == before["_cache_vault"]
+    assert after["_max_live_embeds"] == before["_max_live_embeds"]
+
+
+def test_a_shared_session_never_carries_an_above_ceiling_title_into_a_lower_call(
+    tmp_path: Path,
+) -> None:
+    """A permissive call through a shared session cannot widen the next one.
+
+    The behavioural half of the privacy guard above (#1034). Admission is
+    re-decided per call -- ``gather`` runs ``_load_config`` and ``_load_corpus``
+    on every call, before either memo is consulted -- so a preceding ``ALL``
+    call through the *same* session must leave the following ``OPEN`` call
+    exactly as narrow as it would have been alone.
+
+    Asserted as a **set of tiers**, never as an ordered title string: the
+    conftest model mock seeds each vector from ``hash(text)``, which
+    ``PYTHONHASHSEED`` randomises per process, so multi-title ordering is not
+    stable across runs. The first assertion is the control -- without it, the
+    second could pass because grounding never fired at all.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    session = GroundingSession()
+
+    permissive = _session_factory()
+    reflect_tool(
+        vault_path=vault,
+        llm_factory=permissive,
+        content=_ENTRY,
+        session=session,
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+    narrow = _session_factory()
+    reflect_tool(
+        vault_path=vault,
+        llm_factory=narrow,
+        content=_ENTRY,
+        session=session,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert _tiers_grounded_in(permissive.prompt or "") == set(_CORPUS)
+    assert _tiers_grounded_in(narrow.prompt or "") == {"open"}
+    for tier in ("personal", "unclassified", "intimate"):
+        _assert_tier_left_no_trace(narrow.prompt or "", tier)
+
+
+def test_the_grounding_session_holds_one_specialist_and_evicts_on_vault_change(
+    tmp_path: Path,
+) -> None:
+    """The session keeps exactly one specialist, never a per-vault dictionary.
+
+    A ``dict[Path, RetrievalSpecialist]`` would be unbounded per-request growth
+    introduced by a change whose stated purpose is bounding cost: on ``/v1``
+    production passes no ``vault_path``, so ``configured_vault`` re-reads
+    ``creek_config.yaml`` every request, and a multi-vault or reconfigured host
+    would accumulate one loaded sentence-transformer **and** one full id→vector
+    map per distinct path for the life of the process.
+
+    The third call is the load-bearing one: returning to vault A must build
+    *afresh* rather than find A still cached, which is what proves the slot was
+    replaced rather than added to.
+    """
+    vault_a = _vault(tmp_path / "a")
+    vault_b = _vault(tmp_path / "b")
+    _write_tiered_corpus(vault_a)
+    _write_tiered_corpus(vault_b)
+    session = GroundingSession()
+
+    first = session.specialist(vault_a)
+    assert session.specialist(vault_a) is first, "same vault rebuilt the specialist"
+    second = session.specialist(vault_b)
+    assert second is not first, "a new vault reused the old specialist"
+    third = session.specialist(vault_a)
+
+    assert third is not first, "vault A's specialist survived a switch to vault B"
+    assert third is not second
+
+
+def test_no_module_global_holds_a_specialist_linker_or_session() -> None:
+    """No module-level binding or cache decorator owns the shared state (#1034).
+
+    ``RetrievalSpecialist``'s own docstring forbids a module global, and the
+    conftest's autouse sentence-transformer patch is the concrete reason: a
+    process-lifetime instance would carry one test's ``MagicMock`` model into
+    the next test, and the failure would surface far from its cause. An
+    ``lru_cache`` on the grounder would do the same thing by another name.
+
+    Owner-scoping is what replaces it, so this is the guard that keeps the
+    replacement honest. Scanned with ``ast`` over the four modules that could
+    plausibly acquire one, following the AST-pinning precedent in
+    ``tests/test_v1_api_structure.py``.
+    """
+    import ast
+    from pathlib import Path as _Path
+
+    import creek.author.agents as _agents
+    import creek_mcp.httpapi.app as _app
+    import creek_mcp.server as _server
+    import creek_mcp.tools.reflect as _reflect
+
+    forbidden = {"RetrievalSpecialist", "EmbeddingLinker", "GroundingSession"}
+    cached = {"lru_cache", "cache"}
+    offenders: list[str] = []
+
+    for module in (_reflect, _server, _app, _agents):
+        source = _Path(module.__file__ or "").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for node in tree.body:
+            if not isinstance(node, ast.Assign | ast.AnnAssign):
+                continue
+            for inner in ast.walk(node):
+                if not isinstance(inner, ast.Call):
+                    continue
+                func = inner.func
+                name = func.attr if isinstance(func, ast.Attribute) else None
+                name = name or getattr(func, "id", None)
+                if name in forbidden:
+                    offenders.append(f"{module.__name__}: module-level {name}()")
+        for inner in ast.walk(tree):
+            if not isinstance(inner, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for deco in inner.decorator_list:
+                target = deco.func if isinstance(deco, ast.Call) else deco
+                label = (
+                    target.attr
+                    if isinstance(target, ast.Attribute)
+                    else getattr(target, "id", None)
+                )
+                if label in cached:
+                    offenders.append(f"{module.__name__}: @{label} on {inner.name}")
+
+    assert offenders == [], offenders
+
+
+def test_the_mcp_server_hands_reflect_tool_a_reusable_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``build_server`` really passes a ``session=``, and it really is reusable.
+
+    Criterion 5 of the issue asked for this through ``retrieve=``, and that is
+    **unsatisfiable**: ``_gather_grounding`` composes
+    ``_Grounding(retrieve(entry, vault_path, override), [])``, so an injected
+    ``retrieve`` returns ``list[str]`` and contributes *no* fragment ids by
+    design -- as ``reflect_tool``'s own docstring states and
+    ``test_injected_retrieve_bypasses_the_default_grounder`` pins. Routing
+    production through it would empty ``source_ids``, break the #873 selection
+    path and redden ``test_a_retrieval_seed_alone_selects_the_compiled_layer``.
+    So the lifetime arrives on a **sibling** keyword instead, and ``retrieve=``
+    keeps its exact contract and precedence.
+
+    Recording the kwarg alone would prove only that *something* was passed, so
+    this also drives the recorded session twice and asserts it hands back the
+    same object -- the property the whole change exists to provide.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    seen: list[Any] = []
+
+    def _recording_reflect_tool(**kwargs: Any) -> dict[str, Any]:
+        """Record the ``session`` kwarg and answer with a minimal success."""
+        seen.append(kwargs.get("session"))
+        return {"status": "ok", "notes": []}
+
+    monkeypatch.setattr("creek_mcp.server.reflect_tool", _recording_reflect_tool)
+    server = build_server(
+        transport=Transport.STDIO,
+        vault_path=vault,
+        reflect_llm_factory=_session_factory,
+    )
+    _structured_reflect(server, TierCeiling.OPEN.value)
+
+    assert seen and seen[0] is not None, "creek.reflect passed no session"
+    session = seen[0]
+    assert session.specialist(vault) is session.specialist(vault)
+
+
+def test_a_shared_session_whose_gather_fails_still_degrades_to_no_grounding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Sharing the specialist does not remove the degradation path (#1034).
+
+    ``test_retrieval_failure_degrades_to_no_grounding`` and
+    ``test_retrieval_failure_logs_the_exception_type_not_its_message`` already
+    pin this for the per-call grounder; the risk a shared session introduces is
+    that the failure is now raised by an object built on a *previous* call, so
+    this re-asserts both halves on the shared path.
+
+    Reuses ``_patch_gather_to_raise`` rather than writing a second helper: it
+    patches the class attribute, which is what makes the lazy in-body import in
+    ``_default_retrieve`` pick up the substitution.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    session = GroundingSession()
+    session.specialist(vault)
+    _patch_gather_to_raise(monkeypatch, RuntimeError(_RETRIEVAL_FAILURE_SENTINEL))
+    factory = _session_factory()
+
+    with caplog.at_level(logging.DEBUG):
+        result = reflect_tool(
+            vault_path=vault,
+            llm_factory=factory,
+            content=_ENTRY,
+            session=session,
+            privacy_tier_ceiling=TierCeiling.OPEN,
+        )
+
+    assert result["status"] == "ok", result
+    assert _source_section(factory.prompt or "").strip() == _NO_GROUNDING
+    assert "RuntimeError" in caplog.text
+    assert _RETRIEVAL_FAILURE_SENTINEL not in caplog.text
+
+
+def test_a_session_that_cannot_warm_stores_nothing_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed session build degrades, caches nothing, and the next call retries.
+
+    The half of criterion 19 that a "degrades to empty grounding" assertion
+    alone would miss. If ``specialist()`` stored a half-built object -- or
+    remembered the vault it failed on -- one transient model-load failure at
+    boot would leave the process permanently ungrounded, and every later
+    reflection would silently return no grounding with nothing in the logs to
+    say why.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    session = GroundingSession()
+    attempts: list[Path] = []
+
+    def _failing_warm(_self: Any, warmed: Path) -> None:
+        """Record the attempt, then fail as a cold model load would."""
+        attempts.append(warmed)
+        raise OSError("model weights unavailable")
+
+    monkeypatch.setattr(RetrievalSpecialist, "warm", _failing_warm)
+    grounding = _default_retrieve(
+        _ENTRY, vault, to_privacy_override(TierCeiling.OPEN), session=session
+    )
+
+    assert grounding == ([], []), "a failed warm did not degrade to no grounding"
+    assert vars(session)["_specialist"] is None, "a failed build was cached"
+    assert vars(session)["_vault"] is None, "a failed build recorded its vault"
+
+    monkeypatch.undo()
+    assert session.specialist(vault) is not None, "the session never retried"
+    assert len(attempts) == 1
+
+
+def test_a_shared_session_still_selects_the_compiled_layer_from_one_pass(
+    tmp_path: Path,
+) -> None:
+    """#873's one-pass selection survives the shared specialist (#1034).
+
+    ``related_praxis`` is selected from the ids the *grounding* pass resolved,
+    with no second embedding sweep. The request below carries inline ``content``
+    and **no** ``entry_ref``, so ``from_entry`` is empty by construction and the
+    compiled page can only be reached through a retrieval seed -- exactly the
+    property that wiring production through ``retrieve=`` would have silently
+    destroyed, since an injected grounder contributes no ids.
+
+    Modelled on ``test_a_retrieval_seed_alone_selects_the_compiled_layer``,
+    whose docstring records that this property was reachable but unobserved
+    until it existed. Here it runs through the real grounder and a real session.
+    """
+    vault = _vault(tmp_path)
+    entry_ref = _write_compiled_layer(vault, member_tier="open")
+    session = GroundingSession()
+    factory = _session_factory()
+
+    result = reflect_tool(
+        vault_path=vault,
+        llm_factory=factory,
+        content=_ENTRY,
+        session=session,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result.get("status") == "ok", result
+    # The seed really came from the grounding pass: the compiled page's own
+    # fragment title is in the grounding block, and no ``entry_ref`` was sent.
+    assert entry_ref in _source_section(factory.prompt or ""), factory.prompt
+    assert [row["title"] for row in result["related_praxis"]] == [_PRAXIS_873], result
+
+
+_BENCH_FRAGMENTS = 40
+
+
+def _seed_bench_vault(vault: Path, count: int) -> list[str]:
+    """Write *count* open-tier corpus fragments and return their ids.
+
+    Args:
+        vault: Vault root as created by :func:`_vault`.
+        count: How many fragments to write.
+
+    Returns:
+        The fragment ids written.
+    """
+    ids = [f"frag-bench-{index:04d}" for index in range(count)]
+    for frag_id in ids:
+        _write_corpus_fragment(
+            vault,
+            frag_id=frag_id,
+            title=f"TITLE-{frag_id}",
+            body=f"BODY-{frag_id}",
+            privacy_tier="open",
+        )
+    return ids
+
+
+def _seed_bench_parquet(vault: Path) -> None:
+    """Persist a warm embeddings parquet covering the whole admitted corpus.
+
+    Vectors come from the autouse mock model, the same one the code under test
+    uses, so a cache hit yields exactly the vector a live embed would -- which
+    is what makes the warm cell's ``generate_embedding`` count meaningful rather
+    than an artefact of a different embedder.
+
+    Args:
+        vault: Vault root whose corpus is embedded into the parquet.
+    """
+    from datetime import datetime as _dt
+
+    from creek.author.agents import _load_config, _load_corpus
+    from creek.link.embeddings import (
+        CachedEmbedding,
+        content_hash_for_text,
+        embeddings_cache_path,
+        fragment_embedding_text,
+    )
+
+    config = _load_config(vault)
+    linker = EmbeddingLinker(config.embeddings)
+    entries = {
+        fragment.id: CachedEmbedding(
+            fragment_id=fragment.id,
+            content_hash=content_hash_for_text(fragment_embedding_text(fragment)),
+            model_name=config.embeddings.model,
+            vector=linker.generate_embedding(fragment_embedding_text(fragment)),
+            computed_at=_dt.now(tz=UTC),
+        )
+        for fragment, _body in _load_corpus(vault)
+    }
+    path = embeddings_cache_path(vault)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    linker.save_cache(entries, path)
+
+
+@pytest.mark.slow
+def test_benchmark_grounding_setup_is_paid_once_per_process_not_per_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_sentence_transformer: Any,
+    record_property: Any,
+) -> None:
+    """Measure the #1034 saving as counts across four cells (#1034).
+
+    **Counts are the measurement; the wall time recorded beside them is
+    structure only and must not be quoted as latency.** ``conftest``
+    auto-mocks the sentence-transformer for every test in this suite, so an
+    in-suite second is the cost of a ``MagicMock``, not of a model. Converting
+    these counts to time needs a separately measured single-model-load and
+    single-embed latency from a real-model run; the PR does that conversion and
+    says which number came from where.
+
+    Four cells: {per-call, shared} x {cold parquet, warm parquet}, three
+    reflections each. The shared cells are what the fix buys; the per-call cells
+    are what production did before it.
+    """
+    vault = _vault(tmp_path)
+    ids = _seed_bench_vault(vault, _BENCH_FRAGMENTS)
+    calls = 3
+    override = to_privacy_override(TierCeiling.OPEN)
+
+    for cache_state in ("cold", "warm"):
+        if cache_state == "warm":
+            _seed_bench_parquet(vault)
+        for mode in ("per_call", "shared"):
+            builds = _count_specialist_builds(monkeypatch)
+            reads = _count_cache_reads(monkeypatch)
+            embeds: list[str] = []
+            real_embed = EmbeddingLinker.generate_embedding
+
+            def _counting_embed(
+                self: Any, text: str, _sink: Any = embeds, _real: Any = real_embed
+            ) -> Any:
+                """Record the embed, then perform the real one."""
+                _sink.append(text)
+                return _real(self, text)
+
+            monkeypatch.setattr(EmbeddingLinker, "generate_embedding", _counting_embed)
+            before_loads = mock_sentence_transformer.call_count
+            session = GroundingSession() if mode == "shared" else None
+
+            started = time.perf_counter()
+            for _ in range(calls):
+                _default_retrieve(_ENTRY, vault, override, session=session)
+            elapsed = time.perf_counter() - started
+
+            label = f"{mode}/{cache_state}"
+            loads = mock_sentence_transformer.call_count - before_loads
+            record_property(
+                f"grounding-{label}",
+                f"calls={calls} builds={len(builds)} parquet_reads={len(reads)} "
+                f"embeds={len(embeds)} model_loads={loads} "
+                f"mocked_seconds={elapsed:.4f}",
+            )
+            if mode == "shared":
+                assert len(builds) == 1, f"{label}: {len(builds)} builds"
+                assert len(reads) == 1, f"{label}: {len(reads)} parquet reads"
+                assert loads <= 1, f"{label}: {loads} model loads"
+            else:
+                assert len(builds) == calls, f"{label}: {len(builds)} builds"
+                assert len(reads) == calls, f"{label}: {len(reads)} parquet reads"
+            if cache_state == "cold" and mode == "per_call":
+                # The unbounded pre-fix shape: every admitted fragment, every call.
+                assert len(embeds) == calls * (len(ids) + 1), f"{label}: {len(embeds)}"
+            monkeypatch.undo()
+
+
+def test_the_published_cap_reaches_the_specialist_the_session_builds(
+    tmp_path: Path,
+) -> None:
+    """The production cap is wired, is a real bound, and is read at call time.
+
+    Guards the *upward* direction, which the cap's other tests could not.
+    ``_MAX_LIVE_EMBEDS`` is 256 and the largest fixture vault in this suite is
+    40 fragments, so no test that merely runs a reflection ever crosses the
+    budget — deleting the plumbing entirely, or setting the constant to
+    ``None``, left the whole suite green. Three separate mutations did.
+
+    The key-set guard does not catch it either: ``_max_live_embeds`` is assigned
+    unconditionally in ``__init__``, so under mutation the attribute survives
+    with value ``None`` and an identity comparison of ``None`` to ``None``
+    passes. Only naming the expected *value* closes that.
+
+    Both halves are load-bearing. The `isinstance`/`> 0` half fails if the
+    published constant stops being a bound; the equality half fails if the
+    session stops handing it to the specialist it builds.
+    """
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+
+    specialist = GroundingSession().specialist(vault)
+
+    assert isinstance(_MAX_LIVE_EMBEDS, int), "the published cap is not a bound"
+    assert _MAX_LIVE_EMBEDS > 0, "the published cap does not cap"
+    assert specialist._max_live_embeds == _MAX_LIVE_EMBEDS, (
+        "the session did not hand the published cap to its specialist"
+    )
+
+
+def test_the_production_cap_bounds_a_cold_gather_and_says_so(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Crossing the budget on the production path truncates ranking, and warns.
+
+    The behavioural twin of the wiring test above, driven through
+    ``GroundingSession`` — the way production reaches the cap — rather than a
+    directly constructed ``RetrievalSpecialist``. The constant is monkeypatched
+    down instead of building a >256-fragment fixture, which is why
+    :meth:`GroundingSession.specialist` reads it at call time.
+
+    The log assertion is the point. A truncated pass returns the same *shape* as
+    a genuinely thin vault, so without a runtime signal an operator on a large
+    cold vault would ground against an id-ordered prefix forever with nothing to
+    reveal it. The record must carry the counts and must **not** carry any
+    fragment id, title or body: this logger has no tier and is not covered by
+    the caller's ceiling.
+    """
+    monkeypatch.setattr("creek_mcp.tools.reflect._MAX_LIVE_EMBEDS", 2)
+    vault = _vault(tmp_path)
+    _write_tiered_corpus(vault)
+    session = GroundingSession()
+
+    with caplog.at_level(logging.WARNING, logger="creek.author.agents"):
+        grounding = _default_retrieve(
+            _ENTRY, vault, to_privacy_override(TierCeiling.ALL), session=session
+        )
+
+    assert len(grounding.lines) == 2, (
+        f"budget 2 over 4 admitted fragments ranked {len(grounding.lines)}"
+    )
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, f"expected one budget warning, got {len(warnings)}"
+    message = warnings[0].getMessage()
+    assert "budget" in message.lower(), message
+    assert "2 skipped" in message, message
+    for marks in _CORPUS.values():
+        assert marks.title not in message, "the warning names a fragment title"
+        assert marks.frag_id not in message, "the warning names a fragment id"
+        assert marks.body not in message, "the warning names a fragment body"
