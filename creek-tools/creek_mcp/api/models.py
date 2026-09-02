@@ -42,11 +42,13 @@ non-answer — above the ceiling, purged, orphaned, schema-invalid, or deleted
 out of band — collapses to :attr:`ErrorCode.PRIVACY_REFUSED` carrying
 :data:`creek_mcp.read_gate.GENERIC_ABOVE_CEILING_REASON`.
 
-Today that rule is enforced by this vocabulary alone: there is no handler to
-break it, since ``/v1`` has no routes until #1074 mounts them. The structural
-guard that keeps it from regressing once handlers exist — an AST sweep over
-every ``NOT_FOUND`` construction site in :mod:`creek_mcp`, checked against a
-pinned routing-layer allowlist — is tracked in #1098.
+That rule is enforced structurally as well as by this vocabulary. An AST sweep
+over every module in :mod:`creek_mcp` pins the modules that may name
+``NOT_FOUND`` at all to a routing-layer allowlist this one heads — see
+``test_not_found_is_named_only_in_the_pinned_routing_modules`` in
+``tests/test_v1_api_structure.py``, alongside
+``test_not_found_is_constructed_once_in_the_routing_miss``, which pins the sole
+``error_response(ErrorCode.NOT_FOUND, ...)`` site to the routing-miss handler.
 """
 
 from __future__ import annotations
