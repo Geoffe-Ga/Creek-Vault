@@ -907,10 +907,11 @@ def test_draft_does_not_build_a_provider_when_it_cannot_draft(
     Both the "no idea seeds" empty response and the out-of-range-index refusal
     return before any prompt exists, so invoking the factory would spend a
     provider handshake (and, on a cloud stage, an API credential) on a call
-    that never drafts. Today's ``draft_tool`` takes an already-built ``llm``
-    and the server hands it ``factory()`` eagerly in the handler
-    (``server.py:419``), so both paths pay that cost unconditionally — this
-    test pins the laziness the tier-keyed factory makes possible.
+    that never drafts. ``draft_tool`` takes an ``llm_factory:
+    DraftLLMFactory``, not an already-built ``llm``, and the ``creek.draft``
+    wrapper registered by ``creek_mcp.server._register_authoring_tools`` passes
+    ``llm_factory=factory`` **uncalled**, so the laziness has shipped and this
+    test is what pins it rather than aspiring to it.
     """
     invocations: list[PrivacyTier] = []
 
