@@ -6422,7 +6422,11 @@ def test_no_creek_ingestor_can_put_aliases_on_a_fragment(tmp_path: Path) -> None
     *any* addition so that a human reads this docstring before widening the
     hatch. ``review`` was added by #1517 — it carries an OCR-confidence
     marker, names nothing and resolves to no page, so it cannot become a
-    link the purge would have to follow. The separate ``aliases``
+    link the purge would have to follow. ``page`` and ``scanned`` were added
+    by #1639, when a scanned PDF started ingesting as one fragment per page,
+    and the same test applies to both: ``page`` is an **integer** page index
+    and ``scanned`` is a **boolean**, so neither is a string that could name
+    a vault page, and neither can become a link. The separate ``aliases``
     assertion below is the guarantee itself, and it does not depend on the
     set's exact contents.
 
@@ -6432,7 +6436,7 @@ def test_no_creek_ingestor_can_put_aliases_on_a_fragment(tmp_path: Path) -> None
     """
     assert tmp_path.is_dir()
     assert "aliases" not in PASSTHROUGH_FRONTMATTER_KEYS
-    expected = frozenset({"sheet", "rows", "columns", "review"})
+    expected = frozenset({"sheet", "rows", "columns", "review", "page", "scanned"})
     assert expected == PASSTHROUGH_FRONTMATTER_KEYS
 
     fragment = Fragment.model_validate(

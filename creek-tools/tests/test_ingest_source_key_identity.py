@@ -45,10 +45,14 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek.config import OCRConfig
 from creek.ingest import INGESTOR_REGISTRY, assemble_ingested_fragment
+from creek.ingest.documents import DocumentIngestor
+from creek.ingest.images import OCR_ENGINES, OcrResult
 from creek.ingest.ledger import SourceLedger
-from creek.ingest.pipeline import derive_source_key, run_ingest
+from creek.ingest.pipeline import IngestRunResult, derive_source_key, run_ingest
 from creek.vault.writer import VaultWriter
+from tests.scanned_pdf_support import SCAN_PAGES, scanned_pdf
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -356,3 +360,171 @@ def test_a_genuinely_deleted_out_of_vault_unit_tombs_exactly_once(
         "and its successor must not tomb the same fragment twice."
     )
     assert len(_orphans(vault)) == 1
+
+
+# ---- The scanned-PDF route's sub-unit identity (#1639) -----------------
+
+
+class _PageOcrEngine:
+    """Stub OCR backend returning one canned page per :data:`SCAN_PAGES`.
+
+    Registered through the production ``OCR_ENGINES`` registry rather than
+    injected past it, so these tests exercise the same resolution path
+    ``ocr.engine`` takes in a real vault.
+    """
+
+    def __init__(self, language: str = "eng") -> None:
+        """Accept the language string the production factory passes.
+
+        Args:
+            language: Tesseract language code(s), already joined.
+        """
+        self.language = language
+
+    def is_available(self) -> bool:
+        """Report availability; the stub needs no system binary."""
+        return True
+
+    def extract_text(self, image_path: Path) -> OcrResult:
+        """Unused on this route; present to satisfy the protocol.
+
+        Args:
+            image_path: Image the ingestor asked about.
+
+        Returns:
+            An empty result.
+        """
+        return OcrResult(text="", confidence=0.0)
+
+    def extract_pdf_pages(self, pdf_path: Path) -> list[OcrResult]:
+        """Return one canned result per page.
+
+        Args:
+            pdf_path: PDF the ingestor asked about.
+
+        Returns:
+            One :class:`OcrResult` per entry in :data:`SCAN_PAGES`.
+        """
+        return [
+            OcrResult(
+                text=text,
+                confidence=0.9,
+                page=number,
+                image_type="scanned_pdf_page",
+            )
+            for number, text in enumerate(SCAN_PAGES, start=1)
+        ]
+
+
+def _make_scan_source(tmp_path: Path) -> Path:
+    """Write a pinned-mtime three-page image-only PDF into a source dir."""
+    source = tmp_path / "scans"
+    source.mkdir(parents=True, exist_ok=True)
+    pdf = scanned_pdf(source / "Scan.pdf", 3)
+    _pin_mtime(pdf)
+    return source
+
+
+def _ingest_scan(source: Path, vault: Path) -> IngestRunResult:
+    """Run the document ingest over *source* with the stub OCR engine wired."""
+    return run_ingest(
+        ingestor_cls=DocumentIngestor,
+        source_type="document",
+        input_path=source,
+        vault_path=vault,
+        ocr=OCRConfig(enabled=True, engine="pageocr"),
+    )
+
+
+def _origin_keys(vault: Path) -> list[str]:
+    """Read ``source.origin_key`` off each written fragment's bytes."""
+    return sorted(
+        str(frontmatter.loads(path.read_text(encoding="utf-8"))["source"]["origin_key"])
+        for path in _live_fragments(vault)
+    )
+
+
+def test_each_ocrd_pdf_page_gets_its_own_ledger_key_and_its_own_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routed scan must not collapse three pages into one fragment.
+
+    ``document`` is in ``LEDGERED_SOURCES`` **because**
+    ``DocumentIngestor.parse`` emitted exactly one fragment per file. The
+    #1639 OCR route breaks that invariant, and without the ``source_unit``
+    ``ingest_pdf`` mints, every page of one PDF derives the same
+    ``source.origin_key``, resolves to the same ledger record, and
+    ``write_fragment_idempotent`` reassigns each page's id to that record's —
+    overwriting its predecessor while reporting ``updated``.
+
+    Measured with the discriminator removed: **one** surviving file holding
+    page 3's body under page 1's filename, and the run reporting success.
+    That is silent data loss, so this assertion is the point of the change
+    rather than a detail of it.
+
+    Note the ``set(...)``: the raw ledger JSONL is append-only and keeps three
+    lines under the collapsing mutation, all with the *same* key, so a bare
+    ``len(_raw_ledger_keys(...)) == 3`` reads ``3 == 3`` and passes against
+    exactly the defect it is billed to catch.
+    """
+    monkeypatch.setitem(OCR_ENGINES, "pageocr", _PageOcrEngine)
+    vault = _make_vault(tmp_path)
+    source = _make_scan_source(tmp_path)
+
+    _ingest_scan(source, vault)
+
+    keys = set(_raw_ledger_keys(vault, "document"))
+    assert len(keys) == 3
+    assert sorted(key.rsplit("#", 1)[-1] for key in keys) == [
+        "page-1",
+        "page-2",
+        "page-3",
+    ]
+    assert len(_live_fragments(vault)) == 3
+    assert len(set(_origin_keys(vault))) == 3
+    # Every page keys off the *same* file: the discriminator rides
+    # ``source_unit``, never ``source_path``, because ``routing.arbitrate``
+    # groups fragments on that exact string to decide which ingestor owns a
+    # file. A ``path#page=N`` source path would split one PDF across three
+    # imagined files.
+    assert {key.rsplit("#", 1)[0] for key in keys} == {
+        derive_source_key(str(source / "Scan.pdf"), vault)
+    }
+
+
+def test_re_ingesting_the_same_scan_updates_nothing_and_orphans_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second run of an unchanged scan is a no-op, page by page.
+
+    The identity half of the fix is only proven by a second pass: minting
+    three distinct keys once is compatible with minting three *new* ones next
+    time, which would duplicate the corpus on every ingest.
+    """
+    monkeypatch.setitem(OCR_ENGINES, "pageocr", _PageOcrEngine)
+    vault = _make_vault(tmp_path)
+    source = _make_scan_source(tmp_path)
+
+    first = _ingest_scan(source, vault)
+    assert first.created == 3
+    ids_after_first = sorted(
+        str(frontmatter.loads(path.read_text(encoding="utf-8"))["id"])
+        for path in _live_fragments(vault)
+    )
+
+    second = _ingest_scan(source, vault)
+
+    assert second.created == 0
+    assert second.updated == 0
+    assert second.unchanged == 3
+    assert _orphans(vault) == []
+    assert len(_live_fragments(vault)) == 3
+    assert (
+        sorted(
+            str(frontmatter.loads(path.read_text(encoding="utf-8"))["id"])
+            for path in _live_fragments(vault)
+        )
+        == ids_after_first
+    )

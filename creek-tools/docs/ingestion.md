@@ -12,11 +12,11 @@ Every ingestor is registered in `creek.ingest.INGESTOR_REGISTRY`. The table maps
 | `chatgpt`       | ChatGPT conversation export ZIP.                                      | none                          |
 | `discord`       | Discord channel exports (DiscordChatExporter HTML or JSON).           | none                          |
 | `code`          | A directory tree of source files (`.py`, `.ts`, `.go`, `.md`, …).     | none                          |
-| `document`      | `.docx` and `.pdf` documents.                                         | `python-docx`, `pdfminer.six` |
+| `document`      | `.docx`, `.pdf`, `.html`, `.txt` and `.rtf`. An image-only PDF is detected and OCR'd page by page. | `python-docx`, `pdfminer.six`; for scanned PDFs also `pytesseract`, `pdf2image`, system `tesseract`, `poppler` |
 | `markdown`      | Loose `.md` files.                                                    | none                          |
 | `spreadsheet`   | `.xlsx` (one fragment per sheet) and `.csv` (one fragment per file).  | `openpyxl` (XLSX only)        |
 | `presentation`  | `.pptx` (one fragment per deck; slides become sections).              | `python-pptx`                 |
-| `image`         | `.png` / `.jpg` / `.tiff` / `.pdf-page-as-image` via OCR.             | `pytesseract`, `pdf2image`, system `tesseract`, `poppler` |
+| `image`         | `.png` / `.jpg` / `.jpeg` / `.gif` / `.bmp` / `.tiff` / `.webp` via OCR. **Not** `.pdf` — a scanned PDF is ingested with `--type document`. | `pytesseract`, system `tesseract` |
 | `generic`       | Plain-text fallback for unknown extensions.                           | none                          |
 
 If `--type` is omitted, `creek process` resolves an owner per file — see
@@ -207,11 +207,22 @@ creek ingest --type code         --input ~/projects/diary     --vault ~/Obsidian
 - `.pptx` files emit **one fragment per deck**. Each slide becomes a `## Slide N: Title` section with the body inlined and a `**Speaker notes:**` sub-section when the slide carries notes.
 - The deck title comes from `core_properties.title` if set, otherwise the file stem.
 
-## Images (`images`)
+## Image (`image`)
 
-- Drives `pytesseract` against PNG/JPG/TIFF and via `pdf2image` for PDF pages.
-- The OCR backend is **injectable**: swap in a different engine by implementing `creek.ingest.images.OcrEngine` and passing it to `ImageIngestor(backend=…)`. Useful for tests and for trying alternative OCR engines.
-- Confidence below `OCRConfig.min_confidence` lands the fragment in the review queue.
+- Drives `pytesseract` against the extensions in `creek.ingest.images.IMAGE_EXTENSIONS`: `.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.tiff`, `.webp`.
+- **`.pdf` is not one of them**, so `creek ingest --type image` over a directory of PDFs discovers nothing. A scanned PDF is ingested with `--type document`, which detects it and routes the pages here internally — see [Scanned PDFs](#scanned-pdfs) below.
+- The OCR backend is **injectable**: swap in a different engine by implementing `creek.ingest.images.OcrEngine` and passing it to `ImageIngestor(engine=…)`. Useful for tests and for trying alternative OCR engines. To reach it from a vault config instead, register the engine in `creek.ingest.images.OCR_ENGINES` and name it in `ocr.engine`.
+- Confidence below `OCRConfig.min_confidence` stamps `review: pending_review` on the fragment's frontmatter. That is a marker for a human reader: **no command filters on it**, and in particular `creek redact --review` selects by findings, not by this key.
+
+## Scanned PDFs
+
+- A PDF is treated as scanned when it has **more than one page** and yields fewer than 100 characters of extractable text. A single-page PDF is never flagged — one page holding little text is indistinguishable from one page that genuinely says little, so the detector declines to guess.
+- A detected scan is handed to `ImageIngestor.ingest_pdf`, which renders each page with `pdf2image` and OCRs it. Each page becomes **its own fragment**, titled `<stem> — page N`, bodied with that page's OCR text, and rendered with an `![[file.pdf#page=N]]` embed so Obsidian shows the right page.
+- Each page carries a distinct `source_unit` (`page-N`), so the ingest ledger holds one record per page: re-ingesting an unchanged scan reports every page `unchanged` and orphans nothing.
+- The written frontmatter carries `scanned: true`, `page: N`, and `review: pending_review` when that page's OCR confidence fell below `ocr.min_confidence`.
+- **The route is off unless the vault's `ocr` block turns it on.** A caller that passes no block at all — which is every MCP tool today — gets the old behaviour: one fragment, empty body, `scanned: true`. This is deliberately stricter than the image path, where no block means "use the defaults" and OCR runs. See [`ocr`](configuration.md#ocr--image--pdf-ocr).
+- Under `ocr.enabled: false` the document pass still runs normally — DOCX, TXT, HTML and RTF ingest as usual — and only the scanned-PDF leg declines, with a console advisory naming the config key and the number of files affected.
+- Missing `pdf2image`, `poppler` or `tesseract` does not sink the pass: the failure is recorded in the run's errors with install instructions and the sibling documents still ingest.
 
 ## Generic (`generic`)
 

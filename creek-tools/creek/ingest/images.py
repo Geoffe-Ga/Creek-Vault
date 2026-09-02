@@ -9,13 +9,14 @@ implementation; tests inject a deterministic stub. The default
 optional dependencies (and the ``tesseract``/``poppler`` system
 binaries) are not installed.
 
-The ingestor also exposes :meth:`ImageIngestor.ingest_pdf`, intended for
-:class:`~creek.ingest.documents.DocumentIngestor` to call when it detects
-a scanned (image-only) PDF, routing the OCR work here instead of trying
-to extract text that does not exist. **That routing does not exist yet**:
-``ingest_pdf`` has no production caller, so a scanned PDF is not OCR'd
-today by any command. Callers can invoke it directly on a known-scanned
-PDF in the meantime.
+The ingestor also exposes :meth:`ImageIngestor.ingest_pdf`, which
+:class:`~creek.ingest.documents.DocumentIngestor` calls when it detects a
+scanned (image-only) PDF, routing the OCR work here instead of trying to
+extract text that does not exist. That routing landed in #1639: the caller
+is ``DocumentIngestor._ocr_scanned_pdf``, reached from its ``parse`` when
+``_detect_scanned_pdf`` fires, and it is wired only when the vault's ``ocr``
+block says so — ``ocr=None`` (every MCP surface) declines the route, which
+is deliberately stricter than the image path's "no block means defaults".
 
 Which of the four ``ocr.*`` config keys reach this module, and how, is
 :meth:`ImageIngestor.from_ocr_config` — the one place the block becomes
@@ -748,19 +749,34 @@ class ImageIngestor(Ingestor):
 
         This is a deliberately separate entry point — the standard
         :meth:`Ingestor.ingest` pipeline only handles file extensions
-        in :data:`IMAGE_EXTENSIONS`. Scanned PDFs are routed here from
+        in :data:`IMAGE_EXTENSIONS`, and ``.pdf`` is not one of them.
+        Scanned PDFs are routed here from
         :class:`~creek.ingest.documents.DocumentIngestor` (or a
         higher-level orchestrator) once it detects via
-        ``_detect_scanned_pdf`` that text extraction won't work. Until
-        that integration lands, callers can invoke this method directly
-        on a known-scanned PDF. Pages with no recoverable text are
-        skipped.
+        ``_detect_scanned_pdf`` that text extraction won't work. Pages
+        with no recoverable text are skipped.
+
+        **Every returned fragment carries a ``source_unit`` (#1305), and
+        that is load-bearing rather than decorative.** ``document`` is in
+        :data:`~creek.ingest.pipeline.LEDGERED_SOURCES` precisely because
+        ``DocumentIngestor.parse`` used to emit exactly one fragment per
+        file; this method breaks that invariant. Without the discriminator
+        every page of one PDF shares a ``source.origin_key`` and a ledger
+        record, and
+        :func:`~creek.ingest.pipeline.write_fragment_idempotent` then
+        reassigns each page's id to the record's and overwrites its
+        predecessor — measured: three pages collapse to **one** file
+        holding page 3's body under page 1's filename, while the run
+        reports success. It is minted here, at the one place pages are
+        made, so every future caller inherits it rather than having to
+        remember.
 
         Args:
             pdf_path: Path to the (scanned) PDF.
 
         Returns:
-            One :class:`ParsedFragment` per non-empty page.
+            One :class:`ParsedFragment` per non-empty page, each with a
+            ``source_unit`` of ``page-<n>``.
         """
         results = self.engine.extract_pdf_pages(pdf_path)
         fragments: list[ParsedFragment] = []
@@ -779,7 +795,12 @@ class ImageIngestor(Ingestor):
                 ParsedFragment(
                     content=result.text.strip(),
                     metadata=metadata,
+                    # The whole PDF, verbatim: ``routing.arbitrate`` groups
+                    # fragments on this exact string to decide which ingestor
+                    # owns a file, so the page discriminator rides
+                    # ``source_unit`` and never this (base.py's contract).
                     source_path=str(pdf_path),
+                    source_unit=f"page-{result.page}",
                     timestamp=_modified_time(pdf_path),
                 ),
             )
