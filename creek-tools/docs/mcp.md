@@ -50,6 +50,71 @@ cross-repo contract is
 | `creek.wheel`         | Return a per-frequency balance read of the corpus for the Map: an ordered `F1..F10` map of `{name, count, share}`, where `share` is the fraction of *classified* fragments at that frequency. A corpus walk (the same shape as `state.render` and `report`), so it **excludes** above-ceiling fragments from the tally rather than refusing (#969). |
 | `creek.draft`         | Draft an essay from a mined idea (requires an LLM).        |
 | `creek.redact.scan`   | Regex-scan a path for secrets/PII (FEAT-027); scoped to `00-Creek-Meta/Inbound/` at every ceiling, `intimate`/`all` elsewhere in the vault (#972). |
+| `creek.classify.entry` | Report the ontology classification one named fragment **already carries on disk** (#874). Takes `entry_ref` plus `ceiling`; computes nothing. |
+
+#### `creek.classify.entry` reads a classification; it never makes one (#874)
+
+`creek.classify.entry(entry_ref, privacy_tier_ceiling)` is a **pure read**. It
+is a sibling of the `creek.classify` corpus pass, not part of it: the pass is
+whole-vault, idempotent and takes no fragment selector, while this addresses one
+fragment by id and writes nothing at all — no rule classifier on demand, no LLM,
+no persisted verdict.
+
+A successful call returns **exactly eight keys**:
+
+| Key | Value |
+|-----|-------|
+| `status` | `"ok"` |
+| `tool` | `"creek.classify.entry"` |
+| `tier_ceiling` | The ceiling you declared, echoed — never a derived tier. |
+| `entry_ref` | Your own input, echoed. |
+| `frequency` | An `F1`..`F10` value, or the literal `"unclassified"`. |
+| `phase` | A wavelength phase, or the literal `"unclassified"`. |
+| `privacy_tier` | The fragment's current **persisted** tier: `open`, `personal`, `intimate` or `unclassified`. Within your ceiling by construction, because the gate already ran against it. |
+| `classification_method` | `rules`, `llm`, `manual`, or `none`. |
+
+Every value is a non-null string. `frequency`, `phase` and `privacy_tier` read
+the literal `"unclassified"` when unset — never `null`, never omitted.
+
+**Ingest does not classify.** Neither `creek.ingest` nor `creek.journal` runs
+the frequency/phase classifier, so a freshly written entry reads
+`frequency: "unclassified"`, `phase: "unclassified"`,
+`classification_method: "none"` until a pass runs. That is an honest answer
+rather than a failure, and the remedy is one call: run `creek.classify` (or
+`POST /v1/classifications`), then read again.
+
+`classification_method` is what makes that legible without out-of-band
+knowledge. The provenance stamp is written *unconditionally* by any classify
+write, even when the verdict is `unclassified`, so:
+
+- `rules` with `frequency: "unclassified"` means **a pass ran and genuinely
+  could not classify this fragment**;
+- `none` means **no pass has run yet**.
+
+The sentinel is `none` and deliberately not `unclassified`: that word is
+already a frequency, a phase *and* a privacy tier, and reusing it here would
+collapse the exact distinction the field exists to draw. The value is also
+**clamped** to the three published methods rather than echoed from frontmatter,
+which is arbitrary user-controlled bytes.
+
+There are **three refusal reasons and no others**, each carrying the canonical
+four keys (`status`, `tool`, `tier_ceiling`, `reason`) and nothing else:
+
+| Reason | When | Audited? |
+|--------|------|----------|
+| `entry_ref must not be blank` | A blank or whitespace-only `entry_ref`. Refused before any vault read. | **No** — a malformed call, matching the `creek.journal` / `creek.save` / `creek.ingest` convention. |
+| `entry_ref not found` | The id resolves to no readable fragment. Reachable only at `ceiling=intimate` or `all`, because the fail-closed rule below already refused it everywhere lower. | Yes |
+| `resolved content exceeds the declared tier ceiling` | The fragment's persisted tier is above your ceiling. Names neither the fragment nor its tier. | Yes |
+
+The gate compares the fragment's **current persisted** tier, read through the
+shared source-tier walk — never a tier you supplied, and never one staged on
+the entry, both of which are stale the moment `creek classify` escalates the
+fragment. It fails closed twice over: a fragment whose `privacy_tier` key is
+**missing entirely** ranks `intimate`, distinctly from an explicit
+`unclassified`; and an id that resolves to **nothing** ranks `intimate` too, so
+every locator divergence is refused rather than answered. Note that an explicit
+`unclassified` ranks with `personal` (#961) — admitted at `ceiling=personal`,
+refused at `ceiling=open`.
 
 #### The two `creek.state.*` tools gate in different shapes (#969)
 
@@ -393,7 +458,7 @@ of you and closing one channel says nothing about the others:
 
 | Egress channel | What is checked | Which tools | Forced? |
 |----------------|-----------------|-------------|---------|
-| **JSON response** | The tool is called at `ceiling=open` against a vault holding an `intimate` fragment whose title, body and tags each carry a unique sentinel; that sentinel must appear nowhere in the serialised response. | Ten of the twelve `GATED` tools. `creek.draft` and `creek.author` carry recorded exemptions instead — a bare fixture does not drive either far enough for its envelope to mean anything. | Yes. A newly `GATED` tool must grow a probe or record a justified exemption; it cannot inherit silence. |
+| **JSON response** | The tool is called at `ceiling=open` against a vault holding an `intimate` fragment whose title, body and tags each carry a unique sentinel; that sentinel must appear nowhere in the serialised response. | Twelve of the fourteen `GATED` tools. `creek.draft` and `creek.author` carry recorded exemptions instead — a bare fixture does not drive either far enough for its envelope to mean anything. For `creek.skills.refresh` and `creek.classify.entry` the envelope sweep is a tripwire rather than evidence, and both say so at their probe: neither response can carry a sentinel even with its gate deleted, so each carries a stronger per-tool test alongside — the bytes of the tree `skills.refresh` writes, and the admitted/refused *verdict* for `classify.entry` under one fixed ceiling. | Yes. A newly `GATED` tool must grow a probe or record a justified exemption; it cannot inherit silence. |
 | **Model prompt** | The tool is driven all the way *to* the provider with a recording client, and neither the `intimate` sentinel nor the above-ceiling **`personal`** one may appear in any prompt it sent — nor in the response of that same call ([#1036](https://github.com/Geoffe-Ga/Creek-Vault/issues/1036)). | `creek.reflect`, `creek.compile` and `creek.author`. `creek.draft` is exempt, and its stated reason is executed rather than trusted. | Yes. The set is *derived* from the tools' own signatures — a `GATED` tool taking both an LLM factory and a ceiling — so a tool cannot become model-backed without being asked for a prompt probe. |
 | **Disk artifacts** | The bytes the call writes into the vault carry no sentinel, and a refused call leaves the bytes it would have overwritten untouched. | `creek.report`, `creek.state.render`, `creek.journal`, `creek.upload`. | **No.** Four per-tool tests and no forcing function: nothing obliges the fifth artifact-writing tool to grow a fifth test. Tracked in [#1273](https://github.com/Geoffe-Ga/Creek-Vault/issues/1273). |
 

@@ -51,6 +51,7 @@ EXPECTED_TOOLS = {
     "creek.ingest",
     "creek.redact.scan",
     "creek.classify",
+    "creek.classify.entry",
     "creek.link",
     "creek.report",
     "creek.skills.refresh",

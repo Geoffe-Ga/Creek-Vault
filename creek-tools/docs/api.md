@@ -303,7 +303,8 @@ header, a full patch version like `0.2.0`, or anything unrecognised is `409
 incompatible_version`, refused before any vault read.
 
 That set is a **window, and it widens before it narrows**. It currently holds
-`0.12`, `0.11`, `0.10`, `0.9`, `0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and `0.2`. The
+`0.13`, `0.12`, `0.11`, `0.10`, `0.9`, `0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and
+`0.2`. The
 `0.3.0`, `0.4.0` and `0.6.0` moves all
 came from the MCP surface and changed no `/v1` shape — `0.3.0` added
 `creek.upload` (#1023), `0.4.0` gave `creek.purge.*` its `partial` status
@@ -370,6 +371,25 @@ which carry `supported_contract_minors`. No *field* moves on either, and
 unconstrained array of strings, so a longer window is not a schema change. A
 consumer that hash-pins the manifest must re-pin; one that does not sees
 nothing.
+
+`0.13.0` (#874) is the same shape as `0.12.0` and `0.6.0`: a bump that moves
+**nothing on this surface at all**. It adds one read-only MCP tool,
+`creek.classify.entry`, which reports the classification a named fragment
+already carries on disk. No `/v1` route, capability, wire model, error code,
+status or schema moves; `CONTRACT_MODELS` is unchanged and no `Capability`
+member is added, so a client pinned at `0.12` is answered byte-identically on
+every route it calls and `SUPPORTED_CONTRACT_MINORS` widens to keep serving it.
+The only thing an HTTP consumer sees is, again, the bundle: `manifest.json`'s
+`contract_version` and the two `sha256` rows for
+`examples/capabilities/success.json` and `examples/capabilities/empty.json`,
+which carry `supported_contract_minors`. No *field* moves on either, and
+`schemas/CapabilitiesResponse.schema.json` does not move. A consumer that
+hash-pins the manifest must re-pin; one that does not sees nothing.
+
+Publishing that read over `/v1` is deferred deliberately and strands nobody: a
+`/v1` client still reaches classification through `POST /v1/classifications`,
+published at `0.10.0`, and the per-entry read composes over MCP today because
+`creek.journal` returns `fragment_id` as a required field on both transports.
 
 Read the window off `GET /v1/capabilities` rather than assuming the newest
 minor is the only one accepted.
@@ -721,7 +741,7 @@ pinned, by the tests above.
 
 **The revisit trigger, because "at the next contract minor" already came and
 went twice.** Minors `0.8.0` (#1524), `0.9.0` (#1527/#873), `0.10.0`
-(#1570), `0.11.0` (#1568) and `0.12.0` (#1292) have each
+(#1570), `0.11.0` (#1568), `0.12.0` (#1292) and `0.13.0` (#874) have each
 re-published the bundle since #1111 was filed, so waiting for a free moment is
 not a plan. The trigger is recorded in
 [`docs/decisions/2026-07-31-adepthood-http-application-api.md`](../../docs/decisions/2026-07-31-adepthood-http-application-api.md)

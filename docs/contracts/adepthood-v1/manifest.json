@@ -1,6 +1,6 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.12.0",
+  "contract_version": "0.13.0",
   "files": [
     {
       "capability": "capabilities",
@@ -13,7 +13,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "b48b604cc95eba7844b621af2597a6edd68b819f84a8acc717ec0aebfe16514b",
+      "sha256": "7dd9c73e3dad311774ace1877353e0f8d74fdf2d5af6cc0f1b61aa4eee48072c",
       "state": "empty"
     },
     {
@@ -41,7 +41,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "ea34419a08774ea164a6882c6e3bf80edb87230865c93d312a1e04de45d281b6",
+      "sha256": "84e5ad8384261f0c1de0c7a72ca403c502faa1d1e8beac903666fab2d87a1661",
       "state": "success"
     },
     {

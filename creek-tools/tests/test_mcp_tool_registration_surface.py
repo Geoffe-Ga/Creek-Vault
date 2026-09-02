@@ -1,6 +1,6 @@
 """Characterisation lock for the MCP tool-registration surface (#1385).
 
-``build_server`` publishes 24 tools whose entire advertised contract —
+``build_server`` publishes 25 tools whose entire advertised contract —
 name, order, ``inputSchema`` and ``description`` — is derived by FastMCP
 from the 24 registration closures' own signatures and docstrings. Nothing
 in the suite pinned that surface as a whole: every existing consumer of
@@ -148,6 +148,7 @@ _EXPECTED_ORDER: Final[tuple[str, ...]] = (
     "creek.ingest",
     "creek.redact.scan",
     "creek.classify",
+    "creek.classify.entry",
     "creek.link",
     "creek.report",
     "creek.skills.refresh",
@@ -610,6 +611,24 @@ _EXPECTED_SCHEMAS: Final[dict[str, dict[str, Any]]] = {
         "title": "_classifyArguments",
         "type": "object",
     },
+    "creek.classify.entry": {
+        "$defs": _TIER_CEILING_DEFS,
+        "properties": {
+            "entry_ref": {
+                "title": "Entry Ref",
+                "type": "string",
+            },
+            "privacy_tier_ceiling": {
+                "$ref": "#/$defs/TierCeiling",
+                "default": "open",
+            },
+        },
+        "required": [
+            "entry_ref",
+        ],
+        "title": "_classify_entryArguments",
+        "type": "object",
+    },
     "creek.link": {
         "$defs": _TIER_CEILING_DEFS,
         "properties": {
@@ -896,6 +915,9 @@ _EXPECTED_DESCRIPTIONS: Final[dict[str, str]] = {
         "content and needs privacy_tier_ceiling=intimate or all."
     ),
     "creek.classify": "Re-classify existing fragments via rules or LLM.",
+    "creek.classify.entry": (
+        "Report one fragment's persisted classification; computes nothing."
+    ),
     "creek.link": "Run a single linker stage.",
     "creek.report": (
         "Generate a vault-state report; `period` is for `wavelength` only."
@@ -967,7 +989,7 @@ def _structured(result: object) -> dict[str, Any]:
 
 
 def test_registration_order_is_pinned(registered_tools: list[Tool]) -> None:
-    """The 24 tools register in exactly today's order.
+    """The 25 tools register in exactly today's order.
 
     Compared as a **tuple**, never a set and never ``sorted()``: order is
     the property that a regrouping of 24 registrations can silently
@@ -979,7 +1001,7 @@ def test_registration_order_is_pinned(registered_tools: list[Tool]) -> None:
     Args:
         registered_tools: The live tool surface, in registration order.
     """
-    assert len(registered_tools) == 24
+    assert len(registered_tools) == 25
     assert tuple(tool.name for tool in registered_tools) == _EXPECTED_ORDER
 
 
@@ -996,10 +1018,10 @@ def test_the_pinned_table_covers_the_whole_surface(
         registered_tools: The live tool surface, in registration order.
     """
     live = {tool.name for tool in registered_tools}
-    assert len(registered_tools) == 24
-    assert len(_EXPECTED_ORDER) == 24
-    assert len(_EXPECTED_SCHEMAS) == 24
-    assert len(_EXPECTED_DESCRIPTIONS) == 24
+    assert len(registered_tools) == 25
+    assert len(_EXPECTED_ORDER) == 25
+    assert len(_EXPECTED_SCHEMAS) == 25
+    assert len(_EXPECTED_DESCRIPTIONS) == 25
     assert set(_EXPECTED_ORDER) == live
     assert set(_EXPECTED_SCHEMAS) == live
     assert set(_EXPECTED_DESCRIPTIONS) == live
@@ -1068,7 +1090,7 @@ def test_the_pinned_prose_is_interpreter_independent(
         for name, schema in _EXPECTED_SCHEMAS.items()
         if "$defs" in schema
     }
-    assert len(embedded) == 19
+    assert len(embedded) == 20
     still_normalised = {
         name for name, text in embedded.items() if inspect.cleandoc(text) != text
     }
@@ -1217,7 +1239,7 @@ def test_no_top_level_function_nests_more_than_eight_defs() -> None:
     server_mod = importlib.import_module("creek_mcp.server")
     missing = [name for name in _REGISTRARS if not hasattr(server_mod, name)]
     assert not missing, f"creek_mcp.server is missing registrars: {missing}"
-    assert sum(counts[name] for name in _REGISTRARS) == 24, (
-        "the four registrars must between them hold exactly the 24 tool "
+    assert sum(counts[name] for name in _REGISTRARS) == 25, (
+        "the four registrars must between them hold exactly the 25 tool "
         f"closures, got {[(n, counts[n]) for n in _REGISTRARS]}"
     )

@@ -79,6 +79,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.12",
     "0.11",
     "0.10",
     "0.9",
@@ -163,6 +164,18 @@ capability, wire model, error code or status moves and ``CONTRACT_MODELS`` is
 unchanged, so a ``0.11`` client is answered byte-identically on every ``/v1``
 route it calls and there is nothing for it to be refused over. ``0.11`` is
 therefore retained here.
+
+Contract 0.13 (#874) is a pure MCP-surface move of the same kind, and the
+plainest instance of why this tuple **widens and never shifts**. It adds one
+read-only MCP tool, ``creek.classify.entry``. No ``/v1`` route, capability,
+wire model, error code, status or schema moves and ``CONTRACT_MODELS`` is
+unchanged, so a ``0.12`` client is answered byte-identically on every ``/v1``
+route it calls — it simply is not told about a tool it cannot reach over HTTP
+anyway. The explicit ``"0.12"`` below is therefore the whole of what keeps this
+change additive: without it, ``CONTRACT_MINOR`` moves to ``"0.13"`` and every
+client still sending ``X-Creek-Contract-Version: 0.12`` is refused
+``incompatible_version`` on every capability route, over a break it cannot
+observe.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the

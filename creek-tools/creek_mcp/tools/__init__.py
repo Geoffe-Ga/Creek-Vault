@@ -2,6 +2,7 @@
 
 from creek_mcp.tools.author import author_tool
 from creek_mcp.tools.classify import classify_tool
+from creek_mcp.tools.classify_entry import entry_classification_tool
 from creek_mcp.tools.compile import compile_tool
 from creek_mcp.tools.draft import draft_tool
 from creek_mcp.tools.handshake import handshake_tool
@@ -32,6 +33,7 @@ __all__ = [
     "classify_tool",
     "compile_tool",
     "draft_tool",
+    "entry_classification_tool",
     "handshake_tool",
     "ingest_tool",
     "journal_ingest_tool",
