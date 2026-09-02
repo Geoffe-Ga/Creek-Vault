@@ -72,8 +72,12 @@ This module is therefore the **only** one in :mod:`creek_mcp.httpapi` that names
 distinguish "no such fragment" from "you may not see this fragment" could
 enumerate the corpus one id at a time without reading a byte of it, which is
 what #846, #970, #972 and #1090 spent five issues collapsing. The repo-wide
-version of that guard — an allowlist over every construction site in
-:mod:`creek_mcp` — is tracked in **#1098**.
+version of that guard is
+``test_not_found_is_named_only_in_the_pinned_routing_modules`` in
+``tests/test_v1_api_structure.py``, which pins every module in
+:mod:`creek_mcp` that may name the code at all; its companion,
+``test_not_found_is_constructed_once_in_the_routing_miss``, pins the sole
+construction site to :func:`_routing_miss`.
 """
 
 from __future__ import annotations

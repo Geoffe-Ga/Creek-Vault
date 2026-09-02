@@ -447,12 +447,14 @@ nothing, and a symlink resolving off the vault must all be byte-identical
 below the admitting ceiling. A `404` that a caller could distinguish from a
 `403` over a vault object would hand back precisely the existence-and-rank
 oracle those issues removed. This is a deliberate narrowing of the taxonomy
-issue #1072's Problem section originally sketched. Until
-[#1074](https://github.com/Geoffe-Ga/Creek-Vault/issues/1074) mounts the
-handlers there is nothing to enforce this against; the structural guard that
-keeps it from regressing once they exist — an AST sweep over every `NOT_FOUND`
-construction site, checked against a pinned routing-layer allowlist — is
-tracked in [#1098](https://github.com/Geoffe-Ga/Creek-Vault/issues/1098).
+issue #1072's Problem section originally sketched. The structural guard that
+keeps it from regressing is an AST sweep over every module in `creek_mcp`,
+pinning the modules that may name `NOT_FOUND` at all, the modules that may
+write its wire spelling or the `404` literal, and the sole
+`error_response(ErrorCode.NOT_FOUND, ...)` construction site — see
+`test_not_found_is_named_only_in_the_pinned_routing_modules` and
+`test_not_found_is_constructed_once_in_the_routing_miss` in
+`creek-tools/tests/test_v1_api_structure.py`.
 
 **`creek.reflect`'s two refusal reasons collapse at the `/v1` boundary.** At
 the MCP layer `reflect_tool` keeps `"entry_ref not found"` distinct from
