@@ -955,18 +955,25 @@ class Fragment(BaseModel):
         ``creek.classify.privacy_filter`` imports :class:`PrivacyTier`
         from this module and the reverse import would be a cycle. A tier
         string the enum does not recognise therefore reads as *eligible*
-        here. That residual is accepted rather than overlooked (#1489),
-        but it is **not** fully covered downstream, and the difference
-        matters to anyone auditing this property:
+        here. That residual is accepted rather than overlooked (#1489):
+        both known consumers close it before it can matter, but they do so
+        at different layers, and the difference matters to anyone auditing
+        this property:
 
         * The skill tree re-screens canonically —
           :func:`creek.generate.skills._is_snapshot_fragment` reads
           through ``tier_of`` (#1489).
-        * The voice corpus does **not**.
+        * The voice corpus closes it too, but at a different layer:
           ``creek.generate.voice._eligible_register`` still compares the
-          bare attribute, so it shares this property's fail-open on an
-          unrecognised tier. Tracked by issue #1743; that file was
-          out of scope for #1489.
+          bare attribute, yet every one of its call sites is fed by
+          ``_load_fragment_with_body``, which overwrites ``privacy_tier``
+          with ``raw_privacy_tier(metadata)`` — fail-closed to INTIMATE on
+          both a missing key and an unrecognised string, the latter having
+          already been dropped by ``model_validate``. So the residual there
+          is a **canonical-reader inconsistency** (``raw_privacy_tier`` at
+          the loader rather than ``tier_of`` at the predicate), **not an
+          exposure**. Tracked by issue #1743; that file was out of scope
+          for #1489.
 
         So do not re-open the cycle argument in the next sweep — but do
         not read this docstring as a claim that every consumer is safe.
