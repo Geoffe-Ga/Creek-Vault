@@ -68,6 +68,11 @@ _MIN_TREE_ENTRIES = 30
 _MIN_TRACKED_SCRIPTS = 20
 _MIN_GATE_SCRIPTS = 13
 
+# §5.2 shows these two package roots by their ``__init__.py`` anchor only.
+# Their module inventory turns over constantly, so enumerating it in prose
+# would reintroduce the drift this module exists to catch.
+_UNENUMERATED_PACKAGES = ("creek", "creek_mcp")
+
 _INLINE_CODE = re.compile(r"`([^`]+)`")
 _FENCE = re.compile(r"^\s*(?:```|~~~)")
 _UNIT_START = re.compile(r"^\s*(?:[-*+] |\d+\. |#{1,6} |\|)")
@@ -618,6 +623,43 @@ def test_component_tree_lists_every_tracked_script() -> None:
         "creek-tools/CLAUDE.md §5.2 disagrees with creek-tools/scripts/ -- "
         f"tracked but missing from the tree: {sorted(tracked - listed)}; "
         f"listed but not tracked: {sorted(listed - tracked)}"
+    )
+
+
+def test_component_tree_declares_its_unenumerated_packages() -> None:
+    """§5.2 must both declare and honour its package carve-out.
+
+    The lead-in promised "one level deep" while the tree showed a single
+    ``__init__.py`` for two packages holding dozens of modules -- the same
+    doc/reality gap this module exists to close, reintroduced by the repair
+    itself. Both halves are pinned: enumerating a package without amending the
+    prose reddens the first assertion, and dropping the carve-out sentence
+    reddens the second.
+    """
+    entries = _tree_entries()
+    for package in _UNENUMERATED_PACKAGES:
+        listed = {name for parent, name in entries if parent == package}
+        assert listed == {"__init__.py"}, (
+            f"creek-tools/CLAUDE.md §5.2 lists {sorted(listed)} under "
+            f"{package}/, but the section declares that package unenumerated; "
+            "enumerate it one level deep and amend the lead-in, or restore the "
+            "__init__.py anchor"
+        )
+    section = _section(_read(CREEK_TOOLS_CLAUDE_MD), heading="5.2")
+    spans = set(
+        _code_spans(
+            " ".join(
+                unit
+                for _, unit in _logical_units(section)
+                if not _TREE_BRANCH.search(unit)
+            )
+        )
+    )
+    undeclared = [f"{name}/" for name in _UNENUMERATED_PACKAGES if f"{name}/" not in spans]
+    assert not undeclared, (
+        "creek-tools/CLAUDE.md §5.2 shows only __init__.py for "
+        f"{undeclared} while its lead-in no longer says so -- a reader is told "
+        "the tree is one level deep and shown a package with a single file"
     )
 
 

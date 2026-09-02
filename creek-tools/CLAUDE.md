@@ -320,12 +320,15 @@ Before creating/updating a PR:
 
 ### 5.2 Component Structure
 
-Directories are shown one level deep, **except `scripts/`, which is
-enumerated in full** — `tests/test_claude_md_gate_facts_drift.py` asserts that
-enumeration equals `git ls-files -- creek-tools/scripts/`, so adding a script
-without listing it here fails the gate. The top-level `test_*.py` modules of
-`tests/` are not listed, and no count is quoted anywhere: a number in prose is
-the drift this section was repaired for.
+Directories are shown one level deep, with two deliberate exceptions.
+`scripts/` is **enumerated in full** — `tests/test_claude_md_gate_facts_drift.py`
+asserts that enumeration equals `git ls-files -- creek-tools/scripts/`, so
+adding a script without listing it here fails the gate. The package roots
+`creek/` and `creek_mcp/` are **deliberately not enumerated**: only their
+`__init__.py` anchor is shown, because their module inventory turns over
+constantly and a partial list here would be exactly the drift this section was
+repaired for. The top-level `test_*.py` modules of `tests/` are likewise not
+listed, and no count is quoted anywhere: a number in prose is that same drift.
 
 ```
 creek-tools/
