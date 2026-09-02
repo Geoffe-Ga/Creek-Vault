@@ -2048,6 +2048,13 @@ def _route_reasoning(
     is truncated to :data:`CLASSIFICATION_REASONING_MAX_CHARS` and
     returned for direct embedding in frontmatter.
 
+    The tier is read through
+    :func:`~creek.classify.privacy_filter.tier_of` — already this
+    module's reader elsewhere — so a tier string the enum does not
+    recognise fails closed and routes to the log. The bare attribute
+    comparison this replaced wrote the reasoning preamble into the
+    fragment's vault frontmatter instead (#1489).
+
     Args:
         fragment: The fragment whose tier dictates routing.
         reasoning: The raw reasoning preamble; may be empty.
@@ -2063,7 +2070,7 @@ def _route_reasoning(
     """
     if method != LLM_METHOD or not reasoning:
         return ""
-    if fragment.privacy_tier == PrivacyTier.INTIMATE.value:
+    if tier_of(fragment) is PrivacyTier.INTIMATE:
         if trace_log_path is not None:
             _append_trace_log(trace_log_path, fragment, reasoning)
         return ""

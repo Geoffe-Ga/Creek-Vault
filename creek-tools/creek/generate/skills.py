@@ -617,10 +617,18 @@ def _is_snapshot_fragment(fragment: Fragment, *, allow_intimate: bool) -> bool:
     the function does not delegate to the property because
     ``allow_intimate=True`` deliberately overrides the INTIMATE
     exclusion that the property bakes in.
+
+    The tier is read through
+    :func:`~creek.classify.privacy_filter.tier_of` — already this
+    module's reader for the ceiling gate — so a tier string the enum does
+    not recognise fails closed to ``INTIMATE`` and needs the same
+    ``allow_intimate`` opt-in. The bare attribute comparison this
+    replaced admitted such a fragment's body into a ``SKILL.md``
+    exemplar outright (#1489).
     """
     if fragment.source.author != Authorship.SELF:
         return False
-    if fragment.privacy_tier == PrivacyTier.INTIMATE:
+    if tier_of(fragment) is PrivacyTier.INTIMATE:
         return allow_intimate
     return True
 
