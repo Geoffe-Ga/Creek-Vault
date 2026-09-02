@@ -144,7 +144,18 @@ For every match found by the scan:
    covers just the key half from leaving that tail in cleartext (issue
    #909). Strings on `false_positive_allowlist` are exempt from this
    widening — a regex match inside such a string still redacts only its
-   own span.
+   own span. A marker rendered from `replacement_template` for a name in
+   the active pattern set is likewise inert to every detector at every
+   `min_confidence`, so `--apply` is idempotent and re-running it can
+   never nest markers into `[REDACTED:[REDACTED:...]]` (issue #945). That
+   exemption is matched as a *literal at its own offset*, never by shape:
+   a forged `[REDACTED:<a real secret>]` is still redacted, a bare
+   pattern name in prose is still redacted, and the regex detectors keep
+   firing inside marker text. It holds for any template whose `{name}` is
+   delimited on both sides by a character outside `[A-Za-z0-9+/=_-]` —
+   the default `[REDACTED:{name}]` is. A degenerate template can splice a
+   marker flush against neighbouring token characters, forming a *new*,
+   longer run that is correctly not exempt.
 2. Refuses to write through symlinks (path-traversal guard): before any
    file is read or rewritten the source tree is walked and the run is
    aborted if any descendant symlink resolves outside the source root.

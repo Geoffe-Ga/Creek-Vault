@@ -28,7 +28,7 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from pydantic import BaseModel
 from tqdm import tqdm
@@ -40,6 +40,9 @@ from creek.redact.patterns import (
     PATTERN_METADATA,
     REDACTION_PATTERNS,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +221,10 @@ class RedactionScanner:
         self.config = config
         self.salt: bytes = os.urandom(16)
         self._patterns = self._build_patterns()
+        self._marker_runs = emitted_marker_runs(
+            config.replacement_template,
+            frozenset(self._patterns) | {HIGH_ENTROPY_PATTERN_NAME},
+        )
 
     def _build_patterns(self) -> dict[str, re.Pattern[str]]:
         """Merge built-in patterns with any custom patterns from config.
@@ -372,6 +379,18 @@ class RedactionScanner:
         fragment would neither dedupe against nor describe the span that
         ``--apply`` removes.
 
+        Candidacy comes from :func:`iter_unmarked_candidates`, the one
+        definition this method shares with the redactor's two sweeps, so
+        a run belonging to a marker *this scanner's own configuration*
+        renders is never reported (#945). Without that, ``--scan``,
+        ``--report``, ``--review``, the MCP scan tool and the fail-loud
+        ``creek process`` redaction stage all raised a phantom
+        ``high_entropy_string`` finding on an already-redacted tree,
+        which no amount of ``--apply`` could clear. The carve-out is
+        name-keyed rather than shape-keyed — see
+        :func:`iter_unmarked_candidates` for the bound and the two
+        deliberate non-goals.
+
         Args:
             file_path: Path to the file being scanned (passed through to
                 the resulting :class:`RedactionMatch`).
@@ -383,7 +402,7 @@ class RedactionScanner:
         """
         threshold = entropy_threshold(self.config.min_confidence)
         results: list[RedactionMatch] = []
-        for candidate in HIGH_ENTROPY_CANDIDATE.finditer(line):
+        for candidate in iter_unmarked_candidates(line, marker_runs=self._marker_runs):
             text = candidate.group()
             if self._is_allowlisted(text):
                 continue
@@ -940,6 +959,130 @@ def _window_entropy_clears(text: str, threshold: float) -> bool:
             return True
 
     return False
+
+
+MarkerRuns = dict[str, tuple[tuple[str, int], ...]]
+"""Candidate runs found inside the markers one config would render.
+
+Maps a run's exact text to every ``(marker literal, offset of the run
+within that marker)`` pair that produces it. Built once per scanner or
+redactor instance by :func:`emitted_marker_runs`; consumed by
+:func:`iter_unmarked_candidates`.
+"""
+
+
+def iter_unmarked_candidates(
+    text: str,
+    *,
+    marker_runs: MarkerRuns,
+) -> Iterator[re.Match[str]]:
+    """Yield the high-entropy candidate runs in *text* that are not our own.
+
+    The single definition of "is this run a candidate", shared by
+    ``--scan`` (:meth:`RedactionScanner._scan_high_entropy`), ``--apply``
+    (:meth:`creek.redact.redactor.Redactor._collect_high_entropy_spans`)
+    and span snapping
+    (:meth:`creek.redact.redactor.Redactor._snap_to_candidate_runs`).
+    Those three used to run their own ``HIGH_ENTROPY_CANDIDATE`` sweeps;
+    #909 and #942 each had to be applied to every copy by hand, and #945
+    is what happened when a new fact reached only some of them — the
+    redactor rewrote its own ``[REDACTED:email_password_combo]`` marker
+    into ``[REDACTED:[REDACTED:high_entropy_string]]`` on every re-run,
+    while ``--scan`` reported the same phantom finding and the fail-loud
+    ``creek process`` redaction stage refused on a count no amount of
+    ``--apply`` could clear.
+
+    A run is skipped only when it is **byte-equal** to a run inside one
+    of *this instance's* rendered markers **and** the whole marker
+    literal sits at exactly that run's offset in *text*. The carve-out is
+    therefore **name-keyed, not shape-keyed**: nothing about the
+    ``[REDACTED:...]`` form is privileged, so a forged
+    ``[REDACTED:<real secret>]`` is still a candidate and still redacted.
+    Two deliberate non-goals follow from that and are not oversights:
+
+    - the 21 regex detectors keep firing inside marker text, because
+      suppressing them is what would let a forged marker hide a live key;
+    - an operator ``custom_patterns`` regex that matches its own marker
+      still self-matches, for the same reason — a regex-side carve-out
+      would narrow the guard rather than this one.
+
+    The bound on how much this can ever exempt: ``HIGH_ENTROPY_CANDIDATE``
+    matches maximally, so a secret written flush against a marker forms a
+    *longer* run than the marker's own, fails byte-equality, and stays a
+    candidate. The exempt bytes are always a pattern *name* inside a
+    literal marker at an exact offset, never operator data.
+
+    Cost is one dict lookup per candidate run — nothing when the map is
+    empty, which is the case for any template whose markers hold no run
+    of :data:`~creek.redact.patterns.HIGH_ENTROPY_MIN_RUN` characters. No
+    extra pass is made over *text*.
+
+    Args:
+        text: The line or document to sweep for candidate runs.
+        marker_runs: This instance's map from :func:`emitted_marker_runs`.
+            Pass an empty mapping to sweep with no carve-out at all.
+
+    Yields:
+        Each :class:`re.Match` for a run that is not part of a marker
+        this configuration would render, in document order.
+    """
+    for candidate in HIGH_ENTROPY_CANDIDATE.finditer(text):
+        occurrences = marker_runs.get(candidate.group())
+        if occurrences is not None and any(
+            candidate.start() >= offset
+            and text.startswith(marker, candidate.start() - offset)
+            for marker, offset in occurrences
+        ):
+            continue
+        yield candidate
+
+
+def emitted_marker_runs(
+    replacement_template: str,
+    pattern_names: frozenset[str],
+) -> MarkerRuns:
+    """Precompute the candidate runs inside the markers a config emits.
+
+    Called once per instance, from ``__init__``, so the map is never
+    rebuilt per line, per candidate or per ``redact_content`` call.
+
+    *pattern_names* must be the **range of**
+    ``Redactor._select_marker_name`` — the instance's full pattern set
+    *plus* :data:`HIGH_ENTROPY_PATTERN_NAME`. The entropy detector's own
+    name lives in :data:`~creek.redact.patterns.PATTERN_METADATA` but is
+    excluded from :data:`~creek.redact.patterns.REDACTION_PATTERNS` by
+    ``_DETECTOR_ONLY_PATTERNS``, so it is absent from that pattern set
+    while still being the only marker name the detector ever emits.
+    Building the map from the pattern set alone would leave that one
+    marker un-exempt — latent under the 19-character default rendering,
+    live under a legal template such as ``[REDACTED_{name}_END]``.
+
+    It must equally *not* be built from the per-call ``pattern_types``
+    filter: a marker written by an earlier whole-vault run has to stay
+    inert under a later narrowed call.
+
+    ``replacement_template.format`` is safe for any config that loads —
+    :meth:`creek.config.RedactionConfig.validate_replacement_template`
+    rejects every placeholder but ``{name}``.
+
+    Args:
+        replacement_template: The instance's
+            :pyattr:`RedactionConfig.replacement_template`.
+        pattern_names: Every name this instance can render a marker for.
+
+    Returns:
+        A :data:`MarkerRuns` map, empty when no rendered marker contains
+        a run long enough to be a candidate at all.
+    """
+    found: dict[str, list[tuple[str, int]]] = {}
+    for name in sorted(pattern_names):
+        marker = replacement_template.format(name=name)
+        for run in iter_unmarked_candidates(marker, marker_runs={}):
+            occurrences = found.setdefault(run.group(), [])
+            occurrence = (marker, run.start())
+            if occurrence not in occurrences:
+                occurrences.append(occurrence)
+    return {text: tuple(occurrences) for text, occurrences in found.items()}
 
 
 def entropy_threshold(min_confidence: float) -> float:

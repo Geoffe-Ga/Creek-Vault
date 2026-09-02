@@ -1849,16 +1849,21 @@ class TestHasHighEntropyRegion:
     def test_run_of_exactly_min_run_matches_whole_run_semantics(self) -> None:
         """At length exactly L the new gate reduces to the old one.
 
-        This is the executable proof that issue #945 is not worsened.
-        Every key in ``PATTERN_METADATA`` is at most
-        ``HIGH_ENTROPY_MIN_RUN`` characters (pinned separately by
-        ``test_pattern_metadata_names_fit_within_min_run``), so every
-        emitted ``[REDACTED:<name>]`` marker's candidate run is at most L
-        characters long. At exactly L there is a single window, identical
-        to the whole run, so the sub-run gate returns exactly what the
-        whole-run comparison returned — and the 0.016-bit margin that
-        keeps ``[REDACTED:email_password_combo]`` (3.6842 bits/char
-        against a 3.70 threshold) inert is untouched.
+        Pure boundary semantics for ``has_high_entropy_region``: at a run
+        length of exactly ``HIGH_ENTROPY_MIN_RUN`` there is a single
+        window, identical to the whole run, so the sub-run gate (#942)
+        must return exactly what the whole-run comparison returns — in
+        both directions, which is why a clearing and an inert 20-char run
+        are both asserted.
+
+        It used to be described as "the executable proof that issue #945
+        is not worsened", resting on the 0.016-bit margin that kept
+        ``[REDACTED:email_password_combo]`` (3.6842 bits/char against a
+        3.70 threshold) inert at the default confidence. #945 superseded
+        that argument: marker inertness no longer depends on any margin,
+        because a marker's own run is not a candidate at all. This test
+        is left as what it always actually asserted — the boundary
+        equivalence of the two entropy gates.
         """
         from creek.redact.patterns import HIGH_ENTROPY_MIN_RUN
         from creek.redact.scanner import has_high_entropy_region, shannon_entropy
@@ -2162,14 +2167,23 @@ class TestHighEntropyRegexSourceOfTruth:
     def test_pattern_metadata_names_fit_within_min_run(self) -> None:
         """Every pattern name must fit inside the sub-run window.
 
-        Tripwire for issue #945. Each emitted ``[REDACTED:<name>]`` marker
-        embeds its pattern name as a candidate run; while every name is at
-        most ``HIGH_ENTROPY_MIN_RUN`` characters, that run is never longer
+        Defence-in-depth since #945, no longer the reason inertness
+        holds. Each emitted ``[REDACTED:<name>]`` marker embeds its
+        pattern name as a candidate run; while every name is at most
+        ``HIGH_ENTROPY_MIN_RUN`` characters, that run is never longer
         than the window, so the sub-run gate reduces to the old whole-run
-        comparison and marker inertness is unchanged. A future pattern
-        name over 20 characters pushes markers into the sub-run regime,
-        where a high-entropy window inside a marker could re-flag the
-        marker itself — making #945 worse.
+        comparison. That property used to be load-bearing — a 20+
+        character name pushed markers into the sub-run regime, where a
+        high-entropy window inside a marker re-flagged the marker itself.
+
+        Inertness now rests on the emitted-marker carve-out instead
+        (``TestEmittedMarkerCarveOut``), which holds at every
+        ``min_confidence`` and for names of any length — proven
+        behaviourally over a 22-character operator-supplied name by
+        ``test_a_long_custom_pattern_name_marker_is_inert``. The
+        assertion below is kept verbatim anyway: a built-in name that
+        outgrows the window would still change the detector's regime, and
+        a cheap tripwire on that is worth keeping.
         """
         from creek.redact.patterns import HIGH_ENTROPY_MIN_RUN, PATTERN_METADATA
 
@@ -2415,6 +2429,37 @@ _ENTROPIC_EMAIL = "aB3xY7zQ9mK2pL5nR8vT4wd@example.com"  # pragma: allowlist sec
 # span at all and only token-boundary snapping can keep the tail covered.
 _LOW_ENTROPY_TAIL = "a" * 14
 _KEY_THEN_LOW_ENTROPY_TAIL = f"{_AWS_EXAMPLE_KEY}{_LOW_ENTROPY_TAIL}"
+
+# Geometry of the emitted-marker carve-out (Issue #945), all measured
+# against the committed ``PATTERN_METADATA`` and the default template:
+#   - Of the 484 (pattern x rendered marker) pairs, exactly ONE raw regex
+#     hit exists: ``high_entropy_string`` on ``[REDACTED:email_password_combo]``,
+#     matching the 20-char run ``email_password_combo`` at offset 10. Every
+#     other pattern name is under the 20-char HIGH_ENTROPY_CANDIDATE floor.
+#   - That run measures 3.684183719779189 bits/char, and
+#     ``entropy_threshold(mc) = 2.5 + 2.0 * mc``, so the marker is flagged
+#     at every ``min_confidence <= 0.5920918598895946`` and inert above it.
+_COMBO_MARKER_RUN = "email_password_combo"
+_COMBO_MARKER = f"[REDACTED:{_COMBO_MARKER_RUN}]"
+_COMBO_RUN_ENTROPY = 3.684183719779189
+_COMBO_CROSSOVER_CONFIDENCE = 0.5920918598895946
+"""``min_confidence`` at which the combo marker's own run lands on the bar."""
+
+MARKER_INERTNESS_CONFIDENCES: tuple[float, ...] = (
+    0.0,
+    0.25,
+    _COMBO_CROSSOVER_CONFIDENCE,
+    0.6,
+    1.0,
+)
+"""Confidences every emitted marker must survive unchanged (Issue #945).
+
+Spans the whole configurable range and pins the measured crossover
+itself, so neither side of the cliff can be dropped silently. Emptying
+or trimming this tuple would make the parametrised inertness tests
+vanish behind a green gate, which is why
+``test_marker_inertness_confidences_cover_the_cliff`` asserts its shape.
+"""
 
 
 class TestHighEntropyOverlapLeak:
@@ -2743,39 +2788,479 @@ class TestHighEntropyOverlapLeak:
 
         assert redactor.redact_content(once) == once
 
-    def test_markers_are_inert_for_every_pattern_name(self) -> None:
+    @pytest.mark.parametrize("min_confidence", MARKER_INERTNESS_CONFIDENCES)
+    def test_markers_are_inert_for_every_pattern_name(
+        self, min_confidence: float
+    ) -> None:
         """Every replacement marker must survive a re-redaction unchanged.
 
-        Marker inertness is not a comfortable margin — it sits on a
-        **0.016-bit cliff**. ``[REDACTED:email_password_combo]`` contains
-        the run ``email_password_combo``, which is exactly 20 characters
-        (the ``HIGH_ENTROPY_CANDIDATE`` floor) at exactly **3.6842
-        bits/char** against the default **3.7** threshold. Any change
-        that widens a span outward to a candidate run, nudges the
-        entropy threshold, renames a pattern, or adds a pattern name of
-        20+ base64url characters can tip a marker over that edge — and
-        then the marker itself is re-detected as a secret and rewritten
-        into a nested ``[REDACTED:[REDACTED:...]]``.
+        History, kept because it explains the shape of the guard: marker
+        inertness used to be a **0.016-bit cliff**.
+        ``[REDACTED:email_password_combo]`` contains the run
+        ``email_password_combo``, exactly 20 characters (the
+        ``HIGH_ENTROPY_CANDIDATE`` floor) at exactly **3.6842 bits/char**
+        against the default **3.7** threshold. Inertness at the default
+        confidence was a 0.016-bit accident of the pattern name, and any
+        change that renamed a pattern, nudged the threshold, or added a
+        20+ base64url-character name tipped the marker over that edge
+        into a nested ``[REDACTED:[REDACTED:high_entropy_string]]``.
 
-        Asserting on the complete string for *every* name in
-        ``PATTERN_METADATA`` makes that cliff visible the moment someone
-        steps off it, rather than one release later in a corrupted
-        vault.
+        Since #945 inertness no longer rests on that margin. A run that
+        is byte-equal to a run inside one of this instance's own rendered
+        markers, found at that marker's exact offset, is not a candidate
+        at all — so markers are inert at **every** ``min_confidence``,
+        not just above the accidental crossover. The cliff geometry is
+        retained above as the reason the carve-out exists.
 
-        Deliberately **not** parametrised over ``min_confidence=0.0``:
-        that genuinely fails today (the 2.5 floor flags the 3.6842-bit
-        run) for a pre-existing reason outside the scope of #909, filed
-        as a separate follow-up.
+        Parametrised across the full range (see
+        ``MARKER_INERTNESS_CONFIDENCES``) precisely because the old
+        docstring's "deliberately not parametrised over
+        ``min_confidence=0.0`` … filed as a separate follow-up" *was*
+        issue #945: the exemption below the crossover is the fix, and the
+        ``0.6`` case is preserved byte-identically as the non-regression
+        half. Asserting the complete string for *every* name in
+        ``PATTERN_METADATA`` keeps a regression visible the moment
+        someone steps off it, rather than one release later in a
+        corrupted vault.
         """
         from creek.redact.patterns import PATTERN_METADATA
 
-        config = RedactionConfig()
+        config = RedactionConfig(min_confidence=min_confidence)
         scanner = RedactionScanner(config=config)
         redactor = Redactor(config=config, salt=scanner.salt)
 
         for name in PATTERN_METADATA:
             marker = f"[REDACTED:{name}]"
             assert redactor.redact_content(marker) == marker
+
+    def test_combo_marker_is_inert_at_zero_confidence(self) -> None:
+        """RED at b47682f. The exact defect #945 reports.
+
+        ``[REDACTED:email_password_combo]`` is the one marker the default
+        template renders with a candidate run at all (20 chars, the
+        ``HIGH_ENTROPY_MIN_RUN`` floor, at offset 10). At
+        ``min_confidence=0.0`` the threshold is 2.5 and the run measures
+        3.6842 bits/char, so ``has_high_entropy_region`` clears on its
+        whole-run branch, ``_collect_high_entropy_spans`` emits
+        ``_Span(10, 30, 'high_entropy_string')`` and ``_splice_markers``
+        rewrites the tool's own output into
+        ``[REDACTED:[REDACTED:high_entropy_string]]`` — corruption that
+        compounds on every further ``redact --apply`` run.
+        """
+        config = RedactionConfig(min_confidence=0.0)
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        assert redactor.redact_content(_COMBO_MARKER) == _COMBO_MARKER
+
+
+# ---------------------------------------------------------------------------
+# The tool's own emitted markers are not candidates (Issue #945)
+# ---------------------------------------------------------------------------
+
+
+class TestEmittedMarkerCarveOut:
+    """A marker this instance renders is inert to every detector (#945).
+
+    ``redact --apply`` was corrupting its own output. The high-entropy
+    *candidacy* decision was spelled three times — in
+    ``RedactionScanner._scan_high_entropy``,
+    ``Redactor._collect_high_entropy_spans`` and
+    ``Redactor._snap_to_candidate_runs`` — and none of the three knew
+    that a candidate run might be part of a marker the tool itself had
+    just written. Re-running ``--apply`` therefore rewrote
+    ``[REDACTED:email_password_combo]`` into
+    ``[REDACTED:[REDACTED:high_entropy_string]]``, and each further run
+    nested it again.
+
+    The carve-out is **name-keyed, never shape-keyed**: a run is exempt
+    only when it is byte-equal to a run inside one of *this instance's*
+    rendered markers **and** the whole marker literal sits at exactly
+    that run's offset in the text being examined. Nothing about the
+    ``[REDACTED:...]`` shape is privileged, which is why
+    ``[REDACTED:AKIAIOSFODNN7EXAMPLE]`` — a forged marker wrapping a real
+    secret — is still redacted.
+
+    Because ``HIGH_ENTROPY_CANDIDATE`` matches maximally, a secret glued
+    against a marker forms a *longer* run than the marker's own, fails
+    byte-equality, and is correctly not exempt. That is the bound on the
+    one place this change reduces coverage: ``_snap_to_candidate_runs``
+    no longer widens a span onto a marker's run.
+    """
+
+    def test_marker_inertness_confidences_cover_the_cliff(self) -> None:
+        """The shared parametrisation must not be silently emptied.
+
+        Closing the last case in a parametrise list makes the tests that
+        read it vanish behind a green gate. This pins the tuple's shape
+        directly: both sides of the measured crossover, the crossover
+        itself, and the two endpoints of the configurable range.
+        """
+        assert len(MARKER_INERTNESS_CONFIDENCES) >= 5
+        assert 0.0 in MARKER_INERTNESS_CONFIDENCES
+        assert 1.0 in MARKER_INERTNESS_CONFIDENCES
+        assert 0.6 in MARKER_INERTNESS_CONFIDENCES
+        assert _COMBO_CROSSOVER_CONFIDENCE in MARKER_INERTNESS_CONFIDENCES
+        assert min(MARKER_INERTNESS_CONFIDENCES) < _COMBO_CROSSOVER_CONFIDENCE
+        assert max(MARKER_INERTNESS_CONFIDENCES) > _COMBO_CROSSOVER_CONFIDENCE
+
+    def test_the_measured_crossover_is_where_the_bar_meets_the_run(self) -> None:
+        """The pinned crossover is derived, not copied.
+
+        ``entropy_threshold(mc) = 2.5 + 2.0 * mc``, so the confidence at
+        which the combo run's own entropy lands exactly on the bar is
+        ``(entropy - 2.5) / 2.0``. Recomputing it here means a change to
+        either the threshold formula or the pattern name moves this test
+        rather than leaving a stale constant in the parametrisation.
+        """
+        from creek.redact.scanner import entropy_threshold, shannon_entropy
+
+        assert shannon_entropy(_COMBO_MARKER_RUN) == _COMBO_RUN_ENTROPY
+        assert entropy_threshold(_COMBO_CROSSOVER_CONFIDENCE) == _COMBO_RUN_ENTROPY
+
+    def test_scan_reports_no_finding_on_a_file_of_markers(self, tmp_path: Path) -> None:
+        """RED at b47682f. The scan half the issue omits (#832 parity).
+
+        ``RedactionScanner._scan_high_entropy`` runs byte-for-byte the
+        same three-step gate as the redactor, so ``--scan``,
+        ``--report``, ``--review``, the MCP scan tool and the fail-loud
+        ``creek process`` redaction stage all report a phantom
+        ``high_entropy_string`` finding on an already-redacted tree. A
+        redactor-only fix would leave this live and break the #832
+        scan/apply parity invariant.
+
+        One marker per line, for every name in ``PATTERN_METADATA`` plus
+        the detector-only ``high_entropy_string``, at the 2.5 floor —
+        where every gate is at its most permissive.
+        """
+        from creek.redact.patterns import PATTERN_METADATA
+        from creek.redact.scanner import HIGH_ENTROPY_PATTERN_NAME
+
+        names = sorted(set(PATTERN_METADATA) | {HIGH_ENTROPY_PATTERN_NAME})
+        target = tmp_path / "already-redacted.md"
+        target.write_text(
+            "\n".join(f"[REDACTED:{name}]" for name in names) + "\n",
+            encoding="utf-8",
+        )
+        scanner = RedactionScanner(config=RedactionConfig(min_confidence=0.0))
+
+        matches = scanner.scan_file(target)
+
+        assert [(m.match_type, m.line_number) for m in matches] == []
+
+    def test_scan_apply_parity_over_already_redacted_content(
+        self, tmp_path: Path
+    ) -> None:
+        """RED at b47682f. Parity must hold at the 2.5 floor too.
+
+        Extends ``test_apply_removes_every_scan_finding_parity`` to
+        ``min_confidence=0.0`` over content that *already* contains
+        markers: every finding ``--scan`` reports is removed by
+        ``--apply``, ``--apply`` introduces no finding ``--scan`` did not
+        report, and a second pass over the first output is byte-identical.
+        """
+        config = RedactionConfig(min_confidence=0.0)
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+        content = f"{_COMBO_MARKER}\nkey = {_AWS_EXAMPLE_KEY}\n"
+        source = tmp_path / "mixed.md"
+        source.write_text(content, encoding="utf-8")
+
+        reported = {m.match_type for m in scanner.scan_file(source)}
+        once = redactor.redact_content(content)
+        applied = tmp_path / "applied.md"
+        applied.write_text(once, encoding="utf-8")
+
+        assert reported == {"api_key", "high_entropy_string"}
+        assert scanner.scan_file(applied) == []
+        assert redactor.redact_content(once) == once
+        assert once == f"{_COMBO_MARKER}\nkey = [REDACTED:api_key]\n"
+
+    def test_a_bisecting_custom_match_does_not_snap_onto_a_marker(self) -> None:
+        """RED at b47682f. The third route, live even at max confidence.
+
+        ``_snap_to_candidate_runs`` built its run list from a raw
+        ``HIGH_ENTROPY_CANDIDATE`` sweep filtered only by the allowlist,
+        so a span whose edge fell strictly inside a marker's run was
+        widened out onto the marker and swallowed it. ``min_confidence``
+        is pinned at ``1.0`` here, where ``has_high_entropy_region`` is
+        provably inert (the 4.5 threshold exceeds ``log2(20)``), so the
+        entropy detector contributes nothing and the test isolates
+        snapping alone.
+
+        The custom span covers 16..30 inside the marker's 10..30 run.
+        Post-fix the operator's own pattern still redacts its own span —
+        that is the documented non-goal, an operator regex that matches
+        marker text keeps matching — but the marker's ``[REDACTED:``
+        prefix and pattern name survive instead of being eaten.
+        """
+        config = RedactionConfig(
+            min_confidence=1.0,
+            custom_patterns={"inner": "password_combo"},
+        )
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(_COMBO_MARKER)
+
+        assert result == "[REDACTED:email_[REDACTED:inner]]"
+        assert result != "[REDACTED:[REDACTED:inner]]"
+
+    def test_a_long_custom_pattern_name_marker_is_inert(self) -> None:
+        """RED at b47682f, and red at the DEFAULT confidence too.
+
+        The issue notes that any future 20+ character pattern name
+        inherits the bug; an operator can create one today via
+        ``custom_patterns``. ``twentyplus_custom_name`` is 22 characters,
+        so its marker's run exceeds ``HIGH_ENTROPY_MIN_RUN`` and the
+        sub-run window gate (#942) applies — which is why this one nests
+        even at ``min_confidence=0.6``, not merely below the crossover.
+
+        The fix is the carve-out, **not** a length gate on
+        ``custom_patterns`` keys: adding a config restriction would break
+        vaults that already load. ``test_pattern_metadata_names_fit_within_min_run``
+        stays as defence-in-depth over the built-in names.
+        """
+        name = "twentyplus_custom_name"
+        marker = f"[REDACTED:{name}]"
+        for min_confidence in MARKER_INERTNESS_CONFIDENCES:
+            config = RedactionConfig(
+                min_confidence=min_confidence,
+                custom_patterns={name: r"ZZZ-\d+"},
+            )
+            scanner = RedactionScanner(config=config)
+            redactor = Redactor(config=config, salt=scanner.salt)
+
+            assert redactor.redact_content(marker) == marker, min_confidence
+
+    def test_the_detector_only_marker_is_inert(self) -> None:
+        """RED at b47682f. The exempt set is the range of ``_select_marker_name``.
+
+        ``high_entropy_string`` lives in ``PATTERN_METADATA`` but is
+        excluded from ``REDACTION_PATTERNS`` by ``_DETECTOR_ONLY_PATTERNS``
+        (patterns.py:334, :342-346), so it is **not** in
+        ``Redactor._patterns`` — yet it is the only marker name
+        ``_collect_high_entropy_spans`` ever emits, and
+        docs/redaction.md:123-125 documents it as such. An exempt set
+        built from ``self._patterns`` alone would silently omit it,
+        shipping the same class of hole one name over.
+
+        The default template leaves this latent (the name is 19
+        characters, under the 20-char floor). ``[REDACTED_{name}_END]``
+        is legal under the config validator and renders a 32-character
+        run at 4.0778 bits/char, which makes the hole observable.
+
+        (``'{name}_{name}'`` — the template the design brief proposed for
+        this case — is a **fixed point**: its marker *is* its own run, so
+        splicing the marker over the run is a no-op and the defect hides.
+        Delimiters on both sides are what make the corruption visible.)
+        """
+        from creek.redact.scanner import HIGH_ENTROPY_PATTERN_NAME
+
+        config = RedactionConfig(
+            min_confidence=0.0,
+            replacement_template="[REDACTED_{name}_END]",
+        )
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+        marker = f"[REDACTED_{HIGH_ENTROPY_PATTERN_NAME}_END]"
+
+        assert HIGH_ENTROPY_PATTERN_NAME not in redactor._patterns
+        assert redactor.redact_content(marker) == marker
+
+    def test_only_rendered_markers_are_exempt_at_zero_confidence(self) -> None:
+        """ANTI-BROADENING. The boundary of the exemption, row by row.
+
+        Every row here is **green at b47682f** except the two marked
+        EXEMPT, and that is the point: they are the executable form of
+        the anti-broadening argument, not proof of the fix. If any
+        non-exempt row goes red, the carve-out has become shape-keyed and
+        the change must be escalated rather than shipped.
+
+        - a forged marker wrapping a real AWS key is still redacted —
+          the carve-out keys on *names in this instance's pattern set*,
+          never on the marker shape, so a leak cannot hide inside one;
+        - a bare pattern name in prose is still redacted — exemption
+          needs the whole marker literal at the run's exact offset;
+        - one extra character glued on makes ``HIGH_ENTROPY_CANDIDATE``
+          match a strictly longer run, which fails byte-equality;
+        - a marker for a name this instance does not know is redacted;
+        - a truncated marker fails the offset check and is redacted;
+        - the exemption follows ``replacement_template``: under
+          ``'<<{name}>>'`` the ``<<...>>`` form is inert and the
+          *default* form is redacted — instance-keyed, not shape-keyed.
+        """
+        default = RedactionConfig(min_confidence=0.0)
+        angle = RedactionConfig(min_confidence=0.0, replacement_template="<<{name}>>")
+        nested_entropy = "[REDACTED:[REDACTED:high_entropy_string]]"
+        cases: list[tuple[str, RedactionConfig, str, str]] = [
+            (
+                "EXEMPT: this instance's own marker",
+                default,
+                _COMBO_MARKER,
+                _COMBO_MARKER,
+            ),
+            (
+                "bare name in prose is not a marker",
+                default,
+                f"the {_COMBO_MARKER_RUN} pattern",
+                "the [REDACTED:high_entropy_string] pattern",
+            ),
+            (
+                "forged marker wrapping a real secret",
+                default,
+                f"[REDACTED:{_AWS_EXAMPLE_KEY}]",
+                "[REDACTED:[REDACTED:api_key]]",
+            ),
+            (
+                "a glued character makes a longer run",
+                default,
+                f"[REDACTED:{_COMBO_MARKER_RUN}X]",
+                nested_entropy,
+            ),
+            (
+                "a name this instance does not know",
+                default,
+                "[REDACTED:not_a_real_pattern_name]",
+                nested_entropy,
+            ),
+            (
+                "truncated marker fails the offset check",
+                default,
+                _COMBO_MARKER[:-1],
+                nested_entropy[:-1],
+            ),
+            (
+                "EXEMPT: the configured template's own marker",
+                angle,
+                f"<<{_COMBO_MARKER_RUN}>>",
+                f"<<{_COMBO_MARKER_RUN}>>",
+            ),
+            (
+                "default-shaped marker under a custom template",
+                angle,
+                _COMBO_MARKER,
+                "[REDACTED:<<high_entropy_string>>]",
+            ),
+        ]
+
+        observed = []
+        for label, config, content, _expected in cases:
+            scanner = RedactionScanner(config=config)
+            redactor = Redactor(config=config, salt=scanner.salt)
+            observed.append((label, redactor.redact_content(content)))
+
+        assert observed == [(label, expected) for label, _c, _s, expected in cases]
+
+    def test_the_forged_marker_is_redacted_at_the_default_confidence_too(self) -> None:
+        """ANTI-BROADENING, green at b47682f and after.
+
+        The forged-marker guard must not depend on the low-confidence
+        floor. ``AKIAIOSFODNN7EXAMPLE`` is caught here by the ``api_key``
+        regex, which this change does not touch — the 21 regex detectors
+        deliberately keep firing inside marker text, so a forged
+        ``[REDACTED:<real secret>]`` can never hide a live key.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(f"[REDACTED:{_AWS_EXAMPLE_KEY}]")
+
+        assert result == "[REDACTED:[REDACTED:api_key]]"
+        assert _AWS_EXAMPLE_KEY not in result
+
+    def test_marker_data_is_built_once_from_the_full_pattern_set(self) -> None:
+        """The exempt set must not depend on the caller's ``pattern_types``.
+
+        ``redact_content(content, pattern_types=[...])`` narrows which
+        detectors run. Building the marker data from that per-call subset
+        would make a marker's inertness depend on who is calling, and
+        would rebuild it on every call. It is built once in ``__init__``
+        from the instance's FULL pattern set — the range of
+        ``_select_marker_name`` — so a marker emitted by an earlier
+        whole-vault run stays inert under a later narrowed one.
+        """
+        config = RedactionConfig(min_confidence=0.0)
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+        before = redactor._marker_runs
+
+        narrowed = redactor.redact_content(
+            _COMBO_MARKER, pattern_types=["high_entropy_string"]
+        )
+
+        assert narrowed == _COMBO_MARKER
+        assert redactor._marker_runs is before
+        assert scanner._marker_runs == before
+
+    def test_the_candidacy_gate_has_exactly_one_definition(self) -> None:
+        """RED at b47682f (``3 != 1``). One gate, three consumers.
+
+        ``HIGH_ENTROPY_CANDIDATE.finditer`` was spelled three times, and
+        the copies drifted: #909 and #942 each had to be applied to every
+        copy by hand, and #945 is what happens when a new fact — "this
+        run may be part of a marker we emitted" — reaches only some of
+        them. Behavioural tests cannot stop a *fourth* copy from landing;
+        this reads the two module ASTs and enforces the rule on whatever
+        call sites exist, including ones not written yet.
+
+        Object identity is asserted as well as call-site shape: two
+        functions that agree today are two functions that disagree after
+        the next fix lands in one of them.
+        """
+        from creek.redact import redactor as redactor_module
+        from creek.redact import scanner as scanner_module
+
+        assert (
+            redactor_module.iter_unmarked_candidates
+            is scanner_module.iter_unmarked_candidates
+        ), (
+            "creek.redact.redactor no longer shares the scanner's candidacy "
+            "gate. --scan and --apply must agree by construction (#832), or "
+            "an already-redacted tree fails one and passes the other."
+        )
+
+        raw_sites: list[str] = []
+        callers: dict[str, set[str]] = {}
+        for module in (scanner_module, redactor_module):
+            tree = ast.parse(inspect.getsource(module))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.FunctionDef):
+                    continue
+                for call in ast.walk(node):
+                    if not isinstance(call, ast.Call):
+                        continue
+                    func = call.func
+                    if (
+                        isinstance(func, ast.Attribute)
+                        and func.attr == "finditer"
+                        and isinstance(func.value, ast.Name)
+                        and func.value.id == "HIGH_ENTROPY_CANDIDATE"
+                    ):
+                        raw_sites.append(f"{module.__name__}.{node.name}")
+                    if isinstance(func, ast.Name) and (
+                        func.id == "iter_unmarked_candidates"
+                    ):
+                        callers.setdefault(module.__name__, set()).add(node.name)
+
+        assert raw_sites == ["creek.redact.scanner.iter_unmarked_candidates"], (
+            "HIGH_ENTROPY_CANDIDATE.finditer must be spelled exactly once, "
+            "inside iter_unmarked_candidates. A second raw sweep is a second "
+            "candidacy rule that no future fix will reach.\n\n"
+            f"{raw_sites}"
+        )
+        assert callers == {
+            "creek.redact.scanner": {"_scan_high_entropy", "emitted_marker_runs"},
+            "creek.redact.redactor": {
+                "_collect_high_entropy_spans",
+                "_snap_to_candidate_runs",
+            },
+        }, (
+            "the set of candidacy consumers changed. Every one of them must "
+            "go through iter_unmarked_candidates, or --scan, --apply and "
+            f"span-snapping drift apart again.\n\n{callers}"
+        )
 
 
 # ---------------------------------------------------------------------------
