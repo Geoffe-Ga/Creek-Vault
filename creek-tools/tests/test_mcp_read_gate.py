@@ -189,7 +189,10 @@ import pytest
 from creek.author.client import AuthorLLMClient
 from creek.classify.llm import LLMClassificationResult
 from creek.classify.llm.completion import Completion
-from creek.classify.llm.prompts import build_classification_prompt
+from creek.classify.llm.prompts import (
+    _MAX_PROMPT_CONTENT_CHARS,
+    build_classification_prompt,
+)
 from creek.config import CreekConfig, LLMConfig
 from creek.generate.mining import MiningStrategy
 from creek.models import Fragment, PrivacyTier
@@ -522,6 +525,23 @@ def test_the_counts_only_rationale_is_not_reused_by_a_provider_reaching_tool() -
         "never presented to the router, so widening the router alone is inert "
         "-- needs rechecking (#1274)."
     )
+    # The 8192 cap is quoted as a NUMBER in three prose surfaces this PR adds,
+    # and nothing else in the suite pins it: mutating _MAX_PROMPT_CONTENT_CHARS
+    # to 512 leaves this file and the seven other prompt-builder tests green, so
+    # all three statements could go false with every gate passing. Pin the prose
+    # against the LIVE constant rather than against a literal of our own -- the
+    # same standard the for_tier source quote above is held to.
+    assert str(_MAX_PROMPT_CONTENT_CHARS) in classify, (
+        f"_MAX_PROMPT_CONTENT_CHARS is now {_MAX_PROMPT_CONTENT_CHARS}, but "
+        "_CLASSIFY_PROMPT_CHANNEL_RATIONALE still quotes a different number. "
+        "Three hand-written surfaces state this cap and none is generated: "
+        "read_gate._CLASSIFY_PROMPT_CHANNEL_RATIONALE, the classify_tool "
+        "docstring in creek_mcp/tools/classify.py, and docs/mcp.md's "
+        "creek.classify row. Update all three together. Lowering the cap is a "
+        "NARROWING and welcome -- this asks only that the documented number "
+        "follow the code (#1274)."
+    )
+
     # #658/#661 (the issue body's citation) appear NOWHERE in the routing code.
     # router.py says #647 and classify_engine.py says #666/#664.
     assert "#647" in classify and "#658" not in classify, (
