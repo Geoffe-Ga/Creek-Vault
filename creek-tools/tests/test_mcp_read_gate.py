@@ -2373,6 +2373,62 @@ Each probe is callable with no live provider, no config file and no skills
 tree, so layer (f) stays a unit test.
 """
 
+_RUNTIME_PROBE_CONTROLS: dict[str, str] = {
+    "creek.wheel": "test_wheel_probe_still_counts_the_fragment_it_is_admitted_to",
+    "creek.mine": "test_mine_probe_still_reaches_the_admitted_corpus",
+    "creek.reflect": "test_reflect_probe_refuses_rather_than_merely_staying_quiet",
+    "creek.compile": "test_compile_probe_refuses_rather_than_merely_staying_quiet",
+    "creek.report": "test_report_probe_leaves_no_canary_in_the_artifact_it_writes",
+    "creek.state.render": (
+        "test_state_render_probe_leaves_no_canary_in_the_artifact_it_writes"
+    ),
+    "creek.state.read": (
+        "test_state_read_probe_refuses_rather_than_merely_staying_quiet"
+    ),
+    "creek.journal": (
+        "test_journal_probe_refuses_and_leaves_the_fragment_bytes_untouched"
+    ),
+    "creek.upload": (
+        "test_upload_probe_refuses_and_leaves_the_staged_document_untouched"
+    ),
+    "creek.redact.scan": "test_redact_scan_probe_refuses_and_is_not_vacuous",
+    "creek.skills.refresh": (
+        "test_skills_refresh_probe_leaves_no_canary_in_the_tree_it_writes"
+    ),
+    "creek.classify.entry": (
+        "test_classify_entry_probe_refuses_the_fragment_it_is_not_admitted_to"
+    ),
+    "creek.author": "test_author_probe_still_cites_the_corpus_it_is_admitted_to",
+}
+"""Probed ``GATED`` tool → the test that keeps its sweep case from being vacuous.
+
+The counterpart of :data:`_PROBE_EXEMPT_GUARDS`, on the other side of the same
+choice: a tool is either excused — and then something must execute the excuse —
+or probed, and then something must execute the claim that the probe is worth
+running. Both halves are now forced, and until this dict existed only the first
+one was.
+
+**The gap this closes is specific and it belongs to ``creek.author``.** For
+twelve of the thirteen probes the shared sweep doubles as a crash detector: an
+exception inside the tool propagates out of ``_RUNTIME_PROBES[tool](vault)`` and
+the parametrised case goes red on its own. ``creek_mcp.tools.author`` is the one
+probed module that wraps its whole span in a top-level ``except Exception``, and
+:func:`creek_mcp.tools.author._error_response` sets ``"tool": TOOL_NAME`` — so a
+desk that crashes mid-run answers an envelope that satisfies the ``tool`` echo,
+contains no canary of any tier, and passes the sweep. Measured: with
+:func:`test_author_probe_still_cites_the_corpus_it_is_admitted_to` deleted, a
+Writing Desk raising mid-run leaves this file **fully green**; with it present
+the same crash is caught, by that test alone. All of layer (f)'s security value
+for this tool therefore rested on one standalone function that nothing obliged
+to exist.
+
+Registered by *name* rather than by reference for the reason
+:data:`_PROBE_EXEMPT_GUARDS` is: a reference would be satisfied by any callable,
+and the point is that a **collected test** runs. Deleting or renaming a control
+without updating this dict is the failure mode, and it is the one
+:func:`test_every_runtime_probe_has_a_registered_control` exists to make loud.
+"""
+
 
 @pytest.fixture
 def canary_vault(tmp_path: Path) -> Path:
@@ -2472,6 +2528,79 @@ def test_probe_exemptions_are_specific_to_their_tool(tool: str) -> None:
     )
 
 
+def _collected_test_names() -> frozenset[str]:
+    """Return the names in this module that pytest will collect as tests.
+
+    Deliberately reconstructed from module globals rather than asked of pytest:
+    the registries below are read by tests that must fail for a *missing* test,
+    and reaching into ``_pytest`` internals to answer that would make the check
+    depend on the collector it is trying to second-guess.
+
+    The four conditions are pytest's own default ``python_functions`` rule:
+    the name starts with ``test_``, the object is a plain function (not a
+    class, a partial or a callable instance), it was defined **here** rather
+    than imported from a sibling module, and it is not a fixture wearing a
+    ``test_`` name — fixtures are functions too, and a fixture is never
+    collected as a test.
+
+    Returns:
+        Every collectable test-function name defined in this module.
+    """
+    return frozenset(
+        name
+        for name, obj in globals().items()
+        if name.startswith("test_")
+        and inspect.isfunction(obj)
+        and obj.__module__ == __name__
+        and not hasattr(obj, "_pytestfixturefunction")
+    )
+
+
+def _assert_registry_names_a_collected_test(
+    registry: str, subject: str, name: str
+) -> None:
+    """Assert *name* is a test pytest will run, not merely something callable.
+
+    Shared by both registries because both fail the same way and for the same
+    reason. ``name in globals() and callable(...)`` is **not** enough: every
+    probe helper in this file satisfies it, so an entry repointed at
+    ``_probe_author`` would advertise a claim as executed while nothing ran it
+    — the exact shape of the defect #1279 exists to close, one level up.
+
+    Args:
+        registry: The manifest's name, for the failure message.
+        subject: The tool the entry belongs to.
+        name: The value recorded for it.
+
+    Raises:
+        AssertionError: If *name* is not a collected test in this module.
+    """
+    if name in _collected_test_names():
+        return
+    if name not in globals():
+        detail = "no such name exists in this module"
+    elif not name.startswith("test_"):
+        detail = (
+            f"{name!r} does not start with 'test_', so pytest never collects "
+            "it however callable it is"
+        )
+    else:
+        detail = (
+            f"{name!r} resolves to {type(globals()[name]).__name__}, which "
+            "pytest does not collect as a test"
+        )
+    msg = (
+        f"{registry}[{subject!r}] names {name!r}, and {detail}. A registry "
+        "entry is a promise that something RUNS the claim; a name that is "
+        "merely resolvable, or merely callable, keeps the promise on paper "
+        "and breaks it in fact — which is precisely how creek.author's "
+        "exemption stayed false through every review it passed (#1279). "
+        "Point the entry at a collected test, or remove the entry and the "
+        "claim it stands for."
+    )
+    raise AssertionError(msg)
+
+
 def test_the_response_probe_exemption_set_is_pinned() -> None:
     """Only ``creek.draft`` escapes layer (f) through the exemption hatch.
 
@@ -2521,6 +2650,15 @@ def test_every_response_probe_exemption_has_an_executable_guard() -> None:
     entry naming a test that no longer exists (renamed, or deleted along with
     the probe it excused) leaves the exemption looking supervised while
     nothing runs, which is the same failure wearing a registry entry.
+
+    The name has to be a **collected test**, not merely a resolvable callable.
+    ``guard in globals() and callable(...)`` was the first version of this and
+    it was too weak by exactly the margin that matters: every probe helper in
+    this file satisfies it, so repointing an entry at ``_probe_author`` would
+    have left ``creek.draft``'s exemption executed by nothing while this test
+    reported it supervised. :func:`_assert_registry_names_a_collected_test`
+    carries the stricter rule, shared with
+    :func:`test_every_runtime_probe_has_a_registered_control`.
     """
     assert set(_PROBE_EXEMPT_GUARDS) == set(_PROBE_EXEMPT), (
         "every layer-(f) exemption needs a test that EXECUTES its reason, and "
@@ -2533,14 +2671,52 @@ def test_every_response_probe_exemption_has_an_executable_guard() -> None:
         "exemption and write a probe."
     )
     for tool, guard in sorted(_PROBE_EXEMPT_GUARDS.items()):
-        assert guard in globals(), (
-            f"{tool}'s exemption guard {guard!r} does not resolve in this "
-            "module, so the exemption is supervised on paper and unexecuted "
-            "in fact. Point the entry at the test that runs the reason."
-        )
-        assert callable(globals()[guard]), (
-            f"{tool}'s exemption guard {guard!r} resolves to something that "
-            "is not callable, so no test runs the reason."
+        _assert_registry_names_a_collected_test("_PROBE_EXEMPT_GUARDS", tool, guard)
+
+
+def test_every_runtime_probe_has_a_registered_control() -> None:
+    """Every layer-(f) probe names a test that keeps its sweep case honest.
+
+    :func:`test_every_response_probe_exemption_has_an_executable_guard`'s
+    argument, applied to the other branch of the same choice. A tool is either
+    excused -- and then something must execute the excuse -- or probed, and
+    then something must execute the claim that the probe is worth running.
+    Only the first half was forced until now, which left the sharper half of
+    layer (f) resting on convention.
+
+    **Concretely, and measured.** For twelve of the thirteen probes the shared
+    sweep doubles as a crash detector: an exception raised inside the tool
+    propagates out of ``_RUNTIME_PROBES[tool](canary_vault)`` and the
+    parametrised case reddens by itself. ``creek.author`` is the exception,
+    and uniquely so -- ``creek_mcp.tools.author`` is the only probed module
+    that wraps its whole span in a top-level ``except Exception``, and
+    :func:`creek_mcp.tools.author._error_response` sets ``"tool": TOOL_NAME``,
+    so a crashed desk answers an envelope that satisfies the echo and carries
+    no canary of any tier. Delete
+    :func:`test_author_probe_still_cites_the_corpus_it_is_admitted_to` and a
+    Writing Desk raising mid-run leaves this file **fully green**. Keep it and
+    that same crash produces exactly one failure, on its ``status``
+    assertion. Nothing obliged that test to exist; this does.
+
+    Pinned in both directions, like its sibling. A probe with no control is a
+    sweep case that may be passing for a reason nobody checked. A control
+    registered for a tool that is no longer probed is a claim about nothing,
+    and it inflates the apparent depth of the layer.
+    """
+    assert set(_RUNTIME_PROBE_CONTROLS) == set(_RUNTIME_PROBES), (
+        "every layer-(f) probe needs a test that keeps its sweep case from "
+        "being vacuous, and the two manifests disagree. Probed with no "
+        "control: "
+        f"{sorted(set(_RUNTIME_PROBES) - set(_RUNTIME_PROBE_CONTROLS))}; "
+        "controls for tools that are not probed: "
+        f"{sorted(set(_RUNTIME_PROBE_CONTROLS) - set(_RUNTIME_PROBES))}. The "
+        "shared canary sweep is an exclusion, and an exclusion passes just as "
+        "well over an envelope the tool never filled. Write the control, or "
+        "remove the probe."
+    )
+    for tool, control in sorted(_RUNTIME_PROBE_CONTROLS.items()):
+        _assert_registry_names_a_collected_test(
+            "_RUNTIME_PROBE_CONTROLS", tool, control
         )
 
 
