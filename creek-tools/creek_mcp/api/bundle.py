@@ -226,12 +226,15 @@ _EXAMPLE_EXTERNAL_ID: Final[str] = "adepthood:entry:2026-07-31T06:12:00Z"
 _EXAMPLE_FRAGMENT_ID: Final[str] = "frag-3f9a1c7e40b2"
 """A synthetic vault-side fragment id, in the real ``frag-`` + 12-hex shape.
 
-Deliberately opaque rather than a readable slug. Fragment ids are unguessable
-by construction, and several accepted residuals across the MCP surface rest on
-exactly that — a probing caller cannot enumerate ids it was never shown. An
-example in a date-and-words shape would advertise a guessable id space that
-Creek does not actually have, and a client author copying the shape into a
-test fixture would encode the wrong assumption.
+Deliberately opaque rather than a readable slug. An example in a
+date-and-words shape would advertise a guessable id space that Creek does not
+actually have, and a client author copying the shape into a test fixture would
+encode the wrong assumption.
+
+The shape is a fixture concern only. Ids are deterministic hashes and are
+enumerable downward from any admitted parent, so nothing on the MCP surface
+may rest on their entropy -- see the residual block in
+:func:`creek_mcp.tools.reflect._admit_entry` (#933).
 """
 
 _JOURNAL_SUCCESS: Final[dict[str, Any]] = {

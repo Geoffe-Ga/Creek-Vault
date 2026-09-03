@@ -46,6 +46,9 @@ would be exactly the duplication this module exists to forbid.
 from __future__ import annotations
 
 import ast
+import io
+import re
+import tokenize
 from pathlib import Path
 from typing import Final
 
@@ -901,3 +904,158 @@ def test_not_found_is_constructed_once_in_the_routing_miss() -> None:
     assert sum(len(sites) for sites in found.values()) == 1, found
     qualified = {f"{rel}::{name}" for rel, sites in found.items() for _, name in sites}
     assert qualified == NOT_FOUND_CONSTRUCTION_SITES, found
+
+
+# --------------------------------------------------------------------------- #
+# #933 — no accepted residual may rest on fragment-id entropy
+# --------------------------------------------------------------------------- #
+
+
+_ID_ENTROPY_MENTION: Final[re.Pattern[str]] = re.compile(r"unguessab")
+"""The stem that may only ever appear beside its disclaimer (#933)."""
+
+_ID_ENTROPY_DISCLAIMER: Final[str] = "not a control"
+"""``creek_mcp.tools.compile`` says "*Id unguessability is not a control
+here.*" (#848).
+
+Banning the stem outright would flag that correction as the defect, so the
+rule is a *pairing* rule, scoped to the **sentence**. Module scope was
+measured too weak: post-fix ``creek_mcp.tools.reflect`` carries the
+disclaimer, which would then license a re-minted claim anywhere else in the
+same file. Physical-line scope was measured too brittle: a benign reflow of
+``creek_mcp.tools.compile``'s disclaimer onto a second line turns it red,
+and that module is one a lane may not be free to edit.
+"""
+
+_BANNED_ID_CLAIMS: Final[tuple[str, ...]] = (
+    "fragment ids are unguessable",
+    "ids are unguessable by construction",
+    "only learnable from content already admitted",
+    "cannot enumerate ids it was never shown",
+)
+"""Retired wordings (#933).
+
+Both generators are deterministic, and
+:func:`creek.ingest.base.generate_child_fragment_id` hashes only
+``f"{parent_id}:{level}:{index}"`` over an eight-value
+:data:`creek.models.FragmentLevel`, so ids ARE enumerable downward from any
+admitted parent with no knowledge of the content.
+"""
+
+_REFLECT_TIMING_CAVEAT: Final[str] = "early-returns at the match"
+"""The half of reflect's residual block that must survive any rewrite.
+
+Without this ratchet the offender sweep below is satisfiable by deleting the
+whole block -- which would also delete the timing caveat that
+``creek_mcp.tools.classify_entry`` and the ``/v1`` ADR both cite.
+"""
+
+
+def _prose(source: str) -> str:
+    """Return *source*'s comments and docstrings, whitespace-normalised.
+
+    Normalisation is load-bearing, not cosmetic. The claim this guard
+    retires ("only learnable from content already admitted") **wrapped
+    across two physical lines** in
+    :func:`creek_mcp.tools.reflect._admit_entry`, so a line-oriented scan
+    reports a clean sweep over a live defect.
+
+    Args:
+        source: Python source text.
+
+    Returns:
+        Every comment and string constant, joined and whitespace-collapsed,
+        lowercased, with reST emphasis and double-backtick literal markers
+        flattened to spaces so a claim reads the same however it was marked
+        up.
+    """
+    parts: list[str] = []
+    for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+        if tok.type == tokenize.COMMENT:
+            parts.append(tok.string.lstrip("#"))
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            parts.append(node.value)
+    flat = " ".join(parts).replace("``", " ").replace("*", " ")
+    return re.sub(r"\s+", " ", flat).lower()
+
+
+def test_no_creek_mcp_module_asserts_fragment_id_unguessability() -> None:
+    """#933: no accepted residual may rest on fragment-id entropy.
+
+    Fragment ids are deterministic hashes, and child ids are derived from
+    ``(parent_id, level, index)`` alone -- so a caller holding one admitted
+    parent id can enumerate every child id without seeing any content. Any
+    comment that treats id entropy as a control states a property Creek does
+    not have.
+    """
+    offenders = [
+        f"{path.relative_to(CREEK_MCP)}: {claim!r}"
+        for path in _sources(CREEK_MCP)
+        for claim in _BANNED_ID_CLAIMS
+        if claim in _prose(_read(path))
+    ]
+    assert offenders == [], offenders
+
+
+def test_id_entropy_is_only_mentioned_beside_its_disclaimer() -> None:
+    """#933: closes the class, not just the four retired spellings.
+
+    A blacklist goes green the moment someone paraphrases. The stem may
+    appear, but only in a sentence that also says it is not a control.
+    """
+    offenders: list[str] = []
+    for path in _sources(CREEK_MCP):
+        for sentence in re.split(r"(?<=[.;:]) ", _prose(_read(path))):
+            if _ID_ENTROPY_MENTION.search(sentence) and (
+                _ID_ENTROPY_DISCLAIMER not in sentence
+            ):
+                offenders.append(f"{path.relative_to(CREEK_MCP)}: {sentence[:80]}")
+    assert offenders == [], offenders
+
+
+def test_the_reflect_residual_keeps_its_timing_caveat() -> None:
+    """Anti-deletion ratchet: the sweep must not be satisfiable by deletion.
+
+    Both guards above go green if the residual block is simply removed. The
+    timing asymmetry it records is relied on elsewhere, so deleting it would
+    be a worse outcome than the overstatement this issue fixes.
+    """
+    reflect = _read(CREEK_MCP / "tools" / "reflect.py")
+    assert _REFLECT_TIMING_CAVEAT in reflect
+
+
+def test_the_id_entropy_sweep_actually_reaches_the_surface_it_guards() -> None:
+    """Positive control: fail LOUDLY if the sweep ever finds nothing.
+
+    Both offender guards assert an empty list, so a walk that collapsed to
+    ``[]`` would pass them vacuously. This pins the corpus size, the three
+    modules that carry the construct, and a non-empty mention population.
+    """
+    sources = _sources(CREEK_MCP)
+    assert len(sources) > 50, f"creek_mcp walk collapsed: {len(sources)}"
+    names = {path.relative_to(CREEK_MCP).as_posix() for path in sources}
+    assert {"tools/reflect.py", "tools/compile.py", "api/bundle.py"} <= names
+    mentions = {
+        path.relative_to(CREEK_MCP).as_posix()
+        for path in sources
+        if _ID_ENTROPY_MENTION.search(_prose(_read(path)))
+    }
+    assert "tools/compile.py" in mentions, "the mention population went empty"
+
+
+def test_the_id_entropy_guards_flag_a_source_that_carries_the_construct() -> None:
+    """Non-vacuity twin, per this module's docstring.
+
+    The probe lives in ``tests/`` while the guards sweep ``creek_mcp/`` only
+    -- two disjoint trees -- so this stored literal can never satisfy the
+    guard it exercises.
+    """
+    probe = (
+        '"""Doc.\n\nFragment ids are unguessable\nby construction.\n"""\n'
+        "# a probing caller cannot enumerate ids it was never shown\n"
+    )
+    flat = _prose(probe)
+    assert [claim for claim in _BANNED_ID_CLAIMS if claim in flat]
+    assert _ID_ENTROPY_MENTION.search(flat)
+    assert _ID_ENTROPY_DISCLAIMER not in flat
