@@ -13,6 +13,11 @@ no runtime test can:
 
 * Is there **exactly one** call to :func:`creek_mcp.policy.admitted_ceiling`?
   Two gates are two places to disagree, and the lenient one wins.
+* Is there **exactly one** call to
+  :func:`creek_mcp.remote_auth.access_has_expired`, and does the adapter name
+  ``expires_at`` anywhere itself? A re-inlined credential-lifetime comparison
+  answers correctly on the day it is written and no behavioural test can see
+  it (#1267).
 * Is there **exactly one** ``CallerIdentity(`` site, and does any of them say
   ``is_remote=False``? That literal is the #1073 bug spelled out — a ``/v1``
   caller asserted local is a caller the ``personal`` cap does not apply to.
@@ -498,6 +503,31 @@ def test_there_is_exactly_one_admission_call() -> None:
     assert _count_across_httpapi("admitted_ceiling") == 1
 
 
+def test_the_credential_expiry_check_has_one_call_site() -> None:
+    """One request, one expiry rule, one call site (#1267).
+
+    The rule itself lives in :func:`creek_mcp.remote_auth.access_has_expired`,
+    next to the registry it belongs to; this counts how many times the adapter
+    asks for it. A second site is a second rule, and no behavioural test can
+    see a re-inlined ``access.expires_at < ...`` comparison — it would answer
+    correctly on the day it was written and then drift, which is the whole
+    reason this module exists.
+    """
+    assert _count_across_httpapi("access_has_expired") == 1
+
+
+def test_httpapi_never_compares_an_expiry_itself() -> None:
+    """Nor does it reach for the field to compare it longhand.
+
+    Naming ``expires_at`` inside the adapter means it is reasoning about the
+    instant rather than asking for a verdict — the same shape as a second call
+    site, one step subtler, and the shape that would let ``/v1`` drift from the
+    SDK's answer on the ``None`` and falsy-integer cases the predicate pins.
+    """
+    for path in _sources(HTTPAPI):
+        assert "expires_at" not in _referenced_names(_read(path)), path
+
+
 def test_the_admission_call_lives_in_the_ceiling_middleware() -> None:
     """And it lives above the router, where the ADR puts it."""
     ceiling = HTTPAPI / "middleware" / "ceiling.py"
@@ -541,8 +571,11 @@ def test_no_caller_identity_is_constructed_as_local() -> None:
 
 
 def test_the_admission_guards_are_not_vacuous() -> None:
-    """Each of the four checks above detects its forbidden construct."""
+    """Each of the checks above detects its forbidden construct."""
     assert _called_names("admitted_ceiling(identity, raw)\n") == ["admitted_ceiling"]
+    assert _called_names("access_has_expired(access)\n") == ["access_has_expired"]
+    assert "expires_at" in _referenced_names("if access.expires_at < now:\n    pass\n")
+    assert "expires_at" in _referenced_names("if expires_at < now:\n    pass\n")
     assert _called_names("policy.admitted_ceiling(identity, raw)\n") == [
         "admitted_ceiling"
     ]

@@ -167,6 +167,30 @@ every request.
   the credential is still a static, long-lived secret rather than something
   short-lived.
 
+`/v1` refuses a presented `AccessToken` whose `expires_at` has passed, with the
+same `401` and the same body and headers as an unknown token (but for the
+correlation id). An answer a caller could tell apart would let the holder of a
+captured value learn that it had once been issued. This bounds a *captured
+token object*, not the configured secret — the two bullets above are still the
+only things that revoke that (#1267).
+
+The MCP transport applies the same rule, from the SDK's bearer middleware on
+its own stack. The two gates are not identical, and where they differ **`/v1`
+is always the stricter one** — it never serves a credential the MCP transport
+would refuse. Two cases differ today:
+
+- **The scheme is matched case-sensitively.** `bearer <valid token>` is a `401`
+  on `/v1` and accepted by the MCP transport. RFC 7235 makes the scheme
+  case-insensitive, but every normalisation step is a step where two
+  equal-looking headers stop being equal, and `/v1` has one client with one
+  spelling. **Send `Bearer` exactly.**
+- **`expires_at: 0`** is read here as an expiry in 1970 and refused, where the
+  SDK reads the falsy integer as *no expiry* and serves it. No Creek verifier
+  mints it — the TTL is always positive — so this is unreachable in practice.
+
+Both are pinned as rows in `tests/test_admission_parity.py`, which measures
+both gates against one expected-verdict table.
+
 ### The authenticated consumer *is* the audit identity
 
 `/v1` derives the audited `consumer` from the verified token's `client_id` and
