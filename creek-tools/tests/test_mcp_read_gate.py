@@ -39,6 +39,15 @@ A manifest is only worth having if it cannot lie. Seven layers keep it honest:
     exemption must name a test in :data:`_PROBE_EXEMPT_GUARDS` that
     **executes** its reason. Both were missing while ``creek.author`` sat here
     on a reason whose every load-bearing clause was false.
+
+    The fixture set is two vaults rather than one (#1287). ``canary_vault``
+    is flat, so it can only express the tier of a fragment the caller
+    **names**; ``ancestry_canary_vault`` adds the one privacy channel that
+    travels through persisted hierarchy front matter, where an admitted
+    ``open`` fragment's ``structural_path`` renders an above-ceiling
+    ancestor's heading the caller never named. Only ``creek.compile``
+    reaches that channel, and it is the only tool probed over the second
+    vault.
 (g) **Prompt-channel canary probe** — layer (f) at the other end of the wire.
     Every ``GATED`` tool that can hand corpus text to a model is driven all
     the way *to* the provider with a recording factory, and the gated
@@ -550,6 +559,56 @@ def test_the_counts_only_rationale_is_not_reused_by_a_provider_reaching_tool() -
     )
 
 
+def test_the_compile_ancestry_rationale_clause_is_executed() -> None:
+    """``creek.compile``'s rationale names ``ancestry_tiers``; something must call it.
+
+    Layer (c) verifies a ``GATED`` claim against the implementation, but only
+    for the ONE symbol the entry names in ``gate_symbol``. ``creek.compile``'s
+    is ``_survey_sources``, so ``test_gated_tools_expose_their_named_gate_symbol``
+    and ``test_gated_tools_actually_call_their_named_gate_symbol`` both pass
+    over a module that had stopped ranking ancestry entirely — the rationale's
+    second half, "``ancestry_tiers`` walks parent_id and an above-ceiling
+    ancestor refuses the whole call with the same content-free reason", is
+    prose that nothing in this file executed. That is precisely the #1279
+    shape the counts-only-rationale test above exists to prevent, one clause
+    down, and it is the reason a manifest is only worth having if it cannot
+    lie.
+
+    The repair is to **execute** the claim, not to delete it: the sentence is
+    true at HEAD. It follows the idiom the test above established — the
+    rationale names a symbol, the symbol resolves, and the module the
+    rationale is about actually calls it. :func:`_calls_symbol` requires the
+    result be *consumed*, so a call-and-discard edit that left the name
+    present cannot satisfy this either.
+
+    Note what this does NOT assert: that the refusal happens. That is a layer
+    (f) claim, and it is
+    :func:`test_compile_refuses_an_unnamed_intimate_ancestor`'s. This one is
+    about the manifest's own integrity, which is why deleting the clause from
+    ``creek_mcp/read_gate.py`` reddens this test and nothing else in the file.
+    """
+    rationale = TOOL_POSTURES["creek.compile"].rationale
+    assert "ancestry_tiers" in rationale, (
+        "the creek.compile rationale no longer names ancestry_tiers. If the "
+        "ancestry survey was removed, #1283 regressed; if the prose was "
+        "trimmed, a reader can no longer follow the manifest to the code that "
+        "closes the persisted-structural_path channel."
+    )
+    module = importlib.import_module("creek.classify.privacy_filter")
+    assert hasattr(module, "ancestry_tiers"), (
+        "the rationale names creek.classify.privacy_filter.ancestry_tiers, but "
+        "that symbol does not resolve -- the prose has drifted from the code."
+    )
+    assert _calls_symbol(_import_tool_module("creek.compile"), "ancestry_tiers"), (
+        "creek.compile's rationale claims ancestry_tiers ranks the ancestors "
+        "of every named fragment, but creek_mcp/tools/compile.py never calls "
+        "it (or calls it and discards the result). Layer (c) cannot see this: "
+        "it checks only the gate_symbol _survey_sources, which is still called "
+        "either way. Swapping ancestry_tiers back for its ancestry-blind "
+        "sibling source_tiers is the pre-#1283 shape and re-opens the channel."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fragment-body canaries — unmistakable if they ever surface where they must
 # not. Plain sentinels rather than realistic prose so a leak cannot be excused
@@ -705,6 +764,8 @@ def _write_fragment(
     privacy_tier: str,
     tags: list[str] | None = None,
     file_stem: str | None = None,
+    parent_id: str | None = None,
+    structural_path: list[str] | None = None,
 ) -> Path:
     """Write one classified fragment under ``01-Fragments/Notes``.
 
@@ -727,6 +788,36 @@ def _write_fragment(
             canary in an *id* would be echoed back legitimately by
             ``creek.reflect`` and ``creek.compile``, which are handed the id by
             the caller — see :data:`_RUNTIME_INTIMATE_ID`.
+        parent_id: Optional link up the hierarchy. ``None`` — the default —
+            omits the key entirely, so front matter written by every caller
+            that predates the ancestry fixture is byte-identical to before.
+            That claim is not left to this sentence:
+            :func:`test_write_fragment_leaves_flat_front_matter_byte_identical`
+            reads it back off disk.
+        structural_path: Optional persisted breadcrumb of ancestor headings,
+            as ``creek.atomize.split._build_children`` writes it. Emitted
+            under the same guard, and kept separable from *parent_id* on
+            purpose: they are the two distinct halves of the ancestry channel
+            and the gate ranks them differently — an ancestor reached through
+            ``parent_id`` contributes its own tier, while a breadcrumb deeper
+            than the walk could reach fails closed under
+            ``AncestorIndex._own_tiers``'s rule (e).
+
+    The two hierarchy kwargs are ported verbatim from
+    ``tests/test_mcp_write_tools.py``'s own ``_write_fragment`` (#931/#1287),
+    which already carries this exact emitted-only-when-supplied contract; they
+    are not a second design. Its third hierarchy kwarg, ``child_ids``, is
+    deliberately **not** ported:
+    :func:`creek.classify.privacy_filter.build_ancestor_index` reads only
+    ``parent_id`` and ``len(structural_path)``, so nothing this file gates on
+    would ever consult it and the kwarg would be dead weight.
+
+    Hoisting the three divergent ``_write_fragment`` copies in this suite
+    into one shared writer is **#1751**, deliberately not done here for the
+    reason :class:`_RecordingLLMFactory` gives for the five recorders it is
+    the sibling of (#1275): several tests downstream of these writers assert
+    exact front-matter key sets and exact fragment tallies, so the hoist
+    needs its own diff and its own read-the-file-back proof.
 
     Returns:
         The path the fragment was written to.
@@ -744,6 +835,10 @@ def _write_fragment(
     }
     if tags is not None:
         metadata["tags"] = tags
+    if parent_id is not None:
+        metadata["parent_id"] = parent_id
+    if structural_path is not None:
+        metadata["structural_path"] = structural_path
     target = vault / "01-Fragments" / "Notes" / f"{file_stem or frag_id}.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
@@ -751,6 +846,102 @@ def _write_fragment(
         encoding="utf-8",
     )
     return target
+
+
+def _front_matter_keys(path: Path) -> set[str]:
+    """Return the front-matter key names of the fragment file at *path*.
+
+    Reads the bytes back off disk rather than inspecting the dict a writer
+    built in-process: every claim this helper serves is a claim about what a
+    *vault reader* sees, and an in-process assertion would pass just as
+    happily against a writer that dropped the key on its way out.
+
+    Args:
+        path: A fragment file :func:`_write_fragment` wrote.
+
+    Returns:
+        The set of metadata keys present in that file's front matter.
+    """
+    return set(frontmatter.loads(path.read_text(encoding="utf-8")).metadata)
+
+
+def test_write_fragment_leaves_flat_front_matter_byte_identical(
+    tmp_path: Path,
+) -> None:
+    """Widening the writer for ancestry changes nothing for the callers that skip it.
+
+    :func:`_write_fragment` is the chokepoint every fixture in this file
+    writes through, and several assertions downstream of it are **exact
+    sets** and **exact tallies** rather than containments —
+    :func:`test_wheel_probe_still_counts_the_fragment_it_is_admitted_to`,
+    :func:`test_mine_probe_still_reaches_the_admitted_corpus`, and the report
+    and redact exact-set controls. A stray front-matter key would move those
+    without touching a line of their source, so #1287's two new kwargs have
+    to be provably inert for the callers that never pass them.
+
+    Proved by reading the written file back, not by observing that the suite
+    still passes: a green gate is an inference, and this is the single fact
+    that inference would be resting on. The third case is the positive
+    control — without it a helper that accepted both kwargs and silently
+    discarded them would satisfy the first two and make
+    :func:`ancestry_canary_vault` a vault with no ancestry in it.
+
+    Args:
+        tmp_path: pytest's per-test directory, used as a throwaway vault root.
+    """
+    base_keys = {
+        "type",
+        "id",
+        "title",
+        "created",
+        "ingested",
+        "source",
+        "frequency",
+        "privacy_tier",
+        "eddies",
+    }
+    flat = _write_fragment(
+        tmp_path,
+        frag_id="frag-front-matter-flat",
+        title="Flat",
+        body="Flat body.",
+        privacy_tier="open",
+    )
+    assert _front_matter_keys(flat) == base_keys, (
+        "_write_fragment now writes a front-matter key its caller never asked "
+        "for. Every exact-set and exact-tally assertion in this file reads a "
+        "vault this helper wrote, so an extra key moves them silently."
+    )
+
+    tagged = _write_fragment(
+        tmp_path,
+        frag_id="frag-front-matter-tagged",
+        title="Tagged",
+        body="Tagged body.",
+        privacy_tier="open",
+        tags=["tag-a"],
+    )
+    assert _front_matter_keys(tagged) == base_keys | {"tags"}, (
+        "supplying tags must add exactly the tags key and nothing else."
+    )
+
+    hierarchical = _write_fragment(
+        tmp_path,
+        frag_id="frag-front-matter-hierarchical",
+        title="Hierarchical",
+        body="Hierarchical body.",
+        privacy_tier="open",
+        parent_id="frag-front-matter-flat",
+        structural_path=["Flat"],
+    )
+    assert _front_matter_keys(hierarchical) == base_keys | {
+        "parent_id",
+        "structural_path",
+    }, (
+        "the ancestry kwargs must reach the FILE, not just the helper's local "
+        "dict. If they do not, every ancestry fixture below is a flat vault "
+        "wearing an ancestry-shaped test name."
+    )
 
 
 def _admitted_by_id(vault: Path, ceiling: TierCeiling) -> dict[str, tuple[Path, str]]:
@@ -1655,6 +1846,42 @@ _RUNTIME_INTIMATE_ID = "frag-runtime-intimate"
 # :func:`_assert_prompt_channel_clean`.
 _RUNTIME_PERSONAL_CANARY = "CANARY-RUNTIME-PERSONAL-6c19"
 _RUNTIME_PERSONAL_ID = "frag-runtime-personal"
+
+# A fourth sentinel, declared here with the other three for the same reason
+# the third is: so the next probe author picks a value that cannot collide
+# with one already in flight. It belongs to #1287 and travels a route none of
+# the three above can. Those three ride a fragment the caller NAMES; this one
+# rides a fragment the caller never names, reaching an admitted ``open``
+# child's prompt through that child's persisted ``structural_path``. That is
+# the one privacy channel ``canary_vault`` cannot express, because
+# :func:`_write_fragment`'s callers there write no hierarchy at all.
+_RUNTIME_ANCESTOR_CANARY = "CANARY-RUNTIME-ANCESTOR-9f04"
+
+# The sentinel lives in the ancestor's TITLE, and only there. A title is what
+# ``creek.atomize.split._build_children`` accumulates into each child's
+# ``structural_path``, and what ``creek.compile.engine._build_prompt`` renders
+# after ``structural_path: ``. Putting it in the body or the tags as well
+# would make a hit ambiguous about WHICH field carried it, and the breadcrumb
+# is the whole claim. (``tests/test_mcp_write_tools.py``'s ``_ANCESTOR_HEADING``
+# makes the same argument for using a real heading rather than a bare marker;
+# this one carries a sentinel too, because unlike that file's assertions
+# #1287's sweep the serialised envelope, where a realistic phrase could be
+# excused as having come from anywhere.)
+_ANCESTRY_ANCESTOR_HEADING = f"Ritual with M. {_RUNTIME_ANCESTOR_CANARY}"
+
+# The ids stay canary-free for the reason :data:`_RUNTIME_OPEN_ID` gives:
+# ``creek.compile`` is *handed* these ids by the caller, so echoing one back
+# is not a leak, and a sentinel in an id would make a probe failure ambiguous
+# about whether the tool reached the content.
+_ANCESTRY_ANCESTOR_ID = "frag-runtime-ancestor"
+_ANCESTRY_CHILD_ID = "frag-runtime-child"
+_ANCESTRY_ORPHAN_ID = "frag-runtime-orphan"
+
+# The within-ceiling fixture's heading is deliberately sentinel-free: it names
+# an ``open`` ancestor whose heading is *allowed* to reach the prompt, and
+# reusing the canary for something admitted would blur what a canary means
+# everywhere else in this layer.
+_WITHIN_CEILING_HEADING = "Notes from the front step"
 
 # ``creek_mcp/tools/reflect.py`` inlines this string at its #846 gate rather
 # than naming a constant, so it is repeated here. Asserted (rather than a bare
@@ -2590,6 +2817,139 @@ def canary_vault(tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.fixture
+def ancestry_canary_vault(tmp_path: Path) -> Path:
+    """Return a vault whose above-ceiling material is reachable only through ancestry.
+
+    A **sibling** of :func:`canary_vault`, never an extension of it, for the
+    reason :func:`prompt_canary_vault`'s docstring gives for standing alone:
+    the probes over ``canary_vault`` assert exact tallies and exact id sets,
+    so a third fragment added there moves assertions in tests that never
+    mentioned ancestry. This vault is requested only by the tests that need
+    it.
+
+    **What makes it a real fixture rather than a restatement of
+    ``canary_vault``.** Every id a test hands ``compile_tool`` here is
+    ``privacy_tier: open``. The ancestry-blind survey this gate used before
+    #1283 — ``creek.classify.privacy_filter.source_tiers``, which ranks named
+    ids only — therefore ADMITS every call below. The refusals come entirely
+    from material the caller never named, which is what
+    :func:`_probe_compile` cannot demonstrate: it names
+    :data:`_RUNTIME_INTIMATE_ID` outright, so #848's named-ids-only gate
+    refuses first and the ancestry rule is never the reason.
+
+    **Why every shape here persists a breadcrumb.**
+    :func:`creek.hierarchy.structural_path_context` returns the persisted
+    ``structural_path`` before it walks ``parent_id`` at all, and its
+    ``parent_id`` branch looks the ancestor up in a mapping
+    ``creek.compile.engine`` builds from the fragments it *loaded* — which is
+    only the ids the caller named. So an unnamed ancestor is never in that
+    mapping, and the persisted branch is the only one an MCP caller can
+    reach. A ``parent_id``-without-breadcrumb fragment would exercise the
+    gate but could never have leaked, so no such shape is seeded here.
+
+    Three fragments, two reachable shapes:
+
+    * an ``intimate`` ancestor titled :data:`_ANCESTRY_ANCESTOR_HEADING`,
+      never named by any request — rule (a) of
+      ``AncestorIndex.chain_tiers``;
+    * an ``open`` child linked to it by both ``parent_id`` and breadcrumb;
+    * an ``open`` orphan carrying the same breadcrumb with **no**
+      ``parent_id`` — rule (e), a depth-0 breadcrumb the walk cannot rank.
+      The intimate ancestor sits in the same vault but is not in the orphan's
+      chain and contributes nothing to it; ``chain_tiers`` walks only the
+      chains of the ids it is given.
+
+    A third shape — a ``parent_id`` naming an id that resolves to nothing —
+    is deliberately absent. It is covered in
+    ``tests/test_mcp_write_tools.py::test_compile_refuses_a_dangling_ancestry_link``,
+    and it is not independently provable *here*: its refusal is produced
+    jointly by rules (c) and (e), because both ``_ROOT_CHAIN`` and
+    ``_CYCLE_CHAIN`` carry depth 0, so a dangling child with a length-1
+    breadcrumb refuses under rule (e) no matter what rule (c) returns. No
+    mutation reachable from this file kills such a test without also killing
+    the two above it, and an unkillable test in the file whose whole thesis
+    is "a claim graded for prose and executed by nothing" is the defect, not
+    the fix. Rule (c) is isolated in ``tests/test_privacy_filter.py``.
+
+    Args:
+        tmp_path: pytest's per-test directory, used as the vault root.
+
+    Returns:
+        The vault root.
+    """
+    _write_fragment(
+        tmp_path,
+        frag_id=_ANCESTRY_ANCESTOR_ID,
+        title=_ANCESTRY_ANCESTOR_HEADING,
+        body="Ancestor body, deliberately sentinel-free.",
+        privacy_tier="intimate",
+    )
+    _write_fragment(
+        tmp_path,
+        frag_id=_ANCESTRY_CHILD_ID,
+        title="Admitted child",
+        body="Child body, deliberately sentinel-free.",
+        privacy_tier="open",
+        parent_id=_ANCESTRY_ANCESTOR_ID,
+        structural_path=[_ANCESTRY_ANCESTOR_HEADING],
+    )
+    _write_fragment(
+        tmp_path,
+        frag_id=_ANCESTRY_ORPHAN_ID,
+        title="Admitted orphan",
+        body="Orphan body, deliberately sentinel-free.",
+        privacy_tier="open",
+        structural_path=[_ANCESTRY_ANCESTOR_HEADING],
+    )
+    return tmp_path
+
+
+@pytest.fixture
+def within_ceiling_ancestry_vault(tmp_path: Path) -> Path:
+    """Return the same ancestry shape with the ancestor *inside* the ceiling.
+
+    The anti-vacuity counterweight to :func:`ancestry_canary_vault`: without
+    a vault in which an ancestor-bearing fragment is still admitted, #1283's
+    fix would be satisfiable by "refuse anything that has a parent" and every
+    refusal test above would stay green.
+
+    It is a separate vault rather than a fourth fragment in the one above,
+    because the claim is about a corpus containing **no** above-ceiling
+    fragment at all. Sharing a root would leave the ``intimate`` ancestor
+    present, and a gate that had regressed into ranking every fragment in the
+    vault rather than the requested chains would then refuse here too — the
+    result would be a red anti-vacuity test that could not say which of the
+    two faults it had found. Written under a subdirectory of *tmp_path* for
+    the same reason, since ``tmp_path`` is one directory per test and a test
+    requesting both fixtures would otherwise get one merged corpus.
+
+    Args:
+        tmp_path: pytest's per-test directory.
+
+    Returns:
+        The vault root, a subdirectory of *tmp_path*.
+    """
+    vault = tmp_path / "within-ceiling"
+    _write_fragment(
+        vault,
+        frag_id=_ANCESTRY_ANCESTOR_ID,
+        title=_WITHIN_CEILING_HEADING,
+        body="Ancestor body.",
+        privacy_tier="open",
+    )
+    _write_fragment(
+        vault,
+        frag_id=_ANCESTRY_CHILD_ID,
+        title="Admitted child",
+        body="Child body.",
+        privacy_tier="open",
+        parent_id=_ANCESTRY_ANCESTOR_ID,
+        structural_path=[_WITHIN_CEILING_HEADING],
+    )
+    return vault
+
+
 def test_every_gated_tool_is_probed_or_explicitly_exempt() -> None:
     """Each ``GATED`` tool is either runtime-probed or exempt, never neither.
 
@@ -3139,6 +3499,209 @@ def test_compile_probe_refuses_rather_than_merely_staying_quiet(
     assert response["status"] == "refused"
     assert response["reason"] == _ABOVE_CEILING_REASON
     assert response["tier_ceiling"] == TierCeiling.OPEN.value
+
+
+def test_compile_refuses_an_unnamed_intimate_ancestor(
+    ancestry_canary_vault: Path,
+) -> None:
+    """#1283's ancestry refusal, pinned inside the manifest that asserts it.
+
+    The probe above hands ``compile_tool`` an ``intimate`` id and watches it
+    refuse. This hands it an ``open`` id and watches it refuse anyway,
+    because the fragment's persisted ``structural_path`` renders an
+    ``intimate`` ancestor's heading into the prompt. Before #1283 that was
+    the leak: #848's survey ranked the ids the caller NAMED, the child was
+    ``open``, and the parent's heading went to the provider.
+
+    The load-bearing assertion is not the status — it is
+    :func:`_forbidden_llm_factory`. A refusal is only interesting if the
+    model was never reached, and a stub returning ``"{}"`` would let a broken
+    gate answer with a clean-looking envelope. If this gate regresses, the
+    failure does not arrive at any assert below: it arrives from the factory,
+    naming tier ``INTIMATE`` — the engine derives its routing tier from
+    ``AncestorIndex.chain_tiers`` independently of this gate, so under a
+    regression the message names the exact tier the gate was supposed to
+    stop.
+
+    The reason is compared against the module's own
+    :data:`~creek_mcp.tools.compile._ABOVE_CEILING_REASON` rather than a
+    literal, for the reason
+    :func:`test_compile_probe_refuses_rather_than_merely_staying_quiet` gives:
+    compile's unknown-``target_kind``, empty-``fragment_ids`` and not-found
+    refusals are all ``status="refused"`` too, and none of them would mean
+    the ceiling fired.
+
+    The last assertion is the layer-(f) sweep applied to this channel, and it
+    is the one thing ``tests/test_mcp_write_tools.py``'s ancestry tests do
+    **not** carry: they count the factory calls but never look at the
+    serialised envelope, so a refusal that named the offending ancestor in a
+    diagnostic field would pass there and hand the caller the oracle
+    :data:`~creek_mcp.tools.compile._ABOVE_CEILING_REASON` exists to deny.
+
+    Args:
+        ancestry_canary_vault: The ancestry-shaped canary vault.
+    """
+    result = compile_tool(
+        vault_path=ancestry_canary_vault,
+        fragment_ids=[_ANCESTRY_CHILD_ID],
+        target_kind="thread",
+        target_id="thread-runtime-ancestry",
+        target_title="Runtime ancestry probe target",
+        llm_factory=_forbidden_llm_factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "refused"
+    assert result["reason"] == _ABOVE_CEILING_REASON
+    assert result["tier_ceiling"] == TierCeiling.OPEN.value
+    assert _RUNTIME_ANCESTOR_CANARY not in json.dumps(result), (
+        "the ancestor's heading reached the refusal envelope. The refusal must "
+        "be indistinguishable from a named-id one: naming the offender tells "
+        "the caller which fragment above them in the tree is above their "
+        "ceiling, which is a per-call tier oracle."
+    )
+
+
+def test_compile_refuses_a_depth_zero_orphan_breadcrumb(
+    ancestry_canary_vault: Path,
+) -> None:
+    """A breadcrumb with no ``parent_id`` to rank it fails closed (#1283, rule (e)).
+
+    A distinct channel from the test above, not a restatement of it. Here the
+    requested fragment's whole chain is itself: ``parent_id`` is absent, so
+    the walk terminates at a clean root at depth 0, and no ``intimate``
+    fragment is anywhere in the chain. What refuses the call is the **count**
+    — ``AncestorIndex._own_tiers``'s rule (e), which contributes ``INTIMATE``
+    when a fragment's persisted breadcrumb is deeper than the ancestry the
+    index could walk. The breadcrumb is a ``list[str]`` with no id binding,
+    so its extra entries name ancestors nothing can rank, and unrankable
+    ancestry fails closed.
+
+    Disabling rule (e) alone reddens this test and leaves the one above green
+    — which is what makes the two separate claims rather than one claim
+    written twice.
+
+    Args:
+        ancestry_canary_vault: The ancestry-shaped canary vault.
+    """
+    result = compile_tool(
+        vault_path=ancestry_canary_vault,
+        fragment_ids=[_ANCESTRY_ORPHAN_ID],
+        target_kind="thread",
+        target_id="thread-runtime-orphan",
+        target_title="Runtime ancestry probe target",
+        llm_factory=_forbidden_llm_factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+    assert result["status"] == "refused"
+    assert result["reason"] == _ABOVE_CEILING_REASON
+    assert result["tier_ceiling"] == TierCeiling.OPEN.value
+    assert _RUNTIME_ANCESTOR_CANARY not in json.dumps(result), (
+        "the orphan's breadcrumb reached the refusal envelope."
+    )
+
+
+def test_the_ancestry_fixture_carries_its_breadcrumb_into_the_prompt(
+    ancestry_canary_vault: Path,
+) -> None:
+    """The refusals above are about ancestry, not about a ``parent_id`` alone.
+
+    The two tests above are green at ``ceiling=open`` whether or not the
+    breadcrumb ever reached disk — the ``parent_id`` chain alone is enough to
+    rank the ancestor ``intimate``. That leaves a degenerate reading in which
+    :func:`ancestry_canary_vault` is a flat vault with a ``parent_id`` glued
+    on and the persisted-breadcrumb channel is untested. This is the test
+    that closes it: it runs the **same** call at a ceiling that admits it and
+    reads the bytes that actually reached the model.
+
+    **This relaxes nothing.** ``write_tier_allowed(INTIMATE,
+    TierCeiling.INTIMATE)`` admits today; the engine already derives
+    ``INTIMATE`` as the routing tier for this corpus; and the factory here is
+    a local recorder that constructs no provider. In production
+    ``creek.classify.llm.router.ModelRouter`` forces ``INTIMATE`` to a local
+    model. No gate, ceiling, refusal condition or posture moves in either
+    direction — the call is asserted to behave exactly as it already does.
+
+    Every captured prompt is checked rather than ``prompts[0]``, the rule
+    :func:`_assert_prompt_channel_clean` states: a tool free to make more
+    than one model call could put the corpus in the first prompt and the
+    material under test in the second.
+
+    Args:
+        ancestry_canary_vault: The ancestry-shaped canary vault.
+    """
+    factory = _RecordingLLMFactory()
+    result = compile_tool(
+        vault_path=ancestry_canary_vault,
+        fragment_ids=[_ANCESTRY_CHILD_ID],
+        target_kind="thread",
+        target_id="thread-runtime-ancestry-admitted",
+        target_title="Runtime ancestry probe target",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.INTIMATE,
+    )
+
+    assert result["status"] == "ok", result
+    assert factory.prompts, (
+        "no prompt was captured, so this test asserts nothing about what the "
+        "fixture puts on the wire."
+    )
+    assert factory.tiers == [PrivacyTier.INTIMATE], (
+        "the engine folds the ancestry chain into its routing tier "
+        "independently of the MCP gate, so an admitted compile over this "
+        "fixture must build its client for INTIMATE. This is also why the "
+        "refusal tests above report INTIMATE when they regress, even though "
+        f"every id they name is open: {factory.tiers}."
+    )
+    marker = f"structural_path: {_ANCESTRY_ANCESTOR_HEADING}"
+    assert any(marker in prompt for prompt in factory.prompts), (
+        "the ancestor's heading never reached the prompt, so the child's "
+        "persisted structural_path is not on disk and the refusal tests above "
+        "are proving only that a parent_id refuses. Fix the fixture, not this "
+        f"assertion. Captured: {factory.prompts}"
+    )
+
+
+def test_a_within_ceiling_ancestor_is_still_admitted(
+    within_ceiling_ancestry_vault: Path,
+) -> None:
+    """Ancestry ranking narrows the gate; it must not close it (anti-vacuity).
+
+    Without this row #1283's fix is satisfiable by "refuse any fragment that
+    has a parent", and both refusal tests above stay green over it. The vault
+    is the identical shape with the ancestor at ``open``: the call is
+    admitted, the engine runs exactly once, and the breadcrumb reaches the
+    prompt as designed.
+
+    ``len(factory.prompts)`` rather than a ``calls`` counter: this file's
+    :class:`_RecordingLLMFactory` records ``tiers`` and ``prompts`` and has no
+    ``calls`` attribute — that belongs to the differently-shaped recorder of
+    the same name in ``tests/test_mcp_write_tools.py``.
+
+    Args:
+        within_ceiling_ancestry_vault: The all-``open`` ancestry vault.
+    """
+    factory = _RecordingLLMFactory()
+    result = compile_tool(
+        vault_path=within_ceiling_ancestry_vault,
+        fragment_ids=[_ANCESTRY_CHILD_ID],
+        target_kind="thread",
+        target_id="thread-runtime-ancestry-within",
+        target_title="Runtime ancestry probe target",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "ok", result
+    assert len(factory.prompts) == 1, (
+        "the admitted compile must reach the model exactly once; "
+        f"captured {len(factory.prompts)} prompts."
+    )
+    marker = f"structural_path: {_WITHIN_CEILING_HEADING}"
+    assert any(marker in prompt for prompt in factory.prompts), (
+        "the within-ceiling ancestor's heading did not reach the prompt, so "
+        "this vault is not the same shape as the refusing one and proves "
+        "nothing about the gate having narrowed rather than closed."
+    )
 
 
 def test_state_render_probe_leaves_no_canary_in_the_artifact_it_writes(
@@ -4255,9 +4818,16 @@ def _prompt_probe_compile(vault: Path) -> _PromptCapture:
     is what makes the channel observable and the harness trustworthy for this
     tool. Asserting that #1283's refusal holds is a *layer (f)* claim — there
     is no prompt to inspect once it fires — and it belongs beside the other
-    refusal tests, not here. Tracked in #1287, which also notes that neither
-    ``canary_vault`` nor :func:`prompt_canary_vault` is ancestry-shaped, so no
-    layer in this file pins that refusal today.
+    refusal tests, not here. #1287 put it there, over a fixture of its own,
+    because neither ``canary_vault`` nor :func:`prompt_canary_vault` can
+    express ancestry: see :func:`ancestry_canary_vault`,
+    :func:`test_compile_refuses_an_unnamed_intimate_ancestor` and
+    :func:`test_compile_refuses_a_depth_zero_orphan_breadcrumb`. The
+    *admitted* half of that fixture IS a prompt claim and does belong to this
+    layer; it is asserted by
+    :func:`test_the_ancestry_fixture_carries_its_breadcrumb_into_the_prompt`,
+    which is what stops those refusal tests passing over a vault whose
+    breadcrumb never reached disk.
 
     The target metadata is the caller's own sentinel-free strings, matching
     ``_probe_compile``'s for the same reason: an echo of them would prove
