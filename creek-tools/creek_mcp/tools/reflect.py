@@ -548,24 +548,30 @@ def _admit_entry(
             # ACCEPTED RESIDUAL RISK: keeping this reason distinct from
             # "entry_ref not found" is itself a coarse existence-and-rank oracle
             # across repeated probes (refused at ``open`` implies tier >=
-            # personal; refused at ``personal`` implies intimate).
+            # personal; refused at ``personal`` implies the entry *ranks*
+            # intimate -- which includes one whose ``privacy_tier`` is missing
+            # or unrecognised and fails closed, not only classified content).
             #
             # *Id unguessability is not a control here.* Both generators are
             # deterministic: :func:`creek.ingest.base.generate_fragment_id`
             # hashes source+timestamp+content, and
             # :func:`creek.ingest.base.generate_child_fragment_id` hashes only
             # ``f"{parent_id}:{level}:{index}"`` over an eight-value
-            # :data:`creek.models.FragmentLevel`. So from a single admitted
+            # :data:`creek.models.FragmentLevel` (five minted today; #1342
+            # retired the other three). So from a single admitted
             # parent id a caller enumerates every child id knowing nothing
             # about the content. The id space around known content IS
             # sweepable; only a blind sweep of the full 48-bit space is
             # infeasible.
             #
             # *Probe cost is not a control either*, and here the property is
-            # the converse of ``creek.compile``'s: that tool's walk is
-            # non-short-circuiting, whereas :func:`_resolve_entry` above walks
-            # a lazy rglob and returns at the match, so an above-ceiling probe
-            # is strictly cheaper than a miss.
+            # the converse of ``creek.compile``'s: its survey walks the
+            # non-short-circuiting :func:`creek.classify.privacy_filter.
+            # ancestry_tiers` (the walk moved out of that module in #958),
+            # whereas :func:`_resolve_entry` above walks a lazy rglob and
+            # returns at the match. So an above-ceiling probe is never *more*
+            # expensive than a miss, and is cheaper for every fragment but the
+            # last one the walk happens to yield.
             #
             # What is left is deliberately weak, and it is the whole of the
             # acceptance. The oracle yields existence and a rank bound, never
@@ -576,7 +582,11 @@ def _admit_entry(
             # ``entry_ref`` traffic, and there is no per-probe outcome to
             # correlate; see the comment on that append. And the distinct
             # not-found reason is what makes a legitimate client's bug
-            # debuggable. If the two reasons are ever unified, the scan must be
+            # debuggable. This residual is confined to the MCP surface: the
+            # HTTP application API collapses both reasons into one
+            # ``privacy_refused`` and does not carry it
+            # (:func:`creek_mcp.httpapi.reflect.reflect_refusal_code`).
+            # If the two reasons are ever unified, the scan must be
             # equalised too: the not-found path attempts to parse every
             # fragment file whereas this path early-returns at the match, so
             # the timing difference would preserve the oracle as a side
