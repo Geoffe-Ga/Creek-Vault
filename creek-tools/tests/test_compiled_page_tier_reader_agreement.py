@@ -12,7 +12,7 @@ oversight anybody can fix at the reader.
 Exactly one reader in the repository asks a compiled page for a tier —
 :meth:`creek.generate.tags.TagGardenGenerator._extract_tags`, whose
 ``scan_tags`` rglobs ``02-Threads`` and ``03-Eddies`` (``tags.py:73-79``,
-``:234-241``) — and it fails closed:
+``:235-241``) — and it fails closed:
 :func:`~creek.classify.privacy_filter.raw_privacy_tier` maps the missing key
 to ``INTIMATE`` (``privacy_filter.py:433-435``), so the page is withheld below
 ``ceiling=intimate``. Ten further readers walk the same directories and never
@@ -33,8 +33,8 @@ carried forward:
   directory is under. Asserted structurally below rather than described.
 * A "reader using Fragment-style model defaults" cannot exist.
   :class:`~creek.models.Fragment` requires ``id`` and ``source``
-  (``models.py:730``), neither of which a compiled page's frontmatter carries,
-  so ``Fragment.model_validate`` raises rather than defaulting to
+  (``models.py:772``, ``:774``), neither of which a compiled page's frontmatter
+  carries, so ``Fragment.model_validate`` raises rather than defaulting to
   ``unclassified``.
 
 The obvious end-to-end assertion — that ``Tag-Garden.md`` omits the page — is
@@ -582,7 +582,10 @@ _READER_ROWS: tuple[_ReaderRow, ...] = (
     _ReaderRow(
         name="skills._collect_typed[thread]",
         target_kind="thread",
-        guard=f"skills.py:753-766 — {_TYPE_GUARD}",
+        guard=(
+            f"skills.py:600 — {_TYPE_GUARD}. _collect_typed (:753-766) does "
+            "not test `type` itself; it delegates to _load_typed_model"
+        ),
         read=lambda v, _p: len(
             skills._collect_typed(
                 v / "02-Threads", expected_type="thread", model_cls=Thread
@@ -593,7 +596,10 @@ _READER_ROWS: tuple[_ReaderRow, ...] = (
     _ReaderRow(
         name="skills._collect_typed[eddy]",
         target_kind="eddy",
-        guard=f"skills.py:753-766 — {_TYPE_GUARD}",
+        guard=(
+            f"skills.py:600 — {_TYPE_GUARD}. _collect_typed (:753-766) does "
+            "not test `type` itself; it delegates to _load_typed_model"
+        ),
         read=lambda v, _p: len(
             skills._collect_typed(v / "03-Eddies", expected_type="eddy", model_cls=Eddy)
         ),
@@ -602,7 +608,7 @@ _READER_ROWS: tuple[_ReaderRow, ...] = (
     _ReaderRow(
         name="compost_scan._load_threads",
         target_kind="thread",
-        guard=f"compost_scan.py:229 — {_TYPE_GUARD}; takes the vault ROOT",
+        guard=f"compost_scan.py:230 — {_TYPE_GUARD}; takes the vault ROOT",
         read=lambda v, _p: len(compost_scan._load_threads(v)),
         admit=lambda _v, p: _restamp(p, type="thread"),
     ),
