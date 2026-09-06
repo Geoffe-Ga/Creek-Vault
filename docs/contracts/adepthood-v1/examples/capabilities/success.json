@@ -6,13 +6,15 @@
     "wheel",
     "upload",
     "drive-connector",
-    "pipeline"
+    "pipeline",
+    "voice-drafts"
   ],
-  "contract_minor": "0.14",
-  "contract_version": "0.14.0",
+  "contract_minor": "0.15",
+  "contract_version": "0.15.0",
   "ontology_version": "aptitude-wavelength/2026-05-23",
   "status": "ok",
   "supported_contract_minors": [
+    "0.15",
     "0.14",
     "0.13",
     "0.12",

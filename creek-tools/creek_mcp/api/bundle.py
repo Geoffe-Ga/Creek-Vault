@@ -1,8 +1,8 @@
 """The published contract bundle for the Adepthood ``/v1`` API (#1072).
 
 :func:`build_bundle` renders the whole of ``docs/contracts/adepthood-v1/`` from
-the code in :mod:`creek_mcp.api.models`: one JSON Schema per published model, a
-6x7 matrix of worked example responses, the retry table, and a manifest that
+the code in :mod:`creek_mcp.api.models`: one JSON Schema per published model, an
+8x7 matrix of worked example responses, the retry table, and a manifest that
 hashes every one of them. :func:`write_bundle` materialises it.
 
 **Why generate it instead of hand-writing it.** A hand-written fixture bundle
@@ -204,7 +204,7 @@ _CAPABILITIES_SUCCESS: Final[dict[str, Any]] = {
     "tier_model": _TIER_MODEL_PAYLOAD,
     "capabilities": list(CAPABILITIES),
 }
-"""A ready server: vault present, all six capabilities served."""
+"""A ready server: vault present, all eight capabilities served."""
 
 _CAPABILITIES_EMPTY: Final[dict[str, Any]] = {
     **_CAPABILITIES_SUCCESS,
@@ -249,6 +249,36 @@ _JOURNAL_EMPTY: Final[dict[str, Any]] = {
     "action": JournalAction.UNCHANGED.value,
 }
 """A re-sync that changed nothing: a success, not an error."""
+
+_EXAMPLE_VOICE_DRAFT_EXTERNAL_ID: Final[str] = "adepthood-voicedraft-4ab787c21ef0"
+"""A synthetic Adepthood digest key for one AI-authored Voice Draft."""
+
+_EXAMPLE_VOICE_DRAFT_FRAGMENT_ID: Final[str] = "voice-draft-88f3a410be6c2e9a95d7d0ab"
+"""The stable, content-free fragment identity backing the synthetic draft."""
+
+_VOICE_DRAFT_ATTRIBUTION: Final[dict[str, Any]] = {
+    "author": "ai",
+    "author_slug": "ai-as-user",
+    "voice_weight": 0.0,
+}
+"""The only attribution a Voice Draft response can express."""
+
+_VOICE_DRAFT_SUCCESS: Final[dict[str, Any]] = {
+    "status": OK_STATUS,
+    "tier_ceiling": WireTierCeiling.PERSONAL.value,
+    "external_id": _EXAMPLE_VOICE_DRAFT_EXTERNAL_ID,
+    "fragment_id": _EXAMPLE_VOICE_DRAFT_FRAGMENT_ID,
+    "action": JournalAction.CREATED.value,
+    "tier": WireTierCeiling.PERSONAL.value,
+    "attribution": _VOICE_DRAFT_ATTRIBUTION,
+}
+"""A first Voice Draft write; no generated prose is published in the fixture."""
+
+_VOICE_DRAFT_EMPTY: Final[dict[str, Any]] = {
+    **_VOICE_DRAFT_SUCCESS,
+    "action": JournalAction.UNCHANGED.value,
+}
+"""An idempotent Voice Draft re-sync that wrote no new document."""
 
 _EXAMPLE_UPLOAD_EXTERNAL_ID: Final[str] = "adepthood:doc:2026-08-18T09:30:00Z"
 """A synthetic consumer-side document id, in the shape Adepthood mints."""
@@ -547,7 +577,7 @@ _WHEEL_EMPTY: Final[dict[str, Any]] = {
 
 
 # --------------------------------------------------------------------------
-# The 6 x 7 matrix
+# The 8 x 7 matrix
 # --------------------------------------------------------------------------
 
 _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
@@ -578,6 +608,10 @@ _SUCCESS_EXAMPLES: Final[dict[str, _Example]] = {
     Capability.PIPELINE.value: _Example(
         model="ClassificationResponse",
         payload=_CLASSIFICATION_SUCCESS,
+    ),
+    Capability.VOICE_DRAFTS.value: _Example(
+        model="VoiceDraftUpsertResponse",
+        payload=_VOICE_DRAFT_SUCCESS,
     ),
 }
 """The ``success`` column: one canonical happy response per capability.
@@ -618,6 +652,10 @@ _EMPTY_EXAMPLES: Final[dict[str, _Example]] = {
     Capability.PIPELINE.value: _Example(
         model="LinkResponse",
         payload=_LINK_EMPTY,
+    ),
+    Capability.VOICE_DRAFTS.value: _Example(
+        model="VoiceDraftUpsertResponse",
+        payload=_VOICE_DRAFT_EMPTY,
     ),
 }
 """The ``empty`` column. Every cell is a success envelope, not an error."""

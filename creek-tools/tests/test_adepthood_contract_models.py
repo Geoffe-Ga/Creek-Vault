@@ -115,6 +115,11 @@ from creek_mcp.api.models import (
     UploadRequest,
     UploadResponse,
     VaultState,
+    VoiceDraftAttribution,
+    VoiceDraftDeleteResponse,
+    VoiceDraftReadResponse,
+    VoiceDraftUpsertRequest,
+    VoiceDraftUpsertResponse,
     WheelFrequencies,
     WheelFrequency,
     WheelResponse,
@@ -222,6 +227,46 @@ UPLOAD_RESPONSE_PAYLOAD: dict[str, Any] = {
     "affected_fragment_ids": ["frag-2026-07-31-ridge-notes"],
     "action": "created",
     "source_type": "markdown",
+}
+
+VOICE_DRAFT_ATTRIBUTION_PAYLOAD: dict[str, Any] = {
+    "author": "ai",
+    "author_slug": "ai-as-user",
+    "voice_weight": 0.0,
+}
+
+VOICE_DRAFT_UPSERT_REQUEST_PAYLOAD: dict[str, Any] = {
+    "content": "Synthetic AI-authored draft.",
+    "title": "Synthetic draft",
+    "tier": "personal",
+}
+
+VOICE_DRAFT_UPSERT_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "ok",
+    "tier_ceiling": "personal",
+    "external_id": "adepthood-voicedraft-4ab787c21ef0",
+    "fragment_id": "voice-draft-88f3a410be6c2e9a95d7d0ab",
+    "action": "created",
+    "tier": "personal",
+    "attribution": VOICE_DRAFT_ATTRIBUTION_PAYLOAD,
+}
+
+VOICE_DRAFT_READ_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "ok",
+    "tier_ceiling": "personal",
+    "external_id": "adepthood-voicedraft-4ab787c21ef0",
+    "fragment_id": "voice-draft-88f3a410be6c2e9a95d7d0ab",
+    "title": "Synthetic draft",
+    "content": "Synthetic AI-authored draft.",
+    "tier": "personal",
+    "attribution": VOICE_DRAFT_ATTRIBUTION_PAYLOAD,
+}
+
+VOICE_DRAFT_DELETE_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "ok",
+    "tier_ceiling": "personal",
+    "external_id": "adepthood-voicedraft-4ab787c21ef0",
+    "action": "deleted",
 }
 
 DRIVE_STATUS_RESPONSE_PAYLOAD: dict[str, Any] = {
@@ -430,6 +475,11 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     UploadRequest.__name__: UPLOAD_REQUEST_PAYLOAD,
     UploadResponse.__name__: UPLOAD_RESPONSE_PAYLOAD,
     VaultState.__name__: VAULT_STATE_PAYLOAD,
+    VoiceDraftAttribution.__name__: VOICE_DRAFT_ATTRIBUTION_PAYLOAD,
+    VoiceDraftDeleteResponse.__name__: VOICE_DRAFT_DELETE_RESPONSE_PAYLOAD,
+    VoiceDraftReadResponse.__name__: VOICE_DRAFT_READ_RESPONSE_PAYLOAD,
+    VoiceDraftUpsertRequest.__name__: VOICE_DRAFT_UPSERT_REQUEST_PAYLOAD,
+    VoiceDraftUpsertResponse.__name__: VOICE_DRAFT_UPSERT_RESPONSE_PAYLOAD,
     WheelFrequencies.__name__: WHEEL_FREQUENCIES_PAYLOAD,
     WheelFrequency.__name__: WHEEL_FREQUENCY_PAYLOAD,
     WheelResponse.__name__: WHEEL_RESPONSE_PAYLOAD,
@@ -513,6 +563,7 @@ EXPECTED_UNREACHABLE_CELLS: frozenset[tuple[str, str]] = frozenset(
         ("upload", "care-escalation"),
         ("drive-connector", "care-escalation"),
         ("pipeline", "care-escalation"),
+        ("voice-drafts", "care-escalation"),
     }
 )
 
@@ -974,7 +1025,7 @@ def test_bundle_root_name_matches_the_declared_dir_name() -> None:
 
 
 def test_capability_and_state_axes_are_pinned() -> None:
-    """The fixture matrix is 7 capabilities x 7 states = 49 cells."""
+    """The fixture matrix is 8 capabilities x 7 states = 56 cells."""
     assert CAPABILITIES == (
         "capabilities",
         "journal-upsert",
@@ -983,6 +1034,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "upload",
         "drive-connector",
         "pipeline",
+        "voice-drafts",
     )
     assert EXAMPLE_STATES == (
         "success",
@@ -993,7 +1045,7 @@ def test_capability_and_state_axes_are_pinned() -> None:
         "incompatible-version",
         "unavailable-service",
     )
-    assert len(_matrix()) == 49
+    assert len(_matrix()) == 56
 
 
 @pytest.mark.parametrize(("capability", "state"), _matrix())
@@ -1081,8 +1133,8 @@ def test_retry_policy_json_mirrors_the_runtime_table() -> None:
     }
 
 
-def test_unreachable_cells_are_the_six_non_reflection_care_escalations() -> None:
-    """Only ``reflections`` can escalate; the other six cells are N/A."""
+def test_unreachable_cells_are_the_seven_non_reflection_care_escalations() -> None:
+    """Only ``reflections`` can escalate; the other seven cells are N/A."""
     assert UNREACHABLE_CELLS == EXPECTED_UNREACHABLE_CELLS
 
 
@@ -1755,12 +1807,12 @@ def test_the_committed_success_reflection_fixture_shows_the_populated_shape() ->
 
 
 def test_the_previous_minor_is_still_served() -> None:
-    """0.14 widened the compatibility window rather than shifting it.
+    """0.15 widened the compatibility window rather than shifting it.
 
-    A ``0.13`` client cannot express either long method from its vendored
-    enums, and every short-method request keeps its byte-identical ``200``
-    response under #1605. Earlier minors are checked alongside it because the
-    window only ever widens.
+    A ``0.14`` client has no Voice Draft resource in its vendored route or
+    model set, and every route it does know keeps its byte-identical response
+    under #1727. Earlier minors are checked alongside it because the window
+    only ever widens.
 
     The head entry of :data:`SUPPORTED_CONTRACT_MINORS` is *derived* from
     :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the version
@@ -1768,13 +1820,14 @@ def test_the_previous_minor_is_still_served() -> None:
     what this test's first line is for, and why it is added at every bump
     rather than only when somebody suspects a problem.
     """
+    assert "0.14" in SUPPORTED_CONTRACT_MINORS
     assert "0.13" in SUPPORTED_CONTRACT_MINORS
     assert "0.12" in SUPPORTED_CONTRACT_MINORS
     assert "0.11" in SUPPORTED_CONTRACT_MINORS
     assert "0.10" in SUPPORTED_CONTRACT_MINORS
     assert "0.9" in SUPPORTED_CONTRACT_MINORS
     assert "0.8" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.14"
+    assert CONTRACT_MINOR == "0.15"
 
 
 def test_every_minor_below_the_current_one_is_still_served() -> None:

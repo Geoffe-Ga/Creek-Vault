@@ -51,6 +51,10 @@ from creek_mcp.api.models import (
     ReflectionResponse,
     UploadRequest,
     UploadResponse,
+    VoiceDraftDeleteResponse,
+    VoiceDraftReadResponse,
+    VoiceDraftUpsertRequest,
+    VoiceDraftUpsertResponse,
     WheelResponse,
 )
 
@@ -108,6 +112,15 @@ OP_WHEEL: Final[str] = "getWheel"
 
 OP_UPLOAD: Final[str] = "uploadDocument"
 """``operation_id`` of ``POST /v1/uploads``."""
+
+OP_VOICE_DRAFT_UPSERT: Final[str] = "upsertVoiceDraft"
+"""``operation_id`` of ``PUT /v1/voice-drafts/{external_id}``."""
+
+OP_VOICE_DRAFT_READ: Final[str] = "getVoiceDraft"
+"""``operation_id`` of ``GET /v1/voice-drafts/{external_id}``."""
+
+OP_VOICE_DRAFT_DELETE: Final[str] = "deleteVoiceDraft"
+"""``operation_id`` of ``DELETE /v1/voice-drafts/{external_id}``."""
 
 OP_DRIVE_STATUS: Final[str] = "getDriveConnector"
 """``operation_id`` of ``GET /v1/connectors/drive``."""
@@ -430,6 +443,36 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         requires_contract_version=True,
         summary="Ingest one uploaded document as a fragment, idempotently.",
         max_body_bytes=UPLOAD_MAX_BODY_BYTES,
+    ),
+    RouteSpec(
+        path="/v1/voice-drafts/{external_id}",
+        method="PUT",
+        operation_id=OP_VOICE_DRAFT_UPSERT,
+        capability=Capability.VOICE_DRAFTS,
+        request_model=VoiceDraftUpsertRequest,
+        response_model=VoiceDraftUpsertResponse,
+        requires_contract_version=True,
+        summary="Create or update one AI-attributed Voice Draft idempotently.",
+    ),
+    RouteSpec(
+        path="/v1/voice-drafts/{external_id}",
+        method="GET",
+        operation_id=OP_VOICE_DRAFT_READ,
+        capability=Capability.VOICE_DRAFTS,
+        request_model=None,
+        response_model=VoiceDraftReadResponse,
+        requires_contract_version=True,
+        summary="Recall one admitted Voice Draft by external id.",
+    ),
+    RouteSpec(
+        path="/v1/voice-drafts/{external_id}",
+        method="DELETE",
+        operation_id=OP_VOICE_DRAFT_DELETE,
+        capability=Capability.VOICE_DRAFTS,
+        request_model=None,
+        response_model=VoiceDraftDeleteResponse,
+        requires_contract_version=True,
+        summary="Retract one admitted Voice Draft by external id.",
     ),
     RouteSpec(
         path="/v1/connectors/drive",

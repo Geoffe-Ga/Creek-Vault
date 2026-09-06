@@ -24,6 +24,9 @@ does and does not yet do.
 | `PUT /v1/journal-entries/{external_id}` | **Implemented.** Idempotent journal write over the shared `creek.journal` tool — same tier gates, same audit records, same fragment identity as MCP (#1075). |
 | `POST /v1/reflections` | **Implemented.** Anchored margin notes over the shared `creek.reflect` tool. `ok` / `empty` / `escalate` / every refusal are distinguishable from a closed `status` or `code` enum — **no client needs to parse prose to branch**. `notes[].quote` is the only verbatim-guaranteed field: each is validated as a whitespace-normalised span of the submitted or referenced entry, and a span that is not is dropped rather than returned. `essay` is free model prose and is **never** grounding-checked, which is what `essay_grounded: false` (always present, always `false`) tells you — a client must not present it as the writer's own words. A care-flagged entry returns `status: "escalate"` at HTTP **200** with the full `care_signal`, and the model is never called; an escalation is not an error, because a person in acute distress must not land in a client's error path. An `entry_ref` that is above your ceiling and one that does not resolve are **deliberately indistinguishable** — both are `403 privacy_refused` with the same message, because a caller who could tell them apart could enumerate the corpus (#1077). **Grounding is a local embedding pass, and on a cold cache it costs.** Retrieval ranks the ceiling-admitted corpus against your entry, and a fragment whose vector is not in the embeddings parquet is embedded live by a *local* sentence-transformer — so the first call against a vault that has never run `creek link --method embeddings` does real work before answering. Two things bound it, neither of which existed before #1034: the retrieval specialist (its loaded model and the parquet it read) is built **once per process** rather than once per call, and the live embeds one call may perform are **capped**, with the fragments over the cap dropped from ranking rather than embedded. A dropped fragment contributes nothing — no title, no id, no body — so a cold vault answers with *less* grounding, never with content you are not admitted to. Filling the cache with `creek link --method embeddings` is still the way to ground a large vault fully. |
 | `POST /v1/uploads` | **Implemented.** Idempotent **document** upload over the shared `creek.upload` tool — JSON + base64, never multipart. Body is `{filename, content_base64, external_id, timestamp?, tier}`; the extension of `filename` picks the ingestor and there is deliberately **no `source_type` override** (naming a directory-only ingestor for one file is a silent no-op; whole-archive upload is #1525). `external_id` is the idempotency key: re-sending it updates in place and never mints a second fragment. The response publishes **no `tier`**, on purpose — classification is escalate-only, so a `.md` declaring `intimate` in its own frontmatter lands at `intimate` however modest a tier you declared, and a field claiming the resulting tier could only be false or an oracle. A format Creek must not flatten into one blob (`.json`, `.zip`, `.doc`, …) is `415 unsupported_source` carrying the remedy, never a `500` and never a fragment (#1526). Published at contract `0.8.0` (#1524). |
+| `PUT /v1/voice-drafts/{external_id}` | **Implemented.** Idempotently store one AI-authored Voice Draft under a caller-owned key. The deterministic fragment lives under `11-Other-Authors/ai-as-user` with `author=ai`, `author_slug=ai-as-user`, and `voice_weight=0.0`; those values are fixed literals in the response schema, not caller claims. Both incoming and existing tiers are admitted under the canonical ceiling while the mutation lock is held. Published at contract `0.15.0` (#1727). |
+| `GET /v1/voice-drafts/{external_id}` | **Implemented.** Recall one admitted Voice Draft. Missing, corrupt, deleted, and above-ceiling resources return the same `privacy_refused` shape; a success returns stored content and fixed AI attribution. Published at contract `0.15.0` (#1727). |
+| `DELETE /v1/voice-drafts/{external_id}` | **Implemented.** Retract an admitted Voice Draft, notably when its Adepthood source later becomes `intimate`; no intimate prose is sent to request deletion. Published at contract `0.15.0` (#1727). |
 | `GET /v1/connectors/drive` | **Implemented.** The read-only Google Drive connector's *state*: `connected` / `not_connected` / `expired` / `unsupported`, the granted OAuth scopes (always `.readonly` — the config refuses anything else), and `can_sync`. **No credential is published and none is accepted**: the response has no field a token could sit in, and the model forbids extras. This is the one route that discloses connection state deliberately — a client cannot render a connect button without it — which is exactly why the other two verbs' refusals disclose nothing. Published at contract `0.9.0` (#1527). |
 | `POST /v1/connectors/drive/syncs` | **Implemented.** One **incremental** Drive sync over the existing downloader, followed by an ordinary ledger-backed ingest of whatever it fetched. Takes **no request body** — there is no parameter you could usefully set, and a caller-supplied path or file id would be a way to steer the server at part of the owner's Drive they never asked it to touch. The response is **counts only**: no Drive file name, folder name or id, and no `affected_fragment_ids` — a sync's fragments are the vault owner's content, and a list of them would be a corpus enumeration primitive. Files land at the tier `creek ingest` would give them; the route passes **no** `privacy_tier`, so it cannot make any tier less restrictive. A second sync over an unchanged Drive fetches nothing and writes nothing. Refuses with `503 unavailable` when there is no usable credential, rather than falling through to an OAuth flow that would try to open a browser on the server. Published at contract `0.9.0` (#1527). |
 | `POST /v1/connectors/drive/authorizations` | **Implemented.** Begin a Google Drive authorization. Body is `{"redirect_uri": ...}` — **the caller's own** absolute `https` URI, fragment-free; the response is the Google authorization URL to send the user to, plus an opaque single-use `state` that expires. No credential is accepted and none is published: the client secret stays on this host. The scope list is re-validated against the read-only allowlist on the way out, so a remote connect button cannot widen the grant. Published at contract `0.11.0` (#1568, [ADR-0012](./architecture/ADR/0012-remote-google-drive-authorisation.md)). |
@@ -65,13 +68,14 @@ list of names:
 | `upload` | `0.8` |
 | `drive-connector` | `0.9` |
 | `pipeline` | `0.10` |
+| `voice-drafts` | `0.15` |
 <!-- /capability-set -->
 
 **The advertised list is caller-dependent, and the count above is the ceiling,
 not the answer.** What a given caller is shown is the intersection of that set
 with what its *declared* contract minor published, off `CAPABILITY_SINCE_MINOR`
 in `creek_mcp/api/models.py`: a caller declaring `0.2` is shown the first four,
-one declaring `0.10` — or declaring no minor at all — is shown all seven. The
+one declaring `0.15` — or declaring no minor at all — is shown all eight. The
 route that serves a withheld capability refuses the same caller off the same
 table, so what is hidden here is unreachable there.
 
@@ -80,7 +84,7 @@ single constant, `IMPLEMENTED_CAPABILITIES` in `creek_mcp/api/routes.py`, so
 they cannot disagree. The table above is machine-checked against the enum by
 `tests/test_v1_api_capabilities.py`, along with the committed
 `docs/contracts/adepthood-v1/examples/capabilities/success.json` fixture and a
-live response — one four-way equality, so a seventh capability cannot be added
+live response — one four-way equality, so an eighth capability cannot be added
 without this page moving with it.
 
 > **On the issue's `not_implemented` spelling.** Issue #1074 was written before
@@ -295,17 +299,18 @@ could put on any wire position that names it.
 `/v1` is the HTTP major. Below it, one `contract_version` covers both this
 surface and MCP.
 
-The twelve capability routes — `PUT /v1/journal-entries/{external_id}`,
+The fifteen capability routes — `PUT /v1/journal-entries/{external_id}`,
 `POST /v1/reflections`, `GET /v1/wheel`, `POST /v1/uploads`, the five
 `/v1/connectors/drive` verbs, `POST /v1/classifications`, `POST /v1/links`, and
-`GET /v1/jobs/{job_id}` —
+`GET /v1/jobs/{job_id}`, plus the three verbs on
+`/v1/voice-drafts/{external_id}` —
 require `X-Creek-Contract-Version: <major.minor>`, for example `0.11`. The comparison is
 strict membership against the server's `supported_contract_minors`: a missing
 header, a full patch version like `0.2.0`, or anything unrecognised is `409
 incompatible_version`, refused before any vault read.
 
 That set is a **window, and it widens before it narrows**. It currently holds
-`0.14`, `0.13`, `0.12`, `0.11`, `0.10`, `0.9`, `0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and
+`0.15`, `0.14`, `0.13`, `0.12`, `0.11`, `0.10`, `0.9`, `0.8`, `0.7`, `0.6`, `0.5`, `0.4`, `0.3` and
 `0.2`. The
 `0.3.0`, `0.4.0` and `0.6.0` moves all
 came from the MCP surface and changed no `/v1` shape — `0.3.0` added
@@ -399,6 +404,14 @@ members, the `202` success status, and two wire models. A `0.13` consumer's
 known short-method requests retain the same `200` bytes, and its vendored enums
 cannot express either new long method. `SUPPORTED_CONTRACT_MINORS` therefore
 widens again to retain `0.13` rather than stranding it.
+
+`0.15.0` (#1727) adds `voice-drafts` over three verbs on one caller-owned
+resource. The upsert is deterministic and idempotent, recall is tier-gated,
+and deletion retracts a previously mirrored draft when its source becomes
+intimate. Every stored fragment is fixed to AI authorship in
+`11-Other-Authors/ai-as-user` with zero voice weight. A `0.14` consumer knows
+none of the three routes or five models, so the capability gate withholds and
+refuses them while every older route remains byte-identical.
 
 Read the window off `GET /v1/capabilities` rather than assuming the newest
 minor is the only one accepted.
@@ -555,7 +568,7 @@ false, and would have hidden the fault from the operator as well as the client.
 | Request body size | 1 MiB, except `POST /v1/uploads` at ~13.4 MiB | `422 invalid_request`. Enforced on `Content-Length` *and* on streamed bytes, so a chunked request cannot bypass it, and the body is never buffered past the cap. The upload route declares its own cap (`ROUTE_BODY_CAPS`, keyed on the literal path) because base64 of the tool's 10 MiB document limit does not fit in a limit sized for a journal entry — matching the 10 MiB cap Adepthood already enforces. Raising the *global* cap instead would let every route commit that memory; lowering `max_body_bytes` therefore does **not** lower the upload route, whose cap is published contract. |
 | Request body message count | cap &divide; 256 B, floor 64 | `422 invalid_request`, the same code and the same retry disposition as an oversize body. Bytes alone do not bound the buffer: it is a list of ASGI messages, each costing its own dict, keys and values, so a body arriving in enough small chunks commits far more memory than its size suggests. The ceiling is derived from the byte cap rather than fixed, so a route that raises its own cap raises this with it and an ordinary chunked upload never approaches it. |
 | Per-request timeout, **read routes** | 30 s | `503 temporarily_unavailable`. `GET /v1/capabilities`, `GET /v1/wheel`, `GET /v1/connectors/drive`, `GET /v1/health` and `POST /v1/reflections` mutate no vault state, so the deadline is enforced: the caller is answered on time and the abandoned worker thread has nothing to tear. **Being answered is not the same as the work stopping.** `READ_ABANDONS_ON_CANCEL` returns your slot at 30 s while that worker thread keeps running to completion, so on `POST /v1/reflections` a caller who retries a slow cold-cache call stacks *detached* grounding passes over the same corpus — an amplification, not a hang. Since #1034 two things bound it: the retrieval specialist is built and warmed once per process rather than per call, so the model load and the parquet read are not repeated per retry, and each call's live embeds are capped, so one detached pass is bounded work rather than the whole admitted corpus. |
-| Per-request timeout, **write routes** | **not enforced** | The caller waits for the real answer. `PUT /v1/journal-entries/{external_id}`, `POST /v1/uploads`, the Drive write verbs, and the synchronous methods on `POST /v1/classifications` / `POST /v1/links` mutate the vault, and a Python thread cannot be cancelled — only detached. Shedding one mid-mutation would hand the client a `503` about a write that in fact landed. The `llm` and `embeddings` methods are different: they durably queue and return `202` without holding the request. `GET /v1/jobs/{job_id}` also uses the write-safe path because the first poll after a restart may transition an orphaned active record to `failed`. |
+| Per-request timeout, **write routes** | **not enforced** | The caller waits for the real answer. `PUT /v1/journal-entries/{external_id}`, `POST /v1/uploads`, the Voice Draft `PUT`/`DELETE` verbs, the Drive write verbs, and the synchronous methods on `POST /v1/classifications` / `POST /v1/links` mutate the vault, and a Python thread cannot be cancelled — only detached. Shedding one mid-mutation would hand the client a `503` about a write that in fact landed. The `llm` and `embeddings` methods are different: they durably queue and return `202` without holding the request. `GET /v1/jobs/{job_id}` also uses the write-safe path because the first poll after a restart may transition an orphaned active record to `failed`. |
 | Concurrent requests | 32 | `503 temporarily_unavailable`. |
 
 There are two concurrency ceilings, and they answer different questions. The
