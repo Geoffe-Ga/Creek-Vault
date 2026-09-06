@@ -51,6 +51,10 @@ would be exactly the duplication this module exists to forbid.
 from __future__ import annotations
 
 import ast
+import functools
+import io
+import re
+import tokenize
 from pathlib import Path
 from typing import Final
 
@@ -58,6 +62,8 @@ import pytest
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 CREEK_MCP: Final[Path] = REPO_ROOT / "creek-tools" / "creek_mcp"
+CREEK_PACKAGE: Final[Path] = REPO_ROOT / "creek-tools" / "creek"
+"""The pipeline package. Swept by #933: the id generators live here."""
 HTTPAPI: Final[Path] = CREEK_MCP / "httpapi"
 API: Final[Path] = CREEK_MCP / "api"
 
@@ -934,3 +940,302 @@ def test_not_found_is_constructed_once_in_the_routing_miss() -> None:
     assert sum(len(sites) for sites in found.values()) == 1, found
     qualified = {f"{rel}::{name}" for rel, sites in found.items() for _, name in sites}
     assert qualified == NOT_FOUND_CONSTRUCTION_SITES, found
+
+
+# --------------------------------------------------------------------------- #
+# #933 — no accepted residual may rest on fragment-id entropy
+# --------------------------------------------------------------------------- #
+
+
+_ID_ENTROPY_MENTION: Final[re.Pattern[str]] = re.compile(r"unguessab")
+"""The stem that may only ever appear beside a licence (#933)."""
+
+_ID_ENTROPY_LICENCES: Final[tuple[str, ...]] = ("not a control", "not unguessab")
+"""Phrases that make a mention of the stem legitimate.
+
+``not a control`` is ``creek_mcp.tools.compile``'s #848 correction, "*Id
+unguessability is not a control here.*" ``not unguessab`` licenses the
+plain negation -- "fragment ids are **not** unguessable" is a true sentence
+and must not be flagged as the falsehood it corrects.
+"""
+
+_LICENCE_PROXIMITY: Final[int] = 40
+"""How many characters may sit between a mention and its licence.
+
+Sentence scope was measured too loose and is what a reviewer broke: a
+sentence reading "*Id unguessability is not a control here*, though in
+practice ids are unguessable enough that only a blind sweep is realistic"
+carries the licence and re-mints the claim in the same breath. Proximity
+also removes the dependence on a sentence boundary ever firing --
+``:func:``/``:data:`` roles put a colon before a backtick, never a space,
+so a role-dense paragraph is one 500-character "sentence" -- and on
+``_prose``'s join order, which splices the tail of the last comment onto
+the module docstring. Measured: both legitimate mentions sit 18 characters
+from their licence.
+"""
+
+_BANNED_ID_CLAIMS: Final[tuple[str, ...]] = (
+    "fragment ids are unguessable",
+    "ids are unguessable by construction",
+    "only learnable from content already admitted",
+    "cannot enumerate ids it was never shown",
+)
+"""Retired wordings (#933).
+
+Both generators are deterministic, and
+:func:`creek.ingest.base.generate_child_fragment_id` hashes only
+``f"{parent_id}:{level}:{index}"`` over an eight-value
+:data:`creek.models.FragmentLevel`, so ids ARE enumerable downward from any
+admitted parent with no knowledge of the content.
+
+**This module must never move under** ``creek_mcp/``. These constants are
+data describing other files; swept as source they would make the guard
+below flag itself.
+"""
+
+_UNCORRECTED_CLAIMS: Final[dict[str, frozenset[str]]] = {
+    "docs/decisions/2026-07-31-adepthood-http-application-api.md": frozenset(
+        {"fragment ids are unguessable"}
+    ),
+}
+"""The one site #933 did not correct, enumerated per claim rather than waived.
+
+The ADR is a ratified record; amending it is the owner's call, not a
+lane's, so #933 corrected the code and escalated the document. Naming the
+exact surviving claim keeps that honest **and** keeps the guard live on the
+same file: a *second* claim appearing in this ADR still reddens, which a
+whole-file waiver would hide.
+
+:func:`test_the_uncorrected_claim_allowlist_is_not_stale` is the forcing
+function. The moment the owner corrects the ADR this entry goes stale and
+the suite reddens, which is the prompt to delete the entry -- so the
+allowlist cannot quietly outlive the exception it records.
+"""
+
+_PROSE_MARKUP: Final[str] = "`*"
+"""Markup flattened before matching, so a claim reads the same either way."""
+
+
+def _prose(source: str) -> str:
+    """Return *source*'s comments and docstrings, whitespace-normalised.
+
+    Normalisation is load-bearing, not cosmetic. The claim this guard
+    retires ("only learnable from content already admitted") **wrapped
+    across two physical lines** in
+    :func:`creek_mcp.tools.reflect._admit_entry`, so a line-oriented scan
+    reports a clean sweep over a live defect.
+
+    Neither ``tokenize`` nor ``ast.parse`` is wrapped in ``try``: a file
+    this cannot parse must error the suite, never shrink the corpus to a
+    silent pass.
+
+    Args:
+        source: Python source text.
+
+    Returns:
+        Every comment and string constant, joined and whitespace-collapsed,
+        lowercased, with reST emphasis and literal markers flattened.
+    """
+    parts: list[str] = []
+    for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+        if tok.type == tokenize.COMMENT:
+            parts.append(tok.string.lstrip("#"))
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            parts.append(node.value)
+    return _flatten(" ".join(parts))
+
+
+def _flatten(text: str) -> str:
+    """Return *text* lowercased, markup-stripped and whitespace-collapsed.
+
+    Args:
+        text: Any prose.
+
+    Returns:
+        The normalised form both the Python and Markdown paths compare on.
+    """
+    for mark in _PROSE_MARKUP:
+        text = text.replace(mark, " ")
+    return re.sub(r"\s+", " ", text).lower()
+
+
+@functools.lru_cache(maxsize=1)
+def _claim_corpus() -> tuple[tuple[str, str], ...]:
+    """Return ``(relpath, prose)`` for every file the id-entropy rule covers.
+
+    Scoped to the whole repository, not to ``creek_mcp``. The claim is
+    *about* the generators in ``creek/``, and the record that stated it most
+    authoritatively was a document -- so a package-scoped sweep would have
+    reported a clean repo while the canonical falsehood sat outside it.
+
+    Returns:
+        A repo-root-relative path and its normalised prose, per file.
+    """
+    rows: list[tuple[str, str]] = []
+    for package in (CREEK_MCP, CREEK_PACKAGE):
+        for path in _sources(package):
+            rows.append((path.relative_to(REPO_ROOT).as_posix(), _prose(_read(path))))
+    for docs in (REPO_ROOT / "docs", REPO_ROOT / "creek-tools" / "docs"):
+        if docs.is_dir():
+            for path in sorted(docs.rglob("*.md")):
+                rows.append(
+                    (path.relative_to(REPO_ROOT).as_posix(), _flatten(_read(path)))
+                )
+    readme = REPO_ROOT / "README.md"
+    if readme.is_file():
+        rows.append(("README.md", _flatten(_read(readme))))
+    return tuple(rows)
+
+
+def _unlicensed_mentions(prose: str) -> list[str]:
+    """Return every mention of the stem with no licence within reach.
+
+    Every occurrence is checked, not merely the first: the evasion this
+    replaced put a licensed mention and a re-minted one in one sentence.
+
+    Args:
+        prose: Normalised prose.
+
+    Returns:
+        A snippet per unlicensed mention.
+    """
+    licences = [
+        match.start()
+        for licence in _ID_ENTROPY_LICENCES
+        for match in re.finditer(re.escape(licence), prose)
+    ]
+    return [
+        prose[max(0, mention.start() - 30) : mention.start() + 50]
+        for mention in _ID_ENTROPY_MENTION.finditer(prose)
+        if not any(
+            abs(mention.start() - licence) <= _LICENCE_PROXIMITY for licence in licences
+        )
+    ]
+
+
+def test_no_module_or_document_asserts_fragment_id_unguessability() -> None:
+    """#933: no accepted residual may rest on fragment-id entropy.
+
+    Fragment ids are deterministic hashes, and child ids are derived from
+    ``(parent_id, level, index)`` alone -- so a caller holding one admitted
+    parent id can enumerate every child id without seeing any content. Any
+    prose that treats id entropy as a control states a property Creek does
+    not have.
+    """
+    offenders = [
+        f"{relpath}: {claim!r}"
+        for relpath, prose in _claim_corpus()
+        for claim in _BANNED_ID_CLAIMS
+        if claim in prose and claim not in _UNCORRECTED_CLAIMS.get(relpath, frozenset())
+    ]
+    assert offenders == [], offenders
+
+
+def test_the_uncorrected_claim_allowlist_is_not_stale() -> None:
+    """Every recorded exception must still be a live exception.
+
+    This reddens exactly when the owner corrects the ADR -- which is the
+    point. An allowlist that outlives its exception silently re-opens the
+    hole it documented, and this one is the last place in the repo still
+    asserting the retired property.
+    """
+    corpus = dict(_claim_corpus())
+    for relpath, claims in _UNCORRECTED_CLAIMS.items():
+        assert relpath in corpus, f"{relpath} left the sweep; drop or repoint it"
+        for claim in claims:
+            assert claim in corpus[relpath], (
+                f"{relpath} no longer contains {claim!r}. The #933 escalation "
+                "has landed: delete this allowlist entry so the guard covers "
+                "the file unconditionally."
+            )
+
+
+def test_id_entropy_is_only_mentioned_beside_its_disclaimer() -> None:
+    """#933: closes the class, not just the four retired spellings.
+
+    A blacklist goes green the moment someone paraphrases. The stem may
+    appear, but only within :data:`_LICENCE_PROXIMITY` characters of a
+    phrase that withdraws it.
+    """
+    offenders = [
+        f"{relpath}: {snippet}"
+        for relpath, prose in _claim_corpus()
+        for snippet in _unlicensed_mentions(prose)
+        if not _UNCORRECTED_CLAIMS.get(relpath)
+    ]
+    assert offenders == [], offenders
+
+
+def test_the_reflect_residual_keeps_its_correction() -> None:
+    """Anti-deletion ratchet: the sweep must not be satisfiable by deletion.
+
+    Every guard above goes green if the corrected paragraph is simply
+    removed -- and the repo would then carry no statement of why id entropy
+    is not a control, leaving the uncorrected ADR as the only rationale.
+
+    It pins the **specific** corrected sentence, not any occurrence of
+    ``not a control``: reflect carries that phrase twice, so a generic
+    check was measured to stay green while the whole id-entropy paragraph
+    was deleted and only the probe-cost one survived. Read through
+    :func:`_prose` rather than raw text, so an innocent reflow of the
+    comment cannot redden it.
+    """
+    reflect = _prose(_read(CREEK_MCP / "tools" / "reflect.py"))
+    assert "early-returns at the match" in reflect
+    assert "id unguessability is not a control" in reflect
+
+
+def test_the_id_entropy_sweep_actually_reaches_the_surface_it_guards() -> None:
+    """Positive control: fail LOUDLY if the sweep ever finds nothing.
+
+    The offender guards assert an empty list, so a walk that collapsed to
+    ``[]`` would pass them vacuously. This pins the corpus size, the files
+    that carry the construct, and a non-empty mention population.
+    """
+    corpus = _claim_corpus()
+    assert len(corpus) > 200, f"claim corpus collapsed: {len(corpus)}"
+    names = {relpath for relpath, _ in corpus}
+    assert {
+        "creek-tools/creek_mcp/tools/reflect.py",
+        "creek-tools/creek_mcp/tools/compile.py",
+        "creek-tools/creek_mcp/api/bundle.py",
+        "creek-tools/creek/ingest/base.py",
+        *_UNCORRECTED_CLAIMS,
+    } <= names
+    mentions = {
+        relpath for relpath, prose in corpus if _ID_ENTROPY_MENTION.search(prose)
+    }
+    assert {
+        "creek-tools/creek_mcp/tools/compile.py",
+        "creek-tools/creek_mcp/tools/reflect.py",
+    } <= mentions, f"the mention population went empty: {mentions}"
+
+
+def test_the_id_entropy_guards_flag_a_source_that_carries_the_construct() -> None:
+    """Non-vacuity twin, per this module's docstring.
+
+    Asserts the matched **set**, not that something matched. An ``any``
+    assertion here was measured to survive deleting ``_prose``'s whitespace
+    collapse: one probe claim fits on a single line and satisfied it alone,
+    leaving the guard blind to the wrapped spelling the real defect used.
+    Every claim below is split across a line break or across two comment
+    tokens, so each one requires normalisation to be found.
+
+    The probe lives in ``tests/`` while the sweep covers ``creek_mcp/``,
+    ``creek/`` and the docs trees -- disjoint from this file -- so the
+    stored literal can never satisfy the guard it exercises.
+    """
+    probe = (
+        '"""Doc.\n\nFragment ids are\nunguessable, and ids are unguessable by\n'
+        'construction.\n"""\n'
+        "# They are only learnable from content\n"
+        "# already admitted, so a probing caller\n"
+        "# cannot enumerate ids it was never shown.\n"
+    )
+    flat = _prose(probe)
+    assert {claim for claim in _BANNED_ID_CLAIMS if claim in flat} == set(
+        _BANNED_ID_CLAIMS
+    )
+    assert _unlicensed_mentions(flat)
+    assert not _unlicensed_mentions(_flatten("ids are not unguessable, so enumerate"))
