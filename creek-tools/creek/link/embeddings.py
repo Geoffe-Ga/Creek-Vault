@@ -13,7 +13,7 @@ import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Final
 
 from pydantic import BaseModel
 
@@ -333,10 +333,11 @@ def _load_sentence_transformer(
     """
     from sentence_transformers import SentenceTransformer
 
-    return cast(
-        "SentenceTransformerType",
-        SentenceTransformer(model_name, cache_folder=cache_folder),
+    model: SentenceTransformerType = SentenceTransformer(
+        model_name,
+        cache_folder=cache_folder,
     )
+    return model
 
 
 def _hierarchy_index(
