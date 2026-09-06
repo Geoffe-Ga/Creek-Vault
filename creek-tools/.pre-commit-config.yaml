@@ -53,6 +53,10 @@ repos:
     args:
     - -c
     - creek-tools/pyproject.toml
+    # Match scripts/security.sh and CI: low findings are advisory; medium and
+    # high findings block. Without this, touching a file with a known low
+    # finding can fail after the canonical gate passed (#1764).
+    - -ll
     additional_dependencies:
     - bandit[toml]
 - repo: https://github.com/compilerla/conventional-pre-commit
