@@ -35,7 +35,7 @@ repos:
     - --branch
     - main
 - repo: https://github.com/astral-sh/ruff-pre-commit
-  rev: v0.16.4
+  rev: v0.16.5
   # --no-cache: ruff's cache key is mtime-only, and these hooks seed the very
   # cache check-all.sh would otherwise trust; CI has none (issue #1119).
   hooks:
