@@ -202,7 +202,7 @@ dev = [
     # the drift this pin exists to prevent. 0.15.13 -> 0.16.4 (#1440);
     # the agreement is asserted by
     # tests/test_dependency_pins.py::_LOCKSTEP_TOOLS.
-    "ruff>=0.16.4,<0.17",
+    "ruff>=0.16.5,<0.17",
     # Pinned to the same major.minor as uv.lock so the two provisioning
     # paths (uv sync and pip install -e '.[dev]') run the same mypy version.
     # Pre-commit reuses that project environment through typecheck.sh rather
