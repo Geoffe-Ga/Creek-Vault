@@ -26,7 +26,10 @@ from creek.purge.audit import PurgeAuditEntry, PurgeAuditLog
 from creek.purge.engine import PurgeResult
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tools.purge import (
+    _MAX_DELETED_FILE_PATHS,
     _REFUSAL_NO_TOKEN,
+    _VAULT_TOOL,
+    _result_payload,
     purge_classifications_tool,
     purge_daterange_tool,
     purge_fragment_tool,
@@ -1059,3 +1062,89 @@ def test_every_purge_tool_inherits_the_shared_lockout(
     assert result["reason"] == _REFUSAL_NO_TOKEN
     assert set(result) == {"status", "tool", "reason"}
     assert (vault / "01-Fragments" / "Notes" / "frag-001.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# The deleted_files payload is bounded, and says so (#1454)
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_result(path_count: int) -> PurgeResult:
+    """Build a ``PurgeResult`` carrying *path_count* deleted paths.
+
+    Synthesised rather than purged for real: the bound is a property of
+    the payload renderer, and destroying a few hundred fragments on disk
+    to reach it would test the engine's throughput, not the cap.
+
+    Args:
+        path_count: How many entries ``deleted_files`` should hold.
+
+    Returns:
+        A result whose other fields are left at their defaults.
+    """
+    return PurgeResult(
+        operation="vault",
+        target="all",
+        deleted_files=[
+            f"/vault/01-Fragments/Notes/frag-{n:04d}.md" for n in range(path_count)
+        ],
+        fragments_affected=path_count,
+    )
+
+
+def test_the_mcp_payload_caps_deleted_files_and_states_the_true_total() -> None:
+    """A long erasure record is bounded, and the truncation is reported.
+
+    ``deleted_files`` holds title-derived filenames — content, not just
+    locations — one per destroyed file since #1340. At vault scale that
+    is a multi-megabyte list dropped straight into the calling model's
+    context. The cap is worthless if the shortened list looks complete,
+    so the true total travels with it.
+    """
+    payload = _result_payload(tool=_VAULT_TOOL, result=_synthetic_result(250))
+
+    assert len(payload["deleted_files"]) == _MAX_DELETED_FILE_PATHS
+    assert payload["deleted_files_total"] == 250
+    assert payload["deleted_files_truncated"] is True
+    assert payload["deleted_files"][0].endswith("frag-0000.md")
+
+
+def test_a_short_deleted_files_list_reaches_the_caller_whole() -> None:
+    """Under the cap nothing is dropped and nothing claims truncation.
+
+    The scoped purges an operator actually runs return a handful of
+    paths; the bound must not make their record look partial.
+    """
+    payload = _result_payload(tool=_VAULT_TOOL, result=_synthetic_result(3))
+
+    assert len(payload["deleted_files"]) == 3
+    assert payload["deleted_files_total"] == 3
+    assert payload["deleted_files_truncated"] is False
+
+
+def test_the_cap_does_not_drop_a_single_purge_result_field() -> None:
+    """Bounding one list must not re-open the hand-picked-subset bug.
+
+    #1246 replaced a hand-picked field list with a straight model dump
+    because the hand-picked version had silently lost six fields,
+    ``voice_body_undecodable`` among them — the one a caller needs to
+    learn the erasure was incomplete. A cap that reintroduced a manual
+    field list would lose them again, so the payload is pinned to the
+    model's own field set here rather than to a literal.
+    """
+    payload = _result_payload(tool=_VAULT_TOOL, result=_synthetic_result(250))
+
+    assert set(PurgeResult.model_fields) <= set(payload)
+    assert "voice_body_undecodable" in payload
+
+
+def test_a_real_purge_call_carries_the_bound_through_the_tool(vault: Path) -> None:
+    """The bound reaches the wire, not just the private renderer."""
+    result = purge_fragment_tool(
+        vault_path=vault,
+        fragment_id="frag-001",
+        auth_token=ELEVATED_TOKEN,
+    )
+
+    assert result["deleted_files_total"] == len(result["deleted_files"])
+    assert result["deleted_files_truncated"] is False

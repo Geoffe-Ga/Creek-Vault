@@ -25,9 +25,11 @@ name: De-Slop
 #   secret  CLAUDE_CODE_OAUTH_TOKEN  - same token the other Claude workflows use.
 
 on:
-  schedule:
-    # Mondays at 08:00 UTC. (cron is UTC; GitHub may delay under load.)
-    - cron: "0 8 * * 1"
+  # PAUSED 2026-08-26: automated issue inflow paused by owner request.
+  # Re-enable by uncommenting; workflow_dispatch still allows manual runs.
+  # schedule:
+  # # Mondays at 08:00 UTC. (cron is UTC; GitHub may delay under load.)
+  # - cron: "0 8 * * 1"
   workflow_dispatch:
     inputs:
       area:
@@ -113,7 +115,7 @@ jobs:
           uv pip install --system --no-deps -e .
 
       - name: Run targeted de-slopify scan
-        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c  # v1.0.193
+        uses: anthropics/claude-code-action@a874e9ecd7bb36efdad65429c6b35815f5a08f10  # v1.0.210
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 

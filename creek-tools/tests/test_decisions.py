@@ -1030,30 +1030,41 @@ def _seed_decision_note(
     filename: str,
     source_id: str,
     decision_id: str = "decision-seeded001",
+    subfolder: str = "Active",
+    status: str = "sensing",
+    prose: str = "",
 ) -> Path:
     """Write a well-formed decision note recording *source_id* at *filename*.
 
     Args:
         vault: Vault root.
-        filename: Filename to write inside ``08-Decisions/Active``.
+        filename: Filename to write inside ``08-Decisions/<subfolder>``.
         source_id: The source fragment id the note records — its identity.
         decision_id: Value for the note's ``id`` frontmatter key.
+        subfolder: Folder under ``08-Decisions`` to write into — ``Active``
+            or ``Archive``. #1430's move tests need to seed the latter.
+        status: Value for the note's ``status`` frontmatter key.
+        prose: Operator prose appended under the generated sections, so a
+            byte comparison has something of the operator's own to lose.
 
     Returns:
         The path written.
     """
-    active = vault / "08-Decisions" / "Active"
-    active.mkdir(parents=True, exist_ok=True)
+    target = vault / "08-Decisions" / subfolder
+    target.mkdir(parents=True, exist_ok=True)
+    body = f"## Source Fragments\n\n- {source_id}\n\n## Options\n\n- _One_\n"
+    if prose:
+        body += f"\n{prose}\n"
     post = frontmatter.Post(
-        content=f"## Source Fragments\n\n- {source_id}\n\n## Options\n\n- _One_\n",
+        content=body,
         type="decision",
         id=decision_id,
         title=_PORTLAND_TITLE,
-        status="sensing",
+        status=status,
         opened=date(2026, 4, 1).isoformat(),
         wavelength_phase_at_opening="rising",
     )
-    path = active / filename
+    path = target / filename
     path.write_text(frontmatter.dumps(post), encoding="utf-8")
     return path
 
@@ -2115,3 +2126,244 @@ class TestExistingDecisionFragmentIds:
         assert decisions_mod._existing_decision_fragment_ids(tmp_path) == {
             "frag-sourced1",
         }
+
+
+# ---------------------------------------------------------------------------
+# Issue #1430: the Active/Archive move renamed straight over an occupied path
+#
+# ``update_decision_phase`` moved a note with a bare ``Path.rename``, which on
+# POSIX *silently replaces* an existing destination. ``08-Decisions/Archive``
+# is addressed by the same ``<date>-<sanitised title>`` stem that #1334 proved
+# is a name and not an identity, so archiving a decision whose stem was already
+# taken in ``Archive`` destroyed the note already there — no exception, no
+# return-value signal, and the operator's own writing gone.
+#
+# The move now resolves its destination through the same
+# ``_resolve_decision_note_path`` the writers use, passing ``None`` for the
+# identity: a move carries a note that already exists in full, so there is
+# nothing at the destination it could be a legitimate refresh *of*. Claiming no
+# ownership makes every occupied path a stranger's, so the move takes the first
+# free ordinal instead. Unlike creation, that cannot accumulate copies — the
+# source name is freed by the very move that takes the destination one, so a
+# note shuttled between the folders reclaims its natural name every time.
+# ---------------------------------------------------------------------------
+
+_MOVER_NAME = "2026-04-01-Should-I-move-to-Portland.md"
+"""Filename shared by the note being archived and the stranger already there."""
+
+_MOVER_STEM = "2026-04-01-Should-I-move-to-Portland"
+"""``_MOVER_NAME`` without its extension — the stem the move naturally wants."""
+
+_OPERATOR_PROSE = "I keep coming back to the light in November."
+"""A line only the operator could have written; a clobber destroys it."""
+
+
+def _archive_notes(vault: Path) -> list[Path]:
+    """Return every note in ``08-Decisions/Archive``, sorted by name.
+
+    Args:
+        vault: Vault root.
+
+    Returns:
+        Sorted list of markdown paths in the Archive folder.
+    """
+    return sorted((vault / "08-Decisions" / "Archive").glob("*.md"))
+
+
+class TestDecisionPhaseMoveNeverOverwrites:
+    """Archiving a decision never destroys a note already at the target name."""
+
+    @pytest.fixture()
+    def mover(self, vault_path: Path) -> Path:
+        """Seed the Active note that the tests below archive.
+
+        Args:
+            vault_path: Vault root fixture.
+
+        Returns:
+            Path to the seeded note in ``08-Decisions/Active``.
+        """
+        return _seed_decision_note(
+            vault_path,
+            filename=_MOVER_NAME,
+            source_id="frag-mine",
+            decision_id="decision-mover0001",
+        )
+
+    def test_a_stranger_at_the_target_name_survives_the_move(
+        self,
+        detector: DecisionDetector,
+        vault_path: Path,
+        mover: Path,
+    ) -> None:
+        """The stranger's bytes are unchanged and both notes exist (#1430).
+
+        Bytes, not merely existence: ``Path.rename`` replaces the destination
+        inode outright, so an existence check alone is satisfied by the very
+        file that overwrote it.
+        """
+        stranger = _seed_decision_note(
+            vault_path,
+            filename=_MOVER_NAME,
+            source_id="frag-other",
+            decision_id="decision-stranger1",
+            subfolder="Archive",
+            status="enacted",
+            prose=_OPERATOR_PROSE,
+        )
+        before = stranger.read_bytes()
+
+        moved = detector.update_decision_phase(
+            "decision-mover0001",
+            "enacted",
+            vault_path,
+        )
+
+        assert stranger.read_bytes() == before, (
+            "#1430: the note already in Archive was overwritten by the move"
+        )
+        assert moved.name == f"{_MOVER_STEM}-1.md"
+        assert _source_fragment_of(moved) == "frag-mine"
+        assert frontmatter.load(str(moved))["status"] == "enacted"
+        assert not mover.exists()
+        assert len(_archive_notes(vault_path)) == 2
+
+    @pytest.mark.parametrize("shape", sorted(_DAMAGED_DECISION_NEIGHBOURS))
+    def test_a_neighbour_of_unestablished_identity_survives_the_move(
+        self,
+        detector: DecisionDetector,
+        vault_path: Path,
+        mover: Path,
+        shape: str,
+    ) -> None:
+        """An identity we cannot read is not an identity we may overwrite.
+
+        Args:
+            detector: Detector under test.
+            vault_path: Vault root fixture.
+            mover: The Active note being archived.
+            shape: Key into :data:`_DAMAGED_DECISION_NEIGHBOURS`.
+        """
+        neighbour = vault_path / "08-Decisions" / "Archive" / _MOVER_NAME
+        neighbour.write_text(_DAMAGED_DECISION_NEIGHBOURS[shape], encoding="utf-8")
+        before = neighbour.read_bytes()
+
+        moved = detector.update_decision_phase(
+            "decision-mover0001",
+            "enacted",
+            vault_path,
+        )
+
+        assert neighbour.read_bytes() == before, (
+            f"#1430: the {shape} neighbour was clobbered by the move"
+        )
+        assert moved.name == f"{_MOVER_STEM}-1.md"
+        assert not mover.exists()
+        assert len(_archive_notes(vault_path)) == 2
+
+    def test_a_second_note_recording_the_same_fragment_survives_the_move(
+        self,
+        detector: DecisionDetector,
+        vault_path: Path,
+        mover: Path,
+    ) -> None:
+        """Sharing a source fragment does not make two notes one note (#1430).
+
+        This is where a move differs from a write. ``create_decision_note``
+        treats a note recording the candidate's own fragment as *its own* and
+        refreshes it in place, because it is regenerating that note from the
+        candidate. A move regenerates nothing: the occupant is a separate
+        decision, with its own ``id:`` and its own prose, and replacing it
+        would destroy a file no later run could rebuild.
+        """
+        twin = _seed_decision_note(
+            vault_path,
+            filename=_MOVER_NAME,
+            source_id="frag-mine",
+            decision_id="decision-twin00001",
+            subfolder="Archive",
+            status="reflecting",
+            prose=_OPERATOR_PROSE,
+        )
+        before = twin.read_bytes()
+
+        moved = detector.update_decision_phase(
+            "decision-mover0001",
+            "enacted",
+            vault_path,
+        )
+
+        assert twin.read_bytes() == before, (
+            "#1430: a note sharing the source fragment is still a second note"
+        )
+        assert moved.name == f"{_MOVER_STEM}-1.md"
+        assert frontmatter.load(str(moved))["id"] == "decision-mover0001"
+        assert len(_archive_notes(vault_path)) == 2
+
+    def test_shuttling_between_the_folders_reclaims_the_natural_name(
+        self,
+        detector: DecisionDetector,
+        vault_path: Path,
+        mover: Path,
+    ) -> None:
+        """Ordinals must not creep on every archive/unarchive cycle (#1430).
+
+        The move frees its own source name, so first-free resolution converges
+        where a creation-time counter-suffix would mint a new copy per call.
+        """
+        archived = detector.update_decision_phase(
+            "decision-mover0001",
+            "enacted",
+            vault_path,
+        )
+        reactivated = detector.update_decision_phase(
+            "decision-mover0001",
+            "deliberating",
+            vault_path,
+        )
+        rearchived = detector.update_decision_phase(
+            "decision-mover0001",
+            "enacted",
+            vault_path,
+        )
+
+        assert archived.name == _MOVER_NAME
+        assert reactivated.name == _MOVER_NAME
+        assert rearchived.name == _MOVER_NAME
+        assert len(_archive_notes(vault_path)) == 1
+        assert not _active_notes(vault_path)
+
+    def test_an_unallocatable_destination_leaves_the_source_untouched(
+        self,
+        detector: DecisionDetector,
+        vault_path: Path,
+        mover: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Exhausting the ordinals raises before the note is rewritten (#1430).
+
+        The destination is resolved *before* the status rewrite, so a folder
+        with no free name leaves the vault exactly as it was rather than
+        half-updated: a note stamped ``enacted`` still sitting in ``Active``.
+        """
+        monkeypatch.setattr(decisions_mod, "_MAX_FILENAME_ORDINALS", 1)
+        _seed_decision_note(
+            vault_path,
+            filename=_MOVER_NAME,
+            source_id="frag-other",
+            decision_id="decision-stranger1",
+            subfolder="Archive",
+        )
+        before = mover.read_bytes()
+
+        with pytest.raises(RuntimeError, match="unique filename"):
+            detector.update_decision_phase(
+                "decision-mover0001",
+                "enacted",
+                vault_path,
+            )
+
+        assert mover.read_bytes() == before, (
+            "#1430: the status rewrite ran before the destination was resolved"
+        )
+        assert len(_archive_notes(vault_path)) == 1

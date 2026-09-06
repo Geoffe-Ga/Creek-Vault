@@ -185,7 +185,7 @@ class ProvenanceEntry(BaseModel):
 
 
 PASSTHROUGH_FRONTMATTER_KEYS: Final[frozenset[str]] = frozenset(
-    {"sheet", "rows", "columns", "review"}
+    {"sheet", "rows", "columns", "review", "page", "scanned"}
 )
 """Unmodelled frontmatter keys an ingestor may put on the vault file (#1392).
 
@@ -221,6 +221,35 @@ nothing. It qualifies on the same terms as the three above: a structured
 marker the vault's reader needs, which ``Fragment`` deliberately does not
 model (a nullable field would print ``review: null`` on every fragment from
 every ingestor).
+
+``page`` and ``scanned`` joined in #1639, when the scanned-PDF OCR route
+turned one empty fragment per PDF into one fragment per page. Both qualify on
+exactly the ``sheet`` terms.
+
+* ``page`` is the only structured record of *which page* a per-page fragment
+  came from. Its siblings — ``origin_key`` and the title — are not
+  substitutes: the first is the ledger's key and the second is free text a
+  classifier may rewrite, so neither is something an automated consumer can
+  parse. Measured before it was admitted: ``page`` was silently dropped.
+* ``scanned`` is the operator's only on-disk indication that a PDF's pages
+  were images. ``DocumentIngestor`` has set ``source["scanned"] = True``
+  since it learnt to detect one, and — measured at HEAD — that key never
+  reached a single vault file, because ``FragmentSource`` does not model it
+  and this allowlist is **top-level**, so it cannot rescue a key nested under
+  ``source``. The only test asserting it called ``generate_frontmatter``
+  directly and would have passed against a writer that dropped it: the #1517
+  vacuity above, a second time. The ingestor now emits it top-level and the
+  assertion is on the written bytes.
+
+``ocr_confidence``, ``image_type`` and ``language`` were **considered for
+admission here in #1639 and deliberately refused.** They are dropped today on
+the image path as well, so refusing them is not an oversight left standing.
+Each is quality telemetry about *how the reading went* — a model's confidence
+score, a heuristic's guess at the picture's kind, the language flag handed to
+Tesseract — not provenance about *what the fragment is*. Admitting a number
+that only describes one ingestor's backend would make this allowlist a place
+to publish diagnostics, which is the drift toward ``extra="allow"`` it exists
+to prevent. They stay ingestor-internal and reachable through the logs.
 
 Note this is *not* a model field on ``Fragment`` or ``FragmentSource``.
 ``_write_model`` dumps with ``model_dump(mode="json")`` and no

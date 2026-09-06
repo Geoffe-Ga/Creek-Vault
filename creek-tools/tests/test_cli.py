@@ -954,6 +954,47 @@ def test_classify_summary_distinguishes_manual_and_prior_llm(tmp_path: Path) -> 
     assert "1 previously LLM-classified preserved" in normalized
 
 
+def test_classify_summary_distinguishes_rule_skips_from_llm_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #1356: "N skipped" splits into the two states it used to conflate.
+
+    The counters are driven from a stubbed summary rather than a live provider
+    outage because what is under test is the *reporting* surface: the engine's
+    counting is pinned in
+    :mod:`tests.test_classify_failed_llm_provenance`. A single "N skipped"
+    number cannot tell "the rules were confident" from "the provider was
+    down", and those two readings call for opposite next moves.
+    """
+    from creek.classify import classify_engine
+    from creek.classify.classify_engine import ClassifySummary
+
+    summary = ClassifySummary(
+        total=10,
+        classified=10,
+        preserved_manual=0,
+        preserved_llm=0,
+        skipped_high_confidence=3,
+        errors=(),
+        llm_call_failed=7,
+    )
+    monkeypatch.setattr(
+        classify_engine,
+        "run_classify",
+        lambda **_kwargs: summary,
+    )
+
+    vault = tmp_path / "vault"
+    (vault / "01-Fragments").mkdir(parents=True)
+    result = runner.invoke(app, ["classify", "--vault", str(vault)])
+
+    assert result.exit_code == 0, result.output
+    normalized = " ".join(_strip_ansi(result.output).split())
+    assert "3 skipped (rules confident)" in normalized
+    assert "7 skipped (LLM call failed)" in normalized
+
+
 # ---- Issue #317: --method llm exits non-zero on unavailable provider ----
 
 

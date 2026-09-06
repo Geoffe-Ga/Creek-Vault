@@ -3,10 +3,9 @@
 Two halves, and the second is the point.
 
 **The fix.** ``creek.classify.review.ReviewQueueGenerator.generate_queue``
-writes ``review-queue-<timestamp>.md`` to ``vault_path`` itself
-(``review.py:101-103``), littering the root an operator opens in Obsidian
-every day. It moves under ``00-Creek-Meta/Processing-Log/`` beside the other
-machine-written logs.
+used to write ``review-queue-<timestamp>.md`` to ``vault_path`` itself,
+littering the root an operator opens in Obsidian every day. It moved under
+``00-Creek-Meta/Processing-Log/`` beside the other machine-written logs.
 
 **The detective work.** The stray zero-byte ``frag-f8cd9208e113.md`` that
 prompted #883 has **no writer in today's tree** — it is not reproducible from
@@ -20,8 +19,9 @@ it proposes, ``grep 'vault_path / f"'``, returns **zero hits** across
 ``creek/`` and ``creek_mcp/``. The f-string is bound to a variable first, so
 the issue's own grep would have missed the issue's own defect. The sweep that
 does work — all 188 ``vault_path /``, ``vault_path.joinpath`` and
-``self.vault_path /`` join sites — finds ``review.py:103`` as the only
-root-level bare-filename *write*. Root-level reads
+``self.vault_path /`` join sites — found ``generate_queue``'s
+``review-queue-<timestamp>.md`` write as the only root-level bare-filename
+*write*; it is ``output_dir``-scoped today. Root-level reads
 (``skill_size_budget.py:55`` reading ``AGENTS.md``) are correct, and every
 config-driven relpath is subdirectory-scoped.
 
@@ -131,9 +131,10 @@ class TestReviewQueueRelocation:
     def test_the_filename_shape_is_unchanged(self, scaffold: Path) -> None:
         """``review-queue-%Y-%m-%d_%H%M%S.md`` exactly — the name is an interface.
 
-        ``StaleReviewScanner`` finds queues by ``rglob("review-queue-*.md")``
-        and ages them by ``strptime`` on the stem (``hygiene.py:451``,
-        ``:498-506``). Renaming while relocating would silently stop
+        ``creek.clean.hygiene.StaleReviewScanner.scan`` finds queues by
+        ``rglob("review-queue-*.md")`` and its
+        ``_parse_filename_timestamp`` ages them by ``strptime`` on the stem.
+        Renaming while relocating would silently stop
         ``creek clean stale-reviews`` from ever aging a queue again — and it
         would look like it worked, because the scan would simply find nothing.
         """

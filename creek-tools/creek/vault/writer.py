@@ -1082,6 +1082,8 @@ def _retier_after_rewrite(
     post: frontmatter.Post,
     fragment: Fragment,
     body: str,
+    *,
+    old_body: str,
 ) -> None:
     """Re-derive ``privacy_tier`` from the *new* body after a material edit (#922).
 
@@ -1092,8 +1094,11 @@ def _retier_after_rewrite(
     tier and stayed admissible to an OPEN-ceiling MCP caller until someone
     happened to re-run a privacy pass.
 
-    The policy mirrors :func:`creek.classify.privacy_pass.apply_tier` exactly,
-    expressed in frontmatter terms rather than model terms:
+    The policy mirrors :func:`creek.classify.privacy_pass.reassess` — "act
+    only on new evidence" — expressed in frontmatter terms rather than model
+    terms, **plus** one disjunct ``reassess`` does not need. It is no longer a
+    mirror of :func:`~creek.classify.privacy_pass.apply_tier`, which merges
+    unconditionally; see the ratchet note below (#1136):
 
     * The candidate comes from
       :class:`~creek.classify.privacy.PrivacyClassifier`, which is pure
@@ -1111,6 +1116,31 @@ def _retier_after_rewrite(
       carries the model's ``unclassified`` default, which ranks *below*
       ``open`` in ``privacy_pass._ESCALATION_RANK`` — escalating against it
       would silently discard the operator's decision.
+    * **And that merge happens only when the edit brought new evidence**
+      (:func:`~creek.classify.privacy_pass.edit_added_evidence`, #1136).
+      Escalate-only protects a tier the operator made *more* restrictive; it
+      does nothing for one they made *less* restrictive, and a self-authored
+      journal entry classifies ``intimate`` on the platform axis alone, for
+      any body whatsoever. So every material edit to such a fragment used to
+      overwrite a hand-written ``open`` with ``intimate`` — permanently, since
+      nothing in the package lowers ``privacy_tier`` again. The gate asks what
+      *this edit* introduced instead, which is why it needs *old_body*.
+
+      The divergence from ``reassess`` is deliberate and load-bearing. That
+      function's gate compares only the *aggregate* verdict, which is
+      sufficient there because its input body never changes. Here the body is
+      the thing that changed, and on the saturated journal case the aggregate
+      is pinned at ``intimate`` before and after — so an aggregate-only gate
+      would never fire, and a rewrite that genuinely *added* recovery
+      material to an operator-``open`` journal entry would silently stay
+      readable at an OPEN ceiling. ``edit_added_evidence`` carries a second
+      disjunct over
+      :meth:`~creek.classify.privacy.PrivacyClassifier.body_evidence_tier`
+      for exactly that case, so this stays fail-closed.
+    * The tier is stamped on **both** branches, not only the escalating one.
+      The skip path writes the parsed on-disk tier back, which is what keeps
+      an unrecognised spelling normalising to ``intimate`` via
+      :func:`_tier_on_disk` rather than surviving verbatim in the frontmatter.
     * ``voice_proxy_eligible`` is recomputed from the merged tier and the
       fragment's authorship. It is a *derived* field
       (:attr:`creek.models.Fragment.voice_proxy_eligible`, BUG-009) whose
@@ -1125,10 +1155,16 @@ def _retier_after_rewrite(
       ``False`` for any explicit non-``unclassified`` tier, so no ordinary
       classify pass revisits it, and even ``creek classify --force`` merges
       through :func:`~creek.classify.privacy_pass.escalate`, which never
-      lowers a tier. Nothing in the package downgrades ``privacy_tier`` — the
-      purge engine explicitly excludes the key — so a blanket stamp would bury
-      every edited fragment at ``intimate`` forever, with a hand edit of the
-      frontmatter the only way back out.
+      lowers a tier. Nothing in the package downgrades ``privacy_tier`` at
+      all, so a blanket stamp would bury every edited fragment at
+      ``intimate`` forever, with a hand edit of the frontmatter the only way
+      back out. (This used to claim "the purge engine explicitly excludes the
+      key". It does not, and there is no such exclusion anywhere in
+      :mod:`creek.purge` — ``purge/meta.py``'s ``creek_config.yaml`` keep-entry
+      says in as many words that the ratchet is *not* there, because the tier
+      is per-fragment frontmatter destroyed along with its fragment. The
+      conclusion stands on the simpler ground stated above: no code path
+      lowers the key.)
     * **Resetting to ``unclassified`` would silently narrow exposure rather
       than describe the new body.** Since #961, ``creek_mcp.tier_ceiling``
       ranks ``UNCLASSIFIED`` with ``PERSONAL`` (#876), so a reset fragment
@@ -1139,7 +1175,8 @@ def _retier_after_rewrite(
       re-deriving keeps the tier truthful about it.
 
     Re-deriving avoids both: the tier always describes the current body, and
-    the escalate-only merge preserves operator curation.
+    the gated escalate-only merge preserves operator curation in *both*
+    directions rather than only the restrictive one.
 
     Args:
         post: Loaded frontmatter of the file being rewritten. Its metadata is
@@ -1147,23 +1184,47 @@ def _retier_after_rewrite(
         fragment: The fragment being re-ingested, supplying the platform and
             authorship axes the classifier keys on. Never mutated.
         body: The new markdown body, scanned for recovery keywords.
+        old_body: The body currently on disk, i.e. what *body* replaces. The
+            new-evidence gate needs both to tell what the edit introduced from
+            what the fragment's unchanged axes were always going to say.
     """
     # Deferred import for the same load-time cycle documented on
     # `_clear_classification`: `creek.classify.classify_engine` imports
     # `VaultWriter` from this module.
     from creek.classify.privacy import PrivacyClassifier
-    from creek.classify.privacy_pass import PRIVACY_TIER_KEY, escalate, needs_tier
-
-    # Mirrors `apply_tier`'s shape: assign outright when nothing is on record,
-    # otherwise merge escalate-only. The ternary short-circuits, so the
-    # subscript is only reached on the branch that proved the key is present.
-    assigning = needs_tier(post.metadata)
-    candidate = PrivacyClassifier().classify_tier(fragment, content=body)
-    tier = (
-        candidate
-        if assigning
-        else escalate(_tier_on_disk(post.metadata[PRIVACY_TIER_KEY]), candidate)
+    from creek.classify.privacy_pass import (
+        PRIVACY_TIER_KEY,
+        edit_added_evidence,
+        escalate,
+        needs_tier,
     )
+
+    classifier = PrivacyClassifier()
+    # Assign outright when nothing is on record; otherwise hold the on-disk
+    # decision unless the edit itself brought evidence (#1136). Both branches
+    # fall through to the stamp below: writing the parsed on-disk tier back on
+    # the hold path is what normalises an unrecognised spelling to `intimate`
+    # via `_tier_on_disk`, instead of leaving the raw value in the frontmatter.
+    if needs_tier(post.metadata):
+        tier = classifier.classify_tier(fragment, content=body)
+    else:
+        tier = _tier_on_disk(post.metadata[PRIVACY_TIER_KEY])
+        if edit_added_evidence(
+            fragment,
+            old_body=old_body,
+            new_body=body,
+            classifier=classifier,
+        ):
+            merged = escalate(tier, classifier.classify_tier(fragment, content=body))
+            if merged is not tier:
+                logger.info(
+                    "Re-tiering fragment %s after a material rewrite: %s -> %s "
+                    "(the edit introduced new privacy evidence).",
+                    fragment.id,
+                    tier.value,
+                    merged.value,
+                )
+            tier = merged
     post.metadata[PRIVACY_TIER_KEY] = tier.value
     post.metadata[_VOICE_PROXY_ELIGIBLE_KEY] = (
         tier is not PrivacyTier.INTIMATE
@@ -1407,7 +1468,13 @@ class VaultWriter:
         while it is stale it still governs read-side admission, so a fragment
         rewritten into intimate content would stay visible at an OPEN ceiling
         in the meantime. The re-derivation is escalate-only against the tier
-        already on disk, so it never lowers an operator's decision.
+        already on disk, so it never lowers an operator's decision — and since
+        #1136 it only *raises* one when the edit itself introduced privacy
+        evidence the previous body lacked. Without that gate, escalate-only
+        protected a tier the operator had made more restrictive while
+        overwriting one they had made less restrictive: a self-authored
+        journal entry classifies ``intimate`` on its platform alone, so every
+        material edit buried a hand-written ``open``, permanently.
 
         Returns ``None`` when no file is mapped to ``fragment.id`` (e.g. the
         file was removed out of band), and also when the mapped file exists
@@ -1456,9 +1523,12 @@ class VaultWriter:
             if existing is None:
                 return None
             post = load_post_or_raise(existing)
-            if _is_material_change(post.content, body, reclassify_threshold):
+            # Hoisted before the assignment below: `_retier_after_rewrite`
+            # needs the body being replaced, not the one replacing it.
+            old_body = post.content
+            if _is_material_change(old_body, body, reclassify_threshold):
                 _clear_classification(post)
-                _retier_after_rewrite(post, fragment, body)
+                _retier_after_rewrite(post, fragment, body, old_body=old_body)
             post.content = body
             _atomic_write_text(existing, frontmatter.dumps(post))
             # Record the in-place edit in the provenance log too, so the audit

@@ -543,10 +543,10 @@ def _seed_with_sources(source_fragments: tuple[str, ...]) -> object:
 def _unexplored_ontology_seed() -> object:
     """Return the real ``UNEXPLORED_ONTOLOGY`` seed shape: no vault content.
 
-    ``creek/generate/mining.py::_seed_from_ontology_tuple`` (line 1511) builds
-    the title and description purely from ontology enum labels and leaves
-    ``source_fragments`` / ``threads`` / ``eddies`` empty (line 1529), so no
-    fragment, thread, or eddy text reaches the prompt at all.
+    ``creek.generate.mining._seed_from_ontology_tuple`` builds the title and
+    description purely from ontology enum labels, and returns an ``IdeaSeed``
+    whose ``source_fragments``, ``threads`` and ``eddies`` are all empty
+    tuples, so no fragment, thread, or eddy text reaches the prompt at all.
     """
     from creek.generate.mining import IdeaSeed, MiningStrategy
 
@@ -624,16 +624,16 @@ def test_draft_routes_personal_sources_above_the_open_ceiling(
 ) -> None:
     """A ``personal`` source outranks an ``open`` ceiling for LLM routing.
 
-    ``creek/generate/drafts.py::_render_fragment_section`` (line 2604) emits
-    ``### {fid}: {fragment.title}`` unconditionally, and at an ``open``
-    ceiling ``filter_fragments_by_tier`` replaces a personal body with
-    ``[Personal-tier summary: {title}]`` rather than dropping the fragment —
-    so the personal fragment's id *and* title reach the prompt even though its
-    body was redacted. The ceiling-derived tier alone therefore understates
-    what reaches the model: an implementation that routed on
-    ``routing_tier(ceiling, None)`` would hand personal titles to the cloud
-    ``generation`` stage on the caller's say-so. The tier must be the more
-    sensitive of the ceiling and the sources' own classifications.
+    ``creek.generate.drafts._render_fragment_section`` emits ``### {fid}:
+    {fragment.title}`` for every fragment it renders, with no tier check of
+    any kind, and at an ``open`` ceiling ``filter_fragments_by_tier`` replaces
+    a personal body with ``[Personal-tier summary: {title}]`` rather than
+    dropping the fragment — so the personal fragment's id *and* title reach
+    the prompt even though its body was redacted. The ceiling-derived tier
+    alone therefore understates what reaches the model: an implementation
+    that routed on ``routing_tier(ceiling, None)`` would hand personal titles
+    to the cloud ``generation`` stage on the caller's say-so. The tier must be
+    the more sensitive of the ceiling and the sources' own classifications.
     """
     _write_fragment(
         vault,
@@ -907,10 +907,11 @@ def test_draft_does_not_build_a_provider_when_it_cannot_draft(
     Both the "no idea seeds" empty response and the out-of-range-index refusal
     return before any prompt exists, so invoking the factory would spend a
     provider handshake (and, on a cloud stage, an API credential) on a call
-    that never drafts. Today's ``draft_tool`` takes an already-built ``llm``
-    and the server hands it ``factory()`` eagerly in the handler
-    (``server.py:419``), so both paths pay that cost unconditionally — this
-    test pins the laziness the tier-keyed factory makes possible.
+    that never drafts. ``draft_tool`` takes an ``llm_factory:
+    DraftLLMFactory``, not an already-built ``llm``, and the ``creek.draft``
+    wrapper registered by ``creek_mcp.server._register_authoring_tools`` passes
+    ``llm_factory=factory`` **uncalled**, so the laziness has shipped and this
+    test is what pins it rather than aspiring to it.
     """
     invocations: list[PrivacyTier] = []
 

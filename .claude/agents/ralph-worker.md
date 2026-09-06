@@ -66,8 +66,13 @@ So, concretely:
 - Run its specialists **sequentially** inside your worktree: `test-specialist`
   (Gate 1 RED) → `implementation-specialist` (Gate 1 GREEN + refactor) → only the
   cross-cutting specialists the architect flagged.
-- **Gate 2:** run `cd creek-tools && ./scripts/check-all.sh` until exit 0
-  (`./scripts/fix-all.sh` for autofixable lint/format — never bypass).
+- **Gate 2:** run
+  `cd creek-tools && VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" ./scripts/check-all.sh`
+  until exit 0 (`./scripts/fix-all.sh` for autofixable lint/format — never
+  bypass). `fleet.sh assign`/`adopt` has already provisioned `creek-tools/.venv`
+  — do NOT run your own `uv sync`. The exports are still mandatory: they govern
+  which interpreter is RESOLVED (`creek-tools/scripts/_lib.sh` probes a bare
+  `python`), not whether one exists.
 - **Gate 2.5:** dispatch `code-review-orchestrator` over your diff; fix every
   blocker (drop to Gate 1 via the owning specialist) until `CLEAN`.
 - **Filing a follow-up?** Any issue you `gh issue create` for an unrelated bug

@@ -1,0 +1,18 @@
+{
+  "additionalProperties": false,
+  "description": "Begin a Drive authorization for a redirect URI the *caller* owns (#1568).\n\nThe one field is the whole of ADR-0012's option C. Creek mints the\nauthorization URL and holds the client secret; the caller owns the public\naddress Google redirects the user's browser to, and relays the resulting\ncode back over the bearer credential it already holds. That is why there is\nno callback route on this server, and therefore no anonymous path through\n:class:`~creek_mcp.httpapi.auth.BearerAuthMiddleware`.\n\nAttributes:\n    redirect_uri: The caller's own redirect URI. Absolute, ``https``, and\n        fragment-free \u2014 validated here rather than left to Google, because\n        a plain-``http`` redirect would carry the authorization code in the\n        clear and RFC 6749 \u00a73.1.2 forbids the fragment outright. Never a\n        URI on this server.",
+  "properties": {
+    "redirect_uri": {
+      "description": "Caller-owned absolute https redirect URI, no fragment.",
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Redirect Uri",
+      "type": "string"
+    }
+  },
+  "required": [
+    "redirect_uri"
+  ],
+  "title": "DriveAuthorizationRequest",
+  "type": "object"
+}

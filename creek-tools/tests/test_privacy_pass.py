@@ -5,13 +5,15 @@ layer that the classify engine and the ``creek process`` pipeline both
 call so a fragment never reaches the per-tier router — or the vault —
 still carrying ``privacy_tier: unclassified``.
 
-The four functions under test:
+The five functions under test:
 
 * :func:`needs_tier` — does this raw frontmatter still owe us a tier?
 * :func:`escalate` — merge two candidate tiers, never lowering.
 * :func:`apply_tier` — stamp a tier, honouring a manual override.
 * :func:`reassess` — re-run the tier check after classification,
   escalate-only.
+* :func:`edit_added_evidence` — did an in-place rewrite introduce a
+  privacy signal the previous body lacked? (#1136)
 
 No vault, no I/O, no LLM: every case here is a direct call.
 """
@@ -21,7 +23,13 @@ from __future__ import annotations
 import pytest
 
 from creek.classify.privacy import PrivacyClassifier
-from creek.classify.privacy_pass import apply_tier, escalate, needs_tier, reassess
+from creek.classify.privacy_pass import (
+    apply_tier,
+    edit_added_evidence,
+    escalate,
+    needs_tier,
+    reassess,
+)
 from creek.models import (
     Authorship,
     Confidence,
@@ -484,3 +492,167 @@ class TestReassess:
 
         assert PrivacyTier(result.privacy_tier) is PrivacyTier.INTIMATE
         assert result.voice_proxy_eligible is False
+
+
+# ---- edit_added_evidence (#1136) --------------------------------------
+
+_RECOVERY_BODY = "tonight I wrote about my relapse and what sobriety costs"
+
+
+class TestEditAddedEvidence:
+    """The in-place-rewrite gate fires only on evidence the edit introduced.
+
+    ``_retier_after_rewrite`` used to merge the classifier's fresh verdict
+    over the on-disk tier unconditionally. Escalate-only guards a tier the
+    operator made *stricter*; it does nothing for one they made *looser*,
+    and a self-authored journal entry classifies ``intimate`` on its
+    platform alone — so every material edit buried a hand-written ``open``,
+    permanently (issue #1136).
+    """
+
+    def test_saturated_journal_gains_recovery_evidence(self) -> None:
+        """New recovery vocabulary fires the gate even when the verdict cannot move.
+
+        A self-authored journal entry classifies ``intimate`` on *both*
+        bodies, so the aggregate disjunct is silent. The body-evidence
+        disjunct is what keeps this fail-closed: the fix must not stop a
+        genuinely intimate edit escalating an operator's ``open``.
+        """
+        fragment = _fragment(platform=SourcePlatform.JOURNAL)
+        classifier = PrivacyClassifier()
+        assert (
+            classifier.classify_tier(fragment, content=_NEUTRAL_BODY)
+            is PrivacyTier.INTIMATE
+        )
+
+        assert (
+            edit_added_evidence(
+                fragment,
+                old_body=_NEUTRAL_BODY,
+                new_body=_RECOVERY_BODY,
+                classifier=classifier,
+            )
+            is True
+        )
+
+    def test_saturated_journal_benign_edit_is_not_evidence(self) -> None:
+        """A benign rewrite of a journal entry brings nothing new — the bug."""
+        assert (
+            edit_added_evidence(
+                _fragment(platform=SourcePlatform.JOURNAL),
+                old_body=_NEUTRAL_BODY,
+                new_body="a different plain note about bread and patience",
+                classifier=PrivacyClassifier(),
+            )
+            is False
+        )
+
+    def test_essay_rewritten_into_recovery_moves_the_aggregate(self) -> None:
+        """On an unsaturated fragment the aggregate disjunct carries the case."""
+        assert (
+            edit_added_evidence(
+                _fragment(platform=SourcePlatform.ESSAY),
+                old_body=_NEUTRAL_BODY,
+                new_body=_RECOVERY_BODY,
+                classifier=PrivacyClassifier(),
+            )
+            is True
+        )
+
+    def test_essay_benign_rewrite_is_not_evidence(self) -> None:
+        """Neither disjunct fires when the body's privacy claim did not change."""
+        assert (
+            edit_added_evidence(
+                _fragment(platform=SourcePlatform.ESSAY),
+                old_body=_NEUTRAL_BODY,
+                new_body="a different plain note about bread and patience",
+                classifier=PrivacyClassifier(),
+            )
+            is False
+        )
+
+    def test_removing_recovery_evidence_never_fires(self) -> None:
+        """The gate is one-directional — losing evidence is not gaining it.
+
+        Both disjuncts test for a *strengthening*, so an edit that strips the
+        recovery vocabulary out returns ``False``. Were it merely "the body's
+        claim changed", this would license a re-derivation whose only
+        possible effect on a weakened body is to leave the tier alone — but
+        the predicate would then be lying about what it detects, and the next
+        caller to trust its name would inherit a downgrade path.
+        """
+        assert (
+            edit_added_evidence(
+                _fragment(platform=SourcePlatform.ESSAY),
+                old_body=_RECOVERY_BODY,
+                new_body=_NEUTRAL_BODY,
+                classifier=PrivacyClassifier(),
+            )
+            is False
+        )
+
+    def test_ai_authored_recovery_body_is_not_evidence(self) -> None:
+        """Authorship gates the body signal, so an AI body never fires it.
+
+        ``INTIMATE`` is reserved for self-authored content per the
+        ``PrivacyTier`` model docstring. The gate inherits that rule from
+        ``body_evidence_tier`` rather than re-implementing it, and this
+        pins the inheritance.
+        """
+        assert (
+            edit_added_evidence(
+                _fragment(platform=SourcePlatform.CHATGPT, author=Authorship.AI),
+                old_body=_NEUTRAL_BODY,
+                new_body=_RECOVERY_BODY,
+                classifier=PrivacyClassifier(),
+            )
+            is False
+        )
+
+    def test_a_body_rule_outside_body_evidence_tier_still_fires(self) -> None:
+        """Disjunct 1 catches a body-derived rule ``body_evidence_tier`` misses.
+
+        The two disjuncts are not redundant *in principle*, only in the
+        current build: today ``body_evidence_tier`` is the sole body-derived
+        input to ``classify_tier``, so disjunct 2 subsumes disjunct 1 and
+        deleting disjunct 1 changes no outcome. That coincidence is exactly
+        what disjunct 1 insures against, and an untestable insurance clause
+        is indistinguishable from dead code — so this drives it with a
+        classifier that has the future shape: a body rule wired into
+        ``classify_tier`` alone.
+
+        The double keeps the gate honest the day someone adds such a rule
+        for real. Its sibling ``test_bodies_agreeing_on_evidence_classify_alike``
+        in ``tests/test_privacy.py`` is the other half of the pair: that one
+        fails on the *production* classifier the moment this shape appears,
+        so the divergence is reported rather than silently tolerated.
+        """
+
+        class _ExtraBodyRule(PrivacyClassifier):
+            """A classifier with a body rule that ``body_evidence_tier`` omits."""
+
+            def classify_tier(
+                self,
+                fragment: Fragment,
+                content: str = "",
+            ) -> PrivacyTier:
+                """Escalate to PERSONAL on a marker the evidence method ignores."""
+                if "ampersand" in content:
+                    return PrivacyTier.PERSONAL
+                return super().classify_tier(fragment, content=content)
+
+        classifier = _ExtraBodyRule()
+        fragment = _fragment(platform=SourcePlatform.ESSAY)
+        # The premise: the new rule is invisible to the body-evidence half,
+        # so disjunct 2 cannot see it and disjunct 1 is the only route.
+        assert classifier.body_evidence_tier(fragment, "an ampersand appears") is None
+
+        assert (
+            edit_added_evidence(
+                fragment,
+                old_body=_NEUTRAL_BODY,
+                new_body="an ampersand appears",
+                classifier=classifier,
+            )
+            is True
+        )

@@ -6,6 +6,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$(dirname "$SCRIPT_DIR")"
 
+# shellcheck source=scripts/_lib.sh
+source "$SCRIPT_DIR/_lib.sh"
+
+# Fail with an actionable message rather than auditing whatever copy of
+# pip-audit PATH finds first (#1671). Both invocations below run through
+# `python -m`, so this probe and they agree by construction on which
+# environment is under audit.
+crawdad_require_python_module pip_audit pip-audit || exit 2
+
 echo "=== bandit: source tree ==="
 bandit -r crawdad -ll
 
@@ -44,7 +53,13 @@ echo "=== pip-audit: installed environment ==="
 # PyPI, so pip-audit always reports it as a benign SKIP. --strict would
 # promote that permanent skip into a permanent false failure — do not
 # "harden" this by adding it.
-pip-audit
+#
+# `python -m pip_audit`, not a bare `pip-audit`: the bare form is resolved
+# by PATH, and when this project's environment has no pip-audit of its own
+# PATH silently supplies another one, which then audits the interpreter it
+# belongs to instead of this one (#1671). Still bare in the sense that
+# matters — no -r, so it inspects what is actually installed.
+python -m pip_audit
 
 echo "=== pip-audit: exported uv.lock ==="
 LOCK_REQUIREMENTS="$(mktemp)"
@@ -65,4 +80,4 @@ trap 'rm -f "$LOCK_REQUIREMENTS"' EXIT
 # failures: `--locked` still exits non-zero with "The lockfile at
 # `uv.lock` needs to be updated" on stderr when the lock has drifted.
 uv export --quiet --locked --all-extras --no-emit-project -o "$LOCK_REQUIREMENTS"
-pip-audit --requirement "$LOCK_REQUIREMENTS" --disable-pip
+python -m pip_audit --requirement "$LOCK_REQUIREMENTS" --disable-pip

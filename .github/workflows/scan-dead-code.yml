@@ -8,8 +8,10 @@ name: "Scan: Dead code"
 # queue-depth hopper uses to refill the Ralph backlog off-schedule.
 
 on:
-  schedule:
-    - cron: "0 8 * * 1"       # weekly Monday 08:00 UTC
+  # PAUSED 2026-08-26: automated issue inflow paused by owner request.
+  # Re-enable by uncommenting; workflow_dispatch still allows manual runs.
+  # schedule:
+  # - cron: "0 8 * * 1"       # weekly Monday 08:00 UTC
   workflow_dispatch:
     inputs:
       max_issues:

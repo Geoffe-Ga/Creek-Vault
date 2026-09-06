@@ -1888,6 +1888,36 @@ def test_mcp_ingest_tool_refuses_an_escaping_link(tmp_path: Path) -> None:
         f"a refused MCP ingest still wrote fragments.\n\n{_vault_fragments(vault)}"
     )
 
+    # #885 hoisted one unconditional audit append to the top of ``ingest_tool``
+    # so every refusal arm inherits it. This is the fourth arm — the only one
+    # reached through an EXCEPTION rather than an early return, and so the one
+    # a future refactor is most likely to strand outside the append. The other
+    # three are asserted in tests/test_mcp_write_tools.py; the PR that closed
+    # #885 claimed all four and covered three, which the review caught.
+    from creek_mcp.audit import MCP_AUDIT_RELPATH
+
+    audit_path = vault / MCP_AUDIT_RELPATH
+    assert audit_path.exists(), (
+        "the escaping-symlink refusal wrote no audit entry, so a caller can "
+        "probe this vault with a planted link and leave no trail (#885)"
+    )
+    entries = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert [e["tool"] for e in entries] == ["creek.ingest"], (
+        f"expected exactly one creek.ingest attempt entry, got {entries}"
+    )
+    summary = entries[0]["args_summary"]
+    assert summary["input_path"] == "inbox", (
+        f"the entry does not echo the caller's own input_path: {summary}"
+    )
+    assert not [k for k in summary if "resolv" in k.lower() or "target" in k.lower()], (
+        "the entry names a resolved target; read_gate.py:651-657 forbids it "
+        f"because for a planted link that path is the victim: {summary}"
+    )
+
 
 # ---------------------------------------------------------------------------
 # 13. Mutation-battery backfill

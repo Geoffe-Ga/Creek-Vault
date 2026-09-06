@@ -426,3 +426,151 @@ class TestMaterialRewriteRetiers:
         post = frontmatter.load(str(path))
         assert post["privacy_tier"] == _INTIMATE
         assert tier_allowed(_fragment_tier(post.metadata), TierCeiling.OPEN) is False
+
+
+# ---- The retier ratchet must not bury an operator's own tier (#1136) ----
+
+_PERSONAL = models.PrivacyTier.PERSONAL.value
+
+
+class TestOperatorTierSurvivesABenignEdit:
+    """A material rewrite may raise a stored tier only on evidence it added.
+
+    The #922 re-derivation merged the classifier's fresh verdict
+    escalate-only against the tier on disk, unconditionally. On a
+    **self-authored journal** fragment — the primary population of the
+    in-place update path (#673 mutable-source re-ingest) — that verdict is
+    pinned at ``intimate`` by the platform axis alone, so *every* material
+    edit escalated, no matter how benign, and the operator's own
+    hand-written ``open`` was buried on the next re-ingest. Nothing in the
+    package lowers ``privacy_tier`` again, so the burial was permanent
+    (issue #1136).
+
+    The fixture is a JOURNAL fragment precisely because the ESSAY fixture
+    of :class:`TestMaterialRewriteRetiers` cannot express the bug: on an
+    essay the classifier's verdict tracks the body, so an unconditional
+    merge is indistinguishable from a gated one.
+    """
+
+    def _seed_journal(
+        self,
+        vault: Path,
+        body: str,
+        *,
+        tier: str,
+    ) -> tuple[Fragment, Path]:
+        """Write a self-authored JOURNAL fragment and force its on-disk tier.
+
+        Self-authored + JOURNAL saturates
+        :meth:`~creek.classify.privacy.PrivacyClassifier.classify_tier` at
+        ``intimate`` on any body whatsoever, which is exactly the axis
+        combination the operator overrules by writing a weaker tier by hand.
+        """
+        frag = Fragment(
+            id="frag-ratchet01",
+            title="Morning Pages",
+            source=FragmentSource(
+                platform=SourcePlatform.JOURNAL,
+                author=models.Authorship.SELF,
+            ),
+        )
+        VaultWriter(vault_path=vault).write_fragment(frag, body=body)
+        path = _journal_files(vault)[0]
+        _set_frontmatter(path, privacy_tier=tier)
+        return frag, path
+
+    def test_journal_benign_edit_keeps_the_operator_tier(self, tmp_path: Path) -> None:
+        """A benign rewrite of an operator-``open`` journal entry stays open.
+
+        The edit introduced no privacy signal the old body lacked, so the
+        automatic re-derivation has no standing to overturn a decision the
+        operator already made against the very axes (journal, self) that
+        would otherwise force ``intimate``.
+        """
+        vault = _make_vault(tmp_path)
+        frag, path = self._seed_journal(vault, _ESSAY_SEED, tier=_OPEN)
+
+        VaultWriter(vault_path=vault).update_fragment(
+            frag, _ESSAY_REWRITE_BENIGN, reclassify_threshold=0.9
+        )
+
+        post = frontmatter.load(str(path))
+        assert post["privacy_tier"] == _OPEN
+        assert tier_allowed(_fragment_tier(post.metadata), TierCeiling.OPEN) is True
+
+    def test_journal_benign_edit_keeps_an_operator_personal(
+        self, tmp_path: Path
+    ) -> None:
+        """The middle rank is held too — the gate is not an ``open`` special case."""
+        vault = _make_vault(tmp_path)
+        frag, path = self._seed_journal(vault, _ESSAY_SEED, tier=_PERSONAL)
+
+        VaultWriter(vault_path=vault).update_fragment(
+            frag, _ESSAY_REWRITE_BENIGN, reclassify_threshold=0.9
+        )
+
+        post = frontmatter.load(str(path))
+        assert post["privacy_tier"] == _PERSONAL
+
+    def test_journal_edit_adding_recovery_escalates_over_the_operator_tier(
+        self, tmp_path: Path
+    ) -> None:
+        """New intimate material in the edit STILL escalates an ``open`` journal.
+
+        The guard against turning a fail-closed bug into a fail-open one.
+        Gating on the *aggregate* verdict alone would never fire here — the
+        journal axis pins it at ``intimate`` on both bodies — so the gate has
+        to ask what the **body** justifies, and the new body justifies
+        ``intimate`` where the old one justified nothing.
+        """
+        vault = _make_vault(tmp_path)
+        frag, path = self._seed_journal(vault, _ESSAY_SEED, tier=_OPEN)
+
+        VaultWriter(vault_path=vault).update_fragment(
+            frag, _ESSAY_REWRITE_INTIMATE, reclassify_threshold=0.9
+        )
+
+        post = frontmatter.load(str(path))
+        assert post["privacy_tier"] == _INTIMATE
+        assert tier_allowed(_fragment_tier(post.metadata), TierCeiling.OPEN) is False
+
+    def test_journal_edit_removing_recovery_never_lowers_the_tier(
+        self, tmp_path: Path
+    ) -> None:
+        """Dropping the recovery vocabulary cannot walk an ``intimate`` back down.
+
+        The gate is one-directional: it licenses an escalation, and the merge
+        behind it is still escalate-only, so an edit that *removes* evidence
+        leaves the stored tier exactly where it was.
+        """
+        vault = _make_vault(tmp_path)
+        frag, path = self._seed_journal(vault, _ESSAY_REWRITE_INTIMATE, tier=_INTIMATE)
+
+        VaultWriter(vault_path=vault).update_fragment(
+            frag, _ESSAY_SEED, reclassify_threshold=0.9
+        )
+
+        post = frontmatter.load(str(path))
+        assert post["privacy_tier"] == _INTIMATE
+
+    def test_new_evidence_on_an_already_intimate_journal_is_a_no_op(
+        self, tmp_path: Path
+    ) -> None:
+        """Evidence can fire while changing nothing — the merge is still a no-op.
+
+        The gate opening is not the same as the tier moving. Here the edit
+        genuinely introduces recovery vocabulary, so ``edit_added_evidence``
+        returns ``True``, but the tier on disk is already the ceiling and the
+        escalate-only merge has nowhere to go. The stamp must be idempotent
+        rather than, say, logging a spurious ``intimate -> intimate`` move.
+        """
+        vault = _make_vault(tmp_path)
+        frag, path = self._seed_journal(vault, _ESSAY_SEED, tier=_INTIMATE)
+
+        VaultWriter(vault_path=vault).update_fragment(
+            frag, _ESSAY_REWRITE_INTIMATE, reclassify_threshold=0.9
+        )
+
+        post = frontmatter.load(str(path))
+        assert post["privacy_tier"] == _INTIMATE
+        assert post["voice_proxy_eligible"] is False

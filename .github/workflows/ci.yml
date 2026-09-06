@@ -87,15 +87,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ env.PYTHON_DEFAULT_VERSION }}
 
       - name: Cache uv
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/.cache/uv
           key: ${{ runner.os }}-uv-${{ env.PYTHON_DEFAULT_VERSION }}-${{ hashFiles('creek-tools/uv.lock') }}
@@ -180,7 +180,7 @@ jobs:
         run: ./scripts/lint-vulture.sh
 
       - name: Upload security reports
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
         with:
           name: security-reports
@@ -200,15 +200,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ env.PYTHON_DEFAULT_VERSION }}
 
       - name: Cache uv
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/.cache/uv
           key: ${{ runner.os }}-uv-${{ env.PYTHON_DEFAULT_VERSION }}-${{ hashFiles('creek-tools/uv.lock') }}
@@ -241,7 +241,7 @@ jobs:
         run: ./scripts/pylint.sh --json reports/pylint-report.json
 
       - name: Upload pylint report
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
         with:
           name: pylint-report
@@ -268,17 +268,17 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Cache uv
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/.cache/uv
           key: ${{ runner.os }}-uv-${{ matrix.python-version }}-${{ hashFiles('creek-tools/uv.lock') }}
@@ -306,9 +306,13 @@ jobs:
         #
         # Runs with NO `.mypy_cache` restored from a previous run, and must
         # keep doing so: mypy's incremental cache is the same false-clean
-        # hazard the ruff cache turned out to be (#1119), and it is still
-        # open as #1186. Caching it here would buy ~40s per leg and hand
-        # back a gate that can pass a tree CI would otherwise fail.
+        # hazard the ruff cache turned out to be (#1119). Caching it here
+        # would buy ~40s per leg and hand back a gate that can pass a tree
+        # CI would otherwise fail.
+        #
+        # The script now passes --no-incremental on its default invocation
+        # (#1186), so a developer's local run is cache-free too and this
+        # step no longer depends on the clean tree alone for its honesty.
         run: ./scripts/typecheck.sh
 
       - name: Run pip-audit dependency check
@@ -369,7 +373,7 @@ jobs:
             --report reports/coverage.json
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v7
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7.0.0
         with:
           files: creek-tools/coverage.xml
           flags: python-${{ matrix.python-version }}
@@ -378,7 +382,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload test results
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
         with:
           name: test-results-${{ matrix.python-version }}
@@ -386,7 +390,7 @@ jobs:
           retention-days: 30
 
       - name: Upload coverage reports
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
         with:
           name: coverage-reports-${{ matrix.python-version }}
@@ -397,7 +401,7 @@ jobs:
           retention-days: 30
 
       - name: Upload dependency audit reports
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
         with:
           name: pip-audit-reports-${{ matrix.python-version }}
@@ -425,15 +429,15 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ env.PYTHON_DEFAULT_VERSION }}
 
       - name: Cache uv
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/.cache/uv
           key: ${{ runner.os }}-uv-${{ env.PYTHON_DEFAULT_VERSION }}-${{ hashFiles('creek-tools/uv.lock') }}
@@ -485,17 +489,17 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Cache uv
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: ~/.cache/uv
           key: ${{ runner.os }}-uv-crawdad-${{ matrix.python-version }}-${{ hashFiles('crawdad/uv.lock') }}
@@ -554,7 +558,7 @@ jobs:
         run: ./scripts/check-all.sh
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
         with:
           name: crawdad-coverage-${{ matrix.python-version }}
@@ -574,10 +578,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ env.PYTHON_DEFAULT_VERSION }}
 
@@ -602,7 +606,7 @@ jobs:
         run: ./scripts/complexity.sh
 
       - name: Upload complexity reports
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: complexity-reports
           path: creek-tools/reports/complexity-*.json
@@ -620,10 +624,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ env.PYTHON_DEFAULT_VERSION }}
 
@@ -639,7 +643,7 @@ jobs:
         run: twine check dist/*
 
       - name: Upload distribution artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: distribution
           path: creek-tools/dist/

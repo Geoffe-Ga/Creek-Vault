@@ -51,14 +51,23 @@ def ensure_aware(value: datetime) -> datetime:
     pipeline-generated clock with timestamps read back off disk route
     through this helper first.
 
-    The primary production caller is
-    :class:`~creek.models.Fragment`'s field validator over ``created`` /
-    ``ingested`` / ``authored_at`` (#976), which makes every fragment
-    load through the constructor or ``model_validate`` — the paths
-    ingest and vault reads use — the enforcement point for the "never
-    naive" invariant. See
-    :meth:`~creek.models.Fragment._normalise_timestamp` for the
-    construction paths that bypass it.
+    There are three production callers, at three different layers, and
+    together they are what makes "never naive" hold end to end:
+
+    * :class:`~creek.models.Fragment`'s field validator over ``created``
+      / ``ingested`` / ``authored_at`` (#976) — the *write*-side
+      enforcement point, covering every fragment built through the
+      constructor or ``model_validate``, which is what ingest and vault
+      reads use. See
+      :meth:`~creek.models.Fragment._normalise_timestamp` for the three
+      construction paths that bypass it, and why they stay open.
+    * :func:`effective_authored_at` — the *read*-side chokepoint that
+      covers those bypasses (#1116). Every time-bucketing surface routes
+      through it, so a fragment built by ``model_construct`` still sorts
+      and compares correctly.
+    * :mod:`creek.clean.validator` — anchors the timestamps it checks,
+      after #1115 consolidated away a divergent local copy of this
+      helper that attached UTC instead of LA.
 
     The contract is deliberately asymmetric:
 
@@ -107,14 +116,28 @@ def effective_authored_at(fragment: Fragment) -> datetime:
        source-side timestamp (a Substack post's ``post_date``, a
        Discord message's ``timestamp``, an EXIF ``DateTimeOriginal``).
     2. :attr:`Fragment.ingested` — the wall-clock moment the vault
-       wrote the fragment. Never naive when the fragment was built
-       through the normal constructor or ``model_validate`` path:
-       :class:`~creek.models.Fragment` normalises ``created`` /
-       ``ingested`` / ``authored_at`` through :func:`ensure_aware` at
-       validation time (#976), so a frontmatter timestamp serialised
-       without an offset is anchored to LA before it ever reaches this
-       helper. (See :meth:`~creek.models.Fragment._normalise_timestamp`
-       for which construction paths this covers.)
+       wrote the fragment.
+
+    **The result is never naive** (#1116). That guarantee is
+    unconditional, and it has to be made here rather than inherited from
+    the model, because :class:`~creek.models.Fragment`'s
+    :meth:`~creek.models.Fragment._normalise_timestamp` validator is
+    skipped by three construction paths Pydantic does not route through
+    field validators: ``model_construct``, ``model_copy(update=...)``,
+    and direct attribute assignment on an existing instance. Those paths
+    stay open deliberately — production code depends on them — so the
+    repair moves to the read instead. Both returns therefore pass
+    through :func:`ensure_aware`, which *attaches* America/Los_Angeles to
+    a naive value without moving its wall clock.
+
+    This is the chokepoint that makes the repair worth one line rather
+    than thirty: an AST scan of ``creek/`` and ``creek_mcp/`` finds this
+    function to be the only production read of ``authored_at`` /
+    ``ingested`` that does arithmetic on the value, and roughly thirty
+    downstream call sites sort, subtract, ``min`` and ``max`` on its
+    result. One naive fragment reaching any of them raised ``TypeError:
+    can't compare offset-naive and offset-aware datetimes`` and took the
+    whole pass with it.
 
     :attr:`Fragment.created` is deliberately not in the chain:
     historically it conflated "source authored date" and "filesystem
@@ -123,17 +146,22 @@ def effective_authored_at(fragment: Fragment) -> datetime:
     to fix — a 2024 essay registering as part of *this week's* vault
     activity. ``ingested`` is the honest fallback because it answers
     a different question ("when did Creek see this?") without
-    pretending to know the authored date.
+    pretending to know the authored date. Its exclusion also keeps this
+    function clear of the id-hashing contract: ``ingest/pin_ids.py``
+    deliberately hashes the *raw* frontmatter ``created`` rather than
+    ``Fragment.created``, so nothing here may re-anchor it.
 
     Args:
         fragment: The fragment to bucket.
 
     Returns:
-        ``authored_at`` when populated, otherwise ``ingested``.
+        ``authored_at`` when populated, otherwise ``ingested`` — in
+        either case tz-aware, with its wall clock and microseconds
+        intact.
     """
     if fragment.authored_at is not None:
-        return fragment.authored_at
-    return fragment.ingested
+        return ensure_aware(fragment.authored_at)
+    return ensure_aware(fragment.ingested)
 
 
 def effective_authored_date(fragment: Fragment) -> date:

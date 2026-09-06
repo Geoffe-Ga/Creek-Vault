@@ -31,7 +31,7 @@ Why "a file appeared" is never enough
 -------------------------------------
 Every MCP tool appends ``00-Creek-Meta/audit/mcp.jsonl`` — including all five
 ``creek.purge.*`` tools *while refusing*. A bare "something changed" predicate
-would therefore certify all 24 tools as effectful while proving only that the
+would therefore certify all 25 tools as effectful while proving only that the
 decorator ran. :data:`_BOOKKEEPING_GLOBS` names those paths and
 :func:`test_no_effect_is_satisfied_by_bookkeeping_alone` fails any entry whose
 declared observable lives entirely inside them.
@@ -1687,6 +1687,34 @@ MCP_CONTRACT: Final[Mapping[str, Surface]] = {
         derived_from=("creek.classify.privacy:PrivacyClassifier",),
         kwargs={"method": "rules", **_ALL},
         effect=Effect(frontmatter=_EXPECTED_TIER_MAP),
+    ),
+    "creek.classify.entry": Surface(
+        shape=Shape.REPORTS,
+        why=(
+            "#874: a per-entry read wired to nothing answers 'unclassified' "
+            "forever and every one of its tests still passes"
+        ),
+        derived_from=("creek.classify.constants:RULES_METHOD",),
+        kwargs={"entry_ref": _SHIPPING_ID, **_ALL},
+        prepare=(("classify", "--vault", "{vault}", "--method", "rules"),),
+        # The provenance stamp, not the frequency: it is the one published
+        # field that can only be "rules" because a real pass ran and wrote it,
+        # so it distinguishes a live read from a constant without pinning this
+        # contract to the rule classifier's signal dictionaries.
+        effect=Effect(prints=('"classification_method": "rules"',)),
+        contrast=Contrast(
+            why=(
+                "with no classify pass run first the same fragment must report "
+                "method 'none' -- ingest does not classify, and that is the "
+                "distinction the field exists to publish"
+            ),
+            seeded=True,
+            prepared=False,
+        ),
+        refusal=Refusal(
+            reason="entry_ref must not be blank",
+            kwargs={"entry_ref": "   ", **_ALL},
+        ),
     ),
     "creek.link": Surface(
         shape=Shape.WRITES,

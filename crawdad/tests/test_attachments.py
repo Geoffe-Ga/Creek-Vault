@@ -28,17 +28,20 @@ FEAT-035 adds:
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from crawdad.attachments import (
+    _MAX_FILENAME_CHARS,
     _TEXT_SAMPLE_BYTES,
     AcceptedAttachment,
     MimeVerification,
     ProcessedAttachments,
     RejectedAttachment,
+    _suffixed_name,
     format_attachment_summary,
     infer_ingestor_type,
     process_attachments,
@@ -1196,3 +1199,218 @@ def test_attachment_config_default_allowed_extensions_omits_legacy_office() -> N
     # The verifiable types are still allowed by default.
     for verifiable in (".pdf", ".docx", ".xlsx", ".pptx", ".png", ".md"):
         assert verifiable in config.allowed_extensions
+
+
+# --- Issue #917: same-batch filename collision after sanitisation -----------
+
+
+def _sha256(data: bytes) -> str:
+    """Return the SHA-256 hex digest of *data* (mirrors ``_content_hash``)."""
+    return hashlib.sha256(data).hexdigest()
+
+
+async def test_same_batch_sanitized_collision_stages_both_files(
+    tmp_path: Path, attachment_config: AttachmentConfig
+) -> None:
+    """Two names that alias after sanitisation both survive (issue #917).
+
+    ``"a b.md"`` and ``"a_b.md"`` both sanitise to ``a_b.md``. Before
+    the fix the second attachment's bytes overwrote the first's, both
+    ``AcceptedAttachment`` records pointed at one file, and the first
+    file's ``content_hash`` no longer described anything on disk — so
+    the bot ingested the second payload twice while recording the
+    first hash as ingested.
+    """
+    payload_a = b"# file one, payload P1\n"
+    payload_b = b"# file two, DIFFERENT payload P2\n"
+    result = await process_attachments(
+        attachments=[
+            _FakeAttachment(filename="a b.md", size=len(payload_a), payload=payload_a),
+            _FakeAttachment(filename="a_b.md", size=len(payload_b), payload=payload_b),
+        ],
+        vault_path=tmp_path,
+        channel_id=5,
+        message_id=6,
+        config=attachment_config,
+    )
+
+    assert result.rejected == ()
+    assert len(result.accepted) == 2
+    first, second = result.accepted
+
+    # Both files survive at distinct paths.
+    assert first.staged_path != second.staged_path
+    assert first.staged_path.read_bytes() == payload_a
+    assert second.staged_path.read_bytes() == payload_b
+
+    # Every recorded hash describes the bytes actually on disk, so the
+    # ingest dispatcher never records a hash for content it did not send.
+    for accepted, payload in ((first, payload_a), (second, payload_b)):
+        assert accepted.content_hash == _sha256(payload)
+        assert accepted.content_hash == _sha256(accepted.staged_path.read_bytes())
+        assert accepted.already_present is False
+
+    # Exactly two files landed in the staging dir — no clobbering.
+    staged = sorted(p.name for p in result.staging_dir.iterdir())
+    assert staged == ["a_b-1.md", "a_b.md"]
+
+
+async def test_same_batch_truncation_collision_stages_both_files(
+    tmp_path: Path, attachment_config: AttachmentConfig
+) -> None:
+    """Two long names sharing a prefix alias via truncation — both survive.
+
+    ``sanitize_filename`` caps the name at :data:`_MAX_FILENAME_CHARS`,
+    so two distinct 300-character names with a common prefix collapse
+    onto one staged name just as surely as the punctuation case.
+    """
+    stem = "z" * 300
+    payload_a = b"long-name payload A\n"
+    payload_b = b"long-name payload B\n"
+    result = await process_attachments(
+        attachments=[
+            _FakeAttachment(
+                filename=f"{stem}-one.md", size=len(payload_a), payload=payload_a
+            ),
+            _FakeAttachment(
+                filename=f"{stem}-two.md", size=len(payload_b), payload=payload_b
+            ),
+        ],
+        vault_path=tmp_path,
+        channel_id=5,
+        message_id=7,
+        config=attachment_config,
+    )
+
+    first, second = result.accepted
+    # The two raw names really do alias under the sanitiser...
+    assert sanitize_filename(f"{stem}-one.md") == sanitize_filename(f"{stem}-two.md")
+    # ...but each staged file reports the distinct name it has on disk.
+    assert first.filename != second.filename
+    assert first.staged_path != second.staged_path
+    assert first.staged_path.read_bytes() == payload_a
+    assert second.staged_path.read_bytes() == payload_b
+    # The disambiguating suffix still respects the filename length cap.
+    assert len(second.staged_path.name) <= _MAX_FILENAME_CHARS
+
+
+async def test_same_batch_collision_reprocessed_is_idempotent(
+    tmp_path: Path, attachment_config: AttachmentConfig
+) -> None:
+    """Re-running a colliding batch re-uses both staged paths, minting no third."""
+    payload_a = b"payload P1\n"
+    payload_b = b"payload P2\n"
+
+    def _batch() -> list[_FakeAttachment]:
+        return [
+            _FakeAttachment(filename="a b.md", size=len(payload_a), payload=payload_a),
+            _FakeAttachment(filename="a_b.md", size=len(payload_b), payload=payload_b),
+        ]
+
+    kwargs: dict[str, object] = {
+        "vault_path": tmp_path,
+        "channel_id": 8,
+        "message_id": 9,
+        "config": attachment_config,
+    }
+    first_run = await process_attachments(attachments=_batch(), **kwargs)  # type: ignore[arg-type]
+    second_run = await process_attachments(attachments=_batch(), **kwargs)  # type: ignore[arg-type]
+
+    assert [a.staged_path for a in second_run.accepted] == [
+        a.staged_path for a in first_run.accepted
+    ]
+    assert all(a.already_present for a in second_run.accepted)
+    assert second_run.all_already_present is True
+    assert len(list(second_run.staging_dir.iterdir())) == 2
+
+
+async def test_same_batch_identical_payloads_still_stage_separately(
+    tmp_path: Path, attachment_config: AttachmentConfig
+) -> None:
+    """Aliasing names with *identical* bytes still get one file each.
+
+    The de-dup shortcut must not fire for a sibling inside the same
+    batch: the two ``PendingFile`` records would otherwise share a
+    staged path again, and ``already_present`` would tell the user a
+    file they just uploaded was skipped.
+    """
+    payload = b"identical bytes\n"
+    result = await process_attachments(
+        attachments=[
+            _FakeAttachment(filename="a b.md", size=len(payload), payload=payload),
+            _FakeAttachment(filename="a_b.md", size=len(payload), payload=payload),
+        ],
+        vault_path=tmp_path,
+        channel_id=10,
+        message_id=11,
+        config=attachment_config,
+    )
+
+    first, second = result.accepted
+    assert first.staged_path != second.staged_path
+    assert first.already_present is False
+    assert second.already_present is False
+    assert len(list(result.staging_dir.iterdir())) == 2
+
+
+def test_suffixed_name_ordinal_zero_is_the_name_itself() -> None:
+    """Ordinal 0 is the undisambiguated name — the common, non-colliding case."""
+    assert _suffixed_name("notes.md", 0) == "notes.md"
+
+
+def test_suffixed_name_splices_marker_before_the_extension() -> None:
+    """The extension survives so ``infer_ingestor_type`` still routes the file."""
+    assert _suffixed_name("notes.md", 3) == "notes-3.md"
+    assert infer_ingestor_type(_suffixed_name("notes.md", 3)) == "markdown"
+
+
+def test_suffixed_name_handles_extensionless_names() -> None:
+    """A name with no dot gets the marker appended, not spliced into nothing."""
+    assert _suffixed_name("README", 2) == "README-2"
+
+
+def test_suffixed_name_drops_extension_when_it_eats_the_whole_budget() -> None:
+    """A pathological extension still yields distinct, capped names.
+
+    ``sanitize_filename('a.' + 'b' * 250)`` really does return a name
+    whose \"extension\" is 198 characters, leaving no room for both the
+    extension and the ``-N`` marker inside the cap. Distinct ordinals
+    must still produce distinct names, or the disambiguation loop
+    would spin.
+    """
+    pathological = sanitize_filename(f"a.{'b' * 250}")
+    first = _suffixed_name(pathological, 1)
+    second = _suffixed_name(pathological, 2)
+    assert first != second
+    assert len(first) <= _MAX_FILENAME_CHARS
+    assert len(second) <= _MAX_FILENAME_CHARS
+
+
+async def test_pathological_extension_collision_stages_both_files(
+    tmp_path: Path,
+) -> None:
+    """End-to-end cover for the budget-exhausted disambiguation path."""
+    ext = "b" * 250
+    payload_a = b"pathological A\n"
+    payload_b = b"pathological B\n"
+    config = AttachmentConfig(allowed_extensions=frozenset())
+    result = await process_attachments(
+        attachments=[
+            _FakeAttachment(
+                filename=f"a.{ext}", size=len(payload_a), payload=payload_a
+            ),
+            _FakeAttachment(
+                filename=f"a_.{ext}", size=len(payload_b), payload=payload_b
+            ),
+        ],
+        vault_path=tmp_path,
+        channel_id=12,
+        message_id=13,
+        config=config,
+    )
+
+    assert result.rejected == ()
+    first, second = result.accepted
+    assert first.staged_path != second.staged_path
+    assert first.staged_path.read_bytes() == payload_a
+    assert second.staged_path.read_bytes() == payload_b

@@ -1,0 +1,18 @@
+{
+  "additionalProperties": false,
+  "description": "The authorization code, relayed back to Creek (#1568).\n\n**One field, and the absence of the second is deliberate.** The\n``redirect_uri`` is *not* re-supplied here: it is read from the record the\n``state`` was issued under. A caller able to vary it between the two legs\ncould complete an authorization against an address the first leg never\nnamed, which is exactly what binding the code to a stored authorization\nexists to prevent.\n\nAttributes:\n    code: Google's authorization code, as the caller's redirect handler\n        received it. Single-use and short-lived at Google's end too; it is\n        worthless without the client secret this server holds.",
+  "properties": {
+    "code": {
+      "description": "The authorization code Google handed the caller.",
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Code",
+      "type": "string"
+    }
+  },
+  "required": [
+    "code"
+  ],
+  "title": "DriveAuthorizationExchangeRequest",
+  "type": "object"
+}

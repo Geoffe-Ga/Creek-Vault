@@ -60,6 +60,45 @@ Duplicate issues inflate apparent queue depth with fake work — this step is th
 single most important behavior for keeping the hopper honest. Other scans may
 run concurrently, so re-run the dedupe search immediately before each create.
 
+### Step 4.5 — Verify every symbol citation (MANDATORY)
+
+A filed issue that names a function which does not exist sends whoever picks
+it up hunting for a symbol that was never there. This is not hypothetical:
+#1446 and #1447 cited **eight** phantom names between them, *paraphrased* from
+surrounding code — `_generate_filename` filed as `_unique_filename`, `verify`
+as `verify_chain`. Coverage is the worst-hit scan because
+`--cov-report=term-missing` prints line numbers and no names at all, so there
+is nothing to copy and the gap gets filled by invention (#1651).
+
+So the name is a **checked datum**, not prose. Every finding that names a
+function, method or class must carry it in a `symbol` (or `symbols`) field,
+and before any `gh issue create` you must run:
+
+```bash
+printf '%s\n' "$FINDINGS_NDJSON" \
+  | SCAN_SHA="$GITHUB_SHA" creek-tools/scripts/verify-scan-citations.sh
+```
+
+It resolves each name against the blob **at the scan SHA** and exits non-zero
+naming every phantom. **A rejected citation must not be filed.** Re-resolve it
+against that SHA and cite the real name, or drop the symbol from the finding.
+Never substitute the nearest similar-looking name — that is the exact failure
+this gate exists to stop.
+
+A symbol you are *proposing to create* — a refactor target like "extract a
+helper named `_reject_seed_conflicts`" — is not a citation. It belongs in
+`fix_strategy`, never in `symbol`, or the gate will correctly reject it.
+
+**This pre-create run is no longer the only check (#1700).** A `run:` step in
+`.github/workflows/_claude-scan.yml`, placed after the agent and guarded by
+`if: always()`, re-reads every issue the run actually filed, parses each body's
+own `File(s):` / `Symbol(s):` citations and its own `Scanned at commit:` SHA,
+and pipes them back through this same verifier — asking you for nothing. So
+skipping the step above does not hide a phantom. It turns something you could
+have fixed in a draft into a red workflow run and a public correction comment
+on an issue that is already filed, which is strictly worse for everyone. Run it
+before every create.
+
 ### Step 5 — Write the issue
 Fill the canonical `prompts/templates/scan-issue-body.md` completely — all six
 components, no placeholders left. (It is the single source of truth;

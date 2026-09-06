@@ -24,6 +24,8 @@ sensing → deliberating → committing → enacted → reflecting
 
 Statuses are advanced by `DecisionDetector.update_decision_phase(decision_id, new_phase, vault_path)`. The function rewrites the frontmatter `status` field and moves the file between `Active/` and `Archive/` automatically. Invalid statuses raise `ValueError` — there is no silent fallback.
 
+The move never lands on an occupied path. A filename is not an identity here either, so if the destination folder already holds a note of that name the mover takes the next free collision ordinal (`-1`, `-2`, …) rather than replacing it — the note already there is left byte-for-byte alone, whoever wrote it. Unlike a fresh draft, a move claims no existing note as its own: even a note recording the same source fragment is a *second* decision, with its own `id` and its own prose, and is stepped over rather than refreshed. The ordinal cannot creep, because a move frees its old name as it takes the new one: a decision shuttled between `Active/` and `Archive/` reclaims `<date>-<sanitised-title>.md` on every leg. If every probed name is taken the move raises `RuntimeError` **before** the `status` rewrite, so a failure leaves the note exactly where and as it was.
+
 The frontmatter follows `creek.models.Decision`: `id`, `title`, `status`, `opened`, `decided`, `frequency_context`, `wavelength_phase_at_opening`, `relevant_threads`, `relevant_praxis`, `options`, `criteria`, `outcome`, `tags`. The opening wavelength phase is captured at draft time and is **never** rewritten by later phase advances — the historical record matters more than tidying the frontmatter.
 
 ---

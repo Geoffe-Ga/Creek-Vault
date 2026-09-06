@@ -19,6 +19,11 @@ the primitives that close that hole:
   mixture. This is the write half of the consent log's durability
   contract: a torn rewrite is what manufactured the corrupt log that
   ``creek.consent`` now has to quarantine.
+* :func:`creek._fsio.atomic_replace_path` — the same commit protocol for
+  a writer that is handed a *path* instead of bytes (#1441). It yields a
+  sibling scratch path, ``fsync``s it and renames it into place, which is
+  what stops a torn ``embeddings.parquet`` write from destroying the
+  cache it was replacing.
 
 No ``InterruptedError`` test lives here on purpose: per PEP 475 a signal
 that arrives after ``n > 0`` bytes is reported as a short *success*, so
@@ -33,7 +38,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from creek._fsio import atomic_write_text, create_exclusive, write_all
+from creek._fsio import (
+    atomic_replace_path,
+    atomic_write_text,
+    create_exclusive,
+    write_all,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -292,3 +302,129 @@ def test_atomic_write_text_preserves_original_when_replace_fails(
 
     assert target.read_text(encoding="utf-8") == original
     assert _tmp_residue(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# atomic_replace_path (#1441)
+# ---------------------------------------------------------------------------
+
+
+def test_atomic_replace_path_commits_the_filled_file(tmp_path: Path) -> None:
+    """Whatever the caller writes to the yielded path lands at the target."""
+    target = tmp_path / "cache.bin"
+    target.write_bytes(b"previous")
+
+    with atomic_replace_path(target) as staged:
+        staged.write_bytes(_PAYLOAD)
+
+    assert target.read_bytes() == _PAYLOAD
+    assert _tmp_residue(tmp_path) == []
+
+
+def test_atomic_replace_path_yields_a_sibling_of_the_target(tmp_path: Path) -> None:
+    """The scratch path shares the target's directory.
+
+    ``os.replace`` raises ``EXDEV`` across filesystems, so staging in
+    the system temp directory would silently stop being atomic on any
+    vault that lives on its own volume.
+    """
+    nested = tmp_path / "00-Creek-Meta"
+    nested.mkdir()
+    target = nested / "embeddings.parquet"
+
+    with atomic_replace_path(target) as staged:
+        assert staged.parent == target.parent
+        assert staged != target
+        staged.write_bytes(b"x")
+
+
+def test_atomic_replace_path_preserves_target_when_the_writer_raises(
+    tmp_path: Path,
+) -> None:
+    """A writer that fails part-way leaves the previous file byte-intact."""
+    target = tmp_path / "cache.bin"
+    original = b"the previous, still-good artifact"
+    target.write_bytes(original)
+
+    with (
+        pytest.raises(RuntimeError, match="disk full"),
+        atomic_replace_path(target) as staged,
+    ):
+        staged.write_bytes(b"half a repl")
+        raise RuntimeError("disk full")
+
+    assert target.read_bytes() == original
+    assert _tmp_residue(tmp_path) == []
+
+
+def test_atomic_replace_path_preserves_target_when_replace_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused rename leaves the previous file intact and no debris."""
+    target = tmp_path / "cache.bin"
+    original = b"the previous, still-good artifact"
+    target.write_bytes(original)
+
+    def _refuse(*_args: object, **_kwargs: object) -> None:
+        """Stand in for ``os.replace`` on a filesystem that refuses it.
+
+        Raises:
+            OSError: Always, to simulate a refused rename.
+        """
+        raise OSError("rename refused")
+
+    monkeypatch.setattr("creek._fsio.os.replace", _refuse)
+
+    with (
+        pytest.raises(OSError, match="rename refused"),
+        atomic_replace_path(target) as staged,
+    ):
+        staged.write_bytes(b"replacement")
+
+    assert target.read_bytes() == original
+    assert _tmp_residue(tmp_path) == []
+
+
+def test_atomic_replace_path_fsyncs_before_it_renames(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The staged bytes reach the platter before the name is committed.
+
+    Renaming an unflushed file swaps a durable artifact for one whose
+    contents a power loss can still drop, so the ordering — not merely
+    the presence of an ``fsync`` — is what makes the replace safe.
+    """
+    target = tmp_path / "cache.bin"
+    calls: list[str] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def _record_fsync(fd: int) -> None:
+        """Note the fsync, then perform it.
+
+        Args:
+            fd: Descriptor handed to ``os.fsync``.
+        """
+        calls.append("fsync")
+        real_fsync(fd)
+
+    def _record_replace(src: str, dst: str) -> None:
+        """Note the rename, then perform it.
+
+        Args:
+            src: Staged path being committed.
+            dst: Final path being replaced.
+        """
+        calls.append("replace")
+        real_replace(src, dst)
+
+    monkeypatch.setattr("creek._fsio.os.fsync", _record_fsync)
+    monkeypatch.setattr("creek._fsio.os.replace", _record_replace)
+
+    with atomic_replace_path(target) as staged:
+        staged.write_bytes(_PAYLOAD)
+
+    assert calls == ["fsync", "replace"]
+    assert target.read_bytes() == _PAYLOAD

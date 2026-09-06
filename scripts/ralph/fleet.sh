@@ -41,12 +41,16 @@
 #                      `release` deleted locally while its PR lived on — #1180),
 #                      and only then a fresh branch off origin/main. Aborts if
 #                      the remote lookup is unreadable, and refuses if the fleet
-#                      is full.
+#                      is full. Provisions <worktree>/creek-tools/.venv via
+#                      `uv sync --all-extras` (idempotent; refuses non-zero
+#                      rather than hand back a lane that cannot run its gate,
+#                      and leaves the worktree in place so a retry repairs it).
 #   adopt <N> <PR>   The bot-PR variant of assign: create (or reuse) a worktree
 #                      for issue N attached to PR's EXISTING head branch (e.g.
 #                      Dependabot's), so fixes push to that branch instead of
 #                      opening a second PR. Prints its absolute path. Refuses a
 #                      fork PR (its branch is not pushable) and a full fleet.
+#                      Provisions the worktree venv exactly as `assign` does.
 #   sync <N>         Integrate the latest origin/main into issue N's worktree
 #                      branch by MERGE (no history rewrite ⇒ a plain push updates
 #                      the PR; no force-push, ever). Exit 0 clean, exit 3 on
@@ -63,6 +67,8 @@ set -euo pipefail
 readonly DEFAULT_MAX_WORKERS=4
 readonly WORKTREE_ROOT=".ralph/worktrees"
 readonly STATE_FILE="scripts/ralph/state.json"
+# The subproject a lane's gate runs in: `cd creek-tools && ./scripts/check-all.sh`.
+readonly LANE_PROJECT="creek-tools"
 
 # Print an actionable error and exit. Callers pass the message as ONE arg and an
 # optional exit code as the second ($2) — so the code never leaks into the
@@ -131,6 +137,20 @@ parallel_enabled() {
 # Absolute path of the worktree directory for an issue (may not exist yet).
 issue_dir() {
   printf '%s/%s/issue-%s\n' "$(repo_root)" "$WORKTREE_ROOT" "$1"
+}
+
+# THE one definition of a lane's interpreter. The readiness check, the
+# provisioning postcondition and the failure diagnostic all derive from this, so
+# they cannot drift apart.
+lane_python() { # lane_python <worktree-dir>
+  printf '%s/%s/.venv/bin/python\n' "$1" "$LANE_PROJECT"
+}
+
+# Is this lane runnable? "The directory exists" is NOT the same question: a
+# checked-out lane with no venv fails its first gate on missing dev deps rather
+# than on its own change.
+lane_is_provisioned() { # lane_is_provisioned <worktree-dir>
+  [[ -x "$(lane_python "$1")" ]]
 }
 
 # Emit "<issue>\t<branch>\t<path>" for every active Ralph worktree, sorted by
@@ -241,6 +261,51 @@ remote_branch_state() { # remote_branch_state <root> <branch>
   fi
 }
 
+# Make a lane RUNNABLE. A worker's first gate is
+# `cd creek-tools && ./scripts/check-all.sh`, and every script under
+# creek-tools/scripts/ resolves a BARE `python` (creek-tools/scripts/_lib.sh), so
+# a lane handed back without a venv fails Gate 2 on missing dev deps — never on
+# its own change. Idempotent: a healthy lane returns immediately.
+#
+# On failure the worktree is deliberately LEFT IN PLACE. It may hold a worker's
+# uncommitted implementation (the orchestrator re-assigns existing lanes), and
+# removing it would also stop `free` decrementing, spinning the refill loop
+# forever. Only a PARTIAL .venv is deleted: uv writes .venv/bin/python before it
+# installs anything, so a half-synced tree would satisfy lane_is_provisioned and
+# every later assign would skip provisioning forever, silently.
+provision_lane() { # provision_lane <ctx> <worktree-dir>
+  local ctx="$1" dir="$2" project="$2/$LANE_PROJECT" failed=""
+  if lane_is_provisioned "$dir"; then return 0; fi
+  [[ -d "$project" ]] || die "$ctx: $dir has no $LANE_PROJECT/ to provision"
+  command -v uv >/dev/null 2>&1 ||
+    die "$ctx: uv CLI required to provision $project/.venv (install uv, then: cd $project && uv sync --all-extras)" 2
+  echo "fleet: $ctx: provisioning $project/.venv (uv sync --all-extras)" >&2
+  (cd "$project" && uv sync --all-extras >&2) || failed="uv sync failed"
+  # A `uv` that exits 0 without creating an interpreter must not pass.
+  if [[ -z "$failed" ]] && ! lane_is_provisioned "$dir"; then
+    failed="uv sync reported success but left no interpreter at $(lane_python "$dir")"
+  fi
+  if [[ -n "$failed" ]]; then
+    rm -rf "${project:?}/.venv"
+    die "$ctx: could not provision $project/.venv ($failed); the lane worktree is LEFT IN PLACE — retry, or run by hand: cd $project && uv sync --all-extras"
+  fi
+}
+
+# The one statement that hands a NEWLY STARTED lane to a caller. Provision
+# first, unconditionally: ralph-tick.md captures this stdout as the worktree path
+# for BOTH `assign` and `adopt`, so every byte of provisioning output goes to
+# stderr. Routing all four lane-start exits through here makes "provision before
+# you print" a property of the script rather than a convention four call sites
+# must remember — and this issue exists precisely because `cmd_adopt` did not.
+# (`cmd_path` also prints a lane path, but it is a pure, side-effect-free query
+# invoked repeatedly and from inside lanes; putting a multi-minute sync behind a
+# read would be wrong. A lane whose venv is hand-deleted is repaired by the next
+# assign/adopt, not by `path`.)
+emit_lane() { # emit_lane <ctx> <worktree-dir>
+  provision_lane "$1" "$2"
+  printf '%s\n' "$2"
+}
+
 cmd_assign() {
   local issue="$1" slug="${2:-}" root dir branch base lock remote_state
   [[ -n "$issue" ]] || die "assign: usage: assign <issue> <slug>"
@@ -249,9 +314,12 @@ cmd_assign() {
   dir="$(issue_dir "$issue")"
 
   # Re-entrant: an existing worktree for this issue is simply reused. Checked
-  # BEFORE locking so re-entry never contends on the lock.
+  # BEFORE locking so re-entry never contends on the lock. emit_lane re-checks
+  # readiness, so a lane whose first provision FAILED is repaired here rather
+  # than handed back half-built forever. Provisioning without the lock held is
+  # safe: uv takes its own, and a healthy lane returns immediately.
   if [[ -d "$dir" ]]; then
-    printf '%s\n' "$dir"
+    emit_lane assign "$dir"
     return 0
   fi
 
@@ -318,10 +386,13 @@ cmd_assign() {
   fi
 
   # Success: release the lock now and clear the trap so a later exit does not try
-  # to rmdir an already-gone (or a newly re-acquired) lock.
+  # to rmdir an already-gone (or a newly re-acquired) lock. Provisioning runs
+  # AFTER the release on purpose: FLEET_LOCK_TIMEOUT defaults to 10s and a cold
+  # `uv sync` runs for minutes, so syncing inside the critical section would make
+  # every concurrent lane start die on a false stale lock.
   rmdir "$lock" 2>/dev/null || true
   trap - EXIT
-  printf '%s\n' "$dir"
+  emit_lane assign "$dir"
 }
 
 # Attach a lane to a PR's own head branch (Dependabot & friends), so fixes push to
@@ -369,7 +440,8 @@ cmd_adopt() {
     on_branch="$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
     [[ "$on_branch" == "$head_ref" ]] ||
       die "adopt: worktree for issue $issue is on '$on_branch', not PR #$pr's '$head_ref' — release it first"
-    printf '%s\n' "$dir"
+    # Re-checks readiness, exactly as cmd_assign's re-entrant path does.
+    emit_lane adopt "$dir"
     return 0
   fi
 
@@ -417,9 +489,10 @@ cmd_adopt() {
   # above still releases it, via the EXIT trap acquire_assign_lock installed —
   # both the `die` calls and the two bare `git worktree add` statements, which
   # exit under `set -e` rather than through die(). An EXIT trap fires either way.
+  # Provisioning runs AFTER the release, for the reason cmd_assign's tail records.
   rmdir "$lock" 2>/dev/null || true
   trap - EXIT
-  printf '%s\n' "$dir"
+  emit_lane adopt "$dir"
 }
 
 # Normalize an arbitrary title fragment into a safe kebab slug. Truncate first,
@@ -495,7 +568,7 @@ usage() {
   # Line range = the header comment block, ending at the "Exit codes:" line just
   # above `set -euo pipefail`. Growing the header without moving this range
   # truncates `--help` mid-sentence; test_fleet.sh pins the last line.
-  sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-1}"
 }
 

@@ -74,6 +74,52 @@ google-auth and via mcp → pyjwt; both declare open floors
 upstream blocks the raise and the constraint moves to ``>=50.0.0``
 with zero suppressions.
 
+``idna`` (issue #1328): idna 3.14 and every release below it carry
+CVE-2026-45409 (GHSA-65pc-fj4g-8rjx / PYSEC-2026-215), fixed in 3.15.
+idna is transitive-only, but on three *runtime* edges rather than a
+dev-only one — anyio, httpx, and yarl behind discord.py → aiohttp — so
+the floor lives in ``[tool.uv].constraint-dependencies``.
+
+**The floor here is 3.15 and creek-tools declares 3.19, and that is
+correct.** 3.15 is where the advisory is fixed; creek-tools' higher
+number is not a stricter reading of the same advisory but a different
+kind of claim — a floor in its ``[project].dependencies`` also records
+the resolution that project actually runs (#1000). Harmonising the two
+strings would either assert a compatibility claim crawdad has never
+tested or contradict #1000, so the difference is deliberate and
+documented rather than drift to be tidied away.
+
+``pyjwt`` (issue #1328): pyjwt 2.12.1 carries five advisories —
+CVE-2026-48522 through CVE-2026-48526 (PYSEC-2026-175 through -179) —
+all fixed in 2.13.0. Transitive-only via mcp → pyjwt[crypto], the same
+edge that pulls cryptography, and the library that would verify a
+bearer token on the MCP surface this bot consumes.
+
+Its two OSV records disagree about the boundary: PYSEC-2026-176
+records ``fixed: 2.12.1`` while its GHSA alias GHSA-jq35-7prp-9v3f
+records ``2.13.0``. Both were queried live while closing #1328. The
+floor takes the higher number. When two sources disagree about where a
+fix lands, a security bound resolves the disagreement upward — the
+cost of being one release too strict is a relock, and the cost of
+being one release too loose is the advisory.
+
+``urllib3`` (issue #1328): urllib3 2.6.3 carries CVE-2026-44431
+(PYSEC-2026-141 / GHSA-qccp-gfcp-xxvc) and CVE-2026-44432
+(PYSEC-2026-142 / GHSA-mf9v-mfxr-j63j), both fixed in 2.7.0. 2.6.3
+cleared only the earlier CVE-2026-21441, so it sits inside the
+vulnerable band rather than above it.
+
+**Read the whole consumer list before calling an edge dev-only.** This
+package was one sentence away from being *exempted* from the
+cross-manifest parity guard on the reading that crawdad reaches
+urllib3 only through pip-audit. It does not. ``google-genai`` is
+declared in ``[project].dependencies``, and both google-genai and
+google-auth pull ``requests``, which pulls urllib3 — a runtime path
+through the Gemini provider. pip-audit, xenon and cachecontrol reach
+it as well, and stopping at the first two of five consumers is exactly
+how the wrong conclusion was reached. Enumerate every consumer from
+the lock, then decide.
+
 ``rpds-py`` (issue #1185): not a CVE. rpds-py abandoned SemVer for
 CalVer at 2026.5.1 — the release line runs 0.29.0, 0.30.0, then
 2026.5.1 with no 0.31 or 1.0 in between — and raised its
@@ -232,6 +278,42 @@ _AIOHTTP_PATCHED_VERSION = Version("3.14.1")
 #: GHSA-537c-gmf6-5ccf: 48.0.1 sits inside the vulnerable band.
 _CRYPTOGRAPHY_PATCHED_VERSION = Version("50.0.0")
 
+#: First idna release containing the fix for CVE-2026-45409
+#: (GHSA-65pc-fj4g-8rjx / PYSEC-2026-215).
+_IDNA_PATCHED_VERSION = Version("3.15")
+
+#: The last idna release the advisory still covers. Named as a constant
+#: so the boundary probe below is auditable rather than a magic string:
+#: 3.14 is a real published release, so the assertion that the floor
+#: rejects it is non-vacuous.
+_IDNA_LAST_VULNERABLE = Version("3.14")
+
+#: First pyjwt release containing the fixes for all five advisories
+#: carried by 2.12.1 — CVE-2026-48522 (PYSEC-2026-175 /
+#: GHSA-993g-76c3-p5m4), CVE-2026-48523 (PYSEC-2026-176 /
+#: GHSA-jq35-7prp-9v3f), CVE-2026-48524 (PYSEC-2026-177 /
+#: GHSA-fhv5-28vv-h8m8), CVE-2026-48525 (PYSEC-2026-178 /
+#: GHSA-w7vc-732c-9m39) and CVE-2026-48526 (PYSEC-2026-179 /
+#: GHSA-xgmm-8j9v-c9wx).
+_PYJWT_PATCHED_VERSION = Version("2.13.0")
+
+#: The last pyjwt release the advisories still cover. OSV's two records
+#: for CVE-2026-48523 disagree about this one: PYSEC-2026-176 says
+#: ``fixed: 2.12.1`` while its GHSA alias says ``2.13.0`` (both queried
+#: live for #1328). The floor takes the higher, safer number — a
+#: security bound resolves a source disagreement upward.
+_PYJWT_LAST_VULNERABLE = Version("2.12.1")
+
+#: First urllib3 release containing the fixes for BOTH CVE-2026-44431
+#: (PYSEC-2026-141 / GHSA-qccp-gfcp-xxvc) and CVE-2026-44432
+#: (PYSEC-2026-142 / GHSA-mf9v-mfxr-j63j). 2.6.3 cleared only the
+#: earlier CVE-2026-21441 (PYSEC-2026-1996), so it sits inside this
+#: band rather than above it.
+_URLLIB3_PATCHED_VERSION = Version("2.7.0")
+
+#: The last urllib3 release both advisories still cover.
+_URLLIB3_LAST_VULNERABLE = Version("2.6.3")
+
 #: First pydantic-settings release containing the fix for
 #: GHSA-4xgf-cpjx-pc3j.
 _PYDANTIC_SETTINGS_PATCHED_VERSION = Version("2.14.2")
@@ -345,6 +427,20 @@ _OPENAI_PRE_BOUND_FLOOR = Version("1.0")
 #: pip-audit``) instead of running it; a lookup must not count as an
 #: audit.
 _LOOKUP_BUILTINS = frozenset({"command", "hash", "type", "which"})
+
+#: Helpers that *probe* for a tool without running it. ``security.sh``
+#: guards its audits with ``crawdad_require_python_module pip_audit
+#: pip-audit`` (#1671), and that line mentions pip-audit by name — so
+#: without this exclusion the probe itself would satisfy the
+#: "an environment audit exists" assertion below while the real audit
+#: had been deleted. Same reasoning as ``_LOOKUP_BUILTINS``.
+_PROBE_COMMANDS = frozenset({"crawdad_require_python_module"})
+
+#: The module name ``pip-audit`` is imported and executed under. The
+#: gate invokes it as ``python -m pip_audit`` rather than by bare name,
+#: so that the audit runs in the interpreter under audit instead of
+#: whichever copy PATH resolves first (#1671).
+_PIP_AUDIT_MODULE = "pip_audit"
 
 
 def _mcp_specifier() -> SpecifierSet:
@@ -576,6 +672,129 @@ def _locked_pydantic_settings_version() -> Version:
         if package["name"] == "pydantic-settings":
             return Version(str(package["version"]))
     pytest.fail("pydantic-settings has no [[package]] entry in uv.lock")
+
+
+def _idna_constraint_specifier() -> SpecifierSet:
+    """Return the ``idna`` specifier from uv constraints.
+
+    Reads ``[tool.uv].constraint-dependencies`` in ``pyproject.toml``,
+    the home for floors on transitive-only packages (DEP-003).
+
+    Returns:
+        The specifier set attached to the ``idna`` constraint entry.
+        Fails the calling test if the ``[tool.uv]`` table or the
+        ``idna`` entry is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    constraints: list[str] = (
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in constraints:
+        requirement = Requirement(entry)
+        if requirement.name == "idna":
+            return requirement.specifier
+    pytest.fail(
+        "idna has no entry in [tool.uv].constraint-dependencies of pyproject.toml"
+    )
+
+
+def _locked_idna_version() -> Version:
+    """Return the resolved ``idna`` version pinned in ``uv.lock``.
+
+    Returns:
+        The ``idna`` version resolved in the lockfile. Fails the calling
+        test if the lock has no ``idna`` package entry.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == "idna":
+            return Version(str(package["version"]))
+    pytest.fail("idna has no [[package]] entry in uv.lock")
+
+
+def _urllib3_constraint_specifier() -> SpecifierSet:
+    """Return the ``urllib3`` specifier from uv constraints.
+
+    Reads ``[tool.uv].constraint-dependencies`` in ``pyproject.toml``,
+    the home for floors on transitive-only packages (DEP-003).
+
+    Returns:
+        The specifier set attached to the ``urllib3`` constraint entry.
+        Fails the calling test if the ``[tool.uv]`` table or the
+        ``urllib3`` entry is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    constraints: list[str] = (
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in constraints:
+        requirement = Requirement(entry)
+        if requirement.name == "urllib3":
+            return requirement.specifier
+    pytest.fail(
+        "urllib3 has no entry in [tool.uv].constraint-dependencies of pyproject.toml"
+    )
+
+
+def _locked_urllib3_version() -> Version:
+    """Return the resolved ``urllib3`` version pinned in ``uv.lock``.
+
+    Returns:
+        The ``urllib3`` version resolved in the lockfile. Fails the
+        calling test if the lock has no ``urllib3`` package entry.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == "urllib3":
+            return Version(str(package["version"]))
+    pytest.fail("urllib3 has no [[package]] entry in uv.lock")
+
+
+def _pyjwt_constraint_specifier() -> SpecifierSet:
+    """Return the ``pyjwt`` specifier from uv constraints.
+
+    Reads ``[tool.uv].constraint-dependencies`` in ``pyproject.toml``,
+    the home for floors on transitive-only packages (DEP-003).
+
+    Returns:
+        The specifier set attached to the ``pyjwt`` constraint entry.
+        Fails the calling test if the ``[tool.uv]`` table or the
+        ``pyjwt`` entry is absent.
+    """
+    with _PYPROJECT.open("rb") as handle:
+        pyproject = tomllib.load(handle)
+    constraints: list[str] = (
+        pyproject.get("tool", {}).get("uv", {}).get("constraint-dependencies", [])
+    )
+    for entry in constraints:
+        requirement = Requirement(entry)
+        if requirement.name == "pyjwt":
+            return requirement.specifier
+    pytest.fail(
+        "pyjwt has no entry in [tool.uv].constraint-dependencies of pyproject.toml"
+    )
+
+
+def _locked_pyjwt_version() -> Version:
+    """Return the resolved ``pyjwt`` version pinned in ``uv.lock``.
+
+    Returns:
+        The ``pyjwt`` version resolved in the lockfile. Fails the
+        calling test if the lock has no ``pyjwt`` package entry.
+    """
+    with _UV_LOCK.open("rb") as handle:
+        lock = tomllib.load(handle)
+    packages: list[dict[str, object]] = lock["package"]
+    for package in packages:
+        if package["name"] == "pyjwt":
+            return Version(str(package["version"]))
+    pytest.fail("pyjwt has no [[package]] entry in uv.lock")
 
 
 def _python_multipart_constraint_specifier() -> SpecifierSet:
@@ -855,7 +1074,32 @@ def _is_pip_audit_command(tokens: list[str]) -> bool:
     """
     if any(token in _LOOKUP_BUILTINS for token in tokens):
         return False
-    return any(token.rsplit("/", maxsplit=1)[-1] == "pip-audit" for token in tokens)
+    if tokens and tokens[0] in _PROBE_COMMANDS:
+        return False
+    if any(token.rsplit("/", maxsplit=1)[-1] == "pip-audit" for token in tokens):
+        return True
+    return _runs_python_module(tokens, _PIP_AUDIT_MODULE)
+
+
+def _runs_python_module(tokens: list[str], module: str) -> bool:
+    """Return whether a tokenized command is ``python -m <module>``.
+
+    Args:
+        tokens: Shell tokens of a single command.
+        module: The importable module name, e.g. ``pip_audit``.
+
+    Returns:
+        ``True`` when the command executes ``module`` through the active
+        interpreter. Any ``python``-prefixed argv[0] counts, so
+        ``python3`` and an absolute interpreter path are both
+        recognised.
+    """
+    if len(tokens) < 3:
+        return False
+    interpreter = tokens[0].rsplit("/", maxsplit=1)[-1]
+    return (
+        interpreter.startswith("python") and tokens[1] == "-m" and tokens[2] == module
+    )
 
 
 def _pip_audit_invocations() -> list[list[str]]:
@@ -1239,6 +1483,142 @@ def test_locked_pydantic_settings_at_or_above_patched_release() -> None:
     )
 
 
+def test_idna_floor_rejects_vulnerable_releases() -> None:
+    """The constraint excludes 3.14, the last release the advisory covers.
+
+    idna 3.14 carries CVE-2026-45409 (GHSA-65pc-fj4g-8rjx /
+    PYSEC-2026-215), fixed in 3.15. 3.14 is a real published release —
+    the line runs 3.13, 3.14, 3.15, ... — so this probe is
+    non-vacuous rather than testing a version that never existed.
+    """
+    specifier = _idna_constraint_specifier()
+    assert str(_IDNA_LAST_VULNERABLE) not in specifier, (
+        f"idna constraint {specifier!r} admits {_IDNA_LAST_VULNERABLE}, the "
+        "last release carrying CVE-2026-45409 / GHSA-65pc-fj4g-8rjx / "
+        f"PYSEC-2026-215; the floor must be >={_IDNA_PATCHED_VERSION}"
+    )
+
+
+def test_idna_floor_accepts_patched_release() -> None:
+    """The constraint accepts 3.15, the first patched release.
+
+    The floor is the *advisory* number, not creek-tools' number.
+    creek-tools declares ``idna>=3.19`` because a floor there also
+    records the resolution that project runs (#1000); 3.15 is where the
+    fix lands. The two are deliberately different and must not be
+    "harmonised" — raising this floor to 3.19 would assert a
+    compatibility claim crawdad has never tested.
+    """
+    specifier = _idna_constraint_specifier()
+    assert str(_IDNA_PATCHED_VERSION) in specifier, (
+        f"idna constraint {specifier!r} rejects {_IDNA_PATCHED_VERSION}; the "
+        "patched release itself must satisfy the constraint"
+    )
+
+
+def test_locked_idna_at_or_above_patched_release() -> None:
+    """``uv.lock`` resolves idna to >= 3.15.
+
+    idna reaches this graph on three runtime edges — anyio, httpx, and
+    yarl behind discord.py → aiohttp — so a stale lock ships the
+    vulnerable parser into the bot's own HTTP path, not just a dev
+    tool.
+    """
+    locked = _locked_idna_version()
+    assert locked >= _IDNA_PATCHED_VERSION, (
+        f"uv.lock pins idna {locked}, below the patched "
+        f"{_IDNA_PATCHED_VERSION} (CVE-2026-45409 / GHSA-65pc-fj4g-8rjx); "
+        "the exported lock is audited, so relock after adding the constraint"
+    )
+
+
+def test_urllib3_floor_rejects_vulnerable_releases() -> None:
+    """The constraint excludes 2.6.3, which still carries both advisories.
+
+    urllib3 2.6.3 cleared the earlier CVE-2026-21441 but still carries
+    CVE-2026-44431 and CVE-2026-44432, both fixed in 2.7.0. Stopping at
+    ``>=2.6.3`` would look like a security floor and admit two live
+    advisories, so the probe pins the boundary rather than the general
+    direction.
+    """
+    specifier = _urllib3_constraint_specifier()
+    assert str(_URLLIB3_LAST_VULNERABLE) not in specifier, (
+        f"urllib3 constraint {specifier!r} admits {_URLLIB3_LAST_VULNERABLE}, "
+        "which still carries CVE-2026-44431 and CVE-2026-44432; the floor "
+        f"must be >={_URLLIB3_PATCHED_VERSION}"
+    )
+
+
+def test_urllib3_floor_accepts_patched_release() -> None:
+    """The constraint accepts 2.7.0, the first fully patched release."""
+    specifier = _urllib3_constraint_specifier()
+    assert str(_URLLIB3_PATCHED_VERSION) in specifier, (
+        f"urllib3 constraint {specifier!r} rejects {_URLLIB3_PATCHED_VERSION}; "
+        "the patched release itself must satisfy the constraint"
+    )
+
+
+def test_locked_urllib3_at_or_above_patched_release() -> None:
+    """``uv.lock`` resolves urllib3 to >= 2.7.0.
+
+    urllib3 is transitive here, but it is NOT the dev-only edge it
+    first looks like. crawdad declares ``google-genai`` in
+    ``[project].dependencies``, and both google-genai and google-auth
+    pull ``requests``, which pulls urllib3 — so the Gemini provider
+    reaches it on a runtime path. pip-audit and xenon reach it too;
+    those are the dev edges, and reading only those is what made the
+    package look exemptible while closing #1328.
+    """
+    locked = _locked_urllib3_version()
+    assert locked >= _URLLIB3_PATCHED_VERSION, (
+        f"uv.lock pins urllib3 {locked}, below the patched "
+        f"{_URLLIB3_PATCHED_VERSION} (CVE-2026-44431 / CVE-2026-44432); the "
+        "exported lock is audited, so relock after adding the constraint"
+    )
+
+
+def test_pyjwt_floor_rejects_vulnerable_releases() -> None:
+    """The constraint excludes 2.12.1, which still carries all five advisories.
+
+    pyjwt 2.12.1 carries CVE-2026-48522 through CVE-2026-48526, every
+    one of them fixed at 2.13.0. OSV's PYSEC-2026-176 record claims
+    ``fixed: 2.12.1`` while its own GHSA alias says 2.13.0; the floor
+    takes the higher number, so the disagreement cannot leave a hole.
+    """
+    specifier = _pyjwt_constraint_specifier()
+    assert str(_PYJWT_LAST_VULNERABLE) not in specifier, (
+        f"pyjwt constraint {specifier!r} admits {_PYJWT_LAST_VULNERABLE}, "
+        "which still carries CVE-2026-48522 through CVE-2026-48526; the "
+        f"floor must be >={_PYJWT_PATCHED_VERSION}"
+    )
+
+
+def test_pyjwt_floor_accepts_patched_release() -> None:
+    """The constraint accepts 2.13.0, the first fully patched release."""
+    specifier = _pyjwt_constraint_specifier()
+    assert str(_PYJWT_PATCHED_VERSION) in specifier, (
+        f"pyjwt constraint {specifier!r} rejects {_PYJWT_PATCHED_VERSION}; "
+        "the patched release itself must satisfy the constraint"
+    )
+
+
+def test_locked_pyjwt_at_or_above_patched_release() -> None:
+    """``uv.lock`` resolves pyjwt to >= 2.13.0.
+
+    pyjwt arrives through ``mcp -> pyjwt[crypto]``, the same edge that
+    pulls cryptography, and it is the library that would verify a
+    bearer token on the MCP surface this bot consumes. The exported
+    lock is what ``scripts/security.sh`` audits, so the constraint is
+    only half the guard.
+    """
+    locked = _locked_pyjwt_version()
+    assert locked >= _PYJWT_PATCHED_VERSION, (
+        f"uv.lock pins pyjwt {locked}, below the patched "
+        f"{_PYJWT_PATCHED_VERSION} (CVE-2026-48522 through CVE-2026-48526); "
+        "the exported lock is audited, so relock after adding the constraint"
+    )
+
+
 def test_python_multipart_floor_rejects_vulnerable_releases() -> None:
     """The constraint excludes 0.0.29 and the partial-fix 0.0.30.
 
@@ -1483,8 +1863,14 @@ def test_security_script_audits_installed_environment() -> None:
     honours neither ``uv.lock`` nor
     ``[tool.uv].constraint-dependencies``, so if a future edit ever
     reintroduces a live resolve, this is the pass that would notice —
-    the lock export below cannot. Only a bare ``pip-audit`` (one with no
-    ``-r`` / ``--requirement``) inspects what is actually installed.
+    the lock export below cannot. Only an audit with no ``-r`` /
+    ``--requirement`` inspects what is actually installed.
+
+    "Bare" here means bare of a requirements file, not bare of an
+    interpreter. Since #1671 the invocation is ``python -m pip_audit``:
+    a bare *executable* name is resolved by PATH, which silently
+    supplied Homebrew's copy when this project's environment had none,
+    auditing that interpreter instead of this one.
     """
     invocations = _pip_audit_invocations()
     assert invocations, (

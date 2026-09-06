@@ -22,9 +22,19 @@ committing with ``os.replace`` means a reader sees either the whole old
 file or the whole new one, never a splice of the two — the same
 hardening merged for the vault index in #1307.
 
+:func:`atomic_replace_path` is the same commit protocol for writers
+that will not hand over their bytes: a third-party writer given a
+*path* (``pyarrow.parquet.write_table``, say) opens and truncates the
+target itself, so there is no string or descriptor for
+:func:`atomic_write_text` to stage. This one yields a sibling scratch
+path for such a writer to fill and commits it on a clean exit, which is
+what keeps a killed ``creek link`` from destroying an
+``embeddings.parquet`` that cost a corpus-wide embed to produce
+(#1441).
+
 Near-identical private implementations already exist at
-``creek/vault/writer.py:392`` (``_atomic_write_text``) and
-``creek/redact/cli_commands.py:531`` (``_atomic_write``). Converging
+``creek/vault/writer.py:476`` (``_atomic_write_text``) and
+``creek/redact/cli_commands.py:597`` (``_atomic_write``). Converging
 them onto this helper is deliberate follow-up work, not part of #1312:
 each carries call-site-specific behaviour (a ``mkdir`` in the former, a
 symlink-materialisation contract in the latter) that has to be unpicked
@@ -41,6 +51,10 @@ import errno
 import os
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 _EXCLUSIVE_CREATE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL
 """Create-or-fail open flags: never truncates or clobbers an existing file."""
@@ -200,6 +214,87 @@ def atomic_write_text(path: Path, content: str) -> None:
         # the existence check is what makes this cleanup a no-op on the
         # happy path rather than a spurious ``FileNotFoundError``.
         tmp_path = Path(tmp_name)
+        if tmp_path.exists():
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+
+
+def _fsync_path(path: Path) -> None:
+    """Flush *path*'s already-written bytes from the page cache to disk.
+
+    Opened read-only on purpose: ``fsync`` needs a descriptor, not write
+    access, and reopening for writing would risk truncating a file some
+    other writer has just finished filling.
+
+    Args:
+        path: An existing file whose contents must be durable.
+
+    Raises:
+        OSError: From the open or the flush, propagated untouched.
+    """
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def atomic_replace_path(path: Path) -> Iterator[Path]:
+    """Yield a sibling scratch path, then commit it over *path*.
+
+    For writers that take a *path* rather than bytes or a descriptor,
+    which is why :func:`atomic_write_text` cannot serve them: a library
+    such as ``pyarrow.parquet.write_table`` opens and truncates the
+    destination itself, so pointing it at the real artifact destroys the
+    previous one the instant the write begins — and a crash, a full disk
+    or a ``SIGKILL`` part-way through then leaves nothing behind. Here
+    the writer only ever touches the scratch file; the real path is
+    swapped in with ``os.replace`` once the body returns cleanly, so a
+    failure leaves the previous artifact byte-intact.
+
+    The scratch file is a sibling of the target because ``os.replace``
+    raises ``EXDEV`` across filesystems, and it is removed on both the
+    success and the failure path so repeated failures cannot litter the
+    directory. Its bytes are ``fsync``ed *before* the rename: committing
+    a name to contents the kernel has not yet written back would trade a
+    durable artifact for one a power loss can still empty.
+
+    As with :func:`atomic_write_text`, the committed file inherits
+    ``mkstemp``'s owner-only 0o600 rather than the writer's usual mode,
+    and the parent directory must already exist.
+
+    Args:
+        path: Artifact to replace. Its parent directory must exist and be
+            writable, because the scratch file is created there.
+
+    Yields:
+        The scratch path for the caller's writer to fill. It exists (and
+        is empty) on entry, so a writer that refuses to create files
+        still has a target.
+
+    Raises:
+        OSError: Propagated untouched from the staging create, the
+            ``fsync`` or the rename. A failure to remove the scratch file
+            is suppressed so the caller still sees the original error.
+    """
+    # ``mkstemp`` runs outside the ``try`` for the same reason as in
+    # :func:`atomic_write_text`: a failure there leaves nothing to clean
+    # up and ``tmp_name`` unbound.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        yield tmp_path
+        _fsync_path(tmp_path)
+        os.replace(tmp_name, path)
+    finally:
+        # A successful ``os.replace`` consumes the scratch name, and a
+        # writer that cleans up after its own failure may already have
+        # removed it, so the existence check is what keeps this a no-op
+        # rather than a spurious ``FileNotFoundError``.
         if tmp_path.exists():
             with contextlib.suppress(OSError):
                 tmp_path.unlink()

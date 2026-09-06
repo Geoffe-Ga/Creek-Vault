@@ -1,0 +1,96 @@
+{
+  "$defs": {
+    "VoiceDraftAttribution": {
+      "additionalProperties": false,
+      "description": "The fixed attribution of every remotely stored Voice Draft.\n\nAll three fields are literals with defaults, so a producer can construct\nthe one valid value with no caller input and a consumer cannot mistake an\nAI-authored draft for owner voice.",
+      "properties": {
+        "author": {
+          "const": "ai",
+          "default": "ai",
+          "description": "Always AI; owner authorship is inexpressible.",
+          "title": "Author",
+          "type": "string"
+        },
+        "author_slug": {
+          "const": "ai-as-user",
+          "default": "ai-as-user",
+          "description": "Reserved Creek other-author namespace.",
+          "title": "Author Slug",
+          "type": "string"
+        },
+        "voice_weight": {
+          "const": 0,
+          "default": 0,
+          "description": "Always zero; the draft never trains the owner's voice.",
+          "title": "Voice Weight",
+          "type": "integer"
+        }
+      },
+      "title": "VoiceDraftAttribution",
+      "type": "object"
+    },
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:func:`creek_mcp.policy.admitted_ceiling` refuses any remote call declaring\na ceiling outside :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` *before\ndispatch*. Since #1073 that decision is transport-neutral, so every adapter\nis meant to reach it the same way; the MCP surface does so today through\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool`, and #1074 mounts the\n``/v1`` handlers that will. This enum mirrors that frozenset, so\n``intimate`` and ``all`` are not merely refused at runtime \u2014 they cannot be\nconstructed at all, which is the half of the guarantee that does not depend\non a handler remembering to ask.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "One persisted Voice Draft recalled by its external id.",
+  "properties": {
+    "attribution": {
+      "$ref": "#/$defs/VoiceDraftAttribution",
+      "description": "Fixed AI attribution and zero voice weight."
+    },
+    "content": {
+      "description": "Stored AI-authored markdown.",
+      "title": "Content",
+      "type": "string"
+    },
+    "external_id": {
+      "description": "Consumer-owned durable identity.",
+      "title": "External Id",
+      "type": "string"
+    },
+    "fragment_id": {
+      "description": "Stable vault-side fragment identity.",
+      "title": "Fragment Id",
+      "type": "string"
+    },
+    "status": {
+      "const": "ok",
+      "description": "Always ok; failure is an error.",
+      "title": "Status",
+      "type": "string"
+    },
+    "tier": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Persisted privacy tier."
+    },
+    "tier_ceiling": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Ceiling the call ran at."
+    },
+    "title": {
+      "description": "Stored draft title.",
+      "title": "Title",
+      "type": "string"
+    }
+  },
+  "required": [
+    "status",
+    "tier_ceiling",
+    "external_id",
+    "fragment_id",
+    "title",
+    "content",
+    "tier",
+    "attribution"
+  ],
+  "title": "VoiceDraftReadResponse",
+  "type": "object"
+}

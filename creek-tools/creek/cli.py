@@ -20,6 +20,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from creek._containment import EscapingSymlinkError, assert_source_contained
+from creek.author.models import ZERO_EVIDENCE_WARNING, has_zero_evidence
 from creek.classify.privacy_filter import (
     PrivacyTierOverride,
     override_elevates,
@@ -2834,7 +2835,13 @@ def classify(
         f"{summary.total} fragment(s) "
         f"({summary.preserved_manual} manual preserved, "
         f"{summary.preserved_llm} previously LLM-classified preserved, "
-        f"{summary.skipped_high_confidence} skipped, "
+        # Issue #1356: one "N skipped" number used to cover both reasons the
+        # LLM did not classify a fragment. They call for opposite next moves —
+        # a rule-confident skip means the run went well, a failed call means
+        # the corpus is under-classified — so each is labelled and reported
+        # even at zero.
+        f"{summary.skipped_high_confidence} skipped (rules confident), "
+        f"{summary.llm_call_failed} skipped (LLM call failed), "
         # Issue #876: tier assignment is orthogonal to the classification
         # method — preserved fragments get one too — so it is reported as
         # its own count rather than folded into "classified".
@@ -2850,7 +2857,12 @@ def classify(
         # tier-assignment count above, so "my vault has no pre-#974
         # mis-stamps" is an answer the operator can actually read rather
         # than an absence they have to infer.
-        f"{summary.retiered} re-tiered"
+        f"{summary.retiered} re-tiered, "
+        # Issue #1357: also reported at zero. A non-zero value is the only
+        # place an operator learns their vault held fragments claiming an
+        # LLM classification that never ran — every other count reads them
+        # as already done.
+        f"{summary.healed_unearned_llm} unearned llm stamp(s) healed"
         ").[/bold green]",
     )
     if summary.errors:
@@ -3391,12 +3403,19 @@ class _FillGapCounts:
             for an explicit ``unclassified``, ``untiered`` already reads
             35,330 on the 35k-fragment demo vault. A retier count folded
             into that number could not be seen at all.
+        unearned_llm: Fragments carrying a ``classification_method: llm``
+            that the pre-#1358 weighted soft-failure path wrote without any
+            LLM having run (#1357). Its own count for the same reason as
+            :attr:`retierable`: these are a *subset* of the fragments an
+            operator would call classified, and folding them into any other
+            number hides the one population that is stranded.
     """
 
     untiered: int
     praxis_backfillable: int
     tags_backfillable: int
     retierable: int
+    unearned_llm: int
 
 
 def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
@@ -3438,6 +3457,15 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
     and merging the two would bury this count inside a number that already
     reads 35,330 on the demo vault.
 
+    The unearned-``llm`` detector (#1357) is the fifth, and the only one
+    whose population is *invisible* to every other count: a poisoned
+    fragment reads as classified everywhere else. Its proof is the
+    three-fact conjunction
+    :func:`~creek.classify.provenance_pass.has_unearned_llm_stamp` holds —
+    an ``llm`` stamp over a weighted block that is exactly the empty
+    default over a flattened legacy classification, which is the artifact
+    of a soft-failed weighted call and nothing else.
+
     The imports are function-local (like the rest of this module's) so a
     bare ``creek --help`` never pays to import the classification stack.
 
@@ -3451,6 +3479,7 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
     from creek.classify.praxis_pass import detect
     from creek.classify.privacy import PrivacyClassifier
     from creek.classify.privacy_pass import needs_retier, needs_tier
+    from creek.classify.provenance_pass import has_unearned_llm_stamp
     from creek.classify.tags_pass import has_unrecorded_tags
     from creek.vault.reader import iter_vault_fragments
 
@@ -3461,6 +3490,7 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
     backfillable = 0
     untagged = 0
     retierable = 0
+    unearned_llm = 0
     for _path, fragment, body, raw in iter_vault_fragments(
         vault_path / "01-Fragments",
     ):
@@ -3473,11 +3503,14 @@ def _scan_fill_gaps(vault_path: Path) -> _FillGapCounts:
             untagged += 1
         if needs_retier(fragment, body, raw=raw, classifier=privacy):
             retierable += 1
+        if has_unearned_llm_stamp(fragment, raw):
+            unearned_llm += 1
     return _FillGapCounts(
         untiered=untiered,
         praxis_backfillable=backfillable,
         tags_backfillable=untagged,
         retierable=retierable,
+        unearned_llm=unearned_llm,
     )
 
 
@@ -3602,6 +3635,31 @@ def _count_retierable_fragments(
     if scan is None:
         scan = _scan_fill_gaps(vault_path)
     return scan.retierable
+
+
+def _count_unearned_llm_fragments(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> int:
+    """Count fragments claiming an LLM classification that never happened.
+
+    The #1357 population: fragments a pre-#1358 weighted run stamped
+    ``classification_method: llm`` after the LLM call failed soft. See
+    :func:`~creek.classify.provenance_pass.has_unearned_llm_stamp` for the
+    on-disk signature and why it cannot match a genuine classification.
+
+    Args:
+        vault_path: Vault root.
+        scan: An already-completed :func:`_scan_fill_gaps` result to read
+            the answer out of. Omit it to walk the vault here.
+
+    Returns:
+        The number of mis-stamped fragments; ``0`` when the vault has no
+        ``01-Fragments`` directory at all.
+    """
+    if scan is None:
+        scan = _scan_fill_gaps(vault_path)
+    return scan.unearned_llm
 
 
 def _hint_untiered_fragments(
@@ -3771,6 +3829,49 @@ def _hint_retier(
     )
 
 
+def _hint_unearned_llm(
+    vault_path: Path,
+    scan: _FillGapCounts | None = None,
+) -> None:
+    """Print the nudge for fragments mis-stamped ``llm`` by #1330.
+
+    Its own line and its own guard, like every sibling above: a failing
+    count here must not silence the others.
+
+    The population is *invisible* without this line. A poisoned fragment
+    reports as classified to every other surface — ``creek classify``
+    counts it under ``previously LLM-classified preserved``, the vault
+    statistics count it as done — while carrying an ``unclassified``
+    verdict that no ordinary run will ever revisit.
+
+    The named remedy is a plain ``creek classify --method llm``, **not**
+    ``--force``: since #1357 the engine refuses to honour an unearned
+    stamp, so the ordinary run picks up exactly these fragments and leaves
+    every already-good one alone rather than re-paying for the vault.
+
+    Reports a **count only**, never a fragment id — the config-oracle rule
+    (#846 / #848) that binds every hint on this path.
+
+    Args:
+        vault_path: Vault root.
+        scan: The shared vault walk, when one already succeeded.
+    """
+    try:
+        mis_stamped = _count_unearned_llm_fragments(vault_path, scan)
+    except Exception as exc:
+        logger.warning("fill: skipping unearned-llm hint: %s", exc)
+        return
+    if mis_stamped == 0:
+        return
+    console.print(
+        f"[dim][fill] {mis_stamped} fragment(s) are stamped "
+        "`classification_method: llm` for a weighted LLM call that failed "
+        "and classified nothing (#1330) — they read as done while holding "
+        "an `unclassified` verdict. Run `creek classify --method llm` (no "
+        "--force) to re-classify just those.[/dim]",
+    )
+
+
 def _run_classify_upgrade(vault_path: Path, config: CreekConfig) -> None:
     """Re-classify ``rules`` fragments via the LLM, preserving manual/llm.
 
@@ -3797,7 +3898,8 @@ def _maybe_upgrade_classification(
     without a prompt; an interactive TTY prompts ``[y/N]`` (default No).
 
     The #876 untiered-fragment hint, the #877 praxis-backfill hint, the
-    #878 tags-backfill hint and the #1106 retier hint all fire first,
+    #878 tags-backfill hint, the #1106 retier hint and the #1357
+    unearned-``llm`` hint all fire first,
     ahead of every early return: the
     vault that most needs them (rules-classified, no LLM reachable, every
     fragment untiered) is exactly the one where there is no upgrade to offer.
@@ -3809,6 +3911,7 @@ def _maybe_upgrade_classification(
     _hint_praxis_backfill(vault_path, gaps)
     _hint_tags_backfill(vault_path, gaps)
     _hint_retier(vault_path, gaps)
+    _hint_unearned_llm(vault_path, gaps)
     try:
         offer = _detect_classify_upgrade(vault_path, config)
     except Exception as exc:
@@ -6539,6 +6642,13 @@ def _emit_author_result(draft: AuthoredDraft) -> None:
         f"medium={draft.medium} verdict={draft.verdict} "
         f"rounds={draft.rounds} provenance={len(draft.provenance)}",
     )
+    # #1261: `provenance=0` above is technically a signal and practically not
+    # one -- it names a count, not a cause, and the only other hint was a
+    # lowercase `(no grounded evidence)` fallback inside the body. Say plainly
+    # what happened and what to do about it. The filter is unchanged: #1079
+    # settled that a missing tier resolves restrictively.
+    if has_zero_evidence(draft):
+        console.print(f"[yellow]{ZERO_EVIDENCE_WARNING}[/yellow]")
     leaks = [hit for hit in draft.findings if hit.dimension == _PRIVACY_DIMENSION]
     if not leaks:
         console.print(draft.body)
@@ -7706,8 +7816,9 @@ def _build_compost_verifier(config: CreekConfig) -> SupportsVerifyCompost | None
     # (#646) and gate on availability so any backend (Ollama / OpenAI / Gemini /
     # Anthropic) degrades the same way. A cloud provider validates its env in the
     # constructor and may raise (build_provider contract); a local provider
-    # constructs but reports ``available is False`` when its host is down — both
-    # fall back to embedding-only scoring.
+    # constructs but reports ``available is False`` when its host is down or its
+    # configured model is not installed — both fall back to embedding-only
+    # scoring.
     #
     # No tier argument, and this is *not* the same class of site as the
     # `creek compile` bug (#962). The only call site is
@@ -7730,7 +7841,8 @@ def _build_compost_verifier(config: CreekConfig) -> SupportsVerifyCompost | None
     if not provider.available:
         console.print(
             "[yellow]Skipping LLM verifier — provider prerequisites unmet "
-            "(missing key/consent, or local host unreachable).[/yellow]",
+            "(missing key/consent, local host unreachable, or configured model "
+            "not installed).[/yellow]",
         )
         return None
     return LLMCompostVerifier(provider=provider)
@@ -7797,7 +7909,8 @@ def _refuse_scan_without_verifier(detail: str) -> NoReturn:
     console.print(f"[red]Cannot verify compost candidates: {detail}[/red]")
     console.print(
         "Set the provider credentials (API key + CREEK_CLOUD_CONSENT=1 for a "
-        "cloud provider, or start the local host), or re-run with "
+        "cloud provider), or start the local host and install its configured "
+        "model; alternatively, re-run with "
         "[bold]--no-llm[/bold] to file unverified candidates to the review "
         "queue instead.",
     )
@@ -7849,7 +7962,7 @@ def _build_scan_verifier(config: CreekConfig) -> SupportsVerifyCompost:
     if not provider.available:
         _refuse_scan_without_verifier(
             "provider prerequisites unmet (missing API key, missing cloud "
-            "consent, or local host unreachable)",
+            "consent, local host unreachable, or configured model not installed)",
         )
     return LLMCompostVerifier(provider=provider)
 

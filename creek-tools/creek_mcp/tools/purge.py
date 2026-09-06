@@ -86,6 +86,25 @@ token, is out of the Adepthood surface per the contract ADR, and
 appears in no route or published schema.
 """
 
+_MAX_DELETED_FILE_PATHS: Final = 100
+"""How many deleted paths :func:`_result_payload` forwards before capping.
+
+Since #1340 ``PurgeResult.deleted_files`` holds one entry per destroyed
+file rather than one per top-level folder, and those filenames are
+title-derived — so on a 35k-fragment vault this list is megabytes of
+content dropped into the calling model's context, over a protocol
+boundary that has no other bound on a response.
+
+Deliberately its own number rather than a shared one with
+``creek.cli._MAX_DELETED_FILE_ROWS`` (20), which bounds the same list for
+a different reader and a different reason: twenty rows is what keeps a
+terminal table from pushing the counts off screen. A model reading a
+structured payload can hold more than a scrollback can show, and tying
+the two together would mean tuning one surface silently retunes the
+other. What the two DO share is the rule that makes either safe: the
+remainder is always stated, never silently dropped.
+"""
+
 
 def _refusal(
     *,
@@ -171,10 +190,25 @@ def _result_payload(
     (call outcome, including refusals the engine never saw), and the
     wire meaning of ``status`` must not shift under an existing client.
 
+    ``deleted_files`` is the one field the dump does not forward whole
+    (#1454): it is capped at :data:`_MAX_DELETED_FILE_PATHS`, with
+    ``deleted_files_total`` carrying the real count and
+    ``deleted_files_truncated`` saying outright that the list is short.
+    Capping is not the hand-picking #1246 removed — every field still
+    reaches the caller, and no field can go missing by omission — but a
+    truncated erasure record that does not admit it is truncated would
+    be a worse defect than the flood it replaces, hence two keys rather
+    than one: a caller holding a hundred paths has no reason to go
+    looking for a length to compare.
+
     See :data:`_ENGINE_STATUS_TO_WIRE` for the two success spellings.
     """
+    total = len(result.deleted_files)
     return {
         **result.model_dump(mode="json"),
+        "deleted_files": result.deleted_files[:_MAX_DELETED_FILE_PATHS],
+        "deleted_files_total": total,
+        "deleted_files_truncated": total > _MAX_DELETED_FILE_PATHS,
         "status": _ENGINE_STATUS_TO_WIRE[result.outcome_status],
         "tool": tool,
     }

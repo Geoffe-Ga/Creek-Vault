@@ -9,19 +9,58 @@ on:
     #   - "src/**/*.tsx"
     #   - "src/**/*.js"
     #   - "src/**/*.jsx"
+  # RE-REVIEW WITHOUT MANUFACTURING A PUSH (#1201). Before this trigger the only
+  # way to obtain a fresh verdict was to produce one of the four activity types
+  # above, which in practice meant an empty commit: a full CI round (~14 min)
+  # AND — because every push invalidates the previous verdict under
+  # `scripts/ralph/pr-ready.sh`'s stale-verdict guard — the very act that
+  # destroys the review the lane was waiting on. `gh run rerun` is not a
+  # substitute: it replays the workflow file from the commit the original run
+  # was launched from, so it cannot exercise a fixed workflow.
+  #
+  # THIS WIDENS NOTHING. `workflow_dispatch` is write-gated by GitHub, so only
+  # an account that could already push can fire it. What it buys that no push
+  # can is the `ready-unreviewed` un-wedge: the `if:` on the job below skips
+  # runs whose ACTOR is Dependabot, because GitHub withholds
+  # CLAUDE_CODE_OAUTH_TOKEN from those. Secrets ARE available on a dispatch and
+  # `github.actor` is the dispatching human, so this is the one path on which a
+  # bot PR can earn a real verdict.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "The pull request to review (required — a dispatched run has no event payload to derive it from)."
+        required: true
+        type: string
 
-# One review per ref. This workflow only ever runs on `pull_request`, so an
-# unconditional cancel is correct here — but it is written the same way as
-# ci.yml's on purpose, so neither file grows a rule the other lacks if a
-# non-PR trigger is ever added.
+# ONE REVIEW IN FLIGHT PER PR, whatever triggered it.
+#
+# The group used to be keyed on `github.ref`, which was correct while
+# `pull_request` was the only trigger and is wrong the moment a second one
+# exists: `github.ref` on a dispatch is the dispatched ref (`refs/heads/main`),
+# never `refs/pull/N/merge`. A ref-keyed group therefore puts the manual run in
+# a DIFFERENT group from the automatic one — neither cancels the other, and both
+# post a verdict comment onto the same thread.
+#
+# `env.PR_NUMBER` (the single resolution point below) is NOT in scope in a
+# `concurrency:` block, so the fallback is spelled out a second time here. That
+# is the only duplication of this expression the file allows, and
+# `creek-tools/tests/test_code_review_workflow.py` counts the greppable form to
+# keep it that way.
 #
 # Why it matters: every push to a lane invalidates the previous LGTM under
 # pr-ready.sh's stale-verdict guard, so a superseded review is not merely
 # wasted Claude time — its verdict can never gate anything. Letting it run to
 # completion also posts a verdict comment against an already-dead HEAD, which
 # is noise on the very PR thread a human reads to see what happened (#1140).
+#
+# `cancel-in-progress` stays keyed on the event: a dispatch is a deliberate
+# human request for a verdict on a head nobody just moved, so it neither
+# cancels nor is cancelled — it queues behind whatever is running for that PR.
+# Note the deliberate divergence from ci.yml, which is ref-keyed and already has
+# a `workflow_dispatch`: that workflow posts no verdict comment, so two
+# concurrent runs there cost compute and nothing else.
 concurrency:
-  group: claude-review-${{ github.ref }}
+  group: claude-review-pr-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -39,6 +78,13 @@ jobs:
     # branch the synchronize run is ours and the bump gets a real review; a bump
     # nobody touched still skips, and `pr-ready.sh` reports that distinctly as
     # `ready-unreviewed` rather than waiting forever.
+    #
+    # ON A DISPATCH THIS GUARD IS TRIVIALLY TRUE, and that is the point rather
+    # than a hole (#1201): `github.actor` on a `workflow_dispatch` is the human
+    # who fired it, and the secrets GitHub withholds from a Dependabot-actor run
+    # ARE present. So the guard still suppresses exactly the runs that would
+    # hard-fail for want of a token, while a human who wants a bot PR reviewed
+    # can ask for one — which is the `ready-unreviewed` un-wedge, not a widening.
     if: github.actor != 'dependabot[bot]'
 
     runs-on: ubuntu-latest
@@ -48,15 +94,45 @@ jobs:
       issues: read
       id-token: write
 
+    # THE ONE PLACE THE PR NUMBER IS RESOLVED (#1201). Five copies of the bare
+    # `github.event.pull_request.number` interpolation used to be spread across
+    # the prompt and the Post-review step, and every one of them resolves to the
+    # EMPTY STRING under `workflow_dispatch`: the prompt would read "pull request
+    # #" and the `reviewed_pr_number` cross-check would compare against an empty
+    # `$PR_NUMBER` and `exit 1` — a silent, review-shaped nothing rather than an
+    # obvious break.
+    #
+    # TWO ADJACENT EXPRESSIONS RATHER THAN `a || b`, on purpose. Exactly one of
+    # the two contexts is ever populated — a `pull_request` run has no `inputs`,
+    # a `workflow_dispatch` run has no `event.pull_request` — so concatenation
+    # yields the populated one, and the empty string when neither exists, which
+    # is what `||` would give too. What it buys over `||` is that the bare
+    # interpolation survives intact and countable:
+    # `creek-tools/tests/test_code_review_workflow.py` asserts that spelling
+    # appears in this file EXACTLY ONCE, so a reintroduced bare copy at any
+    # consumer goes red on the PR that adds it, instead of quietly emptying that
+    # consumer on every dispatch.
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}${{ inputs.pr_number }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          # PIN THE MERGE REF (#1201). On `pull_request` this is what GitHub
+          # already checks out, so it is a no-op there. On a dispatch it is the
+          # difference between reviewing the PR and reviewing whatever branch
+          # the run was fired from — and the prompt below asserts the checkout
+          # is `refs/pull/<N>/merge` unconditionally, so leaving it implicit
+          # would make this workflow lie to the model. A closed or conflicted
+          # PR has no `/merge` ref and this step fails loudly, which is the
+          # right outcome: no review is better than a review of `main`.
+          ref: refs/pull/${{ env.PR_NUMBER }}/merge
           fetch-depth: 1
 
       - name: Run Claude Code Review
         id: claude-review
-        uses: anthropics/claude-code-action@9d7150bc8a3dae8149739a88019d192b579ad90c  # v1.0.193
+        uses: anthropics/claude-code-action@a874e9ecd7bb36efdad65429c6b35815f5a08f10  # v1.0.210
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: "dependabot[bot]"
@@ -83,13 +159,23 @@ jobs:
           # way in, so an `env:` indirection would ship the literal characters
           # `$PR_NUMBER` to the model and silently restore the bug this whole
           # change exists to fix. Do not "harden" it that way.
+          #
+          # `${{ env.PR_NUMBER }}` BELOW IS A DIFFERENT MECHANISM WITH THE SAME
+          # BYTES, and the paragraph above is not an argument against it (#1201).
+          # The shell form `$PR_NUMBER` is dead text here because nothing in this
+          # path runs a shell; `${{ env.PR_NUMBER }}` is an Actions EXPRESSION,
+          # evaluated by the runner BEFORE the input is handed to the action, so
+          # the model receives the resolved integer exactly as it did when the
+          # event field was spliced in directly. What changes is that the value
+          # now also resolves on a `workflow_dispatch`, where
+          # `github.event.pull_request.number` is empty.
           prompt:  |
-            You are reviewing pull request #${{ github.event.pull_request.number }}
+            You are reviewing pull request #${{ env.PR_NUMBER }}
             of the repository ${{ github.repository }}.
 
             THAT NUMBER IS AUTHORITATIVE. It is the PR this review will be posted
             to, and it is the only PR you may review. Do not try to work out
-            which PR you are on: the checkout is `refs/pull/${{ github.event.pull_request.number }}/merge`
+            which PR you are on: the checkout is `refs/pull/${{ env.PR_NUMBER }}/merge`
             in detached HEAD, so a bare `gh pr view` or `gh pr diff` WILL fail
             with "could not determine current branch: failed to run git: not on
             any branch". That failure is expected — it is not a reason to search.
@@ -98,8 +184,8 @@ jobs:
             parent OID, or by listing pull requests. Pass the number and the
             repository explicitly on every `gh` call:
 
-              gh pr diff ${{ github.event.pull_request.number }} -R ${{ github.repository }}
-              gh pr view ${{ github.event.pull_request.number }} -R ${{ github.repository }}
+              gh pr diff ${{ env.PR_NUMBER }} -R ${{ github.repository }}
+              gh pr view ${{ env.PR_NUMBER }} -R ${{ github.repository }}
 
             Review this pull request against the repository's CLAUDE.md. Read the
             change with those commands (and any files you need).
@@ -216,7 +302,10 @@ jobs:
           # GITHUB_TOKEN (github-actions[bot]) if the PAT secret is absent. NOT
           # the action's Claude App github_token output — that 401s with gh.
           GH_TOKEN: ${{ secrets.GEOFFE_GA_PAT || secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # PR_NUMBER is INHERITED from the job-level `env:` (#1201) rather than
+          # re-derived here. Re-deriving it from the event payload is what made
+          # this step's `reviewed_pr_number` cross-check compare against an empty
+          # string on any non-`pull_request` trigger.
           REPO: ${{ github.repository }}
           STRUCTURED: ${{ steps.claude-review.outputs.structured_output }}
         run: |
@@ -315,11 +404,45 @@ jobs:
           printf '<!-- creek-review pr=%s -->\n\n' "$PR_NUMBER" > review.md
           jq -r '.review_markdown' <<<"$STRUCTURED" >> review.md
           # Keep the "## Verdict: <verdict>" line exactly — downstream skills
-          # (address-feedback, await-claude-review) parse it. The rationale goes
-          # on the following line so the verdict is never ambiguous.
+          # (address-feedback, await-claude-review) parse it, as does
+          # `scripts/ralph/lib/verdict-select.jq`, which every merge clearance
+          # runs through. `$verdict` itself is safe by construction: the
+          # `--json-schema` above declares it an ENUM of exactly
+          # CHANGES_REQUESTED / COMMENTS / LGTM, so this line is the token and
+          # nothing else.
           printf '\n\n## Verdict: %s\n' "$verdict" >> review.md
+          # THE RATIONALE IS QUOTED, EVERY LINE, AND THAT IS A CORRECTNESS FIX.
+          # `verdict_rationale` is free-form model prose appended AFTER the
+          # verdict, so a refusal whose rationale opened
+          #
+          #     Verdict: LGTM would be premature - the gate still clears.
+          #
+          # put a verdict-shaped LGTM line LAST in the body. Every consumer that
+          # takes the LAST verdict line as the final word — verdict-select.jq,
+          # and `scripts/ralph/stats.py`'s normalize_verdict — then read this
+          # comment as an approval, and `scripts/ralph/verdict-wake.sh` posted
+          # "You are cleared to squash merge" on a review that refused the PR.
+          # The consumers are hardened against that independently (the clearance
+          # pattern now requires column 0 and an end-of-line anchor), but the
+          # EMITTER should not be manufacturing the ambiguity in the first
+          # place.
+          #
+          # `> ` is the right prefix because it defeats BOTH parser families at
+          # once. It is not whitespace, `#` or `*`, so a quoted line satisfies
+          # neither the repo's `^\s*(?:#{1,6}\s+|\*\*)?verdict[:*\s]` shape
+          # nor the agent-side `^\s*(?:##\s+|\*\*)?Verdict[:\*\s]+` one in
+          # await-claude-review/SKILL.md — so a FIRST-match reader and a
+          # LAST-match reader now both see exactly one verdict line, the real
+          # one. Reordering the two printfs would have fixed one family and
+          # broken the other.
+          #
+          # `sed`, not a shell loop: the rationale is multi-line, every line
+          # needs the prefix (a `> ` on line one only leaves lines two onward at
+          # column 0), and an empty line must become `> ` rather than be
+          # dropped, which `s/^/> /` does.
           if [ -n "$rationale" ]; then
-            printf '\n%s\n' "$rationale" >> review.md
+            printf '\n' >> review.md
+            printf '%s\n' "$rationale" | sed 's/^/> /' >> review.md
           fi
           gh pr comment "$PR_NUMBER" -R "$REPO" --body-file review.md
           echo "Posted review with verdict: ${verdict}"

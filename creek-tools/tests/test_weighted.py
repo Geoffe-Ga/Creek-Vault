@@ -1182,7 +1182,7 @@ class TestClassifyEngineWiring:
         # Patch the classifier-availability + invoke_prompt seam used
         # by ``classify_weighted`` so no live provider is needed and a
         # canned response anchors the assertions.
-        from creek.classify.classify_engine import _classify_one
+        from creek.classify.classify_engine import ClassifyOutcome, _classify_one
         from creek.classify.rules import RuleClassifier
 
         fake_invoke[0] = _weighted_yaml_payload()
@@ -1215,7 +1215,7 @@ class TestClassifyEngineWiring:
                 raise AssertionError(msg)
 
         stub_llm = _StubLLM(llm_config)
-        updated, was_skipped, reasoning = _classify_one(
+        updated, outcome, reasoning = _classify_one(
             fragment=fragment,
             body="A short body that mentions a Red Frequency phenomenon.",
             method="llm",
@@ -1234,7 +1234,7 @@ class TestClassifyEngineWiring:
         assert updated.frequency.primary == "F3"
         assert updated.wavelength.phase == "rising"
         # And the rest of the contract: not skipped, reasoning carries.
-        assert was_skipped is False
+        assert outcome is ClassifyOutcome.CLASSIFIED
         assert "F3 / Red" in reasoning
 
     def test_rule_confident_short_circuit_leaves_weighted_none(
@@ -1245,12 +1245,12 @@ class TestClassifyEngineWiring:
 
         When the rule classifier already clears the confidence floor,
         ``_classify_one`` returns the rule result with
-        ``was_skipped=True`` *before* dispatching to either the legacy
+        ``ClassifyOutcome.RULES_SUFFICED`` *before* dispatching to either the legacy
         or weighted LLM paths. ``Fragment.weighted`` therefore stays
         ``None`` even when ``weighted_classification`` is on. This
         preserves the FEAT-017 cost gate.
         """
-        from creek.classify.classify_engine import _classify_one
+        from creek.classify.classify_engine import ClassifyOutcome, _classify_one
 
         fragment = Fragment(
             id="frag-conf0000001",
@@ -1305,7 +1305,7 @@ class TestClassifyEngineWiring:
                 raise AssertionError(msg)
 
         stub_llm = _DispatchedLLM(llm_config)
-        updated, was_skipped, reasoning = _classify_one(
+        updated, outcome, reasoning = _classify_one(
             fragment=fragment,
             body="(test body)",
             method="llm",
@@ -1316,7 +1316,7 @@ class TestClassifyEngineWiring:
         )
 
         # The rule path took the fragment; weighted stays None.
-        assert was_skipped is True
+        assert outcome is ClassifyOutcome.RULES_SUFFICED
         assert updated.weighted is None
         assert reasoning == ""
         # And the weighted LLM stub was never called.
@@ -1430,7 +1430,7 @@ def _run_weighted(
     """
     from creek.classify.classify_engine import _classify_one
 
-    updated, _skipped, _reasoning = _classify_one(
+    updated, _outcome, _reasoning = _classify_one(
         fragment=fragment,
         body=body,
         method="llm",
@@ -1566,7 +1566,7 @@ class TestWeightedPrivacyParity:
             "creek.classify.llm.LLMClassifier._invoke_llm",
             new=lambda self, prompt: _SINGLE_PICK_CONFESSIONAL_RESPONSE,
         ):
-            single_out, _skipped, _reasoning = _classify_one(
+            single_out, _outcome, _reasoning = _classify_one(
                 fragment=fragment,
                 body=_RULE_INERT_BODY,
                 method="llm",
@@ -1834,9 +1834,9 @@ class TestSucceededButEmptyProfile:
             confidences="",
         )
 
-        from creek.classify.classify_engine import _classify_one
+        from creek.classify.classify_engine import ClassifyOutcome, _classify_one
 
-        updated, was_skipped, _reasoning = _classify_one(
+        updated, outcome, _reasoning = _classify_one(
             fragment=fragment,
             body=_RULE_INERT_BODY,
             method="llm",
@@ -1859,7 +1859,7 @@ class TestSucceededButEmptyProfile:
             overall_confidence=0.7,
             reasoning="The fragment lands at F3 / Red, rising into expression.",
         )
-        assert was_skipped is False
+        assert outcome is ClassifyOutcome.CLASSIFIED
 
 
 class TestWeightedBackwardCompatibility:

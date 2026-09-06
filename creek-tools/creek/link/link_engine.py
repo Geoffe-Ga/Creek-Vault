@@ -304,12 +304,17 @@ def _run_threads(
             vectors_persisted=embedding_pass.persisted,
         )
 
-    updated_fragments = detector.assign_fragments_to_threads(fragments, threads)
-    written_paths = _materialise_link_models(
+    # Materialise first, then stamp: a member must never cite a page a
+    # failed write left absent from the vault (#1382).
+    written_threads = _materialise_link_models(
         threads,
         vault_path,
         kind="thread",
         write=lambda writer, thread: writer.write_thread(thread),
+    )
+    updated_fragments = detector.assign_fragments_to_threads(
+        fragments,
+        written_threads,
     )
     fragments_updated = _persist_fragment_link_updates(
         original=fragments,
@@ -323,7 +328,7 @@ def _run_threads(
         fragment_count=len(fragments),
         link_count=len(threads),
         threads_detected=len(threads),
-        threads_written=len(written_paths),
+        threads_written=len(written_threads),
         member_fragments_updated=fragments_updated,
         largest_cluster_fragments=_largest_cluster(detector.thread_members),
         clusters_split=detector.clusters_split,
@@ -398,13 +403,15 @@ def _run_eddies(
             vectors_persisted=embedding_pass.persisted,
         )
 
-    updated_fragments = detector.assign_fragments_to_eddies(fragments, eddies)
-    written_paths = _materialise_link_models(
+    # Materialise first, then stamp: a member must never cite a page a
+    # failed write left absent from the vault (#1382).
+    written_eddies = _materialise_link_models(
         eddies,
         vault_path,
         kind="eddy",
         write=lambda writer, eddy: writer.write_eddy(eddy),
     )
+    updated_fragments = detector.assign_fragments_to_eddies(fragments, written_eddies)
     fragments_updated = _persist_fragment_link_updates(
         original=fragments,
         updated=updated_fragments,
@@ -417,7 +424,7 @@ def _run_eddies(
         fragment_count=len(fragments),
         link_count=len(eddies),
         eddies_detected=len(eddies),
-        eddies_written=len(written_paths),
+        eddies_written=len(written_eddies),
         member_fragments_updated=fragments_updated,
         largest_cluster_fragments=_largest_cluster(detector.eddy_members),
         clusters_split=detector.clusters_split,
@@ -447,7 +454,7 @@ def _materialise_link_models(
     *,
     kind: str,
     write: Callable[[VaultWriter, _M], Path],
-) -> list[Path]:
+) -> list[_M]:
     """Persist each detected link *model* as a markdown page via *write*.
 
     Shared by the eddies and threads linkers: both already produce
@@ -459,6 +466,9 @@ def _materialise_link_models(
     full disk or read-only volume) is logged and the remaining models are still
     attempted — losing one page should not break the others.
 
+    Returns the models rather than their paths because the caller must stamp
+    member wiki-links for exactly the pages that landed (#1382).
+
     Args:
         models: Detected models to write (each carries ``id`` + ``title``).
         vault_path: Vault root.
@@ -468,7 +478,7 @@ def _materialise_link_models(
             returns its path.
 
     Returns:
-        Paths of the pages that were successfully written.
+        The models whose pages were successfully written, in input order.
     """
     try:
         writer = VaultWriter(vault_path=vault_path)
@@ -484,10 +494,10 @@ def _materialise_link_models(
         )
         return []
 
-    written: list[Path] = []
+    written: list[_M] = []
     for model in models:
         try:
-            path = write(writer, model)
+            write(writer, model)
         except OSError as exc:
             logger.warning(
                 "Failed to write %s %s (%s) under %s: %s",
@@ -498,7 +508,7 @@ def _materialise_link_models(
                 exc,
             )
             continue
-        written.append(path)
+        written.append(model)
     return written
 
 

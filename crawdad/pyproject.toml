@@ -199,11 +199,43 @@ constraint-dependencies = [
     # (google-auth: cryptography>=38.0.3, pyjwt: cryptography>=3.4.0),
     # so nothing upstream blocks the raise.
     "cryptography>=50.0.0",
+    # Security: pin idna above CVE-2026-45409 (GHSA-65pc-fj4g-8rjx /
+    # PYSEC-2026-215), carried by every release through 3.14 and fixed
+    # in 3.15. idna reaches this graph on three RUNTIME edges, not a
+    # dev-only one: anyio 4.13.0 (uv.lock:198), httpx 0.28.1
+    # (uv.lock:1014), and yarl 1.24.2 (uv.lock:2699) behind discord.py →
+    # aiohttp. (requests 2.34.2, uv.lock:2189, is a dev-only fourth.)
+    #
+    # 3.15 is the ADVISORY floor and this is deliberately NOT the same
+    # string creek-tools declares. creek-tools carries idna>=3.19
+    # because a floor in its [project].dependencies also records the
+    # resolution that project actually runs (#1000). Read 3.15 as the
+    # number the advisory fixes. Do not "harmonise" the two: raising
+    # this to 3.19 would assert a compatibility claim crawdad has never
+    # tested, and lowering creek-tools' would contradict #1000 (#1328).
+    "idna>=3.15",
     # Security: pin pydantic-settings above GHSA-4xgf-cpjx-pc3j,
     # carried by the previously-locked 2.14.1 — transitive via mcp →
     # pydantic-settings. Fixed in 2.14.2; mcp 1.28.1 declares
     # pydantic-settings>=2.5.2, so the pinned mcp is unaffected (#979).
     "pydantic-settings>=2.14.2",
+    # Security: pin pyjwt above the five advisories carried by 2.12.1 —
+    # CVE-2026-48522 (PYSEC-2026-175 / GHSA-993g-76c3-p5m4),
+    # CVE-2026-48523 (PYSEC-2026-176 / GHSA-jq35-7prp-9v3f),
+    # CVE-2026-48524 (PYSEC-2026-177 / GHSA-fhv5-28vv-h8m8),
+    # CVE-2026-48525 (PYSEC-2026-178 / GHSA-w7vc-732c-9m39) and
+    # CVE-2026-48526 (PYSEC-2026-179 / GHSA-xgmm-8j9v-c9wx). All five
+    # are fixed in 2.13.0. Transitive-only via mcp → pyjwt[crypto]
+    # (uv.lock:1301, under mcp 1.28.1 at :1291) — the same edge that
+    # pulls cryptography, and the library that verifies a bearer token
+    # on the MCP surface this bot consumes.
+    #
+    # OSV's two records for CVE-2026-48523 disagree: PYSEC-2026-176
+    # says `fixed: 2.12.1`, its GHSA alias says 2.13.0 (both queried
+    # live for #1328). The floor takes the higher number — a security
+    # bound resolves a source disagreement upward, never downward.
+    # Matches creek-tools' pyjwt>=2.13.0 constraint (#1328).
+    "pyjwt>=2.13.0",
     # Security: pin python-multipart above PYSEC-2026-3036,
     # PYSEC-2026-3037, and PYSEC-2026-3040, all carried by the
     # previously-locked 0.0.29 — transitive via mcp → python-multipart.
@@ -220,6 +252,23 @@ constraint-dependencies = [
     # Python ≥3.14) and sse-starlette 3.4.4 declares starlette>=0.49.1,
     # so both consumers accept the raise (#979).
     "starlette>=1.3.1",
+    # Security: pin urllib3 above CVE-2026-44431 (PYSEC-2026-141 /
+    # GHSA-qccp-gfcp-xxvc) and CVE-2026-44432 (PYSEC-2026-142 /
+    # GHSA-mf9v-mfxr-j63j). Both fixed in 2.7.0; 2.6.3 cleared only the
+    # earlier CVE-2026-21441, so it sits inside the band, not above it.
+    #
+    # This edge is NOT dev-only, which is the reading that nearly got
+    # this package exempted from the parity guard instead of floored.
+    # google-genai is declared in [project].dependencies above, and both
+    # google-genai and google-auth pull requests, which pulls urllib3 —
+    # so the Gemini provider reaches it at RUNTIME. pip-audit, xenon and
+    # cachecontrol reach it too; those are the dev edges, and reading
+    # only those is how the runtime path got missed.
+    #
+    # Mirrors creek-tools' urllib3>=2.7.0 [project].dependencies floor,
+    # which is where creek-tools puts it because requests is a direct
+    # dependency there (#1328).
+    "urllib3>=2.7.0",
     # NOT a CVE. rpds-py switched from SemVer to CalVer at 2026.5.1 —
     # the line runs 0.29.0, 0.30.0, 2026.5.1, with no 0.31 or 1.0 in
     # between — and raised requires-python to >=3.11, which this project

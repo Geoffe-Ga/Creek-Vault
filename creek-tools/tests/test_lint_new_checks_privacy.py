@@ -23,10 +23,10 @@ What counts as content, and why the obvious mistake is easy:
   ``fragment.title`` in a finding therefore prints the first line of the body.
 * **``structural_path`` entries** — ancestor headings the splitter
   accumulated, i.e. document text.
-* **Absolute paths** — the #969 defect ``broken_links.py:30-39`` documents at
-  length: an absolute source put ``/Users/<operator>/...`` into the artifact
-  and falsified the standing "no path is absolute" claim in
-  ``docs/generation.md``.
+* **Absolute paths** — the #969 defect ``creek.lint.checks.broken_links.run``
+  documents at length in its vault-relative paragraph: an absolute source put
+  ``/Users/<operator>/...`` into the artifact and falsified the standing "no
+  path is absolute" claim in ``docs/generation.md``.
 
 Permitted, and asserted positively so the checks are not merely silent:
 vault-relative paths and content-hashed fragment ids
@@ -34,8 +34,9 @@ vault-relative paths and content-hashed fragment ids
 
 Live precedent that this is not theoretical: #1506 — artifacts written with
 no ``privacy_tier`` at all. And the review queue itself already prints
-``**{fragment.title}**`` for ``INTIMATE`` fragments (``review.py:62-63``,
-``:159``) into a file carrying no tier. Relocating it under
+``**{fragment.title}**`` for ``INTIMATE`` fragments — see
+``creek.classify.review.ReviewQueueGenerator._format_fragment_entry`` — into a
+file carrying no tier. Relocating it under
 ``00-Creek-Meta/Processing-Log/`` adds no new exposure — ``latest_lint_report``
 reads only ``lint-*.md`` — so that is a follow-up issue, not this PR's scope,
 and :meth:`TestReviewQueueExposureIsUnchanged` pins the "no new exposure"

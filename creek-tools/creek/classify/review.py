@@ -10,6 +10,7 @@ import logging
 from pathlib import Path
 from typing import Final
 
+from creek.classify.privacy_filter import tier_of
 from creek.config import ClassificationConfig
 from creek.models import Confidence, Fragment, Frequency, PrivacyTier
 from creek.time import now_la
@@ -62,13 +63,20 @@ class ReviewQueueGenerator:
         - Its voice confidence is None or in the low-confidence set
         - Its privacy tier is INTIMATE (per ontology §13.2)
 
+        The tier is read through
+        :func:`~creek.classify.privacy_filter.tier_of`, which fails closed:
+        a tier string the enum does not recognise reads as ``INTIMATE``
+        and is flagged for a human, where the bare attribute comparison
+        this replaced reported ``False`` and let an unreadable tier skip
+        the §13.2 review flag entirely (#1489).
+
         Args:
             fragment: The fragment to evaluate.
 
         Returns:
             True if the fragment should be reviewed by a human.
         """
-        if fragment.privacy_tier == PrivacyTier.INTIMATE:
+        if tier_of(fragment) is PrivacyTier.INTIMATE:
             return True
 
         if fragment.frequency.primary == Frequency.UNCLASSIFIED:
