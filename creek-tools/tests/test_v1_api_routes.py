@@ -32,9 +32,10 @@ Three properties carry most of the weight:
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, fields
-from typing import TYPE_CHECKING, Final
+from typing import Final
 
 import pytest
+from pydantic import BaseModel
 
 from creek_mcp.api.models import (
     CONTRACT_MODELS,
@@ -48,6 +49,8 @@ from creek_mcp.api.models import (
     DriveConnectorStatusResponse,
     DriveDisconnectResponse,
     DriveSyncResponse,
+    JobAcceptedResponse,
+    JobStatusResponse,
     JournalUpsertRequest,
     JournalUpsertResponse,
     LinkRequest,
@@ -56,19 +59,23 @@ from creek_mcp.api.models import (
     ReflectionResponse,
     UploadRequest,
     UploadResponse,
+    VoiceDraftDeleteResponse,
+    VoiceDraftReadResponse,
+    VoiceDraftUpsertRequest,
+    VoiceDraftUpsertResponse,
     WheelResponse,
 )
 from creek_mcp.api.routes import (
     IMPLEMENTED_CAPABILITIES,
+    PUBLISHABLE_SUCCESS_STATUSES,
+    PUBLISHED_SUCCESS_STATUSES,
     ROUTE_BODY_CAPS,
     ROUTES,
     UPLOAD_MAX_BODY_BYTES,
     RouteSpec,
+    published_success_statuses,
 )
 from creek_mcp.tools.upload import MAX_UPLOAD_BYTES
-
-if TYPE_CHECKING:
-    from pydantic import BaseModel
 
 # --------------------------------------------------------------------------- #
 # The published table, restated here rather than imported
@@ -124,6 +131,33 @@ _EXPECTED: Final[
         Capability.UPLOAD,
         UploadRequest,
         UploadResponse,
+        True,
+    ),
+    (
+        "/v1/voice-drafts/{external_id}",
+        "PUT",
+        "upsertVoiceDraft",
+        Capability.VOICE_DRAFTS,
+        VoiceDraftUpsertRequest,
+        VoiceDraftUpsertResponse,
+        True,
+    ),
+    (
+        "/v1/voice-drafts/{external_id}",
+        "GET",
+        "getVoiceDraft",
+        Capability.VOICE_DRAFTS,
+        None,
+        VoiceDraftReadResponse,
+        True,
+    ),
+    (
+        "/v1/voice-drafts/{external_id}",
+        "DELETE",
+        "deleteVoiceDraft",
+        Capability.VOICE_DRAFTS,
+        None,
+        VoiceDraftDeleteResponse,
         True,
     ),
     (
@@ -190,6 +224,15 @@ _EXPECTED: Final[
         True,
     ),
     (
+        "/v1/jobs/{job_id}",
+        "GET",
+        "getPipelineJob",
+        Capability.PIPELINE,
+        None,
+        JobStatusResponse,
+        True,
+    ),
+    (
         "/v1/health",
         "GET",
         "getHealth",
@@ -206,6 +249,9 @@ _EXPECTED_IDS: Final[tuple[str, ...]] = (
     "reflections",
     "wheel",
     "upload",
+    "voice-draft-upsert",
+    "voice-draft-read",
+    "voice-draft-delete",
     "drive-status",
     "drive-sync",
     "drive-authorize",
@@ -213,10 +259,11 @@ _EXPECTED_IDS: Final[tuple[str, ...]] = (
     "drive-disconnect",
     "classifications",
     "links",
+    "job-status",
     "health",
 )
 
-_EXPECTED_ROUTE_COUNT: Final[int] = 13
+_EXPECTED_ROUTE_COUNT: Final[int] = 17
 
 
 def _by_operation(operation_id: str) -> RouteSpec:
@@ -251,10 +298,10 @@ def _by_operation(operation_id: str) -> RouteSpec:
 # --------------------------------------------------------------------------- #
 
 
-def test_routes_declares_exactly_thirteen_specs() -> None:
-    """``/v1`` publishes thirteen endpoints and no fourteenth.
+def test_routes_declares_exactly_seventeen_specs() -> None:
+    """``/v1`` publishes seventeen endpoints and no eighteenth.
 
-    A fourteenth would be an endpoint no fixture, no OpenAPI response set and
+    An eighteenth would be an endpoint no fixture, no OpenAPI response set and
     no capability entry describes — reachable, undocumented surface.
     """
     assert len(ROUTES) == _EXPECTED_ROUTE_COUNT
@@ -269,7 +316,7 @@ def test_routes_is_a_tuple() -> None:
     assert isinstance(ROUTES, tuple)
 
 
-def test_route_paths_and_methods_are_the_published_thirteen() -> None:
+def test_route_paths_and_methods_are_the_published_seventeen() -> None:
     """Every ``(path, method)`` pair matches the ADR, in order."""
     assert [(spec.path, spec.method) for spec in ROUTES] == [
         (path, method) for path, method, *_rest in _EXPECTED
@@ -296,6 +343,154 @@ def test_operation_ids_are_the_published_ones() -> None:
 def test_every_route_carries_a_summary() -> None:
     """Each route documents itself; an empty summary publishes a blank cell."""
     assert all(spec.summary.strip() for spec in ROUTES)
+
+
+# --------------------------------------------------------------------------- #
+# Per-route success responses (#1605)
+#
+# Until this landed, "the one success status any operation documents" was a
+# module constant in the generator (``openapi.py``'s ``_SUCCESS_STATUS``) and a
+# literal ``200`` in five test modules. A route that answers a second success
+# status could not be expressed at all, and the closed status set the contract
+# publishes was derived from the error table alone. The declaration now lives
+# on the route, beside the request and response models it belongs with, and
+# every derivation of the published set reads it from the table.
+#
+# Every route currently keeps the default, so the generated document is
+# byte-identical — pinned by the golden file in ``test_v1_api_openapi.py``.
+# --------------------------------------------------------------------------- #
+
+
+def test_every_route_declares_its_published_success_responses() -> None:
+    """Each route resolves to a non-empty status-to-model mapping.
+
+    A *mapping*, not a bare tuple of statuses, because the generator derives
+    each success response's schema from a model: one route documenting two
+    success statuses documents two different bodies, and a tuple of ints
+    carries the statuses without the bodies.
+    """
+    for spec in ROUTES:
+        declared = spec.published_success_responses
+        assert declared, spec.operation_id
+        for status, model in declared:
+            assert status in PUBLISHABLE_SUCCESS_STATUSES, spec.operation_id
+            assert model is None or issubclass(model, BaseModel), spec.operation_id
+
+
+def test_only_long_pipeline_writes_declare_the_202_success() -> None:
+    """Only classification and linking can return a durable job handle.
+
+    This is the assertion that makes the diff reviewable: the mechanism is
+    landed and inert, so the whole of its effect on the published document is
+    "no change". The first route to declare a second success status has to
+    edit this test on purpose.
+    """
+    for spec in ROUTES:
+        if spec.operation_id in {"createClassification", "createLink"}:
+            assert spec.published_success_responses == (
+                (200, spec.response_model),
+                (202, JobAcceptedResponse),
+            )
+        else:
+            assert spec.success_responses is None
+            assert spec.published_success_responses == ((200, spec.response_model),)
+
+
+def test_the_published_success_statuses_are_derived_from_the_table() -> None:
+    """The published success set is read off the routes, not restated.
+
+    Derived, so the day a route declares a ``202`` the closed status set the
+    contract publishes grows with it in every module that consumes it, rather
+    than in the five that remembered to be edited.
+    """
+    published = PUBLISHED_SUCCESS_STATUSES
+    assert published == published_success_statuses(ROUTES)
+    assert published == frozenset({200, 202})
+
+
+def test_a_second_success_status_reaches_the_derived_set() -> None:
+    """A route declaring ``202`` widens the derived set — the mutation proof.
+
+    Built from a local route tuple rather than by mutating ``ROUTES``, which
+    is frozen data three other modules read. Without this the derivation above
+    would be indistinguishable from a hardcoded ``{200}``.
+    """
+    accepting = RouteSpec(
+        path="/v1/things",
+        method="POST",
+        operation_id="createThing",
+        capability=None,
+        request_model=None,
+        response_model=WheelResponse,
+        requires_contract_version=True,
+        summary="A route that answers two success statuses.",
+        success_responses=((200, WheelResponse), (202, CapabilitiesResponse)),
+    )
+    assert published_success_statuses((*ROUTES, accepting)) == frozenset({200, 202})
+
+
+def test_a_route_may_not_declare_an_empty_success_response_set() -> None:
+    """An operation documenting no success at all is a build failure.
+
+    Refused at import, like the templated-path body cap, because the failure
+    it prevents is an operation published with only refusals in it — a
+    document telling a consumer the route can never succeed.
+    """
+    with pytest.raises(ValueError, match="at least one success response"):
+        _spec_with_success_responses(())
+
+
+def test_a_route_may_not_declare_the_same_success_status_twice() -> None:
+    """Two entries for one status would silently drop one of the two bodies.
+
+    ``_responses`` keys on the status, so the second entry would overwrite the
+    first and the document would publish one body while the table declared
+    two.
+    """
+    with pytest.raises(ValueError, match="declares status 200 twice"):
+        _spec_with_success_responses(((200, WheelResponse), (200, WheelResponse)))
+
+
+@pytest.mark.parametrize("status", [201, 204, 404, 503], ids=str)
+def test_a_route_may_not_publish_a_success_status_outside_the_closed_pair(
+    status: int,
+) -> None:
+    """Only ``200`` and ``202`` may be declared as a success.
+
+    The two refusal statuses in this list are the sharp cases. Declaring a
+    ``404`` as a *success* would exempt it from
+    ``test_every_non_success_response_is_the_error_envelope``, so a route
+    could publish a bespoke body on a refusal status — which is exactly how a
+    second error shape, and then a field echoing vault material, is born.
+    ``201`` and ``204`` are refused because the contract publishes a closed
+    status set and neither is in it.
+    """
+    with pytest.raises(ValueError, match="not a publishable success status"):
+        _spec_with_success_responses(((status, WheelResponse),))
+
+
+def _spec_with_success_responses(
+    declared: tuple[tuple[int, type[BaseModel] | None], ...],
+) -> RouteSpec:
+    """Build a throwaway route declaring *declared*, for the guard tests.
+
+    Args:
+        declared: The ``success_responses`` value under test.
+
+    Returns:
+        The constructed spec, when the guard admits it.
+    """
+    return RouteSpec(
+        path="/v1/things",
+        method="POST",
+        operation_id="createThing",
+        capability=None,
+        request_model=None,
+        response_model=WheelResponse,
+        requires_contract_version=True,
+        summary="A route built only to exercise the success-response guard.",
+        success_responses=declared,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -400,8 +595,8 @@ def test_exactly_one_route_declares_no_capability() -> None:
     assert uncapable == ["/v1/health"]
 
 
-def test_implemented_capabilities_is_exactly_the_published_seven() -> None:
-    """Every published capability answers for real, pipeline included (#1570).
+def test_implemented_capabilities_is_exactly_the_published_eight() -> None:
+    """Every published capability answers for real, Voice Drafts included (#1727).
 
     An exhaustive literal, not a containment check, and still named one by
     one: an eighth capability added to ``Capability`` has to change this line
@@ -418,6 +613,7 @@ def test_implemented_capabilities_is_exactly_the_published_seven() -> None:
                 Capability.UPLOAD,
                 Capability.DRIVE_CONNECTOR,
                 Capability.PIPELINE,
+                Capability.VOICE_DRAFTS,
             }
         )
         == IMPLEMENTED_CAPABILITIES
@@ -504,7 +700,7 @@ def test_every_route_model_is_a_published_contract_model() -> None:
 
 
 def test_route_spec_declares_the_published_fields() -> None:
-    """``RouteSpec`` carries exactly the nine fields the adapter consumes."""
+    """``RouteSpec`` carries exactly the ten fields the adapter consumes."""
     assert {field.name for field in fields(RouteSpec)} == {
         "path",
         "method",
@@ -515,6 +711,7 @@ def test_route_spec_declares_the_published_fields() -> None:
         "requires_contract_version",
         "summary",
         "max_body_bytes",
+        "success_responses",
     }
 
 

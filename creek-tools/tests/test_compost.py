@@ -158,6 +158,56 @@ def _fragment(
     )
 
 
+def _unvalidated_tier_fragment(
+    *,
+    frag_id: str,
+    title: str,
+    created: datetime,
+    tier: object,
+    threads: list[str] | None = None,
+    tags: list[str] | None = None,
+) -> Fragment:
+    """Build a fragment carrying *tier* without Pydantic validating it.
+
+    ``model_construct`` is the deliberate bypass: it is the only way to
+    plant a tier string the enum does not know, which is what a
+    hand-edited vault note or a forward-incompatible schema migration
+    produces. The same idiom appears in
+    ``tests/test_privacy_filter.py`` for
+    :func:`~creek.classify.privacy_filter.tier_of`.
+
+    ``created`` is mirrored into ``ingested`` for the reason
+    :func:`_fragment` documents: ``effective_authored_at`` falls back to
+    ``ingested``, and an unmirrored fragment would surface at
+    construction-time wall-clock rather than the date the test chose.
+
+    Args:
+        frag_id: The fragment id.
+        title: The fragment title.
+        created: Authored timestamp, mirrored into ``ingested``.
+        tier: The ``privacy_tier`` value to plant, validated or not.
+        threads: Wikilink thread references, if any.
+        tags: Project tags, if any.
+
+    Returns:
+        An unvalidated :class:`~creek.models.Fragment`.
+    """
+    return Fragment.model_construct(
+        id=frag_id,
+        title=title,
+        source=FragmentSource(platform=SourcePlatform.JOURNAL),
+        created=created,
+        ingested=created,
+        frequency=FrequencyClassification(primary=Frequency.F5),
+        voice=VoiceClassification(confidence=None),
+        praxis_potential=PraxisPotential.NONE,
+        threads=threads or [],
+        tags=tags or [],
+        emotional_texture=[],
+        privacy_tier=tier,
+    )
+
+
 @pytest.fixture()
 def dormant_thread() -> Thread:
     """Thread whose last_seen is beyond the dormancy threshold."""
@@ -1163,6 +1213,44 @@ class TestTimezoneAwareClock:
         candidates = tracker.detect_compost_candidates([], self._frags(mixed))
         self._assert_single_project_candidate(candidates)
 
+    def test_bypass_naive_fragment_still_ranks(self) -> None:
+        """A fragment built by a validator bypass still ranks (#1116).
+
+        A **guard**, not a red test: it is green before and after, and
+        that is the point. The sibling tests above all build through
+        ``_tz_fragment``, i.e. the ordinary ``Fragment(...)`` constructor,
+        whose field validator has LA-anchored their "naive" inputs since
+        #976 — so none of them can reach a genuinely naive ``ingested``.
+        This one uses ``model_copy(deep=True)`` plus an attribute write,
+        which Pydantic does not route through field validators, and is
+        therefore the only test here exercising the case ``compost.py``
+        needed a local ``ensure_aware`` wrapper for.
+
+        That wrapper is now redundant, because
+        :func:`creek.time.effective_authored_at` repairs at the read. This
+        test is what makes *removing* it safe: it goes red only when the
+        chokepoint repair and the wrapper are both absent, with
+        ``TypeError: can't compare offset-naive and offset-aware
+        datetimes`` out of the ``max(...)`` generator.
+        """
+        aware = [
+            datetime(2020, 1, 1, 12, 0, tzinfo=_LA_ZONE) + timedelta(days=offset)
+            for offset in range(3)
+        ]
+        frags = self._frags(aware)
+        bypassed = frags[0].model_copy(deep=True)
+        bypassed.ingested = datetime(2020, 1, 1, 12, 0)
+        # Assert the bypass took, so the fixture cannot silently stop
+        # exercising the naive path.
+        assert bypassed.ingested.utcoffset() is None
+        frags[0] = bypassed
+
+        tracker = CompostTracker(project_gap_days=30, project_min_fragments=3)
+
+        self._assert_single_project_candidate(
+            tracker.detect_compost_candidates([], frags),
+        )
+
     def test_default_clock_is_tz_aware_and_la(self, vault_path: Path) -> None:
         """The default clock stamps the LA date on a note, not the UTC one.
 
@@ -1502,6 +1590,87 @@ class TestScreenedFragmentBoundary:
         assert len(threads) == 1
         assert threads[0].fragment_ids == ["f-open"]
         assert threads[0].reason == "Dormant for 455 days"
+
+    def test_an_unrecognised_tier_is_withheld_from_every_candidate_kind(
+        self,
+        reference_now: datetime,
+    ) -> None:
+        """A tier string the enum does not know must fail closed HERE (#1489).
+
+        Unit-level and not vault-level on purpose. An unrecognised tier
+        never survives ``Fragment.model_validate`` — ``Fragment.privacy_tier``
+        carries no ``mode="before"`` coercer — so
+        :func:`creek.vault.reader.try_load_fragment` drops the note and the
+        vault-level pin
+        ``test_compost_scan.py::test_a_fragment_with_an_unrecognised_privacy_tier_never_contributes``
+        is green today without this screen doing any work. That green is
+        borrowed from two other modules; this test makes the screen itself
+        carry it.
+
+        All three candidate kinds are asserted, not just fragment
+        detection: issue #1311's lesson was that a project candidate's
+        identity *is* the tag, and the tag reaches a filename.
+        """
+        thread = _dormant("thr-deep", "Deep Work", date(2024, 5, 1))
+        verifier = _StubVerifier()
+        corpus = [
+            _unvalidated_tier_fragment(
+                frag_id=f"f-bogus-{n}",
+                title="Therapy: the affair and the shame",
+                created=datetime(2024, 5, 2, 9, 0, 0),
+                tier="super-secret",
+                tags=["zine"],
+                threads=["[[Deep Work]]"],
+            )
+            for n in (1, 2)
+        ]
+
+        candidates = CompostTracker(
+            now=reference_now,
+            similarity_fn=_high_similarity,
+            verifier=verifier,
+        ).detect_compost_candidates([thread], corpus)
+
+        assert [(c.source_type, c.source_id) for c in candidates] == []
+        assert verifier.calls == []
+
+    @pytest.mark.parametrize(
+        "tier",
+        [PrivacyTier.OPEN, PrivacyTier.UNCLASSIFIED, "open", "unclassified"],
+    )
+    def test_a_valid_non_intimate_tier_is_still_admitted(
+        self,
+        reference_now: datetime,
+        tier: object,
+    ) -> None:
+        """The #1489 screen must narrow only the unrecognised case.
+
+        Without this pair, ``_is_intimate`` returning a constant ``True``
+        would satisfy the positive test above. Explicit ``unclassified``
+        ranks with ``personal`` (#876/#961) and is admitted here for the
+        same reason
+        ``test_compost_scan.py::test_an_explicitly_unclassified_fragment_is_still_admitted``
+        admits it end to end.
+        """
+        corpus = [
+            _unvalidated_tier_fragment(
+                frag_id=f"f-ok-{n}",
+                title="Laying out the zine",
+                created=datetime(2024, 5, 2, 9, 0, 0),
+                tier=tier,
+                tags=["zine"],
+            )
+            for n in (1, 2)
+        ]
+
+        candidates = CompostTracker(
+            now=reference_now,
+            similarity_fn=_low_similarity,
+        ).detect_compost_candidates([], corpus)
+
+        assert [(c.source_type, c.source_id) for c in candidates] == [
+            ("project", "zine")
+        ]
 
 
 # ---- Issue #1334: colliding compost filenames destroy notes -----------------

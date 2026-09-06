@@ -134,7 +134,10 @@ rather than per tool. Named on that axis, the surface is:
 
 1. **JSON response** — layer (f), driven off ``_RUNTIME_PROBES`` /
    ``_PROBE_EXEMPT``. Forced: a newly ``GATED`` tool must grow a probe or
-   record a justified exemption.
+   record a justified exemption. Since #1279 the exemption set's *membership*
+   is pinned as well, and every exemption must name a test that executes its
+   reason — a reason nobody runs is how ``creek.author``'s stayed false
+   through every review it passed.
 2. **Model prompt** — layer (g), driven off ``_PROMPT_PROBES`` /
    ``_PROMPT_PROBE_EXEMPT``, over a set derived from the tools' own
    signatures. Forced the same way, plus a non-emptiness assertion on the
@@ -156,19 +159,29 @@ dataclass records one, so the obvious repair is a second
 ``(gate_module, gate_symbol)`` pair. It was not taken. A second pair is only
 ever checkable at the strength layers (c)/(e) can offer — the symbol exists in
 the named module and is called there — and for reflect's grounding gate that
-check is green *by construction*: ``creek/author/agents.py`` imports
-``tier_within_override`` at line 28 and calls it in ``_load_corpus`` at line
-115 for every Writing Desk consumer. It would stay green if
+check is green *by construction*: ``creek.author.agents`` imports
+``creek.classify.privacy_filter.tier_within_override`` and calls it inside
+``creek.author.agents._load_corpus`` for every Writing Desk consumer. (Named
+by symbol rather than by line, per #1103: the line numbers this sentence used
+to carry had already drifted off the import.) It would stay green if
 ``creek_mcp.tools.reflect._default_retrieve`` stopped passing ``override``,
 stopped being called, or reflect dropped grounding altogether — three ways to
 lose the gate entirely without disturbing the evidence for it. Layer (g)
 checks that gate's *effect* instead, which is strictly stronger, and the
-injection drill at the top of ``tests/test_mcp_read_gate.py`` is the evidence:
-the two independent mutations that neutralise the grounding cutoff turn (g)
-red and leave every structural layer and all ten response probes green.
-Revisit predicate: **a tool whose second gate's effect no runtime probe can
-observe.** For that tool the structural check is the only one available, and a
-weak check is better than none.
+injection drill at the top of ``tests/test_mcp_read_gate.py`` is the evidence
+— **narrowed to reflect by #1279**, and re-measured there rather than
+restated. Neutralising the shared grounding cutoff turns (g) red and leaves
+every response probe in ``_RUNTIME_PROBES`` green *except*
+``[creek.author]``, which since #1279 reaches that walk under a probe of its
+own and does catch it. The claim this paragraph rests on survives with
+``creek.reflect`` as its subject: reflect's layer-(f) probe is refused at the
+#846 entry gate before the grounding walk, so no response probe of *reflect*
+observes that gate's effect. The second injection, scoped to
+``creek_mcp.tools.reflect``'s own ``to_privacy_override``, leaves every
+response probe green including ``[creek.author]``. Revisit predicate: **a
+tool whose second gate's effect no runtime probe can observe.** For that tool
+the structural check is the only one available, and a weak check is better
+than none.
 
 **``creek.classify`` is a known prompt-channel egress outside both probe
 manifests.** Its posture is ``METADATA_ONLY`` on a rationale about its
@@ -177,15 +190,31 @@ enforced" — and ``creek_mcp/tools/classify.py`` says the same in its own
 words: the ceiling "is recorded for the audit trail; it does not gate
 execution". Both are true of the envelope and beside the point on this
 channel. With ``method="llm"`` the whole corpus, every tier of it, goes
-through a provider, defended only by
+through a provider. Three controls stand between it and a cloud endpoint,
+and **none of them is the caller's ceiling**:
 :class:`creek.classify.llm.router.ModelRouter`'s Intimate-never-cloud gate —
 which ``creek/classify/classify_engine.py`` reaches by resolving a second,
-intimate-only classifier config, and which says nothing about ``personal``.
-Layer (g) structurally cannot enrol it: the derivation looks for a
-function taking both ``llm_factory`` and ``privacy_tier_ceiling``, and
-``classify_tool`` takes no factory — so the reason this tool is absent from
-the prompt manifest is a fact about its signature, not a finding about its
-safety. Tracked in **#1274**.
+intimate-only classifier config, and which is never even *asked* about
+``personal``: the engine's split is binary (``build_tier_classifiers``
+resolves tier-less and ``INTIMATE`` only; ``TierClassifiers.for_tier`` is
+``if tier is not PrivacyTier.INTIMATE``), so a redirect added to the router
+alone would be inert —
+plus two **host-operator** gates that answer "may this machine talk to a
+cloud at all" rather than "may this caller, at this ceiling":
+``creek.classify.llm.consent.has_cloud_consent`` (folded in by
+``AnthropicProvider.available``) and ``_assert_classifiers_available``, which
+refuses before a single fragment is read. Layer (g) cannot enrol it, for
+**two** reasons and not one: the derivation runs over ``_GATED_TOOLS``, and
+this tool is ``METADATA_ONLY``, so it never enters the candidate set at all;
+and separately the derivation looks for a function taking both
+``llm_factory`` and ``privacy_tier_ceiling``, and ``classify_tool`` takes no
+factory. Adding a factory parameter alone would therefore enrol nothing. Its
+absence from the prompt manifest is a fact about its posture and its
+signature, not a finding about its safety — and it is no longer an
+unrecorded one: see :data:`_CLASSIFY_PROMPT_CHANNEL_RATIONALE` for the
+per-tool statement and
+``tests/test_mcp_read_gate.py::test_classify_hands_every_tier_to_the_provider_its_router_resolves``
+for the probe that executes it (#1274).
 """
 
 from __future__ import annotations
@@ -282,6 +311,52 @@ to an attribute of this module.
 _COUNTS_ONLY_RATIONALE = (
     "Returns counts only and produces no new tiered content; the ceiling is "
     "audited for the trail, not enforced."
+)
+
+_CLASSIFY_PROMPT_CHANNEL_RATIONALE = (
+    "METADATA_ONLY is a claim about the RESPONSE envelope only, and on that "
+    "channel it holds: classify returns counts, never fragment text, and "
+    "rewrites frontmatter in place rather than producing new tiered content, "
+    "so the ceiling is audited for the trail and not enforced. The prompt "
+    "channel is a different question and the answer is different. With "
+    "method='llm', creek.classify.classify_engine.run_classify walks every "
+    "'.md' under 01-Fragments -- every tier of it, at every ceiling including "
+    "open -- and hands each fragment's TITLE AND BODY to the configured "
+    "classification provider. Both, not just the body: "
+    "build_classification_prompt interpolates title= and content= alike, each "
+    "passed through _sanitise_for_prompt, which neutralises YAML/HTML-comment "
+    "injection vectors and caps EACH at _MAX_PROMPT_CONTENT_CHARS (8192). The "
+    "title is called out because this module already treats it as a "
+    "first-class leak vector everywhere else -- creek.report and "
+    "creek.skills.refresh both argue that a '[Personal-tier summary: <title>]' "
+    "stub leaks the title it claims to protect, and creek.redact.scan rests on "
+    "fragment filenames being slugified titles. A statement of this channel "
+    "that said 'body' and stopped would understate it in exactly the dimension "
+    "this file has already decided is load-bearing. "
+    "The caller's ceiling is not one of the controls on that walk. Three "
+    "things are. (1) ModelRouter._enforce_local_for_intimate (#647/#666) "
+    "redirects an INTIMATE fragment to the local default or raises "
+    "IntimateRoutingError. It is the only tier gate, and the split it sits "
+    "behind is BINARY, decided in the engine rather than in the router: "
+    "build_tier_classifiers asks the router exactly twice -- once tier-less "
+    "and once for PrivacyTier.INTIMATE -- and TierClassifiers.for_tier is "
+    "'if tier is not PrivacyTier.INTIMATE: return self.non_intimate'. So "
+    "PERSONAL is never presented to the router at all; it takes the tier-less "
+    "classifier and reaches the configured cloud provider unchanged. Widening "
+    "the router's redirect to cover PERSONAL would therefore be INERT -- "
+    "verified by mutation, and the reason any real fix has to move for_tier "
+    "and build_tier_classifiers, not just _enforce_local_for_intimate. "
+    "(2) creek.classify.llm.consent.has_cloud_consent, folded in by "
+    "AnthropicProvider.available. (3) _assert_classifiers_available, which "
+    "refuses before a single fragment is read. (2) and (3) are HOST-OPERATOR "
+    "gates: they answer 'may this machine talk to a cloud at all', never 'may "
+    "this caller, at this ceiling'. Executed by "
+    "test_classify_hands_every_tier_to_the_provider_its_router_resolves. "
+    "Gating the walk on the caller's ceiling is deliberately NOT done: "
+    "creek_mcp/httpapi/pipeline.py records that _TIER_RANK ranks unclassified "
+    "equal to personal, so refusing to classify above the ceiling would leave "
+    "those fragments unclassified and still inside a personal consumer's "
+    "reach -- preserving an exposure rather than preventing one (#1274)."
 )
 
 _PURGE_RATIONALE = (
@@ -610,7 +685,35 @@ TOOL_POSTURES: dict[str, ToolPosture] = {
     ),
     "creek.classify": ToolPosture(
         posture=ReadPosture.METADATA_ONLY,
-        rationale=_COUNTS_ONLY_RATIONALE,
+        rationale=_CLASSIFY_PROMPT_CHANNEL_RATIONALE,
+    ),
+    "creek.classify.entry": ToolPosture(
+        posture=ReadPosture.GATED,
+        rationale=(
+            "One unsupplied read: an entry_ref names a fragment the caller "
+            "did not supply, and the tool hands back that fragment's "
+            "frequency, phase, privacy tier and classification provenance. "
+            "The tier the gate compares is the fragment's CURRENT PERSISTED "
+            "one, read through the shared "
+            "privacy_filter.source_tiers walk and reduced by "
+            "max_source_tier -- never the caller's own declared tier, which "
+            "is not a gate at all, and never a staged-frontmatter tier, "
+            "which is stale the moment creek classify escalates the "
+            "fragment. It fails closed twice over: a MISSING privacy_tier "
+            "key ranks INTIMATE distinctly from an explicit unclassified "
+            "(the #1033 reason iter_admitted_fragments is NOT the primitive "
+            "here -- it reads the tier off the validated Fragment, whose "
+            "default fails open), and an id resolving to nothing reduces to "
+            "INTIMATE as well, so every locator divergence is refused rather "
+            "than answered. It REFUSES rather than excluding, on "
+            "state_read's rule: the target is caller-addressed and singular, "
+            "so there is nothing to partially admit. The resolution walk is "
+            "exhaustive and sits BELOW the gate, so a refused id and a "
+            "not-found id cost the same and the refusal leaks no position "
+            "through timing."
+        ),
+        gate_module="creek_mcp.tools.classify_entry",
+        gate_symbol="refuse_above_ceiling",
     ),
     "creek.redact.scan": ToolPosture(
         posture=ReadPosture.GATED,

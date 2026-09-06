@@ -80,6 +80,9 @@ IFS=',' read -ra toks <<< "${TOKENS:-pending}"
 idx=$((n - 1))
 [[ "$idx" -lt "${#toks[@]}" ]] || idx=$(( ${#toks[@]} - 1 ))
 tok="${toks[$idx]}"
+# The real script prints its refusal block on EVERY poll, and prints it even on
+# the tooling-error path where stdout stays empty. REASON models that.
+[[ -z "${REASON:-}" ]] || printf '%s\n' "$REASON" >&2
 [[ "$tok" != "ERR" ]] || exit 2
 printf '%s\n' "$tok"
 STUB
@@ -120,6 +123,18 @@ run_watch() {
     "$RALPH/watch-pr.sh" "$1" "${2:-0.1}" "${3:-30}" 2>/dev/null )
 }
 polls() { cat "$STATE/case-$1/ready-calls" 2>/dev/null || echo 0; }
+
+# The same run with stdout dropped and STDERR captured, for the diagnostics
+# cases. Mirrors test_pr_ready.sh's `run_err`, and the redirection ORDER is
+# load-bearing for the same reason: stdout is discarded INSIDE the group and
+# stderr is routed into the capture OUTSIDE it, so only stderr is ever captured.
+run_watch_err() {
+  local sdir="$STATE/case-$1"
+  mkdir -p "$sdir"
+  { ( cd "$WORK" &&
+      PATH="$BIN:$PATH" STATE_DIR="$sdir" RALPH_WATCH_PIDDIR="$PIDDIR" \
+      "$RALPH/watch-pr.sh" "$1" "${2:-0.1}" "${3:-30}" >/dev/null ); } 2>&1
+}
 
 # --- usage errors are the ONLY non-zero exits ------------------------------
 rc=0
@@ -438,6 +453,38 @@ rm -f "$BIN/sleep"
 out="$(TOKENS="review-quota-exhausted,ready" run_watch 133 0.05 30)"
 check "a backed-off lane still wakes on the next actionable token" \
   "WATCH 133 ready" "$out"
+
+# --- #1270/#1685: a poll that produces NO token must still say why ----------
+# pr-ready.sh exits 2 with EMPTY STDOUT on a tooling error and puts the reason on
+# stderr. This watcher swallows that non-zero by design, so `$token` is empty —
+# and an emission gated on `[[ -n "$token" ]]` therefore prints nothing at all on
+# the one poll whose explanation matters most. MEASURED before the fix: a stub
+# exiting 2 with a stderr reason produced `WATCH <PR> timeout unknown` on stdout
+# and an EMPTY stderr, which is the exact silence #1270 exists to close.
+watch_err_out="$(TOKENS="ERR" REASON="pr-ready: could not resolve the repository for PR #140" \
+                 run_watch_err 140 0.1 1)"
+if grep -qF -- 'could not resolve the repository' <<<"$watch_err_out"; then
+  ok "a poll that produced no token still emits its reason on stderr"
+else
+  bad "a tooling-error poll discarded pr-ready.sh's reason — the lane burns its whole window with an empty stderr (#1270): '$watch_err_out'"
+fi
+
+# …and stdout stays the byte-frozen contract line while that happens.
+check "an unclassifiable lane still prints the frozen timeout line" \
+  "WATCH 141 timeout unknown" \
+  "$(TOKENS="ERR" REASON="pr-ready: transient" run_watch 141 0.1 1)"
+
+# …and once, not once per poll: the de-duplication has to survive being hoisted
+# out of the token test, or the ~300-lines-per-lane flood #1270 fixed comes back
+# on precisely the noisiest path.
+# Anchored: the TIMEOUT summary quotes the first line of the reason back
+# (`… last reason: pr-ready: transient blip`), so an unanchored count would read
+# 2 on correct behaviour and this pin would be asserting the wrong number.
+watch_err_count="$(TOKENS="ERR" REASON="pr-ready: transient blip" \
+                   run_watch_err 142 0.05 1 | grep -c '^pr-ready: transient blip$' || true)"
+check "the token-less reason is emitted once per transition, not per poll" "1" "$watch_err_count"
+check "the token-less lane polled more than once (so the count above means something)" \
+  "1" "$([[ "$(polls 142)" -gt 1 ]] && echo 1 || echo 0)"
 
 # --- summary ---------------------------------------------------------------
 echo

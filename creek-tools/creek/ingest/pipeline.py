@@ -27,6 +27,7 @@ from creek.ingest.base import (
     assemble_ingested_fragment,
     generate_fragment_id,
 )
+from creek.ingest.documents import DocumentIngestor
 from creek.ingest.images import ImageIngestor
 from creek.ingest.source_unit import compose_source_unit
 
@@ -1571,6 +1572,7 @@ def pre_write_advisories(
     ingest_result: IngestResult,
     input_path: Path,
     ocr_disabled: bool = False,
+    ledger: SourceLedger | None = None,
 ) -> list[Advisory]:
     """Collect every advisory that must be raised BEFORE the first write.
 
@@ -1593,6 +1595,13 @@ def pre_write_advisories(
     * **Collapsed pre-#1305 units.** The operator is told which fragments
       this run supersedes before the run that supersedes them finishes,
       rather than after (#1305).
+    * **Scanned PDF left un-OCR'd.** A document pass under ``ocr.enabled:
+      false`` still ingests every other file, so the one under-read PDF would
+      otherwise vanish into a run that reports success (#1639).
+    * **An un-OCR'd predecessor superseded.** Turning OCR on re-mints a
+      previously-ingested scan per page and strands the original, which is the
+      **default** next run for anyone upgrading, so it cannot be left silent
+      (#1639).
 
     Gathering them here keeps :func:`run_ingest` — already at the project's
     complexity ceiling — from growing a branch per advisory, and makes the
@@ -1608,6 +1617,11 @@ def pre_write_advisories(
         ocr_disabled: Whether :func:`ocr_is_disabled` refused to run this
             pass. Passed in rather than re-derived, because this function
             holds neither the ingestor class nor the config.
+        ledger: The resolved ledger for this run, or ``None``. Passed for the
+            same reason *writer* is — it is resolved vault state this function
+            reads rather than derives — and needed because the #1639 advisory
+            keys on a recorded ``source_key`` rather than on anything
+            recomputable from the fragments in hand.
 
     Returns:
         The advisories that apply, in the order they should be delivered.
@@ -1636,6 +1650,14 @@ def pre_write_advisories(
     collapsed = collapsed_unit_warning(writer, ingest_result.fragments)
     if collapsed is not None:
         advisories.append(collapsed)
+    declined = scanned_pdf_declined_warning(ingest_result.fragments)
+    if declined is not None:
+        advisories.append(declined)
+    superseded = superseded_scan_warning(
+        ledger, writer, ingest_result.fragments, vault_path
+    )
+    if superseded is not None:
+        advisories.append(superseded)
     return advisories
 
 
@@ -1653,6 +1675,177 @@ operator's input. The text is a fixed constant with no interpolation, so it
 names a config key rather than a fragment and travels verbatim across an MCP
 tier ceiling.
 """
+
+
+_SUPERSEDED_SCAN_WARNING_TEMPLATE = (
+    "This vault holds {count} fragment(s) written by an earlier ingest of the "
+    "same scanned PDF(s), before OCR was switched on — each one empty-bodied, "
+    "because the pages are images. Each is now superseded by the per-page "
+    "fragments this run writes, and is left in place: {sample}. Nothing is "
+    "deleted automatically — inspect with `creek purge source --source-path "
+    "<path> --match exact --dry-run`, and purge only what you recognise. "
+    "Links pointing at a superseded fragment keep resolving to it until you do."
+)
+"""Advisory for a vault upgrading from an un-OCR'd scan to per-page fragments.
+
+The #1639 sibling of :data:`_COLLAPSED_UNIT_WARNING_TEMPLATE`, and a separate
+advisory because the *detection* has to be different — see
+:func:`superseded_scan_warning`. The operator-facing shape is deliberately the
+same, down to the inspection command, because the situation is the same one
+:data:`_COLLAPSED_UNIT_WARNING_TEMPLATE` describes: one fragment superseded by
+N, detected, reported, and left alone.
+
+Interpolates fragment ids, which are vault content, so it must not leave this
+process for a caller whose ceiling has not admitted it. See
+:data:`_SUPERSEDED_SCAN_SAFE_TEMPLATE`.
+"""
+
+_SUPERSEDED_SCAN_SAFE_TEMPLATE = (
+    "This vault holds {count} fragment(s) written by an earlier ingest of the "
+    "same scanned PDF(s), before OCR was switched on — each one empty-bodied, "
+    "because the pages are images. Each is now superseded by the per-page "
+    "fragments this run writes, and is left in place. Run the same ingest at a "
+    "terminal to see which fragments. Nothing is deleted automatically — "
+    "inspect with `creek purge source --source-path <path> --match exact "
+    "--dry-run`, and purge only what you recognise. Links pointing at a "
+    "superseded fragment keep resolving to it until you do."
+)
+"""The content-free twin of :data:`_SUPERSEDED_SCAN_WARNING_TEMPLATE` (#1372).
+
+Interpolates a count and nothing else: no fragment id, no path, no body.
+"""
+
+
+def superseded_scan_warning(
+    ledger: SourceLedger | None,
+    writer: VaultWriter,
+    fragments: Sequence[ParsedFragment],
+    vault_path: Path,
+) -> Advisory | None:
+    """Return the un-OCR'd-predecessor advisory, or ``None`` (#1639).
+
+    Before the scanned-PDF OCR route existed, a scanned PDF ingested as
+    **one** fragment with an empty body, keyed on the bare file key. It now
+    ingests as N fragments keyed ``<base_key>#page-1…N``. The bare key matches
+    none of those, so the original is neither updated nor tombed —
+    ``document`` is deliberately absent from :data:`TOMBING_SOURCES` — and an
+    operator who merely re-runs their usual ingest silently acquires a
+    duplicate. That transition is the **default** next run, not an opt-in:
+    ``CreekConfig().ocr`` defaults to ``enabled=True``.
+
+    **Why this cannot reuse :func:`collapsed_unit_warning`.** That function
+    finds its superseded fragment by recomputing
+    ``generate_fragment_id(source_path, timestamp, parsed.content)`` — and on
+    this path ``content`` is exactly what changed, from the empty extraction
+    to the OCR'd text. The recomputed id is one no vault ever held, so the
+    lookup misses and the advisory is structurally silent here. Measured: the
+    recomputation yields three ids absent from the index while the stale
+    fragment sits in it under a fourth. The detection therefore keys on the
+    **ledger's own ``source_key``**, which is the one identifier the OCR does
+    not touch.
+
+    **Detected, reported, and left alone**, which is the answer #1305 and
+    #1304 ratified for this shape. The detection here is exact rather than
+    heuristic — the ledger *records* that this fragment came from this key —
+    but the second half of their reasoning is untouched by that: an ingest run
+    cannot know whether the operator has since edited that fragment, linked to
+    it, or curated it into a thread. Tombing it would also require adding
+    ``document`` to :data:`TOMBING_SOURCES`, reversing the #1329 split of
+    identity from deletion authority, which is not a call a bug fix gets to
+    make.
+
+    Self-clearing, like its sibling: once the operator purges the superseded
+    fragment the ``find_fragment`` lookup misses and the run goes quiet. Also
+    silent on a fresh vault, and on every source that mints no ``source_unit``.
+
+    Args:
+        ledger: The resolved ledger for this run, or ``None`` when the source
+            type is unledgered — in which case there is no recorded
+            predecessor to supersede and nothing to say.
+        writer: The vault writer, consulted read-only via
+            :meth:`~creek.vault.writer.VaultWriter.find_fragment`, so a record
+            whose fragment the operator already deleted stays quiet.
+        fragments: This run's parsed fragments, before any are written.
+        vault_path: Vault root, needed to derive the same source key the
+            ledger recorded.
+
+    Returns:
+        The advisory in both disclosure forms, or ``None`` when this run
+        supersedes nothing.
+    """
+    if ledger is None:
+        return None
+    superseded: list[str] = []
+    for parsed in fragments:
+        if parsed.source_unit is None:
+            continue
+        record = ledger.get(derive_source_key(parsed.source_path, vault_path))
+        if record is None or record.tombed:
+            continue
+        if record.fragment_id in superseded:
+            continue
+        if writer.find_fragment(record.fragment_id) is not None:
+            superseded.append(record.fragment_id)
+    if not superseded:
+        return None
+    sample = ", ".join(sorted(superseded)[:_COLLAPSED_UNIT_SAMPLE])
+    if len(superseded) > _COLLAPSED_UNIT_SAMPLE:
+        sample = f"{sample}, …"
+    count = len(superseded)
+    return Advisory(
+        message=_SUPERSEDED_SCAN_WARNING_TEMPLATE.format(count=count, sample=sample),
+        ceiling_safe=_SUPERSEDED_SCAN_SAFE_TEMPLATE.format(count=count),
+    )
+
+
+_SCANNED_PDF_OCR_DECLINED_ADVISORY: Final[str] = (
+    "{count} scanned (image-only) PDF file(s) were left un-OCR'd because OCR "
+    "is off (`ocr.enabled: false` in the vault config). Each wrote one "
+    "fragment with an empty body, because its pages hold pictures and no "
+    "text to extract. Set `ocr.enabled: true` in "
+    "<vault>/00-Creek-Meta/creek_config.yaml and re-run to read them."
+)
+"""Told to the operator when a document pass declines to OCR a scanned PDF.
+
+The sibling of :data:`_OCR_DISABLED_ADVISORY` for the document route, and a
+separate string because the situation is genuinely different: that one
+explains a pass that wrote *nothing*, this one explains a pass that wrote
+plenty and quietly under-read one file in it. Saying nothing would reproduce
+the #1639 defect under a config key instead of under a missing call — the
+operator would still get an empty fragment with no indication why.
+
+Interpolates a count and nothing else. No path, no filename and no fragment
+content, so ``message`` and ``ceiling_safe`` are the same string and it
+crosses an MCP tier ceiling verbatim rather than being withheld (#1372).
+"""
+
+
+def scanned_pdf_declined_warning(
+    fragments: Sequence[ParsedFragment],
+) -> Advisory | None:
+    """Return the declined-OCR advisory for this run, or ``None`` (#1639).
+
+    Reads the parsed fragments rather than taking the ingestor class and the
+    config, which is what lets it live in :func:`pre_write_advisories` without
+    widening that function's inputs — its docstring records, as a design
+    decision, that it holds neither. ``DocumentIngestor.parse`` marks a
+    declined file with ``ocr_declined`` and this counts the marks, the same
+    shape :func:`collapsed_unit_warning` already uses.
+
+    Args:
+        fragments: Every fragment the pass parsed, before anything is written.
+
+    Returns:
+        The advisory when at least one file was declined, else ``None``.
+    """
+    # One declined PDF yields exactly one fragment carrying the mark, so this
+    # counts *files*, which is what the message says. Counting pages would be
+    # a number nothing knows: the pages were never read.
+    declined = sum(1 for parsed in fragments if parsed.metadata.get("ocr_declined"))
+    if not declined:
+        return None
+    message = _SCANNED_PDF_OCR_DECLINED_ADVISORY.format(count=declined)
+    return Advisory(message=message, ceiling_safe=message)
 
 
 def build_ingestor(
@@ -1673,21 +1866,46 @@ def build_ingestor(
     ``discord_filter_config``: a per-ingestor keyword, supplied by the
     caller that has it, and every other ingestor still constructed zero-arg.
 
+    :class:`~creek.ingest.documents.DocumentIngestor` takes the block too
+    since #1639, because an image-only PDF reaches OCR through *it* rather
+    than through the image ingestor (``.pdf`` is not in
+    :data:`~creek.ingest.images.IMAGE_EXTENSIONS`, so ``creek ingest --type
+    image`` never discovers one). The two are handed it on deliberately
+    different terms, and the asymmetry is the point: the image path treats
+    ``ocr=None`` as "use defaults", i.e. OCR **on**, while the document path
+    treats it as "off". Every MCP surface passes no block at all, so mirroring
+    the image default there would hand a remote caller OCR in a vault whose
+    operator had set ``ocr.enabled: false``. A default that grants a
+    capability is not the same kind of default as one that picks a language.
+
     Args:
         ingestor_cls: Concrete ingestor class to construct.
         ocr: The vault's ``ocr`` block, when the caller has one. ``None``
             leaves every ingestor — image included — on its own defaults,
-            which is what an API caller with no vault config gets.
+            which is what an API caller with no vault config gets, and leaves
+            the document ingestor's scanned-PDF route switched off.
 
     Returns:
         A ready ingestor.
 
     Raises:
-        UnknownOcrEngineError: When *ingestor_cls* reads images and
-            ``ocr.engine`` names no known backend.
+        UnknownOcrEngineError: When *ingestor_cls* reads images — directly or
+            via the scanned-PDF route — and ``ocr.engine`` names no known
+            backend.
+        OcrConfigError: When the same ingestor's ``ocr.languages`` holds no
+            usable code.
     """
     if ocr is not None and issubclass(ingestor_cls, ImageIngestor):
         return ImageIngestor.from_ocr_config(ocr)
+    # No ``ocr is not None`` guard on this branch, unlike the image one above,
+    # and the asymmetry is deliberate rather than an oversight.
+    # ``ImageIngestor.from_ocr_config`` cannot take ``None``, so that branch
+    # must screen for it; ``DocumentIngestor`` takes the block *including* its
+    # absence and decides there. Repeating the screen here would put the
+    # fail-closed rule in two places, one of which no mutation could ever
+    # redden — measured: deleting it changed no test. One home for it.
+    if issubclass(ingestor_cls, DocumentIngestor):
+        return DocumentIngestor(ocr=ocr)
     return ingestor_cls()
 
 
@@ -1698,6 +1916,17 @@ def ocr_is_disabled(ingestor_cls: type[Ingestor], ocr: OCRConfig | None) -> bool
     whose work *is* OCR, so the class is checked too — otherwise a vault that
     turned OCR off would stop ingesting its markdown as well, which is the
     kind of blast radius a boolean should never have.
+
+    **Deliberately not widened to
+    :class:`~creek.ingest.documents.DocumentIngestor` by #1639**, even though
+    that class now reaches OCR. This function short-circuits the *whole pass*
+    to an empty :class:`~creek.ingest.base.IngestResult`
+    (:func:`run_ingestor`), so widening it would stop DOCX, TXT, HTML and RTF
+    ingest outright in any vault that had merely switched OCR off — exactly
+    the blast radius the paragraph above refuses. For documents the disabled
+    case is a **per-file** decision made inside the ingestor: the pass runs
+    normally and only the scanned-PDF leg declines, with
+    :func:`scanned_pdf_declined_warning` saying so.
 
     Args:
         ingestor_cls: Concrete ingestor class about to run.
@@ -1893,6 +2122,7 @@ def run_ingest(
         ingest_result=ingest_result,
         input_path=input_path,
         ocr_disabled=ocr_is_disabled(ingestor_cls, ocr),
+        ledger=ledger,
     ):
         warn(advisory.message, ceiling_safe=advisory.ceiling_safe)
 

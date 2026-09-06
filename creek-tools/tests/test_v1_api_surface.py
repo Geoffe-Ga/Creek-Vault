@@ -45,6 +45,7 @@ from creek_mcp.api.models import (
 from creek_mcp.api.routes import (
     CONTRACT_VERSION_HEADER,
     IMPLEMENTED_CAPABILITIES,
+    PUBLISHED_SUCCESS_STATUSES,
     ROUTES,
 )
 from creek_mcp.httpapi import capabilities as capabilities_module
@@ -82,9 +83,9 @@ _OK_STATUS: Final[int] = 200
 _NOT_FOUND_STATUS: Final[int] = ERROR_STATUS[ErrorCode.NOT_FOUND]
 _UNAUTHENTICATED_STATUS: Final[int] = ERROR_STATUS[ErrorCode.UNAUTHENTICATED]
 
-_PUBLISHED_STATUSES: Final[frozenset[int]] = frozenset(ERROR_STATUS.values()) | {
-    _OK_STATUS
-}
+_PUBLISHED_STATUSES: Final[frozenset[int]] = (
+    frozenset(ERROR_STATUS.values()) | PUBLISHED_SUCCESS_STATUSES
+)
 """Every status ``/v1`` is allowed to answer with. ``307`` is not among them."""
 
 _WEBSOCKET_SCOPE: Final[str] = "websocket"

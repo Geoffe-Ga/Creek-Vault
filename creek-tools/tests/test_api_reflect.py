@@ -920,3 +920,148 @@ def test_the_current_minor_is_served_the_compiled_layer(
     assert [row["title"] for row in payload["related_praxis"]] == [
         "Rest before the collapse"
     ]
+
+
+# --- Owner-scoped grounding session (#1034) --------------------------------- #
+
+# ``/v1`` never goes through ``build_server``: :func:`_reflect` calls
+# ``reflect_tool`` directly, so the MCP-side count test in
+# ``tests/test_mcp_reflect.py`` does not cover this surface at all. These two
+# assert the same lifetime independently, through the real ASGI stack.
+#
+# Note the harness deviation: :func:`_post` builds a **new app per call**, which
+# is exactly what must not happen here, so these construct the app themselves
+# and drive several posts through one ``TestClient``. Counted-seam precedent:
+# ``test_repeated_handshakes_do_not_re_read_the_whole_audit_log``.
+
+
+def _write_corpus_fragment_1034(vault_path: Path, *, frag_id: str) -> None:
+    """Write one model-valid corpus fragment the grounder can actually retrieve.
+
+    Deliberately not :func:`_write_fragment`: that writer serves ``entry_ref``
+    resolution, which reads front matter directly, whereas corpus retrieval goes
+    through ``creek.vault.reader.try_load_fragment`` and skips anything the
+    ``Fragment`` model rejects. A fragment this walk cannot see would leave the
+    corpus empty, ``gather`` would return before touching either memo, and the
+    counts below would all read zero -- passing vacuously.
+
+    Args:
+        vault_path: The vault root.
+        frag_id: The fragment id, also the file stem.
+    """
+    stamp = "2026-05-01T00:00:00+00:00"
+    folder = vault_path / "01-Fragments" / "Notes"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / f"{frag_id}.md").write_text(
+        frontmatter.dumps(
+            frontmatter.Post(
+                content=f"Body of {frag_id}",
+                type="fragment",
+                id=frag_id,
+                title=f"{_FRAGMENT_TITLE}-{frag_id}",
+                created=stamp,
+                ingested=stamp,
+                source={"platform": "journal", "author": "self"},
+                frequency={"primary": "F1", "secondary": []},
+                privacy_tier="open",
+                eddies=[],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_one_app_reuses_one_retrieval_specialist_across_reflection_posts(
+    vault: Path, monkeypatch: pytest.MonkeyPatch, mock_sentence_transformer: Any
+) -> None:
+    """Three posts through one app pay the grounding setup once (#1034).
+
+    The ``/v1`` half of the defect. Against unfixed code every count reads
+    ``3``: ``_default_retrieve`` constructed a ``RetrievalSpecialist`` inline per
+    call, so each request loaded the sentence-transformer from disk and re-read
+    the embeddings parquet before doing any corpus work.
+
+    This surface amplifies that cost rather than merely paying it.
+    ``docs/api.md`` publishes ``POST /v1/reflections`` as a **read** under a 30 s
+    deadline with ``READ_ABANDONS_ON_CANCEL``, so a slow call sheds its caller
+    and returns the slot while the abandoned worker thread keeps embedding -- a
+    caller that retries stacks detached grounding passes. Bounding the per-call
+    work is what stops that stacking, so it is asserted here and not only on MCP.
+    """
+    from creek.author.agents import RetrievalSpecialist
+    from creek.link.embeddings import EmbeddingLinker
+
+    for index in range(3):
+        _write_corpus_fragment_1034(vault, frag_id=f"frag-1034-{index:02d}")
+
+    builds: list[object] = []
+    real_init = RetrievalSpecialist.__init__
+
+    def _counting_init(self: Any, **kwargs: Any) -> None:
+        """Record the construction, then run the real initialiser."""
+        builds.append(self)
+        real_init(self, **kwargs)
+
+    reads: list[object] = []
+    real_load = EmbeddingLinker.load_cache
+
+    def _counting_load(self: Any, path: Path) -> Any:
+        """Record the parquet read, then perform the real one."""
+        reads.append(path)
+        return real_load(self, path)
+
+    monkeypatch.setattr(RetrievalSpecialist, "__init__", _counting_init)
+    monkeypatch.setattr(EmbeddingLinker, "load_cache", _counting_load)
+
+    spy = _FactorySpy(_GOOD_TURN)
+    app = build_app(vault_path=vault, reflect_llm_factory=lambda: spy)
+    with TestClient(app) as test_client:
+        codes = [
+            test_client.post(
+                REFLECTIONS_PATH, json={"content": _ENTRY}, headers=headers()
+            ).status_code
+            for _ in range(3)
+        ]
+
+    assert codes == [_OK, _OK, _OK]
+    assert len(builds) == 1, f"{len(builds)} specialists built, expected 1"
+    assert len(reads) == 1, f"{len(reads)} parquet reads, expected 1"
+    assert mock_sentence_transformer.call_count == 1, "model loaded more than once"
+    assert _FRAGMENT_TITLE in spy.prompts[-1], (
+        "the counts went green because grounding died"
+    )
+
+
+def test_the_v1_route_hands_reflect_tool_a_reusable_session(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``create_app`` really wires a session through, and it really is reusable.
+
+    The ``/v1`` twin of
+    ``test_the_mcp_server_hands_reflect_tool_a_reusable_session``. Both wirings
+    are pinned independently because they are genuinely separate code paths:
+    the MCP one forwards ``session=`` from a registrar closure, while this one
+    travels as a fifth **positional** argument through ``read_off_loop``, whose
+    ``(func, *args)`` signature forbids keywords by design.
+
+    Asserting the kwarg alone would prove only that something was passed, so the
+    recorded session is also driven twice and must hand back the same object.
+    """
+    _write_corpus_fragment_1034(vault, frag_id="frag-1034-wire")
+    seen: list[Any] = []
+
+    def _recording_reflect_tool(**kwargs: Any) -> dict[str, Any]:
+        """Record the ``session`` kwarg and answer with a minimal success."""
+        seen.append(kwargs.get("session"))
+        return {"status": "ok", "notes": []}
+
+    monkeypatch.setattr(
+        "creek_mcp.httpapi.reflect.reflect_tool", _recording_reflect_tool
+    )
+    app = build_app(vault_path=vault, reflect_llm_factory=lambda: _FactorySpy())
+    with TestClient(app) as test_client:
+        test_client.post(REFLECTIONS_PATH, json={"content": _ENTRY}, headers=headers())
+
+    assert seen and seen[0] is not None, "the reflection route passed no session"
+    session = seen[0]
+    assert session.specialist(vault) is session.specialist(vault)

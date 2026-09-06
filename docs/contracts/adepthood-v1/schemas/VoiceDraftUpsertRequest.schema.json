@@ -1,0 +1,46 @@
+{
+  "$defs": {
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:func:`creek_mcp.policy.admitted_ceiling` refuses any remote call declaring\na ceiling outside :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` *before\ndispatch*. Since #1073 that decision is transport-neutral, so every adapter\nis meant to reach it the same way; the MCP surface does so today through\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool`, and #1074 mounts the\n``/v1`` handlers that will. This enum mirrors that frozenset, so\n``intimate`` and ``all`` are not merely refused at runtime \u2014 they cannot be\nconstructed at all, which is the half of the guarantee that does not depend\non a handler remembering to ask.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "An AI-authored draft to persist under the path's external id.\n\nAttributes:\n    content: Persisted model-authored markdown. Blank content is refused.\n    title: Optional operator-safe title. Omission uses a content-free\n        placeholder rather than deriving a filename from protected prose.\n    tier: The source entry's tier. ``intimate`` is unrepresentable on the\n        remote wire, so an intimate entry must use the delete route.",
+  "properties": {
+    "content": {
+      "description": "AI-authored markdown; must not be blank.",
+      "title": "Content",
+      "type": "string"
+    },
+    "tier": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Tier inherited from the source entry."
+    },
+    "title": {
+      "anyOf": [
+        {
+          "maxLength": 255,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional title; omission uses a content-free placeholder.",
+      "title": "Title"
+    }
+  },
+  "required": [
+    "content",
+    "tier"
+  ],
+  "title": "VoiceDraftUpsertRequest",
+  "type": "object"
+}

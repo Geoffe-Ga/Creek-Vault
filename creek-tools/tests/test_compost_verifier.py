@@ -11,6 +11,7 @@ available / unavailable degradation paths.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -189,12 +190,32 @@ class TestBuildCompostVerifier:
         assert _build_compost_verifier(CreekConfig()) is None
 
     def test_none_when_provider_unavailable(
-        self, monkeypatch: pytest.MonkeyPatch
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """A local provider that constructs but is unreachable degrades too."""
+        """A local provider that is unreachable or model-less gives an honest hint."""
         fake = _FakeProvider(available=False)
         monkeypatch.setattr("creek.classify.llm.build_provider", lambda _c: fake)
         assert _build_compost_verifier(CreekConfig()) is None
+        output = capsys.readouterr().out
+        assert "local host unreachable" in output
+        assert "configured model not installed" in output
+
+    @patch("creek.classify.llm.providers.httpx.Client")
+    def test_none_when_ollama_lacks_the_configured_model(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        """A partial Ollama install keeps calibration embedding-only."""
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"models": [{"name": "qwen3:8b"}]}
+        http = MagicMock()
+        http.get.return_value = response
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=http)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        assert _build_compost_verifier(CreekConfig()) is None
+        http.post.assert_not_called()
 
 
 @pytest.mark.parametrize(

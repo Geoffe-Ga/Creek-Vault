@@ -203,12 +203,12 @@ dev = [
     # the agreement is asserted by
     # tests/test_dependency_pins.py::_LOCKSTEP_TOOLS.
     "ruff>=0.16.4,<0.17",
-    # Pinned to the same major.minor as uv.lock and
-    # .pre-commit-config.yaml's mirrors-mypy rev so the three install
-    # paths (uv sync, pip install -e '.[dev]', pre-commit) run the same
-    # mypy version. Bumping requires updating all three together, both
-    # ends at once, for the reason on the ruff pin above.
-    # 2.1.0 -> 2.3.1 (#1440).
+    # Pinned to the same major.minor as uv.lock so the two provisioning
+    # paths (uv sync and pip install -e '.[dev]') run the same mypy version.
+    # Pre-commit reuses that project environment through typecheck.sh rather
+    # than provisioning a third copy (#1759). Bumping requires moving the
+    # declared band and lock together, both ends at once, for the reason on
+    # the ruff pin above. 2.1.0 -> 2.3.1 (#1440).
     "mypy>=2.3.1,<2.4.0",
     "pylint>=4.0.7",
     # Pinned to the same version as uv.lock and .pre-commit-config.yaml's
@@ -221,10 +221,9 @@ dev = [
     "xenon>=0.9.0",
     "interrogate>=1.7.0",
     "refurb>=2.0.0",
-    # Pinned to the same version as uv.lock and .pre-commit-config.yaml's
-    # tryceratops rev so the three install paths run the same tryceratops
-    # version. Bumping requires updating all three together
-    # (issues #206, #409).
+    # Bounded to the same major as uv.lock. Pre-commit reuses the project
+    # installation through lint-tryceratops.sh rather than provisioning an
+    # independent copy (#1759), so the declared band and lock move together.
     "tryceratops>=2.4.1,<3",
     # Floor raised from 2.10 when vulture became a real gate (issue #1395).
     # scripts/lint_vulture.py drives the Python API (Vulture.scavenge,

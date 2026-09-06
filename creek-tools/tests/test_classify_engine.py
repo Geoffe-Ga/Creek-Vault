@@ -514,6 +514,50 @@ def test_intimate_tier_writes_full_trace_to_log_not_frontmatter(
     assert records[0]["reasoning"] == _LONG_REASONING
 
 
+def test_an_unrecognised_tier_routes_the_trace_to_the_log_not_frontmatter(
+    tmp_path: Path,
+) -> None:
+    """A tier the enum does not know must route like ``intimate`` (#1489).
+
+    Exercised directly against :func:`_route_reasoning` rather than
+    through ``run_classify``: an unrecognised tier never survives
+    ``Fragment.model_validate``, so a fragment file carrying one is
+    dropped by the vault reader and could never reach the engine. The
+    unit call is the only way to observe this branch.
+
+    Reading the raw model attribute returns the LLM reasoning preamble
+    for direct embedding in vault frontmatter; the canonical reader
+    fails closed and sends it to the gitignored trace log instead.
+    """
+    import json as _json
+
+    from creek.classify.classify_engine import _route_reasoning
+
+    trace_log = tmp_path / "trace.jsonl"
+    frag = Fragment.model_construct(
+        id="frag-bogustier01",
+        title="hand edited",
+        source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        privacy_tier="super-secret",
+    )
+
+    stored = _route_reasoning(
+        fragment=frag,
+        reasoning=_LONG_REASONING,
+        method="llm",
+        trace_log_path=trace_log,
+    )
+
+    assert stored == ""
+    records = [
+        _json.loads(line)
+        for line in trace_log.read_text(encoding="utf-8").splitlines()
+        if line
+    ]
+    assert len(records) == 1
+    assert records[0]["reasoning"] == _LONG_REASONING
+
+
 def test_short_reasoning_is_persisted_verbatim(tmp_path: Path) -> None:
     """A trace shorter than the cap is stored without truncation marker."""
     from creek.classify.constants import CLASSIFICATION_REASONING_KEY

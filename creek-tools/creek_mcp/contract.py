@@ -20,8 +20,76 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.12.0"
+CONTRACT_VERSION: Final[str] = "0.15.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.15.0 (#1727): ``/v1`` publishes an eighth capability,
+``voice-drafts``, over one caller-owned ``external_id`` resource. ``PUT``
+creates or atomically updates the AI-authored draft, ``GET`` recalls the same
+persisted document, and ``DELETE`` retracts it after a source entry becomes
+intimate. The write/read models carry fixed AI attribution — ``author=ai``,
+``author_slug=ai-as-user`` and ``voice_weight=0`` — and the on-disk fragment
+uses the same metadata under ``11-Other-Authors/ai-as-user/``, so mirrored
+model prose is readable as evidence but can never enter the owner's voice
+corpus. The route set and five wire schemas widen the HTTP contract; ``0.14``
+remains served and is neither told about nor allowed to reach the capability.
+
+0.14.0 (#1605): ``POST /v1/classifications`` now admits ``method=llm`` and
+``POST /v1/links`` admits ``method=embeddings`` as durable asynchronous jobs.
+Both return ``202`` with an opaque job id; ``GET /v1/jobs/{job_id}`` reports a
+closed queued/running/succeeded/failed lifecycle and, on success, the same
+counts-only model the synchronous route returns. Existing short methods keep
+their byte-identical ``200`` responses. Records are atomically persisted
+inside the vault, bound to the authenticated consumer, and an active record
+owned by a prior server instance becomes ``failed`` after restart instead of
+remaining plausibly live forever. No fragment id, path, title, prose, or tool
+error enters either job response. LLM execution still goes through
+``classify_tool`` and ``ModelRouter._enforce_local_for_intimate``, preserving
+the intimate-never-cloud chokepoint. The route, request enums, two wire models,
+and ``202`` response widen the HTTP contract, so the minor moves and ``0.13``
+is retained in the compatibility window.
+
+0.13.0 (#874): one new **read-only** MCP tool, ``creek.classify.entry``. It
+takes an ``entry_ref`` and a ``privacy_tier_ceiling`` and reports the
+classification that fragment **already carries on disk** — ``frequency``,
+``phase``, ``privacy_tier`` and ``classification_method``. It computes
+nothing: no rule classifier on demand, no LLM, no persisted verdict. The tool
+surface widened, so the minor moves; it cannot be a patch, because a consumer
+negotiating capabilities meets a tool name it never agreed to. **No ``/v1``
+route, capability, wire model, error code, status or schema moves**, so this
+is a pure MCP-surface bump of the 0.3/0.4/0.6/0.7 kind and
+:data:`creek_mcp.api.models.SUPPORTED_CONTRACT_MINORS` widens to keep ``0.12``
+served.
+
+**What it closes.** A consumer could write a journal entry and could not ask
+what the ontology made of it. ``creek.journal`` already returns ``fragment_id``
+as a required field on both transports, so ``journal → fragment_id →
+creek.classify.entry`` is a complete round trip with **zero change to the
+journal surface** — which is why the capability landed here rather than as an
+inline field on ``creek.journal``. Inline would have been a constant in
+disguise: ``run_ingest`` never runs the frequency/phase classifier, so the
+answer would have been ``unclassified`` on every call forever.
+
+That fact is now published rather than merely true. A freshly written entry
+reads ``frequency="unclassified"``, ``phase="unclassified"``,
+``classification_method="none"`` until a pass runs, and the tool's fourth field
+is what makes that legible: the provenance stamp is written unconditionally by
+any classify write, so ``method="rules"`` with ``frequency="unclassified"``
+means *a pass ran and could not classify this*, while ``method="none"`` means
+*no pass has run*. The remedy for the latter is the route that shipped at
+``0.10.0`` — run ``creek.classify`` or ``POST /v1/classifications``, then read.
+
+Nothing is newly disclosed. The four published values are bounded enum-valued
+strings, already served at strictly broader granularity by
+``creek.state.render``, ``creek.wheel`` and the compiled layer, and strictly
+less than ``creek.reflect`` — which returns model-generated prose grounded in
+the fragment *body* — already publishes over the same id namespace. The tool
+is ``GATED`` on the shared ``refuse_above_ceiling`` primitive against the
+fragment's current **persisted** tier, never a caller-declared one, failing
+closed to ``intimate`` both for a missing ``privacy_tier`` key and for an id
+that resolves to nothing. ``classification_method`` is **clamped** to the three
+published methods rather than echoed, because raw frontmatter is arbitrary
+user-controlled bytes.
 
 0.12.0 (#1292): ``creek.redact.scan``'s ``statistics`` object gains a fifth
 typed key, ``files_skipped_symlink`` — the count of symlinked children the

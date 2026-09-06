@@ -7816,8 +7816,9 @@ def _build_compost_verifier(config: CreekConfig) -> SupportsVerifyCompost | None
     # (#646) and gate on availability so any backend (Ollama / OpenAI / Gemini /
     # Anthropic) degrades the same way. A cloud provider validates its env in the
     # constructor and may raise (build_provider contract); a local provider
-    # constructs but reports ``available is False`` when its host is down — both
-    # fall back to embedding-only scoring.
+    # constructs but reports ``available is False`` when its host is down or its
+    # configured model is not installed — both fall back to embedding-only
+    # scoring.
     #
     # No tier argument, and this is *not* the same class of site as the
     # `creek compile` bug (#962). The only call site is
@@ -7840,7 +7841,8 @@ def _build_compost_verifier(config: CreekConfig) -> SupportsVerifyCompost | None
     if not provider.available:
         console.print(
             "[yellow]Skipping LLM verifier — provider prerequisites unmet "
-            "(missing key/consent, or local host unreachable).[/yellow]",
+            "(missing key/consent, local host unreachable, or configured model "
+            "not installed).[/yellow]",
         )
         return None
     return LLMCompostVerifier(provider=provider)
@@ -7907,7 +7909,8 @@ def _refuse_scan_without_verifier(detail: str) -> NoReturn:
     console.print(f"[red]Cannot verify compost candidates: {detail}[/red]")
     console.print(
         "Set the provider credentials (API key + CREEK_CLOUD_CONSENT=1 for a "
-        "cloud provider, or start the local host), or re-run with "
+        "cloud provider), or start the local host and install its configured "
+        "model; alternatively, re-run with "
         "[bold]--no-llm[/bold] to file unverified candidates to the review "
         "queue instead.",
     )
@@ -7959,7 +7962,7 @@ def _build_scan_verifier(config: CreekConfig) -> SupportsVerifyCompost:
     if not provider.available:
         _refuse_scan_without_verifier(
             "provider prerequisites unmet (missing API key, missing cloud "
-            "consent, or local host unreachable)",
+            "consent, local host unreachable, or configured model not installed)",
         )
     return LLMCompostVerifier(provider=provider)
 

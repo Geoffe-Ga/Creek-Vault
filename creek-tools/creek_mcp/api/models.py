@@ -42,18 +42,21 @@ non-answer — above the ceiling, purged, orphaned, schema-invalid, or deleted
 out of band — collapses to :attr:`ErrorCode.PRIVACY_REFUSED` carrying
 :data:`creek_mcp.read_gate.GENERIC_ABOVE_CEILING_REASON`.
 
-Today that rule is enforced by this vocabulary alone: there is no handler to
-break it, since ``/v1`` has no routes until #1074 mounts them. The structural
-guard that keeps it from regressing once handlers exist — an AST sweep over
-every ``NOT_FOUND`` construction site in :mod:`creek_mcp`, checked against a
-pinned routing-layer allowlist — is tracked in #1098.
+That rule is enforced structurally as well as by this vocabulary. An AST sweep
+over every module in :mod:`creek_mcp` pins the modules that may name
+``NOT_FOUND`` at all to a routing-layer allowlist this one heads — see
+``test_not_found_is_named_only_in_the_pinned_routing_modules`` in
+``tests/test_v1_api_structure.py``, alongside
+``test_not_found_is_constructed_once_in_the_routing_miss``, which pins the sole
+``error_response(ErrorCode.NOT_FOUND, ...)`` site to the routing-miss handler.
 """
 
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Final, Literal, Self
+from typing import Final, Literal, Self, TypeAlias
 from urllib.parse import urlparse
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -79,6 +82,9 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.14",
+    "0.13",
+    "0.12",
     "0.11",
     "0.10",
     "0.9",
@@ -164,6 +170,29 @@ unchanged, so a ``0.11`` client is answered byte-identically on every ``/v1``
 route it calls and there is nothing for it to be refused over. ``0.11`` is
 therefore retained here.
 
+Contract 0.13 (#874) is a pure MCP-surface move of the same kind, and the
+plainest instance of why this tuple **widens and never shifts**. It adds one
+read-only MCP tool, ``creek.classify.entry``. No ``/v1`` route, capability,
+wire model, error code, status or schema moves and ``CONTRACT_MODELS`` is
+unchanged, so a ``0.12`` client is answered byte-identically on every ``/v1``
+route it calls — it simply is not told about a tool it cannot reach over HTTP
+anyway. The explicit ``"0.12"`` below is therefore the whole of what keeps this
+change additive: without it, ``CONTRACT_MINOR`` moves to ``"0.13"`` and every
+client still sending ``X-Creek-Contract-Version: 0.12`` is refused
+``incompatible_version`` on every capability route, over a break it cannot
+observe.
+
+Contract 0.14 (#1605) widens the existing pipeline capability with two
+asynchronous request members, a ``202`` response, two job wire models and
+``GET /v1/jobs/{job_id}``. The short-method request and response bytes do not
+move, and a ``0.13`` consumer cannot express either new method from its
+vendored enums, so ``0.13`` remains served alongside every earlier minor.
+
+Contract 0.15 (#1727) adds the ``voice-drafts`` capability, three resource
+verbs, and five wire models. Every older response remains byte-identical;
+``0.14`` is kept in the window and the since-minor gate both withholds and
+refuses the new resource for clients whose vendored schema predates it.
+
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
 version alone silently drops the outgoing current minor out of this window and
@@ -226,7 +255,7 @@ class WireTierCeiling(StrEnum):
 
 
 class Capability(StrEnum):
-    """The seven capabilities ``/v1`` publishes.
+    """The eight capabilities ``/v1`` publishes.
 
     The list was identical for every minor in
     :data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3
@@ -276,6 +305,8 @@ class Capability(StrEnum):
             response carries a fragment id, a path or a byte of prose, which
             is what makes running the whole vault under a remote ceiling
             disclose nothing.
+        VOICE_DRAFTS: AI-attributed draft upsert, recall, and retraction by a
+            caller-owned external id. Since contract 0.15 (#1727).
     """
 
     CAPABILITIES = "capabilities"
@@ -285,6 +316,7 @@ class Capability(StrEnum):
     UPLOAD = "upload"
     DRIVE_CONNECTOR = "drive-connector"
     PIPELINE = "pipeline"
+    VOICE_DRAFTS = "voice-drafts"
 
 
 _FOUNDING_MINOR: Final[str] = "0.2"
@@ -318,6 +350,14 @@ would sort ``"0.10"`` below ``"0.8"`` and hide the capability from precisely
 the clients new enough to negotiate it.
 """
 
+_VOICE_DRAFTS_MINOR: Final[str] = "0.15"
+"""The minor ``voice-drafts`` was published at (#1727).
+
+A literal for the same reason :data:`_UPLOAD_MINOR` is one: using the derived
+current minor would silently move the capability forward on the next bump and
+hide it from clients that correctly vendored contract 0.15.
+"""
+
 RELATED_FIELDS_SINCE_MINOR: Final[str] = "0.9"
 """First contract minor whose ``ReflectionResponse`` carries the #873 fields.
 
@@ -342,6 +382,7 @@ CAPABILITY_SINCE_MINOR: Final[dict[Capability, str]] = {
     Capability.UPLOAD: _UPLOAD_MINOR,
     Capability.DRIVE_CONNECTOR: _DRIVE_CONNECTOR_MINOR,
     Capability.PIPELINE: _PIPELINE_MINOR,
+    Capability.VOICE_DRAFTS: _VOICE_DRAFTS_MINOR,
 }
 """The contract minor each capability was first published at.
 
@@ -1009,6 +1050,102 @@ class JournalUpsertResponse(_WireModel):
     )
 
 
+class VoiceDraftAttribution(_WireModel):
+    """The fixed attribution of every remotely stored Voice Draft.
+
+    All three fields are literals with defaults, so a producer can construct
+    the one valid value with no caller input and a consumer cannot mistake an
+    AI-authored draft for owner voice.
+    """
+
+    author: Literal["ai"] = Field(
+        default="ai",
+        description="Always AI; owner authorship is inexpressible.",
+    )
+    author_slug: Literal["ai-as-user"] = Field(
+        default="ai-as-user",
+        description="Reserved Creek other-author namespace.",
+    )
+    voice_weight: Literal[0] = Field(
+        default=0,
+        description="Always zero; the draft never trains the owner's voice.",
+    )
+
+
+class VoiceDraftUpsertRequest(_WireModel):
+    """An AI-authored draft to persist under the path's external id.
+
+    Attributes:
+        content: Persisted model-authored markdown. Blank content is refused.
+        title: Optional operator-safe title. Omission uses a content-free
+            placeholder rather than deriving a filename from protected prose.
+        tier: The source entry's tier. ``intimate`` is unrepresentable on the
+            remote wire, so an intimate entry must use the delete route.
+    """
+
+    content: str = Field(description="AI-authored markdown; must not be blank.")
+    title: str | None = Field(
+        default=None,
+        max_length=MAX_FILENAME_CHARS,
+        description="Optional title; omission uses a content-free placeholder.",
+    )
+    tier: WireTierCeiling = Field(description="Tier inherited from the source entry.")
+
+    @field_validator("content")
+    @classmethod
+    def _reject_blank_content(cls, value: str) -> str:
+        """Return non-blank content and refuse an empty durable document."""
+        if not value.strip():
+            raise ValueError("content must not be blank")
+        return value
+
+    @field_validator("title")
+    @classmethod
+    def _reject_blank_title(cls, value: str | None) -> str | None:
+        """Return a meaningful optional title; blank is not an alternate null."""
+        if value is not None and not value.strip():
+            raise ValueError("title must not be blank")
+        return value
+
+
+class VoiceDraftUpsertResponse(_WireModel):
+    """The result of creating or updating one durable Voice Draft."""
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    external_id: str = Field(description="Consumer-owned durable identity.")
+    fragment_id: str = Field(description="Stable vault-side fragment identity.")
+    action: JournalAction = Field(description="Created, updated, or unchanged.")
+    tier: WireTierCeiling = Field(description="Tier inherited from the source entry.")
+    attribution: VoiceDraftAttribution = Field(
+        description="Fixed AI attribution and zero voice weight.",
+    )
+
+
+class VoiceDraftReadResponse(_WireModel):
+    """One persisted Voice Draft recalled by its external id."""
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    external_id: str = Field(description="Consumer-owned durable identity.")
+    fragment_id: str = Field(description="Stable vault-side fragment identity.")
+    title: str = Field(description="Stored draft title.")
+    content: str = Field(description="Stored AI-authored markdown.")
+    tier: WireTierCeiling = Field(description="Persisted privacy tier.")
+    attribution: VoiceDraftAttribution = Field(
+        description="Fixed AI attribution and zero voice weight.",
+    )
+
+
+class VoiceDraftDeleteResponse(_WireModel):
+    """Confirmation that one addressed Voice Draft was retracted."""
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    external_id: str = Field(description="Consumer-owned identity that was retracted.")
+    action: Literal["deleted"] = Field(description="Always deleted.")
+
+
 class UploadRequest(_WireModel):
     """One document's bytes, handed to the vault under a stable id (#1524).
 
@@ -1441,39 +1578,27 @@ class DriveAuthorizationExchangeRequest(_WireModel):
 class ClassificationMethod(StrEnum):
     """The classification methods ``POST /v1/classifications`` serves.
 
-    One member, and the single member is the point. ``creek classify`` also
-    accepts ``llm``, and it is **deliberately absent here** rather than
-    accepted-and-refused:
-
-    * **Time.** :data:`creek_mcp.httpapi.middleware.limits.DEFAULT_TIMEOUT_SECONDS`
-      is thirty seconds, and the timeout middleware uses ``anyio.fail_after``,
-      which cannot cancel a call already inside ``run_in_threadpool``. An LLM
-      pass over a seeded corpus is minutes to hours: the caller would be handed
-      a ``503`` while the work carried on with no handle on it.
-    * **Egress.** With no ``llm`` member there is no value a producer or a
-      consumer can put on the wire that reaches a provider at all, so "no byte
-      of the vault leaves the host on this route" is a property of the type
-      rather than of a runtime check somebody can forget to call.
-
-    Reaching ``llm`` classification over the network needs an asynchronous job
-    surface — ``202``, a job id, a status route — which this contract does not
-    have. Until then it stays an operator step on the host.
+    ``rules`` remains the bounded synchronous path. ``llm`` is accepted only
+    through the durable job surface added at contract 0.14 (#1605), because a
+    pass can take minutes or hours. The detached worker still invokes the
+    existing classify tool, including ModelRouter's intimate-never-cloud gate.
 
     Attributes:
         RULES: Keyword classification. No model, no key, no consent, no egress.
+        LLM: Model-backed classification, returned as a durable job handle.
     """
 
     RULES = "rules"
+    LLM = "llm"
 
 
 class LinkMethod(StrEnum):
     """The linker stages ``POST /v1/links`` serves.
 
-    Three of :data:`creek.surface_modes.LINK_METHODS`. ``embeddings`` is the
-    fourth and is excluded for the same shape of reason ``llm`` is excluded
-    from :class:`ClassificationMethod`, with a different cause: it is the
-    O(n²) pairwise-similarity stage, which has been observed being abandoned
-    at 35k fragments and is unbounded in a way no cache repairs.
+    All four :data:`creek.surface_modes.LINK_METHODS` values are expressible.
+    ``embeddings`` uses the durable job surface because it is the O(n²)
+    pairwise-similarity stage; the other three retain their synchronous
+    byte-identical ``200`` responses.
 
     **Excluding it does not make every served member cheap, and the schema
     should not be read as promising that.** ``eddies`` and ``threads`` both
@@ -1495,11 +1620,13 @@ class LinkMethod(StrEnum):
         THREADS: Narrative currents, materialised under ``02-Threads/``. Embeds
             on a cold cache, and reads the APTITUDE labels a classification
             pass writes, so run classification first.
+        EMBEDDINGS: Pairwise similarity links, returned as a durable job handle.
     """
 
     TEMPORAL = "temporal"
     EDDIES = "eddies"
     THREADS = "threads"
+    EMBEDDINGS = "embeddings"
 
 
 class ClassificationRequest(_WireModel):
@@ -1527,7 +1654,7 @@ class ClassificationRequest(_WireModel):
 
     method: ClassificationMethod = Field(
         default=ClassificationMethod.RULES,
-        description="Classifier to run; rules is the only served method.",
+        description="Classifier to run; llm is accepted as a durable job.",
     )
     retier: bool = Field(
         default=False,
@@ -1643,6 +1770,39 @@ class LinkResponse(_WireModel):
     largest_cluster_fragments: int = Field(ge=0, description="Biggest cluster's size.")
     clusters_split: int = Field(ge=0, description="Clusters re-clustered tighter.")
     oversized_discarded: int = Field(ge=0, description="Fragments dropped to noise.")
+
+
+class JobState(StrEnum):
+    """The closed lifecycle vocabulary for a durable pipeline job."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+JobId: TypeAlias = UUID
+"""An opaque server-generated identifier for one durable pipeline job."""
+
+
+class JobAcceptedResponse(_WireModel):
+    """The durable handle returned when a long pipeline pass is accepted."""
+
+    status: Literal["accepted"] = Field(description="The job was durably queued.")
+    job_id: JobId = Field(description="Opaque server-generated job identifier.")
+    state: Literal[JobState.QUEUED] = Field(description="Initial lifecycle state.")
+
+
+class JobStatusResponse(_WireModel):
+    """The counts-only public projection of one consumer-bound pipeline job."""
+
+    status: Literal["ok"] = Field(description="The status lookup succeeded.")
+    job_id: JobId = Field(description="Opaque server-generated job identifier.")
+    state: JobState = Field(description="Current lifecycle state.")
+    result: ClassificationResponse | LinkResponse | None = Field(
+        default=None,
+        description="Counts-only result, present only after successful completion.",
+    )
 
 
 class ReflectionRequest(_WireModel):
@@ -2044,6 +2204,8 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "ErrorEnvelope": ErrorEnvelope,
     "JournalUpsertRequest": JournalUpsertRequest,
     "JournalUpsertResponse": JournalUpsertResponse,
+    "JobAcceptedResponse": JobAcceptedResponse,
+    "JobStatusResponse": JobStatusResponse,
     "LinkRequest": LinkRequest,
     "LinkResponse": LinkResponse,
     "NotApplicableExample": NotApplicableExample,
@@ -2056,6 +2218,11 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "UploadRequest": UploadRequest,
     "UploadResponse": UploadResponse,
     "VaultState": VaultState,
+    "VoiceDraftAttribution": VoiceDraftAttribution,
+    "VoiceDraftDeleteResponse": VoiceDraftDeleteResponse,
+    "VoiceDraftReadResponse": VoiceDraftReadResponse,
+    "VoiceDraftUpsertRequest": VoiceDraftUpsertRequest,
+    "VoiceDraftUpsertResponse": VoiceDraftUpsertResponse,
     "WheelFrequencies": WheelFrequencies,
     "WheelFrequency": WheelFrequency,
     "WheelResponse": WheelResponse,

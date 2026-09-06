@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from creek.audit import AuditChainBroken, AuditLog
+from tests.audit_tamper_support import rewrite_last_line_preserving_size
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -316,3 +317,65 @@ def test_thread_lock_holder_collected_when_no_audit_log_references_it(
     gc.collect()
     assert holder_ref() is None
     assert _THREAD_LOCK_HOLDERS.get(resolved) is None
+
+
+def test_same_length_last_line_rewrite_is_caught_when_the_warm_cache_appends(
+    tmp_path: Path,
+) -> None:
+    """A same-length rewrite of the last line breaks the chain on next append.
+
+    Pins the residual settled in ``AuditLog._compute_prev_hash``'s docstring,
+    the canonical decision record. The size-only cache-validity check in
+    ``AuditLog._compute_prev_hash`` is deliberately partial, and its
+    *staleness* is the only thing that turns a byte-length-preserving
+    out-of-band rewrite of the last line into detectable tampering: the warm
+    cache still holds the hash of the ORIGINAL line, so the next append stamps
+    ``prev_hash`` from bytes that are no longer on disk and ``verify()`` raises
+    at the following line.
+
+    Invalidating the cache on mtime/inode/tail-hash instead — the remedy this
+    project rejected — makes the append re-anchor onto the mutated line, and the
+    whole log then verifies clean. That is the "undetectable tampering with a
+    tamper-evidence log" shape recorded in ``docs/security/threat-model.md``
+    under the ``#1308``/``#1561`` bullet, so this test is the guard against
+    that regression, not merely a characterisation of today's behaviour.
+    """
+    path = tmp_path / "audit.jsonl"
+    log = AuditLog(path)
+    log.append({"op": "aaaa"})
+    log.append({"op": "bbbb"})
+
+    rewrite_last_line_preserving_size(path, lambda entry: entry | {"op": "cccc"})
+
+    log.append({"op": "dddd"})
+
+    with pytest.raises(AuditChainBroken) as excinfo:
+        AuditLog(path).verify()
+    message = str(excinfo.value)
+    assert message.startswith("Audit chain broken at line 2:")
+    assert "line 1" not in message
+
+
+def test_same_length_last_line_rewrite_alone_still_verifies(tmp_path: Path) -> None:
+    """A same-length rewrite is invisible to verify() until something appends.
+
+    Records a LIMITATION, not a desirable property. The size-only cache check
+    cannot see a byte-length-preserving out-of-band rewrite, and until the next
+    append nothing downstream depends on the rewritten line's bytes, so the
+    chain remains self-consistent and ``verify()`` is silent. Detection arrives
+    with the next append -- see
+    ``test_same_length_last_line_rewrite_is_caught_when_the_warm_cache_appends``.
+
+    This is the direct evidence for the accepted-residual sentence in
+    ``AuditLog._compute_prev_hash``'s docstring, which would otherwise rest on
+    prose alone.
+    """
+    path = tmp_path / "audit.jsonl"
+    log = AuditLog(path)
+    log.append({"op": "aaaa"})
+    log.append({"op": "bbbb"})
+
+    rewrite_last_line_preserving_size(path, lambda entry: entry | {"op": "cccc"})
+
+    AuditLog(path).verify()
+    assert [entry["op"] for entry in AuditLog(path).read()] == ["aaaa", "cccc"]

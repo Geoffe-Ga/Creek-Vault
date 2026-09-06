@@ -9,6 +9,17 @@ before fragment extraction. Handles:
 - **Abandoned conversations**: Flagged when ≤N turns with no substantive content.
 - **Short human turns**: Skipped when below configurable character threshold.
 - **Code-only responses**: Flagged when >threshold% of content is code blocks.
+
+:class:`ChatbotFilterConfig` is imported from :mod:`creek.config` rather
+than declared here (#1519). It used to be declared in both places under
+two different sets of field names -- ``cleaning.chatbot`` said
+``filter_system_prompts`` where this filter read ``skip_system_prompts``
+-- so the operator-facing block configured nothing. The model has to live
+in ``creek.config`` rather than the other way round because that module
+cannot import :mod:`creek.clean`, which imports back out of it. The name
+is still bound in this module's namespace, so every existing import of
+``creek.clean.filters.chatbot.ChatbotFilterConfig`` resolves to the same
+object it always did.
 """
 
 from __future__ import annotations
@@ -18,47 +29,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-
-class ChatbotFilterConfig(BaseModel):
-    """Configuration for the chatbot pre-ingestion filter.
-
-    All thresholds are configurable to tune filtering behaviour per
-    deployment without modifying code.
-
-    Attributes:
-        min_human_turn_length: Minimum character count for human turns.
-        code_block_threshold: Fraction of content that is code blocks
-            above which the response is flagged as code-only.
-        max_abandoned_turns: Maximum number of turns (human+assistant
-            pairs) for a conversation to be considered abandoned.
-        skip_system_prompts: Whether to filter out system prompt messages.
-        skip_tool_outputs: Whether to filter out tool output messages.
-        collapse_regenerations: Whether to collapse consecutive assistant
-            messages to keep only the final version.
-    """
-
-    min_human_turn_length: int = Field(default=20, ge=0)
-    """Minimum character count for human turns (default: 20)."""
-
-    code_block_threshold: float = Field(default=0.9, ge=0.0, le=1.0)
-    """Code-block ratio above which a response is flagged (default: 0.9)."""
-
-    max_abandoned_turns: int = Field(default=2, ge=0)
-    """Max turn pairs for abandoned conversation detection (default: 2)."""
-
-    skip_system_prompts: bool = True
-    """Whether to skip system prompt messages."""
-
-    skip_tool_outputs: bool = True
-    """Whether to skip tool output messages."""
-
-    collapse_regenerations: bool = True
-    """Whether to collapse consecutive assistant messages."""
-
+from creek.config import ChatbotFilterConfig
 
 # ---------------------------------------------------------------------------
 # Result models
