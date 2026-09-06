@@ -1,0 +1,99 @@
+{
+  "$defs": {
+    "JournalAction": {
+      "description": "What an idempotent write actually did \u2014 journal upsert or upload.\n\n``UNCHANGED`` is a success, not an error: re-sending an unmodified entry is\nthe steady state of a continuous sync, and a client must be able to tell it\napart from a write without diffing content itself.\n\nShared by :class:`JournalUpsertResponse` and :class:`UploadResponse` rather\nthan duplicated under a second name. The three words are the same three\n:func:`creek_mcp.tools.upload._action_of` collapses an ingest tally into,\nand the ledger that decides them is one ledger. The name kept its\n``Journal`` prefix through contract 0.8 because it is a **published schema\ncomponent name**: Adepthood has vendored ``$defs/JournalAction`` since 0.2,\nand renaming it would break every consumer's schema validation to buy\nnothing a docstring cannot say.\n\nAttributes:\n    CREATED: A new fragment was written.\n    UPDATED: An existing fragment was updated in place.\n    UNCHANGED: The content hash matched; nothing was written.",
+      "enum": [
+        "created",
+        "updated",
+        "unchanged"
+      ],
+      "title": "JournalAction",
+      "type": "string"
+    },
+    "VoiceDraftAttribution": {
+      "additionalProperties": false,
+      "description": "The fixed attribution of every remotely stored Voice Draft.\n\nAll three fields are literals with defaults, so a producer can construct\nthe one valid value with no caller input and a consumer cannot mistake an\nAI-authored draft for owner voice.",
+      "properties": {
+        "author": {
+          "const": "ai",
+          "default": "ai",
+          "description": "Always AI; owner authorship is inexpressible.",
+          "title": "Author",
+          "type": "string"
+        },
+        "author_slug": {
+          "const": "ai-as-user",
+          "default": "ai-as-user",
+          "description": "Reserved Creek other-author namespace.",
+          "title": "Author Slug",
+          "type": "string"
+        },
+        "voice_weight": {
+          "const": 0,
+          "default": 0,
+          "description": "Always zero; the draft never trains the owner's voice.",
+          "title": "Voice Weight",
+          "type": "integer"
+        }
+      },
+      "title": "VoiceDraftAttribution",
+      "type": "object"
+    },
+    "WireTierCeiling": {
+      "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:func:`creek_mcp.policy.admitted_ceiling` refuses any remote call declaring\na ceiling outside :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` *before\ndispatch*. Since #1073 that decision is transport-neutral, so every adapter\nis meant to reach it the same way; the MCP surface does so today through\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool`, and #1074 mounts the\n``/v1`` handlers that will. This enum mirrors that frozenset, so\n``intimate`` and ``all`` are not merely refused at runtime \u2014 they cannot be\nconstructed at all, which is the half of the guarantee that does not depend\non a handler remembering to ask.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology \u00a713.2).\n    PERSONAL: Adds personal \u2014 and, per #961, ``unclassified`` \u2014 content.",
+      "enum": [
+        "open",
+        "personal"
+      ],
+      "title": "WireTierCeiling",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "description": "The result of creating or updating one durable Voice Draft.",
+  "properties": {
+    "action": {
+      "$ref": "#/$defs/JournalAction",
+      "description": "Created, updated, or unchanged."
+    },
+    "attribution": {
+      "$ref": "#/$defs/VoiceDraftAttribution",
+      "description": "Fixed AI attribution and zero voice weight."
+    },
+    "external_id": {
+      "description": "Consumer-owned durable identity.",
+      "title": "External Id",
+      "type": "string"
+    },
+    "fragment_id": {
+      "description": "Stable vault-side fragment identity.",
+      "title": "Fragment Id",
+      "type": "string"
+    },
+    "status": {
+      "const": "ok",
+      "description": "Always ok; failure is an error.",
+      "title": "Status",
+      "type": "string"
+    },
+    "tier": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Tier inherited from the source entry."
+    },
+    "tier_ceiling": {
+      "$ref": "#/$defs/WireTierCeiling",
+      "description": "Ceiling the call ran at."
+    }
+  },
+  "required": [
+    "status",
+    "tier_ceiling",
+    "external_id",
+    "fragment_id",
+    "action",
+    "tier",
+    "attribution"
+  ],
+  "title": "VoiceDraftUpsertResponse",
+  "type": "object"
+}

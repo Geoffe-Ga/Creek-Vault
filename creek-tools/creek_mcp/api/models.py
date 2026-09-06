@@ -82,6 +82,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.14",
     "0.13",
     "0.12",
     "0.11",
@@ -187,6 +188,11 @@ asynchronous request members, a ``202`` response, two job wire models and
 move, and a ``0.13`` consumer cannot express either new method from its
 vendored enums, so ``0.13`` remains served alongside every earlier minor.
 
+Contract 0.15 (#1727) adds the ``voice-drafts`` capability, three resource
+verbs, and five wire models. Every older response remains byte-identical;
+``0.14`` is kept in the window and the since-minor gate both withholds and
+refuses the new resource for clients whose vendored schema predates it.
+
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
 version alone silently drops the outgoing current minor out of this window and
@@ -249,7 +255,7 @@ class WireTierCeiling(StrEnum):
 
 
 class Capability(StrEnum):
-    """The seven capabilities ``/v1`` publishes.
+    """The eight capabilities ``/v1`` publishes.
 
     The list was identical for every minor in
     :data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3
@@ -299,6 +305,8 @@ class Capability(StrEnum):
             response carries a fragment id, a path or a byte of prose, which
             is what makes running the whole vault under a remote ceiling
             disclose nothing.
+        VOICE_DRAFTS: AI-attributed draft upsert, recall, and retraction by a
+            caller-owned external id. Since contract 0.15 (#1727).
     """
 
     CAPABILITIES = "capabilities"
@@ -308,6 +316,7 @@ class Capability(StrEnum):
     UPLOAD = "upload"
     DRIVE_CONNECTOR = "drive-connector"
     PIPELINE = "pipeline"
+    VOICE_DRAFTS = "voice-drafts"
 
 
 _FOUNDING_MINOR: Final[str] = "0.2"
@@ -341,6 +350,14 @@ would sort ``"0.10"`` below ``"0.8"`` and hide the capability from precisely
 the clients new enough to negotiate it.
 """
 
+_VOICE_DRAFTS_MINOR: Final[str] = "0.15"
+"""The minor ``voice-drafts`` was published at (#1727).
+
+A literal for the same reason :data:`_UPLOAD_MINOR` is one: using the derived
+current minor would silently move the capability forward on the next bump and
+hide it from clients that correctly vendored contract 0.15.
+"""
+
 RELATED_FIELDS_SINCE_MINOR: Final[str] = "0.9"
 """First contract minor whose ``ReflectionResponse`` carries the #873 fields.
 
@@ -365,6 +382,7 @@ CAPABILITY_SINCE_MINOR: Final[dict[Capability, str]] = {
     Capability.UPLOAD: _UPLOAD_MINOR,
     Capability.DRIVE_CONNECTOR: _DRIVE_CONNECTOR_MINOR,
     Capability.PIPELINE: _PIPELINE_MINOR,
+    Capability.VOICE_DRAFTS: _VOICE_DRAFTS_MINOR,
 }
 """The contract minor each capability was first published at.
 
@@ -1030,6 +1048,102 @@ class JournalUpsertResponse(_WireModel):
             "Content-free operator advisories this write produced; absent when none."
         ),
     )
+
+
+class VoiceDraftAttribution(_WireModel):
+    """The fixed attribution of every remotely stored Voice Draft.
+
+    All three fields are literals with defaults, so a producer can construct
+    the one valid value with no caller input and a consumer cannot mistake an
+    AI-authored draft for owner voice.
+    """
+
+    author: Literal["ai"] = Field(
+        default="ai",
+        description="Always AI; owner authorship is inexpressible.",
+    )
+    author_slug: Literal["ai-as-user"] = Field(
+        default="ai-as-user",
+        description="Reserved Creek other-author namespace.",
+    )
+    voice_weight: Literal[0] = Field(
+        default=0,
+        description="Always zero; the draft never trains the owner's voice.",
+    )
+
+
+class VoiceDraftUpsertRequest(_WireModel):
+    """An AI-authored draft to persist under the path's external id.
+
+    Attributes:
+        content: Persisted model-authored markdown. Blank content is refused.
+        title: Optional operator-safe title. Omission uses a content-free
+            placeholder rather than deriving a filename from protected prose.
+        tier: The source entry's tier. ``intimate`` is unrepresentable on the
+            remote wire, so an intimate entry must use the delete route.
+    """
+
+    content: str = Field(description="AI-authored markdown; must not be blank.")
+    title: str | None = Field(
+        default=None,
+        max_length=MAX_FILENAME_CHARS,
+        description="Optional title; omission uses a content-free placeholder.",
+    )
+    tier: WireTierCeiling = Field(description="Tier inherited from the source entry.")
+
+    @field_validator("content")
+    @classmethod
+    def _reject_blank_content(cls, value: str) -> str:
+        """Return non-blank content and refuse an empty durable document."""
+        if not value.strip():
+            raise ValueError("content must not be blank")
+        return value
+
+    @field_validator("title")
+    @classmethod
+    def _reject_blank_title(cls, value: str | None) -> str | None:
+        """Return a meaningful optional title; blank is not an alternate null."""
+        if value is not None and not value.strip():
+            raise ValueError("title must not be blank")
+        return value
+
+
+class VoiceDraftUpsertResponse(_WireModel):
+    """The result of creating or updating one durable Voice Draft."""
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    external_id: str = Field(description="Consumer-owned durable identity.")
+    fragment_id: str = Field(description="Stable vault-side fragment identity.")
+    action: JournalAction = Field(description="Created, updated, or unchanged.")
+    tier: WireTierCeiling = Field(description="Tier inherited from the source entry.")
+    attribution: VoiceDraftAttribution = Field(
+        description="Fixed AI attribution and zero voice weight.",
+    )
+
+
+class VoiceDraftReadResponse(_WireModel):
+    """One persisted Voice Draft recalled by its external id."""
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    external_id: str = Field(description="Consumer-owned durable identity.")
+    fragment_id: str = Field(description="Stable vault-side fragment identity.")
+    title: str = Field(description="Stored draft title.")
+    content: str = Field(description="Stored AI-authored markdown.")
+    tier: WireTierCeiling = Field(description="Persisted privacy tier.")
+    attribution: VoiceDraftAttribution = Field(
+        description="Fixed AI attribution and zero voice weight.",
+    )
+
+
+class VoiceDraftDeleteResponse(_WireModel):
+    """Confirmation that one addressed Voice Draft was retracted."""
+
+    status: Literal["ok"] = Field(description="Always ok; failure is an error.")
+    tier_ceiling: WireTierCeiling = Field(description="Ceiling the call ran at.")
+    external_id: str = Field(description="Consumer-owned identity that was retracted.")
+    action: Literal["deleted"] = Field(description="Always deleted.")
 
 
 class UploadRequest(_WireModel):
@@ -2104,6 +2218,11 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "UploadRequest": UploadRequest,
     "UploadResponse": UploadResponse,
     "VaultState": VaultState,
+    "VoiceDraftAttribution": VoiceDraftAttribution,
+    "VoiceDraftDeleteResponse": VoiceDraftDeleteResponse,
+    "VoiceDraftReadResponse": VoiceDraftReadResponse,
+    "VoiceDraftUpsertRequest": VoiceDraftUpsertRequest,
+    "VoiceDraftUpsertResponse": VoiceDraftUpsertResponse,
     "WheelFrequencies": WheelFrequencies,
     "WheelFrequency": WheelFrequency,
     "WheelResponse": WheelResponse,

@@ -20,8 +20,19 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.14.0"
+CONTRACT_VERSION: Final[str] = "0.15.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.15.0 (#1727): ``/v1`` publishes an eighth capability,
+``voice-drafts``, over one caller-owned ``external_id`` resource. ``PUT``
+creates or atomically updates the AI-authored draft, ``GET`` recalls the same
+persisted document, and ``DELETE`` retracts it after a source entry becomes
+intimate. The write/read models carry fixed AI attribution — ``author=ai``,
+``author_slug=ai-as-user`` and ``voice_weight=0`` — and the on-disk fragment
+uses the same metadata under ``11-Other-Authors/ai-as-user/``, so mirrored
+model prose is readable as evidence but can never enter the owner's voice
+corpus. The route set and five wire schemas widen the HTTP contract; ``0.14``
+remains served and is neither told about nor allowed to reach the capability.
 
 0.14.0 (#1605): ``POST /v1/classifications`` now admits ``method=llm`` and
 ``POST /v1/links`` admits ``method=embeddings`` as durable asynchronous jobs.

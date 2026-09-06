@@ -108,6 +108,9 @@ JOURNAL_TEMPLATE: Final[str] = "/v1/journal-entries/{external_id}"
 JOURNAL_PATH: Final[str] = "/v1/journal-entries/abc"
 """A concrete journal path — what a log line may never name."""
 
+VOICE_DRAFT_TEMPLATE: Final[str] = "/v1/voice-drafts/{external_id}"
+"""The Voice Draft resource template; no caller-owned id appears here."""
+
 REFLECTIONS_PATH: Final[str] = "/v1/reflections"
 """The reflection endpoint."""
 
