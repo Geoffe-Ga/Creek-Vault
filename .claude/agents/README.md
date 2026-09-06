@@ -109,7 +109,7 @@ reasoning — spend the cheaper tier).
 | Gate 1 RED | write failing tests | **test-specialist** |
 | Gate 1 GREEN | implement + refactor to green | **implementation-specialist** |
 | Cross-cutting (only if flagged) | harden / optimize / document / vet deps | **security / performance / documentation / dependency** specialists |
-| Gate 2 | run `cd creek-tools && ./scripts/check-all.sh` | — (conductor, Bash) |
+| Gate 2 | run `cd creek-tools && VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" ./scripts/check-all.sh` (the lane's venv is pre-provisioned by `fleet.sh`; the exports select that interpreter, they do not create it) | — (conductor, Bash) |
 | Gate 2.5 | pre-push self-review of the diff | **code-review-orchestrator** (reviews the flagged dimensions itself; may fan out to specialists in review mode where nested spawning is available) |
 | Push / PR | commit, push, open PR | — (conductor) |
 | Gate 3 fail (CI) | `ci-debugging` → fix | **test / implementation** specialist |

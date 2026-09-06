@@ -1,6 +1,6 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.10.0",
+  "contract_version": "0.15.0",
   "files": [
     {
       "capability": "capabilities",
@@ -13,7 +13,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "744a15964dd31c589c9cf58f01d6c517712e238b00eecd7db951a3e71be85506",
+      "sha256": "9f5724fa068ef2f9f7f351208c2fdf136bd7f058ca44d31c6705c294653b9604",
       "state": "empty"
     },
     {
@@ -41,7 +41,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "69c509771e60440a19966ba3b9ba093bfa62346f7f65802c76c336fbc807906a",
+      "sha256": "888e1cf5513416260d73c5ffd55fd540a3e8ef0fd77d159628a67708640ad363",
       "state": "success"
     },
     {
@@ -297,6 +297,55 @@
       "state": "unavailable-service"
     },
     {
+      "capability": "voice-drafts",
+      "model": "NotApplicableExample",
+      "path": "examples/voice-drafts/care-escalation.json",
+      "sha256": "a5d2d2bfcd3b274cfe9d191a22b419fbceb1ade75b8ae1326004d4ca2ac58f97",
+      "state": "care-escalation"
+    },
+    {
+      "capability": "voice-drafts",
+      "model": "VoiceDraftUpsertResponse",
+      "path": "examples/voice-drafts/empty.json",
+      "sha256": "943aae7a88639719652bbc3f33e4f5249666fec84127f023e15bbad0e7935a42",
+      "state": "empty"
+    },
+    {
+      "capability": "voice-drafts",
+      "model": "ErrorEnvelope",
+      "path": "examples/voice-drafts/incompatible-version.json",
+      "sha256": "c01c9f5e41349a80a928b18a628637d58943240a72758da7ce5eedaee970655b",
+      "state": "incompatible-version"
+    },
+    {
+      "capability": "voice-drafts",
+      "model": "ErrorEnvelope",
+      "path": "examples/voice-drafts/malformed-input.json",
+      "sha256": "7bf957c6f6c8e8c3a6e8a05a6e3f194c008da73c78d2cef0142c73cadb001f4c",
+      "state": "malformed-input"
+    },
+    {
+      "capability": "voice-drafts",
+      "model": "ErrorEnvelope",
+      "path": "examples/voice-drafts/refusal.json",
+      "sha256": "5062e21432bffc72568f92ff898f812f9cfad0dd1b625df84abfc735c50f29e3",
+      "state": "refusal"
+    },
+    {
+      "capability": "voice-drafts",
+      "model": "VoiceDraftUpsertResponse",
+      "path": "examples/voice-drafts/success.json",
+      "sha256": "65af73dec3562b8d18d7d9504253067945866ed08c7ea7a0c30f3e39fe540391",
+      "state": "success"
+    },
+    {
+      "capability": "voice-drafts",
+      "model": "ErrorEnvelope",
+      "path": "examples/voice-drafts/unavailable-service.json",
+      "sha256": "0771fe94614e7cca4cdd9cf03c4ce83096b897943589ae246dd0ea8420d49be0",
+      "state": "unavailable-service"
+    },
+    {
       "capability": "wheel",
       "model": "NotApplicableExample",
       "path": "examples/wheel/care-escalation.json",
@@ -356,7 +405,7 @@
       "capability": null,
       "model": "CapabilitiesResponse",
       "path": "schemas/CapabilitiesResponse.schema.json",
-      "sha256": "730f04f35cc9342817225bce8ef6ce53b3049b2b040569965385e8ce578c44d6",
+      "sha256": "f2a8986459a94dc61cc33114edb738a039a5ea667dcbd275c1bf06a8c8c2807b",
       "state": null
     },
     {
@@ -384,14 +433,35 @@
       "capability": null,
       "model": "ClassificationRequest",
       "path": "schemas/ClassificationRequest.schema.json",
-      "sha256": "340f63de211b904c7c87a5608ab72ddf1c14ed5386a0329b1bb396b1fed46e75",
+      "sha256": "292ebf2b794ddab4ca9ec18334e1804039fc68347c7f69d2d18769df39d10617",
       "state": null
     },
     {
       "capability": null,
       "model": "ClassificationResponse",
       "path": "schemas/ClassificationResponse.schema.json",
-      "sha256": "cb45a61852f41be211235c75766de08ad2825eeedc93a02f45d960eff00e18ba",
+      "sha256": "d4b79a946574fbf618e8ca66fe08083b9124b5c484e58bcf70b1f1463e9f5862",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "DriveAuthorizationExchangeRequest",
+      "path": "schemas/DriveAuthorizationExchangeRequest.schema.json",
+      "sha256": "c85991651cd4410812b9736191598869b4f8c039632cc3dc96329c8f533b8e5d",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "DriveAuthorizationRequest",
+      "path": "schemas/DriveAuthorizationRequest.schema.json",
+      "sha256": "6c484ff968efbe843f0d9aa8db91db2aeaff527232db5b7bc30c87fa92e7dc45",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "DriveAuthorizationResponse",
+      "path": "schemas/DriveAuthorizationResponse.schema.json",
+      "sha256": "c2389a2275177f381b24c4ea895d4e5a9978452298ba9e34c39dcbc0014c0563",
       "state": null
     },
     {
@@ -424,6 +494,20 @@
     },
     {
       "capability": null,
+      "model": "JobAcceptedResponse",
+      "path": "schemas/JobAcceptedResponse.schema.json",
+      "sha256": "9c01d5c319ea67938959a2f2826808e90cb3d2f4bae5e6b7e7d93be1f1192c4c",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "JobStatusResponse",
+      "path": "schemas/JobStatusResponse.schema.json",
+      "sha256": "c3cceda670e58715bfea8085b32bf813df5cf412bc46258a7048ace6c2e54fd5",
+      "state": null
+    },
+    {
+      "capability": null,
       "model": "JournalUpsertRequest",
       "path": "schemas/JournalUpsertRequest.schema.json",
       "sha256": "76137d5fe64f4b3ced1866d9d50e2d0e66e9fb59b85359ab0971b1b9ce5d1b1c",
@@ -440,14 +524,14 @@
       "capability": null,
       "model": "LinkRequest",
       "path": "schemas/LinkRequest.schema.json",
-      "sha256": "ed451891ee2476c7f0747fef9038f066c102d5fe5a29619430c3832b78aed86c",
+      "sha256": "964737218218e26da31b6c3c19df500b1fb61c478511bc7e5c13c31be6556dcc",
       "state": null
     },
     {
       "capability": null,
       "model": "LinkResponse",
       "path": "schemas/LinkResponse.schema.json",
-      "sha256": "201ba880113dbbb5dbfb343a3a2ca05d32e99b5b06956c9ad0b14b7ea0487c32",
+      "sha256": "f3598bf1e45b01aba83efb94aa9a30e7049d25a3945e9c2f0ab0c8724d8fb209",
       "state": null
     },
     {
@@ -518,6 +602,41 @@
       "model": "VaultState",
       "path": "schemas/VaultState.schema.json",
       "sha256": "6cd84f27aa18111ab4a9c50da4d192ee2fe58d8d9b371ec5ce7b2c474820c8c9",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "VoiceDraftAttribution",
+      "path": "schemas/VoiceDraftAttribution.schema.json",
+      "sha256": "af1aa3bafda58f6c4276473ffd4c706b8188b5053ade40e12a3a0c52add317d3",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "VoiceDraftDeleteResponse",
+      "path": "schemas/VoiceDraftDeleteResponse.schema.json",
+      "sha256": "5d84cc9104c948bef408b6be643570cacd72129cc7b72fe3edca2e1e5a5b40c7",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "VoiceDraftReadResponse",
+      "path": "schemas/VoiceDraftReadResponse.schema.json",
+      "sha256": "05dd79342ed0f8954241a2f2a7bb6217b048137380f3e38dd80019e420cd18d8",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "VoiceDraftUpsertRequest",
+      "path": "schemas/VoiceDraftUpsertRequest.schema.json",
+      "sha256": "1124ba9228dfb60aa5a0dbdb6a8bb512cbcb4b4090a46c22584de23694a7b2b8",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "VoiceDraftUpsertResponse",
+      "path": "schemas/VoiceDraftUpsertResponse.schema.json",
+      "sha256": "6eb486f27bceb56b513ebe31bfdd23418e39af8f9fd25689d5d519cef3b85ab0",
       "state": null
     },
     {

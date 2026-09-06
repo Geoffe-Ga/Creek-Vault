@@ -10,6 +10,51 @@ files into a staging directory, the regular ingest pipeline picks them up via
 `route_to_ingestor` (by extension). The connector never classifies, links, or
 writes fragments.
 
+## Staging is not a promise of ingestion
+
+`route_to_ingestor` is **partial**. It dispatches on the file's extension, and
+for a structured format that the `generic` fallback would flatten into one
+undifferentiated blob, it raises `creek.ingest.UnsupportedSourceError` rather
+than returning an ingestor name (#1526). These are the families it refuses:
+
+<!-- capability-set: connector-refusals -->
+
+| Family | Extensions |
+|--------|------------|
+| Conversation export | `.json`, `.jsonl`, `.ndjson` |
+| Archive | `.zip`, `.tar`, `.tgz`, `.gz`, `.bz2`, `.xz`, `.7z`, `.rar` |
+| Legacy binary Office | `.doc`, `.xls`, `.ppt` |
+
+<!-- /capability-set -->
+
+That table is checked against the live routing table by
+`tests/test_connector_docs_drift.py` in **both** directions — a family the code
+refuses but the table omits, and a family the table invents but the code
+routes, both fail the build.
+
+An extension the table does **not** name still falls through to `generic`,
+which remains the right ingestor for genuinely plain-text-ish content
+(`.yaml`, `.log`, `.org`, an extensionless `README`). #1526 narrowed the
+fallback; it did not retire it. Do not conclude that every unrecognised
+extension is refused.
+
+Your connector does not catch this — its **caller** does, after `fetch_to`
+returns. There are two sanctioned responses:
+
+- **Skip the item** and count it, leaving the bytes in staging for a later
+  `creek ingest --type <chatgpt|claude|discord|substack> --input <export-dir>`.
+- **Surface `exc.guidance`** — the remedy string the exception carries — to
+  whoever asked for the fetch.
+
+The working reference is `_ingest_downloaded` in `creek_mcp/tools/drive.py`:
+it catches `(UnsupportedSourceError, KeyError)`, increments an `unsupported`
+tally and continues, because a background sync has no caller to hand the
+remedy to.
+
+One surface differs, and it is worth knowing about. The MCP upload tool runs
+an archive fork *above* this gate (#1525), so a `.zip` sent there is unpacked
+rather than turned away — even though the routing table refuses it.
+
 ## The contract
 
 Implement these five methods:
@@ -26,7 +71,10 @@ class MySourceConnector:
 
     def fetch_to(self, staging):
         """Download the changed files into `staging`. Returns a result object;
-        callers route the staged files through `route_to_ingestor`."""
+        callers route the staged files through `route_to_ingestor`, which
+        raises `UnsupportedSourceError` for a refused format — the caller
+        skips that item or surfaces `exc.guidance`. An extension the routing
+        table does not name still routes to `generic`."""
 
     def load_cursor(self):
         """Return the persisted cursor, or None if there is none yet."""

@@ -2048,6 +2048,13 @@ def _route_reasoning(
     is truncated to :data:`CLASSIFICATION_REASONING_MAX_CHARS` and
     returned for direct embedding in frontmatter.
 
+    The tier is read through
+    :func:`~creek.classify.privacy_filter.tier_of` — already this
+    module's reader elsewhere — so a tier string the enum does not
+    recognise fails closed and routes to the log. The bare attribute
+    comparison this replaced wrote the reasoning preamble into the
+    fragment's vault frontmatter instead (#1489).
+
     Args:
         fragment: The fragment whose tier dictates routing.
         reasoning: The raw reasoning preamble; may be empty.
@@ -2063,7 +2070,7 @@ def _route_reasoning(
     """
     if method != LLM_METHOD or not reasoning:
         return ""
-    if fragment.privacy_tier == PrivacyTier.INTIMATE.value:
+    if tier_of(fragment) is PrivacyTier.INTIMATE:
         if trace_log_path is not None:
             _append_trace_log(trace_log_path, fragment, reasoning)
         return ""
@@ -2205,7 +2212,7 @@ def _describe_llm_unavailability(provider: str) -> str:
     The hint is provider-specific so a first-time user can act on it
     without scrolling back through orchestrator WARNING logs. Anthropic
     needs two env vars (API key + consent); Ollama needs the local
-    daemon to be reachable.
+    daemon to be reachable with the configured model installed.
 
     Args:
         provider: ``llm.provider`` from the loaded config.
@@ -2220,8 +2227,8 @@ def _describe_llm_unavailability(provider: str) -> str:
         )
     if provider == "ollama":
         return (
-            "ensure the Ollama daemon is running and reachable at the "
-            "URL configured under `llm.url` in creek_config.yaml"
+            "ensure the Ollama daemon is running at the URL configured under "
+            "`llm.url` in creek_config.yaml and has the configured model installed"
         )
     return (
         "check the `llm.*` settings in creek_config.yaml and the "

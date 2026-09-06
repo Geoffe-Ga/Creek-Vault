@@ -45,6 +45,19 @@ def classify_tool(
     escalate-only, so a run can move a fragment out of a remote
     consumer's reach and never into it.
 
+    All of that is about the *response* and the frontmatter, and it says
+    nothing about the prompt channel — where the ceiling is not a control
+    either. With ``method="llm"`` every fragment's **title and body**
+    under ``01-Fragments`` is shown to the configured classification
+    provider whatever ceiling was declared, ``open`` included — both are
+    interpolated into the prompt by ``build_classification_prompt``, each
+    capped at 8192 chars by ``_sanitise_for_prompt``. ``INTIMATE`` is
+    redirected to a local provider by
+    ``ModelRouter._enforce_local_for_intimate`` (#647/#666); ``PERSONAL``
+    is not. See ``creek_mcp.read_gate._CLASSIFY_PROMPT_CHANNEL_RATIONALE``
+    for the full statement of what does and does not gate that walk
+    (#1274).
+
     Args:
         vault_path: Vault root to classify.
         method: ``"rules"`` or ``"llm"``.

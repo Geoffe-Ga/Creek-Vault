@@ -1,0 +1,54 @@
+# The ONE comment payload every merge-clearance path reads.
+#
+# WHY GRAPHQL AND NOT THE TWO PAYLOADS THIS REPLACES. Neither of the payloads
+# the clearance paths used before can answer #1263, and no tightening of the jq
+# on top of them can:
+#
+#   gh pr view N --json comments          author / authorAssociation / body /
+#     (scripts/ralph/pr-ready.sh)         createdAt / id / includesCreatedEdit /
+#                                         isMinimized / minimizedReason /
+#                                         reactionGroups / url / viewerDidAuthor
+#                                         — `includesCreatedEdit` says THAT the
+#                                         body was edited, never BY WHOM.
+#
+#   gh api repos/O/R/issues/N/comments    the REST issue-comments payload, which
+#     (.github/workflows/iteration-       carries no edit history at all.
+#      trigger.yml)
+#
+# `userContentEdits` is the only field that names the account that rewrote a
+# body, and it is reachable with the ordinary token (verified live against this
+# repo: PR #1697's comments come back with `includesCreatedEdit: true` and a
+# populated `userContentEdits.nodes[].editor.login`).
+#
+# ONE FILE, TWO CONSUMERS, and that is the point rather than tidiness. #1266
+# exists because a `.body != null` guard was written into one copy of the
+# selector and not the other; #1199's author allowlist had to be added to each
+# copy separately for the same reason. Two paths that fetch the same bytes
+# cannot drift in what they FETCH, which is the precondition for not drifting in
+# what they CHECK.
+#
+# `databaseId` is requested so a consumer that wants to point a human at one
+# comment can print the numeric id GitHub's own URLs use. The GraphQL `id` is an
+# opaque node id and reads as noise in a human-facing message; asking for
+# `databaseId` explicitly is what keeps the REST-to-GraphQL move from silently
+# changing the meaning of a value already being printed.
+#
+# `last: 100` rather than `first: 100`: an active PR's verdict is at the END of
+# the thread, and the selectors take the LAST admissible comment.
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      comments(last: 100) {
+        nodes {
+          databaseId
+          body
+          createdAt
+          author { login }
+          userContentEdits(first: 100) {
+            nodes { editor { login } }
+          }
+        }
+      }
+    }
+  }
+}

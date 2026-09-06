@@ -9,7 +9,7 @@ other-author attribution, and degrade gracefully on a thin/offline vault.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -494,6 +494,165 @@ def test_retrieval_stale_cache_entry_is_recomputed(tmp_path: Path) -> None:
     # via fragment_embedding_text so the assertion survives a shape change and
     # still proves the stale cache entry was NOT served).
     assert embedded_texts == ["alpha", fragment_embedding_text(by_id["frag-a"])]
+
+
+def _cold_vault(vault: Path, count: int) -> list[str]:
+    """Write *count* corpus fragments with no parquet cache, and return their ids.
+
+    Ids are zero-padded so their lexicographic order is their numeric order,
+    which is what lets a budget test name *which* fragments a bounded pass is
+    required to spend on.
+
+    Args:
+        vault: Vault root.
+        count: How many fragments to write.
+
+    Returns:
+        The fragment ids, in ascending id order.
+    """
+    ids = [f"frag-{index:02d}" for index in range(count)]
+    for frag_id in ids:
+        _write(vault, "01-Fragments/Notes", frag_id, f"Title {frag_id}")
+    return ids
+
+
+def _embed_spy() -> Any:
+    """Return a patcher spying on ``generate_embedding`` while still running it.
+
+    The same autospec/side-effect shape
+    :func:`test_retrieval_cache_hit_avoids_re_embedding` uses, so the count and
+    the behaviour are observed on one seam rather than a stub that changes it.
+
+    Returns:
+        The unstarted ``patch`` context manager.
+    """
+    return patch(
+        "creek.link.embeddings.EmbeddingLinker.generate_embedding",
+        autospec=True,
+        side_effect=EmbeddingLinker.generate_embedding,
+    )
+
+
+def test_an_unbounded_gather_embeds_every_admitted_fragment_once(
+    tmp_path: Path,
+) -> None:
+    """With no budget, a cold gather live-embeds the whole admitted corpus (#1034).
+
+    The control for the live-embed cap, and the reason the cap is provably
+    invisible to :func:`default_specialists` and therefore to the Writing Desk:
+    ``max_live_embeds`` defaults to ``None``, and ``None`` must mean *exactly*
+    today's behaviour — K fragments plus the query, no fragment dropped.
+
+    Without this test, "capped" and "silently degraded" are indistinguishable
+    from the outside: a cap that accidentally applied to the default path would
+    quietly shrink the desk's evidence and every other test would stay green.
+
+    The assertion is a **count**, not a claim list: the conftest mock seeds each
+    vector from ``hash(text)``, which ``PYTHONHASHSEED`` randomises per process,
+    so ranking order is not stable across runs and nothing here may depend on it.
+    """
+    # Four, so nothing is truncated by the default ``retrieval_top_k`` of 5 and
+    # "embedded" is exactly set-equal to "returned" -- an assertion that holds
+    # regardless of the run's ranking order.
+    ids = _cold_vault(tmp_path, 4)
+
+    with _embed_spy() as spy:
+        bundle = RetrievalSpecialist().gather("title", tmp_path)
+
+    assert spy.call_count == len(ids) + 1, "expected one embed per fragment + query"
+    cited = {fid for claim in bundle.claims for fid in claim.source_fragments}
+    assert cited == set(ids), "an unbounded pass dropped a fragment"
+
+
+def test_a_live_embed_budget_bounds_a_cold_gather(tmp_path: Path) -> None:
+    """A budget caps live embeds at ``budget + 1`` and still returns grounding.
+
+    The cold-cache bound (#1034). With no parquet and a corpus larger than the
+    budget, one call embeds the query plus at most *budget* fragments — the
+    remainder are dropped from ranking rather than embedded.
+
+    Asserted as counts and bounds only, never as which specific titles came
+    back, for the ordering reason in
+    :func:`test_an_unbounded_gather_embeds_every_admitted_fragment_once`. The
+    non-empty-bundle half matters as much as the count: a cap that bounded the
+    work by returning nothing would satisfy the count alone.
+    """
+    budget = 2
+    _cold_vault(tmp_path, 6)
+
+    with _embed_spy() as spy:
+        bundle = RetrievalSpecialist(max_live_embeds=budget).gather("title", tmp_path)
+
+    assert spy.call_count == budget + 1, "budget + the query, and no more"
+    assert len(bundle.claims) == budget, "a bounded pass still ranks what it embedded"
+
+
+def test_budget_spend_is_deterministic_and_vault_layout_independent(
+    tmp_path: Path,
+) -> None:
+    """Which fragments spend a bounded budget is fixed by fragment id (#1034).
+
+    A cap that spent its budget in corpus-walk order would make the answer
+    depend on ``CORPUS_SUBDIRS`` order and on directory traversal — neither
+    stable across platforms nor explicable to an operator, and different for the
+    same vault depending on which subtree a fragment happens to live in.
+
+    So the ranking input is walked in **fragment-id order**, and this asserts the
+    consequence twice over: the same two ids survive across two independent
+    gathers, and they are exactly the two lowest ids rather than whatever the
+    filesystem yielded first. The second half is what makes this test fail if the
+    ``sorted()`` is dropped; the first alone could pass on a stable-but-arbitrary
+    traversal.
+    """
+    # Laid out so id order and corpus-walk order DISAGREE. ``CORPUS_SUBDIRS`` is
+    # ``('01-Fragments', '09-Reference', '11-Other-Authors')``, so a walk-order
+    # cap spends its two embeds on ``frag-02``/``frag-03`` under 01-Fragments,
+    # while an id-order cap spends them on ``frag-00``/``frag-01`` under
+    # 09-Reference. Without this disagreement the test could not tell the two
+    # apart and would pass on the defect.
+    for frag_id in ("frag-00", "frag-01"):
+        _write(tmp_path, "09-Reference", frag_id, f"Title {frag_id}")
+    for frag_id in ("frag-02", "frag-03", "frag-04", "frag-05"):
+        _write(tmp_path, "01-Fragments/Notes", frag_id, f"Title {frag_id}")
+    ids = ["frag-00", "frag-01", "frag-02", "frag-03", "frag-04", "frag-05"]
+
+    first = RetrievalSpecialist(max_live_embeds=2).gather("title", tmp_path)
+    second = RetrievalSpecialist(max_live_embeds=2).gather("title", tmp_path)
+
+    def _cited(bundle: EvidenceBundle) -> set[str]:
+        return {fid for claim in bundle.claims for fid in claim.source_fragments}
+
+    assert _cited(first) == _cited(second), "budget spend differed between runs"
+    assert _cited(first) == set(ids[:2]), "budget was not spent in fragment-id order"
+
+
+def test_warm_fills_both_memos_so_a_later_gather_mutates_nothing(
+    tmp_path: Path,
+) -> None:
+    """After ``warm``, ``gather`` reads both memo slots and rebinds neither (#1034).
+
+    This is the property that makes the shared-specialist counts true under
+    ``/v1``'s concurrent worker threads rather than merely likely: if any memo
+    were still filled lazily *inside* ``gather``, two racing first requests would
+    each find the slot empty and each would construct a linker and read the
+    parquet, which atomic rebinding prevents corruption of but not duplication of.
+
+    Identity, not equality, on both slots — an equal-but-rebuilt linker would be
+    a second model load.
+    """
+    _cold_vault(tmp_path, 2)
+    specialist = RetrievalSpecialist()
+
+    specialist.warm(tmp_path)
+    before = dict(vars(specialist))
+    specialist.gather("title", tmp_path)
+    after = dict(vars(specialist))
+
+    assert before["_linker"] is not None, "warm did not build the linker"
+    assert before["_cache"] is not None, "warm did not read the parquet"
+    assert after["_linker"] is before["_linker"], "gather rebuilt the linker"
+    assert after["_cache"] is before["_cache"], "gather re-read the parquet"
+    assert set(after) == set(before), "gather added an instance attribute"
 
 
 def test_build_link_graph_skips_ambiguous_title(tmp_path: Path) -> None:

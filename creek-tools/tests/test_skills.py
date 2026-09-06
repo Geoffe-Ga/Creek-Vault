@@ -42,6 +42,7 @@ from creek.generate.skills import (
     VaultSnapshot,
     _build_exemplar,
     _extract_passage,
+    _is_snapshot_fragment,
     _load_fragment,
     _load_typed_model,
     _load_vault_snapshot,
@@ -1020,6 +1021,32 @@ class TestOptionalSnapshot:
 
 class TestPrivacy:
     """Intimate fragments are excluded by default from exemplar harvesting."""
+
+    def test_an_unrecognised_tier_is_not_snapshot_eligible(self) -> None:
+        """A tier the enum does not know must fail closed here (#1489).
+
+        ``_is_snapshot_fragment`` decides whether a fragment's body may
+        be harvested into a ``SKILL.md`` exemplar. Reading the raw model
+        attribute admits an unknown tier outright; the canonical reader
+        refuses it unless the operator opts in with ``allow_intimate``,
+        which is the same posture the INTIMATE branch already has.
+
+        The two ``allow_intimate`` values are both asserted because the
+        opt-in is the *only* thing that should be able to admit it.
+        """
+        frag = Fragment.model_construct(
+            id="frag-bogus-tier",
+            title="A hand-edited note",
+            source=FragmentSource(platform=SourcePlatform.JOURNAL),
+            created=datetime(2026, 1, 15, 12, 0, 0),
+            ingested=datetime(2026, 1, 15, 12, 0, 0),
+            frequency=FrequencyClassification(primary=Frequency.F3),
+            voice=VoiceClassification(confidence=Confidence.SETTLED),
+            privacy_tier="super-secret",
+        )
+
+        assert _is_snapshot_fragment(frag, allow_intimate=False) is False
+        assert _is_snapshot_fragment(frag, allow_intimate=True) is True
 
     def test_intimate_fragments_excluded_by_default(
         self,

@@ -255,7 +255,7 @@ The pinned count is exercised by `tests/test_ingest_registry.py` so any change t
 All quality gates run from `creek-tools/` via the project scripts:
 
 ```bash
-./scripts/check-all.sh          # Run all 7 gates (lint, format, typecheck, complexity, security, tests, coverage)
+./scripts/check-all.sh          # Run every quality gate — see scripts/check-all.sh for the list, in order
 ./scripts/fix-all.sh             # Auto-fix lint + format
 ./scripts/test.sh                # Unit tests (default)
 ./scripts/test.sh --integration  # Hermetic cross-component lane (blocking in CI)

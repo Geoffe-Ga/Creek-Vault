@@ -6,6 +6,14 @@ and fetches them into a local staging directory (where the regular ingestors
 then pick them up via ``route_to_ingestor``). It does **not** ingest, and by
 construction exposes no write/update/delete surface.
 
+Staging is not a promise of ingestion. ``route_to_ingestor`` is **partial**:
+since #1526 it raises :class:`creek.ingest.UnsupportedSourceError` for a
+conversation export, an archive or a legacy binary Office document instead of
+flattening it into one ``generic`` blob. An extension it does not name still
+routes to ``generic``. A connector never catches this — its *caller* does,
+after :meth:`RemoteSourceConnector.fetch_to` returns, and either skips the
+item or surfaces ``exc.guidance``.
+
 Google Drive is the reference implementation (``creek.ingest.gdrive``); future
 sources (Substack, Notion, an RSS feed, a prose git repo) implement the same
 methods and reuse the stage -> route -> ingest machinery. ``list_changed_since``
@@ -84,7 +92,10 @@ class RemoteSourceConnector(Protocol):
 
         The return is the implementation's own result object (e.g. Drive's
         ``DownloadResult``); callers route the staged files through
-        ``route_to_ingestor``.
+        ``route_to_ingestor``, which raises
+        :class:`creek.ingest.UnsupportedSourceError` for a refused format
+        (#1526) — the caller skips that item or surfaces ``exc.guidance``. An
+        extension the routing table does not name still routes to ``generic``.
         """
 
     def load_cursor(self) -> object:

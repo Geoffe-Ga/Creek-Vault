@@ -25,7 +25,7 @@ because a parser that accepts both spellings is a parser two implementations
 will disagree about.
 
 **And 405 is not in this contract.** The published status set is
-``{200, 401, 403, 404, 409, 422, 500, 501, 503}``. A method mismatch renders
+``{200, 401, 403, 404, 409, 415, 422, 500, 501, 503}``. A method mismatch renders
 ``404 not_found`` like any other routing miss, so an unauthorised prober cannot
 enumerate which verbs a path serves.
 """
@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Any, Final
 import pytest
 
 from creek_mcp.api.models import ERROR_MESSAGES, ERROR_STATUS, ErrorCode
+from creek_mcp.api.routes import PUBLISHED_SUCCESS_STATUSES
 from tests.v1_api_support import (
     HEALTH_BODY,
     HEALTH_PATH,
@@ -69,9 +70,14 @@ _NOT_FOUND_STATUS: Final[int] = 404
 _METHOD_NOT_ALLOWED: Final[int] = 405
 
 ALLOWED_HTTP_STATUSES: Final[frozenset[int]] = frozenset(
-    set(ERROR_STATUS.values()) | {200}
+    set(ERROR_STATUS.values()) | PUBLISHED_SUCCESS_STATUSES
 )
-"""The closed status set the contract publishes, derived not restated."""
+"""The closed status set the contract publishes, derived not restated.
+
+Both halves come from a table (#1605): the refusals from ``ERROR_STATUS``, the
+successes from ``ROUTES``, which declares them per route rather than leaving
+one literal ``200`` to be remembered in six places.
+"""
 
 _BODIES: Final[dict[str, dict[str, Any]]] = {
     "PUT": VALID_JOURNAL_BODY,
@@ -432,9 +438,18 @@ def test_405_is_not_in_the_published_status_set() -> None:
 
     ``415`` joined the set at contract 0.8 with ``unsupported_source``
     (#1524); it is the only member added since 0.2.
+
+    The literal below is deliberate, and is the one restatement of the set in
+    the suite: everywhere else derives it, so without a spelled-out copy a
+    mistake in the derivation would agree with itself everywhere and be
+    invisible. Since #1605 the success half is read off ``ROUTES`` rather than
+    being a literal ``200``, so the first route to document a ``202`` reddens
+    this assertion first — which is where a widening of a published closed set
+    should have to be typed out on purpose.
     """
     assert _METHOD_NOT_ALLOWED not in ALLOWED_HTTP_STATUSES
-    assert {200, 401, 403, 404, 409, 415, 422, 500, 501, 503} == ALLOWED_HTTP_STATUSES
+    expected = {200, 202, 401, 403, 404, 409, 415, 422, 500, 501, 503}
+    assert expected == ALLOWED_HTTP_STATUSES
 
 
 def test_no_reachable_request_produces_a_status_outside_the_set(
@@ -501,7 +516,7 @@ def test_no_unrouted_request_produces_a_status_outside_the_set(vault: Path) -> N
 
 def test_the_method_sweep_is_not_vacuous() -> None:
     """The sweep above really does try every verb on every route."""
-    assert len(MOUNTED) * len(_ALL_METHODS) == 66
+    assert len(MOUNTED) * len(_ALL_METHODS) == 84
     assert "PATCH" in _ALL_METHODS
 
 

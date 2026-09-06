@@ -9,7 +9,118 @@ to locate the originating commit for any reference below.
 
 ## Unreleased
 
+### Added
+
+- **`creek.classify.entry` — read one fragment's persisted classification
+  (#874).** A new read-only MCP tool. It takes an `entry_ref` and a
+  `privacy_tier_ceiling` and returns exactly eight keys — `status`, `tool`,
+  `tier_ceiling`, `entry_ref`, `frequency`, `phase`, `privacy_tier`,
+  `classification_method` — every one a non-null string. It **computes
+  nothing**: no rule classifier on demand, no LLM, no persisted verdict. It is
+  a sibling of `creek.classify` rather than an addition to it, because the pass
+  is whole-vault and rewrites frontmatter while this addresses one fragment and
+  writes none.
+
+  **Why it is not an inline field on `creek.journal`, which is what the issue
+  asked for.** `run_ingest` never runs the frequency/phase classifier — the
+  only `creek.classify` symbol the ingest pipeline touches is
+  `privacy_pass.escalate` — so an inline field would have returned
+  `{frequency: "unclassified", phase: "unclassified", privacy_tier: <the tier
+  the caller itself just sent>}` on every call, forever, with every one of its
+  tests passing. A constant in disguise.
+  `test_a_journal_ingested_fragment_carries_no_classification_on_disk` pins
+  that pre-state so the claim stays executable. The sanctioned composition
+  needs no journal change at all: journal already returns `fragment_id` as a
+  required field, so `journal → fragment_id → creek.classify.entry` is a
+  complete round trip.
+
+  **Ingest does not classify, and the tool says so honestly.** A freshly
+  written entry reads `frequency: "unclassified"`, `phase: "unclassified"`,
+  `classification_method: "none"` until a pass runs; the remedy is the route
+  that shipped at contract `0.10.0` — run `creek.classify` or
+  `POST /v1/classifications`, then read again. `classification_method` ∈
+  `rules | llm | manual | none` is what makes that legible: the provenance
+  stamp is written unconditionally by any classify write, so `rules` alongside
+  `frequency: "unclassified"` means *a pass ran and could not classify this*,
+  while `none` means *no pass has run*. The sentinel is `none` and not
+  `unclassified` deliberately — that word is already a frequency, a phase and a
+  privacy tier — and the value is **clamped** to the three published methods
+  rather than echoed, because raw frontmatter is arbitrary user-controlled
+  bytes.
+
+  **Privacy: strictly narrowing.** The tool is `GATED` on the shared
+  `read_gate.refuse_above_ceiling` primitive — `creek.state.read`'s shape, not
+  `creek.reflect`'s, because an `entry_ref` is caller-*addressed* and singular
+  and there is nothing to partially admit. The tier compared is the fragment's
+  current **persisted** one, read through the shared `source_tiers` walk, never
+  a caller-declared or staged tier. It fails closed twice: a missing
+  `privacy_tier` key ranks `intimate` distinctly from an explicit
+  `unclassified`, and an id resolving to nothing ranks `intimate` too. The
+  resolution walk is exhaustive and sits *below* the gate, so a refused id and
+  a not-found id cost the same and the refusal leaks no position through
+  timing. Nothing becomes reachable that was not already reachable at strictly
+  broader granularity through `creek.state.render`, `creek.wheel` and the
+  compiled layer.
+
+  **Contract `0.12.0` → `0.13.0`**, a pure MCP-surface bump of the
+  `0.3`/`0.4`/`0.6`/`0.7`/`0.12` kind. No `/v1` route, capability, wire model,
+  error code, status or schema moves. `SUPPORTED_CONTRACT_MINORS` **widens** to
+  keep `0.12` served — without that one line every client still sending
+  `X-Creek-Contract-Version: 0.12` would be refused `incompatible_version`,
+  which is the only genuinely breaking change this change could have made.
+
+- **`creek.redact.scan` publishes the escaping-symlink skip count (#1292).**
+  The tool's `statistics` object gains a fifth typed key,
+  `files_skipped_symlink`: the number of symlinked children the scan declined
+  unopened because their target resolves outside the scanned root. #1087 added
+  that counter to `ScanSummary` and taught two of the three surfaces that
+  render a scan about it — `generate_markdown_summary` and the `creek redact`
+  stats table — and missed the third. A consumer was therefore told how many
+  files were skipped as binary and by extension and never how many were
+  declined for pointing out of the subtree, which is the one skip reason that
+  means something tried to aim the scan somewhere it was not pointed.
+
+  **The wire key is unconditional; the markdown row stays conditional on being
+  non-zero.** That asymmetry is deliberate: a report line that fires on every
+  scan is noise for a human reader, while a typed field whose presence varies
+  is a second contract for a machine one.
+
+  A tool's return shape moved, so the contract minor moves with it: **`0.11.0`
+  → `0.12.0`**. No `/v1` route, capability, wire model, error code or status
+  moves, so `SUPPORTED_CONTRACT_MINORS` **widens** rather than shifting and a
+  `0.11` client keeps being served byte-identically on every route it calls.
+  Nothing new is disclosed — the counter is a bare integer naming no path, no
+  filename and no target; the identical count already reached the identical
+  audience through `report_markdown`; and a refusal still carries the canonical
+  four keys with no `statistics` block at all.
+
+  The same change adds the guard #1087 lacked: `tests/test_mcp_redact.py`
+  now holds a *census* mapping every non-`matches` field of `ScanSummary` to
+  `published` or `withheld`, asserted total over the dataclass, so a future
+  counter cannot reach — or fail to reach — a consumer without somebody
+  recording which it is. `tests/test_adepthood_contract_models.py` gains
+  `test_every_minor_below_the_current_one_is_still_served`, which derives the
+  whole served range from the running minor instead of restating it by hand;
+  the two hand-typed guards beside it had between them stopped covering `0.7`
+  four bumps ago.
+
 ### Fixed
+
+- **Ollama readiness now requires the configured model, not merely a running
+  daemon (#1761).** The availability probe previously treated any successful
+  `/api/tags` response as ready, so a healthy Ollama process with only other
+  models installed admitted classification, Author Desk and compost work that
+  could only fail at generation time. The probe now resolves the configured
+  (or provider-default) model and requires it in the returned inventory,
+  including Ollama's untagged-to-`:latest` equivalence while keeping explicit
+  tags and digests exact.
+
+  Malformed inventories fail closed, and operator diagnostics distinguish an
+  unreachable daemon from a reachable daemon missing its configured model.
+  Downstream commands retain their existing safe behavior: classification
+  reports unavailable, Author Desk renders deterministically, compost
+  calibration stays embedding-only, and compost scan refuses an unverified
+  canonical write unless the operator explicitly chooses `--no-llm`.
 
 - **`redact --apply` no longer rewrites the vault it walks when `--vault` is
   omitted (#1561).** `run_apply` anchored its never-rewrite set on
@@ -47,6 +158,30 @@ to locate the originating commit for any reference below.
   vault notes keep resolving and purge's stub sweep still deletes them. Two
   byte-identical untitled bodies still collide and still use the counter, so
   the retry guard stays reachable.
+
+- **The connector guide and the `RemoteSourceConnector` protocol no longer
+  describe `route_to_ingestor` as total (#1544).** Since #1526/#1541 it
+  refuses a conversation export (`.json`, `.jsonl`, `.ndjson`), a legacy
+  binary Office document (`.doc`, `.xls`, `.ppt`) and a non-`.zip` archive
+  (`.tar`, `.tgz`, `.gz`, `.bz2`, `.xz`, `.7z`, `.rar`), raising
+  `UnsupportedSourceError` rather than filing the whole export as one
+  undifferentiated `generic` blob — over the network that surfaces as a `415`
+  carrying `ErrorCode.UNSUPPORTED_SOURCE` and the remedy naming
+  `creek ingest --type`. `docs/connectors/adding-a-remote-connector.md` and
+  `creek/ingest/connectors.py` still taught the pre-#1526 contract, so a
+  connector author would have written a caller with no `except` and let one
+  refused file abort an entire fetch. Both now name the exception, the
+  caller's two responses (skip the item, or surface `exc.guidance`) and the
+  reference handler, and the guide's refused-family table is machine-checked
+  against the live routing table in both directions by
+  `tests/test_connector_docs_drift.py`.
+
+  `.zip` is **not** refused on the upload surface: the archive fork of #1525
+  claims it above that gate and unpacks it. `docs/mcp.md` had listed it among
+  the extensions `creek.upload` turns away, and now records the carve-out. An
+  extension the routing table never names still falls through to `generic` —
+  #1526 narrowed the fallback, it did not retire it. No behaviour changed
+  here; this records what shipped in #1541.
 
 ### Tooling
 

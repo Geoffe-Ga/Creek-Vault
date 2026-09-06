@@ -4,6 +4,9 @@
 - **Date**: 2026-07-01
 - **Driving issues**: epic #757; decision #755 (and `geoffe-ga/adepthood#927`); builds on the routing epic #642 and the handshake epic #748
 - **Implemented by**: #758 (volume key), #759 (network transport), #760 (enclave provider), #761 (BYOK)
+- **Lifecycle amendment**: [ADR-0013](0013-demand-provisioned-vault-lifecycle.md)
+  ratifies activation after signup, a Creek-owned asynchronous control plane,
+  and scale-to-zero per-user compute. The privacy boundary below is unchanged.
 
 ## Context
 

@@ -8,6 +8,7 @@ error redaction, and a mocked end-to-end classify call.
 
 from __future__ import annotations
 
+from typing import Final
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -17,6 +18,9 @@ from creek.classify.llm.completion import Completion
 from creek.classify.llm.consent import CLOUD_CONSENT_ENV, LEGACY_CONSENT_ENV
 from creek.classify.llm.providers import (
     GeminiProvider,
+    _extract_gemini_text,
+    _extract_gemini_usage,
+    _map_gemini_stop_reason,
     build_provider,
     provider_is_cloud,
 )
@@ -41,6 +45,80 @@ def gemini_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(CLOUD_CONSENT_ENV, "1")
 
 
+_DEFAULT: Final[object] = object()
+"""Sentinel: build the well-formed default value for this response attribute."""
+
+_ABSENT: Final[object] = object()
+"""Sentinel: omit the attribute, so ``getattr(response, name, None)`` is ``None``."""
+
+
+def _set_or_delete(
+    target: MagicMock, name: str, value: object, default: object
+) -> None:
+    """Apply the ``_DEFAULT`` / ``_ABSENT`` / explicit-value dispatch to *target*.
+
+    Args:
+        target: The mock to mutate.
+        name: The attribute name.
+        value: ``_DEFAULT``, ``_ABSENT``, or the literal value to set.
+        default: The well-formed value used when *value* is ``_DEFAULT``.
+    """
+    if value is _ABSENT:
+        delattr(target, name)
+        return
+    setattr(target, name, default if value is _DEFAULT else value)
+
+
+def _make_mock_genai_response(
+    text: object = "hello world",
+    *,
+    finish_reason: object = "STOP",
+    prompt_tokens: object = 12,
+    candidate_tokens: object = 8,
+    texts: tuple[object, ...] | None = None,
+    content: object = _DEFAULT,
+    candidates: object = _DEFAULT,
+    usage_metadata: object = _DEFAULT,
+) -> MagicMock:
+    """Build a mock ``generate_content`` response, degenerate envelopes included.
+
+    ``content``, ``candidates`` and ``usage_metadata`` each accept ``_DEFAULT``
+    (the well-formed value built from the other arguments), ``_ABSENT`` (the
+    attribute is deleted, so ``getattr(obj, name, None)`` returns ``None``), or
+    an explicit value such as ``[]`` or ``None``.
+
+    Args:
+        text: The single part's ``text``, when *texts* is not given.
+        finish_reason: The first candidate's raw ``finish_reason``.
+        prompt_tokens: The usage object's ``prompt_token_count``.
+        candidate_tokens: The usage object's ``candidates_token_count``.
+        texts: One part is built per element, for multi-part joins.
+        content: Sentinel or explicit override for ``candidates[0].content``.
+        candidates: Sentinel or explicit override for ``response.candidates``.
+        usage_metadata: Sentinel or explicit override for the usage object.
+
+    Returns:
+        The mock response object.
+    """
+    parts: list[MagicMock] = []
+    for value in (text,) if texts is None else texts:
+        part = MagicMock()
+        part.text = value
+        parts.append(part)
+    default_content = MagicMock()
+    default_content.parts = parts
+    candidate = MagicMock()
+    _set_or_delete(candidate, "content", content, default_content)
+    candidate.finish_reason = finish_reason
+    default_usage = MagicMock()
+    default_usage.prompt_token_count = prompt_tokens
+    default_usage.candidates_token_count = candidate_tokens
+    response = MagicMock()
+    _set_or_delete(response, "candidates", candidates, [candidate])
+    _set_or_delete(response, "usage_metadata", usage_metadata, default_usage)
+    return response
+
+
 def _make_mock_genai_client(
     text: str,
     *,
@@ -49,19 +127,12 @@ def _make_mock_genai_client(
     candidate_tokens: int = 8,
 ) -> MagicMock:
     """Build a mock ``genai.Client`` returning one generate_content response."""
-    part = MagicMock()
-    part.text = text
-    content = MagicMock()
-    content.parts = [part]
-    candidate = MagicMock()
-    candidate.content = content
-    candidate.finish_reason = finish_reason
-    usage = MagicMock()
-    usage.prompt_token_count = prompt_tokens
-    usage.candidates_token_count = candidate_tokens
-    response = MagicMock()
-    response.candidates = [candidate]
-    response.usage_metadata = usage
+    response = _make_mock_genai_response(
+        text,
+        finish_reason=finish_reason,
+        prompt_tokens=prompt_tokens,
+        candidate_tokens=candidate_tokens,
+    )
     client = MagicMock()
     client.models.generate_content.return_value = response
     return client
@@ -303,3 +374,119 @@ def test_gemini_end_to_end_classify(gemini_env: None) -> None:
     assert isinstance(completion, Completion)
     assert completion.text == "response body"
     assert completion.usage == {"input_tokens": 12, "output_tokens": 8}
+
+
+# --------------------------------------------------------------------------- #
+# Degenerate SDK envelopes: the fallback arms (#1449)
+# --------------------------------------------------------------------------- #
+
+
+class TestGeminiDegenerateResponse:
+    """A malformed or partial SDK envelope degrades to a fixed value, never raises."""
+
+    def test_extract_text_returns_empty_string_for_empty_candidates(self) -> None:
+        """A response with zero candidates yields "" — never an IndexError."""
+        response = _make_mock_genai_response(candidates=[])
+        assert _extract_gemini_text(response) == ""
+
+    def test_extract_text_returns_empty_string_when_candidates_absent(self) -> None:
+        """No ``candidates`` attribute at all yields "".
+
+        ``getattr`` falls back to ``None``, which the ``if not candidates``
+        guard treats as empty — the same arm the empty-list case reaches.
+        """
+        response = _make_mock_genai_response(candidates=_ABSENT)
+        assert _extract_gemini_text(response) == ""
+
+    def test_the_absent_sentinel_really_deletes_the_attribute(self) -> None:
+        """Guard the fake itself: ``_ABSENT`` must remove the attribute outright.
+
+        Without this, a silent regression in ``_set_or_delete`` would leave
+        MagicMock's auto-created attribute in place and every ``_ABSENT`` case
+        would still pass — for the wrong reason.
+        """
+        response = _make_mock_genai_response(candidates=_ABSENT, usage_metadata=_ABSENT)
+        assert not hasattr(response, "candidates")
+        assert not hasattr(response, "usage_metadata")
+
+    @pytest.mark.parametrize("content", [None, _ABSENT], ids=["null", "absent"])
+    def test_extract_text_is_empty_when_the_candidate_carries_no_content(
+        self, content: object
+    ) -> None:
+        """A null or missing ``content`` yields "" — the ``parts`` normalisation."""
+        response = _make_mock_genai_response(content=content)
+        assert _extract_gemini_text(response) == ""
+
+    def test_extract_text_skips_non_str_parts_and_joins_the_rest(self) -> None:
+        """Only ``str`` parts join; a non-str part is dropped, not stringified."""
+        response = _make_mock_genai_response(texts=("a", 7, "b"))
+        assert _extract_gemini_text(response) == "ab"
+
+    def test_stop_reason_is_end_turn_for_empty_candidates(self) -> None:
+        """Zero candidates maps to "end_turn" — never an IndexError."""
+        response = _make_mock_genai_response(candidates=[])
+        assert _map_gemini_stop_reason(response) == "end_turn"
+
+    def test_stop_reason_is_end_turn_when_finish_reason_is_none(self) -> None:
+        """A ``None`` ``finish_reason`` maps to "end_turn"."""
+        response = _make_mock_genai_response(finish_reason=None)
+        assert _map_gemini_stop_reason(response) == "end_turn"
+
+    def test_stop_reason_is_end_turn_for_an_unmapped_reason(self) -> None:
+        """An unrecognised reason falls back to the registry's "end_turn" default."""
+        response = _make_mock_genai_response(finish_reason="SAFETY")
+        assert _map_gemini_stop_reason(response) == "end_turn"
+
+    @pytest.mark.parametrize("usage_metadata", [None, _ABSENT], ids=["null", "absent"])
+    def test_extract_usage_is_none_when_the_sdk_omitted_usage(
+        self, usage_metadata: object
+    ) -> None:
+        """A null or missing ``usage_metadata`` yields ``None``, not an empty dict."""
+        response = _make_mock_genai_response(usage_metadata=usage_metadata)
+        assert _extract_gemini_usage(response) is None
+
+    def test_extract_usage_keeps_only_an_int_prompt_token_count(self) -> None:
+        """A non-int ``candidates_token_count`` is skipped, leaving one key."""
+        response = _make_mock_genai_response(
+            prompt_tokens=12, candidate_tokens="not-an-int"
+        )
+        result = _extract_gemini_usage(response)
+        assert result is not None
+        assert result == {"input_tokens": 12}
+        assert "output_tokens" not in result
+
+    def test_extract_usage_keeps_only_an_int_candidates_token_count(self) -> None:
+        """A non-int ``prompt_token_count`` is skipped, leaving one key."""
+        response = _make_mock_genai_response(
+            prompt_tokens="not-an-int", candidate_tokens=8
+        )
+        result = _extract_gemini_usage(response)
+        assert result is not None
+        assert result == {"output_tokens": 8}
+        assert "input_tokens" not in result
+
+    def test_extract_usage_is_none_not_empty_dict_when_no_field_is_an_int(self) -> None:
+        """A usage object carrying no int field collapses to ``None``, not ``{}``."""
+        response = _make_mock_genai_response(
+            prompt_tokens="not-an-int", candidate_tokens=None
+        )
+        assert _extract_gemini_usage(response) is None
+
+
+class TestGeminiClientMemoization:
+    """The lazily-built SDK client is constructed once and then reused."""
+
+    def test_client_is_constructed_once_and_reused(self, gemini_env: None) -> None:
+        """A second ``.client`` access returns the same object, not a new client.
+
+        ``side_effect`` hands out two DISTINCT clients, so ``first is second``
+        is a real assertion: a broken memoization would return the second one.
+        """
+        built = [MagicMock(), MagicMock()]
+        with patch("google.genai.Client", side_effect=built) as ctor:
+            provider = GeminiProvider(LLMConfig(provider="gemini"))
+            first = provider.client
+            second = provider.client
+        assert first is second
+        assert first is built[0]
+        assert ctor.call_count == 1
