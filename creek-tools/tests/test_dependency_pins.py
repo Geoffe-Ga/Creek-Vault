@@ -1971,9 +1971,12 @@ class _LockstepTool:
 
 #: Every tool whose version is asserted across pyproject.toml, uv.lock and
 #: .pre-commit-config.yaml at once (issue #1440). Only tools whose band is
-#: meant to admit a *single* minor line belong here: ``bandit`` is pinned
-#: three ways too, but its ``<2`` band deliberately admits the whole 1.x
-#: series, so a one-minor-line assertion would be wrong for it.
+#: meant to admit a *single* minor line and whose hook still provisions an
+#: independent environment belong here. MyPy left this table in #1759 because
+#: pre-commit now invokes the lockfile-backed canonical wrapper; there is no
+#: third MyPy installation to keep in step. ``bandit`` is pinned three ways
+#: too, but its ``<2`` band deliberately admits the whole 1.x series, so a
+#: one-minor-line assertion would be wrong for it.
 #: Emptying this table would make the guard vanish behind a green gate, so
 #: ``test_every_lockstep_tool_is_guarded`` asserts the membership rather
 #: than trusting the parametrisation.
@@ -1987,16 +1990,6 @@ _LOCKSTEP_TOOLS: tuple[_LockstepTool, ...] = (
             "repository; two minor lines disagree about formatting, so a "
             "pre-commit run and ./scripts/check-all.sh would rewrite each "
             "other's output forever"
-        ),
-    ),
-    _LockstepTool(
-        distribution="mypy",
-        pre_commit_repo="https://github.com/pre-commit/mirrors-mypy",
-        superseded_version=Version("2.1.0"),
-        rationale=(
-            "mypy runs under --strict here, and inference sharpens "
-            "between minor releases; a commit hook on an older mypy "
-            "passes code that ./scripts/typecheck.sh and CI reject"
         ),
     ),
 )
@@ -2097,7 +2090,7 @@ def test_lockstep_band_admits_one_minor_line(tool: _LockstepTool) -> None:
 
 
 def test_every_lockstep_tool_is_guarded() -> None:
-    """Both three-way-pinned gate tools are present in the table.
+    """Every independently provisioned lockstep tool is present in the table.
 
     Deleting a row would empty its parametrisation, and pytest reports
     zero cases as a pass -- so the guard would disappear behind a green
@@ -2105,10 +2098,10 @@ def test_every_lockstep_tool_is_guarded() -> None:
     impossible.
     """
     guarded = {tool.distribution for tool in _LOCKSTEP_TOOLS}
-    assert guarded == {"ruff", "mypy"}, (
-        f"_LOCKSTEP_TOOLS guards {sorted(guarded)!r}; ruff and mypy are "
-        "both pinned in pyproject.toml, uv.lock and "
-        ".pre-commit-config.yaml, and both must stay guarded"
+    assert guarded == {"ruff"}, (
+        f"_LOCKSTEP_TOOLS guards {sorted(guarded)!r}; ruff is the only "
+        "single-minor gate tool still provisioned independently by "
+        ".pre-commit-config.yaml, and it must stay guarded"
     )
 
 
