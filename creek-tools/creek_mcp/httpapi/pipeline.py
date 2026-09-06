@@ -25,21 +25,23 @@ excerpt, and not even the engine's own error strings, which interpolate file
 paths and are collapsed into one boolean. The pass reads material above the
 caller's ceiling on the host and reports nothing whatsoever about it.
 
-**No LLM provider is constructed on this path, and no vault byte leaves the
-host.** :class:`~creek_mcp.api.models.ClassificationMethod` has one member,
-``rules``, so there is no value a caller can send that reaches a provider at
-all. :class:`~creek_mcp.api.models.LinkMethod` omits ``embeddings``, the
-unbounded pairwise-similarity stage. Both exclusions are about the
-thirty-second request deadline
-(:data:`creek_mcp.httpapi.middleware.limits.DEFAULT_TIMEOUT_SECONDS`), which
-these routes deliberately do not honour. They are **writes**, so they dispatch
-through :func:`creek_mcp.httpapi.deadline.write_off_loop` and run to
-completion: shedding a vault mutation mid-flight to meet a deadline would
-report a failure for work that in fact landed (#1109). The caller therefore
-waits for the true answer, and an ``llm`` pass — minutes to hours over a seeded
-corpus — would mean waiting that long with no refusal to act on. Reaching it
-over the network needs an asynchronous job surface this contract does not
-have.
+**Long methods are durable jobs (#1605).** ``llm`` classification and the
+unbounded O(n²) ``embeddings`` linker persist a consumer-bound record before
+answering ``202``. A detached worker calls the same tools as the synchronous
+path and atomically advances that record through ``queued``, ``running`` and a
+terminal state. ``GET /v1/jobs/{job_id}`` projects it back through the same
+counts-only response models. It never publishes the private execution fields
+(``consumer``, ceiling, worker id) or the tool's error text.
+
+Admission is bounded to one active detached pipeline job per authenticated
+consumer. A second long-method request receives the contract's static
+``unavailable`` response until the accepted worker completes, preventing a
+caller from turning cheap ``202`` requests into unbounded full-vault work.
+
+The LLM path preserves the existing egress boundary rather than inventing one:
+``classify_tool`` reaches ``ModelRouter._enforce_local_for_intimate``, so an
+intimate fragment is routed to the local provider even when the classification
+stage is cloud-configured. The HTTP-level test drives that exact worker path.
 
 **The deadline is not fully closed by those exclusions, and saying otherwise
 would be the lie worth avoiding.** ``eddies`` and ``threads`` are served, and
@@ -50,8 +52,8 @@ Two things keep that honest rather than broken. It is a **local** model — the
 egress guarantee is untouched, and this route can no more reach a network
 provider than the classification half can. And the parquet is a cache, so the
 work a long call performs is not lost: it lands, and a retry is the fast path.
-What is genuinely missing is a bounded job surface, which is the same gap
-``llm`` and ``embeddings`` are waiting on (#1605).
+Those methods remain synchronous for compatibility; only explicit ``llm`` and
+``embeddings`` requests take the job path.
 
 **Both passes are idempotent and resumable**, which is what makes a synchronous
 route honest despite that deadline. ``run_classify`` short-circuits on the
@@ -63,8 +65,11 @@ response is the client's signal for which of the two it is looking at.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from functools import partial
-from typing import TYPE_CHECKING, Any, Final, TypeVar
+from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar
+from uuid import UUID
 
 from pydantic import BaseModel, ValidationError
 
@@ -74,6 +79,9 @@ from creek_mcp.api.models import (
     ClassificationRequest,
     ClassificationResponse,
     ErrorCode,
+    JobAcceptedResponse,
+    JobState,
+    JobStatusResponse,
     LinkMethod,
     LinkRequest,
     LinkResponse,
@@ -82,7 +90,15 @@ from creek_mcp.api.models import (
 from creek_mcp.httpapi.context import context_of
 from creek_mcp.httpapi.deadline import write_off_loop
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
+from creek_mcp.httpapi.jobs import (
+    StoredJob,
+    claim_job,
+    create_job,
+    finish_job,
+    status_for,
+)
 from creek_mcp.httpapi.vault import configured_vault
+from creek_mcp.tier_ceiling import TierCeiling
 from creek_mcp.tools.classify import classify_tool
 from creek_mcp.tools.handshake import vault_available
 from creek_mcp.tools.link import link_tool
@@ -95,6 +111,11 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
     from creek_mcp.httpapi.context import RequestContext
+
+logger = logging.getLogger(__name__)
+
+HTTP_ACCEPTED: Final[int] = 202
+"""A long-running pipeline request was durably queued."""
 
 _UNKNOWN_METHOD_PREFIX: Final[str] = "unknown method "
 """How both tools open their unserved-method refusal, verbatim.
@@ -333,6 +354,174 @@ def _link_model(result: dict[str, Any]) -> LinkResponse:
     )
 
 
+def _create_pipeline_job(
+    request: Request,
+    kind: Literal["classification", "link"],
+    method: str,
+    retier: bool,
+    context: RequestContext,
+) -> tuple[Path, StoredJob] | None:
+    """Resolve the vault and durably queue one long-running pipeline pass."""
+    vault = _vault_for(request)
+    if vault is None:
+        return None
+    record = create_job(
+        vault,
+        consumer=context.consumer,
+        kind=kind,
+        method=method,
+        retier=retier,
+        ceiling=context.ceiling.value,
+        worker_id=str(request.app.state.pipeline_worker_id),
+    )
+    return vault, record
+
+
+def _claimed_job(vault: Path, record: StoredJob) -> StoredJob | None:
+    """Claim one queued record, retaining operational detail in the log."""
+    try:
+        return claim_job(vault, record.job_id, record.worker_id)
+    except Exception:
+        logger.exception("pipeline job %s could not be claimed", record.job_id)
+        return None
+
+
+def _finish_pipeline_job(
+    vault: Path,
+    claimed: StoredJob,
+    result: ClassificationResponse | LinkResponse | None,
+) -> None:
+    """Persist one terminal result without letting a disk fault escape a worker."""
+    try:
+        finish_job(vault, claimed.job_id, claimed.worker_id, result)
+    except Exception:
+        logger.exception("pipeline job %s could not record its result", claimed.job_id)
+
+
+def _execute_pipeline_job(vault: Path, record: StoredJob) -> None:
+    """Claim, execute and terminally record one queued pipeline job."""
+    claimed = _claimed_job(vault, record)
+    if claimed is None:
+        return
+    try:
+        ceiling = TierCeiling(claimed.ceiling)
+        result: ClassificationResponse | LinkResponse | None
+        if claimed.kind == "classification":
+            raw = classify_tool(
+                vault_path=vault,
+                method=claimed.method,
+                retier=claimed.retier,
+                privacy_tier_ceiling=ceiling,
+                consumer=claimed.consumer,
+            )
+            result = (
+                _classification_model(raw, method=ClassificationMethod(claimed.method))
+                if raw.get("status") == OK_STATUS
+                else None
+            )
+        else:
+            raw = link_tool(
+                vault_path=vault,
+                method=claimed.method,
+                privacy_tier_ceiling=ceiling,
+                consumer=claimed.consumer,
+            )
+            result = _link_model(raw) if raw.get("status") == OK_STATUS else None
+    except Exception:
+        # The detached worker has no response boundary. Collapse every tool or
+        # projection failure to the public terminal state and retain the
+        # diagnostic only in the operator's log.
+        logger.exception("pipeline job %s failed", claimed.job_id)
+        result = None
+    _finish_pipeline_job(vault, claimed, result)
+
+
+def _forget_task(
+    task: asyncio.Task[None],
+    tasks: set[asyncio.Task[None]],
+    active_job_ids: set[str],
+    active_job_by_consumer: dict[str, str],
+    consumer: str,
+    job_id: str,
+) -> None:
+    """Release event-loop-confined admission state for a completed job."""
+    tasks.discard(task)
+    active_job_ids.discard(job_id)
+    if active_job_by_consumer.get(consumer) == job_id:
+        del active_job_by_consumer[consumer]
+
+
+async def _accepted_job(
+    request: Request,
+    *,
+    kind: Literal["classification", "link"],
+    method: str,
+    retier: bool,
+    context: RequestContext,
+) -> Response:
+    """Durably queue at most one active pass per consumer and return its handle.
+
+    Admission is event-loop serialised and the tracking collections are mutated
+    only on that loop.  The detached worker never touches them, so correctness
+    does not rely on cross-thread ``set`` operations being atomic.  A consumer
+    already running an expensive pass receives the contract's static
+    ``unavailable`` refusal and can retry after polling its accepted job.
+    """
+    async with request.app.state.pipeline_job_admission_lock:
+        active_job_by_consumer: dict[str, str] = (
+            request.app.state.pipeline_active_job_by_consumer
+        )
+        if context.consumer in active_job_by_consumer:
+            return error_response(ErrorCode.UNAVAILABLE, context)
+
+        queued = await write_off_loop(
+            _create_pipeline_job, request, kind, method, retier, context
+        )
+        if queued is None:
+            return error_response(ErrorCode.UNAVAILABLE, context)
+        vault, record = queued
+        task = asyncio.create_task(
+            asyncio.to_thread(_execute_pipeline_job, vault, record)
+        )
+        tasks: set[asyncio.Task[None]] = request.app.state.pipeline_job_tasks
+        active_job_ids: set[str] = request.app.state.pipeline_active_job_ids
+        tasks.add(task)
+        active_job_ids.add(record.job_id)
+        active_job_by_consumer[context.consumer] = record.job_id
+        task.add_done_callback(
+            partial(
+                _forget_task,
+                tasks=tasks,
+                active_job_ids=active_job_ids,
+                active_job_by_consumer=active_job_by_consumer,
+                consumer=context.consumer,
+                job_id=record.job_id,
+            )
+        )
+    payload = JobAcceptedResponse(
+        status="accepted", job_id=UUID(record.job_id), state=JobState.QUEUED
+    )
+    return json_response(payload.model_dump(mode="json"), HTTP_ACCEPTED)
+
+
+def _job_status(
+    request: Request,
+    context: RequestContext,
+    active_job_ids: frozenset[str],
+) -> JobStatusResponse | None:
+    """Resolve and read one consumer-bound job status off the event loop."""
+    vault = _vault_for(request)
+    if vault is None:
+        return None
+    return status_for(
+        vault,
+        request.path_params["job_id"],
+        consumer=context.consumer,
+        worker_id=str(request.app.state.pipeline_worker_id),
+        active_job_ids=active_job_ids,
+    )
+
+
 async def handle_classification(request: Request) -> Response:
     """Classify every fragment in the vault and report what changed.
 
@@ -351,6 +540,14 @@ async def handle_classification(request: Request) -> Response:
     parsed = await _parsed(request, ClassificationRequest)
     if parsed is None:
         return error_response(ErrorCode.INVALID_REQUEST, context)
+    if parsed.method is ClassificationMethod.LLM:
+        return await _accepted_job(
+            request,
+            kind="classification",
+            method=parsed.method.value,
+            retier=parsed.retier,
+            context=context,
+        )
     result = await write_off_loop(_classify, request, parsed, context)
     return _rendered(
         result, context, partial(_classification_model, method=parsed.method)
@@ -370,5 +567,25 @@ async def handle_link(request: Request) -> Response:
     parsed = await _parsed(request, LinkRequest)
     if parsed is None:
         return error_response(ErrorCode.INVALID_REQUEST, context)
+    if parsed.method is LinkMethod.EMBEDDINGS:
+        return await _accepted_job(
+            request,
+            kind="link",
+            method=parsed.method.value,
+            retier=False,
+            context=context,
+        )
     result = await write_off_loop(_link, request, parsed, context)
     return _rendered(result, context, _link_model)
+
+
+async def handle_job_status(request: Request) -> Response:
+    """Return the current counts-only state of one consumer-bound job."""
+    context = context_of(request.scope)
+    # Snapshot on the event loop; the blocking job-file read receives an
+    # immutable value instead of sharing the loop-owned set with a worker.
+    active_job_ids = frozenset(request.app.state.pipeline_active_job_ids)
+    status = await write_off_loop(_job_status, request, context, active_job_ids)
+    if status is None:
+        return error_response(ErrorCode.UNAVAILABLE, context)
+    return json_response(status.model_dump(mode="json"), HTTP_OK)
