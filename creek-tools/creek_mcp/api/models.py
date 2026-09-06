@@ -54,8 +54,9 @@ over every module in :mod:`creek_mcp` pins the modules that may name
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Final, Literal, Self
+from typing import Final, Literal, Self, TypeAlias
 from urllib.parse import urlparse
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -81,6 +82,7 @@ granularity: a patch bump is invisible to the consumer, a minor bump is not.
 
 SUPPORTED_CONTRACT_MINORS: Final[tuple[str, ...]] = (
     CONTRACT_MINOR,
+    "0.13",
     "0.12",
     "0.11",
     "0.10",
@@ -178,6 +180,12 @@ change additive: without it, ``CONTRACT_MINOR`` moves to ``"0.13"`` and every
 client still sending ``X-Creek-Contract-Version: 0.12`` is refused
 ``incompatible_version`` on every capability route, over a break it cannot
 observe.
+
+Contract 0.14 (#1605) widens the existing pipeline capability with two
+asynchronous request members, a ``202`` response, two job wire models and
+``GET /v1/jobs/{job_id}``. The short-method request and response bytes do not
+move, and a ``0.13`` consumer cannot express either new method from its
+vendored enums, so ``0.13`` remains served alongside every earlier minor.
 
 Each retired minor is spelled out rather than derived: :data:`CONTRACT_MINOR`
 is a *prefix of* :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the
@@ -1456,39 +1464,27 @@ class DriveAuthorizationExchangeRequest(_WireModel):
 class ClassificationMethod(StrEnum):
     """The classification methods ``POST /v1/classifications`` serves.
 
-    One member, and the single member is the point. ``creek classify`` also
-    accepts ``llm``, and it is **deliberately absent here** rather than
-    accepted-and-refused:
-
-    * **Time.** :data:`creek_mcp.httpapi.middleware.limits.DEFAULT_TIMEOUT_SECONDS`
-      is thirty seconds, and the timeout middleware uses ``anyio.fail_after``,
-      which cannot cancel a call already inside ``run_in_threadpool``. An LLM
-      pass over a seeded corpus is minutes to hours: the caller would be handed
-      a ``503`` while the work carried on with no handle on it.
-    * **Egress.** With no ``llm`` member there is no value a producer or a
-      consumer can put on the wire that reaches a provider at all, so "no byte
-      of the vault leaves the host on this route" is a property of the type
-      rather than of a runtime check somebody can forget to call.
-
-    Reaching ``llm`` classification over the network needs an asynchronous job
-    surface — ``202``, a job id, a status route — which this contract does not
-    have. Until then it stays an operator step on the host.
+    ``rules`` remains the bounded synchronous path. ``llm`` is accepted only
+    through the durable job surface added at contract 0.14 (#1605), because a
+    pass can take minutes or hours. The detached worker still invokes the
+    existing classify tool, including ModelRouter's intimate-never-cloud gate.
 
     Attributes:
         RULES: Keyword classification. No model, no key, no consent, no egress.
+        LLM: Model-backed classification, returned as a durable job handle.
     """
 
     RULES = "rules"
+    LLM = "llm"
 
 
 class LinkMethod(StrEnum):
     """The linker stages ``POST /v1/links`` serves.
 
-    Three of :data:`creek.surface_modes.LINK_METHODS`. ``embeddings`` is the
-    fourth and is excluded for the same shape of reason ``llm`` is excluded
-    from :class:`ClassificationMethod`, with a different cause: it is the
-    O(n²) pairwise-similarity stage, which has been observed being abandoned
-    at 35k fragments and is unbounded in a way no cache repairs.
+    All four :data:`creek.surface_modes.LINK_METHODS` values are expressible.
+    ``embeddings`` uses the durable job surface because it is the O(n²)
+    pairwise-similarity stage; the other three retain their synchronous
+    byte-identical ``200`` responses.
 
     **Excluding it does not make every served member cheap, and the schema
     should not be read as promising that.** ``eddies`` and ``threads`` both
@@ -1510,11 +1506,13 @@ class LinkMethod(StrEnum):
         THREADS: Narrative currents, materialised under ``02-Threads/``. Embeds
             on a cold cache, and reads the APTITUDE labels a classification
             pass writes, so run classification first.
+        EMBEDDINGS: Pairwise similarity links, returned as a durable job handle.
     """
 
     TEMPORAL = "temporal"
     EDDIES = "eddies"
     THREADS = "threads"
+    EMBEDDINGS = "embeddings"
 
 
 class ClassificationRequest(_WireModel):
@@ -1542,7 +1540,7 @@ class ClassificationRequest(_WireModel):
 
     method: ClassificationMethod = Field(
         default=ClassificationMethod.RULES,
-        description="Classifier to run; rules is the only served method.",
+        description="Classifier to run; llm is accepted as a durable job.",
     )
     retier: bool = Field(
         default=False,
@@ -1658,6 +1656,39 @@ class LinkResponse(_WireModel):
     largest_cluster_fragments: int = Field(ge=0, description="Biggest cluster's size.")
     clusters_split: int = Field(ge=0, description="Clusters re-clustered tighter.")
     oversized_discarded: int = Field(ge=0, description="Fragments dropped to noise.")
+
+
+class JobState(StrEnum):
+    """The closed lifecycle vocabulary for a durable pipeline job."""
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+JobId: TypeAlias = UUID
+"""An opaque server-generated identifier for one durable pipeline job."""
+
+
+class JobAcceptedResponse(_WireModel):
+    """The durable handle returned when a long pipeline pass is accepted."""
+
+    status: Literal["accepted"] = Field(description="The job was durably queued.")
+    job_id: JobId = Field(description="Opaque server-generated job identifier.")
+    state: Literal[JobState.QUEUED] = Field(description="Initial lifecycle state.")
+
+
+class JobStatusResponse(_WireModel):
+    """The counts-only public projection of one consumer-bound pipeline job."""
+
+    status: Literal["ok"] = Field(description="The status lookup succeeded.")
+    job_id: JobId = Field(description="Opaque server-generated job identifier.")
+    state: JobState = Field(description="Current lifecycle state.")
+    result: ClassificationResponse | LinkResponse | None = Field(
+        default=None,
+        description="Counts-only result, present only after successful completion.",
+    )
 
 
 class ReflectionRequest(_WireModel):
@@ -2059,6 +2090,8 @@ CONTRACT_MODELS: Final[dict[str, type[BaseModel]]] = {
     "ErrorEnvelope": ErrorEnvelope,
     "JournalUpsertRequest": JournalUpsertRequest,
     "JournalUpsertResponse": JournalUpsertResponse,
+    "JobAcceptedResponse": JobAcceptedResponse,
+    "JobStatusResponse": JobStatusResponse,
     "LinkRequest": LinkRequest,
     "LinkResponse": LinkResponse,
     "NotApplicableExample": NotApplicableExample,

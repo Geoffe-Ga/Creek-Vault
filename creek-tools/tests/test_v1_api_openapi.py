@@ -95,6 +95,7 @@ from tests.v1_api_support import (
     DRIVE_CONNECTOR_PATH,
     DRIVE_SYNC_PATH,
     HEALTH_PATH,
+    JOB_TEMPLATE,
     JOURNAL_TEMPLATE,
     LINKS_PATH,
     REFLECTIONS_PATH,
@@ -112,9 +113,9 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 SCHEMA_DIR: Final[Path] = REPO_ROOT / "docs" / "contracts" / "adepthood-v1" / "schemas"
 
 OPENAPI_GOLDEN: Final[Path] = (
-    Path(__file__).resolve().parent / "fixtures" / "openapi-0.13.0.json"
+    Path(__file__).resolve().parent / "fixtures" / "openapi-0.14.0.json"
 )
-"""The published document as it stood at ``8b17815``, before #1605's rewrite.
+"""The published document at contract 0.14.0, including #1605's job surface.
 
 Regenerate it **only** with a deliberate contract change, and say in that
 change's ADR row what moved:
@@ -457,6 +458,7 @@ def test_every_published_route_is_documented() -> None:
         DRIVE_AUTHORIZATION_TEMPLATE,
         CLASSIFICATIONS_PATH,
         LINKS_PATH,
+        JOB_TEMPLATE,
         HEALTH_PATH,
     }
 
@@ -554,8 +556,8 @@ def _spec_for(path: str, method: str) -> RouteSpec:
     raise LookupError(msg)
 
 
-def test_the_generated_document_is_unchanged_by_per_route_success_responses() -> None:
-    """The published document is byte-for-byte what it was before #1605.
+def test_the_generated_document_matches_the_current_contract_golden() -> None:
+    """The complete published document is pinned byte-for-byte at 0.14.0.
 
     A **golden file**, deliberately, and it is the whole review of the
     ``RouteSpec.success_responses`` change: that change rewrote the response
@@ -566,8 +568,7 @@ def test_the_generated_document_is_unchanged_by_per_route_success_responses() ->
     user-visible contract of that work, and a live re-derivation would pass
     against a generator that broke the same way twice.
 
-    ``tests/fixtures/openapi-0.13.0.json`` was captured from the generator at
-    ``8b17815``, before the rewrite, with
+    ``tests/fixtures/openapi-0.14.0.json`` was captured from the generator with
     ``json.dumps(build_openapi(), indent=2, ensure_ascii=False) + "\n"`` — no
     ``sort_keys``, so response *insertion order* is pinned too and not merely
     the set of keys.

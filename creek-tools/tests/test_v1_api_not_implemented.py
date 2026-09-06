@@ -448,7 +448,8 @@ def test_405_is_not_in_the_published_status_set() -> None:
     should have to be typed out on purpose.
     """
     assert _METHOD_NOT_ALLOWED not in ALLOWED_HTTP_STATUSES
-    assert {200, 401, 403, 404, 409, 415, 422, 500, 501, 503} == ALLOWED_HTTP_STATUSES
+    expected = {200, 202, 401, 403, 404, 409, 415, 422, 500, 501, 503}
+    assert expected == ALLOWED_HTTP_STATUSES
 
 
 def test_no_reachable_request_produces_a_status_outside_the_set(
@@ -515,7 +516,7 @@ def test_no_unrouted_request_produces_a_status_outside_the_set(vault: Path) -> N
 
 def test_the_method_sweep_is_not_vacuous() -> None:
     """The sweep above really does try every verb on every route."""
-    assert len(MOUNTED) * len(_ALL_METHODS) == 78
+    assert len(MOUNTED) * len(_ALL_METHODS) == 84
     assert "PATCH" in _ALL_METHODS
 
 

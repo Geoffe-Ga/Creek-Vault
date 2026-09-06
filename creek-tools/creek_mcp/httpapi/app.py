@@ -82,8 +82,10 @@ construction site to :func:`_routing_miss`.
 
 from __future__ import annotations
 
+import asyncio
 from functools import update_wrapper
 from typing import TYPE_CHECKING, Final, NoReturn
+from uuid import uuid4
 
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
@@ -548,6 +550,11 @@ def create_app(
     )
     app.router.redirect_slashes = REDIRECT_SLASHES
     app.state.vault_path = vault_path
+    app.state.pipeline_worker_id = uuid4().hex
+    app.state.pipeline_job_admission_lock = asyncio.Lock()
+    app.state.pipeline_job_tasks = set()
+    app.state.pipeline_active_job_ids = set()
+    app.state.pipeline_active_job_by_consumer = {}
     app.state.reflect_llm_factory = reflect_llm_factory
     # One grounding session per app (#1034), so ``POST /v1/reflections`` builds
     # and warms its retrieval specialist once for this process rather than once

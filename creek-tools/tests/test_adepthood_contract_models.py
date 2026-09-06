@@ -93,6 +93,8 @@ from creek_mcp.api.models import (
     DriveSyncResponse,
     ErrorCode,
     ErrorEnvelope,
+    JobAcceptedResponse,
+    JobStatusResponse,
     JournalAction,
     JournalUpsertRequest,
     JournalUpsertResponse,
@@ -296,6 +298,19 @@ LINK_RESPONSE_PAYLOAD: dict[str, Any] = {
     "oversized_discarded": 0,
 }
 
+JOB_ACCEPTED_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "accepted",
+    "job_id": "00000000-0000-4000-8000-000000000000",
+    "state": "queued",
+}
+
+JOB_STATUS_RESPONSE_PAYLOAD: dict[str, Any] = {
+    "status": "ok",
+    "job_id": "00000000-0000-4000-8000-000000000000",
+    "state": "succeeded",
+    "result": CLASSIFICATION_RESPONSE_PAYLOAD,
+}
+
 DRIVE_DISCONNECT_RESPONSE_PAYLOAD: dict[str, Any] = {
     "status": "ok",
     "tier_ceiling": "open",
@@ -401,6 +416,8 @@ HAPPY_PAYLOADS: dict[str, dict[str, Any]] = {
     ErrorEnvelope.__name__: ERROR_ENVELOPE_PAYLOAD,
     JournalUpsertRequest.__name__: JOURNAL_UPSERT_REQUEST_PAYLOAD,
     JournalUpsertResponse.__name__: JOURNAL_UPSERT_RESPONSE_PAYLOAD,
+    JobAcceptedResponse.__name__: JOB_ACCEPTED_RESPONSE_PAYLOAD,
+    JobStatusResponse.__name__: JOB_STATUS_RESPONSE_PAYLOAD,
     LinkRequest.__name__: LINK_REQUEST_PAYLOAD,
     LinkResponse.__name__: LINK_RESPONSE_PAYLOAD,
     NotApplicableExample.__name__: NOT_APPLICABLE_EXAMPLE_PAYLOAD,
@@ -1738,15 +1755,12 @@ def test_the_committed_success_reflection_fixture_shows_the_populated_shape() ->
 
 
 def test_the_previous_minor_is_still_served() -> None:
-    """0.13 widened the compatibility window rather than shifting it.
+    """0.14 widened the compatibility window rather than shifting it.
 
-    A ``0.12`` client's ``/v1`` traffic is not touched at all by #874: the
-    bump adds one read-only **MCP** tool, and no ``/v1`` route, capability,
-    wire model, error code, status or schema moves, so refusing a ``0.12``
-    caller would be a break invented entirely by the version number. The same
-    was true of ``0.11`` under #1292, whose one typed integer key also moved
-    nothing on ``/v1``. ``0.10``, ``0.9`` and ``0.8`` are checked alongside
-    because the window only ever widens.
+    A ``0.13`` client cannot express either long method from its vendored
+    enums, and every short-method request keeps its byte-identical ``200``
+    response under #1605. Earlier minors are checked alongside it because the
+    window only ever widens.
 
     The head entry of :data:`SUPPORTED_CONTRACT_MINORS` is *derived* from
     :data:`~creek_mcp.contract.CONTRACT_VERSION`, so bumping the version
@@ -1754,12 +1768,13 @@ def test_the_previous_minor_is_still_served() -> None:
     what this test's first line is for, and why it is added at every bump
     rather than only when somebody suspects a problem.
     """
+    assert "0.13" in SUPPORTED_CONTRACT_MINORS
     assert "0.12" in SUPPORTED_CONTRACT_MINORS
     assert "0.11" in SUPPORTED_CONTRACT_MINORS
     assert "0.10" in SUPPORTED_CONTRACT_MINORS
     assert "0.9" in SUPPORTED_CONTRACT_MINORS
     assert "0.8" in SUPPORTED_CONTRACT_MINORS
-    assert CONTRACT_MINOR == "0.13"
+    assert CONTRACT_MINOR == "0.14"
 
 
 def test_every_minor_below_the_current_one_is_still_served() -> None:

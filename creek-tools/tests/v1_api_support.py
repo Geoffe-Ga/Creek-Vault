@@ -144,6 +144,12 @@ CLASSIFICATIONS_PATH: Final[str] = "/v1/classifications"
 LINKS_PATH: Final[str] = "/v1/links"
 """The whole-vault linking endpoint (contract 0.10, #1570)."""
 
+JOB_TEMPLATE: Final[str] = "/v1/jobs/{job_id}"
+"""The durable pipeline-job status route template (contract 0.14, #1605)."""
+
+JOB_PATH: Final[str] = "/v1/jobs/00000000-0000-4000-8000-000000000000"
+"""One syntactically valid concrete job path for route-wide assertions."""
+
 HEALTH_PATH: Final[str] = "/v1/health"
 """The liveness probe."""
 
@@ -199,6 +205,7 @@ MOUNTED: Final[tuple[tuple[str, str], ...]] = (
     ("DELETE", DRIVE_CONNECTOR_PATH),
     ("POST", CLASSIFICATIONS_PATH),
     ("POST", LINKS_PATH),
+    ("GET", JOB_PATH),
     ("GET", HEALTH_PATH),
 )
 """Every ``(method, concrete path)`` pair a client can actually reach."""
@@ -216,6 +223,7 @@ MOUNTED_IDS: Final[tuple[str, ...]] = (
     "drive-disconnect",
     "classifications",
     "links",
+    "job-status",
     "health",
 )
 """Stable parametrize ids for :data:`MOUNTED`, in the same order."""
@@ -232,6 +240,7 @@ VERSIONED: Final[tuple[tuple[str, str], ...]] = (
     ("DELETE", DRIVE_CONNECTOR_PATH),
     ("POST", CLASSIFICATIONS_PATH),
     ("POST", LINKS_PATH),
+    ("GET", JOB_PATH),
 )
 """The eleven routes the contract-version gate applies to."""
 
@@ -247,6 +256,7 @@ VERSIONED_IDS: Final[tuple[str, ...]] = (
     "drive-disconnect",
     "classifications",
     "links",
+    "job-status",
 )
 """Stable parametrize ids for :data:`VERSIONED`."""
 

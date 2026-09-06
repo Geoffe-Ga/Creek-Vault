@@ -1,9 +1,10 @@
 {
   "$defs": {
     "ClassificationMethod": {
-      "description": "The classification methods ``POST /v1/classifications`` serves.\n\nOne member, and the single member is the point. ``creek classify`` also\naccepts ``llm``, and it is **deliberately absent here** rather than\naccepted-and-refused:\n\n* **Time.** :data:`creek_mcp.httpapi.middleware.limits.DEFAULT_TIMEOUT_SECONDS`\n  is thirty seconds, and the timeout middleware uses ``anyio.fail_after``,\n  which cannot cancel a call already inside ``run_in_threadpool``. An LLM\n  pass over a seeded corpus is minutes to hours: the caller would be handed\n  a ``503`` while the work carried on with no handle on it.\n* **Egress.** With no ``llm`` member there is no value a producer or a\n  consumer can put on the wire that reaches a provider at all, so \"no byte\n  of the vault leaves the host on this route\" is a property of the type\n  rather than of a runtime check somebody can forget to call.\n\nReaching ``llm`` classification over the network needs an asynchronous job\nsurface \u2014 ``202``, a job id, a status route \u2014 which this contract does not\nhave. Until then it stays an operator step on the host.\n\nAttributes:\n    RULES: Keyword classification. No model, no key, no consent, no egress.",
+      "description": "The classification methods ``POST /v1/classifications`` serves.\n\n``rules`` remains the bounded synchronous path. ``llm`` is accepted only\nthrough the durable job surface added at contract 0.14 (#1605), because a\npass can take minutes or hours. The detached worker still invokes the\nexisting classify tool, including ModelRouter's intimate-never-cloud gate.\n\nAttributes:\n    RULES: Keyword classification. No model, no key, no consent, no egress.\n    LLM: Model-backed classification, returned as a durable job handle.",
       "enum": [
-        "rules"
+        "rules",
+        "llm"
       ],
       "title": "ClassificationMethod",
       "type": "string"

@@ -65,6 +65,7 @@ from creek_mcp.api.routes import (
     OP_DRIVE_STATUS,
     OP_DRIVE_SYNC,
     OP_HEALTH,
+    OP_JOB_STATUS,
     OP_JOURNAL_UPSERT,
     OP_LINK,
     OP_REFLECTIONS,
@@ -85,7 +86,11 @@ from creek_mcp.httpapi.drive_grant import (
 )
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
 from creek_mcp.httpapi.journal import handle_journal_upsert
-from creek_mcp.httpapi.pipeline import handle_classification, handle_link
+from creek_mcp.httpapi.pipeline import (
+    handle_classification,
+    handle_job_status,
+    handle_link,
+)
 from creek_mcp.httpapi.reflect import handle_reflection
 from creek_mcp.httpapi.upload import handle_upload
 from creek_mcp.httpapi.wheel import handle_wheel
@@ -197,6 +202,7 @@ _IMPLEMENTED_HANDLERS: Final[dict[str, Handler]] = {
     OP_DRIVE_SYNC: handle_drive_sync,
     OP_HEALTH: handle_health,
     OP_JOURNAL_UPSERT: handle_journal_upsert,
+    OP_JOB_STATUS: handle_job_status,
     OP_LINK: handle_link,
     OP_REFLECTIONS: handle_reflection,
     OP_UPLOAD: handle_upload,
