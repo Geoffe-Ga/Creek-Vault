@@ -22,6 +22,8 @@ import yaml
 
 from tests.shell_command_support import PRE_COMMIT_CONFIG
 
+PYPROJECT = PRE_COMMIT_CONFIG.parent / "pyproject.toml"
+
 _CANONICAL_SCANNERS = {
     "refurb": "creek-tools/scripts/lint-refurb.sh",
     "tryceratops": "creek-tools/scripts/lint-tryceratops.sh",
@@ -66,6 +68,17 @@ def test_mypy_pre_commit_reuses_the_lockfile_backed_gate() -> None:
 def test_attribute_docstrings_are_not_misread_as_module_docstrings() -> None:
     """The incompatible check-docstring-first hook must not return."""
     assert "check-docstring-first" not in _hooks()
+
+
+def test_lock_backed_hooks_are_not_described_as_independent_installs() -> None:
+    """Dependency comments must agree that local hooks reuse the project env."""
+    pyproject = PYPROJECT.read_text(encoding="utf-8")
+
+    for stale_claim in (
+        ".pre-commit-config.yaml's mirrors-mypy rev",
+        ".pre-commit-config.yaml's tryceratops rev",
+    ):
+        assert stale_claim not in pyproject
 
 
 @pytest.mark.parametrize(
