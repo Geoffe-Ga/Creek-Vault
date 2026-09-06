@@ -49,6 +49,8 @@ from creek_mcp.api.models import (
     DriveConnectorStatusResponse,
     DriveDisconnectResponse,
     DriveSyncResponse,
+    JobAcceptedResponse,
+    JobStatusResponse,
     JournalUpsertRequest,
     JournalUpsertResponse,
     LinkRequest,
@@ -57,6 +59,10 @@ from creek_mcp.api.models import (
     ReflectionResponse,
     UploadRequest,
     UploadResponse,
+    VoiceDraftDeleteResponse,
+    VoiceDraftReadResponse,
+    VoiceDraftUpsertRequest,
+    VoiceDraftUpsertResponse,
     WheelResponse,
 )
 from creek_mcp.api.routes import (
@@ -128,6 +134,33 @@ _EXPECTED: Final[
         True,
     ),
     (
+        "/v1/voice-drafts/{external_id}",
+        "PUT",
+        "upsertVoiceDraft",
+        Capability.VOICE_DRAFTS,
+        VoiceDraftUpsertRequest,
+        VoiceDraftUpsertResponse,
+        True,
+    ),
+    (
+        "/v1/voice-drafts/{external_id}",
+        "GET",
+        "getVoiceDraft",
+        Capability.VOICE_DRAFTS,
+        None,
+        VoiceDraftReadResponse,
+        True,
+    ),
+    (
+        "/v1/voice-drafts/{external_id}",
+        "DELETE",
+        "deleteVoiceDraft",
+        Capability.VOICE_DRAFTS,
+        None,
+        VoiceDraftDeleteResponse,
+        True,
+    ),
+    (
         "/v1/connectors/drive",
         "GET",
         "getDriveConnector",
@@ -191,6 +224,15 @@ _EXPECTED: Final[
         True,
     ),
     (
+        "/v1/jobs/{job_id}",
+        "GET",
+        "getPipelineJob",
+        Capability.PIPELINE,
+        None,
+        JobStatusResponse,
+        True,
+    ),
+    (
         "/v1/health",
         "GET",
         "getHealth",
@@ -207,6 +249,9 @@ _EXPECTED_IDS: Final[tuple[str, ...]] = (
     "reflections",
     "wheel",
     "upload",
+    "voice-draft-upsert",
+    "voice-draft-read",
+    "voice-draft-delete",
     "drive-status",
     "drive-sync",
     "drive-authorize",
@@ -214,10 +259,11 @@ _EXPECTED_IDS: Final[tuple[str, ...]] = (
     "drive-disconnect",
     "classifications",
     "links",
+    "job-status",
     "health",
 )
 
-_EXPECTED_ROUTE_COUNT: Final[int] = 13
+_EXPECTED_ROUTE_COUNT: Final[int] = 17
 
 
 def _by_operation(operation_id: str) -> RouteSpec:
@@ -252,10 +298,10 @@ def _by_operation(operation_id: str) -> RouteSpec:
 # --------------------------------------------------------------------------- #
 
 
-def test_routes_declares_exactly_thirteen_specs() -> None:
-    """``/v1`` publishes thirteen endpoints and no fourteenth.
+def test_routes_declares_exactly_seventeen_specs() -> None:
+    """``/v1`` publishes seventeen endpoints and no eighteenth.
 
-    A fourteenth would be an endpoint no fixture, no OpenAPI response set and
+    An eighteenth would be an endpoint no fixture, no OpenAPI response set and
     no capability entry describes — reachable, undocumented surface.
     """
     assert len(ROUTES) == _EXPECTED_ROUTE_COUNT
@@ -270,7 +316,7 @@ def test_routes_is_a_tuple() -> None:
     assert isinstance(ROUTES, tuple)
 
 
-def test_route_paths_and_methods_are_the_published_thirteen() -> None:
+def test_route_paths_and_methods_are_the_published_seventeen() -> None:
     """Every ``(path, method)`` pair matches the ADR, in order."""
     assert [(spec.path, spec.method) for spec in ROUTES] == [
         (path, method) for path, method, *_rest in _EXPECTED
@@ -331,19 +377,23 @@ def test_every_route_declares_its_published_success_responses() -> None:
             assert model is None or issubclass(model, BaseModel), spec.operation_id
 
 
-def test_every_route_still_declares_the_single_200_default() -> None:
-    """Nothing on the published table has moved off the default yet.
+def test_only_long_pipeline_writes_declare_the_202_success() -> None:
+    """Only classification and linking can return a durable job handle.
 
     This is the assertion that makes the diff reviewable: the mechanism is
     landed and inert, so the whole of its effect on the published document is
     "no change". The first route to declare a second success status has to
     edit this test on purpose.
     """
-    assert all(spec.success_responses is None for spec in ROUTES)
-    assert all(
-        spec.published_success_responses == ((200, spec.response_model),)
-        for spec in ROUTES
-    )
+    for spec in ROUTES:
+        if spec.operation_id in {"createClassification", "createLink"}:
+            assert spec.published_success_responses == (
+                (200, spec.response_model),
+                (202, JobAcceptedResponse),
+            )
+        else:
+            assert spec.success_responses is None
+            assert spec.published_success_responses == ((200, spec.response_model),)
 
 
 def test_the_published_success_statuses_are_derived_from_the_table() -> None:
@@ -355,7 +405,7 @@ def test_the_published_success_statuses_are_derived_from_the_table() -> None:
     """
     published = PUBLISHED_SUCCESS_STATUSES
     assert published == published_success_statuses(ROUTES)
-    assert published == frozenset({200})
+    assert published == frozenset({200, 202})
 
 
 def test_a_second_success_status_reaches_the_derived_set() -> None:
@@ -545,8 +595,8 @@ def test_exactly_one_route_declares_no_capability() -> None:
     assert uncapable == ["/v1/health"]
 
 
-def test_implemented_capabilities_is_exactly_the_published_seven() -> None:
-    """Every published capability answers for real, pipeline included (#1570).
+def test_implemented_capabilities_is_exactly_the_published_eight() -> None:
+    """Every published capability answers for real, Voice Drafts included (#1727).
 
     An exhaustive literal, not a containment check, and still named one by
     one: an eighth capability added to ``Capability`` has to change this line
@@ -563,6 +613,7 @@ def test_implemented_capabilities_is_exactly_the_published_seven() -> None:
                 Capability.UPLOAD,
                 Capability.DRIVE_CONNECTOR,
                 Capability.PIPELINE,
+                Capability.VOICE_DRAFTS,
             }
         )
         == IMPLEMENTED_CAPABILITIES

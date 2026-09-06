@@ -1,0 +1,31 @@
+{
+  "additionalProperties": false,
+  "description": "The durable handle returned when a long pipeline pass is accepted.",
+  "properties": {
+    "job_id": {
+      "description": "Opaque server-generated job identifier.",
+      "format": "uuid",
+      "title": "Job Id",
+      "type": "string"
+    },
+    "state": {
+      "const": "queued",
+      "description": "Initial lifecycle state.",
+      "title": "State",
+      "type": "string"
+    },
+    "status": {
+      "const": "accepted",
+      "description": "The job was durably queued.",
+      "title": "Status",
+      "type": "string"
+    }
+  },
+  "required": [
+    "status",
+    "job_id",
+    "state"
+  ],
+  "title": "JobAcceptedResponse",
+  "type": "object"
+}

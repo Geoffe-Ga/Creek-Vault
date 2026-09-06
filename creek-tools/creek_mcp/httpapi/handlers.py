@@ -65,10 +65,14 @@ from creek_mcp.api.routes import (
     OP_DRIVE_STATUS,
     OP_DRIVE_SYNC,
     OP_HEALTH,
+    OP_JOB_STATUS,
     OP_JOURNAL_UPSERT,
     OP_LINK,
     OP_REFLECTIONS,
     OP_UPLOAD,
+    OP_VOICE_DRAFT_DELETE,
+    OP_VOICE_DRAFT_READ,
+    OP_VOICE_DRAFT_UPSERT,
     OP_WHEEL,
     ROUTES,
 )
@@ -85,9 +89,18 @@ from creek_mcp.httpapi.drive_grant import (
 )
 from creek_mcp.httpapi.errors import HTTP_OK, error_response, json_response
 from creek_mcp.httpapi.journal import handle_journal_upsert
-from creek_mcp.httpapi.pipeline import handle_classification, handle_link
+from creek_mcp.httpapi.pipeline import (
+    handle_classification,
+    handle_job_status,
+    handle_link,
+)
 from creek_mcp.httpapi.reflect import handle_reflection
 from creek_mcp.httpapi.upload import handle_upload
+from creek_mcp.httpapi.voice_drafts import (
+    handle_voice_draft_delete,
+    handle_voice_draft_read,
+    handle_voice_draft_upsert,
+)
 from creek_mcp.httpapi.wheel import handle_wheel
 
 if TYPE_CHECKING:
@@ -197,9 +210,13 @@ _IMPLEMENTED_HANDLERS: Final[dict[str, Handler]] = {
     OP_DRIVE_SYNC: handle_drive_sync,
     OP_HEALTH: handle_health,
     OP_JOURNAL_UPSERT: handle_journal_upsert,
+    OP_JOB_STATUS: handle_job_status,
     OP_LINK: handle_link,
     OP_REFLECTIONS: handle_reflection,
     OP_UPLOAD: handle_upload,
+    OP_VOICE_DRAFT_DELETE: handle_voice_draft_delete,
+    OP_VOICE_DRAFT_READ: handle_voice_draft_read,
+    OP_VOICE_DRAFT_UPSERT: handle_voice_draft_upsert,
     OP_WHEEL: handle_wheel,
 }
 """The operations that answer for real, keyed by ``operation_id``.

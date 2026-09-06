@@ -41,6 +41,8 @@ from creek_mcp.api.models import (
     DriveConnectorStatusResponse,
     DriveDisconnectResponse,
     DriveSyncResponse,
+    JobAcceptedResponse,
+    JobStatusResponse,
     JournalUpsertRequest,
     JournalUpsertResponse,
     LinkRequest,
@@ -49,6 +51,10 @@ from creek_mcp.api.models import (
     ReflectionResponse,
     UploadRequest,
     UploadResponse,
+    VoiceDraftDeleteResponse,
+    VoiceDraftReadResponse,
+    VoiceDraftUpsertRequest,
+    VoiceDraftUpsertResponse,
     WheelResponse,
 )
 
@@ -107,6 +113,15 @@ OP_WHEEL: Final[str] = "getWheel"
 OP_UPLOAD: Final[str] = "uploadDocument"
 """``operation_id`` of ``POST /v1/uploads``."""
 
+OP_VOICE_DRAFT_UPSERT: Final[str] = "upsertVoiceDraft"
+"""``operation_id`` of ``PUT /v1/voice-drafts/{external_id}``."""
+
+OP_VOICE_DRAFT_READ: Final[str] = "getVoiceDraft"
+"""``operation_id`` of ``GET /v1/voice-drafts/{external_id}``."""
+
+OP_VOICE_DRAFT_DELETE: Final[str] = "deleteVoiceDraft"
+"""``operation_id`` of ``DELETE /v1/voice-drafts/{external_id}``."""
+
 OP_DRIVE_STATUS: Final[str] = "getDriveConnector"
 """``operation_id`` of ``GET /v1/connectors/drive``."""
 
@@ -127,6 +142,9 @@ OP_CLASSIFY: Final[str] = "createClassification"
 
 OP_LINK: Final[str] = "createLink"
 """``operation_id`` of ``POST /v1/links``."""
+
+OP_JOB_STATUS: Final[str] = "getPipelineJob"
+"""``operation_id`` of ``GET /v1/jobs/{job_id}``."""
 
 OP_HEALTH: Final[str] = "getHealth"
 """``operation_id`` of ``GET /v1/health``.
@@ -427,6 +445,36 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         max_body_bytes=UPLOAD_MAX_BODY_BYTES,
     ),
     RouteSpec(
+        path="/v1/voice-drafts/{external_id}",
+        method="PUT",
+        operation_id=OP_VOICE_DRAFT_UPSERT,
+        capability=Capability.VOICE_DRAFTS,
+        request_model=VoiceDraftUpsertRequest,
+        response_model=VoiceDraftUpsertResponse,
+        requires_contract_version=True,
+        summary="Create or update one AI-attributed Voice Draft idempotently.",
+    ),
+    RouteSpec(
+        path="/v1/voice-drafts/{external_id}",
+        method="GET",
+        operation_id=OP_VOICE_DRAFT_READ,
+        capability=Capability.VOICE_DRAFTS,
+        request_model=None,
+        response_model=VoiceDraftReadResponse,
+        requires_contract_version=True,
+        summary="Recall one admitted Voice Draft by external id.",
+    ),
+    RouteSpec(
+        path="/v1/voice-drafts/{external_id}",
+        method="DELETE",
+        operation_id=OP_VOICE_DRAFT_DELETE,
+        capability=Capability.VOICE_DRAFTS,
+        request_model=None,
+        response_model=VoiceDraftDeleteResponse,
+        requires_contract_version=True,
+        summary="Retract one admitted Voice Draft by external id.",
+    ),
+    RouteSpec(
         path="/v1/connectors/drive",
         method="GET",
         operation_id=OP_DRIVE_STATUS,
@@ -483,6 +531,10 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         capability=Capability.PIPELINE,
         request_model=ClassificationRequest,
         response_model=ClassificationResponse,
+        success_responses=(
+            (200, ClassificationResponse),
+            (202, JobAcceptedResponse),
+        ),
         requires_contract_version=True,
         summary="Classify every fragment in the vault, idempotently.",
     ),
@@ -493,8 +545,19 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         capability=Capability.PIPELINE,
         request_model=LinkRequest,
         response_model=LinkResponse,
+        success_responses=((200, LinkResponse), (202, JobAcceptedResponse)),
         requires_contract_version=True,
         summary="Run one linker stage over the whole vault.",
+    ),
+    RouteSpec(
+        path="/v1/jobs/{job_id}",
+        method="GET",
+        operation_id=OP_JOB_STATUS,
+        capability=Capability.PIPELINE,
+        request_model=None,
+        response_model=JobStatusResponse,
+        requires_contract_version=True,
+        summary="Report one durable pipeline job's counts-only state.",
     ),
     RouteSpec(
         path="/v1/health",
@@ -513,14 +576,13 @@ A tuple rather than a list so the table is immutable at the container level as
 well as per entry: a list would let any import-time hook append a route after
 the document and the handshake had already been read off it.
 
-**Three entries share one capability**, and that is the first time the table
-has done so. ``drive-connector`` is one feature — a client that may read the
-connector's state may sync and disconnect it, and there is nothing useful it
-could negotiate in between — so it is published as one name over three verbs
-rather than as three names a server could half-implement. Nothing downstream
-assumed the mapping was injective: :data:`~creek_mcp.httpapi.handlers.HANDLERS`
-is keyed on ``operation_id``, the OpenAPI ``paths`` mapping is built with
-``setdefault`` per path, and the handshake advertises a *set*.
+**Several entries may share one capability.** ``drive-connector`` is one
+feature over five verbs, and ``pipeline`` is one feature over two write verbs
+plus its job-status read. Splitting either would let a server advertise half a
+workflow. Nothing downstream assumes the mapping is injective:
+:data:`~creek_mcp.httpapi.handlers.HANDLERS` is keyed on ``operation_id``, the
+OpenAPI ``paths`` mapping is built with ``setdefault`` per path, and the
+handshake advertises a *set*.
 
 ``/v1/health`` is the one entry with no capability. Liveness is infrastructure,
 not something a client negotiates, and it is exempt from the contract-version

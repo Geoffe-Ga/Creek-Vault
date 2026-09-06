@@ -218,6 +218,9 @@ The single-use value ``POST /v1/connectors/drive/authorizations`` issued. Named
 here for the same reason :data:`EXTERNAL_ID_PARAM` is.
 """
 
+JOB_ID_PARAM: Final[str] = "job_id"
+"""The opaque UUID identifying one durable pipeline job (#1605)."""
+
 EXTERNAL_ID_PATTERN: Final[str] = "^[^\u0000-\u001f\u007f/]+$"
 """What a published ``{external_id}`` may be made of (#1132).
 
@@ -266,6 +269,11 @@ A bound rather than the exact length, so raising
 pattern no state can match.
 """
 
+_JOB_ID_PATTERN: Final[str] = (
+    "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+"""The canonical lowercase UUIDv4 shape emitted for every pipeline job."""
+
 _PATH_PARAMETER_SCHEMAS: Final[dict[str, dict[str, Any]]] = {
     EXTERNAL_ID_PARAM: {
         "type": "string",
@@ -278,6 +286,13 @@ _PATH_PARAMETER_SCHEMAS: Final[dict[str, dict[str, Any]]] = {
         "minLength": _MIN_STATE_CHARS,
         "maxLength": _MAX_STATE_CHARS,
         "pattern": _STATE_PATTERN,
+    },
+    JOB_ID_PARAM: {
+        "type": "string",
+        "format": "uuid",
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": _JOB_ID_PATTERN,
     },
 }
 """The published schema for each path parameter, keyed by parameter name.
@@ -295,6 +310,7 @@ for a body cap on a templated path.
 _PATH_PARAMETER_DESCRIPTIONS: Final[dict[str, str]] = {
     EXTERNAL_ID_PARAM: "Consumer-side identifier for this entry.",
     STATE_PARAM: "The single-use value the authorization was issued under.",
+    JOB_ID_PARAM: "Opaque server-generated pipeline job identifier.",
 }
 """What each path parameter *means*, keyed by parameter name.
 

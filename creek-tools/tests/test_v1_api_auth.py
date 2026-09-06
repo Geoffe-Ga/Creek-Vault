@@ -88,6 +88,7 @@ _CALLBACK_SHAPED_PATHS: Final[tuple[str, ...]] = (
 # below probes paths the router really matches rather than literal templates.
 _PATH_PARAMETER_VALUES: Final[dict[str, str]] = {
     "external_id": "abc",
+    "job_id": "00000000-0000-4000-8000-000000000000",
     "state": "abc",
 }
 
