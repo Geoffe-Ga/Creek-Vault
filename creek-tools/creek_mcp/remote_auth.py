@@ -322,6 +322,56 @@ def names_a_consumer(consumer: str | None) -> bool:
     return consumer is not None and bool(consumer.strip())
 
 
+def access_has_expired(access: AccessToken) -> bool:
+    """Return whether *access* carries an expiry that has already passed (#1267).
+
+    It lives beside the registry rather than in the adapter, for the reason
+    :mod:`creek_mcp.httpapi.auth` opens with (**one registry, one floor**): a
+    rule spelled out inside the adapter is a second place for it to drift.
+    That is a claim about *where* the rule lives, not about how much is
+    shared — :class:`NamedConsumerVerifier` does not call this, and the MCP
+    transport still gets its own answer from the SDK. What actually holds the
+    two gates together is ``tests/test_admission_parity.py``, which measures
+    both against one expected-verdict table.
+
+    Before this existed, :class:`~creek_mcp.httpapi.auth.BearerAuthMiddleware`
+    never read ``expires_at`` at all while the SDK's
+    ``BearerAuthBackend.authenticate`` did, so one credential was ``401`` on
+    one network and ``200`` on the other, and the finite lifetime #837 stamps
+    on every verified bearer bounded nothing at all on the HTTP surface.
+
+    ``expires_at=None`` means *no expiry* and is admitted, matching the SDK.
+    Refusing it would make ``/v1`` stricter than the MCP transport in a case
+    that is behaviourally reachable and already pinned: ``_GhostVerifier`` in
+    ``tests/test_v1_api_hardening.py`` mints ``None`` through the documented
+    ``create_app(verifier=...)`` seam and is asserted to reach a limiter
+    ``503``, which only happens past this gate.
+
+    ``expires_at=0`` is read as an expiry in January 1970 and **refused**,
+    where the SDK's truthiness guard (``if auth_info.expires_at and
+    auth_info.expires_at < int(time.time())``) reads the falsy integer as an
+    absent one and serves it. That divergence is deliberate and
+    one-directional — ``/v1`` refuses a credential the MCP transport would
+    serve, never the reverse — and unreachable in production, because
+    :func:`_token_ttl_seconds` is always positive so
+    :meth:`ConsumerTokenVerifier.verify_token` cannot mint it. Only an
+    injected verifier can. (A *negative* ``expires_at`` is truthy, so both
+    surfaces refuse it; the divergence is exactly and only the value ``0``.)
+
+    The two paragraphs above point opposite ways and one rule reconciles them:
+    never **admit** what the MCP transport refuses, and only **refuse** what it
+    admits where the value is unreachable in production and the SDK's reading
+    of it is a falsy-integer accident rather than a decision.
+
+    Args:
+        access: A verified access token.
+
+    Returns:
+        ``True`` when *access* carries an expiry and that instant has passed.
+    """
+    return access.expires_at is not None and access.expires_at < int(_now())
+
+
 def _refuse_unnamed_consumer(consumer: str) -> NoReturn:
     """Refuse a configured consumer whose name identifies nobody (#1100).
 
