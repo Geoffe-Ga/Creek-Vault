@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Creek Adepthood /v1 application API",
-    "version": "0.13.0",
+    "version": "0.14.0",
     "description": "Authenticated HTTP/JSON access to Creek's Adepthood-facing capabilities. Every response this application builds carries Vary: X-Creek-Tier-Ceiling, Authorization, X-Creek-Contract-Version and Cache-Control: no-store — do not enable caching for /v1 on an intermediary. Every error is the ErrorEnvelope, and retryability is the static retry-policy.json table keyed on the error code alone."
   },
   "security": [
@@ -1179,6 +1179,16 @@
               }
             }
           },
+          "202": {
+            "description": "Classify every fragment in the vault, idempotently.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobAcceptedResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "the request carried no valid consumer credential",
             "content": {
@@ -1297,6 +1307,16 @@
               }
             }
           },
+          "202": {
+            "description": "Run one linker stage over the whole vault.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobAcceptedResponse"
+                }
+              }
+            }
+          },
           "401": {
             "description": "the request carried no valid consumer credential",
             "content": {
@@ -1374,6 +1394,127 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/LinkRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}": {
+      "get": {
+        "operationId": "getPipelineJob",
+        "summary": "Report one durable pipeline job's counts-only state.",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "Opaque server-generated pipeline job identifier.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "minLength": 36,
+              "maxLength": 36,
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          },
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Report one durable pipeline job's counts-only state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
               }
             }
           }
@@ -1609,9 +1750,10 @@
         "type": "object"
       },
       "ClassificationMethod": {
-        "description": "The classification methods ``POST /v1/classifications`` serves.\n\nOne member, and the single member is the point. ``creek classify`` also\naccepts ``llm``, and it is **deliberately absent here** rather than\naccepted-and-refused:\n\n* **Time.** :data:`creek_mcp.httpapi.middleware.limits.DEFAULT_TIMEOUT_SECONDS`\n  is thirty seconds, and the timeout middleware uses ``anyio.fail_after``,\n  which cannot cancel a call already inside ``run_in_threadpool``. An LLM\n  pass over a seeded corpus is minutes to hours: the caller would be handed\n  a ``503`` while the work carried on with no handle on it.\n* **Egress.** With no ``llm`` member there is no value a producer or a\n  consumer can put on the wire that reaches a provider at all, so \"no byte\n  of the vault leaves the host on this route\" is a property of the type\n  rather than of a runtime check somebody can forget to call.\n\nReaching ``llm`` classification over the network needs an asynchronous job\nsurface — ``202``, a job id, a status route — which this contract does not\nhave. Until then it stays an operator step on the host.\n\nAttributes:\n    RULES: Keyword classification. No model, no key, no consent, no egress.",
+        "description": "The classification methods ``POST /v1/classifications`` serves.\n\n``rules`` remains the bounded synchronous path. ``llm`` is accepted only\nthrough the durable job surface added at contract 0.14 (#1605), because a\npass can take minutes or hours. The detached worker still invokes the\nexisting classify tool, including ModelRouter's intimate-never-cloud gate.\n\nAttributes:\n    RULES: Keyword classification. No model, no key, no consent, no egress.\n    LLM: Model-backed classification, returned as a durable job handle.",
         "enum": [
-          "rules"
+          "rules",
+          "llm"
         ],
         "title": "ClassificationMethod",
         "type": "string"
@@ -1654,15 +1796,178 @@
         "title": "JournalAction",
         "type": "string"
       },
+      "ClassificationResponse": {
+        "additionalProperties": false,
+        "description": "What one classification pass did, in counts alone (#1570).\n\n**Nothing here names a fragment.** No id, no path, no title, no excerpt,\nnot even an error string — the engine's per-fragment errors interpolate\nfile paths, so they are collapsed into :attr:`complete`. That is what makes\nit safe for this route to run over the *whole* vault while serving a caller\ncapped at ``personal``: the pass reads material above the ceiling on the\nhost, and reports nothing whatsoever about it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call ran at.\n    method: The classifier that ran, echoed so a client that sent an empty\n        body learns which default it got.\n    total: Creek fragments visited.\n    classified: Fragments whose frontmatter this run rewrote.\n    preserved_manual: Fragments left alone because an operator had stamped\n        them by hand.\n    preserved_llm: Fragments left alone by the resume short-circuit.\n    privacy_tiers_assigned: Fragments whose privacy tier this run derived.\n        **Zero is the expected answer for a network-seeded corpus**, and it\n        is not a failure: ``POST /v1/uploads`` requires an explicit tier\n        (#1497), so an uploaded fragment already carries the caller's\n        declared one and the tier pass does not own it. Only ``retier``\n        re-opens that case.\n    retiered: Subset of the above where an already-recorded tier was\n        replaced by a stricter one. Non-zero only under ``retier``.\n    praxis_marked: Fragments raised to a stronger praxis potential.\n    tags_extracted: Fragments that gained a hashtag ``tags`` entry.\n    complete: Whether every visited fragment was processed without error.\n        ``False`` means some were skipped, and — because the pass is\n        resumable — that the honest next step is to call again rather than\n        to treat the corpus as done. The *reasons* stay in the server log:\n        each one names the file it failed on.",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "Always ok; failure is an error.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Ceiling the call ran at."
+          },
+          "method": {
+            "$ref": "#/components/schemas/ClassificationMethod",
+            "description": "The classifier that ran."
+          },
+          "total": {
+            "description": "Creek fragments visited.",
+            "minimum": 0,
+            "title": "Total",
+            "type": "integer"
+          },
+          "classified": {
+            "description": "Fragments rewritten this run.",
+            "minimum": 0,
+            "title": "Classified",
+            "type": "integer"
+          },
+          "preserved_manual": {
+            "description": "Left alone: operator stamp.",
+            "minimum": 0,
+            "title": "Preserved Manual",
+            "type": "integer"
+          },
+          "preserved_llm": {
+            "description": "Left alone: resume stamp.",
+            "minimum": 0,
+            "title": "Preserved Llm",
+            "type": "integer"
+          },
+          "privacy_tiers_assigned": {
+            "description": "Tiers derived this run.",
+            "minimum": 0,
+            "title": "Privacy Tiers Assigned",
+            "type": "integer"
+          },
+          "retiered": {
+            "description": "Recorded tiers replaced by stricter.",
+            "minimum": 0,
+            "title": "Retiered",
+            "type": "integer"
+          },
+          "praxis_marked": {
+            "description": "Fragments raised to praxis.",
+            "minimum": 0,
+            "title": "Praxis Marked",
+            "type": "integer"
+          },
+          "tags_extracted": {
+            "description": "Fragments that gained tags.",
+            "minimum": 0,
+            "title": "Tags Extracted",
+            "type": "integer"
+          },
+          "complete": {
+            "description": "Every visited fragment processed cleanly.",
+            "title": "Complete",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "method",
+          "total",
+          "classified",
+          "preserved_manual",
+          "preserved_llm",
+          "privacy_tiers_assigned",
+          "retiered",
+          "praxis_marked",
+          "tags_extracted",
+          "complete"
+        ],
+        "title": "ClassificationResponse",
+        "type": "object"
+      },
+      "JobState": {
+        "description": "The closed lifecycle vocabulary for a durable pipeline job.",
+        "enum": [
+          "queued",
+          "running",
+          "succeeded",
+          "failed"
+        ],
+        "title": "JobState",
+        "type": "string"
+      },
       "LinkMethod": {
-        "description": "The linker stages ``POST /v1/links`` serves.\n\nThree of :data:`creek.surface_modes.LINK_METHODS`. ``embeddings`` is the\nfourth and is excluded for the same shape of reason ``llm`` is excluded\nfrom :class:`ClassificationMethod`, with a different cause: it is the\nO(n²) pairwise-similarity stage, which has been observed being abandoned\nat 35k fragments and is unbounded in a way no cache repairs.\n\n**Excluding it does not make every served member cheap, and the schema\nshould not be read as promising that.** ``eddies`` and ``threads`` both\nneed vectors, so both fill the embeddings parquet on a cold cache — a\nlocal sentence-transformer pass over every uncached fragment, which is\nminutes of work on a large vault and can outrun the request deadline.\nThey are served anyway because the parquet is a *cache*: the work a\ntimed-out first call performs still lands, so a retry converges instead of\nstarting over. Nothing about that reaches a network provider; the model is\nlocal (ADR-0004). Budget for the first call on a cold vault, and prefer\n``temporal`` when you only need the corpus navigable.\n\nAttributes:\n    TEMPORAL: Same-window adjacency links. The one genuinely cheap stage —\n        no vectors, no model — and the one that makes a freshly-seeded\n        corpus navigable at all.\n    EDDIES: Topic clusters, materialised under ``03-Eddies/``. Embeds on a\n        cold cache.\n    THREADS: Narrative currents, materialised under ``02-Threads/``. Embeds\n        on a cold cache, and reads the APTITUDE labels a classification\n        pass writes, so run classification first.",
+        "description": "The linker stages ``POST /v1/links`` serves.\n\nAll four :data:`creek.surface_modes.LINK_METHODS` values are expressible.\n``embeddings`` uses the durable job surface because it is the O(n²)\npairwise-similarity stage; the other three retain their synchronous\nbyte-identical ``200`` responses.\n\n**Excluding it does not make every served member cheap, and the schema\nshould not be read as promising that.** ``eddies`` and ``threads`` both\nneed vectors, so both fill the embeddings parquet on a cold cache — a\nlocal sentence-transformer pass over every uncached fragment, which is\nminutes of work on a large vault and can outrun the request deadline.\nThey are served anyway because the parquet is a *cache*: the work a\ntimed-out first call performs still lands, so a retry converges instead of\nstarting over. Nothing about that reaches a network provider; the model is\nlocal (ADR-0004). Budget for the first call on a cold vault, and prefer\n``temporal`` when you only need the corpus navigable.\n\nAttributes:\n    TEMPORAL: Same-window adjacency links. The one genuinely cheap stage —\n        no vectors, no model — and the one that makes a freshly-seeded\n        corpus navigable at all.\n    EDDIES: Topic clusters, materialised under ``03-Eddies/``. Embeds on a\n        cold cache.\n    THREADS: Narrative currents, materialised under ``02-Threads/``. Embeds\n        on a cold cache, and reads the APTITUDE labels a classification\n        pass writes, so run classification first.\n    EMBEDDINGS: Pairwise similarity links, returned as a durable job handle.",
         "enum": [
           "temporal",
           "eddies",
-          "threads"
+          "threads",
+          "embeddings"
         ],
         "title": "LinkMethod",
         "type": "string"
+      },
+      "LinkResponse": {
+        "additionalProperties": false,
+        "description": "What one linker stage did, in counts alone (#1570).\n\nCounts only, for the same reason :class:`ClassificationResponse` carries\nnone: the stage runs over every fragment in the vault, including material\nfar above the caller's ceiling, and a thread title or an eddy name is the\ncorpus talking.\n\nThere is no ``complete`` twin of the classification field. The linker has\nno per-fragment error accumulator to collapse — a stage either finishes or\nraises, and a raise is an :class:`ErrorEnvelope` — so a boolean here would\nbe a constant ``True`` wearing the shape of a fact.\n:attr:`oversized_discarded` is the honest partial-loss signal instead.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call ran at.\n    method: The stage that ran, echoed for correlation.\n    fragment_count: Fragments loaded from the vault.\n    link_count: The stage's own count — temporal links, eddies detected,\n        or threads detected.\n    largest_cluster_fragments: Members of the biggest cluster emitted; the\n        proof that no single cluster swallowed the corpus (#880).\n    clusters_split: Clusters re-clustered at a tighter parameter for\n        exceeding the configured ceiling.\n    oversized_discarded: Fragments dropped to noise because their cluster\n        stayed oversized after the split budget was spent. **This is data\n        loss** — those fragments carry no link at all — and it is published\n        rather than folded away because a caller who cannot see it reads a\n        lossy pass as a clean one (#1372).",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "Always ok; failure is an error.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Ceiling the call ran at."
+          },
+          "method": {
+            "$ref": "#/components/schemas/LinkMethod",
+            "description": "The linker stage that ran."
+          },
+          "fragment_count": {
+            "description": "Fragments loaded from the vault.",
+            "minimum": 0,
+            "title": "Fragment Count",
+            "type": "integer"
+          },
+          "link_count": {
+            "description": "The stage's own count.",
+            "minimum": 0,
+            "title": "Link Count",
+            "type": "integer"
+          },
+          "largest_cluster_fragments": {
+            "description": "Biggest cluster's size.",
+            "minimum": 0,
+            "title": "Largest Cluster Fragments",
+            "type": "integer"
+          },
+          "clusters_split": {
+            "description": "Clusters re-clustered tighter.",
+            "minimum": 0,
+            "title": "Clusters Split",
+            "type": "integer"
+          },
+          "oversized_discarded": {
+            "description": "Fragments dropped to noise.",
+            "minimum": 0,
+            "title": "Oversized Discarded",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "method",
+          "fragment_count",
+          "link_count",
+          "largest_cluster_fragments",
+          "clusters_split",
+          "oversized_discarded"
+        ],
+        "title": "LinkResponse",
+        "type": "object"
       },
       "NoteKind": {
         "description": "The seven margin-note kinds, mirroring the reflect tool's vocabulary.\n\nKept in lock-step with :data:`creek_mcp.tools.reflect._ALLOWED_KINDS`,\nwhich is what the produced notes are actually constrained to; a wire enum\nthat drifted from it would let a legitimate note fail validation on the way\nout.\n\nAttributes:\n    FEAR: A named fear surfacing in the entry.\n    GIFT: Something the writer is giving or has been given.\n    LONGING: An unmet want the writing circles.\n    PATTERN: A recurrence the writer has not named yet.\n    REFRAME: The same material seen from another angle.\n    TENSION: Two things the entry holds at once.\n    VALUE: A commitment the entry reveals.",
@@ -1977,7 +2282,7 @@
           "method": {
             "$ref": "#/components/schemas/ClassificationMethod",
             "default": "rules",
-            "description": "Classifier to run; rules is the only served method."
+            "description": "Classifier to run; llm is accepted as a durable job."
           },
           "retier": {
             "default": false,
@@ -1987,95 +2292,6 @@
           }
         },
         "title": "ClassificationRequest",
-        "type": "object"
-      },
-      "ClassificationResponse": {
-        "additionalProperties": false,
-        "description": "What one classification pass did, in counts alone (#1570).\n\n**Nothing here names a fragment.** No id, no path, no title, no excerpt,\nnot even an error string — the engine's per-fragment errors interpolate\nfile paths, so they are collapsed into :attr:`complete`. That is what makes\nit safe for this route to run over the *whole* vault while serving a caller\ncapped at ``personal``: the pass reads material above the ceiling on the\nhost, and reports nothing whatsoever about it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call ran at.\n    method: The classifier that ran, echoed so a client that sent an empty\n        body learns which default it got.\n    total: Creek fragments visited.\n    classified: Fragments whose frontmatter this run rewrote.\n    preserved_manual: Fragments left alone because an operator had stamped\n        them by hand.\n    preserved_llm: Fragments left alone by the resume short-circuit.\n    privacy_tiers_assigned: Fragments whose privacy tier this run derived.\n        **Zero is the expected answer for a network-seeded corpus**, and it\n        is not a failure: ``POST /v1/uploads`` requires an explicit tier\n        (#1497), so an uploaded fragment already carries the caller's\n        declared one and the tier pass does not own it. Only ``retier``\n        re-opens that case.\n    retiered: Subset of the above where an already-recorded tier was\n        replaced by a stricter one. Non-zero only under ``retier``.\n    praxis_marked: Fragments raised to a stronger praxis potential.\n    tags_extracted: Fragments that gained a hashtag ``tags`` entry.\n    complete: Whether every visited fragment was processed without error.\n        ``False`` means some were skipped, and — because the pass is\n        resumable — that the honest next step is to call again rather than\n        to treat the corpus as done. The *reasons* stay in the server log:\n        each one names the file it failed on.",
-        "properties": {
-          "status": {
-            "const": "ok",
-            "description": "Always ok; failure is an error.",
-            "title": "Status",
-            "type": "string"
-          },
-          "tier_ceiling": {
-            "$ref": "#/components/schemas/WireTierCeiling",
-            "description": "Ceiling the call ran at."
-          },
-          "method": {
-            "$ref": "#/components/schemas/ClassificationMethod",
-            "description": "The classifier that ran."
-          },
-          "total": {
-            "description": "Creek fragments visited.",
-            "minimum": 0,
-            "title": "Total",
-            "type": "integer"
-          },
-          "classified": {
-            "description": "Fragments rewritten this run.",
-            "minimum": 0,
-            "title": "Classified",
-            "type": "integer"
-          },
-          "preserved_manual": {
-            "description": "Left alone: operator stamp.",
-            "minimum": 0,
-            "title": "Preserved Manual",
-            "type": "integer"
-          },
-          "preserved_llm": {
-            "description": "Left alone: resume stamp.",
-            "minimum": 0,
-            "title": "Preserved Llm",
-            "type": "integer"
-          },
-          "privacy_tiers_assigned": {
-            "description": "Tiers derived this run.",
-            "minimum": 0,
-            "title": "Privacy Tiers Assigned",
-            "type": "integer"
-          },
-          "retiered": {
-            "description": "Recorded tiers replaced by stricter.",
-            "minimum": 0,
-            "title": "Retiered",
-            "type": "integer"
-          },
-          "praxis_marked": {
-            "description": "Fragments raised to praxis.",
-            "minimum": 0,
-            "title": "Praxis Marked",
-            "type": "integer"
-          },
-          "tags_extracted": {
-            "description": "Fragments that gained tags.",
-            "minimum": 0,
-            "title": "Tags Extracted",
-            "type": "integer"
-          },
-          "complete": {
-            "description": "Every visited fragment processed cleanly.",
-            "title": "Complete",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "status",
-          "tier_ceiling",
-          "method",
-          "total",
-          "classified",
-          "preserved_manual",
-          "preserved_llm",
-          "privacy_tiers_assigned",
-          "retiered",
-          "praxis_marked",
-          "tags_extracted",
-          "complete"
-        ],
-        "title": "ClassificationResponse",
         "type": "object"
       },
       "DriveAuthorizationExchangeRequest": {
@@ -2422,6 +2638,82 @@
         "title": "JournalUpsertResponse",
         "type": "object"
       },
+      "JobAcceptedResponse": {
+        "additionalProperties": false,
+        "description": "The durable handle returned when a long pipeline pass is accepted.",
+        "properties": {
+          "status": {
+            "const": "accepted",
+            "description": "The job was durably queued.",
+            "title": "Status",
+            "type": "string"
+          },
+          "job_id": {
+            "description": "Opaque server-generated job identifier.",
+            "format": "uuid",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "state": {
+            "const": "queued",
+            "description": "Initial lifecycle state.",
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "job_id",
+          "state"
+        ],
+        "title": "JobAcceptedResponse",
+        "type": "object"
+      },
+      "JobStatusResponse": {
+        "additionalProperties": false,
+        "description": "The counts-only public projection of one consumer-bound pipeline job.",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "The status lookup succeeded.",
+            "title": "Status",
+            "type": "string"
+          },
+          "job_id": {
+            "description": "Opaque server-generated job identifier.",
+            "format": "uuid",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState",
+            "description": "Current lifecycle state."
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ClassificationResponse"
+              },
+              {
+                "$ref": "#/components/schemas/LinkResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Counts-only result, present only after successful completion.",
+            "title": "Result"
+          }
+        },
+        "required": [
+          "status",
+          "job_id",
+          "state"
+        ],
+        "title": "JobStatusResponse",
+        "type": "object"
+      },
       "LinkRequest": {
         "additionalProperties": false,
         "description": "One linker stage over the whole vault (#1570).\n\n``method`` is required and has no default, unlike\n:class:`ClassificationRequest`'s. The three stages are not\ninterchangeable — one writes adjacency into fragment frontmatter, one\nmaterialises ``03-Eddies/``, one materialises ``02-Threads/`` — so a\ndefault would silently run a pass the caller did not choose and report it\nas the one they asked for.\n\nAttributes:\n    method: The linker stage to run.",
@@ -2435,68 +2727,6 @@
           "method"
         ],
         "title": "LinkRequest",
-        "type": "object"
-      },
-      "LinkResponse": {
-        "additionalProperties": false,
-        "description": "What one linker stage did, in counts alone (#1570).\n\nCounts only, for the same reason :class:`ClassificationResponse` carries\nnone: the stage runs over every fragment in the vault, including material\nfar above the caller's ceiling, and a thread title or an eddy name is the\ncorpus talking.\n\nThere is no ``complete`` twin of the classification field. The linker has\nno per-fragment error accumulator to collapse — a stage either finishes or\nraises, and a raise is an :class:`ErrorEnvelope` — so a boolean here would\nbe a constant ``True`` wearing the shape of a fact.\n:attr:`oversized_discarded` is the honest partial-loss signal instead.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call ran at.\n    method: The stage that ran, echoed for correlation.\n    fragment_count: Fragments loaded from the vault.\n    link_count: The stage's own count — temporal links, eddies detected,\n        or threads detected.\n    largest_cluster_fragments: Members of the biggest cluster emitted; the\n        proof that no single cluster swallowed the corpus (#880).\n    clusters_split: Clusters re-clustered at a tighter parameter for\n        exceeding the configured ceiling.\n    oversized_discarded: Fragments dropped to noise because their cluster\n        stayed oversized after the split budget was spent. **This is data\n        loss** — those fragments carry no link at all — and it is published\n        rather than folded away because a caller who cannot see it reads a\n        lossy pass as a clean one (#1372).",
-        "properties": {
-          "status": {
-            "const": "ok",
-            "description": "Always ok; failure is an error.",
-            "title": "Status",
-            "type": "string"
-          },
-          "tier_ceiling": {
-            "$ref": "#/components/schemas/WireTierCeiling",
-            "description": "Ceiling the call ran at."
-          },
-          "method": {
-            "$ref": "#/components/schemas/LinkMethod",
-            "description": "The linker stage that ran."
-          },
-          "fragment_count": {
-            "description": "Fragments loaded from the vault.",
-            "minimum": 0,
-            "title": "Fragment Count",
-            "type": "integer"
-          },
-          "link_count": {
-            "description": "The stage's own count.",
-            "minimum": 0,
-            "title": "Link Count",
-            "type": "integer"
-          },
-          "largest_cluster_fragments": {
-            "description": "Biggest cluster's size.",
-            "minimum": 0,
-            "title": "Largest Cluster Fragments",
-            "type": "integer"
-          },
-          "clusters_split": {
-            "description": "Clusters re-clustered tighter.",
-            "minimum": 0,
-            "title": "Clusters Split",
-            "type": "integer"
-          },
-          "oversized_discarded": {
-            "description": "Fragments dropped to noise.",
-            "minimum": 0,
-            "title": "Oversized Discarded",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "status",
-          "tier_ceiling",
-          "method",
-          "fragment_count",
-          "link_count",
-          "largest_cluster_fragments",
-          "clusters_split",
-          "oversized_discarded"
-        ],
-        "title": "LinkResponse",
         "type": "object"
       },
       "NotApplicableExample": {

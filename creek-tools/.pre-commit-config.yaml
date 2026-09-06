@@ -53,6 +53,10 @@ repos:
     args:
     - -c
     - creek-tools/pyproject.toml
+    # Match scripts/security.sh and CI: low findings are advisory; medium and
+    # high findings block. Without this, touching a file with a known low
+    # finding can fail after the canonical gate passed (#1764).
+    - -ll
     additional_dependencies:
     - bandit[toml]
 - repo: https://github.com/compilerla/conventional-pre-commit
@@ -159,7 +163,10 @@ repos:
     args:
     - --baseline
     - creek-tools/.secrets.baseline
-    exclude: \.secrets\.baseline$
+    # Generated contract manifests are registries of SHA-256 checksums. Scanning
+    # them as entropy makes every legitimate bundle regeneration uncommittable;
+    # schemas and examples remain in scope.
+    exclude: ^(creek-tools/\.secrets\.baseline|docs/contracts/[^/]+/manifest\.json)$
 # Local hook: pylint as a CI-aligned gate (CI-002 / CI-004). Runs only
 # on staged Python files so it stays fast; CI runs the full --fail-under
 # pass over creek/ and creek_mcp/.

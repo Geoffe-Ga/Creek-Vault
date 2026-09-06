@@ -2,7 +2,7 @@
 
 - **Status**: Accepted (Creek side)
 - **Date**: 2026-07-31
-- **Contract version**: `0.13.0`
+- **Contract version**: `0.15.0`
 - **Ontology version**: `aptitude-wavelength/2026-05-23`
 - **Driving issues**: [#1072](https://github.com/Geoffe-Ga/Creek-Vault/issues/1072) (this decision), epic [#1071](https://github.com/Geoffe-Ga/Creek-Vault/issues/1071)
 - **Mirrors**: [`Geoffe-Ga/adepthood#2044`](https://github.com/Geoffe-Ga/adepthood/issues/2044)
@@ -39,7 +39,7 @@ remote tier ceiling in order to demo a capability early — see
 ## Versioning
 
 `/v1` in the route path is the HTTP major. Below that, exactly one
-`contract_version` — `creek_mcp.contract.CONTRACT_VERSION`, currently `0.4.0`
+`contract_version` — `creek_mcp.contract.CONTRACT_VERSION`, currently `0.15.0`
 — covers both the MCP surface and `/v1`, because the epic's premise is one
 behavioral implementation: a shape change in a shared `creek_mcp.tools.*`
 function changes what both adapters can honestly promise at the same moment.
@@ -190,8 +190,9 @@ connection refused, a DNS/TLS failure, a timeout, a non-JSON body, or an HTTP
 status outside the closed set the contract publishes — `{200, 401, 403, 404,
 409, 415, 422, 500, 501, 503}` (`ALLOWED_HTTP_STATUSES` in the contract test
 suite, derived on both halves: the refusals from `ERROR_STATUS`'s range, the
-successes from the route table's `RouteSpec.success_responses`, which every
-route currently leaves at the default single `200` (#1605). `415` joined the
+successes from the route table's `RouteSpec.success_responses`; the two pipeline
+write routes declare both `200` and `202`, while every other route retains its
+default single `200` (#1605). `415` joined the
 set at contract `0.8.0` with `unsupported_source`). A conforming client MUST map it to
 a distinct local state and MUST NOT synthesize a capabilities body, and MUST
 NOT fold it into "uninitialized" — those are different facts an operator
@@ -218,6 +219,7 @@ every content route refuses an undeclared minor anyway.
 | `upload` | `0.8` |
 | `drive-connector` | `0.9` |
 | `pipeline` | `0.10` |
+| `voice-drafts` | `0.15` |
 <!-- /capability-set -->
 
 **The build-out divergence is closed (#1112).** While epic #1071 was being
@@ -287,6 +289,28 @@ members (`open`, `personal` — `intimate` is not a constructible value; see
 caller's own malformed payload, which discloses nothing about the vault —
 not `403`, which this contract reserves for a statement about a vault
 object.
+
+## Voice Drafts
+
+`PUT`, `GET`, and `DELETE /v1/voice-drafts/{external_id}` publish one
+caller-owned, idempotent AI-draft resource (#1727). `PUT` accepts
+`{content, title?, tier}`; the same external id creates once and then updates
+the same deterministic fragment or reports `unchanged`. Neither the raw id nor
+the caller's title appears in the filename.
+
+This is not an owner-authored journal entry. Creek files it under
+`11-Other-Authors/ai-as-user` with `source.author=ai`,
+`source.author_slug=ai-as-user`, and `voice_weight=0.0`. The response's
+`VoiceDraftAttribution` makes those three values literals, so neither endpoint
+can describe the draft as owner voice. The fragment remains available to
+retrieval while the existing voice-register eligibility check excludes it.
+
+The incoming tier and any existing draft's tier are admitted under the
+canonical ceiling while the mutation lock is held. A missing, corrupt,
+deleted, or above-ceiling slot collapses to the same `privacy_refused`
+envelope. `DELETE` is the retraction path when Adepthood later classifies a
+source entry as `intimate`: no intimate prose crosses the remote wire merely
+to remove the previously mirrored AI draft.
 
 ## Reflection
 
@@ -685,15 +709,17 @@ network MCP call. It is out of scope for #1117 and is tracked as follow-up
 [`docs/contracts/adepthood-v1/`](../contracts/adepthood-v1/) is the source of
 truth for the wire shapes in this repository:
 `manifest.json`, `retry-policy.json`, one `schemas/*.schema.json` file per
-`CONTRACT_MODELS` entry (thirty at contract `0.12.0`, unchanged since
+`CONTRACT_MODELS` entry (thirty-seven at contract `0.15.0`, adding the five
+Voice Draft request/response and attribution models; thirty-two at contract `0.14.0`, adding
+`JobAcceptedResponse` and `JobStatusResponse`; thirty at contract `0.12.0`, unchanged since
 `0.11.0` because #1292 moves no `/v1` shape — twenty-seven at
 `0.10.0` — twenty-three at
 `0.9.0` — eighteen at `0.8.0`, plus `RelatedPraxis` and `RelatedEddy` from #873
 and the three `Drive*Response` models from #1527 — plus
 `ClassificationRequest`/`ClassificationResponse` and `LinkRequest`/`LinkResponse`
 from #1570 — plus `DriveAuthorizationRequest`, `DriveAuthorizationResponse` and
-`DriveAuthorizationExchangeRequest` from #1568), and forty-nine
-`examples/<capability>/<state>.json` fixtures (seven capabilities × seven
+`DriveAuthorizationExchangeRequest` from #1568), and fifty-six
+`examples/<capability>/<state>.json` fixtures (eight capabilities × seven
 states). Everything in the directory except its own `README.md` is
 **generated** by `build_bundle()`
 ([`creek_mcp/api/bundle.py`](../../creek-tools/creek_mcp/api/bundle.py)), and
@@ -811,6 +837,8 @@ restating the other.
 
 | Contract version | Date | Change |
 |---|---|---|
+| `0.15.0` | 2026-09-06 | #1727 publishes the **eighth capability**, `voice-drafts`, as `PUT`, `GET`, and `DELETE /v1/voice-drafts/{external_id}`. The caller owns the idempotency key; Creek hashes it into a deterministic filename and stable fragment id, so the same id creates once and then updates or returns unchanged without duplicating the document. The stored fragment is structurally outside owner voice: it lives under `11-Other-Authors/ai-as-user`, carries `source.author=ai`, `source.author_slug=ai-as-user`, and `voice_weight=0.0`, and the wire attribution model admits no other values. Reads and mutations enforce the canonical tier ceiling; the existing-tier admission check happens while the storage lock is held, so an open caller cannot race or overwrite a personal draft. Missing, corrupt, deleted, and above-ceiling slots collapse to the same refusal. `DELETE` supports Adepthood's required retraction when a source entry later becomes intimate, without intimate text crossing the network. The route set adds three operations and five closed models; no error code or status is added. `CAPABILITY_SINCE_MINOR` both withholds and refuses the resource for `0.14` clients, whose known routes remain byte-identical, so `SUPPORTED_CONTRACT_MINORS` widens to retain `0.14`. The generated bundle adds five schemas and seven content-free `voice-drafts` examples, and the OpenAPI golden advances deliberately. |
+| `0.14.0` | 2026-09-05 | #1605 closes the long-running pipeline gap with a durable job surface. `POST /v1/classifications` now admits `method=llm`, and `POST /v1/links` admits `method=embeddings`; both persist a consumer-bound record before returning `202` with an opaque UUID. `GET /v1/jobs/{job_id}` returns only `{status, job_id, state, result}` where state is one of `queued`, `running`, `succeeded`, or `failed`, and `result` is either null or the existing counts-only classification/link model. No fragment id, path, title, prose, or tool error is published. Another authenticated consumer and an unknown id collapse to the same `unavailable` response. An active record belonging to an earlier server instance becomes `failed` after restart rather than remaining live forever. Admission permits one active detached pipeline job per authenticated consumer; another long-method request receives static `unavailable` until the worker finishes, bounding the otherwise-cheap `202` fan-out. The event loop alone mutates the admission sets, and status workers receive immutable snapshots. Existing `rules`, `temporal`, `eddies`, and `threads` calls retain their byte-identical synchronous `200` bodies. The worker deliberately reuses `classify_tool` / `link_tool`; in particular, LLM jobs still traverse `ModelRouter._enforce_local_for_intimate`, and the HTTP test observes an intimate fragment reach only the local provider under a cloud classification config. This adds one route, two enum members, `202`, and two wire models, so the shared minor advances and `SUPPORTED_CONTRACT_MINORS` widens to retain `0.13`. The generated fixture bundle gains the two schemas and republishes its version-bearing capability examples and manifest; `openapi.json` remains generated on demand for the standing contract-event reason. |
 | *(no contract change)* | 2026-08-21 | **Documentation corrections (#1111/#1112/#1150).** No route, shape, status, error code or version moved. Three things were written down. **#1150:** row (c) of the capabilities state table said `vault.available` was `—`; the probe runs unconditionally and `_render` emits `VaultState(available=…)` at every status, so an `incompatible` body always carries a real boolean — the table now says so in both this document and `docs/api.md`, and a test asserts the two cells are identical. Whether the probe *should* run at that status is left open — as open question 6 of the [sibling ADR](./2026-06-30-adepthood-creek-mcp-contract.md#open-questions-resolve-before-accepted), not on #1150, whose requested correction this row delivers, and not on #1148, which owned the reordering and is closed. **#1112:** the recorded fixture-vs-server divergence is closed — #1077 and epic #1071 shipped, so the committed fixture, `IMPLEMENTED_CAPABILITIES`, the `Capability` enum and a live response are now asserted as one four-way equality, and the capability list is machine-checked against the enum from both documents. **#1111:** the OpenAPI document stays generated-on-demand and out of `build_bundle()`, because committing it would rewrite the consumer-pinned `manifest.json` — a contract event, not a docs change. The revisit trigger now lives in [The OpenAPI document is deliberately not in the bundle](#the-openapi-document-is-deliberately-not-in-the-bundle-1111-2026-08-21) rather than in an issue nobody reads at bump time. |
 | `0.13.0` | 2026-09-01 | #874 adds one read-only **MCP** tool, `creek.classify.entry`, which reports the classification a named fragment already carries on disk — `frequency`, `phase`, `privacy_tier` and `classification_method` — and computes nothing. **The shared minor advances for a change that is entirely on the other adapter.** NO `/v1` route, capability, wire model, error code or status moves; `CONTRACT_MODELS` is unchanged — still thirty schemas — and no `Capability` member and therefore no `CAPABILITY_SINCE_MINOR` entry is added, so a `0.12` client is answered **byte-identically on every route it calls** and `SUPPORTED_CONTRACT_MINORS` widens to keep `0.12` and everything below it served. Publishing this read over `/v1` is deferred deliberately and strands nobody: `journal → fragment_id → creek.classify.entry` composes today over MCP, and a `/v1`-only consumer still reaches classification through `POST /v1/classifications`, published at `0.10.0`. The locator for a future route is an open question to settle *before* it is designed — the MCP tool keys on `fragment_id`, and a route keyed on `external_id` would be two locators for one read across two transports. **The one consumer-visible cost** is `manifest.json`'s `contract_version` plus the two `sha256` rows for `examples/capabilities/success.json` and `examples/capabilities/empty.json`, both of which carry `supported_contract_minors`; a consumer that hash-pins the manifest must re-pin, and **no *field* moves on either**. `schemas/CapabilitiesResponse.schema.json` does **not** move at this minor, for the reason the `0.12.0` row gives: `supported_contract_minors` is typed as an unconstrained array of strings with no enum, so a longer window is not a schema change. **The `openapi.json` revisit trigger, discharged by restatement:** this minor re-publishes the bundle and therefore owes a decision, and the decision is restated unchanged — `openapi.json` stays generated-on-demand and out of `build_bundle()`, because committing it would rewrite the consumer-pinned `manifest.json` every time an unrelated docstring moved. The middle option, publishing it as a rolling GitHub Release asset at zero manifest cost, stays open. |
 | `0.12.0` | 2026-09-01 | #1292 adds one typed integer key, `files_skipped_symlink`, to the `statistics` object returned by the **MCP** tool `creek.redact.scan` — the count of symlinked children the scan declined unopened because their target resolves outside the scanned root, which #1087 has counted on `ScanSummary` and rendered into `report_markdown` since it closed that walk, and which never reached the wire. **The shared minor advances for a change that is entirely on the other adapter.** NO `/v1` route, capability, wire model, error code or status moves, and `CONTRACT_MODELS` is unchanged — still thirty schemas — so a `0.11` client is answered **byte-identically on every route it calls**, and `SUPPORTED_CONTRACT_MINORS` widens to keep `0.11` and everything below it served. **The one consumer-visible cost** is `manifest.json`'s `contract_version` plus the two `sha256` rows for `examples/capabilities/success.json` and `examples/capabilities/empty.json`, both of which carry `supported_contract_minors`; a consumer that hash-pins the manifest must re-pin, and **no *field* moves on either**. `schemas/CapabilitiesResponse.schema.json` does **not** move at this minor: `supported_contract_minors` is typed as an unconstrained array of strings with no enum, so a longer window is not a schema change. (The `0.11.0` row above lists that file as having moved; that was already inaccurate when it was written — the schema's last change was #1570 — and is not repeated here.) **The `openapi.json` revisit trigger, discharged by restatement:** per [The OpenAPI document is deliberately not in the bundle](#the-openapi-document-is-deliberately-not-in-the-bundle-1111-2026-08-21), this minor re-publishes the bundle and therefore owes a decision. The decision is restated unchanged: `openapi.json` stays generated-on-demand and out of `build_bundle()`, on contract-event grounds — committing it would rewrite the consumer-pinned `manifest.json` every time an unrelated docstring moved. The middle option, publishing it as a rolling GitHub Release asset at zero manifest cost, stays open. |

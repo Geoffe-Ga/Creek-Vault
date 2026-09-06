@@ -20,8 +20,34 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.13.0"
+CONTRACT_VERSION: Final[str] = "0.15.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.15.0 (#1727): ``/v1`` publishes an eighth capability,
+``voice-drafts``, over one caller-owned ``external_id`` resource. ``PUT``
+creates or atomically updates the AI-authored draft, ``GET`` recalls the same
+persisted document, and ``DELETE`` retracts it after a source entry becomes
+intimate. The write/read models carry fixed AI attribution — ``author=ai``,
+``author_slug=ai-as-user`` and ``voice_weight=0`` — and the on-disk fragment
+uses the same metadata under ``11-Other-Authors/ai-as-user/``, so mirrored
+model prose is readable as evidence but can never enter the owner's voice
+corpus. The route set and five wire schemas widen the HTTP contract; ``0.14``
+remains served and is neither told about nor allowed to reach the capability.
+
+0.14.0 (#1605): ``POST /v1/classifications`` now admits ``method=llm`` and
+``POST /v1/links`` admits ``method=embeddings`` as durable asynchronous jobs.
+Both return ``202`` with an opaque job id; ``GET /v1/jobs/{job_id}`` reports a
+closed queued/running/succeeded/failed lifecycle and, on success, the same
+counts-only model the synchronous route returns. Existing short methods keep
+their byte-identical ``200`` responses. Records are atomically persisted
+inside the vault, bound to the authenticated consumer, and an active record
+owned by a prior server instance becomes ``failed`` after restart instead of
+remaining plausibly live forever. No fragment id, path, title, prose, or tool
+error enters either job response. LLM execution still goes through
+``classify_tool`` and ``ModelRouter._enforce_local_for_intimate``, preserving
+the intimate-never-cloud chokepoint. The route, request enums, two wire models,
+and ``202`` response widen the HTTP contract, so the minor moves and ``0.13``
+is retained in the compatibility window.
 
 0.13.0 (#874): one new **read-only** MCP tool, ``creek.classify.entry``. It
 takes an ``entry_ref`` and a ``privacy_tier_ceiling`` and reports the
