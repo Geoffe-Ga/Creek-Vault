@@ -18,29 +18,33 @@ ceiling would preserve the exposure rather than prevent it. Both facts are
 properties of code this issue did not write, so they are asserted here against
 the live constants rather than assumed.
 
-**Nothing of any fragment egresses on this surface.** Both responses are counts
-and a method name: no fragment id, no path, no title, no body. That is what
-makes running the *whole* vault under a ``personal`` ceiling safe — the route
-reads intimate content in the sense that the classifier looks at it on the
-host, and reports nothing about it at all.
+**Nothing of any fragment appears in a response.** Both synchronous results and
+durable job results are counts and a method name: no fragment id, path, title,
+body, or tool error. That is what makes running the *whole* vault under a
+``personal`` ceiling safe — the pass reads intimate content on the host and
+reports nothing of it.
 
-**No model is ever built.** The wire enums admit ``rules`` classification only,
-so no provider is constructed and no byte can leave the host on this path;
-:func:`test_a_classification_never_constructs_an_llm_provider` proves it by
-making construction raise. Link's ``embeddings`` stage is excluded for a
-different reason — it is O(n²) and has been killed at 35k fragments — and both
-exclusions are asserted as refusals rather than left to documentation.
+``rules`` remains the model-free synchronous path. The ``llm`` job path is
+allowed to construct the configured provider, but the tier-before-router
+ordering and ModelRouter chokepoint remain load-bearing: the end-to-end test
+below gives the classification stage a cloud provider, seeds an intimate
+fragment, and observes that only the local provider receives it.
 """
 
 from __future__ import annotations
 
 import base64
+import json
+import time
+from threading import Event
 from typing import TYPE_CHECKING, Any, Final
+from uuid import UUID
 
 import frontmatter
 import pytest
 
 from creek.classify.classify_engine import run_classify
+from creek.classify.llm import LLMClassificationResult
 from creek.classify.rules import FREQUENCY_SIGNALS, WAVELENGTH_PHASE_SIGNALS
 from creek.config import load_vault_config
 from creek.link import embeddings as embeddings_module
@@ -57,6 +61,7 @@ from creek_mcp.tier_ceiling import TierCeiling, tier_sensitivity
 from tests.v1_api_support import (
     CLASSIFICATIONS_PATH,
     LINKS_PATH,
+    OTHER_TOKEN,
     UPLOAD_PATH,
     client,
     headers,
@@ -72,8 +77,11 @@ if TYPE_CHECKING:
 HTTP_OK: Final[int] = 200
 """The one success status either route answers with."""
 
+HTTP_ACCEPTED: Final[int] = 202
+"""What a long-running pipeline method returns once durably queued."""
+
 HTTP_UNPROCESSABLE: Final[int] = 422
-"""What an unserved ``method`` earns: a schema failure, not a privacy refusal."""
+"""What a well-routed request outside the closed input schema earns."""
 
 HTTP_CONFLICT: Final[int] = 409
 """What a client pinned below the minor that published this capability earns."""
@@ -569,24 +577,264 @@ def test_a_classification_never_constructs_an_llm_provider(
     ],
     ids=["classify-llm", "link-embeddings"],
 )
-def test_the_long_running_methods_are_not_expressible(
-    api: TestClient, path: str, body: dict[str, str]
+def test_the_long_running_methods_are_accepted_as_durable_jobs(
+    api: TestClient,
+    path: str,
+    body: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``llm`` and ``embeddings`` are refused by the schema, not by a runtime check.
+    """``llm`` and ``embeddings`` return immediately with a pollable job id.
 
-    Both are minutes-to-hours of work, and the reason is **not** that a
-    deadline would shed the call: these are write routes, so the deadline is
-    not enforced on them and no ``503`` is synthesized while a pass carries on
-    (``docs/api.md``, limits table). A caller who triggered one would simply
-    wait, holding a connection and one of its eight per-consumer concurrency
-    slots, with no progress, no cancellation and no restart visibility.
-    Excluding them from the wire enums makes them unreachable in the *type*,
-    which is also what publishes the exclusion to a consumer reading the
-    schemas.
+    These methods can take minutes or hours, so they must not hold the request
+    or borrow the synchronous ``200`` response. The id is opaque and contains
+    no fragment or path material; UUID parsing pins that it is server-minted
+    rather than derived from anything in the vault.
     """
+    monkeypatch.setattr(pipeline_module, "classify_tool", _llm_success)
+    monkeypatch.setattr(pipeline_module, "link_tool", _embeddings_success)
+
     response = api.post(path, json=body, headers=headers())
 
-    assert response.status_code == HTTP_UNPROCESSABLE
+    assert response.status_code == HTTP_ACCEPTED
+    assert response.json() == {
+        "status": "accepted",
+        "job_id": response.json()["job_id"],
+        "state": "queued",
+    }
+    UUID(response.json()["job_id"])
+
+
+def test_a_short_pipeline_request_keeps_its_exact_synchronous_bytes(
+    api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The new job branch does not alter the pre-0.14 ``rules`` response."""
+    monkeypatch.setattr(pipeline_module, "classify_tool", _llm_success)
+
+    response = api.post(
+        CLASSIFICATIONS_PATH, json={"method": "rules"}, headers=headers()
+    )
+
+    assert response.status_code == HTTP_OK
+    assert response.content == (
+        b'{"status":"ok","tier_ceiling":"open","method":"rules",'
+        b'"total":3,"classified":2,"preserved_manual":1,"preserved_llm":0,'
+        b'"privacy_tiers_assigned":1,"retiered":0,"praxis_marked":1,'
+        b'"tags_extracted":2,"complete":true}'
+    )
+
+
+def _llm_success(**_kwargs: object) -> dict[str, object]:
+    """Return a complete counts-only LLM result without constructing a provider."""
+    return {
+        "status": "ok",
+        "tier_ceiling": "open",
+        "total": 3,
+        "classified": 2,
+        "preserved_manual": 1,
+        "preserved_llm": 0,
+        "privacy_tiers_assigned": 1,
+        "retiered": 0,
+        "praxis_marked": 1,
+        "tags_extracted": 2,
+        "errors": [],
+    }
+
+
+def _embeddings_success(**_kwargs: object) -> dict[str, object]:
+    """Return counts for an embeddings pass without loading a model."""
+    return {
+        "status": "ok",
+        "tier_ceiling": "open",
+        "method": "embeddings",
+        "fragment_count": 3,
+        "link_count": 2,
+        "largest_cluster_fragments": 2,
+        "clusters_split": 0,
+        "oversized_discarded": 0,
+    }
+
+
+def _await_terminal(api: TestClient, job_id: str) -> dict[str, object]:
+    """Poll one test job to a terminal state with a short bounded wait."""
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        response = api.get(f"/v1/jobs/{job_id}", headers=headers())
+        assert response.status_code == HTTP_OK
+        body: dict[str, object] = response.json()
+        if body["state"] in {"succeeded", "failed"}:
+            return body
+        time.sleep(0.01)
+    pytest.fail("pipeline job did not reach a terminal state")
+
+
+def test_an_accepted_job_is_pollable_to_its_counts_only_result(
+    api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A durable handle converges to the synchronous model, never vault prose."""
+    monkeypatch.setattr(pipeline_module, "classify_tool", _llm_success)
+
+    accepted = api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
+    body = _await_terminal(api, accepted.json()["job_id"])
+
+    assert body == {
+        "status": "ok",
+        "job_id": accepted.json()["job_id"],
+        "state": "succeeded",
+        "result": {
+            "status": "ok",
+            "tier_ceiling": "open",
+            "method": "llm",
+            "total": 3,
+            "classified": 2,
+            "preserved_manual": 1,
+            "preserved_llm": 0,
+            "privacy_tiers_assigned": 1,
+            "retiered": 0,
+            "praxis_marked": 1,
+            "tags_extracted": 2,
+            "complete": True,
+        },
+    }
+
+
+def test_an_embeddings_job_is_pollable_to_the_link_counts(
+    api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second long method uses the same durable terminal contract."""
+    monkeypatch.setattr(pipeline_module, "link_tool", _embeddings_success)
+
+    accepted = api.post(LINKS_PATH, json={"method": "embeddings"}, headers=headers())
+    body = _await_terminal(api, accepted.json()["job_id"])
+
+    assert body["state"] == "succeeded"
+    assert body["result"] == {
+        "status": "ok",
+        "tier_ceiling": "open",
+        "method": "embeddings",
+        "fragment_count": 3,
+        "link_count": 2,
+        "largest_cluster_fragments": 2,
+        "clusters_split": 0,
+        "oversized_discarded": 0,
+    }
+
+
+def test_a_job_failure_never_narrates_the_tool_error(
+    api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A detached tool exception becomes only ``failed`` plus a null result."""
+    intimate_marker = "private-title-from-an-intimate-fragment"
+
+    def _explode(**_kwargs: object) -> dict[str, object]:
+        raise RuntimeError(intimate_marker)
+
+    monkeypatch.setattr(pipeline_module, "classify_tool", _explode)
+    accepted = api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
+    body = _await_terminal(api, accepted.json()["job_id"])
+
+    assert body == {
+        "status": "ok",
+        "job_id": accepted.json()["job_id"],
+        "state": "failed",
+        "result": None,
+    }
+    assert intimate_marker not in json.dumps(body)
+
+
+def test_job_status_is_consumer_bound(
+    api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another authenticated consumer cannot enumerate a job or its result."""
+    monkeypatch.setattr(pipeline_module, "classify_tool", _llm_success)
+    accepted = api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
+    job_id = accepted.json()["job_id"]
+
+    refused = api.get(f"/v1/jobs/{job_id}", headers=headers(token=OTHER_TOKEN))
+    terminal = _await_terminal(api, job_id)
+
+    assert refused.status_code == HTTP_UNAVAILABLE
+    assert set(terminal) == {"status", "job_id", "state", "result"}
+
+
+def test_a_restart_marks_an_inflight_job_failed_instead_of_running_forever(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new worker turns an orphaned queued/running record into ``failed``."""
+    started = Event()
+    release = Event()
+
+    def _blocked(**_kwargs: object) -> dict[str, object]:
+        started.set()
+        assert release.wait(timeout=2.0)
+        return _llm_success()
+
+    monkeypatch.setattr(pipeline_module, "classify_tool", _blocked)
+    with client(vault_path=vault) as first:
+        accepted = first.post(
+            CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers()
+        )
+        assert started.wait(timeout=2.0)
+        job_id = accepted.json()["job_id"]
+
+        with client(vault_path=vault) as restarted:
+            status = restarted.get(f"/v1/jobs/{job_id}", headers=headers())
+
+        release.set()
+
+    assert status.status_code == HTTP_OK
+    assert status.json() == {
+        "status": "ok",
+        "job_id": job_id,
+        "state": "failed",
+        "result": None,
+    }
+
+
+def test_an_intimate_fragment_in_an_http_llm_job_never_reaches_cloud(
+    api: TestClient,
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The async adapter retains ModelRouter's intimate-local chokepoint."""
+    providers: list[str] = []
+
+    class _RecordingClassifier:
+        def __init__(self, config: Any) -> None:
+            self.config = config
+            self._provider = str(config.provider)
+
+        @property
+        def available(self) -> bool:
+            return True
+
+        def classify_with_reasoning(
+            self, fragment: Any, content: str
+        ) -> LLMClassificationResult:
+            _ = content
+            providers.append(self._provider)
+            return LLMClassificationResult(fragment=fragment, reasoning="")
+
+    monkeypatch.setattr(
+        "creek.classify.classify_engine.LLMClassifier", _RecordingClassifier
+    )
+    (vault / "00-Creek-Meta" / "creek_config.yaml").write_text(
+        "llm:\n"
+        "  default:\n"
+        "    provider: ollama\n"
+        "    model: qwen3:8b\n"
+        "  classification:\n"
+        "    provider: anthropic\n"
+        "    model: claude-haiku-4-5\n",
+        encoding="utf-8",
+    )
+    _write_fragment(vault, "intimate", _RECOVERY_BODY, tier="intimate")
+
+    accepted = api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
+    terminal = _await_terminal(api, accepted.json()["job_id"])
+
+    assert terminal["state"] == "succeeded"
+    assert providers == ["ollama"]
+    assert _RECOVERY_BODY not in json.dumps(terminal)
 
 
 @pytest.mark.parametrize(

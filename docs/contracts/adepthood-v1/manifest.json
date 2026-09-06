@@ -1,6 +1,6 @@
 {
   "bundle": "adepthood-v1",
-  "contract_version": "0.13.0",
+  "contract_version": "0.14.0",
   "files": [
     {
       "capability": "capabilities",
@@ -13,7 +13,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/empty.json",
-      "sha256": "7dd9c73e3dad311774ace1877353e0f8d74fdf2d5af6cc0f1b61aa4eee48072c",
+      "sha256": "38c2346746fe09aaa075bb093465c7830c47a6003c2ec9b38e9b174207253643",
       "state": "empty"
     },
     {
@@ -41,7 +41,7 @@
       "capability": "capabilities",
       "model": "CapabilitiesResponse",
       "path": "examples/capabilities/success.json",
-      "sha256": "84e5ad8384261f0c1de0c7a72ca403c502faa1d1e8beac903666fab2d87a1661",
+      "sha256": "e639aac80605751c9414b8d9158c697949fe4e0a9e8ba79ae19cf788b93c380b",
       "state": "success"
     },
     {
@@ -384,14 +384,14 @@
       "capability": null,
       "model": "ClassificationRequest",
       "path": "schemas/ClassificationRequest.schema.json",
-      "sha256": "340f63de211b904c7c87a5608ab72ddf1c14ed5386a0329b1bb396b1fed46e75",
+      "sha256": "292ebf2b794ddab4ca9ec18334e1804039fc68347c7f69d2d18769df39d10617",
       "state": null
     },
     {
       "capability": null,
       "model": "ClassificationResponse",
       "path": "schemas/ClassificationResponse.schema.json",
-      "sha256": "cb45a61852f41be211235c75766de08ad2825eeedc93a02f45d960eff00e18ba",
+      "sha256": "d4b79a946574fbf618e8ca66fe08083b9124b5c484e58bcf70b1f1463e9f5862",
       "state": null
     },
     {
@@ -445,6 +445,20 @@
     },
     {
       "capability": null,
+      "model": "JobAcceptedResponse",
+      "path": "schemas/JobAcceptedResponse.schema.json",
+      "sha256": "9c01d5c319ea67938959a2f2826808e90cb3d2f4bae5e6b7e7d93be1f1192c4c",
+      "state": null
+    },
+    {
+      "capability": null,
+      "model": "JobStatusResponse",
+      "path": "schemas/JobStatusResponse.schema.json",
+      "sha256": "c3cceda670e58715bfea8085b32bf813df5cf412bc46258a7048ace6c2e54fd5",
+      "state": null
+    },
+    {
+      "capability": null,
       "model": "JournalUpsertRequest",
       "path": "schemas/JournalUpsertRequest.schema.json",
       "sha256": "76137d5fe64f4b3ced1866d9d50e2d0e66e9fb59b85359ab0971b1b9ce5d1b1c",
@@ -461,14 +475,14 @@
       "capability": null,
       "model": "LinkRequest",
       "path": "schemas/LinkRequest.schema.json",
-      "sha256": "ed451891ee2476c7f0747fef9038f066c102d5fe5a29619430c3832b78aed86c",
+      "sha256": "964737218218e26da31b6c3c19df500b1fb61c478511bc7e5c13c31be6556dcc",
       "state": null
     },
     {
       "capability": null,
       "model": "LinkResponse",
       "path": "schemas/LinkResponse.schema.json",
-      "sha256": "201ba880113dbbb5dbfb343a3a2ca05d32e99b5b06956c9ad0b14b7ea0487c32",
+      "sha256": "f3598bf1e45b01aba83efb94aa9a30e7049d25a3945e9c2f0ab0c8724d8fb209",
       "state": null
     },
     {

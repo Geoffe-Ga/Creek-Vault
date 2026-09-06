@@ -336,7 +336,7 @@ here:
 ## Seeding over the network
 
 The `/v1` API is how an application seeds a vault it does not share a
-filesystem with. It publishes exactly thirteen routes:
+filesystem with. It publishes exactly fourteen routes:
 
 <!-- capability-set: v1-routes -->
 
@@ -354,11 +354,12 @@ filesystem with. It publishes exactly thirteen routes:
 | `DELETE` | `/v1/connectors/drive` |
 | `POST` | `/v1/classifications` |
 | `POST` | `/v1/links` |
+| `GET` | `/v1/jobs/{job_id}` |
 | `GET` | `/v1/health` |
 
 <!-- /capability-set -->
 
-Two of those thirteen were observed writing a fragment into `01-Fragments/`
+Two of those fourteen were observed writing a fragment into `01-Fragments/`
 here — `POST /v1/uploads` and `PUT /v1/journal-entries/{external_id}`:
 
 ```console
@@ -373,7 +374,7 @@ POST /v1/uploads                        200 {"status":"ok","fragment_id":"frag-a
 
 The Drive connector is the third seeding surface, but its sync route could
 only be observed refusing here — see [Google Drive](#google-drive). The
-remaining eight wrote no fragment in these runs; note that `POST
+remaining eleven operations wrote no fragment in these runs; note that `POST
 /v1/reflections` was only reachable as a `503 temporarily_unavailable` (no
 LLM backend was configured), so "it does not seed" is observed for its
 refusal path only. `POST /v1/classifications` and `POST /v1/links` do not
@@ -554,21 +555,31 @@ Both are idempotent. Classification short-circuits on the
 and retried converges rather than duplicating work — `complete: false` is the
 signal to call again.
 
+#### Long methods are durable jobs
+
+`{"method": "llm"}` on classification and `{"method": "embeddings"}` on
+links return `202` with an opaque job id instead of holding an HTTP connection
+for minutes or hours:
+
+```console
+POST /v1/classifications  {"method": "llm"}
+  202 {"status":"accepted","job_id":"…","state":"queued"}
+
+GET /v1/jobs/{job_id}
+  200 {"status":"ok","job_id":"…","state":"succeeded","result":{…counts…}}
+```
+
+The status route is bound to the authenticated consumer and publishes no
+fragment id, path, title, prose, or tool error. A server restart turns an
+orphaned active record into `failed` on the next poll, so it never remains
+plausibly running forever. LLM work still passes through ModelRouter's
+intimate-never-cloud gate; this is a scheduling change, not an egress bypass.
+
+`embeddings` remains the unbounded O(n²) pairwise-similarity stage, so a client
+must poll rather than assume prompt completion. The operator CLI forms remain
+available for local workflows.
+
 #### What these routes deliberately do not offer
-
-- **`{"method": "llm"}` on classification** and **`{"method": "embeddings"}`
-  on links** are refused as schema errors (`422`), not merely discouraged.
-  Both are minutes-to-hours of work on routes the request deadline
-  deliberately does not shed, so a caller would simply wait that long with no
-  refusal to act on, and `embeddings` is the unbounded O(n²)
-  pairwise-similarity stage no cache repairs. Excluding them
-  is not a promise that everything left is quick — see the budget note above
-  for `eddies` and `threads`. They remain operator steps on the vault host:
-
-  ```console
-  $ creek classify --vault <vault> --method llm
-  $ creek link --vault <vault> --method embeddings
-  ```
 
 - **A fragment selector.** There is none, and adding one would be a mistake:
   the passes are idempotent, so "classify everything" converges, whereas a

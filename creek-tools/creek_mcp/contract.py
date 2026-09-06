@@ -20,8 +20,23 @@ from __future__ import annotations
 
 from typing import Final
 
-CONTRACT_VERSION: Final[str] = "0.13.0"
+CONTRACT_VERSION: Final[str] = "0.14.0"
 """Semantic version of the Adepthood ↔ Creek MCP contract (draft).
+
+0.14.0 (#1605): ``POST /v1/classifications`` now admits ``method=llm`` and
+``POST /v1/links`` admits ``method=embeddings`` as durable asynchronous jobs.
+Both return ``202`` with an opaque job id; ``GET /v1/jobs/{job_id}`` reports a
+closed queued/running/succeeded/failed lifecycle and, on success, the same
+counts-only model the synchronous route returns. Existing short methods keep
+their byte-identical ``200`` responses. Records are atomically persisted
+inside the vault, bound to the authenticated consumer, and an active record
+owned by a prior server instance becomes ``failed`` after restart instead of
+remaining plausibly live forever. No fragment id, path, title, prose, or tool
+error enters either job response. LLM execution still goes through
+``classify_tool`` and ``ModelRouter._enforce_local_for_intimate``, preserving
+the intimate-never-cloud chokepoint. The route, request enums, two wire models,
+and ``202`` response widen the HTTP contract, so the minor moves and ``0.13``
+is retained in the compatibility window.
 
 0.13.0 (#874): one new **read-only** MCP tool, ``creek.classify.entry``. It
 takes an ``entry_ref`` and a ``privacy_tier_ceiling`` and reports the
