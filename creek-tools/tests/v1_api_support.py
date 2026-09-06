@@ -26,6 +26,7 @@ import base64
 import re
 from typing import TYPE_CHECKING, Any, Final
 
+from mcp.server.auth.provider import AccessToken
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
@@ -33,7 +34,7 @@ from creek_mcp import policy
 from creek_mcp.api.models import CONTRACT_MINOR, Capability
 from creek_mcp.httpapi.app import create_app
 from creek_mcp.httpapi.middleware import ceiling as ceiling_middleware
-from creek_mcp.remote_auth import ConsumerTokenVerifier
+from creek_mcp.remote_auth import REMOTE_SCOPE, ConsumerTokenVerifier
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -94,6 +95,100 @@ OTHER_TOKEN: Final[str] = "unit-test-other-token-" + "b" * 20
 
 # 44 chars, configured for nobody. test literal, not a real credential.
 UNKNOWN_TOKEN: Final[str] = "unit-test-unknown-token-" + "c" * 20
+
+# --------------------------------------------------------------------------- #
+# Credential lifetime (#1267)
+# --------------------------------------------------------------------------- #
+
+LONG_PAST: Final[int] = 1_000_000
+"""An epoch second in January 1970 — unambiguously past, and it cannot flake.
+
+Deliberately **not** derived from ``creek_mcp.remote_auth._now``. That alias is
+the same clock ``verify_token`` mints with, so back-dating it would move the
+mint and the check together and leave the credential live — a reproduction that
+goes green while proving nothing about expiry.
+"""
+
+FAR_FUTURE: Final[int] = 4_000_000_000
+"""An epoch second in 2096, so a live credential cannot age into a failure."""
+
+EPOCH_ZERO: Final[int] = 0
+"""A falsy stamped instant. ``/v1`` refuses it; the SDK's truthiness guard serves it."""
+
+
+class StampedAccessVerifier(ConsumerTokenVerifier):
+    """Authenticates any bearer, then stamps a caller-chosen identity and expiry.
+
+    Both network gates take an **injected** verifier — ``create_app`` on the
+    ``/v1`` side, ``build_server`` on the MCP side — which is the public seam
+    #1100 was filed on, and the only way a credential with a real
+    ``client_id`` and a dead ``expires_at`` can reach either of them. The
+    production verifier cannot produce one:
+    :meth:`~creek_mcp.remote_auth.ConsumerTokenVerifier.verify_token` stamps
+    ``expires_at`` at ``now + TTL`` inside the very call the gate then checks,
+    so it is fresh by construction.
+
+    It lives here rather than in a test module because two copies of it — one
+    per surface — is exactly the divergence ``tests/test_admission_parity.py``
+    exists to rule out. Its whole premise is that both columns are handed *the
+    same* credential.
+
+    It accepts **any** token on purpose. A refusal measured against it
+    therefore cannot be attributed to an unknown or malformed credential,
+    which is what makes an expiry assertion an assertion about expiry.
+    """
+
+    def __init__(
+        self,
+        tokens: Mapping[str, Sequence[str]],
+        *,
+        client_id: str = CONSUMER,
+        expires_at: int | None,
+    ) -> None:
+        """Store the identity and expiry every issued token will carry.
+
+        Args:
+            tokens: The configured consumers and their token sets.
+            client_id: The consumer name to stamp.
+            expires_at: The instant to stamp, or ``None`` for no expiry.
+        """
+        super().__init__(tokens)
+        self._client_id = client_id
+        self._expires_at = expires_at
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        """Return an access token carrying the stamped identity and expiry.
+
+        Args:
+            token: The presented bearer.
+
+        Returns:
+            The stamped :class:`AccessToken`.
+        """
+        return AccessToken(
+            token=token,
+            client_id=self._client_id,
+            scopes=[REMOTE_SCOPE],
+            expires_at=self._expires_at,
+        )
+
+
+def stamped(
+    expires_at: int | None, *, client_id: str = CONSUMER
+) -> StampedAccessVerifier:
+    """Return a :class:`StampedAccessVerifier` over the suite's one consumer.
+
+    Args:
+        expires_at: The instant to stamp, or ``None`` for no expiry.
+        client_id: The consumer name to stamp.
+
+    Returns:
+        The configured verifier.
+    """
+    return StampedAccessVerifier(
+        {CONSUMER: (STRONG_TOKEN,)}, client_id=client_id, expires_at=expires_at
+    )
+
 
 # --------------------------------------------------------------------------- #
 # The six published routes

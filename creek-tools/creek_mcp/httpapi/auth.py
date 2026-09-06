@@ -43,6 +43,7 @@ from creek_mcp.httpapi.errors import error_response
 from creek_mcp.remote_auth import (
     CONSUMER_TOKENS_ENV,
     ConsumerTokenVerifier,
+    access_has_expired,
     load_consumer_tokens,
     names_a_consumer,
 )
@@ -151,6 +152,16 @@ class BearerAuthMiddleware:
         header — which is the fix for a consumer sending the *name* of an
         environment variable as an identity.
 
+        A verified token that has **expired** is refused here too, through
+        the shared :func:`~creek_mcp.remote_auth.access_has_expired` predicate
+        and into the same refusal, so an "expired" answer is not
+        distinguishable from an "unknown" one. This clause is the *only*
+        expiry check on this network: the MCP transport gets one from the
+        SDK's ``BearerAuthBackend.authenticate`` on its own, separate stack,
+        and nothing in ``/v1``'s middleware chain corresponds to it. This
+        middleware read the ``client_id`` and never the expiry, so the two
+        network surfaces reached opposite verdicts on one credential (#1267).
+
         A verified token that names **nobody** is refused here, identically to
         an unverified one (#1100). ``verifier`` is injectable — ``create_app``
         takes one, and the suite passes one — so a verifier that is not a
@@ -172,7 +183,11 @@ class BearerAuthMiddleware:
         context = context_of(scope)
         token = _presented_token(scope)
         access = None if token is None else await self._verifier.verify_token(token)
-        if access is None or not names_a_consumer(access.client_id):
+        if (
+            access is None
+            or not names_a_consumer(access.client_id)
+            or access_has_expired(access)
+        ):
             refusal = error_response(ErrorCode.UNAUTHENTICATED, context)
             await refusal(scope, receive, send)
             return
