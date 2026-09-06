@@ -147,6 +147,64 @@ def workflow_steps(workflow: Path) -> list[dict[str, Any]]:
     return steps
 
 
+_AGENT_ACTION = "anthropics/claude-code-action"
+
+
+def _effective_issues_permission(
+    document: dict[str, Any], job: dict[str, Any]
+) -> str | None:
+    """Return the ``issues:`` permission in force for one job.
+
+    A job-level ``permissions:`` block replaces the workflow-level one
+    outright rather than merging into it, so a job that declares any
+    permissions and omits ``issues`` has none.
+
+    Args:
+        document: The parsed workflow document.
+        job: The parsed job mapping.
+
+    Returns:
+        The permission string (``"read"``, ``"write"``, …), or ``None``
+        when neither level grants ``issues``.
+    """
+    permissions = job.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = document.get("permissions")
+    if not isinstance(permissions, dict):
+        return None
+    granted = permissions.get("issues")
+    return str(granted) if granted is not None else None
+
+
+def agent_issue_filing_jobs() -> list[tuple[str, str]]:
+    """Return every job that runs a Claude agent able to FILE issues.
+
+    Derived, never enumerated by hand (issue #1700). The population is
+    "runs ``anthropics/claude-code-action``" crossed with "the job's
+    effective ``issues:`` permission is ``write``" -- so a workflow drops
+    out because its token cannot create an issue, not because somebody
+    remembered to exclude it. Flipping such a workflow to ``issues:
+    write`` puts it in the population immediately, which is what makes
+    the disposition table in ``test_scan_citations.py`` an enforced
+    document rather than a decaying prose one.
+
+    Returns:
+        Sorted ``(workflow file name, job id)`` pairs.
+    """
+    found: list[tuple[str, str]] = []
+    for path in workflow_files():
+        document = load_yaml(path)
+        for job_name, job in (document.get("jobs") or {}).items():
+            if not isinstance(job, dict):
+                continue
+            steps = [s for s in (job.get("steps") or []) if isinstance(s, dict)]
+            if not any(str(s.get("uses", "")).startswith(_AGENT_ACTION) for s in steps):
+                continue
+            if _effective_issues_permission(document, job) == "write":
+                found.append((path.name, str(job_name)))
+    return sorted(found)
+
+
 def all_workflow_steps() -> list[dict[str, Any]]:
     """Return every step of every job of every workflow in the repository.
 

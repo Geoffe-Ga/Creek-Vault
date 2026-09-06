@@ -206,6 +206,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from enum import Enum
 from functools import partial
 from pathlib import Path  # noqa: TC003  # no issue: runtime dataclass field
 from typing import TYPE_CHECKING
@@ -236,6 +237,7 @@ from creek.classify.privacy_pass import (
     outranks_recorded_tier,
     reassess,
 )
+from creek.classify.provenance_pass import has_unearned_llm_stamp
 from creek.classify.reatomize import (
     ClassificationTree,
     Classifier,
@@ -317,6 +319,35 @@ class LLMProviderUnavailableError(RuntimeError):
         )
 
 
+class ClassifyOutcome(Enum):
+    """Which classifier actually produced a fragment's verdict (#1356).
+
+    A three-state value rather than the ``was_skipped`` bool it replaces,
+    because that bool could not tell :attr:`RULES_SUFFICED` from
+    :attr:`LLM_FAILED` — and those two call for opposite operator responses.
+    The write path derives *both* the ``classification_method`` stamp and the
+    run counters from this one value, so the frontmatter and the summary line
+    can never disagree about what happened.
+
+    Attributes:
+        CLASSIFIED: The classifier the run asked for produced the verdict —
+            the rule classifier on a ``--method rules`` run, the LLM on a
+            ``--method llm`` run that reached the provider.
+        RULES_SUFFICED: ``--method llm`` never invoked the provider because
+            the rule classifier already cleared the confidence floor. A good
+            outcome: the run saved a call and the fragment is fully classified.
+        LLM_FAILED: ``--method llm`` invoked the provider and the call
+            produced nothing (unavailable, retries exhausted, transport error,
+            malformed response). The rule verdict stands and the fragment
+            stays eligible for a later re-classify, so the corpus is
+            under-classified and the honest next step is to run again.
+    """
+
+    CLASSIFIED = "classified"
+    RULES_SUFFICED = "rules_sufficed"
+    LLM_FAILED = "llm_failed"
+
+
 @dataclass(frozen=True)
 class ClassifySummary:
     """Counts produced by a single ``creek classify`` run.
@@ -349,9 +380,19 @@ class ClassifySummary:
             resume contract). Distinct from :attr:`preserved_manual`
             because the user never touched these files.
         skipped_high_confidence: Subset of ``classified`` for which
-            the LLM was not invoked because the rule classifier
+            the LLM was **not invoked** because the rule classifier
             produced a high-confidence answer. The fragment is still
-            stamped ``classification_method: rules`` on disk.
+            stamped ``classification_method: rules`` on disk. A failed
+            provider call is reported on :attr:`llm_call_failed`, never
+            here (issue #1356): both stamp ``rules``, but only this one
+            means the run went well.
+        llm_call_failed: Subset of ``classified`` for which the LLM
+            **was invoked** and produced nothing — provider unreachable,
+            retries exhausted, transport error, unparseable response
+            (#744 / #1330). The rule verdict stands and is stamped
+            ``classification_method: rules``, so the fragment stays
+            eligible for a later re-classify. Non-zero means the corpus
+            is under-classified and the run is worth repeating.
         errors: Human-readable error messages (one per failure).
         privacy_tiers_assigned: Fragments whose privacy tier this run
             owned and (re-)derived — i.e. the frontmatter carried no
@@ -396,6 +437,13 @@ class ClassifySummary:
             Escalate-only, so a second run over an unchanged vault reports
             ``0``. Like :attr:`privacy_tiers_assigned` this counts the
             decision, not the bytes.
+        healed_unearned_llm: Fragments this run refused to preserve because
+            their ``classification_method: llm`` was written by the pre-#1358
+            weighted soft-failure path and no LLM ever ran (issue #1357).
+            Counted whether or not ``--force`` was passed, since the
+            fabricated ``weighted`` block is cleared either way. Not a subset
+            of :attr:`preserved_llm` but its complement: these are exactly the
+            fragments that stamp would otherwise have stranded.
     """
 
     total: int
@@ -411,6 +459,8 @@ class ClassifySummary:
     praxis_marked: int = 0
     tags_extracted: int = 0
     retiered: int = 0
+    llm_call_failed: int = 0
+    healed_unearned_llm: int = 0
 
 
 @dataclass
@@ -425,11 +475,13 @@ class _RunCounts:
     classified: int = 0
     preserved_manual: int = 0
     preserved_llm: int = 0
-    skipped: int = 0
+    rules_sufficed: int = 0
+    llm_call_failed: int = 0
     privacy_tiers_assigned: int = 0
     praxis_marked: int = 0
     tags_extracted: int = 0
     retiered: int = 0
+    healed_unearned_llm: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -633,7 +685,7 @@ def run_classify(
         classified=counts.classified,
         preserved_manual=counts.preserved_manual,
         preserved_llm=counts.preserved_llm,
-        skipped_high_confidence=counts.skipped,
+        skipped_high_confidence=counts.rules_sufficed,
         # Snapshot-by-tuple so the frozen dataclass is genuinely
         # immutable: the caller can't accidentally append to the
         # underlying list and reach into completed-run state.
@@ -642,6 +694,8 @@ def run_classify(
         praxis_marked=counts.praxis_marked,
         tags_extracted=counts.tags_extracted,
         retiered=counts.retiered,
+        llm_call_failed=counts.llm_call_failed,
+        healed_unearned_llm=counts.healed_unearned_llm,
     )
 
 
@@ -746,6 +800,46 @@ def _record_if_preserved(
         counts.preserved_llm += 1
         return True
     return False
+
+
+def _resolve_resume(
+    fragment: Fragment,
+    raw: dict[str, object],
+    counts: _RunCounts,
+    *,
+    force: bool,
+) -> tuple[Fragment, bool]:
+    """Decide whether the resume short-circuit owns this fragment (#1357).
+
+    The unearned-stamp check comes *first* and is not conditioned on
+    ``force``: an ``llm`` stamp the pre-#1358 weighted soft-failure path
+    wrote is not a resume point, it is a lie, and honouring it is what
+    strands the fragment permanently — no ordinary run ever revisits a
+    fragment :func:`_record_if_preserved` skipped. Refusing it here is what
+    lets a plain ``creek classify --method llm`` heal the vault without
+    ``--force``, which would re-pay for every already-good fragment.
+
+    The fabricated all-zero ``weighted`` block is dropped here rather than
+    left for the classifier to overwrite, because the classifier may not get
+    the chance: if the provider is still down the write path stamps
+    ``rules``, and carrying the block across would trade the false claim "an
+    LLM classified this" for the equally false "a weighted detection ran".
+
+    Args:
+        fragment: The fragment as loaded (already tiered by the caller).
+        raw: Its frontmatter dict, carrying the provenance keys.
+        counts: Mutable per-run counters; mutated in place.
+        force: Whether this run re-derives settled classifications.
+
+    Returns:
+        ``(fragment, preserved)``. *preserved* is ``True`` when the caller
+        must short-circuit; the returned fragment has the fabricated profile
+        cleared when an unearned stamp was found.
+    """
+    if has_unearned_llm_stamp(fragment, raw):
+        counts.healed_unearned_llm += 1
+        return fragment.model_copy(update={"weighted": None}), False
+    return fragment, not force and _record_if_preserved(raw, counts)
 
 
 def _record_praxis(
@@ -1042,7 +1136,11 @@ def _prepare_fragment(
     # (issue #321). The free, non-destructive passes — the tier assigned
     # above (#876) and the hashtag backfill (#1207) — still land, each
     # through a narrow writer that touches nothing else.
-    if not force and _record_if_preserved(raw, counts):
+    # #1357: the resume decision also refuses an ``llm`` stamp no LLM earned.
+    # Resolved *after* the tier work above so a healed fragment carries the
+    # same tier it would have had anyway.
+    fragment, preserved = _resolve_resume(fragment, raw, counts, force=force)
+    if preserved:
         _backfill_preserved(
             md_file=md_file,
             fragment=fragment,
@@ -1150,7 +1248,7 @@ def _process_file(
     # and read-only during the run, and each fragment is an independent input, so
     # concurrent calls are safe.
     with _classify_permit(throttle, llm):
-        new_fragment, was_skipped, reasoning = _classify_one(
+        new_fragment, outcome, reasoning = _classify_one(
             fragment=prepared.fragment,
             body=body,
             method=method,
@@ -1160,18 +1258,12 @@ def _process_file(
             weighted_classification=classification_config.weighted_classification,
         )
 
-    # Stamp the #634 audience axis on every (re)classified fragment. It is a
-    # deterministic heuristic independent of the frequency/phase method above,
-    # so it runs on both the rules and LLM paths and stays idempotent.
-    new_fragment = audience.classify_and_enforce(new_fragment, body)
-
     # #877: score the praxis axis from the free keyword pass. Unconditional
     # by design — the purity of ``apply_praxis`` absorbs the decision (it
     # returns the same object when nothing escalates), so this adds no
     # branch to this function. It runs AFTER ``_classify_one`` so the
     # escalate-only merge already sees any LLM verdict, and BEFORE the
-    # reassess below so the #876 privacy pass stays the last mutation
-    # before the write.
+    # reassess below.
     praxis_before = new_fragment.praxis_potential
     new_fragment = apply_praxis(new_fragment, body)
 
@@ -1203,6 +1295,19 @@ def _process_file(
         classifier=privacy,
     )
 
+    # Stamp the #634 audience axis on every (re)classified fragment. It is a
+    # deterministic heuristic independent of the frequency/phase method above,
+    # so it runs on both the rules and LLM paths and stays idempotent.
+    #
+    # #1689: it runs AFTER ``reassess``, not before. The score reads
+    # ``privacy_tier`` (INTIMATE weighs -3 against PERSONAL's -1), and
+    # ``reassess`` can escalate exactly that tier — so scoring first stamped an
+    # audience the same run then superseded, and the next pass read the
+    # escalated tier off disk and answered differently. Still BEFORE the
+    # ``with lock`` below, so ``_maybe_reatomize_and_persist`` children derived
+    # by ``parent.model_copy`` inherit the corrected value.
+    new_fragment = audience.classify_and_enforce(new_fragment, body)
+
     with lock:
         _record_praxis(praxis_before, new_fragment, counts)
         _record_tags(tags_before, new_fragment, counts)
@@ -1214,7 +1319,7 @@ def _process_file(
         # stamps (method, classified_at, reasoning) stay consistent with the
         # non-reatomize code path. (Re-atomization runs serially — see
         # run_classify — so the shared VaultWriter is never touched concurrently.)
-        if vault_writer is not None and not was_skipped:
+        if vault_writer is not None and outcome is ClassifyOutcome.CLASSIFIED:
             _maybe_reatomize_and_persist(
                 root_fragment=new_fragment,
                 body=body,
@@ -1237,7 +1342,7 @@ def _process_file(
             # cloud-LLM. Only an actual ``llm`` write keeps it (the writer
             # clears it otherwise).
             provider=llm.config.provider if llm is not None else None,
-            was_skipped=was_skipped,
+            outcome=outcome,
             counts=counts,
             progress_path=progress_path,
             trace_log_path=trace_log_path,
@@ -1290,7 +1395,7 @@ def _finalise_fragment_write(
     reasoning: str,
     method: str,
     provider: str | None = None,
-    was_skipped: bool,
+    outcome: ClassifyOutcome,
     counts: _RunCounts,
     progress_path: Path | None,
     trace_log_path: Path | None,
@@ -1299,13 +1404,16 @@ def _finalise_fragment_write(
 
     Pulled out of :func:`_process_file` so the FEAT-023 wire-up does
     not push that function past the cyclomatic-complexity ceiling.
+
+    Both the provenance stamp and the run counters are derived from
+    *outcome* alone, so they cannot drift apart (#1356).
     """
-    # When ``--method llm`` short-circuits because the rule classifier
-    # already produced a confident answer, the provenance stamp must
-    # reflect what actually classified the fragment ("rules"), not
-    # the user's CLI choice ("llm"). Either way the fragment IS
-    # persisted — we never skip the write, only the LLM call.
-    write_method = RULES_METHOD if was_skipped else method
+    # When ``--method llm`` did not get a verdict out of the provider — the
+    # rules short-circuited it, or the call failed — the provenance stamp must
+    # reflect what actually classified the fragment ("rules"), not the user's
+    # CLI choice ("llm"). Either way the fragment IS persisted: we never skip
+    # the write, only the LLM call.
+    write_method = method if outcome is ClassifyOutcome.CLASSIFIED else RULES_METHOD
 
     reasoning_for_frontmatter = _route_reasoning(
         fragment=new_fragment,
@@ -1327,8 +1435,13 @@ def _finalise_fragment_write(
         counts.errors.append(f"failed to update {md_file}: {exc}")
         return
     counts.classified += 1
-    if was_skipped:
-        counts.skipped += 1
+    # The two non-CLASSIFIED states are counted apart (#1356): both stamp
+    # ``rules``, but "the rules were confident" means the run went well while
+    # "the provider was down" means the corpus is under-classified.
+    if outcome is ClassifyOutcome.RULES_SUFFICED:
+        counts.rules_sufficed += 1
+    elif outcome is ClassifyOutcome.LLM_FAILED:
+        counts.llm_call_failed += 1
     elif progress_path is not None and write_method == LLM_METHOD:
         _record_llm_progress(progress_path, new_fragment.id)
 
@@ -1609,7 +1722,7 @@ def _classify_one(
     llm: LLMClassifier | None,
     confidence_threshold: float,
     weighted_classification: bool = False,
-) -> tuple[Fragment, bool, str]:
+) -> tuple[Fragment, ClassifyOutcome, str]:
     """Run the chosen classifier on a single fragment.
 
     Args:
@@ -1638,20 +1751,24 @@ def _classify_one(
             rule in :mod:`creek.classify.evidence`.
 
     Returns:
-        ``(updated_fragment, skipped, reasoning)``. ``skipped`` is
-        ``True`` when the LLM was not invoked because the rule
-        classifier already produced a confident answer. ``reasoning``
-        is the LLM's reasoning trace (FEAT-017); empty string for the
-        rules path or when the LLM produced no preamble.
+        ``(updated_fragment, outcome, reasoning)``. The
+        :class:`ClassifyOutcome` names which classifier produced the
+        verdict, keeping "the rules were confident" distinct from "the
+        provider call failed" (#1356). ``reasoning`` is the LLM's
+        reasoning trace (FEAT-017); empty string for the rules path or
+        when the LLM produced no preamble.
     """
     if method == "rules":
-        return rules.classify(fragment, content=body), False, ""
+        # The run asked for rules and got rules: nothing was skipped, so this
+        # is CLASSIFIED rather than RULES_SUFFICED (which names an LLM call
+        # the confidence floor made unnecessary).
+        return rules.classify(fragment, content=body), ClassifyOutcome.CLASSIFIED, ""
 
     rule_result = rules.classify(fragment, content=body)
     if rule_result.frequency.primary != Frequency.UNCLASSIFIED:
         confidence = rules.confidence_score(rule_result, content=body)
         if confidence >= confidence_threshold:
-            return rule_result, True, ""
+            return rule_result, ClassifyOutcome.RULES_SUFFICED, ""
 
     if llm is None:  # pragma: no cover  # no issue: defensive guard, unreachable
         msg = "LLM classifier required when method='llm'"
@@ -1661,19 +1778,20 @@ def _classify_one(
     llm_result = llm.classify_with_reasoning(rule_result, content=body)
     if not llm_result.succeeded:
         # The LLM call failed (provider unavailable / retries exhausted) and
-        # returned the fragment unchanged. Treat it like the rules-sufficed skip
-        # so the write path stamps ``rules`` (the result that actually stands),
-        # NOT a lying ``classification_method: llm`` — and the fragment stays
-        # eligible for a later re-classify rather than being skipped (#744).
-        return llm_result.fragment, True, ""
-    return llm_result.fragment, False, llm_result.reasoning
+        # returned the fragment unchanged. The write path stamps ``rules`` (the
+        # result that actually stands), NOT a lying ``classification_method:
+        # llm`` — and the fragment stays eligible for a later re-classify
+        # rather than being skipped (#744). Reported as LLM_FAILED, not as the
+        # rules-sufficed skip it used to be indistinguishable from (#1356).
+        return llm_result.fragment, ClassifyOutcome.LLM_FAILED, ""
+    return llm_result.fragment, ClassifyOutcome.CLASSIFIED, llm_result.reasoning
 
 
 def _classify_one_weighted(
     fragment: Fragment,
     body: str,
     llm_config: LLMConfig,
-) -> tuple[Fragment, bool, str]:
+) -> tuple[Fragment, ClassifyOutcome, str]:
     """Dispatch the LLM call through the weighted classifier.
 
     Replaces the single-pick LLM path when
@@ -1697,9 +1815,9 @@ def _classify_one_weighted(
     profile (whitespace-only body, provider unavailable, transport
     error, malformed YAML) nothing is derived from it: the input
     fragment is handed back untouched — rule verdict intact,
-    :attr:`Fragment.weighted` still ``None`` — and reported as a
-    skip, exactly as the single-pick path reports its own failures
-    (#744, #1330).
+    :attr:`Fragment.weighted` still ``None`` — and reported as
+    :attr:`ClassifyOutcome.LLM_FAILED`, exactly as the single-pick path
+    reports its own failures (#744, #1330, #1356).
 
     Args:
         fragment: Fragment carrying any rule-classifier output that
@@ -1710,14 +1828,14 @@ def _classify_one_weighted(
             Anthropic selection the legacy LLM path uses.
 
     Returns:
-        ``(fragment, skipped, reasoning)``. On success,
-        ``(updated_fragment, False, reasoning)``: the weighted profile
-        plus its derived legacy fields land on the returned Fragment,
-        ``False`` reflects "the LLM was actually invoked", and the
-        reasoning trace mirrors the model's preamble for FEAT-017
-        observability. On failure, ``(fragment, True, "")``: the input
-        fragment unchanged, and ``True`` so the caller treats it like
-        the rules-sufficed skip.
+        ``(fragment, outcome, reasoning)``. On success,
+        ``(updated_fragment, CLASSIFIED, reasoning)``: the weighted
+        profile plus its derived legacy fields land on the returned
+        Fragment, and the reasoning trace mirrors the model's preamble
+        for FEAT-017 observability. On failure,
+        ``(fragment, LLM_FAILED, "")``: the input fragment unchanged,
+        stamped ``rules`` by the write path and counted as a provider
+        failure rather than a rule short-circuit.
     """
     ingested = IngestedFragment(fragment=fragment, body=body)
     result = classify_weighted(ingested, llm_config)
@@ -1729,10 +1847,10 @@ def _classify_one_weighted(
         # ``classification_method: llm`` — and the fragment stays eligible for
         # a later re-classify rather than being skipped by
         # ``_record_if_preserved`` forever (#744, #1330).
-        return fragment, True, ""
+        return fragment, ClassifyOutcome.LLM_FAILED, ""
     weighted = result.classification
     updated = weighted.merge_onto(fragment)
-    return updated, False, weighted.reasoning
+    return updated, ClassifyOutcome.CLASSIFIED, weighted.reasoning
 
 
 def _build_reatomize_classifier(
@@ -1761,7 +1879,7 @@ def _build_reatomize_classifier(
     def _classify(
         ingested: IngestedFragment,
     ) -> tuple[IngestedFragment, float]:
-        classified, _was_skipped, _reasoning = _classify_one(
+        classified, _outcome, _reasoning = _classify_one(
             fragment=ingested.fragment,
             body=ingested.body,
             method=LLM_METHOD if llm is not None else RULES_METHOD,
@@ -1930,6 +2048,13 @@ def _route_reasoning(
     is truncated to :data:`CLASSIFICATION_REASONING_MAX_CHARS` and
     returned for direct embedding in frontmatter.
 
+    The tier is read through
+    :func:`~creek.classify.privacy_filter.tier_of` — already this
+    module's reader elsewhere — so a tier string the enum does not
+    recognise fails closed and routes to the log. The bare attribute
+    comparison this replaced wrote the reasoning preamble into the
+    fragment's vault frontmatter instead (#1489).
+
     Args:
         fragment: The fragment whose tier dictates routing.
         reasoning: The raw reasoning preamble; may be empty.
@@ -1945,7 +2070,7 @@ def _route_reasoning(
     """
     if method != LLM_METHOD or not reasoning:
         return ""
-    if fragment.privacy_tier == PrivacyTier.INTIMATE.value:
+    if tier_of(fragment) is PrivacyTier.INTIMATE:
         if trace_log_path is not None:
             _append_trace_log(trace_log_path, fragment, reasoning)
         return ""
@@ -2087,7 +2212,7 @@ def _describe_llm_unavailability(provider: str) -> str:
     The hint is provider-specific so a first-time user can act on it
     without scrolling back through orchestrator WARNING logs. Anthropic
     needs two env vars (API key + consent); Ollama needs the local
-    daemon to be reachable.
+    daemon to be reachable with the configured model installed.
 
     Args:
         provider: ``llm.provider`` from the loaded config.
@@ -2102,8 +2227,8 @@ def _describe_llm_unavailability(provider: str) -> str:
         )
     if provider == "ollama":
         return (
-            "ensure the Ollama daemon is running and reachable at the "
-            "URL configured under `llm.url` in creek_config.yaml"
+            "ensure the Ollama daemon is running at the URL configured under "
+            "`llm.url` in creek_config.yaml and has the configured model installed"
         )
     return (
         "check the `llm.*` settings in creek_config.yaml and the "

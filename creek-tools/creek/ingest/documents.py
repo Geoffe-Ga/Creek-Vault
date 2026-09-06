@@ -4,7 +4,10 @@ Ingests DOCX, PDF, HTML, TXT, and RTF files by converting them to
 markdown fragments. Uses format-specific libraries for extraction:
 
 - **DOCX**: ``python-docx`` for paragraphs, tables, and headings
-- **PDF**: ``pdfminer.six`` for text extraction with scanned detection
+- **PDF**: ``pdfminer.six`` for text extraction; an image-only PDF is
+  detected by ``_detect_scanned_pdf`` and routed to
+  :meth:`creek.ingest.images.ImageIngestor.ingest_pdf` for per-page OCR
+  (#1639), which is the only way its pages produce any body at all
 - **HTML**: ``markdownify`` for direct HTML-to-markdown conversion
 - **TXT**: Heuristic structure detection wrapping
 
@@ -27,9 +30,10 @@ import contextlib
 import io
 import logging
 import re
+import string
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from creek.ingest._detection import is_substack_export
 from creek.ingest.base import (
@@ -42,7 +46,11 @@ from creek.ingest.base import (
     parse_authored_at,
 )
 from creek.ingest.html import extract_html_authored_at, parse_html_to_markdown
+from creek.ingest.images import ImageIngestor
 from creek.models import Authorship, SourcePlatform
+
+if TYPE_CHECKING:
+    from creek.config import OCRConfig
 
 logger = logging.getLogger(__name__)
 
@@ -365,12 +373,28 @@ def _extract_pdf_metadata_from_bytes(pdf_bytes: bytes) -> dict[str, Any]:
 # timezone, then hand the result to ``datetime.strptime`` with two
 # format candidates (with-tz and without). Returning ``None`` rather
 # than guessing matches the FEAT-031 contract.
-_PDF_DATE_FORMATS: tuple[str, ...] = (
-    "%Y%m%d%H%M%S%z",
-    "%Y%m%d%H%M%S",
-    "%Y%m%d%H%M",
-    "%Y%m%d",
+_PDF_DATE_FORMATS: tuple[tuple[str, int], ...] = (
+    ("%Y%m%d%H%M%S%z", 14),
+    ("%Y%m%d%H%M%S", 14),
+    ("%Y%m%d%H%M", 12),
+    ("%Y%m%d", 8),
 )
+"""Each unseparated format paired with the digit count it accepts.
+
+The count is load-bearing, not documentation. ``datetime.strptime`` lets
+every numeric directive match one *or* two digits, so an ungated
+``%Y%m%d%H%M%S`` re-segments a malformed run into a plausible-looking but
+**wrong** date rather than rejecting it: ``D:20241345`` became
+2024-01-03 04:05 and ``D:99999999`` became 9999-09-09 09:09, both then
+written to ``authored_at`` with no signal (#1632). A wrong date
+propagates into threads, eddies and temporal linking, so guessing is the
+one thing the FEAT-031 contract forbids.
+
+The count covers only the leading digit run. The ``%z`` suffix is
+variable-length (``+0500``, ``+05``, ``Z``), so gating on the total
+string length would reject the canonical
+``D:YYYYMMDDHHmmSS+HH'mm'`` form.
+"""
 
 
 def _parse_pdf_date(raw: str) -> datetime | None:
@@ -387,7 +411,10 @@ def _parse_pdf_date(raw: str) -> datetime | None:
     cleaned = cleaned.replace("'", "")
     if cleaned.endswith(("z", "Z")):
         cleaned = cleaned[:-1] + "+0000"
-    for fmt in _PDF_DATE_FORMATS:
+    digits = len(cleaned) - len(cleaned.lstrip(string.digits))
+    for fmt, expected_digits in _PDF_DATE_FORMATS:
+        if digits != expected_digits:
+            continue
         try:
             parsed = datetime.strptime(cleaned, fmt)
         except ValueError:
@@ -571,6 +598,49 @@ class DocumentIngestor(Ingestor):
     Creek-compatible frontmatter with metadata extraction.
     """
 
+    def __init__(self, *, ocr: OCRConfig | None = None) -> None:
+        """Wire the scanned-PDF OCR route, or deliberately decline to.
+
+        **Fail-closed is the shape of this constructor, not a check inside
+        it.** ``ocr is None`` means "the caller has no vault ``ocr`` block",
+        which is what every MCP surface passes today
+        (``creek_mcp.tools.upload`` and its siblings supply none). Mirroring
+        :func:`~creek.ingest.pipeline.build_ingestor`'s image default — where
+        ``None`` means "use OCR defaults", i.e. on — would let a remote caller
+        obtain OCR in a vault whose operator had written ``ocr.enabled:
+        false``. So this route is off unless a block explicitly turns it on,
+        which is deliberately stricter than the image path and preserves
+        today's behaviour byte-for-byte for every caller that passes nothing.
+
+        Resolution is **eager**, so an unknown ``ocr.engine`` or an empty
+        ``ocr.languages`` raises
+        :class:`~creek.ingest.images.OcrConfigError` out of *construction* —
+        outside :meth:`Ingestor._parse_safe`, which would otherwise swallow it
+        into ``IngestResult.errors`` and let the run report a success it did
+        not have. It reaches the CLI's exit 2 instead. Construction is cheap:
+        :class:`~creek.ingest.images.PytesseractOcrEngine` defers every
+        import.
+
+        ``enabled: false`` resolves no engine at all, for the reason
+        :meth:`~creek.ingest.images.ImageIngestor.from_ocr_config` records: an
+        operator who has switched OCR off must not be refused for the name of
+        a backend they just said they did not want.
+
+        Args:
+            ocr: The vault's ``ocr`` block, when the caller has one.
+
+        Raises:
+            UnknownOcrEngineError: When ``ocr.engine`` names no known backend
+                and ``ocr.enabled`` is true.
+            OcrConfigError: When ``ocr.languages`` holds no usable code.
+        """
+        self._pdf_ocr: ImageIngestor | None = (
+            ImageIngestor.from_ocr_config(ocr)
+            if ocr is not None and ocr.enabled
+            else None
+        )
+        self._pdf_ocr_declined: bool = ocr is not None and not ocr.enabled
+
     def discover(self, source_path: Path) -> list[RawDocument]:
         """Find all document files at the given source path (recursively).
 
@@ -679,21 +749,52 @@ class DocumentIngestor(Ingestor):
           exists, so ``authored_at`` is ``None`` and downstream
           surfaces fall through to ``ingested``.
 
+        #1639: an image-only PDF returns **N** fragments, one per page,
+        not one. Metadata is extracted first so ``scanned`` is known before
+        the decision, and the scanned branch returns before
+        :meth:`_extract_content` runs — which is also what keeps the route to
+        exactly one ``_parse_pdf_to_text`` call rather than the two an
+        unrouted PDF pays (``_extract_pdf_content`` and ``_add_pdf_metadata``
+        each run it). Reordering is safe: :meth:`_extract_content` reads only
+        ``file_type``, ``raw_bytes`` and ``text``, and none of the metadata
+        helpers reads content.
+
         Args:
             raw: The raw document to parse.
 
         Returns:
-            A single-element list containing the parsed fragment.
+            A single-element list for every format but a scanned PDF, which
+            returns one fragment per non-empty page.
         """
         file_type = raw.metadata.get("file_type", raw.path.suffix.lower())
         text, encoding = normalize_encoding(raw.content)
 
-        content = self._extract_content(file_type, raw.content, text)
         metadata = self._extract_metadata(file_type, raw.content, encoding)
         metadata["authored_at"] = self._extract_authored_at(
             file_type, raw.content, text, metadata
         )
         timestamp = self._resolve_timestamp(metadata, raw.path)
+
+        # A PDF whose page count could not be read never gains ``scanned``
+        # (``_add_pdf_metadata`` swallows that), so it falls through here and
+        # ingests exactly as it does today.
+        if metadata.get("scanned"):
+            if self._pdf_ocr is not None:
+                pages = self._ocr_scanned_pdf(
+                    self._pdf_ocr, raw.path, metadata, timestamp
+                )
+                # ``ingest_pdf`` skips pages OCR recovered nothing from, so a
+                # scan it could read nothing at all from comes back empty.
+                # Falling through rather than returning ``[]`` is deliberate:
+                # the operator then gets the same single ``scanned: true``
+                # fragment an un-routed scan produces, instead of the file
+                # disappearing from the run without a word.
+                if pages:
+                    return pages
+            elif self._pdf_ocr_declined:
+                metadata["ocr_declined"] = True
+
+        content = self._extract_content(file_type, raw.content, text)
 
         return [
             ParsedFragment(
@@ -703,6 +804,53 @@ class DocumentIngestor(Ingestor):
                 timestamp=timestamp,
             )
         ]
+
+    def _ocr_scanned_pdf(
+        self,
+        ocr: ImageIngestor,
+        pdf_path: Path,
+        metadata: dict[str, Any],
+        timestamp: datetime,
+    ) -> list[ParsedFragment]:
+        """OCR an image-only PDF into one fragment per page (#1639).
+
+        The per-page fragments come back from
+        :meth:`~creek.ingest.images.ImageIngestor.ingest_pdf` and are
+        **mutated in place rather than rebuilt**, deliberately: rebuilding
+        would drop the ``source_unit`` that method mints, and that field is
+        the whole of this fragment's identity under the ``document`` ledger.
+
+        The two metadata dicts are merged with the OCR side winning, so the
+        page keeps ``page`` / ``ocr_confidence`` / ``review`` while gaining
+        the document keys this ingestor's own renderers read — ``file_type``
+        (which decides the platform), ``source_encoding``, ``scanned`` and
+        ``authored_at``. The title is set last and per page: a scanned PDF
+        with a ``/Title`` would otherwise give every page the same one.
+        That is a **legibility** requirement, not a loss-prevention one —
+        measured, the writer disambiguates identical titles to ``-1`` /
+        ``-2`` suffixes and loses no content.
+
+        The timestamp is the document route's, not the OCR route's, so a
+        page's id is anchored to the same instant an unrouted PDF's would be.
+
+        Args:
+            ocr: The image ingestor resolved from the vault's ``ocr`` block.
+            pdf_path: The scanned PDF.
+            metadata: The document metadata extracted for the whole file.
+            timestamp: The identity anchor resolved for the whole file.
+
+        Returns:
+            One fragment per non-empty page.
+        """
+        stem = pdf_path.stem
+        fragments = ocr.ingest_pdf(pdf_path)
+        for fragment in fragments:
+            page = fragment.metadata.get("page")
+            fragment.metadata = (
+                metadata | fragment.metadata | {"title": f"{stem} — page {page}"}
+            )
+            fragment.timestamp = timestamp
+        return fragments
 
     def _extract_authored_at(
         self,
@@ -757,7 +905,12 @@ class DocumentIngestor(Ingestor):
         return text
 
     def _extract_pdf_content(self, raw_bytes: bytes) -> str:
-        """Extract text content from PDF bytes with scanned detection.
+        """Extract text content from PDF bytes.
+
+        One delegation and nothing else. Scanned *detection* lives in
+        :meth:`_add_pdf_metadata` and the OCR route it feeds is taken in
+        :meth:`parse` before this method is reached, so a PDF that arrives
+        here is one whose text pdfminer can actually read.
 
         Args:
             raw_bytes: Raw PDF file bytes.
@@ -856,8 +1009,16 @@ class DocumentIngestor(Ingestor):
     def convert_to_markdown(self, fragment: ParsedFragment) -> str:
         """Return the fragment content as markdown.
 
-        Content is already converted to markdown during parsing, so
-        this method returns it as-is.
+        Content is already converted to markdown during parsing, so this
+        method returns it as-is — except for a scanned-PDF page, which is
+        handed back to :meth:`creek.ingest.images.ImageIngestor.convert_to_markdown`
+        so it renders with the Obsidian ``![[file#page=N]]`` embed that
+        method exists to produce. Without the delegation that branch stays
+        dead production code after the routing lands, and no gate would say
+        so: it is a branch, not a symbol, so vulture is silent about it.
+
+        Keyed on the ``page`` metadata only an OCR'd PDF page carries, so
+        every other document still returns its content untouched.
 
         Args:
             fragment: The parsed fragment to convert.
@@ -865,17 +1026,31 @@ class DocumentIngestor(Ingestor):
         Returns:
             The markdown content string.
         """
+        if self._pdf_ocr is not None and fragment.metadata.get("page"):
+            return self._pdf_ocr.convert_to_markdown(fragment)
         return fragment.content
 
     def generate_frontmatter(self, fragment: ParsedFragment) -> dict[str, Any]:
         """Generate Creek-compatible YAML frontmatter for a document fragment.
 
         Builds frontmatter with type, title, source (platform, original_file,
-        original_encoding), created timestamp, and optional scanned flag.
+        original_encoding), created timestamp, and — for a scanned PDF — the
+        top-level ``scanned``, ``page`` and ``review`` markers.
 
         An extracted document author is split by :func:`_resolve_document_author`
         into ``source.author`` (the ``Authorship`` axis) and ``source.author_name``
         (the free-text name), never conflated into one slot (#1229).
+
+        **``scanned`` is emitted top-level, and that is a fix, not a style
+        choice (#1639).** It used to be written as ``source["scanned"]``, and
+        measured at HEAD it never reached a single vault file: ``FragmentSource``
+        does not model it, ``Fragment.model_validate`` leaves pydantic's
+        ``extra="ignore"`` in place, and
+        :data:`~creek.ingest.base.PASSTHROUGH_FRONTMATTER_KEYS` is a *top-level*
+        allowlist that cannot rescue a key nested under ``source``. So an
+        operator whose PDF was an image got an empty fragment and no indication
+        of any kind. The three keys below ride that allowlist by presence, so a
+        document with nothing to say about them gains no line at all.
 
         Args:
             fragment: The parsed fragment with metadata.
@@ -900,15 +1075,20 @@ class DocumentIngestor(Ingestor):
             source["author"] = authorship
             if author_name is not None:
                 source["author_name"] = author_name
-        if fragment.metadata.get("scanned"):
-            source["scanned"] = True
-
         frontmatter_dict: dict[str, Any] = {
             "type": "fragment",
             "title": title,
             "source": source,
             "created": fragment.timestamp.isoformat(),
         }
+        if fragment.metadata.get("scanned"):
+            frontmatter_dict["scanned"] = True
+        page = fragment.metadata.get("page")
+        if page:
+            frontmatter_dict["page"] = page
+        review = fragment.metadata.get("review")
+        if review:
+            frontmatter_dict["review"] = review
         authored_at: datetime | None = fragment.metadata.get("authored_at")
         if authored_at is not None:
             frontmatter_dict["authored_at"] = authored_at.isoformat()

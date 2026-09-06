@@ -123,6 +123,12 @@ class PrivacyClassifier:
         other-authored fragments cannot be elevated to ``INTIMATE`` via
         content signals.
 
+        Check 1 is delegated to :meth:`body_evidence_tier` rather than
+        inlined, because it is the *only* check that reads *content* and
+        callers comparing two bodies of the same fragment need it in
+        isolation (#1136). Delegating keeps one implementation of the
+        rule — and of its authorship gate — instead of two.
+
         Args:
             fragment: The fragment to classify.
             content: Optional body text scanned for recovery keywords.
@@ -133,9 +139,10 @@ class PrivacyClassifier:
             The assigned :class:`PrivacyTier`.
         """
         platform = SourcePlatform(fragment.source.platform)
+        body_evidence = self.body_evidence_tier(fragment, content)
+        if body_evidence is not None:
+            return body_evidence
         if self._is_self_authored(fragment):
-            if self._has_recovery_content(fragment, content):
-                return PrivacyTier.INTIMATE
             if platform == SourcePlatform.JOURNAL:
                 return PrivacyTier.INTIMATE
             if self._is_high_confidence_confessional(fragment):
@@ -147,6 +154,59 @@ class PrivacyClassifier:
         # Chatbots, DMs, unmapped sources, AI-authored sensitive content
         # → PERSONAL. Leaking content is worse than over-restricting.
         return PrivacyTier.PERSONAL
+
+    def body_evidence_tier(
+        self,
+        fragment: Fragment,
+        content: str,
+    ) -> PrivacyTier | None:
+        """Return the tier *content* alone justifies, or ``None`` (#1136).
+
+        :meth:`classify_tier` answers "what tier does this fragment
+        deserve?" by weighing several axes at once — authorship, source
+        platform, voice register, and the body. This method answers the
+        narrower question a caller comparing *two bodies of the same
+        fragment* needs: **what does the body, by itself, prove?**
+
+        It exists because the aggregate verdict *saturates*. On a
+        self-authored journal entry the platform axis alone pins
+        :meth:`classify_tier` at ``INTIMATE`` for every conceivable body,
+        so comparing that verdict across an edit can never detect that
+        the edit introduced new privacy-relevant material — the verdict
+        was already at the ceiling before the edit and is still there
+        after. :func:`creek.classify.privacy_pass.edit_added_evidence`
+        uses this method to see past that saturation.
+
+        Today the only body-derived signal is the recovery-keyword scan,
+        which :meth:`classify_tier` checks first and which is gated on
+        :class:`Authorship.SELF` per the
+        :class:`~creek.models.PrivacyTier` model docstring. That gate is
+        deliberately kept *here* rather than duplicated in the caller: a
+        body-evidence question that ignored authorship would license
+        escalating an AI-authored fragment to ``INTIMATE`` on content
+        signals, which is exactly what the model docstring forbids.
+        :meth:`classify_tier` delegates its first check to this method so
+        the rule has one implementation, not two that can drift.
+
+        ``None`` is not ``OPEN``. It means "the body makes no claim" —
+        the other axes are free to decide, and a caller comparing two
+        bodies learns that neither one carried evidence.
+
+        Args:
+            fragment: The fragment the body belongs to. Supplies the
+                authorship axis and the title, which is scanned
+                alongside the body. Never mutated.
+            content: The body text to weigh on its own.
+
+        Returns:
+            ``INTIMATE`` when *content* (with the title) carries recovery
+            vocabulary on a self-authored fragment, else ``None``.
+        """
+        if self._is_self_authored(fragment) and self._has_recovery_content(
+            fragment, content
+        ):
+            return PrivacyTier.INTIMATE
+        return None
 
     def enforce_tier(
         self,

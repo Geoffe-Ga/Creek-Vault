@@ -11,7 +11,7 @@ unavailable.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from creek.author.client import AuthorLLMClient
 from creek.author.conductor import build_default_conductor, run_author
@@ -138,6 +138,31 @@ def test_for_voice_or_none_returns_none_when_unavailable(
         LLMRoutingConfig.model_validate({"generation": {"provider": "anthropic"}}),
     )
     assert AuthorLLMClient.for_voice_or_none(router) is None
+
+
+@patch("creek.classify.llm.providers.httpx.Client")
+def test_missing_ollama_model_keeps_author_desk_deterministic(
+    mock_client_cls: MagicMock,
+) -> None:
+    """A live daemon without the voice model never reaches generation."""
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"models": [{"name": "qwen3:8b"}]}
+    http = MagicMock()
+    http.get.return_value = response
+    mock_client_cls.return_value.__enter__ = MagicMock(return_value=http)
+    mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+    router = ModelRouter(
+        LLMRoutingConfig.model_validate(
+            {
+                "writing_desk": {
+                    "voice_drafter": {"provider": "ollama", "model": "mistral"}
+                }
+            }
+        ),
+    )
+
+    assert AuthorLLMClient.for_voice_or_none(router) is None
+    http.post.assert_not_called()
 
 
 def test_for_voice_or_none_uses_writing_desk_role_provider(

@@ -23,13 +23,17 @@ on:
   # Real-time: a Dependabot PR opens or reopens. pull_request_target so the run
   # has the base-repo token (issues:write / pull-requests:write). Gated to
   # Dependabot only below.
-  pull_request_target:
-    types: [opened, reopened]
+  # PAUSED 2026-08-26: automated issue inflow paused by owner request.
+  # Re-enable by uncommenting; workflow_dispatch still allows manual runs.
+  # pull_request_target:
+  # types: [opened, reopened]
   # Backfill + safety net: clears the existing Dependabot backlog on first
   # dispatch and re-links any PR whose body was overwritten. Scheduled a few
   # hours after Dependabot's weekly Monday window so freshly-opened PRs exist.
-  schedule:
-    - cron: "0 12 * * 1"
+  # PAUSED 2026-08-26: automated issue inflow paused by owner request.
+  # Re-enable by uncommenting; workflow_dispatch still allows manual runs.
+  # schedule:
+  # - cron: "0 12 * * 1"
   workflow_dispatch:
 
 # Limit the token to exactly what the bridge needs: file issues, edit PR
@@ -79,26 +83,93 @@ jobs:
         run: |
           set -euo pipefail
 
+          # The open-issue window the dedup scans. It must exceed the number
+          # of open issues in the repo or the scan silently misses the older
+          # end of the list and re-files — so `issue_exists_for_pr` refuses to
+          # answer when the API returns a full page rather than guessing.
+          ISSUE_SCAN_LIMIT=500
+
+          # ---8<--- BEGIN bridge helpers (extracted by tests; keep pure) ---
+          # Everything between these sentinels must be free of side effects at
+          # definition time: tests/test_dependabot_bridge_dedup.py sources this
+          # region with a stubbed `gh` on PATH to exercise the guards for real
+          # rather than only reading them. Do not move executable statements in.
+
           # Marker linking an issue back to its Dependabot PR. Hidden HTML
           # comment in the issue body; the dedup check greps for it so re-runs
-          # never double-file.
+          # never double-file. The trailing ` -->` is part of the match, so
+          # `dependabot-pr:94` cannot collide with `dependabot-pr:943`.
           marker_for() { printf '<!-- dependabot-pr:%s -->' "$1"; }
 
           # True if a PR body already links an issue via Closes/Fixes/Resolves.
+          #
+          # This is a cheap early-out, NOT a guarantee: the body belongs to
+          # Dependabot, which rewrites it on every rebase and erases the
+          # appended `Closes` line (#1019). When that happens this returns
+          # false and `issue_exists_for_pr` below is the only thing standing
+          # between a rebase and a duplicate issue.
           body_links_issue() {
             printf '%s' "$1" | grep -qiE '(closes|fixes|resolves)[[:space:]]+#[0-9]+'
           }
 
-          # True if an open `dependencies` issue already carries this PR's
-          # marker. Idempotency keystone: a second run finds the marker and
-          # files nothing.
+          # True if ANY open issue already carries this PR's marker.
+          #
+          # Idempotency keystone. It used to scan `--label dependencies` only,
+          # which made the guard depend on a label the grooming pass strips:
+          # once `dependencies` was replaced with a priority label the issue
+          # became invisible here, and since Dependabot had also erased the
+          # `Closes` line from the PR body, BOTH guards failed together and the
+          # next reconciler run filed a duplicate — one per PR per week (#1439).
+          # The marker is in the issue body and no process rewrites it, so the
+          # scan is now label-independent and the label is only a picker
+          # concern.
+          #
+          # `gh search` is deliberately not used: it token-matches rather than
+          # matching exactly, so it returns issues that merely *quote* a marker
+          # — the issue describing this very bug is one — and a false positive
+          # here means never filing an issue that is genuinely absent.
           issue_exists_for_pr() {
-            local pr="$1" marker
+            local pr="$1" marker issues found
             marker="$(marker_for "$pr")"
-            gh issue list --repo "$REPO" --label dependencies --state open \
-              --limit 200 --json number,body \
-              --jq '.[].body' 2>/dev/null | grep -qF "$marker"
+
+            issues="$(gh issue list --repo "$REPO" --state open \
+              --limit "$ISSUE_SCAN_LIMIT" --json number,body)"
+
+            # A full page means the window may have cut off older issues, so a
+            # "not found" here would be unproven. Fail the run rather than mint
+            # a duplicate on an answer the scan could not actually support.
+            if [ "$(printf '%s' "$issues" | jq 'length')" -ge "$ISSUE_SCAN_LIMIT" ]; then
+              echo "::error::Open-issue scan hit its ${ISSUE_SCAN_LIMIT}-issue window, so the marker dedup for PR #${pr} cannot be trusted. Raise ISSUE_SCAN_LIMIT in .github/workflows/dependabot-to-ralph-issue.yml." >&2
+              exit 1
+            fi
+
+            found=1
+            printf '%s' "$issues" | jq -r '.[].body' | grep -qF "$marker" && found=0
+            return "$found"
           }
+
+          # THE ONE EMITTER for a `dependencies` label the bridge could not
+          # verify (#1685). It replaces two hand-parallel diagnose-and-die
+          # blocks — one per caller path — which is how the two of them came to
+          # disagree about severity in the first place.
+          #
+          # WHY A WARNING AND NOT A FAILURE. The label is applied with a token
+          # the workflow cannot widen: if `GEOFFE_GA_PAT` lacks Issues/triage
+          # access the REST create endpoint drops the label silently and the
+          # dedicated `--add-label` re-apply exits 0 without applying it (run
+          # 32881808937, observed). Exiting non-zero there reports a condition
+          # the run has no way to remedy, and reports it AFTER everything the
+          # bridge exists to do has already succeeded — the issue is filed and
+          # the Dependabot PR body links it via `Closes`, so `body_links_issue`
+          # short-circuits every re-run and no duplicate is ever minted while
+          # the label is added by hand. All the red check bought was a blocked
+          # PR and a check status that described none of the work that landed.
+          #
+          # STDOUT, NOT STDERR. The runner parses `::warning::` workflow
+          # commands off the step's STDOUT only; the same string on stderr is
+          # just a log line and produces no annotation. The message is emitted
+          # whole on ONE line because an annotation is line-oriented.
+          warn_label_gap() { echo "::warning::$1"; }
 
           # The working contract, stated verbatim, with a `{PR}` placeholder.
           # Kept on one source line so it stays indented inside the YAML block
@@ -158,11 +229,18 @@ jobs:
             echo "Linked PR #$pr → issue #$issue_num via Closes."
 
             # The REST create endpoint silently drops labels when the token
-            # lacks push/triage access — which would break the marker dedup
-            # above (it filters on the `dependencies` label). Re-apply the
-            # label with a dedicated call (that endpoint errors instead of
-            # dropping) and verify it stuck, so a permission gap fails loudly
-            # rather than leaving an unlabeled, picker-invisible issue.
+            # lacks push/triage access. Since #1439 this no longer breaks the
+            # marker dedup above — that scan is label-independent — and it does
+            # NOT gate the picker either: `scripts/ralph/pick-next.sh` reads
+            # `REQUIRE_LABELS="${RALPH_REQUIRE_LABELS:-}"` with an empty
+            # default, and nothing in this tree sets that variable outside
+            # pick-next.sh's own test, so an unlabelled issue is picked up like
+            # any other. The label is an ORGANISING signal (it is how a human
+            # finds the dependency backlog and how the grooming pass reasons
+            # about it), which is worth re-applying and worth reporting when it
+            # does not stick — and is not worth failing a run over (#1685).
+            # Re-apply with a dedicated call (that endpoint errors instead of
+            # dropping) and verify it stuck.
             # Swallow this call's own error: the read-back verification below is
             # the authoritative diagnosis, so a failure here would be redundant.
             gh issue edit "$issue_num" --repo "$REPO" \
@@ -183,22 +261,20 @@ jobs:
               label_error="The 'dependencies' label is absent on issue #$issue_num after re-apply (the token likely lacks Issues/triage permission); add it once by hand: gh issue edit $issue_num --add-label dependencies"
             fi
 
-            # Failure handling differs by path. The single-PR event path fails
-            # loud and immediate (exit 1). The reconciler processes a whole
-            # batch, so one PR's label-verify failure must NOT skip every later
-            # PR: record the diagnosis and let the caller continue, then fail
-            # the run once at the end. The issue is filed and its PR is already
-            # linked, so `body_links_issue` short-circuits any re-run — no
-            # duplicate is ever minted while the label is added by hand.
+            # ONE handler for both caller paths (#1685). It used to branch on
+            # `$EVENT_NAME`: `pull_request_target` failed loud and immediate
+            # while the reconciler deferred to a batch tail that failed the run
+            # anyway. Two copies of one diagnosis is what let them disagree
+            # about severity, and neither severity was right — the label gap is
+            # a permission the workflow cannot grant itself, so it is reported
+            # and the run continues. The diagnosis is still recorded so the
+            # batch tail can summarise how many PRs it affected.
             if [ -n "$label_error" ]; then
-              if [ "$EVENT_NAME" = "pull_request_target" ]; then
-                echo "::error::$label_error" >&2
-                exit 1
-              fi
+              warn_label_gap "$label_error"
               reconcile_failures+=("$label_error")
-              echo "Label-verify failed for issue #$issue_num — recorded; continuing the batch." >&2
             fi
           }
+          # ---8<--- END bridge helpers ---
 
           if [ "$EVENT_NAME" = "pull_request_target" ]; then
             # Real-time path: bridge just this one PR. Title comes from the env
@@ -234,16 +310,14 @@ jobs:
             bridge_pr "$num" "$ttl"
           done
 
-          # Surface every deferred label-verify failure at once and fail the
-          # run, so the batch completes but a permission gap or persistent API
-          # flake is never silently swallowed. Each issue is filed and its PR
-          # linked, so the only manual step is adding the missing label(s).
+          # Summarise how many PRs were affected, through the SAME emitter each
+          # one already used, so the batch has a single countable line to read
+          # in the run log. The per-issue diagnosis (including the one-line
+          # manual remedy) was emitted at the point of failure, so it is not
+          # repeated here — repeating it once per failure is how the count line
+          # stops being the thing the operator sees.
           if [ "${#reconcile_failures[@]}" -gt 0 ]; then
-            echo "::error::${#reconcile_failures[@]} bridged PR(s) could not have their 'dependencies' label verified; add the label(s) by hand (details below)." >&2
-            for failure in "${reconcile_failures[@]}"; do
-              echo "::error::$failure" >&2
-            done
-            exit 1
+            warn_label_gap "${#reconcile_failures[@]} bridged PR(s) could not have their 'dependencies' label verified; add the label(s) by hand — each is named in a warning above."
           fi
 
           echo "Reconciler complete."

@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek.classify.privacy_filter import tier_of
 from creek.generate.compost_verifier import CompostVerdict
 from creek.models import (
     Confidence,
@@ -197,8 +198,46 @@ def _is_paradox(fragment: Fragment) -> bool:
 
 
 def _is_intimate(fragment: Fragment) -> bool:
-    """Return whether *fragment* carries the intimate privacy tier."""
-    return fragment.privacy_tier == PrivacyTier.INTIMATE
+    """Return whether *fragment* carries the intimate privacy tier.
+
+    Reads through :func:`~creek.classify.privacy_filter.tier_of`, the
+    canonical model-side tier reader, rather than comparing the raw
+    ``privacy_tier`` attribute. ``tier_of`` fails closed: a tier string
+    the enum does not recognise is reported as ``INTIMATE`` and so is
+    withheld here, where a bare equality would report ``False`` and
+    admit the fragment into every detector.
+
+    ``tier_of`` is the reader this screen can use.
+    :func:`~creek.classify.privacy_filter.fragment_tier` and
+    :func:`~creek.classify.privacy_filter.raw_privacy_tier` both need the
+    note's raw frontmatter, and no raw dict crosses into the tracker —
+    :meth:`CompostTracker.detect_compost_candidates` receives validated
+    :class:`~creek.models.Fragment` objects only.
+    :func:`creek.generate.compost_scan._load_fragments` already narrows
+    the complementary case, re-deriving a *missing* ``privacy_tier`` key
+    through ``raw_privacy_tier`` before the tracker sees a fragment.
+
+    Neither divergence issue #1489 reported was reachable in production:
+    the missing-key case is closed by that loader, and an unrecognised
+    tier never survives ``Fragment.model_validate`` so
+    :func:`creek.vault.reader.try_load_fragment` drops the note. This
+    reader is nonetheless canonical now so the screen no longer *borrows*
+    its safety from invariants held in
+    :mod:`creek.generate.compost_scan` and :mod:`creek.vault.reader`. A
+    chokepoint that cannot hold on its own is not a chokepoint.
+
+    The comparison is ``is`` rather than ``==`` because
+    :class:`~creek.models.Fragment` sets ``use_enum_values=True`` — the
+    attribute holds a plain ``str`` at runtime, while ``tier_of`` returns
+    a real :class:`~creek.models.PrivacyTier` member.
+
+    Args:
+        fragment: The fragment to screen.
+
+    Returns:
+        ``True`` when the fragment must be withheld from every detector.
+    """
+    return tier_of(fragment) is PrivacyTier.INTIMATE
 
 
 @dataclass(frozen=True)
@@ -758,23 +797,31 @@ class CompostTracker:
 
         Both sides of the silence comparison are timezone-aware before
         they meet: ``cutoff`` derives from the aware clock, and each
-        fragment timestamp is passed through
-        :func:`creek.time.ensure_aware`. A vault mixing naive and aware
-        fragment timestamps — the ordinary result of round-tripping
-        frontmatter without an offset — therefore ranks and compares
-        instead of raising ``TypeError`` (issue #938; the underlying
-        model-level normalisation is issue #976).
+        fragment timestamp comes back aware from
+        :func:`creek.time.effective_authored_at`, which anchors a naive
+        value to America/Los_Angeles at the read (#1116). A vault mixing
+        naive and aware fragment timestamps — the ordinary result of
+        round-tripping frontmatter without an offset — therefore ranks
+        and compares instead of raising ``TypeError`` (issue #938; the
+        model-level normalisation this backs up is issue #976).
+
+        This method used to wrap that call in its own
+        :func:`creek.time.ensure_aware`, because the chokepoint did not
+        repair. It now does, so the wrapper was dropped as a
+        value-for-value no-op — both applied the same LA anchor, so no
+        candidate's ``last_seen`` moves. The guarantee still has to hold
+        *inside* the generator, because ``max`` compares its own
+        candidates and one unrepaired naive timestamp raises before
+        ``cutoff`` is ever consulted; that is what
+        ``tests/test_compost.py::TestTimezoneAwareClock::
+        test_bypass_naive_fragment_still_ranks`` pins.
         """
         if len(frags) < self.project_min_fragments:
             return None
         # FEAT-031: measure silence against the authored-date precedence
         # so a project whose fragments were merely *ingested* recently
         # but authored long ago is still recognised as silent.
-        # ``max`` compares its own candidates, so the normalisation has to
-        # happen inside the generator rather than around it: without it a
-        # single naive timestamp in the group raises before ``cutoff`` is
-        # ever consulted.
-        last_seen = max(ensure_aware(effective_authored_at(frag)) for frag in frags)
+        last_seen = max(effective_authored_at(frag) for frag in frags)
         if last_seen >= cutoff:
             return None
         days = (self._now - last_seen).days

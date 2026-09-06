@@ -49,6 +49,7 @@ from creek_mcp.tools import (
     author_tool,
     classify_tool,
     compile_tool,
+    entry_classification_tool,
     handshake_tool,
     ingest_tool,
     journal_ingest_tool,
@@ -71,6 +72,7 @@ from creek_mcp.tools import (
     wheel_tool,
 )
 from creek_mcp.tools.draft import draft_tool
+from creek_mcp.tools.reflect import GroundingSession
 from creek_mcp.transport_posture import is_loopback, require_transport_confidentiality
 
 if TYPE_CHECKING:
@@ -489,6 +491,75 @@ def build_server(
     compile_factory = compile_llm_factory or partial(_build_compile_llm, vault)
     reflect_factory = reflect_llm_factory or partial(_build_reflect_llm_factory, vault)
 
+    # One grounding session per server (#1034): ``creek.reflect``'s retrieval
+    # specialist is built and warmed once here rather than per call, so the
+    # sentence-transformer load and the embeddings-parquet read are paid once
+    # for this server's lifetime. Owner-scoped, never a module global.
+    _register_conversation_tools(
+        server,
+        vault=vault,
+        consumer=consumer,
+        transport=transport,
+        reflect_factory=reflect_factory,
+        grounding_session=GroundingSession(),
+    )
+    _register_authoring_tools(
+        server,
+        vault=vault,
+        consumer=consumer,
+        draft_factory=factory,
+        author_factory=author_factory,
+    )
+    _register_pipeline_tools(
+        server,
+        vault=vault,
+        consumer=consumer,
+        compile_factory=compile_factory,
+    )
+    _register_purge_tools(server, vault=vault, consumer=consumer)
+
+    return server
+
+
+def _register_conversation_tools(
+    server: FastMCP,
+    *,
+    vault: Path,
+    consumer: str,
+    transport: Transport,
+    reflect_factory: Callable[[], _LLMFactory],
+    grounding_session: GroundingSession,
+) -> None:
+    """Register the five conversational tools on *server*.
+
+    ``creek.handshake``, ``creek.reflect``, ``creek.wheel``,
+    ``creek.journal`` and ``creek.upload`` -- the surface a consumer meets
+    first and the one it writes short-form entries through. Registration
+    order is preserved exactly: ``FastMCP.list_tools()`` yields insertion
+    order, and this group is published first.
+
+    Args:
+        server: The :class:`FastMCP` instance to register on. Positional
+            because it is the object being mutated, not configuration.
+        vault: The resolved vault root this server serves. Already resolved
+            by ``build_server`` (#1409) so every tool and every default LLM
+            builder agree on one vault.
+        consumer: The audit identity recorded for calls arriving without an
+            authenticated caller.
+        transport: The channel the server is served on. Closed over by
+            ``creek.handshake`` alone, which publishes it -- the value the
+            handshake used to answer from a module-level ``"stdio"``
+            literal (#1583). It is threaded explicitly rather than
+            re-derived so it cannot be dropped silently.
+        reflect_factory: Thunk returning the tier-keyed LLM factory for
+            ``creek.reflect``. Invoked lazily per call.
+        grounding_session: The server-scoped :class:`GroundingSession` whose
+            warmed retrieval specialist every ``creek.reflect`` call reuses
+            (#1034). Constructed by ``build_server`` and threaded in rather
+            than built here, so one server has exactly one, and a test can
+            observe or replace it.
+    """
+
     @server.tool(name="creek.handshake")
     async def _handshake(
         privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
@@ -517,6 +588,7 @@ def build_server(
             content=content,
             entry_ref=entry_ref,
             care_guard=acute_distress_guard,
+            session=grounding_session,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
         )
@@ -571,6 +643,40 @@ def build_server(
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
         )
+
+
+def _register_authoring_tools(
+    server: FastMCP,
+    *,
+    vault: Path,
+    consumer: str,
+    draft_factory: DraftLLMFactory,
+    author_factory: AuthorLLMFactory,
+) -> None:
+    """Register the seven state-and-authoring tools on *server*.
+
+    ``creek.state.read``, ``creek.state.render``, ``creek.lint``,
+    ``creek.mine``, ``creek.draft``, ``creek.author`` and ``creek.save`` --
+    the Writing Desk's read side and the two verbs that call a model.
+
+    Args:
+        server: The :class:`FastMCP` instance to register on.
+        vault: The resolved vault root this server serves.
+        consumer: The audit identity recorded for calls arriving without an
+            authenticated caller.
+        draft_factory: Tier-keyed factory for the draft LLM, invoked lazily
+            by ``creek.draft`` once it knows which seed it is drafting.
+        author_factory: Tier-keyed factory for the Writing Desk's voice
+            client, invoked lazily by ``creek.author`` inside the run and
+            not at all on the ``dry_run`` path.
+    """
+    # Aliased rather than renamed in the 119 moved lines below, so the move
+    # is provably byte-identical while the public parameter name still reads
+    # as one of a family beside ``author_factory``. A bare ``factory`` at
+    # module level next to ``author_factory`` and ``compile_factory`` would
+    # be a genuine readability defect. Ruff F841 guarantees the alias cannot
+    # go dead unnoticed.
+    factory = draft_factory
 
     @server.tool(name="creek.state.read")
     def _state_read(
@@ -692,6 +798,39 @@ def build_server(
             consumer=_effective_consumer(consumer),
         )
 
+
+def _register_pipeline_tools(
+    server: FastMCP,
+    *,
+    vault: Path,
+    consumer: str,
+    compile_factory: CompileLLMFactory,
+) -> None:
+    """Register the eight corpus-pipeline tools on *server*.
+
+    ``creek.ingest``, ``creek.redact.scan``, ``creek.classify``,
+    ``creek.classify.entry``, ``creek.link``, ``creek.report``,
+    ``creek.skills.refresh`` and ``creek.compile`` -- the verbs that move
+    content through the ontology rather than converse about it.
+    ``creek.classify.entry`` is the one read among them: it reports what one
+    named fragment already carries and writes nothing, which is why it sits
+    beside the corpus pass rather than inside it.
+
+    **This registrar is now at the nested-def ceiling.** Eight closures is
+    exactly ``_MAX_NESTED_DEFS`` in
+    ``tests/test_mcp_tool_registration_surface.py``, whose predicate is
+    ``count > 8``, so there is zero headroom left. The next pipeline tool
+    splits this function -- it does not raise the ceiling.
+
+    Args:
+        server: The :class:`FastMCP` instance to register on.
+        vault: The resolved vault root this server serves.
+        consumer: The audit identity recorded for calls arriving without an
+            authenticated caller.
+        compile_factory: Tier-keyed factory for the compile LLM, invoked
+            lazily by ``creek.compile`` and only after its source-tier gate.
+    """
+
     @server.tool(name="creek.ingest")
     def _ingest(
         source_type: str,
@@ -736,6 +875,19 @@ def build_server(
             vault_path=vault,
             method=method,
             force=force,
+            privacy_tier_ceiling=privacy_tier_ceiling,
+            consumer=_effective_consumer(consumer),
+        )
+
+    @server.tool(name="creek.classify.entry")
+    def _classify_entry(
+        entry_ref: str,
+        privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
+    ) -> dict[str, Any]:
+        """Report one fragment's persisted classification; computes nothing."""
+        return entry_classification_tool(
+            vault_path=vault,
+            entry_ref=entry_ref,
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
         )
@@ -800,6 +952,30 @@ def build_server(
             privacy_tier_ceiling=privacy_tier_ceiling,
             consumer=_effective_consumer(consumer),
         )
+
+
+def _register_purge_tools(
+    server: FastMCP,
+    *,
+    vault: Path,
+    consumer: str,
+) -> None:
+    """Register the five destructive purge tools on *server*.
+
+    ``creek.purge.fragment``, ``creek.purge.source``,
+    ``creek.purge.classifications``, ``creek.purge.daterange`` and
+    ``creek.purge.vault``. These take no ``privacy_tier_ceiling`` on
+    purpose -- they are gated by an elevated auth token instead, an
+    asymmetry pinned in both directions by ``tests/test_mcp_read_gate.py``
+    and documented in ``docs/mcp.md``. The group therefore closes over no
+    LLM factory at all.
+
+    Args:
+        server: The :class:`FastMCP` instance to register on.
+        vault: The resolved vault root this server serves.
+        consumer: The audit identity recorded for calls arriving without an
+            authenticated caller.
+    """
 
     @server.tool(name="creek.purge.fragment")
     def _purge_fragment(
@@ -875,8 +1051,6 @@ def build_server(
             dry_run=dry_run,
             consumer=_effective_consumer(consumer),
         )
-
-    return server
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

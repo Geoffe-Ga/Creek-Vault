@@ -24,6 +24,8 @@ from typing import Final
 
 import yaml
 
+from creek._schema import coerce_optional_list
+
 logger = logging.getLogger(__name__)
 
 DIMENSIONS: Final[tuple[str, ...]] = (
@@ -102,8 +104,8 @@ def _load_all_examples() -> dict[str, tuple[FewShotExample, ...]]:
             logger.warning("Few-shot fixture for %s not found: %s", dim, exc)
             loaded[dim] = ()
             continue
-        parsed = yaml.safe_load(raw) or []
-        if not isinstance(parsed, list):
+        parsed = coerce_optional_list(yaml.safe_load(raw))
+        if parsed is None:
             logger.warning("Few-shot fixture %s.yaml is not a list; ignoring", dim)
             loaded[dim] = ()
             continue

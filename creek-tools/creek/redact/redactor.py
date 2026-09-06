@@ -43,6 +43,28 @@ token shape rather than on a reported finding. That asymmetry is
 deliberate, fail-closed behaviour — a missed secret is unrecoverable
 once written, whereas over-redaction is visible in the output and
 fixable via ``false_positive_allowlist``.
+
+One class of run is exempt from all three of those layers: a run that is
+byte-equal to a run inside a marker *this instance's own configuration*
+renders, found at that marker's exact offset. Without the exemption the
+tool corrupted its own output — the run ``email_password_combo`` inside
+``[REDACTED:email_password_combo]`` cleared the entropy bar at any
+``min_confidence`` at or below 0.5920918598895946 and the marker was
+rewritten to ``[REDACTED:[REDACTED:high_entropy_string]]``, nesting once
+more on every further ``--apply``; and independently of the threshold, a
+span bisecting that run snapped out onto the marker and swallowed it
+(Issue #945). Both routes, and the identical one in the scanner, now go
+through the single candidacy gate
+:func:`~creek.redact.scanner.iter_unmarked_candidates`.
+
+The exemption is **name-keyed, not shape-keyed**, and that distinction
+is the whole security argument: nothing about the ``[REDACTED:...]``
+form is privileged, so a forged ``[REDACTED:<real secret>]`` is still a
+candidate and still redacted. Two consequences are deliberate non-goals
+rather than oversights — the 21 regex detectors keep firing inside
+marker text (suppressing them is what would let a forged marker hide a
+live key), and an operator ``custom_patterns`` regex that matches its
+own marker still self-matches.
 """
 
 import re
@@ -51,10 +73,11 @@ from typing import NamedTuple
 from creek.config import RedactionConfig
 from creek.redact.patterns import PATTERN_METADATA, REDACTION_PATTERNS
 from creek.redact.scanner import (
-    HIGH_ENTROPY_CANDIDATE,
     HIGH_ENTROPY_PATTERN_NAME,
+    emitted_marker_runs,
     entropy_threshold,
     has_high_entropy_region,
+    iter_unmarked_candidates,
     post_validate,
 )
 
@@ -147,6 +170,29 @@ def _severity_rank(pattern_name: str) -> int:
     return _SEVERITY_RANKS.get(info.severity, _UNKNOWN_SEVERITY_RANK)
 
 
+def _iter_lines_with_offsets(content: str) -> list[tuple[int, str]]:
+    """Yield each line of *content* with its document offset.
+
+    Mirrors ``RedactionScanner``'s ``text.splitlines()`` walk exactly -- the
+    line bodies are what ``splitlines()`` would return, terminators excluded --
+    while also reporting where each line begins, so a per-line match can be
+    stored in document coordinates (#900).
+
+    Args:
+        content: The original, untouched text.
+
+    Returns:
+        ``(offset, line)`` pairs in document order.
+    """
+    windows: list[tuple[int, str]] = []
+    offset = 0
+    for raw in content.splitlines(keepends=True):
+        bodies = raw.splitlines()
+        windows.append((offset, bodies[0] if bodies else ""))
+        offset += len(raw)
+    return windows
+
+
 def _merge_spans(spans: list[_Span]) -> list[_MergedSpan]:
     """Union truly overlapping spans into maximal merged regions.
 
@@ -229,6 +275,10 @@ class Redactor:
         self.config = config
         self.salt = salt
         self._patterns = self._build_patterns()
+        self._marker_runs = emitted_marker_runs(
+            config.replacement_template,
+            frozenset(self._patterns) | {HIGH_ENTROPY_PATTERN_NAME},
+        )
 
     def _build_patterns(self) -> dict[str, re.Pattern[str]]:
         """Merge built-in patterns with any custom patterns from config.
@@ -293,6 +343,19 @@ class Redactor:
         written, while over-redaction is visible and fixable by
         allowlisting the affected token.
 
+        This method is **idempotent** at every ``min_confidence``:
+        re-running it over its own output returns that output byte for
+        byte, because a run belonging to a marker this instance renders
+        is not a candidate for the entropy detector or for snapping
+        (Issue #945). The guarantee holds for a
+        :pyattr:`RedactionConfig.replacement_template` whose ``{name}``
+        is delimited on both sides by a character outside
+        ``[A-Za-z0-9+/=_-]`` — the default ``[REDACTED:{name}]`` is.
+        Under a degenerate template a spliced marker can end up flush
+        against neighbouring token characters, forming a NEW longer run
+        that is correctly *not* exempt: fail-closed, but not a fixed
+        point.
+
         Args:
             content: The text to redact.
             pattern_types: If provided, only apply these pattern names.
@@ -337,10 +400,28 @@ class Redactor:
         that coverage boundary-driven instead of threshold-driven
         (Issue #909).
 
-        Runs on the false-positive allowlist are excluded, so an
-        explicitly allowlisted token is never widened onto — user intent
-        wins. A regex match *inside* such a run still redacts its own
-        span, just unwidened.
+        Two independent exclusions apply to the run list, and both must
+        hold for a run to be snapped onto:
+
+        - runs on the false-positive allowlist, so an explicitly
+          allowlisted token is never widened onto — user intent wins. A
+          regex match *inside* such a run still redacts its own span,
+          just unwidened;
+        - runs belonging to a marker this redactor's own configuration
+          renders (#945). This is the **one place** the fix reduces
+          fail-closed coverage, and it is stated plainly rather than
+          buried: a span that bisects a marker's run is no longer widened
+          onto the marker. Before, an operator ``custom_patterns`` match
+          landing inside ``[REDACTED:email_password_combo]`` snapped out
+          to the whole run and swallowed the marker into
+          ``[REDACTED:[REDACTED:inner]]`` — reachable even at
+          ``min_confidence=1.0``, where the entropy detector is provably
+          inert. The reduction is bounded by construction: the exempt
+          bytes are a pattern *name* inside a literal marker at an exact
+          offset, never operator data, and because
+          ``HIGH_ENTROPY_CANDIDATE`` matches maximally a secret adjacent
+          to a marker forms a longer run that fails byte-equality and is
+          still snapped onto. See :func:`iter_unmarked_candidates`.
 
         Args:
             content: The original, untouched text the spans index into.
@@ -353,7 +434,9 @@ class Redactor:
         """
         runs: list[_Run] = [
             (candidate.start(), candidate.end())
-            for candidate in HIGH_ENTROPY_CANDIDATE.finditer(content)
+            for candidate in iter_unmarked_candidates(
+                content, marker_runs=self._marker_runs
+            )
             if not self._is_allowlisted(candidate.group())
         ]
         return [_snap_one(span, runs) for span in spans]
@@ -373,17 +456,67 @@ class Redactor:
             Spans for every match that survives the allowlist and the
             pattern-specific post-validator (e.g. Luhn for
             ``credit_card``), in collection order.
+
+        Two passes, unioned, because the scanner and the redactor were
+        matching different things (#900). ``RedactionScanner.scan_file``
+        walks ``text.splitlines()`` and matches **per line**; this method
+        matched the **whole document**. Any pattern whose whitespace can
+        cross a newline diverges between the two, and the divergence leaks:
+        on ``"password =\\npassword = s3cret"`` the built-in ``password``
+        pattern matches ``"password =\\npassword"`` whole-document -- the
+        span ENDS before the secret -- so ``--scan`` reported a critical
+        finding that ``--apply`` then wrote straight back out.
+
+        It is a union rather than a swap. A per-line walk alone cannot see a
+        match that legitimately spans a newline, so replacing the
+        whole-document pass would trade this parity gap for the mirror-image
+        one, in the direction that leaks. Duplicate matches (any single-line
+        match is found by both passes) are dropped by offset+name, and
+        genuine overlaps are already unioned downstream by
+        :func:`_merge_spans`.
         """
         spans: list[_Span] = []
-        for name, pattern in patterns.items():
-            for match in pattern.finditer(content):
-                text = match.group()
-                if self._is_allowlisted(text):
-                    continue
-                if not post_validate(name, text):
-                    continue
-                spans.append(_Span(match.start(), match.end(), name, len(spans)))
+        seen: set[tuple[int, int, str]] = set()
+        self._record_matches(spans, seen, content, patterns, offset=0)
+        for offset, line in _iter_lines_with_offsets(content):
+            self._record_matches(spans, seen, line, patterns, offset=offset)
         return spans
+
+    def _record_matches(
+        self,
+        spans: list[_Span],
+        seen: set[tuple[int, int, str]],
+        text: str,
+        patterns: dict[str, re.Pattern[str]],
+        *,
+        offset: int,
+    ) -> None:
+        """Append every surviving match in *text* to *spans*, shifted by *offset*.
+
+        Args:
+            spans: Accumulator, mutated in place.
+            seen: ``(start, end, name)`` keys already recorded, so the
+                whole-document and per-line passes cannot double-count the
+                same match.
+            text: The window to search -- the whole document, or one line.
+            patterns: In-scope mapping of pattern name to compiled regex.
+            offset: Document offset of *text*, added to every match position
+                so a per-line match is stored in document coordinates.
+        """
+        for name, pattern in patterns.items():
+            for match in pattern.finditer(text):
+                start = offset + match.start()
+                end = offset + match.end()
+                key = (start, end, name)
+                if key in seen:
+                    continue
+                matched = match.group()
+                if self._is_allowlisted(matched):
+                    continue
+                if not post_validate(name, matched):
+                    continue
+                seen.add(key)
+                spans.append(_Span(start, end, name, len(spans)))
 
     def _splice_markers(self, content: str, merged: list[_MergedSpan]) -> str:
         """Replace each merged span in *content* with its winning marker.
@@ -441,7 +574,18 @@ class Redactor:
         hand-synchronised copies, scan/apply parity cannot drift: a
         ``--scan`` finding cannot survive a ``--apply`` step, and
         ``--apply`` cannot start firing on runs ``--scan`` reported as
-        clean.
+        clean. Since #945 the *candidacy* half is shared the same way,
+        through :func:`~creek.redact.scanner.iter_unmarked_candidates`,
+        so a run belonging to a marker this redactor itself renders is
+        not a candidate here or in the scanner. Without that,
+        ``redact --apply`` corrupted its own output: at any
+        ``min_confidence`` at or below 0.5920918598895946 the run
+        ``email_password_combo`` inside ``[REDACTED:email_password_combo]``
+        cleared the bar and the marker was rewritten to
+        ``[REDACTED:[REDACTED:high_entropy_string]]``, nesting again on
+        every further run. The carve-out is name-keyed, not shape-keyed —
+        :func:`~creek.redact.scanner.iter_unmarked_candidates` carries
+        the bound and the two deliberate non-goals.
 
         ``post_validate`` is deliberately *not* consulted: no validator
         is registered for ``high_entropy_string`` (it would return
@@ -469,7 +613,9 @@ class Redactor:
         """
         threshold = entropy_threshold(self.config.min_confidence)
         spans: list[_Span] = []
-        for candidate in HIGH_ENTROPY_CANDIDATE.finditer(content):
+        for candidate in iter_unmarked_candidates(
+            content, marker_runs=self._marker_runs
+        ):
             text = candidate.group()
             if self._is_allowlisted(text):
                 continue

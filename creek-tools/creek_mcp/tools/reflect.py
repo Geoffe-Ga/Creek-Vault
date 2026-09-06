@@ -69,7 +69,8 @@ leaves ``retrieve`` unset, so production grounding is :func:`_default_retrieve`
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+import threading
+from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol
 
 from creek.care.guardrail import CARE_POLICY, CARE_SIGNAL
 from creek_mcp.audit import MCPAuditLog
@@ -87,6 +88,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
     from pathlib import Path
 
+    from creek.author.agents import RetrievalSpecialist
     from creek.classify.privacy_filter import PrivacyTierOverride
     from creek.models import PrivacyTier
 
@@ -97,6 +99,119 @@ TOOL_NAME = "creek.reflect"
 _DEFAULT_MAX_NOTES = 6
 _ALLOWED_KINDS = {"reframe", "fear", "longing", "value", "pattern", "tension", "gift"}
 
+_MAX_LIVE_EMBEDS: Final[int] = 256
+"""Cache misses one interactive grounding pass may embed from scratch (#1034).
+
+Bounds the **first** call against a cold vault, which is the unbounded case:
+with no ``embeddings.parquet``, ranking previously live-embedded the entire
+admitted corpus on every request, and ``POST /v1/reflections`` is published as a
+read under a 30 s deadline whose caller is *shed* while the abandoned worker
+thread keeps embedding — so a retrying caller stacked detached grounding passes.
+
+Why a cap and not the alternatives, recorded so the choice is not re-litigated
+silently. *Refuse-with-reason* would remove working grounding from every vault
+that has not run ``creek link --method embeddings`` — the normal state of a new
+vault. *Persist-back* bounds call two while leaving call one unbounded, and puts
+a vault **write** on a route ``docs/api.md`` publishes as mutating no vault
+state, racing ``creek link``. A cap is the only option that is a strict
+narrowing, adds no write, bounds the first call, and leaves every vault smaller
+than the budget bit-identical.
+
+256 is chosen so it exceeds any vault this bound is not meant to change while
+staying far below the corpus sizes that made the pass pathological; the batch
+producer (``creek link``) remains the way to ground a large vault fully.
+"""
+
+
+class GroundingSession:
+    """One owner's reused :class:`RetrievalSpecialist`, held for a server or app.
+
+    The #1034 defect is one of **lifetime**, not of memoisation:
+    :class:`~creek.author.agents.RetrievalSpecialist` already memoises its model
+    handle and its parquet map per instance (pinned by
+    ``test_retrieval_reuses_linker_across_gather_calls`` and
+    ``test_retrieval_loads_cache_once_across_gather_calls`` in
+    ``tests/test_real_agents.py``), but :func:`_default_retrieve` built a fresh
+    one *inline in the call expression* and dropped it, so every
+    ``creek.reflect`` paid a sentence-transformer load from disk plus a full
+    parquet read before any corpus work. This class supplies the missing
+    lifetime and nothing else.
+
+    **Owner-scoped, never a module global.** One instance per ``build_server``
+    and one per ``create_app``, passed down explicitly. A process global or an
+    ``lru_cache`` would carry one test's autouse model mock into the next —
+    the hazard ``RetrievalSpecialist``'s own docstring names.
+
+    **Exactly one specialist at a time.** A different vault *replaces* the slot
+    rather than accumulating one entry per path. That matters on ``/v1``, where
+    production passes no ``vault_path`` and ``configured_vault`` re-reads
+    ``creek_config.yaml`` per request: a per-vault dict on a multi-vault or
+    reconfigured host would grow one loaded model plus one full id→vector map
+    per distinct path, for the life of the process — unbounded per-request
+    growth introduced by a change whose purpose is bounding cost.
+
+    **All mutation happens once, under the lock, before the instance is
+    shared.** ``/v1`` serves reads in worker threads with several concurrency
+    slots, so two first requests really can race. Building *and warming* inside
+    the lock is what makes "one construction, one parquet read, one model load"
+    true rather than merely likely; an unsynchronised ``gather`` would let both
+    racers find the memo slots empty and do the work twice, which atomic
+    rebinding prevents corruption of but not duplication of.
+
+    **Nothing override-derived is stored, here or on the specialist.** The
+    session keys on the vault only. ``gather`` re-runs ``_load_config`` and
+    ``_load_corpus`` on every call, so tier admission is re-decided per call
+    from that caller's own override; what is shared is the tier-blind model
+    handle and id→vector map, which are only ever *read* for ids the current
+    call independently admitted.
+    """
+
+    def __init__(self) -> None:
+        """Create an empty session; the first :meth:`specialist` call fills it."""
+        self._lock = threading.Lock()
+        self._specialist: RetrievalSpecialist | None = None
+        self._vault: Path | None = None
+
+    def specialist(self, vault: Path) -> RetrievalSpecialist:
+        """Return this session's warmed specialist for *vault*, building once.
+
+        The import is deferred to here, not module scope, so importing this tool
+        does not drag in the author agents and their embedding stack — the same
+        reason :func:`_default_retrieve` imports lazily, which keeps the server
+        bootable when those heavier deps are missing.
+
+        Failure stores nothing: if the model or the parquet cannot be loaded the
+        exception propagates to :func:`_default_retrieve`'s swallow, the slot is
+        left as it was, and the next call retries rather than caching a broken
+        session for the life of the process.
+
+        :data:`_MAX_LIVE_EMBEDS` is read **here, at construction time**, not
+        captured as a parameter default when this class was defined. That is
+        deliberate and load-bearing for testability: a default argument binds
+        once at import, so the published cap could not be reached from a test
+        without passing it explicitly — which would have tested a value the
+        production path never uses. Reading the module constant at call time
+        means a test can monkeypatch it and exercise the real production path,
+        and it is why this method takes no budget argument at all.
+
+        Args:
+            vault: The vault this grounding pass will read.
+
+        Returns:
+            The warmed specialist, freshly built when this session held none or
+            held one for a different vault.
+        """
+        from creek.author.agents import RetrievalSpecialist
+
+        with self._lock:
+            if self._specialist is not None and self._vault == vault:
+                return self._specialist
+            built = RetrievalSpecialist(max_live_embeds=_MAX_LIVE_EMBEDS)
+            built.warm(vault)
+            self._specialist = built
+            self._vault = vault
+            return built
+
 
 class _Grounding(NamedTuple):
     """One grounding pass: the prompt lines, and the fragments they came from.
@@ -104,8 +219,12 @@ class _Grounding(NamedTuple):
     Attributes:
         lines: The grounding snippets fed to :func:`_build_prompt` — corpus
             fragment *titles* under the default grounder, never body text.
-        source_ids: The ids of the fragments those lines were drawn from, in
-            retrieval order. Carried so :mod:`creek_mcp.compiled_pages` can
+        source_ids: The ids of the fragments the compiled-layer lookup may
+            *select* from. :func:`_default_retrieve` populates this with the
+            fragments its own lines were drawn from, in retrieval order;
+            :func:`_gather_grounding` returns the same list led by the
+            reflected entry's own ``entry_ref`` when it resolved a fragment.
+            Carried so :mod:`creek_mcp.compiled_pages` can
             *select* candidate eddy and praxis pages from the same pass rather
             than running a second embedding sweep (issue #873's constraint).
             They select only: every candidate page's provenance is re-checked
@@ -372,6 +491,190 @@ def _resolve_entry(
     return "", None
 
 
+def _admit_entry(
+    *,
+    content: str | None,
+    entry_ref: str | None,
+    vault_path: Path,
+    ceiling: TierCeiling,
+    care_guard: Callable[[str], str | None] | None,
+) -> tuple[str, PrivacyTier | None] | dict[str, Any]:
+    """Resolve the entry and run the three admission gates, in source order.
+
+    The order is load-bearing, and keeping the three gates in one function
+    is what keeps it reviewable in one screen: resolve-and-empty-check,
+    then the read-side ceiling gate (#846), then the care seam (#753). The
+    ceiling gate sits *above* the care seam on purpose -- see the comment
+    on it below.
+
+    The audit append deliberately stays in :func:`reflect_tool`, above the
+    call to this function, so a refused above-ceiling attempt is still
+    recorded and there is still exactly one append per call.
+
+    Args:
+        content: The raw entry text, or ``None`` to resolve *entry_ref*.
+        entry_ref: A fragment id whose body is the entry, when *content*
+            is absent.
+        vault_path: Vault root, for fragment resolution.
+        ceiling: The caller's declared ceiling.
+        care_guard: ``(entry) -> reason | None``; the #753 seam, or
+            ``None`` when no guard is wired.
+
+    Returns:
+        Either a ``dict``, which **is** the terminal response for the whole
+        call and must be returned to the caller verbatim with nothing added
+        to it, or the ``(entry, entry_tier)`` pair of an admitted entry.
+    """
+    entry, entry_tier = _resolve_entry(content, entry_ref, vault_path)
+    if not entry.strip():
+        reason = "entry_ref not found" if entry_ref else "no entry content supplied"
+        return refusal_response(tool=TOOL_NAME, ceiling=ceiling, reason=reason)
+
+    # The read-side ceiling gate (#846). It sits *above* the care seam on
+    # purpose: an ``escalate`` response is a one-bit oracle telling a caller who
+    # is not admitted to this fragment that it carries acute-distress markers.
+    # Care still runs for every raw-``content`` call and every within-ceiling
+    # ``entry_ref`` — only unadmitted reads skip it, and they skip the model too.
+    if _above_ceiling(entry_tier, ceiling):
+        return refusal_response(
+            tool=TOOL_NAME,
+            ceiling=ceiling,
+            # Unlike ``save``'s refusal, this reason does NOT echo the offending
+            # tier. There the tier came from the caller's own input, so echoing
+            # it tells them nothing new; here it is derived from content the
+            # caller is not admitted to, so echoing it would turn the refusal
+            # into a tier-classification oracle over the corpus.
+            #
+            # ACCEPTED RESIDUAL RISK: keeping this reason distinct from
+            # "entry_ref not found" is itself a coarse existence-and-rank oracle
+            # across repeated probes (refused at ``open`` implies tier >=
+            # personal; refused at ``personal`` implies intimate). Accepted
+            # because fragment ids are unguessable (``frag-`` + 12 hex), are only
+            # learnable from content already admitted to the caller, and each
+            # probe costs a vault scan — while the distinct not-found reason is
+            # what makes a legitimate client's bug debuggable. If the two reasons
+            # are ever unified, the scan must be equalised too: the not-found
+            # path attempts to parse every fragment file whereas this path
+            # early-returns at the match, so the timing difference would preserve
+            # the oracle as a side channel.
+            reason="entry_ref tier exceeds ceiling",
+        )
+
+    if care_guard is not None:
+        care_reason = care_guard(entry)
+        if care_reason:
+            return {
+                "status": "escalate",
+                "tool": TOOL_NAME,
+                "tier_ceiling": ceiling.value,
+                "reason": care_reason,
+                "care_signal": CARE_SIGNAL,
+            }
+
+    return entry, entry_tier
+
+
+def _gather_grounding(
+    *,
+    entry: str,
+    entry_ref: str | None,
+    entry_tier: PrivacyTier | None,
+    vault_path: Path,
+    ceiling: TierCeiling,
+    retrieve: Callable[[str, Path, PrivacyTierOverride], list[str]] | None,
+    session: GroundingSession | None = None,
+) -> _Grounding:
+    """Run one grounding pass and compose the compiled-layer seed list.
+
+    Args:
+        entry: The admitted entry text, used as the retrieval query.
+        entry_ref: The reflected fragment's id, or ``None`` for raw
+            ``content``. Leads the seed list when it resolved a fragment.
+        entry_tier: That fragment's classified tier, or ``None`` for raw
+            ``content`` -- which contributes no seed because it is not a
+            corpus fragment.
+        vault_path: Vault root.
+        ceiling: The caller's declared ceiling, converted to the grounder's
+            privacy override.
+        retrieve: The injected grounder, or ``None`` for
+            :func:`_default_retrieve`. An injected callable *replaces* the
+            default outright and returns no fragment ids, so it contributes
+            no seeds.
+        session: The owner's :class:`GroundingSession`, supplying the *lifetime*
+            of the default grounder's retrieval specialist — not the grounder
+            itself. Ignored when *retrieve* is injected, because an injected
+            grounder replaces the default outright and owns its own retrieval.
+
+    Returns:
+        The grounding lines for the prompt, and the seed ids that select
+        candidate compiled pages.
+    """
+    override = to_privacy_override(ceiling)
+    if retrieve is not None:
+        grounding, retrieved_ids = _Grounding(retrieve(entry, vault_path, override), [])
+    else:
+        grounding, retrieved_ids = _default_retrieve(
+            entry, vault_path, override, session=session
+        )
+    # Seeds *select* candidate compiled pages; they never authorize one. An
+    # ``entry_ref`` seed is admitted by the #846 gate above, and a retrieval
+    # seed by the grounder's hard tier cutoff — but neither fact is relied on
+    # here, because ``related_compiled`` re-checks the tier of every fragment
+    # each candidate page was compiled from.
+    from_entry = [entry_ref] if entry_ref and entry_tier is not None else []
+    return _Grounding(grounding, from_entry + retrieved_ids)
+
+
+def _reflection_response(
+    *,
+    notes: list[dict[str, str]],
+    essay: str | None,
+    related: RelatedCompiled,
+    ceiling: TierCeiling,
+    tier: PrivacyTier,
+) -> dict[str, Any]:
+    """Render the answered-reflection response, omitting what does not qualify.
+
+    Only the ``ok`` / ``empty`` paths render through here. A ``refused`` or
+    ``escalate`` response is built by :func:`_admit_entry` (or by the
+    provider-unavailable handler) and deliberately carries a *smaller* key
+    set -- no ``routed_tier``, ``notes`` or ``essay_grounded`` -- because it
+    never reached the model. Routing an escalation through this function
+    would invent all three.
+
+    Args:
+        notes: The cleaned, verbatim-verified notes; empty means ``empty``.
+        essay: The model's free prose, or ``None`` when it offered none.
+        related: The admitted compiled structures; empty on both axes when
+            nothing qualifies.
+        ceiling: The caller's declared ceiling, echoed back.
+        tier: The tier the model call was actually routed at.
+
+    Returns:
+        The ``ok`` / ``empty`` response dict.
+    """
+    result: dict[str, Any] = {
+        "status": "ok" if notes else "empty",
+        "tool": TOOL_NAME,
+        "tier_ceiling": ceiling.value,
+        "routed_tier": tier.value,
+        "notes": notes,
+        # ``essay`` is free model prose and is NOT verbatim/grounding-checked the
+        # way ``notes[].quote`` is — a client must not treat it as grounded.
+        "essay_grounded": False,
+    }
+    if essay is not None:
+        result["essay"] = essay
+    # Both keys are OMITTED when nothing qualifies, never present-and-empty: a
+    # consumer written before #873 must parse a reflection with no compiled
+    # neighbours byte-for-byte as it did before.
+    if related.praxis:
+        result["related_praxis"] = related.praxis
+    if related.eddies:
+        result["related_eddies"] = related.eddies
+    return result
+
+
 def reflect_tool(
     *,
     vault_path: Path,
@@ -383,6 +686,7 @@ def reflect_tool(
         Callable[[Sequence[str], Path, TierCeiling], RelatedCompiled] | None
     ) = None,
     care_guard: Callable[[str], str | None] | None = None,
+    session: GroundingSession | None = None,
     privacy_tier_ceiling: TierCeiling = TierCeiling.OPEN,
     consumer: str = "unknown",
     max_notes: int = _DEFAULT_MAX_NOTES,
@@ -415,6 +719,14 @@ def reflect_tool(
             policy this tool implements.
         care_guard: ``(entry) -> reason | None``; a non-``None`` reason escalates
             to a human and skips the model entirely (#753 seam).
+        session: The owner-scoped :class:`GroundingSession` whose warmed
+            retrieval specialist the default grounder reuses (#1034). A
+            **sibling** of *retrieve*, not a replacement for it: *retrieve*
+            supplies a different grounder, *session* supplies the lifetime of
+            the default one, and the two do not interact. ``None`` — the
+            default, and what every ``retrieve=``-injecting test and both
+            read-gate probes pass — builds a cold specialist per call, exactly
+            as before.
         privacy_tier_ceiling: The ceiling; gates admission of the *entry itself*
             when it came from an ``entry_ref`` (see :func:`_above_ceiling`),
             corpus admission for grounding retrieval, and — via
@@ -449,8 +761,8 @@ def reflect_tool(
         provenance cannot be enumerated in full is withheld
         (:mod:`creek_mcp.compiled_pages`).
     """
-    # Logged unconditionally, above the ceiling gate below, so a refused
-    # above-ceiling attempt is still recorded (tool, ceiling, consumer,
+    # Logged unconditionally, above the ceiling gate in :func:`_admit_entry`, so
+    # a refused above-ceiling attempt is still recorded (tool, ceiling, consumer,
     # has_entry_ref, timestamp) — this is the only append for this call; no
     # second append happens on refusal. The probed entry_ref itself and the
     # call's outcome are deliberately NOT logged, so this record cannot
@@ -464,71 +776,31 @@ def reflect_tool(
         consumer=consumer,
     )
 
-    entry, entry_tier = _resolve_entry(content, entry_ref, vault_path)
-    if not entry.strip():
-        reason = "entry_ref not found" if entry_ref else "no entry content supplied"
-        return refusal_response(
-            tool=TOOL_NAME, ceiling=privacy_tier_ceiling, reason=reason
-        )
-
-    # The read-side ceiling gate (#846). It sits *above* the care seam on
-    # purpose: an ``escalate`` response is a one-bit oracle telling a caller who
-    # is not admitted to this fragment that it carries acute-distress markers.
-    # Care still runs for every raw-``content`` call and every within-ceiling
-    # ``entry_ref`` — only unadmitted reads skip it, and they skip the model too.
-    if _above_ceiling(entry_tier, privacy_tier_ceiling):
-        return refusal_response(
-            tool=TOOL_NAME,
-            ceiling=privacy_tier_ceiling,
-            # Unlike ``save``'s refusal, this reason does NOT echo the offending
-            # tier. There the tier came from the caller's own input, so echoing
-            # it tells them nothing new; here it is derived from content the
-            # caller is not admitted to, so echoing it would turn the refusal
-            # into a tier-classification oracle over the corpus.
-            #
-            # ACCEPTED RESIDUAL RISK: keeping this reason distinct from
-            # "entry_ref not found" is itself a coarse existence-and-rank oracle
-            # across repeated probes (refused at ``open`` implies tier >=
-            # personal; refused at ``personal`` implies intimate). Accepted
-            # because fragment ids are unguessable (``frag-`` + 12 hex), are only
-            # learnable from content already admitted to the caller, and each
-            # probe costs a vault scan — while the distinct not-found reason is
-            # what makes a legitimate client's bug debuggable. If the two reasons
-            # are ever unified, the scan must be equalised too: the not-found
-            # path attempts to parse every fragment file whereas this path
-            # early-returns at the match, so the timing difference would preserve
-            # the oracle as a side channel.
-            reason="entry_ref tier exceeds ceiling",
-        )
-
-    if care_guard is not None:
-        care_reason = care_guard(entry)
-        if care_reason:
-            return {
-                "status": "escalate",
-                "tool": TOOL_NAME,
-                "tier_ceiling": privacy_tier_ceiling.value,
-                "reason": care_reason,
-                "care_signal": CARE_SIGNAL,
-            }
+    admitted = _admit_entry(
+        content=content,
+        entry_ref=entry_ref,
+        vault_path=vault_path,
+        ceiling=privacy_tier_ceiling,
+        care_guard=care_guard,
+    )
+    if isinstance(admitted, dict):
+        return admitted
+    entry, entry_tier = admitted
 
     tier = _routing_tier(privacy_tier_ceiling, entry_tier)
-    override = to_privacy_override(privacy_tier_ceiling)
-    if retrieve is not None:
-        grounding, retrieved_ids = _Grounding(retrieve(entry, vault_path, override), [])
-    else:
-        grounding, retrieved_ids = _default_retrieve(entry, vault_path, override)
-    # Seeds *select* candidate compiled pages; they never authorize one. An
-    # ``entry_ref`` seed is admitted by the #846 gate above, and a retrieval
-    # seed by the grounder's hard tier cutoff — but neither fact is relied on
-    # here, because ``related_compiled`` re-checks the tier of every fragment
-    # each candidate page was compiled from.
-    from_entry = [entry_ref] if entry_ref and entry_tier is not None else []
-    seeds = from_entry + retrieved_ids
+    grounding = _gather_grounding(
+        entry=entry,
+        entry_ref=entry_ref,
+        entry_tier=entry_tier,
+        vault_path=vault_path,
+        ceiling=privacy_tier_ceiling,
+        retrieve=retrieve,
+        session=session,
+    )
 
     try:
         llm = llm_factory(tier)
-        response_text = llm(_build_prompt(entry, grounding))
+        response_text = llm(_build_prompt(entry, grounding.lines))
     except RuntimeError as exc:
         # Covers a missing/unavailable provider AND ``IntimateRoutingError``
         # (a RuntimeError subclass) — the router raises the latter rather than
@@ -541,27 +813,16 @@ def reflect_tool(
 
     raw_notes, essay = _parse_notes(response_text)
     notes = _clean_notes(raw_notes, entry, max_notes=max_notes)
-    related = _related(seeds, vault_path, privacy_tier_ceiling, related_lookup)
-    result: dict[str, Any] = {
-        "status": "ok" if notes else "empty",
-        "tool": TOOL_NAME,
-        "tier_ceiling": privacy_tier_ceiling.value,
-        "routed_tier": tier.value,
-        "notes": notes,
-        # ``essay`` is free model prose and is NOT verbatim/grounding-checked the
-        # way ``notes[].quote`` is — a client must not treat it as grounded.
-        "essay_grounded": False,
-    }
-    if essay is not None:
-        result["essay"] = essay
-    # Both keys are OMITTED when nothing qualifies, never present-and-empty: a
-    # consumer written before #873 must parse a reflection with no compiled
-    # neighbours byte-for-byte as it did before.
-    if related.praxis:
-        result["related_praxis"] = related.praxis
-    if related.eddies:
-        result["related_eddies"] = related.eddies
-    return result
+    related = _related(
+        grounding.source_ids, vault_path, privacy_tier_ceiling, related_lookup
+    )
+    return _reflection_response(
+        notes=notes,
+        essay=essay,
+        related=related,
+        ceiling=privacy_tier_ceiling,
+        tier=tier,
+    )
 
 
 def _related(
@@ -604,7 +865,10 @@ def _related(
 
 
 def _default_retrieve(
-    query: str, vault_path: Path, override: PrivacyTierOverride
+    query: str,
+    vault_path: Path,
+    override: PrivacyTierOverride,
+    session: GroundingSession | None = None,
 ) -> _Grounding:
     """Production grounding: the *titles* of the corpus fragments nearest *query*.
 
@@ -646,12 +910,46 @@ def _default_retrieve(
     INTIMATE (local-only) routing. Pinned by
     ``test_routing_tier_dominates_every_retrieved_fragment_tier``.
 
-    **The cost, honestly.** Each call constructs a fresh
-    ``RetrievalSpecialist``, so it parses the corpus and loads the embeddings
-    parquet per call, and live-embeds any fragment whose cached
-    ``content_hash`` is stale or missing — on a cold cache, that is the whole
-    admitted corpus. Tracked by #1034; the ``except Exception`` below does not
-    bound it, because slowness is not an exception.
+    **The cost, honestly.** What a *session* bounds, and what it does not.
+
+    With a *session*, the retrieval specialist is built and warmed once per
+    server/app and reused, so the sentence-transformer load from disk and the
+    embeddings-parquet read are each paid **once per process**, not once per
+    call. That load is corpus-size independent and is paid even on a
+    two-fragment vault, because ``_load_sentence_transformer`` carries no
+    ``lru_cache`` and ``EmbeddingLinker._model`` is a per-instance slot.
+    **Measured, so it is not overstated:** re-instantiating the model costs
+    ~60 ms once the weights are in the OS page cache (~2 s on the first load in
+    a process, ~20 s on a genuinely cold one), against ~13 ms per embed. So on a
+    warm host the dominant per-call cost of a cold-parquet reflection is the
+    embed pass, not the model load — which is why the cap below matters at least
+    as much as the shared lifetime. Live
+    embedding of cache misses is bounded per call by
+    :data:`_MAX_LIVE_EMBEDS`, so a cold vault no longer embeds its whole
+    admitted corpus in one request.
+
+    **What a session does not amortise: the live embeds themselves.** The shared
+    map holds what the parquet held; vectors computed live are *not* written
+    back into it, so against a cold parquet every call still embeds its cache
+    misses, bounded by the cap. Measured at 40 fragments over 3 calls: sharing
+    takes constructions, parquet reads and model loads from 3 to 1 each and
+    leaves the embed count at 123 either way. Writing them back was rejected
+    deliberately — an in-memory write-back would mutate a specialist that
+    several worker threads hold at once, and a parquet write-back would put a
+    vault write on a route published as mutating no vault state, racing
+    ``creek link``. Filling the cache with ``creek link --method embeddings``
+    remains the way to make grounding cheap on a large vault.
+
+    With no *session* — every ``retrieve=``-injecting test, both read-gate
+    probes, and any caller that does not pass one — this is unchanged: a fresh
+    ``RetrievalSpecialist`` per call, an unbounded cold-cache pass, model load
+    included.
+
+    **Not bounded by any of this:** the corpus is still walked three times per
+    reflection (``_resolve_entry``'s rglob, ``_load_corpus``, and
+    ``compiled_pages._read_corpus``). That is the *walk* half of #1034 and it is
+    deliberately not this change. As before, the ``except Exception`` below does
+    not bound any of it, because slowness is not an exception.
 
     A known asymmetry: a fragment with **no** ``privacy_tier`` key at all is
     admitted here from ``ceiling=personal`` (the ``Fragment`` model default is
@@ -673,15 +971,25 @@ def _default_retrieve(
         vault_path: Vault root whose corpus subtrees are searched.
         override: The ceiling-derived admission override, applied as a hard
             cutoff inside the corpus walk.
+        session: The owner-scoped :class:`GroundingSession` holding the warmed
+            specialist to reuse, or ``None`` to build a cold one for this call
+            (the pre-#1034 behaviour, and still the live path for every caller
+            that passes none). The session supplies a *lifetime* only: it is
+            keyed on the vault and holds nothing override-derived, so *override*
+            below is still applied per call, by this call, inside ``gather``.
 
     Returns:
         Fragment titles, most relevant first, paired with the ids they came
         from — both empty when retrieval fails.
     """
     try:
-        from creek.author.agents import RetrievalSpecialist
+        if session is not None:
+            specialist = session.specialist(vault_path)
+        else:
+            from creek.author.agents import RetrievalSpecialist
 
-        bundle = RetrievalSpecialist().gather(query, vault_path, override=override)
+            specialist = RetrievalSpecialist()
+        bundle = specialist.gather(query, vault_path, override=override)
         return _Grounding(
             lines=[claim.claim for claim in bundle.claims],
             source_ids=[
@@ -702,6 +1010,14 @@ def _default_retrieve(
         # sentence-transformer model load, so its failure surface is open-ended
         # (ImportError, OSError, yaml errors, pydantic ``ValidationError``,
         # model-load failures) and none of it may cross the MCP boundary.
+        #
+        # Building and warming the session's specialist happens *inside* this
+        # try for exactly that reason: it reaches the same import, the same
+        # config load and the same model load, so a session that cannot be
+        # built degrades to an ungrounded-but-successful reflection like every
+        # other retrieval failure. ``GroundingSession.specialist`` stores
+        # nothing when it raises, so the next call retries rather than serving
+        # a permanently broken session.
         #
         # Log the exception's *type name only* — never ``str(exc)``,
         # ``exc_info``, or ``logger.exception``, for the reason given at

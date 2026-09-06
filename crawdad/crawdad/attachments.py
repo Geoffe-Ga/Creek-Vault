@@ -539,6 +539,17 @@ async def process_attachments(
        ``already_present`` and do not re-write it.
     5. Otherwise write the bytes to ``<staging>/<sanitised filename>``.
 
+    :func:`sanitize_filename` is many-to-one, so two attachments in the
+    *same* message can alias onto one staged name (``"a b.md"`` and
+    ``"a_b.md"``; or two long names that share a prefix and collide
+    after truncation). A single ``claimed`` set threaded through the
+    loop makes every attachment in the batch take a name of its own via
+    :func:`_claim_staged_path`, so the second one can never overwrite
+    the first (#917). Without it both :class:`AcceptedAttachment`
+    records name one file, the caller ingests those bytes twice, and
+    the lost attachment's hash is still recorded as ingested — so a
+    later idempotent re-run skips it for good.
+
     Args:
         attachments: Iterable of ``discord.Attachment``-shaped objects.
         vault_path: Vault root.
@@ -556,9 +567,12 @@ async def process_attachments(
     )
     accepted: list[AcceptedAttachment] = []
     rejected: list[RejectedAttachment] = []
+    claimed: set[Path] = set()
 
     for attachment in attachments:
-        result = await _process_one(attachment, staging=staging, config=config)
+        result = await _process_one(
+            attachment, staging=staging, config=config, claimed=claimed
+        )
         if isinstance(result, AcceptedAttachment):
             accepted.append(result)
         else:
@@ -571,17 +585,82 @@ async def process_attachments(
     )
 
 
+def _suffixed_name(safe_name: str, ordinal: int) -> str:
+    """Return *safe_name* with ``-<ordinal>`` spliced in before its extension.
+
+    Ordinal ``0`` is the name itself. Higher ordinals keep the
+    extension (so :func:`infer_ingestor_type` still routes the file)
+    and stay inside :data:`_MAX_FILENAME_CHARS`, trimming the stem when
+    the marker would push the name over the cap.
+
+    Args:
+        safe_name: An already-sanitised filename.
+        ordinal: Which disambiguating suffix to apply.
+
+    Returns:
+        A filename unique to *ordinal* for a given *safe_name*.
+    """
+    if ordinal == 0:
+        return safe_name
+    stem, dot, ext = safe_name.rpartition(".")
+    if dot:
+        tail = f".{ext}"
+    else:
+        stem, tail = safe_name, ""
+    marker = f"-{ordinal}"
+    budget = _MAX_FILENAME_CHARS - len(marker) - len(tail)
+    if budget <= 0:
+        # Pathological: the extension alone eats the whole budget. Drop
+        # it rather than return a name that collides at every ordinal.
+        return f"{stem[: max(_MAX_FILENAME_CHARS - len(marker), 0)]}{marker}"
+    return f"{stem[:budget]}{marker}{tail}"
+
+
+def _claim_staged_path(staging: Path, safe_name: str, *, claimed: set[Path]) -> Path:
+    """Reserve a staged path for *safe_name* that no sibling already holds.
+
+    Walks ordinals until it finds a path outside *claimed*, then records
+    it there. Each ordinal yields a distinct name (the ``-N`` marker
+    ends the stem), and *claimed* is finite — bounded by the number of
+    attachments Discord allows on one message — so the walk terminates.
+
+    Only same-batch siblings are stepped over. An occupied path that no
+    sibling claimed is still returned, leaving the caller's
+    ``already_present`` de-dup and re-upload handling intact.
+
+    Args:
+        staging: The batch's staging directory.
+        safe_name: The sanitised filename this attachment wants.
+        claimed: Paths already taken by this batch; mutated in place.
+
+    Returns:
+        The path this attachment owns for the rest of the batch.
+    """
+    candidate = staging / safe_name
+    ordinal = 0
+    while candidate in claimed:
+        ordinal += 1
+        candidate = staging / _suffixed_name(safe_name, ordinal)
+    claimed.add(candidate)
+    return candidate
+
+
 async def _process_one(
     attachment: _AttachmentLike,
     *,
     staging: Path,
     config: AttachmentConfig,
+    claimed: set[Path],
 ) -> AcceptedAttachment | RejectedAttachment:
     """Apply size + extension gates, then download a single attachment.
 
     Returns either an :class:`AcceptedAttachment` (file written or
     already present at the staged path) or a :class:`RejectedAttachment`
     (limits failed, download errored).
+
+    *claimed* carries the staged paths already taken by earlier
+    attachments in this batch; a path taken here is added to it. See
+    :func:`process_attachments` for why the batch needs that memory.
     """
     if not _extension_allowed(attachment.filename, config):
         _LOGGER.info(
@@ -665,7 +744,7 @@ async def _process_one(
 
     safe_name = sanitize_filename(attachment.filename)
     staging.mkdir(parents=True, exist_ok=True)
-    target = staging / safe_name
+    target = _claim_staged_path(staging, safe_name, claimed=claimed)
 
     content_hash = _content_hash(data)
     already_present = False
@@ -674,16 +753,21 @@ async def _process_one(
         if existing_hash == content_hash:
             already_present = True
         else:
-            # Same filename, different content → re-stage. Discord
-            # message_ids are unique, so the same (channel, message,
-            # filename) collision with different bytes means the user
-            # is intentionally overwriting. Preserve the latest copy.
+            # Same staged path, different content → re-stage. The path is
+            # unclaimed by this batch, so the occupant is a leftover from
+            # an earlier run of this same (channel, message, filename):
+            # Discord message_ids are unique, so that means the user is
+            # intentionally re-uploading. Preserve the latest copy.
             target.write_bytes(data)
     else:
         target.write_bytes(data)
 
+    # ``filename`` is documented as the name on disk, so it reports the
+    # disambiguated name rather than the aliased one: it is what the
+    # summary and the ingest reply show the user, and two bullets naming
+    # one file for two uploads is the same lie by another route.
     return AcceptedAttachment(
-        filename=safe_name,
+        filename=target.name,
         original_filename=attachment.filename,
         size=len(data),
         staged_path=target,

@@ -193,7 +193,7 @@ def _recorded_decision_source(note: Path) -> str | None:
 def _resolve_decision_note_path(
     target_dir: Path,
     stem: str,
-    fragment_id: str,
+    fragment_id: str | None,
 ) -> Path:
     """Return the path *fragment_id*'s Decision note owns under *target_dir*.
 
@@ -203,10 +203,25 @@ def _resolve_decision_note_path(
     or a note whose identity :func:`_recorded_decision_source` cannot
     establish — is skipped, never overwritten.
 
+    ``fragment_id=None`` means the caller claims ownership of *nothing*, so
+    every occupied path is a stranger's and the first **free** one is
+    returned (#1430). :meth:`DecisionDetector.update_decision_phase` passes
+    ``None`` because a *move* is not a write: the note it carries already
+    exists in full, so nothing at the destination could be a legitimate
+    refresh of it, and a same-fragment occupant is a second decision with
+    its own ``id:`` and its own prose rather than an earlier draft of this
+    one. ``None`` is also what :func:`_recorded_decision_source` returns for
+    a note it cannot read, and the explicit guard below is what stops those
+    two ``None`` values meeting and reading as a match.
+
     Deliberately *not* ``VaultWriter._atomic_create``: that helper advances on
     occupancy, so it would mint a new file every run and never converge. This
     one advances on ownership, so the file count is bounded by the number of
-    distinct source fragments.
+    distinct source fragments. Advancing on occupancy is safe for the move
+    caller for the opposite reason — a move *frees* its source name as it
+    takes the destination one, so a note shuttled between ``Active`` and
+    ``Archive`` reclaims its natural name on every leg instead of accruing an
+    ordinal.
 
     Only exact paths are probed — never ``glob``/``iterdir``, which would make
     a batch quadratic in directory size at 35k-fragment scale.
@@ -214,14 +229,15 @@ def _resolve_decision_note_path(
     Args:
         target_dir: Directory the note will be written into.
         stem: Filename stem (without ``.md``) the candidate naturally wants.
-        fragment_id: The candidate's source fragment id — its identity.
+        fragment_id: The candidate's source fragment id — its identity — or
+            ``None`` to claim no existing note and take the first free path.
 
     Returns:
         The path to write to.
 
     Raises:
         RuntimeError: If every one of :data:`_MAX_FILENAME_ORDINALS` probed
-            paths belongs to another fragment.
+            paths is occupied by a note this caller does not own.
     """
     # The ordinal loop is duplicated in creek/generate/compost.py on purpose.
     # Hoisting a shared filename builder is explicitly out of scope for #1334
@@ -229,9 +245,9 @@ def _resolve_decision_note_path(
     for ordinal in range(_MAX_FILENAME_ORDINALS):
         suffix = "" if ordinal == 0 else f"-{ordinal}"
         note_path = target_dir / f"{stem}{suffix}.md"
-        if (
-            not note_path.exists()
-            or _recorded_decision_source(note_path) == fragment_id
+        if not note_path.exists() or (
+            fragment_id is not None
+            and _recorded_decision_source(note_path) == fragment_id
         ):
             return note_path
     msg = (
@@ -427,6 +443,21 @@ class DecisionDetector:
         a note. Converting once, here at the boundary, is what keeps the
         vault free of enum objects.
 
+        **The move never lands on an occupied path.** The destination used to
+        be ``target_dir / source_path.name`` handed straight to
+        ``Path.rename``, which on POSIX *silently replaces* an existing file:
+        archiving a decision whose ``<date>-<sanitised title>`` stem was
+        already taken in ``Archive`` destroyed the note that was there, with
+        no exception and nothing in the return value to notice it by (#1430).
+        The destination is now resolved by :func:`_resolve_decision_note_path`
+        with a ``None`` identity, so an occupied path is skipped for an
+        ordinal rather than overwritten — see that function for why a move
+        claims ownership of nothing and why that cannot accrue copies.
+
+        Resolution happens *before* the status rewrite, so a directory with no
+        free name leaves the vault untouched rather than stranding a note
+        stamped with its new phase in the folder for the old one.
+
         Args:
             decision_id: The ID of the decision to update.
             new_phase: The new phase, as a ``DecisionStatus`` member or as
@@ -438,6 +469,8 @@ class DecisionDetector:
 
         Raises:
             ValueError: If the decision ID is not found or the phase is invalid.
+            RuntimeError: If :data:`_MAX_FILENAME_ORDINALS` consecutive
+                destination filenames are all occupied by other notes.
         """
         phase = str(new_phase)
         if phase not in _VALID_PHASES:
@@ -450,23 +483,30 @@ class DecisionDetector:
             msg = f"Decision {decision_id!r} not found in vault"
             raise ValueError(msg)
 
+        # Determine correct folder, and where in it this note may land
+        target_subfolder = "Active" if phase in _ACTIVE_STATUSES else "Archive"
+        target_dir = decisions_dir / target_subfolder
+        target_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = (
+            source_path
+            if source_path.parent == target_dir
+            else _resolve_decision_note_path(target_dir, source_path.stem, None)
+        )
+
         # Update frontmatter
         post = load_post_or_raise(source_path)
         post["status"] = phase
         source_path.write_text(frontmatter.dumps(post), encoding="utf-8")
 
-        # Determine correct folder
-        target_subfolder = "Active" if phase in _ACTIVE_STATUSES else "Archive"
-        target_dir = decisions_dir / target_subfolder
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        # Move if needed
-        if source_path.parent != target_dir:
-            dest_path = target_dir / source_path.name
+        # Move if needed. ``rename`` rather than ``os.replace``: the resolved
+        # destination is always a free path, so nothing here is meant to be
+        # overwritten, and on the platforms where the two differ ``rename`` is
+        # the one that refuses. The probe-then-move window against a
+        # *concurrent* writer is the same one ``create_decision_note``'s
+        # probe-then-write carries and is not this fix's subject.
+        if dest_path != source_path:
             source_path.rename(dest_path)
-            return dest_path
-
-        return source_path
+        return dest_path
 
     @staticmethod
     def _detect_keywords(fragment: Fragment) -> list[str]:

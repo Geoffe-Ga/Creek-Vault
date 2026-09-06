@@ -12,16 +12,43 @@ from typing import TYPE_CHECKING
 
 import frontmatter
 
+from creek.classify.review import ReviewQueueGenerator
 from creek.clean.hygiene import (
     BrokenLinkScanner,
     DuplicateScanner,
     HygieneReporter,
     OrphanScanner,
     StaleReviewScanner,
+    _parse_datetime,
 )
+from creek.time import LA_TZ
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
+
+
+#: A probe offset sitting strictly inside the America/Los_Angeles offset band
+#: in both DST regimes (PDT is -7 h, PST is -8 h). A wall clock this far onto
+#: the "old" side of a cutoff is over the line when anchored to UTC and under
+#: it when anchored to LA, so a test built on it discriminates the two anchors
+#: without depending on the host machine's own zone (#1115).
+_LA_BAND_PROBE = timedelta(hours=3)
+
+
+def _utcnow_naive() -> datetime:
+    """Return the current UTC wall clock with its offset stripped.
+
+    Deriving the naive probe value from UTC rather than from a bare
+    :func:`datetime.datetime.now` keeps every age assertion independent of
+    the host timezone: CI runs UTC and this lane runs LA, and a value read
+    off the host clock would shift the arithmetic between them.
+
+    Returns:
+        The current UTC wall clock as a naive datetime.
+    """
+    return datetime.now(tz=UTC).replace(tzinfo=None)
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +356,48 @@ class TestOrphanScanner:
 
         assert result.orphan_paths == [str(selfref)]
 
+    def test_age_uses_the_la_anchor_at_the_cutoff(self, tmp_path: Path) -> None:
+        """A naive frontmatter ``created`` ages as an LA wall clock (#1115).
+
+        The ontology (§8.3) anchors every timestamp Creek writes to
+        America/Los_Angeles, so an offsetless ``created`` in frontmatter is
+        an LA wall clock that lost its offset in transit — not a UTC one.
+        Anchoring it to UTC instead made the fragment read 7-8 h *older*
+        than it is, which at the ``age_days`` cutoff is the difference
+        between a live fragment and one ``creek clean orphans`` tells the
+        operator to delete.
+
+        The fixture sits 30 days and 3 h past the cutoff measured in UTC,
+        which is inside the LA offset band in both DST regimes: under the
+        UTC anchor it is old enough, under the LA anchor it is not.
+
+        Args:
+            tmp_path: Pytest-provided temporary directory.
+        """
+        vault = _make_vault(tmp_path)
+        naive_created = _utcnow_naive() - timedelta(days=30) - _LA_BAND_PROBE
+        frag = _write_fragment(vault, "lonely", created=naive_created)
+
+        # The fixture only discriminates the two anchors if the value really
+        # reaches the scanner's naive branch, so assert the round trip that
+        # decides it rather than assuming it. ``frontmatter`` hands the value
+        # back as an offsetless *string* — not, as is easy to assume, as a
+        # datetime resolved by PyYAML's implicit timestamp rule — and it is
+        # ``_parse_datetime``'s ``fromisoformat`` branch that turns it into
+        # the naive datetime ``_is_old_enough`` then anchors. A future
+        # quoting or serialisation change would otherwise make this test
+        # silently vacuous by never reaching that branch at all.
+        raw_created = frontmatter.load(str(frag)).get("created")
+        assert isinstance(raw_created, str)
+        parsed_created = _parse_datetime(raw_created)
+        assert parsed_created is not None
+        assert parsed_created.tzinfo is None
+
+        result = OrphanScanner(age_days=30).scan(vault)
+
+        assert result.total_fragments == 1
+        assert result.orphan_paths == []
+
 
 # ---------------------------------------------------------------------------
 # StaleReviewScanner tests
@@ -388,6 +457,120 @@ class TestStaleReviewScanner:
         scanner = StaleReviewScanner(age_days=0)
         result = scanner.scan(vault)
         assert result.total_review_files == 1
+
+    def test_a_short_time_run_is_rejected_not_re_segmented(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A 4-digit time must not parse as a wrong-but-plausible time.
+
+        ``%H%M%S`` is unseparated, so ``strptime`` let each directive match
+        one *or* two digits and read ``2024-03-15_0830`` as 08:**03**:00 —
+        aging the queue by 27 minutes it never had, with no signal. Same
+        re-segmentation defect as the PDF date parser's (#1632).
+
+        Args:
+            tmp_path: Pytest-provided temporary directory.
+        """
+        scanner = StaleReviewScanner(age_days=0)
+        short = tmp_path / "review-queue-2024-03-15_0830.md"
+        full = tmp_path / "review-queue-2024-03-15_083000.md"
+
+        assert scanner._parse_filename_timestamp(short) is None, (
+            "a 4-digit time run was re-segmented into a wrong time instead "
+            "of being rejected"
+        )
+        assert scanner._parse_filename_timestamp(full) == datetime(
+            2024, 3, 15, 8, 30, tzinfo=LA_TZ
+        )
+
+    def test_parse_filename_timestamp_preserves_the_wall_clock(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The filename's wall-clock fields survive the anchor unchanged.
+
+        Characterisation, green before and after #1115: whichever zone the
+        parser attaches, it must *attach* rather than convert. Reading only
+        the wall-clock fields makes this assertion blind to the tzinfo swap
+        and sensitive to exactly one thing — someone replacing the anchor
+        with an ``astimezone`` conversion, which would slide 08:30 by the
+        offset and, near midnight, across a day boundary.
+
+        Args:
+            tmp_path: Pytest-provided temporary directory.
+        """
+        parsed = StaleReviewScanner()._parse_filename_timestamp(
+            tmp_path / "review-queue-2024-03-15_083000.md",
+        )
+
+        assert parsed is not None
+        assert (
+            parsed.year,
+            parsed.month,
+            parsed.day,
+            parsed.hour,
+            parsed.minute,
+            parsed.second,
+        ) == (2024, 3, 15, 8, 30, 0)
+
+    def test_review_queue_filename_round_trips_through_its_writer(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The scanner reads back the instant the writer meant (#1115).
+
+        ``ReviewQueueGenerator`` stamps the filename from
+        :func:`creek.time.now_la` (``creek/classify/review.py:125``), so the
+        digits in ``review-queue-<ts>.md`` are an *LA* wall clock. The
+        scanner anchored them to UTC, so every review queue read back 7-8 h
+        older than it was and ``creek clean stale-reviews`` aged the whole
+        queue by an offset it never had.
+
+        The test drives the real writer rather than re-implementing its
+        format string, and asserts the produced *name* first: a change to
+        the writer's format then fails loudly here instead of quietly making
+        the round trip vacuous. June is unambiguously PDT (-7 h), so no DST
+        fold enters the comparison.
+
+        Args:
+            tmp_path: Pytest-provided temporary directory.
+            monkeypatch: Used to freeze the writer's clock.
+        """
+        vault = _make_vault(tmp_path)
+        frozen = datetime(2024, 6, 15, 23, 30, tzinfo=LA_TZ)
+        monkeypatch.setattr(
+            "creek.classify.review.now_la",
+            lambda: frozen,
+        )
+
+        path = ReviewQueueGenerator().generate_queue([], vault)
+
+        assert path.name.startswith("review-queue-2024-06-15_2330")
+        assert StaleReviewScanner()._parse_filename_timestamp(path) == frozen
+
+    def test_age_uses_the_la_anchor_at_the_cutoff(self, tmp_path: Path) -> None:
+        """A review queue ages as the LA wall clock its writer stamped (#1115).
+
+        Companion to the round-trip test at the operator-visible surface: a
+        queue 14 days and 3 h old measured in UTC sits inside the LA offset
+        band, so the UTC anchor calls it stale at ``age_days=14`` and the LA
+        anchor — the one its writer actually used — does not.
+
+        Args:
+            tmp_path: Pytest-provided temporary directory.
+        """
+        vault = _make_vault(tmp_path)
+        stem = (_utcnow_naive() - timedelta(days=14) - _LA_BAND_PROBE).strftime(
+            "%Y-%m-%d_%H%M%S",
+        )
+        _write_md_file(vault / f"review-queue-{stem}.md", "# Queue")
+
+        result = StaleReviewScanner(age_days=14).scan(vault)
+
+        assert result.total_review_files == 1
+        assert result.stale_paths == []
 
 
 # ---------------------------------------------------------------------------

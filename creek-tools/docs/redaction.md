@@ -108,6 +108,12 @@ It rewrites more than fragment bodies. Every file whose extension is in
 quietly change its meaning. Three paths are excluded unconditionally —
 `00-Creek-Meta/audit/`, the legacy purge log, and
 `<vault>/00-Creek-Meta/creek_config.yaml` (#1398) — and nothing else is.
+"Unconditionally" covers the vault *root* as well as the extension and
+exclude lists: the protected set is anchored on every vault reachable
+from `--source`, not on `--vault` alone. Before #1561 a run without
+`--vault` anchored on the process working directory, so `--source
+<vault>` from a neighbouring directory rewrote that vault's own config
+and purge log.
 Your own structured files are still in scope, so point `--source` at the
 narrowest tree that needs cleaning rather than at a whole vault.
 
@@ -138,7 +144,28 @@ For every match found by the scan:
    covers just the key half from leaving that tail in cleartext (issue
    #909). Strings on `false_positive_allowlist` are exempt from this
    widening — a regex match inside such a string still redacts only its
-   own span.
+   own span. A marker rendered from `replacement_template` for a name in
+   the active pattern set is likewise inert to every detector at every
+   `min_confidence`, so `--apply` is idempotent and re-running it can
+   never nest markers into `[REDACTED:[REDACTED:...]]` (issue #945). That
+   exemption is matched as a *literal at its own offset*, never by shape:
+   a forged `[REDACTED:<a real secret>]` is still redacted, a bare
+   pattern name in prose is still redacted, and the regex detectors keep
+   firing inside marker text. The guarantee holds for a single-line
+   `replacement_template` whose `{name}` is delimited on both sides by a
+   character outside `[A-Za-z0-9+/=_-]` — the default `[REDACTED:{name}]`
+   is. Two caveats apply to other templates, and neither affects the
+   default. **Delimiter-free** templates (`{name}`, `REDACTED_{name}_END`)
+   render a marker that is *itself* one candidate run, so the exemption
+   reduces to matching that literal anywhere; a `custom_patterns` **key**
+   of 20+ token characters then acts as a `false_positive_allowlist` entry
+   for its own name, and a marker spliced flush against neighbouring token
+   characters forms a *new*, longer run that is correctly not exempt.
+   **Multi-line** templates are worse: `--apply` still treats the marker as
+   inert, but `--scan` walks line by line and cannot see a marker that
+   straddles the break, so it reports a finding that no `--apply` can
+   clear — which also blocks `creek process`. Keep the template on one
+   line.
 2. Refuses to write through symlinks (path-traversal guard): before any
    file is read or rewritten the source tree is walked and the run is
    aborted if any descendant symlink resolves outside the source root.
@@ -267,6 +294,9 @@ independent of `supported_extensions` and `exclude_patterns`:
 - the whole of `00-Creek-Meta/audit/`
 - the legacy `00-Creek-Meta/Processing-Log/purge-log.json`
 - `00-Creek-Meta/creek_config.yaml`
+
+This holds whether or not you pass `--vault`: the roots are derived from
+`--source` itself (#1561).
 
 Detection is unaffected: `--scan` and `--review` still report matches there.
 

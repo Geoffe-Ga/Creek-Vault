@@ -45,6 +45,19 @@ def classify_tool(
     escalate-only, so a run can move a fragment out of a remote
     consumer's reach and never into it.
 
+    All of that is about the *response* and the frontmatter, and it says
+    nothing about the prompt channel — where the ceiling is not a control
+    either. With ``method="llm"`` every fragment's **title and body**
+    under ``01-Fragments`` is shown to the configured classification
+    provider whatever ceiling was declared, ``open`` included — both are
+    interpolated into the prompt by ``build_classification_prompt``, each
+    capped at 8192 chars by ``_sanitise_for_prompt``. ``INTIMATE`` is
+    redirected to a local provider by
+    ``ModelRouter._enforce_local_for_intimate`` (#647/#666); ``PERSONAL``
+    is not. See ``creek_mcp.read_gate._CLASSIFY_PROMPT_CHANNEL_RATIONALE``
+    for the full statement of what does and does not gate that walk
+    (#1274).
+
     Args:
         vault_path: Vault root to classify.
         method: ``"rules"`` or ``"llm"``.
@@ -115,6 +128,12 @@ def classify_tool(
         # consumers can present the two reasons distinctly.
         "preserved_llm": summary.preserved_llm,
         "skipped_high_confidence": summary.skipped_high_confidence,
+        # Issue #1356: the LLM-failed skips used to roll into the field above,
+        # so a run against a downed provider reported itself as a run in which
+        # the rules were confident. Surfaced separately because only this one
+        # tells the consumer the corpus is under-classified and the pass is
+        # worth repeating.
+        "llm_call_failed": summary.llm_call_failed,
         # Issue #876: how many fragments this run gave a real privacy
         # tier. Surfaced separately from ``classified`` because the tier
         # pass also runs on fragments the resume short-circuit preserved.
@@ -135,5 +154,11 @@ def classify_tool(
         # until #878, and an invisible producer is how that bug survived
         # 35,330 fragments and an empty Tag Garden.
         "tags_extracted": summary.tags_extracted,
+        # Issue #1357: how many fragments this run refused to treat as
+        # already-LLM-classified because the pre-#1358 weighted soft-failure
+        # path stamped them without any LLM running. Surfaced here for the
+        # same reason as on the CLI: every other field on this payload counts
+        # such a fragment as done.
+        "healed_unearned_llm": summary.healed_unearned_llm,
         "errors": list(summary.errors),
     }

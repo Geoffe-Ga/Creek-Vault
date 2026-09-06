@@ -17,6 +17,7 @@ fragment IDs. The acceptance criteria covered here:
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -862,6 +863,221 @@ def test_compile_to_vault_leaves_existing_page_untouched_on_string_claims(
             llm_factory=lambda _tier: llm,
         )
     assert target.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize("field", ["claims", "paradoxes"])
+@pytest.mark.parametrize(
+    "falsy",
+    [0, "", False, {}],
+    ids=["zero", "empty-string", "false", "empty-object"],
+)
+def test_compile_fragments_rejects_falsy_wrong_typed_arrays(
+    falsy: object,
+    field: str,
+) -> None:
+    """A *falsy* non-list ``claims``/``paradoxes`` is refused, not coerced.
+
+    ``decoded.get(field) or []`` ran before the isinstance guard, so
+    every falsy wrong-typed value became ``[]`` and the schema check
+    below it never saw the value it exists to reject. The payload then
+    compiled to a title-only page that overwrote whatever was already
+    on disk.
+    """
+    frag = _make_fragment(frag_id="frag-aaa")
+    payload: dict[str, object] = {"claims": [], "paradoxes": []}
+    payload[field] = falsy
+    llm, _ = _make_llm([json.dumps(payload)])
+    with pytest.raises(ValueError, match="must be arrays"):
+        compile_fragments(
+            [(frag, "body")],
+            llm=llm,
+            target_kind="thread",
+            target_id="t",
+            target_title="T",
+        )
+
+
+def test_compile_fragments_tolerates_explicit_null_arrays() -> None:
+    """An explicit ``null`` still means "nothing here" and compiles cleanly.
+
+    The tolerated half of the guard above: models routinely emit
+    ``null`` for an empty array, and that reading is unambiguous, so it
+    keeps meaning the empty list while ``0`` / ``""`` / ``false`` /
+    ``{}`` do not.
+    """
+    frag = _make_fragment(frag_id="frag-aaa")
+    llm, _ = _make_llm([json.dumps({"claims": None, "paradoxes": None})])
+    result = compile_fragments(
+        [(frag, "body")],
+        llm=llm,
+        target_kind="thread",
+        target_id="t",
+        target_title="T",
+    )
+    assert result.page.provenance == []
+    assert result.paradoxes == []
+
+
+def test_compile_to_vault_leaves_existing_page_untouched_on_falsy_claims(
+    vault: Path,
+) -> None:
+    """A falsy wrong-typed re-compile aborts before it touches the page.
+
+    The falsy counterpart of
+    ``test_compile_to_vault_leaves_existing_page_untouched_on_string_claims``:
+    the previously compiled page must be *byte*-identical afterwards,
+    not merely still present.
+    """
+    frag = _make_fragment(frag_id="frag-aaa")
+    _write_fragment_to_vault(vault, frag, "body")
+    good = _llm_response(
+        claims=[
+            {
+                "id": "claim-001",
+                "text": "Stable claim.",
+                "fragment_ids": ["frag-aaa"],
+            },
+        ],
+    )
+    bad = json.dumps({"claims": {}, "paradoxes": []})
+    llm, _ = _make_llm([good, bad])
+
+    target = compile_to_vault(
+        fragment_ids=["frag-aaa"],
+        vault_path=vault,
+        target_kind="thread",
+        target_id="thread-falsy",
+        target_title="Falsy",
+        llm_factory=lambda _tier: llm,
+    )
+    before = target.read_bytes()
+    assert b"Stable claim." in before
+
+    with pytest.raises(ValueError, match="must be arrays"):
+        compile_to_vault(
+            fragment_ids=["frag-aaa"],
+            vault_path=vault,
+            target_kind="thread",
+            target_id="thread-falsy",
+            target_title="Falsy",
+            llm_factory=lambda _tier: llm,
+        )
+    assert target.read_bytes() == before
+
+
+def test_compile_fragments_drops_provenance_this_run_did_not_reproduce() -> None:
+    """Provenance never outlives the body: an unreproduced entry is dropped.
+
+    Compile regenerates the whole body from the claims it was just
+    handed, so an existing entry the run did not re-emit describes a
+    claim the new body does not contain.
+    """
+    frag = _make_fragment(frag_id="frag-aaa")
+    stale = ProvenanceEntry(
+        claim_id="claim-old",
+        claim_excerpt="An earlier claim.",
+        fragment_ids=["frag-zzz"],
+        compiled_at=datetime(2026, 1, 1, tzinfo=UTC),
+        compile_method="llm",
+    )
+    llm, _ = _make_llm(
+        [
+            _llm_response(
+                claims=[
+                    {
+                        "id": "claim-new",
+                        "text": "A fresh claim.",
+                        "fragment_ids": ["frag-aaa"],
+                    },
+                ],
+            ),
+        ],
+    )
+    result = compile_fragments(
+        [(frag, "body")],
+        llm=llm,
+        target_kind="thread",
+        target_id="t",
+        target_title="T",
+        existing_provenance=[stale],
+    )
+    assert [p.claim_id for p in result.page.provenance] == ["claim-new"]
+    assert all(
+        entry.compiled_at == result.page.compiled_at for entry in result.page.provenance
+    )
+
+
+def test_compile_to_vault_empty_recompile_leaves_no_stale_provenance(
+    vault: Path,
+) -> None:
+    """An empty compile publishes an empty page, not one asserting old sources.
+
+    ``{"claims": []}`` is a legitimate answer, so the page is rewritten
+    — but the previous run's provenance must not survive into a body
+    that no longer contains those claims.
+    """
+    frag = _make_fragment(frag_id="frag-aaa")
+    _write_fragment_to_vault(vault, frag, "body")
+    good = _llm_response(
+        claims=[
+            {
+                "id": "claim-001",
+                "text": "Stable claim.",
+                "fragment_ids": ["frag-aaa"],
+            },
+        ],
+    )
+    empty = _llm_response(claims=[])
+    llm, _ = _make_llm([good, empty])
+
+    for _ in range(2):
+        target = compile_to_vault(
+            fragment_ids=["frag-aaa"],
+            vault_path=vault,
+            target_kind="thread",
+            target_id="thread-empty",
+            target_title="Empty",
+            llm_factory=lambda _tier: llm,
+        )
+
+    post = frontmatter.load(str(target))
+    assert "Stable claim." not in post.content
+    assert post.metadata["provenance"] == []
+
+
+def test_write_compiled_page_keeps_the_previous_page_when_the_commit_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed write leaves the previously compiled page byte-identical.
+
+    ``Path.write_text`` truncates the target before it writes, so an
+    interrupted re-compile destroyed the good page and left a stub.
+    Committing through :func:`creek._fsio.atomic_write_text` means the
+    real path only ever changes on a clean write.
+    """
+    from creek.compile import engine as engine_module
+
+    target = tmp_path / "page.md"
+    target.write_text("# Previously compiled\n\nA good page.\n", encoding="utf-8")
+    before = target.read_bytes()
+    page = CompiledPage(
+        target_kind="thread",
+        target_id="thread-x",
+        title="X",
+        body="# X\n",
+    )
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        msg = "no space left on device"
+        raise OSError(msg)
+
+    monkeypatch.setattr(os, "replace", _boom)
+    with pytest.raises(OSError, match="no space left"):
+        engine_module._write_compiled_page(target, page)
+
+    assert target.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [target]
 
 
 def test_compile_fragments_skips_claim_with_missing_id() -> None:

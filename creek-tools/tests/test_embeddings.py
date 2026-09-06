@@ -8,8 +8,11 @@ conftest.py to avoid model downloads.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
+import resource
+import signal
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -28,6 +31,7 @@ from creek.link.embeddings import (
 from creek.models import Fragment, FragmentLevel, FragmentSource, SourcePlatform
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
     from unittest.mock import MagicMock
 
@@ -1327,3 +1331,133 @@ def test_similarity_threshold_is_inclusive_at_the_boundary() -> None:
     # similar.
     above = EmbeddingLinker(config=EmbeddingsConfig(similarity_threshold=1.0001))
     assert above.find_resonances(corpus) == []
+
+
+# ---------------------------------------------------------------------------
+# Mid-write durability of the parquet cache (#1441)
+# ---------------------------------------------------------------------------
+
+_CEILING_BYTES = 64 * 1024
+"""File-size ceiling that a full oversized-cache write cannot fit under."""
+
+_OVERSIZED_ROWS = 2000
+"""Rows whose snappy-compressed parquet measures ~178 KiB — well past the ceiling."""
+
+_OVERSIZED_DIMS = 64
+"""Vector width for the oversized corpus; wide enough to resist compression."""
+
+
+@contextlib.contextmanager
+def _file_size_ceiling(limit_bytes: int) -> Iterator[None]:
+    """Cap this process's file size so a real bulk write fails part-way.
+
+    ``RLIMIT_FSIZE`` makes the kernel fail the write that crosses
+    *limit_bytes* with ``EFBIG``, which is a genuine mid-write I/O
+    failure inside pyarrow rather than a stubbed writer. ``SIGXFSZ``
+    must be ignored for the duration or its default disposition kills
+    the interpreter before the errno can surface.
+
+    Args:
+        limit_bytes: Soft file-size limit to impose while the block runs.
+
+    Yields:
+        ``None``; the ceiling is in force for the body only.
+    """
+    soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+    previous = signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+    resource.setrlimit(resource.RLIMIT_FSIZE, (limit_bytes, hard))
+    try:
+        yield
+    finally:
+        resource.setrlimit(resource.RLIMIT_FSIZE, (soft, hard))
+        signal.signal(signal.SIGXFSZ, previous)
+
+
+def _oversized_entries() -> dict[str, CachedEmbedding]:
+    """Build a cache too large to write under :data:`_CEILING_BYTES`.
+
+    Returns:
+        Mapping of fragment ID to entry, with vectors varied enough that
+        snappy cannot compress the payload back under the ceiling.
+    """
+    return {
+        f"frag-{i:05d}": _entry(
+            f"frag-{i:05d}",
+            vector=[(i * j % 977) / 977.0 for j in range(_OVERSIZED_DIMS)],
+        )
+        for i in range(_OVERSIZED_ROWS)
+    }
+
+
+class TestCacheWriteDurability:
+    """A failed cache write must not destroy the cache it was replacing (#1441)."""
+
+    def test_successful_save_leaves_no_staging_file(self, tmp_path: Path) -> None:
+        """The happy path leaves the target and nothing else behind."""
+        linker = EmbeddingLinker(config=EmbeddingsConfig())
+        cache_path = tmp_path / "embeddings.parquet"
+
+        linker.save_cache({"frag-A": _entry("frag-A", vector=[0.1, 0.2])}, cache_path)
+
+        assert [p.name for p in tmp_path.iterdir()] == ["embeddings.parquet"]
+
+    def test_mid_write_failure_preserves_the_previous_cache(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A real ``EFBIG`` part-way through ``save_cache`` costs nothing.
+
+        The prior parquet must still be byte-identical and still load,
+        because re-embedding a large corpus is the expensive thing this
+        cache exists to avoid.
+        """
+        linker = EmbeddingLinker(config=EmbeddingsConfig())
+        cache_path = tmp_path / "embeddings.parquet"
+        linker.save_cache(
+            {"frag-keep": _entry("frag-keep", vector=[0.1, 0.2, 0.3])},
+            cache_path,
+        )
+        original_bytes = cache_path.read_bytes()
+
+        with _file_size_ceiling(_CEILING_BYTES), pytest.raises(OSError):
+            linker.save_cache(_oversized_entries(), cache_path)
+
+        assert cache_path.read_bytes() == original_bytes
+        loaded = linker.load_cache(cache_path)
+        assert set(loaded) == {"frag-keep"}
+        np.testing.assert_allclose(loaded["frag-keep"].vector, [0.1, 0.2, 0.3])
+
+    def test_mid_write_failure_leaves_no_staging_file(self, tmp_path: Path) -> None:
+        """A failed run cannot litter ``00-Creek-Meta`` with scratch files."""
+        linker = EmbeddingLinker(config=EmbeddingsConfig())
+        cache_path = tmp_path / "embeddings.parquet"
+        linker.save_cache({"frag-keep": _entry("frag-keep", vector=[0.5])}, cache_path)
+
+        with _file_size_ceiling(_CEILING_BYTES), pytest.raises(OSError):
+            linker.save_cache(_oversized_entries(), cache_path)
+
+        assert [p.name for p in tmp_path.iterdir()] == ["embeddings.parquet"]
+
+    def test_purge_mid_write_failure_preserves_the_previous_cache(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """``purge_fragment_ids_from_cache`` rewrites the same file, same rule.
+
+        A torn purge that destroyed the cache would trade a
+        right-to-be-forgotten scrub for a full re-embed of the corpus.
+        """
+        from creek.link.embeddings import purge_fragment_ids_from_cache
+
+        linker = EmbeddingLinker(config=EmbeddingsConfig())
+        cache_path = tmp_path / "embeddings.parquet"
+        entries = _oversized_entries()
+        linker.save_cache(entries, cache_path)
+        original_bytes = cache_path.read_bytes()
+
+        with _file_size_ceiling(_CEILING_BYTES), pytest.raises(OSError):
+            purge_fragment_ids_from_cache(cache_path, ["frag-00000"])
+
+        assert cache_path.read_bytes() == original_bytes
+        assert set(linker.load_cache(cache_path)) == set(entries)
+        assert [p.name for p in tmp_path.iterdir()] == ["embeddings.parquet"]

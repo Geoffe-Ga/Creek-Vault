@@ -42,6 +42,8 @@ successful, zero-issue run.
 ## Output Format
 Findings as a JSON list, one object per marker (or marker cluster):
 
+**`symbol` is mandatory whenever the finding names a function, method or class** (#1651). Declare it as a field — `symbol: "name"` or `symbols: ["a", "b"]` — never only inside the title string, and never a name paraphrased from surrounding code. Every declared symbol is verified against the scan SHA's blob by `creek-tools/scripts/verify-scan-citations.sh` before any issue is filed, and a name that has no definition at that SHA blocks the create. A finding that legitimately names no symbol (a whole-module or config finding) simply omits the field. A symbol you are PROPOSING to create — a refactor target — belongs in `fix_strategy`, not in `symbol`.
+
 ```json
 {
   "slug": "todo-resonance-batch-embeddings",
@@ -49,6 +51,7 @@ Findings as a JSON list, one object per marker (or marker cluster):
   "severity": 3,
   "file": "creek-tools/creek/link/resonance.py",
   "lines": "142",
+  "symbol": "score_resonance",
   "marker": "TODO",
   "evidence": "the grep hit plus 3–5 lines of surrounding code",
   "goal": "one measurable sentence for the issue's Goal component"

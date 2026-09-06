@@ -1,25 +1,32 @@
 """Tests for creek.config module — configuration loader with Pydantic Settings."""
 
+import inspect
 import itertools
 import logging
 import warnings
+from collections.abc import Callable
 from pathlib import Path
-from typing import get_args
+from typing import Final, get_args
 
 import pytest
 import yaml
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
+from creek.clean.filters.chatbot import ChatbotFilterConfig
+from creek.clean.filters.discord import DiscordFilterConfig
+from creek.clean.filters.google_drive import GoogleDriveFilter
+from creek.clean.filters.markdown import MarkdownFilter
+from creek.clean.hygiene import OrphanScanner, StaleReviewScanner
+from creek.clean.quality import QualityScorer
+from creek.clean.validator import FragmentValidator
 from creek.config import (
     CONFIG_PATH_ENV_VAR,
     AIStyleConfig,
     AuthorConfig,
-    ChatbotCleaningConfig,
     ClassificationConfig,
     CleaningConfig,
     CreekConfig,
-    DeduplicationConfig,
-    DiscordCleaningConfig,
+    DedupCleaningConfig,
     EmbeddingsConfig,
     GoogleDriveCleaningConfig,
     GoogleDriveConfig,
@@ -34,6 +41,7 @@ from creek.config import (
     SourcePaths,
     ValidationConfig,
     VoiceAudienceWeightingConfig,
+    _default_authorship_weights,
     generate_default_config,
     load_config,
 )
@@ -360,43 +368,83 @@ class TestSourcePaths:
 # ---------------------------------------------------------------------------
 
 
-class TestDiscordCleaningConfig:
-    """Tests for DiscordCleaningConfig model."""
+class TestDiscordFilterConfig:
+    """Tests for the ``cleaning.discord`` model (``DiscordFilterConfig``).
+
+    Renamed from ``TestDiscordCleaningConfig`` by #1519, which collapsed the
+    config-side twin onto the class the filter actually runs on. Every field
+    the old twin had is still asserted, under the surviving name.
+    """
 
     def test_defaults(self) -> None:
-        """DiscordCleaningConfig should have sensible defaults."""
-        cfg = DiscordCleaningConfig()
-        assert cfg.filter_bot_messages is True
+        """``DiscordFilterConfig`` should have sensible defaults."""
+        cfg = DiscordFilterConfig()
+        assert cfg.skip_bots is True
         assert cfg.strip_emoji is False
-        assert cfg.filter_commands is True
-        assert cfg.min_message_length == 10
+        assert cfg.skip_commands is True
+        assert cfg.min_length == 3
+        assert cfg.skip_emoji_only is True
+        assert cfg.skip_media_only is True
+        assert cfg.skip_below_min_length is True
+        assert cfg.flag_link_dumps is True
+        assert cfg.command_prefixes == ["/", "!", "."]
 
     def test_custom_values(self) -> None:
-        """DiscordCleaningConfig should accept custom values."""
-        cfg = DiscordCleaningConfig(
-            filter_bot_messages=False,
+        """``DiscordFilterConfig`` should accept custom values."""
+        cfg = DiscordFilterConfig(
+            skip_bots=False,
             strip_emoji=True,
-            min_message_length=50,
+            min_length=50,
+            command_prefixes=["?"],
         )
-        assert cfg.filter_bot_messages is False
+        assert cfg.skip_bots is False
         assert cfg.strip_emoji is True
-        assert cfg.min_message_length == 50
+        assert cfg.min_length == 50
+        assert cfg.command_prefixes == ["?"]
+
+    def test_strip_emoji_is_not_skip_emoji_only(self) -> None:
+        """The two emoji knobs are separate operations with opposite defaults.
+
+        #1519 kept both rather than merging them: ``skip_emoji_only`` drops a
+        message that is nothing but emoji, while ``strip_emoji`` would edit a
+        message Creek keeps.
+        """
+        cfg = DiscordFilterConfig()
+        assert cfg.strip_emoji is not cfg.skip_emoji_only
 
 
-class TestChatbotCleaningConfig:
-    """Tests for ChatbotCleaningConfig model."""
+class TestChatbotFilterConfig:
+    """Tests for the ``cleaning.chatbot`` model (``ChatbotFilterConfig``).
+
+    Renamed from ``TestChatbotCleaningConfig`` by #1519.
+    """
 
     def test_defaults(self) -> None:
-        """ChatbotCleaningConfig should have sensible defaults."""
-        cfg = ChatbotCleaningConfig()
-        assert cfg.filter_system_prompts is True
-        assert cfg.filter_tool_outputs is True
-        assert cfg.filter_regenerations is True
+        """``ChatbotFilterConfig`` should have sensible defaults."""
+        cfg = ChatbotFilterConfig()
+        assert cfg.skip_system_prompts is True
+        assert cfg.skip_tool_outputs is True
+        assert cfg.collapse_regenerations is True
+        assert cfg.min_human_turn_length == 20
+        assert cfg.code_block_threshold == 0.9
+        assert cfg.max_abandoned_turns == 2
 
     def test_custom_values(self) -> None:
-        """ChatbotCleaningConfig should accept custom values."""
-        cfg = ChatbotCleaningConfig(filter_system_prompts=False)
-        assert cfg.filter_system_prompts is False
+        """``ChatbotFilterConfig`` should accept custom values."""
+        cfg = ChatbotFilterConfig(skip_system_prompts=False)
+        assert cfg.skip_system_prompts is False
+
+    def test_bounds_are_enforced(self) -> None:
+        """The surviving class carries bounds the config twin lacked.
+
+        A tightening, not a loosening: values the deleted
+        ``ChatbotCleaningConfig`` would have accepted silently are now
+        rejected loudly.
+        """
+        with pytest.raises(ValidationError):
+            ChatbotFilterConfig(code_block_threshold=1.5)
+        with pytest.raises(ValidationError):
+            ChatbotFilterConfig(min_human_turn_length=-1)
 
 
 class TestMarkdownCleaningConfig:
@@ -406,7 +454,7 @@ class TestMarkdownCleaningConfig:
         """MarkdownCleaningConfig should have sensible defaults."""
         cfg = MarkdownCleaningConfig()
         assert cfg.skip_empty_files is True
-        assert cfg.min_body_length == 50
+        assert cfg.min_body_length == 10
 
     def test_custom_values(self) -> None:
         """MarkdownCleaningConfig should accept custom values."""
@@ -422,30 +470,40 @@ class TestGoogleDriveCleaningConfig:
         cfg = GoogleDriveCleaningConfig()
         assert cfg.deduplicate is True
         assert cfg.filter_empty_docs is True
-        assert cfg.max_collaboration_ratio == 0.9
+        assert cfg.multi_author_threshold == 0.5
 
     def test_custom_values(self) -> None:
         """GoogleDriveCleaningConfig should accept custom values."""
-        cfg = GoogleDriveCleaningConfig(max_collaboration_ratio=0.5)
-        assert cfg.max_collaboration_ratio == 0.5
+        cfg = GoogleDriveCleaningConfig(multi_author_threshold=0.8)
+        assert cfg.multi_author_threshold == 0.8
 
 
 class TestValidationConfig:
-    """Tests for ValidationConfig model."""
+    """Tests for ValidationConfig model.
+
+    #1519 moved ``min_words`` and ``max_stop_word_ratio`` out of this block:
+    ``FragmentValidator`` runs no word-count and no stop-word check, so the
+    two knobs were describing ``QualityScorer``, in a different block. They
+    are asserted by :class:`TestQualityConfig` below.
+    """
 
     def test_defaults(self) -> None:
         """ValidationConfig should have sensible defaults."""
         cfg = ValidationConfig()
-        assert cfg.min_characters == 20
-        assert cfg.min_words == 5
-        assert cfg.max_stop_word_ratio == 0.8
+        assert cfg.min_content_length == 20
         assert cfg.require_metadata is True
 
     def test_custom_values(self) -> None:
         """ValidationConfig should accept custom values."""
-        cfg = ValidationConfig(min_characters=50, min_words=10)
-        assert cfg.min_characters == 50
-        assert cfg.min_words == 10
+        cfg = ValidationConfig(min_content_length=50, require_metadata=False)
+        assert cfg.min_content_length == 50
+        assert cfg.require_metadata is False
+
+    def test_the_relocated_knobs_are_gone_from_this_block(self) -> None:
+        """The two knobs #1519 relocated must not linger here as well."""
+        fields = set(ValidationConfig.model_fields)
+        assert "min_words" not in fields
+        assert "max_stop_word_ratio" not in fields
 
 
 class TestQualityConfig:
@@ -454,46 +512,86 @@ class TestQualityConfig:
     def test_defaults(self) -> None:
         """QualityConfig should have sensible defaults."""
         cfg = QualityConfig()
-        assert cfg.accept_threshold == 0.7
-        assert cfg.skip_threshold == 0.3
+        assert cfg.accept_threshold == 0.6
+        assert cfg.review_threshold == 0.3
+        assert cfg.min_words == 10
+        assert cfg.stop_word_threshold == 0.7
 
     def test_custom_values(self) -> None:
         """QualityConfig should accept custom values."""
-        cfg = QualityConfig(accept_threshold=0.8, skip_threshold=0.2)
+        cfg = QualityConfig(
+            accept_threshold=0.8,
+            review_threshold=0.2,
+            min_words=3,
+            stop_word_threshold=0.5,
+        )
         assert cfg.accept_threshold == 0.8
-        assert cfg.skip_threshold == 0.2
+        assert cfg.review_threshold == 0.2
+        assert cfg.min_words == 3
+        assert cfg.stop_word_threshold == 0.5
 
 
-class TestDeduplicationConfig:
-    """Tests for DeduplicationConfig model."""
+class TestDedupCleaningConfig:
+    """Tests for DedupCleaningConfig model.
+
+    Renamed from ``DeduplicationConfig`` by #1519 because
+    ``creek.clean.semantic_dedup`` defines a class of that name with a
+    disjoint field set. Both YAML leaf paths are unchanged.
+    """
 
     def test_defaults(self) -> None:
-        """DeduplicationConfig should have sensible defaults."""
-        cfg = DeduplicationConfig()
+        """DedupCleaningConfig should have sensible defaults."""
+        cfg = DedupCleaningConfig()
         assert cfg.strategy == "fuzzy"
         assert cfg.similarity_threshold == 0.85
 
     def test_custom_values(self) -> None:
-        """DeduplicationConfig should accept custom values."""
-        cfg = DeduplicationConfig(strategy="exact", similarity_threshold=1.0)
+        """DedupCleaningConfig should accept custom values."""
+        cfg = DedupCleaningConfig(strategy="exact", similarity_threshold=1.0)
         assert cfg.strategy == "exact"
         assert cfg.similarity_threshold == 1.0
 
+    def test_it_is_not_the_semantic_deduplicator_model(self) -> None:
+        """The rename must leave two distinct classes, not one merged model.
+
+        They describe different subsystems that collided on a name: this one
+        configures the hash-based ``Deduplicator``, the other cosine
+        thresholds over embeddings.
+        """
+        from creek.clean.semantic_dedup import (
+            DeduplicationConfig as SemanticDeduplicationConfig,
+        )
+
+        assert DedupCleaningConfig is not SemanticDeduplicationConfig
+        assert set(DedupCleaningConfig.model_fields).isdisjoint(
+            SemanticDeduplicationConfig.model_fields,
+        )
+
 
 class TestHygieneConfig:
-    """Tests for HygieneConfig model."""
+    """Tests for HygieneConfig model.
+
+    #1519 split ``staleness_days`` (one knob at 90) into the two values the
+    two scanners actually run at.
+    """
 
     def test_defaults(self) -> None:
         """HygieneConfig should have sensible defaults."""
         cfg = HygieneConfig()
         assert cfg.track_orphans is True
-        assert cfg.staleness_days == 90
+        assert cfg.orphan_age_days == 30
+        assert cfg.stale_review_days == 14
 
     def test_custom_values(self) -> None:
         """HygieneConfig should accept custom values."""
-        cfg = HygieneConfig(track_orphans=False, staleness_days=30)
+        cfg = HygieneConfig(
+            track_orphans=False,
+            orphan_age_days=7,
+            stale_review_days=3,
+        )
         assert cfg.track_orphans is False
-        assert cfg.staleness_days == 30
+        assert cfg.orphan_age_days == 7
+        assert cfg.stale_review_days == 3
 
 
 class TestCleaningConfig:
@@ -502,25 +600,297 @@ class TestCleaningConfig:
     def test_defaults(self) -> None:
         """CleaningConfig should compose all sub-configs with defaults."""
         cfg = CleaningConfig()
-        assert isinstance(cfg.discord, DiscordCleaningConfig)
-        assert isinstance(cfg.chatbot, ChatbotCleaningConfig)
+        assert isinstance(cfg.discord, DiscordFilterConfig)
+        assert isinstance(cfg.chatbot, ChatbotFilterConfig)
         assert isinstance(cfg.markdown, MarkdownCleaningConfig)
         assert isinstance(cfg.google_drive, GoogleDriveCleaningConfig)
         assert isinstance(cfg.validation, ValidationConfig)
         assert isinstance(cfg.quality, QualityConfig)
-        assert isinstance(cfg.deduplication, DeduplicationConfig)
+        assert isinstance(cfg.deduplication, DedupCleaningConfig)
         assert isinstance(cfg.hygiene, HygieneConfig)
 
     def test_partial_override(self) -> None:
         """CleaningConfig should accept partial overrides."""
         cfg = CleaningConfig(
-            discord=DiscordCleaningConfig(min_message_length=25),
+            discord=DiscordFilterConfig(min_length=25),
             quality=QualityConfig(accept_threshold=0.9),
         )
-        assert cfg.discord.min_message_length == 25
+        assert cfg.discord.min_length == 25
         assert cfg.quality.accept_threshold == 0.9
         # Other sub-configs keep defaults
-        assert cfg.chatbot.filter_system_prompts is True
+        assert cfg.chatbot.skip_system_prompts is True
+
+
+class TestLegacyCleaningKeys:
+    """The pre-#1519 cleaning keys migrate rather than vanish.
+
+    Every ``creek_config.yaml`` ``creek init`` has ever written carries all
+    of this block's old key names *and* old values, because
+    ``generate_default_config`` dumps the whole model with no hand-written
+    key list. The shim therefore has to do two different things: move a key
+    an operator deliberately set, and *drop* one that merely carries the old
+    default — because re-installing that value would revert the drift
+    resolution on every existing vault.
+    """
+
+    def test_a_deliberate_legacy_value_is_carried_to_the_new_name(self) -> None:
+        """A value that is not the old default was typed on purpose."""
+        cfg = CleaningConfig.model_validate(
+            {"discord": {"min_message_length": 25}},
+        )
+        assert cfg.discord.min_length == 25
+
+    def test_a_legacy_key_holding_the_old_default_adopts_the_new_one(
+        self,
+    ) -> None:
+        """The old default was written by ``creek init``, not chosen.
+
+        This is the arm that stops the migration re-installing
+        ``min_length: 10`` on every installed vault — which would arm a live
+        Discord data-retention change the day #1041 wires the block.
+        """
+        cfg = CleaningConfig.model_validate(
+            {"discord": {"min_message_length": 10}},
+        )
+        assert cfg.discord.min_length == 3
+
+    def test_a_same_named_key_holding_the_old_default_is_dropped(self) -> None:
+        """Two drifted keys kept their names; the value still must not survive.
+
+        ``quality.accept_threshold`` and ``markdown.min_body_length`` are
+        spelled identically before and after #1519, so a migration keyed on
+        renames alone would let the drifted value straight through.
+        """
+        cfg = CleaningConfig.model_validate(
+            {"quality": {"accept_threshold": 0.7}, "markdown": {"min_body_length": 50}},
+        )
+        assert cfg.quality.accept_threshold == 0.6
+        assert cfg.markdown.min_body_length == 10
+
+    def test_a_same_named_key_holding_a_chosen_value_is_kept(self) -> None:
+        """A deliberate value under an unchanged name passes through."""
+        cfg = CleaningConfig.model_validate({"quality": {"accept_threshold": 0.95}})
+        assert cfg.quality.accept_threshold == 0.95
+
+    def test_a_relocated_key_lands_in_the_other_block(self) -> None:
+        """``validation.min_words`` belongs to ``quality``, whose consumer owns it."""
+        cfg = CleaningConfig.model_validate({"validation": {"min_words": 4}})
+        assert cfg.quality.min_words == 4
+        assert "min_words" not in ValidationConfig.model_fields
+
+    def test_the_new_spelling_is_left_alone(self) -> None:
+        """A config already written the new way is not touched."""
+        cfg = CleaningConfig.model_validate({"discord": {"min_length": 7}})
+        assert cfg.discord.min_length == 7
+
+    def test_a_non_mapping_passes_straight_through(self) -> None:
+        """Pydantic must raise its own error, not an AttributeError from the shim."""
+        with pytest.raises(ValidationError):
+            CleaningConfig.model_validate(["not", "a", "mapping"])
+
+    def test_an_absent_block_is_untouched(self) -> None:
+        """An empty cleaning block yields plain defaults."""
+        cfg = CleaningConfig.model_validate({})
+        assert cfg.discord.min_length == 3
+        assert cfg.hygiene.orphan_age_days == 30
+
+    def test_staleness_days_fans_out_to_both_replacements(self) -> None:
+        """One deliberate knob becomes two, because it described two scanners."""
+        cfg = CleaningConfig.model_validate({"hygiene": {"staleness_days": 45}})
+        assert cfg.hygiene.orphan_age_days == 45
+        assert cfg.hygiene.stale_review_days == 45
+
+    def test_staleness_days_does_not_overwrite_an_explicit_replacement(
+        self,
+    ) -> None:
+        """A config mid-migration keeps whichever new key it already sets."""
+        cfg = CleaningConfig.model_validate(
+            {"hygiene": {"staleness_days": 45, "orphan_age_days": 8}},
+        )
+        assert cfg.hygiene.orphan_age_days == 8
+        assert cfg.hygiene.stale_review_days == 45
+
+    def test_staleness_days_at_the_old_default_adopts_both_new_ones(self) -> None:
+        """Ninety matched neither scanner, so it was never a real choice."""
+        cfg = CleaningConfig.model_validate({"hygiene": {"staleness_days": 90}})
+        assert cfg.hygiene.orphan_age_days == 30
+        assert cfg.hygiene.stale_review_days == 14
+
+    def test_the_migration_warns_rather_than_migrating_silently(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An operator must be told which key to edit in their own file.
+
+        Args:
+            caplog: Pytest log capture fixture.
+        """
+        with caplog.at_level(logging.WARNING, logger="creek.config"):
+            CleaningConfig.model_validate({"discord": {"min_message_length": 25}})
+
+        assert any("min_length" in record.message for record in caplog.records)
+
+    def test_the_migration_does_not_mutate_the_callers_dict(self) -> None:
+        """The shim copies; an in-place edit would corrupt the parsed YAML."""
+        raw = {"discord": {"min_message_length": 25}}
+        CleaningConfig.model_validate(raw)
+        assert raw == {"discord": {"min_message_length": 25}}
+
+
+# ---------------------------------------------------------------------------
+# One model per cleaning block, one literal per knob (#1519)
+# ---------------------------------------------------------------------------
+
+
+_COLLAPSING_BLOCKS: Final[tuple[tuple[str, type[BaseModel]], ...]] = (
+    ("discord", DiscordFilterConfig),
+    ("chatbot", ChatbotFilterConfig),
+)
+"""The cleaning blocks that have a filter-side model to collapse into.
+
+Two rows, not eight, and deliberately so: ``markdown``, ``google_drive``,
+``validation``, ``quality``, ``deduplication`` and ``hygiene`` have no
+filter-side config class at all. Their consumers take bare scalar keywords —
+``MarkdownFilter``, ``GoogleDriveFilter``, ``FragmentValidator``,
+``QualityScorer``, ``OrphanScanner``, ``StaleReviewScanner`` — and
+``Deduplicator.__init__`` takes no arguments whatsoever. There is nothing to
+collapse those blocks into, so they are pinned by
+:class:`TestCleaningDefaultsMatchTheLiveConsumer` below instead (#1519).
+"""
+
+
+def test_the_collapsing_block_table_is_not_empty() -> None:
+    """Emptying the table above would make the identity test vanish green."""
+    assert len(_COLLAPSING_BLOCKS) == 2
+
+
+class TestCleaningBlocksAreOneModel:
+    """A cleaning block and its filter must share ONE class object (#1519)."""
+
+    @pytest.mark.parametrize(("block", "expected"), _COLLAPSING_BLOCKS)
+    def test_block_model_is_the_live_filter_config(
+        self,
+        block: str,
+        expected: type[BaseModel],
+    ) -> None:
+        """The block's model IS the filter's own class, not a twin of it.
+
+        Identity, not equality: an equal-but-distinct model would still let
+        the two declarations drift apart, which is the defect. Before #1519
+        ``cleaning.discord`` was a ``DiscordCleaningConfig`` saying
+        ``min_message_length = 10`` while the filter ran on a
+        ``DiscordFilterConfig`` saying ``min_length = 3``, and nothing
+        connected the two.
+
+        Args:
+            block: The ``cleaning`` sub-block name.
+            expected: The filter-side config class it must be.
+        """
+        assert type(getattr(CleaningConfig(), block)) is expected
+
+
+def _signature_default(func: Callable[..., object], parameter: str) -> object:
+    """Return a callable's declared default for one keyword parameter.
+
+    Derived from the live signature rather than retyped, so this test cannot
+    agree with a stale copy of the value.
+
+    Args:
+        func: The callable to inspect.
+        parameter: The keyword parameter name.
+
+    Returns:
+        The parameter's default value.
+    """
+    return inspect.signature(func).parameters[parameter].default
+
+
+def _resolve_leaf(root: object, path: str) -> object:
+    """Walk a dotted config path, failing loudly on a missing field.
+
+    Args:
+        root: The config object to walk from.
+        path: A dotted leaf path such as ``quality.min_words``.
+
+    Returns:
+        The value at the leaf.
+    """
+    node = root
+    walked: list[str] = []
+    for part in path.split("."):
+        assert hasattr(node, part), (
+            f"cleaning.{'.'.join([*walked, part])} does not exist on the "
+            f"model; #1519 requires this leaf path"
+        )
+        walked.append(part)
+        node = getattr(node, part)
+    return node
+
+
+_DRIFTED_KNOBS: Final[tuple[tuple[str, str, str], ...]] = (
+    ("markdown.min_body_length", "MarkdownFilter", "min_body_length"),
+    (
+        "google_drive.multi_author_threshold",
+        "GoogleDriveFilter",
+        "multi_author_threshold",
+    ),
+    ("validation.min_content_length", "FragmentValidator", "min_content_length"),
+    ("quality.accept_threshold", "QualityScorer", "accept_threshold"),
+    ("quality.review_threshold", "QualityScorer", "review_threshold"),
+    ("quality.min_words", "QualityScorer", "min_words"),
+    ("quality.stop_word_threshold", "QualityScorer", "stop_word_threshold"),
+    ("hygiene.orphan_age_days", "OrphanScanner", "age_days"),
+    ("hygiene.stale_review_days", "StaleReviewScanner", "age_days"),
+)
+"""Every cleaning knob whose value is also written down in a live consumer.
+
+The rule #1519 applies uniformly is **the live value wins**: the consumer's
+default is what currently executes, and the config value is dormant, so a
+disagreement is the config being wrong. ``discord.min_length`` is absent
+because after the collapse the filter's class *is* the config model, leaving
+exactly one literal with nothing to compare against.
+"""
+
+_LIVE_CONSUMERS: Final[dict[str, Callable[..., object]]] = {
+    "MarkdownFilter": MarkdownFilter.__init__,
+    "GoogleDriveFilter": GoogleDriveFilter.__init__,
+    "FragmentValidator": FragmentValidator.__init__,
+    "QualityScorer": QualityScorer.__init__,
+    "OrphanScanner": OrphanScanner.__init__,
+    "StaleReviewScanner": StaleReviewScanner.__init__,
+}
+"""Constructor of each live consumer named in :data:`_DRIFTED_KNOBS`."""
+
+
+def test_the_drifted_knob_table_is_not_empty() -> None:
+    """Emptying the table would silently retire the whole drift check."""
+    assert len(_DRIFTED_KNOBS) == 9
+
+
+class TestCleaningDefaultsMatchTheLiveConsumer:
+    """Each cleaning knob agrees with the code that actually runs (#1519)."""
+
+    @pytest.mark.parametrize(("leaf", "consumer", "parameter"), _DRIFTED_KNOBS)
+    def test_config_default_equals_the_live_default(
+        self,
+        leaf: str,
+        consumer: str,
+        parameter: str,
+    ) -> None:
+        """The config's value is the consumer's value, derived not retyped.
+
+        Args:
+            leaf: Dotted path under ``cleaning``.
+            consumer: Name of the class that actually reads this knob.
+            parameter: The consumer's constructor keyword holding the twin.
+        """
+        expected = _signature_default(_LIVE_CONSUMERS[consumer], parameter)
+        actual = _resolve_leaf(CleaningConfig(), leaf)
+
+        assert actual == expected, (
+            f"cleaning.{leaf} is {actual!r} but {consumer}.{parameter} — the "
+            f"value that actually runs — is {expected!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -764,7 +1134,7 @@ class TestLoadConfig:
         config_file = tmp_path / "creek_config.yaml"
         config_data = {
             "cleaning": {
-                "discord": {"min_message_length": 25},
+                "discord": {"min_length": 25},
                 "quality": {"accept_threshold": 0.9},
                 "deduplication": {"strategy": "exact"},
             },
@@ -772,12 +1142,50 @@ class TestLoadConfig:
         config_file.write_text(yaml.dump(config_data))
 
         cfg = load_config(config_file)
-        assert cfg.cleaning.discord.min_message_length == 25
+        assert cfg.cleaning.discord.min_length == 25
         assert cfg.cleaning.quality.accept_threshold == 0.9
         assert cfg.cleaning.deduplication.strategy == "exact"
         # Unspecified sub-configs keep defaults
-        assert cfg.cleaning.chatbot.filter_system_prompts is True
-        assert cfg.cleaning.hygiene.staleness_days == 90
+        assert cfg.cleaning.chatbot.skip_system_prompts is True
+        assert cfg.cleaning.hygiene.orphan_age_days == 30
+        assert cfg.cleaning.hygiene.stale_review_days == 14
+
+    def test_loads_a_pre_1519_cleaning_section(self, tmp_path: Path) -> None:
+        """A YAML written before #1519 still loads, through the migration.
+
+        The same round-trip as above, spelled the old way: every key that
+        ``creek init`` wrote before #1519 is either carried to its new name
+        or, when it merely holds the old default, dropped so the corrected
+        default applies.
+
+        Args:
+            tmp_path: Pytest temporary directory.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_data = {
+            "cleaning": {
+                "discord": {"min_message_length": 25, "filter_bot_messages": False},
+                "quality": {"accept_threshold": 0.7, "skip_threshold": 0.4},
+                "validation": {"min_characters": 33, "min_words": 4},
+                "google_drive": {"max_collaboration_ratio": 0.75},
+                "hygiene": {"staleness_days": 90},
+            },
+        }
+        config_file.write_text(yaml.dump(config_data))
+
+        cfg = load_config(config_file)
+
+        # Deliberate values are carried to the surviving names.
+        assert cfg.cleaning.discord.min_length == 25
+        assert cfg.cleaning.discord.skip_bots is False
+        assert cfg.cleaning.quality.review_threshold == 0.4
+        assert cfg.cleaning.validation.min_content_length == 33
+        assert cfg.cleaning.quality.min_words == 4
+        assert cfg.cleaning.google_drive.multi_author_threshold == 0.75
+        # Values that merely held the old default adopt the corrected one.
+        assert cfg.cleaning.quality.accept_threshold == 0.6
+        assert cfg.cleaning.hygiene.orphan_age_days == 30
+        assert cfg.cleaning.hygiene.stale_review_days == 14
 
 
 class TestLoadConfigEnvVar:
@@ -894,8 +1302,8 @@ class TestGenerateDefaultConfig:
         ]
         # Cleaning section should round-trip with defaults
         assert isinstance(cfg.cleaning, CleaningConfig)
-        assert cfg.cleaning.discord.filter_bot_messages is True
-        assert cfg.cleaning.quality.accept_threshold == 0.7
+        assert cfg.cleaning.discord.skip_bots is True
+        assert cfg.cleaning.quality.accept_threshold == 0.6
         assert cfg.cleaning.deduplication.strategy == "fuzzy"
 
     def test_generated_config_contains_cleaning(self, tmp_path: Path) -> None:
@@ -1506,3 +1914,48 @@ class TestAuthorMaxReproducedTier:
 
         data = yaml.safe_load(output.read_text(encoding="utf-8"))
         assert data["author"]["max_reproduced_tier"] == "open"
+
+
+class TestAIStyleWeightsAtLoad:
+    """The weight guard must bite on the real YAML path (#1615)."""
+
+    def test_a_non_finite_weight_is_refused_at_load(self, tmp_path: Path) -> None:
+        """``ai_style.authorship_weights`` with ``.nan`` fails to load.
+
+        Args:
+            tmp_path: Pytest-provided temporary directory.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(
+            "ai_style:\n  authorship_weights:\n    journal: .nan\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValidationError):
+            load_config(config_file)
+
+    def test_the_issues_path_would_have_been_vacuous(self, tmp_path: Path) -> None:
+        """``author.authorship_weights`` is silently discarded, not validated.
+
+        #1615's own Premise names ``author.authorship_weights``, but the
+        field lives on :class:`AIStyleConfig`. Nested models do not forbid
+        extras — only top-level ``CreekConfig`` does — so this YAML loads
+        **clean** and the key vanishes. Pinned so a future reader does not
+        rediscover it by writing a test that passes for the wrong reason.
+
+        Args:
+            tmp_path: Pytest-provided temporary directory.
+        """
+        config_file = tmp_path / "creek_config.yaml"
+        config_file.write_text(
+            "author:\n  authorship_weights:\n    journal: .nan\n",
+            encoding="utf-8",
+        )
+
+        config = load_config(config_file)
+
+        assert not hasattr(config.author, "authorship_weights"), (
+            "author.authorship_weights now exists; #1615's premise was "
+            "right after all and this pin should become a real assertion"
+        )
+        assert config.ai_style.authorship_weights == _default_authorship_weights()

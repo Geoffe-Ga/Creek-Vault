@@ -23,7 +23,12 @@ from typing import TYPE_CHECKING
 import frontmatter
 from pydantic import BaseModel, Field
 
-from creek.vault.links import build_link_index, iter_link_sources
+from creek.time import ensure_aware
+from creek.vault.links import (
+    WIKILINK_PATTERN,
+    build_link_index,
+    iter_link_sources,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -146,15 +151,11 @@ def _parse_datetime(value: object) -> datetime | None:
     return None
 
 
-_WIKILINK_PATTERN: re.Pattern[str] = re.compile(
-    r"\[\[([^\]|#]+?)(?:[#|][^\]]*?)?\]\]",
-)
-"""Matches Obsidian wiki-links, capturing only the file portion of the target.
-
-Heading anchors (``[[Note#Heading]]``) and aliases (``[[Note|alias]]``) are
-excluded from the captured target, and same-file anchors (``[[#Heading]]``)
-produce no target at all — they name no file to resolve (issue #835).
-"""
+#: Re-exported from :mod:`creek.vault.links`, which owns the pattern now
+#: (#1518). It was defined here and copied verbatim into two other modules;
+#: a copy is how #835's anchor bug reached a second call site in the first
+#: place. The name is kept so this module's existing references still read.
+_WIKILINK_PATTERN = WIKILINK_PATTERN
 
 _RELATIVE_LINK_PATTERN: re.Pattern[str] = re.compile(
     r"\[([^\]]*)\]\((?!#)([^)]+)\)",
@@ -406,11 +407,27 @@ class OrphanScanner:
         """Check if a fragment file is older than the age threshold.
 
         Reads the ``created`` field from frontmatter, falling back to
-        file modification time.
+        file modification time. The two sources are anchored differently,
+        on purpose (#1115):
+
+        * A frontmatter ``created`` is a **wall clock**. The ontology
+          (§8.3) normalises every timestamp Creek writes to
+          America/Los_Angeles, so an offsetless value in frontmatter is an
+          LA reading that lost its offset in serialisation. It is repaired
+          through :func:`creek.time.ensure_aware`, which attaches LA
+          without moving the clock. Anchoring it to UTC instead aged every
+          such fragment by a phantom 7-8 h, which at the ``age_days``
+          cutoff is the difference between a live fragment and one
+          ``creek clean orphans`` tells the operator to delete.
+        * The ``st_mtime`` fallback is a real **instant**, not a wall
+          clock: the filesystem records an epoch offset, which
+          ``fromtimestamp(..., tz=UTC)`` renders exactly. It has no
+          missing offset to restore, so it stays UTC.
 
         Args:
             frag_file: Path to the fragment markdown file.
-            now: Current UTC datetime.
+            now: Current datetime to measure age against; tz-aware, so it
+                compares correctly against either anchor above.
 
         Returns:
             True if the fragment is older than ``age_days``.
@@ -420,9 +437,7 @@ class OrphanScanner:
             created = post.get("created")
             created_dt = _parse_datetime(created)
             if created_dt is not None:
-                if created_dt.tzinfo is None:
-                    created_dt = created_dt.replace(tzinfo=UTC)
-                age = (now - created_dt).days
+                age = (now - ensure_aware(created_dt)).days
                 return age >= self.age_days
         except Exception:
             logger.debug("Failed to read frontmatter from %s", frag_file)
@@ -430,6 +445,15 @@ class OrphanScanner:
         stat = frag_file.stat()
         mtime = datetime.fromtimestamp(stat.st_mtime, tz=UTC)
         return (now - mtime).days >= self.age_days
+
+
+_REVIEW_QUEUE_STEM_RE = re.compile(r"\d{4}-\d{2}-\d{2}_\d{6}")
+"""The exact shape ``review-queue-<timestamp>.md`` stems must have.
+
+``%H%M%S`` is unseparated, so without this gate ``strptime`` re-segments a
+short time run into a wrong-but-plausible time instead of rejecting it
+(#1632).
+"""
 
 
 class StaleReviewScanner:
@@ -500,25 +524,43 @@ class StaleReviewScanner:
         return (now - mtime).days >= self.age_days
 
     def _parse_filename_timestamp(self, review_file: Path) -> datetime | None:
-        """Extract a UTC datetime from a review queue filename.
+        """Extract the datetime a review queue's filename encodes.
 
         Expected format: ``review-queue-YYYY-MM-DD_HHMMSS.md``.
+
+        The digits are an **America/Los_Angeles** wall clock, because that
+        is what the writer stamped: ``ReviewQueueGenerator.generate_queue``
+        formats the name from :func:`creek.time.now_la`
+        (``creek/classify/review.py``). Reading them back as UTC — which
+        this did until #1115 — aged every review queue by the LA offset it
+        never had, so ``creek clean stale-reviews`` reported queues 7-8 h
+        older than they were. The anchor therefore goes through
+        :func:`creek.time.ensure_aware`, which attaches the zone without
+        moving the clock; converting instead would slide a queue written
+        near midnight onto the wrong day.
 
         Args:
             review_file: Path to the review file.
 
         Returns:
-            Parsed datetime with UTC timezone, or None if parsing fails.
+            The parsed datetime anchored to America/Los_Angeles, or
+            ``None`` if the stem is missing, malformed, or the wrong
+            shape.
         """
         stem = review_file.stem
         prefix = "review-queue-"
         if not stem.startswith(prefix):
             return None
         ts_part = stem[len(prefix) :]
+        # The date half is delimited and cannot re-segment, but ``%H%M%S`` is
+        # not: ``strptime`` lets each numeric directive match one *or* two
+        # digits, so ``2024-03-15_0830`` silently parsed as 08:**03**:00 —
+        # aging a queue by 27 minutes it never had. Same defect as the PDF
+        # date parser's (#1632); gate the shape before parsing it.
+        if not _REVIEW_QUEUE_STEM_RE.fullmatch(ts_part):
+            return None
         try:
-            return datetime.strptime(ts_part, "%Y-%m-%d_%H%M%S").replace(
-                tzinfo=UTC,
-            )
+            return ensure_aware(datetime.strptime(ts_part, "%Y-%m-%d_%H%M%S"))
         except ValueError:
             return None
 

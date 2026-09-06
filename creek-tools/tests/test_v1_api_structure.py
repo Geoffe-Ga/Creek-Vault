@@ -22,10 +22,11 @@ no runtime test can:
   construction site is where a fourth field eventually gets added.
 * Is ``ErrorCode.NOT_FOUND`` used outside the routing layer? #846/#970/#972/
   #1090 spent five issues collapsing exactly that distinction; a handler that
-  reintroduced it for a vault object would rebuild the existence oracle. The
-  repo-wide version of this guard — an allowlist over every construction site
-  in ``creek_mcp`` — is tracked in **#1098**; this module holds the
-  ``httpapi``-scoped half that #1074 can enforce today.
+  reintroduced it for a vault object would rebuild the existence oracle. Guard
+  5 holds the ``httpapi``-scoped half; Guard 7 holds the repo-wide half — a
+  pinned allowlist over every module in ``creek_mcp`` that may name the code
+  at all, the wire spelling and the ``404`` literal, plus a pin on the sole
+  construction site.
 * Does ``fastapi`` appear anywhere in ``creek_mcp/``? The ADR rejected it for
   four stated reasons and, until now, nothing enforced that.
 
@@ -57,6 +58,78 @@ API: Final[Path] = CREEK_MCP / "api"
 
 FORBIDDEN_FRAMEWORKS: Final[frozenset[str]] = frozenset({"fastapi"})
 """Rejected in the ADR for four reasons; nothing enforced it before #1074."""
+
+NOT_FOUND_ROUTING_MODULES: Final[frozenset[str]] = frozenset(
+    {
+        # The wire vocabulary itself: the ``NOT_FOUND`` member and its rows in
+        # ERROR_STATUS, ERROR_MESSAGES and RETRY_POLICY. Not a vault-object
+        # path — test_models_module_reads_no_files AST-pins that this module
+        # calls no file reader at all.
+        "api/models.py",
+        # The published document's per-route universal refusal list. A routing
+        # miss is reachable on every published path because routing answers
+        # before any handler does, so the code belongs on every route.
+        "api/openapi.py",
+        # The routing layer: the sole construction site, inside _routing_miss,
+        # plus the ERROR_STATUS key that registers that handler against
+        # Starlette's own router rather than against any handler.
+        "httpapi/app.py",
+    }
+)
+"""The only ``creek_mcp`` modules that may name ``NOT_FOUND`` at all (#1098).
+
+Asserted as set **equality**, not containment: a module that stops naming it is
+as much a change to this invariant as one that starts. Removing
+``api/openapi.py``'s entry would quietly drop the routing miss out of the
+published refusal list, and a subset assertion would permit that silently.
+"""
+
+NOT_FOUND_WIRE_STRING_MODULES: Final[frozenset[str]] = frozenset({"api/models.py"})
+"""The only module that may write the wire spelling ``"not_found"``.
+
+Matched by equality rather than substring: a substring test flags three
+modules, two of them only for docstring prose about routing.
+"""
+
+NOT_FOUND_MEMBER_LITERAL_MODULES: Final[frozenset[str]] = frozenset()
+"""No module may spell the member name as a bare string literal.
+
+``ErrorCode["NOT_FOUND"]`` and ``getattr(ErrorCode, "NOT_FOUND")`` reach the
+member without ever writing the attribute the name arm matches. Neither
+construct exists in the package today — there is not one ``getattr`` call
+anywhere under ``creek_mcp/`` — so this arm is prospective: it forbids the
+evasion before anyone writes it.
+"""
+
+NOT_FOUND_STATUS_MODULES: Final[frozenset[str]] = frozenset({"api/models.py"})
+"""The only module that may carry the integer ``404``.
+
+``ERROR_STATUS`` is where a status is chosen for a code. A ``404`` written
+anywhere else is a handler picking a status directly, which is how the
+existence oracle comes back without ``NOT_FOUND`` ever being named.
+"""
+
+NOT_FOUND_CONSTRUCTION_SITES: Final[frozenset[str]] = frozenset(
+    {"httpapi/app.py::_routing_miss"}
+)
+"""The only ``error_response(ErrorCode.NOT_FOUND, ...)`` site, by ``module::function``.
+
+This is a **static-spelling** pin. Seven ``error_response`` calls across
+``httpapi/`` pass a computed code, so no AST sweep can prove at this call site
+that ``NOT_FOUND`` is constructed exactly once at runtime. What carries that
+half of the invariant is :data:`NOT_FOUND_ROUTING_MODULES`: every one of those
+seven resolves through a ``*_refusal_code`` helper living in a module that may
+not name ``NOT_FOUND`` at all.
+"""
+
+NOT_FOUND_CONSTRUCTION_MODULES: Final[frozenset[str]] = frozenset(
+    site.split("::")[0] for site in NOT_FOUND_CONSTRUCTION_SITES
+)
+"""The module half of :data:`NOT_FOUND_CONSTRUCTION_SITES`, derived not restated.
+
+Asserted separately because the qualified set alone would pass a second call
+added at module level, where there is no enclosing function to name.
+"""
 
 
 # --------------------------------------------------------------------------- #
@@ -247,6 +320,86 @@ def _defined_function_names(source: str) -> set[str]:
         for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
     }
+
+
+def _int_constants(source: str) -> set[int]:
+    """Return every integer literal in *source*.
+
+    ``bool`` is excluded deliberately: it subclasses ``int``, so a bare
+    ``True`` would otherwise be indistinguishable from ``1``.
+
+    Args:
+        source: Python source text.
+
+    Returns:
+        The distinct integer constants.
+    """
+    return {
+        node.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, int)
+        and not isinstance(node.value, bool)
+    }
+
+
+def _enclosing_function_names(tree: ast.Module) -> dict[int, str]:
+    """Map each call node's ``id()`` to the function whose body contains it.
+
+    ``ast.walk`` is breadth-first, so an enclosing function is visited before
+    anything nested inside it and the innermost name is the one that survives.
+
+    Args:
+        tree: A parsed module.
+
+    Returns:
+        ``id(call node) -> enclosing function name``. Calls written at module
+        level are absent from the mapping.
+    """
+    return {
+        id(call): node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+    }
+
+
+def _not_found_construction_sites(source: str) -> list[tuple[int, str]]:
+    """Return every ``error_response(<owner>.NOT_FOUND, ...)`` site in *source*.
+
+    Both ``error_response(...)`` and ``errors.error_response(...)`` count, for
+    the reason :func:`_called_names` documents. A call whose first positional
+    argument is not an attribute is **skipped, not crashed on**: seven real
+    sites across ``httpapi/`` pass a computed ``*_refusal_code(...)`` result
+    or a ``code`` local, and an unguarded ``.attr`` would raise there.
+
+    Args:
+        source: Python source text.
+
+    Returns:
+        ``(lineno, enclosing function name)`` per site, in walk order. The
+        enclosing name is ``""`` for a call written at module level.
+    """
+    tree = ast.parse(source)
+    enclosing = _enclosing_function_names(tree)
+    sites: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            callee = func.attr
+        elif isinstance(func, ast.Name):
+            callee = func.id
+        else:
+            continue
+        first = node.args[0]
+        if callee != "error_response" or not isinstance(first, ast.Attribute):
+            continue
+        if first.attr == "NOT_FOUND":
+            sites.append((node.lineno, enclosing.get(id(node), "")))
+    return sites
 
 
 def _count_across_httpapi(callee: str) -> int:
@@ -484,7 +637,7 @@ def test_the_error_envelope_guard_is_not_vacuous() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Guard 5 — NOT_FOUND is a routing code (the httpapi half of #1098)
+# Guard 5 — NOT_FOUND is a routing code, within httpapi/ (Guard 7 is repo-wide)
 # --------------------------------------------------------------------------- #
 
 
@@ -498,9 +651,10 @@ def test_not_found_is_named_in_exactly_one_httpapi_module() -> None:
     rebuilds that oracle exactly.
 
     Scoped to ``creek_mcp/httpapi/`` because that is the surface #1074 owns.
-    The repo-wide sweep — every ``NOT_FOUND`` construction site in
-    ``creek_mcp``, checked against a pinned routing-layer allowlist — is
-    **#1098**.
+    Guard 7 below sweeps all of ``creek_mcp`` and strictly subsumes this check:
+    its matcher is owner-agnostic, so it also catches the ``EC.NOT_FOUND``
+    spelling this one misses. Both are kept, on the precedent of
+    ``test_api_package_imports_no_web_framework`` sitting beside Guard 6.
     """
     offenders = [
         path.relative_to(CREEK_MCP).as_posix()
@@ -572,3 +726,178 @@ def test_starlette_is_confined_to_the_adapter() -> None:
         and path.name != "server.py"
     ]
     assert offenders == []
+
+
+# --------------------------------------------------------------------------- #
+# Guard 7 — NOT_FOUND stays inside the routing layer, repo-wide (#1098)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_repo_wide_not_found_name_arm_is_not_vacuous() -> None:
+    """Arm (a) is owner-agnostic, which is exactly what Guard 5's matcher is not.
+
+    ``_dotted_attributes`` keys on ``Owner.ATTR``, so ``EC.NOT_FOUND`` and
+    ``models.ErrorCode.NOT_FOUND`` both slip past its
+    ``"ErrorCode.NOT_FOUND"`` membership test — and five ``httpapi`` modules
+    already import ``ErrorCode`` plainly, which puts the aliased spelling one
+    edit away. ``_referenced_names`` keys on the attribute alone, so all three
+    spellings are caught and a rename of the owner cannot evade it. The last
+    assertion is the control: it records what Guard 5's matcher would miss.
+    """
+    assert "NOT_FOUND" in _referenced_names("x = ErrorCode.NOT_FOUND\n")
+    assert "NOT_FOUND" in _referenced_names("x = EC.NOT_FOUND\n")
+    assert "NOT_FOUND" in _referenced_names("x = models.ErrorCode.NOT_FOUND\n")
+    assert "NOT_FOUND" not in _referenced_names("x = ErrorCode.PRIVACY_REFUSED\n")
+    assert "ErrorCode.NOT_FOUND" not in _dotted_attributes("x = EC.NOT_FOUND\n")
+
+
+def test_the_not_found_wire_string_arm_is_not_vacuous() -> None:
+    """Equality, never substring: prose naming ``not_found`` is not a code.
+
+    A substring matcher flags three modules, two of them only for docstring
+    prose such as "a ``404 not_found`` is a routing answer". Equality flags
+    the one module that mints the member. The last pair covers the bare member
+    spelling, which is how ``ErrorCode["NOT_FOUND"]`` would reach the member
+    without ever writing the attribute arm (a) matches.
+    """
+    assert "not_found" in _string_constants('MEMBER = "not_found"\n')
+    assert "not_found" not in _string_constants('MEMBER = "privacy_refused"\n')
+    assert "not_found" not in _string_constants('"""A 404 not_found is routing."""\n')
+    assert "NOT_FOUND" in _string_constants('code = ErrorCode["NOT_FOUND"]\n')
+    assert "NOT_FOUND" not in _string_constants('code = ErrorCode["PRIVACY_REFUSED"]\n')
+
+
+def test_the_404_status_arm_is_not_vacuous() -> None:
+    """``bool`` subclasses ``int``, so a bare ``True`` must not read as ``1``.
+
+    Without the ``bool`` exclusion the arm would be keyed on a type that
+    ``404`` shares with nothing else here, but the exclusion is what stops a
+    future ``status in (404, True)`` shape from reading as two integers.
+    """
+    assert _int_constants("STATUS = 404\n") == {404}
+    assert 404 not in _int_constants("STATUS = 403\n")
+    assert _int_constants("FLAG = True\n") == set()
+
+
+def test_the_not_found_construction_arm_is_not_vacuous() -> None:
+    """It finds the call, skips a computed code, and records the function.
+
+    The computed-code case is a regression pin, not a nicety: seven real
+    ``error_response`` call sites across ``creek_mcp/httpapi/`` pass a
+    ``*_refusal_code(...)`` result or a ``code`` local as the first argument,
+    and an unguarded ``.attr`` on that argument raises ``AttributeError`` on
+    every one of them — which would stop the guard running at all.
+    """
+    assert _not_found_construction_sites(
+        "error_response(ErrorCode.NOT_FOUND, ctx)\n"
+    ) == [(1, "")]
+    assert _not_found_construction_sites(
+        "errors.error_response(EC.NOT_FOUND, ctx)\n"
+    ) == [(1, "")]
+    assert (
+        _not_found_construction_sites("error_response(ErrorCode.PRIVACY_REFUSED, c)\n")
+        == []
+    )
+    assert _not_found_construction_sites("error_response(code_for(r), ctx)\n") == []
+    assert _not_found_construction_sites("error_response(code, ctx)\n") == []
+    assert _not_found_construction_sites(
+        "async def _routing_miss(request):\n"
+        "    return error_response(ErrorCode.NOT_FOUND, ctx)\n"
+    ) == [(2, "_routing_miss")]
+
+
+def test_not_found_is_named_only_in_the_pinned_routing_modules() -> None:
+    """The repo-wide half of #1098: three modules may name it, and only three.
+
+    This is the arm that actually carries the invariant. A handler cannot emit
+    a code it may not name, and the seven ``error_response`` sites that pass a
+    computed code all resolve through ``*_refusal_code`` helpers living in
+    modules this allowlist excludes — so the construction pin below is a
+    static-spelling pin, and *this* is what makes it hold at runtime.
+
+    Owner-agnostic by construction: ``_referenced_names`` keys on the
+    attribute, so ``EC.NOT_FOUND`` and ``models.ErrorCode.NOT_FOUND`` are
+    caught alongside ``ErrorCode.NOT_FOUND``. Guard 5 above, which keys on the
+    owner, is strictly subsumed by this one and is kept anyway — the same
+    scoped-plus-repo-wide pairing ``test_api_package_imports_no_web_framework``
+    already has with Guard 6.
+    """
+    sources = _sources(CREEK_MCP)
+    assert sources
+    named = {
+        path.relative_to(CREEK_MCP).as_posix()
+        for path in sources
+        if "NOT_FOUND" in _referenced_names(_read(path))
+    }
+    assert named == NOT_FOUND_ROUTING_MODULES, sorted(named ^ NOT_FOUND_ROUTING_MODULES)
+
+
+def test_the_not_found_wire_string_appears_only_in_the_vocabulary_module() -> None:
+    """The wire spelling is minted once, and the member name is never a string.
+
+    Both halves are equality tests over string literals. The first pins where
+    ``"not_found"`` may be written; the second forbids ``ErrorCode["NOT_FOUND"]``
+    and ``getattr(ErrorCode, "NOT_FOUND")``, which would otherwise reach the
+    member without writing the attribute the arm above matches.
+    """
+    sources = _sources(CREEK_MCP)
+    assert sources
+    spelled = {
+        path.relative_to(CREEK_MCP).as_posix()
+        for path in sources
+        if "not_found" in _string_constants(_read(path))
+    }
+    assert spelled == NOT_FOUND_WIRE_STRING_MODULES, sorted(
+        spelled ^ NOT_FOUND_WIRE_STRING_MODULES
+    )
+    by_member_name = {
+        path.relative_to(CREEK_MCP).as_posix()
+        for path in sources
+        if "NOT_FOUND" in _string_constants(_read(path))
+    }
+    assert by_member_name == NOT_FOUND_MEMBER_LITERAL_MODULES, sorted(
+        by_member_name ^ NOT_FOUND_MEMBER_LITERAL_MODULES
+    )
+
+
+def test_the_404_status_literal_appears_only_in_the_status_table() -> None:
+    """A ``404`` written outside ``ERROR_STATUS`` is the oracle without the name.
+
+    ``NOT_FOUND`` is a code, but the leak is the *status*. A handler that
+    answered ``404`` directly — never naming the enum member, so the arm above
+    stays green — would hand back the same existence signal.
+    """
+    sources = _sources(CREEK_MCP)
+    assert sources
+    carrying = {
+        path.relative_to(CREEK_MCP).as_posix()
+        for path in sources
+        if 404 in _int_constants(_read(path))
+    }
+    assert carrying == NOT_FOUND_STATUS_MODULES, sorted(
+        carrying ^ NOT_FOUND_STATUS_MODULES
+    )
+
+
+def test_not_found_is_constructed_once_in_the_routing_miss() -> None:
+    """One refusal is built with this code, in the handler for a routing miss.
+
+    Three assertions, because no one of them is sufficient. The module set
+    alone passes a second call added at module level in ``app.py``; the
+    function set alone passes a second call added inside ``_routing_miss``;
+    the count alone passes a call moved to another module's function of the
+    same name. Together they pin module, multiplicity and enclosing function.
+
+    A **static-spelling** pin only — see :data:`NOT_FOUND_CONSTRUCTION_SITES`.
+    """
+    sources = _sources(CREEK_MCP)
+    assert sources
+    found: dict[str, list[tuple[int, str]]] = {}
+    for path in sources:
+        sites = _not_found_construction_sites(_read(path))
+        if sites:
+            found[path.relative_to(CREEK_MCP).as_posix()] = sites
+    assert set(found) == NOT_FOUND_CONSTRUCTION_MODULES, found
+    assert sum(len(sites) for sites in found.values()) == 1, found
+    qualified = {f"{rel}::{name}" for rel, sites in found.items() for _, name in sites}
+    assert qualified == NOT_FOUND_CONSTRUCTION_SITES, found

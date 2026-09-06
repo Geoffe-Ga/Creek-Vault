@@ -237,3 +237,46 @@ class AuthoredDraft(BaseModel):
     def rendered_text(self) -> str:
         """The rendered draft text (alias for :attr:`body`), included in dumps."""
         return self.body
+
+
+ZERO_EVIDENCE_WARNING = (
+    "No grounded evidence was found for this query, so the draft stands on "
+    "nothing from your vault. The usual cause is an unclassified corpus: at "
+    "the default `open` ceiling a fragment with no concrete privacy_tier is "
+    "excluded from evidence gathering (#1079), so a freshly-ingested vault "
+    "reads as empty. Run `creek classify` over the vault and author again, "
+    "or raise the ceiling with --include-tier if you intend to draft from "
+    "unclassified material."
+)
+"""Warning emitted when evidence gathering returns zero grounded claims.
+
+Issue #1261. The filter itself is correct and deliberately unchanged -- #1079
+settled that a missing tier resolves restrictively, and reopening that is a
+privacy-posture decision, not a UX one. What was wrong is that the command
+said nothing: an operator with a freshly-ingested vault got a
+confident-looking artefact built on no evidence, with the only hint being a
+lowercase ``(no grounded evidence)`` fallback inside the body itself
+(``creek/author/voice.py:222``).
+
+Defined once, beside the model it describes, and rendered by both the CLI and
+its MCP twin so the two cannot drift into wording the same condition
+differently -- the failure #1362 records as four unlinked copies of one string.
+"""
+
+
+def has_zero_evidence(draft: AuthoredDraft) -> bool:
+    """Return whether *draft* gathered no grounded provenance at all.
+
+    Keyed on provenance rather than on ``verdict``: escalation is routine on
+    this surface (an empty vault escalates, and any unresolved soft finding
+    escalates once the round budget runs out), so a verdict test would fire on
+    ordinary grounded drafts. Zero provenance is the precise condition #1261
+    is about.
+
+    Args:
+        draft: The finished draft to inspect.
+
+    Returns:
+        ``True`` when the draft cites no provenance entries.
+    """
+    return not draft.provenance

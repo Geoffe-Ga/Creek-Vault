@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -3315,3 +3316,96 @@ async def test_non_refusal_scan_bodies_stay_scanned(
     assert batch is not None
     assert batch.scanned is True
     assert channel.sent[-1] == _INGEST_CONSENT_PROMPT
+
+
+async def test_colliding_attachments_ingest_each_file_once(
+    config: CrawDadConfig, session_state: SessionState
+) -> None:
+    """Aliasing filenames dispatch two distinct paths, not one twice (#917).
+
+    Before the fix ``"a b.md"`` and ``"a_b.md"`` both staged to
+    ``a_b.md``: the second payload overwrote the first, both
+    ``PendingFile`` records named that one path, and the dispatcher
+    ingested the surviving bytes twice while recording *both* content
+    hashes as ingested — so the first file was reported to the user as
+    a success it never was, and an idempotent retry would skip it
+    forever.
+    """
+    channel = _FakeChannel(id=999, sent=[])
+    store = _make_store()
+    payload_a = b"# payload P1\n"
+    payload_b = b"# payload P2 differs\n"
+    msg: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="",
+        id=321,
+        attachments=[
+            _FakeAttachment(filename="a b.md", size=len(payload_a), payload=payload_a),
+            _FakeAttachment(filename="a_b.md", size=len(payload_b), payload=payload_b),
+        ],
+    )
+
+    class _ScanSession:
+        async def call_tool(
+            self, _name: str, _args: dict[str, Any] | None = None
+        ) -> str:
+            return "Scan summary: no findings"
+
+    await handle_message(
+        msg,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_ScanSession()),  # type: ignore[arg-type]
+        known_tools=("creek.redact.scan",),
+        pending_batches=store,
+    )
+    channel.sent.clear()
+
+    ingested_paths: list[str] = []
+
+    class _IngestSession:
+        async def call_tool(
+            self, _name: str, arguments: dict[str, Any] | None = None
+        ) -> str:
+            args = arguments or {}
+            ingested_paths.append(str(args["input_path"]))
+            return "ingested"
+
+    followup: Any = _FakeMessage(
+        author=_FakeAuthor(id=111),
+        channel=channel,
+        content="ingest",
+    )
+    await handle_message(
+        followup,
+        config=config,
+        session_state=session_state,
+        bot_user_id=42,
+        mcp_client=_StubMCPClient(_IngestSession()),  # type: ignore[arg-type]
+        known_tools=("creek.ingest",),
+        pending_batches=store,
+    )
+
+    # Two distinct staged paths were ingested — nobody's bytes were skipped.
+    assert len(ingested_paths) == 2
+    assert len(set(ingested_paths)) == 2
+
+    staged = {
+        p.name: p.read_bytes()
+        for p in (config.vault_path / "00-Creek-Meta" / "Inbound" / "999" / "321")
+        .resolve()
+        .iterdir()
+    }
+    assert sorted(staged) == ["a_b-1.md", "a_b.md"]
+    assert set(staged.values()) == {payload_a, payload_b}
+
+    # Every hash recorded as ingested belongs to a file whose bytes were
+    # actually dispatched, so a retry cannot silently skip a lost file.
+    stored = store.get(999)
+    assert stored is not None
+    assert stored.state == "ingested"
+    assert len(stored.ingested_hashes) == 2
+    on_disk = {hashlib.sha256(b).hexdigest() for b in staged.values()}
+    assert set(stored.ingested_hashes) == on_disk

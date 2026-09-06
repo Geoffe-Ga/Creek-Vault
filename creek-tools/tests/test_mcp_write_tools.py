@@ -649,6 +649,29 @@ def test_ingest_refuses_unknown_source_type(vault: Path) -> None:
     assert "unknown source_type" in result["reason"]
 
 
+def test_ingest_refuses_a_nul_byte_path_without_raising(vault: Path) -> None:
+    """An unresolvable path becomes a refusal, not an exception (#1089).
+
+    ``resolve_within_vault``'s ``candidate.resolve()`` used to sit outside its
+    own ``try``, so an embedded NUL in a caller-supplied ``input_path`` raised
+    ``ValueError`` straight out of the MCP boundary instead of taking the
+    ordinary outside-the-vault exit. A tool that raises where it should refuse
+    hands the caller a stack trace in place of a structured answer.
+
+    ``pytest.raises`` is deliberately absent: the assertion is that calling
+    this at all returns rather than raises, which the call itself makes.
+    """
+    result = ingest_tool(
+        vault_path=vault,
+        source_type="markdown",
+        input_path="staging/no\x00pe.md",
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+    )
+    assert result["status"] == "refused", (
+        f"a NUL-byte input_path did not produce a structured refusal: {result}"
+    )
+
+
 def test_ingest_refuses_missing_path(vault: Path) -> None:
     """A non-existent input path returns a structured refusal."""
     result = ingest_tool(
@@ -672,6 +695,109 @@ def test_ingest_writes_audit_entry_on_refusal(vault: Path) -> None:
     )
     entries = _read_audit(vault)
     assert any(e["tool"] == "creek.ingest" for e in entries)
+
+
+def test_every_ingest_refusal_is_audited(vault: Path) -> None:
+    """A refused ingest must leave a trail, whichever arm refuses it (#885).
+
+    ``ingest_tool`` appended only at the tier-ceiling refusal and on success,
+    so four refusal arms returned with no entry at all: unknown
+    ``source_type``, the vault-confinement refusal, not-found, and the
+    escaping-symlink refusal. A remote consumer could probe the vault
+    boundary -- "is this path inside your vault?" -- and leave nothing behind.
+
+    ``creek.redact.scan`` has appended unconditionally at the top of the
+    function since #972 (``redact.py:179``); this is ingest catching up to
+    the discipline ``read_gate.py:20-23`` already states: "Audit-log the
+    attempt first and unconditionally."
+    """
+    outside = str(vault.parent / "elsewhere" / "note.md")
+    arms = {
+        "unknown source_type": {
+            "source_type": "not-a-real-type",
+            "input_path": str(vault),
+        },
+        "outside the vault": {"source_type": "markdown", "input_path": outside},
+        "not found": {"source_type": "markdown", "input_path": str(vault / "nope.md")},
+    }
+    for label, kwargs in arms.items():
+        audit = vault / MCP_AUDIT_RELPATH
+        if audit.exists():
+            audit.unlink()
+        result = ingest_tool(
+            vault_path=vault,
+            privacy_tier_ceiling=TierCeiling.PERSONAL,
+            consumer="crawdad",
+            **kwargs,
+        )
+        assert result["status"] == "refused", f"{label}: expected a refusal"
+        entries = _read_audit(vault)
+        assert entries, (
+            f"the {label!r} refusal wrote no audit entry, so the attempt is "
+            "invisible to the operator"
+        )
+        assert entries[0]["tool"] == "creek.ingest"
+
+
+def test_an_ingest_refusal_records_the_raw_path_never_a_resolved_one(
+    vault: Path,
+) -> None:
+    """The entry echoes what the caller sent, not what it resolved to.
+
+    ``read_gate.py:651-657`` forbids recording the resolved target by name:
+    for a staged symlink the resolved path IS an intimate fragment's path,
+    so writing it into the audit file would move the #972 leak rather than
+    close it. Issue #885 asked for "the offending (raw) path, and the
+    resolved target"; only the first half is admissible, and this pins that.
+    """
+    audit = vault / MCP_AUDIT_RELPATH
+    if audit.exists():
+        audit.unlink()
+
+    secret = vault / "01-Fragments" / "intimate-note.md"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_text("# private\n", encoding="utf-8")
+    link = vault / "00-Creek-Meta" / "Inbound" / "innocuous.md"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(secret, link)
+
+    raw = "00-Creek-Meta/Inbound/innocuous.md"
+    ingest_tool(
+        vault_path=vault,
+        source_type="not-a-real-type",
+        input_path=raw,
+        privacy_tier_ceiling=TierCeiling.PERSONAL,
+        consumer="crawdad",
+    )
+
+    entries = _read_audit(vault)
+    assert entries, "the refusal wrote no audit entry"
+    summary = entries[0]["args_summary"]
+    assert isinstance(summary, dict)
+
+    assert summary.get("input_path") == raw, (
+        f"the caller's own input_path was not recorded verbatim: {summary}"
+    )
+
+    # Assert on KEYS, not on the rendered blob. `summarise_args`
+    # (creek_mcp/audit.py:141) replaces any string over 64 characters with
+    # `{"len": N}`, and a resolved absolute path is almost always longer than
+    # that -- so a content check for the target's name passes whether or not
+    # the code records it, which is a test that proves nothing. A short vault
+    # root would still leak verbatim, so the rule is real; the key check is
+    # what actually enforces it.
+    forbidden = {
+        key for key in summary if "resolv" in key.lower() or "target" in key.lower()
+    }
+    assert not forbidden, (
+        f"the audit entry carries {sorted(forbidden)}; read_gate.py:651-657 "
+        "forbids recording the resolved target, because for a staged symlink "
+        "it IS an intimate fragment's path (#972)"
+    )
+    assert set(summary) == {"source_type", "input_path"}, (
+        f"unexpected audit args {sorted(summary)}; the attempt entry records "
+        "what the caller sent and nothing derived from it"
+    )
 
 
 def test_ingest_writes_fragments_and_audit(
@@ -927,6 +1053,45 @@ def test_classify_refuses_when_llm_provider_unavailable(vault: Path) -> None:
     assert result["status"] == "refused"
     assert result["tool"] == "creek.classify"
     assert "unavailable" in result["reason"]
+
+
+def test_classify_reports_rule_skips_and_llm_failures_as_separate_fields(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #1356: the tool publishes both skip reasons, not one merged count.
+
+    The counters are stubbed because what is under test is this wrapper's
+    projection of the summary onto the wire dict; the engine's counting is
+    pinned in :mod:`tests.test_classify_failed_llm_provenance`.
+    """
+    from creek.classify.classify_engine import ClassifySummary
+    from creek_mcp.tools import classify as classify_mod
+
+    monkeypatch.setattr(
+        classify_mod,
+        "run_classify",
+        lambda **_kwargs: ClassifySummary(
+            total=10,
+            classified=10,
+            preserved_manual=0,
+            preserved_llm=0,
+            skipped_high_confidence=3,
+            errors=(),
+            llm_call_failed=7,
+        ),
+    )
+
+    result = classify_tool(
+        vault_path=vault,
+        method="llm",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="crawdad",
+    )
+
+    assert result["status"] == "ok"
+    assert result["skipped_high_confidence"] == 3
+    assert result["llm_call_failed"] == 7
 
 
 # ---------------------------------------------------------------------------

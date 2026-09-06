@@ -246,7 +246,9 @@ from most to least likely:
   the legacy `Processing-Log/purge-log.json` from its rewrite set
   **unconditionally** — independent of `redaction.supported_extensions`
   and `redaction.exclude_patterns`, both of which are operator-editable
-  and neither of which mentioned `00-Creek-Meta`. Before #1308 the log
+  and neither of which mentioned `00-Creek-Meta`, and independent of
+  whether `--vault` was passed: the protected roots are derived from the
+  tree `--source` actually walks (#1561). Before #1308 the log
   survived only because `.jsonl` happened to be absent from the default
   extension list; adding it made a vault-wide run rewrite its own first
   entry, after which `verify()` still passed because the entries
@@ -259,6 +261,17 @@ from most to least likely:
   authentic. Detection is deliberately unchanged: `--scan` and
   `--review` still report matches inside `00-Creek-Meta/audit/`; only
   in-place destruction narrows.
+- **The audit log's cache staleness is deliberate.** `AuditLog`
+  caches the last line's chain hash keyed on the file's byte size
+  alone, so a byte-length-preserving out-of-band rewrite of the last
+  line is not seen at write time. That is an accepted residual, not an
+  oversight: invalidating on mtime or inode instead would make the next
+  append re-anchor the chain onto the mutated line and produce exactly
+  the clean-verifying chain the bullet above records as a defect. The
+  tamper still surfaces — as a chain break at the following line, and
+  for `mcp.jsonl` at its own line via `entry_hash`, since
+  `verify_mcp_audit_chain` checks both invariants per line. Decided in
+  `creek/audit/log.py`, `AuditLog._compute_prev_hash`.
 - **A destructive redaction cannot outrun its own record.** The
   per-file audit entry is appended immediately after that file's
   atomic write, and the `intent` entry naming every candidate is

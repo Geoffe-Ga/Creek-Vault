@@ -8,7 +8,7 @@ builder, and therefore outside every guarantee that builder makes.
 **A trailing slash was a ``307`` (#1369).** Starlette's router redirects
 ``/v1/health/`` to ``/v1/health`` by default. Three things ride on that, and the
 middle one is the serious one. ``307`` is outside the contract's published
-status set ``{200, 401, 403, 404, 409, 422, 500, 501, 503}``, which a conforming
+status set ``{200, 401, 403, 404, 409, 415, 422, 500, 501, 503}``, which a conforming
 client maps to "unreachable" — the same reasoning that makes
 :data:`~creek_mcp.httpapi.app.METHOD_NOT_ALLOWED` render as ``404``. The
 redirect is issued by the router, which sits *above* the contract-version gate
@@ -51,6 +51,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from creek_mcp.api.models import ERROR_MESSAGES, ERROR_STATUS, ErrorCode
+from creek_mcp.api.routes import PUBLISHED_SUCCESS_STATUSES
 from creek_mcp.httpapi.app import REDIRECT_SLASHES
 from creek_mcp.httpapi.errors import CACHE_CONTROL_HEADER, NO_STORE, VARY_HEADER
 from creek_mcp.httpapi.middleware import access_log as access_log_module
@@ -77,12 +78,16 @@ if TYPE_CHECKING:
 JSON_MEDIA_TYPE: Final[str] = "application/json"
 """The only media type ``/v1`` speaks, in either direction."""
 
-PUBLISHED_STATUSES: Final[frozenset[int]] = frozenset(ERROR_STATUS.values()) | {200}
-"""The contract's closed status set, derived from the table rather than listed.
+PUBLISHED_STATUSES: Final[frozenset[int]] = (
+    frozenset(ERROR_STATUS.values()) | PUBLISHED_SUCCESS_STATUSES
+)
+"""The contract's closed status set, derived from the tables rather than listed.
 
 A literal set here could agree with the contract on the day it was typed and
 drift the day a code was added; deriving it means the assertion below is always
-about the published set and never about a copy of it.
+about the published set and never about a copy of it. Both halves are now
+derived (#1605): the refusals from ``ERROR_STATUS``, the successes from the
+route table, which carries them per route rather than assuming one ``200``.
 """
 
 REDIRECT_STATUS: Final[int] = 307
