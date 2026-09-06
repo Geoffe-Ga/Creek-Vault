@@ -21,6 +21,7 @@ import pytest
 
 from creek.classify.llm.base import LLMProvider
 from creek.classify.llm.completion import Completion
+from creek.classify.llm.orchestrator import LLMClassifier
 from creek.classify.llm.providers import (
     DEFAULT_MODELS,
     AnthropicProvider,
@@ -32,6 +33,7 @@ from creek.classify.llm.providers import (
     provider_is_cloud,
 )
 from creek.config import LLMConfig
+from creek.models import Fragment, FragmentSource, SourcePlatform
 
 
 @pytest.fixture
@@ -172,14 +174,75 @@ class TestOllamaProvider:
         assert payload["model"] == OllamaProvider.DEFAULT_MODEL
 
     @patch("creek.classify.llm.httpx.Client")
-    def test_available_true_on_200(self, mock_client_cls: MagicMock) -> None:
-        """``available`` is ``True`` when the Ollama health check returns 200."""
+    def test_available_true_when_resolved_model_is_installed(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        """An untagged request matches Ollama's installed ``latest`` tag."""
         mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"models": [{"name": "mistral:latest"}]}
         ctx = MagicMock()
         ctx.get.return_value = mock_resp
         mock_client_cls.return_value.__enter__ = MagicMock(return_value=ctx)
         mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
         assert OllamaProvider(LLMConfig()).available is True
+
+    @patch("creek.classify.llm.httpx.Client")
+    def test_available_false_when_resolved_model_is_absent(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        """A healthy daemon serving only another model is not ready."""
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"models": [{"name": "qwen3:8b"}]}
+        ctx = MagicMock()
+        ctx.get.return_value = mock_resp
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=ctx)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        assert OllamaProvider(LLMConfig()).available is False
+        ctx.post.assert_not_called()
+
+    @patch("creek.classify.llm.httpx.Client")
+    def test_missing_model_short_circuits_classification_before_generate(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        """Explicit classification keeps its stable unavailable outcome."""
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"models": [{"name": "qwen3:8b"}]}
+        ctx = MagicMock()
+        ctx.get.return_value = mock_resp
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=ctx)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+        fragment = Fragment(
+            id="frag-missingmodel1",
+            title="Unchanged",
+            source=FragmentSource(platform=SourcePlatform.MARKDOWN),
+        )
+
+        result = LLMClassifier(LLMConfig()).classify_with_reasoning(
+            fragment,
+            "ordinary text",
+        )
+
+        assert result.succeeded is False
+        assert result.fragment is fragment
+        ctx.post.assert_not_called()
+
+    @patch("creek.classify.llm.httpx.Client")
+    def test_available_honours_an_explicit_tag(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        """An explicit model tag must itself appear in the daemon inventory."""
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {
+            "models": [{"name": "llama3:latest"}, {"model": "llama3:8b"}]
+        }
+        ctx = MagicMock()
+        ctx.get.return_value = mock_resp
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=ctx)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        assert OllamaProvider(LLMConfig(model="llama3:8b")).available is True
+        assert OllamaProvider(LLMConfig(model="llama3:70b")).available is False
 
     @patch("creek.classify.llm.httpx.Client")
     def test_available_false_on_connect_error(self, mock_client_cls: MagicMock) -> None:

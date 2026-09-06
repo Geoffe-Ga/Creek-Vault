@@ -410,13 +410,14 @@ class TestLLMClassifierAvailability:
     """Tests for Ollama availability checking."""
 
     @patch("creek.classify.llm.httpx.Client")
-    def test_available_when_ollama_responds_200(
+    def test_available_when_ollama_lists_the_configured_model(
         self,
         mock_client_cls: MagicMock,
     ) -> None:
-        """available should be True when Ollama returns 200."""
+        """Availability requires both a healthy daemon and the requested model."""
         mock_resp = MagicMock()
         mock_resp.status_code = 200
+        mock_resp.json.return_value = {"models": [{"name": "mistral:latest"}]}
         mock_ctx = MagicMock()
         mock_ctx.get.return_value = mock_resp
         mock_client_cls.return_value.__enter__ = MagicMock(

@@ -651,24 +651,57 @@ def call_ollama(config: LLMConfig, prompt: str, *, timeout: float) -> str:
 
 
 def check_ollama_available(config: LLMConfig, *, timeout: float) -> bool:
-    """Health-check the Ollama HTTP endpoint at ``/api/tags``.
+    """Check that Ollama can serve the configured model.
 
     Args:
         config: LLM provider configuration with the Ollama URL.
         timeout: HTTP request timeout in seconds.
 
     Returns:
-        ``True`` when Ollama replies ``200``; ``False`` on any HTTP
-        error or non-200 status.
+        ``True`` when Ollama replies ``200`` and its model inventory contains
+        the configured (or default) model; ``False`` otherwise. Ollama treats
+        an omitted tag as ``latest``, so those two spellings are equivalent.
     """
+    model = _resolve_configured_model(config.model, DEFAULT_MODELS["ollama"])
     try:
         with httpx.Client(timeout=timeout) as client:
             resp = client.get(f"{config.ollama_url}/api/tags")
-            if resp.status_code == 200:
+            if resp.status_code == 200 and _ollama_has_model(resp.json(), model):
                 return True
-    except httpx.HTTPError:
+    except (httpx.HTTPError, TypeError, ValueError):
         pass
-    logger.warning("Ollama not available at %s", config.ollama_url)
+    logger.warning(
+        "Ollama model %r is not available at %s",
+        model,
+        config.ollama_url,
+    )
+    return False
+
+
+def _ollama_has_model(payload: object, requested: str) -> bool:
+    """Return whether an Ollama tags payload contains *requested*.
+
+    Ollama's inventory has used both ``name`` and ``model`` for the canonical
+    identifier, so either field is accepted. Malformed rows are ignored and a
+    malformed envelope fails closed. An untagged generation request means the
+    ``latest`` tag; explicit tags and digests must match verbatim.
+    """
+    if not isinstance(payload, dict):
+        return False
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return False
+    accepted = {requested}
+    tail = requested.rsplit("/", maxsplit=1)[-1]
+    if ":" not in tail and "@" not in tail:
+        accepted.add(f"{requested}:latest")
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        for field in ("name", "model"):
+            installed = item.get(field)
+            if isinstance(installed, str) and installed in accepted:
+                return True
     return False
 
 
@@ -720,10 +753,10 @@ class OllamaProvider:
 
     @property
     def available(self) -> bool:
-        """Whether the local Ollama endpoint is reachable.
+        """Whether the local Ollama endpoint can serve this provider's model.
 
         Returns:
-            ``True`` when the ``/api/tags`` health check returns ``200``.
+            ``True`` when ``/api/tags`` lists :attr:`model`.
         """
         return check_ollama_available(
             self.config,

@@ -149,7 +149,8 @@ class AuthorLLMClient:
         Resolves the ``voice_drafter`` role via :meth:`for_role` (so it inherits
         per-stage routing and the ``Intimate``-never-cloud gate), then returns it
         only when its provider is :attr:`available` (key + consent for a cloud
-        provider, a reachable server for Ollama). When unavailable it returns
+        provider, a reachable server with the configured model for Ollama).
+        When unavailable it returns
         ``None`` so the desk falls back to deterministic rendering rather than
         erroring — enabling live voicing when a provider is configured while
         preserving the historical stub behaviour otherwise (#658).
@@ -174,7 +175,7 @@ class AuthorLLMClient:
         """Whether the wrapped provider can serve a call right now.
 
         Delegates to the provider's own readiness check (API key + cloud
-        consent, or a reachable local server).
+        consent, or a reachable local server with the configured model).
         """
         return self._provider.available
 
