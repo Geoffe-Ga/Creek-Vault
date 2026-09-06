@@ -203,12 +203,12 @@ dev = [
     # the agreement is asserted by
     # tests/test_dependency_pins.py::_LOCKSTEP_TOOLS.
     "ruff>=0.16.4,<0.17",
-    # Pinned to the same major.minor as uv.lock and
-    # .pre-commit-config.yaml's mirrors-mypy rev so the three install
-    # paths (uv sync, pip install -e '.[dev]', pre-commit) run the same
-    # mypy version. Bumping requires updating all three together, both
-    # ends at once, for the reason on the ruff pin above.
-    # 2.1.0 -> 2.3.1 (#1440).
+    # Pinned to the same major.minor as uv.lock so the two provisioning
+    # paths (uv sync and pip install -e '.[dev]') run the same mypy version.
+    # Pre-commit reuses that project environment through typecheck.sh rather
+    # than provisioning a third copy (#1759). Bumping requires moving the
+    # declared band and lock together, both ends at once, for the reason on
+    # the ruff pin above. 2.1.0 -> 2.3.1 (#1440).
     "mypy>=2.3.1,<2.4.0",
     "pylint>=4.0.7",
     # Pinned to the same version as uv.lock and .pre-commit-config.yaml's
@@ -221,10 +221,9 @@ dev = [
     "xenon>=0.9.0",
     "interrogate>=1.7.0",
     "refurb>=2.0.0",
-    # Pinned to the same version as uv.lock and .pre-commit-config.yaml's
-    # tryceratops rev so the three install paths run the same tryceratops
-    # version. Bumping requires updating all three together
-    # (issues #206, #409).
+    # Bounded to the same major as uv.lock. Pre-commit reuses the project
+    # installation through lint-tryceratops.sh rather than provisioning an
+    # independent copy (#1759), so the declared band and lock move together.
     "tryceratops>=2.4.1,<3",
     # Floor raised from 2.10 when vulture became a real gate (issue #1395).
     # scripts/lint_vulture.py drives the Python API (Vulture.scavenge,
@@ -278,6 +277,28 @@ constraint-dependencies = [
     # Fixed in 50.0.0 (#1167).
     "cryptography>=50.0.0",
     "pyjwt>=2.13.0",
+    # Security: pin python-multipart above the FOUR advisories carried by
+    # 0.0.29 — PYSEC-2026-3036 (CVE-2026-53539), PYSEC-2026-3037
+    # (CVE-2026-53538), PYSEC-2026-3041 (CVE-2026-53537) and
+    # PYSEC-2026-3040 (CVE-2026-53540). 0.0.30 clears three of the four,
+    # leaving PYSEC-2026-3040 open, so the floor is 0.0.31 — the first
+    # fully patched release (same first-fully-patched convention as
+    # crawdad's aiohttp>=3.14.1). Transitive-only via mcp →
+    # python-multipart (uv.lock:1973, inside mcp 1.29.0's dependency
+    # table at :1962), so the floor belongs here rather than in
+    # [project].dependencies.
+    #
+    # This project's OWN /v1 routes never parse multipart: uploads are
+    # JSON + base64 by design and creek_mcp.api.models says so
+    # explicitly. The reachable surface is the MCP SDK's own Starlette
+    # app, which creek_mcp.server mounts under the streamable-http
+    # transport. Floored regardless — a constraint's job is to stop a
+    # future `uv lock` walking back down onto 0.0.29.
+    #
+    # Held with crawdad/pyproject.toml, which floored this first; the
+    # parity guard in tests/test_dependency_pins.py now fails if either
+    # manifest drops it (#1328).
+    "python-multipart>=0.0.31",
     # Security: pip arrives transitively via pip-api (a pip-audit dep).
     # Floored above PYSEC-2026-3721, fixed in 26.2. Build/dev tooling
     # only, never a runtime import.

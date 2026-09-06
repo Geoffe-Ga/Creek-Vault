@@ -48,8 +48,11 @@ against the file's own before trusting the cached hash, so an append by another
 instance, another thread or another process still forces the rescan it needs.
 The one thing that check cannot see is an out-of-band rewrite preserving the
 file's byte length — pre-existing, but the window is longer now that a cache
-lives for the process rather than for one call, so it is written down and
-tracked in #1149 rather than left to be rediscovered.
+lives for the process rather than for one call. That residual is accepted
+deliberately: the stale cache is what makes such a rewrite detectable on the
+next append, so tightening the check would re-anchor the chain onto the
+mutated line and verify clean. See
+:meth:`~creek.audit.AuditLog._compute_prev_hash` for the full reasoning.
 """
 
 from __future__ import annotations

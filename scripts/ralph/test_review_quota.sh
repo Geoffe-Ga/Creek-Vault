@@ -109,15 +109,18 @@
 #   argv           `--workflow code-review.yml`, `--limit 20`, the json field
 #                  list, `--repo` forwarded when given and not invented when
 #                  absent — and NO `--branch` anywhere. main-health.sh has
-#                  `--branch main`; copying that here yields a permanently empty
-#                  window, because code-review.yml only ever runs on
-#                  `pull_request`.
+#                  `--branch main`; copying that here scopes the window to
+#                  main-branch runs, which are either none at all (the
+#                  `pull_request` path) or an arbitrary slice of #1201's
+#                  dispatched re-reviews — never the PR runs this helper is
+#                  asking about.
 #
 # Plus one cross-file coupling check, the same silent-wedge class as
 # test_pr_ready.sh:1121-1148: `.github/workflows/code-review.yml` must keep
-# existing at that path, must keep its `claude-review` job key, and must keep its
-# `pull_request:` trigger. A rename makes this helper answer `unknown` forever
-# and #1160's bug silently returns with nothing else in the repo failing.
+# existing at that path, must keep its `claude-review` job key, and must keep
+# BOTH of its triggers (`pull_request:` and, since #1201, `workflow_dispatch:`).
+# A rename makes this helper answer `unknown` forever and #1160's bug silently
+# returns with nothing else in the repo failing.
 #
 # Run:  bash scripts/ralph/test_review_quota.sh
 set -euo pipefail
@@ -850,12 +853,15 @@ contains "the run list asks for all four fields" \
 lacks "no --repo is invented when none was given" "--repo" "$argv"
 
 # THE HARMONISATION TRAP. main-health.sh's list call carries `--branch main`,
-# because the run it reads is `ci.yml` on `push: main`. `code-review.yml` only
-# ever runs on `pull_request` (asserted against the workflow file below), so a
-# `--branch main` copied across from the sibling yields an EMPTY window forever:
-# this helper would answer `unknown` on every lane, always, and — because
-# `unknown` falls through to `behind` by design — nothing would ever look broken.
-# The bug would just quietly come back.
+# because the run it reads is `ci.yml` on `push: main`. `code-review.yml`'s runs
+# are PR runs (its `pull_request:` trigger is asserted against the workflow file
+# below) plus, since #1201, whatever branch a `workflow_dispatch` was fired
+# from. A `--branch main` copied across from the sibling therefore scopes this
+# window to runs that are never the ones being asked about: empty on the
+# automatic path, and an arbitrary slice of dispatched re-reviews otherwise.
+# Either way this helper answers `unknown` on every lane — and because `unknown`
+# falls through to `behind` by design, nothing would look broken. The bug would
+# just quietly come back.
 lacks "NO --branch anywhere in the argv (see the harmonisation trap)" "--branch" "$argv"
 
 # `--repo` must survive to BOTH calls: pr-ready.sh forwards its own, and a log
@@ -1187,13 +1193,27 @@ else
   bad "code-review.yml no longer has the '  claude-review:' job key"
 fi
 
-# The justification for having NO `--branch` in the query: this workflow runs on
-# `pull_request` only, so every run in the window is a PR run and a `--branch
-# main` scope would match none of them, ever.
+# The justification for having NO `--branch` in the query. It USED to be "this
+# workflow runs on `pull_request` only, so a `--branch main` scope would match
+# nothing, ever". #1201 added a `workflow_dispatch`, and a dispatch fired from
+# `main` IS a main-branch run — so the prohibition survives with a DIFFERENT
+# reason: `--branch main` would now return an arbitrary slice of dispatched runs
+# rather than an empty one. Still wrong, differently wrong, and worse to debug.
+#
+# Both triggers are asserted, and asserted as PRESENCE rather than exclusivity:
+# the property that matters is that the 20-run window review-quota.sh reads can
+# be fed by either path, so losing either one silently narrows what the quota
+# helper can ever see.
 if grep -qx "  pull_request:" "$REVIEW_WORKFLOW" 2>/dev/null; then
-  ok "code-review.yml still triggers on pull_request (so --branch would be empty)"
+  ok "code-review.yml still triggers on pull_request (the automatic review path)"
 else
   bad "code-review.yml no longer triggers on pull_request — re-check the no---branch rule"
+fi
+
+if grep -qx "  workflow_dispatch:" "$REVIEW_WORKFLOW" 2>/dev/null; then
+  ok "code-review.yml still triggers on workflow_dispatch (#1201's re-review path)"
+else
+  bad "code-review.yml no longer triggers on workflow_dispatch — the only way back to a fresh verdict is an empty commit, which destroys the verdict the lane is waiting on (#1201)"
 fi
 
 # --- summary ---------------------------------------------------------------

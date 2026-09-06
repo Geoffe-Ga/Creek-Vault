@@ -63,10 +63,13 @@ from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 
+from creek_mcp.api import openapi as openapi_module
 from creek_mcp.api.models import (
     CONTRACT_MODELS,
     ERROR_STATUS,
     MAX_EXTERNAL_ID_CHARS,
+    CapabilitiesResponse,
+    WheelResponse,
 )
 from creek_mcp.api.openapi import (
     BEARER_SCHEME_DESCRIPTION,
@@ -75,20 +78,29 @@ from creek_mcp.api.openapi import (
     SECURITY_SCHEME_NAME,
     build_openapi,
 )
-from creek_mcp.api.routes import AUTHORIZATION_HEADER
+from creek_mcp.api.routes import (
+    AUTHORIZATION_HEADER,
+    PUBLISHED_SUCCESS_STATUSES,
+    ROUTES,
+    RouteSpec,
+)
 from creek_mcp.contract import CONTRACT_VERSION
 from creek_mcp.httpapi.journal import admissible_external_id
 from tests.v1_api_support import (
     CAPABILITIES_PATH,
     CLASSIFICATIONS_PATH,
     CONTRACT_VERSION_HEADER,
+    DRIVE_AUTHORIZATION_PATH,
+    DRIVE_AUTHORIZATION_TEMPLATE,
     DRIVE_CONNECTOR_PATH,
     DRIVE_SYNC_PATH,
     HEALTH_PATH,
+    JOB_TEMPLATE,
     JOURNAL_TEMPLATE,
     LINKS_PATH,
     REFLECTIONS_PATH,
     UPLOAD_PATH,
+    VOICE_DRAFT_TEMPLATE,
     WHEEL_PATH,
     build_app,
     mounted_method_paths,
@@ -101,12 +113,27 @@ if TYPE_CHECKING:
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 SCHEMA_DIR: Final[Path] = REPO_ROOT / "docs" / "contracts" / "adepthood-v1" / "schemas"
 
+OPENAPI_GOLDEN: Final[Path] = (
+    Path(__file__).resolve().parent / "fixtures" / "openapi-0.15.0.json"
+)
+"""The published document at contract 0.15.0, including Voice Drafts (#1727).
+
+Regenerate it **only** with a deliberate contract change, and say in that
+change's ADR row what moved:
+``json.dumps(build_openapi(), indent=2, ensure_ascii=False) + "\n"``.
+"""
+
 MODEL_NAMES: Final[tuple[str, ...]] = tuple(sorted(CONTRACT_MODELS))
 
 ALLOWED_HTTP_STATUSES: Final[frozenset[str]] = frozenset(
-    str(status) for status in set(ERROR_STATUS.values()) | {200}
+    str(status) for status in set(ERROR_STATUS.values()) | PUBLISHED_SUCCESS_STATUSES
 )
-"""The published closed status set, as the string keys OpenAPI uses."""
+"""The published closed status set, as the string keys OpenAPI uses.
+
+Both halves are derived: the refusals from ``ERROR_STATUS``, the successes from
+the route table (#1605). Neither is a literal, so a route documenting a second
+success status widens this with it rather than reddening it.
+"""
 
 ERROR_ENVELOPE_REF: Final[str] = "#/components/schemas/ErrorEnvelope"
 
@@ -413,10 +440,10 @@ def test_documented_paths_equal_the_mounted_routes(vault: Path) -> None:
 
 
 def test_every_published_route_is_documented() -> None:
-    """All ten paths appear, named explicitly so a silent drop is visible.
+    """All fourteen paths appear, named explicitly so a silent drop is visible.
 
-    Ten paths over eleven operations since #1570: ``/v1/connectors/drive``
-    serves both ``GET`` and ``DELETE``, which is why this is a set of paths
+    Fourteen paths over seventeen operations since #1727: two resource paths
+    serve multiple methods, which is why this is a set of paths
     while ``test_documented_routes_are_the_mounted_ones`` above compares
     ``(method, path)`` pairs.
     """
@@ -426,10 +453,14 @@ def test_every_published_route_is_documented() -> None:
         REFLECTIONS_PATH,
         WHEEL_PATH,
         UPLOAD_PATH,
+        VOICE_DRAFT_TEMPLATE,
         DRIVE_CONNECTOR_PATH,
         DRIVE_SYNC_PATH,
+        DRIVE_AUTHORIZATION_PATH,
+        DRIVE_AUTHORIZATION_TEMPLATE,
         CLASSIFICATIONS_PATH,
         LINKS_PATH,
+        JOB_TEMPLATE,
         HEALTH_PATH,
     }
 
@@ -449,10 +480,13 @@ def test_every_operation_declares_a_unique_operation_id() -> None:
 
 
 def test_every_documented_status_is_in_the_published_set() -> None:
-    """No documented response falls outside ``{200,401,403,404,409,422,500,501,503}``.
+    """No documented response falls outside the contract's closed status set.
 
-    A conforming client maps an out-of-set status to "unreachable" and must
-    not synthesize a body, so documenting one — ``405`` above all — would tell
+    That set is ``{200, 401, 403, 404, 409, 415, 422, 500, 501, 503}`` today,
+    and it is *derived* on both halves rather than spelled out here (#1605):
+    the refusals from ``ERROR_STATUS``, the successes from the route table. A
+    conforming client maps an out-of-set status to "unreachable" and must not
+    synthesize a body, so documenting one — ``405`` above all — would tell
     consumers to write handling for a state that means "the vault is gone".
     """
     documented = {
@@ -473,19 +507,129 @@ def test_no_operation_documents_a_405() -> None:
     )
 
 
-def test_every_non_200_response_is_the_error_envelope() -> None:
+def test_every_non_success_response_is_the_error_envelope() -> None:
     """One error shape across the whole surface, referenced not restated.
 
     An inline error schema on one route is how a second envelope shape is
     born, and a second shape is a place for a field that echoes request or
     vault material.
+
+    The exemption is the route's **own** declared success statuses (#1605), not
+    the literal ``"200"`` this skipped until the route table carried them. A
+    route documenting a ``202`` would otherwise have had its accepted-job body
+    asserted to be an error envelope; skipping a hardcoded second literal
+    instead would have exempted ``202`` on the eleven routes that never answer
+    it.
     """
+    checked = 0
     for path, method, operation in _operations():
+        spec = _spec_for(path, method)
+        success_keys = {
+            str(status) for status, _model in spec.published_success_responses
+        }
         for status, response in operation["responses"].items():
-            if status == "200":
+            if status in success_keys:
                 continue
             schema = response["content"]["application/json"]["schema"]
             assert schema == {"$ref": ERROR_ENVELOPE_REF}, f"{method} {path} {status}"
+            checked += 1
+    assert checked, "the loop skipped every response and asserted nothing"
+
+
+def _spec_for(path: str, method: str) -> RouteSpec:
+    """Return the :class:`RouteSpec` the document's operation was built from.
+
+    Args:
+        path: The route template as the document publishes it.
+        method: The HTTP method, lowercased by the document.
+
+    Returns:
+        The matching spec.
+
+    Raises:
+        LookupError: When the document publishes an operation the table does
+            not declare — which would mean the document and the table had
+            diverged, and is worth a clear failure rather than a ``KeyError``.
+    """
+    for spec in ROUTES:
+        if spec.path == path and spec.method.lower() == method.lower():
+            return spec
+    msg = f"the document publishes {method} {path}, which ROUTES does not declare"
+    raise LookupError(msg)
+
+
+def test_the_generated_document_matches_the_current_contract_golden() -> None:
+    """The complete published document is pinned byte-for-byte at 0.15.0.
+
+    A **golden file**, deliberately, and it is the whole review of the
+    ``RouteSpec.success_responses`` change: that change rewrote the response
+    half of the generator — deleting ``openapi.py``'s ``_SUCCESS_STATUS``,
+    making ``_responses`` emit one entry per declared success and
+    ``_success_response`` take its model as an argument — while every route
+    kept the default. "No published byte moved" is therefore the entire
+    user-visible contract of that work, and a live re-derivation would pass
+    against a generator that broke the same way twice.
+
+    ``tests/fixtures/openapi-0.15.0.json`` was captured from the generator with
+    ``json.dumps(build_openapi(), indent=2, ensure_ascii=False) + "\n"`` — no
+    ``sort_keys``, so response *insertion order* is pinned too and not merely
+    the set of keys.
+
+    This costs no maintenance that is not already owed. Every component in the
+    document is either a ``CONTRACT_MODELS`` member or an enum nested inside
+    one, and all of them are already committed under
+    ``docs/contracts/adepthood-v1/schemas/`` and pinned by
+    ``test_committed_bundle_equals_a_fresh_build``. Anything that would move
+    this file already reds that one.
+    """
+    generated = json.dumps(build_openapi(), indent=2, ensure_ascii=False) + "\n"
+    assert generated == OPENAPI_GOLDEN.read_text(encoding="utf-8")
+
+
+def test_a_route_declaring_two_successes_documents_both(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The generator reads the declaration; it does not assume one ``200``.
+
+    The mechanism landed inert — every published route keeps the default, and
+    the golden file above is the proof of that — so without this test nothing
+    would exercise the branch the change exists for, and a generator that
+    still emitted one hardcoded ``200`` key would pass the whole suite.
+
+    Driven by substituting the route table the generator reads rather than by
+    calling a private helper, so the assertion is about the published
+    document. ``ROUTES`` itself is frozen data three modules consume and is
+    never mutated.
+    """
+    accepting = RouteSpec(
+        path="/v1/things",
+        method="POST",
+        operation_id="createThing",
+        capability=None,
+        request_model=None,
+        response_model=WheelResponse,
+        requires_contract_version=True,
+        summary="A route that answers two success statuses.",
+        success_responses=((200, WheelResponse), (202, CapabilitiesResponse)),
+    )
+    monkeypatch.setattr(openapi_module, "ROUTES", (accepting,))
+
+    operation = build_openapi()["paths"]["/v1/things"]["post"]
+
+    assert [*operation["responses"]][:2] == ["200", "202"]
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/WheelResponse"
+    }
+    assert operation["responses"]["202"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/CapabilitiesResponse"
+    }
+    successes = {"200", "202"}
+    assert all(
+        response["content"]["application/json"]["schema"]
+        == {"$ref": ERROR_ENVELOPE_REF}
+        for status, response in operation["responses"].items()
+        if status not in successes
+    )
 
 
 def test_every_operation_documents_the_unauthenticated_refusal() -> None:

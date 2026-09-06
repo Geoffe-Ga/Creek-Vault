@@ -36,12 +36,17 @@ never goes to a cloud model.
 | Gate | Check | On pass | On fail |
 | --- | --- | --- | --- |
 | 1 | **TDD** Red→Green→Refactor (`stay-green` skill) | → Gate 2 | — |
-| 2 | **`cd creek-tools && ./scripts/check-all.sh`** exits 0 | → self-review → push → Gate 3 | **drop to Gate 1** |
+| 2 | **`cd creek-tools && VIRTUAL_ENV="$PWD/.venv" PATH="$PWD/.venv/bin:$PATH" ./scripts/check-all.sh`** exits 0 | → self-review → push → Gate 3 | **drop to Gate 1** |
 | 3 | **CI** all green | → Gate 4 | **drop to Gate 1** (`ci-debugging`) |
 | 4 | **Claude review `Verdict:`** | `LGTM` → merge | **drop to Gate 1** (`address-feedback`) |
 
 "Drop to Gate 1" means: fix the **root cause** with a failing-test-first cycle,
 re-clear Gate 2 locally, push, climb again. **Never weaken a gate to pass it.**
+
+In a fleet lane, `fleet.sh assign`/`adopt` has already provisioned
+`creek-tools/.venv` — do NOT run your own `uv sync`. The Gate 2 exports are still
+mandatory: they govern which interpreter is RESOLVED
+(`creek-tools/scripts/_lib.sh` probes a bare `python`), not whether one exists.
 
 ## Quality thresholds (non-negotiable — from `CLAUDE.md`)
 

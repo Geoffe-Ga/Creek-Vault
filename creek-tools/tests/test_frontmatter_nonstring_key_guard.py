@@ -170,6 +170,7 @@ _HELPER_BRACKETING_SITES: Final[frozenset[tuple[str, str]]] = frozenset(
         ("classify/review_runner.py", "_read_entry"),
         ("classify/classify_engine.py", "_load_classifiable_fragment"),
         ("author/checks.py", "_scan_subtree_for_cited"),
+        ("voice_drafts.py", "_load_path"),
     },
 )
 """Every site that brackets :func:`creek.vault.reader.try_load_fragment`.
@@ -382,7 +383,7 @@ def test_every_frontmatter_guard_brackets_exactly_one_load() -> None:
     paragraph stating them also carried a hand-counted tally of the package's
     uses that was simply wrong. A count nobody can check becomes false
     silently; this test checks the claims instead, so a guard that widens its
-    bracket — or a fifth caller that starts bracketing the helper — fails here
+    bracket — or another caller that starts bracketing the helper — fails here
     rather than quietly outdating the docstring (#1548 will move sites).
     """
     sites = _frontmatter_guard_sites()

@@ -30,7 +30,7 @@ Like the rest of :mod:`creek_mcp.api`, this module imports no web framework.
 from __future__ import annotations
 
 import re
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from creek_mcp.api.models import (
     CONTRACT_MODELS,
@@ -49,6 +49,9 @@ from creek_mcp.api.routes import (
     RouteSpec,
 )
 from creek_mcp.contract import CONTRACT_VERSION
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
 
 OPENAPI_VERSION: Final[str] = "3.1.0"
 """The OpenAPI dialect the document declares.
@@ -97,14 +100,18 @@ _DEFS_KEY: Final[str] = "$defs"
 _JSON_MEDIA_TYPE: Final[str] = "application/json"
 """The single media type ``/v1`` speaks, in both directions."""
 
-_SUCCESS_STATUS: Final[str] = "200"
-"""The one success status any operation documents."""
-
 _PATH_PARAMETER: Final[re.Pattern[str]] = re.compile(r"{(\w+)}")
 """Matches a ``{name}`` placeholder in a route template."""
 
 _ERROR_ENVELOPE_NAME: Final[str] = "ErrorEnvelope"
-"""The component every non-``200`` response references."""
+"""The component every non-success response references.
+
+"Non-success" rather than "non-``200``" since #1605: which statuses count as a
+success is declared per route now, on
+:attr:`~creek_mcp.api.routes.RouteSpec.success_responses`, so the rule is
+"everything the route did not declare as a success" rather than "everything but
+one literal".
+"""
 
 _UNIVERSAL_ERROR_CODES: Final[tuple[ErrorCode, ...]] = (
     ErrorCode.UNAUTHENTICATED,
@@ -198,11 +205,21 @@ and five copies are five places for one to be dropped or to acquire an
 """
 
 EXTERNAL_ID_PARAM: Final[str] = "external_id"
-"""The one path parameter ``/v1`` publishes today.
+"""The journal route's path parameter.
 
 Named so :data:`_PATH_PARAMETER_SCHEMAS` is keyed on a constant rather than on
 a string that also appears in ``routes.py``'s path template.
 """
+
+STATE_PARAM: Final[str] = "state"
+"""The Drive-authorization path parameter (#1568).
+
+The single-use value ``POST /v1/connectors/drive/authorizations`` issued. Named
+here for the same reason :data:`EXTERNAL_ID_PARAM` is.
+"""
+
+JOB_ID_PARAM: Final[str] = "job_id"
+"""The opaque UUID identifying one durable pipeline job (#1605)."""
 
 EXTERNAL_ID_PATTERN: Final[str] = "^[^\u0000-\u001f\u007f/]+$"
 """What a published ``{external_id}`` may be made of (#1132).
@@ -232,12 +249,50 @@ on it.
 _MIN_EXTERNAL_ID_CHARS: Final[int] = 1
 """An empty path segment does not match the route at all, let alone identify one."""
 
+_STATE_PATTERN: Final[str] = "^[A-Za-z0-9_-]+$"
+"""What a published ``{state}`` may be made of (#1568).
+
+``secrets.token_urlsafe`` emits exactly the base64url alphabet, so this is the
+server's own output shape rather than a guess at it. Published for the reason
+:data:`EXTERNAL_ID_PATTERN` is: Starlette's default converter admits a NUL byte
+and an unbounded length, and a consumer pins this bundle.
+"""
+
+_MIN_STATE_CHARS: Final[int] = 1
+"""An empty path segment does not match the route at all."""
+
+_MAX_STATE_CHARS: Final[int] = 128
+"""Comfortably above what ``token_urlsafe(32)`` emits (43 characters).
+
+A bound rather than the exact length, so raising
+:data:`creek_mcp.tools.drive_grant.STATE_BYTES` does not silently publish a
+pattern no state can match.
+"""
+
+_JOB_ID_PATTERN: Final[str] = (
+    "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+"""The canonical lowercase UUIDv4 shape emitted for every pipeline job."""
+
 _PATH_PARAMETER_SCHEMAS: Final[dict[str, dict[str, Any]]] = {
     EXTERNAL_ID_PARAM: {
         "type": "string",
         "minLength": _MIN_EXTERNAL_ID_CHARS,
         "maxLength": MAX_EXTERNAL_ID_CHARS,
         "pattern": EXTERNAL_ID_PATTERN,
+    },
+    STATE_PARAM: {
+        "type": "string",
+        "minLength": _MIN_STATE_CHARS,
+        "maxLength": _MAX_STATE_CHARS,
+        "pattern": _STATE_PATTERN,
+    },
+    JOB_ID_PARAM: {
+        "type": "string",
+        "format": "uuid",
+        "minLength": 36,
+        "maxLength": 36,
+        "pattern": _JOB_ID_PATTERN,
     },
 }
 """The published schema for each path parameter, keyed by parameter name.
@@ -250,6 +305,20 @@ directly, so a parameter added to a route template without an entry here fails
 the document build rather than being published unconstrained — the same
 fail-loud posture :meth:`~creek_mcp.api.routes.RouteSpec.__post_init__` takes
 for a body cap on a templated path.
+"""
+
+_PATH_PARAMETER_DESCRIPTIONS: Final[dict[str, str]] = {
+    EXTERNAL_ID_PARAM: "Consumer-side identifier for this entry.",
+    STATE_PARAM: "The single-use value the authorization was issued under.",
+    JOB_ID_PARAM: "Opaque server-generated pipeline job identifier.",
+}
+"""What each path parameter *means*, keyed by parameter name.
+
+A table for the reason :data:`_PATH_PARAMETER_SCHEMAS` is one. Until #1568
+there was one path parameter and the description was a literal in
+:func:`_path_parameter`; a second parameter inheriting "consumer-side
+identifier for this entry" would have published a plain untruth about a
+server-minted nonce.
 """
 
 _HEALTH_RESPONSE_SCHEMA: Final[dict[str, Any]] = {
@@ -345,20 +414,24 @@ def _json_content(schema: dict[str, Any]) -> dict[str, Any]:
     return {_JSON_MEDIA_TYPE: {"schema": schema}}
 
 
-def _success_response(spec: RouteSpec) -> dict[str, Any]:
-    """Return the ``200`` response object for *spec*.
+def _success_response(spec: RouteSpec, model: type[BaseModel] | None) -> dict[str, Any]:
+    """Return one success response object for *spec*.
 
     Args:
         spec: The route under consideration.
+        model: The wire model governing this success status' body, or ``None``
+            when the body is outside the published contract. Passed rather
+            than read off ``spec.response_model`` because a route may document
+            more than one success status, each with its own body — the reason
+            :attr:`~creek_mcp.api.routes.RouteSpec.success_responses` is a
+            status-to-model mapping rather than a tuple of statuses.
 
     Returns:
-        A reference to the route's published response model, or the inline
-        liveness shape for the one route that has none.
+        A reference to the named response model, or the inline liveness shape
+        for the one route that has none.
     """
     schema: dict[str, Any] = (
-        _HEALTH_RESPONSE_SCHEMA
-        if spec.response_model is None
-        else _component_ref(spec.response_model.__name__)
+        _HEALTH_RESPONSE_SCHEMA if model is None else _component_ref(model.__name__)
     )
     return {"description": spec.summary, "content": _json_content(schema)}
 
@@ -387,9 +460,13 @@ def _responses(spec: RouteSpec) -> dict[str, Any]:
         spec: The route under consideration.
 
     Returns:
-        The success response plus one entry per reachable refusal.
+        Every success the route declares, in declaration order, plus one entry
+        per reachable refusal.
     """
-    responses: dict[str, Any] = {_SUCCESS_STATUS: _success_response(spec)}
+    responses: dict[str, Any] = {
+        str(status): _success_response(spec, model)
+        for status, model in spec.published_success_responses
+    }
     for code in _error_codes(spec):
         responses[str(ERROR_STATUS[code])] = _error_response(code)
     return responses
@@ -435,7 +512,7 @@ def _path_parameter(name: str) -> dict[str, Any]:
         "name": name,
         "in": "path",
         "required": True,
-        "description": "Consumer-side identifier for this entry.",
+        "description": _PATH_PARAMETER_DESCRIPTIONS[name],
         "schema": _PATH_PARAMETER_SCHEMAS[name],
     }
 

@@ -4,6 +4,21 @@ Redaction must be idempotent: applying it twice yields the same output
 as once, so a marker the redactor emitted is never itself rewritten on a
 later pass. Hypothesis fuzzes inputs that mix arbitrary text with
 recognisable secrets to exercise these contracts on the patch logic.
+
+Since #945 idempotence is enforced across the ``min_confidence`` range it
+claims, not only at the ``0.6`` default. It used to hold at ``0.6`` by a
+0.016-bit accident of pattern-name entropy and to fail outright at
+``0.0``, where ``[REDACTED:email_password_combo]`` was rewritten into
+``[REDACTED:[REDACTED:high_entropy_string]]`` on every further pass. It
+now holds because a marker's own candidate run is exempt from candidacy.
+
+Precondition, stated because a degenerate operator template can void it:
+the guarantee covers a ``replacement_template`` whose ``{name}`` is
+delimited on both sides by a character outside ``[A-Za-z0-9+/=_-]`` (the
+default ``[REDACTED:{name}]`` is). Without a delimiter the spliced marker
+can end up flush against neighbouring token characters, forming a NEW,
+longer run that is correctly *not* exempt — fail-closed, but not a fixed
+point.
 """
 
 from __future__ import annotations
@@ -34,6 +49,16 @@ _SECRET_SAMPLES = st.sampled_from(
         "user@example.com",
         "555-12-3456",
         "4111111111111111",  # pragma: allowlist secret  card test PAN
+        # pragma: allowlist secret  (email:password shape, not a credential)
+        # The #945 killer, and the reason this suite missed the bug for so
+        # long. It is the only built-in pattern whose NAME is 20 characters,
+        # so its marker is the only one the default template renders with a
+        # candidate run — and idempotence is violated on the *second* pass,
+        # not the first: `once` is a clean marker and `twice` used to be
+        # `[REDACTED:[REDACTED:high_entropy_string]]`. Feeding an
+        # already-redacted marker in as input would NOT catch it, because
+        # the corruption is itself a fixed point after one rewrite.
+        "user@example.com:example-not-a-password",
     ]
 )
 
@@ -43,16 +68,44 @@ _TEXT_NOISE = st.text(
 )
 
 
-def _make_redactor() -> Redactor:
-    """Construct a Redactor with default patterns and a fixed salt."""
-    return Redactor(RedactionConfig(), salt=b"property-test-salt")
+_IDEMPOTENCE_CONFIDENCES = (0.0, 0.6)
+"""The default, and the 2.5 floor where every gate is most permissive."""
+
+
+def _make_redactor(min_confidence: float = 0.6) -> Redactor:
+    """Construct a Redactor with default patterns and a fixed salt.
+
+    Args:
+        min_confidence: Entropy sensitivity to build the config with;
+            defaults to the ``RedactionConfig`` default so existing
+            callers are unchanged.
+
+    Returns:
+        A redactor over the built-in patterns at that confidence.
+    """
+    return Redactor(
+        RedactionConfig(min_confidence=min_confidence),
+        salt=b"property-test-salt",
+    )
 
 
 @_PROFILE
-@given(prefix=_TEXT_NOISE, secret=_SECRET_SAMPLES, suffix=_TEXT_NOISE)
-def test_redaction_is_idempotent(prefix: str, secret: str, suffix: str) -> None:
-    """Applying redaction twice produces the same output as once."""
-    redactor = _make_redactor()
+@given(
+    prefix=_TEXT_NOISE,
+    secret=_SECRET_SAMPLES,
+    suffix=_TEXT_NOISE,
+    min_confidence=st.sampled_from(_IDEMPOTENCE_CONFIDENCES),
+)
+def test_redaction_is_idempotent(
+    prefix: str, secret: str, suffix: str, min_confidence: float
+) -> None:
+    """Applying redaction twice produces the same output as once.
+
+    Fuzzed at the 2.5 floor as well as the default since #945: below the
+    old crossover the redactor rewrote its own markers, so the property
+    held only over the range this test happened to sample.
+    """
+    redactor = _make_redactor(min_confidence)
     content = f"{prefix}{secret}{suffix}"
     once = redactor.redact_content(content)
     twice = redactor.redact_content(once)
@@ -187,13 +240,24 @@ def test_redaction_known_aws_key_smoke() -> None:
     )
 
 
+@pytest.mark.parametrize("min_confidence", _IDEMPOTENCE_CONFIDENCES)
 @pytest.mark.parametrize(
     "secret",
-    ["foo@bar.com", "555-12-3456"],
+    [
+        "foo@bar.com",
+        "555-12-3456",
+        # pragma: allowlist secret  (email:password shape, not a credential)
+        "foo@bar.com:example-not-a-password",
+    ],
 )
-def test_redaction_idempotency_concrete(secret: str) -> None:
-    """Concrete idempotency guard separate from Hypothesis."""
-    redactor = _make_redactor()
+def test_redaction_idempotency_concrete(secret: str, min_confidence: float) -> None:
+    """Concrete idempotency guard separate from Hypothesis.
+
+    Parametrised over ``min_confidence`` since #945 for the same reason
+    as the fuzzed sibling: idempotence must hold across the configurable
+    range, not only at the default the fixtures happened to use.
+    """
+    redactor = _make_redactor(min_confidence)
     once = redactor.redact_content(f"prefix {secret} suffix")
     twice = redactor.redact_content(once)
     assert once == twice

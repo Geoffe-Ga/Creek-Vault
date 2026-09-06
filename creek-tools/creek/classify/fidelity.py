@@ -68,8 +68,9 @@ def _available_rank(config: LLMConfig) -> int:
     """Return the rank an LLM stage *config* can deliver right now.
 
     Falls back to :data:`RANK_RULES` when the provider is unavailable (no key /
-    consent for a cloud provider, or an unreachable local server) — i.e. the LLM
-    rung is only credited when a real classification could actually run.
+    consent for a cloud provider, or an unreachable local server / absent model)
+    — i.e. the LLM rung is only credited when a real classification could
+    actually run.
     """
     is_cloud = provider_is_cloud(config.provider)
     try:

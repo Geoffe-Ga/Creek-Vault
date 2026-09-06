@@ -96,13 +96,23 @@ DORMANT_CONFIG_FIELDS: Final[dict[str, str]] = {
     "context.quality_penalty": (
         "declared dormant: context handling wire-in tracked by #1041"
     ),
-    "cleaning.discord.filter_bot_messages": _CLEANING,
+    # #1519 collapsed cleaning.discord onto DiscordFilterConfig, so the
+    # filter's full field set is now the operator's YAML surface. Every path
+    # below is still dormant: both filters store their config as
+    # ``config or XFilterConfig()``, which the reader below cannot root, and
+    # no ingestor passes a cleaning block. Wire-in remains #1041's.
+    "cleaning.discord.skip_bots": _CLEANING,
+    "cleaning.discord.skip_emoji_only": _CLEANING,
+    "cleaning.discord.skip_commands": _CLEANING,
+    "cleaning.discord.skip_media_only": _CLEANING,
+    "cleaning.discord.skip_below_min_length": _CLEANING,
+    "cleaning.discord.flag_link_dumps": _CLEANING,
+    "cleaning.discord.min_length": _CLEANING,
+    "cleaning.discord.command_prefixes": _CLEANING,
     "cleaning.discord.strip_emoji": _CLEANING,
-    "cleaning.discord.filter_commands": _CLEANING,
-    "cleaning.discord.min_message_length": _CLEANING,
-    "cleaning.chatbot.filter_system_prompts": _CLEANING,
-    "cleaning.chatbot.filter_tool_outputs": _CLEANING,
-    "cleaning.chatbot.filter_regenerations": _CLEANING,
+    "cleaning.chatbot.skip_system_prompts": _CLEANING,
+    "cleaning.chatbot.skip_tool_outputs": _CLEANING,
+    "cleaning.chatbot.collapse_regenerations": _CLEANING,
     "cleaning.chatbot.min_human_turn_length": _CLEANING,
     "cleaning.chatbot.code_block_threshold": _CLEANING,
     "cleaning.chatbot.max_abandoned_turns": _CLEANING,
@@ -110,17 +120,18 @@ DORMANT_CONFIG_FIELDS: Final[dict[str, str]] = {
     "cleaning.markdown.min_body_length": _CLEANING,
     "cleaning.google_drive.deduplicate": _CLEANING,
     "cleaning.google_drive.filter_empty_docs": _CLEANING,
-    "cleaning.google_drive.max_collaboration_ratio": _CLEANING,
-    "cleaning.validation.min_characters": _CLEANING,
-    "cleaning.validation.min_words": _CLEANING,
-    "cleaning.validation.max_stop_word_ratio": _CLEANING,
+    "cleaning.google_drive.multi_author_threshold": _CLEANING,
+    "cleaning.validation.min_content_length": _CLEANING,
     "cleaning.validation.require_metadata": _CLEANING,
     "cleaning.quality.accept_threshold": _CLEANING,
-    "cleaning.quality.skip_threshold": _CLEANING,
+    "cleaning.quality.review_threshold": _CLEANING,
+    "cleaning.quality.min_words": _CLEANING,
+    "cleaning.quality.stop_word_threshold": _CLEANING,
     "cleaning.deduplication.strategy": _CLEANING,
     "cleaning.deduplication.similarity_threshold": _CLEANING,
     "cleaning.hygiene.track_orphans": _CLEANING,
-    "cleaning.hygiene.staleness_days": _CLEANING,
+    "cleaning.hygiene.orphan_age_days": _CLEANING,
+    "cleaning.hygiene.stale_review_days": _CLEANING,
     "ai_style.citation_network_checks": (
         "declared dormant: citation-network checking is unimplemented; tracked by #1041"
     ),
@@ -1233,4 +1244,72 @@ def test_detector_finds_nested_reads_in_the_real_model() -> None:
     assert any("." in path for path in consumed), (
         "the scan resolved no nested config reads at all — the resolver is "
         "broken and every dormancy verdict below it is meaningless"
+    )
+
+
+# --------------------------------------------------------------------------
+# One name, one class (#1519)
+# --------------------------------------------------------------------------
+
+
+def _config_class_definition_sites() -> dict[str, list[str]]:
+    """Map every ``*Config`` class name to the files that define it.
+
+    Walks ``_PRODUCTION_ROOTS`` directly rather than going through
+    :func:`_production_files`: that helper subtracts ``_EXCLUDED_SOURCES``,
+    which is exactly ``creek/config.py`` — the file that held the duplicate
+    ``DeduplicationConfig`` this check exists to catch. Reusing it would make
+    the check pass against the very defect it names (#1519).
+
+    Returns:
+        Class name to the sorted repo-relative paths defining it.
+    """
+    sites: dict[str, set[str]] = {}
+    for root in _PRODUCTION_ROOTS:
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef) and node.name.endswith("Config"):
+                    relative = str(path.relative_to(_CREEK_TOOLS_ROOT))
+                    sites.setdefault(node.name, set()).add(relative)
+    return {name: sorted(paths) for name, paths in sites.items()}
+
+
+def test_the_config_class_inventory_is_not_empty() -> None:
+    """A broken walk would make the collision check below vacuously green."""
+    inventory = _config_class_definition_sites()
+
+    assert len(inventory) > 20, (
+        f"only {len(inventory)} *Config classes were found under "
+        f"{[str(r) for r in _PRODUCTION_ROOTS]} — the AST walk is broken, so "
+        "the collision check below proves nothing"
+    )
+
+
+def test_no_two_modules_define_the_same_config_class_name() -> None:
+    """One config class name means one class object (#1519).
+
+    Two modules defining ``DeduplicationConfig`` with **disjoint** field sets
+    is how ``cleaning.deduplication`` came to describe a class nothing
+    dispatches: a reader who found either definition had no signal that the
+    other existed. The rule is a name-uniqueness rule, not an
+    identity-of-fields rule, because the failure is a reader failure.
+
+    Scoped to names ending in ``Config`` on purpose. The tree carries five
+    other duplicated class names — ``_Candidate``, ``_LockHolder``,
+    ``_NamingContext``, ``CalibrationReport`` and ``ProvenanceEntry`` — none
+    of which is a settings model reachable from ``CreekConfig``; three are
+    private module-local helpers. Widening this check to every class would
+    fail on those, which is a different decision than the one #1519 made.
+    """
+    collisions = {
+        name: paths
+        for name, paths in _config_class_definition_sites().items()
+        if len(paths) > 1
+    }
+
+    assert not collisions, (
+        f"These config class names are defined in more than one module: "
+        f"{collisions}. Rename one, or import the other — two declarations of "
+        "one name drift apart silently, because neither reader sees the twin."
     )

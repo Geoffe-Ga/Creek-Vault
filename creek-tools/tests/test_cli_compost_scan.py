@@ -150,6 +150,7 @@ def test_scan_refuses_when_the_provider_reports_prerequisites_unmet(
 
     assert result.exit_code != 0
     assert "--no-llm" in result.output
+    assert "configured model not installed" in result.output
     assert _notes_in(vault, _CANONICAL_RELDIR) == []
 
 

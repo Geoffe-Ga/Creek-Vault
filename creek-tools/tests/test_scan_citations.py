@@ -30,19 +30,31 @@ of that exact name exists there.
 from __future__ import annotations
 
 import io
+import json
+import os
+import shlex
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from scripts.scan_citations import (
     CitationError,
     MalformedFindingError,
+    citations_from_body,
     extract_citations,
     main,
     resolve_enclosing_symbol,
+    sha_from_body,
     verify_symbol,
+)
+from tests.shell_command_support import (
+    agent_issue_filing_jobs,
+    load_yaml,
+    shell_tokens,
 )
 
 _REVISION_A = '''\
@@ -319,14 +331,28 @@ class TestTheGuardIsActuallyWired:
         assert script.stat().st_mode & 0o111, f"{script} is not executable"
 
     def test_the_scan_workflow_invokes_the_verifier(self) -> None:
-        """The reusable scan core must name the script, not just the skill."""
+        """The workflow TEXT names the tool. That is all this proves.
+
+        Kept, and deliberately narrowed in description rather than
+        deleted: it still pins the defence-in-depth sentence in the
+        ``prompt:`` block, and a rejected citation should never be filed
+        in the first place.
+
+        But read what it can see. The assertion is a raw substring scan
+        over the whole file, and the only mention of the verifier in
+        ``_claude-scan.yml`` before #1700 was **prose inside the
+        ``prompt:`` block** — which satisfies this on its own. A sentence
+        asking an agent to check itself and a `run:` step that checks it
+        are indistinguishable here. The agent-independent guarantee is
+        :class:`TestTheBackstopRunsOutsideTheAgent`; this is not it.
+        """
         workflow = (
             _REPO_ROOT / ".github" / "workflows" / "_claude-scan.yml"
         ).read_text(encoding="utf-8")
 
         assert "verify-scan-citations.sh" in workflow, (
-            "the scan workflow no longer invokes the citation verifier, so "
-            "nothing stops a phantom symbol reaching a filed issue"
+            "the scan workflow no longer names the citation verifier, so the "
+            "agent is not even asked to reject a phantom symbol before filing"
         )
 
     def test_the_skill_mandates_the_verification_step(self) -> None:
@@ -386,6 +412,174 @@ class TestTheGuardIsActuallyWired:
 
         assert "valid ONLY at that scan SHA" in template
         assert "Symbol(s)" in template
+
+
+_BACKSTOP = "creek-tools/scripts/recheck-filed-scan-citations.sh"
+"""The agent-independent re-check, as a `run:` step would invoke it."""
+
+_BACKSTOP_SCRIPT = _REPO_ROOT / _BACKSTOP
+"""The same script as an absolute path, for the subprocess tests."""
+
+
+def _runs_the_backstop(step: dict[str, Any]) -> bool:
+    """Whether this step's ``run:`` body actually invokes the backstop.
+
+    Comment-blind and tokenised via :func:`shell_tokens`, for the reason
+    that helper exists: prose naming a command is never the command. The
+    workflow's ``prompt:`` block names ``verify-scan-citations.sh`` in
+    English, and a substring scan cannot tell that apart from a step that
+    runs it.
+
+    Args:
+        step: One parsed GitHub Actions step mapping.
+
+    Returns:
+        ``True`` when a non-comment line of ``run:`` has the backstop as a
+        shell token.
+    """
+    for raw in str(step.get("run", "")).splitlines():
+        if raw.lstrip().startswith("#"):
+            continue
+        try:
+            tokens = shell_tokens(raw)
+        except ValueError:
+            continue
+        if _BACKSTOP in tokens:
+            return True
+    return False
+
+
+def _assert_backstop_wiring(workflow_name: str, job_name: str) -> None:
+    """Assert one job re-verifies filed citations outside the agent.
+
+    Args:
+        workflow_name: File name under ``.github/workflows``.
+        job_name: Job id within that workflow.
+    """
+    document = load_yaml(_REPO_ROOT / ".github" / "workflows" / workflow_name)
+    steps = document["jobs"][job_name]["steps"]
+    assert steps, f"the {job_name} job has no steps; this test would be vacuous"
+
+    agent = [
+        index
+        for index, step in enumerate(steps)
+        if str(step.get("uses", "")).startswith("anthropics/claude-code-action")
+    ]
+    assert len(agent) == 1, (
+        f"the {job_name} job no longer runs exactly one Claude action"
+    )
+
+    backstop = [index for index, step in enumerate(steps) if _runs_the_backstop(step)]
+    assert backstop, (
+        f"no step in the `{job_name}` job of {workflow_name} has a `run:` "
+        "invoking recheck-filed-scan-citations.sh; the only mention of the "
+        "citation verifier in this file is prose inside the `prompt:` block "
+        "(line 239), which the agent may skip, error out of, or exhaust "
+        "--max-turns 40 before reaching -- while the issues it already filed "
+        "stay filed"
+    )
+
+    index = backstop[0]
+    step = steps[index]
+    assert index > agent[-1], "the backstop runs before the issues exist"
+    assert "always()" in str(step.get("if", "")), (
+        "the backstop is skipped exactly when it is needed -- the agent step "
+        "failing is the scenario issue #1700 names"
+    )
+    assert step.get("continue-on-error") in (None, False)
+    assert "${{" not in str(step["run"]), (
+        "a workflow expression is substituted into the shell SOURCE"
+    )
+    assert "GH_TOKEN" in (step.get("env") or {}), (
+        "the GH_TOKEN at line 201 is scoped to the claude-code-action step and "
+        "does not reach a new run: step"
+    )
+
+
+_AGENT_ISSUE_FILING_DISPOSITIONS: dict[tuple[str, str], str] = {
+    ("_claude-scan.yml", "scan"): "BACKSTOPPED",
+    ("deslop.yml", "deslop"): "NO_CITATION_CONTRACT (#1708)",
+    ("scan-groom.yml", "groom"): "CONSUMER_NOT_PRODUCER",
+}
+"""Every Claude job that can FILE an issue, and what guards its citations.
+
+The defect #1700 names is a class, not one workflow: *the only enforcement
+of a machine-checkable claim lives inside the prompt of the agent that
+makes the claim*. The population is **derived** by
+:func:`agent_issue_filing_jobs` -- runs ``anthropics/claude-code-action``
+crossed with an effective ``issues: write`` -- so ``claude.yml`` and
+``code-review.yml`` fall out because their token cannot create an issue,
+not because anyone remembered to exclude them. A twelfth producer, or a
+flip of an existing one to ``issues: write``, reddens the test below until
+someone declares what guards it.
+
+* ``BACKSTOPPED`` -- an agent-independent post-run ``run:`` step re-reads
+  the issues it filed. Asserted structurally, not declared.
+* ``NO_CITATION_CONTRACT`` -- files issues, has no symbol/SHA contract for
+  a backstop to check yet. Scoped out of #1700 by its own Context and
+  tracked as a real issue number rather than a promise in prose.
+* ``CONSUMER_NOT_PRODUCER`` -- routes through the ``backlog-grooming``
+  skill (``prompts/scans/groom.md``): it closes, dedupes and promotes, and
+  creates nothing. It cites nothing, so there is nothing to backstop.
+  ``test_backlog_ceiling_gate.py`` already pins it away from
+  ``scan-issue-writer``, so a rewrite into a producer reddens rather than
+  silently acquiring the gap.
+"""
+
+
+class TestTheBackstopRunsOutsideTheAgent:
+    """Issue #1700. A prompt sentence is not a gate; a `run:` step is."""
+
+    def test_the_scan_job_reverifies_filed_citations_in_a_run_step(self) -> None:
+        """A prompt sentence is not a gate; a `run:` step is.
+
+        The agent has Bash and ``--max-turns 40``. It can file issues and
+        then error, or exhaust the budget, before it ever reaches the
+        verification the prompt asks for -- and nothing downstream would
+        know. Substring-scanning the workflow cannot see this: the prompt
+        at line 239 already names the script.
+        """
+        _assert_backstop_wiring("_claude-scan.yml", "scan")
+
+    def test_every_agent_issue_filing_job_declares_a_disposition(self) -> None:
+        """A derived population, so the table cannot decay into fiction.
+
+        Prose sweep tables in this repository go stale; a derived one
+        cannot. The non-emptiness and the explicit membership check are
+        not belt-and-braces: a helper that returned ``[]`` -- a renamed
+        action, a YAML shape change -- would otherwise satisfy an
+        equality against a table nobody noticed had emptied.
+        """
+        derived = agent_issue_filing_jobs()
+
+        assert derived, (
+            "no job was derived as able to file issues with a Claude agent; "
+            "the population helper found nothing and this test is vacuous"
+        )
+        assert ("_claude-scan.yml", "scan") in derived, (
+            "the job issue #1700 is about is not in its own population"
+        )
+        assert set(derived) == set(_AGENT_ISSUE_FILING_DISPOSITIONS), (
+            "a Claude job that can file issues has appeared or moved; declare "
+            "what guards its citations in _AGENT_ISSUE_FILING_DISPOSITIONS "
+            f"(derived {sorted(derived)})"
+        )
+
+    def test_every_backstopped_job_runs_the_backstop_outside_the_agent(self) -> None:
+        """`BACKSTOPPED` is asserted structurally, never taken on trust.
+
+        Otherwise the table is just another prose claim, one edit away
+        from saying a job is guarded when it is not.
+        """
+        backstopped = [
+            job
+            for job, disposition in _AGENT_ISSUE_FILING_DISPOSITIONS.items()
+            if disposition == "BACKSTOPPED"
+        ]
+
+        assert backstopped, "no job claims to be backstopped; this test is vacuous"
+        for workflow_name, job_name in backstopped:
+            _assert_backstop_wiring(workflow_name, job_name)
 
 
 class TestCommandLineInterface:
@@ -729,6 +923,574 @@ class TestTheShellWrapperFromItsRealWorkingDirectory:
         assert "::warning::" not in result.stdout + result.stderr
 
 
+@dataclass
+class _BackstopResult:
+    """One run of the filed-issue backstop against a stub ``gh``.
+
+    Attributes:
+        returncode: The script's exit status.
+        console: Combined stdout and stderr, for ``::error::`` and
+            ``::warning::`` annotations.
+        gh_argv: Every argv line the stub ``gh`` recorded. Empty means
+            the stub was never reached, which makes any assertion about
+            what was queried or commented vacuous -- so the tests check
+            it either way, and say which way they expect.
+    """
+
+    returncode: int
+    console: str
+    gh_argv: str
+
+
+def _write_backstop_stub_gh(
+    bin_dir: Path, listing: str, list_exit: int, log: Path
+) -> None:
+    """Install a stub ``gh`` that answers `issue list` and logs every call.
+
+    ``issue comment`` always exits 0 while ``issue list`` exits
+    ``list_exit``: the failure under test is "the run cannot read back
+    what it filed", and a stub that also failed the comment would blur
+    that with "the correction could not be posted", which the script
+    treats as a warning rather than a failure.
+
+    An empty ``listing`` prints **nothing at all**, not a bare newline --
+    the same distinction ``test_backlog_ceiling_gate.py::_write_stub_gh``
+    records, for the same reason: a stray newline lets a fail-open bug be
+    caught by the wrong assertion.
+
+    Args:
+        bin_dir: Directory prepended to ``PATH``.
+        listing: JSON the stub prints for ``gh issue list``.
+        list_exit: The status ``gh issue list`` exits with.
+        log: File the stub appends its argv to.
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    stub = bin_dir / "gh"
+    emit = f"printf '%s\\n' {shlex.quote(listing)}\n" if listing else ""
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> {shlex.quote(str(log))}\n'
+        'if [ "$1" = "issue" ] && [ "$2" = "list" ]; then\n'
+        f"{emit}"
+        f"  exit {list_exit}\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+
+
+def _run_backstop(
+    tmp_path: Path,
+    issues: list[dict[str, Any]] | str,
+    *,
+    issues_before: str = "",
+    snapshot_ok: str | None = "true",
+    scan_label: str = "scan:coverage",
+    list_exit: int = 0,
+    gh_override: bool = False,
+) -> _BackstopResult:
+    """Run the real backstop script against a stub ``gh``, as CI does.
+
+    Args:
+        tmp_path: Sandbox directory.
+        issues: The ``gh issue list`` payload, as records or raw text.
+        issues_before: ``ISSUES_BEFORE`` -- the pre-agent snapshot.
+        snapshot_ok: ``ISSUES_SNAPSHOT_OK``; ``None`` leaves it unset.
+        scan_label: ``SCAN_LABEL``.
+        list_exit: Status the stub's ``issue list`` exits with.
+        gh_override: Point ``GH`` at the stub by absolute path instead of
+            relying on ``PATH`` resolution.
+
+    Returns:
+        The parsed result of the run.
+    """
+    assert _BACKSTOP_SCRIPT.is_file(), f"{_BACKSTOP} does not exist"
+    bin_dir = tmp_path / "bin"
+    log = tmp_path / "gh_argv"
+    log.touch()
+    listing = issues if isinstance(issues, str) else json.dumps(issues)
+    _write_backstop_stub_gh(bin_dir, listing, list_exit, log)
+
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}/usr/bin:/bin:/usr/local/bin",
+        # sys.executable, never a hardcoded .venv path: CI provisions with
+        # `uv pip install --system` and creates no creek-tools/.venv.
+        "PYTHON": sys.executable,
+        "SCAN_LABEL": scan_label,
+        "ISSUES_BEFORE": issues_before,
+        "RUN_STARTED_AT": "2000-01-01T00:00:00Z",
+        "SCAN_SHA": _SCAN_SHA,
+        "HOME": str(tmp_path),
+    }
+    if snapshot_ok is not None:
+        env["ISSUES_SNAPSHOT_OK"] = snapshot_ok
+    if gh_override:
+        env["GH"] = str(bin_dir / "gh")
+
+    completed = subprocess.run(
+        [str(_BACKSTOP_SCRIPT)],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return _BackstopResult(
+        returncode=completed.returncode,
+        console=completed.stdout + completed.stderr,
+        gh_argv=log.read_text(encoding="utf-8"),
+    )
+
+
+def _filed_issue(
+    number: int, body: str, created: str = "2030-01-01T00:00:00Z"
+) -> dict[str, Any]:
+    """Build one ``gh issue list --json number,body,createdAt`` record.
+
+    Args:
+        number: Issue number.
+        body: Issue body.
+        created: Creation instant.
+
+    Returns:
+        The record.
+    """
+    return {"number": number, "body": body, "createdAt": created}
+
+
+class TestTheFiledIssueBackstop:
+    """Issue #1700. The gate that runs after the agent, on what it filed.
+
+    Every case drives the real script as a subprocess from the repository
+    root -- the CWD ``_claude-scan.yml``'s scan job actually has -- with a
+    stub ``gh`` whose argv is recorded. A test that asserted on exit codes
+    without checking that log would pass identically against a ``PATH``
+    mistake that never invoked ``gh`` at all.
+    """
+
+    def test_a_run_that_filed_nothing_new_passes_without_commenting(
+        self, tmp_path: Path
+    ) -> None:
+        """Every returned issue is in the snapshot, so none is this run's.
+
+        Args:
+            tmp_path: Sandbox directory.
+        """
+        result = _run_backstop(
+            tmp_path,
+            [_filed_issue(1447, _fixture("issue-1447.md"))],
+            issues_before="1447",
+        )
+
+        assert result.returncode == 0, result.console
+        assert result.gh_argv.strip(), "the stub gh was never called"
+        assert "issue comment" not in result.gh_argv
+        assert "1 pre-existing" in result.console
+
+    def test_an_empty_label_reports_differently_from_an_all_old_one(
+        self, tmp_path: Path
+    ) -> None:
+        """ "Nothing filed" and "nothing new" must not read identically.
+
+        Args:
+            tmp_path: Sandbox directory.
+        """
+        result = _run_backstop(tmp_path, [])
+
+        assert result.returncode == 0, result.console
+        assert result.gh_argv.strip(), "the stub gh was never called"
+        assert "0 pre-existing" in result.console
+
+    def test_a_filed_issue_with_no_parseable_citation_fails(
+        self, tmp_path: Path
+    ) -> None:
+        """A body nothing can check is not a body that checked out.
+
+        Args:
+            tmp_path: Sandbox directory.
+        """
+        result = _run_backstop(
+            tmp_path,
+            [_filed_issue(9001, "## Context\n- Evidence: no citation bullet here.\n")],
+        )
+
+        assert result.returncode == 1, result.console
+        assert "::error::" in result.console
+        assert "not one carries a parseable" in result.console
+
+    def test_a_phantom_in_a_filed_body_reddens_and_is_commented_on(
+        self, tmp_path: Path
+    ) -> None:
+        """The end-to-end case the issue exists for.
+
+        ``_unique_filename`` is the real confabulation from #1447: it
+        exists in no revision of ``writer.py``, having been paraphrased
+        from ``_generate_filename``.
+
+        Args:
+            tmp_path: Sandbox directory.
+        """
+        result = _run_backstop(
+            tmp_path,
+            [_filed_issue(9002, _SINGLE_SYMBOL_BODY.format(symbol="_unique_filename"))],
+        )
+
+        assert result.returncode == 1, result.console
+        assert "#9002" in result.console
+        assert "_unique_filename" in result.console
+        assert "issue comment 9002 --body-file" in result.gh_argv
+
+    def test_the_same_body_with_the_real_symbol_passes(self, tmp_path: Path) -> None:
+        """The mirror case. Without it the gate could simply always fail.
+
+        Args:
+            tmp_path: Sandbox directory.
+        """
+        result = _run_backstop(
+            tmp_path,
+            [
+                _filed_issue(
+                    9002, _SINGLE_SYMBOL_BODY.format(symbol="_generate_filename")
+                )
+            ],
+        )
+
+        assert result.returncode == 0, result.console
+        assert "issue comment" not in result.gh_argv
+        assert "re-verified 1 citation(s)" in result.console
+
+    def test_a_failed_listing_is_a_hard_failure(self, tmp_path: Path) -> None:
+        """A run that cannot read back what it filed has verified nothing.
+
+        Args:
+            tmp_path: Sandbox directory.
+        """
+        result = _run_backstop(tmp_path, [], list_exit=1)
+
+        assert result.returncode == 1, result.console
+        assert "::error::" in result.console
+        assert "gh exited non-zero" in result.console
+        assert result.gh_argv.strip(), "the stub gh was never called"
+
+    def test_a_missing_snapshot_fails_rather_than_skips(self, tmp_path: Path) -> None:
+        """The fail-open trap, refused explicitly.
+
+        Conditioning the step's ``if:`` on the snapshot's conclusion --
+        or degrading here to "check everything" -- would leave the job
+        GREEN with zero citations verified. That is a gate reporting it
+        did nothing, which is the failure class #1700 exists to close.
+        The stub is deliberately NOT reached: refusing before spending a
+        query is the point.
+
+        Args:
+            tmp_path: Sandbox directory.
+        """
+        result = _run_backstop(tmp_path, [], snapshot_ok=None)
+
+        assert result.returncode == 1, result.console
+        assert "::error::" in result.console
+        assert "snapshot" in result.console
+        assert not result.gh_argv.strip(), (
+            "the backstop queried gh before establishing a baseline"
+        )
+
+    def test_a_snapshot_that_reports_failure_also_fails(self, tmp_path: Path) -> None:
+        """``ok=false`` is not "unset"; both must redden.
+
+        Args:
+            tmp_path: Sandbox directory.
+        """
+        result = _run_backstop(tmp_path, [], snapshot_ok="false")
+
+        assert result.returncode == 1, result.console
+        assert "snapshot" in result.console
+
+    def test_a_listing_at_the_limit_is_treated_as_truncated(
+        self, tmp_path: Path
+    ) -> None:
+        """A full page may be a partial answer, and a partial answer lies.
+
+        Truncation drops issues out of the snapshot's set difference, so
+        an OLD issue looks newly filed -- and the script would comment a
+        correction on somebody else's issue. Every one here is in the
+        snapshot, so the run would otherwise be a clean no-op: only the
+        truncation guard can redden it.
+
+        Args:
+            tmp_path: Sandbox directory.
+        """
+        numbers = list(range(1, 201))
+        result = _run_backstop(
+            tmp_path,
+            [_filed_issue(n, "") for n in numbers],
+            issues_before=",".join(str(n) for n in numbers),
+        )
+
+        assert result.returncode == 1, result.console
+        assert "TRUNCATED" in result.console
+
+    def test_an_invalid_scan_label_never_reaches_gh(self, tmp_path: Path) -> None:
+        """The charset allowlist mirrors the workflow's scan_name guard.
+
+        Args:
+            tmp_path: Sandbox directory.
+        """
+        result = _run_backstop(tmp_path, [], scan_label="scan:x; rm -rf /")
+
+        assert result.returncode == 1, result.console
+        assert "invalid SCAN_LABEL" in result.console
+        assert not result.gh_argv.strip(), "an unvalidated label reached gh"
+
+    def test_an_unreachable_recorded_sha_falls_back_and_says_so(
+        self, tmp_path: Path
+    ) -> None:
+        """Checking a citation against a revision it never claimed is a lie.
+
+        Under ``fetch-depth: 50`` a body's own SHA may be absent. The
+        fallback is legitimate but must be announced, naming both
+        revisions, or a reader cannot tell which one produced the verdict.
+
+        Args:
+            tmp_path: Sandbox directory.
+        """
+        body = _SINGLE_SYMBOL_BODY.format(symbol="_generate_filename").replace(
+            "`c8c5131`", "`" + "0" * 40 + "`"
+        )
+        result = _run_backstop(tmp_path, [_filed_issue(9003, body)])
+
+        assert result.returncode == 0, result.console
+        assert "::warning::" in result.console
+        assert "0000000000" in result.console
+        assert _SCAN_SHA in result.console
+
+    def test_the_gh_override_is_a_real_seam(self, tmp_path: Path) -> None:
+        """``GH`` must select the binary, not merely be documented.
+
+        A subprocess test under a restricted ``PATH`` is one export away
+        from silently resolving the real ``gh``; the override makes the
+        seam explicit.
+
+        Args:
+            tmp_path: Sandbox directory.
+        """
+        result = _run_backstop(tmp_path, [], gh_override=True)
+
+        assert result.returncode == 0, result.console
+        assert result.gh_argv.strip(), "the GH override did not select the stub"
+
+    def test_a_missing_gh_fails_instead_of_reporting_a_clean_pass(
+        self, tmp_path: Path
+    ) -> None:
+        """A backstop that cannot run must not look like a backstop that ran.
+
+        Args:
+            tmp_path: Sandbox directory.
+        """
+        completed = subprocess.run(
+            [str(_BACKSTOP_SCRIPT)],
+            cwd=_REPO_ROOT,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "PYTHON": sys.executable,
+                "GH": "/nonexistent/gh",
+                "SCAN_LABEL": "scan:coverage",
+                "ISSUES_SNAPSHOT_OK": "true",
+                "ISSUES_BEFORE": "",
+                "SCAN_SHA": _SCAN_SHA,
+                "HOME": str(tmp_path),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert completed.returncode == 1
+        assert "not executable" in completed.stdout + completed.stderr
+
+    def test_an_unusable_interpreter_fails_instead_of_passing_silently(
+        self, tmp_path: Path
+    ) -> None:
+        """The same refusal ``verify-scan-citations.sh`` already makes.
+
+        Args:
+            tmp_path: Sandbox directory.
+        """
+        completed = subprocess.run(
+            [str(_BACKSTOP_SCRIPT)],
+            cwd=_REPO_ROOT,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "PYTHON": "/nonexistent/python",
+                "SCAN_LABEL": "scan:coverage",
+                "ISSUES_SNAPSHOT_OK": "true",
+                "ISSUES_BEFORE": "",
+                "SCAN_SHA": _SCAN_SHA,
+                "HOME": str(tmp_path),
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert completed.returncode == 1
+        assert "unusable" in completed.stdout + completed.stderr
+
+
+class TestFromIssuesMode:
+    """`--from-issues` is the seam between `gh` and the existing verifier."""
+
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        payload: str,
+        *args: str,
+    ) -> int:
+        """Feed *payload* on stdin and run the CLI.
+
+        Args:
+            monkeypatch: Used to feed stdin.
+            payload: Raw stdin text.
+            args: Extra command-line arguments.
+
+        Returns:
+            The exit code.
+        """
+        monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
+        return main(["--from-issues", *args])
+
+    def test_records_are_typed_and_carry_the_verifier_shape(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The JSON payload must be what `extract_citations` consumes.
+
+        Args:
+            monkeypatch: Used to feed stdin.
+            capsys: Captures stdout.
+        """
+        payload = json.dumps(
+            [_filed_issue(7, _SINGLE_SYMBOL_BODY.format(symbol="_generate_filename"))]
+        )
+
+        assert self._run(monkeypatch, payload, "--default-sha", "deadbee") == 0
+
+        lines = capsys.readouterr().out.splitlines()
+        assert lines[0] == "RETURNED\t1"
+        assert lines[1] == "ISSUES\t1"
+        kind, number, sha, blob = lines[2].split("\t")
+        assert (kind, number, sha) == ("CITATION", "7", "c8c5131")
+        assert extract_citations(blob) == [
+            ("creek-tools/creek/vault/writer.py", "_generate_filename", "1929-1936")
+        ]
+
+    def test_a_body_recording_no_sha_falls_back_to_the_default(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The run's own SHA is the fallback, never "skip the citation".
+
+        Args:
+            monkeypatch: Used to feed stdin.
+            capsys: Captures stdout.
+        """
+        body = _SINGLE_SYMBOL_BODY.format(symbol="_generate_filename").replace(
+            "- Scanned at commit: `c8c5131` — re-verify against HEAD before starting\n",
+            "",
+        )
+        payload = json.dumps([_filed_issue(7, body)])
+
+        assert self._run(monkeypatch, payload, "--default-sha", "deadbee") == 0
+        assert "CITATION\t7\tdeadbee\t" in capsys.readouterr().out
+
+    def test_excluded_numbers_are_dropped_from_the_selection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The snapshot is the selector, and it is a set difference.
+
+        Args:
+            monkeypatch: Used to feed stdin.
+            capsys: Captures stdout.
+        """
+        payload = json.dumps(
+            [
+                _filed_issue(7, _SINGLE_SYMBOL_BODY.format(symbol="f")),
+                _filed_issue(8, ""),
+            ]
+        )
+
+        assert self._run(monkeypatch, payload, "--exclude", "7, 8") == 0
+
+        out = capsys.readouterr().out
+        assert "RETURNED\t2" in out
+        assert "ISSUES\t0" in out
+        assert "CITATION" not in out
+
+    def test_an_older_issue_is_skipped_with_a_notice(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The date filter is secondary, and it says when it fires.
+
+        Args:
+            monkeypatch: Used to feed stdin.
+            capsys: Captures output.
+        """
+        payload = json.dumps(
+            [
+                _filed_issue(
+                    7,
+                    _SINGLE_SYMBOL_BODY.format(symbol="f"),
+                    created="1999-01-01T00:00:00Z",
+                )
+            ]
+        )
+
+        assert self._run(monkeypatch, payload, "--created-after", "2030-01-01") == 0
+
+        captured = capsys.readouterr()
+        assert "ISSUES\t0" in captured.out
+        assert "::notice::issue #7" in captured.err
+
+    @pytest.mark.parametrize(
+        ("payload", "args", "reason"),
+        [
+            pytest.param("not json", (), "unparseable", id="not-json"),
+            pytest.param('{"number": 1}', (), "an object, not an array", id="object"),
+            pytest.param("[1, 2]", (), "not issue records", id="array-of-ints"),
+            pytest.param("[]", ("--exclude", "7,nine"), "bad baseline", id="exclude"),
+        ],
+    )
+    def test_malformed_input_exits_two(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        payload: str,
+        args: tuple[str, ...],
+        reason: str,
+    ) -> None:
+        """Every one of these would otherwise verify zero citations quietly.
+
+        A malformed ``--exclude`` is the subtlest: an empty baseline makes
+        every pre-existing issue look newly filed, so the run comments
+        corrections on other people's issues.
+
+        Args:
+            monkeypatch: Used to feed stdin.
+            capsys: Captures stderr.
+            payload: Raw stdin text.
+            args: Extra command-line arguments.
+            reason: Why it is malformed, for the failure message.
+        """
+        assert self._run(monkeypatch, payload, *args) == 2, reason
+        assert "UNCHECKABLE" in capsys.readouterr().err
+
+
 class TestExtractCitations:
     """Findings parsing is a unit, not an inline shell heredoc.
 
@@ -779,6 +1541,365 @@ class TestExtractCitations:
         """
         with pytest.raises(MalformedFindingError):
             extract_citations(payload)
+
+
+_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "scan_issue_bodies"
+"""Filed issue bodies, fetched byte-for-byte with ``gh issue view``.
+
+Not retyped. The em-dashes, the ``(`:207-224`)`` parentheses and the
+two-space continuation indents ARE the contract the parser must meet: a
+hand-tidied copy would quietly test a shape no scan has ever filed.
+"""
+
+
+_FIXTURE_SHA_NAMES = (
+    "issue-1449.md",
+    "issue-1447.md",
+    "issue-993.md",
+    "issue-1177.md",
+    "issue-869.md",
+)
+"""The five real bodies, which between them record four distinct revisions."""
+
+
+def _fixture(name: str) -> str:
+    """Read one committed issue-body fixture.
+
+    Args:
+        name: File name under ``tests/fixtures/scan_issue_bodies``.
+
+    Returns:
+        The body text.
+    """
+    path = _FIXTURES / name
+    assert path.is_file(), f"{path} is missing; the parser tests would be vacuous"
+    return path.read_text(encoding="utf-8")
+
+
+_SINGLE_SYMBOL_BODY = """\
+## Context
+- File(s): `creek-tools/creek/vault/writer.py:1929-1936`
+- Symbol(s): `{symbol}` — verified present at the scan SHA
+- Scanned at commit: `c8c5131` — re-verify against HEAD before starting
+- Evidence: purpose-built fixture for the end-to-end backstop test.
+
+## Output Format
+A single PR.
+"""
+"""A body citing exactly ONE symbol, for the phantom/real mirror pair.
+
+Purpose-built, and that is deliberate. No real filed body has exactly one
+citation: #1447 carries four phantoms, #1449 one of nine, #993 three of
+four -- so "swap the phantom for the real name and assert exit 0" is
+unachievable against any of them. Real bodies are the parser's fixtures,
+where the assertion is the extracted citation LIST; this one is the
+verifier's, where the assertion is an exit code.
+"""
+
+
+class TestCitationsFromAFiledIssueBody:
+    """Issue #1700. The backstop reads what was filed, not what was promised.
+
+    Two shapes are live at once. The template grew a ``- Symbol(s):``
+    bullet in 8160ed0 (HEAD~1 when #1700 was written) and no scan has run
+    since, so **every** issue in the backlog still carries the older
+    inline ``- File(s):`` shape. A parser tested only against the template
+    would parse nothing that actually exists.
+    """
+
+    def test_the_forward_looking_template_shape_yields_one_citation(self) -> None:
+        """`File(s)` supplies path and lines; `Symbol(s)` supplies the name."""
+        assert citations_from_body(_fixture("template-forward.md")) == [
+            ("path/to/file.py", "enclosing_function_name", "120-164")
+        ]
+
+    def test_1449_yields_every_backticked_symbol_in_a_four_line_bullet(self) -> None:
+        """Nine symbols across a wrapped bullet, not just the first.
+
+        A parser that stopped at the first clause would pass a test
+        written to match it and check one citation in nine.
+        """
+        assert citations_from_body(_fixture("issue-1449.md")) == [
+            ("creek-tools/creek/classify/llm/providers.py", "_require_env", "133-134"),
+            (
+                "creek-tools/creek/classify/llm/providers.py",
+                "_extract_anthropic_usage",
+                "612",
+            ),
+            (
+                "creek-tools/creek/classify/llm/providers.py",
+                "_fetch_attestation_quote",
+                "850",
+            ),
+            (
+                "creek-tools/creek/classify/llm/providers.py",
+                "_extract_openai_text",
+                "1316",
+            ),
+            (
+                "creek-tools/creek/classify/llm/providers.py",
+                "_map_openai_stop_reason",
+                "1333",
+            ),
+            (
+                "creek-tools/creek/classify/llm/providers.py",
+                "_extract_openai_usage",
+                "1352",
+            ),
+            (
+                "creek-tools/creek/classify/llm/providers.py",
+                "_extract_gemini_text",
+                "1563",
+            ),
+            (
+                "creek-tools/creek/classify/llm/providers.py",
+                "_map_gemini_stop_reason",
+                "1589",
+            ),
+            (
+                "creek-tools/creek/classify/llm/providers.py",
+                "_extract_gemini_usage",
+                "1610",
+            ),
+        ]
+
+    def test_1449_invents_no_citation_for_its_unbackticked_prose_clause(self) -> None:
+        """``enclave payload options (`:981`, `:983`)`` must yield nothing.
+
+        The clause has line numbers and no backticked name. Manufacturing
+        a symbol for it -- by reaching for the nearest name, as the
+        original confabulation did -- would put a phantom into the very
+        pipeline that exists to refuse them.
+        """
+        citations = citations_from_body(_fixture("issue-1449.md"))
+
+        assert not [lines for _, _, lines in citations if lines in {"981", "983"}]
+        assert "enclave" not in {symbol for _, symbol, _ in citations}
+
+    def test_993_reads_both_token_orders_and_the_inherited_path(self) -> None:
+        """The range precedes the name here, and only clause one names a path."""
+        assert citations_from_body(_fixture("issue-993.md")) == [
+            ("creek-tools/creek/audit/log.py", "_read_last_line", "149-157"),
+            ("creek-tools/creek/audit/log.py", "iter_entries", "266-277"),
+            ("creek-tools/creek/audit/log.py", "verify_chain", "289-296"),
+            ("creek-tools/creek/audit/log.py", "_verify_line", "313-320"),
+        ]
+
+    def test_1177_cites_only_line_ranges_and_that_is_not_an_error(self) -> None:
+        """``:120-121`` is a range, never an identifier.
+
+        The trap: a span that looks token-shaped but is a line span. Read
+        as a symbol it becomes a guaranteed phantom, reddening a run for
+        a citation that was fine.
+        """
+        assert citations_from_body(_fixture("issue-1177.md")) == []
+
+    def test_1447_yields_all_eight_symbols_with_their_ranges(self) -> None:
+        """The range follows the name here, and one clause is range-only."""
+        assert citations_from_body(_fixture("issue-1447.md")) == [
+            ("creek-tools/creek/vault/writer.py", "_read_legacy_provenance", "207-224"),
+            (
+                "creek-tools/creek/vault/writer.py",
+                "_migrate_legacy_provenance",
+                "295-308",
+            ),
+            ("creek-tools/creek/vault/writer.py", "_render_decision_body", "362"),
+            ("creek-tools/creek/vault/writer.py", "_atomic_write", "414-415"),
+            ("creek-tools/creek/vault/writer.py", "find_fragment_file", "941"),
+            ("creek-tools/creek/vault/writer.py", "_rebuild_index", "1747"),
+            ("creek-tools/creek/vault/writer.py", "_unique_filename", "1929-1936"),
+            ("creek-tools/creek/vault/writer.py", "_log_provenance", "1980-1981"),
+        ]
+
+    def test_869_cites_a_whole_module_and_names_no_symbol(self) -> None:
+        """A whole-module finding legitimately cites none -- and is not an error."""
+        assert citations_from_body(_fixture("issue-869.md")) == []
+
+    @pytest.mark.parametrize(
+        ("path", "symbol"),
+        [
+            pytest.param(".github/workflows/_claude-scan.yml", "scan", id="yaml-job"),
+            pytest.param("creek-tools/scripts/backlog-gate.sh", "fail", id="shell-fn"),
+            pytest.param("creek-tools/pyproject.toml", "tool", id="toml-table"),
+        ],
+    )
+    def test_a_non_python_path_yields_no_symbol_citation(
+        self,
+        path: str,
+        symbol: str,
+    ) -> None:
+        """A non-Python citation must never reach the ast resolver.
+
+        Every name here is a perfectly good identifier -- a job id, a
+        shell function, a TOML table -- which is the whole point: the
+        gate has to be the FILE's extension, not the name's shape.
+
+        ``ast.parse`` on a YAML, shell or TOML blob raises, the resolver
+        turns that into ``CitationError`` and exits 2, and
+        ``verify-scan-citations.sh`` counts any non-zero as a phantom --
+        so an ungated parser reddens a run for a **correct** citation.
+
+        Args:
+            path: A non-Python file the issue cites.
+            symbol: An identifier-shaped name inside it.
+        """
+        body = (
+            "## Context\n"
+            f"- File(s): `{path}:195-201`\n"
+            f"- Symbol(s): `{symbol}` — verified present at the scan SHA\n"
+            "- Scanned at commit: `c8c5131`\n"
+        )
+
+        assert citations_from_body(body) == []
+
+    def test_the_same_body_with_a_python_path_does_yield_the_citation(self) -> None:
+        """The mirror of the case above, so the gate is not just "never".
+
+        Without this, a parser that returned nothing at all would satisfy
+        the non-Python cases perfectly.
+        """
+        body = (
+            "## Context\n"
+            "- File(s): `creek-tools/creek/audit/log.py:195-201`\n"
+            "- Symbol(s): `scan` — verified present at the scan SHA\n"
+            "- Scanned at commit: `c8c5131`\n"
+        )
+
+        assert citations_from_body(body) == [
+            ("creek-tools/creek/audit/log.py", "scan", "195-201")
+        ]
+
+    def test_a_bare_file_name_is_never_read_as_a_symbol(self) -> None:
+        """``README.md`` beside a `.py` path must not become a citation.
+
+        Found in pre-push review of this change, and it is the parser's
+        own worst failure mode rather than a cosmetic one: the span is
+        identifier-shaped, so it reached the SYMBOL branch; then
+        ``verify_symbol`` strips to the last dotted segment and hunts for
+        a definition named ``md``, which exists in no file. The result is
+        a **correct** issue reported as citing a phantom, a red scan run,
+        and an automated correction comment posted on it.
+        """
+        body = (
+            "## Context\n"
+            "- File(s): `creek-tools/creek/vault/writer.py:100-120`, `README.md`\n"
+            "- Scanned at commit: `c8c5131`\n"
+        )
+
+        assert citations_from_body(body) == []
+
+    def test_a_bare_file_name_clears_the_path_rather_than_guessing(self) -> None:
+        """After an unresolvable file reference, later names are dropped.
+
+        The alternative -- keeping the previous path in force -- would
+        attribute ``some_helper`` to ``writer.py`` when the issue plainly
+        meant it to belong to whatever ``helpers.py`` is. Guessing which
+        file a name lives in is how a phantom gets manufactured.
+        """
+        body = (
+            "## Context\n"
+            "- File(s): `creek-tools/creek/vault/writer.py:100-120` — `_atomic_write`,"
+            " `helpers.py` — `some_helper`\n"
+            "- Scanned at commit: `c8c5131`\n"
+        )
+
+        assert citations_from_body(body) == [
+            ("creek-tools/creek/vault/writer.py", "_atomic_write", "100-120")
+        ]
+
+    def test_symbols_are_dropped_when_the_files_bullet_names_two_modules(self) -> None:
+        """A guess about WHICH file a name lives in manufactures a phantom.
+
+        Pinned by its own test because the rule reads like an omission:
+        the next reader "fixes" it by attaching the names to the first
+        path, and the parser starts inventing citations.
+        """
+        body = (
+            "## Context\n"
+            "- File(s): `creek-tools/creek/audit/log.py:10-20`, "
+            "`creek-tools/creek/vault/writer.py:30-40`\n"
+            "- Symbol(s): `verify`, `_generate_filename`\n"
+            "- Scanned at commit: `c8c5131`\n"
+        )
+
+        assert citations_from_body(body) == []
+
+    @pytest.mark.parametrize(
+        ("fixture", "prefix", "length"),
+        [
+            ("issue-1449.md", "c8c5131b", 40),
+            ("issue-1447.md", "c8c5131b", 40),
+            ("issue-993.md", "317ea3d9", 40),
+            ("issue-1177.md", "a5809aa5", 40),
+            ("issue-869.md", "82f9b89", 7),
+        ],
+    )
+    def test_the_recorded_scan_sha_is_read_from_the_body(
+        self,
+        fixture: str,
+        prefix: str,
+        length: int,
+    ) -> None:
+        """Each body's citations are checked at ITS OWN revision, not HEAD.
+
+        Asserted as prefix plus exact length rather than one 40-character
+        literal per row. The length is the load-bearing half: a parser
+        that truncated, padded or normalised the recorded value would
+        still satisfy the prefix, and a truncated SHA sent to
+        ``git cat-file`` resolves to a *different* revision or to nothing.
+        #869 records a **7-character** SHA, so a 40-character floor would
+        silently fall back to the run's SHA and check the citation against
+        the wrong revision entirely.
+
+        (Writing the full SHAs out here would also trip ``detect-secrets``
+        as high-entropy hex, and the honest fix for a false positive is
+        not to write the string, not to annotate around the scanner.)
+
+        Args:
+            fixture: Fixture file name.
+            prefix: The opening characters of the SHA that body records.
+            length: The exact length of the recorded SHA.
+        """
+        recorded = sha_from_body(_fixture(fixture))
+
+        assert recorded is not None, "the body records a SHA and the parser lost it"
+        assert len(recorded) == length
+        assert recorded.startswith(prefix)
+
+    def test_bodies_from_the_same_scan_run_agree_and_others_differ(self) -> None:
+        """Distinct revisions must not collapse onto one another.
+
+        #1447 and #1449 were filed by the same run and record the same
+        SHA; #993 and #1177 were filed by different runs. A parser
+        returning a constant -- or the first SHA it ever saw -- passes
+        every per-fixture assertion above and fails here.
+        """
+        shas = {name: sha_from_body(_fixture(name)) for name in _FIXTURE_SHA_NAMES}
+
+        assert shas["issue-1447.md"] == shas["issue-1449.md"]
+        assert len(set(shas.values())) == 4, f"expected four distinct SHAs: {shas}"
+
+    @pytest.mark.parametrize(
+        ("body", "reason"),
+        [
+            pytest.param("## Context\n- File(s): `a/b.py`\n", "absent", id="no-line"),
+            pytest.param(
+                _fixture.__doc__ or "", "not a body", id="prose-without-the-line"
+            ),
+        ],
+    )
+    def test_a_body_recording_no_sha_yields_none(self, body: str, reason: str) -> None:
+        """No SHA is None, so the caller falls back deliberately, not silently.
+
+        Args:
+            body: An issue body with no ``Scanned at commit:`` line.
+            reason: Why it has none, for the failure message.
+        """
+        assert sha_from_body(body) is None, reason
+
+    def test_the_template_placeholder_is_not_mistaken_for_a_sha(self) -> None:
+        """``<SHA>`` left unfilled must not parse as a revision."""
+        assert sha_from_body(_fixture("template-forward.md")) is None
 
 
 class TestExtractModeCLI:

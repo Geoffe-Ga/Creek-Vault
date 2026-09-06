@@ -29,12 +29,14 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import fields
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
 from creek.config import CreekConfig
+from creek.redact.scanner import ScanSummary
 from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.tier_ceiling import TierCeiling, refusal_response
 from creek_mcp.tools.redact import (
@@ -109,6 +111,43 @@ _HEADING_PATTERN = re.compile(r"^### `(?P<path>.+)`$", re.MULTILINE)
 
 Anchored on the backticks so the ``### By Severity`` heading in the same
 document is not mistaken for a path.
+"""
+
+_STATISTICS_KEYS = frozenset(
+    {
+        "files_scanned",
+        "files_skipped_binary",
+        "files_skipped_extension",
+        "files_skipped_symlink",
+        "total_findings",
+    }
+)
+"""Every key ``creek.redact.scan``'s ``statistics`` object publishes.
+
+Spelled out rather than derived from :mod:`creek_mcp.tools.redact`, for the
+reason :data:`_TOOL_NAME` gives: a key set read off the implementation's own
+dict can only ever agree with itself, so it would go green against the very
+omission this pins. Contract ``0.12.0`` (#1292) added the fifth entry.
+"""
+
+_COUNTER_DISPOSITION = {
+    "files_scanned": "published",
+    "files_skipped_binary": "published",
+    "files_skipped_extension": "published",
+    "files_skipped_symlink": "published",
+}
+"""What the MCP wire does with each non-``matches`` field of ``ScanSummary``.
+
+A census rather than a list: every field the dataclass carries has to appear
+here with a decision recorded against it, ``published`` or ``withheld``.
+:func:`test_every_scan_counter_has_a_recorded_wire_disposition` asserts the
+mapping is *total* over the dataclass, so a field added to
+:class:`~creek.redact.scanner.ScanSummary` cannot reach — or fail to reach —
+a consumer without somebody writing down which it is.
+
+That guard is the one #1087 lacked. It added ``files_skipped_symlink`` to the
+dataclass, taught two renderers about it, missed the wire, and nothing went
+red; #1292 is the whole content of that miss.
 """
 
 _ADMITTED_SCANS = [
@@ -386,6 +425,9 @@ def test_scan_accepts_single_file_path(vault: Path) -> None:
     )
     assert result["status"] == "empty"
     assert result["statistics"]["files_scanned"] == 1
+    # The statistics dict is built unconditionally, so an "empty" scan that
+    # declined nothing still renders the counter rather than omitting it.
+    assert result["statistics"]["files_skipped_symlink"] == 0
 
 
 def test_scan_accepts_absolute_path_inside_vault(vault: Path) -> None:
@@ -1010,7 +1052,9 @@ def test_an_unrenderable_path_falls_back_to_a_non_disclosing_placeholder(
 # already-resolved scan root or it is declined unopened. The test below pins
 # that from the MCP surface — the shared locator means it holds for
 # ``creek redact`` and ``creek process`` too, but each surface asserts its own
-# statistics contract, and ``files_scanned`` is this one's.
+# statistics contract, and ``files_scanned`` and ``files_skipped_symlink``
+# are this one's: the first says the escaping child was not opened, the second
+# says the caller was told it was declined (#1292, contract ``0.12.0``).
 # ---------------------------------------------------------------------------
 
 _STAGED_PII_RELPATH = f"{_STAGING_ROOT}/ch1/msg/staged.md"
@@ -1043,6 +1087,12 @@ def test_scan_does_not_read_a_symlink_escaping_the_scan_root(
     only held at ``open`` would be a second ranking rule in disguise.
 
     The **behavioural** assertion is ``files_scanned == 1``; today it is ``2``.
+    ``files_skipped_symlink == 1`` is its counterpart on the reporting side
+    (#1292): counting the decline is not the same as publishing it, and until
+    contract ``0.12.0`` the tool did the first and not the second, so an
+    operator could not distinguish "nothing pointed out of this subtree" from
+    "a link out of it was declined". It sits beside the containment assertion
+    rather than replacing it — the two fail for different reasons.
     The finding-set equality is the second behavioural assertion and doubles as
     the non-vacuity guard: the in-root control (:data:`_STAGED_PII_RELPATH`) is
     legitimately scanned and legitimately reports PII, so "scanned nothing" and
@@ -1082,6 +1132,14 @@ def test_scan_does_not_read_a_symlink_escaping_the_scan_root(
         "creek.redact.scan opened a symlinked child whose target resolves "
         "outside the scanned root and counted it, so files_scanned carries an "
         "existence-and-readability bit about an out-of-scope file.\n\n"
+        f"statistics: {result['statistics']}"
+    )
+    assert result["statistics"]["files_skipped_symlink"] == 1, (
+        "the decline happened but the caller was not told: "
+        "ScanSummary.files_skipped_symlink counts it and reaches this tool "
+        "through _relativised_summary, so an operator reading statistics "
+        "cannot tell a subtree nothing pointed out of from one where a link "
+        "was declined (#1292).\n\n"
         f"statistics: {result['statistics']}"
     )
     finding_paths = {str(finding["file_path"]) for finding in result["findings"]}
@@ -1129,3 +1187,188 @@ def test_scan_accepts_a_vault_root_with_a_symlinked_component(vault: Path) -> No
     assert result["status"] == "ok"
     assert result["input_path"] == _STAGING_ROOT
     assert result["statistics"]["total_findings"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# The escaping-symlink decline is a typed key on the wire (contract 0.12.0, #1292)
+#
+# #1087 stopped the walk reading an escaping symlinked child and counted the
+# decline on ``ScanSummary.files_skipped_symlink``. Two of the three surfaces
+# that render a scan learned about it -- ``generate_markdown_summary`` and the
+# ``creek redact`` stats table -- and the third, this tool's ``statistics``
+# object, did not. A consumer was therefore told how many files were skipped
+# as binary and by extension and never how many were declined for escaping the
+# scan root, which is the one skip reason that means "something tried to point
+# this scan out of its subtree".
+#
+# The tests below pin two different things and both are needed. The first pins
+# the *key set*, which is the contract; the second pins the *census*, which is
+# the mechanism that makes the next counter go red here instead of shipping
+# silently the way this one did.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("ceiling", list(TierCeiling))
+def test_scan_statistics_publish_the_symlink_skip_counter_at_every_ceiling(
+    scannable_vault: Path,
+    ceiling: TierCeiling,
+) -> None:
+    """``statistics`` carries all five keys, at every ceiling, present at zero.
+
+    Parametrised over every ceiling because a response *shape* must not be a
+    function of what the caller declared: the ceiling decides admission, and
+    once a scan is admitted the object it returns is the same object. A key
+    that appeared only at ``all`` would be a second contract in disguise.
+
+    The ``status == "ok"`` guard runs first so a failure here is unambiguously
+    about the key set rather than about admission -- the staging subtree is
+    admitted at every ceiling (FEAT-027), and if that ever stops being true
+    this test would otherwise fail for the wrong reason.
+
+    The zero assertion is deliberate and is not a duplicate of the set
+    assertion. On the wire the key is **unconditional**: it renders at zero.
+    The markdown row is deliberately the opposite, omitted when the count is
+    zero (``creek/redact/scanner.py::_statistics_lines``), because a human
+    reading a report does not need a line of noise per skip reason that did
+    not fire. A typed field is not a report line, and a consumer branching on
+    ``statistics["files_skipped_symlink"]`` must not have to handle its
+    absence.
+
+    Args:
+        scannable_vault: Seeds one PII-bearing staged file, so the scan has
+            findings and returns ``ok`` rather than ``empty``. It plants no
+            symlink, which is what makes the expected count zero.
+        ceiling: The caller's declared tier ceiling.
+    """
+    result = redact_scan_tool(
+        vault_path=scannable_vault,
+        input_path=_STAGING_ROOT,
+        privacy_tier_ceiling=ceiling,
+        consumer="crawdad",
+    )
+
+    assert result["status"] == "ok", (
+        "the staging subtree must stay admitted at "
+        f"ceiling={ceiling.value!r} (FEAT-027) or there is no statistics "
+        f"object for the rest of this test to measure.\n\n{result}"
+    )
+    assert set(result["statistics"]) == _STATISTICS_KEYS, (
+        "creek.redact.scan's statistics object does not publish the "
+        "escaping-symlink skip counter: ScanSummary.files_skipped_symlink "
+        "(#1087) reaches this function through _relativised_summary and is "
+        "then dropped, so a consumer is told how many files were skipped as "
+        "binary and by extension but never how many were declined for "
+        f"escaping the scan root.\n\nstatistics: {sorted(result['statistics'])}"
+    )
+    assert result["statistics"]["files_skipped_symlink"] == 0, (
+        "the wire key must be present and zero on a scan that declined "
+        "nothing -- unlike the markdown row, which is deliberately omitted "
+        "at zero (creek/redact/scanner.py::_statistics_lines).\n\n"
+        f"statistics: {result['statistics']}"
+    )
+
+
+def test_every_scan_counter_has_a_recorded_wire_disposition(
+    scannable_vault: Path,
+) -> None:
+    """Every ``ScanSummary`` field is either published or explicitly withheld.
+
+    **Red here does not mean "add the field to the wire."** It means a field
+    was added to :class:`~creek.redact.scanner.ScanSummary` and nobody has
+    recorded what this tool does with it. The correct response is to add the
+    field to :data:`_COUNTER_DISPOSITION` with the disposition somebody
+    decided -- and if that decision is ``published``, to move the contract
+    minor, because a new typed key on a published response is a contract
+    event. In a tool whose entire job is not naming the files a caller was
+    refused, ``withheld`` is a perfectly good answer and for some future field
+    it will be the only safe one.
+
+    The first assertion is what makes this a census rather than a list: the
+    mapping is asserted **total** over the dataclass, so it cannot silently
+    fall behind it. The second closes the loop in the other direction --
+    everything marked ``published`` really is on the wire, and nothing else
+    is besides ``total_findings``, which is derived from ``matches`` rather
+    than being a counter field.
+
+    Args:
+        scannable_vault: Any admitted scan will do; the assertion is about the
+            key set, and the fixture guarantees a non-refusal response.
+    """
+    counter_fields = {field.name for field in fields(ScanSummary)} - {"matches"}
+    assert set(_COUNTER_DISPOSITION) == counter_fields, (
+        "ScanSummary's fields and this file's census have diverged. Record "
+        "the missing field's disposition ('published' or 'withheld') and "
+        "decide -- deliberately -- whether creek.redact.scan's statistics "
+        "object should carry it and therefore whether the contract minor "
+        "moves. Do not reach for 'published' by default: #1087 added "
+        "files_skipped_symlink and no test noticed the wire had not been "
+        f"told.\n\ncensus: {sorted(_COUNTER_DISPOSITION)}\n"
+        f"ScanSummary: {sorted(counter_fields)}"
+    )
+
+    result = redact_scan_tool(
+        vault_path=scannable_vault,
+        input_path=_STAGING_ROOT,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="crawdad",
+    )
+
+    published = {
+        name
+        for name, disposition in _COUNTER_DISPOSITION.items()
+        if disposition == "published"
+    }
+    assert published | {"total_findings"} == set(result["statistics"]), (
+        "the counters this file records as published and the keys the tool "
+        "actually publishes disagree.\n\n"
+        f"census says published: {sorted(published)}\n"
+        f"wire carries: {sorted(result['statistics'])}"
+    )
+
+
+def test_the_symlink_counter_never_reaches_a_refusal(scannable_vault: Path) -> None:
+    """A refused scan carries no ``statistics`` block, symlink counter included.
+
+    The counter is a skip *count*, and a count over a subtree the caller was
+    refused is the same one-bit oracle the refusal exists to deny: an
+    ``open``-ceiling caller who could ask "how many escaping links are under
+    ``01-Fragments``" would be reading a fact about a corpus they cannot see.
+    So the refusal envelope stays exactly the canonical four keys, and the new
+    contract key must not have widened it.
+
+    Asserted as whole-payload equality against
+    :func:`~creek_mcp.tier_ceiling.refusal_response` rather than as
+    ``"statistics" not in result``, because equality also catches the key
+    arriving under a different name or alongside something else new.
+
+    The symlink is planted first so the assertion is not vacuous: the vault
+    genuinely has a non-zero count to leak at the moment the tool declines to
+    say so.
+
+    Args:
+        scannable_vault: Provides the intimate fragment the planted link
+            points at, so the escaping link resolves to something real.
+    """
+    staged = scannable_vault / "00-Creek-Meta" / "Inbound" / "ch1" / "sneaky.md"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.symlink_to(
+        scannable_vault / _FRAGMENTS_ROOT / "Notes" / f"my-{_FILENAME_CANARY}-note.md",
+    )
+
+    result = redact_scan_tool(
+        vault_path=scannable_vault,
+        input_path=_FRAGMENTS_ROOT,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer="crawdad",
+    )
+
+    assert result == refusal_response(
+        tool=_TOOL_NAME,
+        ceiling=TierCeiling.OPEN,
+        reason=_OUT_OF_SCOPE_REASON,
+    ), (
+        "an out-of-scope refusal must carry the canonical four keys and "
+        "nothing else: a statistics block reporting how many escaping "
+        "symlinks live under a refused subtree is a fact about that subtree."
+        f"\n\n{result}"
+    )

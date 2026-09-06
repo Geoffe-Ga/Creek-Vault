@@ -167,8 +167,8 @@ back to the one-issue-at-a-time loop with zero other changes.
 | `active` | Active issue numbers, space-separated. |
 | `count` / `free` | Active count / remaining capacity (honors `parallel_enabled`). |
 | `path <N>` | Worktree path for issue N (exit 1 if none). |
-| `assign <N> <slug>` | Create/reuse a worktree off `origin/main`; prints its path; refuses when full. |
-| `adopt <N> <PR>` | The bot-PR variant of `assign`: create/reuse a worktree for issue N attached to PR `<PR>`'s **existing** head branch (e.g. Dependabot's), so fixes push there instead of opening a second PR. Refuses a fork PR (its branch is not pushable), a local branch diverged from `origin/<ref>`, and a full fleet. |
+| `assign <N> <slug>` | Create/reuse a worktree off `origin/main`; prints its path; refuses when full. Provisions the lane's `creek-tools/.venv` (`uv sync --all-extras`, idempotent) so the worker's first gate runs against real dev deps; refuses non-zero on a provisioning failure, leaving the worktree in place so a retry repairs it. |
+| `adopt <N> <PR>` | The bot-PR variant of `assign`: create/reuse a worktree for issue N attached to PR `<PR>`'s **existing** head branch (e.g. Dependabot's), so fixes push there instead of opening a second PR. Refuses a fork PR (its branch is not pushable), a local branch diverged from `origin/<ref>`, and a full fleet. Provisions the lane's venv exactly as `assign` does. |
 | `sync <N>` | Merge latest `origin/main` into issue N's branch (no force-push); exit 3 on conflict (aborted, left clean). |
 | `release <N>` | Remove issue N's worktree + delete its branch. |
 | `reconcile` | Release worktrees whose PR merged/closed or whose issue is closed; prune. |
@@ -196,7 +196,7 @@ rather than reading as "no hold."
 | `pending` | CI still running, or no checks registered yet. Wait. |
 | `ci-failed` | A **non-review** check is **positively proven** failed or errored — the rollup shows at least one failing entry that isn't the reviewer. Advance via `ci-debugging`. |
 | `ci-unreadable` | The status rollup could not be read or reconciled with `gh pr checks`'s own exit code — a failed tally probe, a surplus field, a non-numeric count, an unclassifiable entry, or zero failing entries while `gh pr checks` exited non-zero (#1407, #1420). **Nothing is known to be red.** Non-terminal — it is in `watch-pr.sh`'s `IN_FLIGHT_TOKENS`, so the lane keeps polling and self-resolves: a genuinely red tree reads `ci-failed` on the next readable poll, a green one reads `ready`/`behind`/etc. **Do not dispatch `ci-debugging`** — that is the exact bug this token exists to stop (#1408). If the watcher instead prints `timeout ci-unreadable`, the rollup has been unreadable for ~30 minutes straight — treat it as tooling weather, re-check by hand, never convert it into a `ci-debugging` dispatch. |
-| `review-failed` | Every failing check in the status rollup is `claude-review` itself, so CI is green and **the code needs no change** (#1200). The reviewer malfunctioned — rate limit, timeout, `cancel-in-progress` cancellation, or one of `code-review.yml`'s deliberate `exit 1` paths. **Do not dispatch `ci-debugging`**: re-run the failed review (`gh run rerun --failed <id>`) and re-classify. `#1201` is still open, so there is no `workflow_dispatch` and a rerun replays the old workflow file — fine for a rate-limit retry, an empty commit otherwise. A strict **refinement** of `ci-failed`, never a replacement: an unreadable rollup, a failed probe, a surplus field, a non-numeric count, zero failing entries or any unclassifiable entry now read `ci-unreadable` instead — a non-terminal wait, not this token — so `review-failed` still can never swallow a real failure. A non-review check still **running** beside the failed review reads `pending`, not this. |
+| `review-failed` | Every failing check in the status rollup is `claude-review` itself, so CI is green and **the code needs no change** (#1200). The reviewer malfunctioned — rate limit, timeout, `cancel-in-progress` cancellation, or one of `code-review.yml`'s deliberate `exit 1` paths. **Do not dispatch `ci-debugging`**: re-run the failed review (`gh run rerun --failed <id>`) and re-classify. A rerun replays the old workflow file, which is fine for a rate-limit retry; once `code-review.yml` itself has changed, use the dispatch #1201 added — `gh workflow run code-review.yml -f pr_number=<PR>` — rather than an empty commit, which would invalidate the verdict the lane is waiting on. A strict **refinement** of `ci-failed`, never a replacement: an unreadable rollup, a failed probe, a surplus field, a non-numeric count, zero failing entries or any unclassifiable entry now read `ci-unreadable` instead — a non-terminal wait, not this token — so `review-failed` still can never swallow a real failure. A non-review check still **running** beside the failed review reads `pending`, not this. |
 | `changes-requested` | CI green + a **fresh** verdict (posted after the HEAD commit) that is not `LGTM` — `CHANGES_REQUESTED` or `COMMENTS`. Gate 4 failed: advance via `address-feedback` (`ralph-tick.md` Step 2) now. A stale non-LGTM stays `awaiting-review`, and an unreadable verdict lookup fails closed (tooling error / `awaiting-review`) — never this token. |
 | `awaiting-review` | CI green but no verdict for the current HEAD yet — none posted, or only a stale one (it predates HEAD, LGTM or not). Wait, or check for a hidden merge conflict masquerading as a missing review (see `ralph-tick.md` Step 1). |
 | `optout` | `do-not-auto-merge` on the PR's own labels, or on the labels of the last issue it closes. Leave the lane **entirely** alone — no merge, no sync, no dispatch; a lane it already occupies stays occupied. |
@@ -250,7 +250,14 @@ pre-commit hook alone, i.e. not at all for anyone who bypassed it.)
   refusal (including a `|` smuggled into the branch name, with a legal
   same-repo twin so the guard is not just "reject every `|`"), a local branch
   diverged from `origin/<ref>`, both malformed head-lookup shapes, the cap, and
-  a tag that shadows the branch name.
+  a tag that shadows the branch name. Lane **provisioning** is covered against a
+  knob-driven fake `uv` (the CI job never installs the real one): the success
+  path, stdout/stderr discipline on both `assign` and `adopt`, the failure path
+  (non-zero, empty stdout, an actionable diagnostic, the lock released, the
+  worktree and its uncommitted work left alone, a partial `.venv` removed), a
+  `uv` that exits 0 creating nothing, repair of a lane whose first provision
+  failed, idempotency over a healthy lane, a missing `uv` (exit 2), and that a
+  slow sync does not block a concurrent lane start.
 - `scripts/ralph/test_pick_next.sh` stubs `gh` and exercises the picker's
   parallel-awareness: first-worker-lowest, worktree exclusion, in-flight-PR
   exclusion, the `solo` guard (candidate and active), the same-epic guard, the

@@ -1,0 +1,3058 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Creek Adepthood /v1 application API",
+    "version": "0.14.0",
+    "description": "Authenticated HTTP/JSON access to Creek's Adepthood-facing capabilities. Every response this application builds carries Vary: X-Creek-Tier-Ceiling, Authorization, X-Creek-Contract-Version and Cache-Control: no-store — do not enable caching for /v1 on an intermediary. Every error is the ErrorEnvelope, and retryability is the static retry-policy.json table keyed on the error code alone."
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/v1/capabilities": {
+      "get": {
+        "operationId": "getCapabilities",
+        "summary": "Negotiate versions, vault readiness and the capability list.",
+        "parameters": [
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Negotiate versions, vault readiness and the capability list.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilitiesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/journal-entries/{external_id}": {
+      "put": {
+        "operationId": "upsertJournalEntry",
+        "summary": "Create or update one journal entry, idempotently.",
+        "parameters": [
+          {
+            "name": "external_id",
+            "in": "path",
+            "required": true,
+            "description": "Consumer-side identifier for this entry.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "pattern": "^[^\u0000-\u001f/]+$"
+            }
+          },
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Create or update one journal entry, idempotently.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JournalUpsertResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JournalUpsertRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/reflections": {
+      "post": {
+        "operationId": "createReflection",
+        "summary": "Return anchored margin notes for one entry.",
+        "parameters": [
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Return anchored margin notes for one entry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReflectionResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReflectionRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/wheel": {
+      "get": {
+        "operationId": "getWheel",
+        "summary": "Return the aggregate APTITUDE frequency distribution.",
+        "parameters": [
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Return the aggregate APTITUDE frequency distribution.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WheelResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/uploads": {
+      "post": {
+        "operationId": "uploadDocument",
+        "summary": "Ingest one uploaded document as a fragment, idempotently.",
+        "parameters": [
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ingest one uploaded document as a fragment, idempotently.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "this file format cannot be ingested as one document: unpack a conversation export or archive and run `creek ingest --type <chatgpt|claude|discord|substack> --input <dir>`, or re-save a legacy Office document as .docx, .xlsx or .pptx",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UploadRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/connectors/drive": {
+      "get": {
+        "operationId": "getDriveConnector",
+        "summary": "Report the read-only Google Drive connector's state.",
+        "parameters": [
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Report the read-only Google Drive connector's state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveConnectorStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "disconnectDriveConnector",
+        "summary": "Revoke the cached Drive credential and erase it from disk.",
+        "parameters": [
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Revoke the cached Drive credential and erase it from disk.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveDisconnectResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/connectors/drive/syncs": {
+      "post": {
+        "operationId": "syncDriveConnector",
+        "summary": "Run one incremental Google Drive sync and ingest what it fetched.",
+        "parameters": [
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run one incremental Google Drive sync and ingest what it fetched.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveSyncResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/connectors/drive/authorizations": {
+      "post": {
+        "operationId": "createDriveAuthorization",
+        "summary": "Begin a Google Drive authorization for a caller-owned redirect.",
+        "parameters": [
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Begin a Google Drive authorization for a caller-owned redirect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveAuthorizationResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DriveAuthorizationRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/connectors/drive/authorizations/{state}": {
+      "post": {
+        "operationId": "completeDriveAuthorization",
+        "summary": "Complete a Google Drive authorization with the relayed code.",
+        "parameters": [
+          {
+            "name": "state",
+            "in": "path",
+            "required": true,
+            "description": "The single-use value the authorization was issued under.",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
+          },
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Complete a Google Drive authorization with the relayed code.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DriveConnectorStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DriveAuthorizationExchangeRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/classifications": {
+      "post": {
+        "operationId": "createClassification",
+        "summary": "Classify every fragment in the vault, idempotently.",
+        "parameters": [
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Classify every fragment in the vault, idempotently.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClassificationResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Classify every fragment in the vault, idempotently.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobAcceptedResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClassificationRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/links": {
+      "post": {
+        "operationId": "createLink",
+        "summary": "Run one linker stage over the whole vault.",
+        "parameters": [
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Run one linker stage over the whole vault.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Run one linker stage over the whole vault.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobAcceptedResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{job_id}": {
+      "get": {
+        "operationId": "getPipelineJob",
+        "summary": "Report one durable pipeline job's counts-only state.",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "Opaque server-generated pipeline job identifier.",
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "minLength": 36,
+              "maxLength": 36,
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
+          },
+          {
+            "name": "X-Creek-Contract-Version",
+            "in": "header",
+            "required": true,
+            "description": "Contract major.minor; matched by strict membership.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Report one durable pipeline job's counts-only state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "resolved content exceeds the declared tier ceiling",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "the requested contract minor is not served here",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/health": {
+      "get": {
+        "operationId": "getHealth",
+        "summary": "Liveness probe; answers one constant derived from nothing.",
+        "parameters": [
+          {
+            "name": "X-Creek-Tier-Ceiling",
+            "in": "header",
+            "required": false,
+            "description": "Declared tier ceiling; absent reads as 'open'.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Liveness probe; answers one constant derived from nothing.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "status": {
+                      "const": "ok",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "the request carried no valid consumer credential",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such endpoint on this server",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "the request does not satisfy the published schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "the server failed to complete this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "the service is briefly unable to answer",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CapabilitiesStatus": {
+        "description": "Overall readiness reported by the capabilities handshake.\n\nAttributes:\n    OK: The vault is present and this server can serve the contract.\n    UNINITIALIZED: No vault has been scaffolded yet. Both version strings\n        are still reported, so a client can always negotiate versions\n        against a server whose vault does not exist.\n    INCOMPATIBLE: The client's requested contract minor is not in\n        :data:`SUPPORTED_CONTRACT_MINORS`.",
+        "enum": [
+          "ok",
+          "uninitialized",
+          "incompatible"
+        ],
+        "title": "CapabilitiesStatus",
+        "type": "string"
+      },
+      "Capability": {
+        "description": "The seven capabilities ``/v1`` publishes.\n\nThe list was identical for every minor in\n:data:`SUPPORTED_CONTRACT_MINORS` up to and including 0.7: contract 0.3\ngrew the *MCP* tool surface (``creek.upload``, #1023) and added no ``/v1``\nroute, so a ``0.2`` client and a ``0.7`` client were answered from the same\nfour names. Contract 0.8 (#1524) ends that by publishing ``UPLOAD``, and\nthe list is therefore **no longer minor-independent**: what a caller is\ntold, and what it is served, are both keyed on\n:data:`CAPABILITY_SINCE_MINOR`.\n\nThe values are also the directory names of the example matrix in\n:mod:`creek_mcp.api.bundle`, so the advertised capability list and the\ndocumented fixtures cannot name different things.\n\nAttributes:\n    CAPABILITIES: Version and feature handshake; safe before any read.\n    JOURNAL_UPSERT: Idempotent journal entry create/update.\n    REFLECTIONS: Margin notes on an entry, care-guarded.\n    WHEEL: Aggregate APTITUDE frequency distribution.\n    UPLOAD: Idempotent document upload — base64 bytes plus a filename,\n        dispatched to an ingestor by extension. Since contract 0.8.\n    DRIVE_CONNECTOR: The read-only Google Drive connector's *state* and\n        its two verbs — one incremental sync, and disconnection. Since\n        contract 0.9 (#1527). Three routes rather than one, and one\n        capability rather than three, because a client cannot usefully\n        negotiate \"may I read the connector's state\" separately from \"may\n        I sync it\": they are one feature, and splitting them would let a\n        server advertise half a connector.\n\n        **It does not include authorisation.** No route begins, completes\n        or carries an OAuth flow; the credential is minted locally by\n        ``creek gdrive --download`` and never leaves the host.\n    PIPELINE: Whole-vault classification and linking — the two passes that\n        turn ingested bytes into a *usable* corpus. Since contract 0.10\n        (#1570). Two routes and one capability, for the\n        ``drive-connector`` reason: a consumer cannot usefully negotiate\n        \"may I classify\" apart from \"may I link\", because a classified\n        corpus with no resonances is as inert as an unclassified one, and\n        a server advertising half the pipeline would be advertising a\n        vault it cannot finish.\n\n        **It is the tightening half of the surface, not a widening one.**\n        :data:`creek_mcp.tier_ceiling._TIER_RANK` admits ``unclassified``\n        at ceiling ``personal``, so a network-seeded corpus is *already*\n        readable by a remote consumer; classification is what can move a\n        fragment up to ``intimate`` and out of that reach. Neither\n        response carries a fragment id, a path or a byte of prose, which\n        is what makes running the whole vault under a remote ceiling\n        disclose nothing.",
+        "enum": [
+          "capabilities",
+          "journal-upsert",
+          "reflections",
+          "wheel",
+          "upload",
+          "drive-connector",
+          "pipeline"
+        ],
+        "title": "Capability",
+        "type": "string"
+      },
+      "TierModel": {
+        "additionalProperties": false,
+        "description": "What the server promises about privacy tiers, advertised up front.\n\nAttributes:\n    ceilings: Every ceiling this surface admits — the two members of\n        :class:`WireTierCeiling`, in ascending breadth.\n    default: The ceiling applied when a caller declares none. Pinned to\n        ``open``, the most restrictive value, so an omitted ceiling can\n        only ever fail closed.\n    intimate_never_egresses: ``Literal[True]``. A promise, not a flag: the\n        schema admits no other value, so a server cannot advertise the\n        opposite and a client need not branch on it.",
+        "properties": {
+          "ceilings": {
+            "description": "Tier ceilings this surface admits.",
+            "items": {
+              "$ref": "#/components/schemas/WireTierCeiling"
+            },
+            "title": "Ceilings",
+            "type": "array"
+          },
+          "default": {
+            "const": "open",
+            "type": "string",
+            "description": "Ceiling applied when the caller declares none.",
+            "title": "Default"
+          },
+          "intimate_never_egresses": {
+            "const": true,
+            "description": "Standing promise that intimate content never egresses.",
+            "title": "Intimate Never Egresses",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ceilings",
+          "default",
+          "intimate_never_egresses"
+        ],
+        "title": "TierModel",
+        "type": "object"
+      },
+      "VaultState": {
+        "additionalProperties": false,
+        "description": "Whether a vault exists behind this server.\n\nDeliberately one boolean. Anything richer — fragment counts, last-write\ntimestamps, initialisation progress — is a measurement of the corpus, and\nthe handshake is reachable before any tier gate has run.\n\nAttributes:\n    available: ``True`` when a scaffolded vault is readable.",
+        "properties": {
+          "available": {
+            "description": "True when a scaffolded vault is readable.",
+            "title": "Available",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "available"
+        ],
+        "title": "VaultState",
+        "type": "object"
+      },
+      "WireTierCeiling": {
+        "description": "The only two tier ceilings expressible on ``/v1``.\n\n``/v1`` is remote by construction, and\n:func:`creek_mcp.policy.admitted_ceiling` refuses any remote call declaring\na ceiling outside :data:`creek_mcp.policy.REMOTE_ADMITTED_CEILINGS` *before\ndispatch*. Since #1073 that decision is transport-neutral, so every adapter\nis meant to reach it the same way; the MCP surface does so today through\n:meth:`creek_mcp.server._BoundedFastMCP.call_tool`, and #1074 mounts the\n``/v1`` handlers that will. This enum mirrors that frozenset, so\n``intimate`` and ``all`` are not merely refused at runtime — they cannot be\nconstructed at all, which is the half of the guarantee that does not depend\non a handler remembering to ask.\n\nThe same two values double as the wire's *tier* vocabulary (see\n:class:`JournalUpsertRequest`, :class:`JournalUpsertResponse` and\n:class:`ReflectionResponse`). The two vocabularies coincide by\nconstruction: the set of tiers a remote caller may name is exactly the set\nof ceilings a remote caller may declare, because a tier above the remote\ncap is one no remote request can reach in either direction.\n\nAttributes:\n    OPEN: Openly publishable content only (ontology §13.2).\n    PERSONAL: Adds personal — and, per #961, ``unclassified`` — content.",
+        "enum": [
+          "open",
+          "personal"
+        ],
+        "title": "WireTierCeiling",
+        "type": "string"
+      },
+      "CareResource": {
+        "additionalProperties": false,
+        "description": "A way to reach a human, named and contactable.\n\nAttributes:\n    name: What the resource is called.\n    contact: How to reach it. Required — a resource without a contact\n        dead-ends the person reading it at the worst possible moment.",
+        "properties": {
+          "name": {
+            "description": "Name of the care resource.",
+            "title": "Name",
+            "type": "string"
+          },
+          "contact": {
+            "description": "How to reach it; required.",
+            "title": "Contact",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "contact"
+        ],
+        "title": "CareResource",
+        "type": "object"
+      },
+      "CareSignal": {
+        "additionalProperties": false,
+        "description": "The structured \"reach a human\" envelope, mirroring the runtime constant.\n\nValidates :data:`creek.care.guardrail.CARE_SIGNAL` itself rather than an\nabridged copy of it, so the wire shape cannot fall behind the guardrail.\n\nAttributes:\n    kind: The care guard that fired.\n    message: Prose addressed to the person, not to the client.\n    resources: At least one contactable resource. The signal never\n        dead-ends.",
+        "properties": {
+          "kind": {
+            "description": "The care guard that fired.",
+            "title": "Kind",
+            "type": "string"
+          },
+          "message": {
+            "description": "Prose addressed to the person.",
+            "title": "Message",
+            "type": "string"
+          },
+          "resources": {
+            "description": "At least one contactable resource.",
+            "items": {
+              "$ref": "#/components/schemas/CareResource"
+            },
+            "minItems": 1,
+            "title": "Resources",
+            "type": "array"
+          }
+        },
+        "required": [
+          "kind",
+          "message",
+          "resources"
+        ],
+        "title": "CareSignal",
+        "type": "object"
+      },
+      "ClassificationMethod": {
+        "description": "The classification methods ``POST /v1/classifications`` serves.\n\n``rules`` remains the bounded synchronous path. ``llm`` is accepted only\nthrough the durable job surface added at contract 0.14 (#1605), because a\npass can take minutes or hours. The detached worker still invokes the\nexisting classify tool, including ModelRouter's intimate-never-cloud gate.\n\nAttributes:\n    RULES: Keyword classification. No model, no key, no consent, no egress.\n    LLM: Model-backed classification, returned as a durable job handle.",
+        "enum": [
+          "rules",
+          "llm"
+        ],
+        "title": "ClassificationMethod",
+        "type": "string"
+      },
+      "DriveConnectionState": {
+        "description": "The four states the read-only Drive connector can be in (#1527).\n\nA closed enum rather than a boolean, because the three unusable states are\nanswered by three different operator actions and a client that could only\nsee ``connected: false`` would have to guess which to prompt for.\n\n**Every member is a fact about this server's own configuration**, never\nabout the user's Drive: no file, folder, id or count is expressible here.\n\nAttributes:\n    CONNECTED: A cached credential exists and is usable, so a sync will\n        run without a human present.\n    NOT_CONNECTED: No cached credential. The operator authorises with\n        ``creek gdrive --download`` on the host; there is no ``/v1`` route\n        that can do it for them.\n    EXPIRED: A credential exists but has lapsed and carries no refresh\n        token, so it cannot be renewed non-interactively. The same\n        operator action clears it.\n    UNSUPPORTED: The optional Google client libraries are not installed on\n        this server, so no credential could be used even if one existed.\n        Distinguished from :attr:`NOT_CONNECTED` because the remedy is an\n        install rather than an authorisation, and a client that conflated\n        them would send the operator round a loop that cannot terminate.",
+        "enum": [
+          "connected",
+          "not_connected",
+          "expired",
+          "unsupported"
+        ],
+        "title": "DriveConnectionState",
+        "type": "string"
+      },
+      "ErrorCode": {
+        "description": "The ten wire error codes: nine from contract 0.2, one added at 0.8.\n\nThere is deliberately **no** ``care_escalation`` member: an escalation is a\nsuccessful, 200-shaped :class:`CareEscalationResponse`, because a person in\nacute distress must not have their response swallowed by a client's error\npath.\n\nAttributes:\n    UNAUTHENTICATED: No valid consumer credential accompanied the request.\n    INVALID_REQUEST: The body does not satisfy the published schema.\n    INCOMPATIBLE_VERSION: The requested contract minor is not served here.\n    PRIVACY_REFUSED: The single answer for every vault-object non-answer.\n        Above the ceiling, purged, orphaned, schema-invalid and deleted out\n        of band all collapse to this one code with this one message.\n    NOT_FOUND: A **routing** code only — no such endpoint or path on this\n        server. Never emitted for a vault object. Emitting it for a\n        fragment would reintroduce the existence oracle that #846 / #970 /\n        #972 / #1090 collapsed: the difference between \"no such id\" and\n        \"not for you\" is a corpus enumeration primitive.\n    UNSUPPORTED_CAPABILITY: A published capability this server does not\n        implement.\n    UNSUPPORTED_SOURCE: The uploaded file's **extension** names a format\n        Creek must not ingest as one document — a conversation export, an\n        archive, a legacy binary Office file (#1526). A statement about\n        the caller's own filename and nothing else, so it discloses\n        nothing about the vault. Added at contract 0.8 (#1524), and\n        reachable only on ``POST /v1/uploads``.\n    UNAVAILABLE: The vault is absent or unreadable; a human must act.\n    TEMPORARILY_UNAVAILABLE: A transient condition; backoff will clear it.\n    INTERNAL_ERROR: An unexpected server fault.",
+        "enum": [
+          "unauthenticated",
+          "invalid_request",
+          "incompatible_version",
+          "privacy_refused",
+          "not_found",
+          "unsupported_capability",
+          "unsupported_source",
+          "unavailable",
+          "temporarily_unavailable",
+          "internal_error"
+        ],
+        "title": "ErrorCode",
+        "type": "string"
+      },
+      "JournalAction": {
+        "description": "What an idempotent write actually did — journal upsert or upload.\n\n``UNCHANGED`` is a success, not an error: re-sending an unmodified entry is\nthe steady state of a continuous sync, and a client must be able to tell it\napart from a write without diffing content itself.\n\nShared by :class:`JournalUpsertResponse` and :class:`UploadResponse` rather\nthan duplicated under a second name. The three words are the same three\n:func:`creek_mcp.tools.upload._action_of` collapses an ingest tally into,\nand the ledger that decides them is one ledger. The name kept its\n``Journal`` prefix through contract 0.8 because it is a **published schema\ncomponent name**: Adepthood has vendored ``$defs/JournalAction`` since 0.2,\nand renaming it would break every consumer's schema validation to buy\nnothing a docstring cannot say.\n\nAttributes:\n    CREATED: A new fragment was written.\n    UPDATED: An existing fragment was updated in place.\n    UNCHANGED: The content hash matched; nothing was written.",
+        "enum": [
+          "created",
+          "updated",
+          "unchanged"
+        ],
+        "title": "JournalAction",
+        "type": "string"
+      },
+      "ClassificationResponse": {
+        "additionalProperties": false,
+        "description": "What one classification pass did, in counts alone (#1570).\n\n**Nothing here names a fragment.** No id, no path, no title, no excerpt,\nnot even an error string — the engine's per-fragment errors interpolate\nfile paths, so they are collapsed into :attr:`complete`. That is what makes\nit safe for this route to run over the *whole* vault while serving a caller\ncapped at ``personal``: the pass reads material above the ceiling on the\nhost, and reports nothing whatsoever about it.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call ran at.\n    method: The classifier that ran, echoed so a client that sent an empty\n        body learns which default it got.\n    total: Creek fragments visited.\n    classified: Fragments whose frontmatter this run rewrote.\n    preserved_manual: Fragments left alone because an operator had stamped\n        them by hand.\n    preserved_llm: Fragments left alone by the resume short-circuit.\n    privacy_tiers_assigned: Fragments whose privacy tier this run derived.\n        **Zero is the expected answer for a network-seeded corpus**, and it\n        is not a failure: ``POST /v1/uploads`` requires an explicit tier\n        (#1497), so an uploaded fragment already carries the caller's\n        declared one and the tier pass does not own it. Only ``retier``\n        re-opens that case.\n    retiered: Subset of the above where an already-recorded tier was\n        replaced by a stricter one. Non-zero only under ``retier``.\n    praxis_marked: Fragments raised to a stronger praxis potential.\n    tags_extracted: Fragments that gained a hashtag ``tags`` entry.\n    complete: Whether every visited fragment was processed without error.\n        ``False`` means some were skipped, and — because the pass is\n        resumable — that the honest next step is to call again rather than\n        to treat the corpus as done. The *reasons* stay in the server log:\n        each one names the file it failed on.",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "Always ok; failure is an error.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Ceiling the call ran at."
+          },
+          "method": {
+            "$ref": "#/components/schemas/ClassificationMethod",
+            "description": "The classifier that ran."
+          },
+          "total": {
+            "description": "Creek fragments visited.",
+            "minimum": 0,
+            "title": "Total",
+            "type": "integer"
+          },
+          "classified": {
+            "description": "Fragments rewritten this run.",
+            "minimum": 0,
+            "title": "Classified",
+            "type": "integer"
+          },
+          "preserved_manual": {
+            "description": "Left alone: operator stamp.",
+            "minimum": 0,
+            "title": "Preserved Manual",
+            "type": "integer"
+          },
+          "preserved_llm": {
+            "description": "Left alone: resume stamp.",
+            "minimum": 0,
+            "title": "Preserved Llm",
+            "type": "integer"
+          },
+          "privacy_tiers_assigned": {
+            "description": "Tiers derived this run.",
+            "minimum": 0,
+            "title": "Privacy Tiers Assigned",
+            "type": "integer"
+          },
+          "retiered": {
+            "description": "Recorded tiers replaced by stricter.",
+            "minimum": 0,
+            "title": "Retiered",
+            "type": "integer"
+          },
+          "praxis_marked": {
+            "description": "Fragments raised to praxis.",
+            "minimum": 0,
+            "title": "Praxis Marked",
+            "type": "integer"
+          },
+          "tags_extracted": {
+            "description": "Fragments that gained tags.",
+            "minimum": 0,
+            "title": "Tags Extracted",
+            "type": "integer"
+          },
+          "complete": {
+            "description": "Every visited fragment processed cleanly.",
+            "title": "Complete",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "method",
+          "total",
+          "classified",
+          "preserved_manual",
+          "preserved_llm",
+          "privacy_tiers_assigned",
+          "retiered",
+          "praxis_marked",
+          "tags_extracted",
+          "complete"
+        ],
+        "title": "ClassificationResponse",
+        "type": "object"
+      },
+      "JobState": {
+        "description": "The closed lifecycle vocabulary for a durable pipeline job.",
+        "enum": [
+          "queued",
+          "running",
+          "succeeded",
+          "failed"
+        ],
+        "title": "JobState",
+        "type": "string"
+      },
+      "LinkMethod": {
+        "description": "The linker stages ``POST /v1/links`` serves.\n\nAll four :data:`creek.surface_modes.LINK_METHODS` values are expressible.\n``embeddings`` uses the durable job surface because it is the O(n²)\npairwise-similarity stage; the other three retain their synchronous\nbyte-identical ``200`` responses.\n\n**Excluding it does not make every served member cheap, and the schema\nshould not be read as promising that.** ``eddies`` and ``threads`` both\nneed vectors, so both fill the embeddings parquet on a cold cache — a\nlocal sentence-transformer pass over every uncached fragment, which is\nminutes of work on a large vault and can outrun the request deadline.\nThey are served anyway because the parquet is a *cache*: the work a\ntimed-out first call performs still lands, so a retry converges instead of\nstarting over. Nothing about that reaches a network provider; the model is\nlocal (ADR-0004). Budget for the first call on a cold vault, and prefer\n``temporal`` when you only need the corpus navigable.\n\nAttributes:\n    TEMPORAL: Same-window adjacency links. The one genuinely cheap stage —\n        no vectors, no model — and the one that makes a freshly-seeded\n        corpus navigable at all.\n    EDDIES: Topic clusters, materialised under ``03-Eddies/``. Embeds on a\n        cold cache.\n    THREADS: Narrative currents, materialised under ``02-Threads/``. Embeds\n        on a cold cache, and reads the APTITUDE labels a classification\n        pass writes, so run classification first.\n    EMBEDDINGS: Pairwise similarity links, returned as a durable job handle.",
+        "enum": [
+          "temporal",
+          "eddies",
+          "threads",
+          "embeddings"
+        ],
+        "title": "LinkMethod",
+        "type": "string"
+      },
+      "LinkResponse": {
+        "additionalProperties": false,
+        "description": "What one linker stage did, in counts alone (#1570).\n\nCounts only, for the same reason :class:`ClassificationResponse` carries\nnone: the stage runs over every fragment in the vault, including material\nfar above the caller's ceiling, and a thread title or an eddy name is the\ncorpus talking.\n\nThere is no ``complete`` twin of the classification field. The linker has\nno per-fragment error accumulator to collapse — a stage either finishes or\nraises, and a raise is an :class:`ErrorEnvelope` — so a boolean here would\nbe a constant ``True`` wearing the shape of a fact.\n:attr:`oversized_discarded` is the honest partial-loss signal instead.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call ran at.\n    method: The stage that ran, echoed for correlation.\n    fragment_count: Fragments loaded from the vault.\n    link_count: The stage's own count — temporal links, eddies detected,\n        or threads detected.\n    largest_cluster_fragments: Members of the biggest cluster emitted; the\n        proof that no single cluster swallowed the corpus (#880).\n    clusters_split: Clusters re-clustered at a tighter parameter for\n        exceeding the configured ceiling.\n    oversized_discarded: Fragments dropped to noise because their cluster\n        stayed oversized after the split budget was spent. **This is data\n        loss** — those fragments carry no link at all — and it is published\n        rather than folded away because a caller who cannot see it reads a\n        lossy pass as a clean one (#1372).",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "Always ok; failure is an error.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Ceiling the call ran at."
+          },
+          "method": {
+            "$ref": "#/components/schemas/LinkMethod",
+            "description": "The linker stage that ran."
+          },
+          "fragment_count": {
+            "description": "Fragments loaded from the vault.",
+            "minimum": 0,
+            "title": "Fragment Count",
+            "type": "integer"
+          },
+          "link_count": {
+            "description": "The stage's own count.",
+            "minimum": 0,
+            "title": "Link Count",
+            "type": "integer"
+          },
+          "largest_cluster_fragments": {
+            "description": "Biggest cluster's size.",
+            "minimum": 0,
+            "title": "Largest Cluster Fragments",
+            "type": "integer"
+          },
+          "clusters_split": {
+            "description": "Clusters re-clustered tighter.",
+            "minimum": 0,
+            "title": "Clusters Split",
+            "type": "integer"
+          },
+          "oversized_discarded": {
+            "description": "Fragments dropped to noise.",
+            "minimum": 0,
+            "title": "Oversized Discarded",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "method",
+          "fragment_count",
+          "link_count",
+          "largest_cluster_fragments",
+          "clusters_split",
+          "oversized_discarded"
+        ],
+        "title": "LinkResponse",
+        "type": "object"
+      },
+      "NoteKind": {
+        "description": "The seven margin-note kinds, mirroring the reflect tool's vocabulary.\n\nKept in lock-step with :data:`creek_mcp.tools.reflect._ALLOWED_KINDS`,\nwhich is what the produced notes are actually constrained to; a wire enum\nthat drifted from it would let a legitimate note fail validation on the way\nout.\n\nAttributes:\n    FEAR: A named fear surfacing in the entry.\n    GIFT: Something the writer is giving or has been given.\n    LONGING: An unmet want the writing circles.\n    PATTERN: A recurrence the writer has not named yet.\n    REFRAME: The same material seen from another angle.\n    TENSION: Two things the entry holds at once.\n    VALUE: A commitment the entry reveals.",
+        "enum": [
+          "fear",
+          "gift",
+          "longing",
+          "pattern",
+          "reframe",
+          "tension",
+          "value"
+        ],
+        "title": "NoteKind",
+        "type": "string"
+      },
+      "PraxisKind": {
+        "description": "The five praxis types, mirroring the vault's own vocabulary.\n\nKept in lock-step with :class:`creek.models.PraxisType`, which is what a\n``04-Praxis/`` page's ``praxis_type`` is actually constrained to;\n:mod:`creek_mcp.compiled_pages` withholds any page naming something outside\nit, so a wire enum that drifted would refuse a legitimate page on the way\nout — or, worse, admit a hand-edited value the vault never sanctioned.\n``tests/test_adepthood_contract_models.py`` pins the two lists equal.\n\nAttributes:\n    COMMITMENT: A promise the writer has made.\n    FRAMEWORK: A way of seeing they reuse.\n    HABIT: Something done repeatedly, near-automatically.\n    INSIGHT: A distilled realisation.\n    PRACTICE: Something done deliberately and returned to.",
+        "enum": [
+          "commitment",
+          "framework",
+          "habit",
+          "insight",
+          "practice"
+        ],
+        "title": "PraxisKind",
+        "type": "string"
+      },
+      "PraxisLifecycle": {
+        "description": "The four praxis lifecycle statuses, mirroring :class:`creek.models.PraxisStatus`.\n\nAttributes:\n    ACTIVE: Currently being practised.\n    INTEGRATED: Absorbed; no longer needs deliberate attention.\n    PROPOSED: Named but not yet taken up.\n    RELEASED: Deliberately let go.",
+        "enum": [
+          "active",
+          "integrated",
+          "proposed",
+          "released"
+        ],
+        "title": "PraxisLifecycle",
+        "type": "string"
+      },
+      "ReflectionNote": {
+        "additionalProperties": false,
+        "description": "One margin note: a verbatim span, a kind, and the reflection itself.\n\nAttributes:\n    quote: A span copied verbatim from the entry. The producing tool\n        verifies this; a note whose quote is not verbatim is dropped rather\n        than returned.\n    kind: One of the seven :class:`NoteKind` values.\n    note: The reflection, addressed to the writer in second person.",
+        "properties": {
+          "quote": {
+            "description": "Verbatim span copied from the entry.",
+            "title": "Quote",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/NoteKind",
+            "description": "Margin-note kind."
+          },
+          "note": {
+            "description": "The reflection itself.",
+            "title": "Note",
+            "type": "string"
+          }
+        },
+        "required": [
+          "quote",
+          "kind",
+          "note"
+        ],
+        "title": "ReflectionNote",
+        "type": "object"
+      },
+      "RelatedEddy": {
+        "additionalProperties": false,
+        "description": "One eddy the reflected entry belongs to (contract 0.9, #873).\n\nCarries the same compiled-page caveat as :class:`RelatedPraxis`, and one\nmore that is specific to it: ``description`` and ``fragment_count`` are\n*synthesised from the eddy's members*, so publishing the page to a caller\nadmitted to only some of them would hand over a summary of content they\ncannot read. :mod:`creek_mcp.compiled_pages` therefore admits an eddy only\nwhen the members it can enumerate account for ``fragment_count`` exactly\n**and** every one of them is within the ceiling.\n\nAttributes:\n    title: The eddy page's title.\n    description: The eddy's own one-line description; ``\"\"`` when the page\n        declares none.\n    fragment_count: How many fragments the eddy clusters. A tally, so never\n        negative.\n    formed: The ``YYYY-MM-DD`` the eddy was first detected.",
+        "properties": {
+          "title": {
+            "description": "The eddy page's title.",
+            "title": "Title",
+            "type": "string"
+          },
+          "description": {
+            "description": "The eddy's own description; may be empty.",
+            "title": "Description",
+            "type": "string"
+          },
+          "fragment_count": {
+            "description": "How many fragments the eddy clusters.",
+            "minimum": 0,
+            "title": "Fragment Count",
+            "type": "integer"
+          },
+          "formed": {
+            "description": "ISO date the eddy was first detected.",
+            "title": "Formed",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "description",
+          "fragment_count",
+          "formed"
+        ],
+        "title": "RelatedEddy",
+        "type": "object"
+      },
+      "RelatedPraxis": {
+        "additionalProperties": false,
+        "description": "One praxis page the reflected entry contributed to (contract 0.9, #873).\n\n**Compiled, not raw.** A praxis page is distilled *from* fragments, so it\nis published only when every id in its ``derived_from`` resolves to a\nfragment within the caller's ceiling — and withheld outright when its\nprovenance cannot be enumerated in full. That rule lives in\n:mod:`creek_mcp.compiled_pages`; nothing on this model re-derives it, and\nno field here carries a tier, because a page that reached the wire is one\nwhose whole provenance was already admitted.\n\nAttributes:\n    title: The praxis page's title.\n    praxis_type: Which of the five :class:`PraxisKind` values it is.\n    status: Where it sits in the :class:`PraxisLifecycle`.\n    excerpt: The page's own opening prose, whitespace-collapsed and capped\n        at :data:`creek_mcp.compiled_pages.EXCERPT_CHARS`. Not a model\n        summary and not grounding-checked — it is the page as written.",
+        "properties": {
+          "title": {
+            "description": "The praxis page's title.",
+            "title": "Title",
+            "type": "string"
+          },
+          "praxis_type": {
+            "$ref": "#/components/schemas/PraxisKind",
+            "description": "Which kind of praxis this is."
+          },
+          "status": {
+            "$ref": "#/components/schemas/PraxisLifecycle",
+            "description": "Where it sits in its lifecycle."
+          },
+          "excerpt": {
+            "description": "The page's own opening prose, capped.",
+            "title": "Excerpt",
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "praxis_type",
+          "status",
+          "excerpt"
+        ],
+        "title": "RelatedPraxis",
+        "type": "object"
+      },
+      "WheelFrequency": {
+        "additionalProperties": false,
+        "description": "One APTITUDE frequency's slice of the wheel.\n\nAttributes:\n    name: The canonical frequency name from\n        :data:`creek.generate.indexes.CANONICAL_FREQUENCY_NAMES`.\n    count: Classified fragments at this frequency. A tally, so never\n        negative.\n    share: Fraction of *classified* fragments at this frequency, bounded to\n        ``[0.0, 1.0]``.",
+        "properties": {
+          "name": {
+            "description": "Canonical APTITUDE frequency name.",
+            "title": "Name",
+            "type": "string"
+          },
+          "count": {
+            "description": "Classified fragments here.",
+            "minimum": 0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "share": {
+            "description": "Fraction of classified fragments at this frequency.",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Share",
+            "type": "number"
+          }
+        },
+        "required": [
+          "name",
+          "count",
+          "share"
+        ],
+        "title": "WheelFrequency",
+        "type": "object"
+      },
+      "WheelFrequencies": {
+        "additionalProperties": false,
+        "description": "All ten frequencies, as ten separate required fields.\n\nTen declared fields rather than a mapping, on purpose. It is what makes the\npublished JSON Schema say ``required: [F1 .. F10]`` — a consumer generating\ncode from the schema gets ten guaranteed members instead of an open\ndictionary it has to defend against — and it fixes the emission order at\nthe canonical one, so a diff of two wheels is a diff of numbers rather than\nof key ordering.\n\nFields are declared in the order of\n:data:`creek.generate.indexes.CANONICAL_FREQUENCY_NAMES`. An eleventh\nfrequency is a change to the shared ontology vocabulary — a contract change\nwith a version bump — which is why ``extra=\"forbid\"`` rejects one rather\nthan passing it through.\n\nAttributes:\n    F1: Agency.\n    F2: Receptivity.\n    F3: Self-Love / Power.\n    F4: Community Love / Conformity.\n    F5: Achievism.\n    F6: Pluralism.\n    F7: Integration.\n    F8: True Self / Transcendence.\n    F9: Unity.\n    F10: Emptiness.",
+        "properties": {
+          "F1": {
+            "$ref": "#/components/schemas/WheelFrequency"
+          },
+          "F2": {
+            "$ref": "#/components/schemas/WheelFrequency"
+          },
+          "F3": {
+            "$ref": "#/components/schemas/WheelFrequency"
+          },
+          "F4": {
+            "$ref": "#/components/schemas/WheelFrequency"
+          },
+          "F5": {
+            "$ref": "#/components/schemas/WheelFrequency"
+          },
+          "F6": {
+            "$ref": "#/components/schemas/WheelFrequency"
+          },
+          "F7": {
+            "$ref": "#/components/schemas/WheelFrequency"
+          },
+          "F8": {
+            "$ref": "#/components/schemas/WheelFrequency"
+          },
+          "F9": {
+            "$ref": "#/components/schemas/WheelFrequency"
+          },
+          "F10": {
+            "$ref": "#/components/schemas/WheelFrequency"
+          }
+        },
+        "required": [
+          "F1",
+          "F2",
+          "F3",
+          "F4",
+          "F5",
+          "F6",
+          "F7",
+          "F8",
+          "F9",
+          "F10"
+        ],
+        "title": "WheelFrequencies",
+        "type": "object"
+      },
+      "CapabilitiesResponse": {
+        "additionalProperties": false,
+        "description": "The handshake: versions, vault readiness and the capability list.\n\nSafe to call before anything else, including against an uninitialised vault\n— which is why both version strings are required regardless of\n:attr:`status`. A client must always be able to read the version off a\nserver whose vault does not exist yet, or version negotiation would need a\nvault to negotiate about.\n\nAttributes:\n    status: Overall readiness.\n    contract_version: :data:`creek_mcp.contract.CONTRACT_VERSION`.\n    contract_minor: The ``major.minor`` this response speaks.\n    supported_contract_minors: Every minor still served here.\n    ontology_version: :data:`creek_mcp.contract.ONTOLOGY_VERSION` — the\n        shared frequency/phase vocabulary. A mismatch means \"renegotiate\".\n    vault: Vault readiness.\n    tier_model: The standing tier promise.\n    capabilities: The capabilities actually served. Empty on an\n        uninitialised vault.",
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/CapabilitiesStatus",
+            "description": "Overall server readiness."
+          },
+          "contract_version": {
+            "description": "Full semantic contract version.",
+            "title": "Contract Version",
+            "type": "string"
+          },
+          "contract_minor": {
+            "description": "The major.minor spoken here.",
+            "title": "Contract Minor",
+            "type": "string"
+          },
+          "supported_contract_minors": {
+            "description": "Every contract minor this server still serves.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Supported Contract Minors",
+            "type": "array"
+          },
+          "ontology_version": {
+            "description": "Shared APTITUDE frequency / Wavelength phase vocabulary.",
+            "title": "Ontology Version",
+            "type": "string"
+          },
+          "vault": {
+            "$ref": "#/components/schemas/VaultState",
+            "description": "Vault readiness."
+          },
+          "tier_model": {
+            "$ref": "#/components/schemas/TierModel",
+            "description": "Standing privacy-tier promise."
+          },
+          "capabilities": {
+            "description": "Capabilities served; empty on an uninitialised vault.",
+            "items": {
+              "$ref": "#/components/schemas/Capability"
+            },
+            "title": "Capabilities",
+            "type": "array"
+          }
+        },
+        "required": [
+          "status",
+          "contract_version",
+          "contract_minor",
+          "supported_contract_minors",
+          "ontology_version",
+          "vault",
+          "tier_model",
+          "capabilities"
+        ],
+        "title": "CapabilitiesResponse",
+        "type": "object"
+      },
+      "CareEscalationResponse": {
+        "additionalProperties": false,
+        "description": "A 200-shaped escalation: the care signal instead of model prose.\n\nNot an error, and there is no ``care_escalation`` member of\n:class:`ErrorCode`, because a person in acute distress must not have their\nresponse swallowed by a client's error path.\n\nAttributes:\n    status: Pinned to :attr:`ReflectionStatus.ESCALATE`.\n    tier_ceiling: The caller's own declared ceiling, echoed.\n    reason: Which care guard fired.\n    care_signal: The runtime :data:`creek.care.guardrail.CARE_SIGNAL`,\n        whole.",
+        "properties": {
+          "status": {
+            "const": "escalate",
+            "description": "Always escalate.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Caller's declared ceiling."
+          },
+          "reason": {
+            "description": "Which care guard fired.",
+            "title": "Reason",
+            "type": "string"
+          },
+          "care_signal": {
+            "$ref": "#/components/schemas/CareSignal",
+            "description": "The runtime care signal, whole."
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "reason",
+          "care_signal"
+        ],
+        "title": "CareEscalationResponse",
+        "type": "object"
+      },
+      "ClassificationRequest": {
+        "additionalProperties": false,
+        "description": "A whole-vault classification pass (#1570).\n\nThere is no fragment selector, and there will not be one. The pass is\nidempotent and resumable — :func:`creek.classify.classify_engine.run_classify`\nshort-circuits on the ``classification_method`` stamp it already wrote — so\n\"classify everything\" converges on retry, whereas a caller-supplied id list\nwould be an enumeration primitive on a corpus this consumer cannot read.\n\nAttributes:\n    method: Which classifier to run. Defaults to the only served member so\n        the empty body — the request a consumer writes first — is the\n        correct one.\n    retier: Whether to also re-derive the privacy tier of fragments that\n        already carry a concrete one. Off by default, because re-deriving a\n        tier the operator settled by hand is the operator's decision. It is\n        the *only* way this surface can correct a consumer that declared\n        ``personal`` on intimate bytes at upload time, and it cannot loosen\n        anything: the engine merges the new verdict with\n        ``escalate``, so a recorded tier is replaced only by a stricter one\n        (#1106).",
+        "properties": {
+          "method": {
+            "$ref": "#/components/schemas/ClassificationMethod",
+            "default": "rules",
+            "description": "Classifier to run; llm is accepted as a durable job."
+          },
+          "retier": {
+            "default": false,
+            "description": "Also re-derive an already-recorded tier, escalate-only.",
+            "title": "Retier",
+            "type": "boolean"
+          }
+        },
+        "title": "ClassificationRequest",
+        "type": "object"
+      },
+      "DriveAuthorizationExchangeRequest": {
+        "additionalProperties": false,
+        "description": "The authorization code, relayed back to Creek (#1568).\n\n**One field, and the absence of the second is deliberate.** The\n``redirect_uri`` is *not* re-supplied here: it is read from the record the\n``state`` was issued under. A caller able to vary it between the two legs\ncould complete an authorization against an address the first leg never\nnamed, which is exactly what binding the code to a stored authorization\nexists to prevent.\n\nAttributes:\n    code: Google's authorization code, as the caller's redirect handler\n        received it. Single-use and short-lived at Google's end too; it is\n        worthless without the client secret this server holds.",
+        "properties": {
+          "code": {
+            "description": "The authorization code Google handed the caller.",
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "DriveAuthorizationExchangeRequest",
+        "type": "object"
+      },
+      "DriveAuthorizationRequest": {
+        "additionalProperties": false,
+        "description": "Begin a Drive authorization for a redirect URI the *caller* owns (#1568).\n\nThe one field is the whole of ADR-0012's option C. Creek mints the\nauthorization URL and holds the client secret; the caller owns the public\naddress Google redirects the user's browser to, and relays the resulting\ncode back over the bearer credential it already holds. That is why there is\nno callback route on this server, and therefore no anonymous path through\n:class:`~creek_mcp.httpapi.auth.BearerAuthMiddleware`.\n\nAttributes:\n    redirect_uri: The caller's own redirect URI. Absolute, ``https``, and\n        fragment-free — validated here rather than left to Google, because\n        a plain-``http`` redirect would carry the authorization code in the\n        clear and RFC 6749 §3.1.2 forbids the fragment outright. Never a\n        URI on this server.",
+        "properties": {
+          "redirect_uri": {
+            "description": "Caller-owned absolute https redirect URI, no fragment.",
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Redirect Uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "redirect_uri"
+        ],
+        "title": "DriveAuthorizationRequest",
+        "type": "object"
+      },
+      "DriveAuthorizationResponse": {
+        "additionalProperties": false,
+        "description": "The URL to send a user to, and the state binding the code (#1568).\n\n**Carries no secret.** The client secret stays on this host; the\nauthorization URL is a public value by construction — it is what a browser\naddress bar shows — and ``state`` is a server-minted nonce that is useless\nwithout an authorization code.\n\nAttributes:\n    status: Always ``\"ok\"``. A refusal is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call ran at, echoed for correlation.\n    authorization_url: Where the caller sends its user. Built by\n        ``google_auth_oauthlib`` from this deployment's client description\n        and the config's read-only scope list, re-validated by\n        :func:`creek_mcp.tools.drive_grant._readonly_scopes` on the way out\n        so a remote connect button cannot widen the grant.\n    state: The single-use, expiring value the eventual code must be\n        presented under. It binds a relayed code to an authorization *this*\n        server issued; it is not a CSRF token, because Creek never sees the\n        browser.",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "Always ok; failure is an error.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Ceiling the call ran at."
+          },
+          "authorization_url": {
+            "description": "Where to send the user's browser.",
+            "title": "Authorization Url",
+            "type": "string"
+          },
+          "state": {
+            "description": "Single-use value the code must be relayed under.",
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "authorization_url",
+          "state"
+        ],
+        "title": "DriveAuthorizationResponse",
+        "type": "object"
+      },
+      "DriveConnectorStatusResponse": {
+        "additionalProperties": false,
+        "description": "What ``GET /v1/connectors/drive`` reports about the connector (#1527).\n\n**The one thing this model must never carry is the credential**, and its\nclosed field list is what enforces that: ``_WireModel`` forbids extras, so\na token cannot be bolted on without editing this class and the schema it\npublishes. What a caller gets is the *state* of the connection and the\n*scope set* it was granted under — never the token, the refresh token, the\nclient secret, or the path any of them live at.\n\nPublishing connection state deliberately is not in tension with the\nno-oracle rule the refusals follow. This route **is** the negotiated\ndisclosure — a client that cannot tell \"connected\" from \"not connected\"\ncannot render a connect button — and it is reachable only by an\nauthenticated consumer. The rule the refusals keep is the complementary\none: because this route answers the question honestly, no *other* route\nhas any reason to leak the answer sideways.\n\nAttributes:\n    status: Always ``\"ok\"``. An unreadable vault or config is an\n        :class:`ErrorEnvelope`, not a state.\n    tier_ceiling: The ceiling the call ran at — the caller's own declared\n        value, echoed for correlation.\n    connection: The connector's state.\n    scopes: The OAuth scope set the cached credential was requested\n        under, verbatim. Published because a client showing a user \"Creek\n        can read your Drive\" should be able to *check* that claim rather\n        than repeat it;\n        :meth:`creek.config.GoogleDriveConfig.validate_readonly_scopes`\n        refuses to construct a config carrying anything else, so a widened\n        scope cannot reach this field without failing validation first.\n    can_sync: Whether ``POST /v1/connectors/drive/syncs`` would run rather\n        than refuse. Derived from :attr:`connection` and published\n        separately so a client need not encode this server's state\n        algebra to know whether its button is live.",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "Always ok; failure is an error.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Ceiling the call ran at."
+          },
+          "connection": {
+            "$ref": "#/components/schemas/DriveConnectionState",
+            "description": "Connector state."
+          },
+          "scopes": {
+            "description": "Read-only OAuth scopes the credential was granted under.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Scopes",
+            "type": "array"
+          },
+          "can_sync": {
+            "description": "True when a sync would run, not refuse.",
+            "title": "Can Sync",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "connection",
+          "scopes",
+          "can_sync"
+        ],
+        "title": "DriveConnectorStatusResponse",
+        "type": "object"
+      },
+      "DriveDisconnectResponse": {
+        "additionalProperties": false,
+        "description": "The outcome of ``DELETE /v1/connectors/drive`` (#1527).\n\nIdempotent, and constant-shaped: disconnecting an already-disconnected\nconnector is a success, and reports the same\n:attr:`~DriveConnectionState.NOT_CONNECTED` as disconnecting a live one.\nThat is why :attr:`connection` is published rather than a\n``token_erased`` boolean — the latter would answer \"was there a\ncredential a moment ago\", which is a question about the past that this\nverb has no reason to answer.\n\nAttributes:\n    status: Always ``\"ok\"``.\n    tier_ceiling: The ceiling the call ran at.\n    connection: The state afterwards. Always\n        :attr:`~DriveConnectionState.NOT_CONNECTED` on a ``200``: the\n        local credential is erased before the response is built, and a\n        failure to erase it is an :class:`ErrorEnvelope` rather than a\n        success reporting that nothing happened.\n    remote_revoked: Whether Google's revocation endpoint confirmed the\n        credential is dead on their side too. ``False`` does **not** mean\n        the local erase failed — it means the operator should finish the\n        job at Google's account page, which is the one piece of advice a\n        client can act on and cannot derive.",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "Always ok; failure is an error.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Ceiling the call ran at."
+          },
+          "connection": {
+            "$ref": "#/components/schemas/DriveConnectionState",
+            "description": "State after the call."
+          },
+          "remote_revoked": {
+            "description": "Google confirmed the revocation.",
+            "title": "Remote Revoked",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "connection",
+          "remote_revoked"
+        ],
+        "title": "DriveDisconnectResponse",
+        "type": "object"
+      },
+      "DriveSyncResponse": {
+        "additionalProperties": false,
+        "description": "The tally of one incremental Drive sync (#1527).\n\n**Counts, and nothing but counts.** Not a file name, not a folder name,\nnot a Drive id, not a fragment id, not a tier. Every one of those is the\nuser's own content or a handle onto it, and this response is the only\nthing a remote caller learns from a run that may have touched material far\nabove its ceiling — a sync ingests whatever the user's own Drive holds,\nbecause the tier of that content is derived from the content, never\ndeclared by the caller.\n\nThat is also why there is no ``affected_fragment_ids`` here, despite\n:class:`UploadResponse` publishing one for the #1305 right-to-be-forgotten\nargument. An upload's fragments are the caller's own bytes, handed over a\nmoment earlier; a sync's are the vault owner's, and a list of them handed\nto an ``open``-ceiling consumer is a corpus enumeration primitive dressed\nas a receipt. The vault-side record of what a sync wrote is the ingest\nledger, which RTBF already reads.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call ran at.\n    files_fetched: Files Drive reported as newer than the local copy and\n        this run downloaded.\n    files_unchanged: Files the incremental skip passed over. This is the\n        number that makes a second sync of an untouched Drive visibly a\n        no-op rather than an invisible one.\n    files_failed: Files whose download raised. The run continues past\n        each, so a quota blip mid-sync does not abandon the rest — and the\n        count is published because a caller told only about successes\n        would believe an incomplete sync was complete. The *reasons* stay\n        in the server log: they interpolate Drive file names.\n    fragments_failed: Files that downloaded cleanly and then failed to\n        become fragments — a per-unit assemble or write error. Published\n        separately from ``files_failed`` because the two are different\n        shortfalls: one never landed, the other landed and was lost.\n        Without it a sync whose content half-failed reports ``ok`` with\n        silently fewer fragments and no signal anywhere.\n    files_unsupported: Files that downloaded cleanly and were **not**\n        ingested, because their extension names a format Creek must not\n        read as one document (#1526) — a conversation export, an archive,\n        a legacy binary Office file. Published rather than folded into\n        :attr:`files_failed`, which would be untrue, and rather than left\n        out, which would be worse: a fetched-but-undigested file is\n        precisely the silent no-op this whole surface exists to prevent.\n        The bytes are in the staging mirror and ``creek ingest`` can read\n        them; nothing is lost, but nothing happened either.\n    fragments_created: Fragments this run's ingest newly wrote.\n    fragments_updated: Fragments it rewrote in place.\n    fragments_unchanged: Fragments the ledger recognised as identical.",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "Always ok; failure is an error.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Ceiling the call ran at."
+          },
+          "files_fetched": {
+            "description": "Files downloaded this run.",
+            "minimum": 0,
+            "title": "Files Fetched",
+            "type": "integer"
+          },
+          "files_unchanged": {
+            "description": "Files the skip passed over.",
+            "minimum": 0,
+            "title": "Files Unchanged",
+            "type": "integer"
+          },
+          "files_failed": {
+            "description": "Files whose download raised.",
+            "minimum": 0,
+            "title": "Files Failed",
+            "type": "integer"
+          },
+          "files_unsupported": {
+            "description": "Files fetched but of a format Creek must not ingest.",
+            "minimum": 0,
+            "title": "Files Unsupported",
+            "type": "integer"
+          },
+          "fragments_failed": {
+            "description": "Files that downloaded cleanly and then failed to become fragments. Distinct from files_failed, which is a download that never landed.",
+            "minimum": 0,
+            "title": "Fragments Failed",
+            "type": "integer"
+          },
+          "fragments_created": {
+            "description": "Fragments newly written.",
+            "minimum": 0,
+            "title": "Fragments Created",
+            "type": "integer"
+          },
+          "fragments_updated": {
+            "description": "Fragments rewritten.",
+            "minimum": 0,
+            "title": "Fragments Updated",
+            "type": "integer"
+          },
+          "fragments_unchanged": {
+            "description": "Fragments left as they were.",
+            "minimum": 0,
+            "title": "Fragments Unchanged",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "files_fetched",
+          "files_unchanged",
+          "files_failed",
+          "files_unsupported",
+          "fragments_failed",
+          "fragments_created",
+          "fragments_updated",
+          "fragments_unchanged"
+        ],
+        "title": "DriveSyncResponse",
+        "type": "object"
+      },
+      "ErrorEnvelope": {
+        "additionalProperties": false,
+        "description": "The one error shape on ``/v1``: three fields, and never a fourth.\n\nIt echoes nothing. Not the request body, not the resolved tier, not the\nidentifier that was probed. Everything a caller needs in order to act is in\n:data:`ERROR_STATUS` and :data:`RETRY_POLICY`, both keyed on :attr:`code`\nalone; everything else they might want is something this server must not\ntell them.\n\nAttributes:\n    code: The closed wire code. Look up HTTP status, human message and\n        retry disposition from it.\n    message: A constant drawn from :data:`ERROR_MESSAGES`. Never composed\n        from request or vault material.\n    request_id: A server-generated correlation id for the operator's logs.\n        Opaque to the client, and derived from nothing the caller sent.",
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode",
+            "description": "Closed wire error code."
+          },
+          "message": {
+            "description": "Constant message from ERROR_MESSAGES.",
+            "title": "Message",
+            "type": "string"
+          },
+          "request_id": {
+            "description": "Server-generated correlation id.",
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "request_id"
+        ],
+        "title": "ErrorEnvelope",
+        "type": "object"
+      },
+      "JournalUpsertRequest": {
+        "additionalProperties": false,
+        "description": "An idempotent journal write from a remote consumer.\n\nAttributes:\n    content: The entry body. Whitespace-only is refused rather than\n        written: an empty fragment is indistinguishable from a corrupted\n        one once it is in the vault, and it would still consume an\n        ``external_id``.\n    timestamp: Optional client-supplied entry time. Omitted means \"the\n        server stamps it\", so a client with no reliable clock is still a\n        valid client.\n    tier: The tier to create the entry at. Typed\n        :class:`WireTierCeiling`, so ``intimate`` is not expressible — a\n        remote consumer cannot even *ask* for an intimate write.",
+        "properties": {
+          "content": {
+            "description": "Entry body; must not be blank.",
+            "title": "Content",
+            "type": "string"
+          },
+          "timestamp": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional client-supplied entry time.",
+            "title": "Timestamp"
+          },
+          "tier": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Tier to create the entry at."
+          }
+        },
+        "required": [
+          "content",
+          "tier"
+        ],
+        "title": "JournalUpsertRequest",
+        "type": "object"
+      },
+      "JournalUpsertResponse": {
+        "additionalProperties": false,
+        "description": "The result of an idempotent journal write.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call was served under — the caller's own\n        declared value, echoed for correlation.\n    external_id: The consumer-side identity of the entry, unchanged.\n    fragment_id: The vault-side identity now backing it.\n    action: Whether the write created, updated, or changed nothing.\n    tier: The tier the entry was created at. Not expressible as\n        ``intimate``, for the same reason as on the request.\n    warnings: Content-free operator advisories this write produced, and\n        absent entirely when there were none (#1372). Optional rather\n        than an always-present empty list on purpose: ``_WireModel`` is\n        ``extra=\"forbid\"`` and this server still serves contract minors\n        0.2, 0.3 and 0.4, so an unconditional key would put an\n        unnegotiated field in every ``200`` those clients receive. Paired\n        with ``exclude_none`` at the dump, the quiet write stays\n        byte-identical to what it was before this field existed. Every\n        entry is proven free of vault content at the producer — see\n        :attr:`creek.ingest.pipeline.IngestRunResult.ceiling_safe_warnings`\n        — so nothing here varies with the caller's ceiling.",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "Always ok; failure is an error.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Ceiling the call ran at."
+          },
+          "external_id": {
+            "description": "Consumer-side entry identity.",
+            "title": "External Id",
+            "type": "string"
+          },
+          "fragment_id": {
+            "description": "Vault-side fragment identity.",
+            "title": "Fragment Id",
+            "type": "string"
+          },
+          "action": {
+            "$ref": "#/components/schemas/JournalAction",
+            "description": "Created, updated, or unchanged."
+          },
+          "tier": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Tier the entry was created at."
+          },
+          "warnings": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Content-free operator advisories this write produced; absent when none.",
+            "title": "Warnings"
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "external_id",
+          "fragment_id",
+          "action",
+          "tier"
+        ],
+        "title": "JournalUpsertResponse",
+        "type": "object"
+      },
+      "JobAcceptedResponse": {
+        "additionalProperties": false,
+        "description": "The durable handle returned when a long pipeline pass is accepted.",
+        "properties": {
+          "status": {
+            "const": "accepted",
+            "description": "The job was durably queued.",
+            "title": "Status",
+            "type": "string"
+          },
+          "job_id": {
+            "description": "Opaque server-generated job identifier.",
+            "format": "uuid",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "state": {
+            "const": "queued",
+            "description": "Initial lifecycle state.",
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "job_id",
+          "state"
+        ],
+        "title": "JobAcceptedResponse",
+        "type": "object"
+      },
+      "JobStatusResponse": {
+        "additionalProperties": false,
+        "description": "The counts-only public projection of one consumer-bound pipeline job.",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "The status lookup succeeded.",
+            "title": "Status",
+            "type": "string"
+          },
+          "job_id": {
+            "description": "Opaque server-generated job identifier.",
+            "format": "uuid",
+            "title": "Job Id",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState",
+            "description": "Current lifecycle state."
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ClassificationResponse"
+              },
+              {
+                "$ref": "#/components/schemas/LinkResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Counts-only result, present only after successful completion.",
+            "title": "Result"
+          }
+        },
+        "required": [
+          "status",
+          "job_id",
+          "state"
+        ],
+        "title": "JobStatusResponse",
+        "type": "object"
+      },
+      "LinkRequest": {
+        "additionalProperties": false,
+        "description": "One linker stage over the whole vault (#1570).\n\n``method`` is required and has no default, unlike\n:class:`ClassificationRequest`'s. The three stages are not\ninterchangeable — one writes adjacency into fragment frontmatter, one\nmaterialises ``03-Eddies/``, one materialises ``02-Threads/`` — so a\ndefault would silently run a pass the caller did not choose and report it\nas the one they asked for.\n\nAttributes:\n    method: The linker stage to run.",
+        "properties": {
+          "method": {
+            "$ref": "#/components/schemas/LinkMethod",
+            "description": "Linker stage to run."
+          }
+        },
+        "required": [
+          "method"
+        ],
+        "title": "LinkRequest",
+        "type": "object"
+      },
+      "NotApplicableExample": {
+        "additionalProperties": false,
+        "description": "Marks a fixture-matrix cell that has no response shape to document.\n\nThe published example matrix is 5 capabilities x 7 states. Four of those\ncells — care escalation for ``capabilities``, ``journal-upsert``, ``wheel``\nand ``upload`` — are *structurally* unreachable: the acute-distress guard runs\nonly inside :func:`creek_mcp.tools.reflect.reflect_tool`, so no other\ncapability can ever escalate.\n\nBoth alternatives were worse. Fabricating a care-escalation response for\nthose cells would publish a shape the server can never emit, and a consumer\nwould write handling code for a branch that cannot be taken. Omitting the\ncells would break the rectangular matrix, and a hole in a matrix reads as\n\"not documented yet\" rather than \"cannot happen\" — which is exactly the\ndistinction a cross-repo consumer needs.\n\nSo the cell is filled with an explicit, machine-checkable statement of\nunreachability that says *why*.\n\nAttributes:\n    unreachable: ``Literal[True]``. The claim is the whole point of the\n        model, so the schema admits no other value.\n    reason: Why this cell cannot occur.",
+        "properties": {
+          "unreachable": {
+            "const": true,
+            "description": "Always true; this cell has no reachable response shape.",
+            "title": "Unreachable",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Why this cell is structurally unreachable.",
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "unreachable",
+          "reason"
+        ],
+        "title": "NotApplicableExample",
+        "type": "object"
+      },
+      "ReflectionRequest": {
+        "additionalProperties": false,
+        "description": "A request for margin notes on exactly one source.\n\nAttributes:\n    content: Inline text supplied by the caller — their own words, so no\n        vault tier applies to it.\n    entry_ref: A vault fragment reference instead. Resolving it is a read,\n        so it is subject to the ceiling gate.\n    max_notes: How many notes at most, bounded to ``[1, 10]`` inclusive.",
+        "properties": {
+          "content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Inline text to reflect on.",
+            "title": "Content"
+          },
+          "entry_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Vault fragment reference to reflect on.",
+            "title": "Entry Ref"
+          },
+          "max_notes": {
+            "default": 3,
+            "description": "Maximum margin notes to return.",
+            "maximum": 10,
+            "minimum": 1,
+            "title": "Max Notes",
+            "type": "integer"
+          }
+        },
+        "title": "ReflectionRequest",
+        "type": "object"
+      },
+      "ReflectionResponse": {
+        "additionalProperties": false,
+        "description": "Margin notes for one entry.\n\nAttributes:\n    status: ``ok`` or ``empty``. ``escalate`` arrives as a\n        :class:`CareEscalationResponse` instead.\n    tier_ceiling: The caller's own declared ceiling, echoed.\n    routed_tier: The tier the model call was keyed with. **Safe to expose,\n        and provably so:** for every ceiling ``/v1`` permits and every\n        :class:`~creek.models.PrivacyTier` that ceiling admits,\n        ``routing_tier(ceiling, tier)`` equals\n        ``CEILING_ROUTING_TIER[ceiling]``. It is a constant function of the\n        caller's *own declared ceiling*, so it carries zero bits about the\n        content's tier — the caller learns only what they themselves\n        supplied. The invariant holds because ``routing_tier`` takes the\n        more sensitive of the ceiling-derived tier and the content tier,\n        and an admitted tier is by definition no more sensitive than its\n        ceiling. It is pinned by\n        ``test_routed_tier_is_a_constant_function_of_the_declared_ceiling``\n        in ``tests/test_adepthood_contract_models.py``. **If that test ever\n        fails, remove this field — do not relax the test.** A\n        ``routed_tier`` that varies with content is a one-bit tier oracle\n        over the whole corpus.\n    notes: The margin notes; empty when ``status`` is ``empty``.\n    essay: Optional free prose. Ungrounded by construction.\n    essay_grounded: Required, and only ``False`` is admissible at 0.2.",
+        "properties": {
+          "status": {
+            "description": "ok or empty; escalate is CareEscalationResponse instead.",
+            "enum": [
+              "ok",
+              "empty"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Caller's declared ceiling."
+          },
+          "routed_tier": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Tier the call was keyed with; a function of tier_ceiling."
+          },
+          "notes": {
+            "description": "Margin notes; may be empty.",
+            "items": {
+              "$ref": "#/components/schemas/ReflectionNote"
+            },
+            "title": "Notes",
+            "type": "array"
+          },
+          "essay": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional free prose.",
+            "title": "Essay"
+          },
+          "essay_grounded": {
+            "const": false,
+            "description": "Required; only False is admissible at contract 0.2.",
+            "title": "Essay Grounded",
+            "type": "boolean"
+          },
+          "related_praxis": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/RelatedPraxis"
+                },
+                "maxItems": 3,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Praxis pages the entry contributed to; absent when none.",
+            "title": "Related Praxis"
+          },
+          "related_eddies": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/RelatedEddy"
+                },
+                "maxItems": 2,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Eddies the entry belongs to; absent when none.",
+            "title": "Related Eddies"
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "routed_tier",
+          "notes",
+          "essay_grounded"
+        ],
+        "title": "ReflectionResponse",
+        "type": "object"
+      },
+      "UploadRequest": {
+        "additionalProperties": false,
+        "description": "One document's bytes, handed to the vault under a stable id (#1524).\n\nThe wire half of :func:`creek_mcp.tools.upload.upload_tool`, and\ndeliberately its *subset*: it carries no ``source_type``. The tool refuses\nthat override because the ``chatgpt`` / ``claude`` / ``discord`` /\n``substack`` ingestors are directory-only and would discover nothing from a\nsingle staged file, reporting a silent no-op as a success. Dispatch is by\nthe filename's extension, through\n:func:`creek.ingest.route_to_ingestor`, and nothing else. Uploading a whole\nexport archive is tracked separately, in #1525.\n\n**JSON and base64, never multipart.** The consumer's HTTP client is JSON\nand its CI bans ``python-multipart``, so a multipart route would be one\nneither end could use. The cost is the ~33% base64 expansion, which is what\n:data:`creek_mcp.api.routes.UPLOAD_MAX_BODY_BYTES` is sized around.\n\nAttributes:\n    filename: The caller's original filename. Only its **extension** is\n        trusted, and only to choose an ingestor; the staged file's name is\n        derived from *external_id*, so nothing here reaches a path.\n    content_base64: The document's bytes, base64-encoded. Refused when\n        blank; refused by the tool when it is not valid base64, and — via\n        the encoded-length guard — before an oversize payload is ever\n        turned into memory.\n    external_id: The consumer-side stable id, and the idempotency key. The\n        same id updates in place; a new id creates a new fragment.\n    timestamp: Optional ISO-8601 upload time, accepted for symmetry with\n        :class:`JournalUpsertRequest` and echoed nowhere on disk — a binary\n        document has no frontmatter to put it in, so the fragment's\n        timestamp comes from the ingestor.\n    tier: The tier to file the document at. **Required, and typed\n        :class:`WireTierCeiling`,** so ``intimate`` is not expressible and\n        omission is not defaultable. Both halves matter: #1494 removed this\n        field's ``open`` default from ``creek.upload`` precisely because\n        only the caller knows what the document holds, and a default filed\n        intimate-derived bytes in the clear.",
+        "properties": {
+          "filename": {
+            "description": "Original filename; only its extension is trusted.",
+            "maxLength": 255,
+            "title": "Filename",
+            "type": "string"
+          },
+          "content_base64": {
+            "description": "The document's bytes, base64.",
+            "title": "Content Base64",
+            "type": "string"
+          },
+          "external_id": {
+            "description": "Consumer-side stable id; the idempotency key.",
+            "maxLength": 512,
+            "title": "External Id",
+            "type": "string"
+          },
+          "timestamp": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional client-supplied upload time.",
+            "title": "Timestamp"
+          },
+          "tier": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Tier to file the document at."
+          }
+        },
+        "required": [
+          "filename",
+          "content_base64",
+          "external_id",
+          "tier"
+        ],
+        "title": "UploadRequest",
+        "type": "object"
+      },
+      "UploadResponse": {
+        "additionalProperties": false,
+        "description": "The result of an idempotent document upload.\n\n**There is deliberately no ``tier`` field**, and its absence is the whole\nof this model's privacy argument. ``creek classify`` is escalate-only and\n:meth:`creek.vault.writer.VaultWriter.update_fragment` re-derives a\nfragment's tier the same way, so an uploaded ``.md`` whose own frontmatter\ndeclares ``intimate`` is filed at ``intimate`` however modest a tier the\ncaller declared. A ``tier`` field here would have exactly two possible\nvalues and both are wrong: echo the declared tier and the response asserts\nsomething about the file on disk that is false — the #1491 defect, where a\nresponse claimed a tier the bytes did not carry — or report the resolved\ntier and the response becomes a tier oracle, spelled in a vocabulary\n(:class:`WireTierCeiling`) that cannot even express the answer. So the\nresponse says only what it can say truthfully: which ceiling the call ran\nat, and which fragments now exist.\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The ceiling the call was served under — the caller's own\n        declared value, echoed for correlation and carrying no bit of the\n        vault's state.\n    external_id: The consumer-side identity of the document, unchanged.\n    fragment_id: The vault-side identity now backing it. For the\n        one-fragment-per-file majority this is simply *the* fragment; for a\n        document that splits (a multi-sheet workbook) it is the first of\n        :attr:`affected_fragment_ids` in ledger-key order, which is\n        deterministic across runs.\n    affected_fragment_ids: **Every** fragment this document produced, in\n        that same order. Published rather than left implicit because a\n        right-to-be-forgotten request answered from ``fragment_id`` alone\n        would miss the other sheets of a workbook (#1305).\n    action: Whether the upload created, updated, or changed nothing.\n    source_type: The ingestor the extension dispatched to (``markdown``,\n        ``document``, ``spreadsheet``, …). Derived from the caller's own\n        filename, so it discloses nothing, and worth publishing because\n        \"which reader interpreted my bytes\" is otherwise unknowable.\n    warnings: Content-free operator advisories this ingest produced, absent\n        entirely when there were none — the same optional-and-omitted shape\n        :class:`JournalUpsertResponse` uses, and for the same reason. This\n        is the surface that most needs it: the collapsed-unit advisory\n        reports actual data loss on the multi-sheet workbook path. Every\n        entry is proven ceiling-safe at the producer (see\n        :attr:`creek.ingest.pipeline.IngestRunResult.ceiling_safe_warnings`).",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "Always ok; failure is an error.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Ceiling the call ran at."
+          },
+          "external_id": {
+            "description": "Consumer-side document identity.",
+            "title": "External Id",
+            "type": "string"
+          },
+          "fragment_id": {
+            "description": "Vault-side fragment identity.",
+            "title": "Fragment Id",
+            "type": "string"
+          },
+          "affected_fragment_ids": {
+            "description": "Every fragment this document produced, in ledger order.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Affected Fragment Ids",
+            "type": "array"
+          },
+          "action": {
+            "$ref": "#/components/schemas/JournalAction",
+            "description": "Created, updated, or unchanged."
+          },
+          "source_type": {
+            "description": "Ingestor the extension dispatched to.",
+            "title": "Source Type",
+            "type": "string"
+          },
+          "warnings": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Content-free operator advisories this upload produced; absent when none.",
+            "title": "Warnings"
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "external_id",
+          "fragment_id",
+          "affected_fragment_ids",
+          "action",
+          "source_type"
+        ],
+        "title": "UploadResponse",
+        "type": "object"
+      },
+      "WheelResponse": {
+        "additionalProperties": false,
+        "description": "The aggregate APTITUDE frequency distribution of the admitted corpus.\n\nAn empty corpus is an all-zero wheel with ``total_classified == 0``, not an\nerror: a freshly-initialised vault is a legitimate state, and answering it\nwith an error would make a client treat \"new\" as \"broken\".\n\nAttributes:\n    status: Always ``\"ok\"``. Failure is an :class:`ErrorEnvelope`.\n    tier_ceiling: The caller's own declared ceiling, echoed. Fragments\n        above it were excluded from the tally.\n    total_classified: Admitted fragments carrying a frequency.\n    unclassified: Admitted fragments carrying no frequency yet.\n    wheel: The ten frequency slices.",
+        "properties": {
+          "status": {
+            "const": "ok",
+            "description": "Always ok; failure is an error.",
+            "title": "Status",
+            "type": "string"
+          },
+          "tier_ceiling": {
+            "$ref": "#/components/schemas/WireTierCeiling",
+            "description": "Caller's declared ceiling."
+          },
+          "total_classified": {
+            "description": "Admitted fragments carrying a frequency.",
+            "minimum": 0,
+            "title": "Total Classified",
+            "type": "integer"
+          },
+          "unclassified": {
+            "description": "Admitted fragments with no frequency yet.",
+            "minimum": 0,
+            "title": "Unclassified",
+            "type": "integer"
+          },
+          "wheel": {
+            "$ref": "#/components/schemas/WheelFrequencies",
+            "description": "The ten frequency slices."
+          }
+        },
+        "required": [
+          "status",
+          "tier_ceiling",
+          "total_classified",
+          "unclassified",
+          "wheel"
+        ],
+        "title": "WheelResponse",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Consumer bearer token, presented as Authorization: Bearer <token>. Enforced above the router, so every published route refuses without it and there is no anonymous access to any of them."
+      }
+    }
+  }
+}

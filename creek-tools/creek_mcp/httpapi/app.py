@@ -72,14 +72,20 @@ This module is therefore the **only** one in :mod:`creek_mcp.httpapi` that names
 distinguish "no such fragment" from "you may not see this fragment" could
 enumerate the corpus one id at a time without reading a byte of it, which is
 what #846, #970, #972 and #1090 spent five issues collapsing. The repo-wide
-version of that guard — an allowlist over every construction site in
-:mod:`creek_mcp` — is tracked in **#1098**.
+version of that guard is
+``test_not_found_is_named_only_in_the_pinned_routing_modules`` in
+``tests/test_v1_api_structure.py``, which pins every module in
+:mod:`creek_mcp` that may name the code at all; its companion,
+``test_not_found_is_constructed_once_in_the_routing_miss``, pins the sole
+construction site to :func:`_routing_miss`.
 """
 
 from __future__ import annotations
 
+import asyncio
 from functools import update_wrapper
 from typing import TYPE_CHECKING, Final, NoReturn
+from uuid import uuid4
 
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
@@ -544,5 +550,20 @@ def create_app(
     )
     app.router.redirect_slashes = REDIRECT_SLASHES
     app.state.vault_path = vault_path
+    app.state.pipeline_worker_id = uuid4().hex
+    app.state.pipeline_job_admission_lock = asyncio.Lock()
+    app.state.pipeline_job_tasks = set()
+    app.state.pipeline_active_job_ids = set()
+    app.state.pipeline_active_job_by_consumer = {}
     app.state.reflect_llm_factory = reflect_llm_factory
+    # One grounding session per app (#1034), so ``POST /v1/reflections`` builds
+    # and warms its retrieval specialist once for this process rather than once
+    # per request. Set on ``app.state`` rather than taken as a ``create_app``
+    # parameter: the production entry point never needs to configure it, and a
+    # test replaces the attribute directly. Imported here rather than at module
+    # scope to keep this module's import graph free of the author agents that
+    # ``GroundingSession.specialist`` pulls in lazily.
+    from creek_mcp.tools.reflect import GroundingSession
+
+    app.state.reflect_grounding_session = GroundingSession()
     return app

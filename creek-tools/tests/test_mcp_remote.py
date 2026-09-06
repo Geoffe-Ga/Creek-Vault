@@ -2124,7 +2124,9 @@ def test_cap_re_evaluates_remoteness_local_then_remote(
 
 
 # --------------------------------------------------------------------------- #
-# Pin: the deliberate creek.purge.* carve-out (server.py:120-131)
+# Pin: the deliberate creek.purge.* carve-out. The rule lives in the ``Note:``
+# paragraph of ``creek_mcp.server._BoundedFastMCP.call_tool``'s docstring, and
+# the verdict it describes is ``creek_mcp.policy.admitted_ceiling``'s.
 #
 # Purge tools declare no ``privacy_tier_ceiling``, so the remote cap always
 # falls back to ``open`` for them and is a documented no-op. Their real gate is

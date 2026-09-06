@@ -183,12 +183,20 @@
 # SCOPE: `code-review.yml`, and NO `--branch` — the harmonisation trap
 # ---------------------------------------------------------------------------
 # main-health.sh's list call carries `--branch main`, because the run it reads is
-# `ci.yml` on `push: main`. `code-review.yml` only ever triggers on
-# `pull_request` (pinned by test_review_quota.sh against the workflow file), so a
-# `--branch main` copied across from the sibling would yield an EMPTY window
-# forever: this helper would answer `unknown` on every lane, always — and because
+# `ci.yml` on `push: main`. `code-review.yml`'s runs are PR runs — plus, since
+# #1201 added a `workflow_dispatch`, whatever branch a manual re-review was
+# fired from (both triggers pinned by test_review_quota.sh against the workflow
+# file). A `--branch main` copied across from the sibling therefore scopes this
+# window to runs that are never the ones being asked about: EMPTY on the
+# automatic path, and an arbitrary slice of dispatched re-reviews otherwise.
+# Either way this helper answers `unknown` on every lane, always — and because
 # `unknown` falls through to today's `behind` by design, nothing would ever look
 # broken and #1160's bug would simply come back invisibly. Do not add it.
+#
+# The reason changed with #1201; the PROHIBITION did not. "Still wrong,
+# differently wrong" is written down here rather than left to be re-derived,
+# because the old reason ("the window would be empty") is the kind that invites
+# a reader who finds a non-empty window to conclude the rule has lapsed.
 #
 # ---------------------------------------------------------------------------
 # COST BUDGET: 1 gh call, or exactly 2. NEVER 3, and NEVER a retry.

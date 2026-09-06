@@ -108,6 +108,9 @@ JOURNAL_TEMPLATE: Final[str] = "/v1/journal-entries/{external_id}"
 JOURNAL_PATH: Final[str] = "/v1/journal-entries/abc"
 """A concrete journal path — what a log line may never name."""
 
+VOICE_DRAFT_TEMPLATE: Final[str] = "/v1/voice-drafts/{external_id}"
+"""The Voice Draft resource template; no caller-owned id appears here."""
+
 REFLECTIONS_PATH: Final[str] = "/v1/reflections"
 """The reflection endpoint."""
 
@@ -127,11 +130,28 @@ is why :data:`MOUNTED` below carries it twice.
 DRIVE_SYNC_PATH: Final[str] = "/v1/connectors/drive/syncs"
 """The Drive incremental-sync endpoint (contract 0.9, #1527)."""
 
+DRIVE_AUTHORIZATION_PATH: Final[str] = "/v1/connectors/drive/authorizations"
+"""Where a Drive authorization is begun (contract 0.11, #1568).
+
+``POST`` here mints one; ``POST`` to ``{this}/{state}`` completes it. Both are
+ordinary authenticated routes: ADR-0012 keeps the OAuth redirect at the caller
+precisely so no anonymous callback has to be mounted on this server.
+"""
+
+DRIVE_AUTHORIZATION_TEMPLATE: Final[str] = "/v1/connectors/drive/authorizations/{state}"
+"""The complete-authorization route *template* — what a log line may name."""
+
 CLASSIFICATIONS_PATH: Final[str] = "/v1/classifications"
 """The whole-vault classification endpoint (contract 0.10, #1570)."""
 
 LINKS_PATH: Final[str] = "/v1/links"
 """The whole-vault linking endpoint (contract 0.10, #1570)."""
+
+JOB_TEMPLATE: Final[str] = "/v1/jobs/{job_id}"
+"""The durable pipeline-job status route template (contract 0.14, #1605)."""
+
+JOB_PATH: Final[str] = "/v1/jobs/00000000-0000-4000-8000-000000000000"
+"""One syntactically valid concrete job path for route-wide assertions."""
 
 HEALTH_PATH: Final[str] = "/v1/health"
 """The liveness probe."""
@@ -160,6 +180,12 @@ OP_DRIVE_SYNC: Final[str] = "syncDriveConnector"
 OP_DRIVE_DISCONNECT: Final[str] = "disconnectDriveConnector"
 """``operation_id`` of ``DELETE /v1/connectors/drive``."""
 
+OP_DRIVE_AUTHORIZE: Final[str] = "createDriveAuthorization"
+"""``operation_id`` of ``POST /v1/connectors/drive/authorizations``."""
+
+OP_DRIVE_AUTHORIZE_COMPLETE: Final[str] = "completeDriveAuthorization"
+"""``operation_id`` of ``POST /v1/connectors/drive/authorizations/{state}``."""
+
 OP_CLASSIFY: Final[str] = "createClassification"
 """``operation_id`` of ``POST /v1/classifications``."""
 
@@ -177,9 +203,12 @@ MOUNTED: Final[tuple[tuple[str, str], ...]] = (
     ("POST", UPLOAD_PATH),
     ("GET", DRIVE_CONNECTOR_PATH),
     ("POST", DRIVE_SYNC_PATH),
+    ("POST", DRIVE_AUTHORIZATION_PATH),
+    ("POST", f"{DRIVE_AUTHORIZATION_PATH}/abc"),
     ("DELETE", DRIVE_CONNECTOR_PATH),
     ("POST", CLASSIFICATIONS_PATH),
     ("POST", LINKS_PATH),
+    ("GET", JOB_PATH),
     ("GET", HEALTH_PATH),
 )
 """Every ``(method, concrete path)`` pair a client can actually reach."""
@@ -192,9 +221,12 @@ MOUNTED_IDS: Final[tuple[str, ...]] = (
     "upload",
     "drive-status",
     "drive-sync",
+    "drive-authorize",
+    "drive-authorize-complete",
     "drive-disconnect",
     "classifications",
     "links",
+    "job-status",
     "health",
 )
 """Stable parametrize ids for :data:`MOUNTED`, in the same order."""
@@ -206,11 +238,14 @@ VERSIONED: Final[tuple[tuple[str, str], ...]] = (
     ("POST", UPLOAD_PATH),
     ("GET", DRIVE_CONNECTOR_PATH),
     ("POST", DRIVE_SYNC_PATH),
+    ("POST", DRIVE_AUTHORIZATION_PATH),
+    ("POST", f"{DRIVE_AUTHORIZATION_PATH}/abc"),
     ("DELETE", DRIVE_CONNECTOR_PATH),
     ("POST", CLASSIFICATIONS_PATH),
     ("POST", LINKS_PATH),
+    ("GET", JOB_PATH),
 )
-"""The nine routes the contract-version gate applies to."""
+"""The eleven routes the contract-version gate applies to."""
 
 VERSIONED_IDS: Final[tuple[str, ...]] = (
     "journal-upsert",
@@ -219,9 +254,12 @@ VERSIONED_IDS: Final[tuple[str, ...]] = (
     "upload",
     "drive-status",
     "drive-sync",
+    "drive-authorize",
+    "drive-authorize-complete",
     "drive-disconnect",
     "classifications",
     "links",
+    "job-status",
 )
 """Stable parametrize ids for :data:`VERSIONED`."""
 
