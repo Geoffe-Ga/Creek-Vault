@@ -106,6 +106,22 @@ to locate the originating commit for any reference below.
 
 ### Fixed
 
+- **Ollama readiness now requires the configured model, not merely a running
+  daemon (#1761).** The availability probe previously treated any successful
+  `/api/tags` response as ready, so a healthy Ollama process with only other
+  models installed admitted classification, Author Desk and compost work that
+  could only fail at generation time. The probe now resolves the configured
+  (or provider-default) model and requires it in the returned inventory,
+  including Ollama's untagged-to-`:latest` equivalence while keeping explicit
+  tags and digests exact.
+
+  Malformed inventories fail closed, and operator diagnostics distinguish an
+  unreachable daemon from a reachable daemon missing its configured model.
+  Downstream commands retain their existing safe behavior: classification
+  reports unavailable, Author Desk renders deterministically, compost
+  calibration stays embedding-only, and compost scan refuses an unverified
+  canonical write unless the operator explicitly chooses `--no-llm`.
+
 - **`redact --apply` no longer rewrites the vault it walks when `--vault` is
   omitted (#1561).** `run_apply` anchored its never-rewrite set on
   `config.vault_path`, which defaults to `Path()` — the process CWD — while

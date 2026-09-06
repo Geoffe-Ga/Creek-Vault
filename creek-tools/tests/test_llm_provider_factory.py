@@ -188,11 +188,59 @@ class TestOllamaProvider:
 
     @patch("creek.classify.llm.httpx.Client")
     def test_available_false_when_resolved_model_is_absent(
-        self, mock_client_cls: MagicMock
+        self, mock_client_cls: MagicMock, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """A healthy daemon serving only another model is not ready."""
+        """A healthy daemon serving only another model says what is missing."""
         mock_resp = MagicMock(status_code=200)
         mock_resp.json.return_value = {"models": [{"name": "qwen3:8b"}]}
+        ctx = MagicMock()
+        ctx.get.return_value = mock_resp
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=ctx)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        with caplog.at_level("WARNING", logger="creek.classify.llm.providers"):
+            assert OllamaProvider(LLMConfig()).available is False
+
+        assert "reachable" in caplog.text
+        assert "mistral" in caplog.text
+        assert "not installed" in caplog.text
+        assert "unreachable" not in caplog.text
+        ctx.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            None,
+            {"models": {"name": "mistral:latest"}},
+            {"models": ["mistral:latest"]},
+            {"models": [{"name": 7, "model": False}]},
+        ],
+        ids=("non-object", "models-not-list", "row-not-object", "fields-not-string"),
+    )
+    @patch("creek.classify.llm.httpx.Client")
+    def test_available_fails_closed_on_a_malformed_inventory(
+        self,
+        mock_client_cls: MagicMock,
+        payload: object,
+    ) -> None:
+        """Every malformed inventory shape is unavailable rather than an error."""
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = payload
+        ctx = MagicMock()
+        ctx.get.return_value = mock_resp
+        mock_client_cls.return_value.__enter__ = MagicMock(return_value=ctx)
+        mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        assert OllamaProvider(LLMConfig()).available is False
+        ctx.post.assert_not_called()
+
+    @patch("creek.classify.llm.httpx.Client")
+    def test_available_fails_closed_when_the_inventory_is_not_json(
+        self, mock_client_cls: MagicMock
+    ) -> None:
+        """An invalid JSON response is unavailable and never escapes as ValueError."""
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.side_effect = ValueError("not json")
         ctx = MagicMock()
         ctx.get.return_value = mock_resp
         mock_client_cls.return_value.__enter__ = MagicMock(return_value=ctx)
@@ -245,15 +293,23 @@ class TestOllamaProvider:
         assert OllamaProvider(LLMConfig(model="llama3:70b")).available is False
 
     @patch("creek.classify.llm.httpx.Client")
-    def test_available_false_on_connect_error(self, mock_client_cls: MagicMock) -> None:
-        """``available`` is ``False`` when the health check connection fails."""
+    def test_available_false_on_connect_error(
+        self,
+        mock_client_cls: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A failed connection is distinguished from a missing local model."""
         import httpx
 
         ctx = MagicMock()
         ctx.get.side_effect = httpx.ConnectError("refused")
         mock_client_cls.return_value.__enter__ = MagicMock(return_value=ctx)
         mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
-        assert OllamaProvider(LLMConfig()).available is False
+        with caplog.at_level("WARNING", logger="creek.classify.llm.providers"):
+            assert OllamaProvider(LLMConfig()).available is False
+
+        assert "daemon is unreachable" in caplog.text
+        assert "not installed" not in caplog.text
 
     @patch("creek.classify.llm.httpx.Client")
     def test_complete_returns_completion_with_response_text(

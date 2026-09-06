@@ -190,12 +190,17 @@ class TestBuildCompostVerifier:
         assert _build_compost_verifier(CreekConfig()) is None
 
     def test_none_when_provider_unavailable(
-        self, monkeypatch: pytest.MonkeyPatch
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """A local provider that constructs but is unreachable degrades too."""
+        """A local provider that is unreachable or model-less gives an honest hint."""
         fake = _FakeProvider(available=False)
         monkeypatch.setattr("creek.classify.llm.build_provider", lambda _c: fake)
         assert _build_compost_verifier(CreekConfig()) is None
+        output = capsys.readouterr().out
+        assert "local host unreachable" in output
+        assert "configured model not installed" in output
 
     @patch("creek.classify.llm.providers.httpx.Client")
     def test_none_when_ollama_lacks_the_configured_model(

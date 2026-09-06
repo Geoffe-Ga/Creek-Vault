@@ -150,10 +150,10 @@ class AuthorLLMClient:
         per-stage routing and the ``Intimate``-never-cloud gate), then returns it
         only when its provider is :attr:`available` (key + consent for a cloud
         provider, a reachable server with the configured model for Ollama).
-        When unavailable it returns
-        ``None`` so the desk falls back to deterministic rendering rather than
-        erroring — enabling live voicing when a provider is configured while
-        preserving the historical stub behaviour otherwise (#658).
+        When unavailable it returns ``None`` so the desk falls back to
+        deterministic rendering rather than erroring — enabling live voicing
+        when a provider is configured while preserving the historical stub
+        behaviour otherwise (#658).
 
         Args:
             router: The run's :class:`ModelRouter`.

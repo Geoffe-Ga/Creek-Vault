@@ -650,6 +650,17 @@ def call_ollama(config: LLMConfig, prompt: str, *, timeout: float) -> str:
         return str(data.get("response", ""))
 
 
+_UNREADABLE_OLLAMA_INVENTORY = object()
+
+
+def _read_ollama_inventory(response: httpx.Response) -> object:
+    """Decode an Ollama inventory without letting malformed JSON escape."""
+    try:
+        return response.json()
+    except (TypeError, ValueError):
+        return _UNREADABLE_OLLAMA_INVENTORY
+
+
 def check_ollama_available(config: LLMConfig, *, timeout: float) -> bool:
     """Check that Ollama can serve the configured model.
 
@@ -666,14 +677,30 @@ def check_ollama_available(config: LLMConfig, *, timeout: float) -> bool:
     try:
         with httpx.Client(timeout=timeout) as client:
             resp = client.get(f"{config.ollama_url}/api/tags")
-            if resp.status_code == 200 and _ollama_has_model(resp.json(), model):
-                return True
-    except (httpx.HTTPError, TypeError, ValueError):
-        pass
+    except httpx.HTTPError:
+        logger.warning("Ollama daemon is unreachable at %s", config.ollama_url)
+        return False
+
+    if resp.status_code != 200:
+        logger.warning(
+            "Ollama daemon at %s returned HTTP %s for its model inventory",
+            config.ollama_url,
+            resp.status_code,
+        )
+        return False
+    payload = _read_ollama_inventory(resp)
+    if payload is _UNREADABLE_OLLAMA_INVENTORY:
+        logger.warning(
+            "Ollama is reachable at %s but its model inventory is unreadable",
+            config.ollama_url,
+        )
+        return False
+    if _ollama_has_model(payload, model):
+        return True
     logger.warning(
-        "Ollama model %r is not available at %s",
-        model,
+        "Ollama is reachable at %s but configured model %r is not installed",
         config.ollama_url,
+        model,
     )
     return False
 

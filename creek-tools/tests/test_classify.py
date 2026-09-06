@@ -498,7 +498,8 @@ class TestLLMClassifierAvailability:
         classifier = LLMClassifier(config=config)
         with caplog.at_level(logging.WARNING):
             _ = classifier.available
-        assert any("not available" in r.message.lower() for r in caplog.records)
+        assert any("daemon is unreachable" in r.message.lower() for r in caplog.records)
+        assert not any("not installed" in r.message.lower() for r in caplog.records)
 
 
 # ---- Prompt Building ----
