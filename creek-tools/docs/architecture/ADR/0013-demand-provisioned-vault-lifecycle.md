@@ -179,4 +179,3 @@ this decision; it is a different architecture requiring a new ADR.
   auditability, reconciliation, quotas, and adversarial tests.
 - ADR-0007's privacy posture remains intact and is no longer conflated with an
   always-on VM or signup-time allocation.
-
