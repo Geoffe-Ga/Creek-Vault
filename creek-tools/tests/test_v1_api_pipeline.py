@@ -36,6 +36,7 @@ from __future__ import annotations
 import base64
 import json
 import time
+from functools import partial
 from threading import Event
 from typing import TYPE_CHECKING, Any, Final
 from uuid import UUID
@@ -640,6 +641,19 @@ def _llm_success(**_kwargs: object) -> dict[str, object]:
     }
 
 
+def _blocked_llm_success(
+    started: Event,
+    release: Event,
+    calls: list[None],
+    **_kwargs: object,
+) -> dict[str, object]:
+    """Hold one fake pass open so the admission boundary can be exercised."""
+    calls.append(None)
+    started.set()
+    assert release.wait(timeout=2.0)
+    return _llm_success()
+
+
 def _embeddings_success(**_kwargs: object) -> dict[str, object]:
     """Return counts for an embeddings pass without loading a model."""
     return {
@@ -695,6 +709,35 @@ def test_an_accepted_job_is_pollable_to_its_counts_only_result(
             "complete": True,
         },
     }
+
+
+def test_a_consumer_cannot_fan_out_inflight_pipeline_jobs(
+    api: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One active expensive pass per consumer bounds detached worker fan-out."""
+    started = Event()
+    release = Event()
+    calls: list[None] = []
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "classify_tool",
+        partial(_blocked_llm_success, started, release, calls),
+    )
+    first = api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
+    assert started.wait(timeout=2.0)
+    second = api.post(CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers())
+    release.set()
+
+    assert first.status_code == HTTP_ACCEPTED
+    assert second.status_code == HTTP_UNAVAILABLE
+    assert _await_terminal(api, first.json()["job_id"])["state"] == "succeeded"
+    assert calls == [None]
+
+    admitted_after_completion = api.post(
+        CLASSIFICATIONS_PATH, json={"method": "llm"}, headers=headers()
+    )
+    assert admitted_after_completion.status_code == HTTP_ACCEPTED
 
 
 def test_an_embeddings_job_is_pollable_to_the_link_counts(

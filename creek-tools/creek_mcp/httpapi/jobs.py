@@ -24,6 +24,7 @@ from creek_mcp.api.models import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Set as AbstractSet
     from pathlib import Path
 
 _JOB_DIRECTORY: Final[tuple[str, ...]] = ("00-Creek-Meta", "State", "jobs")
@@ -153,7 +154,7 @@ def status_for(
     *,
     consumer: str,
     worker_id: str,
-    active_job_ids: set[str],
+    active_job_ids: AbstractSet[str],
 ) -> JobStatusResponse | None:
     """Return one consumer's public job state, recovering stale work as failed."""
     try:

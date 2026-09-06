@@ -33,6 +33,11 @@ terminal state. ``GET /v1/jobs/{job_id}`` projects it back through the same
 counts-only response models. It never publishes the private execution fields
 (``consumer``, ceiling, worker id) or the tool's error text.
 
+Admission is bounded to one active detached pipeline job per authenticated
+consumer. A second long-method request receives the contract's static
+``unavailable`` response until the accepted worker completes, preventing a
+caller from turning cheap ``202`` requests into unbounded full-vault work.
+
 The LLM path preserves the existing egress boundary rather than inventing one:
 ``classify_tool`` reaches ``ModelRouter._enforce_local_for_intimate``, so an
 intimate fragment is routed to the local provider even when the classification
@@ -372,13 +377,30 @@ def _create_pipeline_job(
     return vault, record
 
 
-def _execute_pipeline_job(vault: Path, record: StoredJob) -> None:
-    """Claim, execute and terminally record one queued pipeline job."""
+def _claimed_job(vault: Path, record: StoredJob) -> StoredJob | None:
+    """Claim one queued record, retaining operational detail in the log."""
     try:
-        claimed = claim_job(vault, record.job_id, record.worker_id)
+        return claim_job(vault, record.job_id, record.worker_id)
     except Exception:
         logger.exception("pipeline job %s could not be claimed", record.job_id)
-        return
+        return None
+
+
+def _finish_pipeline_job(
+    vault: Path,
+    claimed: StoredJob,
+    result: ClassificationResponse | LinkResponse | None,
+) -> None:
+    """Persist one terminal result without letting a disk fault escape a worker."""
+    try:
+        finish_job(vault, claimed.job_id, claimed.worker_id, result)
+    except Exception:
+        logger.exception("pipeline job %s could not record its result", claimed.job_id)
+
+
+def _execute_pipeline_job(vault: Path, record: StoredJob) -> None:
+    """Claim, execute and terminally record one queued pipeline job."""
+    claimed = _claimed_job(vault, record)
     if claimed is None:
         return
     try:
@@ -411,21 +433,22 @@ def _execute_pipeline_job(vault: Path, record: StoredJob) -> None:
         # diagnostic only in the operator's log.
         logger.exception("pipeline job %s failed", claimed.job_id)
         result = None
-    try:
-        finish_job(vault, claimed.job_id, claimed.worker_id, result)
-    except Exception:
-        logger.exception("pipeline job %s could not record its result", claimed.job_id)
+    _finish_pipeline_job(vault, claimed, result)
 
 
 def _forget_task(
     task: asyncio.Task[None],
     tasks: set[asyncio.Task[None]],
     active_job_ids: set[str],
+    active_job_by_consumer: dict[str, str],
+    consumer: str,
     job_id: str,
 ) -> None:
-    """Release the strong application reference to a completed job task."""
+    """Release event-loop-confined admission state for a completed job."""
     tasks.discard(task)
     active_job_ids.discard(job_id)
+    if active_job_by_consumer.get(consumer) == job_id:
+        del active_job_by_consumer[consumer]
 
 
 async def _accepted_job(
@@ -436,33 +459,56 @@ async def _accepted_job(
     retier: bool,
     context: RequestContext,
 ) -> Response:
-    """Durably queue one pass, start its worker and return its opaque handle."""
-    queued = await write_off_loop(
-        _create_pipeline_job, request, kind, method, retier, context
-    )
-    if queued is None:
-        return error_response(ErrorCode.UNAVAILABLE, context)
-    vault, record = queued
-    task = asyncio.create_task(asyncio.to_thread(_execute_pipeline_job, vault, record))
-    tasks: set[asyncio.Task[None]] = request.app.state.pipeline_job_tasks
-    active_job_ids: set[str] = request.app.state.pipeline_active_job_ids
-    tasks.add(task)
-    active_job_ids.add(record.job_id)
-    task.add_done_callback(
-        partial(
-            _forget_task,
-            tasks=tasks,
-            active_job_ids=active_job_ids,
-            job_id=record.job_id,
+    """Durably queue at most one active pass per consumer and return its handle.
+
+    Admission is event-loop serialised and the tracking collections are mutated
+    only on that loop.  The detached worker never touches them, so correctness
+    does not rely on cross-thread ``set`` operations being atomic.  A consumer
+    already running an expensive pass receives the contract's static
+    ``unavailable`` refusal and can retry after polling its accepted job.
+    """
+    async with request.app.state.pipeline_job_admission_lock:
+        active_job_by_consumer: dict[str, str] = (
+            request.app.state.pipeline_active_job_by_consumer
         )
-    )
+        if context.consumer in active_job_by_consumer:
+            return error_response(ErrorCode.UNAVAILABLE, context)
+
+        queued = await write_off_loop(
+            _create_pipeline_job, request, kind, method, retier, context
+        )
+        if queued is None:
+            return error_response(ErrorCode.UNAVAILABLE, context)
+        vault, record = queued
+        task = asyncio.create_task(
+            asyncio.to_thread(_execute_pipeline_job, vault, record)
+        )
+        tasks: set[asyncio.Task[None]] = request.app.state.pipeline_job_tasks
+        active_job_ids: set[str] = request.app.state.pipeline_active_job_ids
+        tasks.add(task)
+        active_job_ids.add(record.job_id)
+        active_job_by_consumer[context.consumer] = record.job_id
+        task.add_done_callback(
+            partial(
+                _forget_task,
+                tasks=tasks,
+                active_job_ids=active_job_ids,
+                active_job_by_consumer=active_job_by_consumer,
+                consumer=context.consumer,
+                job_id=record.job_id,
+            )
+        )
     payload = JobAcceptedResponse(
         status="accepted", job_id=UUID(record.job_id), state=JobState.QUEUED
     )
     return json_response(payload.model_dump(mode="json"), HTTP_ACCEPTED)
 
 
-def _job_status(request: Request, context: RequestContext) -> JobStatusResponse | None:
+def _job_status(
+    request: Request,
+    context: RequestContext,
+    active_job_ids: frozenset[str],
+) -> JobStatusResponse | None:
     """Resolve and read one consumer-bound job status off the event loop."""
     vault = _vault_for(request)
     if vault is None:
@@ -472,7 +518,7 @@ def _job_status(request: Request, context: RequestContext) -> JobStatusResponse 
         request.path_params["job_id"],
         consumer=context.consumer,
         worker_id=str(request.app.state.pipeline_worker_id),
-        active_job_ids=request.app.state.pipeline_active_job_ids,
+        active_job_ids=active_job_ids,
     )
 
 
@@ -536,7 +582,10 @@ async def handle_link(request: Request) -> Response:
 async def handle_job_status(request: Request) -> Response:
     """Return the current counts-only state of one consumer-bound job."""
     context = context_of(request.scope)
-    status = await write_off_loop(_job_status, request, context)
+    # Snapshot on the event loop; the blocking job-file read receives an
+    # immutable value instead of sharing the loop-owned set with a worker.
+    active_job_ids = frozenset(request.app.state.pipeline_active_job_ids)
+    status = await write_off_loop(_job_status, request, context, active_job_ids)
     if status is None:
         return error_response(ErrorCode.UNAVAILABLE, context)
     return json_response(status.model_dump(mode="json"), HTTP_OK)
