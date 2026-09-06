@@ -66,6 +66,7 @@ from starlette.responses import JSONResponse
 
 from creek.audit import log as audit_log_module
 from creek_mcp import httpapi as httpapi_package
+from creek_mcp import remote_auth as remote_auth_module
 from creek_mcp.api.models import ERROR_MESSAGES, ERROR_STATUS, ErrorCode
 from creek_mcp.api.routes import (
     AUTHORIZATION_HEADER,
@@ -101,14 +102,18 @@ from tests.v1_api_support import (
     CEILING_HEADER,
     CONSUMER,
     CONTRACT_VERSION_HEADER,
+    EPOCH_ZERO,
+    FAR_FUTURE,
     HEALTH_PATH,
     JOURNAL_PATH,
     JOURNAL_TEMPLATE,
+    LONG_PAST,
     OP_HEALTH,
     OTHER_CONSUMER,
     OTHER_TOKEN,
     REFLECTIONS_PATH,
     STRONG_TOKEN,
+    UNKNOWN_TOKEN,
     UPLOAD_PATH,
     VALID_JOURNAL_BODY,
     VALID_REFLECTION_BODY,
@@ -118,9 +123,11 @@ from tests.v1_api_support import (
     client,
     contains_a_path,
     envelope,
+    header_items,
     headers,
     seed_vault,
     snapshot,
+    stamped,
     verifier,
 )
 
@@ -2120,6 +2127,160 @@ def test_a_verifier_that_names_a_consumer_still_serves(vault: Path) -> None:
     assert response.status_code == _OK_STATUS
     written = (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8").splitlines()
     assert len(written) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Credential lifetime: an expired AccessToken (#1267)
+# --------------------------------------------------------------------------- #
+
+
+def test_an_expired_access_token_is_refused_on_v1(vault: Path) -> None:
+    """A credential past its ``expires_at`` is ``401``, not served.
+
+    The MCP surface already refused this one layer down, in the SDK's
+    ``BearerAuthBackend.authenticate``. ``/v1`` read the ``client_id`` and never
+    the expiry, so one credential got ``200`` here and ``401`` there — and the
+    finite lifetime #837 stamps on every verified bearer bounded nothing at all
+    on this surface.
+
+    Args:
+        vault: A seeded vault.
+    """
+    with client(vault_path=vault, verifier=stamped(LONG_PAST)) as test_client:
+        response = test_client.get(CAPABILITIES_PATH, headers=headers())
+    assert response.status_code == _UNAUTHENTICATED_STATUS
+
+
+def test_an_expired_access_token_writes_no_audit_entry(vault: Path) -> None:
+    """ "Refused before dispatch" is a claim about the vault, not the status.
+
+    Read back off disk rather than off a return value: an expired credential
+    that merely got the wrong status would still be a bug, but one that reaches
+    :meth:`creek_mcp.audit.MCPAuditLog.append` has had the handler run and has
+    a line in the trail attributing a real call to a dead credential.
+
+    Args:
+        vault: A seeded vault.
+    """
+    audit = vault / MCP_AUDIT_RELPATH
+    with client(vault_path=vault, verifier=stamped(LONG_PAST)) as test_client:
+        test_client.get(CAPABILITIES_PATH, headers=headers())
+    written = audit.read_text(encoding="utf-8").splitlines() if audit.exists() else []
+    assert written == []
+
+
+def test_the_expired_refusal_is_byte_identical_to_an_unknown_one(vault: Path) -> None:
+    """An "expired" answer a caller can tell from "unknown" is a probe oracle.
+
+    It would let a holder of a captured credential learn that the value was
+    once issued — the difference between "this secret is wrong" and "this
+    secret is stale" — without ever holding a live one.
+
+    Args:
+        vault: A seeded vault.
+    """
+    with client(vault_path=vault, verifier=stamped(LONG_PAST)) as test_client:
+        on_expired = test_client.get(CAPABILITIES_PATH, headers=headers())
+    with client(vault_path=vault) as test_client:
+        on_unknown = test_client.get(
+            CAPABILITIES_PATH, headers=headers(token=UNKNOWN_TOKEN)
+        )
+    assert on_expired.status_code == on_unknown.status_code
+    assert blank_request_id(envelope(on_expired)) == blank_request_id(
+        envelope(on_unknown)
+    )
+    assert header_items(on_expired) == header_items(on_unknown)
+
+
+def test_an_unexpired_access_token_is_served_on_v1(vault: Path) -> None:
+    """The twin that differs from the expired case in exactly one integer.
+
+    Without it a guard that refused every credential *carrying* an expiry —
+    which is every credential the production verifier mints — would satisfy the
+    three tests above while taking the surface offline. The two verifiers differ
+    only in ``expires_at``, so no rule about anything else can separate them.
+
+    Args:
+        vault: A seeded vault.
+    """
+    with client(vault_path=vault, verifier=stamped(FAR_FUTURE)) as test_client:
+        response = test_client.get(CAPABILITIES_PATH, headers=headers())
+    assert response.status_code == _OK_STATUS
+    written = (vault / MCP_AUDIT_RELPATH).read_text(encoding="utf-8").splitlines()
+    assert len(written) == 1
+
+
+def test_an_access_token_without_an_expiry_is_still_served(vault: Path) -> None:
+    """``expires_at=None`` means *no expiry* and still serves — SDK parity.
+
+    Pins the null branch so a later edit cannot make ``/v1`` stricter than
+    the MCP transport, which would be the same drift pointed the other way.
+
+    Forced, not chosen, and the forcing test is
+    ``test_an_unconfigured_consumer_is_shed_rather_than_given_its_own_bucket``
+    below: ``_GhostVerifier`` mints ``expires_at=None`` and that test asserts a
+    ``503``, which is only reachable **past** this gate. Refusing a null expiry
+    would turn its three ``503`` responses into ``401``. Verified by mutation:
+    inverting the predicate to ``is None or`` reddens exactly that test and
+    this one, and nothing else.
+
+    Args:
+        vault: A seeded vault.
+    """
+    with client(vault_path=vault, verifier=stamped(None)) as test_client:
+        response = test_client.get(CAPABILITIES_PATH, headers=headers())
+    assert response.status_code == _OK_STATUS
+
+
+def test_the_same_credential_flips_verdict_when_only_the_clock_moves(
+    vault: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refused *because* it expired, with nothing else about it different.
+
+    One credential, one verifier, one header, one stamped instant. The only
+    thing that differs between the two halves of this test is where the
+    adapter's wall clock sits relative to that instant — so a refusal here
+    cannot be attributed to a malformed token, an unknown consumer, a blank
+    ``client_id`` or a missing header, which are the four ways an expiry test
+    usually passes for the wrong reason.
+
+    Patching ``creek_mcp.remote_auth._now`` is sound here **only** because
+    :class:`_StampedExpiryVerifier` stamps a constant. Against the production
+    verifier the same patch would move the mint and the check together — the
+    token is stamped at ``_now() + TTL`` inside the call the middleware then
+    checks — and the credential would stay live no matter where the clock
+    went, which is a reproduction that goes green while proving nothing.
+
+    Args:
+        vault: A seeded vault.
+        monkeypatch: Moves the adapter's clock, never the credential.
+    """
+    stamp = FAR_FUTURE
+    credential = stamped(stamp)
+
+    monkeypatch.setattr(remote_auth_module, "_now", lambda: float(stamp - 60))
+    with client(vault_path=vault, verifier=credential) as test_client:
+        before = test_client.get(CAPABILITIES_PATH, headers=headers())
+
+    monkeypatch.setattr(remote_auth_module, "_now", lambda: float(stamp + 60))
+    with client(vault_path=vault, verifier=credential) as test_client:
+        after = test_client.get(CAPABILITIES_PATH, headers=headers())
+
+    assert (before.status_code, after.status_code) == (
+        _OK_STATUS,
+        _UNAUTHENTICATED_STATUS,
+    )
+
+
+def test_an_expiry_stamped_at_epoch_zero_is_refused(vault: Path) -> None:
+    """A falsy instant is an instant, not an absence — see :data:`_EPOCH_ZERO`.
+
+    Args:
+        vault: A seeded vault.
+    """
+    with client(vault_path=vault, verifier=stamped(EPOCH_ZERO)) as test_client:
+        response = test_client.get(CAPABILITIES_PATH, headers=headers())
+    assert response.status_code == _UNAUTHENTICATED_STATUS
 
 
 # --------------------------------------------------------------------------- #
