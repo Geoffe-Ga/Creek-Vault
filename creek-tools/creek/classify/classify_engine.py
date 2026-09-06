@@ -2212,7 +2212,7 @@ def _describe_llm_unavailability(provider: str) -> str:
     The hint is provider-specific so a first-time user can act on it
     without scrolling back through orchestrator WARNING logs. Anthropic
     needs two env vars (API key + consent); Ollama needs the local
-    daemon to be reachable.
+    daemon to be reachable with the configured model installed.
 
     Args:
         provider: ``llm.provider`` from the loaded config.
@@ -2227,8 +2227,8 @@ def _describe_llm_unavailability(provider: str) -> str:
         )
     if provider == "ollama":
         return (
-            "ensure the Ollama daemon is running and reachable at the "
-            "URL configured under `llm.url` in creek_config.yaml"
+            "ensure the Ollama daemon is running at the URL configured under "
+            "`llm.url` in creek_config.yaml and has the configured model installed"
         )
     return (
         "check the `llm.*` settings in creek_config.yaml and the "
