@@ -135,6 +135,30 @@ def test_provider_result_secrets_never_reach_the_durable_database(
     assert vault_url not in persisted
 
 
+def test_conflicting_one_time_handoff_fails_closed_without_retry(
+    store: ProvisioningStore,
+) -> None:
+    """A contradictory prior delivery becomes a stable terminal job failure."""
+    job = store.submit("activation-handoff-conflict", "adepthood", now=_NOW)
+    handoff = FakeOneTimeHandoff()
+    handoff.deliver(
+        job.job_id,
+        "adepthood",
+        "https://conflicting.invalid/v1",
+        "conflicting-handoff-canary",
+    )
+    worker = ProvisioningWorker(store, FakeProviderDriver(), handoff)
+
+    assert worker.run_once(now=_NOW) is True
+    result = store.get(job.job_id, "adepthood")
+
+    assert result is not None
+    assert result.state is JobState.FAILED
+    assert result.failure_reason is FailureReason.HANDOFF_FAILED
+    assert result.retryable is False
+    assert handoff.delivery_count == 1
+
+
 def test_retry_reuses_the_same_provider_allocation(
     store: ProvisioningStore,
 ) -> None:

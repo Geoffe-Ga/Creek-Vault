@@ -123,6 +123,31 @@ def test_authenticated_consumer_identity_must_match_the_request(
     assert response.json()["code"] == "consumer_mismatch"
 
 
+@pytest.mark.parametrize(
+    ("activation_id", "consumer_identity"),
+    [("   ", "adepthood"), ("activation-whitespace", "   ")],
+)
+def test_whitespace_only_identifiers_are_bounded_request_errors(
+    app_client: TestClient,
+    store: ProvisioningStore,
+    activation_id: str,
+    consumer_identity: str,
+) -> None:
+    """Blank identifiers are rejected at the wire boundary, never as server faults."""
+    response = app_client.post(
+        "/control/v1/activations",
+        headers=_headers(),
+        json={
+            "activation_id": activation_id,
+            "consumer_identity": consumer_identity,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_request"
+    assert store.count_jobs() == 0
+
+
 def test_job_status_is_scoped_to_the_authenticated_consumer(
     app_client: TestClient,
 ) -> None:
