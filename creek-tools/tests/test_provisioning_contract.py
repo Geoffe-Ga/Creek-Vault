@@ -8,6 +8,7 @@ import tomllib
 from pathlib import Path
 
 from creek_mcp.provisioning.api import CONTRACT_VERSION
+from creek_mcp.provisioning.store import MAX_ACTIVATION_ALIASES_PER_CONSUMER
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROJECT_ROOT = REPO_ROOT / "creek-tools"
@@ -47,6 +48,19 @@ def test_public_schema_contains_no_credential_or_provider_result_field() -> None
         "passphrase",
     ):
         assert forbidden not in serialized
+
+
+def test_public_contract_publishes_the_durable_activation_alias_limit() -> None:
+    """Clients can predict the bounded idempotency ledger's refusal boundary."""
+    contract = json.loads(OPENAPI.read_text(encoding="utf-8"))
+    activation = contract["components"]["schemas"]["ActivationRequest"]["properties"][
+        "activation_id"
+    ]
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    limit = str(MAX_ACTIVATION_ALIASES_PER_CONSUMER)
+
+    assert limit in activation["description"]
+    assert limit in runbook
 
 
 def test_authentication_contract_is_backend_only_and_file_mounted() -> None:

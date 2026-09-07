@@ -173,7 +173,8 @@
           "activation_id": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 200
+            "maxLength": 200,
+            "description": "Durable idempotency key. A consumer retains at most 256 distinct activation aliases; existing aliases remain replayable after the limit is reached."
           },
           "consumer_identity": {
             "type": "string",

@@ -56,23 +56,36 @@ def test_worker_provisions_once_and_stops_at_the_key_ceremony_boundary(
 
 def test_post_handoff_process_crash_retries_without_delivering_twice(
     store: ProvisioningStore,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An expired lease replays idempotently across the handoff/commit crash window."""
+
+    class CrashAfterFirstDelivery(FakeOneTimeHandoff):
+        """Simulate process loss after delivery but before the database commit."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._crash = True
+
+        def deliver(
+            self,
+            job_id: str,
+            consumer_identity: str,
+            vault_url: str,
+            consumer_credential: str,
+        ) -> None:
+            super().deliver(job_id, consumer_identity, vault_url, consumer_credential)
+            if self._crash:
+                self._crash = False
+                raise SystemExit("simulated process crash")
+
     job = store.submit("activation-crash", "adepthood", now=_NOW)
     driver = FakeProviderDriver()
-    handoff = FakeOneTimeHandoff()
+    handoff = CrashAfterFirstDelivery()
     worker = ProvisioningWorker(store, driver, handoff, lease_for=timedelta(seconds=5))
-    complete_create = store.complete_create
 
-    def crash_before_commit(*args: object, **kwargs: object) -> None:
-        raise SystemExit("simulated process crash")
-
-    monkeypatch.setattr(store, "complete_create", crash_before_commit)
     with pytest.raises(SystemExit, match="simulated process crash"):
         worker.run_once(now=_NOW)
 
-    monkeypatch.setattr(store, "complete_create", complete_create)
     assert worker.run_once(now=_NOW + timedelta(seconds=6)) is True
     result = store.get(job.job_id, "adepthood")
 

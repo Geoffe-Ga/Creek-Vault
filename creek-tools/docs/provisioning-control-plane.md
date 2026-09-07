@@ -68,4 +68,6 @@ capability.
 
 Activation ids remain durable aliases. Repeating one returns the same job;
 distinct concurrent ids for the same consumer resolve to its one live job, so
-two API processes cannot create two billable allocations.
+two API processes cannot create two billable allocations. Each consumer may
+retain at most 256 activation aliases. Existing aliases remain idempotent after
+the limit is reached; an additional distinct alias is rejected with `409`.

@@ -12,8 +12,10 @@ import pytest
 
 from creek_mcp.provisioning.models import FailureReason, JobState
 from creek_mcp.provisioning.store import (
+    MAX_ACTIVATION_ALIASES_PER_CONSUMER,
     ActivationConflictError,
     InvalidJobTransitionError,
+    LostJobLeaseError,
     ProvisioningStore,
 )
 
@@ -67,6 +69,22 @@ def test_an_activation_id_cannot_be_replayed_as_another_consumer(
         store.submit("activation-shared", "other-consumer", now=_NOW)
 
 
+def test_activation_alias_growth_is_bounded_without_forgetting_existing_ids(
+    store: ProvisioningStore,
+) -> None:
+    """A consumer cannot grow the idempotency table past its published cap."""
+    first = store.submit("activation-cap-000", "adepthood", now=_NOW)
+    for number in range(1, MAX_ACTIVATION_ALIASES_PER_CONSUMER):
+        assert (
+            store.submit(f"activation-cap-{number:03d}", "adepthood", now=_NOW) == first
+        )
+
+    assert store.submit("activation-cap-000", "adepthood", now=_NOW) == first
+    with pytest.raises(ActivationConflictError, match="activation cannot be accepted"):
+        store.submit("activation-over-cap", "adepthood", now=_NOW)
+    assert store.count_activation_ids() == MAX_ACTIVATION_ALIASES_PER_CONSUMER
+
+
 def test_database_enforces_activation_and_live_consumer_uniqueness(
     tmp_path: Path,
 ) -> None:
@@ -107,6 +125,7 @@ def test_allocation_is_a_distinct_durable_model_with_one_active_per_consumer(
         first_job.job_id,
         first_claim.lease_token,
         "provider-allocation-1",
+        handoff=lambda: None,
         now=_NOW,
     )
 
@@ -128,11 +147,66 @@ def test_allocation_is_a_distinct_durable_model_with_one_active_per_consumer(
         second_job.job_id,
         second_claim.lease_token,
         "provider-allocation-2",
+        handoff=lambda: None,
         now=_NOW,
     )
 
     assert store.count_allocations() == 2
     assert store.count_allocations(active_only=True) == 1
+
+
+def test_create_handoff_runs_inside_the_lease_settlement_write_fence(
+    tmp_path: Path,
+) -> None:
+    """No deletion transaction can interleave after validation and before handoff."""
+    database = tmp_path / "fenced-handoff.sqlite3"
+    local_store = ProvisioningStore(database)
+    job = local_store.submit("activation-fenced-handoff", "adepthood", now=_NOW)
+    claimed = local_store.claim_next(now=_NOW)
+    assert claimed is not None
+
+    def assert_write_fenced() -> None:
+        with (
+            closing(
+                sqlite3.connect(database, timeout=0, isolation_level=None)
+            ) as contender,
+            pytest.raises(sqlite3.OperationalError, match="locked"),
+        ):
+            contender.execute("BEGIN IMMEDIATE")
+
+    completed = local_store.complete_create(
+        job.job_id,
+        claimed.lease_token,
+        "provider-fenced-handoff",
+        handoff=assert_write_fenced,
+        now=_NOW,
+    )
+
+    assert completed.state is JobState.AWAITING_KEY_CEREMONY
+
+
+def test_an_expired_create_lease_cannot_handoff_or_complete(
+    store: ProvisioningStore,
+) -> None:
+    """Lease expiry fences the handoff before another worker even claims."""
+    job = store.submit("activation-expired-handoff", "adepthood", now=_NOW)
+    claimed = store.claim_next(now=_NOW, lease_for=timedelta(seconds=1))
+    assert claimed is not None
+    handed_off = False
+
+    def handoff() -> None:
+        nonlocal handed_off
+        handed_off = True
+
+    with pytest.raises(LostJobLeaseError, match="no longer owned"):
+        store.complete_create(
+            job.job_id,
+            claimed.lease_token,
+            "provider-expired-handoff",
+            handoff=handoff,
+            now=_NOW + timedelta(seconds=2),
+        )
+    assert handed_off is False
 
 
 def test_a_crashed_worker_lease_is_reclaimed_without_making_a_second_job(

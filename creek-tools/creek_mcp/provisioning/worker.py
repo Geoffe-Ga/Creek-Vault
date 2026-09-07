@@ -59,26 +59,20 @@ class ProvisioningWorker:
                     claimed.job.job_id,
                     claimed.job.consumer_identity,
                 )
-                if not self._store.owns_lease(
-                    claimed.job.job_id,
-                    claimed.lease_token,
-                    now=now,
-                ):
-                    _LOGGER.info(
-                        "provisioning result discarded after lease loss job_id=%s",
+
+                def handoff() -> None:
+                    self._handoff.deliver(
                         claimed.job.job_id,
+                        claimed.job.consumer_identity,
+                        allocation.vault_url,
+                        allocation.consumer_credential,
                     )
-                    return True
-                self._handoff.deliver(
-                    claimed.job.job_id,
-                    claimed.job.consumer_identity,
-                    allocation.vault_url,
-                    allocation.consumer_credential,
-                )
+
                 self._store.complete_create(
                     claimed.job.job_id,
                     claimed.lease_token,
                     allocation.allocation_id,
+                    handoff=handoff,
                     now=now,
                 )
         except ProviderError as failure:

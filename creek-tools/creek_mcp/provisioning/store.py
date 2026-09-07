@@ -18,12 +18,13 @@ from creek_mcp.provisioning.models import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
 _SCHEMA_VERSION: Final[int] = 1
 _DEFAULT_LEASE: Final[timedelta] = timedelta(minutes=1)
 _MAX_IDENTIFIER_LENGTH: Final[int] = 200
+MAX_ACTIVATION_ALIASES_PER_CONSUMER: Final[int] = 256
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS provisioning_jobs (
@@ -190,6 +191,14 @@ class ProvisioningStore:
                 )
             else:
                 job_id = str(live["job_id"])
+            alias_count = connection.execute(
+                "SELECT COUNT(*) FROM provisioning_activation_ids "
+                "WHERE consumer_identity = ?",
+                (consumer,),
+            ).fetchone()
+            assert alias_count is not None
+            if int(alias_count[0]) >= MAX_ACTIVATION_ALIASES_PER_CONSUMER:
+                raise ActivationConflictError("activation cannot be accepted")
             connection.execute(
                 "INSERT INTO provisioning_activation_ids "
                 "(activation_id, consumer_identity, job_id) VALUES (?, ?, ?)",
@@ -277,32 +286,16 @@ class ProvisioningStore:
             now=now,
         )
 
-    def owns_lease(
-        self,
-        job_id: str,
-        lease_token: str,
-        *,
-        now: datetime | None = None,
-    ) -> bool:
-        """Return whether a worker still owns an unexpired claim."""
-        instant = now or _utc_now()
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT 1 FROM provisioning_jobs WHERE job_id = ? "
-                "AND lease_token = ? AND lease_expires_at > ?",
-                (job_id, lease_token, _timestamp(instant)),
-            ).fetchone()
-        return row is not None
-
     def complete_create(
         self,
         job_id: str,
         lease_token: str,
         provider_allocation_id: str,
         *,
+        handoff: Callable[[], None],
         now: datetime | None = None,
     ) -> ProvisioningJob:
-        """Settle a create claim at the key-ceremony boundary."""
+        """Handoff and settle a create claim inside one lease-valid write fence."""
         allocation = _validate_identifier(
             provider_allocation_id,
             field="provider_allocation_id",
@@ -312,6 +305,7 @@ class ProvisioningStore:
             lease_token,
             state=JobState.AWAITING_KEY_CEREMONY,
             provider_allocation_id=allocation,
+            before_settle=handoff,
             now=now,
         )
 
@@ -457,19 +451,26 @@ class ProvisioningStore:
         retryable: bool = False,
         failure_reason: FailureReason | None = None,
         provider_allocation_id: str | None = None,
+        before_settle: Callable[[], None] | None = None,
         now: datetime | None = None,
     ) -> ProvisioningJob:
         """Apply one terminal claim transition when *lease_token* still owns it."""
         instant = now or _utc_now()
         with self._connect(write=True) as connection:
-            row = connection.execute(
+            query = (
                 "SELECT * FROM provisioning_jobs WHERE job_id = ? AND lease_token = ? "
-                "AND state IN ('provisioning', 'deleting')",
-                (job_id, lease_token),
-            ).fetchone()
+                "AND state IN ('provisioning', 'deleting')"
+            )
+            parameters: tuple[str, ...] = (job_id, lease_token)
+            if before_settle is not None:
+                query += " AND lease_expires_at > ?"
+                parameters += (_timestamp(instant),)
+            row = connection.execute(query, parameters).fetchone()
             if row is None:
                 raise LostJobLeaseError("job lease is no longer owned")
             stamp = _timestamp(instant)
+            if before_settle is not None:
+                before_settle()
             if provider_allocation_id is not None:
                 connection.execute(
                     "INSERT INTO provisioning_allocations "
