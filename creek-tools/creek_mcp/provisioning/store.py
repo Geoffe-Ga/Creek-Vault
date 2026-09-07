@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Final, cast
 from uuid import uuid4
 
+from creek_mcp.provisioning.ceremony import (
+    KEY_CEREMONY_TTL,
+    CeremonyConflictError,
+    CeremonyExpiredError,
+    CeremonySubmission,
+    CeremonyUnavailableError,
+    KeyCeremonyChallenge,
+    WrappedKeyArtifact,
+)
 from creek_mcp.provisioning.models import (
     ClaimedJob,
     FailureReason,
@@ -21,7 +32,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
 
-_SCHEMA_VERSION: Final[int] = 1
+_SCHEMA_VERSION: Final[int] = 2
 _DEFAULT_LEASE: Final[timedelta] = timedelta(minutes=1)
 _MAX_IDENTIFIER_LENGTH: Final[int] = 200
 MAX_ACTIVATION_ALIASES_PER_CONSUMER: Final[int] = 256
@@ -39,6 +50,7 @@ CREATE TABLE IF NOT EXISTS provisioning_jobs (
     failure_reason TEXT,
     lease_token TEXT,
     lease_expires_at TEXT,
+    attested_confidential INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     CHECK (state IN (
@@ -46,7 +58,8 @@ CREATE TABLE IF NOT EXISTS provisioning_jobs (
         'failed', 'deleting', 'deleted'
     )),
     CHECK (operation IN ('create', 'delete')),
-    CHECK (retryable IN (0, 1))
+    CHECK (retryable IN (0, 1)),
+    CHECK (attested_confidential IS NULL OR attested_confidential IN (0, 1))
 );
 
 CREATE TABLE IF NOT EXISTS provisioning_allocations (
@@ -74,6 +87,19 @@ WHERE deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS ix_provisioning_claimable
 ON provisioning_jobs(state, lease_expires_at, created_at);
+
+CREATE TABLE IF NOT EXISTS provisioning_key_ceremonies (
+    job_id TEXT PRIMARY KEY REFERENCES provisioning_jobs(job_id),
+    ceremony_id TEXT NOT NULL UNIQUE,
+    server_nonce TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    wrapped_artifact_json TEXT,
+    completion_fingerprint TEXT,
+    completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS ix_provisioning_key_ceremony_expiry
+ON provisioning_key_ceremonies(expires_at);
 """
 
 
@@ -122,6 +148,19 @@ class ProvisioningStore:
         self._database.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(_SCHEMA)
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(provisioning_jobs)"
+                ).fetchall()
+            }
+            if "attested_confidential" not in columns:
+                connection.execute(
+                    "ALTER TABLE provisioning_jobs "
+                    "ADD COLUMN attested_confidential INTEGER "
+                    "CHECK (attested_confidential IS NULL "
+                    "OR attested_confidential IN (0, 1))"
+                )
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
 
     @contextmanager
@@ -306,6 +345,7 @@ class ProvisioningStore:
             state=JobState.AWAITING_KEY_CEREMONY,
             provider_allocation_id=allocation,
             before_settle=handoff,
+            create_key_ceremony=True,
             now=now,
         )
 
@@ -377,6 +417,7 @@ class ProvisioningStore:
             connection.execute(
                 "UPDATE provisioning_jobs SET state = ?, operation = ?, "
                 "retry_count = 0, retryable = 0, failure_reason = NULL, "
+                "attested_confidential = NULL, "
                 "lease_token = NULL, "
                 "lease_expires_at = NULL, updated_at = ? WHERE job_id = ?",
                 (
@@ -387,6 +428,166 @@ class ProvisioningStore:
                 ),
             )
             return self._job_by_id(connection, job_id)
+
+    def get_key_ceremony(
+        self,
+        job_id: str,
+        consumer_identity: str,
+    ) -> KeyCeremonyChallenge:
+        """Return the public challenge for one consumer-owned allocation."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT provisioning_jobs.canonical_activation_id, "
+                "provisioning_key_ceremonies.* FROM provisioning_jobs "
+                "JOIN provisioning_key_ceremonies USING (job_id) "
+                "WHERE job_id = ? AND consumer_identity = ?",
+                (job_id, consumer_identity),
+            ).fetchone()
+        if row is None:
+            raise CeremonyUnavailableError("key ceremony is unavailable")
+        return KeyCeremonyChallenge(
+            job_id=job_id,
+            activation_id=str(row["canonical_activation_id"]),
+            ceremony_id=str(row["ceremony_id"]),
+            server_nonce=str(row["server_nonce"]),
+            expires_at=datetime.fromisoformat(str(row["expires_at"])),
+        )
+
+    def get_wrapped_key_artifact(
+        self,
+        job_id: str,
+        consumer_identity: str,
+    ) -> WrappedKeyArtifact | None:
+        """Return only the ciphertext artifact for one completed owned ceremony."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT wrapped_artifact_json FROM provisioning_key_ceremonies "
+                "JOIN provisioning_jobs USING (job_id) "
+                "WHERE job_id = ? AND consumer_identity = ?",
+                (job_id, consumer_identity),
+            ).fetchone()
+        if row is None or row["wrapped_artifact_json"] is None:
+            return None
+        return WrappedKeyArtifact.model_validate_json(str(row["wrapped_artifact_json"]))
+
+    def complete_key_ceremony(
+        self,
+        job_id: str,
+        consumer_identity: str,
+        submission: CeremonySubmission,
+        *,
+        attested_confidential: bool,
+        before_settle: Callable[[], None] | None,
+        now: datetime | None = None,
+    ) -> ProvisioningJob:
+        """Persist ciphertext and settle one valid, unexpired ceremony."""
+        instant = now or _utc_now()
+        canonical = submission.canonical_json()
+        fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        artifact_json = submission.wrapped_artifact.model_dump_json()
+        expired = False
+        completed: ProvisioningJob | None = None
+        with self._connect(write=True) as connection:
+            job_row = self._owned_job(connection, job_id, consumer_identity)
+            ceremony = connection.execute(
+                "SELECT * FROM provisioning_key_ceremonies WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if ceremony is None:
+                raise CeremonyUnavailableError("key ceremony is unavailable")
+            prior = ceremony["completion_fingerprint"]
+            if job_row["state"] == JobState.READY.value:
+                if prior != fingerprint:
+                    raise CeremonyConflictError(
+                        "key ceremony conflicts with prior completion"
+                    )
+                return self._from_row(job_row)
+            if job_row["state"] != JobState.AWAITING_KEY_CEREMONY.value:
+                raise CeremonyUnavailableError("key ceremony is unavailable")
+            if instant >= datetime.fromisoformat(str(ceremony["expires_at"])):
+                connection.execute(
+                    "UPDATE provisioning_jobs SET state = ?, operation = ?, "
+                    "retry_count = 0, retryable = 0, failure_reason = NULL, "
+                    "attested_confidential = NULL, lease_token = NULL, "
+                    "lease_expires_at = NULL, updated_at = ? WHERE job_id = ?",
+                    (
+                        JobState.DELETING.value,
+                        JobOperation.DELETE.value,
+                        _timestamp(instant),
+                        job_id,
+                    ),
+                )
+                expired = True
+            else:
+                self._validate_ceremony_binding(job_row, ceremony, submission)
+                if before_settle is not None:
+                    before_settle()
+                stamp = _timestamp(instant)
+                connection.execute(
+                    "UPDATE provisioning_key_ceremonies SET "
+                    "wrapped_artifact_json = ?, completion_fingerprint = ?, "
+                    "completed_at = ? WHERE job_id = ?",
+                    (artifact_json, fingerprint, stamp, job_id),
+                )
+                connection.execute(
+                    "UPDATE provisioning_jobs SET state = ?, "
+                    "attested_confidential = ?, updated_at = ? WHERE job_id = ?",
+                    (
+                        JobState.READY.value,
+                        int(attested_confidential),
+                        stamp,
+                        job_id,
+                    ),
+                )
+                completed = self._job_by_id(connection, job_id)
+        if expired:
+            raise CeremonyExpiredError("key ceremony expired")
+        assert completed is not None
+        return completed
+
+    def expire_key_ceremonies(self, *, now: datetime | None = None) -> int:
+        """Idempotently queue teardown for every incomplete expired ceremony."""
+        instant = now or _utc_now()
+        with self._connect(write=True) as connection:
+            cursor = connection.execute(
+                "UPDATE provisioning_jobs SET state = ?, operation = ?, "
+                "retry_count = 0, retryable = 0, failure_reason = NULL, "
+                "attested_confidential = NULL, lease_token = NULL, "
+                "lease_expires_at = NULL, updated_at = ? "
+                "WHERE state = ? AND job_id IN ("
+                "SELECT job_id FROM provisioning_key_ceremonies "
+                "WHERE completed_at IS NULL AND expires_at <= ?)",
+                (
+                    JobState.DELETING.value,
+                    JobOperation.DELETE.value,
+                    _timestamp(instant),
+                    JobState.AWAITING_KEY_CEREMONY.value,
+                    _timestamp(instant),
+                ),
+            )
+            return cursor.rowcount
+
+    @staticmethod
+    def _validate_ceremony_binding(
+        job: sqlite3.Row,
+        ceremony: sqlite3.Row,
+        submission: CeremonySubmission,
+    ) -> None:
+        """Reject a replay whose public AEAD binding misses this job challenge."""
+        binding = submission.wrapped_artifact.binding
+        expected = (
+            str(job["canonical_activation_id"]),
+            str(ceremony["ceremony_id"]),
+            str(ceremony["server_nonce"]),
+        )
+        received = (
+            binding.activation_id,
+            submission.ceremony_id,
+            submission.server_nonce,
+        )
+        nested = (binding.activation_id, binding.ceremony_id, binding.server_nonce)
+        if received != expected or nested != expected:
+            raise CeremonyConflictError("key ceremony binding does not match challenge")
 
     def count_jobs(self) -> int:
         """Return the number of durable job records (test and telemetry seam)."""
@@ -452,6 +653,7 @@ class ProvisioningStore:
         failure_reason: FailureReason | None = None,
         provider_allocation_id: str | None = None,
         before_settle: Callable[[], None] | None = None,
+        create_key_ceremony: bool = False,
         now: datetime | None = None,
     ) -> ProvisioningJob:
         """Apply one terminal claim transition when *lease_token* still owns it."""
@@ -482,6 +684,18 @@ class ProvisioningStore:
                         row["consumer_identity"],
                         provider_allocation_id,
                         stamp,
+                    ),
+                )
+            if create_key_ceremony:
+                connection.execute(
+                    "INSERT INTO provisioning_key_ceremonies "
+                    "(job_id, ceremony_id, server_nonce, expires_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        job_id,
+                        str(uuid4()),
+                        secrets.token_urlsafe(32),
+                        _timestamp(instant + KEY_CEREMONY_TTL),
                     ),
                 )
             if state is JobState.DELETED:
@@ -538,6 +752,7 @@ class ProvisioningStore:
     def _from_row(row: sqlite3.Row) -> ProvisioningJob:
         """Convert one SQLite row into its immutable domain representation."""
         reason = row["failure_reason"]
+        attested = row["attested_confidential"]
         return ProvisioningJob(
             job_id=str(row["job_id"]),
             activation_id=str(row["canonical_activation_id"]),
@@ -549,6 +764,7 @@ class ProvisioningStore:
             failure_reason=None if reason is None else FailureReason(str(reason)),
             created_at=datetime.fromisoformat(str(row["created_at"])),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
+            attested_confidential=None if attested is None else bool(attested),
         )
 
     @staticmethod

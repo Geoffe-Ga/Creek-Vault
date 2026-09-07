@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final
 
 from pydantic import ValidationError
@@ -17,6 +18,13 @@ from creek_mcp.httpapi.deadline import read_off_loop, write_off_loop
 from creek_mcp.httpapi.middleware.access_log import AccessLogMiddleware
 from creek_mcp.httpapi.middleware.boundary import ErrorBoundaryMiddleware
 from creek_mcp.provisioning.api import CONTRACT_VERSION, ActivationRequest
+from creek_mcp.provisioning.ceremony import (
+    CeremonyConflictError,
+    CeremonyExpiredError,
+    CeremonySubmission,
+    CeremonyUnavailableError,
+    KeyCeremonyService,
+)
 from creek_mcp.provisioning.store import (
     ActivationConflictError,
     InvalidJobTransitionError,
@@ -26,6 +34,7 @@ from creek_mcp.provisioning.store import (
 if TYPE_CHECKING:
     from starlette.requests import Request
 
+    from creek_mcp.provisioning.ceremony import AttestationVerifier, KeyReleaseSink
     from creek_mcp.provisioning.models import ProvisioningJob
     from creek_mcp.remote_auth import ConsumerTokenVerifier
 
@@ -71,6 +80,7 @@ def _job_payload(job: ProvisioningJob) -> dict[str, object]:
         ),
         "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),
+        "attested_confidential": job.attested_confidential,
         "status_url": f"/control/v1/jobs/{job.job_id}",
     }
 
@@ -78,9 +88,14 @@ def _job_payload(job: ProvisioningJob) -> dict[str, object]:
 class ProvisioningAPI:
     """HTTP handlers that mutate only durable queue state, never provider state."""
 
-    def __init__(self, store: ProvisioningStore) -> None:
+    def __init__(
+        self,
+        store: ProvisioningStore,
+        ceremony: KeyCeremonyService,
+    ) -> None:
         """Bind handlers to the injected durable store."""
         self._store = store
+        self._ceremony = ceremony
 
     async def activate(self, request: Request) -> Response:
         """Submit an activation and immediately return its durable handle."""
@@ -151,6 +166,74 @@ class ProvisioningAPI:
             return _error(request, "job_unavailable", "job unavailable", 403)
         return _response(_job_payload(job), status_code=202)
 
+    async def key_ceremony(self, request: Request) -> Response:
+        """Return the fresh public challenge for one awaiting owned job."""
+        job = await self._owned_job(request)
+        if job is None:
+            return _error(request, "job_unavailable", "job unavailable", 403)
+        if job.state.value != "awaiting_key_ceremony":
+            return _error(
+                request,
+                "invalid_transition",
+                "key ceremony is unavailable",
+                409,
+            )
+        try:
+            challenge = await read_off_loop(
+                self._store.get_key_ceremony,
+                job.job_id,
+                job.consumer_identity,
+            )
+        except CeremonyUnavailableError:
+            return _error(
+                request,
+                "invalid_transition",
+                "key ceremony is unavailable",
+                409,
+            )
+        return _response(challenge.model_dump(mode="json"), status_code=200)
+
+    async def complete_key_ceremony(self, request: Request) -> Response:
+        """Validate ciphertext-only client material and settle the ceremony."""
+        payload = await self._ceremony_payload(request)
+        if isinstance(payload, Response):
+            return payload
+        consumer = context_of(request.scope).consumer
+        assert consumer is not None
+        job_id = request.path_params["job_id"]
+        try:
+            job = await write_off_loop(
+                self._ceremony.complete,
+                job_id,
+                consumer,
+                payload,
+                datetime.now(tz=UTC),
+            )
+        except CeremonyExpiredError:
+            return _error(
+                request,
+                "ceremony_expired",
+                "key ceremony expired; teardown queued",
+                409,
+            )
+        except CeremonyConflictError:
+            return _error(
+                request,
+                "ceremony_conflict",
+                "key ceremony cannot be completed",
+                409,
+            )
+        except CeremonyUnavailableError:
+            if await read_off_loop(self._store.get, job_id, consumer) is None:
+                return _error(request, "job_unavailable", "job unavailable", 403)
+            return _error(
+                request,
+                "invalid_transition",
+                "key ceremony is unavailable",
+                409,
+            )
+        return _response(_job_payload(job), status_code=200)
+
     async def _owned_job(self, request: Request) -> ProvisioningJob | None:
         """Load the path job under the authenticated consumer boundary."""
         consumer = context_of(request.scope).consumer
@@ -175,18 +258,52 @@ class ProvisioningAPI:
                 400,
             )
 
+    @staticmethod
+    async def _ceremony_payload(request: Request) -> CeremonySubmission | Response:
+        """Parse the strict no-secret ceremony body or return a stable refusal."""
+        try:
+            raw = await request.json()
+            return CeremonySubmission.model_validate(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValidationError):
+            return _error(
+                request,
+                "invalid_request",
+                "request body does not match the key ceremony schema",
+                400,
+            )
+
 
 def build_provisioning_app(
     store: ProvisioningStore,
     verifier: ConsumerTokenVerifier,
+    *,
+    attestation_verifier: AttestationVerifier | None = None,
+    key_release_sink: KeyReleaseSink | None = None,
 ) -> Starlette:
     """Build the authenticated control plane without injecting a provider driver."""
-    api = ProvisioningAPI(store)
+    api = ProvisioningAPI(
+        store,
+        KeyCeremonyService(
+            store,
+            verifier=attestation_verifier,
+            release_sink=key_release_sink,
+        ),
+    )
     routes = [
         Route("/control/v1/activations", api.activate, methods=["POST"]),
         Route("/control/v1/jobs/{job_id}", api.status, methods=["GET"]),
         Route("/control/v1/jobs/{job_id}", api.delete, methods=["DELETE"]),
         Route("/control/v1/jobs/{job_id}/retry", api.retry, methods=["POST"]),
+        Route(
+            "/control/v1/jobs/{job_id}/key-ceremony",
+            api.key_ceremony,
+            methods=["GET"],
+        ),
+        Route(
+            "/control/v1/jobs/{job_id}/key-ceremony",
+            api.complete_key_ceremony,
+            methods=["PUT"],
+        ),
     ]
     middleware = [
         Middleware(AccessLogMiddleware),

@@ -1,0 +1,48 @@
+{
+  "description": "Synthetic deterministic interoperability vector; no production secret material.",
+  "client_inputs": {
+    "passphrase": "correct horse test battery staple",
+    "recovery_code": "AEAQC-AIBAE-AQCAI-BAEAQ-CAIBA-EAQCA-IBAEA-QCAIB-AEAQC-AIBAE-AQ",
+    "volume_master_key_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "binding": {
+    "protocol_version": "1.0.0",
+    "activation_id": "activation-vector-001",
+    "ceremony_id": "ceremony-vector-001",
+    "server_nonce": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+    "client_nonce": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+  },
+  "submission": {
+    "protocol_version": "1.0.0",
+    "ceremony_id": "ceremony-vector-001",
+    "server_nonce": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+    "recovery_saved": true,
+    "wrapped_artifact": {
+      "version": 2,
+      "kdf": {
+        "algorithm": "argon2id",
+        "salt": "02020202020202020202020202020202",
+        "time_cost": 3,
+        "lanes": 4,
+        "memory_kib": 65536
+      },
+      "passphrase_wrapped": {
+        "nonce": "050505050505050505050505",
+        "ciphertext": "5d6afeebc5eddf9c3786b8382167a3ae75ef04b0589cd82172c4826c0f0335743007c505bab6594ec2e5f88ed92a4925"
+      },
+      "recovery_wrapped": {
+        "nonce": "060606060606060606060606",
+        "ciphertext": "6c8c7debd637df1de396db75cb4e13438bc1dffb342b03d6cebea3ea1fe7c5ce46cb78dd2d851db914a87a030f2f402a"
+      },
+      "binding": {
+        "protocol_version": "1.0.0",
+        "activation_id": "activation-vector-001",
+        "ceremony_id": "ceremony-vector-001",
+        "server_nonce": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+        "client_nonce": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+      }
+    },
+    "attestation": null,
+    "key_release": null
+  }
+}

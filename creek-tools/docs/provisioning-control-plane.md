@@ -94,17 +94,30 @@ sequence is drain, commit, close, and stop. Both success and failure close the
 vault and explicitly stop the Machine; HTTP-request lifetime is never the
 shutdown signal.
 
-Successful create work stops at `awaiting_key_ceremony`. The user-held
-no-escrow and attestation protocol that can advance it to `ready` is #1771.
-Until that work lands, an ordinary allocation must not advertise INTIMATE
-capability: an ordinary Fly Machine does not advertise INTIMATE.
+Successful create work stops at `awaiting_key_ceremony` and atomically creates
+a 24-hour challenge. The versioned
+[`key ceremony protocol`](contracts/provisioning-v1/key-ceremony.md) (issue
+#1771) accepts only an activation-bound ciphertext artifact. Passphrase,
+recovery value/code, and unwrapped volume key never reach this service. An
+identical completion retry is idempotent; a conflicting replay is refused.
+Expired incomplete ceremonies move to `deleting`, and every worker pass sweeps
+them before claiming work, so an abandoned activation reconciles provider
+resources to zero.
+
+The completed job advertises `attested_confidential`. An ordinary Fly Machine
+does not advertise INTIMATE: it completes as `false`. `true` requires a fresh,
+correctly measured, trust-root-signed recipient statement and delivery of an
+opaque key envelope to the injected idempotent release sink. Attestation expiry,
+signature failure, measurement mismatch, challenge mismatch, or recipient
+mismatch fails before release.
 
 ## State and retry rules
 
 - `pending` is claimable create work.
 - a create lease moves it to `provisioning`;
 - a successful fake/real driver result moves it to `awaiting_key_ceremony`;
-- #1771 may mark a completed ceremony `ready`;
+- a valid ciphertext-only ceremony marks the job `ready` and reports whether
+  attested confidential processing was actually verified;
 - stable failures become `failed` and are retryable only when explicitly
   recorded as safe;
 - delete changes any live state to `deleting`, and only provider confirmation

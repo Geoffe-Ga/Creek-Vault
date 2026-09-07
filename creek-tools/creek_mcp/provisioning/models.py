@@ -55,6 +55,7 @@ class ProvisioningJob:
     failure_reason: FailureReason | None
     created_at: datetime
     updated_at: datetime
+    attested_confidential: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

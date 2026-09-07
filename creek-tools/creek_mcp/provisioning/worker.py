@@ -40,6 +40,7 @@ class ProvisioningWorker:
 
     def run_once(self, *, now: datetime | None = None) -> bool:
         """Process one claim and return whether work was available."""
+        self._store.expire_key_ceremonies(now=now)
         claimed = self._store.claim_next(now=now, lease_for=self._lease_for)
         if claimed is None:
             return False
