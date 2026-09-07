@@ -10,7 +10,7 @@ primitives (:func:`~creek_mcp.read_gate.refuse_above_ceiling` and
 ways a tool may satisfy the ceiling, so gaps can be closed by adoption rather
 than by re-deriving the policy per tool.
 
-A manifest is only worth having if it cannot lie. Seven layers keep it honest:
+A manifest is only worth having if it cannot lie. Eight layers keep it honest:
 
 (a) **Surface completeness** — the manifest covers exactly the live tool list,
     derived from ``server.list_tools()`` rather than a second hardcoded copy,
@@ -66,6 +66,21 @@ A manifest is only worth having if it cannot lie. Seven layers keep it honest:
     declared cannot quietly empty itself; a set computed by signature
     introspection can, on nothing worse than a parameter rename, and would
     take the whole layer green with it.
+(h) **Disk-artifact canary probe** — layer (f) at the third channel, the one
+    neither of the others can reach. Every ``GATED`` tool is called at an
+    **admitting** ceiling against a throwaway vault, with the vault
+    snapshotted **between** the seeding and the call, and the tools that
+    changed a non-bookkeeping file are the derived subject set
+    (:data:`_PINNED_ARTIFACT_WRITING_GATED_TOOLS` — eight of them today).
+    Forced by a manifest pair of its own (:data:`_ARTIFACT_PROBES` /
+    :data:`_ARTIFACT_PROBE_EXEMPT`) exactly as (f) and (g) are, with the same
+    non-emptiness assertion (g) needs and one more reason to need it: an
+    observation whose seed stops reaching a tool's write path observes no
+    writes and shrinks the set in silence. The observed status is therefore
+    checked per tool rather than against a global ``!= "refused"``, because
+    ``draft``'s ``"empty"`` and ``compile``'s ``"noop"`` both mean
+    *"succeeded and wrote nothing"* and would derive the two tools this layer
+    most needs straight back out of it.
 
 Layer (f) exists because layers (a)-(e) are **structural**. Between them they
 prove that a gate is declared in the manifest, exists in the named module, and
@@ -185,11 +200,15 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import functools
+import hashlib
 import importlib
 import inspect
 import json
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import frontmatter
@@ -203,8 +222,11 @@ from creek.classify.llm.prompts import (
     build_classification_prompt,
 )
 from creek.config import CreekConfig, LLMConfig
+from creek.generate.compile_routing import COMPILE_GAPS_RELPATH
 from creek.generate.mining import MiningStrategy
 from creek.models import Fragment, PrivacyTier
+from creek.vault.writer import INDEX_FILENAME, INDEX_LOCK_FILENAME
+from creek_mcp.audit import MCP_AUDIT_RELPATH
 from creek_mcp.policy import Transport
 from creek_mcp.read_gate import (
     _COUNTS_ONLY_RATIONALE,
@@ -235,7 +257,6 @@ from creek_mcp.tools.wheel import wheel_tool
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
     from types import ModuleType
 
     from mcp.types import Tool
@@ -2787,6 +2808,37 @@ without updating this dict is the failure mode, and it is the one
 """
 
 
+def _seed_canary_fragments(vault: Path) -> None:
+    """Write :func:`canary_vault`'s two fragments into *vault*.
+
+    Extracted from the fixture, byte-for-byte, so layer (h) can build the same
+    corpus without depending on pytest fixture machinery: its derivation runs
+    over fourteen throwaway vaults created inside a plain function, where no
+    fixture is available. An extraction, **not** an extension — the fixture is
+    still exactly these two fragments, for the reason
+    :func:`_seed_skills_canaries` records at length.
+
+    Args:
+        vault: Vault root, mutated in place.
+    """
+    _write_fragment(
+        vault,
+        frag_id=_RUNTIME_OPEN_ID,
+        title=f"Open canary {_RUNTIME_OPEN_CANARY}",
+        body=f"Open canary body {_RUNTIME_OPEN_CANARY}",
+        privacy_tier="open",
+        tags=[_RUNTIME_OPEN_CANARY],
+    )
+    _write_fragment(
+        vault,
+        frag_id=_RUNTIME_INTIMATE_ID,
+        title=f"Intimate canary {_RUNTIME_INTIMATE_CANARY}",
+        body=f"Intimate canary body {_RUNTIME_INTIMATE_CANARY}",
+        privacy_tier="intimate",
+        tags=[_RUNTIME_INTIMATE_CANARY],
+    )
+
+
 @pytest.fixture
 def canary_vault(tmp_path: Path) -> Path:
     """Return a vault holding one ``open`` and one ``intimate`` canary fragment.
@@ -2798,22 +2850,7 @@ def canary_vault(tmp_path: Path) -> Path:
     control, and the per-tool tests below assert it *is* reachable, so a tool
     that returned nothing at all could not pass layer (f) by being empty.
     """
-    _write_fragment(
-        tmp_path,
-        frag_id=_RUNTIME_OPEN_ID,
-        title=f"Open canary {_RUNTIME_OPEN_CANARY}",
-        body=f"Open canary body {_RUNTIME_OPEN_CANARY}",
-        privacy_tier="open",
-        tags=[_RUNTIME_OPEN_CANARY],
-    )
-    _write_fragment(
-        tmp_path,
-        frag_id=_RUNTIME_INTIMATE_ID,
-        title=f"Intimate canary {_RUNTIME_INTIMATE_CANARY}",
-        body=f"Intimate canary body {_RUNTIME_INTIMATE_CANARY}",
-        privacy_tier="intimate",
-        tags=[_RUNTIME_INTIMATE_CANARY],
-    )
+    _seed_canary_fragments(tmp_path)
     return tmp_path
 
 
@@ -4275,6 +4312,16 @@ class _PromptCapture:
     pasting it into its prompt is precisely what this layer exists to catch,
     and evidence gathered from two separate calls could never distinguish that
     from two different code paths.
+
+    **Layer (h) deliberately does not fold its disk snapshot in here**, and
+    that is worth stating because unifying the three channels on one capture
+    object is the obvious tidy-up. It would cover exactly one tool:
+    :data:`_PROMPT_PROBES` is author, compile and reflect, and neither
+    ``creek.author`` nor ``creek.reflect`` writes a vault artifact at all.
+    Worse, compile's artifact evidence is a **byte-snapshot equality across a
+    refused call** — a comparison of the vault before and after — which is not
+    a value any capture object can carry, because half of it has to be taken
+    before the call this object describes was made.
     """
 
     response: dict[str, Any]
@@ -5453,4 +5500,1585 @@ def test_creek_classify_is_deliberately_outside_the_layer_g_derivation() -> None
         "ALONE would still enrol nothing, because the derivation runs over "
         "_GATED_TOOLS first -- so if this fires, check which of the two "
         "reasons is still standing before assuming the tool is covered."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Layer (h) — the disk-artifact channel (#1273)
+#
+# Layers (f) and (g) watch the two channels a caller can *see*: the response
+# envelope and the prompt that crossed to the provider. Neither can see the
+# third, which is the bytes a tool leaves in the vault. That channel was
+# covered per tool and **not forced** — five good tests, and nothing obliging
+# the sixth artifact-writing tool to grow a sixth. #968 and #969 were both
+# found here, so it was simultaneously the channel with the worst track record
+# and the only one with no forcing function.
+#
+# This layer is layer (g)'s construct, one channel over: an **observationally
+# derived** membership set, a non-emptiness assertion, a pin, probes,
+# exemptions, guards, controls, and the same five-assertion forcing function in
+# the same order.
+#
+# Two things about it are not obvious, and both are load-bearing.
+#
+# 1. **The snapshot boundary sits between the seed and the tool call**, which
+#    is why :class:`_ArtifactObservation` has two fields instead of being one
+#    callable. Six of layer (f)'s probes seed inside their own bodies, and
+#    ``_probe_state_read`` runs an *admitting*
+#    ``state_render_tool(..., TierCeiling.ALL)`` inside itself. A derivation
+#    that snapshotted *around* an existing layer-(f) probe would attribute that
+#    render to ``creek.state.read`` and derive a read-only tool into the
+#    writer set — and would do it on defect-free code at HEAD. The split is the
+#    enforcement: the runner can only snapshot between the two halves.
+# 2. **The status is asserted per tool, not against a global
+#    ``!= "refused"``.** ``draft_tool`` returns ``status="empty"`` and writes
+#    nothing when the miner surfaces no seeds; ``compile_tool`` returns
+#    ``status="noop"`` and writes nothing when the pre-hash equals the
+#    post-hash. Neither is a refusal, so a bare ``!= "refused"`` would let a
+#    degenerate observation derive the two tools this layer exists to cover
+#    silently *out* of the set — a green forcing function guarding nothing.
+# ---------------------------------------------------------------------------
+
+_ARTIFACT_DERIVATION_CARVE_OUT_NAMES = frozenset({INDEX_FILENAME, INDEX_LOCK_FILENAME})
+"""Bookkeeping filenames every tool may touch, excluded by ``name``.
+
+``creek.vault.writer`` maintains ``.id-index.jsonl`` and its lock beside the
+fragments, and any tool that resolves a fragment id can cause them to be
+rewritten. Imported as symbols rather than spelled as literals so a rename in
+the writer surfaces here as an import error rather than as a silently widened
+derivation.
+"""
+
+
+def _is_artifact_carve_out(relpath: Path) -> bool:
+    """Return whether *relpath* is bookkeeping rather than a vault artifact.
+
+    The MCP audit trail is carved out by its **exact relative path**, never by
+    its directory. ``creek_mcp.tools.compile`` writes its own
+    ``compile-<id>.hash`` marker into that same ``00-Creek-Meta/audit/``
+    directory, so a directory-shaped carve-out would blind the derivation to
+    compile's marker — one of the two artifacts this layer exists to force.
+
+    Args:
+        relpath: A vault-relative path.
+
+    Returns:
+        ``True`` when the path is bookkeeping the derivation must ignore.
+    """
+    return (
+        relpath == MCP_AUDIT_RELPATH
+        or relpath.name in _ARTIFACT_DERIVATION_CARVE_OUT_NAMES
+    )
+
+
+def _vault_digest(vault: Path) -> dict[str, str]:
+    """Return every non-bookkeeping file under *vault* mapped to its sha256.
+
+    A mapping rather than a set of paths, because the interesting write is
+    often an **in-place rewrite**: ``creek.journal`` and ``creek.upload`` both
+    update fragments that already exist, and a path-set comparison would
+    report no change at all. Hashes rather than bytes because this runs over
+    fourteen vaults and the generated skill tree alone is dozens of files.
+
+    Args:
+        vault: Vault root.
+
+    Returns:
+        ``{vault-relative path: sha256 hex}``.
+    """
+    digest: dict[str, str] = {}
+    for path in sorted(vault.rglob("*")):
+        if not path.is_file():
+            continue
+        relpath = path.relative_to(vault)
+        if _is_artifact_carve_out(relpath):
+            continue
+        digest[str(relpath)] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digest
+
+
+@dataclass(frozen=True)
+class _ArtifactObservation:
+    """One tool's recipe, split at the point the snapshot has to be taken.
+
+    The two fields are the whole enforcement of this layer's hardest
+    constraint. ``seed`` puts the corpus, the ledger records and — for
+    ``creek.state.read`` — the rendered report the tool addresses on disk;
+    ``call`` invokes the tool and nothing else. A runner handed one combined
+    callable could only snapshot around both, and would then record the seed's
+    own writes as the tool's.
+    """
+
+    seed: Callable[[Path], None]
+    call: Callable[[Path], dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class _ArtifactEvidence:
+    """What one observed call left on disk, paired with what it answered.
+
+    Paired for :func:`_assert_prompt_channel_clean`'s reason, one channel
+    over: an artifact assertion is only meaningful about a call whose status is
+    known, because a tool that refused and a tool that wrote nothing leave
+    identical directories behind.
+    """
+
+    tool: str
+    response: dict[str, Any]
+    written: tuple[str, ...]
+    blob: str
+
+
+def _artifact_blob(vault: Path, written: tuple[str, ...]) -> str:
+    """Return the text of every file *written* names, concatenated.
+
+    Decoded with ``errors="replace"`` rather than skipping undecodable files:
+    ``creek.upload`` stages the caller's own bytes, and a sentinel in a file
+    this helper declined to read would be a leak the sweep reported clean.
+
+    Args:
+        vault: Vault root.
+        written: Vault-relative paths, as recorded on :class:`_ArtifactEvidence`.
+
+    Returns:
+        One string covering every named file that still exists.
+    """
+    return "".join(
+        (vault / relpath).read_bytes().decode("utf-8", errors="replace")
+        for relpath in written
+        if (vault / relpath).is_file()
+    )
+
+
+def _run_artifact_observation(tool: str, vault: Path) -> _ArtifactEvidence:
+    """Seed *vault*, snapshot it, call *tool*, and report what changed.
+
+    The three steps are in this order and the order is the layer. Everything
+    the seed writes is inside the "before" snapshot, so only bytes the tool
+    itself produced can appear in :attr:`_ArtifactEvidence.written`.
+
+    Args:
+        tool: The registered MCP tool name.
+        vault: A vault root the observation may seed and write into.
+
+    Returns:
+        The call's response, the paths it changed, and their text.
+    """
+    observation = _ARTIFACT_OBSERVATIONS[tool]
+    observation.seed(vault)
+    before = _vault_digest(vault)
+    response = observation.call(vault)
+    after = _vault_digest(vault)
+    changed = {relpath for relpath, sha in after.items() if before.get(relpath) != sha}
+    written = tuple(sorted(changed | (set(before) - set(after))))
+    return _ArtifactEvidence(
+        tool=tool,
+        response=response,
+        written=written,
+        blob=_artifact_blob(vault, written),
+    )
+
+
+_ARTIFACT_CONSUMER = "read-gate-artifact-observation"
+"""The ``consumer`` string the observed calls identify themselves by."""
+
+_ARTIFACT_JOURNAL_EXTERNAL_ID = "artifact-observation-journal-1273"
+_ARTIFACT_UPLOAD_EXTERNAL_ID = "artifact-observation-upload-1273"
+_ARTIFACT_COMPILE_TARGET_ID = "thread-artifact-observation"
+_ARTIFACT_COMPILE_TARGET_TITLE = "Artifact observation target"
+
+_ARTIFACT_COMPILE_MARKER_RELDIR = Path("00-Creek-Meta") / "audit"
+"""Where ``compile_tool`` writes its ``compile-<id>.hash`` re-run marker.
+
+Named here because the compile probe's positive control asserts the marker was
+written, and because it is the reason :func:`_is_artifact_carve_out` carves the
+audit **file** rather than the audit directory.
+"""
+
+
+def _seed_meta_subtree(vault: Path) -> None:
+    """Create the meta folders ``creek.journal`` and ``creek.upload`` expect.
+
+    The same widening :func:`_seed_journal_canary` and
+    :func:`_seed_upload_canary` do, minus the above-ceiling seeding those two
+    add: this layer's observations run at an **admitting** ceiling over a
+    within-ceiling call, because the question they answer is "does this tool
+    write to the vault when it is allowed to", not "does its gate refuse".
+
+    Args:
+        vault: Vault root, mutated in place.
+    """
+    _seed_canary_fragments(vault)
+    for sub in ("00-Creek-Meta/State", "00-Creek-Meta/audit"):
+        (vault / sub).mkdir(parents=True, exist_ok=True)
+
+
+def _seed_report_vault(vault: Path) -> None:
+    """Seed the canary corpus and the meta folder ``creek.report`` writes into.
+
+    ``generate_garden`` writes ``00-Creek-Meta/Tag-Garden.md`` without creating
+    its parent — the reason :func:`_probe_report` creates it. Here that mkdir
+    belongs to the **seed**, not to the call, so the snapshot boundary stays
+    exactly at the tool.
+
+    Args:
+        vault: Vault root, mutated in place.
+    """
+    _seed_canary_fragments(vault)
+    (vault / "00-Creek-Meta").mkdir(parents=True, exist_ok=True)
+
+
+def _seed_state_vault(vault: Path) -> None:
+    """Seed the canary corpus plus the carriers a state report actually renders.
+
+    Args:
+        vault: Vault root, mutated in place.
+    """
+    _seed_canary_fragments(vault)
+    _seed_state_carriers(vault)
+
+
+def _seed_rendered_state_vault(vault: Path) -> None:
+    """Seed a state vault **and render it**, so ``creek.state.read`` has a file.
+
+    This is the whole reason :class:`_ArtifactObservation` is split in two.
+    ``creek.state.read`` reads ``00-Creek-Meta/State/latest.md``, which does
+    not exist until something renders it — so ``_probe_state_read`` runs an
+    admitting ``state_render_tool(..., TierCeiling.ALL)`` *inside its own
+    body*. An observation that snapshotted around that probe would attribute
+    the render's four files to ``creek.state.read`` and derive a tool that
+    writes nothing into the artifact-writing set, on defect-free code.
+
+    Running the render here — before the snapshot — is what makes
+    :func:`test_creek_state_read_and_creek_wheel_derive_out_of_the_artifact_set`
+    a real assertion rather than a restatement of how the recipe was written.
+
+    The render runs at ``TierCeiling.OPEN``, **not** at ``ALL`` the way
+    ``_probe_state_read`` runs it. That probe renders above the ceiling on
+    purpose, so the open-ceiling read it then makes has something above-ceiling
+    to refuse; measured, this seed at ``ALL`` makes ``state_read_tool`` answer
+    ``status="refused"``, which would be an observation of the #846 gate rather
+    than of whether the tool writes. This layer's question is what an
+    **admitted** call leaves on disk.
+
+    Args:
+        vault: Vault root, mutated in place.
+    """
+    _seed_state_vault(vault)
+    state_render_tool(vault_path=vault, privacy_tier_ceiling=TierCeiling.OPEN)
+
+
+def _seed_skills_vault(vault: Path) -> None:
+    """Seed the canary corpus plus bodies long enough to be quoted as exemplars.
+
+    Args:
+        vault: Vault root, mutated in place.
+    """
+    _seed_canary_fragments(vault)
+    _seed_skills_canaries(vault)
+
+
+def _seed_redact_vault(vault: Path) -> None:
+    """Seed the canary corpus plus the staged file the admitted scan reports on.
+
+    Args:
+        vault: Vault root, mutated in place.
+    """
+    _seed_canary_fragments(vault)
+    _seed_redact_canaries(vault)
+
+
+def _artifact_call_author(vault: Path) -> dict[str, Any]:
+    """Run the Writing Desk at the open ceiling over the admitted corpus.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return author_tool(
+        vault_path=vault,
+        query=_AUTHOR_PROMPT_PROBE_QUERY,
+        llm_factory=_RecordingAuthorFactory(),
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        dry_run=False,
+    )
+
+
+def _artifact_call_classify_entry(vault: Path) -> dict[str, Any]:
+    """Classify the **open** fragment at the open ceiling — an admitted call.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return entry_classification_tool(
+        vault_path=vault,
+        entry_ref=_RUNTIME_OPEN_ID,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer=_ARTIFACT_CONSUMER,
+    )
+
+
+def _artifact_call_compile(vault: Path) -> dict[str, Any]:
+    """Compile the **open** fragment at the open ceiling, through a recorder.
+
+    :func:`_forbidden_llm_factory` would raise here and is the wrong recorder
+    for an admitted call: this observation exists to find out what an *allowed*
+    compile writes, which is the page plus its ``compile-<id>.hash`` marker.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return compile_tool(
+        vault_path=vault,
+        fragment_ids=[_RUNTIME_OPEN_ID],
+        target_kind="thread",
+        target_id=_ARTIFACT_COMPILE_TARGET_ID,
+        target_title=_ARTIFACT_COMPILE_TARGET_TITLE,
+        llm_factory=_RecordingLLMFactory(),
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _artifact_call_draft(vault: Path) -> dict[str, Any]:
+    """Draft at the open ceiling over the canary corpus.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return draft_tool(
+        vault_path=vault,
+        llm_factory=_RecordingLLMFactory(),
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _artifact_call_journal(vault: Path) -> dict[str, Any]:
+    """Ingest one **open** journal entry at the open ceiling — a plain creation.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return journal_ingest_tool(
+        vault_path=vault,
+        content="Artifact observation journal body",
+        external_id=_ARTIFACT_JOURNAL_EXTERNAL_ID,
+        timestamp=_JOURNAL_PROBE_TS,
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _artifact_call_mine(vault: Path) -> dict[str, Any]:
+    """Mine every seed at the open ceiling.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return mine_tool(
+        vault_path=vault,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        limit=0,
+    )
+
+
+def _artifact_call_redact_scan(vault: Path) -> dict[str, Any]:
+    """Scan the **admitted** staging subtree, not the refused fragment subtree.
+
+    ``_probe_redact_scan`` aims at ``01-Fragments`` precisely to be refused.
+    This observation aims at :data:`_REDACT_STAGING_TARGET`, which is admitted
+    at every ceiling, because an observation of a refused call would report
+    "writes nothing" about the refusal rather than about the tool.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return redact_scan_tool(
+        vault_path=vault,
+        input_path=_REDACT_STAGING_TARGET,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _artifact_call_reflect(vault: Path) -> dict[str, Any]:
+    """Reflect on raw ``content`` at the open ceiling, through a recorder.
+
+    Raw content rather than an ``entry_ref`` for :func:`_prompt_probe_reflect`'s
+    reason: an above-ceiling ``entry_ref`` is refused above the grounding walk,
+    and a refusal writes nothing whether or not the tool has a write path.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return reflect_tool(
+        vault_path=vault,
+        llm_factory=_RecordingLLMFactory(),
+        content=_REFLECT_PROMPT_PROBE_ENTRY,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        care_guard=None,
+    )
+
+
+def _artifact_call_report(vault: Path) -> dict[str, Any]:
+    """Render the ``tags`` report at the open ceiling.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return report_tool(
+        vault_path=vault,
+        report_type="tags",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _artifact_call_skills_refresh(vault: Path) -> dict[str, Any]:
+    """Regenerate the skill tree at the open ceiling.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return skills_refresh_tool(
+        vault_path=vault,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+        consumer=_ARTIFACT_CONSUMER,
+    )
+
+
+def _artifact_call_state_read(vault: Path) -> dict[str, Any]:
+    """Read the already-rendered state report at the open ceiling.
+
+    The render that produced the file it reads belongs to
+    :func:`_seed_rendered_state_vault`, deliberately: it is the write this
+    layer must **not** attribute to a read-only tool.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return state_read_tool(
+        vault_path=vault,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _artifact_call_state_render(vault: Path) -> dict[str, Any]:
+    """Render the state report at the open ceiling.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return state_render_tool(
+        vault_path=vault,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _artifact_call_upload(vault: Path) -> dict[str, Any]:
+    """Upload one **open** document at the open ceiling — a plain creation.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return upload_tool(
+        vault_path=vault,
+        filename=_UPLOAD_PROBE_FILENAME,
+        content_base64=_upload_b64("Artifact observation upload body"),
+        external_id=_ARTIFACT_UPLOAD_EXTERNAL_ID,
+        tier="open",
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+
+def _artifact_call_wheel(vault: Path) -> dict[str, Any]:
+    """Count the wheel at the open ceiling.
+
+    Args:
+        vault: The seeded vault.
+
+    Returns:
+        The tool's response envelope.
+    """
+    return wheel_tool(vault_path=vault, privacy_tier_ceiling=TierCeiling.OPEN)
+
+
+_ARTIFACT_OBSERVATIONS: dict[str, _ArtifactObservation] = {
+    "creek.author": _ArtifactObservation(
+        seed=_seed_canary_fragments, call=_artifact_call_author
+    ),
+    "creek.classify.entry": _ArtifactObservation(
+        seed=_seed_canary_fragments, call=_artifact_call_classify_entry
+    ),
+    "creek.compile": _ArtifactObservation(
+        seed=_seed_canary_fragments, call=_artifact_call_compile
+    ),
+    "creek.draft": _ArtifactObservation(
+        seed=_seed_canary_fragments, call=_artifact_call_draft
+    ),
+    "creek.journal": _ArtifactObservation(
+        seed=_seed_meta_subtree, call=_artifact_call_journal
+    ),
+    "creek.mine": _ArtifactObservation(
+        seed=_seed_canary_fragments, call=_artifact_call_mine
+    ),
+    "creek.redact.scan": _ArtifactObservation(
+        seed=_seed_redact_vault, call=_artifact_call_redact_scan
+    ),
+    "creek.reflect": _ArtifactObservation(
+        seed=_seed_canary_fragments, call=_artifact_call_reflect
+    ),
+    "creek.report": _ArtifactObservation(
+        seed=_seed_report_vault, call=_artifact_call_report
+    ),
+    "creek.skills.refresh": _ArtifactObservation(
+        seed=_seed_skills_vault, call=_artifact_call_skills_refresh
+    ),
+    "creek.state.read": _ArtifactObservation(
+        seed=_seed_rendered_state_vault, call=_artifact_call_state_read
+    ),
+    "creek.state.render": _ArtifactObservation(
+        seed=_seed_state_vault, call=_artifact_call_state_render
+    ),
+    "creek.upload": _ArtifactObservation(
+        seed=_seed_meta_subtree, call=_artifact_call_upload
+    ),
+    "creek.wheel": _ArtifactObservation(
+        seed=_seed_canary_fragments, call=_artifact_call_wheel
+    ),
+}
+"""``GATED`` tool → how to put it in a position to write, and then call it.
+
+Every ``GATED`` tool is here, not only the ones that write — the derivation
+below cannot ask "which tools write" unless it is able to run the ones that do
+not. That is what :func:`test_every_gated_tool_has_an_artifact_observation`
+forces, and it is why a newly ``GATED`` tool cannot slip into this layer as an
+absence.
+
+Every call is at an **admitting** ceiling over a within-ceiling target. A
+refused call writes nothing, so an observation built out of layer (f)'s refusal
+probes would derive the empty set and report green.
+"""
+
+
+_ARTIFACT_OBSERVATION_STATUS: dict[str, frozenset[str]] = {
+    "creek.author": frozenset({"ok"}),
+    "creek.classify.entry": frozenset({"ok"}),
+    "creek.compile": frozenset({"ok"}),
+    "creek.draft": frozenset({"ok"}),
+    "creek.journal": frozenset({"ok"}),
+    "creek.mine": frozenset({"ok"}),
+    "creek.redact.scan": frozenset({"ok"}),
+    "creek.reflect": frozenset({"ok", "empty"}),
+    "creek.report": frozenset({"ok"}),
+    "creek.skills.refresh": frozenset({"ok"}),
+    "creek.state.read": frozenset({"ok"}),
+    "creek.state.render": frozenset({"ok"}),
+    "creek.upload": frozenset({"ok"}),
+    "creek.wheel": frozenset({"ok"}),
+}
+"""``GATED`` tool → the statuses its observation is allowed to answer.
+
+**Per tool, and never a single global** ``!= "refused"``. Two live statuses in
+this repo mean *"the call succeeded and wrote nothing"*, and both belong to
+tools this layer exists to cover:
+
+* ``creek_mcp.tools.draft`` returns ``{"status": "empty"}`` above its
+  ``save_draft`` call when ``IdeaMiner`` surfaces no seeds;
+* ``creek_mcp.tools.compile`` returns ``{"status": "noop"}`` above its marker
+  write when the pre-hash equals the post-hash.
+
+Neither is a refusal. Under ``!= "refused"`` a degenerate seed would make the
+observation report an empty diff, the derivation would put the tool *outside*
+the artifact-writing set, the forcing function would stop demanding a probe for
+it, and every test here would stay green — the layer quietly narrowed to
+exactly the tools that were already covered. Naming the expected status per
+tool converts that silent narrowing into a named failure.
+
+``creek.reflect`` is the one entry that names a second status, and the
+distinction is the whole point of the dict. Its ``"empty"`` is set on the
+**terminal** path — ``creek_mcp.tools.reflect._success_response`` ends with
+``"status": "ok" if notes else "empty"``, below every read the tool makes — and
+it is reached here because :data:`_CANNED_LLM_RESPONSE` is ``{"notes": []}``,
+so the recorder hands back a completion that parses to zero notes. That is a
+statement about the harness, not an early return above a write path. Contrast
+``draft``'s and ``compile``'s, which are returned *above* ``save_draft`` and
+above the marker write respectively: those two are exactly the silent
+narrowing this dict exists to refuse, which is why neither is allowed here.
+"""
+
+
+def _observe_artifact_writes(tool: str) -> tuple[str, ...]:
+    """Return the vault-relative paths one admitted call to *tool* changed.
+
+    A **fresh** temporary vault per tool, never a shared one. ``compile_tool``
+    short-circuits to ``status="noop"`` when it finds its own re-run marker
+    already carrying the post-hash, so a reused vault would turn the second
+    observation of a writing tool into an observation of a tool that writes
+    nothing.
+
+    Args:
+        tool: The registered MCP tool name.
+
+    Returns:
+        Sorted vault-relative paths, empty when the call wrote nothing.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        # ``.resolve()`` is required, not hygiene. On macOS ``TemporaryDirectory``
+        # hands back ``/var/folders/...`` while the kernel reports the same file
+        # as ``/private/var/folders/...``; ``compile_tool`` calls
+        # ``written.relative_to(vault_path)`` on the resolved page path, which
+        # raises ValueError against an unresolved root. Measured: the compile
+        # observation died there before this call was added. ``tmp_path`` — what
+        # the probes below run over — is already resolved, so this is the only
+        # site that needs it.
+        evidence = _run_artifact_observation(tool, Path(tmp).resolve())
+    status = evidence.response.get("status")
+    assert status in _ARTIFACT_OBSERVATION_STATUS[tool], (
+        f"{tool} answered status={status!r} to its artifact observation, but "
+        f"only {sorted(_ARTIFACT_OBSERVATION_STATUS[tool])} means the call ran "
+        "far enough for its write path to be reached. The path diff is "
+        "therefore taken over a vault the tool never wrote to, and this tool "
+        "would derive OUT of the artifact-writing set for a reason that has "
+        "nothing to do with whether it writes. Repair the observation's seed "
+        f"in _ARTIFACT_OBSERVATIONS; never widen this set to match.\n\n"
+        f"{evidence.response}"
+    )
+    return evidence.written
+
+
+@functools.cache
+def _artifact_writes_by_tool() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Return every ``GATED`` tool paired with the paths its observation changed.
+
+    Cached, and deliberately **not** bound at module level the way
+    :data:`_LLM_BACKED_GATED_TOOLS` is. That derivation reads signatures; this
+    one calls fourteen production tools against fourteen temporary vaults, and
+    an exception raised at import would be a *collection* error over this whole
+    file — taking layers (a) through (g) down with it and reporting the loss as
+    a single unrelated-looking error.
+
+    Returns:
+        ``((tool, (relpath, ...)), ...)``, in :data:`_GATED_TOOLS` order.
+        Immutable so a caller cannot edit the cached result.
+    """
+    return tuple((tool, _observe_artifact_writes(tool)) for tool in _GATED_TOOLS)
+
+
+def _derive_artifact_writing_gated_tools() -> list[str]:
+    """Return the ``GATED`` tools observed to write into the vault.
+
+    Derived by **observation** rather than hand-listed, and that choice is the
+    layer — the argument :func:`_derive_llm_backed_gated_tools` makes for the
+    prompt channel, applied here. A hand-list is a snapshot of the day it was
+    written: the next artifact-writing tool would be triaged into
+    ``TOOL_POSTURES`` by layer (a), given a probe or an exemption by layers (f)
+    and (g), and then inherit "response-probed, prompt-probed,
+    artifact-unchecked" in silence, because a list nobody recomputes cannot ask
+    a new tool for anything.
+
+    Observation rather than a **declarative** rule, too, and that fork was
+    decided by measurement rather than taste. The obvious declarative
+    predicate is the ``created_path`` field tools put on their envelope —
+    and ``git grep created_path`` finds it in neither
+    ``creek_mcp/tools/state.py`` nor ``creek_mcp/tools/draft.py``, both of
+    which write: ``state.py`` calls ``StateReportGenerator(...).write()`` and
+    ``draft.py`` calls ``generator.save_draft(...)``. A declarative derivation
+    would have missed ``creek.state.render``, whose leak was #969.
+
+    The package cannot be enumerated either. Since #1772
+    ``creek_mcp.tools`` is a lazy ``__getattr__`` package with no ``__dir__``,
+    so ``dir(creek_mcp.tools)`` yields nothing and a package-walk derivation
+    would come back EMPTY — green, and guarding nothing. Tools are resolved
+    only through :data:`_ARTIFACT_OBSERVATIONS`, whose own completeness is
+    forced against :data:`_GATED_TOOLS`.
+
+    Returns:
+        Sorted tool names whose admitted call changed at least one
+        non-bookkeeping file.
+    """
+    return sorted(tool for tool, written in _artifact_writes_by_tool() if written)
+
+
+_PINNED_ARTIFACT_WRITING_GATED_TOOLS = (
+    "creek.compile",
+    "creek.draft",
+    "creek.journal",
+    "creek.mine",
+    "creek.report",
+    "creek.skills.refresh",
+    "creek.state.render",
+    "creek.upload",
+)
+"""The eight tools observed to write into the vault when layer (h) was written.
+
+Pinned in the ``_EXPECTED_TOOL_COUNT`` idiom, and for
+:func:`test_the_llm_backed_gated_set_is_pinned`'s reason: the derivation above
+answers "which ``GATED`` tools leave bytes in the vault today"; this answers
+"which ones did when the layer was written". The two disagreeing is news in
+either direction, and a ninth tool arriving as an ``unchecked`` name in
+somebody else's PR is a puzzle rather than a report.
+
+**Eight, not seven.** ``creek.mine`` was not on anyone's list and was found by
+running the derivation: it appends a ``compile-needed`` record to
+``creek.generate.compile_routing.COMPILE_GAPS_RELPATH`` on every routing miss.
+That is precisely the class of write a hand-list misses — no ``created_path``
+on the envelope, no mention in the tool's own docstring, and a file under
+``00-Creek-Meta/Processing-Log/`` that ``creek lint`` later reads back.
+"""
+
+
+def _artifact_probe_compile(vault: Path) -> _ArtifactEvidence:
+    """Observe what an **admitted** ``creek.compile`` leaves in the vault.
+
+    Args:
+        vault: A vault the observation may seed and write into.
+
+    Returns:
+        The compiled page and its re-run marker, with their text.
+    """
+    return _run_artifact_observation("creek.compile", vault)
+
+
+def _artifact_probe_journal(vault: Path) -> _ArtifactEvidence:
+    """Observe what an **admitted** ``creek.journal`` ingest leaves in the vault.
+
+    Args:
+        vault: A vault the observation may seed and write into.
+
+    Returns:
+        The fragment, the staged entry and the two ledgers, with their text.
+    """
+    return _run_artifact_observation("creek.journal", vault)
+
+
+def _artifact_probe_mine(vault: Path) -> _ArtifactEvidence:
+    """Observe the compile-gap record ``creek.mine`` appends on a routing miss.
+
+    Args:
+        vault: A vault the observation may seed and write into.
+
+    Returns:
+        The compile-gaps log, with its text.
+    """
+    return _run_artifact_observation("creek.mine", vault)
+
+
+def _artifact_probe_report(vault: Path) -> _ArtifactEvidence:
+    """Observe the tag garden and tag history ``creek.report`` writes.
+
+    Args:
+        vault: A vault the observation may seed and write into.
+
+    Returns:
+        Both report artifacts, with their text.
+    """
+    return _run_artifact_observation("creek.report", vault)
+
+
+def _artifact_probe_skills_refresh(vault: Path) -> _ArtifactEvidence:
+    """Observe the skill tree ``creek.skills.refresh`` writes.
+
+    Args:
+        vault: A vault the observation may seed and write into.
+
+    Returns:
+        Every generated skill file, with its text.
+    """
+    return _run_artifact_observation("creek.skills.refresh", vault)
+
+
+def _artifact_probe_state_render(vault: Path) -> _ArtifactEvidence:
+    """Observe the ISO-week report and ``latest.md`` ``creek.state.render`` writes.
+
+    Args:
+        vault: A vault the observation may seed and write into.
+
+    Returns:
+        Both state artifacts, with their text.
+    """
+    return _run_artifact_observation("creek.state.render", vault)
+
+
+def _artifact_probe_upload(vault: Path) -> _ArtifactEvidence:
+    """Observe what an **admitted** ``creek.upload`` leaves in the vault.
+
+    Args:
+        vault: A vault the observation may seed and write into.
+
+    Returns:
+        The fragment, the staged document and the two ledgers, with their text.
+    """
+    return _run_artifact_observation("creek.upload", vault)
+
+
+_ARTIFACT_PROBES: dict[str, Callable[[Path], _ArtifactEvidence]] = {
+    "creek.compile": _artifact_probe_compile,
+    "creek.journal": _artifact_probe_journal,
+    "creek.mine": _artifact_probe_mine,
+    "creek.report": _artifact_probe_report,
+    "creek.skills.refresh": _artifact_probe_skills_refresh,
+    "creek.state.render": _artifact_probe_state_render,
+    "creek.upload": _artifact_probe_upload,
+}
+"""Artifact-writing ``GATED`` tool → a callable that runs it and reads its bytes.
+
+The layer-(f) / layer-(g) counterpart on the third channel, and read by the same
+kind of forcing function. Each probe delegates to
+:func:`_run_artifact_observation` so no probe can invent its own snapshot
+boundary — the one thing this layer cannot afford to have drift per tool.
+"""
+
+_ARTIFACT_PROBE_EXEMPT: dict[str, str] = {
+    "creek.draft": (
+        "draft_tool DOES write a file — creek_mcp/tools/draft.py calls "
+        "generator.save_draft(draft, vault_path) and returns its relpath as "
+        "draft_path — so nothing about the write path is what excuses it, and "
+        "neither of this tool's other two exemptions transfers here. The "
+        "reason is that the shared sweep's assertion is the WRONG assertion "
+        "for this tool. Every other artifact probe asserts that no "
+        "above-ceiling sentinel reached the bytes; creek.draft's contract on "
+        "the content channel is routing, not exclusion — an above-ceiling "
+        "personal TITLE reaching a draft at ceiling=open is by design, "
+        "defended by routing the call to the more sensitive of the ceiling and "
+        "the sources' own tiers, and pinned as live behaviour by "
+        "tests/test_mcp_tools.py::"
+        "test_draft_prompt_carries_the_personal_title_at_an_open_ceiling. "
+        "Enrolling draft in the shared sweep would assert the opposite of its "
+        "own contract, and narrowing that contract to fit the sweep is an "
+        "owner decision, not a test-suite one. "
+        "test_the_draft_artifact_exemption_is_still_true executes this reason "
+        "rather than trusting it, and reads the saved file off disk to do it."
+    ),
+}
+"""Artifact-writing ``GATED`` tools whose bytes cannot be usefully asserted here.
+
+Kept separate from :data:`_PROBE_EXEMPT` and :data:`_PROMPT_PROBE_EXEMPT`
+deliberately, and the separation is the same one those two keep from each
+other. "The envelope carries no corpus text" and "the prompt carries no corpus
+text" are claims about two other channels; neither says anything about what
+landed on disk, and a tool can be honestly excused on both while writing the
+corpus into a file. A reason here has to be re-derived on this channel or it is
+an inherited claim wearing a new label.
+"""
+
+_ARTIFACT_PROBE_GUARDS: dict[str, str] = {
+    "creek.draft": "test_the_draft_artifact_exemption_is_still_true",
+}
+"""Layer-(h) exemption → the test that *executes* its stated reason.
+
+:data:`_PROBE_EXEMPT_GUARDS`' argument, on the third channel. A reason nobody
+runs is how ``creek.author``'s stayed false through every review it passed
+(#1279), and a registry entry naming something pytest never collects is the
+same defect one level down — which is why the value is resolved through
+:func:`_assert_registry_names_a_collected_test` rather than merely checked
+callable.
+"""
+
+_ARTIFACT_PROBE_CONTROLS: dict[str, str] = {
+    "creek.compile": (
+        "test_the_compile_artifact_probe_refuses_and_an_admitted_compile_writes"
+    ),
+    "creek.mine": "test_the_mine_artifact_probe_writes_a_routing_only_gap_record",
+    "creek.journal": (
+        "test_journal_probe_refuses_and_leaves_the_fragment_bytes_untouched"
+    ),
+    "creek.report": "test_report_probe_leaves_no_canary_in_the_artifact_it_writes",
+    "creek.skills.refresh": (
+        "test_skills_refresh_probe_leaves_no_canary_in_the_tree_it_writes"
+    ),
+    "creek.state.render": (
+        "test_state_render_probe_leaves_no_canary_in_the_artifact_it_writes"
+    ),
+    "creek.upload": (
+        "test_upload_probe_refuses_and_leaves_the_staged_document_untouched"
+    ),
+}
+"""Artifact-probed tool → the test that keeps its sweep case from being vacuous.
+
+:data:`_RUNTIME_PROBE_CONTROLS`' argument, on the third channel, and the
+counterpart of :data:`_ARTIFACT_PROBE_GUARDS` on the other side of the same
+choice: a tool is either excused — and then something must execute the excuse —
+or probed, and then something must execute the claim that the probe is worth
+running.
+
+Five of these are the tests that already existed when this layer was written.
+They are registered **by their existing names, unedited**: the point of layer
+(h) is not to rewrite five good tests, it is to make it impossible to delete
+one of them quietly. Registered by name rather than by reference for
+:data:`_PROBE_EXEMPT_GUARDS`' reason — a reference is satisfied by any
+callable, and the point is that a **collected test** runs.
+"""
+
+
+def test_every_gated_tool_has_an_artifact_observation() -> None:
+    """Every ``GATED`` tool has a recipe for being observed, writer or not.
+
+    The derivation cannot answer "which tools write" unless it is able to run
+    the ones that do not: a tool missing from :data:`_ARTIFACT_OBSERVATIONS`
+    would be absent from the derived set for the same reason a genuinely
+    read-only tool is, and the two are indistinguishable downstream. So the
+    manifest's completeness is forced before its contents are read.
+    """
+    observed = set(_ARTIFACT_OBSERVATIONS)
+    gated = set(_GATED_TOOLS)
+    missing = gated - observed
+    assert not missing, (
+        f"GATED tool(s) with no artifact observation: {sorted(missing)}. Add "
+        "an _ArtifactObservation for each: a `seed` that puts the tool in a "
+        "position to write, and a `call` that invokes it at an ADMITTING "
+        "ceiling. Without one the tool derives out of the artifact-writing "
+        "set by absence rather than by evidence, and layer (h) stops asking "
+        "it for anything."
+    )
+    stale = observed - gated
+    assert not stale, (
+        f"_ARTIFACT_OBSERVATIONS names non-GATED tool(s): {sorted(stale)}. "
+        "Delete the entry, or restore the tool's gate."
+    )
+
+
+def test_every_gated_tool_has_an_expected_artifact_status() -> None:
+    """Every observation declares, per tool, what a run that reached its end says.
+
+    The status map is what stops a degenerate observation narrowing the layer
+    in silence, so it is useless if a tool can be missing from it. Set-equal
+    against :data:`_GATED_TOOLS` in both directions, exactly as the observation
+    manifest above is.
+    """
+    assert set(_ARTIFACT_OBSERVATION_STATUS) == set(_GATED_TOOLS), (
+        "_ARTIFACT_OBSERVATION_STATUS and _GATED_TOOLS disagree. Declared: "
+        f"{sorted(_ARTIFACT_OBSERVATION_STATUS)}; gated: {sorted(_GATED_TOOLS)}."
+    )
+
+
+def test_the_artifact_writing_gated_set_is_pinned() -> None:
+    """The derived artifact-writing set is the eight tools layer (h) was built on.
+
+    The derivation is the load-bearing half of this layer, so it gets a pin of
+    its own — :func:`test_the_llm_backed_gated_set_is_pinned`'s argument, one
+    channel over. Without one a ninth artifact-writing tool would be enrolled
+    silently and surface only as an ``unchecked`` name in the forcing function
+    below: correct, but arriving as a puzzle in somebody else's PR.
+    """
+    derived = _derive_artifact_writing_gated_tools()
+    assert tuple(derived) == _PINNED_ARTIFACT_WRITING_GATED_TOOLS, (
+        "the set of GATED tools observed to write into the vault changed: add "
+        "the new tool to the pin AND give it an artifact probe or an exemption "
+        "re-derived on this channel. If a tool LEFT the set, find out why "
+        "before updating the pin — a tool that stopped writing is as likely to "
+        "be an observation that stopped reaching the write path. Derived "
+        f"{derived}, pinned {list(_PINNED_ARTIFACT_WRITING_GATED_TOOLS)}.\n\n"
+        f"Per-tool paths: {[list(w) for _t, w in _artifact_writes_by_tool()]}"
+    )
+
+
+def test_every_artifact_writing_gated_tool_is_artifact_probed_or_exempt() -> None:
+    """Each artifact-writing ``GATED`` tool is probed or exempt, never neither.
+
+    Layer (g)'s forcing function, moved one channel over, carrying the same
+    five assertions in the same order and for the same reasons. Non-emptiness
+    comes first because this set — like layer (g)'s and unlike layer (f)'s — is
+    *computed* rather than declared, so it can silently empty itself and turn
+    every remaining assertion here into a green statement about nothing. This
+    one can empty itself in one more way than layer (g)'s can: an observation
+    whose seed stops reaching the tool's write path observes no writes.
+
+    Disjointness and staleness are asserted for layer (f)'s reasons: a tool in
+    both dicts carries an exemption nobody reads, and an entry for a tool that
+    no longer belongs is a claim about nothing that inflates the apparent depth
+    of the layer.
+    """
+    probed = set(_ARTIFACT_PROBES)
+    exempt = set(_ARTIFACT_PROBE_EXEMPT)
+    writing = set(_derive_artifact_writing_gated_tools())
+    assert writing, (
+        "the artifact-writing GATED set derived EMPTY, so layer (h) is "
+        "guarding nothing while reporting green. The set is computed by "
+        "snapshotting a temporary vault around fourteen real tool calls, which "
+        "means it silently shrinks to [] if _ARTIFACT_OBSERVATIONS stops "
+        "seeding the tools into a position to write, or if the carve-outs in "
+        "_is_artifact_carve_out widen far enough to swallow real artifacts. "
+        "Repair the derivation; never pin around it."
+    )
+    both = probed & exempt
+    assert not both, (
+        f"tool(s) both artifact-probed and artifact-exempt: {sorted(both)}. An "
+        "exemption states that no artifact assertion is possible here; a probe "
+        "that makes one refutes it."
+    )
+    unchecked = writing - probed - exempt
+    assert not unchecked, (
+        "artifact-writing GATED tool(s) with no artifact probe and no "
+        f"exemption: {sorted(unchecked)}. Add a probe to _ARTIFACT_PROBES, or "
+        "record in _ARTIFACT_PROBE_EXEMPT the specific reason this tool's disk "
+        "artifact cannot be usefully asserted here. Layer (f)'s response probe "
+        "terminates at the envelope and layer (g)'s prompt probe terminates at "
+        "the wire; neither can see the bytes that landed in the vault. #968 "
+        "and #969 were both found on this channel."
+    )
+    stale = (probed | exempt) - writing
+    assert not stale, (
+        "_ARTIFACT_PROBES/_ARTIFACT_PROBE_EXEMPT name tool(s) that were not "
+        f"observed to write anything: {sorted(stale)}. Delete the entry, or "
+        "find out why the observation no longer sees that tool writing — a "
+        "seed that stopped reaching the write path looks exactly like a tool "
+        "that stopped writing."
+    )
+    assert (probed | exempt) == writing
+
+
+def test_creek_state_read_and_creek_wheel_derive_out_of_the_artifact_set() -> None:
+    """Two read-only tools derive OUT, and one of them is the layer's hardest case.
+
+    ``creek.wheel`` is the easy half and is here as the control: it counts
+    fragments and writes nothing, so a derivation that enrolled it would be
+    reporting on something other than writes.
+
+    ``creek.state.read`` is the whole reason :class:`_ArtifactObservation` has
+    two fields. Layer (f)'s ``_probe_state_read`` runs an admitting
+    ``state_render_tool`` **inside its own body**, because ``canary_vault``
+    holds no rendered report for the read to address. A layer-(h) observation
+    built by wrapping that probe — the obvious way to write this, and the way
+    that reuses the most code — would snapshot around both calls, attribute the
+    render's two files to the read, and enrol a tool that has no write
+    primitive anywhere in its module. It would do that on **defect-free code**,
+    which is the worst kind of false positive: one that arrives green-looking
+    as an "eight is now nine" pin failure and gets pinned around.
+
+    So the render lives in :func:`_seed_rendered_state_vault`, before the
+    snapshot, and this test is what says so in a way that fails if it ever
+    moves back.
+    """
+    writing = set(_derive_artifact_writing_gated_tools())
+    for tool in ("creek.state.read", "creek.wheel"):
+        assert tool in _ARTIFACT_OBSERVATIONS, (
+            f"{tool} is not observed at all, so its absence from the "
+            "artifact-writing set is evidence about nothing."
+        )
+        assert tool not in writing, (
+            f"{tool} derived INTO the artifact-writing set. Neither module "
+            "contains a write primitive, so this is an observation defect "
+            "rather than a discovery: check that everything the recipe needs "
+            "on disk is written by its `seed` and that its `call` invokes the "
+            "tool and nothing else. The known instance is _probe_state_read's "
+            "in-body state_render_tool(..., TierCeiling.ALL), which belongs to "
+            f"the seed here.\n\nDerived: {sorted(writing)}"
+        )
+
+
+def test_the_artifact_probe_exemption_set_is_pinned() -> None:
+    """Only ``creek.draft`` escapes layer (h) through the exemption hatch.
+
+    :func:`test_the_prompt_probe_exemption_set_is_pinned`'s argument, one
+    channel over. The forcing function above is satisfied by probing a tool
+    *or* excusing it, so it cannot tell the two apart: moving
+    ``creek.state.render`` out of :data:`_ARTIFACT_PROBES` and into
+    :data:`_ARTIFACT_PROBE_EXEMPT` with any sixty-character string containing
+    ``"state"`` would delete the probe over the artifact #969 leaked into and
+    leave every layer-(h) test green.
+    :func:`test_artifact_probe_exemptions_are_specific_to_their_tool` cannot
+    catch it either: it grades the prose, not the membership.
+    """
+    assert set(_ARTIFACT_PROBE_EXEMPT) == {"creek.draft"}, (
+        "the layer-(h) exemption set changed. Adding a tool here REMOVES the "
+        "only assertion that watches the bytes it leaves in the vault, so the "
+        "change needs the same scrutiny as deleting a test: state in the PR "
+        "why no artifact assertion can be made for it, and update this pin "
+        f"deliberately. Currently exempt: {sorted(_ARTIFACT_PROBE_EXEMPT)}."
+    )
+
+
+@pytest.mark.parametrize("tool", sorted(_ARTIFACT_PROBE_EXEMPT))
+def test_artifact_probe_exemptions_are_specific_to_their_tool(tool: str) -> None:
+    """An artifact-channel exemption names its tool and says something.
+
+    ``test_probe_exemptions_are_specific_to_their_tool``'s argument, applied to
+    the third manifest — and applied again rather than inherited, because that
+    test is parametrised over :data:`_PROBE_EXEMPT` and this one over
+    :data:`_ARTIFACT_PROBE_EXEMPT`; neither would ever look at the other's
+    entries. The module leaf rules out a reason copy-pasted from a sibling
+    channel, which is the specific failure mode this layer is most exposed to:
+    ``creek.draft`` is exempt on all three channels for three different
+    reasons, and two of them are wrong here.
+    """
+    reason = _ARTIFACT_PROBE_EXEMPT[tool]
+    module = TOOL_POSTURES[tool].gate_module
+    assert module is not None
+    leaf = module.rsplit(".", maxsplit=1)[-1]
+    assert leaf in reason, (
+        f"{tool}'s artifact-channel exemption never mentions {leaf!r}, the "
+        f"module it is excusing: {reason!r}. A reason that does not name the "
+        "tool cannot be checked against it."
+    )
+    assert len(reason) >= 60, (
+        f"{tool}'s artifact-channel exemption is too short to be a reason: "
+        f"{reason!r}. State what specifically makes this tool's disk artifact "
+        "unassertable here."
+    )
+    assert reason not in (
+        _PROBE_EXEMPT.get(tool),
+        _PROMPT_PROBE_EXEMPT.get(tool),
+    ), (
+        f"{tool}'s artifact-channel exemption is byte-identical to its "
+        "response-channel or prompt-channel one. Those are claims about what "
+        "the caller got back and about what crossed to the provider; neither "
+        "says anything about the bytes that landed in the vault. Re-derive the "
+        "reason on this channel or delete the entry and write a probe."
+    )
+
+
+def test_every_artifact_probe_exemption_has_an_executable_guard() -> None:
+    """Every layer-(h) exemption names a **collected test** that runs its reason.
+
+    :func:`test_every_response_probe_exemption_has_an_executable_guard`'s
+    argument, on the third channel, and the reason it is asserted in both
+    directions is #1279: a reason nobody executes is how ``creek.author``'s
+    stayed false through every review it passed, and a guard entry for a tool
+    that is no longer exempt is a claim about nothing.
+    """
+    assert set(_ARTIFACT_PROBE_GUARDS) == set(_ARTIFACT_PROBE_EXEMPT), (
+        "_ARTIFACT_PROBE_GUARDS and _ARTIFACT_PROBE_EXEMPT disagree. Guarded: "
+        f"{sorted(_ARTIFACT_PROBE_GUARDS)}; exempt: "
+        f"{sorted(_ARTIFACT_PROBE_EXEMPT)}. An exemption with no guard is a "
+        "claim nobody runs; a guard with no exemption runs a claim nobody "
+        "makes."
+    )
+    for tool, name in sorted(_ARTIFACT_PROBE_GUARDS.items()):
+        _assert_registry_names_a_collected_test("_ARTIFACT_PROBE_GUARDS", tool, name)
+
+
+def test_every_artifact_probe_has_a_registered_control() -> None:
+    """Every layer-(h) probe names a **collected test** that keeps it non-vacuous.
+
+    :func:`test_every_runtime_probe_has_a_registered_control`'s argument, on
+    the third channel. The shared sweep below is a tripwire by construction —
+    see its docstring — so for this layer the controls are not a supplement to
+    the evidence, they *are* the evidence, and a control silently deleted or
+    renamed would leave the sweep looking exactly as green as before.
+    """
+    assert set(_ARTIFACT_PROBE_CONTROLS) == set(_ARTIFACT_PROBES), (
+        "_ARTIFACT_PROBE_CONTROLS and _ARTIFACT_PROBES disagree. Controlled: "
+        f"{sorted(_ARTIFACT_PROBE_CONTROLS)}; probed: "
+        f"{sorted(_ARTIFACT_PROBES)}. A probe with no control is a sweep case "
+        "nothing proves is worth running; a control with no probe names a "
+        "sweep case that does not exist."
+    )
+    for tool, name in sorted(_ARTIFACT_PROBE_CONTROLS.items()):
+        _assert_registry_names_a_collected_test("_ARTIFACT_PROBE_CONTROLS", tool, name)
+
+
+@pytest.mark.parametrize("tool", sorted(_ARTIFACT_PROBES))
+def test_gated_tools_leak_no_above_ceiling_content_into_the_artifacts_they_write(
+    tool: str,
+    canary_vault: Path,
+) -> None:
+    """No above-ceiling sentinel reaches the bytes an admitted call left behind.
+
+    **This sweep is a tripwire, not the evidence, and saying so is the point.**
+    The dangerous failure of a canary layer is not a red probe — it is a green
+    one taken for a broader guarantee than it makes, which is the register
+    :func:`_probe_skills_refresh` and :func:`_probe_classify_entry` already
+    use. Two facts bound what a green here means:
+
+    * The only above-ceiling sentinel in :func:`canary_vault` is
+      :data:`_RUNTIME_INTIMATE_CANARY`, and ``intimate`` is the cheap tier —
+      every path in this repo drops it. For ``creek.skills.refresh``
+      specifically, ``_is_snapshot_fragment``'s ``allow_intimate=False``
+      hardcode excluded it *before* the ceiling gate existed, so its absence
+      here is not evidence the ceiling is enforced at all. The tier that
+      matters is ``personal``, and the fixture deliberately holds none: it is
+      **not** extended, because ten other probes assert exact tallies over it.
+    * Three of the seven artifacts are structurally content-free at HEAD.
+      ``creek.mine``'s compile-gap record is five routing fields;
+      ``creek.journal``'s and ``creek.upload``'s admitted creations contain the
+      caller's own text. A sentinel could not appear in them today however
+      broken the gate was.
+
+    What the sweep does buy is the thing the per-tool tests cannot: it is
+    **forced**. Every tool the derivation observes writing gets a case here
+    without anyone remembering to write one, and it is a live tripwire against
+    a future artifact shape that *does* carry corpus text. The weight is
+    carried by :data:`_ARTIFACT_PROBE_CONTROLS`, whose registration is itself
+    forced by :func:`test_every_artifact_probe_has_a_registered_control`.
+    """
+    evidence = _ARTIFACT_PROBES[tool](canary_vault)
+    assert evidence.tool == tool, (
+        f"_ARTIFACT_PROBES[{tool!r}] ran an observation for "
+        f"{evidence.tool!r}. The registry key and the tool the probe body "
+        "names have drifted, so this case is asserting over the wrong tool's "
+        "artifact and some other tool's case is running twice."
+    )
+    assert evidence.written, (
+        f"{tool} wrote nothing during its artifact probe, so the exclusion "
+        "below holds over an empty byte range. It was derived INTO the "
+        "artifact-writing set from a temporary vault, so a fixture-shaped "
+        f"difference is the first thing to check.\n\n{evidence.response}"
+    )
+    assert _RUNTIME_INTIMATE_CANARY not in evidence.blob, (
+        f"{tool} wrote an intimate fragment's sentinel into "
+        f"{list(evidence.written)} at privacy_tier_ceiling=open. The response "
+        "envelope and the prompt are both clean on this call — layers (f) and "
+        "(g) could not have caught it, and #968 and #969 were both exactly "
+        f"this.\n\n{evidence.blob}"
+    )
+
+
+def test_the_artifact_sweep_collects_one_case_per_probe() -> None:
+    """The sweep's parametrisation is non-empty and covers every probe.
+
+    An emptied or narrowed ``parametrize`` list collects nothing and reads as a
+    fast green: the sweep above would disappear from the run while every
+    surrounding test kept passing, which is the same silent-narrowing failure
+    :data:`_ARTIFACT_OBSERVATION_STATUS` exists to refuse one level up. So the
+    argument list is read back off the mark and asserted.
+    """
+    # Annotated Any because the subject is already decorated: mypy sees the
+    # parametrize wrapper's type, which has no ``pytestmark``, while pytest
+    # attaches the attribute at decoration time.
+    sweep: Any = (
+        test_gated_tools_leak_no_above_ceiling_content_into_the_artifacts_they_write
+    )
+    parametrised = [
+        mark.args[1] for mark in sweep.pytestmark if mark.name == "parametrize"
+    ]
+    assert len(parametrised) == 1, (
+        "the artifact sweep no longer carries exactly one parametrize mark: "
+        f"{parametrised}. This test reads the case list off that mark."
+    )
+    cases = parametrised[0]
+    assert cases, (
+        "the artifact sweep's parametrize list is EMPTY, so it collects zero "
+        "cases and reports a fast green. Repair the list; never delete this "
+        "assertion."
+    )
+    assert list(cases) == sorted(_ARTIFACT_PROBES), (
+        f"the artifact sweep runs over {list(cases)} but _ARTIFACT_PROBES "
+        f"holds {sorted(_ARTIFACT_PROBES)}. A probe registered but not swept "
+        "satisfies the forcing function without ever being run."
+    )
+
+
+_COMPILE_GAP_RECORD_KEYS = frozenset(
+    {"timestamp", "target_kind", "target_id", "surfaced_by", "reason"}
+)
+"""Every key ``creek.generate.compile_routing.log_compile_gap`` writes today.
+
+Pinned, and the pin is what makes ``creek.mine``'s sweep case a live tripwire
+rather than a green statement about nothing. The record is routing metadata —
+no title, no body, no fragment id — so today no sentinel could reach it however
+broken the gate was. The day a field carrying corpus text is added, this set
+changes, this test says so, and the exclusion in the shared sweep stops being
+vacuous. Asserting the shape is the only way to know which of those two worlds
+the suite is in.
+"""
+
+
+def test_the_compile_artifact_probe_refuses_and_an_admitted_compile_writes(
+    canary_vault: Path,
+) -> None:
+    """A refused compile writes nothing; an admitted one writes page and marker.
+
+    **Read the two halves for what each is worth, because they are not worth
+    the same thing.**
+
+    The refusal half restates evidence that already exists, unregistered, in
+    another file: ``tests/test_mcp_write_tools.py`` asserts on three separate
+    refusal paths that neither the thread page, nor the paradox log, nor
+    ``00-Creek-Meta/audit/compile-<id>.hash`` exists afterwards. This test does
+    not discover that, and no mutation of compile's gate is isolating to it —
+    every such mutation reddens one of those three first, and neutralising the
+    gate additionally reddens layer (f)'s
+    :func:`test_compile_probe_refuses_rather_than_merely_staying_quiet`. What
+    layer (h) adds on that half is **registration**: until this entry existed
+    in :data:`_ARTIFACT_PROBES`, deleting all three of those assertions left
+    this file — and this layer — entirely green.
+
+    The admitting half is genuinely new. Nothing anywhere asserted that an
+    *accepted* compile writes its re-run marker, so the three ``assert not
+    ... .hash.exists()`` in ``test_mcp_write_tools.py`` were unpaired: a
+    compile that stopped writing the marker altogether would have satisfied all
+    three. It is asserted here because the marker is what
+    ``compile.py``'s pre-hash short circuit reads, and because it is the reason
+    :func:`_is_artifact_carve_out` carves the audit **file** and not the audit
+    **directory** — a directory-shaped carve-out drops the marker out of the
+    observation and this assertion is what notices.
+
+    The refusal runs **first**, on a vault where the page does not yet exist,
+    so the byte-snapshot equality is a real inequality rather than a comparison
+    of two identical compiles.
+
+    Finally, the exclusion below is weak for this tool and that is recorded
+    rather than left for a reader to assume otherwise, in the register
+    :func:`_prompt_probe_compile`'s docstring uses: ``compile_tool`` loads only
+    the ids its caller names, so the intimate fragment in this fixture is never
+    a candidate for the admitted call.
+    """
+    before = _vault_digest(canary_vault)
+    refused = _probe_compile(canary_vault)
+    assert refused["status"] == "refused", (
+        "creek.compile did not refuse an intimate fragment id at "
+        f"privacy_tier_ceiling=open, so the byte comparison below is not "
+        f"about a refusal at all.\n\n{refused}"
+    )
+    assert _vault_digest(canary_vault) == before, (
+        "creek.compile's refusal still changed bytes in the vault. A refusal "
+        "returned above the write writes nothing; one returned below it "
+        "leaves a compiled page, or a re-run marker asserting a page that "
+        "should not exist."
+    )
+
+    evidence = _artifact_probe_compile(canary_vault)
+    assert evidence.response["status"] == "ok", (
+        "the admitted compile did not succeed, so the positive control below "
+        f"asserts nothing.\n\n{evidence.response}"
+    )
+    marker = (
+        _ARTIFACT_COMPILE_MARKER_RELDIR / f"compile-{_ARTIFACT_COMPILE_TARGET_ID}.hash"
+    )
+    assert str(marker) in evidence.written, (
+        "an admitted creek.compile wrote no re-run marker at "
+        f"{marker}. The three 'assert not ... .hash.exists()' assertions in "
+        "tests/test_mcp_write_tools.py are unpaired without this one: a "
+        "compile that stopped writing the marker entirely would satisfy all "
+        f"three of them.\n\nWrote: {list(evidence.written)}"
+    )
+    assert evidence.response["compiled_path"] in evidence.written, (
+        "an admitted creek.compile reported a compiled_path it did not write: "
+        f"{evidence.response['compiled_path']!r} is not in "
+        f"{list(evidence.written)}."
+    )
+    assert _RUNTIME_INTIMATE_CANARY not in evidence.blob, (
+        "an admitted creek.compile of the OPEN fragment put the intimate "
+        f"sentinel in {list(evidence.written)}.\n\n{evidence.blob}"
+    )
+
+
+def test_the_mine_artifact_probe_writes_a_routing_only_gap_record(
+    canary_vault: Path,
+) -> None:
+    """``creek.mine``'s artifact is a compile-gap record, and it is routing-only.
+
+    ``creek.mine`` was not on anybody's list of artifact-writing tools. It was
+    found by running the derivation, which is the argument for deriving the set
+    rather than writing it down: the write has no ``created_path`` on the
+    envelope, no mention in the tool's own docstring, and lands in a file under
+    ``00-Creek-Meta/Processing-Log/`` that ``creek lint`` reads back later.
+
+    The exclusion is a tripwire and the **shape assertion is the real content
+    of this control**. ``log_compile_gap`` writes five routing fields —
+    timestamp, target kind, target id, the verb that surfaced it, and a
+    reason — and none of them is corpus text, so no sentinel could reach this
+    file today however broken the ceiling was. Asserting the key set is what
+    turns that from an assumption into a dated fact: add a field carrying a
+    fragment title and this test says so, at which point the exclusion in the
+    shared sweep starts meaning something and this docstring stops being true.
+    """
+    evidence = _artifact_probe_mine(canary_vault)
+    assert evidence.response["status"] == "ok", (
+        f"creek.mine did not mine on the canary fixture.\n\n{evidence.response}"
+    )
+    assert evidence.written == (str(COMPILE_GAPS_RELPATH),), (
+        "creek.mine's artifact set changed. It was one file — the compile-gaps "
+        "log — when this control was written; anything else here is a new "
+        f"write path that needs its own assertion.\n\n{list(evidence.written)}"
+    )
+    records = [json.loads(line) for line in evidence.blob.splitlines() if line.strip()]
+    assert records, (
+        "creek.mine wrote an empty compile-gaps log, so every assertion below "
+        "holds over nothing."
+    )
+    for record in records:
+        assert set(record) == _COMPILE_GAP_RECORD_KEYS, (
+            "a compile-gap record's fields changed: "
+            f"{sorted(record)} vs {sorted(_COMPILE_GAP_RECORD_KEYS)}. This "
+            "file is asserted to be routing-only, which is the whole reason "
+            "its sweep case is honestly labelled a tripwire. A new field may "
+            "carry corpus text — re-read the sweep's docstring and decide "
+            "whether this tool now needs a real content assertion."
+        )
+    assert _RUNTIME_INTIMATE_CANARY not in evidence.blob, (
+        "an intimate fragment's sentinel reached the compile-gaps log at "
+        f"privacy_tier_ceiling=open.\n\n{evidence.blob}"
+    )
+
+
+def test_the_draft_artifact_exemption_is_still_true(canary_vault: Path) -> None:
+    """``creek.draft``'s layer-(h) exemption is executed, not taken on trust.
+
+    The third guard for the third channel, and it has to be written again
+    rather than inherited for the reason
+    :func:`test_the_draft_response_exemption_is_still_true` gives about the
+    second: the three exemptions are claims about three different channels, and
+    two of the three reasons are simply not true here. Draft's response carries
+    no corpus text and its prompt carries no corpus text — but it **writes a
+    file**, and the file is the one artifact in this repo that nothing anywhere
+    reads back.
+
+    Run over :func:`canary_vault`, never :func:`prompt_canary_vault`, for
+    ``:4133``'s reason: a guard for one layer's exemption run on another
+    layer's corpus would go on agreeing after the two stopped.
+
+    What is asserted is the reason's stated *cause*: that draft succeeds (so
+    the guard is on the path the exemption describes rather than on a crash),
+    that the ontology-tuple fallback is the strategy that fired, that the seed
+    cites no corpus fragment, and then — the load-bearing clause, and the only
+    assertion in this whole layer that nothing anywhere else duplicates — that
+    the **open** canary is absent from the bytes at ``draft_path``. The open
+    one, not the gated ones: asserting only that above-ceiling sentinels are
+    missing would leave the exemption green on the day draft starts writing
+    corpus text into the file, which is the day it stops being true and starts
+    needing a real probe.
+
+    When this goes red the fix is never to edit the reason. It is to delete the
+    entry from :data:`_ARTIFACT_PROBE_EXEMPT` and write ``_artifact_probe_draft``
+    — and to decide, deliberately and with the owner, what a draft artifact
+    assertion should say given that draft's content contract is routing rather
+    than exclusion.
+    """
+    evidence = _run_artifact_observation("creek.draft", canary_vault)
+    response = evidence.response
+    assert response["status"] == "ok", (
+        "creek.draft did not draft on the layer-(f) canary fixture, so this "
+        "guard is asserting over a path the exemption does not describe.\n\n"
+        f"{response}"
+    )
+    assert response["idea_strategy"] == MiningStrategy.UNEXPLORED_ONTOLOGY.value, (
+        "creek.draft drafted from a strategy other than unexplored-ontology: "
+        f"{response['idea_strategy']!r}. The exemption rests on the "
+        "ontology-tuple seed being the only one this fixture can produce."
+    )
+    assert response["source_fragments"] == [], (
+        "creek.draft's seed now cites corpus fragments: "
+        f"{response['source_fragments']}. Delete the exemption from "
+        "_ARTIFACT_PROBE_EXEMPT and write a real artifact probe."
+    )
+    draft_path = canary_vault / response["draft_path"]
+    assert draft_path.is_file(), (
+        "creek.draft reported a draft_path that is not a file: "
+        f"{response['draft_path']!r}. Every assertion below reads that file."
+    )
+    saved = draft_path.read_text(encoding="utf-8")
+    assert saved.strip(), (
+        "creek.draft saved an empty file, so the exclusions below hold over "
+        "no bytes at all."
+    )
+    for canary in (_RUNTIME_OPEN_CANARY, _RUNTIME_INTIMATE_CANARY):
+        assert canary not in saved, (
+            f"the file creek.draft saved to {response['draft_path']} now "
+            f"carries {canary!r}. The exemption's claim is that no corpus text "
+            "of ANY tier reaches this artifact — which is the whole reason a "
+            "canary assertion over it would be vacuous — and it is no longer "
+            "true. Delete the exemption from _ARTIFACT_PROBE_EXEMPT and add a "
+            f"probe to _ARTIFACT_PROBES.\n\n{saved}"
+        )
+
+
+def test_creek_lint_is_deliberately_outside_the_layer_h_derivation() -> None:
+    """``creek.lint``'s absence from the artifact manifest is asserted, not assumed.
+
+    Mirrors :func:`test_creek_classify_is_deliberately_outside_the_layer_g_derivation`
+    by asserting the *reason* rather than the bare absence, and it is the
+    sharpest known residual on this channel, so it is named rather than left to
+    be noticed. ``creek.lint`` writes a markdown report under
+    ``00-Creek-Meta/Processing-Log/`` that **does** embed above-ceiling titles
+    and tag names, and its tags check deliberately surveys the whole vault at
+    ``PrivacyTierOverride.ALL``. That is not a gap this issue closes: the tool
+    is ``METADATA_ONLY``, so it is outside ``_GATED_TOOLS`` and outside every
+    layer here, and #969 closed the hole at the *serving* boundary instead —
+    ``creek state`` renders the section only at ``ceiling=intimate`` or broader
+    and escalates its own tier stamp when it does.
+
+    Widening this layer's derivation to reach ``creek.lint`` would be a real
+    change of scope with a real design question attached (what a per-row
+    tierable Processing-Log report would even look like), and it must not
+    happen as a side effect of somebody adding a tool to a dict.
+    """
+    assert "creek.lint" not in _GATED_TOOLS, (
+        "creek.lint has entered _GATED_TOOLS, so it is now inside layer (h)'s "
+        "candidate set and needs an _ArtifactObservation. Note what it writes "
+        "before writing one: its Processing-Log report embeds above-ceiling "
+        "titles and tag names by design, so the shared sweep's exclusion is "
+        "the WRONG assertion for it and would fail on correct behaviour."
+    )
+    assert TOOL_POSTURES["creek.lint"].posture is ReadPosture.METADATA_ONLY, (
+        "the reason for creek.lint's exclusion has changed: the posture is no "
+        "longer METADATA_ONLY. _GATED_TOOLS is derived from posture is GATED, "
+        "so re-check which side of this layer the tool is now on."
+    )
+    assert "Processing-Log" in TOOL_POSTURES["creek.lint"].rationale, (
+        "creek.lint's manifest rationale no longer records that its "
+        "Processing-Log report embeds above-ceiling titles and tag names. That "
+        "sentence is the residual this exclusion is deliberately leaving open "
+        "(read_gate.py's creek.lint entry); if it has been removed, find out "
+        "whether the behaviour changed or only the documentation did."
+    )
+
+
+def test_creek_classify_is_deliberately_outside_the_layer_h_derivation() -> None:
+    """``creek.classify``'s absence from the artifact manifest is asserted, not assumed.
+
+    One test per excluded tool, mirroring
+    :func:`test_creek_classify_is_deliberately_outside_the_layer_g_derivation`:
+    folding the two exclusions into one test would let a single failing reason
+    mask the other tool's status entirely.
+
+    ``creek.classify`` rewrites fragment front matter in place, which is a
+    write — but it is ``METADATA_ONLY`` and therefore outside ``_GATED_TOOLS``,
+    and its egress is already recorded on a different channel: the intimate
+    body legitimately reaches the LOCAL prompt, pinned by
+    ``_CLASSIFY_PROMPT_CHANNEL_RATIONALE`` and executed by
+    :func:`test_classify_hands_every_tier_to_the_provider_its_router_resolves`.
+    Enrolling it here would hand it the shared sweep's exclusion, which is the
+    opposite of its contract, exactly as layer (g) records.
+    """
+    assert "creek.classify" not in _GATED_TOOLS, (
+        "creek.classify has entered _GATED_TOOLS and would now be asked for an "
+        "_ArtifactObservation. It must NOT inherit the shared artifact sweep: "
+        "that assertion excludes above-ceiling sentinels from the bytes a tool "
+        "writes, and classify legitimately stamps the tier it resolved onto "
+        "the fragment it read. Reconcile the two contracts deliberately "
+        "(#1274)."
+    )
+    assert TOOL_POSTURES["creek.classify"].posture is ReadPosture.METADATA_ONLY, (
+        "the reason for creek.classify's exclusion has changed: the posture is "
+        "no longer METADATA_ONLY. _GATED_TOOLS is derived from posture is "
+        "GATED, so a METADATA_ONLY tool never enters layer (h)'s candidate "
+        "set; if classify is now GATED it needs a real gate call site and an "
+        "artifact decision of its own (#1274)."
     )
