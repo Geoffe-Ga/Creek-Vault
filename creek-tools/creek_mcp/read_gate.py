@@ -142,16 +142,31 @@ rather than per tool. Named on that axis, the surface is:
    ``_PROMPT_PROBE_EXEMPT``, over a set derived from the tools' own
    signatures. Forced the same way, plus a non-emptiness assertion on the
    derivation, since a derived set can silently empty itself.
-3. **Disk artifacts** — covered per tool, and **not forced**.
+3. **Disk artifacts** — layer (h), driven off ``_ARTIFACT_PROBES`` /
+   ``_ARTIFACT_PROBE_EXEMPT`` over a set derived by **observation**: every
+   ``GATED`` tool is called at an admitting ceiling against a throwaway vault
+   and the ones that changed a non-bookkeeping file are the subject set.
+   Forced the same way (f) and (g) are, plus the non-emptiness assertion (g)
+   needs, because a derived set can silently empty itself. Until **#1273**
+   this channel was covered per tool and **not forced**:
    ``test_report_probe_leaves_no_canary_in_the_artifact_it_writes``,
    ``test_state_render_probe_leaves_no_canary_in_the_artifact_it_writes``,
+   ``test_skills_refresh_probe_leaves_no_canary_in_the_tree_it_writes``,
    ``test_journal_probe_refuses_and_leaves_the_fragment_bytes_untouched`` and
-   ``test_upload_probe_refuses_and_leaves_the_staged_document_untouched`` are
-   four good ideas, and nothing obliges the fifth artifact-writing tool to
-   grow a fifth. That gap is deliberately **out of scope here** and split to
-   **#1273** rather than left implied: #968 and #969 were both found on this
-   channel, so it is simultaneously the channel with the worst track record
-   and the only one with no forcing function.
+   ``test_upload_probe_refuses_and_leaves_the_staged_document_untouched`` were
+   five good ideas, and nothing obliged the sixth artifact-writing tool to
+   grow a sixth. Those five are unchanged; what (h) adds is that none of them
+   can be deleted quietly, and that a newly artifact-writing tool must grow a
+   probe or record an exemption whose reason is *re-derived on this channel*
+   and *executed* by a named test. Read what it does and does not buy per
+   tool: ``creek.compile``'s refuse-shaped evidence already existed,
+   unregistered, in ``tests/test_mcp_write_tools.py``, so (h) contributes its
+   registration plus the previously-absent positive control that an admitted
+   compile writes its re-run marker — not new detection. The derivation also
+   found an eighth writer nobody had listed, ``creek.mine``, whose
+   compile-gap record is asserted routing-only. #968 and #969 were both found
+   on this channel, so it was simultaneously the channel with the worst track
+   record and the only one with no forcing function.
 
 **Scope item 4 of #1036 — a second gate pair on :class:`ToolPosture` — is
 decided NO.** ``creek.reflect``'s rationale names two gates while the
