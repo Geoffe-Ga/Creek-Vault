@@ -6362,6 +6362,28 @@ The layer-(f) / layer-(g) counterpart on the third channel, and read by the same
 kind of forcing function. Each probe delegates to
 :func:`_run_artifact_observation` so no probe can invent its own snapshot
 boundary — the one thing this layer cannot afford to have drift per tool.
+
+**Two artifact shapes are represented here, and they carry different weight.**
+
+* **Exclude-shaped** — the call succeeds, an artifact is written, and no
+  above-ceiling sentinel is in its bytes. That assertion is worth nothing on
+  its own, so each of these is paired with a positive control asserting the
+  artifact is non-empty and carries the *admitted* canary: a gate broken in
+  the drop-everything direction writes a leak-free, useless file and would
+  satisfy every exclusion. ``creek.report`` (#968), ``creek.state.render``
+  (#969) and ``creek.skills.refresh`` (#971) are this shape, and their
+  controls are the three tests that already existed.
+* **Refuse-shaped** — the call is refused and the vault's bytes are
+  **identical across it**, paired *in the same test* with an admitting call
+  that must produce exactly those bytes. Without the admitting half a tool
+  that stopped writing altogether would satisfy the refusal half forever.
+  ``creek.journal`` (#970), ``creek.upload`` (#1023) and ``creek.compile``
+  are this shape.
+
+``creek.mine`` is neither: its artifact is a routing-only record with no
+corpus text in it at all, so its control asserts the record's *field set*
+rather than its content — see
+:func:`test_the_mine_artifact_probe_writes_a_routing_only_gap_record`.
 """
 
 _ARTIFACT_PROBE_EXEMPT: dict[str, str] = {
