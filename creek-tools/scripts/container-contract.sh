@@ -17,6 +17,12 @@ chmod 0755 "$TMP_ROOT"
 cleanup() {
     docker rm --force "$NAME_A" "$NAME_B" >/dev/null 2>&1 || true
     docker volume rm --force "$VOLUME_A" "$VOLUME_B" >/dev/null 2>&1 || true
+    if [[ -d "$TMP_ROOT" ]]; then
+        docker run --rm --user 0:0 \
+            --mount "type=bind,src=$TMP_ROOT,dst=/cleanup" \
+            --entrypoint /bin/chmod "$IMAGE" -R 0777 /cleanup \
+            >/dev/null 2>&1 || true
+    fi
     rm -rf "$TMP_ROOT"
 }
 trap cleanup EXIT
@@ -38,7 +44,13 @@ make_inputs() {
         -out "$root/secrets/tls.crt" \
         -days 1 -subj '/CN=127.0.0.1' \
         -addext 'subjectAltName=IP:127.0.0.1' >/dev/null 2>&1
-    chmod 0444 "$root/secrets"/*
+    docker run --rm --user 0:0 \
+        --mount "type=bind,src=$root/secrets,dst=/run/secrets" \
+        --entrypoint /bin/sh "$IMAGE" \
+        -c 'chown -R 10001:10001 /run/secrets &&
+            chmod 0511 /run/secrets &&
+            chmod 0400 /run/secrets/creek_consumer_tokens /run/secrets/bad_tokens /run/secrets/tls.key &&
+            chmod 0444 /run/secrets/tls.crt'
 }
 
 start_container() {

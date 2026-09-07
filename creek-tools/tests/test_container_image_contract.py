@@ -97,6 +97,20 @@ def test_contract_uses_managed_volumes_and_linux_traversable_secret_root() -> No
     assert "docker volume rm --force" in script
 
 
+def test_runbook_and_contract_grant_only_the_image_uid_secret_access() -> None:
+    """The documented golden path must work without world-readable secrets."""
+    doc = DOC.read_text(encoding="utf-8")
+    script = CONTRACT_SCRIPT.read_text(encoding="utf-8")
+
+    assert "chown -R 10001:10001 ./run-secrets" in doc
+    assert "chmod 0511 ./run-secrets" in doc
+    assert "chmod 0400" in doc
+    assert "--user 0:0" in script
+    assert "chown -R 10001:10001 /run/secrets" in script
+    assert "chmod 0400" in script
+    assert 'chmod 0444 "$root/secrets"/*' not in script
+
+
 def test_http_api_cold_import_does_not_require_the_optional_author_stack() -> None:
     """The base API image must start without importing optional NumPy code."""
     code = """

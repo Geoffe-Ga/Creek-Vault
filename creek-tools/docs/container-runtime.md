@@ -38,9 +38,19 @@ openssl rand -base64 48 | sed 's/^/adepthood=/' > ./run-secrets/creek_consumer_t
 openssl req -x509 -newkey rsa:3072 -nodes \
   -keyout ./run-secrets/tls.key -out ./run-secrets/tls.crt \
   -days 30 -subj '/CN=127.0.0.1' -addext 'subjectAltName=IP:127.0.0.1'
-chmod 0400 ./run-secrets/creek_consumer_tokens ./run-secrets/tls.key
-chmod 0444 ./run-secrets/tls.crt
+sudo chown -R 10001:10001 ./run-secrets
+sudo chmod 0511 ./run-secrets
+sudo chmod 0400 ./run-secrets/creek_consumer_tokens ./run-secrets/tls.key
+sudo chmod 0444 ./run-secrets/tls.crt
 ```
+
+The image runs as UID/GID `10001:10001`. Bind mounts retain host ownership, so
+the `chown` step is required: owner-only mode `0400` is secure and readable by
+the container only when UID 10001 owns the file. Directory mode `0511` lets an
+operator pass the public certificate to `curl` by its known name without
+allowing directory listing; the bearer registry and private key remain
+owner-only. Apply equivalent ownership and permissions when a secret manager
+materializes these files.
 
 The token file uses Creek's existing registry format:
 `consumer=current-token`. During rotation, two tokens for that same consumer
