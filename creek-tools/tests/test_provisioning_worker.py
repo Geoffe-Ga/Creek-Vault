@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from creek_mcp.provisioning.driver import ProviderAllocation
+    from creek_mcp.provisioning.models import ProvisioningJob
 
 _NOW = datetime(2026, 9, 6, 13, tzinfo=UTC)
 
@@ -225,12 +226,11 @@ def test_delete_racing_create_suppresses_the_stale_credential_handoff(
 
         def provision(
             self,
-            job_id: str,
-            consumer_identity: str,
+            job: ProvisioningJob,
         ) -> ProviderAllocation:
             self.started.set()
             assert self.release.wait(timeout=5)
-            return super().provision(job_id, consumer_identity)
+            return super().provision(job)
 
     job = store.submit("activation-delete-race", "adepthood", now=_NOW)
     driver = BlockingDriver()
@@ -269,10 +269,9 @@ def test_provider_failure_after_delete_loses_lease_without_escaping_worker(
 
         def provision(
             self,
-            job_id: str,
-            consumer_identity: str,
+            job: ProvisioningJob,
         ) -> ProviderAllocation:
-            del job_id, consumer_identity
+            del job
             self.started.set()
             assert self.release.wait(timeout=5)
             raise ProviderError(
