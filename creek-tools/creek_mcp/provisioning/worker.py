@@ -116,13 +116,21 @@ class ProvisioningWorker:
         now: datetime | None,
     ) -> None:
         """Persist and log only the stable, content-free failure classification."""
-        self._store.record_failure(
-            job_id,
-            lease_token,
-            reason,
-            retryable=retryable,
-            now=now,
-        )
+        try:
+            self._store.record_failure(
+                job_id,
+                lease_token,
+                reason,
+                retryable=retryable,
+                now=now,
+            )
+        except LostJobLeaseError:
+            _LOGGER.info(
+                "provisioning failure discarded after lease loss job_id=%s reason=%s",
+                job_id,
+                reason.value,
+            )
+            return
         _LOGGER.info(
             "provisioning job failed job_id=%s reason=%s retryable=%s",
             job_id,

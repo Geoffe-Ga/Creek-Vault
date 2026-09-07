@@ -254,6 +254,48 @@ def test_delete_racing_create_suppresses_the_stale_credential_handoff(
     assert driver.delete_count == 1
 
 
+def test_provider_failure_after_delete_loses_lease_without_escaping_worker(
+    store: ProvisioningStore,
+) -> None:
+    """A failure settlement that loses a delete race is stale, not a worker crash."""
+
+    class BlockingFailingDriver(FakeProviderDriver):
+        """Pause after claim, then fail after deletion has revoked the lease."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = Event()
+            self.release = Event()
+
+        def provision(
+            self,
+            job_id: str,
+            consumer_identity: str,
+        ) -> ProviderAllocation:
+            del job_id, consumer_identity
+            self.started.set()
+            assert self.release.wait(timeout=5)
+            raise ProviderError(
+                FailureReason.PROVIDER_UNAVAILABLE,
+                retryable=True,
+            )
+
+    job = store.submit("activation-delete-failure-race", "adepthood", now=_NOW)
+    driver = BlockingFailingDriver()
+    worker = ProvisioningWorker(store, driver, FakeOneTimeHandoff())
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(worker.run_once, now=_NOW)
+        assert driver.started.wait(timeout=5)
+        store.request_delete(job.job_id, "adepthood", now=_NOW)
+        driver.release.set()
+        assert future.result(timeout=5) is True
+
+    deleting = store.get(job.job_id, "adepthood")
+    assert deleting is not None
+    assert deleting.state is JobState.DELETING
+    assert deleting.failure_reason is None
+
+
 def test_delete_calls_the_driver_once_and_finishes_idempotently(
     store: ProvisioningStore,
 ) -> None:
