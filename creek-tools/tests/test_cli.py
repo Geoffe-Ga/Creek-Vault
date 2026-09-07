@@ -3288,7 +3288,7 @@ def test_report_voice_rewrites_the_summary_of_an_emptied_register(
     # A second register keeps the run itself non-empty, so this test cannot
     # pass by way of the command doing nothing at all.
     _write_voice_fragment(vault, "frag-ctl", tier="open")
-    secret_title = "My affair with the neighbour"
+    secret_title = "My affair with the neighbour"  # pragma: allowlist secret
     _write_voice_fragment(
         vault,
         "frag-secret",
@@ -3975,7 +3975,7 @@ def test_process_reports_a_consent_log_that_breaks_mid_run(
     assert calls["n"] > 1, "the pipeline never re-read the consent log"
     assert result.exit_code == 1
     assert isinstance(result.exception, SystemExit)
-    output = _strip_ansi(result.output).replace("\n", "")
+    output = " ".join(_strip_ansi(result.output).split())
     assert "Consent log unavailable" in output
     assert "disk went away" in output
 
