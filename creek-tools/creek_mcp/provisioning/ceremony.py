@@ -319,12 +319,12 @@ class KeyCeremonyService:
     def complete(
         self,
         job_id: str,
-        consumer_identity: str,
+        requester_identity: str,
         submission: CeremonySubmission,
         now: datetime,
     ) -> ProvisioningJob:
         """Complete an ordinary or verified-attested key ceremony idempotently."""
-        challenge = self._store.get_key_ceremony(job_id, consumer_identity)
+        challenge = self._store.get_key_ceremony(job_id, requester_identity)
         before_settle, attested = self._release_gate(
             job_id,
             challenge,
@@ -333,7 +333,7 @@ class KeyCeremonyService:
         )
         return self._store.complete_key_ceremony(
             job_id,
-            consumer_identity,
+            requester_identity,
             submission,
             attested_confidential=attested,
             before_settle=before_settle,

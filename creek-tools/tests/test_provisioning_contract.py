@@ -121,6 +121,8 @@ def test_authentication_contract_is_backend_only_and_file_mounted() -> None:
         "never returned to browser",
         "mounted file",
         "one-time handoff",
+        "requester identity",
+        "requester's namespace",
         "tls",
     ):
         assert phrase in text

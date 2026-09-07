@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from starlette.testclient import TestClient
@@ -52,13 +52,16 @@ def _submit(
     token: str = _TOKEN,
 ) -> Response:
     """Submit one activation request through the public API."""
-    return client.post(
-        "/control/v1/activations",
-        headers=_headers(token),
-        json={
-            "activation_id": activation_id,
-            "consumer_identity": consumer_identity,
-        },
+    return cast(
+        "Response",
+        client.post(
+            "/control/v1/activations",
+            headers=_headers(token),
+            json={
+                "activation_id": activation_id,
+                "consumer_identity": consumer_identity,
+            },
+        ),
     )
 
 
@@ -109,18 +112,47 @@ def test_missing_and_unknown_credentials_fail_before_route_disclosure(
     assert "Creek-Provisioning-Version" not in unknown.headers
 
 
-def test_authenticated_consumer_identity_must_match_the_request(
+def test_authenticated_requester_can_provision_distinct_consumer_identities(
     app_client: TestClient,
 ) -> None:
-    """A bearer cannot ask the control plane to allocate for another identity."""
-    response = _submit(
+    """One backend bearer can own one isolated allocation per activated user."""
+    first = _submit(
         app_client,
-        "activation-wrong-consumer",
-        consumer_identity="other-consumer",
+        "activation-first-user",
+        consumer_identity="adepthood-user-001",
+    )
+    second = _submit(
+        app_client,
+        "activation-second-user",
+        consumer_identity="adepthood-user-002",
     )
 
-    assert response.status_code == 403
-    assert response.json()["code"] == "consumer_mismatch"
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert first.json()["job_id"] != second.json()["job_id"]
+
+
+def test_authenticated_requester_cannot_access_another_requesters_subject(
+    app_client: TestClient,
+) -> None:
+    """A body subject never controls the authenticated job ownership boundary."""
+    created = _submit(
+        app_client,
+        "activation-owned-subject",
+        consumer_identity="shared-subject-name",
+    ).json()
+    other_created = _submit(
+        app_client,
+        "activation-other-requester",
+        consumer_identity="shared-subject-name",
+        token=_OTHER_TOKEN,
+    )
+    other_read = app_client.get(created["status_url"], headers=_headers(_OTHER_TOKEN))
+
+    assert other_created.status_code == 202
+    assert other_created.json()["job_id"] != created["job_id"]
+    assert other_read.status_code == 403
+    assert other_read.json()["code"] == "job_unavailable"
 
 
 @pytest.mark.parametrize(

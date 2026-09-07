@@ -47,6 +47,7 @@ class ProvisioningJob:
 
     job_id: str
     activation_id: str
+    requester_identity: str
     consumer_identity: str
     state: JobState
     operation: JobOperation
@@ -64,6 +65,7 @@ class ProvisioningAllocation:
 
     allocation_id: str
     job_id: str
+    requester_identity: str
     consumer_identity: str
     provider_allocation_id: str
     created_at: datetime

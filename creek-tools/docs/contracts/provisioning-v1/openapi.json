@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Creek Provisioning Control Plane",
-    "version": "1.0.0",
-    "description": "Authenticated asynchronous job API for one isolated vault allocation per consumer."
+    "version": "1.1.0",
+    "description": "Authenticated asynchronous job API for one isolated vault allocation per consumer subject."
   },
   "security": [
     {
@@ -247,7 +247,8 @@
           "consumer_identity": {
             "type": "string",
             "minLength": 1,
-            "maxLength": 200
+            "maxLength": 200,
+            "description": "Stable opaque subject identity inside the authenticated requester's namespace. It is not the bearer-authenticated requester identity."
           }
         }
       },

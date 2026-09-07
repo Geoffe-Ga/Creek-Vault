@@ -102,19 +102,14 @@ class ProvisioningAPI:
         payload = await self._activation_payload(request)
         if isinstance(payload, Response):
             return payload
-        consumer = context_of(request.scope).consumer
-        if payload.consumer_identity != consumer:
-            return _error(
-                request,
-                "consumer_mismatch",
-                "consumer identity does not match the authenticated caller",
-                403,
-            )
+        requester = context_of(request.scope).consumer
+        assert requester is not None
         try:
             job = await write_off_loop(
                 self._store.submit,
                 payload.activation_id,
                 payload.consumer_identity,
+                requester,
             )
         except ActivationConflictError:
             return _error(
@@ -126,14 +121,14 @@ class ProvisioningAPI:
         return _response(_job_payload(job), status_code=202)
 
     async def status(self, request: Request) -> Response:
-        """Return one consumer-owned job without provider or credential fields."""
+        """Return one requester-owned job without provider or credential fields."""
         job = await self._owned_job(request)
         if job is None:
             return _error(request, "job_unavailable", "job unavailable", 403)
         return _response(_job_payload(job), status_code=200)
 
     async def retry(self, request: Request) -> Response:
-        """Requeue one consumer-owned retryable failure."""
+        """Requeue one requester-owned retryable failure."""
         job_id = request.path_params["job_id"]
         consumer = context_of(request.scope).consumer
         assert consumer is not None
@@ -179,10 +174,12 @@ class ProvisioningAPI:
                 409,
             )
         try:
+            requester = context_of(request.scope).consumer
+            assert requester is not None
             challenge = await read_off_loop(
                 self._store.get_key_ceremony,
                 job.job_id,
-                job.consumer_identity,
+                requester,
             )
         except CeremonyUnavailableError:
             return _error(
@@ -235,7 +232,7 @@ class ProvisioningAPI:
         return _response(_job_payload(job), status_code=200)
 
     async def _owned_job(self, request: Request) -> ProvisioningJob | None:
-        """Load the path job under the authenticated consumer boundary."""
+        """Load the path job under the authenticated requester boundary."""
         consumer = context_of(request.scope).consumer
         assert consumer is not None
         return await read_off_loop(

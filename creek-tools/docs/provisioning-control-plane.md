@@ -26,7 +26,11 @@ recovery material, key material, or corpus content.
 
 The checked-in contract is
 [`contracts/provisioning-v1/openapi.json`](contracts/provisioning-v1/openapi.json).
-Clients submit `{activation_id, consumer_identity}`, poll `status_url`, retry
+Clients submit `{activation_id, consumer_identity}`, where `consumer_identity`
+is a stable opaque account subject in the bearer-authenticated requester's
+namespace. The single mounted `adepthood` service bearer can therefore own one
+isolated allocation per activated Adepthood user. Job ownership always comes
+from the bearer, never from this body field. Clients poll `status_url`, retry
 only a `failed` job whose `retryable` flag is true, and request deletion through
 the same job URL.
 
@@ -124,7 +128,8 @@ mismatch fails before release.
   produces the durable `deleted` receipt.
 
 Activation ids remain durable aliases. Repeating one returns the same job;
-distinct concurrent ids for the same consumer resolve to its one live job, so
-two API processes cannot create two billable allocations. Each consumer may
-retain at most 256 activation aliases. Existing aliases remain idempotent after
-the limit is reached; an additional distinct alias is rejected with `409`.
+distinct concurrent ids for the same requester/consumer-subject pair resolve to
+its one live job, so two API processes cannot create two billable allocations.
+Each requester/subject pair may retain at most 256 activation aliases. Existing
+aliases remain idempotent after the limit is reached; an additional distinct
+alias is rejected with `409`.

@@ -32,15 +32,31 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
 
-_SCHEMA_VERSION: Final[int] = 2
+_SCHEMA_VERSION: Final[int] = 3
 _DEFAULT_LEASE: Final[timedelta] = timedelta(minutes=1)
 _MAX_IDENTIFIER_LENGTH: Final[int] = 200
 MAX_ACTIVATION_ALIASES_PER_CONSUMER: Final[int] = 256
+
+_REQUESTER_MIGRATIONS: Final[dict[str, tuple[str, str]]] = {
+    "provisioning_jobs": (
+        "ALTER TABLE provisioning_jobs ADD COLUMN requester_identity TEXT",
+        "UPDATE provisioning_jobs SET requester_identity = consumer_identity",
+    ),
+    "provisioning_allocations": (
+        "ALTER TABLE provisioning_allocations ADD COLUMN requester_identity TEXT",
+        "UPDATE provisioning_allocations SET requester_identity = consumer_identity",
+    ),
+    "provisioning_activation_ids": (
+        "ALTER TABLE provisioning_activation_ids ADD COLUMN requester_identity TEXT",
+        "UPDATE provisioning_activation_ids SET requester_identity = consumer_identity",
+    ),
+}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS provisioning_jobs (
     job_id TEXT PRIMARY KEY,
     canonical_activation_id TEXT NOT NULL,
+    requester_identity TEXT NOT NULL,
     consumer_identity TEXT NOT NULL,
     state TEXT NOT NULL,
     operation TEXT NOT NULL,
@@ -65,6 +81,7 @@ CREATE TABLE IF NOT EXISTS provisioning_jobs (
 CREATE TABLE IF NOT EXISTS provisioning_allocations (
     allocation_id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL UNIQUE REFERENCES provisioning_jobs(job_id),
+    requester_identity TEXT NOT NULL,
     consumer_identity TEXT NOT NULL,
     provider_allocation_id TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL,
@@ -73,17 +90,10 @@ CREATE TABLE IF NOT EXISTS provisioning_allocations (
 
 CREATE TABLE IF NOT EXISTS provisioning_activation_ids (
     activation_id TEXT PRIMARY KEY,
+    requester_identity TEXT NOT NULL,
     consumer_identity TEXT NOT NULL,
     job_id TEXT NOT NULL REFERENCES provisioning_jobs(job_id)
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_provisioning_live_consumer
-ON provisioning_jobs(consumer_identity)
-WHERE state != 'deleted';
-
-CREATE UNIQUE INDEX IF NOT EXISTS uq_provisioning_active_allocation_consumer
-ON provisioning_allocations(consumer_identity)
-WHERE deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS ix_provisioning_claimable
 ON provisioning_jobs(state, lease_expires_at, created_at);
@@ -102,13 +112,23 @@ CREATE INDEX IF NOT EXISTS ix_provisioning_key_ceremony_expiry
 ON provisioning_key_ceremonies(expires_at);
 """
 
+_OWNERSHIP_INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_provisioning_live_requester_consumer
+ON provisioning_jobs(requester_identity, consumer_identity)
+WHERE state != 'deleted';
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_provisioning_active_allocation_requester_consumer
+ON provisioning_allocations(requester_identity, consumer_identity)
+WHERE deleted_at IS NULL;
+"""
+
 
 class ProvisioningStoreError(RuntimeError):
     """Base class for content-free store failures."""
 
 
 class ActivationConflictError(ProvisioningStoreError):
-    """An activation id already belongs to another authenticated consumer."""
+    """An activation id already belongs to another requester or subject."""
 
 
 class InvalidJobTransitionError(ProvisioningStoreError):
@@ -148,20 +168,70 @@ class ProvisioningStore:
         self._database.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             connection.executescript(_SCHEMA)
-            columns = {
-                str(row[1])
-                for row in connection.execute(
-                    "PRAGMA table_info(provisioning_jobs)"
-                ).fetchall()
-            }
-            if "attested_confidential" not in columns:
-                connection.execute(
-                    "ALTER TABLE provisioning_jobs "
-                    "ADD COLUMN attested_confidential INTEGER "
-                    "CHECK (attested_confidential IS NULL "
-                    "OR attested_confidential IN (0, 1))"
-                )
+            self._migrate_schema(connection)
+            self._install_requester_guards(connection)
+            connection.executescript(_OWNERSHIP_INDEXES)
             connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+
+    @staticmethod
+    def _migrate_schema(connection: sqlite3.Connection) -> None:
+        """Upgrade pre-v3 databases without weakening their ownership boundary."""
+        table_columns = {
+            table: {
+                str(row[1])
+                for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            for table in (
+                "provisioning_jobs",
+                "provisioning_allocations",
+                "provisioning_activation_ids",
+            )
+        }
+        if "attested_confidential" not in table_columns["provisioning_jobs"]:
+            connection.execute(
+                "ALTER TABLE provisioning_jobs "
+                "ADD COLUMN attested_confidential INTEGER "
+                "CHECK (attested_confidential IS NULL "
+                "OR attested_confidential IN (0, 1))"
+            )
+        for table, migration in _REQUESTER_MIGRATIONS.items():
+            if "requester_identity" not in table_columns[table]:
+                add_requester_column, backfill_requester = migration
+                connection.execute(add_requester_column)
+                connection.execute(backfill_requester)
+        connection.execute("DROP INDEX IF EXISTS uq_provisioning_live_consumer")
+        connection.execute(
+            "DROP INDEX IF EXISTS uq_provisioning_active_allocation_consumer"
+        )
+
+    @staticmethod
+    def _install_requester_guards(connection: sqlite3.Connection) -> None:
+        """Restore the v3 NOT NULL/identifier invariant on ALTERed SQLite tables."""
+        for table in (
+            "provisioning_jobs",
+            "provisioning_allocations",
+            "provisioning_activation_ids",
+        ):
+            connection.executescript(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS ck_{table}_requester_insert
+                BEFORE INSERT ON {table}
+                WHEN NEW.requester_identity IS NULL
+                  OR length(trim(NEW.requester_identity)) = 0
+                  OR length(NEW.requester_identity) > {_MAX_IDENTIFIER_LENGTH}
+                BEGIN
+                    SELECT RAISE(ABORT, 'invalid requester identity');
+                END;
+                CREATE TRIGGER IF NOT EXISTS ck_{table}_requester_update
+                BEFORE UPDATE OF requester_identity ON {table}
+                WHEN NEW.requester_identity IS NULL
+                  OR length(trim(NEW.requester_identity)) = 0
+                  OR length(NEW.requester_identity) > {_MAX_IDENTIFIER_LENGTH}
+                BEGIN
+                    SELECT RAISE(ABORT, 'invalid requester identity');
+                END;
+                """
+            )
 
     @contextmanager
     def _connect(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
@@ -188,39 +258,51 @@ class ProvisioningStore:
         self,
         activation_id: str,
         consumer_identity: str,
+        requester_identity: str | None = None,
         *,
         now: datetime | None = None,
     ) -> ProvisioningJob:
-        """Atomically return the one live job for an activation and consumer."""
+        """Return one live subject job owned by the authenticated requester."""
         activation = _validate_identifier(activation_id, field="activation_id")
         consumer = _validate_identifier(consumer_identity, field="consumer_identity")
+        requester = _validate_identifier(
+            requester_identity or consumer,
+            field="requester_identity",
+        )
         instant = now or _utc_now()
         with self._connect(write=True) as connection:
             existing = connection.execute(
-                "SELECT consumer_identity, job_id FROM provisioning_activation_ids "
+                "SELECT requester_identity, consumer_identity, job_id "
+                "FROM provisioning_activation_ids "
                 "WHERE activation_id = ?",
                 (activation,),
             ).fetchone()
             if existing is not None:
-                if existing["consumer_identity"] != consumer:
+                if (
+                    existing["requester_identity"] != requester
+                    or existing["consumer_identity"] != consumer
+                ):
                     raise ActivationConflictError("activation cannot be accepted")
                 return self._job_by_id(connection, str(existing["job_id"]))
 
             live = connection.execute(
                 "SELECT * FROM provisioning_jobs "
-                "WHERE consumer_identity = ? AND state != 'deleted'",
-                (consumer,),
+                "WHERE requester_identity = ? AND consumer_identity = ? "
+                "AND state != 'deleted'",
+                (requester, consumer),
             ).fetchone()
             if live is None:
                 job_id = str(uuid4())
                 stamp = _timestamp(instant)
                 connection.execute(
                     "INSERT INTO provisioning_jobs "
-                    "(job_id, canonical_activation_id, consumer_identity, state, "
-                    "operation, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "(job_id, canonical_activation_id, requester_identity, "
+                    "consumer_identity, state, operation, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         job_id,
                         activation,
+                        requester,
                         consumer,
                         JobState.PENDING.value,
                         JobOperation.CREATE.value,
@@ -232,26 +314,27 @@ class ProvisioningStore:
                 job_id = str(live["job_id"])
             alias_count = connection.execute(
                 "SELECT COUNT(*) FROM provisioning_activation_ids "
-                "WHERE consumer_identity = ?",
-                (consumer,),
+                "WHERE requester_identity = ? AND consumer_identity = ?",
+                (requester, consumer),
             ).fetchone()
             assert alias_count is not None
             if int(alias_count[0]) >= MAX_ACTIVATION_ALIASES_PER_CONSUMER:
                 raise ActivationConflictError("activation cannot be accepted")
             connection.execute(
                 "INSERT INTO provisioning_activation_ids "
-                "(activation_id, consumer_identity, job_id) VALUES (?, ?, ?)",
-                (activation, consumer, job_id),
+                "(activation_id, requester_identity, consumer_identity, job_id) "
+                "VALUES (?, ?, ?, ?)",
+                (activation, requester, consumer, job_id),
             )
             return self._job_by_id(connection, job_id)
 
-    def get(self, job_id: str, consumer_identity: str) -> ProvisioningJob | None:
-        """Return *job_id* only when it belongs to *consumer_identity*."""
+    def get(self, job_id: str, requester_identity: str) -> ProvisioningJob | None:
+        """Return *job_id* only when its requester owns it."""
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM provisioning_jobs "
-                "WHERE job_id = ? AND consumer_identity = ?",
-                (job_id, consumer_identity),
+                "WHERE job_id = ? AND requester_identity = ?",
+                (job_id, requester_identity),
             ).fetchone()
             return None if row is None else self._from_row(row)
 
@@ -367,14 +450,14 @@ class ProvisioningStore:
     def retry(
         self,
         job_id: str,
-        consumer_identity: str,
+        requester_identity: str,
         *,
         now: datetime | None = None,
     ) -> ProvisioningJob:
         """Requeue a failed operation only when its recorded policy permits retry."""
         instant = now or _utc_now()
         with self._connect(write=True) as connection:
-            row = self._owned_job(connection, job_id, consumer_identity)
+            row = self._owned_job(connection, job_id, requester_identity)
             if row["state"] != JobState.FAILED.value:
                 # The counter is scoped to the current operation. An operation
                 # change resets it, so only replays of the retry that already
@@ -404,14 +487,14 @@ class ProvisioningStore:
     def request_delete(
         self,
         job_id: str,
-        consumer_identity: str,
+        requester_identity: str,
         *,
         now: datetime | None = None,
     ) -> ProvisioningJob:
-        """Idempotently enqueue deletion for one consumer-owned allocation."""
+        """Idempotently enqueue deletion for one requester-owned allocation."""
         instant = now or _utc_now()
         with self._connect(write=True) as connection:
-            row = self._owned_job(connection, job_id, consumer_identity)
+            row = self._owned_job(connection, job_id, requester_identity)
             if row["state"] in {JobState.DELETING.value, JobState.DELETED.value}:
                 return self._from_row(row)
             connection.execute(
@@ -432,16 +515,16 @@ class ProvisioningStore:
     def get_key_ceremony(
         self,
         job_id: str,
-        consumer_identity: str,
+        requester_identity: str,
     ) -> KeyCeremonyChallenge:
-        """Return the public challenge for one consumer-owned allocation."""
+        """Return the public challenge for one requester-owned allocation."""
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT provisioning_jobs.canonical_activation_id, "
                 "provisioning_key_ceremonies.* FROM provisioning_jobs "
                 "JOIN provisioning_key_ceremonies USING (job_id) "
-                "WHERE job_id = ? AND consumer_identity = ?",
-                (job_id, consumer_identity),
+                "WHERE job_id = ? AND requester_identity = ?",
+                (job_id, requester_identity),
             ).fetchone()
         if row is None:
             raise CeremonyUnavailableError("key ceremony is unavailable")
@@ -456,15 +539,15 @@ class ProvisioningStore:
     def get_wrapped_key_artifact(
         self,
         job_id: str,
-        consumer_identity: str,
+        requester_identity: str,
     ) -> WrappedKeyArtifact | None:
         """Return only the ciphertext artifact for one completed owned ceremony."""
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT wrapped_artifact_json FROM provisioning_key_ceremonies "
                 "JOIN provisioning_jobs USING (job_id) "
-                "WHERE job_id = ? AND consumer_identity = ?",
-                (job_id, consumer_identity),
+                "WHERE job_id = ? AND requester_identity = ?",
+                (job_id, requester_identity),
             ).fetchone()
         if row is None or row["wrapped_artifact_json"] is None:
             return None
@@ -473,7 +556,7 @@ class ProvisioningStore:
     def complete_key_ceremony(
         self,
         job_id: str,
-        consumer_identity: str,
+        requester_identity: str,
         submission: CeremonySubmission,
         *,
         attested_confidential: bool,
@@ -488,7 +571,7 @@ class ProvisioningStore:
         expired = False
         completed: ProvisioningJob | None = None
         with self._connect(write=True) as connection:
-            job_row = self._owned_job(connection, job_id, consumer_identity)
+            job_row = self._owned_job(connection, job_id, requester_identity)
             ceremony = connection.execute(
                 "SELECT * FROM provisioning_key_ceremonies WHERE job_id = ?",
                 (job_id,),
@@ -610,14 +693,14 @@ class ProvisioningStore:
     def get_allocation(
         self,
         job_id: str,
-        consumer_identity: str,
+        requester_identity: str,
     ) -> ProvisioningAllocation | None:
-        """Return one allocation only inside its authenticated consumer boundary."""
+        """Return one allocation only inside its requester ownership boundary."""
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM provisioning_allocations "
-                "WHERE job_id = ? AND consumer_identity = ?",
-                (job_id, consumer_identity),
+                "WHERE job_id = ? AND requester_identity = ?",
+                (job_id, requester_identity),
             ).fetchone()
         return None if row is None else self._allocation_from_row(row)
 
@@ -676,11 +759,12 @@ class ProvisioningStore:
             if provider_allocation_id is not None:
                 connection.execute(
                     "INSERT INTO provisioning_allocations "
-                    "(allocation_id, job_id, consumer_identity, "
-                    "provider_allocation_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                    "(allocation_id, job_id, requester_identity, consumer_identity, "
+                    "provider_allocation_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         str(uuid4()),
                         job_id,
+                        row["requester_identity"],
                         row["consumer_identity"],
                         provider_allocation_id,
                         stamp,
@@ -722,13 +806,13 @@ class ProvisioningStore:
     def _owned_job(
         connection: sqlite3.Connection,
         job_id: str,
-        consumer_identity: str,
+        requester_identity: str,
     ) -> sqlite3.Row:
-        """Return a consumer-owned row or a content-free not-found error."""
+        """Return a requester-owned row or a content-free not-found error."""
         row = connection.execute(
             "SELECT * FROM provisioning_jobs "
-            "WHERE job_id = ? AND consumer_identity = ?",
-            (job_id, consumer_identity),
+            "WHERE job_id = ? AND requester_identity = ?",
+            (job_id, requester_identity),
         ).fetchone()
         if row is None:
             raise InvalidJobTransitionError("job is unavailable")
@@ -756,6 +840,7 @@ class ProvisioningStore:
         return ProvisioningJob(
             job_id=str(row["job_id"]),
             activation_id=str(row["canonical_activation_id"]),
+            requester_identity=str(row["requester_identity"]),
             consumer_identity=str(row["consumer_identity"]),
             state=JobState(str(row["state"])),
             operation=JobOperation(str(row["operation"])),
@@ -774,6 +859,7 @@ class ProvisioningStore:
         return ProvisioningAllocation(
             allocation_id=str(row["allocation_id"]),
             job_id=str(row["job_id"]),
+            requester_identity=str(row["requester_identity"]),
             consumer_identity=str(row["consumer_identity"]),
             provider_allocation_id=str(row["provider_allocation_id"]),
             created_at=datetime.fromisoformat(str(row["created_at"])),
