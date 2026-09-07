@@ -1,4 +1,7 @@
 {
+  "env": {
+    "CLAUDE_CODE_MAX_SUBAGENTS_PER_SESSION": "1000"
+  },
   "hooks": {
     "SessionStart": [
       {
