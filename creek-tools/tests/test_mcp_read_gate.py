@@ -6193,6 +6193,13 @@ def _artifact_writes_by_tool() -> tuple[tuple[str, tuple[str, ...]], ...]:
     file — taking layers (a) through (g) down with it and reporting the loss as
     a single unrelated-looking error.
 
+    The cache is **per process**, so under ``pytest-xdist`` the fourteen-tool
+    observation runs once per worker rather than once per session. That is
+    redundant wall-clock, not a correctness problem: every observation is taken
+    on a fresh :class:`tempfile.TemporaryDirectory` and depends on nothing
+    outside it, so N workers compute N identical answers. Recorded here so the
+    cost is a known quantity rather than a surprise in a CI timing report.
+
     Returns:
         ``((tool, (relpath, ...)), ...)``, in :data:`_GATED_TOOLS` order.
         Immutable so a caller cannot edit the cached result.
@@ -6220,6 +6227,18 @@ def _derive_artifact_writing_gated_tools() -> list[str]:
     which write: ``state.py`` calls ``StateReportGenerator(...).write()`` and
     ``draft.py`` calls ``generator.save_draft(...)``. A declarative derivation
     would have missed ``creek.state.render``, whose leak was #969.
+
+    The sharpest evidence for observation over any source-reading rule is
+    ``creek.mine``. ``creek_mcp/tools/mine.py`` contains **no write primitive
+    at all** — no ``write_text``, no ``write_bytes``, no ``mkdir``, no
+    ``open()`` — and the tool nonetheless appends a ``compile-needed`` record
+    to the vault on every routing miss, three modules down:
+    ``mine_tool`` → ``creek.generate.mining.IdeaMiner.mine_all`` →
+    ``record_compile_gap`` → ``creek.generate.compile_routing.log_compile_gap``,
+    which opens the file. A grep, an AST walk, or any other rule scoped to the
+    tool's own module answers "writes nothing" and is wrong. Only calling the
+    tool and looking at the disk can see it, which is the same argument layer
+    (f) makes for calling the tool at all.
 
     The package cannot be enumerated either. Since #1772
     ``creek_mcp.tools`` is a lazy ``__getattr__`` package with no ``__dir__``,
