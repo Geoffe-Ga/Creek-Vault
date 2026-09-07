@@ -193,6 +193,55 @@ def test_only_a_retryable_failure_can_return_to_pending(
         store.retry(permanent.job_id, "adepthood", now=_NOW)
 
 
+def test_a_prior_create_retry_does_not_make_a_later_delete_retryable(
+    store: ProvisioningStore,
+) -> None:
+    """Changing operations invalidates idempotency state from an earlier retry."""
+    job = store.submit("activation-retry-then-delete", "adepthood", now=_NOW)
+    claimed = store.claim_next(now=_NOW)
+    assert claimed is not None
+    store.record_failure(
+        job.job_id,
+        claimed.lease_token,
+        FailureReason.PROVIDER_UNAVAILABLE,
+        retryable=True,
+        now=_NOW,
+    )
+    store.retry(job.job_id, "adepthood", now=_NOW)
+    deleting = store.request_delete(job.job_id, "adepthood", now=_NOW)
+
+    assert deleting.state is JobState.DELETING
+    with pytest.raises(InvalidJobTransitionError, match="not retryable"):
+        store.retry(job.job_id, "adepthood", now=_NOW)
+
+
+def test_concurrent_retries_of_a_failed_delete_remain_idempotent(
+    store: ProvisioningStore,
+) -> None:
+    """Resetting retry state at deletion still admits duplicates of its own retry."""
+    job = store.submit("activation-delete-retry", "adepthood", now=_NOW)
+    store.request_delete(job.job_id, "adepthood", now=_NOW)
+    claimed = store.claim_next(now=_NOW)
+    assert claimed is not None
+    store.record_failure(
+        job.job_id,
+        claimed.lease_token,
+        FailureReason.PROVIDER_UNAVAILABLE,
+        retryable=True,
+        now=_NOW,
+    )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        states = list(
+            executor.map(
+                lambda _: store.retry(job.job_id, "adepthood", now=_NOW).state,
+                range(16),
+            )
+        )
+
+    assert set(states) == {JobState.DELETING}
+
+
 def test_delete_is_idempotent_and_remains_durable_until_a_worker_claims_it(
     store: ProvisioningStore,
 ) -> None:

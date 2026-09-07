@@ -342,6 +342,9 @@ class ProvisioningStore:
         with self._connect(write=True) as connection:
             row = self._owned_job(connection, job_id, consumer_identity)
             if row["state"] != JobState.FAILED.value:
+                # The counter is scoped to the current operation. An operation
+                # change resets it, so only replays of the retry that already
+                # moved this same operation out of FAILED are idempotent here.
                 if int(row["retry_count"]) > 0 and row["state"] in {
                     JobState.PENDING.value,
                     JobState.PROVISIONING.value,
@@ -379,7 +382,8 @@ class ProvisioningStore:
                 return self._from_row(row)
             connection.execute(
                 "UPDATE provisioning_jobs SET state = ?, operation = ?, "
-                "retryable = 0, failure_reason = NULL, lease_token = NULL, "
+                "retry_count = 0, retryable = 0, failure_reason = NULL, "
+                "lease_token = NULL, "
                 "lease_expires_at = NULL, updated_at = ? WHERE job_id = ?",
                 (
                     JobState.DELETING.value,
