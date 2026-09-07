@@ -47,6 +47,7 @@ class ProvisioningJob:
 
     job_id: str
     activation_id: str
+    requester_identity: str
     consumer_identity: str
     state: JobState
     operation: JobOperation
@@ -55,6 +56,7 @@ class ProvisioningJob:
     failure_reason: FailureReason | None
     created_at: datetime
     updated_at: datetime
+    attested_confidential: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +65,7 @@ class ProvisioningAllocation:
 
     allocation_id: str
     job_id: str
+    requester_identity: str
     consumer_identity: str
     provider_allocation_id: str
     created_at: datetime

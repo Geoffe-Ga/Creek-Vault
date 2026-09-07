@@ -186,22 +186,23 @@ class _FakeFlyAPI:
             return httpx.Response(200, json=machine, request=request)
         if not segments:
             return httpx.Response(404, request=request)
-        machine = next(
-            (item for item in self.machines[app_name] if item["id"] == segments[0]),
-            None,
-        )
-        if machine is None:
+        matched_machine: dict[str, Any] | None = None
+        for candidate in self.machines[app_name]:
+            if candidate["id"] == segments[0]:
+                matched_machine = candidate
+                break
+        if matched_machine is None:
             return httpx.Response(404, request=request)
         if len(segments) == 2 and request.method == "POST":
             if segments[1] == "start":
-                machine["state"] = "started"
+                matched_machine["state"] = "started"
             elif segments[1] == "stop":
-                machine["state"] = "stopped"
+                matched_machine["state"] = "stopped"
             else:
                 return httpx.Response(404, request=request)
-            return httpx.Response(200, json=machine, request=request)
+            return httpx.Response(200, json=matched_machine, request=request)
         if len(segments) == 1 and request.method == "DELETE":
-            self.machines[app_name].remove(machine)
+            self.machines[app_name].remove(matched_machine)
             return httpx.Response(200, request=request)
         return httpx.Response(404, request=request)
 
@@ -219,6 +220,7 @@ def _job(activation_id: str = "activation-fly-001") -> ProvisioningJob:
     return ProvisioningJob(
         job_id="job-fly-001",
         activation_id=activation_id,
+        requester_identity="adepthood",
         consumer_identity="adepthood-user-001",
         state=JobState.PROVISIONING,
         operation=JobOperation.CREATE,

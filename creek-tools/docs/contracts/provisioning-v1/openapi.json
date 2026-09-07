@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Creek Provisioning Control Plane",
-    "version": "1.0.0",
-    "description": "Authenticated asynchronous job API for one isolated vault allocation per consumer."
+    "version": "1.1.0",
+    "description": "Authenticated asynchronous job API for one isolated vault allocation per consumer subject."
   },
   "security": [
     {
@@ -129,6 +129,74 @@
           }
         }
       }
+    },
+    "/control/v1/jobs/{job_id}/key-ceremony": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobId"
+        }
+      ],
+      "get": {
+        "operationId": "getKeyCeremonyChallenge",
+        "responses": {
+          "200": {
+            "description": "Fresh public challenge for an awaiting allocation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyCeremonyChallenge"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "operationId": "completeKeyCeremony",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CeremonySubmission"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Ciphertext artifact accepted idempotently",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -179,7 +247,283 @@
           "consumer_identity": {
             "type": "string",
             "minLength": 1,
+            "maxLength": 200,
+            "description": "Stable opaque subject identity inside the authenticated requester's namespace. It is not the bearer-authenticated requester identity."
+          }
+        }
+      },
+      "KeyCeremonyChallenge": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "protocol_version",
+          "job_id",
+          "activation_id",
+          "ceremony_id",
+          "server_nonce",
+          "expires_at"
+        ],
+        "properties": {
+          "protocol_version": {
+            "const": "1.0.0"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "activation_id": {
+            "type": "string",
+            "minLength": 1,
             "maxLength": 200
+          },
+          "ceremony_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "server_nonce": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43}$"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CeremonyBinding": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "protocol_version",
+          "activation_id",
+          "ceremony_id",
+          "server_nonce",
+          "client_nonce"
+        ],
+        "properties": {
+          "protocol_version": {
+            "const": "1.0.0"
+          },
+          "activation_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "ceremony_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "server_nonce": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43}$"
+          },
+          "client_nonce": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43}$"
+          }
+        }
+      },
+      "Argon2idParameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "algorithm",
+          "salt",
+          "time_cost",
+          "lanes",
+          "memory_kib"
+        ],
+        "properties": {
+          "algorithm": {
+            "const": "argon2id"
+          },
+          "salt": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{32}$"
+          },
+          "time_cost": {
+            "const": 3
+          },
+          "lanes": {
+            "const": 4
+          },
+          "memory_kib": {
+            "const": 65536
+          }
+        }
+      },
+      "WrappedCiphertext": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "nonce",
+          "ciphertext"
+        ],
+        "properties": {
+          "nonce": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{24}$"
+          },
+          "ciphertext": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{96}$"
+          }
+        }
+      },
+      "WrappedKeyArtifact": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "version",
+          "kdf",
+          "passphrase_wrapped",
+          "recovery_wrapped",
+          "binding"
+        ],
+        "properties": {
+          "version": {
+            "const": 2
+          },
+          "kdf": {
+            "$ref": "#/components/schemas/Argon2idParameters"
+          },
+          "passphrase_wrapped": {
+            "$ref": "#/components/schemas/WrappedCiphertext"
+          },
+          "recovery_wrapped": {
+            "$ref": "#/components/schemas/WrappedCiphertext"
+          },
+          "binding": {
+            "$ref": "#/components/schemas/CeremonyBinding"
+          }
+        }
+      },
+      "AttestationStatement": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "format",
+          "measurement",
+          "challenge_nonce",
+          "recipient_public_key",
+          "issued_at",
+          "expires_at",
+          "signature"
+        ],
+        "properties": {
+          "format": {
+            "const": "creek-ed25519-x25519-v1"
+          },
+          "measurement": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "challenge_nonce": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43}$"
+          },
+          "recipient_public_key": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43}$"
+          },
+          "issued_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "signature": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{86}$"
+          }
+        }
+      },
+      "KeyReleaseEnvelope": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "algorithm",
+          "recipient_public_key",
+          "ephemeral_public_key",
+          "nonce",
+          "ciphertext"
+        ],
+        "properties": {
+          "algorithm": {
+            "const": "x25519-hkdf-sha256-aes256gcm"
+          },
+          "recipient_public_key": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43}$"
+          },
+          "ephemeral_public_key": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43}$"
+          },
+          "nonce": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{16}$"
+          },
+          "ciphertext": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{64}$"
+          }
+        }
+      },
+      "CeremonySubmission": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "protocol_version",
+          "ceremony_id",
+          "server_nonce",
+          "recovery_saved",
+          "wrapped_artifact",
+          "attestation",
+          "key_release"
+        ],
+        "properties": {
+          "protocol_version": {
+            "const": "1.0.0"
+          },
+          "ceremony_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "server_nonce": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43}$"
+          },
+          "recovery_saved": {
+            "const": true
+          },
+          "wrapped_artifact": {
+            "$ref": "#/components/schemas/WrappedKeyArtifact"
+          },
+          "attestation": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AttestationStatement"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "key_release": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/KeyReleaseEnvelope"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       },
@@ -195,6 +539,7 @@
           "failure_reason",
           "created_at",
           "updated_at",
+          "attested_confidential",
           "status_url"
         ],
         "properties": {
@@ -244,6 +589,13 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "attested_confidential": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Null before readiness; true only after verified attested key release."
           },
           "status_url": {
             "type": "string"

@@ -59,6 +59,51 @@ def test_one_consumer_cannot_gain_two_live_allocations_under_concurrency(
     assert store.count_activation_ids() == 24
 
 
+def test_one_requester_can_own_distinct_consumer_allocations(
+    store: ProvisioningStore,
+) -> None:
+    """A backend service can provision one isolated vault per activated user."""
+    first = store.submit(
+        "activation-user-001",
+        "user-001",
+        requester_identity="adepthood",
+        now=_NOW,
+    )
+    second = store.submit(
+        "activation-user-002",
+        "user-002",
+        requester_identity="adepthood",
+        now=_NOW,
+    )
+
+    assert first.job_id != second.job_id
+    assert first.requester_identity == "adepthood"
+    assert second.requester_identity == "adepthood"
+    assert store.count_jobs() == 2
+
+
+def test_subject_identity_is_scoped_to_the_authenticated_requester(
+    store: ProvisioningStore,
+) -> None:
+    """Two service consumers may use the same opaque local subject safely."""
+    first = store.submit(
+        "activation-service-a",
+        "user-001",
+        requester_identity="service-a",
+        now=_NOW,
+    )
+    second = store.submit(
+        "activation-service-b",
+        "user-001",
+        requester_identity="service-b",
+        now=_NOW,
+    )
+
+    assert first.job_id != second.job_id
+    assert store.get(first.job_id, "service-a") == first
+    assert store.get(first.job_id, "service-b") is None
+
+
 def test_an_activation_id_cannot_be_replayed_as_another_consumer(
     store: ProvisioningStore,
 ) -> None:
@@ -98,20 +143,115 @@ def test_database_enforces_activation_and_live_consumer_uniqueness(
         ).fetchall()
         live_index = connection.execute(
             "SELECT sql FROM sqlite_master WHERE name = ?",
-            ("uq_provisioning_live_consumer",),
+            ("uq_provisioning_live_requester_consumer",),
         ).fetchone()
         allocation_index = connection.execute(
             "SELECT sql FROM sqlite_master WHERE name = ?",
-            ("uq_provisioning_active_allocation_consumer",),
+            ("uq_provisioning_active_allocation_requester_consumer",),
         ).fetchone()
 
     assert any(row[2] == 1 for row in activation_indexes)
     assert live_index is not None
     assert "UNIQUE" in live_index[0]
+    assert "requester_identity, consumer_identity" in live_index[0]
     assert "WHERE state != 'deleted'" in live_index[0]
     assert allocation_index is not None
     assert "UNIQUE" in allocation_index[0]
+    assert "requester_identity, consumer_identity" in allocation_index[0]
     assert "WHERE deleted_at IS NULL" in allocation_index[0]
+
+
+def test_v2_database_migrates_authenticated_ownership_without_data_loss(
+    tmp_path: Path,
+) -> None:
+    """Existing single-identity rows become requester-owned v3 rows in place."""
+    database = tmp_path / "provisioning-v2.sqlite3"
+    stamp = _NOW.isoformat(timespec="microseconds")
+    with closing(sqlite3.connect(database)) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE provisioning_jobs (
+                job_id TEXT PRIMARY KEY,
+                canonical_activation_id TEXT NOT NULL,
+                consumer_identity TEXT NOT NULL,
+                state TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                retryable INTEGER NOT NULL DEFAULT 0,
+                failure_reason TEXT,
+                lease_token TEXT,
+                lease_expires_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE provisioning_allocations (
+                allocation_id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL UNIQUE REFERENCES provisioning_jobs(job_id),
+                consumer_identity TEXT NOT NULL,
+                provider_allocation_id TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                deleted_at TEXT
+            );
+            CREATE TABLE provisioning_activation_ids (
+                activation_id TEXT PRIMARY KEY,
+                consumer_identity TEXT NOT NULL,
+                job_id TEXT NOT NULL REFERENCES provisioning_jobs(job_id)
+            );
+            CREATE UNIQUE INDEX uq_provisioning_live_consumer
+            ON provisioning_jobs(consumer_identity) WHERE state != 'deleted';
+            CREATE UNIQUE INDEX uq_provisioning_active_allocation_consumer
+            ON provisioning_allocations(consumer_identity) WHERE deleted_at IS NULL;
+            """
+        )
+        connection.execute(
+            "INSERT INTO provisioning_jobs "
+            "(job_id, canonical_activation_id, consumer_identity, state, operation, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "job-v2",
+                "activation-v2",
+                "adepthood",
+                "pending",
+                "create",
+                stamp,
+                stamp,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO provisioning_activation_ids VALUES (?, ?, ?)",
+            ("activation-v2", "adepthood", "job-v2"),
+        )
+        connection.execute(
+            "INSERT INTO provisioning_allocations VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "allocation-v2",
+                "job-v2",
+                "adepthood",
+                "provider-v2",
+                stamp,
+                None,
+            ),
+        )
+        connection.commit()
+
+    migrated = ProvisioningStore(database)
+    job = migrated.get("job-v2", "adepthood")
+
+    assert job is not None
+    assert job.requester_identity == "adepthood"
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (3,)
+        assert connection.execute(
+            "SELECT requester_identity FROM provisioning_activation_ids"
+        ).fetchone() == ("adepthood",)
+        for table in (
+            "provisioning_jobs",
+            "provisioning_allocations",
+            "provisioning_activation_ids",
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(f"UPDATE {table} SET requester_identity = NULL")
 
 
 def test_allocation_is_a_distinct_durable_model_with_one_active_per_consumer(

@@ -83,9 +83,10 @@ mounted secrets, and layered health/readiness.
 
 The separate demand-provisioning service is documented in the
 [`provisioning control-plane`](docs/provisioning-control-plane.md) runbook. Its
-versioned [OpenAPI contract](docs/contracts/provisioning-v1/openapi.json) keeps
-provider work and one-time credential handoff outside the browser-facing job
-API.
+versioned [OpenAPI contract](docs/contracts/provisioning-v1/openapi.json)
+defines the [user-held key ceremony](docs/contracts/provisioning-v1/key-ceremony.md)
+while keeping provider work and one-time credential handoff outside the
+browser-facing job API.
 
 ---
 

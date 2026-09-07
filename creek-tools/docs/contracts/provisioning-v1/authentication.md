@@ -1,8 +1,7 @@
 # Provisioning v1 authentication and handoff
 
 The provisioning API is a backend-to-backend service. A browser never holds its
-bearer token and the control plane never accepts cookies, query credentials, or
-a caller-supplied identity that disagrees with the authenticated token.
+bearer token and the control plane never accepts cookies or query credentials.
 
 Each consumer receives a high-entropy bearer in the existing Creek registry
 format, `consumer=current-token,replacement-token`. The service reads that
@@ -15,9 +14,18 @@ transport-confidentiality gate and refuses a non-loopback bind without a valid
 `--tls-cert`/`--tls-key` pair. Missing, malformed, and unknown bearer values are
 refused above the router, before route or contract-version disclosure.
 
-The authenticated identity must equal `consumer_identity` on activation.
-Status, retry, and delete paths resolve jobs inside that identity boundary; a
-valid token cannot enumerate another consumer's handles.
+The bearer resolves an authenticated **requester identity**, such as the
+`adepthood` backend. `consumer_identity` in an activation request is a stable,
+opaque subject inside that requester's namespace, such as one pseudonymous
+Adepthood account id. One requester can therefore own one isolated allocation
+for each activated account without minting or mounting a Creek bearer per user.
+
+The body never selects the requester. Creek derives job ownership only from the
+verified bearer and stores both identities. Database uniqueness is scoped to
+`(requester_identity, consumer_identity)`. Status, retry, deletion, and key
+ceremony paths resolve jobs inside the requester boundary; even a valid token
+cannot enumerate another requester's handles or take ownership by repeating its
+subject spelling.
 
 The public job schema contains no provider output or secret material. A worker
 delivers the resulting service endpoint and consumer secret through the

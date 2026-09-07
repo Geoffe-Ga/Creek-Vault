@@ -4,7 +4,7 @@ from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-CONTRACT_VERSION: Final[str] = "1.0.0"
+CONTRACT_VERSION: Final[str] = "1.1.0"
 """Version of the language-neutral provisioning API contract."""
 
 

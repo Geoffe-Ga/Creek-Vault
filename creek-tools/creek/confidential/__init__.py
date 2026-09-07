@@ -8,8 +8,10 @@ master key, with NO operator escrow and no reset path. See
 
 from creek.confidential.keyvault import (
     KeyVault,
+    KeyVaultBinding,
     SetupResult,
     UnlockError,
+    create_bound_key_vault,
     create_key_vault,
     load_key_vault,
     save_key_vault,
@@ -19,8 +21,10 @@ from creek.confidential.keyvault import (
 
 __all__ = [
     "KeyVault",
+    "KeyVaultBinding",
     "SetupResult",
     "UnlockError",
+    "create_bound_key_vault",
     "create_key_vault",
     "load_key_vault",
     "save_key_vault",
