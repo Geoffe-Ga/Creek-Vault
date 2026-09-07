@@ -81,6 +81,12 @@ For the isolated one-consumer deployment used by confidential hosting, see the
 Docker contract covers first boot, restart persistence, per-volume isolation,
 mounted secrets, and layered health/readiness.
 
+The separate demand-provisioning service is documented in the
+[`provisioning control-plane`](docs/provisioning-control-plane.md) runbook. Its
+versioned [OpenAPI contract](docs/contracts/provisioning-v1/openapi.json) keeps
+provider work and one-time credential handoff outside the browser-facing job
+API.
+
 ---
 
 ## Command reference

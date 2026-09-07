@@ -82,6 +82,9 @@ creek-tools-mcp = "creek_mcp.server:main"
 # creek-tools-mcp on purpose: MCP stays the agent adapter, /v1 is the
 # application adapter, and both call one behavioural implementation.
 creek-tools-api = "creek_mcp.httpapi.cli:main"
+# Durable authenticated provisioning API. Provider workers are composed with
+# an injected driver by the deployment; the API process never holds one.
+creek-provisioning-api = "creek_mcp.provisioning.cli:main"
 
 [project.optional-dependencies]
 # Transport hold, same swap the openai ceiling below holds. anthropic
