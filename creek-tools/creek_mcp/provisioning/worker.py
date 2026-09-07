@@ -46,7 +46,7 @@ class ProvisioningWorker:
         try:
             if claimed.job.operation is JobOperation.DELETE:
                 self._driver.delete(
-                    claimed.job.job_id,
+                    claimed.job,
                     claimed.provider_allocation_id,
                 )
                 self._store.complete_delete(
@@ -55,10 +55,7 @@ class ProvisioningWorker:
                     now=now,
                 )
             else:
-                allocation = self._driver.provision(
-                    claimed.job.job_id,
-                    claimed.job.consumer_identity,
-                )
+                allocation = self._driver.provision(claimed.job)
 
                 def handoff() -> None:
                     self._handoff.deliver(

@@ -8,7 +8,7 @@ from threading import Lock
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from creek_mcp.provisioning.models import FailureReason
+    from creek_mcp.provisioning.models import FailureReason, ProvisioningJob
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,11 +44,15 @@ class HandoffError(RuntimeError):
 class ProviderDriver(Protocol):
     """Provider operations injected into the durable worker."""
 
-    def provision(self, job_id: str, consumer_identity: str) -> ProviderAllocation:
-        """Idempotently create or return the allocation for *job_id*."""
+    def provision(self, job: ProvisioningJob) -> ProviderAllocation:
+        """Idempotently create or return the allocation for *job*."""
 
-    def delete(self, job_id: str, provider_allocation_id: str | None) -> None:
-        """Idempotently remove every provider resource associated with *job_id*."""
+    def delete(
+        self,
+        job: ProvisioningJob,
+        provider_allocation_id: str | None,
+    ) -> None:
+        """Idempotently remove every provider resource associated with *job*."""
 
 
 class OneTimeCredentialHandoff(Protocol):
@@ -93,32 +97,36 @@ class FakeProviderDriver:
         with self._lock:
             self._failures.append(failure)
 
-    def provision(self, job_id: str, consumer_identity: str) -> ProviderAllocation:
-        """Return one stable fake allocation for *job_id*."""
+    def provision(self, job: ProvisioningJob) -> ProviderAllocation:
+        """Return one stable fake allocation for *job*."""
         with self._lock:
             if self._failures:
                 failure = self._failures.pop(0)
                 self.last_failure = failure
                 raise failure
-            existing = self._allocations.get(job_id)
+            existing = self._allocations.get(job.job_id)
             if existing is not None:
                 return existing
-            digest = hashlib.sha256(job_id.encode("utf-8")).hexdigest()
+            digest = hashlib.sha256(job.job_id.encode("utf-8")).hexdigest()
             allocation = ProviderAllocation(
                 allocation_id=f"fake-{digest[:24]}",
                 vault_url=f"https://fake-{digest[:16]}.internal.invalid/v1",
-                consumer_credential=f"fake-consumer-{consumer_identity}-{digest}",
+                consumer_credential=(f"fake-consumer-{job.consumer_identity}-{digest}"),
             )
-            self._allocations[job_id] = allocation
+            self._allocations[job.job_id] = allocation
             return allocation
 
-    def delete(self, job_id: str, provider_allocation_id: str | None) -> None:
+    def delete(
+        self,
+        job: ProvisioningJob,
+        provider_allocation_id: str | None,
+    ) -> None:
         """Record one idempotent fake teardown without inspecting credentials."""
         del provider_allocation_id
         with self._lock:
-            if job_id in self._deleted:
+            if job.job_id in self._deleted:
                 return
-            self._deleted.add(job_id)
+            self._deleted.add(job.job_id)
             self._delete_count += 1
 
 

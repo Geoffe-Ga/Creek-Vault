@@ -112,12 +112,19 @@ anywhere under ``creek_mcp/`` — so this arm is prospective: it forbids the
 evasion before anyone writes it.
 """
 
-NOT_FOUND_STATUS_MODULES: Final[frozenset[str]] = frozenset({"api/models.py"})
-"""The only module that may carry the integer ``404``.
+NOT_FOUND_STATUS_MODULES: Final[frozenset[str]] = frozenset(
+    {"api/models.py", "provisioning/fly.py"}
+)
+"""The only modules that may carry the integer ``404``.
 
 ``ERROR_STATUS`` is where a status is chosen for a code. A ``404`` written
 anywhere else is a handler picking a status directly, which is how the
 existence oracle comes back without ``NOT_FOUND`` ever being named.
+
+``provisioning/fly.py`` is the one non-wire exception: it interprets Fly's
+upstream resource-absence status while reconciling private provider resources.
+The module is still excluded from :data:`NOT_FOUND_ROUTING_MODULES`, so it
+cannot construct or name Creek's public ``NOT_FOUND`` error code.
 """
 
 NOT_FOUND_CONSTRUCTION_SITES: Final[frozenset[str]] = frozenset(
