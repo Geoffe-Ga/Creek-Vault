@@ -2,6 +2,10 @@
 
 A Python CLI and pipeline for organizing large volumes of semi-structured personal data — chat exports, documents, notes, screenshots, messages — into an interlinked [Obsidian](https://obsidian.md/) knowledge base with semantic classification and NLP-driven discovery.
 
+The demand-provisioned hosting primitive is documented in the
+[`single-vault container runtime`](creek-tools/docs/container-runtime.md)
+runbook.
+
 ## What it does
 
 The pipeline runs in five stages:
