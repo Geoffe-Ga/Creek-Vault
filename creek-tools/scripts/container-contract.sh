@@ -9,10 +9,14 @@ TOKEN_B="contract-b-token-000000000000000000000000000000000002"
 BAD_TOKEN="contract-bad-token-0000000000000000000000000000000003"
 NAME_A="creek-contract-a-$$"
 NAME_B="creek-contract-b-$$"
+VOLUME_A="creek-contract-volume-a-$$"
+VOLUME_B="creek-contract-volume-b-$$"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/creek-container-contract.XXXXXX")"
+chmod 0755 "$TMP_ROOT"
 
 cleanup() {
     docker rm --force "$NAME_A" "$NAME_B" >/dev/null 2>&1 || true
+    docker volume rm --force "$VOLUME_A" "$VOLUME_B" >/dev/null 2>&1 || true
     rm -rf "$TMP_ROOT"
 }
 trap cleanup EXIT
@@ -26,8 +30,7 @@ make_inputs() {
     local identity="$1"
     local token="$2"
     local root="$TMP_ROOT/$identity"
-    mkdir -p "$root/vault" "$root/secrets"
-    chmod 0777 "$root/vault"
+    mkdir -p "$root/secrets"
     printf '%s=%s\n' "$identity" "$token" > "$root/secrets/creek_consumer_tokens"
     printf 'adepthood=%s\n' "$BAD_TOKEN" > "$root/secrets/bad_tokens"
     openssl req -x509 -newkey rsa:2048 -nodes \
@@ -42,11 +45,12 @@ start_container() {
     local name="$1"
     local identity="$2"
     local port="$3"
+    local volume="$4"
     docker run --detach --name "$name" \
         --read-only --tmpfs /tmp:rw,noexec,nosuid,size=32m \
         --security-opt no-new-privileges \
         --publish "127.0.0.1:${port}:8823" \
-        --mount "type=bind,src=$TMP_ROOT/$identity/vault,dst=/vault" \
+        --mount "type=volume,src=$volume,dst=/vault" \
         --mount "type=bind,src=$TMP_ROOT/$identity/secrets,dst=/run/secrets,readonly" \
         "$IMAGE" >/dev/null
 }
@@ -107,6 +111,14 @@ put_journal() {
         "https://127.0.0.1:${port}/v1/journal-entries/${external_id}"
 }
 
+hash_in_container() {
+    local name="$1"
+    local path="$2"
+    docker exec "$name" python -c \
+        'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
+        "$path"
+}
+
 assert_no_secret() {
     local where="$1"
     local body="$2"
@@ -116,7 +128,9 @@ assert_no_secret() {
 
 make_inputs "adepthood-a" "$TOKEN_A"
 make_inputs "adepthood-b" "$TOKEN_B"
-start_container "$NAME_A" "adepthood-a" 18823
+docker volume create "$VOLUME_A" >/dev/null
+docker volume create "$VOLUME_B" >/dev/null
+start_container "$NAME_A" "adepthood-a" 18823 "$VOLUME_A"
 wait_healthy "$NAME_A"
 
 [[ "$(get_health "adepthood-a" "$TOKEN_A" 18823)" == '{"status":"ok"}' ]] \
@@ -125,31 +139,31 @@ wait_healthy "$NAME_A"
 response_a="$(put_journal "adepthood-a" "$TOKEN_A" 18823 \
     'container-contract-a' 'isolated journal sentinel alpha')"
 [[ "$response_a" == *'"status":"ok"'* ]] || fail "consumer A journal write failed"
-journal_a="$(find "$TMP_ROOT/adepthood-a/vault/01-Fragments/Journal" \
-    -type f ! -name .gitkeep -print -quit)"
+journal_a="$(docker exec "$NAME_A" sh -c \
+    'find /vault/01-Fragments/Journal -type f ! -name .gitkeep -print -quit')"
 [[ -n "$journal_a" ]] || fail "consumer A journal did not reach the mounted vault"
-hash_before="$(shasum -a 256 "$journal_a" | cut -d ' ' -f 1)"
+hash_before="$(hash_in_container "$NAME_A" "$journal_a")"
 
 docker restart "$NAME_A" >/dev/null
 wait_healthy "$NAME_A"
-hash_after="$(shasum -a 256 "$journal_a" | cut -d ' ' -f 1)"
+hash_after="$(hash_in_container "$NAME_A" "$journal_a")"
 [[ "$hash_after" == "$hash_before" ]] || fail "restart rewrote journal content"
 [[ "$(get_health "adepthood-a" "$TOKEN_A" 18823)" == '{"status":"ok"}' ]] \
     || fail "restart did not preserve the mounted consumer credential"
 
-start_container "$NAME_B" "adepthood-b" 18824
+start_container "$NAME_B" "adepthood-b" 18824 "$VOLUME_B"
 wait_healthy "$NAME_B"
 response_b="$(put_journal "adepthood-b" "$TOKEN_B" 18824 \
     'container-contract-b' 'isolated journal sentinel beta')"
 [[ "$response_b" == *'"status":"ok"'* ]] || fail "consumer B journal write failed"
-grep -R -F -q 'isolated journal sentinel alpha' "$TMP_ROOT/adepthood-a/vault" \
+docker exec "$NAME_A" grep -R -F -q 'isolated journal sentinel alpha' /vault \
     || fail "consumer A content is absent from volume A"
-grep -R -F -q 'isolated journal sentinel beta' "$TMP_ROOT/adepthood-b/vault" \
+docker exec "$NAME_B" grep -R -F -q 'isolated journal sentinel beta' /vault \
     || fail "consumer B content is absent from volume B"
-if grep -R -F -q 'isolated journal sentinel beta' "$TMP_ROOT/adepthood-a/vault"; then
+if docker exec "$NAME_A" grep -R -F -q 'isolated journal sentinel beta' /vault; then
     fail "consumer B content crossed into volume A"
 fi
-if grep -R -F -q 'isolated journal sentinel alpha' "$TMP_ROOT/adepthood-b/vault"; then
+if docker exec "$NAME_B" grep -R -F -q 'isolated journal sentinel alpha' /vault; then
     fail "consumer A content crossed into volume B"
 fi
 
@@ -204,10 +218,10 @@ assert_no_secret "image metadata" "$metadata"
 assert_no_secret "image history" "$history"
 assert_no_secret "container process arguments" "$processes"
 assert_no_secret "container logs" "$logs"
-if grep -R -F -q "$TOKEN_A" "$TMP_ROOT/adepthood-a/vault"; then
+if docker exec "$NAME_A" grep -R -F -q "$TOKEN_A" /vault; then
     fail "consumer A credential was written into its vault corpus"
 fi
-if grep -R -F -q "$TOKEN_B" "$TMP_ROOT/adepthood-b/vault"; then
+if docker exec "$NAME_B" grep -R -F -q "$TOKEN_B" /vault; then
     fail "consumer B credential was written into its vault corpus"
 fi
 

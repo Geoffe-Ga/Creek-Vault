@@ -88,6 +88,15 @@ def test_contract_fixture_and_operator_runbook_are_committed() -> None:
         assert phrase in doc
 
 
+def test_contract_uses_managed_volumes_and_linux_traversable_secret_root() -> None:
+    """CI must exercise the image UID without depending on macOS bind semantics."""
+    script = CONTRACT_SCRIPT.read_text(encoding="utf-8")
+    assert 'chmod 0755 "$TMP_ROOT"' in script
+    assert "docker volume create" in script
+    assert "type=volume,src=$volume,dst=/vault" in script
+    assert "docker volume rm --force" in script
+
+
 def test_http_api_cold_import_does_not_require_the_optional_author_stack() -> None:
     """The base API image must start without importing optional NumPy code."""
     code = """
