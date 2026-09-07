@@ -339,6 +339,7 @@ creek-tools/
 │   ├── _lib.sh                       # Shared shell helpers sourced by the gates
 │   ├── check-all.sh                  # Run every quality gate (single source of truth)
 │   ├── complexity.sh                 # Radon + Xenon (CI-002)
+│   ├── container-contract.sh         # Real single-vault Docker runtime contract
 │   ├── coverage-per-file.sh          # Per-file gate (80% strict, 65% waiver floor; TEST-002)
 │   ├── coverage-waivers.txt          # Documented waivers for the per-file gate
 │   ├── coverage.sh                   # pytest --cov-fail-under (90% aggregate)

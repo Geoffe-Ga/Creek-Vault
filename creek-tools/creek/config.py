@@ -2676,7 +2676,11 @@ introducing any new keys (issue #320).
 """
 
 
-def generate_default_config(output_path: Path) -> None:
+def generate_default_config(
+    output_path: Path,
+    *,
+    vault_path: Path | None = None,
+) -> None:
     """Generate a default ``creek_config.yaml`` file.
 
     Serialises the default ``CreekConfig`` to YAML and writes it to
@@ -2688,8 +2692,11 @@ def generate_default_config(output_path: Path) -> None:
 
     Args:
         output_path: Destination file path for the generated YAML.
+        vault_path: Explicit vault root to persist in the generated config.
+            ``None`` preserves the CLI's historical current-directory default.
     """
-    data: dict[str, object] = CreekConfig().model_dump(mode="json")
+    config = CreekConfig() if vault_path is None else CreekConfig(vault_path=vault_path)
+    data: dict[str, object] = config.model_dump(mode="json")
     with output_path.open("w") as f:
         f.write(_ANTHROPIC_CONSENT_NOTE)
         yaml.dump(data, f, default_flow_style=False, sort_keys=False)

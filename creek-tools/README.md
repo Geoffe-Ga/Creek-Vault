@@ -76,6 +76,11 @@ creek report   --type wavelength --period weekly --vault ~/Obsidian/Creek
 
 Every command is also documented under [`docs/`](docs/) with end-to-end examples.
 
+For the isolated one-consumer deployment used by confidential hosting, see the
+[`single-vault container runtime`](docs/container-runtime.md) runbook. Its
+Docker contract covers first boot, restart persistence, per-volume isolation,
+mounted secrets, and layered health/readiness.
+
 ---
 
 ## Command reference
