@@ -59,12 +59,14 @@ _VECTOR = (
 )
 
 
-def _awaiting_store(tmp_path: Path) -> tuple[ProvisioningStore, str]:
+def _awaiting_store(
+    tmp_path: Path, *, now: datetime = _NOW
+) -> tuple[ProvisioningStore, str]:
     """Return one real store whose provider create reached the ceremony boundary."""
     store = ProvisioningStore(tmp_path / "provisioning.sqlite3")
-    job = store.submit("activation-ceremony", "adepthood", now=_NOW)
+    job = store.submit("activation-ceremony", "adepthood", now=now)
     worker = ProvisioningWorker(store, FakeProviderDriver(), FakeOneTimeHandoff())
-    assert worker.run_once(now=_NOW) is True
+    assert worker.run_once(now=now) is True
     awaiting = store.get(job.job_id, "adepthood")
     assert awaiting is not None
     assert awaiting.state is JobState.AWAITING_KEY_CEREMONY
@@ -149,12 +151,18 @@ def _release_envelope(recipient: X25519PublicKey) -> KeyReleaseEnvelope:
     )
 
 
-def _api_client(store: ProvisioningStore) -> TestClient:
-    """Return the authenticated public ceremony API over *store*."""
+def _api_client(store: ProvisioningStore, *, now: datetime = _NOW) -> TestClient:
+    """Return the authenticated public ceremony API over *store*.
+
+    The clock is injected so the HTTP lane is pinned to the same frozen
+    ``_NOW`` the fixtures are built against. Without it the handler reads real
+    wall-clock time, and every ceremony minted at ``_NOW`` starts returning 409
+    ``ceremony_expired`` the moment real time passes ``_NOW + 24h``.
+    """
     verifier = ConsumerTokenVerifier(
         {"adepthood": (_TOKEN,), "other-consumer": (_OTHER_TOKEN,)}
     )
-    return TestClient(build_provisioning_app(store, verifier))
+    return TestClient(build_provisioning_app(store, verifier, clock=lambda: now))
 
 
 def _headers(token: str = _TOKEN) -> dict[str, str]:
@@ -576,3 +584,33 @@ def test_http_rejects_secret_fields_and_cross_consumer_access(tmp_path: Path) ->
     assert invalid.json()["code"] == "invalid_request"
     assert foreign.status_code == 403
     assert foreign.json()["code"] == "job_unavailable"
+
+
+def test_the_control_plane_clock_defaults_to_real_wall_clock_time(
+    tmp_path: Path,
+) -> None:
+    """An app built without a clock reads real time, not a frozen test constant.
+
+    This is the guard for the regression that made the frozen-clock HTTP tests
+    fail: it pins that injecting a clock stayed a *test* affordance and did not
+    freeze production. It mints its ceremony against real ``now``, so it cannot
+    itself rot the way a fixed ``_NOW`` does.
+    """
+    real_now = datetime.now(tz=UTC)
+    store, job_id = _awaiting_store(tmp_path, now=real_now)
+    verifier = ConsumerTokenVerifier(
+        {"adepthood": (_TOKEN,), "other-consumer": (_OTHER_TOKEN,)}
+    )
+    client = TestClient(build_provisioning_app(store, verifier))
+    path = f"/control/v1/jobs/{job_id}/key-ceremony"
+
+    challenge_response = client.get(path, headers=_headers())
+    challenge = KeyCeremonyChallenge.model_validate(challenge_response.json())
+    completed = client.put(
+        path,
+        headers=_headers(),
+        json=_for_challenge(_vector_submission(), challenge).model_dump(mode="json"),
+    )
+
+    assert challenge_response.status_code == 200
+    assert completed.status_code == 200
