@@ -220,6 +220,7 @@ class RedactionScanner:
         """
         self.config = config
         self.salt: bytes = os.urandom(16)
+        self._allowlist = frozenset(config.false_positive_allowlist)
         self._patterns = self._build_patterns()
         self._marker_runs = emitted_marker_runs(
             config.replacement_template,
@@ -251,13 +252,28 @@ class RedactionScanner:
     def _is_allowlisted(self, text: str) -> bool:
         """Check whether *text* appears in the false-positive allowlist.
 
+        Exact-string membership, tested against :attr:`_allowlist` — the
+        frozenset snapshot taken in :meth:`__init__` — because this runs
+        once per regex match and once per candidate run on every line of
+        every scanned file, and against the configured ``list[str]`` each
+        of those was an O(allowlist) scan. The snapshot is taken at
+        construction, the same idiom :attr:`_patterns` and
+        :attr:`_marker_runs` already use, because
+        :class:`~creek.config.RedactionConfig` is a non-frozen
+        ``BaseModel``. Semantics are unchanged: ``in`` on a frozenset of
+        ``str`` is the same exact-equality test as ``in`` on a list.
+
+        Its mirror, :meth:`creek.redact.redactor.Redactor._is_allowlisted`,
+        snapshots identically, so ``--scan`` and ``--apply`` cannot
+        disagree about the allowlist.
+
         Args:
             text: The matched string to check.
 
         Returns:
             ``True`` if the string should be excluded from results.
         """
-        return text in self.config.false_positive_allowlist
+        return text in self._allowlist
 
     @staticmethod
     def is_binary(file_path: Path) -> bool:
@@ -979,10 +995,11 @@ def iter_unmarked_candidates(
     """Yield the high-entropy candidate runs in *text* that are not our own.
 
     The single definition of "is this run a candidate", shared by
-    ``--scan`` (:meth:`RedactionScanner._scan_high_entropy`), ``--apply``
-    (:meth:`creek.redact.redactor.Redactor._collect_high_entropy_spans`)
-    and span snapping
-    (:meth:`creek.redact.redactor.Redactor._snap_to_candidate_runs`).
+    ``--scan`` (:meth:`RedactionScanner._scan_high_entropy`) and, on the
+    ``--apply`` side, by :meth:`creek.redact.redactor.Redactor._candidate_runs`
+    — which since #946 is itself the one place the redactor obtains runs,
+    feeding both its entropy collector and its span snapping from a
+    single sweep per ``redact_content`` call.
     Those three used to run their own ``HIGH_ENTROPY_CANDIDATE`` sweeps;
     #909 and #942 each had to be applied to every copy by hand, and #945
     is what happened when a new fact reached only some of them — the

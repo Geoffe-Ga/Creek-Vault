@@ -19,6 +19,7 @@ Tests cover:
 
 import ast
 import inspect
+import itertools
 import json
 import random
 import re
@@ -634,12 +635,20 @@ class TestNewPatterns:
     # -- private_key --
 
     def test_private_key_matches(self) -> None:
-        """private_key should match PEM key headers."""
+        """private_key should match PEM key headers.
+
+        The headers are assembled from parts rather than written as literals.
+        They are detector test vectors holding no key material, but
+        pre-commit's ``detect-private-key`` scans file *bytes* for the
+        contiguous header text, so a literal here makes this whole file
+        uncommittable for everyone. Assembling keeps that hook at full
+        strength over this file -- the one most likely to gain real key
+        material -- instead of excluding the file from the scan.
+        """
         pattern = REDACTION_PATTERNS["private_key"]
-        assert pattern.search("-----BEGIN PRIVATE KEY-----")
-        assert pattern.search("-----BEGIN RSA PRIVATE KEY-----")
-        assert pattern.search("-----BEGIN EC PRIVATE KEY-----")
-        assert pattern.search("-----BEGIN OPENSSH PRIVATE KEY-----")
+        for kind in ("", "RSA ", "EC ", "OPENSSH "):
+            header = f"-----BEGIN {kind}PRIVATE KEY-----"
+            assert pattern.search(header), header
 
     def test_private_key_no_false_positive(self) -> None:
         """private_key should not match public key headers."""
@@ -1664,7 +1673,7 @@ class TestHighEntropyDetector:
     def test_high_entropy_long_random_string_matches(self, tmp_path: Path) -> None:
         """A 32-char random hex string should be flagged."""
         # Hex random secret — high entropy, no obvious pattern.
-        secret = "a3f1c8b2e9d74105fb6c2e8a91d34c70"
+        secret = "a3f1c8b2e9d74105fb6c2e8a91d34c70"  # pragma: allowlist secret
         test_file = tmp_path / "data.txt"
         test_file.write_text(f"token = {secret}\n")
 
@@ -1715,7 +1724,7 @@ class TestHighEntropyDetector:
 
     def test_high_entropy_respects_allowlist(self, tmp_path: Path) -> None:
         """A high-entropy string in the allowlist must not be flagged."""
-        secret = "a3f1c8b2e9d74105fb6c2e8a91d34c70"
+        secret = "a3f1c8b2e9d74105fb6c2e8a91d34c70"  # pragma: allowlist secret
         test_file = tmp_path / "data.txt"
         test_file.write_text(secret + "\n")
 
@@ -2065,7 +2074,7 @@ class TestRedactorHighEntropy:
         """
         from creek.config import RedactionConfig as CfgCls
 
-        secret = "a3f1c8b2e9d74105fb6c2e8a91d34c70"
+        secret = "a3f1c8b2e9d74105fb6c2e8a91d34c70"  # pragma: allowlist secret
         cfg = CfgCls()
         scanner = RedactionScanner(config=cfg)
         redactor = Redactor(config=cfg, salt=scanner.salt)
@@ -2083,7 +2092,7 @@ class TestRedactorHighEntropy:
         """
         from creek.config import RedactionConfig as CfgCls
 
-        secret = "a3f1c8b2e9d74105fb6c2e8a91d34c70"
+        secret = "a3f1c8b2e9d74105fb6c2e8a91d34c70"  # pragma: allowlist secret
         cfg = CfgCls(false_positive_allowlist=[secret])
         scanner = RedactionScanner(config=cfg)
         redactor = Redactor(config=cfg, salt=scanner.salt)
@@ -2424,11 +2433,68 @@ _REPEATING_RUN = "ababababababababababab"
 _SUB_THRESHOLD_RUN = "abcdefghabcdefghabcdefgh"
 _ENTROPIC_EMAIL = "aB3xY7zQ9mK2pL5nR8vT4wd@example.com"  # pragma: allowlist secret
 # A deliberately *predictable* tail: 14 repeats of one character. Glued to
-# `_AWS_EXAMPLE_KEY` the combined 34-char run measures 3.1446 bits/char —
-# BELOW the default 3.7 threshold — so the entropy detector contributes no
-# span at all and only token-boundary snapping can keep the tail covered.
+# `_AWS_EXAMPLE_KEY` the combined 34-char run measures 3.144585 bits/char
+# whole-run — BELOW the default 3.7 threshold, which is why this fixture
+# was built. Read the rest before reusing it: that is only half the story
+# and the missing half used to be stated the wrong way round here.
+#
+# The run's best contiguous 20-char window, at offset 1, measures
+# **3.821928 bits/char**, which CLEARS the same 3.7 bar. So since the #942
+# window gate landed, `has_high_entropy_region` returns True on this
+# fixture and `_collect_high_entropy_spans` emits a span over the whole
+# 0..34 run on its own. This fixture is therefore invisible to the
+# WHOLE-RUN gate only — never to the detector as a whole — and the tests
+# built on it do NOT exercise token-boundary snapping. The fixture that is
+# genuinely inert to both gates at the default confidence is
+# `_PREFIX_THEN_PHONE` below. Pinned by
+# `test_the_low_entropy_tail_fixture_measures_what_the_docs_claim`.
 _LOW_ENTROPY_TAIL = "a" * 14
 _KEY_THEN_LOW_ENTROPY_TAIL = f"{_AWS_EXAMPLE_KEY}{_LOW_ENTROPY_TAIL}"
+_KEY_THEN_LOW_ENTROPY_TAIL_WHOLE_RUN_ENTROPY = 3.1445847115159293
+"""Whole-run Shannon entropy of ``_KEY_THEN_LOW_ENTROPY_TAIL``, measured."""
+
+_KEY_THEN_LOW_ENTROPY_TAIL_BEST_WINDOW_ENTROPY = 3.821928094887362
+"""Best 20-char window of the same run (offset 1) — above the 3.7 default."""
+
+# The counterexample that refuses ITEM 1 of issue #946 (ADR-0014): a
+# 20-character opaque token glued to a *self-delimiting* PII match. Both
+# are measured against ``entropy_threshold(mc) = 2.5 + 2.0 * mc``.
+#
+#   - `_PREFIX_THEN_PHONE` is ONE candidate run at offsets 0..33, measuring
+#     3.327090 bits/char whole-run and 3.346439 best-window, so BOTH
+#     entropy gates are inert for every `min_confidence` strictly greater
+#     than 0.4232196723355077 — the shipped default of 0.6 included.
+#     `phone_number` matches 21..33, its START strictly inside the run, so
+#     token-boundary snapping is the ONLY layer covering the prefix.
+#   - `_PREFIX_THEN_IPV4` is the `ipv4` mirror. Its candidate run is only
+#     `deadbeefdeadbeefdead-192` (offsets 0..24) because `.` sits outside
+#     `[A-Za-z0-9+/=_-]`; that run measures 2.755123 whole-run and 2.846439
+#     best-window, so the whole-run gate fires up to `min_confidence`
+#     0.12756152200862747 and the window gate up to 0.17321967233550772.
+#     Above that it too rests on snapping alone.
+#
+# Those crossovers are why the exact-byte pins on these fixtures are NOT
+# parametrised over `MARKER_INERTNESS_CONFIDENCES`: at its `0.0` member the
+# entropy detector covers the ipv4 run and the assertion would pass for the
+# wrong reason — the same vacuity that hollowed out the claim on
+# `_KEY_THEN_LOW_ENTROPY_TAIL` above.
+_OPAQUE_LOW_ENTROPY_PREFIX = "deadbeefdeadbeefdead"  # pragma: allowlist secret
+_PREFIX_THEN_PHONE = f"{_OPAQUE_LOW_ENTROPY_PREFIX}-555-123-4567"
+_PREFIX_THEN_IPV4 = f"{_OPAQUE_LOW_ENTROPY_PREFIX}-192.168.1.1"
+_PREFIX_THEN_IPV4_RUN = f"{_OPAQUE_LOW_ENTROPY_PREFIX}-192"
+# The same run with the phone number in front, so the two `_snap_one`
+# no-move geometries can each be exercised where snapping is provably the
+# ONLY active layer. `_PREFIX_THEN_PHONE` matches 21..33 in a 0..33 run —
+# start strictly inside, end flush with `run_end`. `_PHONE_THEN_PREFIX`
+# matches 0..12 in a 0..33 run — start flush with `run_start`, end
+# strictly inside. Both measure the same 3.327090 whole-run, since the
+# character multiset is unchanged.
+_PHONE_THEN_PREFIX = f"555-123-4567-{_OPAQUE_LOW_ENTROPY_PREFIX}"
+_PHONE_RUN_INERT_ABOVE = 0.4232196723355077
+"""``min_confidence`` above which both gates are inert on the phone run."""
+
+_IPV4_RUN_INERT_ABOVE = 0.17321967233550772
+"""``min_confidence`` above which both gates are inert on the ipv4 run."""
 
 # Geometry of the emitted-marker carve-out (Issue #945), all measured
 # against the committed ``PATTERN_METADATA`` and the default template:
@@ -2496,20 +2562,27 @@ class TestHighEntropyOverlapLeak:
         assert "[REDACTED:high_entropy_string]" not in result
 
     def test_sub_threshold_entropy_tail_after_api_key_still_redacted(self) -> None:
-        """A sub-threshold tail of the SAME token must not leak (RED at HEAD).
+        """A sub-threshold tail of the SAME token must not leak.
 
         ``_KEY_THEN_LOW_ENTROPY_TAIL`` is one contiguous 34-char
-        ``HIGH_ENTROPY_CANDIDATE`` run whose Shannon entropy is
-        **3.145 bits/char — BELOW the default 3.7 threshold**
-        (``min_confidence=0.6``). The entropy detector therefore does not
-        fire at all, so span-unioning alone cannot cover the remainder:
-        only **token-boundary snapping** — widening the ``api_key`` match
-        outward to the enclosing run's boundaries — keeps the tail from
-        leaking.
+        ``HIGH_ENTROPY_CANDIDATE`` run whose **whole-run** Shannon entropy
+        is 3.144585 bits/char, below the default 3.7 threshold
+        (``min_confidence=0.6``). When this test was written that was
+        taken to mean the entropy detector did not fire at all, and the
+        docstring claimed only token-boundary snapping kept the tail
+        covered.
 
-        At HEAD this returns ``[REDACTED:api_key]aaaaaaaaaaaaaa``: 14
-        characters of the very token a *critical* ``api_key`` detector
-        fired on survive in cleartext.
+        That claim is false and has been corrected (#946). The run's best
+        contiguous 20-char window, at offset 1, measures 3.821928, which
+        CLEARS the same bar — so since #942's window gate landed the
+        detector emits a span over the whole run on its own and this test
+        passes with snapping deleted. It is kept as a valid
+        non-regression on the *outcome*, not as evidence for the snap;
+        ``TestSnappingIsNotDetectorScoped`` carries fixtures that are
+        genuinely inert to both gates, and
+        ``test_the_low_entropy_tail_fixture_measures_what_the_docs_claim``
+        pins both numbers so the prose cannot drift from the fixture
+        again.
         """
         config = RedactionConfig()
         scanner = RedactionScanner(config=config)
@@ -2852,6 +2925,585 @@ class TestHighEntropyOverlapLeak:
         redactor = Redactor(config=config, salt=scanner.salt)
 
         assert redactor.redact_content(_COMBO_MARKER) == _COMBO_MARKER
+
+
+# ---------------------------------------------------------------------------
+# Snapping: cost and behavioural equivalence (Issue #946, ITEM 2)
+# ---------------------------------------------------------------------------
+
+
+class _SweepTally:
+    """Mutable tally shared by a proxy pattern and the test asserting on it.
+
+    Attributes:
+        sweeps: Number of ``finditer`` calls made through the proxy.
+        comparisons: Number of ordering comparisons taken against an
+            offset the proxy produced.
+    """
+
+    def __init__(self) -> None:
+        """Start both counters at zero."""
+        self.sweeps = 0
+        self.comparisons = 0
+
+
+class _CountedOffset(int):
+    """An ``int`` offset that tallies every ordering comparison it takes part in.
+
+    ``_snap_one`` decides whether to widen a span by comparing a run's
+    offsets against the span's, so counting those comparisons measures the
+    snap's asymptotic cost without touching the wall clock. Subclassing
+    ``int`` rather than wrapping it matters twice: the value stays usable
+    everywhere a real offset is (slicing, ``_Span`` construction, the
+    splice), and Python gives a subclass's reflected comparison method
+    priority over a plain ``int``'s, so ``plain < counted`` is counted too.
+
+    Attributes:
+        tally: The counter every comparison is reported into.
+    """
+
+    tally: _SweepTally
+
+    def __new__(cls, value: int, tally: _SweepTally) -> "_CountedOffset":
+        """Build an offset bound to *tally*.
+
+        Args:
+            value: The real offset.
+            tally: Counter the comparisons are reported into.
+
+        Returns:
+            The offset, indistinguishable from *value* in arithmetic.
+        """
+        offset = super().__new__(cls, value)
+        offset.tally = tally
+        return offset
+
+    def __lt__(self, other: int) -> bool:
+        """Tally, then compare as an ordinary ``int``.
+
+        Args:
+            other: The right-hand operand.
+
+        Returns:
+            ``True`` when this offset is smaller.
+        """
+        self.tally.comparisons += 1
+        return int(self) < int(other)
+
+    def __gt__(self, other: int) -> bool:
+        """Tally, then compare as an ordinary ``int``.
+
+        Args:
+            other: The right-hand operand.
+
+        Returns:
+            ``True`` when this offset is larger.
+        """
+        self.tally.comparisons += 1
+        return int(self) > int(other)
+
+    def __le__(self, other: int) -> bool:
+        """Tally, then compare as an ordinary ``int``.
+
+        Args:
+            other: The right-hand operand.
+
+        Returns:
+            ``True`` when this offset is not larger.
+        """
+        self.tally.comparisons += 1
+        return int(self) <= int(other)
+
+    def __ge__(self, other: int) -> bool:
+        """Tally, then compare as an ordinary ``int``.
+
+        Args:
+            other: The right-hand operand.
+
+        Returns:
+            ``True`` when this offset is not smaller.
+        """
+        self.tally.comparisons += 1
+        return int(self) >= int(other)
+
+
+class _CountedMatch:
+    """A ``re.Match`` stand-in whose offsets are :class:`_CountedOffset`.
+
+    Only the three members the candidacy gate and its two consumers use
+    are provided — ``start``, ``end`` and ``group`` — because
+    ``iter_unmarked_candidates`` yields the match straight through to
+    them and nothing else is touched.
+    """
+
+    def __init__(self, match: re.Match[str], tally: _SweepTally) -> None:
+        """Wrap *match*, routing its offsets through *tally*.
+
+        Args:
+            match: The real match to delegate to.
+            tally: Counter the wrapped offsets report into.
+        """
+        self._match = match
+        self._tally = tally
+
+    def start(self) -> _CountedOffset:
+        """Return the match start as a counting offset.
+
+        Returns:
+            The start offset.
+        """
+        return _CountedOffset(self._match.start(), self._tally)
+
+    def end(self) -> _CountedOffset:
+        """Return the match end as a counting offset.
+
+        Returns:
+            The end offset.
+        """
+        return _CountedOffset(self._match.end(), self._tally)
+
+    def group(self) -> str:
+        """Return the matched text unchanged.
+
+        Returns:
+            The matched substring.
+        """
+        return self._match.group()
+
+
+class _CountingCandidatePattern:
+    """Proxy over ``HIGH_ENTROPY_CANDIDATE`` that tallies sweeps and compares.
+
+    ``creek.redact.scanner.HIGH_ENTROPY_CANDIDATE`` is read at exactly one
+    site — ``HIGH_ENTROPY_CANDIDATE.finditer`` inside
+    ``iter_unmarked_candidates`` — which is itself asserted by
+    ``test_the_candidacy_gate_has_exactly_one_definition``. Substituting
+    this object for that global therefore intercepts *every* candidate
+    sweep by construction, with no risk of a second unproxied path.
+    """
+
+    def __init__(self, pattern: re.Pattern[str], tally: _SweepTally) -> None:
+        """Wrap *pattern*, reporting into *tally*.
+
+        Args:
+            pattern: The real compiled candidate regex.
+            tally: Counter for sweeps and offset comparisons.
+        """
+        self._pattern = pattern
+        self._tally = tally
+
+    def finditer(self, text: str) -> list[_CountedMatch]:
+        """Sweep *text*, tallying the sweep and wrapping each match.
+
+        Args:
+            text: The line or document to sweep.
+
+        Returns:
+            One :class:`_CountedMatch` per candidate run, in order.
+        """
+        self._tally.sweeps += 1
+        return [
+            _CountedMatch(match, self._tally) for match in self._pattern.finditer(text)
+        ]
+
+
+def _install_counting_candidate_pattern(
+    monkeypatch: pytest.MonkeyPatch,
+) -> _SweepTally:
+    """Swap the candidate regex for a counting proxy for one test.
+
+    Args:
+        monkeypatch: pytest's undo-on-teardown patcher.
+
+    Returns:
+        The tally the proxy reports into, with both counters at zero.
+    """
+    from creek.redact import scanner as scanner_module
+
+    tally = _SweepTally()
+    monkeypatch.setattr(
+        scanner_module,
+        "HIGH_ENTROPY_CANDIDATE",
+        _CountingCandidatePattern(scanner_module.HIGH_ENTROPY_CANDIDATE, tally),
+    )
+    return tally
+
+
+class TestSnapCostAndCorrectness:
+    """Token-boundary snapping is O(S log R), and unchanged byte for byte.
+
+    Issue #946 ITEM 2. ``_snap_to_candidate_runs`` compared every span
+    against every run and rebuilt the run list from a second full sweep of
+    the content, so a token-dense file paid O(S x R) plus a redundant
+    O(len(content)) regex pass on every ``redact --apply``.
+
+    The two cost tests here count *operations*, never wall-clock seconds,
+    so they are deterministic under load and belong in the ordinary CI
+    lane rather than behind ``slow`` — a timing test would be quarantined
+    exactly where the regression would recur. The equivalence tests beside
+    them are what make the cost change safe to take: this is a privacy
+    guard (#909), and an "obviously equivalent" rewrite of one is worth
+    precisely as much as the test that distinguishes it from the original.
+    """
+
+    def test_redact_content_sweeps_candidate_runs_exactly_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One ``redact_content`` call means one candidate sweep (RED at HEAD).
+
+        The entropy collector and the snapper each ran
+        ``iter_unmarked_candidates`` over the whole content, so every
+        ``--apply`` paid two full regex passes to build the same list
+        twice. RED at HEAD with ``assert 2 == 1``.
+
+        The redactor is constructed BEFORE the proxy is installed on
+        purpose: ``Redactor.__init__`` calls ``emitted_marker_runs``,
+        which sweeps once per pattern name and would swamp the tally.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+        content = "\n".join(f"line{index} {_HEX_SECRET}" for index in range(8))
+
+        tally = _install_counting_candidate_pattern(monkeypatch)
+        redactor.redact_content(content)
+
+        assert tally.sweeps == 1, (
+            "HIGH_ENTROPY_CANDIDATE.finditer must be swept once per "
+            f"redact_content call; it ran {tally.sweeps} times "
+            "(_snap_to_candidate_runs and _collect_high_entropy_spans each "
+            "built the run list from their own full pass)."
+        )
+
+    def test_snapping_does_not_compare_every_span_against_every_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Snapping must not be quadratic in spans x runs (RED at HEAD).
+
+        ``min_confidence=1.0`` puts the entropy detector provably out of
+        reach (4.5 bits/char), so every span here is an ``api_key`` hit
+        and snapping is the only layer that can widen it — which is also
+        the configuration in which the #909 backstop matters most.
+
+        With 2000 runs each carrying one bisecting match, HEAD's nested
+        loop takes two ordering comparisons per (span, run) pair:
+        ``assert 8000000 < 400000``. A bisect over the run starts takes
+        O(log R) per edge, comfortably inside a budget of
+        ``100 * (spans + runs)`` that leaves room for the merge sort.
+        """
+        run_count = 2000
+        config = RedactionConfig(min_confidence=1.0)
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+        content = "\n".join(
+            f"line{index} {_KEY_THEN_LOW_ENTROPY_TAIL}" for index in range(run_count)
+        )
+        budget = 100 * (run_count + run_count)
+
+        tally = _install_counting_candidate_pattern(monkeypatch)
+        redactor.redact_content(content)
+
+        assert tally.comparisons < budget, (
+            f"snapping took {tally.comparisons} ordering comparisons over "
+            f"{run_count} spans and {run_count} runs; a per-edge bisect over "
+            f"the run starts fits in {budget}. A quadratic scan is back."
+        )
+
+    def test_candidate_runs_are_sorted_and_disjoint(self) -> None:
+        """The bisect's precondition, asserted directly rather than assumed.
+
+        ``_containing_run`` replaces a linear scan with one
+        ``bisect_right`` over the run starts. That is only equivalent
+        because the run list is sorted and non-overlapping: ``re.finditer``
+        yields non-overlapping matches in document order, and the
+        allowlist and marker filters only *remove* members. If a future
+        change ever reorders or overlaps the list, the equivalence proof in
+        ``_containing_run``'s docstring evaporates — so the precondition is
+        pinned here instead of living only in prose.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+        content = "\n".join(
+            [
+                f"alpha {_KEY_THEN_TAIL} omega",
+                f"beta {_HEX_SECRET} {_SUB_THRESHOLD_RUN}",
+                f"gamma {_ENTROPIC_EMAIL} {_PREFIX_THEN_PHONE}",
+                f"delta {_REPEATING_RUN}{_HEX_SECRET}",
+            ]
+        )
+
+        runs = redactor._candidate_runs(content)
+
+        assert runs, "the fixture must produce candidate runs to be meaningful"
+        assert runs == sorted(runs), f"candidate runs are not sorted: {runs}"
+        for earlier, later in itertools.pairwise(runs):
+            assert earlier[1] <= later[0], (
+                f"candidate runs {earlier} and {later} overlap; "
+                "at most one run may contain any offset"
+            )
+        for start, end in runs:
+            assert start < end, f"empty candidate run {(start, end)}"
+
+    @pytest.mark.parametrize(
+        ("content", "expected", "geometry"),
+        [
+            (
+                _KEY_THEN_LOW_ENTROPY_TAIL,
+                "[REDACTED:api_key]",
+                "edge strictly inside a run: the api_key end bisects it",
+            ),
+            (
+                _HEX_SECRET,
+                "[REDACTED:high_entropy_string]",
+                "both edges flush with the run: no move",
+            ),
+            (
+                f"key {_ENTROPIC_EMAIL} end",
+                "key [REDACTED:email] end",
+                "span fully containing a run: no move, widest span wins",
+            ),
+            (
+                f"{_KEY_THEN_TAIL} and {_HEX_SECRET}",
+                "[REDACTED:api_key] and [REDACTED:high_entropy_string]",
+                "two disjoint runs: each span snaps within its own run",
+            ),
+            (
+                _PREFIX_THEN_PHONE,
+                "[REDACTED:phone_number]",
+                "end flush with run_end, start inside: only the start moves "
+                "(and both entropy gates are inert here, so this row is "
+                "snapping and nothing else)",
+            ),
+            (
+                _PHONE_THEN_PREFIX,
+                "[REDACTED:phone_number]",
+                "start flush with run_start, end inside: only the end moves "
+                "(entropy gates inert here too)",
+            ),
+        ],
+    )
+    def test_snapping_output_is_byte_identical_across_all_geometries(
+        self, content: str, expected: str, geometry: str
+    ) -> None:
+        """Every snap geometry keeps HEAD's exact bytes.
+
+        This is the differential pin for the O(S x R) -> O(S log R)
+        rewrite: a refactor of a security guard whose test cannot tell it
+        from the original is worth nothing, so each of the four geometries
+        ``_snap_one`` distinguishes is asserted by its exact output.
+
+        Args:
+            content: Input exercising one snap geometry.
+            expected: The exact bytes HEAD produces for it.
+            geometry: Which geometry the row covers, for the failure line.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        assert redactor.redact_content(content) == expected, geometry
+
+    def test_both_classes_snapshot_the_allowlist_the_same_way(self) -> None:
+        """Scanner and redactor hoist the allowlist, or neither does.
+
+        ``_is_allowlisted`` runs once per regex match and once per
+        candidate run on both sides, so testing membership against the
+        configured ``list[str]`` added an O(allowlist) scan to every one
+        of them. Both classes now consult a ``frozenset`` snapshot taken
+        in ``__init__``.
+
+        Hoisting on only one side would be worse than hoisting on
+        neither: ``--scan`` and ``--apply`` would then answer "is this
+        allowlisted?" from two different objects, and a config mutated
+        between construction and use would make them disagree — the
+        parity #832 exists to guarantee. So the invariant asserted here
+        is *sameness*, not merely presence.
+        """
+        entry = _HEX_SECRET
+        config = RedactionConfig(false_positive_allowlist=[entry])
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        assert isinstance(scanner._allowlist, frozenset)
+        assert isinstance(redactor._allowlist, frozenset)
+        assert scanner._allowlist == redactor._allowlist == {entry}
+        assert scanner._is_allowlisted(entry) is redactor._is_allowlisted(entry)
+        assert scanner._is_allowlisted(entry) is True
+        assert redactor._is_allowlisted(entry + "x") is False
+
+    def test_a_zero_width_custom_match_expands_to_the_whole_run(self) -> None:
+        """A zero-width match inside a run widens to the whole run.
+
+        Both edges of a zero-width span sit strictly inside the run, so
+        both are pushed out and the span becomes the run. That is the
+        documented consequence of a boundary-driven rule, pinned here so
+        the bisect rewrite cannot change it silently: the direction is
+        MORE redaction, which the escalate-only rule permits.
+        """
+        config = RedactionConfig(
+            min_confidence=1.0,
+            custom_patterns={"zero_width_probe": "(?<=deadbeef)(?=deadbeef)"},
+        )
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(_OPAQUE_LOW_ENTROPY_PREFIX)
+
+        assert result == "[REDACTED:zero_width_probe]"
+
+
+class TestSnappingIsNotDetectorScoped:
+    """The refusal of issue #946 ITEM 1, pinned so it cannot erode (ADR-0014).
+
+    #946 asked for ``phone_number``, ``ssn``, ``ipv4``, ``ipv6`` and
+    ``email`` to be exempted from token-boundary snapping, on the ground
+    that a self-delimiting detector "cannot leave the rest of the secret
+    behind". That is refused, and ADR-0014 carries the reasoning.
+    "Self-delimiting" bounds a match against bisecting *its own* value; it
+    says nothing about the rest of the RUN, which may hold something else
+    entirely. These tests hold the two halves of that argument in place.
+    """
+
+    def test_the_low_entropy_tail_fixture_measures_what_the_docs_claim(
+        self,
+    ) -> None:
+        """The arithmetic guard ``_KEY_THEN_LOW_ENTROPY_TAIL`` never had.
+
+        Four separate places used to justify snapping by saying this
+        fixture had "no clearing 20-character window". It does: 3.821928
+        at offset 1, against a 3.7 bar. The consequence is that the tests
+        built on it pass with snapping deleted, so it cannot be the
+        fixture that defends the guard.
+
+        Both numbers are asserted, not just the flattering one, mirroring
+        the discipline ``_COMBO_RUN_ENTROPY`` already gets — that is the
+        whole point: a fixture whose measurements are unpinned drifts out
+        from under the prose describing it.
+        """
+        from creek.redact.scanner import (
+            entropy_threshold,
+            has_high_entropy_region,
+            shannon_entropy,
+        )
+
+        assert shannon_entropy(_KEY_THEN_LOW_ENTROPY_TAIL) == pytest.approx(
+            _KEY_THEN_LOW_ENTROPY_TAIL_WHOLE_RUN_ENTROPY
+        )
+        default_bar = entropy_threshold(0.6)
+        assert default_bar > _KEY_THEN_LOW_ENTROPY_TAIL_WHOLE_RUN_ENTROPY
+        assert default_bar < _KEY_THEN_LOW_ENTROPY_TAIL_BEST_WINDOW_ENTROPY
+        assert (
+            has_high_entropy_region(_KEY_THEN_LOW_ENTROPY_TAIL, entropy_threshold(0.6))
+            is True
+        )
+
+    def test_the_snapping_fixtures_are_inert_to_both_entropy_gates(self) -> None:
+        """The refusal's fixtures really do rest on snapping alone.
+
+        Without this the exact-byte pins below could go vacuous exactly
+        the way the claim on ``_KEY_THEN_LOW_ENTROPY_TAIL`` did: passing
+        because the entropy detector covered the run, while reading as
+        proof that snapping did. The measured crossovers are pinned too,
+        so the margin is visible rather than assumed.
+        """
+        from creek.redact.scanner import entropy_threshold, has_high_entropy_region
+
+        for min_confidence in (0.6, 1.0):
+            threshold = entropy_threshold(min_confidence)
+            assert has_high_entropy_region(_PREFIX_THEN_PHONE, threshold) is False
+            assert has_high_entropy_region(_PREFIX_THEN_IPV4_RUN, threshold) is False
+
+        assert (
+            has_high_entropy_region(
+                _PREFIX_THEN_PHONE, entropy_threshold(_PHONE_RUN_INERT_ABOVE)
+            )
+            is True
+        )
+        assert (
+            has_high_entropy_region(
+                _PREFIX_THEN_IPV4_RUN, entropy_threshold(_IPV4_RUN_INERT_ABOVE)
+            )
+            is True
+        )
+        assert _PHONE_RUN_INERT_ABOVE < 0.6
+        assert _IPV4_RUN_INERT_ABOVE < 0.6
+
+    @pytest.mark.parametrize("min_confidence", MARKER_INERTNESS_CONFIDENCES)
+    @pytest.mark.parametrize(
+        "content", [_PREFIX_THEN_PHONE, _PREFIX_THEN_IPV4], ids=["phone", "ipv4"]
+    )
+    def test_a_self_delimiting_pii_match_still_snaps_to_the_whole_run(
+        self, content: str, min_confidence: float
+    ) -> None:
+        """No opaque prefix survives, at any confidence (escalate-only).
+
+        This is the invariant the ITEM 1 carve-out would break. In
+        ``deadbeefdeadbeefdead-555-123-4567`` the ``phone_number`` match
+        starts at 21, strictly inside the 0..33 run, and both entropy
+        gates are inert at the shipped default — so exempting the detector
+        from snapping would leave a 20-character opaque token in
+        cleartext, which is precisely the class #909 exists to cover.
+
+        Only the weak, universally-true half is parametrised over the
+        whole confidence range; the exact bytes are pinned separately at
+        the default, because below the measured crossovers the entropy
+        detector covers these runs and an exact-byte assertion here would
+        pass for the wrong reason.
+
+        Args:
+            content: One of the two counterexample fixtures.
+            min_confidence: Confidence the redactor is configured with.
+        """
+        config = RedactionConfig(min_confidence=min_confidence)
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(content)
+
+        assert _OPAQUE_LOW_ENTROPY_PREFIX not in result, (
+            "a match whose edge falls strictly inside a candidate run must "
+            "never leave the remainder of that run in cleartext (#909)"
+        )
+
+    def test_the_snapped_run_is_replaced_by_a_single_marker(self) -> None:
+        """Exact bytes at the shipped default ``min_confidence=0.6``.
+
+        Deliberately NOT parametrised over ``MARKER_INERTNESS_CONFIDENCES``
+        (see ADR-0014): at its ``0.0`` member the ipv4 fixture's run clears
+        the 2.5 bar and the entropy detector, not snapping, is what covers
+        it. 0.6 is the configuration operators actually run, and there
+        both gates are inert — so these bytes are snapping's work alone.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        assert redactor.redact_content(_PREFIX_THEN_PHONE) == "[REDACTED:phone_number]"
+        assert redactor.redact_content(_PREFIX_THEN_IPV4) == "[REDACTED:ipv4]"
+
+    def test_prose_over_redaction_survives_a_snapping_carve_out(self) -> None:
+        """#946's own example is redacted whole by ENTROPY, not by snapping.
+
+        ``order-555-123-4567-confirmation`` measures 4.002268 bits/char
+        whole-run against the 3.7 default, so the entropy detector emits a
+        span over the whole string on its own. Isolating that detector
+        shows the prose swallowing the issue reports would survive the
+        carve-out it proposed untouched — exempting ``phone_number`` from
+        snapping would change only which name ``_select_marker_name``
+        puts in the marker. The lever that governs this class of
+        over-redaction is ``min_confidence``, not the snap.
+        """
+        config = RedactionConfig()
+        scanner = RedactionScanner(config=config)
+        redactor = Redactor(config=config, salt=scanner.salt)
+
+        result = redactor.redact_content(
+            "order-555-123-4567-confirmation",
+            pattern_types=["high_entropy_string"],
+        )
+
+        assert result == "[REDACTED:high_entropy_string]"
 
 
 # ---------------------------------------------------------------------------
@@ -3297,6 +3949,18 @@ class TestEmittedMarkerCarveOut:
         Object identity is asserted as well as call-site shape: two
         functions that agree today are two functions that disagree after
         the next fix lands in one of them.
+
+        The redactor's half of the expected set SHRANK in #946, from
+        ``{_collect_high_entropy_spans, _snap_to_candidate_runs}`` to
+        ``{_candidate_runs}``. Those two swept the content independently
+        for the same run list; they now receive it from one
+        ``_candidate_runs`` call per ``redact_content``. That strengthens
+        this invariant rather than relaxing it: a future third consumer
+        cannot obtain runs at all without going through the one helper,
+        so there is no longer a per-consumer place for a candidacy rule
+        to be added to and forgotten in the other. This assertion stays
+        an equality — never a subset check — for the same reason it was
+        written as one.
         """
         from creek.redact import redactor as redactor_module
         from creek.redact import scanner as scanner_module
@@ -3341,10 +4005,7 @@ class TestEmittedMarkerCarveOut:
         )
         assert callers == {
             "creek.redact.scanner": {"_scan_high_entropy", "emitted_marker_runs"},
-            "creek.redact.redactor": {
-                "_collect_high_entropy_spans",
-                "_snap_to_candidate_runs",
-            },
+            "creek.redact.redactor": {"_candidate_runs"},
         }, (
             "the set of candidacy consumers changed. Every one of them must "
             "go through iter_unmarked_candidates, or --scan, --apply and "

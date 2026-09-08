@@ -1179,6 +1179,16 @@ def _rewrite_and_record(
         _AuditWriteError: From the append; the file IS rewritten.
     """
     text = file_path.read_text(encoding="utf-8", errors="replace")
+    # pattern_types is deliberately not passed. Narrowing it switches off
+    # the token-boundary snapping backstop (#909) as well as the entropy
+    # collector -- both hang off Redactor._should_apply_high_entropy -- so a
+    # narrowed --apply would write the remainder of a bisected token back to
+    # disk in cleartext, irreversibly: _atomic_write os.replaces the original
+    # and the audit log holds no original text or offsets. The narrowed
+    # behaviour is intentional where a caller asks for it and is pinned by
+    # tests/test_redact.py::TestHighEntropyOverlapLeak::
+    # test_pattern_types_without_entropy_detector_leaves_tail; this write
+    # path must stay on the full detector set.
     redacted = redactor.redact_content(text)
     _atomic_write(file_path, redacted)
     audit.record_file(file_path)

@@ -23,12 +23,15 @@ a genuine secret used to drag the whole-run average below the bar and
 hide the secret outright (Issue #942).
 
 Even both entropy gates together are not sufficient, because a run can
-fail both and still need covering. A documented AWS example key followed
-by fourteen repeats of a single character measures 3.14 bits/char
-whole-run with no clearing window, so the entropy detector contributes
-no span at all — yet an ``api_key`` match covers only the key half and
-would leave the tail of that same token in cleartext. Raising
-``min_confidence`` to cut false positives widens that class of run. So
+fail both and still need covering. Twenty opaque hex characters glued to
+a phone number — ``deadbeefdeadbeefdead-555-123-4567`` — is one 33-char
+run measuring 3.327090 bits/char whole-run with a best 20-char window of
+3.346439, so both gates are inert for every ``min_confidence`` above
+0.4232196723355077, the shipped default of 0.6 included. The entropy
+detector contributes no span at all, yet ``phone_number`` matches only
+the last twelve characters and would leave a 20-character opaque token
+in cleartext. Raising ``min_confidence`` to cut false positives widens
+that class of run. So
 spans are also **snapped to token boundaries** before merging, as the
 threshold-independent backstop (Issue #909): a span whose edge falls
 strictly inside a ``HIGH_ENTROPY_CANDIDATE`` run is widened to that
@@ -67,6 +70,7 @@ live key), and an operator ``custom_patterns`` regex that matches its
 own marker still self-matches.
 """
 
+import bisect
 import re
 from typing import NamedTuple
 
@@ -127,30 +131,78 @@ _Run = tuple[int, int]
 """Half-open ``(start, end)`` offsets of one high-entropy candidate run."""
 
 
-def _snap_one(span: _Span, runs: list[_Run]) -> _Span:
+def _containing_run(
+    runs: list[_Run],
+    starts: list[int],
+    offset: int,
+) -> _Run | None:
+    """Find the one candidate run *offset* falls strictly inside.
+
+    Equivalence to the linear scan this replaces is a consequence of the
+    run list's shape, not a claim about it. ``re.finditer`` yields
+    non-overlapping matches in document order, and the two filters
+    applied downstream of it — the false-positive allowlist and the
+    emitted-marker carve-out — only ever *remove* members. So ``runs``
+    is sorted by start and pairwise disjoint, and therefore **at most
+    one** run can satisfy ``run_start < offset < run_end``. The previous
+    "scan every run, last match wins" loop and this single lookup can
+    only ever disagree if two runs both contained *offset*, which
+    disjointness forbids; the precondition itself is pinned by
+    ``tests/test_redact.py::TestSnapCostAndCorrectness::
+    test_candidate_runs_are_sorted_and_disjoint``.
+
+    ``bisect_right`` returns the insertion point after every start at or
+    below *offset*, so the run one place before it is the last run that
+    could possibly contain *offset*; the strict containment test then
+    rejects the case where *offset* is at or past that run's end.
+
+    Args:
+        runs: Half-open ``(start, end)`` offsets, sorted and disjoint.
+        starts: The start offsets of *runs*, in the same order — built
+            once per call so the bisect is O(log R) rather than O(R).
+        offset: The span edge to locate.
+
+    Returns:
+        The containing run, or ``None`` when *offset* falls outside
+        every run or lands exactly on a run boundary.
+    """
+    index = bisect.bisect_right(starts, offset) - 1
+    if index < 0:
+        return None
+    run_start, run_end = runs[index]
+    if run_start < offset < run_end:
+        return (run_start, run_end)
+    return None
+
+
+def _snap_one(span: _Span, runs: list[_Run], starts: list[int]) -> _Span:
     """Widen *span* to the boundaries of any candidate run it bisects.
 
     A boundary is only moved when the span's edge falls *strictly*
     inside a run, so a span already flush with a run boundary — or one
-    that fully contains the run — is returned unchanged. The pattern
-    name and collection order are preserved verbatim so the merged
-    span's marker selection is unaffected.
+    that fully contains the run — is returned unchanged. A zero-width
+    span strictly inside a run has *both* edges moved and so becomes the
+    whole run. The pattern name and collection order are preserved
+    verbatim so the merged span's marker selection is unaffected.
 
     Args:
         span: The match span to snap.
-        runs: Half-open offsets of the candidate runs to snap against.
+        runs: Half-open offsets of the candidate runs to snap against,
+            sorted and disjoint.
+        starts: The start offsets of *runs*, in the same order.
 
     Returns:
         The span, widened to whole-token boundaries where it bisected a
         run; otherwise an equal copy of the input.
     """
-    start, end = span.start, span.end
-    for run_start, run_end in runs:
-        if run_start < span.start < run_end:
-            start = run_start
-        if run_start < span.end < run_end:
-            end = run_end
-    return _Span(start, end, span.pattern_name, span.order)
+    start_run = _containing_run(runs, starts, span.start)
+    end_run = _containing_run(runs, starts, span.end)
+    return _Span(
+        span.start if start_run is None else start_run[0],
+        span.end if end_run is None else end_run[1],
+        span.pattern_name,
+        span.order,
+    )
 
 
 def _severity_rank(pattern_name: str) -> int:
@@ -274,6 +326,7 @@ class Redactor:
         """
         self.config = config
         self.salt = salt
+        self._allowlist = frozenset(config.false_positive_allowlist)
         self._patterns = self._build_patterns()
         self._marker_runs = emitted_marker_runs(
             config.replacement_template,
@@ -294,13 +347,29 @@ class Redactor:
     def _is_allowlisted(self, text: str) -> bool:
         """Check whether *text* appears in the false-positive allowlist.
 
+        Membership is tested against :attr:`_allowlist`, the frozenset
+        snapshot taken in :meth:`__init__`, because this predicate runs
+        once per regex match *and* once per candidate run: against the
+        configured ``list[str]`` that was an O(allowlist) scan on every
+        one of them. The snapshot is taken at construction — the same
+        idiom :attr:`_patterns` and :attr:`_marker_runs` already use —
+        because :class:`~creek.config.RedactionConfig` is a non-frozen
+        ``BaseModel`` and could otherwise be mutated mid-scan. Semantics
+        are unchanged: ``in`` on a ``frozenset`` of ``str`` is the same
+        exact-equality test as ``in`` on a ``list`` of ``str``.
+
+        The mirror of this method,
+        :meth:`creek.redact.scanner.RedactionScanner._is_allowlisted`,
+        snapshots identically, so ``--scan`` and ``--apply`` cannot
+        disagree about the allowlist.
+
         Args:
             text: The matched string to check.
 
         Returns:
             ``True`` if the string should be excluded from redaction.
         """
-        return text in self.config.false_positive_allowlist
+        return text in self._allowlist
 
     def redact_content(
         self,
@@ -374,15 +443,55 @@ class Redactor:
 
         spans = self._collect_spans(content, patterns_to_use)
         if self._should_apply_high_entropy(pattern_types):
-            spans.extend(self._collect_high_entropy_spans(content, len(spans)))
-            spans = self._snap_to_candidate_runs(content, spans)
+            # One sweep, two consumers. The entropy collector and the
+            # snapper need the identical run list, and building it twice
+            # cost a second full regex pass over the content as well as a
+            # second chance for the two candidacy rules to drift apart.
+            runs = self._candidate_runs(content)
+            spans.extend(self._collect_high_entropy_spans(content, len(spans), runs))
+            spans = self._snap_to_candidate_runs(spans, runs)
 
         return self._splice_markers(content, _merge_spans(spans))
 
+    def _candidate_runs(self, content: str) -> list[_Run]:
+        """Locate every high-entropy candidate run in *content*, once.
+
+        This is the single place the redactor obtains candidate runs, and
+        it applies both exclusions exactly once: the emitted-marker
+        carve-out, which lives inside
+        :func:`~creek.redact.scanner.iter_unmarked_candidates` (Issue
+        #945), and the false-positive allowlist. Both the entropy
+        collector and the snapping step consume the result, so neither
+        can apply a different candidacy rule from the other, and
+        ``redact_content`` pays one regex sweep instead of two.
+
+        The allowlist is keyed on the **whole maximal run** here, not on
+        a regex match: an allowlisted run is skipped, which is what makes
+        an allowlist entry an exemption from token-boundary widening as
+        well as from the entropy detector.
+
+        Args:
+            content: The original, untouched text.
+
+        Returns:
+            Half-open ``(start, end)`` offsets of every run that is not
+            allowlisted and not part of a marker this configuration
+            renders — sorted by start and pairwise disjoint, because
+            ``re.finditer`` yields non-overlapping matches in document
+            order and both filters only remove members.
+        """
+        return [
+            (candidate.start(), candidate.end())
+            for candidate in iter_unmarked_candidates(
+                content, marker_runs=self._marker_runs
+            )
+            if not self._is_allowlisted(candidate.group())
+        ]
+
     def _snap_to_candidate_runs(
         self,
-        content: str,
         spans: list[_Span],
+        runs: list[_Run],
     ) -> list[_Span]:
         """Widen every span that bisects a contiguous high-entropy run.
 
@@ -390,15 +499,24 @@ class Redactor:
         :func:`~creek.redact.scanner.entropy_threshold` or when any
         contiguous ``HIGH_ENTROPY_MIN_RUN``-character window of it does
         (Issue #942) — but a run can fail *both* of those gates and still
-        need covering. A documented AWS example key followed by fourteen
-        repeats of a single character measures 3.14 bits/char whole-run
-        with no clearing window, so the detector contributes no span at
-        all, and a regex matching only the key half would leave the tail
-        of that same token in cleartext; raising
-        :pyattr:`RedactionConfig.min_confidence` widens that class of
-        run. Snapping is the layer beneath both entropy gates, making
-        that coverage boundary-driven instead of threshold-driven
-        (Issue #909).
+        need covering. ``deadbeefdeadbeefdead-555-123-4567`` is one
+        33-char run measuring 3.327090 bits/char whole-run with a best
+        20-char window of 3.346439, so both gates are inert for every
+        :pyattr:`RedactionConfig.min_confidence` above
+        0.4232196723355077 — the shipped default of 0.6 included. The
+        detector contributes no span, and ``phone_number`` matches only
+        the trailing twelve characters, so without snapping a
+        20-character opaque token survives in cleartext; raising
+        ``min_confidence`` widens that class of run. Snapping is the
+        layer beneath both entropy gates, making that coverage
+        boundary-driven instead of threshold-driven (Issue #909).
+
+        Because the rule is boundary-driven it is deliberately **not**
+        scoped to a subset of detectors. A "self-delimiting" pattern such
+        as ``phone_number`` or ``ipv4`` is bounded against bisecting *its
+        own* value; that says nothing about the rest of the run, which is
+        where the fixture above hides its secret. Exempting such
+        detectors was asked for and refused — see ADR-0014.
 
         Two independent exclusions apply to the run list, and both must
         hold for a run to be snapped onto:
@@ -423,23 +541,27 @@ class Redactor:
           to a marker forms a longer run that fails byte-equality and is
           still snapped onto. See :func:`iter_unmarked_candidates`.
 
+        Cost is O(S log R) in the number of spans and runs: the run
+        starts are extracted once and each span edge is placed with a
+        single :func:`bisect.bisect_right`. Comparing every span against
+        every run — which is what this did before Issue #946 — made a
+        token-dense file quadratic on a code path that runs on every
+        ``redact --apply``.
+
         Args:
-            content: The original, untouched text the spans index into.
-            spans: Match spans collected against that content.
+            spans: Match spans collected against the original content.
+            runs: The shared candidate runs from :meth:`_candidate_runs`,
+                sorted and disjoint. Passed in rather than rebuilt so
+                this step and the entropy collector cannot diverge, and
+                so the content is swept once per call.
 
         Returns:
             The spans with bisecting edges pushed out to whole-token
             boundaries; overlaps this creates are absorbed by
             :func:`_merge_spans`.
         """
-        runs: list[_Run] = [
-            (candidate.start(), candidate.end())
-            for candidate in iter_unmarked_candidates(
-                content, marker_runs=self._marker_runs
-            )
-            if not self._is_allowlisted(candidate.group())
-        ]
-        return [_snap_one(span, runs) for span in spans]
+        starts = [run_start for run_start, _ in runs]
+        return [_snap_one(span, runs, starts) for span in spans]
 
     def _collect_spans(
         self,
@@ -545,6 +667,16 @@ class Redactor:
     ) -> bool:
         """Decide whether the entropy detector should run for this call.
 
+        Narrowing *pattern_types* to exclude ``high_entropy_string``
+        switches off **two** things, not one: the entropy collector and
+        the token-boundary snapping backstop (Issue #909), because both
+        are gated here. A narrowed call therefore leaves the remainder of
+        a bisected token in cleartext. That is deliberate — a caller who
+        asked for one detector gets one detector — and it is pinned by
+        ``tests/test_redact.py::TestHighEntropyOverlapLeak::
+        test_pattern_types_without_entropy_detector_leaves_tail``, so
+        read that test before "fixing" it.
+
         Args:
             pattern_types: Caller-supplied filter; ``None`` means *all*.
 
@@ -559,6 +691,7 @@ class Redactor:
         self,
         content: str,
         start_order: int,
+        runs: list[_Run],
     ) -> list[_Span]:
         """Locate high-entropy substrings as spans on the original content.
 
@@ -603,6 +736,11 @@ class Redactor:
                 spans keep :attr:`_Span.order` globally unique against the
                 already-collected regex spans and the marker tie-break
                 stays deterministic.
+            runs: The shared candidate runs from :meth:`_candidate_runs`.
+                They have already been through the emitted-marker
+                carve-out and the false-positive allowlist, so neither
+                filter is re-applied here — re-applying them would be the
+                second copy of a candidacy rule that #945 was created by.
 
         Returns:
             Spans for every candidate that is not allowlisted and that
@@ -613,18 +751,13 @@ class Redactor:
         """
         threshold = entropy_threshold(self.config.min_confidence)
         spans: list[_Span] = []
-        for candidate in iter_unmarked_candidates(
-            content, marker_runs=self._marker_runs
-        ):
-            text = candidate.group()
-            if self._is_allowlisted(text):
-                continue
-            if not has_high_entropy_region(text, threshold):
+        for start, end in runs:
+            if not has_high_entropy_region(content[start:end], threshold):
                 continue
             spans.append(
                 _Span(
-                    candidate.start(),
-                    candidate.end(),
+                    start,
+                    end,
                     HIGH_ENTROPY_PATTERN_NAME,
                     start_order + len(spans),
                 )

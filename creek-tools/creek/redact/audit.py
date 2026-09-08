@@ -55,7 +55,10 @@ class RedactionAuditEntry(BaseModel):
         pattern_names: Pattern names that matched in the file.
         match_counts: Per-pattern hit count **as the scan found it** —
             not a count of substitutions actually performed. Scan/apply
-            parity is a separate open gap (#900, #946).
+            parity is a separate open gap (#946): token-boundary snapping
+            makes ``--apply`` redact more than this reports. #900, the
+            mirror-image gap where ``--apply`` left a credential
+            ``--scan`` had reported, was closed by 50833a56.
         replacement_template: Marker template used to replace each hit
             (``[REDACTED:{name}]``).
         operator: Who initiated the apply.
