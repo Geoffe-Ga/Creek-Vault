@@ -557,35 +557,24 @@ def test_ancestry_tiers_reads_the_vault_in_one_walk(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The MCP entry point surveys ancestry with a single ``01-Fragments`` pass.
+    """The ancestry survey costs exactly one ``01-Fragments`` pass per call.
 
     ``iter_vault_fragments`` rglobs and parses every file under the root
     before returning, so a second pass is a real 35k-vault regression rather
-    than a micro-optimisation.
+    than a micro-optimisation. Since #930 the walk belongs to
+    :meth:`FragmentCorpus.load` and the survey adds none of its own, which
+    is what lets ``creek_mcp.tools.compile`` gate and compile off one
+    snapshot. Both halves are asserted: moving a walk into the survey, or
+    back out into a second loader call, breaks this.
     """
-    root = tmp_path / "01-Fragments" / "Notes"
-    root.mkdir(parents=True)
-    for frag_id, tier, parent in (
-        ("frag-anc", PrivacyTier.INTIMATE, None),
-        ("frag-kid", PrivacyTier.OPEN, "frag-anc"),
-    ):
-        fragment, _raw = _node(frag_id, tier=tier, parent_id=parent)
-        post = frontmatter.Post(content="body", **fragment.model_dump(mode="json"))
-        (root / f"{frag_id}.md").write_text(frontmatter.dumps(post), encoding="utf-8")
-
-    real = privacy_filter.iter_vault_fragments
+    _seed_pair(tmp_path / "01-Fragments")
     calls: list[Path] = []
+    monkeypatch.setattr(privacy_filter, "iter_vault_fragments", _counting_loader(calls))
 
-    def _counting(
-        walk_root: Path,
-    ) -> list[tuple[Path, Fragment, str, dict[str, object]]]:
-        """Record the walked root and delegate to the real loader."""
-        calls.append(walk_root)
-        return real(walk_root)
+    corpus = FragmentCorpus.load(tmp_path / "01-Fragments")
+    assert calls == [tmp_path / "01-Fragments"]
 
-    monkeypatch.setattr(privacy_filter, "iter_vault_fragments", _counting)
-
-    tiers = ancestry_tiers(tmp_path, ["frag-kid"])
+    tiers = ancestry_tiers(corpus, ["frag-kid"])
 
     assert calls == [tmp_path / "01-Fragments"]
     assert PrivacyTier.INTIMATE in tiers
@@ -610,8 +599,9 @@ def test_source_tiers_stays_ancestry_blind(tmp_path: Path) -> None:
         post = frontmatter.Post(content="body", **fragment.model_dump(mode="json"))
         (root / f"{frag_id}.md").write_text(frontmatter.dumps(post), encoding="utf-8")
 
+    corpus = FragmentCorpus.load(tmp_path / "01-Fragments")
     assert source_tiers(tmp_path, ["frag-kid"]) == [PrivacyTier.OPEN]
-    assert PrivacyTier.INTIMATE in ancestry_tiers(tmp_path, ["frag-kid"])
+    assert PrivacyTier.INTIMATE in ancestry_tiers(corpus, ["frag-kid"])
 
 
 def _write_node(root: Path, frag_id: str, tier: PrivacyTier) -> None:
@@ -821,3 +811,25 @@ def test_fragment_corpus_skips_an_escaping_symlink_like_the_shared_loader(
 
     assert corpus.records == ()
     assert "frag-planted" not in corpus.by_id
+
+
+def test_the_ancestry_survey_stays_scoped_to_01_fragments(tmp_path: Path) -> None:
+    """Neither survey widens or narrows its scope when it takes a corpus.
+
+    ``FragmentCorpus`` takes a fragments_root, not a vault_path, precisely
+    so this cannot drift: ``CORPUS_SUBDIRS`` names three fragment
+    directories and the Writing Desk reads all three, while
+    :func:`source_tiers` and :func:`ancestry_tiers` are deliberately
+    ``01-Fragments``-only (#1424). A survey that quietly started seeing
+    ``11-Other-Authors`` would refuse calls that leak nothing; one that
+    stopped seeing part of ``01-Fragments`` would admit calls that do.
+    """
+    _seed_pair(tmp_path / "01-Fragments")
+    for subdir in ("09-Reference", "11-Other-Authors"):
+        _write_node(tmp_path / subdir, "frag-elsewhere", PrivacyTier.INTIMATE)
+
+    corpus = FragmentCorpus.load(tmp_path / "01-Fragments")
+
+    assert set(corpus.by_id) == {"frag-anc", "frag-kid"}
+    assert corpus.ancestors.chain_tiers(["frag-elsewhere"]) == []
+    assert source_tiers(tmp_path, ["frag-elsewhere"]) == []

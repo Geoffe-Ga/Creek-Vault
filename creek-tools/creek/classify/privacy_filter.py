@@ -1051,12 +1051,15 @@ class FragmentCorpus:
         )
 
 
-def ancestry_tiers(vault_path: Path, fragment_ids: Iterable[str]) -> list[PrivacyTier]:
+def ancestry_tiers(
+    corpus: FragmentCorpus,
+    fragment_ids: Iterable[str],
+) -> list[PrivacyTier]:
     """Return the tiers of *fragment_ids* **and their ancestors**, in one vault walk.
 
-    The ancestry-aware sibling of :func:`source_tiers` (#931), and the entry
-    point for callers that have no corpus walk of their own —
-    ``creek_mcp.tools.compile._survey_sources`` is the only one.
+    The ancestry-aware sibling of :func:`source_tiers` (#931), and the
+    reduction ``creek_mcp.tools.compile._survey_sources`` — its only
+    production caller — reads its admission decision off.
 
     It exists because ``creek.compile``'s prompt renders an admitted
     fragment's ancestry: :func:`creek.hierarchy.structural_path_context`
@@ -1069,15 +1072,30 @@ def ancestry_tiers(vault_path: Path, fragment_ids: Iterable[str]) -> list[Privac
     breadcrumb, which is unredactable anyway: the persisted entries are bare
     strings with no owning-fragment id.
 
-    Uses the same shared loader as :func:`source_tiers` and
-    ``creek.compile.engine._load_fragments_for_compile``, for the same
-    reason: a file one side sees and the other does not is the bug class
-    these surveys exist to prevent. The walk is a single non-short-circuiting
-    pass and the ranking that follows it is exhaustive, so probe cost stays
-    uniform by construction — see :meth:`AncestorIndex.chain_tiers` rule (f).
+    It takes the corpus rather than a vault path (#930). The walk it used
+    to perform is the same walk ``creek.compile.engine`` performs a moment
+    later, and the gap between the two was a window in which a concurrent
+    writer raising a fragment's tier was admitted under the pre-write one;
+    with one snapshot handed to both, gate and engine rank the same bytes.
+    That the two read one set of files was already the point — a file one
+    side sees and the other does not is the bug class these surveys exist
+    to prevent — and the corpus makes it true by construction rather than
+    by two calls to one loader.
+
+    The uniform-cost property is unchanged and still shared: the I/O half
+    belongs to :meth:`FragmentCorpus.load`, which materialises the whole
+    directory before returning, and the ranking half stays here —
+    :meth:`AncestorIndex.chain_tiers` walks every resolved id's whole chain
+    before any decision is read (rule (f)), so probe cost still cannot
+    reveal *where* an offending fragment sits. Both halves are required;
+    an early return over the in-memory records would open the channel even
+    with the walk already paid.
 
     Args:
-        vault_path: Vault root; fragments are read from ``01-Fragments``.
+        corpus: One snapshot of ``<vault>/01-Fragments``. Required rather
+            than optional: its one production caller always has a corpus,
+            and an optional form would leave a walk branch inside a
+            fail-closed survey with no production caller to exercise it.
         fragment_ids: The ids the caller named. Duplicates collapse; an id
             that does not resolve contributes nothing, exactly as in
             :func:`source_tiers`, so a caller's not-found path is untouched.
@@ -1086,12 +1104,7 @@ def ancestry_tiers(vault_path: Path, fragment_ids: Iterable[str]) -> list[Privac
         The tiers to reduce over. See :meth:`AncestorIndex.chain_tiers` for
         why this is a bag rather than one entry per requested id.
     """
-    return build_ancestor_index(
-        (fragment, raw)
-        for _path, fragment, _body, raw in iter_vault_fragments(
-            vault_path / "01-Fragments",
-        )
-    ).chain_tiers(fragment_ids)
+    return corpus.ancestors.chain_tiers(fragment_ids)
 
 
 def record_privacy_override(

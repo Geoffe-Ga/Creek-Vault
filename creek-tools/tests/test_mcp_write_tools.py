@@ -25,12 +25,14 @@ from creek.config import LLMConfig, LLMRoutingConfig
 from creek.models import PrivacyTier
 from creek.save import TARGET_SUBDIRS
 from creek.surface_modes import REPORT_TYPES
+from creek.vault.reader import iter_vault_fragments
 from creek_mcp.audit import (
     MCP_AUDIT_RELPATH,
     MCPAuditLog,
     verify_mcp_audit_chain,
 )
 from creek_mcp.tier_ceiling import TierCeiling, write_tier_allowed
+from creek_mcp.tools import compile as compile_module
 from creek_mcp.tools.classify import classify_tool
 from creek_mcp.tools.compile import _ABOVE_CEILING_REASON, compile_tool
 from creek_mcp.tools.ingest import ingest_tool
@@ -48,6 +50,9 @@ from creek_mcp.tools.skills import skills_refresh_tool
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
+
+    from creek.classify.privacy_filter import FragmentCorpus
+    from creek.models import Fragment
 
 
 # ---------------------------------------------------------------------------
@@ -2332,6 +2337,183 @@ def test_compile_admits_a_within_ceiling_ancestor(vault: Path) -> None:
 
     assert result["status"] == "ok"
     assert factory.calls == 1
+
+
+def test_compile_tool_walks_the_vault_exactly_once(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The MCP wrapper must not re-walk what the engine walks (#930).
+
+    ``_survey_sources`` ranks ancestry through ``ancestry_tiers``, which
+    walked ``01-Fragments`` itself, and
+    ``creek.compile.engine._load_fragments_for_compile`` then walked it
+    again. Both module bindings are patched deliberately:
+    ``tests/test_compile.py``'s
+    ``test_compile_to_vault_walks_the_vault_exactly_once`` patches only the
+    engine's name, which is why it passed while the wrapper walked too — a
+    counter at the MCP boundary is the only place the second pass is
+    visible.
+    """
+    _seed_ancestry(vault, ancestor_tier="open", child_tier="open")
+    real = iter_vault_fragments
+    calls: list[Path] = []
+
+    def _counting(root: Path) -> list[tuple[Path, Fragment, str, dict[str, object]]]:
+        """Record the walked root and delegate to the real loader."""
+        calls.append(root)
+        return real(root)
+
+    monkeypatch.setattr("creek.compile.engine.iter_vault_fragments", _counting)
+    monkeypatch.setattr("creek.classify.privacy_filter.iter_vault_fragments", _counting)
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-child"],
+        target_kind="thread",
+        target_id="thread-walks-once",
+        target_title="Walks once",
+        llm_factory=_noop_llm_factory,
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+
+    # Anti-vacuity: a refused or errored compile would also walk once.
+    assert result["status"] == "ok"
+    assert calls == [vault / "01-Fragments"]
+
+
+class _SnapshotRecordingLLMFactory:
+    """Compile LLM factory recording the tier it was keyed with and the prompt.
+
+    Both halves of the #930 admission window are visible only together. The
+    tier says which bytes the engine *ranked*; the prompt says which bytes it
+    *sent*. A wrapper that gated one snapshot and let the engine fetch
+    another would show an open gate-time tier with post-write content in the
+    prompt, or an intimate tier on a call the gate admitted — so the two are
+    recorded on one object and asserted side by side.
+    """
+
+    def __init__(self) -> None:
+        """Start with no recorded tiers and no recorded prompts."""
+        self.tiers: list[PrivacyTier | None] = []
+        self.prompts: list[str] = []
+
+    def __call__(self, tier: PrivacyTier) -> object:
+        """Record *tier* and return a stub LLM that records its prompt."""
+        self.tiers.append(tier)
+
+        def _llm(prompt: str) -> str:
+            """Record *prompt* and return an empty compile result."""
+            self.prompts.append(prompt)
+            return "{}"
+
+        return _llm
+
+
+def test_compile_gate_and_engine_read_one_snapshot_not_two(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tier raised after admission cannot change what this call compiles (#930).
+
+    The gate used to walk the vault, return, and let the engine walk it
+    again. A concurrent writer landing between the two — ``creek classify``,
+    the ``creek.classify`` MCP tool, a text editor — meant the call was
+    *admitted* on one read of the file and *compiled* from another. This
+    plants exactly that writer, in the only window that ever existed, by
+    rewriting the fragment on disk from inside the gate itself.
+
+    Both halves are asserted because either alone is satisfiable by
+    accident: the engine keys the LLM factory with the tier of the bytes it
+    ranked, and the prompt carries the body it read. One snapshot means both
+    are the pre-write ones. The safe direction of that trade is deliberate
+    and stated in ``_survey_sources``: an edit landing mid-call is compiled
+    in its pre-edit form, and admission and content can no longer disagree.
+
+    The ceiling is ``open`` so the recorded tier is the *content's*:
+    :func:`creek_mcp.tier_ceiling.routing_tier` takes the more sensitive of
+    the ceiling and the content, and ``ALL`` would swamp the signal this
+    test exists to read.
+    """
+    _write_fragment(vault, frag_id="frag-1", privacy_tier="open", body="BEFORE-BYTES")
+    factory = _SnapshotRecordingLLMFactory()
+    real_survey = compile_module._survey_sources
+
+    def _raise_the_tier_mid_call(
+        corpus: FragmentCorpus,
+        fragment_ids: list[str],
+        ceiling: TierCeiling,
+    ) -> object:
+        """Rank the call, then raise the fragment's tier on disk behind it."""
+        gate = real_survey(corpus, fragment_ids, ceiling)
+        _write_fragment(
+            vault,
+            frag_id="frag-1",
+            privacy_tier="intimate",
+            body="AFTER-BYTES",
+        )
+        return gate
+
+    monkeypatch.setattr(compile_module, "_survey_sources", _raise_the_tier_mid_call)
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=["frag-1"],
+        target_kind="thread",
+        target_id="thread-toctou",
+        target_title="Snapshot",
+        llm_factory=factory,
+        privacy_tier_ceiling=TierCeiling.OPEN,
+    )
+
+    assert result["status"] == "ok"
+    assert factory.tiers == [PrivacyTier.OPEN]
+    assert "BEFORE-BYTES" in factory.prompts[0]
+    assert "AFTER-BYTES" not in factory.prompts[0]
+
+
+@pytest.mark.parametrize(
+    ("target_kind", "fragment_ids"),
+    [("not-a-kind", ["frag-1"]), ("thread", [])],
+)
+def test_compile_walks_nothing_for_a_malformed_call(
+    vault: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_kind: str,
+    fragment_ids: list[str],
+) -> None:
+    """The corpus load stays below the argument-validation refusals (#930).
+
+    Neither ordering leaks — those two checks read only caller-supplied
+    input and touch no vault state — so the tiebreaker is cost asymmetry: a
+    walk above them would let any caller force a 35k-file parse with a
+    syntactically invalid call. Moving the walk out of the gate and into
+    ``compile_tool`` put it one edit away from drifting upward, which is
+    what this pins.
+    """
+    _write_fragment(vault, frag_id="frag-1")
+    calls: list[Path] = []
+
+    def _counting(root: Path) -> list[tuple[Path, Fragment, str, dict[str, object]]]:
+        """Record the walked root and delegate to the real loader."""
+        calls.append(root)
+        return iter_vault_fragments(root)
+
+    monkeypatch.setattr("creek.compile.engine.iter_vault_fragments", _counting)
+    monkeypatch.setattr("creek.classify.privacy_filter.iter_vault_fragments", _counting)
+
+    result = compile_tool(
+        vault_path=vault,
+        fragment_ids=fragment_ids,
+        target_kind=target_kind,
+        target_id="thread-malformed",
+        target_title="Malformed",
+        llm_factory=_noop_llm_factory,
+        privacy_tier_ceiling=TierCeiling.ALL,
+    )
+
+    assert result["status"] == "refused"
+    assert calls == []
 
 
 def test_compile_refuses_a_dangling_ancestry_link(vault: Path) -> None:

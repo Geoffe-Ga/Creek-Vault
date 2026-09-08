@@ -26,11 +26,13 @@ import pytest
 from typer.testing import CliRunner
 
 from creek.classify.llm.router import IntimateRoutingError, ModelRouter
+from creek.classify.privacy_filter import FragmentCorpus
 from creek.cli import app
 from creek.compile.engine import (
     PARADOX_LOG_RELPATH,
     CompileLLM,
     CompileResult,
+    _load_fragments_for_compile,
     compile_fragments,
     compile_to_vault,
     default_llm,
@@ -2181,6 +2183,37 @@ def test_compile_to_vault_refuses_an_unnamed_intimate_ancestor_with_no_local_bac
         )
 
     assert not (vault / "02-Threads" / "Active" / "thread-anc-refused.md").exists()
+
+
+def test_load_fragments_for_compile_keeps_requested_order_and_duplicates(
+    vault: Path,
+) -> None:
+    """Naming one id twice still loads it twice, in the order asked (#930).
+
+    Selecting the requested fragments used to be a dict comprehension over
+    the whole corpus testing ``fragment.id in requested`` against a *list*
+    — O(n*k), and at the 35k-fragment bar with a large batch that is the
+    dominant term after the walk itself. The scan is gone rather than
+    merely turned into a set lookup: the projection reads the corpus's
+    ``by_id`` view. What must not change is what comes back, so this pins
+    both properties the old comprehension happened to provide — the
+    caller's order and a duplicate id's multiplicity — and pins them for
+    the caller-supplied corpus too, since the MCP wrapper takes that branch
+    and the CLI takes the other.
+    """
+    for frag_id in ("frag-a", "frag-b"):
+        _write_fragment_to_vault(vault, _make_fragment(frag_id=frag_id), "Body.")
+    requested = ["frag-b", "frag-a", "frag-b"]
+
+    walked, _ancestors = _load_fragments_for_compile(vault, requested)
+    passed, _ancestors_again = _load_fragments_for_compile(
+        vault,
+        requested,
+        corpus=FragmentCorpus.load(vault / "01-Fragments"),
+    )
+
+    assert [fragment.id for fragment, _body, _raw in walked] == requested
+    assert [fragment.id for fragment, _body, _raw in passed] == requested
 
 
 def test_compile_to_vault_walks_the_vault_exactly_once(
