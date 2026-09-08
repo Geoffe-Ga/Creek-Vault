@@ -13,6 +13,7 @@ from creek_mcp.provisioning.ceremony import (
     CeremonySubmission,
 )
 from creek_mcp.provisioning.store import MAX_ACTIVATION_ALIASES_PER_CONSUMER
+from tests.provisioning_secret_support import FORBIDDEN_FIELD_NAMES, field_names
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROJECT_ROOT = REPO_ROOT / "creek-tools"
@@ -51,26 +52,9 @@ def test_public_schema_contains_no_credential_or_provider_result_field() -> None
     contract = json.loads(OPENAPI.read_text(encoding="utf-8"))
     schemas = contract["components"]["schemas"]
 
-    def field_names(value: object) -> set[str]:
-        """Return every exact object key from the language-neutral schema."""
-        if isinstance(value, dict):
-            return set(value) | {
-                name for item in value.values() for name in field_names(item)
-            }
-        if isinstance(value, list):
-            return {name for item in value for name in field_names(item)}
-        return set()
-
     names = field_names(schemas)
 
-    for forbidden in (
-        "consumer_credential",
-        "provider_token",
-        "recovery_key",
-        "volume_master_key",
-        "vault_url",
-        "passphrase",
-    ):
+    for forbidden in FORBIDDEN_FIELD_NAMES:
         assert forbidden not in names
 
 

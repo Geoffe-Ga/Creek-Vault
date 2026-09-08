@@ -24,6 +24,7 @@ from creek_mcp.provisioning.models import (
     FailureReason,
     JobOperation,
     JobState,
+    OperatorAllocationView,
     ProvisioningAllocation,
     ProvisioningJob,
 )
@@ -713,6 +714,87 @@ class ProvisioningStore:
             row = connection.execute(query).fetchone()
         assert row is not None
         return int(row[0])
+
+    # ------------------------------------------------------------------
+    # Operator-scoped fleet queries (#1769).
+    #
+    # These two are DELIBERATELY not fenced by requester_identity, in the same
+    # style as claim_next above. Fleet reconciliation runs for the operator who
+    # pays the provider invoice, not for a consumer: a requester fence would
+    # hide precisely the divergences it exists to find, because an orphaned
+    # resource has no owning requester left to ask on its behalf. Both are
+    # read-only, neither selects canonical_activation_id, and _owned_job
+    # remains the only path every consumer-facing method takes.
+    # ------------------------------------------------------------------
+
+    _OPERATOR_COLUMNS: Final[str] = (
+        "SELECT provisioning_allocations.provider_allocation_id, "
+        "provisioning_allocations.job_id, "
+        "provisioning_allocations.consumer_identity, "
+        "provisioning_jobs.state, provisioning_jobs.operation, "
+        "provisioning_jobs.updated_at "
+        "FROM provisioning_allocations JOIN provisioning_jobs USING (job_id) "
+    )
+
+    def live_allocations(self) -> list[OperatorAllocationView]:
+        """Return every allocation the provider should still be billing for."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                self._OPERATOR_COLUMNS
+                + "WHERE provisioning_allocations.deleted_at IS NULL "
+                "ORDER BY provisioning_allocations.provider_allocation_id"
+            ).fetchall()
+        return [self._operator_view(row) for row in rows]
+
+    def unconfirmed_deletions(
+        self,
+        older_than: timedelta,
+        *,
+        now: datetime | None = None,
+    ) -> list[OperatorAllocationView]:
+        """Return deletions the provider has not confirmed within *older_than*.
+
+        The predicate covers state ``failed`` as well as ``deleting``, and that
+        arm is load-bearing rather than defensive. ``record_failure`` settles
+        through ``_settle_claim(state=FAILED)``, which never reaches the branch
+        that sets ``deleted_at``; ``_release_expired_claims`` only rescues rows
+        still holding an expired lease, ``expire_key_ceremonies`` only touches
+        ``awaiting_key_ceremony``, and ``retry`` is requester-fenced. A delete
+        whose provider call raised therefore parks forever at
+        ``state='failed'`` with a live allocation row — a Fly bill nobody is
+        watching, which is exactly what ADR-0013 Decision 6 forbids.
+        """
+        if older_than < timedelta(0):
+            raise ValueError("older_than must not be negative")
+        threshold = _timestamp((now or _utc_now()) - older_than)
+        with self._connect() as connection:
+            rows = connection.execute(
+                self._OPERATOR_COLUMNS
+                + "WHERE provisioning_allocations.deleted_at IS NULL "
+                "AND provisioning_jobs.operation = ? "
+                "AND provisioning_jobs.state IN (?, ?) "
+                "AND provisioning_jobs.updated_at <= ? "
+                "ORDER BY provisioning_allocations.provider_allocation_id",
+                (
+                    JobOperation.DELETE.value,
+                    JobState.DELETING.value,
+                    JobState.FAILED.value,
+                    threshold,
+                ),
+            ).fetchall()
+        return [self._operator_view(row) for row in rows]
+
+    @staticmethod
+    def _operator_view(row: sqlite3.Row) -> OperatorAllocationView:
+        """Convert one operator-scoped row into its content-free projection."""
+        return OperatorAllocationView(
+            provider_allocation_id=str(row["provider_allocation_id"]),
+            job_id=str(row["job_id"]),
+            consumer_identity=str(row["consumer_identity"]),
+            state=JobState(str(row["state"])),
+            operation=JobOperation(str(row["operation"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
 
     @staticmethod
     def _release_expired_claims(connection: sqlite3.Connection, stamp: str) -> None:
