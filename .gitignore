@@ -81,3 +81,6 @@
 # regenerated). Published as a rolling GitHub Release ("knowledge-graph")
 # by .github/workflows/graph-update.yml; the adepthood hub fetches it there.
 graphify-out/
+
+# Ultracode loop state (session bookkeeping, not repo content).
+.ultracode/
